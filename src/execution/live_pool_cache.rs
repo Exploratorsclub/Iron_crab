@@ -235,6 +235,12 @@ pub struct PumpAmmState {
     pub pool_accounts: Vec<Pubkey>,
     /// Creator of the token (parsed from pool account at offset 11-43)
     pub creator: Option<Pubkey>,
+    /// Observed on-chain: PumpSwap `sell` uses three trailing accounts (cashback / volume tracking).
+    /// When true, the execution builder must append those metas for SELL; derived from `user` + pool (not copied from a third-party tx).
+    /// Monotonic: once true (MASTER/Geyser), never cleared on SLAVE merge.
+    pub sell_cashback_remaining: bool,
+    /// Third readonly trailing meta for extended `sell` (from observed on-chain ix only).
+    pub sell_cashback_third_meta: Option<Pubkey>,
 }
 
 /// Meteora CPMM (DAMM V2) cached state
@@ -864,6 +870,25 @@ impl LivePoolCache {
                 pool = %pool,
                 "LivePoolCache: set_pump_amm_pool_accounts called but pool not in cache"
             );
+        }
+    }
+
+    /// MASTER/Geyser: extended PumpSwap `sell` observation — flag monotonic; third meta only when observed.
+    pub fn merge_pump_amm_sell_extended_layout(
+        &self,
+        pool: &Pubkey,
+        requires_extended: bool,
+        third_meta: Option<Pubkey>,
+    ) {
+        if let Some(mut entry) = self.pools.get_mut(pool) {
+            if let CachedPoolState::PumpAmm(ref mut s) = entry.value_mut().state {
+                if requires_extended {
+                    s.sell_cashback_remaining = true;
+                }
+                if let Some(pk) = third_meta.filter(|p| *p != Pubkey::default()) {
+                    s.sell_cashback_third_meta = Some(pk);
+                }
+            }
         }
     }
 
@@ -1799,6 +1824,8 @@ fn parse_pumpamm_pool(data: &[u8]) -> Option<CachedPoolState> {
         quote_reserve: None,
         pool_accounts: vec![], // Will be populated from DexPoolAccounts event
         creator: Some(creator),
+        sell_cashback_remaining: false,
+        sell_cashback_third_meta: None,
     }))
 }
 
@@ -2006,6 +2033,8 @@ mod tests {
                 quote_reserve: Some(50_000_000_000),
                 pool_accounts: vec![],
                 creator: None,
+                sell_cashback_remaining: false,
+                sell_cashback_third_meta: None,
             }),
             100,
         );
@@ -2138,6 +2167,8 @@ mod tests {
             quote_reserve,
             pool_accounts,
             creator: None,
+            sell_cashback_remaining: false,
+            sell_cashback_third_meta: None,
         })
     }
 
@@ -2459,6 +2490,8 @@ mod tests {
                 quote_reserve: Some(quote_reserve),
                 pool_accounts: vec![],
                 creator: Some(creator),
+                sell_cashback_remaining: false,
+                sell_cashback_third_meta: None,
             }),
             100,
         );

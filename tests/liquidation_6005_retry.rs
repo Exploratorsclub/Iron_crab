@@ -101,6 +101,8 @@ fn fixture_pubkeys_parse_and_cache_hit() {
             quote_reserve: Some(50_000_000_000),
             pool_accounts: pool_accounts.clone(),
             creator: None,
+            sell_cashback_remaining: false,
+            sell_cashback_third_meta: None,
         }),
         0,
     );

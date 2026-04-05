@@ -327,6 +327,20 @@ fn build_minimal_pool_state_with_reserves(
                 })
                 .unwrap_or_default();
 
+            let sell_cashback_remaining = update
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("pump_amm_sell_cashback_remaining"))
+                .map(|v| v == "true")
+                .unwrap_or(false);
+
+            let sell_cashback_third_meta = update
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("pump_amm_sell_cashback_third_meta"))
+                .and_then(|s| Pubkey::from_str(s).ok())
+                .filter(|p| *p != Pubkey::default());
+
             CachedPoolState::PumpAmm(PumpAmmState {
                 base_mint,
                 quote_mint,
@@ -336,6 +350,8 @@ fn build_minimal_pool_state_with_reserves(
                 quote_reserve: Some(quote_reserve),
                 pool_accounts,
                 creator,
+                sell_cashback_remaining,
+                sell_cashback_third_meta,
             })
         }
         "pumpfun" => {
@@ -456,6 +472,12 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                             }
                             if new_pump.creator.is_none() && existing_pump.creator.is_some() {
                                 new_pump.creator = existing_pump.creator;
+                            }
+                            new_pump.sell_cashback_remaining |=
+                                existing_pump.sell_cashback_remaining;
+                            if new_pump.sell_cashback_third_meta.is_none() {
+                                new_pump.sell_cashback_third_meta =
+                                    existing_pump.sell_cashback_third_meta;
                             }
                         }
                     }
@@ -590,6 +612,22 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                         }
                         if new_pump.creator.is_none() && existing_pump.creator.is_some() {
                             new_pump.creator = existing_pump.creator;
+                        }
+                        let meta_has_flag = update
+                            .metadata
+                            .as_ref()
+                            .and_then(|m| m.get("pump_amm_sell_cashback_remaining"))
+                            .is_some();
+                        if !meta_has_flag {
+                            new_pump.sell_cashback_remaining =
+                                existing_pump.sell_cashback_remaining;
+                        } else {
+                            new_pump.sell_cashback_remaining |=
+                                existing_pump.sell_cashback_remaining;
+                        }
+                        if new_pump.sell_cashback_third_meta.is_none() {
+                            new_pump.sell_cashback_third_meta =
+                                existing_pump.sell_cashback_third_meta;
                         }
                     }
                 }
@@ -1108,6 +1146,57 @@ mod tests {
                 assert!(s.cashback_enabled, "A.30: cashback_enabled must be true when JetStream metadata contains cashback_enabled=\"true\"");
             }
             other => panic!("expected PumpFun state, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_jetstream_metadata_propagates_pump_amm_sell_cashback_remaining() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = "So11111111111111111111111111111111111111112";
+        let accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        let mut update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run-456",
+            pool_market.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            1,
+            None,
+            1,
+        );
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            "pool_accounts".to_string(),
+            accounts
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        meta.insert(
+            "pump_amm_sell_cashback_remaining".to_string(),
+            "true".to_string(),
+        );
+        meta.insert(
+            "pump_amm_sell_cashback_third_meta".to_string(),
+            Pubkey::new_unique().to_string(),
+        );
+        update.metadata = Some(meta);
+        update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+
+        assert!(apply_pool_cache_update(&cache, &update));
+        match cache.get(&pool_market).expect("pool") {
+            CachedPoolState::PumpAmm(s) => {
+                assert!(s.sell_cashback_remaining);
+                assert!(s.sell_cashback_third_meta.is_some());
+            }
+            other => panic!("expected PumpAmm, got {:?}", other),
         }
     }
 

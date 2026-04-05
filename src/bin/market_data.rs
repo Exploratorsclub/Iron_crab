@@ -5015,6 +5015,8 @@ async fn handle_ensure_pump_amm_pool_accounts(
         .await
     {
         Ok(Some(wrapped)) if wrapped.accounts.len() >= 14 => {
+            let sell_cashback_remaining = wrapped.sell_requires_cashback_remaining;
+            let sell_cashback_third = wrapped.sell_cashback_third_meta;
             let accounts = wrapped.accounts;
             let diag = wrapped.diagnostic;
             log_pump_amm_scope44_pool_accounts_diag(
@@ -5042,6 +5044,22 @@ async fn handle_ensure_pump_amm_pool_accounts(
                 CachedPoolState::PumpAmm(s) => s.creator,
                 _ => None,
             });
+            let sell_flag_merged = existing
+                .as_ref()
+                .and_then(|st| match st {
+                    CachedPoolState::PumpAmm(s) => Some(s.sell_cashback_remaining),
+                    _ => None,
+                })
+                .unwrap_or(false)
+                || sell_cashback_remaining;
+            let third_merged = sell_cashback_third
+                .or_else(|| {
+                    existing.as_ref().and_then(|st| match st {
+                        CachedPoolState::PumpAmm(s) => s.sell_cashback_third_meta,
+                        _ => None,
+                    })
+                })
+                .filter(|p| *p != Pubkey::default());
 
             let (base_reserve, quote_reserve) =
                 match resolve_pump_amm_reserves_for_ensure_discovery(
@@ -5088,6 +5106,8 @@ async fn handle_ensure_pump_amm_pool_accounts(
                 quote_reserve: Some(quote_reserve),
                 pool_accounts: accounts.clone(),
                 creator: creator_opt,
+                sell_cashback_remaining: sell_flag_merged,
+                sell_cashback_third_meta: third_merged,
             });
             ctx.live_pool_cache.upsert(pool_address, state, 0);
             ctx.live_pool_cache
@@ -5112,6 +5132,16 @@ async fn handle_ensure_pump_amm_pool_accounts(
                 let mut meta = std::collections::HashMap::new();
                 let accounts_str: Vec<String> = accounts.iter().map(|p| p.to_string()).collect();
                 meta.insert("pool_accounts".to_string(), accounts_str.join(","));
+                meta.insert(
+                    "pump_amm_sell_cashback_remaining".to_string(),
+                    sell_flag_merged.to_string(),
+                );
+                if let Some(pk) = third_merged {
+                    meta.insert(
+                        "pump_amm_sell_cashback_third_meta".to_string(),
+                        pk.to_string(),
+                    );
+                }
                 if let Some(creator) = creator_opt {
                     meta.insert("creator".to_string(), creator.to_string());
                 }
@@ -7332,6 +7362,19 @@ async fn run_geyser_loop(
                                     let accounts_str: Vec<String> = effective_pool_accounts.iter().map(|p| p.to_string()).collect();
                                     meta.insert("pool_accounts".to_string(), accounts_str.join(","));
                                 }
+                                meta.insert(
+                                    "pump_amm_sell_cashback_remaining".to_string(),
+                                    s.sell_cashback_remaining.to_string(),
+                                );
+                                if let Some(pk) = s
+                                    .sell_cashback_third_meta
+                                    .filter(|p| *p != Pubkey::default())
+                                {
+                                    meta.insert(
+                                        "pump_amm_sell_cashback_third_meta".to_string(),
+                                        pk.to_string(),
+                                    );
+                                }
                                 if !meta.is_empty() {
                                     pool_update.metadata = Some(meta);
                                 }
@@ -7983,9 +8026,18 @@ async fn run_geyser_loop(
                     mint: base_mint_pk,
                     dex: DexType::PumpFunAmm,
                     pool_accounts: Some(pool_accounts),
+                    pump_amm_sell_requires_cashback_remaining,
+                    pump_amm_sell_cashback_third_meta,
                     ..
                 }) = parsed_event.as_ref()
                 {
+                    if *pump_amm_sell_requires_cashback_remaining {
+                        ctx.live_pool_cache.merge_pump_amm_sell_extended_layout(
+                            pool_address,
+                            true,
+                            *pump_amm_sell_cashback_third_meta,
+                        );
+                    }
                     // v1 order (see MarketEventKind::DexPoolAccounts docs): base_mint at [2], quote_mint at [3]
                     let base_mint = pool_accounts.get(2).map(|p| p.to_string()).unwrap_or_default();
                     let quote_mint = pool_accounts.get(3).map(|p| p.to_string()).unwrap_or_default();
@@ -8092,6 +8144,32 @@ async fn run_geyser_loop(
                             let mut meta = std::collections::HashMap::new();
                             let accounts_str: Vec<String> = pool_accounts.iter().map(|p| p.to_string()).collect();
                             meta.insert("pool_accounts".to_string(), accounts_str.join(","));
+                            let merged_flag = ctx
+                                .live_pool_cache
+                                .get(pool_address)
+                                .and_then(|st| match st {
+                                    CachedPoolState::PumpAmm(s) => Some(s.sell_cashback_remaining),
+                                    _ => None,
+                                })
+                                .unwrap_or(*pump_amm_sell_requires_cashback_remaining);
+                            meta.insert(
+                                "pump_amm_sell_cashback_remaining".to_string(),
+                                merged_flag.to_string(),
+                            );
+                            if let Some(pk) = ctx
+                                .live_pool_cache
+                                .get(pool_address)
+                                .and_then(|st| match st {
+                                    CachedPoolState::PumpAmm(s) => s.sell_cashback_third_meta,
+                                    _ => None,
+                                })
+                                .filter(|p| *p != Pubkey::default())
+                            {
+                                meta.insert(
+                                    "pump_amm_sell_cashback_third_meta".to_string(),
+                                    pk.to_string(),
+                                );
+                            }
                             pool_update.metadata = Some(meta);
                             pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
                             let subject = pool_subject(&pool_address.to_string());
@@ -9102,6 +9180,8 @@ mod discovery_tests {
                 quote_reserve: Some(1),
                 pool_accounts: accounts.clone(),
                 creator: None,
+                sell_cashback_remaining: false,
+                sell_cashback_third_meta: None,
             }),
             0,
         );
