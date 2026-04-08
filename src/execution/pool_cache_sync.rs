@@ -506,6 +506,10 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 }
                 cache.upsert(pool_addr, minimal_state, update.geyser_slot);
                 if update.dex == "pump_amm" {
+                    cache.merge_pump_amm_sell_layout_from_metadata(
+                        &pool_addr,
+                        update.metadata.as_ref(),
+                    );
                     cache.merge_pump_amm_pool_accounts_readiness(
                         pool_addr,
                         update.effective_dex_readiness(),
@@ -927,6 +931,7 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 }
                 cache.upsert(addr, minimal_state, update.geyser_slot);
                 if update.dex == "pump_amm" {
+                    cache.merge_pump_amm_sell_layout_from_metadata(&addr, update.metadata.as_ref());
                     cache.merge_pump_amm_pool_accounts_readiness(
                         addr,
                         update.effective_dex_readiness(),
@@ -1109,6 +1114,53 @@ mod tests {
             }
             other => panic!("expected PumpFun state, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_jetstream_metadata_propagates_pump_amm_sell_cashback_remaining() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = "So11111111111111111111111111111111111111112";
+        let accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        let mut update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run-456",
+            pool_market.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            1,
+            None,
+            1,
+        );
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            "pool_accounts".to_string(),
+            accounts
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        meta.insert(
+            "pump_amm_sell_cashback_remaining".to_string(),
+            "true".to_string(),
+        );
+        meta.insert(
+            "pump_amm_sell_cashback_third_meta".to_string(),
+            Pubkey::new_unique().to_string(),
+        );
+        update.metadata = Some(meta);
+        update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+
+        assert!(apply_pool_cache_update(&cache, &update));
+        let (flag, third) = cache.pump_amm_sell_extended_layout(&pool_market);
+        assert!(flag);
+        assert!(third.is_some());
     }
 
     #[test]

@@ -164,6 +164,8 @@ fn test_build_swap_ix_with_cached_accounts() {
         user,
         &pool_accounts,
         None,
+        false,
+        None,
     );
 
     assert!(result.is_ok());

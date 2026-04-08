@@ -7,6 +7,9 @@
 //! Supports: Raydium AMM V4, Orca Whirlpool, PumpFun
 
 use crate::solana::dex::pumpfun::BondingCurveState;
+use crate::solana::dex::pumpfun_amm::{
+    pump_amm_sell_ix_discriminator, PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS,
+};
 use crate::solana::geyser_listener::{GeyserAccountUpdate, GeyserTransactionUpdate};
 use rust_decimal::Decimal;
 use solana_sdk::hash::hash;
@@ -92,6 +95,10 @@ pub enum ParsedDexEvent {
         /// - SPL Token: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
         /// - Token-2022: TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb
         token_program: Option<Pubkey>,
+        /// PumpSwap only: observed `sell` used 24 accounts (three trailing cashback/volume metas).
+        pump_amm_sell_requires_cashback_remaining: bool,
+        /// PumpSwap only: third trailing readonly meta from the observed ix (not user-derivable).
+        pump_amm_sell_cashback_third_meta: Option<Pubkey>,
     },
     /// Liquidity removed (potential rug)
     LiquidityRemoved {
@@ -499,6 +506,8 @@ fn parse_raydium_swap(
         pool_accounts: None,
         creator: None,
         token_program: None, // Raydium uses SPL Token, but we don't trade there for momentum
+        pump_amm_sell_requires_cashback_remaining: false,
+        pump_amm_sell_cashback_third_meta: None,
     })
 }
 
@@ -727,6 +736,8 @@ fn parse_orca_transaction(
         pool_accounts,
         creator: None,
         token_program,
+        pump_amm_sell_requires_cashback_remaining: false,
+        pump_amm_sell_cashback_third_meta: None,
     })
 }
 
@@ -994,6 +1005,8 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
         pool_accounts: None,
         creator,
         token_program,
+        pump_amm_sell_requires_cashback_remaining: false,
+        pump_amm_sell_cashback_third_meta: None,
     })
 }
 
@@ -1091,29 +1104,46 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     if update.instruction_data.len() < 24 {
         return None;
     }
-    if update.instruction_accounts.len() < 21 {
-        return None;
-    }
-
-    let disc = &update.instruction_data[0..8];
     let buy_disc = anchor_disc("buy_exact_quote_in");
-    let sell_disc = anchor_disc("sell");
+    let sell_disc = pump_amm_sell_ix_discriminator();
+    let disc: [u8; 8] = update.instruction_data[0..8].try_into().ok()?;
 
     let is_buy = if disc == buy_disc {
+        if update.instruction_accounts.len() < 23 {
+            return None;
+        }
         true
     } else if disc == sell_disc {
+        let n = update.instruction_accounts.len();
+        if n != 21 && n != PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS {
+            return None;
+        }
         false
     } else {
         return None;
     };
 
+    let sell_requires_cashback_remaining =
+        !is_buy && update.instruction_accounts.len() == PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS;
+    let sell_cashback_third_meta = if sell_requires_cashback_remaining {
+        update.instruction_accounts.get(23).copied()
+    } else {
+        None
+    };
+    if sell_requires_cashback_remaining && sell_cashback_third_meta.is_none() {
+        return None;
+    }
+
     // Observed account order from on-chain PumpFun AMM swap TX:
     // BUY: 23 accounts (includes global_volume_accumulator + user_volume)
-    // SELL: 21 accounts (no volume accumulators)
+    // SELL: 21 base metas, or 24 with three trailing cashback/volume accounts (Pump docs / mainnet).
     // See src/solana/dex/pumpfun_amm.rs build_swap_ix_from_pool_accounts for reference.
     let pool_market = update.instruction_accounts[0];
-    let user = update.instruction_accounts[1];
-    let trader = update.account_keys.first().copied().unwrap_or(user);
+    let trader = update
+        .account_keys
+        .first()
+        .copied()
+        .unwrap_or(update.instruction_accounts[1]);
     let global_config = update.instruction_accounts[2];
     let base_mint = update.instruction_accounts[3];
     // instruction_accounts[5] = user_base_ta
@@ -1134,16 +1164,16 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     // BUY: [16]=global_volume_accumulator, [17]=coin_creator_vault_ata, [18]=coin_creator_vault_authority,
     //      [19]=user_volume, [20]=fee_config (pool-specific PDA), [21]=fee_program, [22]=program_id
     // SELL: [16]=program_id, [17]=coin_creator_vault_ata, [18]=coin_creator_vault_authority,
-    //       [19]=fee_config (pool-specific PDA), [20]=fee_program
+    //       [19]=fee_config global, [20]=fee_program, [21..24]=optional cashback remaining metas
     //
-    // CRITICAL: Transaction fee_config accounts are pool-specific PDAs (AMM-owned).
-    // We must use global constants instead:
+    // CRITICAL: BUY uses pool-specific fee_config in the ix; we still publish global constants in v14 cache.
     //   - PUMPFUN_AMM_FEE_CONFIG = 5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx
     //   - PUMPFUN_AMM_FEE_PROGRAM_ID = pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ
+    let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM).ok()?;
     let global_volume_accumulator = if is_buy {
         update.instruction_accounts[16]
     } else {
-        Pubkey::default()
+        Pubkey::find_program_address(&[b"global_volume_accumulator"], &pump_amm_program).0
     };
     let coin_creator_vault_ata = update.instruction_accounts[17];
     let coin_creator_vault_authority = update.instruction_accounts[18];
@@ -1194,7 +1224,6 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
 
     // Pool static accounts in v1 format (14 accounts, includes global_volume_accumulator)
     // See docs/MOMENTUM_V2_SPEC.md section 9.2 and pumpfun_amm.rs build_swap_ix_from_pool_accounts
-    // For SELL, global_volume_accumulator will be Pubkey::default() (not needed)
     let pool_accounts = vec![
         pool_market,                  // [0]
         global_config,                // [1]
@@ -1207,9 +1236,9 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         event_authority,              // [8]
         coin_creator_vault_ata,       // [9]
         coin_creator_vault_authority, // [10]
-        global_volume_accumulator, // [11] - v1 format: for BUY this is real, for SELL it's default
-        fee_config,                // [12]
-        fee_program,               // [13]
+        global_volume_accumulator,    // [11] - singleton PDA for SELL; observed for BUY
+        fee_config,                   // [12]
+        fee_program,                  // [13]
     ];
 
     debug!(
@@ -1256,6 +1285,8 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         pool_accounts: Some(pool_accounts),
         creator: None, // PumpSwap uses coin_creator_vault_authority from pool_accounts[10]
         token_program,
+        pump_amm_sell_requires_cashback_remaining: sell_requires_cashback_remaining,
+        pump_amm_sell_cashback_third_meta: sell_cashback_third_meta,
     })
 }
 
@@ -1574,6 +1605,8 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
         pool_accounts: None,
         creator: None,
         token_program: None, // Meteora uses SPL Token, not relevant for momentum trading
+        pump_amm_sell_requires_cashback_remaining: false,
+        pump_amm_sell_cashback_third_meta: None,
     })
 }
 
@@ -1700,6 +1733,8 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
         pool_accounts: None,
         creator: None,
         token_program: None, // Raydium CPMM uses SPL Token, not relevant for momentum trading
+        pump_amm_sell_requires_cashback_remaining: false,
+        pump_amm_sell_cashback_third_meta: None,
     })
 }
 
@@ -1879,9 +1914,13 @@ mod tests {
         let event = parsed.expect("sell parse");
         match &event {
             ParsedDexEvent::Trade {
-                dex, pool_accounts, ..
+                dex,
+                pool_accounts,
+                pump_amm_sell_requires_cashback_remaining,
+                ..
             } => {
                 assert_eq!(dex, &DexType::PumpFunAmm);
+                assert!(!pump_amm_sell_requires_cashback_remaining);
                 let accts = pool_accounts
                     .as_ref()
                     .expect("swap path must carry pool_accounts");
@@ -1890,6 +1929,121 @@ mod tests {
                 assert_eq!(accts[6], protocol_fee_recipient);
             }
             _ => panic!("expected Trade, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_pumpfun_amm_sell_24_accounts_sets_cashback_remaining_flag() {
+        let pool_market = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let global_config = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let user_base = Pubkey::new_unique();
+        let user_quote = Pubkey::new_unique();
+        let pool_base_vault = Pubkey::new_unique();
+        let pool_quote_vault = Pubkey::new_unique();
+        let protocol_fee_recipient = Pubkey::new_unique();
+        let protocol_fee_recipient_ta = Pubkey::new_unique();
+        let spl_token = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let system = Pubkey::from_str("11111111111111111111111111111111").unwrap();
+        let ata_program = Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap();
+        let event_authority = Pubkey::new_unique();
+        let pumpfun_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM).unwrap();
+        let coin_creator_vault_ata = Pubkey::new_unique();
+        let coin_creator_vault_authority = Pubkey::new_unique();
+        let fee_config = Pubkey::from_str("5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx").unwrap();
+        let fee_program = Pubkey::from_str("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ").unwrap();
+
+        let third_trailing = Pubkey::new_unique();
+        let instruction_accounts = vec![
+            pool_market,
+            user,
+            global_config,
+            base_mint,
+            quote_mint,
+            user_base,
+            user_quote,
+            pool_base_vault,
+            pool_quote_vault,
+            protocol_fee_recipient,
+            protocol_fee_recipient_ta,
+            spl_token,
+            spl_token,
+            system,
+            ata_program,
+            event_authority,
+            pumpfun_amm_program,
+            coin_creator_vault_ata,
+            coin_creator_vault_authority,
+            fee_config,
+            fee_program,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            third_trailing,
+        ];
+        assert_eq!(instruction_accounts.len(), 24);
+
+        let sell_disc = anchor_disc("sell");
+        let mut instruction_data = sell_disc.to_vec();
+        instruction_data.extend_from_slice(&1_000_000u64.to_le_bytes());
+        instruction_data.extend_from_slice(&0u64.to_le_bytes());
+
+        let mut account_keys = instruction_accounts.clone();
+        account_keys.insert(0, user);
+
+        let base_mint_str = base_mint.to_string();
+        let pre_token = vec![TokenBalance {
+            account_index: 5,
+            mint: base_mint_str.clone(),
+            ui_token_amount: TokenAmount {
+                ui_amount: None,
+                decimals: 6,
+                amount: "2000000".to_string(),
+            },
+            program_id: Some(spl_token.to_string()),
+        }];
+        let post_token = vec![TokenBalance {
+            account_index: 5,
+            mint: base_mint_str,
+            ui_token_amount: TokenAmount {
+                ui_amount: None,
+                decimals: 6,
+                amount: "1000000".to_string(),
+            },
+            program_id: Some(spl_token.to_string()),
+        }];
+
+        let pre_balances = vec![1_000_000_000u64; account_keys.len()];
+        let mut post_balances = pre_balances.clone();
+        post_balances[0] = 1_000_050_000_000;
+
+        let update = GeyserTransactionUpdate {
+            signature: "sell_ext_synth_sig".to_string(),
+            slot: 201,
+            account_keys,
+            instruction_accounts,
+            instruction_data,
+            inner_instructions: vec![],
+            pre_token_balances: pre_token,
+            post_token_balances: post_token,
+            pre_balances,
+            post_balances,
+            fee_lamports: 5000,
+            compute_units_consumed: None,
+        };
+
+        let event = parse_transaction_update(&update).expect("extended sell parse");
+        match event {
+            ParsedDexEvent::Trade {
+                pump_amm_sell_requires_cashback_remaining,
+                pump_amm_sell_cashback_third_meta,
+                ..
+            } => {
+                assert!(pump_amm_sell_requires_cashback_remaining);
+                assert_eq!(pump_amm_sell_cashback_third_meta, Some(third_trailing));
+            }
+            _ => panic!("expected Trade"),
         }
     }
 }

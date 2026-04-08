@@ -431,6 +431,13 @@ pub struct LivePoolCache {
 
     /// Meteora DLMM pool address → explicit [`DexPoolReadiness`] from JetStream / MASTER (Bug #36).
     meteora_dlmm_readiness_by_pool: DashMap<Pubkey, DexPoolReadiness>,
+
+    /// PumpSwap pool-market → extended `sell` layout observed on-chain (Scope 46).
+    /// **Not** part of [`PumpAmmState`] so external crates (Level-5 eval) keep stable struct literals.
+    /// Monotonic flag: once true, never cleared.
+    pump_amm_sell_extended_flag_by_market: DashMap<Pubkey, bool>,
+    /// Third trailing readonly meta for extended `sell` (from observed ix); set when authoritatively known.
+    pump_amm_sell_extended_third_meta_by_market: DashMap<Pubkey, Pubkey>,
 }
 
 /// Which vault position (A/B or X/Y or 0/1) this vault represents
@@ -467,6 +474,8 @@ impl LivePoolCache {
             meteora_cpmm_readiness_by_pool: DashMap::new(),
             orca_readiness_by_pool: DashMap::new(),
             meteora_dlmm_readiness_by_pool: DashMap::new(),
+            pump_amm_sell_extended_flag_by_market: DashMap::new(),
+            pump_amm_sell_extended_third_meta_by_market: DashMap::new(),
         }
     }
 
@@ -865,6 +874,63 @@ impl LivePoolCache {
                 "LivePoolCache: set_pump_amm_pool_accounts called but pool not in cache"
             );
         }
+    }
+
+    /// JetStream / Geyser: merge PumpSwap extended `sell` layout keys into side maps (not `PumpAmmState`).
+    pub fn merge_pump_amm_sell_layout_from_metadata(
+        &self,
+        pool: &Pubkey,
+        meta: Option<&std::collections::HashMap<String, String>>,
+    ) {
+        let Some(m) = meta else {
+            return;
+        };
+        if m.get("pump_amm_sell_cashback_remaining")
+            .is_some_and(|v| v == "true")
+        {
+            self.pump_amm_sell_extended_flag_by_market
+                .insert(*pool, true);
+        }
+        if let Some(s) = m.get("pump_amm_sell_cashback_third_meta") {
+            if let Ok(pk) = Pubkey::from_str(s) {
+                if pk != Pubkey::default() {
+                    self.pump_amm_sell_extended_third_meta_by_market
+                        .insert(*pool, pk);
+                }
+            }
+        }
+    }
+
+    /// Geyser trade path: mark pool-market as needing extended `sell` (monotonic flag + optional third meta).
+    pub fn merge_pump_amm_sell_extended_layout(
+        &self,
+        pool: &Pubkey,
+        requires_extended: bool,
+        third_meta: Option<Pubkey>,
+    ) {
+        if requires_extended {
+            self.pump_amm_sell_extended_flag_by_market
+                .insert(*pool, true);
+        }
+        if let Some(pk) = third_meta.filter(|p| *p != Pubkey::default()) {
+            self.pump_amm_sell_extended_third_meta_by_market
+                .insert(*pool, pk);
+        }
+    }
+
+    /// Extended PumpSwap `sell` layout: flag + third readonly meta (if known).
+    #[must_use]
+    pub fn pump_amm_sell_extended_layout(&self, pool_market: &Pubkey) -> (bool, Option<Pubkey>) {
+        let flag = self
+            .pump_amm_sell_extended_flag_by_market
+            .get(pool_market)
+            .map(|e| *e.value())
+            .unwrap_or(false);
+        let third = self
+            .pump_amm_sell_extended_third_meta_by_market
+            .get(pool_market)
+            .map(|e| *e.value());
+        (flag, third)
     }
 
     /// Set Raydium AMM Serum/OpenBook accounts (bids, asks, event_queue).

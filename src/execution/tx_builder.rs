@@ -1,5 +1,5 @@
 use crate::execution::live_pool_cache::{CachedPoolState, MeteoraState, SharedLivePoolCache};
-use crate::ipc::{RejectReason, SwapHop, TradeIntent, TradeSide};
+use crate::ipc::{RejectReason, SwapHop, TradeIntent, TradeSide, NATIVE_SOL_MINT};
 use crate::solana::dex::meteora_dlmm::MeteoraDlmm;
 use crate::solana::dex::orca::Orca;
 use crate::solana::dex::orca_whirlpool_layout;
@@ -761,13 +761,20 @@ pub async fn build_tx_plan(
         // - 12 accounts: SELL format (no volume accumulators)
         // - 14 accounts: BUY format (with global_volume_accumulator + user_volume_accumulator)
         let accounts_len = intent.resources.accounts.len();
+        let (sell_requires_cashback_remaining, sell_cashback_third_meta) = cache
+            .map(|c| c.pump_amm_sell_extended_layout(&pool_id))
+            .unwrap_or((false, None));
+
         let pool_accounts: Vec<Pubkey> = if accounts_len == 0 {
             if let Some(cache) = cache {
                 if let Some(CachedPoolState::PumpAmm(amm_state)) = cache.get(&pool_id) {
                     if amm_state.pool_accounts.len() >= 12 {
+                        let (sell_ext, sell_third) = cache.pump_amm_sell_extended_layout(&pool_id);
                         tracing::warn!(
                             pool = %pool_id,
                             accounts_len = amm_state.pool_accounts.len(),
+                            sell_cashback_remaining = sell_ext,
+                            sell_cashback_third_meta = ?sell_third,
                             "pump_amm: using cached pool_accounts (intent missing accounts)"
                         );
                         amm_state.pool_accounts.clone()
@@ -874,6 +881,12 @@ pub async fn build_tx_plan(
             wallet_pubkey,
             &pool_accounts,
             token_program_override,
+            sell_requires_cashback_remaining && intent.side == TradeSide::Sell,
+            if intent.side == TradeSide::Sell {
+                sell_cashback_third_meta
+            } else {
+                None
+            },
         ) {
             Ok(ixs) => ixs,
             Err(e) => {
@@ -1572,16 +1585,17 @@ async fn build_hop_pump_amm(
     cache: Option<&SharedLivePoolCache>,
 ) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
     // PumpSwap AMM (graduated tokens) - get pool_accounts from cache
-    let pool_accounts = if let Some(cache) = cache {
-        if let Some(state) = cache.get(pool_address) {
-            if let CachedPoolState::PumpAmm(amm_state) = state {
+    let (pool_accounts, sell_requires, sell_third) = if let Some(cache) = cache {
+        match cache.get(pool_address) {
+            Some(CachedPoolState::PumpAmm(amm_state)) => {
+                let (sell_requires, sell_third) = cache.pump_amm_sell_extended_layout(pool_address);
                 if amm_state.pool_accounts.len() >= 14 {
                     tracing::debug!(
                         pool = %pool_address,
                         accounts_len = amm_state.pool_accounts.len(),
                         "multi-hop pump_amm: using cached pool_accounts"
                     );
-                    amm_state.pool_accounts.clone()
+                    (amm_state.pool_accounts.clone(), sell_requires, sell_third)
                 } else {
                     return Err(UnsupportedTxPlan {
                         reason: RejectReason::UnsupportedIntent,
@@ -1591,7 +1605,8 @@ async fn build_hop_pump_amm(
                         ),
                     });
                 }
-            } else {
+            }
+            Some(_) => {
                 return Err(UnsupportedTxPlan {
                     reason: RejectReason::UnsupportedIntent,
                     details: format!(
@@ -1600,11 +1615,12 @@ async fn build_hop_pump_amm(
                     ),
                 });
             }
-        } else {
-            return Err(UnsupportedTxPlan {
-                reason: RejectReason::UnsupportedIntent,
-                details: format!("pump_amm: pool {} not in cache", pool_address),
-            });
+            None => {
+                return Err(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: format!("pump_amm: pool {} not in cache", pool_address),
+                });
+            }
         }
     } else {
         return Err(UnsupportedTxPlan {
@@ -1624,6 +1640,8 @@ async fn build_hop_pump_amm(
         wallet_pubkey,
         &pool_accounts,
         None, // Token-2022 not yet supported in multi-hop arb
+        sell_requires && hop.output_mint == NATIVE_SOL_MINT,
+        sell_third,
     )
     .map_err(|e| UnsupportedTxPlan {
         reason: RejectReason::UnsupportedIntent,

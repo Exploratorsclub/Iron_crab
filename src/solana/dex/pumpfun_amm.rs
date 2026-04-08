@@ -3,6 +3,7 @@ use crate::solana::dex::{Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use bs58;
 use dashmap::DashMap;
 use serde_json::{json, Value};
 use solana_account_decoder::UiAccountEncoding;
@@ -127,6 +128,15 @@ fn anchor_disc(ix_name: &str) -> [u8; 8] {
     disc.copy_from_slice(&out.as_ref()[..8]);
     disc
 }
+
+/// Anchor discriminator for PumpSwap `sell` (IDL `global:sell`).
+pub fn pump_amm_sell_ix_discriminator() -> [u8; 8] {
+    anchor_disc("sell")
+}
+
+/// PumpSwap `sell` uses 21 base account metas; some pools require three trailing accounts (Pump cashback / volume tracking), total 24.
+/// Verified on mainnet (e.g. sig `2CCmRDScAErjuBLnVJbGEyV3jsWbuNZpniZ5iTLSwZoE84nmyf285hqJXjRStMHJUaJ9Ex7EvL9fgwAVM83qGd3o`).
+pub const PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS: usize = 24;
 
 /// Stable, structured reason when local (validator) market-account parsing cannot build `PumpAmmPoolStatic`.
 /// Used by `market-data` cold-path logging (Scope 42); not a global canonicalization of fee recipients.
@@ -302,6 +312,10 @@ pub struct PumpAmmPoolStatic {
     global_volume_accumulator: Pubkey,
     fee_config: Pubkey,
     fee_program: Pubkey,
+    /// Observed on-chain: this pool's `sell` instruction includes three trailing accounts after the 21 base metas.
+    pub sell_requires_cashback_remaining: bool,
+    /// Third trailing `sell` meta (readonly context); **not** user-derivable — from observed swap / TX-history only.
+    pub sell_cashback_third_meta: Option<Pubkey>,
     /// Set when this struct was built inside `pumpfun_amm` (parse / tx-history / cache reconstruct).
     pub last_parse_diagnostics: Option<PumpAmmPoolAccountsDiagnostic>,
 }
@@ -311,6 +325,9 @@ pub struct PumpAmmPoolStatic {
 pub struct PoolAccountsV14WithDiagnostic {
     pub accounts: Vec<Pubkey>,
     pub diagnostic: PumpAmmPoolAccountsDiagnostic,
+    /// Propagate to JetStream / SLAVE: pool needs extended `sell` (24 metas).
+    pub sell_requires_cashback_remaining: bool,
+    pub sell_cashback_third_meta: Option<Pubkey>,
 }
 
 impl PumpAmmPoolStatic {
@@ -703,6 +720,8 @@ impl PumpFunAmmDex {
                             "pump_amm: pool_accounts from LivePoolCache (Ready, ZERO RPC)"
                         );
                         let pool_market = accounts[0];
+                        let (sell_requires, sell_third) =
+                            cache.pump_amm_sell_extended_layout(&pool_market);
                         return Ok(Some(PoolAccountsV14WithDiagnostic {
                             accounts,
                             diagnostic: Self::pump_amm_livepoolcache_diagnostic(
@@ -711,6 +730,8 @@ impl PumpFunAmmDex {
                                 pool_market,
                                 base_mint,
                             ),
+                            sell_requires_cashback_remaining: sell_requires,
+                            sell_cashback_third_meta: sell_third,
                         }));
                     }
                 }
@@ -776,6 +797,8 @@ impl PumpFunAmmDex {
                     return Ok(Some(PoolAccountsV14WithDiagnostic {
                         accounts,
                         diagnostic,
+                        sell_requires_cashback_remaining: pool.sell_requires_cashback_remaining,
+                        sell_cashback_third_meta: pool.sell_cashback_third_meta,
                     }));
                 }
                 PumpAmmMarketParseOutcome::LocalFail(reason) => {
@@ -809,6 +832,8 @@ impl PumpFunAmmDex {
                         return Ok(Some(PoolAccountsV14WithDiagnostic {
                             accounts,
                             diagnostic,
+                            sell_requires_cashback_remaining: pool.sell_requires_cashback_remaining,
+                            sell_cashback_third_meta: pool.sell_cashback_third_meta,
                         }));
                     }
                     return Err(anyhow!(
@@ -857,6 +882,8 @@ impl PumpFunAmmDex {
         Ok(Some(PoolAccountsV14WithDiagnostic {
             accounts,
             diagnostic,
+            sell_requires_cashback_remaining: pool.sell_requires_cashback_remaining,
+            sell_cashback_third_meta: pool.sell_cashback_third_meta,
         }))
     }
 
@@ -874,18 +901,40 @@ impl PumpFunAmmDex {
         pool_market: Pubkey,
         user: Pubkey,
     ) -> Pubkey {
-        // Best-effort PDA derivation.
-        // Observed accounts suggest this is a user-specific PDA; we default to a common Anchor seed
-        // pattern: ("user_volume_accumulator", pool_market, user).
-        //
-        // If this is wrong, the tx will fail with an account constraint error; we can then adjust
-        // based on observed on-chain addresses.
+        // BUY layout uses pool-scoped seeds (pool_market, user) — see on-chain `buy_exact_quote_in`.
         let seeds: [&[u8]; 3] = [
             b"user_volume_accumulator",
             pool_market.as_ref(),
             user.as_ref(),
         ];
         Pubkey::find_program_address(&seeds, &program_id).0
+    }
+
+    /// PumpSwap extended `sell`: `user_volume_accumulator` PDA uses **only** the user pubkey (same seed
+    /// pattern as PumpFun cashback). Verified against mainnet sig
+    /// `2CCmRDScAErjuBLnVJbGEyV3jsWbuNZpniZ5iTLSwZoE84nmyf285hqJXjRStMHJUaJ9Ex7EvL9fgwAVM83qGd3o`.
+    fn derive_pump_amm_user_volume_accumulator_for_sell_cashback(
+        program_id: Pubkey,
+        user: Pubkey,
+    ) -> Pubkey {
+        Pubkey::find_program_address(&[b"user_volume_accumulator", user.as_ref()], &program_id).0
+    }
+
+    /// First two trailing `sell` metas when cashback/extended path is active (mainnet order).
+    /// The **third** meta is pool/context-specific and must be supplied from authoritative observation
+    /// (Geyser / TX-history); it is not user-derivable.
+    pub fn pump_amm_sell_cashback_first_two_metas(
+        user: Pubkey,
+        quote_mint: Pubkey,
+        quote_token_program: Pubkey,
+    ) -> (Pubkey, Pubkey) {
+        let program_id =
+            Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).expect("PUMPFUN_AMM_PROGRAM_ID is valid");
+        let user_vol =
+            Self::derive_pump_amm_user_volume_accumulator_for_sell_cashback(program_id, user);
+        let user_vol_wsol_ata =
+            Self::derive_ata_with_program(user_vol, quote_mint, quote_token_program);
+        (user_vol_wsol_ata, user_vol)
     }
 
     async fn rpc_get_account_owner_and_executable(
@@ -2319,6 +2368,8 @@ impl PumpFunAmmDex {
             global_volume_accumulator,
             fee_config,
             fee_program,
+            sell_requires_cashback_remaining: false,
+            sell_cashback_third_meta: None,
             last_parse_diagnostics: Some(diag),
         }))
     }
@@ -2537,105 +2588,64 @@ impl PumpFunAmmDex {
                         .collect(),
                     None => continue,
                 };
-                // PumpSwap AMM swap instructions have 21 accounts (not 23 as originally assumed).
-                if accounts.len() != 21 {
-                    // Log first mismatch or reference TX
-                    if scanned_tx_count == 1 || is_ref_tx {
+                let Some(ix_data) = Self::pump_amm_ix_data_from_json(ix) else {
+                    if is_ref_tx {
+                        info!("pump_amm TX-history: reference TX missing ix data (need base58/binary for discriminator)");
+                    }
+                    continue;
+                };
+
+                let Some(pool) = Self::pump_amm_pool_static_from_parsed_swap_ix(
+                    &account_keys,
+                    &accounts,
+                    &ix_data,
+                    |s_opt| {
+                        Self::pump_amm_tx_history_diagnostic(
+                            "tx_history_market_scan",
+                            force_refresh,
+                            pool_market,
+                            base_mint,
+                            s_opt.or_else(|| Some(sig.clone())),
+                        )
+                    },
+                ) else {
+                    if is_ref_tx {
                         info!(
-                            "pump_amm TX-history: account count mismatch sig={} expected=21 actual={}",
-                            sig, accounts.len()
+                            "pump_amm TX-history: reference TX not buy/sell or bad account count sig={} n_accounts={}",
+                            sig,
+                            accounts.len()
                         );
                     }
                     continue;
-                }
-
-                if is_ref_tx {
-                    info!("pump_amm TX-history: reference TX account count OK (21)");
-                }
-
-                // Ensure we're extracting accounts for the market we scanned.
-                let pool_market_ix = match account_keys.get(accounts[0]) {
-                    Some(v) => v,
-                    None => {
-                        if is_ref_tx {
-                            info!("pump_amm TX-history: reference TX accounts[0] out of bounds");
-                        }
-                        continue;
-                    }
                 };
-                if Pubkey::from_str(pool_market_ix).ok() != Some(pool_market) {
-                    // Log first mismatch or reference TX
+
+                if pool.pool_market != pool_market {
                     if scanned_tx_count == 1 || is_ref_tx {
                         info!(
                             "pump_amm TX-history: market mismatch sig={} expected={} actual={}",
-                            sig, pool_market, pool_market_ix
+                            sig, pool_market, pool.pool_market
                         );
                     }
                     continue;
                 }
-
-                if is_ref_tx {
-                    info!("pump_amm TX-history: reference TX market match OK");
-                }
-
-                // Base mint is accounts[3] for pump_amm v1.
-                let base_mint_ix = match account_keys.get(accounts[3]) {
-                    Some(v) => v,
-                    None => {
-                        if is_ref_tx {
-                            info!("pump_amm TX-history: reference TX accounts[3] out of bounds");
-                        }
-                        continue;
-                    }
-                };
-                if Pubkey::from_str(base_mint_ix).ok() != Some(base_mint) {
-                    // Log first mismatch or reference TX
+                if pool.base_mint != base_mint {
                     if scanned_tx_count == 1 || is_ref_tx {
                         info!(
                             "pump_amm TX-history: base_mint mismatch sig={} expected={} actual={}",
-                            sig, base_mint, base_mint_ix
+                            sig, base_mint, pool.base_mint
                         );
                     }
                     continue;
                 }
 
                 if is_ref_tx {
-                    info!("pump_amm TX-history: reference TX base_mint match OK, proceeding to build pool...");
+                    info!(
+                        "pump_amm TX-history: reference TX parsed OK (sell_cashback_remaining={})",
+                        pool.sell_requires_cashback_remaining
+                    );
                 }
 
-                // Build the subset we store as pool static.
-                // Account mapping from actual PumpSwap AMM swap instruction (23 accounts total):
-                // #0 = pool_market, #2 = global_config, #3 = base_mint, #4 = quote_mint,
-                // #7 = pool_base_vault, #8 = pool_quote_vault,
-                // #9 = protocol_fee_recipient, #10 = protocol_fee_recipient_ta,
-                // #15 = event_authority, #17 = coin_creator_vault_ata,
-                // #18 = coin_creator_vault_authority, #16 = global_volume_accumulator,
-                // #19 = fee_config, #20 = fee_program
-                let pool = PumpAmmPoolStatic {
-                    pool_market: Pubkey::from_str(&account_keys[accounts[0]])?,
-                    global_config: Pubkey::from_str(&account_keys[accounts[2]])?,
-                    base_mint: Pubkey::from_str(&account_keys[accounts[3]])?,
-                    quote_mint: Pubkey::from_str(&account_keys[accounts[4]])?,
-                    pool_base_vault: Pubkey::from_str(&account_keys[accounts[7]])?,
-                    pool_quote_vault: Pubkey::from_str(&account_keys[accounts[8]])?,
-                    protocol_fee_recipient: Pubkey::from_str(&account_keys[accounts[9]])?,
-                    protocol_fee_recipient_ta: Pubkey::from_str(&account_keys[accounts[10]])?,
-                    event_authority: Pubkey::from_str(&account_keys[accounts[15]])?,
-                    coin_creator_vault_ata: Pubkey::from_str(&account_keys[accounts[17]])?,
-                    coin_creator_vault_authority: Pubkey::from_str(&account_keys[accounts[18]])?,
-                    global_volume_accumulator: Pubkey::from_str(&account_keys[accounts[16]])?,
-                    fee_config: Pubkey::from_str(&account_keys[accounts[19]])?,
-                    fee_program: Pubkey::from_str(&account_keys[accounts[20]])?,
-                    last_parse_diagnostics: Some(Self::pump_amm_tx_history_diagnostic(
-                        "tx_history_market_scan",
-                        force_refresh,
-                        pool_market,
-                        base_mint,
-                        Some(sig.clone()),
-                    )),
-                };
-
-                // Fee guardrails (same as the broader scanner).
+                // Fee guardrails: BUY uses pool-specific `fee_config` (AMM-owned); SELL uses global fee accounts.
                 let expected_fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
                 if pool.fee_program != expected_fee_program {
                     if is_ref_tx {
@@ -2651,8 +2661,6 @@ impl PumpFunAmmDex {
                     info!("pump_amm TX-history: reference TX fee_program OK, checking fee_config owner...");
                 }
 
-                // CRITICAL: fee_config must be owned by the Fee Program, not the AMM Program!
-                // This matches the fix in discover_pool_markets_via_program_accounts (lines 763-818).
                 let Some((fee_owner, fee_executable)) =
                     Self::rpc_account_owner_executable_for(tx_rpc.as_ref(), pool.fee_config)
                         .await?
@@ -2663,15 +2671,24 @@ impl PumpFunAmmDex {
                     continue;
                 };
 
+                let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
+                let fee_ok = if accounts.len() == 23 {
+                    !fee_executable && fee_owner == pump_amm_program
+                } else {
+                    !fee_executable && fee_owner == expected_fee_program
+                };
+
                 if is_ref_tx {
                     info!(
-                        "pump_amm TX-history: reference TX fee_config owner={} executable={} (expected owner={} Fee Program)",
-                        fee_owner, fee_executable, expected_fee_program
+                        "pump_amm TX-history: reference TX fee_config owner={} executable={} buy_layout={} fee_ok={}",
+                        fee_owner,
+                        fee_executable,
+                        accounts.len() == 23,
+                        fee_ok
                     );
                 }
 
-                // fee_config must be owned by Fee Program and not be executable
-                if fee_executable || fee_owner != expected_fee_program {
+                if !fee_ok {
                     if is_ref_tx {
                         info!("pump_amm TX-history: reference TX fee_config owner check FAILED");
                     }
@@ -2735,6 +2752,8 @@ impl PumpFunAmmDex {
                                 "pump_amm: cache pool_accounts[8] != canonical event_authority; using canonical"
                             );
                         }
+                        let (sell_requires, sell_third) =
+                            cache.pump_amm_sell_extended_layout(&accounts[0]);
                         let pool = PumpAmmPoolStatic {
                             pool_market: accounts[0],
                             global_config,
@@ -2750,6 +2769,8 @@ impl PumpFunAmmDex {
                             global_volume_accumulator: accounts[11],
                             fee_config: accounts[12],
                             fee_program: accounts[13],
+                            sell_requires_cashback_remaining: sell_requires,
+                            sell_cashback_third_meta: sell_third,
                             last_parse_diagnostics: Some(Self::pump_amm_livepoolcache_diagnostic(
                                 "discover_pool_static_livepoolcache_reconstruct",
                                 force_refresh,
@@ -3132,77 +3153,53 @@ impl PumpFunAmmDex {
                                     .collect(),
                                 None => continue,
                             };
-                        // PumpSwap AMM swap instructions have 21 accounts (not 23 as originally assumed).
-                        if accounts.len() != 21 {
+                        let Some(ix_data) = Self::pump_amm_ix_data_from_json(ix) else {
+                            continue;
+                        };
+                        let Some(mut pool) = Self::pump_amm_pool_static_from_parsed_swap_ix(
+                            &account_keys,
+                            &accounts,
+                            &ix_data,
+                            |_| {
+                                Self::pump_amm_tx_history_diagnostic_local_paginated_scan(
+                                    "tx_history_paginated_address_scan",
+                                    force_refresh,
+                                    Pubkey::default(),
+                                    base_mint,
+                                    Some(sig.clone()),
+                                )
+                            },
+                        ) else {
+                            continue;
+                        };
+
+                        if pool.base_mint != base_mint {
+                            continue;
+                        }
+                        if pool.quote_mint != Pubkey::from_str(WSOL_MINT).unwrap_or_default() {
                             continue;
                         }
 
-                        let base_mint_ix = match account_keys.get(accounts[3]) {
-                            Some(v) => v,
-                            None => continue,
-                        };
-                        let quote_mint_ix = match account_keys.get(accounts[4]) {
-                            Some(v) => v,
-                            None => continue,
-                        };
-                        if base_mint_ix != base_mint.to_string().as_str() {
-                            continue;
-                        }
-                        if quote_mint_ix != WSOL_MINT {
-                            continue;
-                        }
-
-                        let pool = PumpAmmPoolStatic {
-                            pool_market: Pubkey::from_str(&account_keys[accounts[0]])?,
-                            global_config: Pubkey::from_str(&account_keys[accounts[2]])?,
-                            base_mint,
-                            quote_mint: Pubkey::from_str(WSOL_MINT)?,
-                            pool_base_vault: Pubkey::from_str(&account_keys[accounts[7]])?,
-                            pool_quote_vault: Pubkey::from_str(&account_keys[accounts[8]])?,
-                            protocol_fee_recipient: Pubkey::from_str(&account_keys[accounts[9]])?,
-                            protocol_fee_recipient_ta: Pubkey::from_str(
-                                &account_keys[accounts[10]],
-                            )?,
-                            event_authority: Pubkey::from_str(&account_keys[accounts[15]])?,
-                            coin_creator_vault_ata: Pubkey::from_str(&account_keys[accounts[17]])?,
-                            coin_creator_vault_authority: Pubkey::from_str(
-                                &account_keys[accounts[18]],
-                            )?,
-                            global_volume_accumulator: Pubkey::from_str(
-                                &account_keys[accounts[19]],
-                            )?,
-                            fee_config: Pubkey::default(),
-                            fee_program: Pubkey::default(),
-                            last_parse_diagnostics: None,
-                        };
-
-                        // Deterministic mapping: our Geyser parser and observed on-chain swaps agree that
-                        // PumpSwap v1 uses fixed indices.
-                        // - fee_config: accounts[21]
-                        // - fee_program: accounts[22]
-                        let fee_config = Pubkey::from_str(&account_keys[accounts[21]])?;
-                        let fee_program = Pubkey::from_str(&account_keys[accounts[22]])?;
-
-                        // Guardrails: fee_config must be owned by pump_amm (Anchor constraint), and the
-                        // fee program is expected to be pfee.
                         let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
                         let expected_fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
-                        if fee_program != expected_fee_program {
+                        if pool.fee_program != expected_fee_program {
                             continue;
                         }
                         let Some((fee_owner, fee_executable)) = self
-                            .rpc_get_account_owner_and_executable(fee_config)
+                            .rpc_get_account_owner_and_executable(pool.fee_config)
                             .await?
                         else {
                             continue;
                         };
-                        if fee_executable || fee_owner != pump_amm_program {
+                        let fee_ok = if accounts.len() == 23 {
+                            !fee_executable && fee_owner == pump_amm_program
+                        } else {
+                            !fee_executable && fee_owner == expected_fee_program
+                        };
+                        if !fee_ok {
                             continue;
                         }
 
-                        let mut pool = pool;
-                        pool.fee_program = fee_program;
-                        pool.fee_config = fee_config;
                         pool.last_parse_diagnostics =
                             Some(Self::pump_amm_tx_history_diagnostic_local_paginated_scan(
                                 "tx_history_paginated_address_scan",
@@ -3408,6 +3405,103 @@ impl PumpFunAmmDex {
         }
 
         out
+    }
+
+    fn pump_amm_ix_data_from_json(ix: &Value) -> Option<Vec<u8>> {
+        let d = ix.get("data")?;
+        if let Some(s) = d.as_str() {
+            return bs58::decode(s).into_vec().ok();
+        }
+        if let Some(arr) = d.as_array() {
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
+                let b = v.as_u64()? as u8;
+                out.push(b);
+            }
+            return Some(out);
+        }
+        None
+    }
+
+    /// Parse `buy_exact_quote_in` (23 accounts) or `sell` (21 or 24 accounts) into static pool fields.
+    /// `account_keys` must include loaded addresses (v0).
+    fn pump_amm_pool_static_from_parsed_swap_ix(
+        account_keys: &[String],
+        acc_indices: &[usize],
+        ix_data: &[u8],
+        diag_factory: impl FnOnce(Option<String>) -> PumpAmmPoolAccountsDiagnostic,
+    ) -> Option<PumpAmmPoolStatic> {
+        if ix_data.len() < 8 {
+            return None;
+        }
+        let disc: [u8; 8] = ix_data[0..8].try_into().ok()?;
+        let buy_disc = anchor_disc("buy_exact_quote_in");
+        let sell_disc = anchor_disc("sell");
+
+        let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).ok()?;
+        let singleton_gva = pump_amm_singleton_global_volume_accumulator(&pump_amm_program);
+
+        let parse_pk = |i: usize| -> Option<Pubkey> {
+            let s = account_keys.get(*acc_indices.get(i)?)?;
+            Pubkey::from_str(s).ok()
+        };
+
+        if disc == buy_disc {
+            if acc_indices.len() != 23 {
+                return None;
+            }
+            return Some(PumpAmmPoolStatic {
+                pool_market: parse_pk(0)?,
+                global_config: parse_pk(2)?,
+                base_mint: parse_pk(3)?,
+                quote_mint: parse_pk(4)?,
+                pool_base_vault: parse_pk(7)?,
+                pool_quote_vault: parse_pk(8)?,
+                protocol_fee_recipient: parse_pk(9)?,
+                protocol_fee_recipient_ta: parse_pk(10)?,
+                event_authority: parse_pk(15)?,
+                coin_creator_vault_ata: parse_pk(17)?,
+                coin_creator_vault_authority: parse_pk(18)?,
+                global_volume_accumulator: parse_pk(16)?,
+                fee_config: parse_pk(20)?,
+                fee_program: parse_pk(21)?,
+                sell_requires_cashback_remaining: false,
+                sell_cashback_third_meta: None,
+                last_parse_diagnostics: Some(diag_factory(None)),
+            });
+        }
+
+        if disc == sell_disc {
+            let extended = match acc_indices.len() {
+                21 => false,
+                24 => true,
+                _ => return None,
+            };
+            let pool_market = parse_pk(0)?;
+            let base_mint = parse_pk(3)?;
+            let third = if extended { Some(parse_pk(23)?) } else { None };
+            return Some(PumpAmmPoolStatic {
+                pool_market,
+                global_config: parse_pk(2)?,
+                base_mint,
+                quote_mint: parse_pk(4)?,
+                pool_base_vault: parse_pk(7)?,
+                pool_quote_vault: parse_pk(8)?,
+                protocol_fee_recipient: parse_pk(9)?,
+                protocol_fee_recipient_ta: parse_pk(10)?,
+                event_authority: parse_pk(15)?,
+                coin_creator_vault_ata: parse_pk(17)?,
+                coin_creator_vault_authority: parse_pk(18)?,
+                global_volume_accumulator: singleton_gva,
+                fee_config: parse_pk(19)?,
+                fee_program: parse_pk(20)?,
+                sell_requires_cashback_remaining: extended,
+                sell_cashback_third_meta: third,
+                last_parse_diagnostics: Some(diag_factory(None)),
+            });
+        }
+
+        None
     }
 
     async fn get_vault_amount(&self, ta: Pubkey) -> Result<u64> {
@@ -3788,6 +3882,8 @@ impl Dex for PumpFunAmmDex {
             global_volume_accumulator,
             fee_config,
             fee_program,
+            sell_requires_cashback_remaining: false,
+            sell_cashback_third_meta: None,
             last_parse_diagnostics: None,
         };
 
@@ -4010,6 +4106,10 @@ impl Dex for PumpFunAmmDex {
                 "pump_amm build_swap_ix: cached pool.event_authority != canonical; using canonical"
             );
         }
+        // SELL position [19] must be the global Fee-Program fee_config (same as
+        // `build_swap_ix_from_pool_accounts`). BUY position [20] is pool-specific (AMM-owned);
+        // pools discovered from BUY tx-history would otherwise store the wrong pubkey for SELL.
+        let sell_fee_config = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG)?;
         let (protocol_fee_recipient, protocol_fee_recipient_ta) =
             pump_amm_resolve_protocol_fee_accounts(
                 pool.protocol_fee_recipient,
@@ -4055,15 +4155,42 @@ impl Dex for PumpFunAmmDex {
             metas.push(AccountMeta::new_readonly(pool.fee_program, false)); // 21
             metas.push(AccountMeta::new_readonly(program_id, false)); // 22
         } else {
-            // SELL: accounts 16-20 (21 total) - no volume accumulators
+            // SELL: 21 base metas; extended path adds three trailing accounts when observed on-chain.
             metas.push(AccountMeta::new_readonly(program_id, false)); // 16
             metas.push(AccountMeta::new(pool.coin_creator_vault_ata, false)); // 17
             metas.push(AccountMeta::new_readonly(
                 pool.coin_creator_vault_authority,
                 false,
             )); // 18
-            metas.push(AccountMeta::new_readonly(pool.fee_config, false)); // 19
+            metas.push(AccountMeta::new_readonly(sell_fee_config, false)); // 19
             metas.push(AccountMeta::new_readonly(pool.fee_program, false)); // 20
+                                                                            // `pools_by_base` can be stale vs monotonic LivePoolCache (Geyser); prefer DashMap for extended SELL.
+            let mut sell_requires_cashback_remaining = pool.sell_requires_cashback_remaining;
+            let mut sell_cashback_third_meta = pool.sell_cashback_third_meta;
+            if let Some(ref cache) = self.live_pool_cache {
+                let (dash_flag, dash_third) =
+                    cache.pump_amm_sell_extended_layout(&pool.pool_market);
+                if dash_flag {
+                    sell_requires_cashback_remaining = true;
+                    sell_cashback_third_meta = dash_third.or(sell_cashback_third_meta);
+                }
+            }
+            if sell_requires_cashback_remaining {
+                let Some(third) = sell_cashback_third_meta.filter(|p| *p != Pubkey::default())
+                else {
+                    return Err(anyhow!(
+                        "pump_amm SELL: extended layout required but sell_cashback_third_meta missing (authoritative observation required)"
+                    ));
+                };
+                let (user_vol_wsol_ata, user_vol) = Self::pump_amm_sell_cashback_first_two_metas(
+                    user,
+                    pool.quote_mint,
+                    quote_token_program,
+                );
+                metas.push(AccountMeta::new(user_vol_wsol_ata, false));
+                metas.push(AccountMeta::new(user_vol, false));
+                metas.push(AccountMeta::new_readonly(third, false));
+            }
         }
 
         Ok(vec![Instruction {
@@ -4108,6 +4235,7 @@ impl PumpFunAmmDex {
     /// `base_token_program` - Optional token program override for the base token.
     /// Use `Some(TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb)` for Token-2022 tokens.
     /// Defaults to SPL Token if None.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_swap_ix_from_pool_accounts(
         input_mint: &str,
         output_mint: &str,
@@ -4116,6 +4244,8 @@ impl PumpFunAmmDex {
         user: Pubkey,
         pool_accounts: &[Pubkey],
         base_token_program: Option<Pubkey>,
+        sell_requires_cashback_remaining: bool,
+        sell_cashback_third_meta: Option<Pubkey>,
     ) -> Result<Vec<Instruction>> {
         // Require 14 accounts (v1 format with global_volume_accumulator)
         if pool_accounts.len() < 14 {
@@ -4243,8 +4373,8 @@ impl PumpFunAmmDex {
                 AccountMeta::new_readonly(program_id, false), // 22
             ]
         } else {
-            // SELL: 21 accounts (no volume accumulators)
-            vec![
+            // SELL: 21 base metas; some pools require three trailing accounts (mainnet 24-account sells).
+            let mut metas = vec![
                 AccountMeta::new(pool_market, false),                     // 0
                 AccountMeta::new(user, true),                             // 1
                 AccountMeta::new_readonly(global_config, false),          // 2
@@ -4272,7 +4402,21 @@ impl PumpFunAmmDex {
                 AccountMeta::new_readonly(coin_creator_vault_authority, false), // 18
                 AccountMeta::new_readonly(fee_config, false), // 19
                 AccountMeta::new_readonly(fee_program, false), // 20
-            ]
+            ];
+            if sell_requires_cashback_remaining {
+                let Some(third) = sell_cashback_third_meta.filter(|p| *p != Pubkey::default())
+                else {
+                    return Err(anyhow!(
+                        "pump_amm SELL: extended layout required but sell_cashback_third_meta missing (MASTER/Geyser observation required)"
+                    ));
+                };
+                let (user_vol_wsol_ata, user_vol) =
+                    Self::pump_amm_sell_cashback_first_two_metas(user, quote_mint, quote_tp);
+                metas.push(AccountMeta::new(user_vol_wsol_ata, false)); // 21
+                metas.push(AccountMeta::new(user_vol, false)); // 22
+                metas.push(AccountMeta::new_readonly(third, false)); // 23
+            }
+            metas
         };
 
         Ok(vec![Instruction {
@@ -4634,6 +4778,8 @@ mod tests {
             user,
             &pool_accounts,
             None,
+            false,
+            None,
         );
 
         assert!(result.is_ok());
@@ -4681,6 +4827,8 @@ mod tests {
             user,
             &pool_accounts,
             None,
+            false,
+            None,
         )
         .expect("SELL build");
 
@@ -4724,6 +4872,8 @@ mod tests {
             user,
             &pool_accounts,
             None,
+            false,
+            None,
         )
         .expect("SELL build");
 
@@ -4738,6 +4888,22 @@ mod tests {
         let gva = pump_amm_singleton_global_volume_accumulator(&program_id);
         let expected = Pubkey::from_str("C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw").unwrap();
         assert_eq!(gva, expected);
+    }
+
+    /// Mainnet 24-account `sell` (sig `2CCmRDScAErjuBLnVJbGEyV3jsWbuNZpniZ5iTLSwZoE84nmyf285hqJXjRStMHJUaJ9Ex7EvL9fgwAVM83qGd3o`): first two trailing metas are user-derivable; third is observed-only.
+    #[test]
+    fn test_pumpswap_sell_extended_first_two_metas_match_mainnet_reference() {
+        let user = Pubkey::from_str("AazGgNrpzFAE5S5WENfP4YxaZ2oiVXjuAJFRCvF56E5e").unwrap();
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let expected_user_vol_pda =
+            Pubkey::from_str("A5jW7JYYX3Mxf9qC1bmuNoCFW9togSr5EoKzhJaXtSJG").unwrap();
+        let expected_user_vol_wsol_ata =
+            Pubkey::from_str("8vNm4swQAQgcUDZxYHQyghMyH76SFuS6iX8nvv1Z3nJt").unwrap();
+        let (wsol_ata, uv_pda) =
+            PumpFunAmmDex::pump_amm_sell_cashback_first_two_metas(user, wsol, quote_tp);
+        assert_eq!(wsol_ata, expected_user_vol_wsol_ata);
+        assert_eq!(uv_pda, expected_user_vol_pda);
     }
 
     /// Creator-vault PDA fallback must derive the quote-mint (WSOL) ATA — same as offset-211 path (not `base_mint`).
@@ -4795,6 +4961,8 @@ mod tests {
             user,
             &pool_accounts,
             None,
+            false,
+            None,
         )
         .expect("SELL build");
 
@@ -4838,6 +5006,8 @@ mod tests {
             user,
             &pool_accounts,
             Some(token_2022),
+            false,
+            None,
         )
         .expect("SELL build Token-2022");
 
@@ -4885,6 +5055,8 @@ mod tests {
             global_volume_accumulator: Pubkey::new_unique(),
             fee_config: Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap(),
             fee_program: Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(),
+            sell_requires_cashback_remaining: false,
+            sell_cashback_third_meta: None,
             last_parse_diagnostics: None,
         };
         dex.pools_by_base.insert(base_mint, pool);
@@ -4933,6 +5105,8 @@ mod tests {
             user,
             &pool_accounts,
             None,
+            false,
+            None,
         )
         .expect_err("must not invent protocol fee accounts");
         assert!(
@@ -4952,6 +5126,8 @@ mod tests {
             1,
             user,
             &pool_accounts,
+            None,
+            false,
             None,
         )
         .expect("SELL build partial fee");
