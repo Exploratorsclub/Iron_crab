@@ -228,6 +228,93 @@ fn raydium_cpmm_readiness_for_pool_cache_update(s: &RaydiumCpmmState) -> DexPool
     }
 }
 
+/// PumpSwap SELL-layout contract for JetStream / SLAVE SSOT.
+///
+/// - Base-only SELL stays ready as long as the underlying refresh/observation says the base layout is usable.
+/// - Extended SELL is ready only when the observed third readonly meta is authoritatively known.
+fn pump_amm_sell_layout_publish_state(
+    sell_requires_extended: bool,
+    sell_cashback_third_meta: Option<Pubkey>,
+    base_layout_ready: bool,
+) -> (bool, DexPoolReadiness) {
+    let sell_layout_ready = if sell_requires_extended {
+        sell_cashback_third_meta
+            .filter(|p| *p != Pubkey::default())
+            .is_some()
+    } else {
+        base_layout_ready
+    };
+    let dex_readiness = if sell_layout_ready {
+        DexPoolReadiness::Ready
+    } else {
+        DexPoolReadiness::Partial
+    };
+    (sell_layout_ready, dex_readiness)
+}
+
+/// Resolve PumpSwap SELL-layout state for the EnsurePumpAmmPoolAccounts publish path.
+///
+/// `force_refresh=true` is authoritative and must be able to override stale monotonic cache hints.
+fn pump_amm_sell_layout_state_for_ensure_publish(
+    force_refresh: bool,
+    cached_requires_extended: bool,
+    cached_third_meta: Option<Pubkey>,
+    refresh_requires_extended: bool,
+    refresh_third_meta: Option<Pubkey>,
+    refresh_layout_ready: bool,
+) -> (bool, Option<Pubkey>, bool, DexPoolReadiness) {
+    let (effective_requires_extended, effective_third_meta, base_layout_ready) = if force_refresh {
+        (
+            refresh_requires_extended,
+            refresh_third_meta.filter(|p| *p != Pubkey::default()),
+            refresh_layout_ready,
+        )
+    } else {
+        (
+            cached_requires_extended || refresh_requires_extended,
+            refresh_third_meta
+                .or(cached_third_meta)
+                .filter(|p| *p != Pubkey::default()),
+            refresh_layout_ready,
+        )
+    };
+    let (sell_layout_ready, dex_readiness) = pump_amm_sell_layout_publish_state(
+        effective_requires_extended,
+        effective_third_meta,
+        base_layout_ready,
+    );
+    (
+        effective_requires_extended,
+        effective_third_meta,
+        sell_layout_ready,
+        dex_readiness,
+    )
+}
+
+/// Control-response contract for PumpSwap EnsurePumpAmmPoolAccounts.
+///
+/// Only the authoritative `force_refresh=true` path may turn a successful JetStream publish into an
+/// error when the resolved SELL layout is still not ready.
+fn pump_amm_control_response_for_ensure_publish(
+    force_refresh: bool,
+    jetstream_ok: bool,
+    sell_layout_ready: bool,
+) -> (ControlResponseStatus, Option<String>) {
+    if !jetstream_ok {
+        return (
+            ControlResponseStatus::Error,
+            Some("JetStream publish failed".to_string()),
+        );
+    }
+    if force_refresh && !sell_layout_ready {
+        return (
+            ControlResponseStatus::Error,
+            Some("authoritative PumpSwap SELL layout unresolved after force_refresh".to_string()),
+        );
+    }
+    (ControlResponseStatus::Ok, None)
+}
+
 /// Market data configuration (hot-reloadable via NATS)
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -5017,6 +5104,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
         Ok(Some(wrapped)) if wrapped.accounts.len() >= 14 => {
             let sell_cashback_remaining = wrapped.sell_requires_cashback_remaining;
             let sell_cashback_third = wrapped.sell_cashback_third_meta;
+            let sell_layout_ready_from_refresh = wrapped.sell_layout_ready;
             let accounts = wrapped.accounts;
             let diag = wrapped.diagnostic;
             log_pump_amm_scope44_pool_accounts_diag(
@@ -5047,10 +5135,15 @@ async fn handle_ensure_pump_amm_pool_accounts(
             let (ext_flag_cache, ext_third_cache) = ctx
                 .live_pool_cache
                 .pump_amm_sell_extended_layout(&pool_address);
-            let sell_flag_merged = ext_flag_cache || sell_cashback_remaining;
-            let third_merged = sell_cashback_third
-                .or(ext_third_cache)
-                .filter(|p| *p != Pubkey::default());
+            let (sell_flag_merged, third_merged, sell_layout_ready, dex_readiness) =
+                pump_amm_sell_layout_state_for_ensure_publish(
+                    force_refresh,
+                    ext_flag_cache,
+                    ext_third_cache,
+                    sell_cashback_remaining,
+                    sell_cashback_third,
+                    sell_layout_ready_from_refresh,
+                );
 
             let (base_reserve, quote_reserve) =
                 match resolve_pump_amm_reserves_for_ensure_discovery(
@@ -5099,13 +5192,23 @@ async fn handle_ensure_pump_amm_pool_accounts(
                 creator: creator_opt,
             });
             ctx.live_pool_cache.upsert(pool_address, state, 0);
-            ctx.live_pool_cache.merge_pump_amm_sell_extended_layout(
-                &pool_address,
-                sell_flag_merged,
-                third_merged,
-            );
+            if force_refresh {
+                ctx.live_pool_cache.set_pump_amm_sell_layout_authoritative(
+                    &pool_address,
+                    sell_flag_merged,
+                    third_merged,
+                );
+            } else {
+                ctx.live_pool_cache.merge_pump_amm_sell_extended_layout(
+                    &pool_address,
+                    sell_flag_merged,
+                    third_merged,
+                );
+            }
             ctx.live_pool_cache
-                .merge_pump_amm_pool_accounts_readiness(pool_address, DexPoolReadiness::Ready);
+                .set_pump_amm_sell_layout_ready(&pool_address, sell_layout_ready);
+            ctx.live_pool_cache
+                .set_pump_amm_pool_accounts_readiness_authoritative(pool_address, dex_readiness);
 
             // Publish JetStream PoolCacheUpdate (authoritative SSOT).
             // Reply Ok ONLY when JetStream write succeeds (I-24a).
@@ -5130,6 +5233,16 @@ async fn handle_ensure_pump_amm_pool_accounts(
                     "pump_amm_sell_cashback_remaining".to_string(),
                     sell_flag_merged.to_string(),
                 );
+                meta.insert(
+                    "pump_amm_sell_layout_ready".to_string(),
+                    sell_layout_ready.to_string(),
+                );
+                if force_refresh {
+                    meta.insert(
+                        "pump_amm_sell_layout_authoritative".to_string(),
+                        "true".to_string(),
+                    );
+                }
                 if let Some(pk) = third_merged {
                     meta.insert(
                         "pump_amm_sell_cashback_third_meta".to_string(),
@@ -5140,7 +5253,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
                     meta.insert("creator".to_string(), creator.to_string());
                 }
                 pool_update.metadata = Some(meta);
-                pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+                pool_update.set_dex_readiness_in_metadata(dex_readiness);
                 let subject = pool_subject(&pool_address_str);
                 match nats.jetstream_publish(&subject, &pool_update).await {
                     Ok(true) => {
@@ -5167,27 +5280,50 @@ async fn handle_ensure_pump_amm_pool_accounts(
             };
 
             if let Some(ref nats) = ctx.nats {
-                let (status, message) = if jetstream_ok {
-                    info!(
-                        request_id = %request_id,
-                        base_mint = %base_mint_str,
-                        pool_address = %pool_address_str,
-                        rpc_global_scan = "no",
-                        control_response = "pending_publish",
-                        "I-24d Discovery: terminal outcome ok"
-                    );
-                    (ControlResponseStatus::Ok, None)
-                } else {
-                    warn!(
-                        request_id = %request_id,
-                        base_mint = %base_mint_str,
-                        "I-24d Discovery: terminal outcome error (JetStream publish failed)"
-                    );
-                    (
-                        ControlResponseStatus::Error,
-                        Some("JetStream publish failed".to_string()),
-                    )
-                };
+                let (status, message) = pump_amm_control_response_for_ensure_publish(
+                    force_refresh,
+                    jetstream_ok,
+                    sell_layout_ready,
+                );
+                match (jetstream_ok, force_refresh, sell_layout_ready) {
+                    (true, _, true) => {
+                        info!(
+                            request_id = %request_id,
+                            base_mint = %base_mint_str,
+                            pool_address = %pool_address_str,
+                            rpc_global_scan = "no",
+                            control_response = "pending_publish",
+                            "I-24d Discovery: terminal outcome ok"
+                        );
+                    }
+                    (true, true, false) => {
+                        warn!(
+                            request_id = %request_id,
+                            base_mint = %base_mint_str,
+                            pool_address = %pool_address_str,
+                            sell_cashback_remaining = sell_flag_merged,
+                            sell_cashback_third_meta = ?third_merged,
+                            "I-24d Discovery: force_refresh result published as Partial (authoritative SELL layout unresolved)"
+                        );
+                    }
+                    (true, false, false) => {
+                        info!(
+                            request_id = %request_id,
+                            base_mint = %base_mint_str,
+                            pool_address = %pool_address_str,
+                            sell_cashback_remaining = sell_flag_merged,
+                            sell_cashback_third_meta = ?third_merged,
+                            "I-24d Discovery: terminal outcome ok (non-force-refresh publish may remain Partial)"
+                        );
+                    }
+                    (false, _, _) => {
+                        warn!(
+                            request_id = %request_id,
+                            base_mint = %base_mint_str,
+                            "I-24d Discovery: terminal outcome error (JetStream publish failed)"
+                        );
+                    }
+                }
                 publish_control_response(
                     nats,
                     &ctx.run_id,
@@ -8130,10 +8266,24 @@ async fn run_geyser_loop(
                     // when the parsed Geyser state has empty pool_accounts.
                     if pool_accounts.len() >= 14 {
                         ctx.live_pool_cache.set_pump_amm_pool_accounts(pool_address, pool_accounts.clone());
-                        ctx.live_pool_cache.merge_pump_amm_pool_accounts_readiness(
-                            *pool_address,
-                            DexPoolReadiness::Ready,
+                        let (ext_flag, ext_third) =
+                            ctx.live_pool_cache.pump_amm_sell_extended_layout(pool_address);
+                        let merged_flag = ext_flag || *pump_amm_sell_requires_cashback_remaining;
+                        let merged_third = ext_third
+                            .or(*pump_amm_sell_cashback_third_meta)
+                            .filter(|p| *p != Pubkey::default());
+                        let (sell_layout_ready, dex_readiness) = pump_amm_sell_layout_publish_state(
+                            merged_flag,
+                            merged_third,
+                            true,
                         );
+                        ctx.live_pool_cache
+                            .set_pump_amm_sell_layout_ready(pool_address, sell_layout_ready);
+                        ctx.live_pool_cache
+                            .set_pump_amm_pool_accounts_readiness_authoritative(
+                                *pool_address,
+                                dex_readiness,
+                            );
 
                         // FIX-33: Persist pool_accounts to JetStream so bootstrap recovers them after restart.
                         if let Some(ref nats) = ctx.nats {
@@ -8153,25 +8303,22 @@ async fn run_geyser_loop(
                             let mut meta = std::collections::HashMap::new();
                             let accounts_str: Vec<String> = pool_accounts.iter().map(|p| p.to_string()).collect();
                             meta.insert("pool_accounts".to_string(), accounts_str.join(","));
-                            let (ext_flag, ext_third) =
-                                ctx.live_pool_cache.pump_amm_sell_extended_layout(pool_address);
-                            let merged_flag =
-                                ext_flag || *pump_amm_sell_requires_cashback_remaining;
                             meta.insert(
                                 "pump_amm_sell_cashback_remaining".to_string(),
                                 merged_flag.to_string(),
                             );
-                            if let Some(pk) = ext_third
-                                .or(*pump_amm_sell_cashback_third_meta)
-                                .filter(|p| *p != Pubkey::default())
-                            {
+                            meta.insert(
+                                "pump_amm_sell_layout_ready".to_string(),
+                                sell_layout_ready.to_string(),
+                            );
+                            if let Some(pk) = merged_third {
                                 meta.insert(
                                     "pump_amm_sell_cashback_third_meta".to_string(),
                                     pk.to_string(),
                                 );
                             }
                             pool_update.metadata = Some(meta);
-                            pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+                            pool_update.set_dex_readiness_in_metadata(dex_readiness);
                             let subject = pool_subject(&pool_address.to_string());
                             if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
                                 warn!(error = %e, "FIX-33: Failed to publish pump_amm pool_accounts PoolCacheUpdate to JetStream (trade)");
@@ -9085,6 +9232,23 @@ mod discovery_tests {
         );
     }
 
+    #[test]
+    fn test_pump_amm_non_force_refresh_partial_publish_keeps_ok_response() {
+        let (status, message) = pump_amm_control_response_for_ensure_publish(false, true, false);
+        assert_eq!(status, ControlResponseStatus::Ok);
+        assert!(message.is_none());
+    }
+
+    #[test]
+    fn test_pump_amm_force_refresh_partial_publish_returns_authoritative_error() {
+        let (status, message) = pump_amm_control_response_for_ensure_publish(true, true, false);
+        assert_eq!(status, ControlResponseStatus::Error);
+        assert_eq!(
+            message.as_deref(),
+            Some("authoritative PumpSwap SELL layout unresolved after force_refresh")
+        );
+    }
+
     /// PR #50 follow-up: async Serum RPC may finish long after the pool discovery Geyser slot.
     /// JetStream `PoolCacheUpdate::geyser_slot` for the post-fetch publish must reflect the **current**
     /// cache entry slot (latest vault / pool update), not the stale discovery slot, so reserves and
@@ -9364,6 +9528,55 @@ mod discovery_tests {
             raydium_cpmm_readiness_for_pool_cache_update(&s),
             DexPoolReadiness::Observed
         );
+    }
+
+    #[test]
+    fn test_pump_amm_trade_publish_extended_without_third_meta_is_partial() {
+        let (sell_layout_ready, dex_readiness) =
+            pump_amm_sell_layout_publish_state(true, None, true);
+        assert!(
+            !sell_layout_ready,
+            "extended SELL without authoritative third meta must not be marked ready"
+        );
+        assert_eq!(dex_readiness, DexPoolReadiness::Partial);
+    }
+
+    #[test]
+    fn test_pump_amm_trade_publish_extended_with_third_meta_is_ready() {
+        let (sell_layout_ready, dex_readiness) =
+            pump_amm_sell_layout_publish_state(true, Some(Pubkey::new_unique()), true);
+        assert!(
+            sell_layout_ready,
+            "extended SELL with authoritative third meta must be marked ready"
+        );
+        assert_eq!(dex_readiness, DexPoolReadiness::Ready);
+    }
+
+    #[test]
+    fn test_pump_amm_force_refresh_base_overrides_stale_extended_cache_flag() {
+        let stale_third = Pubkey::new_unique();
+        let (effective_requires_extended, effective_third_meta, sell_layout_ready, dex_readiness) =
+            pump_amm_sell_layout_state_for_ensure_publish(
+                true,
+                true,
+                Some(stale_third),
+                false,
+                None,
+                true,
+            );
+        assert!(
+            !effective_requires_extended,
+            "authoritative force_refresh base result must override stale extended cache flag"
+        );
+        assert!(
+            effective_third_meta.is_none(),
+            "authoritative base result must discard stale third meta"
+        );
+        assert!(
+            sell_layout_ready,
+            "base layout proven by force_refresh stays ready"
+        );
+        assert_eq!(dex_readiness, DexPoolReadiness::Ready);
     }
 
     #[test]

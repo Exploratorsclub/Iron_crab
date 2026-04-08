@@ -328,6 +328,15 @@ pub struct PoolAccountsV14WithDiagnostic {
     /// Propagate to JetStream / SLAVE: pool needs extended `sell` (24 metas).
     pub sell_requires_cashback_remaining: bool,
     pub sell_cashback_third_meta: Option<Pubkey>,
+    /// `true` only when the cold-path result is authoritative enough for SELL planning.
+    pub sell_layout_ready: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpAmmAuthoritativeSellLayout {
+    Unknown,
+    Base,
+    Extended { third_meta: Pubkey },
 }
 
 impl PumpAmmPoolStatic {
@@ -732,6 +741,7 @@ impl PumpFunAmmDex {
                             ),
                             sell_requires_cashback_remaining: sell_requires,
                             sell_cashback_third_meta: sell_third,
+                            sell_layout_ready: true,
                         }));
                     }
                 }
@@ -785,7 +795,6 @@ impl PumpFunAmmDex {
                         pool_market = %pool.pool_market,
                         "pump_amm: PumpAmmPoolStatic from pool_address hint (fast path)"
                     );
-                    let accounts = pool.as_pool_accounts_v14();
                     let diagnostic = pool.last_parse_diagnostics.clone().unwrap_or_else(|| {
                         Self::pump_amm_livepoolcache_diagnostic(
                             "pool_address_hint_fast_path_missing_diag",
@@ -794,12 +803,15 @@ impl PumpFunAmmDex {
                             base_mint,
                         )
                     });
-                    return Ok(Some(PoolAccountsV14WithDiagnostic {
-                        accounts,
-                        diagnostic,
-                        sell_requires_cashback_remaining: pool.sell_requires_cashback_remaining,
-                        sell_cashback_third_meta: pool.sell_cashback_third_meta,
-                    }));
+                    return Ok(Some(
+                        self.wrap_pool_accounts_v14_with_diagnostic(
+                            base_mint,
+                            pool,
+                            force_refresh,
+                            diagnostic,
+                        )
+                        .await?,
+                    ));
                 }
                 PumpAmmMarketParseOutcome::LocalFail(reason) => {
                     warn!(
@@ -819,7 +831,6 @@ impl PumpFunAmmDex {
                         .await?
                     {
                         self.insert_pool_static_cache(pool.clone());
-                        let accounts = pool.as_pool_accounts_v14();
                         let diagnostic = pool.last_parse_diagnostics.clone().unwrap_or_else(|| {
                             Self::pump_amm_tx_history_diagnostic(
                                 "bounded_external_tx_history_pool_address_hint",
@@ -829,12 +840,15 @@ impl PumpFunAmmDex {
                                 None,
                             )
                         });
-                        return Ok(Some(PoolAccountsV14WithDiagnostic {
-                            accounts,
-                            diagnostic,
-                            sell_requires_cashback_remaining: pool.sell_requires_cashback_remaining,
-                            sell_cashback_third_meta: pool.sell_cashback_third_meta,
-                        }));
+                        return Ok(Some(
+                            self.wrap_pool_accounts_v14_with_diagnostic(
+                                base_mint,
+                                pool,
+                                force_refresh,
+                                diagnostic,
+                            )
+                            .await?,
+                        ));
                     }
                     return Err(anyhow!(
                         "pump_amm: pool_address hint parse failed local_parse={} (base_mint={}, pool={}); refusing unbounded getProgramAccounts (I-24d)",
@@ -855,22 +869,6 @@ impl PumpFunAmmDex {
         // CRITICAL: global_volume_accumulator is required for BUY (BuyExactQuoteIn).
         // The PumpSwap program validates it exists and is initialized.
         // Without it: "AccountNotInitialized" error (Custom(3012)).
-        let accounts = vec![
-            pool.pool_market,                  // [0]
-            pool.global_config,                // [1]
-            pool.base_mint,                    // [2]
-            pool.quote_mint,                   // [3]
-            pool.pool_base_vault,              // [4]
-            pool.pool_quote_vault,             // [5]
-            pool.protocol_fee_recipient,       // [6]
-            pool.protocol_fee_recipient_ta,    // [7]
-            pool.event_authority,              // [8]
-            pool.coin_creator_vault_ata,       // [9]
-            pool.coin_creator_vault_authority, // [10]
-            pool.global_volume_accumulator,    // [11] - REQUIRED for BUY!
-            pool.fee_config,                   // [12]
-            pool.fee_program,                  // [13]
-        ];
         let diagnostic = pool.last_parse_diagnostics.clone().unwrap_or_else(|| {
             Self::pump_amm_livepoolcache_diagnostic(
                 "discover_pool_static_missing_diag",
@@ -879,12 +877,10 @@ impl PumpFunAmmDex {
                 base_mint,
             )
         });
-        Ok(Some(PoolAccountsV14WithDiagnostic {
-            accounts,
-            diagnostic,
-            sell_requires_cashback_remaining: pool.sell_requires_cashback_remaining,
-            sell_cashback_third_meta: pool.sell_cashback_third_meta,
-        }))
+        Ok(Some(
+            self.wrap_pool_accounts_v14_with_diagnostic(base_mint, pool, force_refresh, diagnostic)
+                .await?,
+        ))
     }
 
     /// Convenience wrapper: pool_accounts_v1_for_base_mint without hint.
@@ -894,6 +890,258 @@ impl PumpFunAmmDex {
     ) -> Result<Option<Vec<Pubkey>>> {
         self.pool_accounts_v1_for_base_mint_with_hint(base_mint, None, false)
             .await
+    }
+
+    async fn wrap_pool_accounts_v14_with_diagnostic(
+        &self,
+        base_mint: Pubkey,
+        mut pool: PumpAmmPoolStatic,
+        force_refresh: bool,
+        diagnostic: PumpAmmPoolAccountsDiagnostic,
+    ) -> Result<PoolAccountsV14WithDiagnostic> {
+        let sell_layout_ready = if force_refresh {
+            match self
+                .resolve_authoritative_sell_layout_for_force_refresh(&pool, base_mint)
+                .await?
+            {
+                PumpAmmAuthoritativeSellLayout::Unknown => false,
+                PumpAmmAuthoritativeSellLayout::Base => {
+                    pool.sell_requires_cashback_remaining = false;
+                    pool.sell_cashback_third_meta = None;
+                    true
+                }
+                PumpAmmAuthoritativeSellLayout::Extended { third_meta } => {
+                    pool.sell_requires_cashback_remaining = true;
+                    pool.sell_cashback_third_meta = Some(third_meta);
+                    true
+                }
+            }
+        } else {
+            true
+        };
+
+        Ok(PoolAccountsV14WithDiagnostic {
+            accounts: pool.as_pool_accounts_v14(),
+            diagnostic,
+            sell_requires_cashback_remaining: pool.sell_requires_cashback_remaining,
+            sell_cashback_third_meta: pool.sell_cashback_third_meta,
+            sell_layout_ready,
+        })
+    }
+
+    async fn resolve_authoritative_sell_layout_for_force_refresh(
+        &self,
+        pool: &PumpAmmPoolStatic,
+        base_mint: Pubkey,
+    ) -> Result<PumpAmmAuthoritativeSellLayout> {
+        if pool.sell_requires_cashback_remaining {
+            if let Some(third_meta) = pool
+                .sell_cashback_third_meta
+                .filter(|p| *p != Pubkey::default())
+            {
+                return Ok(PumpAmmAuthoritativeSellLayout::Extended { third_meta });
+            }
+        }
+
+        let local_observation = match self
+            .observe_authoritative_sell_layout_from_tx_history_with_rpc(
+                Arc::clone(&self.rpc),
+                pool.pool_market,
+                base_mint,
+                "local_force_refresh_sell_layout",
+            )
+            .await
+        {
+            Ok(layout) => layout,
+            Err(e) => {
+                warn!(
+                    pool = %pool.pool_market,
+                    base_mint = %base_mint,
+                    error = %e,
+                    "pump_amm: local force_refresh SELL-layout observation failed"
+                );
+                PumpAmmAuthoritativeSellLayout::Unknown
+            }
+        };
+        if local_observation != PumpAmmAuthoritativeSellLayout::Unknown {
+            return Ok(local_observation);
+        }
+
+        let Some(ref h_rpc) = self.bounded_tx_fallback_rpc else {
+            return Ok(PumpAmmAuthoritativeSellLayout::Unknown);
+        };
+
+        let local_sigs_empty = match self
+            .rpc
+            .get_signatures_for_address(&pool.pool_market, Some(1))
+            .await
+        {
+            Ok(v) => v.is_empty(),
+            Err(e) => {
+                warn!(
+                    pool = %pool.pool_market,
+                    base_mint = %base_mint,
+                    error = %e,
+                    "pump_amm: local tx index check failed during force_refresh; trying bounded external SELL-layout observation"
+                );
+                true
+            }
+        };
+        if !local_sigs_empty {
+            return Ok(PumpAmmAuthoritativeSellLayout::Unknown);
+        }
+
+        const BOUNDED_EXTERNAL_TX_TIMEOUT: Duration = Duration::from_secs(12);
+        match tokio::time::timeout(
+            BOUNDED_EXTERNAL_TX_TIMEOUT,
+            self.observe_authoritative_sell_layout_from_tx_history_with_rpc(
+                Arc::clone(h_rpc),
+                pool.pool_market,
+                base_mint,
+                "bounded_external_force_refresh_sell_layout",
+            ),
+        )
+        .await
+        {
+            Ok(Ok(layout)) => Ok(layout),
+            Ok(Err(e)) => {
+                warn!(
+                    pool = %pool.pool_market,
+                    base_mint = %base_mint,
+                    error = %e,
+                    "pump_amm: bounded external SELL-layout observation failed"
+                );
+                Ok(PumpAmmAuthoritativeSellLayout::Unknown)
+            }
+            Err(_) => {
+                warn!(
+                    pool = %pool.pool_market,
+                    base_mint = %base_mint,
+                    timeout_secs = BOUNDED_EXTERNAL_TX_TIMEOUT.as_secs(),
+                    "pump_amm: bounded external SELL-layout observation timed out"
+                );
+                Ok(PumpAmmAuthoritativeSellLayout::Unknown)
+            }
+        }
+    }
+
+    async fn observe_authoritative_sell_layout_from_tx_history_with_rpc(
+        &self,
+        tx_rpc: Arc<SolanaRpc>,
+        pool_market: Pubkey,
+        base_mint: Pubkey,
+        log_ctx: &'static str,
+    ) -> Result<PumpAmmAuthoritativeSellLayout> {
+        const MAX_TX_FETCHES: usize = 200;
+        let sigs = tx_rpc
+            .get_signatures_for_address(&pool_market, Some(MAX_TX_FETCHES))
+            .await
+            .map_err(|e| anyhow!("getSignaturesForAddress failed: {e}"))?;
+        if sigs.is_empty() {
+            info!(
+                pool = %pool_market,
+                base_mint = %base_mint,
+                log_ctx,
+                "pump_amm: no signatures available for authoritative SELL-layout observation"
+            );
+            return Ok(PumpAmmAuthoritativeSellLayout::Unknown);
+        }
+
+        let mut fetched = 0usize;
+        for s in &sigs {
+            if fetched >= MAX_TX_FETCHES {
+                break;
+            }
+            if s.err.is_some() {
+                continue;
+            }
+            fetched += 1;
+            let sig = s.signature.to_string();
+            let tx_v = match Self::fetch_tx_as_value_with_rpc(tx_rpc.as_ref(), &sig).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        pool = %pool_market,
+                        base_mint = %base_mint,
+                        signature = %sig,
+                        log_ctx,
+                        error = %e,
+                        "pump_amm: getTransaction failed during authoritative SELL-layout scan; skipping signature"
+                    );
+                    continue;
+                }
+            };
+            let msg = match tx_v
+                .get("result")
+                .and_then(|r| r.get("transaction"))
+                .and_then(|t| t.get("message"))
+            {
+                Some(v) => v,
+                None => continue,
+            };
+            let meta = tx_v
+                .get("result")
+                .and_then(|r| r.get("meta"))
+                .unwrap_or(&Value::Null);
+
+            let mut account_keys = match Self::parse_account_keys(msg) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            Self::extend_with_loaded_addresses(&mut account_keys, meta);
+
+            for ix in Self::collect_all_instructions(msg, meta) {
+                let program_id_index = match ix.get("programIdIndex").and_then(|v| v.as_u64()) {
+                    Some(v) => v as usize,
+                    None => continue,
+                };
+                let Some(program_id) = account_keys.get(program_id_index) else {
+                    continue;
+                };
+                if program_id != PUMPFUN_AMM_PROGRAM_ID {
+                    continue;
+                }
+                let accounts: Vec<usize> = match ix.get("accounts").and_then(|v| v.as_array()) {
+                    Some(a) => a
+                        .iter()
+                        .filter_map(|v| v.as_u64().map(|x| x as usize))
+                        .collect(),
+                    None => continue,
+                };
+                let Some(ix_data) = Self::pump_amm_ix_data_from_json(ix) else {
+                    continue;
+                };
+                let Some((observed_pool, observed_base, layout)) =
+                    Self::pump_amm_sell_layout_observation_from_parsed_swap_ix(
+                        &account_keys,
+                        &accounts,
+                        &ix_data,
+                    )
+                else {
+                    continue;
+                };
+                if observed_pool != pool_market || observed_base != base_mint {
+                    continue;
+                }
+                info!(
+                    pool = %pool_market,
+                    base_mint = %base_mint,
+                    log_ctx,
+                    signature = %sig,
+                    layout = ?layout,
+                    "pump_amm: authoritative SELL-layout observed from successful swap tx"
+                );
+                return Ok(layout);
+            }
+        }
+
+        info!(
+            pool = %pool_market,
+            base_mint = %base_mint,
+            log_ctx,
+            "pump_amm: no successful SELL tx observed for authoritative SELL-layout"
+        );
+        Ok(PumpAmmAuthoritativeSellLayout::Unknown)
     }
 
     fn derive_user_volume_accumulator(
@@ -3504,6 +3752,36 @@ impl PumpFunAmmDex {
         None
     }
 
+    fn pump_amm_sell_layout_observation_from_parsed_swap_ix(
+        account_keys: &[String],
+        acc_indices: &[usize],
+        ix_data: &[u8],
+    ) -> Option<(Pubkey, Pubkey, PumpAmmAuthoritativeSellLayout)> {
+        let pool = Self::pump_amm_pool_static_from_parsed_swap_ix(
+            account_keys,
+            acc_indices,
+            ix_data,
+            |_| {
+                Self::pump_amm_livepoolcache_diagnostic(
+                    "sell_layout_observation",
+                    true,
+                    Pubkey::default(),
+                    Pubkey::default(),
+                )
+            },
+        )?;
+        let layout = match acc_indices.len() {
+            21 => PumpAmmAuthoritativeSellLayout::Base,
+            24 => PumpAmmAuthoritativeSellLayout::Extended {
+                third_meta: pool
+                    .sell_cashback_third_meta
+                    .filter(|p| *p != Pubkey::default())?,
+            },
+            _ => return None,
+        };
+        Some((pool.pool_market, pool.base_mint, layout))
+    }
+
     async fn get_vault_amount(&self, ta: Pubkey) -> Result<u64> {
         let acc = self
             .rpc
@@ -4888,6 +5166,63 @@ mod tests {
         let gva = pump_amm_singleton_global_volume_accumulator(&program_id);
         let expected = Pubkey::from_str("C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw").unwrap();
         assert_eq!(gva, expected);
+    }
+
+    #[test]
+    fn test_pump_amm_sell_layout_observation_parses_standard_sell() {
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let mut account_keys: Vec<Pubkey> = (0..21).map(|_| Pubkey::new_unique()).collect();
+        account_keys[0] = pool_market;
+        account_keys[2] = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap();
+        account_keys[3] = base_mint;
+        account_keys[4] = Pubkey::from_str(WSOL_MINT).unwrap();
+        account_keys[20] = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap();
+        let account_keys: Vec<String> = account_keys.iter().map(ToString::to_string).collect();
+        let acc_indices: Vec<usize> = (0..21).collect();
+        let ix_data = pump_amm_sell_ix_discriminator().to_vec();
+
+        let observed = PumpFunAmmDex::pump_amm_sell_layout_observation_from_parsed_swap_ix(
+            &account_keys,
+            &acc_indices,
+            &ix_data,
+        )
+        .expect("standard sell observation");
+
+        assert_eq!(observed.0, pool_market);
+        assert_eq!(observed.1, base_mint);
+        assert_eq!(observed.2, PumpAmmAuthoritativeSellLayout::Base);
+    }
+
+    #[test]
+    fn test_pump_amm_sell_layout_observation_parses_extended_sell() {
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let third_meta = Pubkey::new_unique();
+        let mut account_keys: Vec<Pubkey> = (0..24).map(|_| Pubkey::new_unique()).collect();
+        account_keys[0] = pool_market;
+        account_keys[2] = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap();
+        account_keys[3] = base_mint;
+        account_keys[4] = Pubkey::from_str(WSOL_MINT).unwrap();
+        account_keys[20] = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap();
+        account_keys[23] = third_meta;
+        let account_keys: Vec<String> = account_keys.iter().map(ToString::to_string).collect();
+        let acc_indices: Vec<usize> = (0..24).collect();
+        let ix_data = pump_amm_sell_ix_discriminator().to_vec();
+
+        let observed = PumpFunAmmDex::pump_amm_sell_layout_observation_from_parsed_swap_ix(
+            &account_keys,
+            &acc_indices,
+            &ix_data,
+        )
+        .expect("extended sell observation");
+
+        assert_eq!(observed.0, pool_market);
+        assert_eq!(observed.1, base_mint);
+        assert_eq!(
+            observed.2,
+            PumpAmmAuthoritativeSellLayout::Extended { third_meta }
+        );
     }
 
     /// Mainnet 24-account `sell` (sig `2CCmRDScAErjuBLnVJbGEyV3jsWbuNZpniZ5iTLSwZoE84nmyf285hqJXjRStMHJUaJ9Ex7EvL9fgwAVM83qGd3o`): first two trailing metas are user-derivable; third is observed-only.
