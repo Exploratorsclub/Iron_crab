@@ -291,6 +291,30 @@ fn pump_amm_sell_layout_state_for_ensure_publish(
     )
 }
 
+/// Control-response contract for PumpSwap EnsurePumpAmmPoolAccounts.
+///
+/// Only the authoritative `force_refresh=true` path may turn a successful JetStream publish into an
+/// error when the resolved SELL layout is still not ready.
+fn pump_amm_control_response_for_ensure_publish(
+    force_refresh: bool,
+    jetstream_ok: bool,
+    sell_layout_ready: bool,
+) -> (ControlResponseStatus, Option<String>) {
+    if !jetstream_ok {
+        return (
+            ControlResponseStatus::Error,
+            Some("JetStream publish failed".to_string()),
+        );
+    }
+    if force_refresh && !sell_layout_ready {
+        return (
+            ControlResponseStatus::Error,
+            Some("authoritative PumpSwap SELL layout unresolved after force_refresh".to_string()),
+        );
+    }
+    (ControlResponseStatus::Ok, None)
+}
+
 /// Market data configuration (hot-reloadable via NATS)
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -5256,17 +5280,23 @@ async fn handle_ensure_pump_amm_pool_accounts(
             };
 
             if let Some(ref nats) = ctx.nats {
-                let (status, message) = if jetstream_ok && sell_layout_ready {
-                    info!(
-                        request_id = %request_id,
-                        base_mint = %base_mint_str,
-                        pool_address = %pool_address_str,
-                        rpc_global_scan = "no",
-                        control_response = "pending_publish",
-                        "I-24d Discovery: terminal outcome ok"
-                    );
-                    (ControlResponseStatus::Ok, None)
-                } else if jetstream_ok {
+                let (status, message) = pump_amm_control_response_for_ensure_publish(
+                    force_refresh,
+                    jetstream_ok,
+                    sell_layout_ready,
+                );
+                match (jetstream_ok, force_refresh, sell_layout_ready) {
+                    (true, _, true) => {
+                        info!(
+                            request_id = %request_id,
+                            base_mint = %base_mint_str,
+                            pool_address = %pool_address_str,
+                            rpc_global_scan = "no",
+                            control_response = "pending_publish",
+                            "I-24d Discovery: terminal outcome ok"
+                        );
+                    }
+                    (true, true, false) => {
                     warn!(
                         request_id = %request_id,
                         base_mint = %base_mint_str,
@@ -5275,24 +5305,25 @@ async fn handle_ensure_pump_amm_pool_accounts(
                         sell_cashback_third_meta = ?third_merged,
                         "I-24d Discovery: force_refresh result published as Partial (authoritative SELL layout unresolved)"
                     );
-                    (
-                        ControlResponseStatus::Error,
-                        Some(
-                            "authoritative PumpSwap SELL layout unresolved after force_refresh"
-                                .to_string(),
-                        ),
-                    )
-                } else {
-                    warn!(
-                        request_id = %request_id,
-                        base_mint = %base_mint_str,
-                        "I-24d Discovery: terminal outcome error (JetStream publish failed)"
-                    );
-                    (
-                        ControlResponseStatus::Error,
-                        Some("JetStream publish failed".to_string()),
-                    )
-                };
+                    }
+                    (true, false, false) => {
+                        info!(
+                            request_id = %request_id,
+                            base_mint = %base_mint_str,
+                            pool_address = %pool_address_str,
+                            sell_cashback_remaining = sell_flag_merged,
+                            sell_cashback_third_meta = ?third_merged,
+                            "I-24d Discovery: terminal outcome ok (non-force-refresh publish may remain Partial)"
+                        );
+                    }
+                    (false, _, _) => {
+                        warn!(
+                            request_id = %request_id,
+                            base_mint = %base_mint_str,
+                            "I-24d Discovery: terminal outcome error (JetStream publish failed)"
+                        );
+                    }
+                }
                 publish_control_response(
                     nats,
                     &ctx.run_id,
@@ -9198,6 +9229,25 @@ mod discovery_tests {
         assert_eq!(
             discovery_response_status_for_jetstream(false),
             ControlResponseStatus::Error
+        );
+    }
+
+    #[test]
+    fn test_pump_amm_non_force_refresh_partial_publish_keeps_ok_response() {
+        let (status, message) =
+            pump_amm_control_response_for_ensure_publish(false, true, false);
+        assert_eq!(status, ControlResponseStatus::Ok);
+        assert!(message.is_none());
+    }
+
+    #[test]
+    fn test_pump_amm_force_refresh_partial_publish_returns_authoritative_error() {
+        let (status, message) =
+            pump_amm_control_response_for_ensure_publish(true, true, false);
+        assert_eq!(status, ControlResponseStatus::Error);
+        assert_eq!(
+            message.as_deref(),
+            Some("authoritative PumpSwap SELL layout unresolved after force_refresh")
         );
     }
 
