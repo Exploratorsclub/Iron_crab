@@ -4164,10 +4164,19 @@ impl Dex for PumpFunAmmDex {
             )); // 18
             metas.push(AccountMeta::new_readonly(sell_fee_config, false)); // 19
             metas.push(AccountMeta::new_readonly(pool.fee_program, false)); // 20
-            if pool.sell_requires_cashback_remaining {
-                let Some(third) = pool
-                    .sell_cashback_third_meta
-                    .filter(|p| *p != Pubkey::default())
+                                                                            // `pools_by_base` can be stale vs monotonic LivePoolCache (Geyser); prefer DashMap for extended SELL.
+            let mut sell_requires_cashback_remaining = pool.sell_requires_cashback_remaining;
+            let mut sell_cashback_third_meta = pool.sell_cashback_third_meta;
+            if let Some(ref cache) = self.live_pool_cache {
+                let (dash_flag, dash_third) =
+                    cache.pump_amm_sell_extended_layout(&pool.pool_market);
+                if dash_flag {
+                    sell_requires_cashback_remaining = true;
+                    sell_cashback_third_meta = dash_third.or(sell_cashback_third_meta);
+                }
+            }
+            if sell_requires_cashback_remaining {
+                let Some(third) = sell_cashback_third_meta.filter(|p| *p != Pubkey::default())
                 else {
                     return Err(anyhow!(
                         "pump_amm SELL: extended layout required but sell_cashback_third_meta missing (authoritative observation required)"

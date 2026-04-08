@@ -7359,10 +7359,12 @@ async fn run_geyser_loop(
                                 let (ext_flag, ext_third) = ctx
                                     .live_pool_cache
                                     .pump_amm_sell_extended_layout(&account_update.pubkey);
-                                meta.insert(
-                                    "pump_amm_sell_cashback_remaining".to_string(),
-                                    ext_flag.to_string(),
-                                );
+                                if ext_flag {
+                                    meta.insert(
+                                        "pump_amm_sell_cashback_remaining".to_string(),
+                                        "true".to_string(),
+                                    );
+                                }
                                 if let Some(pk) =
                                     ext_third.filter(|p| *p != Pubkey::default())
                                 {
