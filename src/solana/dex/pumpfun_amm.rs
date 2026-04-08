@@ -805,7 +805,10 @@ impl PumpFunAmmDex {
                     });
                     return Ok(Some(
                         self.wrap_pool_accounts_v14_with_diagnostic(
-                            base_mint, pool, force_refresh, diagnostic,
+                            base_mint,
+                            pool,
+                            force_refresh,
+                            diagnostic,
                         )
                         .await?,
                     ));
@@ -839,7 +842,10 @@ impl PumpFunAmmDex {
                         });
                         return Ok(Some(
                             self.wrap_pool_accounts_v14_with_diagnostic(
-                                base_mint, pool, force_refresh, diagnostic,
+                                base_mint,
+                                pool,
+                                force_refresh,
+                                diagnostic,
                             )
                             .await?,
                         ));

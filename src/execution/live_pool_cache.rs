@@ -929,7 +929,8 @@ impl LivePoolCache {
 
     /// Authoritative SELL-layout completeness for PumpSwap.
     pub fn set_pump_amm_sell_layout_ready(&self, pool: &Pubkey, ready: bool) {
-        self.pump_amm_sell_layout_ready_by_market.insert(*pool, ready);
+        self.pump_amm_sell_layout_ready_by_market
+            .insert(*pool, ready);
     }
 
     /// Extended PumpSwap `sell` layout: flag + third readonly meta (if known).
@@ -1140,9 +1141,18 @@ impl LivePoolCache {
             .or_insert(incoming);
     }
 
-    fn pump_amm_sell_layout_complete_for_ready(&self, pool_market: &Pubkey) -> bool {
-        let (requires_extended, third_meta) = self.pump_amm_sell_extended_layout(pool_market);
-        !requires_extended || third_meta.filter(|p| *p != Pubkey::default()).is_some()
+    pub fn merge_pump_amm_sell_layout_ready_from_metadata(
+        &self,
+        pool: &Pubkey,
+        meta: Option<&std::collections::HashMap<String, String>>,
+    ) {
+        let Some(m) = meta else {
+            return;
+        };
+        if let Some(v) = m.get("pump_amm_sell_layout_ready") {
+            self.pump_amm_sell_layout_ready_by_market
+                .insert(*pool, v == "true");
+        }
     }
 
     /// Merge PumpFun bonding-curve readiness for `bonding_curve` (monotonic — never downgrade).

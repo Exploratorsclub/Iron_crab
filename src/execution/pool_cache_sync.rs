@@ -936,8 +936,10 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 cache.upsert(addr, minimal_state, update.geyser_slot);
                 if update.dex == "pump_amm" {
                     cache.merge_pump_amm_sell_layout_from_metadata(&addr, update.metadata.as_ref());
-                    cache
-                        .merge_pump_amm_sell_layout_ready_from_metadata(&addr, update.metadata.as_ref());
+                    cache.merge_pump_amm_sell_layout_ready_from_metadata(
+                        &addr,
+                        update.metadata.as_ref(),
+                    );
                     cache.merge_pump_amm_pool_accounts_readiness(
                         addr,
                         update.effective_dex_readiness(),
@@ -1207,9 +1209,8 @@ mod tests {
         update.set_dex_readiness_in_metadata(DexPoolReadiness::Partial);
 
         assert!(apply_pool_cache_update(&cache, &update));
-        assert_eq!(
-            cache.pump_amm_sell_layout_ready(&pool_market),
-            Some(false),
+        assert!(
+            !cache.pump_amm_sell_layout_ready(&pool_market),
             "SLAVE must preserve authoritative 'SELL layout still unknown' signal"
         );
     }
