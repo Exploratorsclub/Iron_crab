@@ -5135,6 +5135,8 @@ async fn handle_ensure_pump_amm_pool_accounts(
                 third_merged,
             );
             ctx.live_pool_cache
+                .set_pump_amm_sell_layout_ready(&pool_address, sell_layout_ready);
+            ctx.live_pool_cache
                 .merge_pump_amm_pool_accounts_readiness(pool_address, dex_readiness);
 
             // Publish JetStream PoolCacheUpdate (authoritative SSOT).
