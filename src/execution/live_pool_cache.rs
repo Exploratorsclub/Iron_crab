@@ -1141,6 +1141,30 @@ impl LivePoolCache {
             .or_insert(incoming);
     }
 
+    /// Overwrite PumpSwap `pool_accounts` readiness for authoritative updates where `Partial`
+    /// must replace a previously cached `Ready` (e.g. force-refresh / trade-publish SSOT).
+    pub fn set_pump_amm_pool_accounts_readiness_authoritative(
+        &self,
+        pool_market: Pubkey,
+        readiness: DexPoolReadiness,
+    ) {
+        self.pool_accounts_readiness_by_market
+            .insert(pool_market, readiness);
+    }
+
+    pub fn merge_pump_amm_sell_layout_ready_from_metadata(
+        &self,
+        pool: &Pubkey,
+        meta: Option<&std::collections::HashMap<String, String>>,
+    ) {
+        let Some(m) = meta else {
+            return;
+        };
+        if let Some(v) = m.get("pump_amm_sell_layout_ready") {
+            self.pump_amm_sell_layout_ready_by_market
+                .insert(*pool, v == "true");
+        }
+    }
     /// Merge PumpFun bonding-curve readiness for `bonding_curve` (monotonic — never downgrade).
     pub fn merge_pumpfun_bonding_readiness(
         &self,
@@ -2500,6 +2524,34 @@ mod tests {
         assert!(
             !cache.base_mint_has_explicit_pump_amm_ready_pool(&base_mint),
             "mint-level explicit Ready gate must also reject incomplete extended SELL state"
+        );
+    }
+
+    #[test]
+    fn test_pump_amm_authoritative_readiness_overwrites_ready_with_partial() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+
+        cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
+        assert_eq!(
+            cache
+                .pool_accounts_readiness_by_market
+                .get(&pool_market)
+                .map(|r| *r.value()),
+            Some(DexPoolReadiness::Ready)
+        );
+
+        cache.set_pump_amm_pool_accounts_readiness_authoritative(
+            pool_market,
+            DexPoolReadiness::Partial,
+        );
+        assert_eq!(
+            cache
+                .pool_accounts_readiness_by_market
+                .get(&pool_market)
+                .map(|r| *r.value()),
+            Some(DexPoolReadiness::Partial),
+            "authoritative PumpSwap updates must be able to replace stale Ready with Partial"
         );
     }
 

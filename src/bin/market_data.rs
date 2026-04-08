@@ -5137,7 +5137,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
             ctx.live_pool_cache
                 .set_pump_amm_sell_layout_ready(&pool_address, sell_layout_ready);
             ctx.live_pool_cache
-                .merge_pump_amm_pool_accounts_readiness(pool_address, dex_readiness);
+                .set_pump_amm_pool_accounts_readiness_authoritative(pool_address, dex_readiness);
 
             // Publish JetStream PoolCacheUpdate (authoritative SSOT).
             // Reply Ok ONLY when JetStream write succeeds (I-24a).
@@ -8184,23 +8184,22 @@ async fn run_geyser_loop(
                         ctx.live_pool_cache.set_pump_amm_pool_accounts(pool_address, pool_accounts.clone());
                         let (ext_flag, ext_third) =
                             ctx.live_pool_cache.pump_amm_sell_extended_layout(pool_address);
-                        let merged_flag =
-                            ext_flag || *pump_amm_sell_requires_cashback_remaining;
+                        let merged_flag = ext_flag || *pump_amm_sell_requires_cashback_remaining;
                         let merged_third = ext_third
                             .or(*pump_amm_sell_cashback_third_meta)
                             .filter(|p| *p != Pubkey::default());
-                        let (sell_layout_ready, dex_readiness) =
-                            pump_amm_sell_layout_publish_state(
-                                merged_flag,
-                                merged_third,
-                                true,
-                            );
+                        let (sell_layout_ready, dex_readiness) = pump_amm_sell_layout_publish_state(
+                            merged_flag,
+                            merged_third,
+                            true,
+                        );
                         ctx.live_pool_cache
                             .set_pump_amm_sell_layout_ready(pool_address, sell_layout_ready);
-                        ctx.live_pool_cache.merge_pump_amm_pool_accounts_readiness(
-                            *pool_address,
-                            dex_readiness,
-                        );
+                        ctx.live_pool_cache
+                            .set_pump_amm_pool_accounts_readiness_authoritative(
+                                *pool_address,
+                                dex_readiness,
+                            );
 
                         // FIX-33: Persist pool_accounts to JetStream so bootstrap recovers them after restart.
                         if let Some(ref nats) = ctx.nats {

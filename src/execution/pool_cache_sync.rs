@@ -510,10 +510,25 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                         &pool_addr,
                         update.metadata.as_ref(),
                     );
-                    cache.merge_pump_amm_pool_accounts_readiness(
-                        pool_addr,
-                        update.effective_dex_readiness(),
+                    cache.merge_pump_amm_sell_layout_ready_from_metadata(
+                        &pool_addr,
+                        update.metadata.as_ref(),
                     );
+                    if update
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|m| m.contains_key("pump_amm_sell_layout_ready"))
+                    {
+                        cache.set_pump_amm_pool_accounts_readiness_authoritative(
+                            pool_addr,
+                            update.effective_dex_readiness(),
+                        );
+                    } else {
+                        cache.merge_pump_amm_pool_accounts_readiness(
+                            pool_addr,
+                            update.effective_dex_readiness(),
+                        );
+                    }
                 }
                 if update.dex == "raydium_cpmm" {
                     cache.merge_raydium_cpmm_pool_readiness(
@@ -932,10 +947,25 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 cache.upsert(addr, minimal_state, update.geyser_slot);
                 if update.dex == "pump_amm" {
                     cache.merge_pump_amm_sell_layout_from_metadata(&addr, update.metadata.as_ref());
-                    cache.merge_pump_amm_pool_accounts_readiness(
-                        addr,
-                        update.effective_dex_readiness(),
+                    cache.merge_pump_amm_sell_layout_ready_from_metadata(
+                        &addr,
+                        update.metadata.as_ref(),
                     );
+                    if update
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|m| m.contains_key("pump_amm_sell_layout_ready"))
+                    {
+                        cache.set_pump_amm_pool_accounts_readiness_authoritative(
+                            addr,
+                            update.effective_dex_readiness(),
+                        );
+                    } else {
+                        cache.merge_pump_amm_pool_accounts_readiness(
+                            addr,
+                            update.effective_dex_readiness(),
+                        );
+                    }
                 }
                 if update.dex == "raydium_cpmm" {
                     cache.merge_raydium_cpmm_pool_readiness(addr, update.effective_dex_readiness());
@@ -1377,6 +1407,84 @@ mod tests {
                 .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
                 .is_some(),
             "merge must not downgrade Ready to Observed"
+        );
+    }
+
+    #[test]
+    fn test_pump_amm_authoritative_partial_overwrites_prior_ready() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        let mut ready_meta = std::collections::HashMap::new();
+        ready_meta.insert(
+            "pool_accounts".to_string(),
+            accounts
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        ready_meta.insert("pump_amm_sell_layout_ready".to_string(), "true".to_string());
+
+        let mut ready_update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool_market.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            1,
+            None,
+            1,
+        );
+        ready_update.metadata = Some(ready_meta);
+        ready_update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+        assert!(apply_pool_cache_update(&cache, &ready_update));
+        assert!(
+            cache.base_mint_has_explicit_pump_amm_ready_pool(&base_mint),
+            "authoritative Ready metadata should mark the pool explicitly ready"
+        );
+
+        let mut partial_meta = std::collections::HashMap::new();
+        partial_meta.insert(
+            "pool_accounts".to_string(),
+            accounts
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        partial_meta.insert(
+            "pump_amm_sell_layout_ready".to_string(),
+            "false".to_string(),
+        );
+
+        let mut partial_update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool_market.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            1,
+            None,
+            2,
+        );
+        partial_update.metadata = Some(partial_meta);
+        partial_update.set_dex_readiness_in_metadata(DexPoolReadiness::Partial);
+        assert!(apply_pool_cache_update(&cache, &partial_update));
+
+        cache.set_pump_amm_sell_layout_ready(&pool_market, true);
+        assert!(
+            !cache.base_mint_has_explicit_pump_amm_ready_pool(&base_mint),
+            "readiness map itself must stay Partial after authoritative overwrite"
         );
     }
 
