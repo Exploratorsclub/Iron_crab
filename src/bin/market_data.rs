@@ -8027,11 +8027,22 @@ async fn run_geyser_loop(
                     ..
                 }) = parsed_event.as_ref()
                 {
-                    if *pump_amm_sell_requires_cashback_remaining {
+                    // Merge when this trade is extended OR cache already knows extended layout
+                    // (e.g. prior Geyser observation / JetStream). Skipping when the trade is a
+                    // standard 21-account sell would drop a true extended flag from the MASTER cache.
+                    let (ext_flag_prior, ext_third_prior) = ctx
+                        .live_pool_cache
+                        .pump_amm_sell_extended_layout(pool_address);
+                    let merge_requires = *pump_amm_sell_requires_cashback_remaining
+                        || ext_flag_prior;
+                    let merge_third = (*pump_amm_sell_cashback_third_meta)
+                        .filter(|p| *p != Pubkey::default())
+                        .or(ext_third_prior);
+                    if merge_requires || merge_third.is_some() {
                         ctx.live_pool_cache.merge_pump_amm_sell_extended_layout(
                             pool_address,
-                            true,
-                            *pump_amm_sell_cashback_third_meta,
+                            merge_requires,
+                            merge_third,
                         );
                     }
                     // v1 order (see MarketEventKind::DexPoolAccounts docs): base_mint at [2], quote_mint at [3]

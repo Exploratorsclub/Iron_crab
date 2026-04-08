@@ -4107,6 +4107,10 @@ impl Dex for PumpFunAmmDex {
                 "pump_amm build_swap_ix: cached pool.event_authority != canonical; using canonical"
             );
         }
+        // SELL position [19] must be the global Fee-Program fee_config (same as
+        // `build_swap_ix_from_pool_accounts`). BUY position [20] is pool-specific (AMM-owned);
+        // pools discovered from BUY tx-history would otherwise store the wrong pubkey for SELL.
+        let sell_fee_config = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG)?;
         let (protocol_fee_recipient, protocol_fee_recipient_ta) =
             pump_amm_resolve_protocol_fee_accounts(
                 pool.protocol_fee_recipient,
@@ -4159,7 +4163,7 @@ impl Dex for PumpFunAmmDex {
                 pool.coin_creator_vault_authority,
                 false,
             )); // 18
-            metas.push(AccountMeta::new_readonly(pool.fee_config, false)); // 19
+            metas.push(AccountMeta::new_readonly(sell_fee_config, false)); // 19
             metas.push(AccountMeta::new_readonly(pool.fee_program, false)); // 20
             if pool.sell_requires_cashback_remaining {
                 let Some(third) = pool
