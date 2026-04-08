@@ -1057,7 +1057,20 @@ impl PumpFunAmmDex {
             }
             fetched += 1;
             let sig = s.signature.to_string();
-            let tx_v = Self::fetch_tx_as_value_with_rpc(tx_rpc.as_ref(), &sig).await?;
+            let tx_v = match Self::fetch_tx_as_value_with_rpc(tx_rpc.as_ref(), &sig).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        pool = %pool_market,
+                        base_mint = %base_mint,
+                        signature = %sig,
+                        log_ctx,
+                        error = %e,
+                        "pump_amm: getTransaction failed during authoritative SELL-layout scan; skipping signature"
+                    );
+                    continue;
+                }
+            };
             let msg = match tx_v
                 .get("result")
                 .and_then(|r| r.get("transaction"))
