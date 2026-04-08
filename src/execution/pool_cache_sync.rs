@@ -510,10 +510,6 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                         &pool_addr,
                         update.metadata.as_ref(),
                     );
-                    cache.merge_pump_amm_sell_layout_ready_from_metadata(
-                        &pool_addr,
-                        update.metadata.as_ref(),
-                    );
                     if update
                         .metadata
                         .as_ref()
@@ -947,10 +943,6 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 cache.upsert(addr, minimal_state, update.geyser_slot);
                 if update.dex == "pump_amm" {
                     cache.merge_pump_amm_sell_layout_from_metadata(&addr, update.metadata.as_ref());
-                    cache.merge_pump_amm_sell_layout_ready_from_metadata(
-                        &addr,
-                        update.metadata.as_ref(),
-                    );
                     if update
                         .metadata
                         .as_ref()

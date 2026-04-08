@@ -1152,19 +1152,6 @@ impl LivePoolCache {
             .insert(pool_market, readiness);
     }
 
-    pub fn merge_pump_amm_sell_layout_ready_from_metadata(
-        &self,
-        pool: &Pubkey,
-        meta: Option<&std::collections::HashMap<String, String>>,
-    ) {
-        let Some(m) = meta else {
-            return;
-        };
-        if let Some(v) = m.get("pump_amm_sell_layout_ready") {
-            self.pump_amm_sell_layout_ready_by_market
-                .insert(*pool, v == "true");
-        }
-    }
     /// Merge PumpFun bonding-curve readiness for `bonding_curve` (monotonic — never downgrade).
     pub fn merge_pumpfun_bonding_readiness(
         &self,
