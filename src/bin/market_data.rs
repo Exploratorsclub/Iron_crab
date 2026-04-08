@@ -252,6 +252,45 @@ fn pump_amm_sell_layout_publish_state(
     (sell_layout_ready, dex_readiness)
 }
 
+/// Resolve PumpSwap SELL-layout state for the EnsurePumpAmmPoolAccounts publish path.
+///
+/// `force_refresh=true` is authoritative and must be able to override stale monotonic cache hints.
+fn pump_amm_sell_layout_state_for_ensure_publish(
+    force_refresh: bool,
+    cached_requires_extended: bool,
+    cached_third_meta: Option<Pubkey>,
+    refresh_requires_extended: bool,
+    refresh_third_meta: Option<Pubkey>,
+    refresh_layout_ready: bool,
+) -> (bool, Option<Pubkey>, bool, DexPoolReadiness) {
+    let (effective_requires_extended, effective_third_meta, base_layout_ready) = if force_refresh {
+        (
+            refresh_requires_extended,
+            refresh_third_meta.filter(|p| *p != Pubkey::default()),
+            refresh_layout_ready,
+        )
+    } else {
+        (
+            cached_requires_extended || refresh_requires_extended,
+            refresh_third_meta
+                .or(cached_third_meta)
+                .filter(|p| *p != Pubkey::default()),
+            refresh_layout_ready,
+        )
+    };
+    let (sell_layout_ready, dex_readiness) = pump_amm_sell_layout_publish_state(
+        effective_requires_extended,
+        effective_third_meta,
+        base_layout_ready,
+    );
+    (
+        effective_requires_extended,
+        effective_third_meta,
+        sell_layout_ready,
+        dex_readiness,
+    )
+}
+
 /// Market data configuration (hot-reloadable via NATS)
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -5072,15 +5111,15 @@ async fn handle_ensure_pump_amm_pool_accounts(
             let (ext_flag_cache, ext_third_cache) = ctx
                 .live_pool_cache
                 .pump_amm_sell_extended_layout(&pool_address);
-            let sell_flag_merged = ext_flag_cache || sell_cashback_remaining;
-            let third_merged = sell_cashback_third
-                .or(ext_third_cache)
-                .filter(|p| *p != Pubkey::default());
-            let (sell_layout_ready, dex_readiness) = pump_amm_sell_layout_publish_state(
-                sell_flag_merged,
-                third_merged,
-                sell_layout_ready_from_refresh,
-            );
+            let (sell_flag_merged, third_merged, sell_layout_ready, dex_readiness) =
+                pump_amm_sell_layout_state_for_ensure_publish(
+                    force_refresh,
+                    ext_flag_cache,
+                    ext_third_cache,
+                    sell_cashback_remaining,
+                    sell_cashback_third,
+                    sell_layout_ready_from_refresh,
+                );
 
             let (base_reserve, quote_reserve) =
                 match resolve_pump_amm_reserves_for_ensure_discovery(
@@ -5129,11 +5168,19 @@ async fn handle_ensure_pump_amm_pool_accounts(
                 creator: creator_opt,
             });
             ctx.live_pool_cache.upsert(pool_address, state, 0);
-            ctx.live_pool_cache.merge_pump_amm_sell_extended_layout(
-                &pool_address,
-                sell_flag_merged,
-                third_merged,
-            );
+            if force_refresh {
+                ctx.live_pool_cache.set_pump_amm_sell_layout_authoritative(
+                    &pool_address,
+                    sell_flag_merged,
+                    third_merged,
+                );
+            } else {
+                ctx.live_pool_cache.merge_pump_amm_sell_extended_layout(
+                    &pool_address,
+                    sell_flag_merged,
+                    third_merged,
+                );
+            }
             ctx.live_pool_cache
                 .set_pump_amm_sell_layout_ready(&pool_address, sell_layout_ready);
             ctx.live_pool_cache
@@ -5166,6 +5213,12 @@ async fn handle_ensure_pump_amm_pool_accounts(
                     "pump_amm_sell_layout_ready".to_string(),
                     sell_layout_ready.to_string(),
                 );
+                if force_refresh {
+                    meta.insert(
+                        "pump_amm_sell_layout_authoritative".to_string(),
+                        "true".to_string(),
+                    );
+                }
                 if let Some(pk) = third_merged {
                     meta.insert(
                         "pump_amm_sell_cashback_third_meta".to_string(),
@@ -9448,6 +9501,34 @@ mod discovery_tests {
             sell_layout_ready,
             "extended SELL with authoritative third meta must be marked ready"
         );
+        assert_eq!(dex_readiness, DexPoolReadiness::Ready);
+    }
+
+    #[test]
+    fn test_pump_amm_force_refresh_base_overrides_stale_extended_cache_flag() {
+        let stale_third = Pubkey::new_unique();
+        let (
+            effective_requires_extended,
+            effective_third_meta,
+            sell_layout_ready,
+            dex_readiness,
+        ) = pump_amm_sell_layout_state_for_ensure_publish(
+            true,
+            true,
+            Some(stale_third),
+            false,
+            None,
+            true,
+        );
+        assert!(
+            !effective_requires_extended,
+            "authoritative force_refresh base result must override stale extended cache flag"
+        );
+        assert!(
+            effective_third_meta.is_none(),
+            "authoritative base result must discard stale third meta"
+        );
+        assert!(sell_layout_ready, "base layout proven by force_refresh stays ready");
         assert_eq!(dex_readiness, DexPoolReadiness::Ready);
     }
 

@@ -894,17 +894,31 @@ impl LivePoolCache {
             self.pump_amm_sell_layout_ready_by_market
                 .insert(*pool, v == "true");
         }
-        if m.get("pump_amm_sell_cashback_remaining")
-            .is_some_and(|v| v == "true")
-        {
-            self.pump_amm_sell_extended_flag_by_market
-                .insert(*pool, true);
-        }
-        if let Some(s) = m.get("pump_amm_sell_cashback_third_meta") {
-            if let Ok(pk) = Pubkey::from_str(s) {
-                if pk != Pubkey::default() {
-                    self.pump_amm_sell_extended_third_meta_by_market
-                        .insert(*pool, pk);
+        let authoritative =
+            m.get("pump_amm_sell_layout_authoritative")
+                .is_some_and(|v| v == "true");
+        if authoritative {
+            let requires_extended = m
+                .get("pump_amm_sell_cashback_remaining")
+                .is_some_and(|v| v == "true");
+            let third_meta = m
+                .get("pump_amm_sell_cashback_third_meta")
+                .and_then(|s| Pubkey::from_str(s).ok())
+                .filter(|pk| *pk != Pubkey::default());
+            self.set_pump_amm_sell_layout_authoritative(pool, requires_extended, third_meta);
+        } else {
+            if m.get("pump_amm_sell_cashback_remaining")
+                .is_some_and(|v| v == "true")
+            {
+                self.pump_amm_sell_extended_flag_by_market
+                    .insert(*pool, true);
+            }
+            if let Some(s) = m.get("pump_amm_sell_cashback_third_meta") {
+                if let Ok(pk) = Pubkey::from_str(s) {
+                    if pk != Pubkey::default() {
+                        self.pump_amm_sell_extended_third_meta_by_market
+                            .insert(*pool, pk);
+                    }
                 }
             }
         }
@@ -931,6 +945,26 @@ impl LivePoolCache {
     pub fn set_pump_amm_sell_layout_ready(&self, pool: &Pubkey, ready: bool) {
         self.pump_amm_sell_layout_ready_by_market
             .insert(*pool, ready);
+    }
+
+    /// Overwrite PumpSwap SELL-layout shape from an authoritative source (e.g. force-refresh SSOT).
+    pub fn set_pump_amm_sell_layout_authoritative(
+        &self,
+        pool: &Pubkey,
+        requires_extended: bool,
+        third_meta: Option<Pubkey>,
+    ) {
+        self.pump_amm_sell_extended_flag_by_market
+            .insert(*pool, requires_extended);
+        match third_meta.filter(|p| *p != Pubkey::default()) {
+            Some(pk) => {
+                self.pump_amm_sell_extended_third_meta_by_market
+                    .insert(*pool, pk);
+            }
+            None => {
+                self.pump_amm_sell_extended_third_meta_by_market.remove(pool);
+            }
+        }
     }
 
     /// Extended PumpSwap `sell` layout: flag + third readonly meta (if known).
@@ -2539,6 +2573,41 @@ mod tests {
                 .map(|r| *r.value()),
             Some(DexPoolReadiness::Partial),
             "authoritative PumpSwap updates must be able to replace stale Ready with Partial"
+        );
+    }
+
+    #[test]
+    fn test_authoritative_pump_amm_metadata_clears_stale_extended_layout() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let stale_third = Pubkey::new_unique();
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            "pump_amm_sell_layout_authoritative".to_string(),
+            "true".to_string(),
+        );
+        meta.insert(
+            "pump_amm_sell_cashback_remaining".to_string(),
+            "false".to_string(),
+        );
+        meta.insert("pump_amm_sell_layout_ready".to_string(), "true".to_string());
+
+        cache.merge_pump_amm_sell_extended_layout(&pool_market, true, Some(stale_third));
+        cache.set_pump_amm_sell_layout_ready(&pool_market, false);
+        cache.merge_pump_amm_sell_layout_from_metadata(&pool_market, Some(&meta));
+
+        let (requires_extended, third_meta) = cache.pump_amm_sell_extended_layout(&pool_market);
+        assert!(
+            !requires_extended,
+            "authoritative base metadata must clear stale extended flag"
+        );
+        assert!(
+            third_meta.is_none(),
+            "authoritative base metadata must clear stale third meta"
+        );
+        assert!(
+            cache.pump_amm_sell_layout_ready(&pool_market),
+            "authoritative base metadata keeps SELL layout ready"
         );
     }
 
