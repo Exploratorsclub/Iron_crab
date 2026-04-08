@@ -228,6 +228,30 @@ fn raydium_cpmm_readiness_for_pool_cache_update(s: &RaydiumCpmmState) -> DexPool
     }
 }
 
+/// PumpSwap SELL-layout contract for JetStream / SLAVE SSOT.
+///
+/// - Base-only SELL stays ready as long as the underlying refresh/observation says the base layout is usable.
+/// - Extended SELL is ready only when the observed third readonly meta is authoritatively known.
+fn pump_amm_sell_layout_publish_state(
+    sell_requires_extended: bool,
+    sell_cashback_third_meta: Option<Pubkey>,
+    base_layout_ready: bool,
+) -> (bool, DexPoolReadiness) {
+    let sell_layout_ready = if sell_requires_extended {
+        sell_cashback_third_meta
+            .filter(|p| *p != Pubkey::default())
+            .is_some()
+    } else {
+        base_layout_ready
+    };
+    let dex_readiness = if sell_layout_ready {
+        DexPoolReadiness::Ready
+    } else {
+        DexPoolReadiness::Partial
+    };
+    (sell_layout_ready, dex_readiness)
+}
+
 /// Market data configuration (hot-reloadable via NATS)
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -5052,16 +5076,11 @@ async fn handle_ensure_pump_amm_pool_accounts(
             let third_merged = sell_cashback_third
                 .or(ext_third_cache)
                 .filter(|p| *p != Pubkey::default());
-            let sell_layout_ready = if sell_flag_merged {
-                third_merged.is_some()
-            } else {
-                sell_layout_ready_from_refresh
-            };
-            let dex_readiness = if sell_layout_ready {
-                DexPoolReadiness::Ready
-            } else {
-                DexPoolReadiness::Partial
-            };
+            let (sell_layout_ready, dex_readiness) = pump_amm_sell_layout_publish_state(
+                sell_flag_merged,
+                third_merged,
+                sell_layout_ready_from_refresh,
+            );
 
             let (base_reserve, quote_reserve) =
                 match resolve_pump_amm_reserves_for_ensure_discovery(
@@ -8188,25 +8207,31 @@ async fn run_geyser_loop(
                                 ctx.live_pool_cache.pump_amm_sell_extended_layout(pool_address);
                             let merged_flag =
                                 ext_flag || *pump_amm_sell_requires_cashback_remaining;
+                            let merged_third = ext_third
+                                .or(*pump_amm_sell_cashback_third_meta)
+                                .filter(|p| *p != Pubkey::default());
+                            let (sell_layout_ready, dex_readiness) =
+                                pump_amm_sell_layout_publish_state(
+                                    merged_flag,
+                                    merged_third,
+                                    true,
+                                );
                             meta.insert(
                                 "pump_amm_sell_cashback_remaining".to_string(),
                                 merged_flag.to_string(),
                             );
                             meta.insert(
                                 "pump_amm_sell_layout_ready".to_string(),
-                                "true".to_string(),
+                                sell_layout_ready.to_string(),
                             );
-                            if let Some(pk) = ext_third
-                                .or(*pump_amm_sell_cashback_third_meta)
-                                .filter(|p| *p != Pubkey::default())
-                            {
+                            if let Some(pk) = merged_third {
                                 meta.insert(
                                     "pump_amm_sell_cashback_third_meta".to_string(),
                                     pk.to_string(),
                                 );
                             }
                             pool_update.metadata = Some(meta);
-                            pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+                            pool_update.set_dex_readiness_in_metadata(dex_readiness);
                             let subject = pool_subject(&pool_address.to_string());
                             if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
                                 warn!(error = %e, "FIX-33: Failed to publish pump_amm pool_accounts PoolCacheUpdate to JetStream (trade)");
@@ -9399,6 +9424,28 @@ mod discovery_tests {
             raydium_cpmm_readiness_for_pool_cache_update(&s),
             DexPoolReadiness::Observed
         );
+    }
+
+    #[test]
+    fn test_pump_amm_trade_publish_extended_without_third_meta_is_partial() {
+        let (sell_layout_ready, dex_readiness) =
+            pump_amm_sell_layout_publish_state(true, None, true);
+        assert!(
+            !sell_layout_ready,
+            "extended SELL without authoritative third meta must not be marked ready"
+        );
+        assert_eq!(dex_readiness, DexPoolReadiness::Partial);
+    }
+
+    #[test]
+    fn test_pump_amm_trade_publish_extended_with_third_meta_is_ready() {
+        let (sell_layout_ready, dex_readiness) =
+            pump_amm_sell_layout_publish_state(true, Some(Pubkey::new_unique()), true);
+        assert!(
+            sell_layout_ready,
+            "extended SELL with authoritative third meta must be marked ready"
+        );
+        assert_eq!(dex_readiness, DexPoolReadiness::Ready);
     }
 
     #[test]
