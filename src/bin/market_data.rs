@@ -9507,19 +9507,15 @@ mod discovery_tests {
     #[test]
     fn test_pump_amm_force_refresh_base_overrides_stale_extended_cache_flag() {
         let stale_third = Pubkey::new_unique();
-        let (
-            effective_requires_extended,
-            effective_third_meta,
-            sell_layout_ready,
-            dex_readiness,
-        ) = pump_amm_sell_layout_state_for_ensure_publish(
-            true,
-            true,
-            Some(stale_third),
-            false,
-            None,
-            true,
-        );
+        let (effective_requires_extended, effective_third_meta, sell_layout_ready, dex_readiness) =
+            pump_amm_sell_layout_state_for_ensure_publish(
+                true,
+                true,
+                Some(stale_third),
+                false,
+                None,
+                true,
+            );
         assert!(
             !effective_requires_extended,
             "authoritative force_refresh base result must override stale extended cache flag"
@@ -9528,7 +9524,10 @@ mod discovery_tests {
             effective_third_meta.is_none(),
             "authoritative base result must discard stale third meta"
         );
-        assert!(sell_layout_ready, "base layout proven by force_refresh stays ready");
+        assert!(
+            sell_layout_ready,
+            "base layout proven by force_refresh stays ready"
+        );
         assert_eq!(dex_readiness, DexPoolReadiness::Ready);
     }
 

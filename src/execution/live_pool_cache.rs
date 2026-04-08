@@ -894,9 +894,9 @@ impl LivePoolCache {
             self.pump_amm_sell_layout_ready_by_market
                 .insert(*pool, v == "true");
         }
-        let authoritative =
-            m.get("pump_amm_sell_layout_authoritative")
-                .is_some_and(|v| v == "true");
+        let authoritative = m
+            .get("pump_amm_sell_layout_authoritative")
+            .is_some_and(|v| v == "true");
         if authoritative {
             let requires_extended = m
                 .get("pump_amm_sell_cashback_remaining")
@@ -962,7 +962,8 @@ impl LivePoolCache {
                     .insert(*pool, pk);
             }
             None => {
-                self.pump_amm_sell_extended_third_meta_by_market.remove(pool);
+                self.pump_amm_sell_extended_third_meta_by_market
+                    .remove(pool);
             }
         }
     }
