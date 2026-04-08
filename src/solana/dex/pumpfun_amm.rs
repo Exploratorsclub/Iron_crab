@@ -134,9 +134,8 @@ pub fn pump_amm_sell_ix_discriminator() -> [u8; 8] {
     anchor_disc("sell")
 }
 
-/// `sell` uses 21 base metas; some pools require three trailing accounts (Pump cashback / volume tracking).
+/// PumpSwap `sell` uses 21 base account metas; some pools require three trailing accounts (Pump cashback / volume tracking), total 24.
 /// Verified on mainnet (e.g. sig `2CCmRDScAErjuBLnVJbGEyV3jsWbuNZpniZ5iTLSwZoE84nmyf285hqJXjRStMHJUaJ9Ex7EvL9fgwAVM83qGd3o`).
-pub const PUMPFUN_AMM_SELL_BASE_ACCOUNT_METAS: usize = 21;
 pub const PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS: usize = 24;
 
 /// Stable, structured reason when local (validator) market-account parsing cannot build `PumpAmmPoolStatic`.

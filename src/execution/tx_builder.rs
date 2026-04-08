@@ -882,7 +882,11 @@ pub async fn build_tx_plan(
             &pool_accounts,
             token_program_override,
             sell_requires_cashback_remaining && intent.side == TradeSide::Sell,
-            sell_cashback_third_meta,
+            if intent.side == TradeSide::Sell {
+                sell_cashback_third_meta
+            } else {
+                None
+            },
         ) {
             Ok(ixs) => ixs,
             Err(e) => {
