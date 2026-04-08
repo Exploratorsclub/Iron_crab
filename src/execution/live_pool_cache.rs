@@ -438,6 +438,10 @@ pub struct LivePoolCache {
     pump_amm_sell_extended_flag_by_market: DashMap<Pubkey, bool>,
     /// Third trailing readonly meta for extended `sell` (from observed ix); set when authoritatively known.
     pump_amm_sell_extended_third_meta_by_market: DashMap<Pubkey, Pubkey>,
+    /// PumpSwap pool-market -> whether the authoritative source has proven the current SELL layout
+    /// is fully known. `false` means "do not treat this as sell-ready truth yet", even if
+    /// pool_accounts/reserves are otherwise present.
+    pump_amm_sell_layout_ready_by_market: DashMap<Pubkey, bool>,
 }
 
 /// Which vault position (A/B or X/Y or 0/1) this vault represents
@@ -476,6 +480,7 @@ impl LivePoolCache {
             meteora_dlmm_readiness_by_pool: DashMap::new(),
             pump_amm_sell_extended_flag_by_market: DashMap::new(),
             pump_amm_sell_extended_third_meta_by_market: DashMap::new(),
+            pump_amm_sell_layout_ready_by_market: DashMap::new(),
         }
     }
 
@@ -885,6 +890,10 @@ impl LivePoolCache {
         let Some(m) = meta else {
             return;
         };
+        if let Some(v) = m.get("pump_amm_sell_layout_ready") {
+            self.pump_amm_sell_layout_ready_by_market
+                .insert(*pool, v == "true");
+        }
         if m.get("pump_amm_sell_cashback_remaining")
             .is_some_and(|v| v == "true")
         {
@@ -918,6 +927,11 @@ impl LivePoolCache {
         }
     }
 
+    /// Authoritative SELL-layout completeness for PumpSwap.
+    pub fn set_pump_amm_sell_layout_ready(&self, pool: &Pubkey, ready: bool) {
+        self.pump_amm_sell_layout_ready_by_market.insert(*pool, ready);
+    }
+
     /// Extended PumpSwap `sell` layout: flag + third readonly meta (if known).
     #[must_use]
     pub fn pump_amm_sell_extended_layout(&self, pool_market: &Pubkey) -> (bool, Option<Pubkey>) {
@@ -931,6 +945,26 @@ impl LivePoolCache {
             .get(pool_market)
             .map(|e| *e.value());
         (flag, third)
+    }
+
+    #[must_use]
+    pub fn pump_amm_sell_layout_ready(&self, pool_market: &Pubkey) -> bool {
+        self.pump_amm_sell_layout_ready_by_market
+            .get(pool_market)
+            .map(|e| *e.value())
+            .unwrap_or(true)
+    }
+
+    fn pump_amm_sell_layout_complete_for_ready(&self, pool_market: &Pubkey) -> bool {
+        if !self.pump_amm_sell_layout_ready(pool_market) {
+            return false;
+        }
+        let (requires_extended, third) = self.pump_amm_sell_extended_layout(pool_market);
+        if requires_extended {
+            third.filter(|p| *p != Pubkey::default()).is_some()
+        } else {
+            true
+        }
     }
 
     /// Set Raydium AMM Serum/OpenBook accounts (bids, asks, event_queue).
@@ -1104,6 +1138,11 @@ impl LivePoolCache {
             .entry(pool_market)
             .and_modify(|stored| *stored = stored.merge(incoming))
             .or_insert(incoming);
+    }
+
+    fn pump_amm_sell_layout_complete_for_ready(&self, pool_market: &Pubkey) -> bool {
+        let (requires_extended, third_meta) = self.pump_amm_sell_extended_layout(pool_market);
+        !requires_extended || third_meta.filter(|p| *p != Pubkey::default()).is_some()
     }
 
     /// Merge PumpFun bonding-curve readiness for `bonding_curve` (monotonic — never downgrade).
@@ -1466,6 +1505,9 @@ impl LivePoolCache {
         pool_market: &Pubkey,
         state: &PumpAmmState,
     ) -> bool {
+        if !self.pump_amm_sell_layout_complete_for_ready(pool_market) {
+            return false;
+        }
         match self.pool_accounts_readiness_by_market.get(pool_market) {
             Some(r) => *r == DexPoolReadiness::Ready,
             None => {
@@ -1540,7 +1582,11 @@ impl LivePoolCache {
                     .get(pool_market)
                     .map(|r| *r == DexPoolReadiness::Ready)
                     .unwrap_or(false);
-                if explicit_ready && !s.pool_accounts.is_empty() && s.pool_accounts.len() >= 14 {
+                if explicit_ready
+                    && self.pump_amm_sell_layout_complete_for_ready(pool_market)
+                    && !s.pool_accounts.is_empty()
+                    && s.pool_accounts.len() >= 14
+                {
                     return true;
                 }
             }
@@ -2392,6 +2438,73 @@ mod tests {
 
         cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Observed);
         assert!(!cache.pump_amm_swap_accounts_ready_by_base_mint(&base_mint));
+    }
+
+    #[test]
+    fn test_pump_amm_swap_accounts_ready_false_when_extended_layout_missing_third_meta() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let pool_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(1_000_000_000),
+                Some(50_000_000_000),
+                pool_accounts,
+            ),
+            100,
+        );
+        cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
+        cache.merge_pump_amm_sell_extended_layout(&pool_market, true, None);
+        cache.set_pump_amm_sell_layout_ready(&pool_market, false);
+
+        assert!(
+            !cache.pump_amm_swap_accounts_ready_by_base_mint(&base_mint),
+            "extended layout without third meta must not count as swap-ready"
+        );
+    }
+
+    #[test]
+    fn test_pump_amm_extended_flag_without_third_meta_blocks_ready_gate() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let pool_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(1_000_000_000),
+                Some(50_000_000_000),
+                pool_accounts,
+            ),
+            100,
+        );
+        cache.merge_pump_amm_sell_extended_layout(&pool_market, true, None);
+        cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
+
+        assert!(
+            cache
+                .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
+                .is_none(),
+            "extended SELL without third meta must not count as ready pool_accounts"
+        );
+        assert!(
+            !cache.pump_amm_swap_accounts_ready_by_base_mint(&base_mint),
+            "execution-engine gate must block extended SELL pools until third meta is present"
+        );
+        assert!(
+            !cache.base_mint_has_explicit_pump_amm_ready_pool(&base_mint),
+            "mint-level explicit Ready gate must also reject incomplete extended SELL state"
+        );
     }
 
     #[test]

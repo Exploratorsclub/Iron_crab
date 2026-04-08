@@ -5017,6 +5017,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
         Ok(Some(wrapped)) if wrapped.accounts.len() >= 14 => {
             let sell_cashback_remaining = wrapped.sell_requires_cashback_remaining;
             let sell_cashback_third = wrapped.sell_cashback_third_meta;
+            let sell_layout_ready_from_refresh = wrapped.sell_layout_ready;
             let accounts = wrapped.accounts;
             let diag = wrapped.diagnostic;
             log_pump_amm_scope44_pool_accounts_diag(
@@ -5051,6 +5052,16 @@ async fn handle_ensure_pump_amm_pool_accounts(
             let third_merged = sell_cashback_third
                 .or(ext_third_cache)
                 .filter(|p| *p != Pubkey::default());
+            let sell_layout_ready = if sell_flag_merged {
+                third_merged.is_some()
+            } else {
+                sell_layout_ready_from_refresh
+            };
+            let dex_readiness = if sell_layout_ready {
+                DexPoolReadiness::Ready
+            } else {
+                DexPoolReadiness::Partial
+            };
 
             let (base_reserve, quote_reserve) =
                 match resolve_pump_amm_reserves_for_ensure_discovery(
@@ -5105,7 +5116,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
                 third_merged,
             );
             ctx.live_pool_cache
-                .merge_pump_amm_pool_accounts_readiness(pool_address, DexPoolReadiness::Ready);
+                .merge_pump_amm_pool_accounts_readiness(pool_address, dex_readiness);
 
             // Publish JetStream PoolCacheUpdate (authoritative SSOT).
             // Reply Ok ONLY when JetStream write succeeds (I-24a).
@@ -5130,6 +5141,10 @@ async fn handle_ensure_pump_amm_pool_accounts(
                     "pump_amm_sell_cashback_remaining".to_string(),
                     sell_flag_merged.to_string(),
                 );
+                meta.insert(
+                    "pump_amm_sell_layout_ready".to_string(),
+                    sell_layout_ready.to_string(),
+                );
                 if let Some(pk) = third_merged {
                     meta.insert(
                         "pump_amm_sell_cashback_third_meta".to_string(),
@@ -5140,7 +5155,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
                     meta.insert("creator".to_string(), creator.to_string());
                 }
                 pool_update.metadata = Some(meta);
-                pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+                pool_update.set_dex_readiness_in_metadata(dex_readiness);
                 let subject = pool_subject(&pool_address_str);
                 match nats.jetstream_publish(&subject, &pool_update).await {
                     Ok(true) => {
@@ -5167,7 +5182,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
             };
 
             if let Some(ref nats) = ctx.nats {
-                let (status, message) = if jetstream_ok {
+                let (status, message) = if jetstream_ok && sell_layout_ready {
                     info!(
                         request_id = %request_id,
                         base_mint = %base_mint_str,
@@ -5177,6 +5192,22 @@ async fn handle_ensure_pump_amm_pool_accounts(
                         "I-24d Discovery: terminal outcome ok"
                     );
                     (ControlResponseStatus::Ok, None)
+                } else if jetstream_ok {
+                    warn!(
+                        request_id = %request_id,
+                        base_mint = %base_mint_str,
+                        pool_address = %pool_address_str,
+                        sell_cashback_remaining = sell_flag_merged,
+                        sell_cashback_third_meta = ?third_merged,
+                        "I-24d Discovery: force_refresh result published as Partial (authoritative SELL layout unresolved)"
+                    );
+                    (
+                        ControlResponseStatus::Error,
+                        Some(
+                            "authoritative PumpSwap SELL layout unresolved after force_refresh"
+                                .to_string(),
+                        ),
+                    )
                 } else {
                     warn!(
                         request_id = %request_id,
@@ -8160,6 +8191,10 @@ async fn run_geyser_loop(
                             meta.insert(
                                 "pump_amm_sell_cashback_remaining".to_string(),
                                 merged_flag.to_string(),
+                            );
+                            meta.insert(
+                                "pump_amm_sell_layout_ready".to_string(),
+                                "true".to_string(),
                             );
                             if let Some(pk) = ext_third
                                 .or(*pump_amm_sell_cashback_third_meta)
