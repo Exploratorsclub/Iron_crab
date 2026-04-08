@@ -5297,14 +5297,14 @@ async fn handle_ensure_pump_amm_pool_accounts(
                         );
                     }
                     (true, true, false) => {
-                    warn!(
-                        request_id = %request_id,
-                        base_mint = %base_mint_str,
-                        pool_address = %pool_address_str,
-                        sell_cashback_remaining = sell_flag_merged,
-                        sell_cashback_third_meta = ?third_merged,
-                        "I-24d Discovery: force_refresh result published as Partial (authoritative SELL layout unresolved)"
-                    );
+                        warn!(
+                            request_id = %request_id,
+                            base_mint = %base_mint_str,
+                            pool_address = %pool_address_str,
+                            sell_cashback_remaining = sell_flag_merged,
+                            sell_cashback_third_meta = ?third_merged,
+                            "I-24d Discovery: force_refresh result published as Partial (authoritative SELL layout unresolved)"
+                        );
                     }
                     (true, false, false) => {
                         info!(
@@ -9234,16 +9234,14 @@ mod discovery_tests {
 
     #[test]
     fn test_pump_amm_non_force_refresh_partial_publish_keeps_ok_response() {
-        let (status, message) =
-            pump_amm_control_response_for_ensure_publish(false, true, false);
+        let (status, message) = pump_amm_control_response_for_ensure_publish(false, true, false);
         assert_eq!(status, ControlResponseStatus::Ok);
         assert!(message.is_none());
     }
 
     #[test]
     fn test_pump_amm_force_refresh_partial_publish_returns_authoritative_error() {
-        let (status, message) =
-            pump_amm_control_response_for_ensure_publish(true, true, false);
+        let (status, message) = pump_amm_control_response_for_ensure_publish(true, true, false);
         assert_eq!(status, ControlResponseStatus::Error);
         assert_eq!(
             message.as_deref(),
