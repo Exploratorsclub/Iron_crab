@@ -865,7 +865,7 @@ impl PumpFunAmmDex {
         let tx = rpc
             .get_transaction_with_config_retry(&sig_parsed, cfg)
             .await
-            .map_err(|e| anyhow!("getTransaction failed: {e}"))?;
+            .context("getTransaction failed")?;
         let tx_val = serde_json::to_value(&tx).context("serialize transaction")?;
         Ok(json!({"result": tx_val}))
     }
@@ -1487,6 +1487,8 @@ impl PumpFunAmmDex {
             let tx_v = match Self::fetch_tx_as_value_with_rpc(tx_rpc.as_ref(), &sig).await {
                 Ok(v) => {
                     summary.provider_status_last = PumpAmmSellLayoutProviderStatus::Ok;
+                    summary.termination_reason =
+                        PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalNoSellCandidates;
                     if structured_telemetry
                         && (summary.get_transaction_calls == 1
                             || summary.get_transaction_calls % 5 == 0)
