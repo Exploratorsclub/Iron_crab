@@ -522,6 +522,23 @@ fn force_refresh_no_fallback_termination_reason(
     }
 }
 
+/// Top-level `termination_reason` after an external SELL-layout attempt (must not be replaced by local observation failure).
+fn force_refresh_external_termination_reason_after_attempt(
+    layout: PumpAmmAuthoritativeSellLayout,
+    timed_out: bool,
+    summary: Option<&PumpAmmSellLayoutExternalAttemptSummary>,
+) -> PumpAmmSellLayoutTerminationReason {
+    if layout != PumpAmmAuthoritativeSellLayout::Unknown {
+        PumpAmmSellLayoutTerminationReason::LayoutFound
+    } else if timed_out {
+        PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalTimeoutBudgetExhausted
+    } else if let Some(s) = summary {
+        s.termination_reason
+    } else {
+        PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalRpcError
+    }
+}
+
 fn provider_status_from_anyhow_rpc(err: &anyhow::Error) -> PumpAmmSellLayoutProviderStatus {
     for cause in err.chain() {
         if let Some(ce) = cause.downcast_ref::<ClientError>() {
@@ -1280,19 +1297,11 @@ impl PumpFunAmmDex {
             }
         };
 
-        let mut termination_reason = if layout != PumpAmmAuthoritativeSellLayout::Unknown {
-            PumpAmmSellLayoutTerminationReason::LayoutFound
-        } else if timed_out {
-            PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalTimeoutBudgetExhausted
-        } else if let Some(ref s) = summary_opt {
-            s.termination_reason
-        } else {
-            PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalRpcError
-        };
-
-        if local_observation_failed && layout == PumpAmmAuthoritativeSellLayout::Unknown {
-            termination_reason = PumpAmmSellLayoutTerminationReason::LocalObservationError;
-        }
+        let termination_reason = force_refresh_external_termination_reason_after_attempt(
+            layout,
+            timed_out,
+            summary_opt.as_ref(),
+        );
 
         let local_history_empty = local_one_sig_probe == PumpAmmLocalHistoryProbe::Empty;
         let local_history_probe = if local_one_sig_probe != PumpAmmLocalHistoryProbe::Unknown {
@@ -5355,6 +5364,44 @@ mod tests {
         assert_eq!(
             force_refresh_no_fallback_termination_reason(false),
             PumpAmmSellLayoutTerminationReason::ExternalSkippedNoFallbackRpc
+        );
+    }
+
+    /// Local observation may fail, but after an external attempt the top-level reason stays external (e.g. outer timeout).
+    #[test]
+    fn scope49_external_termination_not_hidden_by_local_observation_failed() {
+        let tr = force_refresh_external_termination_reason_after_attempt(
+            PumpAmmAuthoritativeSellLayout::Unknown,
+            true,
+            None,
+        );
+        assert_eq!(
+            tr,
+            PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalTimeoutBudgetExhausted
+        );
+        // Independent signal for supervisor: local_observation_failed would still be true on the diag.
+        let tr_with_summary = force_refresh_external_termination_reason_after_attempt(
+            PumpAmmAuthoritativeSellLayout::Unknown,
+            false,
+            Some(&PumpAmmSellLayoutExternalAttemptSummary {
+                rpc_method_last: "getTransaction",
+                elapsed_total_ms: 100,
+                get_signatures_calls: 1,
+                get_signatures_succeeded: true,
+                get_transaction_calls: 3,
+                signatures_limit_last: Some(40),
+                signatures_returned_last: 5,
+                transactions_fetched: 2,
+                pump_amm_instructions_seen: 1,
+                sell_candidates_seen: 0,
+                provider_status_last: PumpAmmSellLayoutProviderStatus::Ok,
+                termination_reason:
+                    PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalHttp429,
+            }),
+        );
+        assert_eq!(
+            tr_with_summary,
+            PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalHttp429
         );
     }
 
