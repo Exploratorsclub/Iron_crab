@@ -335,10 +335,36 @@ pub struct PoolAccountsV14WithDiagnostic {
     pub force_refresh_sell_layout_diag: Option<PumpAmmForceRefreshSellLayoutDiag>,
 }
 
+/// Whether the local `getSignaturesForAddress` probe succeeded and what it returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpAmmLocalHistoryProbe {
+    /// RPC succeeded and returned zero signatures (confirmed empty index page).
+    Empty,
+    /// RPC succeeded and returned at least one signature.
+    NonEmpty,
+    /// Observation or probe failed, or state is unknown — do **not** treat as empty history.
+    Unknown,
+}
+
+impl PumpAmmLocalHistoryProbe {
+    pub fn as_log_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::NonEmpty => "non_empty",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Cold-path diagnostics for `force_refresh` SELL-layout resolution (market-data logs / supervisor).
 #[derive(Debug, Clone)]
 pub struct PumpAmmForceRefreshSellLayoutDiag {
+    /// `true` only when the local signature listing RPC **succeeded** and returned zero entries.
     pub local_history_empty: bool,
+    /// Local `observe_*` failed (e.g. `getSignaturesForAddress` error) before a layout was found.
+    pub local_observation_failed: bool,
+    /// Tri-state local index: empty vs non-empty vs unknown/error (for supervisor; prefer over bool alone).
+    pub local_history_probe: PumpAmmLocalHistoryProbe,
     pub external_attempted: bool,
     pub external_sig_limit: Option<usize>,
     pub external_max_tx_fetches: Option<usize>,
@@ -371,6 +397,8 @@ pub struct PumpAmmSellLayoutExternalAttemptSummary {
     pub rpc_method_last: &'static str,
     pub elapsed_total_ms: u128,
     pub get_signatures_calls: u32,
+    /// `true` only after a successful `getSignaturesForAddress` response (even if zero sigs).
+    pub get_signatures_succeeded: bool,
     pub get_transaction_calls: u32,
     pub signatures_limit_last: Option<usize>,
     pub signatures_returned_last: usize,
@@ -470,6 +498,28 @@ enum PumpAmmAuthoritativeSellLayout {
     Unknown,
     Base,
     Extended { third_meta: Pubkey },
+}
+
+fn local_history_probe_from_sell_layout_summary(
+    s: &PumpAmmSellLayoutExternalAttemptSummary,
+) -> PumpAmmLocalHistoryProbe {
+    if s.get_signatures_succeeded && s.signatures_returned_last == 0 {
+        PumpAmmLocalHistoryProbe::Empty
+    } else if s.get_signatures_succeeded && s.signatures_returned_last > 0 {
+        PumpAmmLocalHistoryProbe::NonEmpty
+    } else {
+        PumpAmmLocalHistoryProbe::Unknown
+    }
+}
+
+fn force_refresh_no_fallback_termination_reason(
+    local_observation_failed: bool,
+) -> PumpAmmSellLayoutTerminationReason {
+    if local_observation_failed {
+        PumpAmmSellLayoutTerminationReason::LocalObservationError
+    } else {
+        PumpAmmSellLayoutTerminationReason::ExternalSkippedNoFallbackRpc
+    }
 }
 
 fn provider_status_from_anyhow_rpc(err: &anyhow::Error) -> PumpAmmSellLayoutProviderStatus {
@@ -1121,6 +1171,10 @@ impl PumpFunAmmDex {
             )
             .await;
 
+        let local_observation_failed = local_outcome.result.is_err();
+        let local_probe_after_observation =
+            local_history_probe_from_sell_layout_summary(&local_outcome.summary);
+
         match local_outcome.result {
             Ok(layout) if layout != PumpAmmAuthoritativeSellLayout::Unknown => {
                 return Ok((layout, None));
@@ -1138,25 +1192,31 @@ impl PumpFunAmmDex {
         }
 
         let Some(ref h_rpc) = self.bounded_tx_fallback_rpc else {
+            let local_history_empty =
+                local_probe_after_observation == PumpAmmLocalHistoryProbe::Empty;
+            let termination_reason =
+                force_refresh_no_fallback_termination_reason(local_observation_failed);
             let diag = PumpAmmForceRefreshSellLayoutDiag {
-                local_history_empty: local_outcome.summary.signatures_returned_last == 0,
+                local_history_empty,
+                local_observation_failed,
+                local_history_probe: local_probe_after_observation,
                 external_attempted: false,
                 external_sig_limit: None,
                 external_max_tx_fetches: None,
                 external_max_get_transaction_calls: None,
-                termination_reason:
-                    PumpAmmSellLayoutTerminationReason::ExternalSkippedNoFallbackRpc,
+                termination_reason,
                 last_external: None,
             };
             return Ok((PumpAmmAuthoritativeSellLayout::Unknown, Some(diag)));
         };
 
-        let local_sigs_empty = match self
+        let local_one_sig_probe = match self
             .rpc
             .get_signatures_for_address(&pool.pool_market, Some(1))
             .await
         {
-            Ok(v) => v.is_empty(),
+            Ok(v) if v.is_empty() => PumpAmmLocalHistoryProbe::Empty,
+            Ok(_) => PumpAmmLocalHistoryProbe::NonEmpty,
             Err(e) => {
                 warn!(
                     pool = %pool.pool_market,
@@ -1164,12 +1224,14 @@ impl PumpFunAmmDex {
                     error = %e,
                     "pump_amm: local tx index check failed during force_refresh; trying bounded external SELL-layout observation"
                 );
-                true
+                PumpAmmLocalHistoryProbe::Unknown
             }
         };
-        if !local_sigs_empty {
+        if local_one_sig_probe == PumpAmmLocalHistoryProbe::NonEmpty {
             let diag = PumpAmmForceRefreshSellLayoutDiag {
                 local_history_empty: false,
+                local_observation_failed,
+                local_history_probe: local_one_sig_probe,
                 external_attempted: false,
                 external_sig_limit: None,
                 external_max_tx_fetches: None,
@@ -1218,7 +1280,7 @@ impl PumpFunAmmDex {
             }
         };
 
-        let termination_reason = if layout != PumpAmmAuthoritativeSellLayout::Unknown {
+        let mut termination_reason = if layout != PumpAmmAuthoritativeSellLayout::Unknown {
             PumpAmmSellLayoutTerminationReason::LayoutFound
         } else if timed_out {
             PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalTimeoutBudgetExhausted
@@ -1228,8 +1290,21 @@ impl PumpFunAmmDex {
             PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalRpcError
         };
 
+        if local_observation_failed && layout == PumpAmmAuthoritativeSellLayout::Unknown {
+            termination_reason = PumpAmmSellLayoutTerminationReason::LocalObservationError;
+        }
+
+        let local_history_empty = local_one_sig_probe == PumpAmmLocalHistoryProbe::Empty;
+        let local_history_probe = if local_one_sig_probe != PumpAmmLocalHistoryProbe::Unknown {
+            local_one_sig_probe
+        } else {
+            local_probe_after_observation
+        };
+
         let diag = PumpAmmForceRefreshSellLayoutDiag {
-            local_history_empty: true,
+            local_history_empty,
+            local_observation_failed,
+            local_history_probe,
             external_attempted: true,
             external_sig_limit: Some(FORCE_REFRESH_EXTERNAL_SIG_LIMIT),
             external_max_tx_fetches: Some(FORCE_REFRESH_EXTERNAL_MAX_TX_ATTEMPTS),
@@ -1257,6 +1332,7 @@ impl PumpFunAmmDex {
             rpc_method_last: "getSignaturesForAddress",
             elapsed_total_ms: 0,
             get_signatures_calls: 0,
+            get_signatures_succeeded: false,
             get_transaction_calls: 0,
             signatures_limit_last: Some(limits.signatures_limit),
             signatures_returned_last: 0,
@@ -1276,6 +1352,7 @@ impl PumpFunAmmDex {
                 .await
             {
                 Ok(v) => {
+                    summary.get_signatures_succeeded = true;
                     summary.signatures_returned_last = v.len();
                     summary.provider_status_last = PumpAmmSellLayoutProviderStatus::Ok;
                     if structured_telemetry {
@@ -5218,6 +5295,66 @@ mod tests {
         assert_eq!(
             derived_ta, expected_ta,
             "WSOL ATA for protocol_fee_recipient must match swap ix account #10"
+        );
+    }
+
+    /// Scope 49: failed local `getSignaturesForAddress` must not be classified as "empty history".
+    #[test]
+    fn scope49_local_history_probe_unknown_when_get_signatures_failed() {
+        let s = PumpAmmSellLayoutExternalAttemptSummary {
+            rpc_method_last: "getSignaturesForAddress",
+            elapsed_total_ms: 0,
+            get_signatures_calls: 1,
+            get_signatures_succeeded: false,
+            get_transaction_calls: 0,
+            signatures_limit_last: Some(200),
+            signatures_returned_last: 0,
+            transactions_fetched: 0,
+            pump_amm_instructions_seen: 0,
+            sell_candidates_seen: 0,
+            provider_status_last: PumpAmmSellLayoutProviderStatus::RpcError,
+            termination_reason:
+                PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalRpcError,
+        };
+        assert_eq!(
+            local_history_probe_from_sell_layout_summary(&s),
+            PumpAmmLocalHistoryProbe::Unknown
+        );
+    }
+
+    #[test]
+    fn scope49_local_history_probe_empty_when_rpc_ok_zero_sigs() {
+        let s = PumpAmmSellLayoutExternalAttemptSummary {
+            rpc_method_last: "getSignaturesForAddress",
+            elapsed_total_ms: 1,
+            get_signatures_calls: 1,
+            get_signatures_succeeded: true,
+            get_transaction_calls: 0,
+            signatures_limit_last: Some(200),
+            signatures_returned_last: 0,
+            transactions_fetched: 0,
+            pump_amm_instructions_seen: 0,
+            sell_candidates_seen: 0,
+            provider_status_last: PumpAmmSellLayoutProviderStatus::Ok,
+            termination_reason:
+                PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalNoSellCandidates,
+        };
+        assert_eq!(
+            local_history_probe_from_sell_layout_summary(&s),
+            PumpAmmLocalHistoryProbe::Empty
+        );
+    }
+
+    /// Scope 49: no-fallback diag must surface `LocalObservationError` in structured `termination_reason`.
+    #[test]
+    fn scope49_no_fallback_termination_prefers_local_observation_error() {
+        assert_eq!(
+            force_refresh_no_fallback_termination_reason(true),
+            PumpAmmSellLayoutTerminationReason::LocalObservationError
+        );
+        assert_eq!(
+            force_refresh_no_fallback_termination_reason(false),
+            PumpAmmSellLayoutTerminationReason::ExternalSkippedNoFallbackRpc
         );
     }
 

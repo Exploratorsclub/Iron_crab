@@ -5078,6 +5078,8 @@ fn log_pump_amm_scope49_force_refresh_sell_layout_failure(
         base_mint = %base_mint_str,
         scope = "49",
         local_history_empty = d.local_history_empty,
+        local_observation_failed = d.local_observation_failed,
+        local_history_probe = %d.local_history_probe.as_log_str(),
         external_attempted = d.external_attempted,
         external_sig_limit = ?d.external_sig_limit,
         external_max_tx_fetches = ?d.external_max_tx_fetches,
