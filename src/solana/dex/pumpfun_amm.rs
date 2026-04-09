@@ -1,12 +1,13 @@
 use crate::execution::live_pool_cache::LivePoolCache;
 use crate::solana::dex::{Dex, Quote};
-use crate::solana::rpc::SolanaRpc;
+use crate::solana::rpc::{ErrorClass, SolanaRpc};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use bs58;
 use dashmap::DashMap;
 use serde_json::{json, Value};
 use solana_account_decoder::UiAccountEncoding;
+use solana_client::client_error::ClientError;
 use solana_client::rpc_config::{
     RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcTransactionConfig,
 };
@@ -330,6 +331,138 @@ pub struct PoolAccountsV14WithDiagnostic {
     pub sell_cashback_third_meta: Option<Pubkey>,
     /// `true` only when the cold-path result is authoritative enough for SELL planning.
     pub sell_layout_ready: bool,
+    /// Scope 49: structured outcome when `force_refresh` could not resolve SELL layout (empty if ready).
+    pub force_refresh_sell_layout_diag: Option<PumpAmmForceRefreshSellLayoutDiag>,
+}
+
+/// Cold-path diagnostics for `force_refresh` SELL-layout resolution (market-data logs / supervisor).
+#[derive(Debug, Clone)]
+pub struct PumpAmmForceRefreshSellLayoutDiag {
+    pub local_history_empty: bool,
+    pub external_attempted: bool,
+    pub external_sig_limit: Option<usize>,
+    pub external_max_tx_fetches: Option<usize>,
+    pub external_max_get_transaction_calls: Option<u32>,
+    pub termination_reason: PumpAmmSellLayoutTerminationReason,
+    pub last_external: Option<PumpAmmSellLayoutExternalAttemptSummary>,
+}
+
+/// Stable reason codes for force_refresh SELL-layout resolution (logs / ControlResponse forensics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpAmmSellLayoutTerminationReason {
+    LayoutFound,
+    LocalLayoutResolved,
+    ExternalSkippedLocalSigsPresent,
+    ExternalSkippedNoFallbackRpc,
+    LocalHistoryEmptyExternalTimeout,
+    LocalHistoryEmptyExternalRpcError,
+    LocalHistoryEmptyExternalHttp429,
+    LocalHistoryEmptyExternalRateLimited,
+    LocalHistoryEmptyExternalTimeoutBudgetExhausted,
+    LocalHistoryEmptyExternalRequestBudgetExhausted,
+    LocalHistoryEmptyExternalNoSellCandidates,
+    LocalHistoryEmptyExternalEmptySignatures,
+    LocalObservationError,
+}
+
+/// One bounded external observation attempt: aggregate counters + last failure/success signal.
+#[derive(Debug, Clone)]
+pub struct PumpAmmSellLayoutExternalAttemptSummary {
+    pub rpc_method_last: &'static str,
+    pub elapsed_total_ms: u128,
+    pub get_signatures_calls: u32,
+    pub get_transaction_calls: u32,
+    pub signatures_limit_last: Option<usize>,
+    pub signatures_returned_last: usize,
+    pub transactions_fetched: usize,
+    pub pump_amm_instructions_seen: usize,
+    pub sell_candidates_seen: usize,
+    pub provider_status_last: PumpAmmSellLayoutProviderStatus,
+    pub termination_reason: PumpAmmSellLayoutTerminationReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpAmmSellLayoutProviderStatus {
+    Ok,
+    Empty,
+    Timeout,
+    Http429,
+    Http5xx,
+    RpcError,
+    RateLimited,
+}
+
+impl PumpAmmSellLayoutProviderStatus {
+    fn from_error_class(c: ErrorClass) -> Self {
+        match c {
+            ErrorClass::RateLimited => Self::RateLimited,
+            ErrorClass::Timeout => Self::Timeout,
+            ErrorClass::Http(429) => Self::Http429,
+            ErrorClass::Http(code) if (500..=599).contains(&code) => Self::Http5xx,
+            ErrorClass::Http(_) => Self::RpcError,
+            ErrorClass::Other => Self::RpcError,
+        }
+    }
+
+    pub fn as_log_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Empty => "empty",
+            Self::Timeout => "timeout",
+            Self::Http429 => "http_429",
+            Self::Http5xx => "http_5xx",
+            Self::RpcError => "rpc_error",
+            Self::RateLimited => "rate_limited",
+        }
+    }
+}
+
+impl PumpAmmSellLayoutTerminationReason {
+    pub fn as_log_str(self) -> &'static str {
+        match self {
+            Self::LayoutFound => "layout_found",
+            Self::LocalLayoutResolved => "local_layout_resolved",
+            Self::ExternalSkippedLocalSigsPresent => "external_skipped_local_sigs_present",
+            Self::ExternalSkippedNoFallbackRpc => "external_skipped_no_fallback_rpc",
+            Self::LocalHistoryEmptyExternalTimeout => "local_history_empty_external_timeout",
+            Self::LocalHistoryEmptyExternalRpcError => "local_history_empty_external_rpc_error",
+            Self::LocalHistoryEmptyExternalHttp429 => "local_history_empty_external_http_429",
+            Self::LocalHistoryEmptyExternalRateLimited => {
+                "local_history_empty_external_rate_limited"
+            }
+            Self::LocalHistoryEmptyExternalTimeoutBudgetExhausted => {
+                "local_history_empty_external_timeout_budget_exhausted"
+            }
+            Self::LocalHistoryEmptyExternalRequestBudgetExhausted => {
+                "local_history_empty_external_request_budget_exhausted"
+            }
+            Self::LocalHistoryEmptyExternalNoSellCandidates => {
+                "local_history_empty_external_no_sell_candidates"
+            }
+            Self::LocalHistoryEmptyExternalEmptySignatures => {
+                "local_history_empty_external_empty_signatures"
+            }
+            Self::LocalObservationError => "local_observation_error",
+        }
+    }
+}
+
+/// Bounded external SELL-layout history scan (Free-tier friendly): small sig page + hard TX cap.
+const FORCE_REFRESH_EXTERNAL_SIG_LIMIT: usize = 40;
+const FORCE_REFRESH_EXTERNAL_MAX_TX_ATTEMPTS: usize = 40;
+const FORCE_REFRESH_EXTERNAL_MAX_GET_TRANSACTION_CALLS: u32 = 40;
+const BOUNDED_EXTERNAL_SELL_LAYOUT_TIMEOUT: Duration = Duration::from_secs(12);
+
+#[derive(Debug, Clone, Copy)]
+struct SellLayoutObserveLimits {
+    signatures_limit: usize,
+    max_tx_fetch_attempts: usize,
+    max_get_transaction_calls: u32,
+}
+
+struct SellLayoutObserveOutcome {
+    result: Result<PumpAmmAuthoritativeSellLayout>,
+    summary: PumpAmmSellLayoutExternalAttemptSummary,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,6 +470,27 @@ enum PumpAmmAuthoritativeSellLayout {
     Unknown,
     Base,
     Extended { third_meta: Pubkey },
+}
+
+fn provider_status_from_anyhow_rpc(err: &anyhow::Error) -> PumpAmmSellLayoutProviderStatus {
+    for cause in err.chain() {
+        if let Some(ce) = cause.downcast_ref::<ClientError>() {
+            return PumpAmmSellLayoutProviderStatus::from_error_class(
+                SolanaRpc::classify_client_error(ce),
+            );
+        }
+    }
+    let s = format!("{err:#}").to_lowercase();
+    if s.contains("timeout") || s.contains("timed out") || s.contains("deadline") {
+        return PumpAmmSellLayoutProviderStatus::Timeout;
+    }
+    if s.contains("too many requests") || s.contains("rate limit") || s.contains("throttl") {
+        return PumpAmmSellLayoutProviderStatus::RateLimited;
+    }
+    if s.contains("429") {
+        return PumpAmmSellLayoutProviderStatus::Http429;
+    }
+    PumpAmmSellLayoutProviderStatus::RpcError
 }
 
 impl PumpAmmPoolStatic {
@@ -742,6 +896,7 @@ impl PumpFunAmmDex {
                             sell_requires_cashback_remaining: sell_requires,
                             sell_cashback_third_meta: sell_third,
                             sell_layout_ready: true,
+                            force_refresh_sell_layout_diag: None,
                         }));
                     }
                 }
@@ -899,25 +1054,25 @@ impl PumpFunAmmDex {
         force_refresh: bool,
         diagnostic: PumpAmmPoolAccountsDiagnostic,
     ) -> Result<PoolAccountsV14WithDiagnostic> {
-        let sell_layout_ready = if force_refresh {
-            match self
+        let (sell_layout_ready, force_refresh_sell_layout_diag) = if force_refresh {
+            let (layout, diag) = self
                 .resolve_authoritative_sell_layout_for_force_refresh(&pool, base_mint)
-                .await?
-            {
-                PumpAmmAuthoritativeSellLayout::Unknown => false,
+                .await?;
+            match layout {
+                PumpAmmAuthoritativeSellLayout::Unknown => (false, diag),
                 PumpAmmAuthoritativeSellLayout::Base => {
                     pool.sell_requires_cashback_remaining = false;
                     pool.sell_cashback_third_meta = None;
-                    true
+                    (true, None)
                 }
                 PumpAmmAuthoritativeSellLayout::Extended { third_meta } => {
                     pool.sell_requires_cashback_remaining = true;
                     pool.sell_cashback_third_meta = Some(third_meta);
-                    true
+                    (true, None)
                 }
             }
         } else {
-            true
+            (true, None)
         };
 
         Ok(PoolAccountsV14WithDiagnostic {
@@ -926,6 +1081,7 @@ impl PumpFunAmmDex {
             sell_requires_cashback_remaining: pool.sell_requires_cashback_remaining,
             sell_cashback_third_meta: pool.sell_cashback_third_meta,
             sell_layout_ready,
+            force_refresh_sell_layout_diag,
         })
     }
 
@@ -933,42 +1089,66 @@ impl PumpFunAmmDex {
         &self,
         pool: &PumpAmmPoolStatic,
         base_mint: Pubkey,
-    ) -> Result<PumpAmmAuthoritativeSellLayout> {
+    ) -> Result<(
+        PumpAmmAuthoritativeSellLayout,
+        Option<PumpAmmForceRefreshSellLayoutDiag>,
+    )> {
         if pool.sell_requires_cashback_remaining {
             if let Some(third_meta) = pool
                 .sell_cashback_third_meta
                 .filter(|p| *p != Pubkey::default())
             {
-                return Ok(PumpAmmAuthoritativeSellLayout::Extended { third_meta });
+                return Ok((
+                    PumpAmmAuthoritativeSellLayout::Extended { third_meta },
+                    None,
+                ));
             }
         }
 
-        let local_observation = match self
+        let local_limits = SellLayoutObserveLimits {
+            signatures_limit: 200,
+            max_tx_fetch_attempts: 200,
+            max_get_transaction_calls: 200,
+        };
+        let local_outcome = self
             .observe_authoritative_sell_layout_from_tx_history_with_rpc(
                 Arc::clone(&self.rpc),
                 pool.pool_market,
                 base_mint,
                 "local_force_refresh_sell_layout",
+                local_limits,
+                false,
             )
-            .await
-        {
-            Ok(layout) => layout,
+            .await;
+
+        match local_outcome.result {
+            Ok(layout) if layout != PumpAmmAuthoritativeSellLayout::Unknown => {
+                return Ok((layout, None));
+            }
+            Ok(_) => {}
             Err(e) => {
                 warn!(
                     pool = %pool.pool_market,
                     base_mint = %base_mint,
                     error = %e,
+                    termination_reason = %PumpAmmSellLayoutTerminationReason::LocalObservationError.as_log_str(),
                     "pump_amm: local force_refresh SELL-layout observation failed"
                 );
-                PumpAmmAuthoritativeSellLayout::Unknown
             }
-        };
-        if local_observation != PumpAmmAuthoritativeSellLayout::Unknown {
-            return Ok(local_observation);
         }
 
         let Some(ref h_rpc) = self.bounded_tx_fallback_rpc else {
-            return Ok(PumpAmmAuthoritativeSellLayout::Unknown);
+            let diag = PumpAmmForceRefreshSellLayoutDiag {
+                local_history_empty: local_outcome.summary.signatures_returned_last == 0,
+                external_attempted: false,
+                external_sig_limit: None,
+                external_max_tx_fetches: None,
+                external_max_get_transaction_calls: None,
+                termination_reason:
+                    PumpAmmSellLayoutTerminationReason::ExternalSkippedNoFallbackRpc,
+                last_external: None,
+            };
+            return Ok((PumpAmmAuthoritativeSellLayout::Unknown, Some(diag)));
         };
 
         let local_sigs_empty = match self
@@ -988,41 +1168,79 @@ impl PumpFunAmmDex {
             }
         };
         if !local_sigs_empty {
-            return Ok(PumpAmmAuthoritativeSellLayout::Unknown);
+            let diag = PumpAmmForceRefreshSellLayoutDiag {
+                local_history_empty: false,
+                external_attempted: false,
+                external_sig_limit: None,
+                external_max_tx_fetches: None,
+                external_max_get_transaction_calls: None,
+                termination_reason:
+                    PumpAmmSellLayoutTerminationReason::ExternalSkippedLocalSigsPresent,
+                last_external: None,
+            };
+            return Ok((PumpAmmAuthoritativeSellLayout::Unknown, Some(diag)));
         }
 
-        const BOUNDED_EXTERNAL_TX_TIMEOUT: Duration = Duration::from_secs(12);
-        match tokio::time::timeout(
-            BOUNDED_EXTERNAL_TX_TIMEOUT,
-            self.observe_authoritative_sell_layout_from_tx_history_with_rpc(
-                Arc::clone(h_rpc),
-                pool.pool_market,
-                base_mint,
-                "bounded_external_force_refresh_sell_layout",
-            ),
-        )
-        .await
-        {
-            Ok(Ok(layout)) => Ok(layout),
-            Ok(Err(e)) => {
-                warn!(
-                    pool = %pool.pool_market,
-                    base_mint = %base_mint,
-                    error = %e,
-                    "pump_amm: bounded external SELL-layout observation failed"
-                );
-                Ok(PumpAmmAuthoritativeSellLayout::Unknown)
+        let external_limits = SellLayoutObserveLimits {
+            signatures_limit: FORCE_REFRESH_EXTERNAL_SIG_LIMIT,
+            max_tx_fetch_attempts: FORCE_REFRESH_EXTERNAL_MAX_TX_ATTEMPTS,
+            max_get_transaction_calls: FORCE_REFRESH_EXTERNAL_MAX_GET_TRANSACTION_CALLS,
+        };
+
+        let external_fut = self.observe_authoritative_sell_layout_from_tx_history_with_rpc(
+            Arc::clone(h_rpc),
+            pool.pool_market,
+            base_mint,
+            "bounded_external_force_refresh_sell_layout",
+            external_limits,
+            true,
+        );
+
+        let timed = tokio::time::timeout(BOUNDED_EXTERNAL_SELL_LAYOUT_TIMEOUT, external_fut).await;
+
+        let (layout, summary_opt, timed_out) = match timed {
+            Ok(obs) => {
+                let layout = match obs.result {
+                    Ok(l) => l,
+                    Err(_) => PumpAmmAuthoritativeSellLayout::Unknown,
+                };
+                (layout, Some(obs.summary), false)
             }
             Err(_) => {
                 warn!(
                     pool = %pool.pool_market,
                     base_mint = %base_mint,
-                    timeout_secs = BOUNDED_EXTERNAL_TX_TIMEOUT.as_secs(),
-                    "pump_amm: bounded external SELL-layout observation timed out"
+                    timeout_secs = BOUNDED_EXTERNAL_SELL_LAYOUT_TIMEOUT.as_secs(),
+                    termination_reason = %PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalTimeoutBudgetExhausted.as_log_str(),
+                    "pump_amm: bounded external SELL-layout observation timed out (outer budget)"
                 );
-                Ok(PumpAmmAuthoritativeSellLayout::Unknown)
+                (PumpAmmAuthoritativeSellLayout::Unknown, None, true)
             }
-        }
+        };
+
+        let termination_reason = if layout != PumpAmmAuthoritativeSellLayout::Unknown {
+            PumpAmmSellLayoutTerminationReason::LayoutFound
+        } else if timed_out {
+            PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalTimeoutBudgetExhausted
+        } else if let Some(ref s) = summary_opt {
+            s.termination_reason
+        } else {
+            PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalRpcError
+        };
+
+        let diag = PumpAmmForceRefreshSellLayoutDiag {
+            local_history_empty: true,
+            external_attempted: true,
+            external_sig_limit: Some(FORCE_REFRESH_EXTERNAL_SIG_LIMIT),
+            external_max_tx_fetches: Some(FORCE_REFRESH_EXTERNAL_MAX_TX_ATTEMPTS),
+            external_max_get_transaction_calls: Some(
+                FORCE_REFRESH_EXTERNAL_MAX_GET_TRANSACTION_CALLS,
+            ),
+            termination_reason,
+            last_external: summary_opt,
+        };
+
+        Ok((layout, Some(diag)))
     }
 
     async fn observe_authoritative_sell_layout_from_tx_history_with_rpc(
@@ -1031,46 +1249,218 @@ impl PumpFunAmmDex {
         pool_market: Pubkey,
         base_mint: Pubkey,
         log_ctx: &'static str,
-    ) -> Result<PumpAmmAuthoritativeSellLayout> {
-        const MAX_TX_FETCHES: usize = 200;
-        let sigs = tx_rpc
-            .get_signatures_for_address(&pool_market, Some(MAX_TX_FETCHES))
-            .await
-            .map_err(|e| anyhow!("getSignaturesForAddress failed: {e}"))?;
+        limits: SellLayoutObserveLimits,
+        structured_telemetry: bool,
+    ) -> SellLayoutObserveOutcome {
+        let t0 = std::time::Instant::now();
+        let mut summary = PumpAmmSellLayoutExternalAttemptSummary {
+            rpc_method_last: "getSignaturesForAddress",
+            elapsed_total_ms: 0,
+            get_signatures_calls: 0,
+            get_transaction_calls: 0,
+            signatures_limit_last: Some(limits.signatures_limit),
+            signatures_returned_last: 0,
+            transactions_fetched: 0,
+            pump_amm_instructions_seen: 0,
+            sell_candidates_seen: 0,
+            provider_status_last: PumpAmmSellLayoutProviderStatus::Ok,
+            termination_reason:
+                PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalNoSellCandidates,
+        };
+
+        let sigs = {
+            let stage_start = std::time::Instant::now();
+            summary.get_signatures_calls += 1;
+            match tx_rpc
+                .get_signatures_for_address(&pool_market, Some(limits.signatures_limit))
+                .await
+            {
+                Ok(v) => {
+                    summary.signatures_returned_last = v.len();
+                    summary.provider_status_last = PumpAmmSellLayoutProviderStatus::Ok;
+                    if structured_telemetry {
+                        info!(
+                            pool = %pool_market,
+                            base_mint = %base_mint,
+                            log_ctx,
+                            stage = "getSignaturesForAddress",
+                            elapsed_ms = stage_start.elapsed().as_millis() as u64,
+                            request_limit = limits.signatures_limit,
+                            signatures_returned = v.len(),
+                            provider_status = %summary.provider_status_last.as_log_str(),
+                            "pump_amm: force_refresh SELL-layout external RPC stage"
+                        );
+                    }
+                    v
+                }
+                Err(e) => {
+                    summary.provider_status_last =
+                        PumpAmmSellLayoutProviderStatus::from_error_class(
+                            SolanaRpc::classify_client_error(&e),
+                        );
+                    let tr = match summary.provider_status_last {
+                        PumpAmmSellLayoutProviderStatus::Http429 => {
+                            PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalHttp429
+                        }
+                        PumpAmmSellLayoutProviderStatus::RateLimited => {
+                            PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalRateLimited
+                        }
+                        PumpAmmSellLayoutProviderStatus::Timeout => {
+                            PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalTimeout
+                        }
+                        _ => PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalRpcError,
+                    };
+                    summary.termination_reason = tr;
+                    summary.elapsed_total_ms = t0.elapsed().as_millis();
+                    if structured_telemetry {
+                        warn!(
+                            pool = %pool_market,
+                            base_mint = %base_mint,
+                            log_ctx,
+                            stage = "getSignaturesForAddress",
+                            elapsed_ms = stage_start.elapsed().as_millis() as u64,
+                            request_limit = limits.signatures_limit,
+                            signatures_returned = 0usize,
+                            provider_status = %summary.provider_status_last.as_log_str(),
+                            termination_reason = %tr.as_log_str(),
+                            error = %e,
+                            "pump_amm: force_refresh SELL-layout external RPC stage failed"
+                        );
+                    } else {
+                        warn!(
+                            pool = %pool_market,
+                            base_mint = %base_mint,
+                            log_ctx,
+                            error = %e,
+                            "pump_amm: getSignaturesForAddress failed for authoritative SELL-layout observation"
+                        );
+                    }
+                    return SellLayoutObserveOutcome {
+                        result: Err(anyhow!("getSignaturesForAddress failed: {e}")),
+                        summary,
+                    };
+                }
+            }
+        };
+
         if sigs.is_empty() {
-            info!(
-                pool = %pool_market,
-                base_mint = %base_mint,
-                log_ctx,
-                "pump_amm: no signatures available for authoritative SELL-layout observation"
-            );
-            return Ok(PumpAmmAuthoritativeSellLayout::Unknown);
+            summary.provider_status_last = PumpAmmSellLayoutProviderStatus::Empty;
+            summary.termination_reason =
+                PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalEmptySignatures;
+            if structured_telemetry {
+                info!(
+                    pool = %pool_market,
+                    base_mint = %base_mint,
+                    log_ctx,
+                    stage = "getSignaturesForAddress",
+                    elapsed_ms = t0.elapsed().as_millis() as u64,
+                    request_limit = limits.signatures_limit,
+                    signatures_returned = 0usize,
+                    provider_status = %summary.provider_status_last.as_log_str(),
+                    termination_reason = %summary.termination_reason.as_log_str(),
+                    "pump_amm: no signatures available for authoritative SELL-layout observation"
+                );
+            } else {
+                info!(
+                    pool = %pool_market,
+                    base_mint = %base_mint,
+                    log_ctx,
+                    "pump_amm: no signatures available for authoritative SELL-layout observation"
+                );
+            }
+            summary.elapsed_total_ms = t0.elapsed().as_millis();
+            return SellLayoutObserveOutcome {
+                result: Ok(PumpAmmAuthoritativeSellLayout::Unknown),
+                summary,
+            };
         }
 
-        let mut fetched = 0usize;
+        let mut tx_attempts = 0usize;
         for s in &sigs {
-            if fetched >= MAX_TX_FETCHES {
+            if tx_attempts >= limits.max_tx_fetch_attempts {
+                summary.termination_reason =
+                    PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalRequestBudgetExhausted;
                 break;
             }
             if s.err.is_some() {
                 continue;
             }
-            fetched += 1;
+            tx_attempts += 1;
+
+            if summary.get_transaction_calls >= limits.max_get_transaction_calls {
+                summary.termination_reason =
+                    PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalRequestBudgetExhausted;
+                break;
+            }
+
             let sig = s.signature.to_string();
+            let gt_start = std::time::Instant::now();
+            summary.rpc_method_last = "getTransaction";
+            summary.get_transaction_calls += 1;
+
             let tx_v = match Self::fetch_tx_as_value_with_rpc(tx_rpc.as_ref(), &sig).await {
-                Ok(v) => v,
+                Ok(v) => {
+                    summary.provider_status_last = PumpAmmSellLayoutProviderStatus::Ok;
+                    if structured_telemetry
+                        && (summary.get_transaction_calls == 1
+                            || summary.get_transaction_calls % 5 == 0)
+                    {
+                        info!(
+                            pool = %pool_market,
+                            base_mint = %base_mint,
+                            log_ctx,
+                            stage = "getTransaction",
+                            elapsed_ms = gt_start.elapsed().as_millis() as u64,
+                            transactions_fetched = summary.transactions_fetched,
+                            get_transaction_calls = summary.get_transaction_calls,
+                            provider_status = %summary.provider_status_last.as_log_str(),
+                            "pump_amm: force_refresh SELL-layout external RPC stage"
+                        );
+                    }
+                    v
+                }
                 Err(e) => {
-                    warn!(
-                        pool = %pool_market,
-                        base_mint = %base_mint,
-                        signature = %sig,
-                        log_ctx,
-                        error = %e,
-                        "pump_amm: getTransaction failed during authoritative SELL-layout scan; skipping signature"
-                    );
+                    summary.provider_status_last = provider_status_from_anyhow_rpc(&e);
+                    summary.termination_reason = match summary.provider_status_last {
+                        PumpAmmSellLayoutProviderStatus::Http429 => {
+                            PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalHttp429
+                        }
+                        PumpAmmSellLayoutProviderStatus::RateLimited => {
+                            PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalRateLimited
+                        }
+                        PumpAmmSellLayoutProviderStatus::Timeout => {
+                            PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalTimeout
+                        }
+                        _ => PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalRpcError,
+                    };
+                    if structured_telemetry {
+                        warn!(
+                            pool = %pool_market,
+                            base_mint = %base_mint,
+                            log_ctx,
+                            stage = "getTransaction",
+                            elapsed_ms = gt_start.elapsed().as_millis() as u64,
+                            signature = %sig,
+                            get_transaction_calls = summary.get_transaction_calls,
+                            provider_status = %summary.provider_status_last.as_log_str(),
+                            termination_reason = %summary.termination_reason.as_log_str(),
+                            error = %e,
+                            "pump_amm: force_refresh SELL-layout getTransaction failed; skipping signature"
+                        );
+                    } else {
+                        warn!(
+                            pool = %pool_market,
+                            base_mint = %base_mint,
+                            signature = %sig,
+                            log_ctx,
+                            error = %e,
+                            "pump_amm: getTransaction failed during authoritative SELL-layout scan; skipping signature"
+                        );
+                    }
                     continue;
                 }
             };
+
             let msg = match tx_v
                 .get("result")
                 .and_then(|r| r.get("transaction"))
@@ -1090,7 +1480,10 @@ impl PumpFunAmmDex {
             };
             Self::extend_with_loaded_addresses(&mut account_keys, meta);
 
+            summary.transactions_fetched += 1;
+            let mut ix_count_stage: u32 = 0;
             for ix in Self::collect_all_instructions(msg, meta) {
+                ix_count_stage += 1;
                 let program_id_index = match ix.get("programIdIndex").and_then(|v| v.as_u64()) {
                     Some(v) => v as usize,
                     None => continue,
@@ -1101,6 +1494,7 @@ impl PumpFunAmmDex {
                 if program_id != PUMPFUN_AMM_PROGRAM_ID {
                     continue;
                 }
+                summary.pump_amm_instructions_seen += 1;
                 let Some(acc_strings) =
                     Self::pump_amm_ix_account_strings_from_json(ix, &account_keys)
                 else {
@@ -1117,28 +1511,80 @@ impl PumpFunAmmDex {
                 else {
                     continue;
                 };
+                summary.sell_candidates_seen += 1;
+                if structured_telemetry && summary.sell_candidates_seen <= 3 {
+                    info!(
+                        pool = %pool_market,
+                        base_mint = %base_mint,
+                        log_ctx,
+                        stage = "decode_instruction",
+                        elapsed_ms = t0.elapsed().as_millis() as u64,
+                        signature = %sig,
+                        sell_candidates_seen = summary.sell_candidates_seen,
+                        "pump_amm: force_refresh SELL-layout candidate instruction decoded"
+                    );
+                }
                 if observed_pool != pool_market || observed_base != base_mint {
                     continue;
                 }
+                summary.termination_reason = PumpAmmSellLayoutTerminationReason::LayoutFound;
+                summary.elapsed_total_ms = t0.elapsed().as_millis();
                 info!(
                     pool = %pool_market,
                     base_mint = %base_mint,
                     log_ctx,
                     signature = %sig,
                     layout = ?layout,
+                    transactions_fetched = summary.transactions_fetched,
+                    pump_amm_instructions_seen = summary.pump_amm_instructions_seen,
+                    sell_candidates_seen = summary.sell_candidates_seen,
+                    termination_reason = %summary.termination_reason.as_log_str(),
                     "pump_amm: authoritative SELL-layout observed from successful swap tx"
                 );
-                return Ok(layout);
+                return SellLayoutObserveOutcome {
+                    result: Ok(layout),
+                    summary,
+                };
+            }
+            if structured_telemetry
+                && summary.transactions_fetched > 0
+                && summary.transactions_fetched % 5 == 0
+            {
+                info!(
+                    pool = %pool_market,
+                    base_mint = %base_mint,
+                    log_ctx,
+                    stage = "scan_transactions",
+                    elapsed_ms = t0.elapsed().as_millis() as u64,
+                    transactions_fetched = summary.transactions_fetched,
+                    instructions_decoded_in_last_tx = ix_count_stage,
+                    pump_amm_instructions_seen = summary.pump_amm_instructions_seen,
+                    sell_candidates_seen = summary.sell_candidates_seen,
+                    "pump_amm: force_refresh SELL-layout scan progress"
+                );
             }
         }
 
-        info!(
-            pool = %pool_market,
-            base_mint = %base_mint,
-            log_ctx,
-            "pump_amm: no successful SELL tx observed for authoritative SELL-layout"
-        );
-        Ok(PumpAmmAuthoritativeSellLayout::Unknown)
+        summary.elapsed_total_ms = t0.elapsed().as_millis();
+        if summary.termination_reason
+            == PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalNoSellCandidates
+        {
+            info!(
+                pool = %pool_market,
+                base_mint = %base_mint,
+                log_ctx,
+                transactions_fetched = summary.transactions_fetched,
+                pump_amm_instructions_seen = summary.pump_amm_instructions_seen,
+                sell_candidates_seen = summary.sell_candidates_seen,
+                termination_reason = %summary.termination_reason.as_log_str(),
+                "pump_amm: no successful SELL tx observed for authoritative SELL-layout"
+            );
+        }
+
+        SellLayoutObserveOutcome {
+            result: Ok(PumpAmmAuthoritativeSellLayout::Unknown),
+            summary,
+        }
     }
 
     fn derive_user_volume_accumulator(
