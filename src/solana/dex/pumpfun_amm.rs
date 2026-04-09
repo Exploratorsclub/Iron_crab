@@ -387,6 +387,14 @@ pub enum PumpAmmSellLayoutTerminationReason {
     LocalHistoryEmptyExternalTimeoutBudgetExhausted,
     LocalHistoryEmptyExternalRequestBudgetExhausted,
     LocalHistoryEmptyExternalNoSellCandidates,
+    /// Scope 50: external history has router/other activity invoking PumpSwap, but no `sell`-discriminator ix in the bounded scan.
+    LocalHistoryEmptyExternalRouterShellNoPumpAmmSellDiscriminator,
+    /// Scope 50: `sell` discriminator seen but `accounts.len()` is not the supported 21/24 meta layout.
+    LocalHistoryEmptyExternalPumpAmmSellAccountShapeUnsupported,
+    /// Scope 50: `sell` ix matches supported length but `pump_amm_sell_layout_observation_from_parsed_swap_ix` could not derive layout.
+    LocalHistoryEmptyExternalPumpAmmSellLayoutNotDerivable,
+    /// Scope 50: decoded `sell` ix for another pool/base mint — not authoritative for this refresh target.
+    LocalHistoryEmptyExternalPumpAmmSellPoolOrMintMismatch,
     LocalHistoryEmptyExternalEmptySignatures,
     LocalObservationError,
 }
@@ -404,6 +412,8 @@ pub struct PumpAmmSellLayoutExternalAttemptSummary {
     pub signatures_returned_last: usize,
     pub transactions_fetched: usize,
     pub pump_amm_instructions_seen: usize,
+    /// Ix where program is PumpSwap AMM and the Anchor discriminator is `global:sell` (any account length).
+    pub pump_amm_sell_discriminator_seen: usize,
     pub sell_candidates_seen: usize,
     pub provider_status_last: PumpAmmSellLayoutProviderStatus,
     pub termination_reason: PumpAmmSellLayoutTerminationReason,
@@ -466,6 +476,18 @@ impl PumpAmmSellLayoutTerminationReason {
             }
             Self::LocalHistoryEmptyExternalNoSellCandidates => {
                 "local_history_empty_external_no_sell_candidates"
+            }
+            Self::LocalHistoryEmptyExternalRouterShellNoPumpAmmSellDiscriminator => {
+                "local_history_empty_external_router_shell_no_pump_amm_sell_discriminator"
+            }
+            Self::LocalHistoryEmptyExternalPumpAmmSellAccountShapeUnsupported => {
+                "local_history_empty_external_pump_amm_sell_account_shape_unsupported"
+            }
+            Self::LocalHistoryEmptyExternalPumpAmmSellLayoutNotDerivable => {
+                "local_history_empty_external_pump_amm_sell_layout_not_derivable"
+            }
+            Self::LocalHistoryEmptyExternalPumpAmmSellPoolOrMintMismatch => {
+                "local_history_empty_external_pump_amm_sell_pool_or_mint_mismatch"
             }
             Self::LocalHistoryEmptyExternalEmptySignatures => {
                 "local_history_empty_external_empty_signatures"
@@ -536,6 +558,21 @@ fn force_refresh_external_termination_reason_after_attempt(
         s.termination_reason
     } else {
         PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalRpcError
+    }
+}
+
+/// After a successful `getTransaction` in a bounded SELL-layout scan, default back to "still searching"
+/// unless we already recorded a **decode-level** signal from a prior signature in the same scan.
+fn sell_layout_scan_termination_after_successful_tx_fetch(
+    prev: PumpAmmSellLayoutTerminationReason,
+) -> PumpAmmSellLayoutTerminationReason {
+    match prev {
+        PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalPumpAmmSellAccountShapeUnsupported
+        | PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalPumpAmmSellLayoutNotDerivable
+        | PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalPumpAmmSellPoolOrMintMismatch => {
+            prev
+        }
+        _ => PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalNoSellCandidates,
     }
 }
 
@@ -1347,6 +1384,7 @@ impl PumpFunAmmDex {
             signatures_returned_last: 0,
             transactions_fetched: 0,
             pump_amm_instructions_seen: 0,
+            pump_amm_sell_discriminator_seen: 0,
             sell_candidates_seen: 0,
             provider_status_last: PumpAmmSellLayoutProviderStatus::Ok,
             termination_reason:
@@ -1461,6 +1499,9 @@ impl PumpFunAmmDex {
             };
         }
 
+        let sell_layout_sell_disc = anchor_disc("sell");
+        let sell_layout_buy_disc = anchor_disc("buy_exact_quote_in");
+
         let mut tx_attempts = 0usize;
         for s in &sigs {
             if tx_attempts >= limits.max_tx_fetch_attempts {
@@ -1488,7 +1529,9 @@ impl PumpFunAmmDex {
                 Ok(v) => {
                     summary.provider_status_last = PumpAmmSellLayoutProviderStatus::Ok;
                     summary.termination_reason =
-                        PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalNoSellCandidates;
+                        sell_layout_scan_termination_after_successful_tx_fetch(
+                            summary.termination_reason,
+                        );
                     if structured_telemetry
                         && (summary.get_transaction_calls == 1
                             || summary.get_transaction_calls % 5 == 0)
@@ -1572,31 +1615,50 @@ impl PumpFunAmmDex {
             let mut ix_count_stage: u32 = 0;
             for ix in Self::collect_all_instructions(msg, meta) {
                 ix_count_stage += 1;
-                let program_id_index = match ix.get("programIdIndex").and_then(|v| v.as_u64()) {
-                    Some(v) => v as usize,
-                    None => continue,
-                };
-                let Some(program_id) = account_keys.get(program_id_index) else {
+                let Some(program_id) =
+                    Self::program_id_str_from_instruction_json(ix, &account_keys)
+                else {
                     continue;
                 };
                 if program_id != PUMPFUN_AMM_PROGRAM_ID {
                     continue;
                 }
                 summary.pump_amm_instructions_seen += 1;
+                let Some(ix_data) = Self::pump_amm_ix_data_from_json(ix) else {
+                    continue;
+                };
+                let disc8: Option<[u8; 8]> = ix_data.get(..8).and_then(|s| s.try_into().ok());
+                let Some(disc8) = disc8 else {
+                    continue;
+                };
+                if disc8 == sell_layout_sell_disc {
+                    summary.pump_amm_sell_discriminator_seen += 1;
+                } else if disc8 != sell_layout_buy_disc {
+                    continue;
+                }
                 let Some(acc_strings) =
                     Self::pump_amm_ix_account_strings_from_json(ix, &account_keys)
                 else {
                     continue;
                 };
-                let Some(ix_data) = Self::pump_amm_ix_data_from_json(ix) else {
+                if disc8 == sell_layout_sell_disc
+                    && acc_strings.len() != 21
+                    && acc_strings.len() != 24
+                {
+                    summary.termination_reason =
+                        PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalPumpAmmSellAccountShapeUnsupported;
                     continue;
-                };
+                }
                 let Some((observed_pool, observed_base, layout)) =
                     Self::pump_amm_sell_layout_observation_from_parsed_swap_ix(
                         &acc_strings,
                         &ix_data,
                     )
                 else {
+                    if disc8 == sell_layout_sell_disc {
+                        summary.termination_reason =
+                            PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalPumpAmmSellLayoutNotDerivable;
+                    }
                     continue;
                 };
                 summary.sell_candidates_seen += 1;
@@ -1613,6 +1675,10 @@ impl PumpFunAmmDex {
                     );
                 }
                 if observed_pool != pool_market || observed_base != base_mint {
+                    if disc8 == sell_layout_sell_disc {
+                        summary.termination_reason =
+                            PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalPumpAmmSellPoolOrMintMismatch;
+                    }
                     continue;
                 }
                 summary.termination_reason = PumpAmmSellLayoutTerminationReason::LayoutFound;
@@ -1657,12 +1723,19 @@ impl PumpFunAmmDex {
         if summary.termination_reason
             == PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalNoSellCandidates
         {
+            if summary.pump_amm_instructions_seen > 0
+                && summary.pump_amm_sell_discriminator_seen == 0
+            {
+                summary.termination_reason =
+                    PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalRouterShellNoPumpAmmSellDiscriminator;
+            }
             info!(
                 pool = %pool_market,
                 base_mint = %base_mint,
                 log_ctx,
                 transactions_fetched = summary.transactions_fetched,
                 pump_amm_instructions_seen = summary.pump_amm_instructions_seen,
+                pump_amm_sell_discriminator_seen = summary.pump_amm_sell_discriminator_seen,
                 sell_candidates_seen = summary.sell_candidates_seen,
                 termination_reason = %summary.termination_reason.as_log_str(),
                 "pump_amm: no successful SELL tx observed for authoritative SELL-layout"
@@ -3338,13 +3411,10 @@ impl PumpFunAmmDex {
             }
 
             for ix in Self::collect_all_instructions(msg, meta) {
-                let program_id_index = match ix.get("programIdIndex").and_then(|v| v.as_u64()) {
-                    Some(v) => v as usize,
-                    None => continue,
-                };
-                let program_id = match account_keys.get(program_id_index) {
-                    Some(v) => v,
-                    None => continue,
+                let Some(program_id) =
+                    Self::program_id_str_from_instruction_json(ix, &account_keys)
+                else {
+                    continue;
                 };
                 if program_id != PUMPFUN_AMM_PROGRAM_ID {
                     if is_ref_tx {
@@ -3908,14 +3978,10 @@ impl PumpFunAmmDex {
                     Self::extend_with_loaded_addresses(&mut account_keys, meta);
 
                     for ix in Self::collect_all_instructions(msg, meta) {
-                        let program_id_index =
-                            match ix.get("programIdIndex").and_then(|v| v.as_u64()) {
-                                Some(v) => v as usize,
-                                None => continue,
-                            };
-                        let program_id = match account_keys.get(program_id_index) {
-                            Some(v) => v,
-                            None => continue,
+                        let Some(program_id) =
+                            Self::program_id_str_from_instruction_json(ix, &account_keys)
+                        else {
+                            continue;
                         };
                         if program_id != PUMPFUN_AMM_PROGRAM_ID {
                             continue;
@@ -4061,13 +4127,10 @@ impl PumpFunAmmDex {
             Self::extend_with_loaded_addresses(&mut account_keys, meta);
 
             for ix in Self::collect_all_instructions(msg, meta) {
-                let program_id_index = match ix.get("programIdIndex").and_then(|v| v.as_u64()) {
-                    Some(v) => v as usize,
-                    None => continue,
-                };
-                let program_id = match account_keys.get(program_id_index) {
-                    Some(v) => v,
-                    None => continue,
+                let Some(program_id) =
+                    Self::program_id_str_from_instruction_json(ix, &account_keys)
+                else {
+                    continue;
                 };
                 if program_id != PUMPFUN_AMM_PROGRAM_ID {
                     continue;
@@ -4078,8 +4141,8 @@ impl PumpFunAmmDex {
                 else {
                     continue;
                 };
-                // PumpSwap AMM swap instructions have 21 accounts (not 23 as originally assumed).
-                if acc_strings.len() != 21 {
+                // PumpSwap AMM `sell` uses 21 base metas or 24 extended; legacy scans used 21-only.
+                if acc_strings.len() != 21 && acc_strings.len() != 24 {
                     continue;
                 }
 
@@ -4175,6 +4238,26 @@ impl PumpFunAmmDex {
         }
 
         out
+    }
+
+    /// `getTransaction` with `encoding: jsonParsed` uses string `programId` and omits `programIdIndex`
+    /// on many inner instructions. Resolve to the same base58 string as `message.accountKeys` entries.
+    fn program_id_str_from_instruction_json<'a>(
+        ix: &'a Value,
+        message_account_keys: &'a [String],
+    ) -> Option<&'a str> {
+        if let Some(s) = ix.get("programId").and_then(|v| v.as_str()) {
+            return Some(s);
+        }
+        if let Some(w) = ix
+            .get("Parsed")
+            .and_then(|p| p.get("programId"))
+            .and_then(|v| v.as_str())
+        {
+            return Some(w);
+        }
+        let idx = ix.get("programIdIndex").and_then(|v| v.as_u64())? as usize;
+        message_account_keys.get(idx).map(|s| s.as_str())
     }
 
     fn pump_amm_ix_data_from_json(ix: &Value) -> Option<Vec<u8>> {
@@ -5273,6 +5356,7 @@ mod tests {
     use crate::solana::dex::Dex;
     use crate::solana::rpc::SolanaRpc;
     use base64::Engine;
+    use serde_json::json;
     use std::str::FromStr;
     use std::sync::Arc;
 
@@ -5322,6 +5406,7 @@ mod tests {
             signatures_returned_last: 0,
             transactions_fetched: 0,
             pump_amm_instructions_seen: 0,
+            pump_amm_sell_discriminator_seen: 0,
             sell_candidates_seen: 0,
             provider_status_last: PumpAmmSellLayoutProviderStatus::RpcError,
             termination_reason:
@@ -5345,6 +5430,7 @@ mod tests {
             signatures_returned_last: 0,
             transactions_fetched: 0,
             pump_amm_instructions_seen: 0,
+            pump_amm_sell_discriminator_seen: 0,
             sell_candidates_seen: 0,
             provider_status_last: PumpAmmSellLayoutProviderStatus::Ok,
             termination_reason:
@@ -5395,6 +5481,7 @@ mod tests {
                 signatures_returned_last: 5,
                 transactions_fetched: 2,
                 pump_amm_instructions_seen: 1,
+                pump_amm_sell_discriminator_seen: 0,
                 sell_candidates_seen: 0,
                 provider_status_last: PumpAmmSellLayoutProviderStatus::Ok,
                 termination_reason:
@@ -5404,6 +5491,58 @@ mod tests {
         assert_eq!(
             tr_with_summary,
             PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalHttp429
+        );
+    }
+
+    /// Scope 50: `jsonParsed` inner CPI instructions often omit `programIdIndex` but carry `programId`.
+    #[test]
+    fn scope50_program_id_str_from_instruction_accepts_json_parsed_shape() {
+        let keys = vec!["11111111111111111111111111111111".to_string()];
+        let ix: Value = json!({
+            "programId": PUMPFUN_AMM_PROGRAM_ID,
+            "accounts": [],
+            "data": "xx",
+            "stackHeight": 2
+        });
+        assert_eq!(
+            PumpFunAmmDex::program_id_str_from_instruction_json(&ix, &keys),
+            Some(PUMPFUN_AMM_PROGRAM_ID)
+        );
+
+        let ix_wrapped: Value = json!({
+            "Parsed": {
+                "programId": PUMPFUN_AMM_PROGRAM_ID,
+            }
+        });
+        assert_eq!(
+            PumpFunAmmDex::program_id_str_from_instruction_json(&ix_wrapped, &keys),
+            Some(PUMPFUN_AMM_PROGRAM_ID)
+        );
+
+        let ix_idx: Value = json!({
+            "programIdIndex": 0u64,
+            "accounts": [],
+            "data": "xx"
+        });
+        assert_eq!(
+            PumpFunAmmDex::program_id_str_from_instruction_json(&ix_idx, &keys),
+            Some("11111111111111111111111111111111")
+        );
+    }
+
+    #[test]
+    fn scope50_sell_layout_scan_preserves_decode_termination_across_later_successful_tx_fetch() {
+        assert_eq!(
+            sell_layout_scan_termination_after_successful_tx_fetch(
+                PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalPumpAmmSellAccountShapeUnsupported,
+            ),
+            PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalPumpAmmSellAccountShapeUnsupported
+        );
+        assert_eq!(
+            sell_layout_scan_termination_after_successful_tx_fetch(
+                PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalNoSellCandidates,
+            ),
+            PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalNoSellCandidates
         );
     }
 
