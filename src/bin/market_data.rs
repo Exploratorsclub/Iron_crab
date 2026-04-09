@@ -5054,6 +5054,50 @@ fn log_pump_amm_scope44_pool_accounts_diag(
     );
 }
 
+/// Scope 49: single structured line before ControlResponse=Error when force_refresh SELL layout stays unresolved.
+fn log_pump_amm_scope49_force_refresh_sell_layout_failure(
+    request_id: &str,
+    pool_address_str: &str,
+    base_mint_str: &str,
+    diag: Option<&ironcrab::solana::dex::pumpfun_amm::PumpAmmForceRefreshSellLayoutDiag>,
+) {
+    let Some(d) = diag else {
+        warn!(
+            request_id = %request_id,
+            pool = %pool_address_str,
+            base_mint = %base_mint_str,
+            sell_layout_failure_class = "force_refresh_diag_missing",
+            "I-24d Scope49: sell_layout_ready=false after force_refresh (no structured diag from dex — check pumpfun_amm version)"
+        );
+        return;
+    };
+    let ext = d.last_external.as_ref();
+    warn!(
+        request_id = %request_id,
+        pool = %pool_address_str,
+        base_mint = %base_mint_str,
+        scope = "49",
+        local_history_empty = d.local_history_empty,
+        local_observation_failed = d.local_observation_failed,
+        local_history_probe = %d.local_history_probe.as_log_str(),
+        external_attempted = d.external_attempted,
+        external_sig_limit = ?d.external_sig_limit,
+        external_max_tx_fetches = ?d.external_max_tx_fetches,
+        external_max_get_transaction_calls = ?d.external_max_get_transaction_calls,
+        termination_reason = %d.termination_reason.as_log_str(),
+        ext_elapsed_ms = ext.map(|s| s.elapsed_total_ms),
+        ext_get_signatures_calls = ext.map(|s| s.get_signatures_calls),
+        ext_get_transaction_calls = ext.map(|s| s.get_transaction_calls),
+        ext_signatures_returned = ext.map(|s| s.signatures_returned_last),
+        ext_transactions_fetched = ext.map(|s| s.transactions_fetched),
+        ext_pump_amm_ix_seen = ext.map(|s| s.pump_amm_instructions_seen),
+        ext_sell_candidates_seen = ext.map(|s| s.sell_candidates_seen),
+        ext_provider_status = ext.map(|s| s.provider_status_last.as_log_str()),
+        ext_termination = ext.map(|s| s.termination_reason.as_log_str()),
+        "I-24d Scope49: sell_layout_ready=false after force_refresh — classification for supervisor (timeout vs 429 vs budget vs empty)"
+    );
+}
+
 /// I-24d: Handle EnsurePumpAmmPoolAccounts Discovery Request.
 ///
 /// Performs RPC-based discovery (Cold Path), updates MASTER cache, publishes
@@ -5105,6 +5149,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
             let sell_cashback_remaining = wrapped.sell_requires_cashback_remaining;
             let sell_cashback_third = wrapped.sell_cashback_third_meta;
             let sell_layout_ready_from_refresh = wrapped.sell_layout_ready;
+            let pump_amm_force_refresh_sell_diag = wrapped.force_refresh_sell_layout_diag;
             let accounts = wrapped.accounts;
             let diag = wrapped.diagnostic;
             log_pump_amm_scope44_pool_accounts_diag(
@@ -5285,6 +5330,14 @@ async fn handle_ensure_pump_amm_pool_accounts(
                     jetstream_ok,
                     sell_layout_ready,
                 );
+                if force_refresh && jetstream_ok && !sell_layout_ready {
+                    log_pump_amm_scope49_force_refresh_sell_layout_failure(
+                        request_id,
+                        &pool_address_str,
+                        &base_mint_str,
+                        pump_amm_force_refresh_sell_diag.as_ref(),
+                    );
+                }
                 match (jetstream_ok, force_refresh, sell_layout_ready) {
                     (true, _, true) => {
                         info!(
