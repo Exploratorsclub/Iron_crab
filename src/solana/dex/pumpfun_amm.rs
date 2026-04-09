@@ -1101,20 +1101,17 @@ impl PumpFunAmmDex {
                 if program_id != PUMPFUN_AMM_PROGRAM_ID {
                     continue;
                 }
-                let accounts: Vec<usize> = match ix.get("accounts").and_then(|v| v.as_array()) {
-                    Some(a) => a
-                        .iter()
-                        .filter_map(|v| v.as_u64().map(|x| x as usize))
-                        .collect(),
-                    None => continue,
+                let Some(acc_strings) =
+                    Self::pump_amm_ix_account_strings_from_json(ix, &account_keys)
+                else {
+                    continue;
                 };
                 let Some(ix_data) = Self::pump_amm_ix_data_from_json(ix) else {
                     continue;
                 };
                 let Some((observed_pool, observed_base, layout)) =
                     Self::pump_amm_sell_layout_observation_from_parsed_swap_ix(
-                        &account_keys,
-                        &accounts,
+                        &acc_strings,
                         &ix_data,
                     )
                 else {
@@ -2829,12 +2826,10 @@ impl PumpFunAmmDex {
                     info!("pump_amm TX-history: reference TX has PumpSwap AMM instruction!");
                 }
 
-                let accounts: Vec<usize> = match ix.get("accounts").and_then(|v| v.as_array()) {
-                    Some(a) => a
-                        .iter()
-                        .filter_map(|v| v.as_u64().map(|x| x as usize))
-                        .collect(),
-                    None => continue,
+                let Some(acc_strings) =
+                    Self::pump_amm_ix_account_strings_from_json(ix, &account_keys)
+                else {
+                    continue;
                 };
                 let Some(ix_data) = Self::pump_amm_ix_data_from_json(ix) else {
                     if is_ref_tx {
@@ -2844,8 +2839,7 @@ impl PumpFunAmmDex {
                 };
 
                 let Some(pool) = Self::pump_amm_pool_static_from_parsed_swap_ix(
-                    &account_keys,
-                    &accounts,
+                    &acc_strings,
                     &ix_data,
                     |s_opt| {
                         Self::pump_amm_tx_history_diagnostic(
@@ -2861,7 +2855,7 @@ impl PumpFunAmmDex {
                         info!(
                             "pump_amm TX-history: reference TX not buy/sell or bad account count sig={} n_accounts={}",
                             sig,
-                            accounts.len()
+                            acc_strings.len()
                         );
                     }
                     continue;
@@ -2920,7 +2914,7 @@ impl PumpFunAmmDex {
                 };
 
                 let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
-                let fee_ok = if accounts.len() == 23 {
+                let fee_ok = if acc_strings.len() == 23 {
                     !fee_executable && fee_owner == pump_amm_program
                 } else {
                     !fee_executable && fee_owner == expected_fee_program
@@ -2931,7 +2925,7 @@ impl PumpFunAmmDex {
                         "pump_amm TX-history: reference TX fee_config owner={} executable={} buy_layout={} fee_ok={}",
                         fee_owner,
                         fee_executable,
-                        accounts.len() == 23,
+                        acc_strings.len() == 23,
                         fee_ok
                     );
                 }
@@ -3393,20 +3387,16 @@ impl PumpFunAmmDex {
                             continue;
                         }
 
-                        let accounts: Vec<usize> =
-                            match ix.get("accounts").and_then(|v| v.as_array()) {
-                                Some(a) => a
-                                    .iter()
-                                    .filter_map(|v| v.as_u64().map(|x| x as usize))
-                                    .collect(),
-                                None => continue,
-                            };
+                        let Some(acc_strings) =
+                            Self::pump_amm_ix_account_strings_from_json(ix, &account_keys)
+                        else {
+                            continue;
+                        };
                         let Some(ix_data) = Self::pump_amm_ix_data_from_json(ix) else {
                             continue;
                         };
                         let Some(mut pool) = Self::pump_amm_pool_static_from_parsed_swap_ix(
-                            &account_keys,
-                            &accounts,
+                            &acc_strings,
                             &ix_data,
                             |_| {
                                 Self::pump_amm_tx_history_diagnostic_local_paginated_scan(
@@ -3439,7 +3429,7 @@ impl PumpFunAmmDex {
                         else {
                             continue;
                         };
-                        let fee_ok = if accounts.len() == 23 {
+                        let fee_ok = if acc_strings.len() == 23 {
                             !fee_executable && fee_owner == pump_amm_program
                         } else {
                             !fee_executable && fee_owner == expected_fee_program
@@ -3549,31 +3539,29 @@ impl PumpFunAmmDex {
                     continue;
                 }
 
-                let accounts: Vec<usize> = match ix.get("accounts").and_then(|v| v.as_array()) {
-                    Some(a) => a
-                        .iter()
-                        .filter_map(|v| v.as_u64().map(|x| x as usize))
-                        .collect(),
-                    None => continue,
+                let Some(acc_strings) =
+                    Self::pump_amm_ix_account_strings_from_json(ix, &account_keys)
+                else {
+                    continue;
                 };
                 // PumpSwap AMM swap instructions have 21 accounts (not 23 as originally assumed).
-                if accounts.len() != 21 {
+                if acc_strings.len() != 21 {
                     continue;
                 }
 
-                let pool_ix = Pubkey::from_str(&account_keys[accounts[0]])?;
+                let pool_ix = Pubkey::from_str(acc_strings[0].as_str())?;
                 if pool_ix != pool_market {
                     continue;
                 }
-                let base_ix = Pubkey::from_str(&account_keys[accounts[3]])?;
+                let base_ix = Pubkey::from_str(acc_strings[3].as_str())?;
                 if base_ix != base_mint {
                     continue;
                 }
 
                 let ua = PumpAmmUserAccounts {
-                    user_base_ta: Pubkey::from_str(&account_keys[accounts[5]])?,
-                    user_quote_ta: Pubkey::from_str(&account_keys[accounts[6]])?,
-                    user_volume_accumulator: Pubkey::from_str(&account_keys[accounts[20]])?,
+                    user_base_ta: Pubkey::from_str(acc_strings[5].as_str())?,
+                    user_quote_ta: Pubkey::from_str(acc_strings[6].as_str())?,
+                    user_volume_accumulator: Pubkey::from_str(acc_strings[20].as_str())?,
                 };
                 self.user_accounts.insert((pool_market, user), ua.clone());
                 return Ok(Some(ua));
@@ -3671,11 +3659,39 @@ impl PumpFunAmmDex {
         None
     }
 
+    /// Decode `instruction.accounts` from JSON-RPC / Helius transaction shapes.
+    ///
+    /// Standard Solana encoding uses a **u64 index array** into `message.accountKeys` (plus loaded
+    /// addresses). Some providers instead return **base58 pubkey strings** for the same field.
+    /// PumpSwap observers must accept both or SELL-layout discovery falsely returns `Unknown`.
+    fn pump_amm_ix_account_strings_from_json(
+        ix: &Value,
+        message_account_keys: &[String],
+    ) -> Option<Vec<String>> {
+        let arr = ix.get("accounts")?.as_array()?;
+        if arr.is_empty() {
+            return None;
+        }
+        if arr[0].as_str().is_some() {
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
+                out.push(v.as_str()?.to_string());
+            }
+            return Some(out);
+        }
+        let mut out = Vec::with_capacity(arr.len());
+        for v in arr {
+            let idx = v.as_u64()? as usize;
+            out.push(message_account_keys.get(idx)?.clone());
+        }
+        Some(out)
+    }
+
     /// Parse `buy_exact_quote_in` (23 accounts) or `sell` (21 or 24 accounts) into static pool fields.
-    /// `account_keys` must include loaded addresses (v0).
+    /// `acc_accounts` must be the resolved account list (indices expanded into base58 strings, or
+    /// direct pubkey strings from RPC).
     fn pump_amm_pool_static_from_parsed_swap_ix(
-        account_keys: &[String],
-        acc_indices: &[usize],
+        acc_accounts: &[String],
         ix_data: &[u8],
         diag_factory: impl FnOnce(Option<String>) -> PumpAmmPoolAccountsDiagnostic,
     ) -> Option<PumpAmmPoolStatic> {
@@ -3690,12 +3706,12 @@ impl PumpFunAmmDex {
         let singleton_gva = pump_amm_singleton_global_volume_accumulator(&pump_amm_program);
 
         let parse_pk = |i: usize| -> Option<Pubkey> {
-            let s = account_keys.get(*acc_indices.get(i)?)?;
+            let s = acc_accounts.get(i)?;
             Pubkey::from_str(s).ok()
         };
 
         if disc == buy_disc {
-            if acc_indices.len() != 23 {
+            if acc_accounts.len() != 23 {
                 return None;
             }
             return Some(PumpAmmPoolStatic {
@@ -3720,7 +3736,7 @@ impl PumpFunAmmDex {
         }
 
         if disc == sell_disc {
-            let extended = match acc_indices.len() {
+            let extended = match acc_accounts.len() {
                 21 => false,
                 24 => true,
                 _ => return None,
@@ -3753,24 +3769,18 @@ impl PumpFunAmmDex {
     }
 
     fn pump_amm_sell_layout_observation_from_parsed_swap_ix(
-        account_keys: &[String],
-        acc_indices: &[usize],
+        acc_accounts: &[String],
         ix_data: &[u8],
     ) -> Option<(Pubkey, Pubkey, PumpAmmAuthoritativeSellLayout)> {
-        let pool = Self::pump_amm_pool_static_from_parsed_swap_ix(
-            account_keys,
-            acc_indices,
-            ix_data,
-            |_| {
-                Self::pump_amm_livepoolcache_diagnostic(
-                    "sell_layout_observation",
-                    true,
-                    Pubkey::default(),
-                    Pubkey::default(),
-                )
-            },
-        )?;
-        let layout = match acc_indices.len() {
+        let pool = Self::pump_amm_pool_static_from_parsed_swap_ix(acc_accounts, ix_data, |_| {
+            Self::pump_amm_livepoolcache_diagnostic(
+                "sell_layout_observation",
+                true,
+                Pubkey::default(),
+                Pubkey::default(),
+            )
+        })?;
+        let layout = match acc_accounts.len() {
             21 => PumpAmmAuthoritativeSellLayout::Base,
             24 => PumpAmmAuthoritativeSellLayout::Extended {
                 third_meta: pool
@@ -5178,13 +5188,11 @@ mod tests {
         account_keys[3] = base_mint;
         account_keys[4] = Pubkey::from_str(WSOL_MINT).unwrap();
         account_keys[20] = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap();
-        let account_keys: Vec<String> = account_keys.iter().map(ToString::to_string).collect();
-        let acc_indices: Vec<usize> = (0..21).collect();
+        let acc_strings: Vec<String> = account_keys.iter().map(ToString::to_string).collect();
         let ix_data = pump_amm_sell_ix_discriminator().to_vec();
 
         let observed = PumpFunAmmDex::pump_amm_sell_layout_observation_from_parsed_swap_ix(
-            &account_keys,
-            &acc_indices,
+            &acc_strings,
             &ix_data,
         )
         .expect("standard sell observation");
@@ -5206,13 +5214,11 @@ mod tests {
         account_keys[4] = Pubkey::from_str(WSOL_MINT).unwrap();
         account_keys[20] = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap();
         account_keys[23] = third_meta;
-        let account_keys: Vec<String> = account_keys.iter().map(ToString::to_string).collect();
-        let acc_indices: Vec<usize> = (0..24).collect();
+        let acc_strings: Vec<String> = account_keys.iter().map(ToString::to_string).collect();
         let ix_data = pump_amm_sell_ix_discriminator().to_vec();
 
         let observed = PumpFunAmmDex::pump_amm_sell_layout_observation_from_parsed_swap_ix(
-            &account_keys,
-            &acc_indices,
+            &acc_strings,
             &ix_data,
         )
         .expect("extended sell observation");
@@ -5223,6 +5229,35 @@ mod tests {
             observed.2,
             PumpAmmAuthoritativeSellLayout::Extended { third_meta }
         );
+    }
+
+    /// Helius / some RPC encodings return `instruction.accounts` as base58 strings instead of indices.
+    #[test]
+    fn test_pump_amm_ix_account_strings_accepts_pubkey_array() {
+        let message_keys: Vec<String> = Vec::new();
+        let ix = json!({
+            "accounts": [
+                "B8bvg3KzXzGAq51QjirhPTw5ChhiZWn2kNwvQd3YZFN8",
+                "So11111111111111111111111111111111111111112"
+            ]
+        });
+        let out = PumpFunAmmDex::pump_amm_ix_account_strings_from_json(&ix, &message_keys)
+            .expect("pubkey-string accounts");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], "B8bvg3KzXzGAq51QjirhPTw5ChhiZWn2kNwvQd3YZFN8");
+    }
+
+    #[test]
+    fn test_pump_amm_ix_account_strings_resolves_index_array() {
+        let message_keys: Vec<String> = vec![
+            "Key0xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_string(),
+            "Key1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_string(),
+            "Key2xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_string(),
+        ];
+        let ix = json!({ "accounts": [0u64, 2u64] });
+        let out = PumpFunAmmDex::pump_amm_ix_account_strings_from_json(&ix, &message_keys)
+            .expect("index accounts");
+        assert_eq!(out, vec![message_keys[0].clone(), message_keys[2].clone()]);
     }
 
     /// Mainnet 24-account `sell` (sig `2CCmRDScAErjuBLnVJbGEyV3jsWbuNZpniZ5iTLSwZoE84nmyf285hqJXjRStMHJUaJ9Ex7EvL9fgwAVM83qGd3o`): first two trailing metas are user-derivable; third is observed-only.
