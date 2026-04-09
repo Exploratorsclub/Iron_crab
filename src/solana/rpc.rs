@@ -240,7 +240,8 @@ impl SolanaRpc {
         tokio::time::sleep(Duration::from_millis(base + jitter)).await;
     }
 
-    fn classify_error(e: &ClientError) -> ErrorClass {
+    /// Best-effort classification for structured diagnostics (Cold Path logging).
+    pub fn classify_client_error(e: &ClientError) -> ErrorClass {
         let s = format!("{e}").to_lowercase();
         if s.contains("timeout")
             || s.contains("timed out")
@@ -281,7 +282,7 @@ impl SolanaRpc {
     }
 
     fn is_transient_error(e: &ClientError) -> bool {
-        match Self::classify_error(e) {
+        match Self::classify_client_error(e) {
             ErrorClass::Timeout | ErrorClass::RateLimited => true,
             ErrorClass::Http(code) => code == 429 || code == 408 || (500..=599).contains(&code),
             ErrorClass::Other => true,
@@ -314,7 +315,7 @@ impl SolanaRpc {
                     return Ok(h);
                 }
                 Some(Err(e)) => {
-                    let class = Self::classify_error(&e);
+                    let class = Self::classify_client_error(&e);
                     match class {
                         ErrorClass::RateLimited
                         | ErrorClass::Http(429)
@@ -362,7 +363,7 @@ impl SolanaRpc {
                     return Ok(f);
                 }
                 Some(Err(e)) => {
-                    let class = Self::classify_error(&e);
+                    let class = Self::classify_client_error(&e);
                     match class {
                         ErrorClass::RateLimited
                         | ErrorClass::Http(429)
@@ -421,7 +422,7 @@ impl SolanaRpc {
                     return Ok(acc);
                 }
                 Some(Err(e)) => {
-                    let class = Self::classify_error(&e);
+                    let class = Self::classify_client_error(&e);
                     match class {
                         ErrorClass::RateLimited
                         | ErrorClass::Http(429)
@@ -468,7 +469,7 @@ impl SolanaRpc {
                     return Ok(b);
                 }
                 Some(Err(e)) => {
-                    let class = Self::classify_error(&e);
+                    let class = Self::classify_client_error(&e);
                     match class {
                         ErrorClass::RateLimited
                         | ErrorClass::Http(429)
@@ -522,7 +523,7 @@ impl SolanaRpc {
                     return Ok(s);
                 }
                 Some(Err(e)) => {
-                    let class = Self::classify_error(&e);
+                    let class = Self::classify_client_error(&e);
                     match class {
                         ErrorClass::RateLimited
                         | ErrorClass::Http(429)
@@ -577,7 +578,7 @@ impl SolanaRpc {
                     return Ok(tx);
                 }
                 Some(Err(e)) => {
-                    let class = Self::classify_error(&e);
+                    let class = Self::classify_client_error(&e);
                     match class {
                         ErrorClass::RateLimited
                         | ErrorClass::Http(429)
@@ -635,7 +636,7 @@ impl SolanaRpc {
                     return Ok(v);
                 }
                 Some(Err(e)) => {
-                    let class = Self::classify_error(&e);
+                    let class = Self::classify_client_error(&e);
                     match class {
                         ErrorClass::RateLimited
                         | ErrorClass::Http(429)
