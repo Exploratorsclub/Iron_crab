@@ -387,8 +387,8 @@ pub enum PumpAmmSellLayoutTerminationReason {
     LocalHistoryEmptyExternalTimeoutBudgetExhausted,
     LocalHistoryEmptyExternalRequestBudgetExhausted,
     LocalHistoryEmptyExternalNoSellCandidates,
-    /// Scope 50: external history has router/other activity invoking PumpSwap, but no `sell`-discriminator ix in the bounded scan.
-    LocalHistoryEmptyExternalRouterShellNoPumpAmmSellDiscriminator,
+    /// Scope 50: bounded external scan saw at least one PumpSwap program ix, but none with `global:sell` discriminator (e.g. only `buy_exact_quote_in` CPIs).
+    LocalHistoryEmptyExternalPumpAmmSeenButNoSellDiscriminator,
     /// Scope 50: `sell` discriminator seen but `accounts.len()` is not the supported 21/24 meta layout.
     LocalHistoryEmptyExternalPumpAmmSellAccountShapeUnsupported,
     /// Scope 50: `sell` ix matches supported length but `pump_amm_sell_layout_observation_from_parsed_swap_ix` could not derive layout.
@@ -477,8 +477,8 @@ impl PumpAmmSellLayoutTerminationReason {
             Self::LocalHistoryEmptyExternalNoSellCandidates => {
                 "local_history_empty_external_no_sell_candidates"
             }
-            Self::LocalHistoryEmptyExternalRouterShellNoPumpAmmSellDiscriminator => {
-                "local_history_empty_external_router_shell_no_pump_amm_sell_discriminator"
+            Self::LocalHistoryEmptyExternalPumpAmmSeenButNoSellDiscriminator => {
+                "local_history_empty_external_pump_amm_seen_but_no_sell_discriminator"
             }
             Self::LocalHistoryEmptyExternalPumpAmmSellAccountShapeUnsupported => {
                 "local_history_empty_external_pump_amm_sell_account_shape_unsupported"
@@ -1727,7 +1727,7 @@ impl PumpFunAmmDex {
                 && summary.pump_amm_sell_discriminator_seen == 0
             {
                 summary.termination_reason =
-                    PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalRouterShellNoPumpAmmSellDiscriminator;
+                    PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalPumpAmmSeenButNoSellDiscriminator;
             }
             info!(
                 pool = %pool_market,
