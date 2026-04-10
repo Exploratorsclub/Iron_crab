@@ -5091,6 +5091,7 @@ fn log_pump_amm_scope49_force_refresh_sell_layout_failure(
         ext_signatures_returned = ext.map(|s| s.signatures_returned_last),
         ext_transactions_fetched = ext.map(|s| s.transactions_fetched),
         ext_pump_amm_ix_seen = ext.map(|s| s.pump_amm_instructions_seen),
+        ext_pump_amm_sell_discriminator_seen = ext.map(|s| s.pump_amm_sell_discriminator_seen),
         ext_sell_candidates_seen = ext.map(|s| s.sell_candidates_seen),
         ext_provider_status = ext.map(|s| s.provider_status_last.as_log_str()),
         ext_termination = ext.map(|s| s.termination_reason.as_log_str()),
