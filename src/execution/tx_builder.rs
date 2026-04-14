@@ -765,7 +765,13 @@ pub async fn build_tx_plan(
             .map(|c| c.pump_amm_sell_extended_layout(&pool_id))
             .unwrap_or((false, None));
 
-        let pool_accounts: Vec<Pubkey> = if accounts_len == 0 {
+        let mut pool_accounts_build_source = if accounts_len == 0 {
+            "slave_livepoolcache"
+        } else {
+            "intent_resources"
+        };
+
+        let mut pool_accounts: Vec<Pubkey> = if accounts_len == 0 {
             if let Some(cache) = cache {
                 if let Some(CachedPoolState::PumpAmm(amm_state)) = cache.get(&pool_id) {
                     if amm_state.pool_accounts.len() >= 12 {
@@ -838,6 +844,25 @@ pub async fn build_tx_plan(
             parsed
         };
 
+        // Scope 51 / Bug #34: After market-data `force_refresh`, SLAVE holds authoritative v14 +
+        // extended SELL layout (`third_meta`). Cold-path intents often still carry stale
+        // `resources.accounts` (same 14er); the builder must prefer JetStream-ready `pool_accounts`
+        // for the rebuild — not re-simulate with the stale intent slice (I-24d: no local discovery).
+        if allow_rpc_fallback && intent.side == TradeSide::Sell && accounts_len > 0 {
+            if let (Ok(base_mint_pk), Some(c)) =
+                (Pubkey::from_str(&intent.resources.input_mint), cache)
+            {
+                if let Some(ready_v14) =
+                    c.get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint_pk)
+                {
+                    if ready_v14.len() >= 14 && ready_v14[0] == pool_id {
+                        pool_accounts = ready_v14;
+                        pool_accounts_build_source = "slave_ready_jetstream_v14";
+                    }
+                }
+            }
+        }
+
         if pool_accounts.len() != 12 && pool_accounts.len() != 14 {
             return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
                 reason: RejectReason::UnsupportedIntent,
@@ -904,11 +929,6 @@ pub async fn build_tx_plan(
             && !ixs.is_empty()
             && ixs[0].accounts.len() >= 21
         {
-            let pool_accounts_source = if accounts_len == 0 {
-                "slave_livepoolcache"
-            } else {
-                "intent_resources"
-            };
             let canonical_fee_cfg =
                 Pubkey::from_str(PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR).unwrap_or_default();
             let canonical_fee_prog =
@@ -923,7 +943,9 @@ pub async fn build_tx_plan(
                 intent_id = %intent.intent_id,
                 scope = "44",
                 dex = "pump_amm",
-                pool_accounts_source = pool_accounts_source,
+                pool_accounts_source = pool_accounts_build_source,
+                sell_extended = sell_requires_cashback_remaining,
+                sell_cashback_third_meta = ?sell_cashback_third_meta,
                 pool = %pool_id,
                 input_mint = %intent.resources.input_mint,
                 base_token_program_override = ?token_program_override,
@@ -1906,10 +1928,12 @@ async fn build_hop_meteora_dlmm(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::live_pool_cache::MeteoraState;
+    use crate::execution::live_pool_cache::{
+        CachedPoolState, LivePoolCache, MeteoraState, PumpAmmState,
+    };
     use crate::ipc::{
-        ExplicitAmount, IntentOrigin, IntentTier, TradeExecutionConstraints, TradeResources,
-        TradingRegime,
+        DexPoolReadiness, ExplicitAmount, IntentOrigin, IntentTier, TradeExecutionConstraints,
+        TradeResources, TradingRegime, NATIVE_SOL_MINT,
     };
 
     fn base_intent() -> TradeIntent {
@@ -2047,5 +2071,74 @@ mod tests {
             reserve_y_balance: Some(2),
         };
         assert!(!super::meteora_dlmm_cache_state_injectable(&s));
+    }
+
+    /// Scope 51: cold-path SELL with non-empty `resources.accounts` must still use JetStream-ready
+    /// v14 from SLAVE when `get_ready_pump_amm_pool_accounts_by_base_mint` matches the intent pool,
+    /// so extended `third_meta` from cache feeds `build_swap_ix_from_pool_accounts`.
+    #[tokio::test]
+    async fn pump_amm_cold_path_sell_prefers_ready_slave_v14_over_stale_intent_accounts() {
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(NATIVE_SOL_MINT).expect("wsol mint");
+        let third_meta = Pubkey::new_unique();
+
+        let mut ready_v14: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        ready_v14[0] = pool_market;
+        ready_v14[2] = base_mint;
+        ready_v14[3] = quote_mint;
+
+        let mut stale_intent_accounts: Vec<String> =
+            (0..14).map(|_| Pubkey::new_unique().to_string()).collect();
+        stale_intent_accounts[0] = pool_market.to_string();
+
+        let cache = LivePoolCache::new();
+        cache.upsert(
+            pool_market,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint,
+                quote_mint,
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(1_000_000_000),
+                quote_reserve: Some(50_000_000_000),
+                pool_accounts: ready_v14.clone(),
+                creator: None,
+            }),
+            100,
+        );
+        cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
+        cache.merge_pump_amm_sell_extended_layout(&pool_market, true, Some(third_meta));
+
+        let mut intent = base_intent();
+        intent
+            .metadata
+            .insert("dex".to_string(), "pump_amm".to_string());
+        intent.resources.input_mint = base_mint.to_string();
+        intent.resources.output_mint = NATIVE_SOL_MINT.to_string();
+        intent.resources.pools = vec![pool_market.to_string()];
+        intent.resources.accounts = stale_intent_accounts;
+        intent.execution = Some(TradeExecutionConstraints {
+            min_out: Some(ExplicitAmount::new(1, 9)),
+        });
+
+        let wallet = Pubkey::new_unique();
+        let rpc = Arc::new(crate::solana::rpc::SolanaRpc::new("http://127.0.0.1:8899"));
+        let cache_arc = Arc::new(cache);
+
+        let outcome =
+            super::build_tx_plan(&intent, wallet, rpc, Some(&cache_arc), None, true).await;
+
+        let super::TxPlanOutcome::Planned(plan) = outcome else {
+            panic!("expected Planned outcome, got {outcome:?}");
+        };
+        assert!(!plan.instructions.is_empty());
+        let sell_ix = &plan.instructions[plan.instructions.len() - 1];
+        assert!(
+            sell_ix.accounts.len() > 21,
+            "expected extended SELL metas, got len={}",
+            sell_ix.accounts.len()
+        );
+        assert_eq!(sell_ix.accounts.last().unwrap().pubkey, third_meta);
     }
 }
