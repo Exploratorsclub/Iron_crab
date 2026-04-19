@@ -846,19 +846,18 @@ pub async fn build_tx_plan(
 
         // Scope 51 / Bug #34: After market-data `force_refresh`, SLAVE holds authoritative v14 +
         // extended SELL layout (`third_meta`). Cold-path intents often still carry stale
-        // `resources.accounts` (same 14er); the builder must prefer JetStream-ready `pool_accounts`
-        // for the rebuild — not re-simulate with the stale intent slice (I-24d: no local discovery).
+        // `resources.accounts` (same 14er); the builder must prefer **this pool’s** JetStream-
+        // merged explicit `Ready` row — not mint-only heuristics (multi-pool) and not legacy
+        // effective-ready fallback (mislabels observability). I-24d: no local discovery / no RPC.
         if allow_rpc_fallback && intent.side == TradeSide::Sell && accounts_len > 0 {
-            if let (Ok(base_mint_pk), Some(c)) =
-                (Pubkey::from_str(&intent.resources.input_mint), cache)
-            {
-                if let Some(ready_v14) =
-                    c.get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint_pk)
+            if let Some(c) = cache {
+                if let Some(v14) = c
+                    .get_explicit_jetstream_ready_pump_amm_pool_accounts_v14_for_pool_market(
+                        &pool_id,
+                    )
                 {
-                    if ready_v14.len() >= 14 && ready_v14[0] == pool_id {
-                        pool_accounts = ready_v14;
-                        pool_accounts_build_source = "slave_ready_jetstream_v14";
-                    }
+                    pool_accounts = v14;
+                    pool_accounts_build_source = "slave_explicit_jetstream_ready_v14";
                 }
             }
         }
@@ -2073,11 +2072,12 @@ mod tests {
         assert!(!super::meteora_dlmm_cache_state_injectable(&s));
     }
 
-    /// Scope 51: cold-path SELL with non-empty `resources.accounts` must still use JetStream-ready
-    /// v14 from SLAVE when `get_ready_pump_amm_pool_accounts_by_base_mint` matches the intent pool,
-    /// so extended `third_meta` from cache feeds `build_swap_ix_from_pool_accounts`.
+    /// Scope 51: cold-path SELL with non-empty `resources.accounts` must use **this pool’s**
+    /// explicit JetStream `DexPoolReadiness::Ready` v14 (not stale intent), so extended `third_meta`
+    /// from SLAVE feeds `build_swap_ix_from_pool_accounts`.
     #[tokio::test]
-    async fn pump_amm_cold_path_sell_prefers_ready_slave_v14_over_stale_intent_accounts() {
+    async fn pump_amm_cold_path_sell_prefers_explicit_jetstream_ready_v14_over_stale_intent_accounts(
+    ) {
         let pool_market = Pubkey::new_unique();
         let base_mint = Pubkey::new_unique();
         let quote_mint = Pubkey::from_str(NATIVE_SOL_MINT).expect("wsol mint");
@@ -2140,5 +2140,93 @@ mod tests {
             sell_ix.accounts.len()
         );
         assert_eq!(sell_ix.accounts.last().unwrap().pubkey, third_meta);
+    }
+
+    /// Two PumpSwap pools for the same base mint: only the intent’s `pools[0]` row (explicit Ready)
+    /// must drive the override — not another pool that happens to be legacy-“ready” first.
+    #[tokio::test]
+    async fn pump_amm_cold_path_sell_multi_pool_targets_intent_pool_explicit_ready_only() {
+        let pool_other = Pubkey::new_unique();
+        let pool_target = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(NATIVE_SOL_MINT).expect("wsol mint");
+        let third_other = Pubkey::new_unique();
+        let third_target = Pubkey::new_unique();
+
+        let mut v14_other: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        v14_other[0] = pool_other;
+        v14_other[2] = base_mint;
+        v14_other[3] = quote_mint;
+
+        let mut v14_target: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        v14_target[0] = pool_target;
+        v14_target[2] = base_mint;
+        v14_target[3] = quote_mint;
+
+        let mut stale_intent_accounts: Vec<String> =
+            (0..14).map(|_| Pubkey::new_unique().to_string()).collect();
+        stale_intent_accounts[0] = pool_target.to_string();
+
+        let cache = LivePoolCache::new();
+        // Other pool: legacy-effective ready only (no explicit readiness map merge).
+        cache.upsert(
+            pool_other,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint,
+                quote_mint,
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(1_000_000_000),
+                quote_reserve: Some(50_000_000_000),
+                pool_accounts: v14_other.clone(),
+                creator: None,
+            }),
+            100,
+        );
+        cache.merge_pump_amm_sell_extended_layout(&pool_other, true, Some(third_other));
+
+        // Target pool: explicit JetStream Ready (force_refresh / PoolCacheUpdate path).
+        cache.upsert(
+            pool_target,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint,
+                quote_mint,
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(1_000_000_000),
+                quote_reserve: Some(50_000_000_000),
+                pool_accounts: v14_target.clone(),
+                creator: None,
+            }),
+            100,
+        );
+        cache.merge_pump_amm_pool_accounts_readiness(pool_target, DexPoolReadiness::Ready);
+        cache.merge_pump_amm_sell_extended_layout(&pool_target, true, Some(third_target));
+
+        let mut intent = base_intent();
+        intent
+            .metadata
+            .insert("dex".to_string(), "pump_amm".to_string());
+        intent.resources.input_mint = base_mint.to_string();
+        intent.resources.output_mint = NATIVE_SOL_MINT.to_string();
+        intent.resources.pools = vec![pool_target.to_string()];
+        intent.resources.accounts = stale_intent_accounts;
+        intent.execution = Some(TradeExecutionConstraints {
+            min_out: Some(ExplicitAmount::new(1, 9)),
+        });
+
+        let wallet = Pubkey::new_unique();
+        let rpc = Arc::new(crate::solana::rpc::SolanaRpc::new("http://127.0.0.1:8899"));
+        let cache_arc = Arc::new(cache);
+
+        let outcome =
+            super::build_tx_plan(&intent, wallet, rpc, Some(&cache_arc), None, true).await;
+
+        let super::TxPlanOutcome::Planned(plan) = outcome else {
+            panic!("expected Planned outcome, got {outcome:?}");
+        };
+        let sell_ix = &plan.instructions[plan.instructions.len() - 1];
+        assert_eq!(sell_ix.accounts.last().unwrap().pubkey, third_target);
+        assert_ne!(sell_ix.accounts.last().unwrap().pubkey, third_other);
     }
 }
