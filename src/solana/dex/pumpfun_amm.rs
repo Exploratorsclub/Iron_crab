@@ -576,6 +576,24 @@ fn sell_layout_scan_termination_after_successful_tx_fetch(
     }
 }
 
+/// Merge SELL-layout observations while scanning **reverse-chronological** signatures (newest first).
+///
+/// A newer **21-account** `sell` must not hide an older **24-account** extended `sell` for the same
+/// pool: `Extended` wins; `Base` is kept only until an `Extended` match appears.
+fn merge_pump_amm_authoritative_sell_layout_observation(
+    best: PumpAmmAuthoritativeSellLayout,
+    candidate: PumpAmmAuthoritativeSellLayout,
+) -> PumpAmmAuthoritativeSellLayout {
+    match candidate {
+        PumpAmmAuthoritativeSellLayout::Extended { .. } => candidate,
+        PumpAmmAuthoritativeSellLayout::Base => match best {
+            PumpAmmAuthoritativeSellLayout::Unknown => PumpAmmAuthoritativeSellLayout::Base,
+            _ => best,
+        },
+        PumpAmmAuthoritativeSellLayout::Unknown => best,
+    }
+}
+
 fn provider_status_from_anyhow_rpc(err: &anyhow::Error) -> PumpAmmSellLayoutProviderStatus {
     for cause in err.chain() {
         if let Some(ce) = cause.downcast_ref::<ClientError>() {
@@ -1502,6 +1520,7 @@ impl PumpFunAmmDex {
         let sell_layout_sell_disc = anchor_disc("sell");
         let sell_layout_buy_disc = anchor_disc("buy_exact_quote_in");
 
+        let mut best_layout = PumpAmmAuthoritativeSellLayout::Unknown;
         let mut tx_attempts = 0usize;
         for s in &sigs {
             if tx_attempts >= limits.max_tx_fetch_attempts {
@@ -1681,24 +1700,28 @@ impl PumpFunAmmDex {
                     }
                     continue;
                 }
-                summary.termination_reason = PumpAmmSellLayoutTerminationReason::LayoutFound;
-                summary.elapsed_total_ms = t0.elapsed().as_millis();
-                info!(
-                    pool = %pool_market,
-                    base_mint = %base_mint,
-                    log_ctx,
-                    signature = %sig,
-                    layout = ?layout,
-                    transactions_fetched = summary.transactions_fetched,
-                    pump_amm_instructions_seen = summary.pump_amm_instructions_seen,
-                    sell_candidates_seen = summary.sell_candidates_seen,
-                    termination_reason = %summary.termination_reason.as_log_str(),
-                    "pump_amm: authoritative SELL-layout observed from successful swap tx"
-                );
-                return SellLayoutObserveOutcome {
-                    result: Ok(layout),
-                    summary,
-                };
+                best_layout =
+                    merge_pump_amm_authoritative_sell_layout_observation(best_layout, layout);
+                if matches!(best_layout, PumpAmmAuthoritativeSellLayout::Extended { .. }) {
+                    summary.termination_reason = PumpAmmSellLayoutTerminationReason::LayoutFound;
+                    summary.elapsed_total_ms = t0.elapsed().as_millis();
+                    info!(
+                        pool = %pool_market,
+                        base_mint = %base_mint,
+                        log_ctx,
+                        signature = %sig,
+                        layout = ?best_layout,
+                        transactions_fetched = summary.transactions_fetched,
+                        pump_amm_instructions_seen = summary.pump_amm_instructions_seen,
+                        sell_candidates_seen = summary.sell_candidates_seen,
+                        termination_reason = %summary.termination_reason.as_log_str(),
+                        "pump_amm: authoritative SELL-layout observed from successful swap tx (extended wins over newer base-only evidence)"
+                    );
+                    return SellLayoutObserveOutcome {
+                        result: Ok(best_layout),
+                        summary,
+                    };
+                }
             }
             if structured_telemetry
                 && summary.transactions_fetched > 0
@@ -1717,6 +1740,26 @@ impl PumpFunAmmDex {
                     "pump_amm: force_refresh SELL-layout scan progress"
                 );
             }
+        }
+
+        if best_layout != PumpAmmAuthoritativeSellLayout::Unknown {
+            summary.termination_reason = PumpAmmSellLayoutTerminationReason::LayoutFound;
+            summary.elapsed_total_ms = t0.elapsed().as_millis();
+            info!(
+                pool = %pool_market,
+                base_mint = %base_mint,
+                log_ctx,
+                layout = ?best_layout,
+                transactions_fetched = summary.transactions_fetched,
+                pump_amm_instructions_seen = summary.pump_amm_instructions_seen,
+                sell_candidates_seen = summary.sell_candidates_seen,
+                termination_reason = %summary.termination_reason.as_log_str(),
+                "pump_amm: authoritative SELL-layout observed after full bounded scan (base-only or no extended in window)"
+            );
+            return SellLayoutObserveOutcome {
+                result: Ok(best_layout),
+                summary,
+            };
         }
 
         summary.elapsed_total_ms = t0.elapsed().as_millis();
@@ -5543,6 +5586,44 @@ mod tests {
                 PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalNoSellCandidates,
             ),
             PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalNoSellCandidates
+        );
+    }
+
+    /// Scope 54: newer 21-account SELL in history must not erase extended (24-account) evidence.
+    #[test]
+    fn scope54_merge_sell_layout_extended_wins_over_base() {
+        let third = Pubkey::new_unique();
+        assert_eq!(
+            merge_pump_amm_authoritative_sell_layout_observation(
+                PumpAmmAuthoritativeSellLayout::Base,
+                PumpAmmAuthoritativeSellLayout::Extended { third_meta: third },
+            ),
+            PumpAmmAuthoritativeSellLayout::Extended { third_meta: third }
+        );
+        assert_eq!(
+            merge_pump_amm_authoritative_sell_layout_observation(
+                PumpAmmAuthoritativeSellLayout::Extended { third_meta: third },
+                PumpAmmAuthoritativeSellLayout::Base,
+            ),
+            PumpAmmAuthoritativeSellLayout::Extended { third_meta: third }
+        );
+    }
+
+    #[test]
+    fn scope54_merge_sell_layout_base_accumulates_from_unknown() {
+        assert_eq!(
+            merge_pump_amm_authoritative_sell_layout_observation(
+                PumpAmmAuthoritativeSellLayout::Unknown,
+                PumpAmmAuthoritativeSellLayout::Base,
+            ),
+            PumpAmmAuthoritativeSellLayout::Base
+        );
+        assert_eq!(
+            merge_pump_amm_authoritative_sell_layout_observation(
+                PumpAmmAuthoritativeSellLayout::Base,
+                PumpAmmAuthoritativeSellLayout::Unknown,
+            ),
+            PumpAmmAuthoritativeSellLayout::Base
         );
     }
 
