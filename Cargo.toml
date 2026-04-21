@@ -121,8 +121,9 @@ serial_test = "2"
 features = ["python"]
 no-default-features = true
 
-# RUSTSEC-2026-0049: rustls-webpki < 0.103.10. Upstream async-nats still pins 0.102.x; Solana 3.0
-# pubsub still uses tungstenite 0.20 / rustls 0.21. Vendor-patched crates until ecosystem releases.
+# RUSTSEC-2026-0049 note: async-nats historically pinned 0.102.x; Solana pubsub uses vendored tungstenite where needed.
+# RUSTSEC-2026-0098/0099: do not add a direct rustls-webpki pin — it conflicts with ironcrab-eval’s merged
+# resolver when patched as a path/git dep; advisories are ignored in `.cargo/audit.toml` until rustls pins ≥0.103.12.
 [patch.crates-io]
 async-nats = { path = "vendor/async-nats" }
 solana-pubsub-client = { path = "vendor/solana-pubsub-client" }
