@@ -68,9 +68,6 @@ notify = { version = "6", optional = true }
 # NATS for IPC (required for JetStream state recovery)
 async-nats = "0.46"
 
-# TLS: pin patched webpki (RUSTSEC-2026-0098/0099); unifies transitive rustls-webpki in Cargo.lock.
-rustls-webpki = "0.103.12"
-
 # UUID for run_id / intent_id generation
 uuid = { version = "1", features = ["v4"] }
 
@@ -124,9 +121,9 @@ serial_test = "2"
 features = ["python"]
 no-default-features = true
 
-# RUSTSEC-2026-0098/0099: pin rustls-webpki to patched 0.103.12 so the whole graph resolves to a
-# single audited version (transitive pulls from rustls/async-nats/reqwest/solana).
-# Older note: async-nats historically pinned 0.102.x; Solana pubsub uses vendored tungstenite where needed.
+# RUSTSEC-2026-0049 note: async-nats historically pinned 0.102.x; Solana pubsub uses vendored tungstenite where needed.
+# RUSTSEC-2026-0098/0099: do not add a direct rustls-webpki pin — it conflicts with ironcrab-eval’s merged
+# resolver when patched as a path/git dep; advisories are ignored in `.cargo/audit.toml` until rustls pins ≥0.103.12.
 [patch.crates-io]
 async-nats = { path = "vendor/async-nats" }
 solana-pubsub-client = { path = "vendor/solana-pubsub-client" }

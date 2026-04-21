@@ -2324,7 +2324,6 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "rust_decimal",
- "rustls-webpki",
  "scopeguard",
  "sd-notify",
  "serde",

@@ -5,11 +5,15 @@
 # bincode unmaintained (Solana/spl-token-2022), rustls-pemfile (async-nats)
 # RUSTSEC-2025-0161 / RUSTSEC-2026-0097: libsecp256k1 + rand pulled by solana-program 2.x / SPL 7
 # (spl-associated-token-account) — no patch without Solana/SPL major alignment.
+# RUSTSEC-2026-0098 / RUSTSEC-2026-0099: rustls-webpki — fixing via direct dep pin breaks ironcrab-eval
+# (path/git patch) resolver; ignore until transitive rustls pulls a patched webpki without a root pin.
 ignore = [
     "RUSTSEC-2025-0141",
     "RUSTSEC-2025-0134",
     "RUSTSEC-2025-0161",
     "RUSTSEC-2026-0097",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
 ]
 
 # Disable yanked warnings - js-sys, wasm-bindgen come from web-time/rustls-pki-types via async-nats
