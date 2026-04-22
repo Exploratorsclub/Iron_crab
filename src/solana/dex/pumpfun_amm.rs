@@ -594,6 +594,23 @@ fn merge_pump_amm_authoritative_sell_layout_observation(
     }
 }
 
+/// Same fold as `observe_authoritative_sell_layout_from_tx_history_with_rpc` when it sees
+/// matching pool/mint `sell` layouts in **newest-first** order (one observation per outer step).
+///
+/// Used by unit tests to lock the scan conflict without RPC; production calls this from the scan loop.
+fn fold_force_refresh_sell_layout_observations_newest_first(
+    mut best_layout: PumpAmmAuthoritativeSellLayout,
+    layouts_newest_first: impl IntoIterator<Item = PumpAmmAuthoritativeSellLayout>,
+) -> PumpAmmAuthoritativeSellLayout {
+    for layout in layouts_newest_first {
+        best_layout = merge_pump_amm_authoritative_sell_layout_observation(best_layout, layout);
+        if matches!(best_layout, PumpAmmAuthoritativeSellLayout::Extended { .. }) {
+            return best_layout;
+        }
+    }
+    best_layout
+}
+
 fn provider_status_from_anyhow_rpc(err: &anyhow::Error) -> PumpAmmSellLayoutProviderStatus {
     for cause in err.chain() {
         if let Some(ce) = cause.downcast_ref::<ClientError>() {
@@ -1700,8 +1717,10 @@ impl PumpFunAmmDex {
                     }
                     continue;
                 }
-                best_layout =
-                    merge_pump_amm_authoritative_sell_layout_observation(best_layout, layout);
+                best_layout = fold_force_refresh_sell_layout_observations_newest_first(
+                    best_layout,
+                    std::iter::once(layout),
+                );
                 if matches!(best_layout, PumpAmmAuthoritativeSellLayout::Extended { .. }) {
                     summary.termination_reason = PumpAmmSellLayoutTerminationReason::LayoutFound;
                     summary.elapsed_total_ms = t0.elapsed().as_millis();
@@ -5624,6 +5643,27 @@ mod tests {
                 PumpAmmAuthoritativeSellLayout::Unknown,
             ),
             PumpAmmAuthoritativeSellLayout::Base
+        );
+    }
+
+    /// Scope 54 PR follow-up: same fold as the force_refresh TX-history scan (newest sig first).
+    ///
+    /// Simulates two successful pool-matching `sell` decodes: a **newer** 21-account Base tx, then an
+    /// **older** 24-account Extended tx in the signature list — the scan must not stop at Base.
+    #[test]
+    fn scope54_force_refresh_sell_layout_fold_newest_base_then_older_extended() {
+        let third = Pubkey::new_unique();
+        let layouts = [
+            PumpAmmAuthoritativeSellLayout::Base,
+            PumpAmmAuthoritativeSellLayout::Extended { third_meta: third },
+        ];
+        let out = fold_force_refresh_sell_layout_observations_newest_first(
+            PumpAmmAuthoritativeSellLayout::Unknown,
+            layouts,
+        );
+        assert_eq!(
+            out,
+            PumpAmmAuthoritativeSellLayout::Extended { third_meta: third }
         );
     }
 
