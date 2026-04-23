@@ -306,7 +306,7 @@ version = "0.7"
 version = "1"
 
 [dependencies.rustls-webpki]
-version = "0.103.10"
+version = "0.103.13"
 default-features = false
 package = "rustls-webpki"
 
