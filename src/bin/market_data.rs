@@ -764,6 +764,15 @@ fn try_parse_token_account_balance(data: &[u8]) -> Option<u64> {
     }
 }
 
+/// WSOL wrapped-SOL token account: balance from a Geyser account update, or `None` to skip.
+/// Empty `data` means the account no longer exists as a token account (e.g. ATA closed) → `Some(0)`.
+fn wsol_ata_balance_lamports_from_geyser_data(data: &[u8]) -> Option<u64> {
+    if data.is_empty() {
+        return Some(0);
+    }
+    try_parse_token_account_balance(data)
+}
+
 /// Wallet `mints_in_wallet` are non-zero balances from bootstrap RPC; pick at most `max_mints`
 /// unique pubkeys that still lack explicit Ready for any modeled slice per
 /// [`LivePoolCache::base_mint_has_any_ready_pool`] (PumpSwap, PumpFun, Raydium CPMM, Meteora CPMM, Meteora DLMM,
@@ -6472,15 +6481,18 @@ async fn run_geyser_loop(
                             let wsol_value = if has_wsol { Some(wsol) } else { None };
                             (lamports, wsol_value, lamports != prev)
                         } else {
-                            // WSOL ATA - parse token account balance
-                            if let Some(balance) = try_parse_token_account_balance(&account_update.data) {
-                                let prev = tracked_wallet.last_wsol_balance.swap(balance, Ordering::Relaxed);
-                                tracked_wallet.wsol_seen.store(true, Ordering::Relaxed);
-                                let sol = tracked_wallet.last_sol_balance.load(Ordering::Relaxed);
-                                (sol, Some(balance), balance != prev)
-                            } else {
-                                continue; // Failed to parse, skip
-                            }
+                            // WSOL ATA - parse token account balance.
+                            // When the ATA is closed (unwrap), Geyser often delivers an update with
+                            // `data` empty (account gone) — not parseable as SPL token state.
+                            // That means WSOL=0. Previously we `continue`d and kept a stale balance
+                            // with no zero WalletBalanceSnapshot to JetStream.
+                            let Some(balance) = wsol_ata_balance_lamports_from_geyser_data(&account_update.data) else {
+                                continue;
+                            };
+                            let prev = tracked_wallet.last_wsol_balance.swap(balance, Ordering::Relaxed);
+                            tracked_wallet.wsol_seen.store(true, Ordering::Relaxed);
+                            let sol = tracked_wallet.last_sol_balance.load(Ordering::Relaxed);
+                            (sol, Some(balance), balance != prev)
                         };
 
                         if balance_changed {
@@ -10006,5 +10018,34 @@ mod discovery_tests {
         let mints = vec![base_mint.to_string(), other.to_string()];
         let out = wallet_mints_needing_dex_bootstrap_verify(&cache, &mints, wsol, 8);
         assert_eq!(out, vec![other]);
+    }
+}
+
+/// WSOL ATA balance parsing from Geyser (Scope 55: zero after close)
+#[cfg(test)]
+mod wsol_ata_update_tests {
+    use super::wsol_ata_balance_lamports_from_geyser_data;
+
+    #[test]
+    fn empty_wsol_ata_data_means_zero_balance() {
+        assert_eq!(wsol_ata_balance_lamports_from_geyser_data(&[]), Some(0));
+    }
+
+    #[test]
+    fn short_corrupt_wsol_ata_data_skips_update() {
+        // Not enough bytes for a standard token account; must not be treated as 0
+        // (avoids clobbering state on transient garbage).
+        assert_eq!(wsol_ata_balance_lamports_from_geyser_data(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn standard_spl_token_account_parses_amount() {
+        let mut data = vec![0u8; 165];
+        let amt: u64 = 1_000_000_000;
+        data[64..72].copy_from_slice(&amt.to_le_bytes());
+        assert_eq!(
+            wsol_ata_balance_lamports_from_geyser_data(&data),
+            Some(1_000_000_000)
+        );
     }
 }

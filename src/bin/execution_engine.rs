@@ -4316,7 +4316,7 @@ impl ExecutionContext {
                         .await
                         {
                             Ok(sig) => {
-                                info!(wallet = %wallet, wsol_ata = %wsol_ata, signature = %sig, "Unwrapped WSOL (closed ATA)")
+                                info!(wallet = %wallet, wsol_ata = %wsol_ata, signature = %sig, "Unwrapped WSOL (closed ATA)");
                             }
                             Err(e) => {
                                 warn!(wallet = %wallet, wsol_ata = %wsol_ata, error = %e, "Failed to unwrap WSOL (close ATA send failed)")
