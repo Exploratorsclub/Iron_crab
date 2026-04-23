@@ -91,9 +91,9 @@ use ironcrab::metrics::{
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
-    ensure_trade_intents_stream, wallet_snapshot_consumer_config, NatsClient, NatsConfig,
-    CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_CONTROL_REQUESTS, TOPIC_CONTROL_RESPONSES,
-    TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
+    ensure_trade_intents_stream, wallet_snapshot_consumer_config, wallet_snapshot_subject,
+    NatsClient, NatsConfig, CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_CONTROL_REQUESTS,
+    TOPIC_CONTROL_RESPONSES, TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
     TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS, TRADE_INTENTS_STREAM_NAME,
     WALLET_SNAPSHOT_STREAM_NAME,
 };
@@ -4251,16 +4251,62 @@ impl ExecutionContext {
         tokio::time::sleep(Duration::from_secs(15)).await;
         #[cfg(unix)]
         maybe_ping_watchdog();
-        if let Err(e) = Self::cleanup_wallet_after_liquidation(ctx.as_ref(), owner).await {
+        if let Err(e) =
+            Self::cleanup_wallet_after_liquidation(ctx.as_ref(), owner, &ctx.run_id).await
+        {
             warn!(error = %e, "Liquidation cleanup failed (best-effort)");
         }
 
         info!("Liquidation job completed");
     }
 
+    /// After WSOL ATA close (unwrap), push authoritative `WSOL=0` to JetStream and LockManager
+    /// so dashboard/metrics do not retain the last Geyser balance. Cold path only (RPC + cleanup).
+    async fn publish_wsol_zero_snapshot_after_ata_close(ctx: &ExecutionContext, run_id: &str) {
+        let Some(ref nats) = ctx.nats else {
+            return;
+        };
+        let Some(wallet) = ctx.wallet_pubkey else {
+            return;
+        };
+        let wallet_str = wallet.to_string();
+        let event = MarketEvent::new(
+            "execution-engine",
+            BUILD_VERSION,
+            run_id,
+            format!("wsol_ata_close_{}", Uuid::new_v4()),
+            "wsol_ata_close",
+            None,
+            MarketEventKind::WalletBalanceSnapshot {
+                mint: WSOL_MINT.to_string(),
+                balance_raw: 0,
+                decimals: 9,
+                token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            },
+        );
+        let subject = wallet_snapshot_subject(&wallet_str, WSOL_MINT);
+        match nats.jetstream_publish(&subject, &event).await {
+            Ok(true) => {
+                info!(wallet = %wallet_str, "Published WSOL=0 WalletBalanceSnapshot after WSOL ATA close");
+            }
+            Ok(false) => {
+                warn!(wallet = %wallet_str, "WSOL=0 snapshot publish dropped (no NATS client or timeout)");
+            }
+            Err(e) => {
+                warn!(error = %e, wallet = %wallet_str, "Failed to publish WSOL=0 snapshot after WSOL ATA close");
+            }
+        }
+        ctx.lock_manager.update_wsol_only(0);
+        if let Some(ref tx) = ctx.wsol_balance_tx {
+            let sol = ctx.lock_manager.total_native_sol();
+            let _ = tx.try_send((sol, Some(0u64)));
+        }
+    }
+
     async fn cleanup_wallet_after_liquidation(
         ctx: &ExecutionContext,
         wallet: Pubkey,
+        run_id: &str,
     ) -> Result<()> {
         let token_program_id = Pubkey::new_from_array(spl_token::id().to_bytes());
         let token_2022_program_id = Pubkey::new_from_array(spl_token_2022::id().to_bytes());
@@ -4316,7 +4362,8 @@ impl ExecutionContext {
                         .await
                         {
                             Ok(sig) => {
-                                info!(wallet = %wallet, wsol_ata = %wsol_ata, signature = %sig, "Unwrapped WSOL (closed ATA)")
+                                info!(wallet = %wallet, wsol_ata = %wsol_ata, signature = %sig, "Unwrapped WSOL (closed ATA)");
+                                Self::publish_wsol_zero_snapshot_after_ata_close(ctx, run_id).await;
                             }
                             Err(e) => {
                                 warn!(wallet = %wallet, wsol_ata = %wsol_ata, error = %e, "Failed to unwrap WSOL (close ATA send failed)")
