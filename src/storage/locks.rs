@@ -962,4 +962,106 @@ mod tests {
         assert!(!tracker.should_block_preemption("victim", "aggressor"));
         assert_eq!(tracker.get_preemption_count("victim"), 0);
     }
+
+    // ========================================================================
+    // Scope 56: amount-scoped capital — parallel TXs, no global mint serializing
+    // ========================================================================
+
+    #[test]
+    fn test_parallel_buys_same_quote_mint_do_not_exceed_combined_reservation() {
+        // Two BUYs each need part of the same SOL budget — both succeed if enough free capital.
+        let m = LockManager::new(1_000_000_000);
+        let h1 = LockHolder::new("buy-a");
+        let h2 = LockHolder::new("buy-b");
+        assert!(matches!(
+            m.try_lock_capital(h1, 400_000_000, HashMap::new()),
+            LockResult::Acquired
+        ));
+        assert!(matches!(
+            m.try_lock_capital(h2, 400_000_000, HashMap::new()),
+            LockResult::Acquired
+        ));
+        assert_eq!(m.available_sol(), 200_000_000);
+        m.release_locks("buy-a");
+        m.release_locks("buy-b");
+        assert_eq!(m.available_sol(), 1_000_000_000);
+    }
+
+    #[test]
+    fn test_overlapping_buys_reject_when_sum_exceeds_available() {
+        let m = LockManager::new(500_000_000);
+        let h1 = LockHolder::new("buy-1");
+        let h2 = LockHolder::new("buy-2");
+        assert!(matches!(
+            m.try_lock_capital(h1, 300_000_000, HashMap::new()),
+            LockResult::Acquired
+        ));
+        let r = m.try_lock_capital(h2, 300_000_000, HashMap::new());
+        assert!(matches!(r, LockResult::InsufficientCapital { .. }));
+        m.release_locks("buy-1");
+    }
+
+    #[test]
+    fn test_sell_does_not_block_sell_different_mints_parallel() {
+        // Different token mints: both can lock their respective balances.
+        let m = LockManager::new(0);
+        let mut t = HashMap::new();
+        t.insert("TokenMintA".to_string(), 1_000_000u64);
+        t.insert("TokenMintB".to_string(), 1_000_000u64);
+        m.update_balances(0, t);
+
+        let mut a = HashMap::new();
+        a.insert("TokenMintA".to_string(), 400_000u64);
+        let mut b = HashMap::new();
+        b.insert("TokenMintB".to_string(), 400_000u64);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("sell-a"), 0, a),
+            LockResult::Acquired
+        ));
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("sell-b"), 0, b),
+            LockResult::Acquired
+        ));
+        m.release_locks("sell-a");
+        m.release_locks("sell-b");
+    }
+
+    #[test]
+    fn test_sell_reservations_same_mint_reject_on_insufficient() {
+        let m = LockManager::new(0);
+        m.update_balances(0, HashMap::from([("BaseMintX".to_string(), 1_000_000u64)]));
+
+        let mut t1 = HashMap::new();
+        t1.insert("BaseMintX".to_string(), 600_000u64);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("s1"), 0, t1),
+            LockResult::Acquired
+        ));
+
+        let mut t2 = HashMap::new();
+        t2.insert("BaseMintX".to_string(), 500_000u64);
+        let r = m.try_lock_capital(LockHolder::new("s2"), 0, t2);
+        assert!(matches!(r, LockResult::InsufficientCapital { .. }));
+        m.release_locks("s1");
+    }
+
+    /// Output-side mints are not in `tokens: HashMap` for SELL — this documents
+    /// that WSOL/quote received is not a second global reservation on the sold mint.
+    #[test]
+    fn test_sell_locks_only_input_mint_not_wsol_out() {
+        let m = LockManager::new(0);
+        m.update_balances(0, HashMap::from([("TOKEN_BASE".to_string(), 2_000_000u64)]));
+
+        let mut sell = HashMap::new();
+        sell.insert("TOKEN_BASE".to_string(), 1_000_000u64);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("sell-1"), 0, sell),
+            LockResult::Acquired
+        ));
+        // WSOL would only appear as a separate key if we also reserved output (we do not).
+        assert_eq!(
+            m.available_token_balance("So11111111111111111111111111111111111111112"),
+            0
+        );
+    }
 }

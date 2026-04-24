@@ -8478,34 +8478,12 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         }
     }
 
-    for mint in [&intent.resources.input_mint, &intent.resources.output_mint] {
-        if mint.is_empty() {
-            continue;
-        }
-        match ctx
-            .lock_manager
-            .try_lock_resource(holder.clone(), mint, ResourceType::Mint)
-        {
-            LockResult::Acquired | LockResult::AcquiredByPreemption { .. } => {
-                locked_resources += 1;
-            }
-            LockResult::Conflict { holder: existing } => {
-                let reason = RejectReason::LockResourceConflict;
-                REJECT_RESOURCE_LOCK.fetch_add(1, Ordering::Relaxed);
-                checks.push(CheckResult {
-                    check_name: "resource_lock".to_string(),
-                    passed: false,
-                    reason_code: Some(reason.to_string()),
-                    details: Some(format!("mint locked by {}", existing.intent_id)),
-                });
-                ctx.lock_manager.release_locks(&intent.intent_id);
-                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
-            }
-            LockResult::InsufficientCapital { .. } => {
-                // Not applicable for resource locks
-            }
-        }
-    }
+    // No global per-mint resource locks. Amount-scoped `try_lock_capital` below
+    // is the canonical protection for consumed wallet balances (BUY: SOL/WSOL
+    // spend, SELL: input token). Locking both `input_mint` and `output_mint` as
+    // `ResourceType::Mint` serialized unrelated intents (e.g. in-flight BUY
+    // vs STOP_LOSS SELL) whenever they shared a route mint such as WSOL, even
+    // when the second leg only *receives* that mint.
 
     checks.push(CheckResult {
         check_name: "resource_locks".to_string(),
