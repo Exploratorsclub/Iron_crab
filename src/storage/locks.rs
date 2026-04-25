@@ -779,7 +779,24 @@ impl LockManager {
 
     /// Release all locks for an intent
     pub fn release_locks(&self, intent_id: &str) {
-        // Release capital lock. Same `available_*` order as `try_lock_capital`.
+        self.release_capital_lock_restore_tokens(intent_id, true);
+        self.release_resource_locks_for_intent(intent_id);
+    }
+
+    /// Release all locks after an **on-chain confirmed** SELL: restore SOL/WSOL from the
+    /// capital lock as in [`Self::release_locks`], but do **not** return locked *input*
+    /// token amounts to [`Self::available_tokens`]. After a successful SELL those tokens
+    /// are no longer held; [`Self::set_available_token_balance`] to zero and this path
+    /// must not resurrect a ghost `open_positions` count (Invariant A.28, KNOWN_BUG #5).
+    pub fn release_locks_after_confirmed_sell(&self, intent_id: &str) {
+        self.release_capital_lock_restore_tokens(intent_id, false);
+        self.release_resource_locks_for_intent(intent_id);
+    }
+
+    /// Release the capital lock for `intent_id`. If `restore_tokens` is true, return locked
+    /// token amounts to `available_tokens` (failure / rejection paths). If false, only
+    /// release lamport reservations (e.g. confirmed SELL: tokens are already sold).
+    fn release_capital_lock_restore_tokens(&self, intent_id: &str, restore_tokens: bool) {
         if let Some(lock) = self.capital_locks.write().remove(intent_id) {
             let mut available_sol = self.available_sol.write();
             let mut available_wsol = self.available_wsol.write();
@@ -789,13 +806,16 @@ impl LockManager {
             } else {
                 *available_sol += lock.sol_lamports;
             }
-            for (mint, amount) in lock.tokens {
-                *available_tokens.entry(mint).or_insert(0) += amount;
+            if restore_tokens {
+                for (mint, amount) in lock.tokens {
+                    *available_tokens.entry(mint).or_insert(0) += amount;
+                }
             }
-            debug!(intent_id, "Capital lock released");
+            debug!(intent_id, restore_tokens, "Capital lock released");
         }
+    }
 
-        // Release resource locks
+    fn release_resource_locks_for_intent(&self, intent_id: &str) {
         let mut resource_locks = self.resource_locks.write();
         let to_remove: Vec<_> = resource_locks
             .iter()
@@ -1463,5 +1483,69 @@ mod tests {
             m.available_token_balance("So11111111111111111111111111111111111111112"),
             0
         );
+    }
+
+    // --- Scope 47: confirmed SELL must not resurrect sold token via lock release ---
+
+    #[test]
+    fn test_confirmed_sell_release_does_not_restore_sold_token_to_available() {
+        const M: &str = "GhostMint";
+        let m = LockManager::new(0);
+        m.update_balances(0, HashMap::from([(M.to_string(), 1_000_000u64)]));
+
+        let mut sell = HashMap::new();
+        sell.insert(M.to_string(), 1_000_000u64);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("sell-confirmed"), 0, sell),
+            LockResult::Acquired
+        ));
+
+        m.set_available_token_balance(M.to_string(), 0);
+        assert_eq!(m.available_token_balance(M), 0);
+        assert_eq!(m.count_non_zero_token_balances(), 0);
+
+        m.release_locks_after_confirmed_sell("sell-confirmed");
+
+        assert_eq!(
+            m.available_token_balance(M),
+            0,
+            "must not re-add sold token from released capital lock"
+        );
+        assert_eq!(m.count_non_zero_token_balances(), 0);
+    }
+
+    #[test]
+    fn test_failed_sell_release_restores_locked_tokens() {
+        const M: &str = "FailedSellMint";
+        let m = LockManager::new(0);
+        m.update_balances(0, HashMap::from([(M.to_string(), 1_000_000u64)]));
+
+        let mut sell = HashMap::new();
+        sell.insert(M.to_string(), 800_000u64);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("sell-failed"), 0, sell),
+            LockResult::Acquired
+        ));
+        assert_eq!(m.available_token_balance(M), 200_000);
+
+        m.release_locks("sell-failed");
+
+        assert_eq!(m.available_token_balance(M), 1_000_000);
+        assert_eq!(m.count_non_zero_token_balances(), 1);
+    }
+
+    #[test]
+    fn test_confirmed_sell_release_still_restores_wsol_buy_reservation() {
+        let m = LockManager::new(10_000_000_000);
+        m.update_wallet_balances(5_000_000_000, Some(1_000_000_000));
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("buy-inflight"), 300_000_000, HashMap::new()),
+            LockResult::Acquired
+        ));
+        assert_eq!(m.available_wsol(), 700_000_000);
+
+        m.release_locks_after_confirmed_sell("buy-inflight");
+
+        assert_eq!(m.available_wsol(), 1_000_000_000);
     }
 }
