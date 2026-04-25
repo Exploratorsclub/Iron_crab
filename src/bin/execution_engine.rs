@@ -6494,7 +6494,7 @@ async fn main() -> Result<()> {
             if let Some(ref tx) = ctx.wsol_balance_tx {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 let sol = ctx.lock_manager.total_native_sol();
-                let wsol = ctx.lock_manager.available_wsol();
+                let wsol = ctx.lock_manager.wsol_balance();
                 if let Err(e) = tx.send((sol, Some(wsol))).await {
                     warn!(error = %e, "Failed to send bootstrap balance to WsolManager");
                 } else {
@@ -7419,7 +7419,7 @@ async fn main() -> Result<()> {
                             // Trigger WsolManager so it runs check_and_act immediately (can wrap now).
                             if let Some(ref tx) = ctx.wsol_balance_tx {
                                 let sol = ctx.lock_manager.total_native_sol();
-                                let wsol = ctx.lock_manager.available_wsol();
+                                let wsol = ctx.lock_manager.wsol_balance();
                                 if let Err(e) = tx.try_send((sol, Some(wsol))) {
                                     warn!(error = %e, "Failed to send balance to WsolManager after kill switch reset");
                                 } else {
