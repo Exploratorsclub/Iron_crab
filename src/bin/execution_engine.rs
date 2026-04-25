@@ -8492,7 +8492,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         details: Some(format!("locked={}", locked_resources)),
     });
 
-    // === Check 5: Capital lock (BUY: SOL, SELL: tokens) ===
+    // === Check 5: Capital lock (BUY: trading WSOL after first WSOL snapshot, else native SOL; SELL: input tokens) ===
     let lock_result = if intent.side == TradeSide::Buy {
         ctx.lock_manager.try_lock_capital(
             holder,
@@ -8515,7 +8515,17 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 passed: true,
                 reason_code: None,
                 details: Some(if intent.side == TradeSide::Buy {
-                    "sol".to_string()
+                    if ctx.lock_manager.is_wsol_trading_capital_tracked() {
+                        format!(
+                            "buy:reserve_lamports_from_wsol_ata={}",
+                            intent.required_capital.raw
+                        )
+                    } else {
+                        format!(
+                            "buy:reserve_lamports_from_native_sol_fallback={}",
+                            intent.required_capital.raw
+                        )
+                    }
                 } else {
                     format!("token:{}", intent.resources.input_mint)
                 }),
