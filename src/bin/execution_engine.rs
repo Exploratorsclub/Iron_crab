@@ -6494,7 +6494,7 @@ async fn main() -> Result<()> {
             if let Some(ref tx) = ctx.wsol_balance_tx {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 let sol = ctx.lock_manager.total_native_sol();
-                let wsol = ctx.lock_manager.available_wsol();
+                let wsol = ctx.lock_manager.wsol_balance();
                 if let Err(e) = tx.send((sol, Some(wsol))).await {
                     warn!(error = %e, "Failed to send bootstrap balance to WsolManager");
                 } else {
@@ -7419,7 +7419,7 @@ async fn main() -> Result<()> {
                             // Trigger WsolManager so it runs check_and_act immediately (can wrap now).
                             if let Some(ref tx) = ctx.wsol_balance_tx {
                                 let sol = ctx.lock_manager.total_native_sol();
-                                let wsol = ctx.lock_manager.available_wsol();
+                                let wsol = ctx.lock_manager.wsol_balance();
                                 if let Err(e) = tx.try_send((sol, Some(wsol))) {
                                     warn!(error = %e, "Failed to send balance to WsolManager after kill switch reset");
                                 } else {
@@ -8478,34 +8478,12 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         }
     }
 
-    for mint in [&intent.resources.input_mint, &intent.resources.output_mint] {
-        if mint.is_empty() {
-            continue;
-        }
-        match ctx
-            .lock_manager
-            .try_lock_resource(holder.clone(), mint, ResourceType::Mint)
-        {
-            LockResult::Acquired | LockResult::AcquiredByPreemption { .. } => {
-                locked_resources += 1;
-            }
-            LockResult::Conflict { holder: existing } => {
-                let reason = RejectReason::LockResourceConflict;
-                REJECT_RESOURCE_LOCK.fetch_add(1, Ordering::Relaxed);
-                checks.push(CheckResult {
-                    check_name: "resource_lock".to_string(),
-                    passed: false,
-                    reason_code: Some(reason.to_string()),
-                    details: Some(format!("mint locked by {}", existing.intent_id)),
-                });
-                ctx.lock_manager.release_locks(&intent.intent_id);
-                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
-            }
-            LockResult::InsufficientCapital { .. } => {
-                // Not applicable for resource locks
-            }
-        }
-    }
+    // No global per-mint resource locks. Amount-scoped `try_lock_capital` below
+    // is the canonical protection for consumed wallet balances (BUY: SOL/WSOL
+    // spend, SELL: input token). Locking both `input_mint` and `output_mint` as
+    // `ResourceType::Mint` serialized unrelated intents (e.g. in-flight BUY
+    // vs STOP_LOSS SELL) whenever they shared a route mint such as WSOL, even
+    // when the second leg only *receives* that mint.
 
     checks.push(CheckResult {
         check_name: "resource_locks".to_string(),
@@ -8514,7 +8492,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         details: Some(format!("locked={}", locked_resources)),
     });
 
-    // === Check 5: Capital lock (BUY: SOL, SELL: tokens) ===
+    // === Check 5: Capital lock (BUY: trading WSOL after first WSOL snapshot, else native SOL; SELL: input tokens) ===
     let lock_result = if intent.side == TradeSide::Buy {
         ctx.lock_manager.try_lock_capital(
             holder,
@@ -8537,7 +8515,21 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 passed: true,
                 reason_code: None,
                 details: Some(if intent.side == TradeSide::Buy {
-                    "sol".to_string()
+                    if ctx
+                        .lock_manager
+                        .capital_lock_reserves_trading_wsol(&intent.intent_id)
+                        .unwrap_or(false)
+                    {
+                        format!(
+                            "buy:reserve_lamports_from_wsol_ata={}",
+                            intent.required_capital.raw
+                        )
+                    } else {
+                        format!(
+                            "buy:reserve_lamports_from_native_sol_fallback={}",
+                            intent.required_capital.raw
+                        )
+                    }
                 } else {
                     format!("token:{}", intent.resources.input_mint)
                 }),
