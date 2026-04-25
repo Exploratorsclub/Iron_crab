@@ -305,6 +305,20 @@ pub struct FairnessStats {
 }
 
 /// Global lock manager for the execution engine
+///
+/// # Lock order (avoids lock inversion / deadlock)
+/// Any path that must hold **more than one** of the balance maps or `capital_locks` at
+/// the same time uses this **strict total order** (acquire; release in reverse / drop):
+///
+/// 1. `capital_locks`
+/// 2. `available_sol`
+/// 3. `available_wsol`
+/// 4. `available_tokens`
+///
+/// `locked_native_sol_lamports` / `locked_wsol_trading_lamports` use only
+/// `capital_locks` **read** — never call them while already holding
+/// an `available_*` **write** lock (a previous bug: RHS of `*available_sol = …`
+/// with `saturating_sub(self.locked_*())`).
 pub struct LockManager {
     /// Available native SOL capital (not locked) - used for gas fees
     available_sol: RwLock<u64>,
@@ -368,8 +382,8 @@ impl LockManager {
 
     /// Update available balances (call after balance refresh)
     pub fn update_balances(&self, sol_lamports: u64, tokens: HashMap<String, u64>) {
-        *self.available_sol.write() =
-            sol_lamports.saturating_sub(self.locked_native_sol_lamports());
+        let sub_native = self.locked_native_sol_lamports();
+        *self.available_sol.write() = sol_lamports.saturating_sub(sub_native);
         *self.available_tokens.write() = tokens;
     }
 
@@ -448,10 +462,11 @@ impl LockManager {
     /// The dashboard "Available WSOL" metric should show WSOL, as that's what
     /// is actually used for BUY trades (no in-TX wrapping).
     pub fn update_wallet_balances(&self, sol_lamports: u64, wsol_lamports: Option<u64>) {
-        *self.available_sol.write() =
-            sol_lamports.saturating_sub(self.locked_native_sol_lamports());
+        let sub_native = self.locked_native_sol_lamports();
+        *self.available_sol.write() = sol_lamports.saturating_sub(sub_native);
         if let Some(wsol) = wsol_lamports {
-            *self.available_wsol.write() = wsol.saturating_sub(self.locked_wsol_trading_lamports());
+            let sub_wsol = self.locked_wsol_trading_lamports();
+            *self.available_wsol.write() = wsol.saturating_sub(sub_wsol);
             // Mark WSOL as initialized once we've seen it
             self.wsol_initialized
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -469,15 +484,15 @@ impl LockManager {
     /// Subtracts active capital locks so that total_native_sol() = on-chain value
     /// (avoids double-counting: on-chain already includes locked amounts).
     pub fn update_native_sol_only(&self, sol_lamports: u64) {
-        *self.available_sol.write() =
-            sol_lamports.saturating_sub(self.locked_native_sol_lamports());
+        let sub = self.locked_native_sol_lamports();
+        *self.available_sol.write() = sol_lamports.saturating_sub(sub);
     }
 
     /// Update only WSOL balance (from Geyser WSOL event).
     /// Does NOT touch native SOL — each event handler only updates its own value.
     pub fn update_wsol_only(&self, wsol_lamports: u64) {
-        *self.available_wsol.write() =
-            wsol_lamports.saturating_sub(self.locked_wsol_trading_lamports());
+        let sub = self.locked_wsol_trading_lamports();
+        *self.available_wsol.write() = wsol_lamports.saturating_sub(sub);
         self.wsol_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -556,10 +571,12 @@ impl LockManager {
                 .wsol_initialized
                 .load(std::sync::atomic::Ordering::Relaxed);
 
+        // Lock order: `capital_locks` → `available_sol` → `available_wsol` → `available_tokens`
+        // (see struct doc; matches `release_locks` / `cleanup_expired`).
+        let mut locks = self.capital_locks.write();
         let mut available_sol = self.available_sol.write();
         let mut available_wsol = self.available_wsol.write();
         let mut available_tokens = self.available_tokens.write();
-        let mut locks = self.capital_locks.write();
 
         // Check if already locked by this intent
         if locks.contains_key(&holder.intent_id) {
@@ -715,14 +732,16 @@ impl LockManager {
 
     /// Release all locks for an intent
     pub fn release_locks(&self, intent_id: &str) {
-        // Release capital lock
+        // Release capital lock. Same `available_*` order as `try_lock_capital`.
         if let Some(lock) = self.capital_locks.write().remove(intent_id) {
-            if lock.reserves_trading_wsol {
-                *self.available_wsol.write() += lock.sol_lamports;
-            } else {
-                *self.available_sol.write() += lock.sol_lamports;
-            }
+            let mut available_sol = self.available_sol.write();
+            let mut available_wsol = self.available_wsol.write();
             let mut available_tokens = self.available_tokens.write();
+            if lock.reserves_trading_wsol {
+                *available_wsol += lock.sol_lamports;
+            } else {
+                *available_sol += lock.sol_lamports;
+            }
             for (mint, amount) in lock.tokens {
                 *available_tokens.entry(mint).or_insert(0) += amount;
             }
@@ -757,12 +776,14 @@ impl LockManager {
 
         for key in expired {
             if let Some(lock) = capital_locks.remove(&key) {
-                if lock.reserves_trading_wsol {
-                    *self.available_wsol.write() += lock.sol_lamports;
-                } else {
-                    *self.available_sol.write() += lock.sol_lamports;
-                }
+                let mut available_sol = self.available_sol.write();
+                let mut available_wsol = self.available_wsol.write();
                 let mut available_tokens = self.available_tokens.write();
+                if lock.reserves_trading_wsol {
+                    *available_wsol += lock.sol_lamports;
+                } else {
+                    *available_sol += lock.sol_lamports;
+                }
                 for (mint, amount) in lock.tokens {
                     *available_tokens.entry(mint).or_insert(0) += amount;
                 }
@@ -868,6 +889,48 @@ impl LockManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn test_concurrent_wsol_update_and_lock_try_no_deadlock() {
+        // Smokes the stable lock order: geyser-style `update_wsol_only` (background)
+        // vs `try_lock_capital`+`release_locks` in parallel. A hang here would be a
+        // regression in cross-thread lock ordering.
+        let m = Arc::new(LockManager::new(10_000_000_000));
+        m.update_wallet_balances(5_000_000_000, Some(1_000_000_000));
+        assert!(matches!(
+            m.try_lock_capital(
+                LockHolder::new("in-flight-buy"),
+                400_000_000,
+                HashMap::new()
+            ),
+            LockResult::Acquired
+        ));
+        let m1 = m.clone();
+        let t1 = thread::spawn(move || {
+            for _ in 0..200 {
+                m1.update_wsol_only(1_000_000_000);
+            }
+        });
+        let m2 = m.clone();
+        let t2 = thread::spawn(move || {
+            for i in 0..200 {
+                let id = format!("p{}", i);
+                let _ = m2.try_lock_capital(
+                    LockHolder::new(&id),
+                    1_000_000, // 0.000001 WSOL, fits in free 600M
+                    HashMap::new(),
+                );
+                m2.release_locks(&id);
+            }
+        });
+        t1.join().expect("t1");
+        t2.join().expect("t2");
+        m.release_locks("in-flight-buy");
+        assert_eq!(m.total_wsol_lamports(), 1_000_000_000);
+    }
 
     #[test]
     fn test_capital_lock_acquire_release() {
