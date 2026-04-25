@@ -478,6 +478,41 @@ impl LockManager {
         self.available_tokens.write().insert(mint, new_total);
     }
 
+    /// Subtract sold raw units from the unlocked balance for `mint` (saturating at zero).
+    ///
+    /// Used after a **partial** confirmed SELL: do not call [`Self::set_available_token_balance`]
+    /// to zero while a capital lock still holds sold tokens — that would double-subtract when
+    /// the lock is released ([`Self::release_locks_after_confirmed_sell`]).
+    pub fn subtract_available_token_balance(&self, mint: String, sold_raw: u64) {
+        let current = self
+            .available_tokens
+            .read()
+            .get(&mint)
+            .copied()
+            .unwrap_or(0);
+        let new_total = current.saturating_sub(sold_raw);
+        self.available_tokens.write().insert(mint, new_total);
+    }
+
+    /// `(available_unlocked, locked_in_capital_lock)` for `mint` on `intent_id`'s capital lock.
+    ///
+    /// For a normal in-flight SELL, `available + locked` is the wallet position size the engine
+    /// believed before lock release.
+    pub fn available_and_locked_tokens_for_intent(
+        &self,
+        intent_id: &str,
+        mint: &str,
+    ) -> (u64, u64) {
+        let locked = self
+            .capital_locks
+            .read()
+            .get(intent_id)
+            .and_then(|l| l.tokens.get(mint).copied())
+            .unwrap_or(0);
+        let available = self.available_token_balance(mint);
+        (available, locked)
+    }
+
     /// Update wallet balances from WalletBalanceUpdate event (SOL + WSOL).
     ///
     /// This is called when market-data publishes balance updates via NATS.
@@ -785,9 +820,10 @@ impl LockManager {
 
     /// Release all locks after an **on-chain confirmed** SELL: restore SOL/WSOL from the
     /// capital lock as in [`Self::release_locks`], but do **not** return locked *input*
-    /// token amounts to [`Self::available_tokens`]. After a successful SELL those tokens
-    /// are no longer held; [`Self::set_available_token_balance`] to zero and this path
-    /// must not resurrect a ghost `open_positions` count (Invariant A.28, KNOWN_BUG #5).
+    /// token amounts to [`Self::available_tokens`]. After a successful full SELL those
+    /// tokens are no longer held — use [`Self::set_available_token_balance`] to zero **or**
+    /// [`Self::subtract_available_token_balance`] for a partial — and this path must not
+    /// resurrect a ghost `open_positions` count (Invariant A.28, KNOWN_BUG #5).
     pub fn release_locks_after_confirmed_sell(&self, intent_id: &str) {
         self.release_capital_lock_restore_tokens(intent_id, false);
         self.release_resource_locks_for_intent(intent_id);
@@ -1547,5 +1583,93 @@ mod tests {
         m.release_locks_after_confirmed_sell("buy-inflight");
 
         assert_eq!(m.available_wsol(), 1_000_000_000);
+    }
+
+    // --- Scope 48: partial confirmed SELL leaves residual balance; full SELL clears ---
+
+    #[test]
+    fn test_partial_confirmed_sell_skip_balance_replace_then_release_keeps_residual() {
+        const M: &str = "ProbeScaleMint";
+        let probe = 25_313_868_645u64;
+        let scale_in = 56_323_355_801u64;
+        let total = probe.saturating_add(scale_in);
+
+        let m = LockManager::new(0);
+        m.update_balances(0, HashMap::from([(M.to_string(), total)]));
+
+        let mut sell = HashMap::new();
+        sell.insert(M.to_string(), probe);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("sell-partial"), 0, sell),
+            LockResult::Acquired
+        ));
+        // In-flight SELL: locked probe is gone from `available_tokens`; residual scale_in remains.
+        assert_eq!(m.available_token_balance(M), scale_in);
+        assert_eq!(m.count_non_zero_token_balances(), 1);
+
+        // Partial confirmed SELL: engine must NOT `set_available_token_balance(..., 0)` here —
+        // balance is already correct until lock release.
+        m.release_locks_after_confirmed_sell("sell-partial");
+
+        assert_eq!(
+            m.available_token_balance(M),
+            scale_in,
+            "must not restore sold probe from lock"
+        );
+        assert_eq!(m.count_non_zero_token_balances(), 1);
+    }
+
+    #[test]
+    fn test_subtract_available_token_balance_saturating() {
+        const M: &str = "SubMint";
+        let m = LockManager::new(0);
+        m.update_balances(0, HashMap::from([(M.to_string(), 500u64)]));
+        m.subtract_available_token_balance(M.to_string(), 200);
+        assert_eq!(m.available_token_balance(M), 300);
+        m.subtract_available_token_balance(M.to_string(), 1_000);
+        assert_eq!(m.available_token_balance(M), 0);
+    }
+
+    #[test]
+    fn test_full_confirmed_sell_zero_then_release_stays_zero() {
+        const M: &str = "FullSellMint";
+        let m = LockManager::new(0);
+        m.update_balances(0, HashMap::from([(M.to_string(), 1_000_000u64)]));
+
+        let mut sell = HashMap::new();
+        sell.insert(M.to_string(), 1_000_000u64);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("sell-full"), 0, sell),
+            LockResult::Acquired
+        ));
+
+        m.set_available_token_balance(M.to_string(), 0);
+        m.release_locks_after_confirmed_sell("sell-full");
+
+        assert_eq!(m.available_token_balance(M), 0);
+        assert_eq!(m.count_non_zero_token_balances(), 0);
+    }
+
+    #[test]
+    fn test_available_and_locked_tokens_for_intent() {
+        const M: &str = "LockViewMint";
+        let m = LockManager::new(0);
+        m.update_balances(0, HashMap::from([(M.to_string(), 100u64)]));
+
+        let mut sell = HashMap::new();
+        sell.insert(M.to_string(), 30u64);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("sell-1"), 0, sell),
+            LockResult::Acquired
+        ));
+
+        assert_eq!(
+            m.available_and_locked_tokens_for_intent("sell-1", M),
+            (70, 30)
+        );
+        assert_eq!(
+            m.available_and_locked_tokens_for_intent("missing", M),
+            (70, 0)
+        );
     }
 }

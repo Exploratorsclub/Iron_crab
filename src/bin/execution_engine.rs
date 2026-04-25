@@ -10006,6 +10006,9 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // Capture fill_out for immediate LockManager update after confirmed BUY.
     // Populated inside the should_emit block when fills are available.
     let mut confirmed_buy_fill_out_raw: Option<u64> = None;
+    // Confirmed SELL: token `fill_in` raw (sold amount), for LockManager + ExecutionResult metadata.
+    let mut confirmed_sell_fill_in_raw: Option<u64> = None;
+    let mut confirmed_sell_fill_status: Option<FillStatus> = None;
 
     if config.send_enabled {
         let status = match decision.outcome {
@@ -10178,6 +10181,11 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                             if let Some(ref fo) = fill_out {
                                 confirmed_buy_fill_out_raw = Some(fo.raw);
                             }
+                        } else if intent.side == TradeSide::Sell {
+                            confirmed_sell_fill_status = Some(fill_status);
+                            if let Some(ref fi) = fill_in {
+                                confirmed_sell_fill_in_raw = Some(fi.raw);
+                            }
                         }
 
                         exec = exec
@@ -10185,6 +10193,60 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                             .with_fill_diagnostics(fill_status, fill_reason);
                         if let Some(delta) = wallet_sol_delta {
                             exec = exec.with_sol_delta(delta);
+                        }
+
+                        // Scope 48: metadata for market-data — only untrack ATA / zero snapshot on full close.
+                        if intent.side == TradeSide::Sell
+                            && matches!(status, ExecutionStatus::Confirmed)
+                        {
+                            let mint_key = intent.resources.input_mint.clone();
+                            let (avail, locked) =
+                                ctx.lock_manager.available_and_locked_tokens_for_intent(
+                                    &intent.intent_id,
+                                    &mint_key,
+                                );
+                            let total_pos = avail.saturating_add(locked);
+                            let sold_raw =
+                                confirmed_sell_fill_in_raw.unwrap_or(intent.required_capital.raw);
+                            let is_liquidation = intent
+                                .metadata
+                                .get("purpose")
+                                .map(|v| v == "liquidation")
+                                .unwrap_or(false)
+                                || intent
+                                    .metadata
+                                    .get("kill_switch")
+                                    .map(|v| v == "true")
+                                    .unwrap_or(false);
+                            let close_ata_requested = intent
+                                .metadata
+                                .get("close_token_ata")
+                                .map(|v| v == "true")
+                                .unwrap_or(false);
+                            let token_account_closed = close_ata_requested
+                                && fill_status == FillStatus::Complete
+                                && confirmed_sell_fill_in_raw.is_some();
+                            let full_close =
+                                is_liquidation || token_account_closed || sold_raw >= total_pos;
+
+                            if token_account_closed {
+                                exec.metadata.insert(
+                                    "sell_token_account_closed".to_string(),
+                                    "true".to_string(),
+                                );
+                            }
+                            exec.metadata.insert(
+                                "sell_position_delta_applied".to_string(),
+                                if full_close {
+                                    "full".to_string()
+                                } else {
+                                    "partial".to_string()
+                                },
+                            );
+                            if full_close && !token_account_closed {
+                                exec.metadata
+                                    .insert("sell_untracked_ata".to_string(), "true".to_string());
+                            }
                         }
                     }
                 }
@@ -10273,17 +10335,59 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 }
             }
             TradeSide::Sell => {
-                // Clear token balance from LockManager after successful SELL.
-                // This prevents stale balances that would pass pre-flight checks
-                // for tokens we no longer hold.
-                let mint_str = &intent.resources.input_mint;
-                ctx.lock_manager
-                    .set_available_token_balance(mint_str.to_string(), 0);
-                info!(
-                    intent_id = %intent.intent_id,
-                    mint = %mint_str,
-                    "LockManager: cleared token balance after confirmed SELL"
-                );
+                // Amount-aware SELL (Scope 48): partial sells must not zero the mint or
+                // double-subtract when `release_locks_after_confirmed_sell` runs (lock still holds sold amount).
+                let mint_str = intent.resources.input_mint.clone();
+                let (avail, locked) = ctx
+                    .lock_manager
+                    .available_and_locked_tokens_for_intent(&intent.intent_id, &mint_str);
+                let total_pos = avail.saturating_add(locked);
+                let sold_raw = confirmed_sell_fill_in_raw.unwrap_or(intent.required_capital.raw);
+                let is_liquidation = intent
+                    .metadata
+                    .get("purpose")
+                    .map(|v| v == "liquidation")
+                    .unwrap_or(false)
+                    || intent
+                        .metadata
+                        .get("kill_switch")
+                        .map(|v| v == "true")
+                        .unwrap_or(false);
+                let close_ata_requested = intent
+                    .metadata
+                    .get("close_token_ata")
+                    .map(|v| v == "true")
+                    .unwrap_or(false);
+                let fill_complete = confirmed_sell_fill_status == Some(FillStatus::Complete);
+                let token_account_closed =
+                    close_ata_requested && fill_complete && confirmed_sell_fill_in_raw.is_some();
+                let full_close = is_liquidation || token_account_closed || sold_raw >= total_pos;
+
+                if full_close {
+                    ctx.lock_manager
+                        .set_available_token_balance(mint_str.clone(), 0);
+                    info!(
+                        intent_id = %intent.intent_id,
+                        mint = %mint_str,
+                        sold_raw,
+                        total_pos,
+                        is_liquidation,
+                        token_account_closed,
+                        "LockManager: cleared token balance after confirmed full SELL"
+                    );
+                } else {
+                    // Partial SELL: `available_tokens` already reflects post-sell unlocked balance
+                    // (total minus lock). Do not `set(..., 0)` or subtract — would double-count vs
+                    // `release_locks_after_confirmed_sell` (Scope 47 + Scope 48).
+                    info!(
+                        intent_id = %intent.intent_id,
+                        mint = %mint_str,
+                        sold_raw,
+                        total_pos,
+                        fill_status = ?confirmed_sell_fill_status,
+                        "LockManager: partial confirmed SELL — leaving token balance unchanged until lock release"
+                    );
+                }
             }
         }
 

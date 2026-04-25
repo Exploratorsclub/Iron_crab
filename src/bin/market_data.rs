@@ -3787,6 +3787,96 @@ async fn handle_wallet_bootstrap_meteora_dlmm_verify_for_mint(
     }
 }
 
+/// True when a confirmed SELL [`ExecutionResult`] indicates the wallet no longer holds the
+/// position for this mint (full exit, liquidation, or token ATA closed). Partial sells must
+/// return false so Geyser keeps tracking the ATA until an on-chain balance update arrives.
+fn execution_result_sell_closes_wallet_position(exec: &ExecutionResult) -> bool {
+    if exec.metadata.get("side").map(|s| s.as_str()) != Some("SELL") {
+        return false;
+    }
+    if exec
+        .metadata
+        .get("sell_token_account_closed")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if exec
+        .metadata
+        .get("sell_untracked_ata")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    matches!(
+        exec.metadata
+            .get("sell_position_delta_applied")
+            .map(|s| s.as_str()),
+        Some("full") | Some("full_no_balance_update")
+    )
+}
+
+#[cfg(test)]
+mod execution_result_sell_close_tests {
+    use super::execution_result_sell_closes_wallet_position;
+    use ironcrab::ipc::{ExecutionResult, ExecutionStatus};
+    use std::collections::HashMap;
+
+    fn base_sell_exec() -> ExecutionResult {
+        let mut exec = ExecutionResult::new_sent(
+            "execution-engine",
+            "test",
+            "run",
+            "ex1".to_string(),
+            "d1".to_string(),
+            "i1".to_string(),
+            "src".to_string(),
+            Some("mint".to_string()),
+            Some("sig".to_string()),
+            None,
+        );
+        exec.status = ExecutionStatus::Confirmed;
+        exec.metadata = HashMap::from([("side".to_string(), "SELL".to_string())]);
+        exec
+    }
+
+    #[test]
+    fn partial_sell_metadata_does_not_close_position() {
+        let mut exec = base_sell_exec();
+        exec.metadata.insert(
+            "sell_position_delta_applied".to_string(),
+            "partial".to_string(),
+        );
+        assert!(!execution_result_sell_closes_wallet_position(&exec));
+    }
+
+    #[test]
+    fn full_sell_metadata_closes_position() {
+        let mut exec = base_sell_exec();
+        exec.metadata.insert(
+            "sell_position_delta_applied".to_string(),
+            "full".to_string(),
+        );
+        exec.metadata
+            .insert("sell_untracked_ata".to_string(), "true".to_string());
+        assert!(execution_result_sell_closes_wallet_position(&exec));
+    }
+
+    #[test]
+    fn token_account_closed_closes_even_if_partial_flag_wrong() {
+        let mut exec = base_sell_exec();
+        exec.metadata.insert(
+            "sell_position_delta_applied".to_string(),
+            "partial".to_string(),
+        );
+        exec.metadata
+            .insert("sell_token_account_closed".to_string(), "true".to_string());
+        assert!(execution_result_sell_closes_wallet_position(&exec));
+    }
+}
+
 /// Publish wallet token balance snapshot for position reconciliation.
 ///
 /// Called at market-data startup to provide momentum-bot with current wallet state.
@@ -6390,8 +6480,9 @@ async fn run_geyser_loop(
                                             "ExecutionResult: tracked wallet ATA/mint"
                                         );
 
-                                        // 5) For confirmed SELLs: write zero-balance snapshot and untrack ATA
-                                        if is_confirmed_sell {
+                                        // 5) Full close / liquidation / ATA-close SELL: zero snapshot + untrack.
+                                        // Partial SELL: keep ATA tracked; residual balance comes from Geyser.
+                                        if is_confirmed_sell && execution_result_sell_closes_wallet_position(&exec) {
                                             let wallet_str = tracked_wallet.wallet.to_string();
                                             let snapshot = MarketEvent::new(
                                                 "market-data",
@@ -6434,6 +6525,13 @@ async fn run_geyser_loop(
                                                     "Untracked ATA after confirmed SELL"
                                                 );
                                             }
+                                        } else if is_confirmed_sell {
+                                            info!(
+                                                mint = %mint_str,
+                                                ata = %ata,
+                                                sell_position_delta = ?exec.metadata.get("sell_position_delta_applied"),
+                                                "Confirmed partial SELL: keeping ATA tracked (no zero snapshot / untrack)"
+                                            );
                                         }
 
                                         if let Err(e) = msg.ack().await {
