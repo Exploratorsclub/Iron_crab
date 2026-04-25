@@ -8515,7 +8515,11 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 passed: true,
                 reason_code: None,
                 details: Some(if intent.side == TradeSide::Buy {
-                    if ctx.lock_manager.is_wsol_trading_capital_tracked() {
+                    if ctx
+                        .lock_manager
+                        .capital_lock_reserves_trading_wsol(&intent.intent_id)
+                        .unwrap_or(false)
+                    {
                         format!(
                             "buy:reserve_lamports_from_wsol_ata={}",
                             intent.required_capital.raw

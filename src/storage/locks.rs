@@ -545,6 +545,18 @@ impl LockManager {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// `reserves_trading_wsol` for the capital lock held by `intent_id`, if present.
+    ///
+    /// Use this (not [`Self::is_wsol_trading_capital_tracked`]) to describe a lock that was
+    /// just acquired: `wsol_initialized` can change between the decision in
+    /// [`Self::try_lock_capital`] and a second read of the atomic.
+    pub fn capital_lock_reserves_trading_wsol(&self, intent_id: &str) -> Option<bool> {
+        self.capital_locks
+            .read()
+            .get(intent_id)
+            .map(|l| l.reserves_trading_wsol)
+    }
+
     /// Get current available (unlocked) token balance for a mint (raw units).
     pub fn available_token_balance(&self, mint: &str) -> u64 {
         self.available_tokens.read().get(mint).copied().unwrap_or(0)
