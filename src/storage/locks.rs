@@ -315,9 +315,11 @@ pub struct FairnessStats {
 /// 3. `available_wsol`
 /// 4. `available_tokens`
 ///
-/// `update_wsol_only` and `set_available_token_balance` are exceptions: they take
-/// `capital_locks` read before `available_*` write so the locked sum and
-/// `available_*` update stay consistent with `try_lock_capital` / `release_locks`.
+/// `update_wsol_only`, `update_native_sol_only`, `update_wallet_balances`, and
+/// the SOL arm of `update_balances` take `capital_locks` read through the
+/// snapshot subtract and corresponding `available_*` write so locked sums and
+/// balances do not desynchronize vs `try_lock_capital` / `release_locks`.
+/// `set_available_token_balance` also uses the same read-before-`available_tokens` pattern.
 ///
 /// `locked_native_sol_lamports` / `locked_wsol_trading_lamports` use only
 /// `capital_locks` **read** — never call them while already holding
@@ -386,8 +388,14 @@ impl LockManager {
 
     /// Update available balances (call after balance refresh)
     pub fn update_balances(&self, sol_lamports: u64, tokens: HashMap<String, u64>) {
-        let sub_native = self.locked_native_sol_lamports();
-        *self.available_sol.write() = sol_lamports.saturating_sub(sub_native);
+        {
+            // SOL: hold one `capital_locks` read across subtract + `available_sol` write.
+            // Token map is a replacement snapshot: keep that write separate (no broad
+            // scope over `available_tokens`).
+            let cl = self.capital_locks.read();
+            let sub_native = Self::sum_locked_native_sol(&cl);
+            *self.available_sol.write() = sol_lamports.saturating_sub(sub_native);
+        }
         *self.available_tokens.write() = tokens;
     }
 
@@ -476,14 +484,19 @@ impl LockManager {
     /// The dashboard "Available WSOL" metric should show WSOL, as that's what
     /// is actually used for BUY trades (no in-TX wrapping).
     pub fn update_wallet_balances(&self, sol_lamports: u64, wsol_lamports: Option<u64>) {
-        let sub_native = self.locked_native_sol_lamports();
-        *self.available_sol.write() = sol_lamports.saturating_sub(sub_native);
-        if let Some(wsol) = wsol_lamports {
-            let sub_wsol = self.locked_wsol_trading_lamports();
-            *self.available_wsol.write() = wsol.saturating_sub(sub_wsol);
-            // Mark WSOL as initialized once we've seen it
-            self.wsol_initialized
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+        {
+            // Single snapshot: native + (optional) WSOL locked sums match one `available_sol` /
+            // `available_wsol` pair vs concurrent lock/release.
+            let cl = self.capital_locks.read();
+            let sub_native = Self::sum_locked_native_sol(&cl);
+            *self.available_sol.write() = sol_lamports.saturating_sub(sub_native);
+            if let Some(wsol) = wsol_lamports {
+                let sub_wsol = Self::sum_locked_wsol_trading(&cl);
+                *self.available_wsol.write() = wsol.saturating_sub(sub_wsol);
+                // Mark WSOL as initialized once we've seen it
+                self.wsol_initialized
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         tracing::info!(
             sol = sol_lamports,
@@ -498,7 +511,8 @@ impl LockManager {
     /// Subtracts active capital locks so that total_native_sol() = on-chain value
     /// (avoids double-counting: on-chain already includes locked amounts).
     pub fn update_native_sol_only(&self, sol_lamports: u64) {
-        let sub = self.locked_native_sol_lamports();
+        let cl = self.capital_locks.read();
+        let sub = Self::sum_locked_native_sol(&cl);
         *self.available_sol.write() = sol_lamports.saturating_sub(sub);
     }
 
@@ -948,6 +962,107 @@ mod tests {
         t2.join().expect("t2");
         m.release_locks("in-flight-buy");
         assert_eq!(m.total_wsol_lamports(), 1_000_000_000);
+    }
+
+    #[test]
+    fn test_concurrent_native_sol_update_and_lock_try_consistent_total() {
+        // Same TOCTOU class as WSOL, but on the native-SOL (pre-WSOL) path.
+        let m = Arc::new(LockManager::new(10_000_000_000));
+        assert!(!m.is_wsol_trading_capital_tracked());
+        assert!(matches!(
+            m.try_lock_capital(
+                LockHolder::new("in-flight-buy"),
+                400_000_000,
+                HashMap::new()
+            ),
+            LockResult::Acquired
+        ));
+        let m1 = m.clone();
+        let t1 = thread::spawn(move || {
+            for _ in 0..200 {
+                m1.update_native_sol_only(10_000_000_000);
+            }
+        });
+        let m2 = m.clone();
+        let t2 = thread::spawn(move || {
+            for i in 0..200 {
+                let id = format!("p{}", i);
+                let _ = m2.try_lock_capital(LockHolder::new(&id), 1_000_000, HashMap::new());
+                m2.release_locks(&id);
+            }
+        });
+        t1.join().expect("t1");
+        t2.join().expect("t2");
+        m.release_locks("in-flight-buy");
+        assert_eq!(m.total_native_sol(), 10_000_000_000);
+    }
+
+    #[test]
+    fn test_concurrent_update_wallet_balances_and_lock_try_consistent_totals() {
+        // Full `update_wallet_balances` re-applies both SOL and WSOL from one snapshot.
+        let m = Arc::new(LockManager::new(10_000_000_000));
+        m.update_wallet_balances(5_000_000_000, Some(1_000_000_000));
+        assert!(matches!(
+            m.try_lock_capital(
+                LockHolder::new("in-flight-buy"),
+                400_000_000,
+                HashMap::new()
+            ),
+            LockResult::Acquired
+        ));
+        let m1 = m.clone();
+        let t1 = thread::spawn(move || {
+            for _ in 0..200 {
+                m1.update_wallet_balances(5_000_000_000, Some(1_000_000_000));
+            }
+        });
+        let m2 = m.clone();
+        let t2 = thread::spawn(move || {
+            for i in 0..200 {
+                let id = format!("p{}", i);
+                let _ = m2.try_lock_capital(LockHolder::new(&id), 1_000_000, HashMap::new());
+                m2.release_locks(&id);
+            }
+        });
+        t1.join().expect("t1");
+        t2.join().expect("t2");
+        m.release_locks("in-flight-buy");
+        assert_eq!(m.total_wsol_lamports(), 1_000_000_000);
+        assert_eq!(m.total_native_sol(), 5_000_000_000);
+    }
+
+    #[test]
+    fn test_concurrent_update_balances_sol_and_lock_try_consistent_native_total() {
+        // `update_balances` SOL arm + token map replacement: native total must stay exact.
+        let m = Arc::new(LockManager::new(10_000_000_000));
+        m.update_balances(10_000_000_000, HashMap::new());
+        assert!(!m.is_wsol_trading_capital_tracked());
+        assert!(matches!(
+            m.try_lock_capital(
+                LockHolder::new("in-flight-buy"),
+                400_000_000,
+                HashMap::new()
+            ),
+            LockResult::Acquired
+        ));
+        let m1 = m.clone();
+        let t1 = thread::spawn(move || {
+            for _ in 0..200 {
+                m1.update_balances(10_000_000_000, HashMap::new());
+            }
+        });
+        let m2 = m.clone();
+        let t2 = thread::spawn(move || {
+            for i in 0..200 {
+                let id = format!("p{}", i);
+                let _ = m2.try_lock_capital(LockHolder::new(&id), 1_000_000, HashMap::new());
+                m2.release_locks(&id);
+            }
+        });
+        t1.join().expect("t1");
+        t2.join().expect("t2");
+        m.release_locks("in-flight-buy");
+        assert_eq!(m.total_native_sol(), 10_000_000_000);
     }
 
     #[test]
