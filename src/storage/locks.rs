@@ -319,7 +319,8 @@ pub struct FairnessStats {
 /// the SOL arm of `update_balances` take `capital_locks` read through the
 /// snapshot subtract and corresponding `available_*` write so locked sums and
 /// balances do not desynchronize vs `try_lock_capital` / `release_locks`.
-/// `set_available_token_balance` also uses the same read-before-`available_tokens` pattern.
+/// `set_available_token_balance` holds `capital_locks` read through the per-mint
+/// locked sum and the `available_tokens` insert (1 then 4).
 ///
 /// `locked_native_sol_lamports` / `locked_wsol_trading_lamports` use only
 /// `capital_locks` **read** — never call them while already holding
@@ -412,10 +413,12 @@ impl LockManager {
         // pass the `sell_token_balance` check but still fail at the capital-lock stage.
         //
         // Also, do not overwrite reservations: subtract any active capital locks for
-        // this mint so that available_tokens remains "free-to-lock".
-        let locked_for_mint: u64 = self
-            .capital_locks
-            .read()
+        // this mint so that available_tokens remains "free-to-lock". Hold
+        // `capital_locks` read until `insert` so concurrent `try_lock_capital` /
+        // `release_locks` cannot desynchronize the per-mint sum and the write
+        // (TOCTOU vs SOL/WSOL update paths).
+        let cl = self.capital_locks.read();
+        let locked_for_mint: u64 = cl
             .values()
             .map(|l| l.tokens.get(&mint).copied().unwrap_or(0))
             .sum();
@@ -1305,6 +1308,70 @@ mod tests {
         let r = m.try_lock_capital(LockHolder::new("s2"), 0, t2);
         assert!(matches!(r, LockResult::InsufficientCapital { .. }));
         m.release_locks("s1");
+    }
+
+    #[test]
+    fn test_set_available_token_balance_subtracts_in_flight_sell_lock() {
+        // Same accounting class as `update_wsol_only`: on-chain amount minus active
+        // token capital locks for this mint must stay consistent for `try_lock_capital`.
+        const M: &str = "BaseMintY";
+        let m = LockManager::new(0);
+        m.update_balances(0, HashMap::from([(M.to_string(), 1_000_000u64)]));
+
+        let mut sell = HashMap::new();
+        sell.insert(M.to_string(), 600_000u64);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("sell-in-flight"), 0, sell),
+            LockResult::Acquired
+        ));
+        m.set_available_token_balance(M.to_string(), 1_000_000);
+        assert_eq!(m.available_token_balance(M), 400_000u64);
+        m.release_locks("sell-in-flight");
+        m.set_available_token_balance(M.to_string(), 1_000_000);
+        assert_eq!(m.available_token_balance(M), 1_000_000u64);
+    }
+
+    #[test]
+    fn test_concurrent_set_available_token_balance_and_sell_lock_try() {
+        const M: &str = "BaseMintZ";
+        let m = Arc::new(LockManager::new(0));
+        m.update_balances(0, HashMap::from([(M.to_string(), 1_000_000u64)]));
+
+        let mut sell = HashMap::new();
+        sell.insert(M.to_string(), 600_000u64);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("sell-hold"), 0, sell),
+            LockResult::Acquired
+        ));
+
+        let m1 = m.clone();
+        let t1 = thread::spawn(move || {
+            for _ in 0..200 {
+                m1.set_available_token_balance(M.to_string(), 1_000_000);
+            }
+        });
+        let m2 = m.clone();
+        let t2 = thread::spawn(move || {
+            for i in 0..200 {
+                let id = format!("p{}", i);
+                let mut tiny = HashMap::new();
+                tiny.insert(M.to_string(), 1_000u64);
+                let _ = m2.try_lock_capital(LockHolder::new(&id), 0, tiny);
+                m2.release_locks(&id);
+            }
+        });
+        t1.join().expect("t1");
+        t2.join().expect("t2");
+
+        m.set_available_token_balance(M.to_string(), 1_000_000);
+        assert_eq!(
+            m.available_token_balance(M),
+            400_000,
+            "600k SELL still reserved: free must stay 400k after concurrent refresh + tiny locks"
+        );
+        m.release_locks("sell-hold");
+        m.set_available_token_balance(M.to_string(), 1_000_000);
+        assert_eq!(m.available_token_balance(M), 1_000_000u64);
     }
 
     // --- BUY: WSOL-trading path vs native-SOL fallback ---
