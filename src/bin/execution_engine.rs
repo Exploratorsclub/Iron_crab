@@ -10286,7 +10286,6 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 );
             }
         }
-        OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
 
         // Best-effort recent trade record for Grafana (/trades via Infinity datasource).
         // NOTE: If fill accounting is available, use it; otherwise fall back to placeholders.
@@ -10350,7 +10349,20 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     }
 
     // Release lock (in production: would release after confirmation)
-    ctx.lock_manager.release_locks(&intent.intent_id);
+    if matches!(decision.outcome, DecisionOutcome::Confirmed) && intent.side == TradeSide::Sell {
+        // Do not re-add the sold input tokens to `available_tokens` (ghost open_positions).
+        ctx.lock_manager
+            .release_locks_after_confirmed_sell(&intent.intent_id);
+    } else {
+        ctx.lock_manager.release_locks(&intent.intent_id);
+    }
+
+    if matches!(
+        decision.outcome,
+        DecisionOutcome::Confirmed | DecisionOutcome::FailedConfirmed
+    ) {
+        OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
+    }
 
     info!(
         intent_id = %intent.intent_id,
