@@ -315,6 +315,10 @@ pub struct FairnessStats {
 /// 3. `available_wsol`
 /// 4. `available_tokens`
 ///
+/// `update_wsol_only` and `set_available_token_balance` are exceptions: they take
+/// `capital_locks` read before `available_*` write so the locked sum and
+/// `available_*` update stay consistent with `try_lock_capital` / `release_locks`.
+///
 /// `locked_native_sol_lamports` / `locked_wsol_trading_lamports` use only
 /// `capital_locks` **read** — never call them while already holding
 /// an `available_*` **write** lock (a previous bug: RHS of `*available_sol = …`
@@ -415,24 +419,34 @@ impl LockManager {
             .insert(mint, effective_available);
     }
 
-    /// Sum of native-SOL (non-WSOL) lamports currently held in capital locks.
-    fn locked_native_sol_lamports(&self) -> u64 {
-        self.capital_locks
-            .read()
+    /// Sum of native-SOL (non-WSOL) lamports in `capital_locks` (BUY path uses map snapshot).
+    fn sum_locked_native_sol(locks: &HashMap<String, CapitalLock>) -> u64 {
+        locks
             .values()
             .filter(|l| !l.reserves_trading_wsol)
             .map(|l| l.sol_lamports)
             .sum()
     }
 
-    /// Sum of WSOL-trading lamports currently held in capital locks (BUY side).
-    fn locked_wsol_trading_lamports(&self) -> u64 {
-        self.capital_locks
-            .read()
+    /// Sum of WSOL-trading lamports in `capital_locks` (BUY side; map snapshot).
+    fn sum_locked_wsol_trading(locks: &HashMap<String, CapitalLock>) -> u64 {
+        locks
             .values()
             .filter(|l| l.reserves_trading_wsol)
             .map(|l| l.sol_lamports)
             .sum()
+    }
+
+    /// Sum of native-SOL (non-WSOL) lamports currently held in capital locks.
+    fn locked_native_sol_lamports(&self) -> u64 {
+        let locks = self.capital_locks.read();
+        Self::sum_locked_native_sol(&locks)
+    }
+
+    /// Sum of WSOL-trading lamports currently held in capital locks (BUY side).
+    fn locked_wsol_trading_lamports(&self) -> u64 {
+        let locks = self.capital_locks.read();
+        Self::sum_locked_wsol_trading(&locks)
     }
 
     /// Add to an existing mint's available token balance (accumulate).
@@ -491,7 +505,11 @@ impl LockManager {
     /// Update only WSOL balance (from Geyser WSOL event).
     /// Does NOT touch native SOL — each event handler only updates its own value.
     pub fn update_wsol_only(&self, wsol_lamports: u64) {
-        let sub = self.locked_wsol_trading_lamports();
+        // Hold `capital_locks` read across the subtract+write to `available_wsol` so
+        // the locked sum and `available_wsol` cannot desynchronize vs concurrent
+        // `try_lock_capital` / `release_locks` (same order as other paths: 1 then 3).
+        let cl = self.capital_locks.read();
+        let sub = Self::sum_locked_wsol_trading(&cl);
         *self.available_wsol.write() = wsol_lamports.saturating_sub(sub);
         self.wsol_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
