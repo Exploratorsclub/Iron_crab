@@ -8158,6 +8158,30 @@ fn create_test_intent(run_id: &str) -> TradeIntent {
     .with_ttl_ms(5000)
 }
 
+/// BUY max-open-positions gate: conservative count vs config limit (A.28 / Scope 49).
+///
+/// `authoritative_current` must come from [`ExecutionContext::get_open_positions`]
+/// (`LockManager::count_non_zero_token_balances`) — in-process only, no wallet scan / RPC.
+/// `metadata_current` is strategy-reported (`current_open_positions`); we take the max of both
+/// so neither stale-low metadata nor optimistic-high metadata alone can bypass the limit.
+fn max_open_positions_buy_gate(
+    metadata_current: usize,
+    authoritative_current: usize,
+    max_open: usize,
+) -> (bool, String) {
+    let effective_current = metadata_current.max(authoritative_current);
+    let passed = effective_current < max_open;
+    let details = format!(
+        "metadata_current={} authoritative_current={} effective_current={} {} max={}",
+        metadata_current,
+        authoritative_current,
+        effective_current,
+        if passed { "<" } else { ">=" },
+        max_open
+    );
+    (passed, details)
+}
+
 /// Process a single TradeIntent through the execution pipeline
 async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<()> {
     ctx.record_intent_received();
@@ -8341,25 +8365,28 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     }
 
     // Check 3c: Max open positions (applies to BUY only; SELL exits should remain possible)
-    // Position count comes from strategy (momentum-bot) via intent metadata.
-    // execution-engine does NOT track positions itself - momentum-bot is Single Source of Truth.
+    // Authoritative count: LockManager non-zero token balances (A.28). Strategy metadata is kept
+    // for observability but must not be the sole enforcement source (Scope 49).
     if intent.side == TradeSide::Buy {
-        let current_positions = intent
+        let metadata_current = intent
             .metadata
             .get("current_open_positions")
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0);
+        let authoritative_current = ctx.get_open_positions();
+        let (passed, details) = max_open_positions_buy_gate(
+            metadata_current,
+            authoritative_current,
+            config.max_open_positions,
+        );
 
-        if current_positions >= config.max_open_positions {
+        if !passed {
             let reason = RejectReason::RiskMaxOpenPositions;
             checks.push(CheckResult {
                 check_name: "max_open_positions".to_string(),
                 passed: false,
                 reason_code: Some(reason.to_string()),
-                details: Some(format!(
-                    "current={} >= max={} (from intent metadata)",
-                    current_positions, config.max_open_positions
-                )),
+                details: Some(details),
             });
             return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
         }
@@ -8367,10 +8394,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             check_name: "max_open_positions".to_string(),
             passed: true,
             reason_code: None,
-            details: Some(format!(
-                "current={} < max={} (from intent metadata)",
-                current_positions, config.max_open_positions
-            )),
+            details: Some(details),
         });
     } else {
         checks.push(CheckResult {
@@ -11388,10 +11412,11 @@ mod execution_engine_tests {
     use super::{
         apply_scope48_confirmed_sell_execution_metadata, is_cold_path_recovery_sell,
         is_pump_amm_structural_sim_error, is_pumpfun_bonding_curve_structural_sim_error,
-        is_regular_momentum_hot_path_sell, pump_amm_hint_pool_cache_usable_for_tx_plan_builder,
-        pump_amm_pool_market_hint_merge, record_pump_amm_hot_path_refresh_after_success,
-        scope48_confirmed_sell_close_decision, select_best_route,
-        try_pump_amm_hot_path_refresh_publish, wait_for_meteora_dlmm_slave_after_recovery,
+        is_regular_momentum_hot_path_sell, max_open_positions_buy_gate,
+        pump_amm_hint_pool_cache_usable_for_tx_plan_builder, pump_amm_pool_market_hint_merge,
+        record_pump_amm_hot_path_refresh_after_success, scope48_confirmed_sell_close_decision,
+        select_best_route, try_pump_amm_hot_path_refresh_publish,
+        wait_for_meteora_dlmm_slave_after_recovery,
         wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder,
         wait_for_pumpfun_bonding_cache_refresh, DiscoveryRequestOutcome,
         PumpAmmHotPathRefreshDecision, RouteCandidate, PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN,
@@ -11411,6 +11436,38 @@ mod execution_engine_tests {
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::time::Instant;
+
+    #[test]
+    fn max_open_positions_gate_rejects_when_lock_manager_exceeds_metadata() {
+        let max_open = 5usize;
+        let (passed, details) = max_open_positions_buy_gate(1, 5, max_open);
+        assert!(!passed);
+        assert!(details.contains("metadata_current=1"));
+        assert!(details.contains("authoritative_current=5"));
+        assert!(details.contains("effective_current=5"));
+        assert!(details.contains("max=5"));
+    }
+
+    #[test]
+    fn max_open_positions_gate_rejects_when_metadata_exceeds_lock_manager() {
+        let max_open = 5usize;
+        let (passed, details) = max_open_positions_buy_gate(5, 1, max_open);
+        assert!(!passed);
+        assert!(details.contains("metadata_current=5"));
+        assert!(details.contains("authoritative_current=1"));
+        assert!(details.contains("effective_current=5"));
+    }
+
+    #[test]
+    fn max_open_positions_gate_passes_when_both_counts_below_max() {
+        let max_open = 5usize;
+        let (passed, details) = max_open_positions_buy_gate(2, 3, max_open);
+        assert!(passed);
+        assert!(details.contains("metadata_current=2"));
+        assert!(details.contains("authoritative_current=3"));
+        assert!(details.contains("effective_current=3"));
+        assert!(details.contains("< max=5"));
+    }
 
     #[test]
     fn pump_amm_structural_sim_error_matches_cold_path_recovery_pattern() {
