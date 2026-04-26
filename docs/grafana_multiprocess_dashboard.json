@@ -2,7 +2,7 @@
   "title": "IronCrab Multi-Process Architecture",
   "description": "Dashboard for the Debuggable-First Multi-Process Architecture",
   "schemaVersion": 39,
-  "version": 6,
+  "version": 7,
   "time": {
     "from": "now-1h",
     "to": "now"
@@ -1916,13 +1916,28 @@
       }
     },
     {
+      "type": "text",
+      "title": "Recent Trades: Zeit-Modus",
+      "gridPos": {
+        "h": 2,
+        "w": 24,
+        "x": 0,
+        "y": 65
+      },
+      "options": {
+        "content": "**Time mode:** Grafana shows dashboard variables in the **top bar**; this JSON model cannot place the `time_mode` control between panels. Use the **Trades: Zeit (Recent Trades)** dropdown at the top to switch Relativ/UTC. The table column arrows **only** control sort order.",
+        "mode": "markdown"
+      },
+      "transparent": true
+    },
+    {
       "type": "table",
       "title": "Recent Trades (Current Run)",
       "gridPos": {
         "h": 12,
         "w": 24,
         "x": 0,
-        "y": 59
+        "y": 67
       },
       "datasource": {
         "type": "yesoreyeram-infinity-datasource",
@@ -2058,7 +2073,7 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 300
+                "value": 110
               },
               {
                 "id": "links",
@@ -2118,7 +2133,7 @@
               },
               {
                 "id": "decimals",
-                "value": 12
+                "value": 9
               }
             ]
           },
@@ -2350,7 +2365,7 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 520
+                "value": 710
               }
             ]
           }
@@ -2368,7 +2383,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 71
+        "y": 79
       },
       "collapsed": false
     },
@@ -2401,7 +2416,7 @@
         "h": 6,
         "w": 12,
         "x": 0,
-        "y": 72
+        "y": 80
       },
       "fieldConfig": {
         "defaults": {
@@ -2422,7 +2437,7 @@
         "h": 3,
         "w": 4,
         "x": 12,
-        "y": 72
+        "y": 80
       },
       "fieldConfig": {
         "defaults": {
@@ -2462,7 +2477,7 @@
         "h": 3,
         "w": 4,
         "x": 16,
-        "y": 72
+        "y": 80
       },
       "fieldConfig": {
         "defaults": {
@@ -2498,7 +2513,7 @@
         "h": 3,
         "w": 4,
         "x": 20,
-        "y": 72
+        "y": 80
       }
     }
   ]
