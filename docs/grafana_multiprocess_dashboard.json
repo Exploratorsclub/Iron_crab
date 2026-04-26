@@ -1942,18 +1942,8 @@
           "root_selector": "",
           "columns": [
             {
-              "selector": "timestamp_ms",
-              "text": "Sort (ms)",
-              "type": "number"
-            },
-            {
               "selector": "time_display",
               "text": "Time",
-              "type": "string"
-            },
-            {
-              "selector": "mint_full",
-              "text": "mint_full",
               "type": "string"
             },
             {
@@ -1962,7 +1952,7 @@
               "type": "string"
             },
             {
-              "selector": "mint",
+              "selector": "mint_full",
               "text": "Token (Mint)",
               "type": "string"
             },
@@ -2010,44 +2000,12 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Sort (ms)"
-            },
-            "properties": [
-              {
-                "id": "custom.hideFrom",
-                "value": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": true
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
               "options": "Time"
             },
             "properties": [
               {
                 "id": "custom.width",
-                "value": 120
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "mint_full"
-            },
-            "properties": [
-              {
-                "id": "custom.hideFrom",
-                "value": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": true
-                }
+                "value": 150
               }
             ]
           },
@@ -2100,14 +2058,14 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 130
+                "value": 300
               },
               {
                 "id": "links",
                 "value": [
                   {
                     "title": "View on Solscan",
-                    "url": "https://solscan.io/token/${__data.fields.mint_full}",
+                    "url": "https://solscan.io/token/${__value.text}",
                     "targetBlank": true
                   }
                 ]
@@ -2392,7 +2350,7 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 500
+                "value": 520
               }
             ]
           }
@@ -2400,12 +2358,7 @@
       },
       "options": {
         "showHeader": true,
-        "sortBy": [
-          {
-            "displayName": "Sort (ms)",
-            "desc": true
-          }
-        ]
+        "sortBy": []
       }
     },
     {
