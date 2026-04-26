@@ -421,9 +421,9 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 
 ### BUG A: Killswitch-Liquidation – Token werden übersprungen
 
-**Problem:** Bei `run_liquidation_job()` gibt es mehrere Pfade wo Token übersprungen werden: `min_out_sol.is_none()`, Creator fehlt im Cache, `pool_accounts_v1_for_base_mint()` gibt `None`.
+**Problem:** Der urspruengliche Hauptfehler war, dass sellbare Tokens wegen stale/missing Cache-State, falscher DEX-Reihenfolge oder fehlender Recovery-Hooks still uebersprungen wurden. Heute existieren weiterhin bewusste Skip-Pfade fuer echte `QuoteUnavailable`-/Discovery-Timeout-/No-Route-Faelle; offen ist damit vor allem noch die Frage nach verbleibender Runtime-Evidenz, nicht mehr der alte Kernfehler in seiner urspruenglichen Form.
 
-**Status:** ✅ TEILWEISE BEHOBEN — Liquidation versucht Multi-Pool zuerst, PumpFun als Fallback. 6005-Retry bei BondingCurveComplete implementiert (2026-02-25). Defensive Logging (2026-03-04): Alle Token-Skip-Pfade loggen jetzt `warn!` mit mint, Grund und balance_raw — inkl. ungültige Mint-Pubkeys und QuoteUnavailable-DecisionRecord.
+**Status:** ✅ WEITGEHEND BEHOBEN / WEITER BEOBACHTEN — Liquidation versucht Multi-Pool zuerst, PumpFun als Fallback. 6005-Retry bei BondingCurveComplete implementiert (2026-02-25). DEX-uebergreifende Request/Reply-Control-Plane fuer Cold Path ist fuer alle aktuell implementierten DEX-Connectoren gemergt. Defensive Logging (2026-03-04): Alle Token-Skip-Pfade loggen jetzt `warn!` mit mint, Grund und balance_raw — inkl. ungueltige Mint-Pubkeys und `QuoteUnavailable`-DecisionRecord. Verbleibender offener Punkt ist damit vor allem Monitoring/Runtime-Evidenz fuer unerwartete Skips, nicht mehr die fehlende Recovery-Architektur selbst.
 
 ### BUG B: `load_pool_from_geyser()` in `raydium.rs` macht RPC
 
