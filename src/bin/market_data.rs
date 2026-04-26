@@ -3823,6 +3823,30 @@ fn execution_result_sell_closes_wallet_position(exec: &ExecutionResult) -> bool 
     )
 }
 
+/// Mixed-deploy / foreign producers may omit Scope 48 fields. Preserve legacy behavior: assume
+/// full close so zero snapshot + untrack still runs for old sell-all tooling, etc.
+/// **Never** backfill `execution-engine` results — that process must emit explicit metadata.
+fn backfill_scope48_metadata_foreign_confirmed_sell(exec: &mut ExecutionResult) {
+    if exec.header.component == "execution-engine" {
+        return;
+    }
+    if exec.status != ExecutionStatus::Confirmed {
+        return;
+    }
+    if exec.metadata.get("side").map(|s| s.as_str()) != Some("SELL") {
+        return;
+    }
+    if exec.metadata.contains_key("sell_position_delta_applied") {
+        return;
+    }
+    exec.metadata.insert(
+        "sell_position_delta_applied".to_string(),
+        "full".to_string(),
+    );
+    exec.metadata
+        .insert("sell_untracked_ata".to_string(), "true".to_string());
+}
+
 #[cfg(test)]
 mod execution_result_sell_close_tests {
     use super::execution_result_sell_closes_wallet_position;
@@ -3885,6 +3909,46 @@ mod execution_result_sell_close_tests {
         exec.metadata
             .insert("sell_token_account_closed".to_string(), "true".to_string());
         assert!(execution_result_sell_closes_wallet_position(&exec));
+    }
+
+    #[test]
+    fn backfill_foreign_confirmed_sell_sets_full_when_scope48_missing() {
+        use super::backfill_scope48_metadata_foreign_confirmed_sell;
+
+        let mut exec = ExecutionResult::new_sent(
+            "legacy-sell-tool",
+            "test",
+            "run",
+            "ex2".to_string(),
+            "d2".to_string(),
+            "i2".to_string(),
+            "src".to_string(),
+            Some("mint".to_string()),
+            Some("sig".to_string()),
+            None,
+        );
+        exec.status = ExecutionStatus::Confirmed;
+        exec.metadata = HashMap::from([("side".to_string(), "SELL".to_string())]);
+        backfill_scope48_metadata_foreign_confirmed_sell(&mut exec);
+        assert_eq!(
+            exec.metadata
+                .get("sell_position_delta_applied")
+                .map(|s| s.as_str()),
+            Some("full")
+        );
+        assert_eq!(
+            exec.metadata.get("sell_untracked_ata").map(|s| s.as_str()),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn backfill_skips_execution_engine_results() {
+        use super::backfill_scope48_metadata_foreign_confirmed_sell;
+
+        let mut exec = base_sell_exec();
+        backfill_scope48_metadata_foreign_confirmed_sell(&mut exec);
+        assert!(!exec.metadata.contains_key("sell_position_delta_applied"));
     }
 }
 
@@ -6323,7 +6387,8 @@ async fn run_geyser_loop(
                             while let Some(msg_result) = messages.next().await {
                                 match msg_result {
                                     Ok(msg) => {
-                                        let exec: ExecutionResult = match serde_json::from_slice(&msg.payload) {
+                                        let mut exec: ExecutionResult =
+                                            match serde_json::from_slice(&msg.payload) {
                                             Ok(e) => e,
                                             Err(e) => {
                                                 debug!(error = %e, "Failed to deserialize ExecutionResult");
@@ -6331,6 +6396,8 @@ async fn run_geyser_loop(
                                                 continue;
                                             }
                                         };
+
+                                        backfill_scope48_metadata_foreign_confirmed_sell(&mut exec);
 
                                         // Dedup on execution_id (fallback: signature)
                                         let dedup_key = if !exec.execution_id.is_empty() {

@@ -436,7 +436,8 @@ fn tx_meta_wallet_token_balance_absent_after_tx(
 /// Scope 48: after a confirmed SELL, whether we treat the position as fully closed for
 /// LockManager / `ExecutionResult` metadata.
 ///
-/// - **Liquidation / kill-switch**: always full-close (conservative).
+/// - **Cold-path recovery** ([`is_cold_path_recovery_sell`]: liquidation, kill-switch, sell-all):
+///   always full-close (conservative).
 /// - **Regular Momentum / other SELLs**: full-close only when sold amount covers the engine's
 ///   pre-release position (`sold_raw >= total_pos`) **or** transaction meta proves the wallet
 ///   no longer holds any balance for the mint (actual ATA close / zero balance).
@@ -451,19 +452,68 @@ struct Scope48ConfirmedSellCloseDecision {
 }
 
 fn scope48_confirmed_sell_close_decision(
-    is_liquidation: bool,
+    is_cold_path_recovery: bool,
     sold_raw: u64,
     total_pos: u64,
     wallet_token_balance_absent_after_tx: bool,
 ) -> Scope48ConfirmedSellCloseDecision {
     let regular_full_close = sold_raw >= total_pos || wallet_token_balance_absent_after_tx;
-    let full_close = is_liquidation || regular_full_close;
+    let full_close = is_cold_path_recovery || regular_full_close;
     let sell_token_account_closed = wallet_token_balance_absent_after_tx;
     let sell_untracked_ata = full_close && !sell_token_account_closed;
     Scope48ConfirmedSellCloseDecision {
         full_close,
         sell_token_account_closed,
         sell_untracked_ata,
+    }
+}
+
+/// Scope 48: always set `sell_position_delta_applied` / optional flags on confirmed SELL
+/// `ExecutionResult`s from this engine, using lock snapshot + intent when tx fills are missing.
+fn apply_scope48_confirmed_sell_execution_metadata(
+    exec: &mut ExecutionResult,
+    lock_manager: &LockManager,
+    intent: &TradeIntent,
+    confirmed_sell_fill_in_raw: Option<u64>,
+    wallet_token_balance_absent_after_tx: bool,
+) {
+    if intent.side != TradeSide::Sell || exec.status != ExecutionStatus::Confirmed {
+        return;
+    }
+    let mint_key = intent.resources.input_mint.clone();
+    let (avail, locked) =
+        lock_manager.available_and_locked_tokens_for_intent(&intent.intent_id, &mint_key);
+    let total_pos = lock_manager
+        .intent_token_position_total_at_lock(&intent.intent_id, &mint_key)
+        .unwrap_or_else(|| avail.saturating_add(locked));
+    let sold_raw = confirmed_sell_fill_in_raw.unwrap_or(intent.required_capital.raw);
+    let is_cold_path_recovery = is_cold_path_recovery_sell(intent);
+    let s48 = scope48_confirmed_sell_close_decision(
+        is_cold_path_recovery,
+        sold_raw,
+        total_pos,
+        wallet_token_balance_absent_after_tx,
+    );
+
+    if s48.sell_token_account_closed {
+        exec.metadata
+            .insert("sell_token_account_closed".to_string(), "true".to_string());
+    } else {
+        exec.metadata.remove("sell_token_account_closed");
+    }
+    exec.metadata.insert(
+        "sell_position_delta_applied".to_string(),
+        if s48.full_close {
+            "full".to_string()
+        } else {
+            "partial".to_string()
+        },
+    );
+    if s48.sell_untracked_ata {
+        exec.metadata
+            .insert("sell_untracked_ata".to_string(), "true".to_string());
+    } else {
+        exec.metadata.remove("sell_untracked_ata");
     }
 }
 
@@ -10307,71 +10357,22 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                         if let Some(delta) = fills.wallet_sol_delta {
                             exec = exec.with_sol_delta(delta);
                         }
-
-                        // Scope 48: metadata for market-data — full close from amount semantics or hard
-                        // tx-meta evidence (wallet token balance gone). Never from `close_token_ata` alone.
-                        if intent.side == TradeSide::Sell
-                            && matches!(status, ExecutionStatus::Confirmed)
-                        {
-                            let mint_key = intent.resources.input_mint.clone();
-                            let (avail, locked) =
-                                ctx.lock_manager.available_and_locked_tokens_for_intent(
-                                    &intent.intent_id,
-                                    &mint_key,
-                                );
-                            let total_pos = ctx
-                                .lock_manager
-                                .intent_token_position_total_at_lock(&intent.intent_id, &mint_key)
-                                .unwrap_or_else(|| avail.saturating_add(locked));
-                            let sold_raw =
-                                confirmed_sell_fill_in_raw.unwrap_or(intent.required_capital.raw);
-                            let is_liquidation = is_cold_path_recovery_sell(&intent);
-                            let s48 = scope48_confirmed_sell_close_decision(
-                                is_liquidation,
-                                sold_raw,
-                                total_pos,
-                                fills.wallet_token_balance_absent_after_tx,
-                            );
-
-                            if s48.sell_token_account_closed {
-                                exec.metadata.insert(
-                                    "sell_token_account_closed".to_string(),
-                                    "true".to_string(),
-                                );
-                            }
-                            exec.metadata.insert(
-                                "sell_position_delta_applied".to_string(),
-                                if s48.full_close {
-                                    "full".to_string()
-                                } else {
-                                    "partial".to_string()
-                                },
-                            );
-                            if s48.sell_untracked_ata {
-                                exec.metadata
-                                    .insert("sell_untracked_ata".to_string(), "true".to_string());
-                            }
-                        }
                     }
                 }
             }
 
-            // Confirmed SELL must always carry Scope 48 position metadata for market-data. If the
-            // fill/signature path above was skipped (parse error, missing wallet, etc.), default
-            // to legacy full-close semantics so ATAs are not stuck tracked.
-            if matches!(status, ExecutionStatus::Confirmed)
-                && intent.side == TradeSide::Sell
-                && !exec.metadata.contains_key("sell_position_delta_applied")
-            {
-                exec.metadata.insert(
-                    "sell_position_delta_applied".to_string(),
-                    "full".to_string(),
-                );
-                exec.metadata
-                    .insert("sell_untracked_ata".to_string(), "true".to_string());
-            }
-
             exec.status = status;
+            // Scope 48: always classify confirmed SELL for market-data, even when fill RPC path
+            // was skipped (no signature / parse failure / missing wallet).
+            if intent.side == TradeSide::Sell && exec.status == ExecutionStatus::Confirmed {
+                apply_scope48_confirmed_sell_execution_metadata(
+                    &mut exec,
+                    &ctx.lock_manager,
+                    &intent,
+                    confirmed_sell_fill_in_raw,
+                    confirmed_sell_wallet_balance_absent_after_tx,
+                );
+            }
             if matches!(exec.status, ExecutionStatus::Failed) {
                 exec.error_message = Some("execution_failed".to_string());
                 exec.error_code = decision
@@ -10465,9 +10466,9 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     .intent_token_position_total_at_lock(&intent.intent_id, &mint_str)
                     .unwrap_or_else(|| avail.saturating_add(locked));
                 let sold_raw = confirmed_sell_fill_in_raw.unwrap_or(intent.required_capital.raw);
-                let is_liquidation = is_cold_path_recovery_sell(&intent);
+                let is_cold_path_recovery = is_cold_path_recovery_sell(&intent);
                 let s48 = scope48_confirmed_sell_close_decision(
-                    is_liquidation,
+                    is_cold_path_recovery,
                     sold_raw,
                     total_pos,
                     confirmed_sell_wallet_balance_absent_after_tx,
@@ -10481,7 +10482,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                         mint = %mint_str,
                         sold_raw,
                         total_pos,
-                        is_liquidation,
+                        is_cold_path_recovery,
                         sell_token_account_closed = s48.sell_token_account_closed,
                         "LockManager: cleared token balance after confirmed full SELL"
                     );
@@ -11385,12 +11386,12 @@ async fn spawn_rebroadcast_loop(
 #[cfg(test)]
 mod execution_engine_tests {
     use super::{
-        is_cold_path_recovery_sell, is_pump_amm_structural_sim_error,
-        is_pumpfun_bonding_curve_structural_sim_error, is_regular_momentum_hot_path_sell,
-        pump_amm_hint_pool_cache_usable_for_tx_plan_builder, pump_amm_pool_market_hint_merge,
-        record_pump_amm_hot_path_refresh_after_success, scope48_confirmed_sell_close_decision,
-        select_best_route, try_pump_amm_hot_path_refresh_publish,
-        wait_for_meteora_dlmm_slave_after_recovery,
+        apply_scope48_confirmed_sell_execution_metadata, is_cold_path_recovery_sell,
+        is_pump_amm_structural_sim_error, is_pumpfun_bonding_curve_structural_sim_error,
+        is_regular_momentum_hot_path_sell, pump_amm_hint_pool_cache_usable_for_tx_plan_builder,
+        pump_amm_pool_market_hint_merge, record_pump_amm_hot_path_refresh_after_success,
+        scope48_confirmed_sell_close_decision, select_best_route,
+        try_pump_amm_hot_path_refresh_publish, wait_for_meteora_dlmm_slave_after_recovery,
         wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder,
         wait_for_pumpfun_bonding_cache_refresh, DiscoveryRequestOutcome,
         PumpAmmHotPathRefreshDecision, RouteCandidate, PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN,
@@ -11399,8 +11400,9 @@ mod execution_engine_tests {
         CachedPoolState, LivePoolCache, MeteoraState, PumpAmmState, PumpFunState,
     };
     use ironcrab::ipc::{
-        ControlResponse, ControlResponseStatus, DexPoolReadiness, ExplicitAmount, IntentOrigin,
-        IntentTier, TradeIntent, TradeResources, TradeSide, TradingRegime,
+        ControlResponse, ControlResponseStatus, DexPoolReadiness, ExecutionResult, ExecutionStatus,
+        ExplicitAmount, IntentOrigin, IntentTier, TradeIntent, TradeResources, TradeSide,
+        TradingRegime,
     };
     use ironcrab::solana::dex::pumpfun::PumpFunDex;
     use ironcrab::storage::locks::{LockHolder, LockManager, LockResult};
@@ -12178,5 +12180,150 @@ mod execution_engine_tests {
         m.release_locks_after_confirmed_sell("sell-all");
         assert_eq!(m.available_token_balance(M), 0);
         assert_eq!(m.count_non_zero_token_balances(), 0);
+    }
+
+    /// No tx-meta fill (`confirmed_sell_fill_in_raw` None): still classify partial from
+    /// `required_capital` + lock snapshot (production RPC/fill gap).
+    #[test]
+    fn scope48_apply_metadata_partial_momentum_sell_without_fill_in_raw() {
+        const MINT: &str = "Scope48MintNoFill";
+        let probe = 25_313_868_645u64;
+        let scale_in = 56_323_355_801u64;
+        let total = probe.saturating_add(scale_in);
+
+        let lm = LockManager::new(0);
+        lm.update_balances(0, HashMap::from([(MINT.to_string(), total)]));
+        let mut sell_map = HashMap::new();
+        sell_map.insert(MINT.to_string(), probe);
+        assert!(matches!(
+            lm.try_lock_capital(LockHolder::new("intent-no-fill"), 0, sell_map),
+            LockResult::Acquired
+        ));
+
+        let mut intent = TradeIntent::new(
+            "momentum-bot",
+            "v0.1.0",
+            "run-1",
+            "intent-no-fill".to_string(),
+            "momentum-bot",
+            IntentTier::Tier1,
+            IntentOrigin::StrategyA,
+            ExplicitAmount::new(probe, 6),
+            TradeResources {
+                input_mint: MINT.to_string(),
+                output_mint: ironcrab::ipc::NATIVE_SOL_MINT.to_string(),
+                pools: vec!["pool".to_string()],
+                accounts: vec![],
+                token_program: None,
+            },
+            0,
+            200,
+            TradeSide::Sell,
+            TradingRegime::Early,
+        );
+        intent
+            .metadata
+            .insert("close_token_ata".to_string(), "true".to_string());
+
+        let mut exec = ExecutionResult::new_sent(
+            "execution-engine",
+            "test",
+            "run",
+            "ex1".to_string(),
+            "d1".to_string(),
+            "intent-no-fill".to_string(),
+            "momentum-bot".to_string(),
+            Some(MINT.to_string()),
+            Some("sig".to_string()),
+            None,
+        );
+        exec.status = ExecutionStatus::Confirmed;
+
+        apply_scope48_confirmed_sell_execution_metadata(&mut exec, &lm, &intent, None, false);
+
+        assert_eq!(
+            exec.metadata
+                .get("sell_position_delta_applied")
+                .map(|s| s.as_str()),
+            Some("partial")
+        );
+        assert!(!exec.metadata.contains_key("sell_untracked_ata"));
+        assert!(!exec.metadata.contains_key("sell_token_account_closed"));
+
+        let sold_raw = intent.required_capital.raw;
+        let total_pos = lm
+            .intent_token_position_total_at_lock(&intent.intent_id, MINT)
+            .expect("snapshot at lock");
+        let s48 = scope48_confirmed_sell_close_decision(false, sold_raw, total_pos, false);
+        assert!(!s48.full_close);
+    }
+
+    #[test]
+    fn scope48_sell_all_conservative_full_close_despite_probe_vs_total() {
+        const MINT: &str = "SellAllMint";
+        let probe = 100u64;
+        let scale = 900u64;
+        let total = probe.saturating_add(scale);
+
+        let lm = LockManager::new(0);
+        lm.update_balances(0, HashMap::from([(MINT.to_string(), total)]));
+        let mut sell_map = HashMap::new();
+        sell_map.insert(MINT.to_string(), probe);
+        assert!(matches!(
+            lm.try_lock_capital(LockHolder::new("sell-all-intent"), 0, sell_map),
+            LockResult::Acquired
+        ));
+
+        let mut intent = TradeIntent::new(
+            "sell-all",
+            "v0.1.0",
+            "run-1",
+            "sell-all-intent".to_string(),
+            "sell-all",
+            IntentTier::Tier1,
+            IntentOrigin::StrategyA,
+            ExplicitAmount::new(probe, 6),
+            TradeResources {
+                input_mint: MINT.to_string(),
+                output_mint: ironcrab::ipc::NATIVE_SOL_MINT.to_string(),
+                pools: vec!["pool".to_string()],
+                accounts: vec![],
+                token_program: None,
+            },
+            0,
+            200,
+            TradeSide::Sell,
+            TradingRegime::Early,
+        );
+        intent
+            .metadata
+            .insert("sell_all".to_string(), "true".to_string());
+        assert!(is_cold_path_recovery_sell(&intent));
+
+        let mut exec = ExecutionResult::new_sent(
+            "execution-engine",
+            "test",
+            "run",
+            "ex-sa".to_string(),
+            "d-sa".to_string(),
+            "sell-all-intent".to_string(),
+            "sell-all".to_string(),
+            Some(MINT.to_string()),
+            None,
+            None,
+        );
+        exec.status = ExecutionStatus::Confirmed;
+
+        apply_scope48_confirmed_sell_execution_metadata(&mut exec, &lm, &intent, None, false);
+        assert_eq!(
+            exec.metadata
+                .get("sell_position_delta_applied")
+                .map(|s| s.as_str()),
+            Some("full")
+        );
+        assert_eq!(
+            exec.metadata.get("sell_untracked_ata").map(|s| s.as_str()),
+            Some("true")
+        );
     }
 }

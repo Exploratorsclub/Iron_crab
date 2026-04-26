@@ -1700,4 +1700,18 @@ mod tests {
             (70, 0)
         );
     }
+
+    #[test]
+    fn test_intent_token_position_total_at_lock_matches_avail_plus_locked() {
+        const M: &str = "TotalAtLockMint";
+        let m = LockManager::new(0);
+        m.update_balances(0, HashMap::from([(M.to_string(), 100u64)]));
+        let mut sell = HashMap::new();
+        sell.insert(M.to_string(), 30u64);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("x"), 0, sell),
+            LockResult::Acquired
+        ));
+        assert_eq!(m.intent_token_position_total_at_lock("x", M), Some(100));
+    }
 }
