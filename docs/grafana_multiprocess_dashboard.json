@@ -1907,7 +1907,7 @@
         "h": 6,
         "w": 8,
         "x": 0,
-        "y": 61
+        "y": 59
       },
       "fieldConfig": {
         "defaults": {
@@ -1922,7 +1922,7 @@
         "h": 2,
         "w": 24,
         "x": 0,
-        "y": 59
+        "y": 65
       },
       "options": {
         "content": "**Time mode:** Grafana shows dashboard variables in the **top bar**; this JSON model cannot place the `time_mode` control between panels. Use the **Trades: Zeit (Recent Trades)** dropdown at the top to switch Relativ/UTC. The table column arrows **only** control sort order.",
