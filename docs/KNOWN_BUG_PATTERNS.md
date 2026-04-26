@@ -312,7 +312,7 @@
 
 ## 31. discover_pool_static nutzt getProgramAccounts statt getAccount fuer bekannte Pools
 
-| Symptom | Liquidation scheitert mit `pump_amm=timeout (10s)` oder `pump_amm=err_discovery` fuer PumpSwap AMM Pools, obwohl die Pool-Adresse im LivePoolCache bekannt ist. |
+| Symptom | Liquidation scheitert mit `pump_amm=timeout (45s)` oder `pump_amm=err_discovery` fuer PumpSwap AMM Pools, obwohl die Pool-Adresse im LivePoolCache bekannt ist. |
 |---------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **Root Cause** | `discover_pool_static` in `pumpfun_amm.rs` prueft den LivePoolCache nur auf `pool_accounts` (14 Account-Liste). Wenn diese leer sind, faellt es direkt auf `getProgramAccounts` zurueck — ein Full-Scan aller PumpSwap Pools (~10s+). Dabei ist die Pool-ADRESSE bereits im Cache bekannt (via JetStream Bootstrap). Ein einzelner `getAccount` Call fuer die bekannte Adresse wuerde <1s dauern. |
 | **Fix** | Neue Zwischenstufe in `discover_pool_static`: Nach dem pool_accounts-Check die Pool-Adresse via `get_pump_amm_pool_address_by_base_mint()` holen und `try_parse_pool_static_from_market_account()` (single getAccount) aufrufen, bevor auf den langsamen `getProgramAccounts`-Scan zurueckgefallen wird. |
