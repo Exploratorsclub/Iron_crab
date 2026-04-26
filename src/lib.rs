@@ -5,6 +5,7 @@ pub mod execution;
 pub mod ipc;
 pub mod metrics;
 pub mod nats;
+pub mod position_authority;
 pub mod solana;
 pub mod storage;
 pub mod tx_fee_parser;
