@@ -2835,6 +2835,11 @@ impl MomentumContext {
             if let Some(pos) = positions.get_mut(p.mint) {
                 pos.token_amount = pos.token_amount.saturating_add(p.token_amount);
                 pos.add_investment(p.sol_invested);
+                // Scope 50: Scale-in increases total held — any prior exit intent was sized for
+                // the old total (often probe-only). Reset exit latch so the next exit uses the
+                // combined amount; avoids selling probe while scale-in tokens remain.
+                pos.exit_generated = false;
+                pos.exit_generated_at = None;
                 // Keep the best-known decimals (prefer non-zero).
                 if pos.token_decimals == 0 && p.token_decimals != 0 {
                     pos.token_decimals = p.token_decimals;
@@ -6628,6 +6633,7 @@ async fn generate_and_publish_buy_intent(
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+    use ironcrab::ipc::{FillStatus, RecordHeader};
     use tempfile::TempDir;
 
     #[test]
@@ -7423,6 +7429,283 @@ mod tests {
         assert!(candidates_after.is_empty());
     }
 
+    /// Scope 50: probe + scale-in aggregate; scale-in clears exit latch; exit intent uses live total.
+    #[tokio::test]
+    async fn scale_in_resets_exit_latch_and_exit_intent_uses_combined_position_amount() {
+        let mut cfg = MomentumConfig::default();
+        cfg.hard_stop_loss_pct = 1_000.0;
+        cfg.take_profit_pct = 1_000.0;
+        cfg.max_hold_time_secs = 999_999;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+
+        let ctx = Arc::new(MomentumContext {
+            run_id: "run-test".to_string(),
+            config: parking_lot::RwLock::new(cfg),
+            nats: None,
+            jsonl_writer,
+            intent_counter: std::sync::atomic::AtomicU64::new(0),
+            pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
+            mint_infos: parking_lot::RwLock::new(HashMap::new()),
+            token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            positions: parking_lot::RwLock::new(HashMap::new()),
+            pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            live_pool_cache: LivePoolCache::new(),
+            position_kv: tokio::sync::OnceCell::new(),
+            orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            tokens_tracked: std::sync::atomic::AtomicU64::new(0),
+            tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            intents_generated: std::sync::atomic::AtomicU64::new(0),
+            exits_generated: std::sync::atomic::AtomicU64::new(0),
+            last_event_slot: std::sync::atomic::AtomicU64::new(0),
+            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+        });
+
+        ctx.register_pool("mintX", "poolX", "raydium", 1);
+        ctx.update_pool_trade_data("mintX", "poolX", "raydium", 1_000_000_000, 1_000_000, 1);
+        ctx.update_pool_accounts("mintX", "poolX", vec!["a0".to_string(), "a1".to_string()]);
+
+        ctx.open_position(OpenPositionParams {
+            mint: "mintX",
+            pool: "poolX",
+            dex: "raydium",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 14_099_749_285,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: None,
+        });
+        ctx.mark_exit_generated("mintX");
+        assert!(ctx.positions.read().get("mintX").unwrap().exit_generated);
+
+        ctx.open_position(OpenPositionParams {
+            mint: "mintX",
+            pool: "poolX",
+            dex: "raydium",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 38_711_432_312,
+            sol_invested: 2_000_000,
+            token_program: None,
+            creator: None,
+        });
+        {
+            let pos = ctx.positions.read().get("mintX").unwrap().clone();
+            assert_eq!(
+                pos.token_amount,
+                14_099_749_285u64.saturating_add(38_711_432_312)
+            );
+            assert!(
+                !pos.exit_generated,
+                "scale-in must clear exit latch so a new exit sizes to full total"
+            );
+        }
+
+        generate_and_publish_exit_intent(
+            ctx.as_ref(),
+            "mintX",
+            "poolX",
+            "raydium",
+            "TIME_EXIT",
+            "test",
+            14_099_749_285,
+        )
+        .await
+        .expect("exit intent");
+
+        let path = ctx.jsonl_writer.current_path().expect("jsonl path");
+        let content = std::fs::read_to_string(path).expect("read jsonl");
+        let line = content.lines().last().expect("intent line");
+        let intent: TradeIntent = serde_json::from_str(line).expect("parse TradeIntent");
+        assert_eq!(
+            intent.required_capital.raw,
+            14_099_749_285u64.saturating_add(38_711_432_312),
+            "exit must sell full tracked position, not stale probe hint"
+        );
+    }
+
+    /// Scope 50: confirmed SELL smaller than tracked total reduces position and clears exit latch.
+    #[tokio::test]
+    async fn partial_sell_confirmed_reduces_tracker_and_timed_reconcile_uses_residual_amount() {
+        let mut cfg = MomentumConfig::default();
+        cfg.max_hold_time_secs = 60;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+
+        let ctx = Arc::new(MomentumContext {
+            run_id: "run-test".to_string(),
+            config: parking_lot::RwLock::new(cfg.clone()),
+            nats: None,
+            jsonl_writer,
+            intent_counter: std::sync::atomic::AtomicU64::new(0),
+            pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
+            mint_infos: parking_lot::RwLock::new(HashMap::new()),
+            token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            positions: parking_lot::RwLock::new(HashMap::new()),
+            pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            live_pool_cache: LivePoolCache::new(),
+            position_kv: tokio::sync::OnceCell::new(),
+            orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            tokens_tracked: std::sync::atomic::AtomicU64::new(0),
+            tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            intents_generated: std::sync::atomic::AtomicU64::new(0),
+            exits_generated: std::sync::atomic::AtomicU64::new(0),
+            last_event_slot: std::sync::atomic::AtomicU64::new(0),
+            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+        });
+
+        ctx.open_position(OpenPositionParams {
+            mint: "mintY",
+            pool: "poolY",
+            dex: "raydium",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 52_811_181_597,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: None,
+        });
+        ctx.mark_exit_generated("mintY");
+
+        let probe_only = 14_099_749_285u64;
+        ctx.register_sell_intent("sell-y-1", "mintY", "poolY", "raydium", probe_only);
+
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("side".to_string(), "SELL".to_string());
+        let result = ExecutionResult {
+            header: RecordHeader::new("test", BUILD_VERSION, "run-test"),
+            execution_id: "ex1".to_string(),
+            decision_id: "dec1".to_string(),
+            intent_id: "sell-y-1".to_string(),
+            source: "momentum-bot".to_string(),
+            token_mint: Some("mintY".to_string()),
+            signature: Some("sig1".to_string()),
+            bundle_id: None,
+            status: ExecutionStatus::Confirmed,
+            fill_in: Some(ExplicitAmount::new(probe_only, 6)),
+            fill_out: Some(ExplicitAmount::new(50_000_000, 9)),
+            fill_status: Some(FillStatus::Complete),
+            fill_unavailable_reason: None,
+            confirmed_slot: Some(1),
+            fees: None,
+            pnl: None,
+            wallet_sol_delta_lamports: Some(50_000_000),
+            error_message: None,
+            error_code: None,
+            latency_ms: Some(1),
+            metadata: meta,
+        };
+
+        Arc::clone(&ctx).handle_execution_result(&result);
+
+        let pos = ctx.positions.read().get("mintY").expect("position").clone();
+        let expected_remaining = 52_811_181_597u64.saturating_sub(probe_only);
+        assert_eq!(pos.token_amount, expected_remaining);
+        assert!(!pos.exit_generated);
+
+        let now = Instant::now();
+        {
+            let mut w = ctx.positions.write();
+            let p = w.get_mut("mintY").unwrap();
+            p.entry_time = now - Duration::from_secs(120);
+            p.exit_generated = true;
+            p.exit_generated_at = Some(now - Duration::from_secs(120));
+        }
+
+        let candidates = ctx.collect_timed_exit_reconcile_candidates(now);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].token_amount, expected_remaining);
+    }
+
+    /// Scope 50: SELL failure (e.g. resource lock) must clear exit latch for retries.
+    #[tokio::test]
+    async fn sell_execution_failure_resets_exit_generated() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+
+        let ctx = Arc::new(MomentumContext {
+            run_id: "run-test".to_string(),
+            config: parking_lot::RwLock::new(MomentumConfig::default()),
+            nats: None,
+            jsonl_writer,
+            intent_counter: std::sync::atomic::AtomicU64::new(0),
+            pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
+            mint_infos: parking_lot::RwLock::new(HashMap::new()),
+            token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            positions: parking_lot::RwLock::new(HashMap::new()),
+            pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            live_pool_cache: LivePoolCache::new(),
+            position_kv: tokio::sync::OnceCell::new(),
+            orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            tokens_tracked: std::sync::atomic::AtomicU64::new(0),
+            tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            intents_generated: std::sync::atomic::AtomicU64::new(0),
+            exits_generated: std::sync::atomic::AtomicU64::new(0),
+            last_event_slot: std::sync::atomic::AtomicU64::new(0),
+            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+        });
+
+        ctx.open_position(OpenPositionParams {
+            mint: "mintZ",
+            pool: "poolZ",
+            dex: "raydium",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 1_000,
+            sol_invested: 1,
+            token_program: None,
+            creator: None,
+        });
+        ctx.mark_exit_generated("mintZ");
+        ctx.register_sell_intent("sell-z-1", "mintZ", "poolZ", "raydium", 1_000);
+
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("side".to_string(), "SELL".to_string());
+        let result = ExecutionResult {
+            header: RecordHeader::new("test", BUILD_VERSION, "run-test"),
+            execution_id: "exz".to_string(),
+            decision_id: "decz".to_string(),
+            intent_id: "sell-z-1".to_string(),
+            source: "momentum-bot".to_string(),
+            token_mint: Some("mintZ".to_string()),
+            signature: None,
+            bundle_id: None,
+            status: ExecutionStatus::Failed,
+            fill_in: None,
+            fill_out: None,
+            fill_status: None,
+            fill_unavailable_reason: None,
+            confirmed_slot: None,
+            fees: None,
+            pnl: None,
+            wallet_sol_delta_lamports: None,
+            error_message: Some("pool locked by int-other".to_string()),
+            error_code: None,
+            latency_ms: None,
+            metadata: meta,
+        };
+
+        Arc::clone(&ctx).handle_execution_result(&result);
+        let pos = ctx.positions.read().get("mintZ").unwrap().clone();
+        assert!(!pos.exit_generated);
+        assert_eq!(pos.token_amount, 1_000);
+    }
+
     #[test]
     fn integration_style_wallet_snapshot_reconcile_creates_retry_candidate() {
         let mut cfg = MomentumConfig::default();
@@ -7600,6 +7883,16 @@ async fn generate_and_publish_exit_intent(
     reason: &str,
     token_amount: u64,
 ) -> Result<()> {
+    // Authoritative sell size: open position total at publish time (handles probe+scale-in
+    // and races where the caller still had a stale hint amount).
+    let token_amount = ctx
+        .positions
+        .read()
+        .get(mint)
+        .map(|p| p.token_amount)
+        .filter(|t| *t > 0)
+        .unwrap_or(token_amount);
+
     // Phase 3: Slippage escalation — when prior sells failed with 6002, increase tolerance
     let max_slippage = {
         let base = ctx.config.read().exit_max_slippage_bps;
