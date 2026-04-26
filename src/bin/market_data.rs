@@ -3787,6 +3787,171 @@ async fn handle_wallet_bootstrap_meteora_dlmm_verify_for_mint(
     }
 }
 
+/// True when a confirmed SELL [`ExecutionResult`] indicates the wallet no longer holds the
+/// position for this mint (full exit, liquidation, or token ATA closed). Partial sells must
+/// return false so Geyser keeps tracking the ATA until an on-chain balance update arrives.
+fn execution_result_sell_closes_wallet_position(exec: &ExecutionResult) -> bool {
+    if exec.metadata.get("side").map(|s| s.as_str()) != Some("SELL") {
+        return false;
+    }
+    // Rolling deploy / skipped Scope 48 block: without an explicit partial marker, keep legacy
+    // "confirmed SELL closes wallet position" semantics (only `partial` keeps the ATA tracked).
+    if !exec.metadata.contains_key("sell_position_delta_applied") {
+        return true;
+    }
+    if exec
+        .metadata
+        .get("sell_token_account_closed")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if exec
+        .metadata
+        .get("sell_untracked_ata")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    matches!(
+        exec.metadata
+            .get("sell_position_delta_applied")
+            .map(|s| s.as_str()),
+        Some("full") | Some("full_no_balance_update")
+    )
+}
+
+/// Mixed-deploy / foreign producers may omit Scope 48 fields. Preserve legacy behavior: assume
+/// full close so zero snapshot + untrack still runs for old sell-all tooling, etc.
+/// **Never** backfill `execution-engine` results — that process must emit explicit metadata.
+fn backfill_scope48_metadata_foreign_confirmed_sell(exec: &mut ExecutionResult) {
+    if exec.header.component == "execution-engine" {
+        return;
+    }
+    if exec.status != ExecutionStatus::Confirmed {
+        return;
+    }
+    if exec.metadata.get("side").map(|s| s.as_str()) != Some("SELL") {
+        return;
+    }
+    if exec.metadata.contains_key("sell_position_delta_applied") {
+        return;
+    }
+    exec.metadata.insert(
+        "sell_position_delta_applied".to_string(),
+        "full".to_string(),
+    );
+    exec.metadata
+        .insert("sell_untracked_ata".to_string(), "true".to_string());
+}
+
+#[cfg(test)]
+mod execution_result_sell_close_tests {
+    use super::execution_result_sell_closes_wallet_position;
+    use ironcrab::ipc::{ExecutionResult, ExecutionStatus};
+    use std::collections::HashMap;
+
+    fn base_sell_exec() -> ExecutionResult {
+        let mut exec = ExecutionResult::new_sent(
+            "execution-engine",
+            "test",
+            "run",
+            "ex1".to_string(),
+            "d1".to_string(),
+            "i1".to_string(),
+            "src".to_string(),
+            Some("mint".to_string()),
+            Some("sig".to_string()),
+            None,
+        );
+        exec.status = ExecutionStatus::Confirmed;
+        exec.metadata = HashMap::from([("side".to_string(), "SELL".to_string())]);
+        exec
+    }
+
+    #[test]
+    fn partial_sell_metadata_does_not_close_position() {
+        let mut exec = base_sell_exec();
+        exec.metadata.insert(
+            "sell_position_delta_applied".to_string(),
+            "partial".to_string(),
+        );
+        assert!(!execution_result_sell_closes_wallet_position(&exec));
+    }
+
+    #[test]
+    fn confirmed_sell_without_scope48_keys_treated_as_full_close() {
+        let exec = base_sell_exec();
+        assert!(execution_result_sell_closes_wallet_position(&exec));
+    }
+
+    #[test]
+    fn full_sell_metadata_closes_position() {
+        let mut exec = base_sell_exec();
+        exec.metadata.insert(
+            "sell_position_delta_applied".to_string(),
+            "full".to_string(),
+        );
+        exec.metadata
+            .insert("sell_untracked_ata".to_string(), "true".to_string());
+        assert!(execution_result_sell_closes_wallet_position(&exec));
+    }
+
+    #[test]
+    fn token_account_closed_closes_even_if_partial_flag_wrong() {
+        let mut exec = base_sell_exec();
+        exec.metadata.insert(
+            "sell_position_delta_applied".to_string(),
+            "partial".to_string(),
+        );
+        exec.metadata
+            .insert("sell_token_account_closed".to_string(), "true".to_string());
+        assert!(execution_result_sell_closes_wallet_position(&exec));
+    }
+
+    #[test]
+    fn backfill_foreign_confirmed_sell_sets_full_when_scope48_missing() {
+        use super::backfill_scope48_metadata_foreign_confirmed_sell;
+
+        let mut exec = ExecutionResult::new_sent(
+            "legacy-sell-tool",
+            "test",
+            "run",
+            "ex2".to_string(),
+            "d2".to_string(),
+            "i2".to_string(),
+            "src".to_string(),
+            Some("mint".to_string()),
+            Some("sig".to_string()),
+            None,
+        );
+        exec.status = ExecutionStatus::Confirmed;
+        exec.metadata = HashMap::from([("side".to_string(), "SELL".to_string())]);
+        backfill_scope48_metadata_foreign_confirmed_sell(&mut exec);
+        assert_eq!(
+            exec.metadata
+                .get("sell_position_delta_applied")
+                .map(|s| s.as_str()),
+            Some("full")
+        );
+        assert_eq!(
+            exec.metadata.get("sell_untracked_ata").map(|s| s.as_str()),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn backfill_skips_execution_engine_results() {
+        use super::backfill_scope48_metadata_foreign_confirmed_sell;
+
+        let mut exec = base_sell_exec();
+        backfill_scope48_metadata_foreign_confirmed_sell(&mut exec);
+        assert!(!exec.metadata.contains_key("sell_position_delta_applied"));
+    }
+}
+
 /// Publish wallet token balance snapshot for position reconciliation.
 ///
 /// Called at market-data startup to provide momentum-bot with current wallet state.
@@ -6222,7 +6387,8 @@ async fn run_geyser_loop(
                             while let Some(msg_result) = messages.next().await {
                                 match msg_result {
                                     Ok(msg) => {
-                                        let exec: ExecutionResult = match serde_json::from_slice(&msg.payload) {
+                                        let mut exec: ExecutionResult =
+                                            match serde_json::from_slice(&msg.payload) {
                                             Ok(e) => e,
                                             Err(e) => {
                                                 debug!(error = %e, "Failed to deserialize ExecutionResult");
@@ -6230,6 +6396,8 @@ async fn run_geyser_loop(
                                                 continue;
                                             }
                                         };
+
+                                        backfill_scope48_metadata_foreign_confirmed_sell(&mut exec);
 
                                         // Dedup on execution_id (fallback: signature)
                                         let dedup_key = if !exec.execution_id.is_empty() {
@@ -6390,8 +6558,9 @@ async fn run_geyser_loop(
                                             "ExecutionResult: tracked wallet ATA/mint"
                                         );
 
-                                        // 5) For confirmed SELLs: write zero-balance snapshot and untrack ATA
-                                        if is_confirmed_sell {
+                                        // 5) Full close / liquidation / ATA-close SELL: zero snapshot + untrack.
+                                        // Partial SELL: keep ATA tracked; residual balance comes from Geyser.
+                                        if is_confirmed_sell && execution_result_sell_closes_wallet_position(&exec) {
                                             let wallet_str = tracked_wallet.wallet.to_string();
                                             let snapshot = MarketEvent::new(
                                                 "market-data",
@@ -6434,6 +6603,13 @@ async fn run_geyser_loop(
                                                     "Untracked ATA after confirmed SELL"
                                                 );
                                             }
+                                        } else if is_confirmed_sell {
+                                            info!(
+                                                mint = %mint_str,
+                                                ata = %ata,
+                                                sell_position_delta = ?exec.metadata.get("sell_position_delta_applied"),
+                                                "Confirmed partial SELL: keeping ATA tracked (no zero snapshot / untrack)"
+                                            );
                                         }
 
                                         if let Err(e) = msg.ack().await {

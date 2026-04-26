@@ -68,6 +68,11 @@ pub struct CapitalLock {
     pub reserves_trading_wsol: bool,
     /// Token amounts locked (mint -> raw amount)
     pub tokens: HashMap<String, u64>,
+    /// At lock acquisition: per mint, `available_tokens[mint]` **before** this lock subtracted
+    /// `amount` (i.e. the engine's notion of total position for that mint at SELL reservation).
+    /// Used for Scope 48 decisions so a concurrent Geyser `set_available_token_balance` cannot
+    /// shrink `avail+locked` mid-flight.
+    pub token_position_total_at_lock: HashMap<String, u64>,
     pub created_at: Instant,
     pub ttl: Duration,
 }
@@ -478,6 +483,37 @@ impl LockManager {
         self.available_tokens.write().insert(mint, new_total);
     }
 
+    /// `(available_unlocked, locked_in_capital_lock)` for `mint` on `intent_id`'s capital lock.
+    ///
+    /// For a normal in-flight SELL, `available + locked` is the wallet position size the engine
+    /// believed before lock release.
+    pub fn available_and_locked_tokens_for_intent(
+        &self,
+        intent_id: &str,
+        mint: &str,
+    ) -> (u64, u64) {
+        let locked = self
+            .capital_locks
+            .read()
+            .get(intent_id)
+            .and_then(|l| l.tokens.get(mint).copied())
+            .unwrap_or(0);
+        let available = self.available_token_balance(mint);
+        (available, locked)
+    }
+
+    /// Engine position size for `mint` at SELL lock acquisition (`available + locked` before lock),
+    /// if `intent_id` holds a capital lock that includes `mint`.
+    ///
+    /// Stable vs concurrent Geyser updates that call [`Self::set_available_token_balance`] while
+    /// the lock is held (see Scope 48).
+    pub fn intent_token_position_total_at_lock(&self, intent_id: &str, mint: &str) -> Option<u64> {
+        self.capital_locks
+            .read()
+            .get(intent_id)
+            .and_then(|l| l.token_position_total_at_lock.get(mint).copied())
+    }
+
     /// Update wallet balances from WalletBalanceUpdate event (SOL + WSOL).
     ///
     /// This is called when market-data publishes balance updates via NATS.
@@ -663,9 +699,12 @@ impl LockManager {
         } else if sol_lamports > 0 {
             *available_sol -= sol_lamports;
         }
+        let mut token_position_total_at_lock = HashMap::with_capacity(tokens.len());
         for (mint, amount) in &tokens {
             if let Some(avail) = available_tokens.get_mut(mint) {
+                let position_total_before = *avail;
                 *avail -= amount;
+                token_position_total_at_lock.insert(mint.clone(), position_total_before);
             }
         }
 
@@ -674,6 +713,7 @@ impl LockManager {
             sol_lamports,
             reserves_trading_wsol: buy_reserves_wsol,
             tokens,
+            token_position_total_at_lock,
             created_at: Instant::now(),
             ttl: self.default_ttl,
         };
@@ -785,9 +825,11 @@ impl LockManager {
 
     /// Release all locks after an **on-chain confirmed** SELL: restore SOL/WSOL from the
     /// capital lock as in [`Self::release_locks`], but do **not** return locked *input*
-    /// token amounts to [`Self::available_tokens`]. After a successful SELL those tokens
-    /// are no longer held; [`Self::set_available_token_balance`] to zero and this path
-    /// must not resurrect a ghost `open_positions` count (Invariant A.28, KNOWN_BUG #5).
+    /// token amounts to [`Self::available_tokens`]. After a successful full SELL those
+    /// tokens are no longer held — use [`Self::set_available_token_balance`] to zero the mint;
+    /// after a partial SELL do not replace balances while the lock is held (avoid double-count vs
+    /// this release path). This path must not resurrect a ghost `open_positions` count (Invariant
+    /// A.28, KNOWN_BUG #5).
     pub fn release_locks_after_confirmed_sell(&self, intent_id: &str) {
         self.release_capital_lock_restore_tokens(intent_id, false);
         self.release_resource_locks_for_intent(intent_id);
@@ -1547,5 +1589,129 @@ mod tests {
         m.release_locks_after_confirmed_sell("buy-inflight");
 
         assert_eq!(m.available_wsol(), 1_000_000_000);
+    }
+
+    // --- Scope 48: partial confirmed SELL leaves residual balance; full SELL clears ---
+
+    #[test]
+    fn test_partial_confirmed_sell_skip_balance_replace_then_release_keeps_residual() {
+        const M: &str = "ProbeScaleMint";
+        let probe = 25_313_868_645u64;
+        let scale_in = 56_323_355_801u64;
+        let total = probe.saturating_add(scale_in);
+
+        let m = LockManager::new(0);
+        m.update_balances(0, HashMap::from([(M.to_string(), total)]));
+
+        let mut sell = HashMap::new();
+        sell.insert(M.to_string(), probe);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("sell-partial"), 0, sell),
+            LockResult::Acquired
+        ));
+        // In-flight SELL: locked probe is gone from `available_tokens`; residual scale_in remains.
+        assert_eq!(m.available_token_balance(M), scale_in);
+        assert_eq!(m.count_non_zero_token_balances(), 1);
+
+        // Partial confirmed SELL: engine must NOT `set_available_token_balance(..., 0)` here —
+        // balance is already correct until lock release.
+        m.release_locks_after_confirmed_sell("sell-partial");
+
+        assert_eq!(
+            m.available_token_balance(M),
+            scale_in,
+            "must not restore sold probe from lock"
+        );
+        assert_eq!(m.count_non_zero_token_balances(), 1);
+    }
+
+    #[test]
+    fn test_intent_token_position_total_at_lock_stable_across_geyser_mid_flight() {
+        const M: &str = "GeyserRaceMint";
+        let total = 1_000_000u64;
+        let sell_amt = 600_000u64;
+        let m = LockManager::new(0);
+        m.update_balances(0, HashMap::from([(M.to_string(), total)]));
+
+        let mut sell = HashMap::new();
+        sell.insert(M.to_string(), sell_amt);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("sell-race"), 0, sell),
+            LockResult::Acquired
+        ));
+
+        assert_eq!(
+            m.intent_token_position_total_at_lock("sell-race", M),
+            Some(total)
+        );
+
+        // Geyser: wallet already reflects partial sell (T−S) while SELL lock still reserves S.
+        m.set_available_token_balance(M.to_string(), total.saturating_sub(sell_amt));
+        let (avail, locked) = m.available_and_locked_tokens_for_intent("sell-race", M);
+        assert!(
+            avail.saturating_add(locked) < total,
+            "naive avail+locked must not equal pre-lock position under concurrent Geyser replace"
+        );
+        assert_eq!(
+            m.intent_token_position_total_at_lock("sell-race", M),
+            Some(total)
+        );
+    }
+
+    #[test]
+    fn test_full_confirmed_sell_zero_then_release_stays_zero() {
+        const M: &str = "FullSellMint";
+        let m = LockManager::new(0);
+        m.update_balances(0, HashMap::from([(M.to_string(), 1_000_000u64)]));
+
+        let mut sell = HashMap::new();
+        sell.insert(M.to_string(), 1_000_000u64);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("sell-full"), 0, sell),
+            LockResult::Acquired
+        ));
+
+        m.set_available_token_balance(M.to_string(), 0);
+        m.release_locks_after_confirmed_sell("sell-full");
+
+        assert_eq!(m.available_token_balance(M), 0);
+        assert_eq!(m.count_non_zero_token_balances(), 0);
+    }
+
+    #[test]
+    fn test_available_and_locked_tokens_for_intent() {
+        const M: &str = "LockViewMint";
+        let m = LockManager::new(0);
+        m.update_balances(0, HashMap::from([(M.to_string(), 100u64)]));
+
+        let mut sell = HashMap::new();
+        sell.insert(M.to_string(), 30u64);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("sell-1"), 0, sell),
+            LockResult::Acquired
+        ));
+
+        assert_eq!(
+            m.available_and_locked_tokens_for_intent("sell-1", M),
+            (70, 30)
+        );
+        assert_eq!(
+            m.available_and_locked_tokens_for_intent("missing", M),
+            (70, 0)
+        );
+    }
+
+    #[test]
+    fn test_intent_token_position_total_at_lock_matches_avail_plus_locked() {
+        const M: &str = "TotalAtLockMint";
+        let m = LockManager::new(0);
+        m.update_balances(0, HashMap::from([(M.to_string(), 100u64)]));
+        let mut sell = HashMap::new();
+        sell.insert(M.to_string(), 30u64);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("x"), 0, sell),
+            LockResult::Acquired
+        ));
+        assert_eq!(m.intent_token_position_total_at_lock("x", M), Some(100));
     }
 }

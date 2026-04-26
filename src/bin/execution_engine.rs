@@ -383,6 +383,140 @@ fn extract_owner_mint_delta_raw(
     Some((decimals, delta))
 }
 
+/// Hard evidence from confirmed transaction meta: the wallet no longer has any token balance
+/// for `mint` after the tx (typical SPL `close_account` on the wallet ATA).
+///
+/// **Not** inferred from intent metadata (`close_token_ata`) — partial sells can still carry
+/// that flag while the ATA stays open (Scope 48 production case).
+fn tx_meta_wallet_token_balance_absent_after_tx(
+    tx: &EncodedConfirmedTransactionWithStatusMeta,
+    wallet: &Pubkey,
+    mint: &str,
+) -> bool {
+    let Some(meta) = tx.transaction.meta.as_ref() else {
+        return false;
+    };
+    let Some(pre_balances) =
+        Option::<Vec<UiTransactionTokenBalance>>::from(meta.pre_token_balances.clone())
+    else {
+        return false;
+    };
+    let Some(post_balances) =
+        Option::<Vec<UiTransactionTokenBalance>>::from(meta.post_token_balances.clone())
+    else {
+        return false;
+    };
+
+    let owner_str = wallet.to_string();
+    let mut pre_sum: u128 = 0;
+    for b in pre_balances.iter() {
+        let b_owner = Option::<String>::from(b.owner.clone());
+        if b.mint == mint && b_owner.as_deref() == Some(owner_str.as_str()) {
+            if let Ok(v) = u128::from_str(&b.ui_token_amount.amount) {
+                pre_sum = pre_sum.saturating_add(v);
+            }
+        }
+    }
+    if pre_sum == 0 {
+        return false;
+    }
+
+    let mut post_sum: u128 = 0;
+    for b in post_balances.iter() {
+        let b_owner = Option::<String>::from(b.owner.clone());
+        if b.mint == mint && b_owner.as_deref() == Some(owner_str.as_str()) {
+            if let Ok(v) = u128::from_str(&b.ui_token_amount.amount) {
+                post_sum = post_sum.saturating_add(v);
+            }
+        }
+    }
+    post_sum == 0
+}
+
+/// Scope 48: after a confirmed SELL, whether we treat the position as fully closed for
+/// LockManager / `ExecutionResult` metadata.
+///
+/// - **Cold-path recovery** ([`is_cold_path_recovery_sell`]: liquidation, kill-switch, sell-all):
+///   always full-close (conservative).
+/// - **Regular Momentum / other SELLs**: full-close only when sold amount covers the engine's
+///   pre-release position (`sold_raw >= total_pos`) **or** transaction meta proves the wallet
+///   no longer holds any balance for the mint (actual ATA close / zero balance).
+///
+/// `sell_token_account_closed` metadata is emitted **only** with hard tx-meta evidence, never
+/// from `close_token_ata` intent metadata alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Scope48ConfirmedSellCloseDecision {
+    full_close: bool,
+    sell_token_account_closed: bool,
+    sell_untracked_ata: bool,
+}
+
+fn scope48_confirmed_sell_close_decision(
+    is_cold_path_recovery: bool,
+    sold_raw: u64,
+    total_pos: u64,
+    wallet_token_balance_absent_after_tx: bool,
+) -> Scope48ConfirmedSellCloseDecision {
+    let regular_full_close = sold_raw >= total_pos || wallet_token_balance_absent_after_tx;
+    let full_close = is_cold_path_recovery || regular_full_close;
+    let sell_token_account_closed = wallet_token_balance_absent_after_tx;
+    let sell_untracked_ata = full_close && !sell_token_account_closed;
+    Scope48ConfirmedSellCloseDecision {
+        full_close,
+        sell_token_account_closed,
+        sell_untracked_ata,
+    }
+}
+
+/// Scope 48: always set `sell_position_delta_applied` / optional flags on confirmed SELL
+/// `ExecutionResult`s from this engine, using lock snapshot + intent when tx fills are missing.
+fn apply_scope48_confirmed_sell_execution_metadata(
+    exec: &mut ExecutionResult,
+    lock_manager: &LockManager,
+    intent: &TradeIntent,
+    confirmed_sell_fill_in_raw: Option<u64>,
+    wallet_token_balance_absent_after_tx: bool,
+) {
+    if intent.side != TradeSide::Sell || exec.status != ExecutionStatus::Confirmed {
+        return;
+    }
+    let mint_key = intent.resources.input_mint.clone();
+    let (avail, locked) =
+        lock_manager.available_and_locked_tokens_for_intent(&intent.intent_id, &mint_key);
+    let total_pos = lock_manager
+        .intent_token_position_total_at_lock(&intent.intent_id, &mint_key)
+        .unwrap_or_else(|| avail.saturating_add(locked));
+    let sold_raw = confirmed_sell_fill_in_raw.unwrap_or(intent.required_capital.raw);
+    let is_cold_path_recovery = is_cold_path_recovery_sell(intent);
+    let s48 = scope48_confirmed_sell_close_decision(
+        is_cold_path_recovery,
+        sold_raw,
+        total_pos,
+        wallet_token_balance_absent_after_tx,
+    );
+
+    if s48.sell_token_account_closed {
+        exec.metadata
+            .insert("sell_token_account_closed".to_string(), "true".to_string());
+    } else {
+        exec.metadata.remove("sell_token_account_closed");
+    }
+    exec.metadata.insert(
+        "sell_position_delta_applied".to_string(),
+        if s48.full_close {
+            "full".to_string()
+        } else {
+            "partial".to_string()
+        },
+    );
+    if s48.sell_untracked_ata {
+        exec.metadata
+            .insert("sell_untracked_ata".to_string(), "true".to_string());
+    } else {
+        exec.metadata.remove("sell_untracked_ata");
+    }
+}
+
 fn find_message_account_index(
     tx: &EncodedConfirmedTransactionWithStatusMeta,
     pubkey: &Pubkey,
@@ -575,18 +709,24 @@ fn extract_swap_sol_from_inner_instructions(
     (sol_out, sol_in)
 }
 
+/// Best-effort fill accounting from confirmed transaction RPC fetch (cold path after send).
+#[derive(Debug, Clone)]
+struct ComputedIntentFills {
+    fill_in: Option<ExplicitAmount>,
+    fill_out: Option<ExplicitAmount>,
+    fill_status: FillStatus,
+    fill_unavailable_reason: Option<FillUnavailableReason>,
+    wallet_sol_delta: Option<i128>,
+    /// True only from tx meta: wallet had this mint pre-tx and no post-tx token balance for it.
+    wallet_token_balance_absent_after_tx: bool,
+}
+
 async fn compute_intent_fills_best_effort(
     ctx: &ExecutionContext,
     wallet: Pubkey,
     signature: &Signature,
     intent: &TradeIntent,
-) -> (
-    Option<ExplicitAmount>,
-    Option<ExplicitAmount>,
-    FillStatus,
-    Option<FillUnavailableReason>,
-    Option<i128>, // SOL delta in lamports
-) {
+) -> ComputedIntentFills {
     let cfg = RpcTransactionConfig {
         encoding: Some(UiTransactionEncoding::JsonParsed),
         commitment: Some(solana_commitment_config::CommitmentConfig {
@@ -603,24 +743,26 @@ async fn compute_intent_fills_best_effort(
         Ok(tx) => tx,
         Err(e) => {
             debug!(sig = %signature, error = %e, "Failed to fetch tx meta for fills (best-effort)");
-            return (
-                None,
-                None,
-                FillStatus::Unavailable,
-                Some(FillUnavailableReason::RpcTxFetchFailed),
-                None,
-            );
+            return ComputedIntentFills {
+                fill_in: None,
+                fill_out: None,
+                fill_status: FillStatus::Unavailable,
+                fill_unavailable_reason: Some(FillUnavailableReason::RpcTxFetchFailed),
+                wallet_sol_delta: None,
+                wallet_token_balance_absent_after_tx: false,
+            };
         }
     };
 
     if tx.transaction.meta.is_none() {
-        return (
-            None,
-            None,
-            FillStatus::Unavailable,
-            Some(FillUnavailableReason::TxMetaMissing),
-            None,
-        );
+        return ComputedIntentFills {
+            fill_in: None,
+            fill_out: None,
+            fill_status: FillStatus::Unavailable,
+            fill_unavailable_reason: Some(FillUnavailableReason::TxMetaMissing),
+            wallet_sol_delta: None,
+            wallet_token_balance_absent_after_tx: false,
+        };
     }
 
     let input_mint = intent.resources.input_mint.as_str();
@@ -692,13 +834,14 @@ async fn compute_intent_fills_best_effort(
                 wsol_delta // Native delta unavailable, use WSOL delta only
             };
 
-            return (
+            return ComputedIntentFills {
                 fill_in,
                 fill_out,
-                FillStatus::Complete,
-                None,
-                Some(total_sol_delta),
-            );
+                fill_status: FillStatus::Complete,
+                fill_unavailable_reason: None,
+                wallet_sol_delta: Some(total_sol_delta),
+                wallet_token_balance_absent_after_tx: false,
+            };
         }
 
         // Fallback if WSOL token balance not found - use native lamport delta
@@ -711,13 +854,14 @@ async fn compute_intent_fills_best_effort(
                 Some(ExplicitAmount::new(out_raw, 9))
             };
 
-            return (
+            return ComputedIntentFills {
                 fill_in,
                 fill_out,
-                FillStatus::Partial,
-                Some(FillUnavailableReason::TokenBalanceDeltaMissing),
-                Some(payer_delta_lamports),
-            );
+                fill_status: FillStatus::Partial,
+                fill_unavailable_reason: Some(FillUnavailableReason::TokenBalanceDeltaMissing),
+                wallet_sol_delta: Some(payer_delta_lamports),
+                wallet_token_balance_absent_after_tx: false,
+            };
         }
     }
 
@@ -854,6 +998,17 @@ async fn compute_intent_fills_best_effort(
         (false, false) => FillStatus::Unavailable,
     };
 
+    let wallet_token_balance_absent_after_tx =
+        if intent.side == TradeSide::Sell && intent.resources.input_mint != SOL_MINT {
+            tx_meta_wallet_token_balance_absent_after_tx(
+                &tx,
+                &wallet,
+                intent.resources.input_mint.as_str(),
+            )
+        } else {
+            false
+        };
+
     let sol_leg_missing = (input_mint == SOL_MINT && fill_in.is_none())
         || (output_mint == SOL_MINT && fill_out.is_none());
 
@@ -886,13 +1041,14 @@ async fn compute_intent_fills_best_effort(
     // (including ATA rent, fees, etc.) which is exactly what PnL needs.
     let wallet_sol_delta = Some(payer_delta_lamports);
 
-    (
+    ComputedIntentFills {
         fill_in,
         fill_out,
         fill_status,
         fill_unavailable_reason,
         wallet_sol_delta,
-    )
+        wallet_token_balance_absent_after_tx,
+    }
 }
 
 /// Extract WSOL flows from arbitrage TX: (amount_spent, amount_received)
@@ -10006,6 +10162,11 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // Capture fill_out for immediate LockManager update after confirmed BUY.
     // Populated inside the should_emit block when fills are available.
     let mut confirmed_buy_fill_out_raw: Option<u64> = None;
+    // Confirmed SELL: token `fill_in` raw (sold amount), for LockManager + ExecutionResult metadata.
+    let mut confirmed_sell_fill_in_raw: Option<u64> = None;
+    let mut confirmed_sell_fill_status: Option<FillStatus> = None;
+    // From tx meta only: wallet had input mint pre-tx and zero post-tx token balance rows.
+    let mut confirmed_sell_wallet_balance_absent_after_tx: bool = false;
 
     if config.send_enabled {
         let status = match decision.outcome {
@@ -10170,20 +10331,30 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     (ctx.wallet_pubkey, exec.signature.as_deref())
                 {
                     if let Ok(sig) = Signature::from_str(sig_str) {
-                        let (fill_in, fill_out, fill_status, fill_reason, wallet_sol_delta) =
+                        let fills =
                             compute_intent_fills_best_effort(ctx, wallet, &sig, &intent).await;
 
                         // Capture fill_out for immediate LockManager update (Fix: SIM_INSUFFICIENT_BALANCE)
                         if intent.side == TradeSide::Buy {
-                            if let Some(ref fo) = fill_out {
+                            if let Some(ref fo) = fills.fill_out {
                                 confirmed_buy_fill_out_raw = Some(fo.raw);
+                            }
+                        } else if intent.side == TradeSide::Sell {
+                            confirmed_sell_fill_status = Some(fills.fill_status);
+                            confirmed_sell_wallet_balance_absent_after_tx =
+                                fills.wallet_token_balance_absent_after_tx;
+                            if let Some(ref fi) = fills.fill_in {
+                                confirmed_sell_fill_in_raw = Some(fi.raw);
                             }
                         }
 
                         exec = exec
-                            .with_fills(fill_in, fill_out)
-                            .with_fill_diagnostics(fill_status, fill_reason);
-                        if let Some(delta) = wallet_sol_delta {
+                            .with_fills(fills.fill_in, fills.fill_out)
+                            .with_fill_diagnostics(
+                                fills.fill_status,
+                                fills.fill_unavailable_reason,
+                            );
+                        if let Some(delta) = fills.wallet_sol_delta {
                             exec = exec.with_sol_delta(delta);
                         }
                     }
@@ -10191,6 +10362,17 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             }
 
             exec.status = status;
+            // Scope 48: always classify confirmed SELL for market-data, even when fill RPC path
+            // was skipped (no signature / parse failure / missing wallet).
+            if intent.side == TradeSide::Sell && exec.status == ExecutionStatus::Confirmed {
+                apply_scope48_confirmed_sell_execution_metadata(
+                    &mut exec,
+                    &ctx.lock_manager,
+                    &intent,
+                    confirmed_sell_fill_in_raw,
+                    confirmed_sell_wallet_balance_absent_after_tx,
+                );
+            }
             if matches!(exec.status, ExecutionStatus::Failed) {
                 exec.error_message = Some("execution_failed".to_string());
                 exec.error_code = decision
@@ -10273,17 +10455,50 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 }
             }
             TradeSide::Sell => {
-                // Clear token balance from LockManager after successful SELL.
-                // This prevents stale balances that would pass pre-flight checks
-                // for tokens we no longer hold.
-                let mint_str = &intent.resources.input_mint;
-                ctx.lock_manager
-                    .set_available_token_balance(mint_str.to_string(), 0);
-                info!(
-                    intent_id = %intent.intent_id,
-                    mint = %mint_str,
-                    "LockManager: cleared token balance after confirmed SELL"
+                // Amount-aware SELL (Scope 48): partial sells must not zero the mint or
+                // double-subtract when `release_locks_after_confirmed_sell` runs (lock still holds sold amount).
+                let mint_str = intent.resources.input_mint.clone();
+                let (avail, locked) = ctx
+                    .lock_manager
+                    .available_and_locked_tokens_for_intent(&intent.intent_id, &mint_str);
+                let total_pos = ctx
+                    .lock_manager
+                    .intent_token_position_total_at_lock(&intent.intent_id, &mint_str)
+                    .unwrap_or_else(|| avail.saturating_add(locked));
+                let sold_raw = confirmed_sell_fill_in_raw.unwrap_or(intent.required_capital.raw);
+                let is_cold_path_recovery = is_cold_path_recovery_sell(&intent);
+                let s48 = scope48_confirmed_sell_close_decision(
+                    is_cold_path_recovery,
+                    sold_raw,
+                    total_pos,
+                    confirmed_sell_wallet_balance_absent_after_tx,
                 );
+
+                if s48.full_close {
+                    ctx.lock_manager
+                        .set_available_token_balance(mint_str.clone(), 0);
+                    info!(
+                        intent_id = %intent.intent_id,
+                        mint = %mint_str,
+                        sold_raw,
+                        total_pos,
+                        is_cold_path_recovery,
+                        sell_token_account_closed = s48.sell_token_account_closed,
+                        "LockManager: cleared token balance after confirmed full SELL"
+                    );
+                } else {
+                    // Partial SELL: `available_tokens` already reflects post-sell unlocked balance
+                    // (total minus lock). Do not `set(..., 0)` or subtract — would double-count vs
+                    // `release_locks_after_confirmed_sell` (Scope 47 + Scope 48).
+                    info!(
+                        intent_id = %intent.intent_id,
+                        mint = %mint_str,
+                        sold_raw,
+                        total_pos,
+                        fill_status = ?confirmed_sell_fill_status,
+                        "LockManager: partial confirmed SELL — leaving token balance unchanged until lock release"
+                    );
+                }
             }
         }
 
@@ -10299,7 +10514,14 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
         let (fill_in, fill_out, _fill_status, _fill_reason, _wallet_sol_delta) =
             if let (Some(wallet), Ok(sig)) = (ctx.wallet_pubkey, Signature::from_str(&tx_hash)) {
-                compute_intent_fills_best_effort(ctx, wallet, &sig, &intent).await
+                let f = compute_intent_fills_best_effort(ctx, wallet, &sig, &intent).await;
+                (
+                    f.fill_in,
+                    f.fill_out,
+                    f.fill_status,
+                    f.fill_unavailable_reason,
+                    f.wallet_sol_delta,
+                )
             } else {
                 (None, None, FillStatus::Unavailable, None, None)
             };
@@ -11164,10 +11386,11 @@ async fn spawn_rebroadcast_loop(
 #[cfg(test)]
 mod execution_engine_tests {
     use super::{
-        is_cold_path_recovery_sell, is_pump_amm_structural_sim_error,
-        is_pumpfun_bonding_curve_structural_sim_error, is_regular_momentum_hot_path_sell,
-        pump_amm_hint_pool_cache_usable_for_tx_plan_builder, pump_amm_pool_market_hint_merge,
-        record_pump_amm_hot_path_refresh_after_success, select_best_route,
+        apply_scope48_confirmed_sell_execution_metadata, is_cold_path_recovery_sell,
+        is_pump_amm_structural_sim_error, is_pumpfun_bonding_curve_structural_sim_error,
+        is_regular_momentum_hot_path_sell, pump_amm_hint_pool_cache_usable_for_tx_plan_builder,
+        pump_amm_pool_market_hint_merge, record_pump_amm_hot_path_refresh_after_success,
+        scope48_confirmed_sell_close_decision, select_best_route,
         try_pump_amm_hot_path_refresh_publish, wait_for_meteora_dlmm_slave_after_recovery,
         wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder,
         wait_for_pumpfun_bonding_cache_refresh, DiscoveryRequestOutcome,
@@ -11177,10 +11400,12 @@ mod execution_engine_tests {
         CachedPoolState, LivePoolCache, MeteoraState, PumpAmmState, PumpFunState,
     };
     use ironcrab::ipc::{
-        ControlResponse, ControlResponseStatus, DexPoolReadiness, ExplicitAmount, IntentOrigin,
-        IntentTier, TradeIntent, TradeResources, TradeSide, TradingRegime,
+        ControlResponse, ControlResponseStatus, DexPoolReadiness, ExecutionResult, ExecutionStatus,
+        ExplicitAmount, IntentOrigin, IntentTier, TradeIntent, TradeResources, TradeSide,
+        TradingRegime,
     };
     use ironcrab::solana::dex::pumpfun::PumpFunDex;
+    use ironcrab::storage::locks::{LockHolder, LockManager, LockResult};
     use parking_lot::Mutex as ParkingMutex;
     use solana_sdk::pubkey::Pubkey;
     use std::collections::HashMap;
@@ -11855,6 +12080,250 @@ mod execution_engine_tests {
         assert!(
             !stuck,
             "with before == post-recovery evidence, wait must not succeed (guards Bug #34 ordering)"
+        );
+    }
+
+    /// Production Scope 48 failure: `close_token_ata=true` + complete fills + probe-only sold amount
+    /// must NOT be treated as full close for regular Momentum SELL.
+    #[test]
+    fn scope48_regular_momentum_partial_sell_close_token_ata_complete_fills_still_partial() {
+        let probe = 25_313_868_645u64;
+        let scale_in = 56_323_355_801u64;
+        let total_pos = probe.saturating_add(scale_in);
+
+        let s48 = scope48_confirmed_sell_close_decision(
+            false, probe, total_pos,
+            false, // would have been wrongly inferred from close_ata + Complete before fix
+        );
+        assert!(!s48.full_close);
+        assert!(!s48.sell_token_account_closed);
+        assert!(!s48.sell_untracked_ata);
+    }
+
+    #[test]
+    fn scope48_regular_momentum_full_sell_when_sold_covers_position() {
+        let total = 81_637_224_446u64;
+        let s48 = scope48_confirmed_sell_close_decision(false, total, total, false);
+        assert!(s48.full_close);
+        assert!(!s48.sell_token_account_closed);
+        assert!(s48.sell_untracked_ata);
+    }
+
+    #[test]
+    fn scope48_hard_meta_token_balance_gone_sets_sell_token_account_closed() {
+        let s48 = scope48_confirmed_sell_close_decision(false, 1, 1_000_000, true);
+        assert!(s48.full_close);
+        assert!(s48.sell_token_account_closed);
+        assert!(!s48.sell_untracked_ata);
+    }
+
+    #[test]
+    fn scope48_liquidation_conservative_full_close_even_if_amounts_ambiguous() {
+        let s48 = scope48_confirmed_sell_close_decision(true, 1, 10_000_000, false);
+        assert!(s48.full_close);
+        assert!(!s48.sell_token_account_closed);
+        assert!(s48.sell_untracked_ata);
+    }
+
+    /// LockManager: after partial probe sell, residual scale_in remains; Scope 47 release does not resurrect probe.
+    #[test]
+    fn scope48_lockmanager_probe_scale_partial_sell_residual() {
+        const M: &str = "ProdMintScope48";
+        let probe = 25_313_868_645u64;
+        let scale_in = 56_323_355_801u64;
+        let total = probe.saturating_add(scale_in);
+
+        let m = LockManager::new(0);
+        m.update_balances(0, HashMap::from([(M.to_string(), total)]));
+
+        let mut sell = HashMap::new();
+        sell.insert(M.to_string(), probe);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("sell-probe"), 0, sell),
+            LockResult::Acquired
+        ));
+        assert_eq!(m.available_token_balance(M), scale_in);
+
+        let total_pos = m
+            .intent_token_position_total_at_lock("sell-probe", M)
+            .expect("snapshot at lock");
+        let sold_raw = probe;
+        let s48 = scope48_confirmed_sell_close_decision(false, sold_raw, total_pos, false);
+        assert!(!s48.full_close);
+
+        m.release_locks_after_confirmed_sell("sell-probe");
+        assert_eq!(m.available_token_balance(M), scale_in);
+        assert_eq!(m.count_non_zero_token_balances(), 1);
+    }
+
+    #[test]
+    fn scope48_lockmanager_full_sell_zeros_balance() {
+        const M: &str = "FullMintScope48";
+        let total = 1_000_000u64;
+        let m = LockManager::new(0);
+        m.update_balances(0, HashMap::from([(M.to_string(), total)]));
+
+        let mut sell = HashMap::new();
+        sell.insert(M.to_string(), total);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("sell-all"), 0, sell),
+            LockResult::Acquired
+        ));
+
+        let total_pos = m
+            .intent_token_position_total_at_lock("sell-all", M)
+            .expect("snapshot at lock");
+        let s48 = scope48_confirmed_sell_close_decision(false, total, total_pos, false);
+        assert!(s48.full_close);
+
+        m.set_available_token_balance(M.to_string(), 0);
+        m.release_locks_after_confirmed_sell("sell-all");
+        assert_eq!(m.available_token_balance(M), 0);
+        assert_eq!(m.count_non_zero_token_balances(), 0);
+    }
+
+    /// No tx-meta fill (`confirmed_sell_fill_in_raw` None): still classify partial from
+    /// `required_capital` + lock snapshot (production RPC/fill gap).
+    #[test]
+    fn scope48_apply_metadata_partial_momentum_sell_without_fill_in_raw() {
+        const MINT: &str = "Scope48MintNoFill";
+        let probe = 25_313_868_645u64;
+        let scale_in = 56_323_355_801u64;
+        let total = probe.saturating_add(scale_in);
+
+        let lm = LockManager::new(0);
+        lm.update_balances(0, HashMap::from([(MINT.to_string(), total)]));
+        let mut sell_map = HashMap::new();
+        sell_map.insert(MINT.to_string(), probe);
+        assert!(matches!(
+            lm.try_lock_capital(LockHolder::new("intent-no-fill"), 0, sell_map),
+            LockResult::Acquired
+        ));
+
+        let mut intent = TradeIntent::new(
+            "momentum-bot",
+            "v0.1.0",
+            "run-1",
+            "intent-no-fill".to_string(),
+            "momentum-bot",
+            IntentTier::Tier1,
+            IntentOrigin::StrategyA,
+            ExplicitAmount::new(probe, 6),
+            TradeResources {
+                input_mint: MINT.to_string(),
+                output_mint: ironcrab::ipc::NATIVE_SOL_MINT.to_string(),
+                pools: vec!["pool".to_string()],
+                accounts: vec![],
+                token_program: None,
+            },
+            0,
+            200,
+            TradeSide::Sell,
+            TradingRegime::Early,
+        );
+        intent
+            .metadata
+            .insert("close_token_ata".to_string(), "true".to_string());
+
+        let mut exec = ExecutionResult::new_sent(
+            "execution-engine",
+            "test",
+            "run",
+            "ex1".to_string(),
+            "d1".to_string(),
+            "intent-no-fill".to_string(),
+            "momentum-bot".to_string(),
+            Some(MINT.to_string()),
+            Some("sig".to_string()),
+            None,
+        );
+        exec.status = ExecutionStatus::Confirmed;
+
+        apply_scope48_confirmed_sell_execution_metadata(&mut exec, &lm, &intent, None, false);
+
+        assert_eq!(
+            exec.metadata
+                .get("sell_position_delta_applied")
+                .map(|s| s.as_str()),
+            Some("partial")
+        );
+        assert!(!exec.metadata.contains_key("sell_untracked_ata"));
+        assert!(!exec.metadata.contains_key("sell_token_account_closed"));
+
+        let sold_raw = intent.required_capital.raw;
+        let total_pos = lm
+            .intent_token_position_total_at_lock(&intent.intent_id, MINT)
+            .expect("snapshot at lock");
+        let s48 = scope48_confirmed_sell_close_decision(false, sold_raw, total_pos, false);
+        assert!(!s48.full_close);
+    }
+
+    #[test]
+    fn scope48_sell_all_conservative_full_close_despite_probe_vs_total() {
+        const MINT: &str = "SellAllMint";
+        let probe = 100u64;
+        let scale = 900u64;
+        let total = probe.saturating_add(scale);
+
+        let lm = LockManager::new(0);
+        lm.update_balances(0, HashMap::from([(MINT.to_string(), total)]));
+        let mut sell_map = HashMap::new();
+        sell_map.insert(MINT.to_string(), probe);
+        assert!(matches!(
+            lm.try_lock_capital(LockHolder::new("sell-all-intent"), 0, sell_map),
+            LockResult::Acquired
+        ));
+
+        let mut intent = TradeIntent::new(
+            "sell-all",
+            "v0.1.0",
+            "run-1",
+            "sell-all-intent".to_string(),
+            "sell-all",
+            IntentTier::Tier1,
+            IntentOrigin::StrategyA,
+            ExplicitAmount::new(probe, 6),
+            TradeResources {
+                input_mint: MINT.to_string(),
+                output_mint: ironcrab::ipc::NATIVE_SOL_MINT.to_string(),
+                pools: vec!["pool".to_string()],
+                accounts: vec![],
+                token_program: None,
+            },
+            0,
+            200,
+            TradeSide::Sell,
+            TradingRegime::Early,
+        );
+        intent
+            .metadata
+            .insert("sell_all".to_string(), "true".to_string());
+        assert!(is_cold_path_recovery_sell(&intent));
+
+        let mut exec = ExecutionResult::new_sent(
+            "execution-engine",
+            "test",
+            "run",
+            "ex-sa".to_string(),
+            "d-sa".to_string(),
+            "sell-all-intent".to_string(),
+            "sell-all".to_string(),
+            Some(MINT.to_string()),
+            None,
+            None,
+        );
+        exec.status = ExecutionStatus::Confirmed;
+
+        apply_scope48_confirmed_sell_execution_metadata(&mut exec, &lm, &intent, None, false);
+        assert_eq!(
+            exec.metadata
+                .get("sell_position_delta_applied")
+                .map(|s| s.as_str()),
+            Some("full")
+        );
+        assert_eq!(
+            exec.metadata.get("sell_untracked_ata").map(|s| s.as_str()),
+            Some("true")
         );
     }
 }
