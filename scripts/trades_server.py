@@ -85,6 +85,8 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 return "vor 1 Stunde"
             return f"vor {h} Stunden"
         d = max(1, total_secs // 86400)
+        if d == 1:
+            return "vor 1 Tag"
         return f"vor {d} Tagen"
 
     def _apply_time_mode_fields(self, trades: list, time_mode: str) -> None:
