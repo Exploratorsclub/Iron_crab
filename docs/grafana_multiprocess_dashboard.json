@@ -2,7 +2,7 @@
   "title": "IronCrab Multi-Process Architecture",
   "description": "Dashboard for the Debuggable-First Multi-Process Architecture",
   "schemaVersion": 39,
-  "version": 5,
+  "version": 6,
   "time": {
     "from": "now-1h",
     "to": "now"
@@ -13,6 +13,34 @@
     "multi-process",
     "trading"
   ],
+  "templating": {
+    "list": [
+      {
+        "name": "time_mode",
+        "type": "custom",
+        "label": "Trades: Zeit (Recent Trades)",
+        "query": "relative,utc",
+        "options": [
+          {
+            "value": "relative",
+            "text": "Relativ (z.B. vor 25 Min.)",
+            "selected": true
+          },
+          {
+            "value": "utc",
+            "text": "UTC"
+          }
+        ],
+        "current": {
+          "value": "relative",
+          "text": "Relativ (z.B. vor 25 Min.)"
+        },
+        "includeAll": false,
+        "multi": false,
+        "hide": 0
+      }
+    ]
+  },
   "panels": [
     {
       "type": "row",
@@ -1906,7 +1934,7 @@
           "type": "json",
           "source": "url",
           "format": "table",
-          "url": "/trades?mode=run",
+          "url": "/trades?mode=run&time_mode=${time_mode}",
           "url_options": {
             "method": "GET",
             "data": ""
@@ -1915,8 +1943,18 @@
           "columns": [
             {
               "selector": "timestamp_ms",
+              "text": "Sort (ms)",
+              "type": "number"
+            },
+            {
+              "selector": "time_display",
               "text": "Time",
-              "type": "timestamp_epoch"
+              "type": "string"
+            },
+            {
+              "selector": "mint_full",
+              "text": "mint_full",
+              "type": "string"
             },
             {
               "selector": "action",
@@ -1972,12 +2010,44 @@
           {
             "matcher": {
               "id": "byName",
+              "options": "Sort (ms)"
+            },
+            "properties": [
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": true
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
               "options": "Time"
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "dateTimeFromNow"
+                "id": "custom.width",
+                "value": 120
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "mint_full"
+            },
+            "properties": [
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": true
+                }
               }
             ]
           },
@@ -1987,6 +2057,10 @@
               "options": "Action"
             },
             "properties": [
+              {
+                "id": "custom.width",
+                "value": 70
+              },
               {
                 "id": "custom.cellOptions",
                 "value": {
@@ -2026,14 +2100,14 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 120
+                "value": 130
               },
               {
                 "id": "links",
                 "value": [
                   {
                     "title": "View on Solscan",
-                    "url": "https://solscan.io/token/${__value.text}",
+                    "url": "https://solscan.io/token/${__data.fields.mint_full}",
                     "targetBlank": true
                   }
                 ]
@@ -2048,7 +2122,7 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 100
+                "value": 110
               },
               {
                 "id": "links",
@@ -2065,9 +2139,25 @@
           {
             "matcher": {
               "id": "byName",
+              "options": "Amount"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
               "options": "Value (SOL)"
             },
             "properties": [
+              {
+                "id": "custom.width",
+                "value": 115
+              },
               {
                 "id": "decimals",
                 "value": 12
@@ -2080,6 +2170,10 @@
               "options": "PnL (SOL)"
             },
             "properties": [
+              {
+                "id": "custom.width",
+                "value": 95
+              },
               {
                 "id": "decimals",
                 "value": 6
@@ -2114,6 +2208,10 @@
               "options": "PnL %"
             },
             "properties": [
+              {
+                "id": "custom.width",
+                "value": 75
+              },
               {
                 "id": "unit",
                 "value": "percent"
@@ -2154,7 +2252,7 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 200
+                "value": 160
               },
               {
                 "id": "custom.cellOptions",
@@ -2294,7 +2392,7 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 300
+                "value": 500
               }
             ]
           }
@@ -2304,7 +2402,7 @@
         "showHeader": true,
         "sortBy": [
           {
-            "displayName": "Time",
+            "displayName": "Sort (ms)",
             "desc": true
           }
         ]
