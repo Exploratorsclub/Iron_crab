@@ -3794,6 +3794,11 @@ fn execution_result_sell_closes_wallet_position(exec: &ExecutionResult) -> bool 
     if exec.metadata.get("side").map(|s| s.as_str()) != Some("SELL") {
         return false;
     }
+    // Rolling deploy / skipped Scope 48 block: without an explicit partial marker, keep legacy
+    // "confirmed SELL closes wallet position" semantics (only `partial` keeps the ATA tracked).
+    if !exec.metadata.contains_key("sell_position_delta_applied") {
+        return true;
+    }
     if exec
         .metadata
         .get("sell_token_account_closed")
@@ -3850,6 +3855,12 @@ mod execution_result_sell_close_tests {
             "partial".to_string(),
         );
         assert!(!execution_result_sell_closes_wallet_position(&exec));
+    }
+
+    #[test]
+    fn confirmed_sell_without_scope48_keys_treated_as_full_close() {
+        let exec = base_sell_exec();
+        assert!(execution_result_sell_closes_wallet_position(&exec));
     }
 
     #[test]

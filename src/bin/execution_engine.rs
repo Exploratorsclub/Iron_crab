@@ -10319,19 +10319,13 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                                     &intent.intent_id,
                                     &mint_key,
                                 );
-                            let total_pos = avail.saturating_add(locked);
+                            let total_pos = ctx
+                                .lock_manager
+                                .intent_token_position_total_at_lock(&intent.intent_id, &mint_key)
+                                .unwrap_or_else(|| avail.saturating_add(locked));
                             let sold_raw =
                                 confirmed_sell_fill_in_raw.unwrap_or(intent.required_capital.raw);
-                            let is_liquidation = intent
-                                .metadata
-                                .get("purpose")
-                                .map(|v| v == "liquidation")
-                                .unwrap_or(false)
-                                || intent
-                                    .metadata
-                                    .get("kill_switch")
-                                    .map(|v| v == "true")
-                                    .unwrap_or(false);
+                            let is_liquidation = is_cold_path_recovery_sell(&intent);
                             let s48 = scope48_confirmed_sell_close_decision(
                                 is_liquidation,
                                 sold_raw,
@@ -10360,6 +10354,21 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                         }
                     }
                 }
+            }
+
+            // Confirmed SELL must always carry Scope 48 position metadata for market-data. If the
+            // fill/signature path above was skipped (parse error, missing wallet, etc.), default
+            // to legacy full-close semantics so ATAs are not stuck tracked.
+            if matches!(status, ExecutionStatus::Confirmed)
+                && intent.side == TradeSide::Sell
+                && !exec.metadata.contains_key("sell_position_delta_applied")
+            {
+                exec.metadata.insert(
+                    "sell_position_delta_applied".to_string(),
+                    "full".to_string(),
+                );
+                exec.metadata
+                    .insert("sell_untracked_ata".to_string(), "true".to_string());
             }
 
             exec.status = status;
@@ -10451,18 +10460,12 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 let (avail, locked) = ctx
                     .lock_manager
                     .available_and_locked_tokens_for_intent(&intent.intent_id, &mint_str);
-                let total_pos = avail.saturating_add(locked);
+                let total_pos = ctx
+                    .lock_manager
+                    .intent_token_position_total_at_lock(&intent.intent_id, &mint_str)
+                    .unwrap_or_else(|| avail.saturating_add(locked));
                 let sold_raw = confirmed_sell_fill_in_raw.unwrap_or(intent.required_capital.raw);
-                let is_liquidation = intent
-                    .metadata
-                    .get("purpose")
-                    .map(|v| v == "liquidation")
-                    .unwrap_or(false)
-                    || intent
-                        .metadata
-                        .get("kill_switch")
-                        .map(|v| v == "true")
-                        .unwrap_or(false);
+                let is_liquidation = is_cold_path_recovery_sell(&intent);
                 let s48 = scope48_confirmed_sell_close_decision(
                     is_liquidation,
                     sold_raw,
@@ -12139,8 +12142,9 @@ mod execution_engine_tests {
         ));
         assert_eq!(m.available_token_balance(M), scale_in);
 
-        let (avail, locked) = m.available_and_locked_tokens_for_intent("sell-probe", M);
-        let total_pos = avail.saturating_add(locked);
+        let total_pos = m
+            .intent_token_position_total_at_lock("sell-probe", M)
+            .expect("snapshot at lock");
         let sold_raw = probe;
         let s48 = scope48_confirmed_sell_close_decision(false, sold_raw, total_pos, false);
         assert!(!s48.full_close);
@@ -12164,8 +12168,9 @@ mod execution_engine_tests {
             LockResult::Acquired
         ));
 
-        let (avail, locked) = m.available_and_locked_tokens_for_intent("sell-all", M);
-        let total_pos = avail.saturating_add(locked);
+        let total_pos = m
+            .intent_token_position_total_at_lock("sell-all", M)
+            .expect("snapshot at lock");
         let s48 = scope48_confirmed_sell_close_decision(false, total, total_pos, false);
         assert!(s48.full_close);
 
