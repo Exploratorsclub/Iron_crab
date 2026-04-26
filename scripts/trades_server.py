@@ -7,12 +7,17 @@ Reads from: trade_logs/executions/execution_results-YYYYMMDD.jsonl
 Grafana Infinity data source connects to this for "Recent Trades" table panel.
 
 Usage: python3 trades_server.py [--port 9899]
+
+Query params (GET /trades):
+- mode: limit|run — same as before
+- time_mode: relative|utc — controls `time_display` (default relative); `timestamp_ms` always for sorting
+  Response adds: time_utc, time_age, time_display
 """
 
 import http.server
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 import argparse
@@ -29,7 +34,8 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/trades":
             mode = params.get('mode', ['limit'])[0]
-            self.serve_trades(mode=mode)
+            time_mode = params.get('time_mode', ['relative'])[0]
+            self.serve_trades(mode=mode, time_mode=time_mode)
         elif path == "/decisions":
             self.serve_decisions()
         elif path == "/pnl_24h":
@@ -43,17 +49,63 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
     
-    def serve_trades(self, mode: str = "limit"):
+    def serve_trades(self, mode: str = "limit", time_mode: str = "relative"):
         if mode == "run":
             trades = self.read_trades_by_run()
         else:
             trades = self.read_recent_trades(20)
-        
+
+        self._apply_time_mode_fields(trades, time_mode)
+
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(json.dumps(trades).encode())
+
+    def _format_time_age_german(self, ts_ms: int) -> str:
+        """Relative age in German, e.g. 'vor 25 Minuten' (Grafana table display)."""
+        if not ts_ms:
+            return "—"
+        now = datetime.now(tz=timezone.utc)
+        ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        delta = now - ts
+        total_secs = int(max(0, delta.total_seconds()))
+        if total_secs < 60:
+            s = max(1, total_secs)
+            return f"vor {s} Sekunde{'n' if s != 1 else ''}"
+        if total_secs < 3600:
+            m = max(1, total_secs // 60)
+            if m == 1:
+                return "vor 1 Minute"
+            return f"vor {m} Minuten"
+        if total_secs < 86400:
+            h = max(1, total_secs // 3600)
+            if h == 1:
+                return "vor 1 Stunde"
+            return f"vor {h} Stunden"
+        d = max(1, total_secs // 86400)
+        return f"vor {d} Tagen"
+
+    def _apply_time_mode_fields(self, trades: list, time_mode: str) -> None:
+        """Add time_utc, time_age, and time_display for dashboard toggles (keeps timestamp_ms for sort)."""
+        if time_mode not in ("relative", "utc"):
+            time_mode = "relative"
+        for t in trades:
+            ts_ms = t.get("timestamp_ms") or 0
+            if ts_ms:
+                utc_str = (
+                    datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                    + " UTC"
+                )
+            else:
+                utc_str = "—"
+            age_str = self._format_time_age_german(ts_ms)
+            t["time_utc"] = utc_str
+            t["time_age"] = age_str
+            t["time_display"] = age_str if time_mode == "relative" else utc_str
 
     def serve_decisions(self):
         decisions = self.read_recent_decisions(200)
@@ -697,11 +749,39 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def _self_check():
+    """Quick sanity check for time_mode fields (no server)."""
+    h = TradesHandler.__new__(TradesHandler)
+    ts_ms = 1_700_000_000_000
+    expected_utc = (
+        datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        + " UTC"
+    )
+    row = {"timestamp_ms": ts_ms}
+    TradesHandler._apply_time_mode_fields(h, [row], "relative")
+    assert row.get("time_utc") == expected_utc
+    assert row.get("time_display") == row.get("time_age")
+    TradesHandler._apply_time_mode_fields(h, [row], "utc")
+    assert row.get("time_display") == expected_utc
+    print("trades_server: self-check OK")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Trades history server')
     parser.add_argument('--port', type=int, default=9899, help='Port to listen on (default: 9899)')
+    parser.add_argument(
+        '--self-check',
+        action='store_true',
+        help='Run a quick local check of time_mode fields and exit',
+    )
     args = parser.parse_args()
-    
+
+    if args.self_check:
+        _self_check()
+        return
+
     server = http.server.HTTPServer(('0.0.0.0', args.port), TradesHandler)
     print(f"Trades server running on http://0.0.0.0:{args.port}/trades")
     print(f"Reading from: {EXECUTIONS_DIR}")
