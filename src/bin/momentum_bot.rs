@@ -25,7 +25,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
@@ -74,6 +74,50 @@ use sd_notify::NotifyState;
 
 /// Build version for decision records
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// JetStream replay dedup for orphaned BUY path — bounded so memory does not grow forever.
+const ORPHANED_RECOVERED_INTENT_IDS_CAP: usize = 50_000;
+
+/// [`HashSet`] insert/remove with LRU eviction when size exceeds `cap` (new inserts only).
+struct BoundedIntentIdCache {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+    cap: usize,
+}
+
+impl BoundedIntentIdCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            set: HashSet::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    fn insert(&mut self, id: String) -> bool {
+        if self.set.contains(&id) {
+            return false;
+        }
+        self.set.insert(id.clone());
+        self.order.push_back(id);
+        while self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        true
+    }
+
+    fn remove(&mut self, id: &str) -> bool {
+        let removed = self.set.remove(id);
+        if removed {
+            if let Some(pos) = self.order.iter().position(|x| x == id) {
+                self.order.remove(pos);
+            }
+        }
+        removed
+    }
+}
 
 // #region agent log
 fn dbg_log(location: &str, message: &str, data: serde_json::Value, hypothesis_id: &str) {
@@ -2118,7 +2162,7 @@ struct MomentumContext {
     orphaned_mints: parking_lot::RwLock<HashMap<String, (u64, u8)>>,
     /// Scope 56: in-memory idempotency for duplicate JetStream / replayed ExecutionResults
     /// on the orphaned-BUY path (no durable store in this scope).
-    orphaned_recovered_intent_ids: parking_lot::RwLock<HashSet<String>>,
+    orphaned_recovered_intent_ids: parking_lot::RwLock<BoundedIntentIdCache>,
     /// Stats
     tokens_tracked: std::sync::atomic::AtomicU64,
     tokens_blacklisted: std::sync::atomic::AtomicU64,
@@ -5822,7 +5866,9 @@ async fn main() -> Result<()> {
         live_pool_cache,
         position_kv: tokio::sync::OnceCell::new(),
         orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-        orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+        orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
+            ORPHANED_RECOVERED_INTENT_IDS_CAP,
+        )),
         tokens_tracked: std::sync::atomic::AtomicU64::new(0),
         tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
         intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7159,7 +7205,9 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
+                ORPHANED_RECOVERED_INTENT_IDS_CAP,
+            )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7212,7 +7260,9 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
+                ORPHANED_RECOVERED_INTENT_IDS_CAP,
+            )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7290,7 +7340,9 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
+                ORPHANED_RECOVERED_INTENT_IDS_CAP,
+            )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7542,7 +7594,9 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
+                ORPHANED_RECOVERED_INTENT_IDS_CAP,
+            )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7645,7 +7699,9 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
+                ORPHANED_RECOVERED_INTENT_IDS_CAP,
+            )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7716,7 +7772,9 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
+                ORPHANED_RECOVERED_INTENT_IDS_CAP,
+            )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7775,7 +7833,9 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
+                ORPHANED_RECOVERED_INTENT_IDS_CAP,
+            )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7849,7 +7909,9 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
+                ORPHANED_RECOVERED_INTENT_IDS_CAP,
+            )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7949,7 +8011,9 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
+                ORPHANED_RECOVERED_INTENT_IDS_CAP,
+            )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -8045,7 +8109,9 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
+                ORPHANED_RECOVERED_INTENT_IDS_CAP,
+            )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -8126,7 +8192,9 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
+                ORPHANED_RECOVERED_INTENT_IDS_CAP,
+            )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -8187,7 +8255,9 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
+                ORPHANED_RECOVERED_INTENT_IDS_CAP,
+            )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -8239,7 +8309,9 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
+                ORPHANED_RECOVERED_INTENT_IDS_CAP,
+            )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -8431,7 +8503,9 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
+                ORPHANED_RECOVERED_INTENT_IDS_CAP,
+            )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -8552,7 +8626,9 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
+                ORPHANED_RECOVERED_INTENT_IDS_CAP,
+            )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
