@@ -852,8 +852,10 @@ impl PositionTracker {
     ) -> Option<(String, String)> {
         // Returns: Some((exit_type, reason)) or None
 
-        let pnl = self.pnl_pct();
-        let drawdown = self.drawdown_from_ath_pct();
+        // Mut: refreshed after `update_price` in validation suppress paths so trailing/activation
+        // do not use stale pnl/drawdown vs updated self.current_price (see f7477a89).
+        let mut pnl = self.pnl_pct();
+        let mut drawdown = self.drawdown_from_ath_pct();
         let hold_secs = self.entry_time.elapsed().as_secs();
 
         let pnl_for_reporting = match exit_quote {
@@ -876,6 +878,8 @@ impl PositionTracker {
             if action == ExitPriceValidationAction::Suppress {
                 if let Some(q) = exit_quote.filter(|q| q.pool_sourced && q.tokens_per_sol > 0.0) {
                     self.update_price(q.tokens_per_sol);
+                    pnl = self.pnl_pct();
+                    drawdown = self.drawdown_from_ath_pct();
                 }
                 warn!(
                     mint = %self.mint,
@@ -926,6 +930,8 @@ impl PositionTracker {
             if action == ExitPriceValidationAction::Suppress {
                 if let Some(q) = exit_quote.filter(|q| q.pool_sourced && q.tokens_per_sol > 0.0) {
                     self.update_price(q.tokens_per_sol);
+                    pnl = self.pnl_pct();
+                    drawdown = self.drawdown_from_ath_pct();
                 }
                 warn!(
                     mint = %self.mint,
@@ -1019,6 +1025,7 @@ impl PositionTracker {
             if action == ExitPriceValidationAction::Suppress {
                 if let Some(q) = exit_quote.filter(|q| q.pool_sourced && q.tokens_per_sol > 0.0) {
                     self.update_price(q.tokens_per_sol);
+                    pnl = self.pnl_pct();
                 }
                 warn!(
                     mint = %self.mint,
