@@ -78,8 +78,9 @@ use ironcrab::metrics::{
     INTENTS_EXECUTED_TOTAL, INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL,
     JITO_BUNDLES_LANDED_TOTAL, JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL,
     JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL, KILL_SWITCH_ACTIVE,
-    NATS_MESSAGES_RECEIVED_TOTAL, OPEN_POSITIONS_GAUGE,
-    PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_FAIL_TOTAL,
+    NATS_MESSAGES_RECEIVED_TOTAL, OPEN_POSITIONS_GAUGE, POSITION_AUTHORITY_DRIFT_LOCKMANAGER,
+    POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE, POSITION_AUTHORITY_OPEN_GAUGE,
+    POSITION_AUTHORITY_RECONCILE_NEEDED_GAUGE, PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_FAIL_TOTAL,
     PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_SUCCESS_TOTAL,
     PUMPSWAP_HOT_PATH_HEALING_COOLDOWN_SUPPRESSED_TOTAL,
     PUMPSWAP_HOT_PATH_HEALING_SKIPPED_NO_NATS_TOTAL, PUMPSWAP_HOT_PATH_HEALING_TRIGGER_TOTAL,
@@ -97,6 +98,7 @@ use ironcrab::nats::{
     TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS, TRADE_INTENTS_STREAM_NAME,
     WALLET_SNAPSHOT_STREAM_NAME,
 };
+use ironcrab::position_authority::{position_authority_drift_lockmanager, PositionAuthority};
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::dex::meteora_dlmm::MeteoraDlmm;
 use ironcrab::solana::dex::orca::Orca;
@@ -1915,6 +1917,8 @@ struct ExecutionContext {
     execution_writer: JsonlWriter,
     burn_writer: JsonlWriter,
     lock_manager: LockManager,
+    /// PA-2: passive PositionAuthority (metrics only; not used for gating or reservations).
+    position_authority: Arc<ParkingMutex<PositionAuthority>>,
     log_base: PathBuf, // P1: For state persistence
     decision_counter: std::sync::atomic::AtomicU64,
     execution_counter: std::sync::atomic::AtomicU64,
@@ -5751,6 +5755,34 @@ impl ExecutionContext {
     fn get_open_positions(&self) -> usize {
         self.lock_manager.count_non_zero_token_balances()
     }
+
+    fn apply_position_authority_from_execution_result(&self, exec: &ExecutionResult) {
+        self.position_authority
+            .lock()
+            .apply_from_confirmed_execution_result(exec);
+        self.refresh_position_authority_metrics();
+    }
+
+    /// Wallet snapshot: same filter as `PositionEvent::try_from_market_event_kind` (ignores SOL/WSOL for authority open count).
+    fn apply_position_authority_from_wallet_event_kind(&self, kind: &MarketEventKind) {
+        self.position_authority
+            .lock()
+            .apply_from_wallet_market_event_kind(kind);
+        self.refresh_position_authority_metrics();
+    }
+
+    fn refresh_position_authority_metrics(&self) {
+        let a = self.position_authority.lock();
+        let auth_open = a.open_positions_count();
+        let reconcile = a.reconcile_needed_positions_count();
+        let lock_open = self.lock_manager.count_non_zero_token_balances();
+        let drift = position_authority_drift_lockmanager(auth_open, lock_open);
+        drop(a);
+        POSITION_AUTHORITY_OPEN_GAUGE.store(auth_open as u64, Ordering::Relaxed);
+        POSITION_AUTHORITY_RECONCILE_NEEDED_GAUGE.store(reconcile as u64, Ordering::Relaxed);
+        POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE.store(lock_open as u64, Ordering::Relaxed);
+        POSITION_AUTHORITY_DRIFT_LOCKMANAGER.store(drift, Ordering::Relaxed);
+    }
 }
 
 #[allow(dead_code)]
@@ -6547,6 +6579,7 @@ async fn main() -> Result<()> {
         execution_writer,
         burn_writer,
         lock_manager,
+        position_authority: Arc::new(ParkingMutex::new(PositionAuthority::new())),
         log_base: log_base.clone(),
         decision_counter: std::sync::atomic::AtomicU64::new(initial_decision_counter),
         execution_counter: std::sync::atomic::AtomicU64::new(initial_execution_counter),
@@ -6674,6 +6707,7 @@ async fn main() -> Result<()> {
 
     // Publish initial gauge values immediately (before the first 30s heartbeat).
     OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
+    ctx.refresh_position_authority_metrics();
 
     // Shutdown channel for background tasks (WsolManager, etc.)
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -7818,6 +7852,8 @@ async fn main() -> Result<()> {
                                                         }
                                                     }
                                                 }
+                                                // PA-2: passive PositionAuthority from same JetStream events (SOL/WSOL ignored for open count)
+                                                ctx.apply_position_authority_from_wallet_event_kind(&event.kind);
                                             }
                                             Err(e) => {
                                                 debug!(error = %e, "Failed to deserialize wallet snapshot MarketEvent");
@@ -7868,6 +7904,7 @@ async fn main() -> Result<()> {
                     INTENTS_REJECTED_TOTAL.store(rejected, Ordering::Relaxed);
                     SIMULATION_FAILURES_TOTAL.store(sim_fail, Ordering::Relaxed);
                     OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
+                    ctx.refresh_position_authority_metrics();
                     ACTIVE_CAPITAL_LOCKS.store(cap_locks as u64, Ordering::Relaxed);
                     ACTIVE_RESOURCE_LOCKS.store(res_locks as u64, Ordering::Relaxed);
                     // "Available WSOL" panel: actual WSOL only (0 when no ATA)
@@ -8073,6 +8110,7 @@ async fn build_replay_context(
         execution_writer,
         burn_writer,
         lock_manager,
+        position_authority: Arc::new(ParkingMutex::new(PositionAuthority::new())),
         log_base: log_dir,
         decision_counter: std::sync::atomic::AtomicU64::new(0),
         execution_counter: std::sync::atomic::AtomicU64::new(0),
@@ -10491,6 +10529,9 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             if let Some(ref nats) = ctx.nats {
                 nats.jetstream_publish(TOPIC_EXECUTION_RESULTS, &exec)
                     .await?;
+            }
+            if exec.status == ExecutionStatus::Confirmed {
+                ctx.apply_position_authority_from_execution_result(&exec);
             }
         }
     }

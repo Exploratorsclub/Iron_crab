@@ -3,9 +3,10 @@
 //! This module is **not** wired to production. Pure reducer for tests and future
 //! `position-manager` / JetStream consumption.
 
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 
-use crate::ipc::schema::{ExecutionResult, ExecutionStatus, MarketEventKind};
+use crate::ipc::schema::{ExecutionResult, ExecutionStatus, MarketEventKind, NATIVE_SOL_MINT};
 
 // ---------------------------------------------------------------------------
 // Public domain types
@@ -87,6 +88,9 @@ impl PositionEvent {
             return None;
         }
         let mint = result.token_mint.clone()?;
+        if is_sol_or_wsol_mint(&mint) {
+            return None;
+        }
         let side = result.metadata.get("side")?.as_str();
         match side {
             "BUY" => {
@@ -131,12 +135,17 @@ impl PositionEvent {
                 balance_raw,
                 decimals,
                 token_program,
-            } => Some(PositionEvent::WalletBalanceSnapshot {
-                mint: mint.clone(),
-                balance_raw: *balance_raw,
-                decimals: *decimals,
-                token_program: token_program.clone(),
-            }),
+            } => {
+                if is_sol_or_wsol_mint(mint) {
+                    return None;
+                }
+                Some(PositionEvent::WalletBalanceSnapshot {
+                    mint: mint.clone(),
+                    balance_raw: *balance_raw,
+                    decimals: *decimals,
+                    token_program: token_program.clone(),
+                })
+            }
             MarketEventKind::WalletSnapshotComplete {
                 mints_in_wallet,
                 wallet,
@@ -155,6 +164,21 @@ fn default_spl_token_program() -> String {
     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string()
 }
 
+/// Mints that must not be counted as open **trade** positions in PositionAuthority
+/// (wrapped/native SOL; same canonical mint as [`NATIVE_SOL_MINT`], plus JetStream
+/// `NATIVE_SOL` sentinel for lamports).
+#[inline]
+pub fn is_sol_or_wsol_mint(mint: &str) -> bool {
+    mint == "NATIVE_SOL" || mint == NATIVE_SOL_MINT
+}
+
+/// `authority open count` minus `lock manager open count` (same notion as
+/// `LockManager::count_non_zero_token_balances` in execution-engine).
+#[inline]
+pub fn position_authority_drift_lockmanager(authority_open: usize, lockmanager_open: usize) -> i64 {
+    authority_open as i64 - lockmanager_open as i64
+}
+
 // ---------------------------------------------------------------------------
 // Reducer
 // ---------------------------------------------------------------------------
@@ -168,6 +192,20 @@ pub struct PositionAuthority {
 impl PositionAuthority {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// PA-2: same mapping as execution-engine (confirmed-only; WSOL/SOL execution rows ignored).
+    pub fn apply_from_confirmed_execution_result(&mut self, result: &ExecutionResult) {
+        if let Some(ev) = PositionEvent::try_from_execution_result(result) {
+            self.apply(&ev);
+        }
+    }
+
+    /// PA-2: `MarketEventKind` → same filter as `try_from_market_event_kind` (skips SOL/WSOL for snapshots).
+    pub fn apply_from_wallet_market_event_kind(&mut self, kind: &MarketEventKind) {
+        if let Some(ev) = PositionEvent::try_from_market_event_kind(kind) {
+            self.apply(&ev);
+        }
     }
 
     pub fn apply(&mut self, event: &PositionEvent) {
@@ -282,25 +320,37 @@ impl PositionAuthority {
             self.by_mint.remove(mint);
             return;
         }
-        let e = self
-            .by_mint
-            .entry(mint.to_string())
-            .or_insert_with(|| PositionState {
-                mint: mint.to_string(),
-                balance_raw: 0,
-                decimals,
-                token_program: token_program.to_string(),
-                ata: None,
-                buy_fills: Vec::new(),
-                sold_raw_total: 0,
-                status: PositionStatus::Closed,
-                last_update_source: UpdateSource::WalletSnapshot,
-            });
-        e.decimals = decimals;
-        e.token_program = token_program.to_string();
-        e.balance_raw = balance_raw;
-        e.status = PositionStatus::ReconcileNeeded;
-        e.last_update_source = UpdateSource::WalletSnapshot;
+
+        match self.by_mint.entry(mint.to_string()) {
+            Entry::Occupied(mut occ) => {
+                let e = occ.get_mut();
+                let prev = e.balance_raw;
+                e.decimals = decimals;
+                e.token_program = token_program.to_string();
+                e.last_update_source = UpdateSource::WalletSnapshot;
+                if prev == balance_raw {
+                    // Invariant: balance_raw > 0 (zero balances remove the entry at function start).
+                    e.status = PositionStatus::Open;
+                } else {
+                    e.balance_raw = balance_raw;
+                    e.status = PositionStatus::ReconcileNeeded;
+                }
+            }
+            Entry::Vacant(v) => {
+                // `balance_raw > 0` here: recovered from wallet with no prior execution state.
+                v.insert(PositionState {
+                    mint: mint.to_string(),
+                    balance_raw,
+                    decimals,
+                    token_program: token_program.to_string(),
+                    ata: None,
+                    buy_fills: Vec::new(),
+                    sold_raw_total: 0,
+                    status: PositionStatus::ReconcileNeeded,
+                    last_update_source: UpdateSource::WalletSnapshot,
+                });
+            }
+        }
     }
 
     pub fn get(&self, mint: &str) -> Option<&PositionState> {
@@ -311,11 +361,21 @@ impl PositionAuthority {
     pub fn open_positions_count(&self) -> usize {
         self.by_mint.values().filter(|p| p.balance_raw > 0).count()
     }
+
+    /// Mints in [`PositionStatus::ReconcileNeeded`] with non-zero model balance.
+    pub fn reconcile_needed_positions_count(&self) -> usize {
+        self.by_mint
+            .values()
+            .filter(|p| p.balance_raw > 0 && p.status == PositionStatus::ReconcileNeeded)
+            .count()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::ipc::schema::{ExplicitAmount, RecordHeader};
 
     fn mint() -> String {
         "SoMeMint1111111111111111111111111111111111".to_string()
@@ -411,6 +471,30 @@ mod tests {
     }
 
     #[test]
+    fn wallet_snapshot_matching_existing_position_keeps_open_not_reconcile() {
+        let m = mint();
+        let mut a = PositionAuthority::new();
+        a.apply(&buy(&m, 400, 6));
+        a.apply(&snap(&m, 400, 6));
+        let p = a.get(&m).expect("position");
+        assert_eq!(p.balance_raw, 400);
+        assert_eq!(p.status, PositionStatus::Open);
+        assert_eq!(a.reconcile_needed_positions_count(), 0);
+    }
+
+    #[test]
+    fn wallet_snapshot_different_existing_position_marks_reconcile_needed() {
+        let m = mint();
+        let mut a = PositionAuthority::new();
+        a.apply(&buy(&m, 400, 6));
+        a.apply(&snap(&m, 350, 6));
+        let p = a.get(&m).expect("position");
+        assert_eq!(p.balance_raw, 350);
+        assert_eq!(p.status, PositionStatus::ReconcileNeeded);
+        assert_eq!(a.reconcile_needed_positions_count(), 1);
+    }
+
+    #[test]
     fn token_2022_program_preserved() {
         let m = mint();
         let tp = token_2022();
@@ -435,6 +519,216 @@ mod tests {
         assert_eq!(p.balance_raw, 0);
         assert_eq!(p.sold_raw_total, 150);
         assert_eq!(p.status, PositionStatus::ReconcileNeeded);
+    }
+
+    #[test]
+    fn wallet_snapshot_ignores_wsol_mint() {
+        let m = NATIVE_SOL_MINT.to_string();
+        let k = MarketEventKind::WalletBalanceSnapshot {
+            mint: m,
+            balance_raw: 1_000_000,
+            decimals: 9,
+            token_program: default_spl_token_program(),
+        };
+        assert!(PositionEvent::try_from_market_event_kind(&k).is_none());
+    }
+
+    #[test]
+    fn wallet_snapshot_ignores_native_sol_lamport_sentinel() {
+        let k = MarketEventKind::WalletBalanceSnapshot {
+            mint: "NATIVE_SOL".to_string(),
+            balance_raw: 5_000_000_000,
+            decimals: 9,
+            token_program: default_spl_token_program(),
+        };
+        assert!(PositionEvent::try_from_market_event_kind(&k).is_none());
+    }
+
+    #[test]
+    fn reconcile_needed_count_only_reconcile_status() {
+        let m = mint();
+        let mut a = PositionAuthority::new();
+        a.apply(&snap(&m, 250, 6));
+        assert_eq!(a.reconcile_needed_positions_count(), 1);
+        a.apply(&buy(&m, 100, 6));
+        assert_eq!(a.reconcile_needed_positions_count(), 0);
+    }
+
+    #[test]
+    fn drift_helper_matches_lock_manager_style_counts() {
+        use crate::storage::locks::LockManager;
+        let lm = LockManager::new(0);
+        lm.set_available_token_balance("mintA".to_string(), 1);
+        lm.set_available_token_balance("mintB".to_string(), 1);
+        let lock_open = lm.count_non_zero_token_balances();
+        let mut a = PositionAuthority::new();
+        a.apply_from_wallet_market_event_kind(&MarketEventKind::WalletBalanceSnapshot {
+            mint: "mintA".to_string(),
+            balance_raw: 1,
+            decimals: 6,
+            token_program: default_spl_token_program(),
+        });
+        a.apply_from_wallet_market_event_kind(&MarketEventKind::WalletBalanceSnapshot {
+            mint: "mintB".to_string(),
+            balance_raw: 1,
+            decimals: 6,
+            token_program: default_spl_token_program(),
+        });
+        a.apply_from_wallet_market_event_kind(&MarketEventKind::WalletBalanceSnapshot {
+            mint: "mintC".to_string(),
+            balance_raw: 1,
+            decimals: 6,
+            token_program: default_spl_token_program(),
+        });
+        let auth_open = a.open_positions_count();
+        assert_eq!(lock_open, 2);
+        assert_eq!(auth_open, 3);
+        assert_eq!(
+            position_authority_drift_lockmanager(auth_open, lock_open),
+            1
+        );
+    }
+
+    #[test]
+    fn apply_from_confirmed_exec_buy_increments_open() {
+        use std::collections::HashMap;
+
+        let m = mint();
+        let mut meta = HashMap::new();
+        meta.insert("side".to_string(), "BUY".to_string());
+        meta.insert("token_program".to_string(), default_spl_token_program());
+
+        let r = ExecutionResult {
+            header: RecordHeader::new("test", "0", "run"),
+            execution_id: "e1".to_string(),
+            decision_id: "d1".to_string(),
+            intent_id: "i1".to_string(),
+            source: "test".to_string(),
+            token_mint: Some(m.clone()),
+            signature: None,
+            bundle_id: None,
+            status: ExecutionStatus::Confirmed,
+            fill_in: None,
+            fill_out: Some(ExplicitAmount::new(10, 6)),
+            fill_status: None,
+            fill_unavailable_reason: None,
+            confirmed_slot: None,
+            fees: None,
+            pnl: None,
+            wallet_sol_delta_lamports: None,
+            error_message: None,
+            error_code: None,
+            latency_ms: None,
+            metadata: meta,
+        };
+        let mut a = PositionAuthority::new();
+        a.apply_from_confirmed_execution_result(&r);
+        assert_eq!(a.open_positions_count(), 1);
+        assert_eq!(a.get(&m).unwrap().balance_raw, 10);
+    }
+
+    #[test]
+    fn apply_from_confirmed_exec_sell_closes() {
+        use std::collections::HashMap;
+
+        let m = mint();
+        let mut buy_meta = HashMap::new();
+        buy_meta.insert("side".to_string(), "BUY".to_string());
+        buy_meta.insert("token_program".to_string(), default_spl_token_program());
+        let buy = ExecutionResult {
+            header: RecordHeader::new("test", "0", "run"),
+            execution_id: "e0".to_string(),
+            decision_id: "d0".to_string(),
+            intent_id: "i0".to_string(),
+            source: "test".to_string(),
+            token_mint: Some(m.clone()),
+            signature: None,
+            bundle_id: None,
+            status: ExecutionStatus::Confirmed,
+            fill_in: None,
+            fill_out: Some(ExplicitAmount::new(100, 6)),
+            fill_status: None,
+            fill_unavailable_reason: None,
+            confirmed_slot: None,
+            fees: None,
+            pnl: None,
+            wallet_sol_delta_lamports: None,
+            error_message: None,
+            error_code: None,
+            latency_ms: None,
+            metadata: buy_meta,
+        };
+        let mut sell_meta = HashMap::new();
+        sell_meta.insert("side".to_string(), "SELL".to_string());
+        sell_meta.insert("token_program".to_string(), default_spl_token_program());
+        let sell = ExecutionResult {
+            header: RecordHeader::new("test", "0", "run"),
+            execution_id: "e1".to_string(),
+            decision_id: "d1".to_string(),
+            intent_id: "i1".to_string(),
+            source: "test".to_string(),
+            token_mint: Some(m.clone()),
+            signature: None,
+            bundle_id: None,
+            status: ExecutionStatus::Confirmed,
+            fill_in: Some(ExplicitAmount::new(100, 6)),
+            fill_out: None,
+            fill_status: None,
+            fill_unavailable_reason: None,
+            confirmed_slot: None,
+            fees: None,
+            pnl: None,
+            wallet_sol_delta_lamports: None,
+            error_message: None,
+            error_code: None,
+            latency_ms: None,
+            metadata: sell_meta,
+        };
+        let mut a = PositionAuthority::new();
+        a.apply_from_confirmed_execution_result(&buy);
+        a.apply_from_confirmed_execution_result(&sell);
+        assert_eq!(a.open_positions_count(), 0);
+    }
+
+    #[test]
+    fn apply_from_wallet_snapshot_zero_removes() {
+        let m = mint();
+        let mut a = PositionAuthority::new();
+        a.apply_from_confirmed_execution_result(&ExecutionResult {
+            header: RecordHeader::new("t", "0", "r"),
+            execution_id: "e".to_string(),
+            decision_id: "d".to_string(),
+            intent_id: "i".to_string(),
+            source: "s".to_string(),
+            token_mint: Some(m.clone()),
+            signature: None,
+            bundle_id: None,
+            status: ExecutionStatus::Confirmed,
+            fill_in: None,
+            fill_out: Some(ExplicitAmount::new(100, 6)),
+            fill_status: None,
+            fill_unavailable_reason: None,
+            confirmed_slot: None,
+            fees: None,
+            pnl: None,
+            wallet_sol_delta_lamports: None,
+            error_message: None,
+            error_code: None,
+            latency_ms: None,
+            metadata: {
+                let mut h = std::collections::HashMap::new();
+                h.insert("side".to_string(), "BUY".to_string());
+                h.insert("token_program".to_string(), default_spl_token_program());
+                h
+            },
+        });
+        a.apply_from_wallet_market_event_kind(&MarketEventKind::WalletBalanceSnapshot {
+            mint: m,
+            balance_raw: 0,
+            decimals: 6,
+            token_program: default_spl_token_program(),
+        });
+        assert_eq!(a.open_positions_count(), 0);
     }
 
     #[test]

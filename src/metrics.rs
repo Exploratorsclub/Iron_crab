@@ -467,6 +467,16 @@ pub static RPC_CONCURRENCY_ADJUSTMENTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| Ato
 pub static RPC_INFLIGHT_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static RPC_ALLOWED_CONCURRENCY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static OPEN_POSITIONS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// PA-2: PositionAuthority model open count (read-only; does not replace `open_positions`).
+pub static POSITION_AUTHORITY_OPEN_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Count of authority positions in `ReconcileNeeded` with non-zero balance.
+pub static POSITION_AUTHORITY_RECONCILE_NEEDED_GAUGE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// LockManager `count_non_zero_token_balances` mirrored for drift visibility (same instant as authority gauges when refreshed together).
+pub static POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// `authority_open - lockmanager_open` (signed; Prometheus scalar).
+pub static POSITION_AUTHORITY_DRIFT_LOCKMANAGER: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
 pub static CONCURRENT_INTENTS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static DAILY_REALIZED_PNL_SOL_MICRO: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static LIQUIDITY_ESTIMATE_SOL_MICRO: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -1305,6 +1315,22 @@ async fn metrics_response() -> Response<Body> {
         "open_positions",
         OPEN_POSITIONS_GAUGE.load(Ordering::Relaxed)
     );
+    line!(
+        "position_authority_open_positions",
+        POSITION_AUTHORITY_OPEN_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "position_authority_reconcile_needed_positions",
+        POSITION_AUTHORITY_RECONCILE_NEEDED_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "position_authority_lockmanager_open_positions",
+        POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE.load(Ordering::Relaxed)
+    );
+    out.push_str(&format!(
+        "position_authority_drift_lockmanager {}\n",
+        POSITION_AUTHORITY_DRIFT_LOCKMANAGER.load(Ordering::Relaxed)
+    ));
     line!(
         "concurrent_intents",
         CONCURRENT_INTENTS_GAUGE.load(Ordering::Relaxed)
