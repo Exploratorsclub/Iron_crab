@@ -1037,6 +1037,9 @@ impl PositionTracker {
                 if let Some(q) = exit_quote.filter(|q| q.pool_sourced && q.tokens_per_sol > 0.0) {
                     self.update_price(q.tokens_per_sol);
                     pnl = self.pnl_pct();
+                    drawdown = self.drawdown_from_ath_pct();
+                    // Same invariant as STOP_LOSS/TAKE_PROFIT suppress; not used below this block.
+                    let _ = drawdown;
                 }
                 warn!(
                     mint = %self.mint,
