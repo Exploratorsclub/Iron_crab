@@ -4224,6 +4224,11 @@ impl MomentumContext {
                         } else {
                             None
                         };
+                        // JetStream replay: same intent_id may be processed on the pending path first,
+                        // then redelivered with pending already consumed — orphan path must idempotently skip.
+                        self.orphaned_recovered_intent_ids
+                            .write()
+                            .insert(result.intent_id.clone());
                         self.open_position(OpenPositionParams {
                             mint: &pending.mint,
                             pool: &pending.pool,
