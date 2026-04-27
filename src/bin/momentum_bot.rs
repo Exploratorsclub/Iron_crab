@@ -469,8 +469,7 @@ struct PositionTracker {
 /// I-7: from LivePoolCache in-process only — no RPC.
 #[derive(Debug, Clone, Copy)]
 struct ExitExecutableQuote {
-    /// tokens_per_sol implied by selling `position.token_amount` through the position pool
-    /// (raw token / raw lamports, same unit convention as `entry_price`).
+    /// tokens_per_sol (UI): token_ui / sol_ui, matching `entry_price` / `current_price` (I-14).
     tokens_per_sol: f64,
     /// True when `tokens_per_sol` was computed from LivePoolCache for `position.pool`.
     pool_sourced: bool,
@@ -2117,6 +2116,9 @@ struct MomentumContext {
     /// Mints with non-zero wallet balance that could not be reconciled at bootstrap
     /// because no pool was known yet. Checked when new pools are registered.
     orphaned_mints: parking_lot::RwLock<HashMap<String, (u64, u8)>>,
+    /// Scope 56: in-memory idempotency for duplicate JetStream / replayed ExecutionResults
+    /// on the orphaned-BUY path (no durable store in this scope).
+    orphaned_recovered_intent_ids: parking_lot::RwLock<HashSet<String>>,
     /// Stats
     tokens_tracked: std::sync::atomic::AtomicU64,
     tokens_blacklisted: std::sync::atomic::AtomicU64,
@@ -2148,7 +2150,8 @@ impl MomentumContext {
         if sol_out == 0 {
             return None;
         }
-        let tps = (pos.token_amount as f64) / (sol_out as f64);
+        // I-14: same units as `entry_price` (tok_ui/sol_ui), not raw_token/raw_lamports.
+        let tps = tokens_per_sol::ui_tokens_per_sol(pos.token_amount, pos.token_decimals, sol_out);
         if !tps.is_finite() || tps <= 0.0 {
             return None;
         }
@@ -3810,9 +3813,52 @@ impl MomentumContext {
             {
                 if let Some(ref mint) = result.token_mint {
                     if let Some(ref fill_out) = result.fill_out {
-                        // Position may already exist (e.g., scale-in recovered on restart)
-                        let already_has_position = self.positions.read().contains_key(mint);
-                        if !already_has_position {
+                        let idem_inserted = self
+                            .orphaned_recovered_intent_ids
+                            .write()
+                            .insert(result.intent_id.clone());
+                        if !idem_inserted {
+                            debug!(
+                                intent_id = %result.intent_id,
+                                mint = %mint,
+                                "Orphaned BUY: duplicate execution result (already applied) — skip"
+                            );
+                        } else {
+                            let sol_invested = result
+                                .wallet_sol_delta_lamports
+                                .map(|d| d.unsigned_abs() as u64)
+                                .or_else(|| result.fill_in.as_ref().map(|a| a.raw))
+                                .unwrap_or(0);
+
+                            let token_decimals = self
+                                .mint_infos
+                                .read()
+                                .get(mint)
+                                .map(|m| m.decimals)
+                                .unwrap_or(fill_out.decimals);
+
+                            let sol_ui = result
+                                .fill_in
+                                .as_ref()
+                                .map(|a| a.as_f64())
+                                .unwrap_or(sol_invested as f64 / 1e9)
+                                .max(0.0);
+                            let tok_ui = fill_out.as_f64().max(0.0);
+                            let entry_price = if sol_ui > 0.0 { tok_ui / sol_ui } else { 1.0 };
+
+                            let token_program = result
+                                .metadata
+                                .get("token_program")
+                                .cloned()
+                                .filter(|tp| !tp.is_empty())
+                                .or_else(|| {
+                                    self.mint_infos
+                                        .read()
+                                        .get(mint)
+                                        .map(|m| m.token_program.clone())
+                                        .filter(|tp| !tp.is_empty())
+                                });
+
                             // Reconstruct pool/dex/creator from TokenTracker (still alive in memory)
                             let tracker_info: Option<(String, String, Option<String>)> = {
                                 let trackers = self.token_trackers.read();
@@ -3826,42 +3872,44 @@ impl MomentumContext {
                                 })
                             };
 
-                            if let Some((pool, dex, creator)) = tracker_info {
-                                let sol_invested = result
-                                    .wallet_sol_delta_lamports
-                                    .map(|d| d.unsigned_abs() as u64)
-                                    .or_else(|| result.fill_in.as_ref().map(|a| a.raw))
-                                    .unwrap_or(0);
+                            let already_has_position = self.positions.read().contains_key(mint);
 
-                                let token_decimals = self
-                                    .mint_infos
-                                    .read()
-                                    .get(mint)
-                                    .map(|m| m.decimals)
-                                    .unwrap_or(fill_out.decimals);
-
-                                let sol_ui = result
-                                    .fill_in
-                                    .as_ref()
-                                    .map(|a| a.as_f64())
-                                    .unwrap_or(sol_invested as f64 / 1e9)
-                                    .max(0.0);
-                                let tok_ui = fill_out.as_f64().max(0.0);
-                                let entry_price = if sol_ui > 0.0 { tok_ui / sol_ui } else { 1.0 };
-
-                                let token_program = result
-                                    .metadata
-                                    .get("token_program")
-                                    .cloned()
-                                    .filter(|tp| !tp.is_empty())
-                                    .or_else(|| {
-                                        self.mint_infos
-                                            .read()
-                                            .get(mint)
-                                            .map(|m| m.token_program.clone())
-                                            .filter(|tp| !tp.is_empty())
+                            if already_has_position {
+                                if let Some((pool, dex, creator)) = tracker_info {
+                                    info!(
+                                        intent_id = %result.intent_id,
+                                        mint = %mint,
+                                        pool = %pool,
+                                        dex = %dex,
+                                        sol_invested,
+                                        token_amount_raw = fill_out.raw,
+                                        "⚠️ ORPHANED BUY APPLIED TO EXISTING POSITION — scale-in fill \
+                                         recovered after pending intent was dropped"
+                                    );
+                                    self.open_position(OpenPositionParams {
+                                        mint,
+                                        pool: &pool,
+                                        dex: &dex,
+                                        entry_price,
+                                        token_decimals,
+                                        token_amount: fill_out.raw,
+                                        sol_invested,
+                                        token_program,
+                                        creator,
                                     });
-
+                                } else {
+                                    self.orphaned_recovered_intent_ids
+                                        .write()
+                                        .remove(&result.intent_id);
+                                    warn!(
+                                        intent_id = %result.intent_id,
+                                        mint = %mint,
+                                        "Orphaned scale-in BUY: existing Momentum position but no \
+                                         TokenTracker — cannot apply fill (pool/dex unknown). \
+                                         I-12: not silently ignored"
+                                    );
+                                }
+                            } else if let Some((pool, dex, creator)) = tracker_info {
                                 warn!(
                                     intent_id = %result.intent_id,
                                     mint = %mint,
@@ -3885,6 +3933,9 @@ impl MomentumContext {
                                     creator,
                                 });
                             } else {
+                                self.orphaned_recovered_intent_ids
+                                    .write()
+                                    .remove(&result.intent_id);
                                 warn!(
                                     intent_id = %result.intent_id,
                                     mint = %mint,
@@ -5738,6 +5789,7 @@ async fn main() -> Result<()> {
         live_pool_cache,
         position_kv: tokio::sync::OnceCell::new(),
         orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+        orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
         tokens_tracked: std::sync::atomic::AtomicU64::new(0),
         tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
         intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7074,6 +7126,7 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7126,6 +7179,7 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7203,6 +7257,7 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7454,6 +7509,7 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7556,6 +7612,7 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7626,6 +7683,7 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7684,6 +7742,7 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7757,6 +7816,7 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7856,6 +7916,7 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -7951,6 +8012,7 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -8031,6 +8093,7 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -8091,6 +8154,7 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -8142,6 +8206,7 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -8278,6 +8343,132 @@ mod tests {
         let exec = 3_692_386.0f64; // more valuable (lower tps) than entry
         let p = tokens_per_sol::pnl_pct(entry, exec);
         assert!(p > 0.0, "lower exec tps should be profit, pnl={}", p);
+    }
+
+    /// Scope 56: 9mR7-like numbers — matched UI executable must allow STOP_LOSS (not fake +90k% PnL).
+    #[test]
+    fn scope56_stop_loss_allows_with_ui_matched_executable_quote() {
+        let mut c = make_exit_config();
+        c.hard_stop_loss_pct = 50.0;
+        c.take_profit_pct = 1_000.0;
+
+        let entry = 9_876_538.033_6;
+        let current_stale = 30_000_000.0;
+        let mut pos = PositionTracker::new("m9", "p9", "dex", entry, 6, 12_345_672_542, 0);
+        pos.current_price = current_stale;
+        pos.highest_price = entry;
+        // Pool-correct sell quote (UI): same convention as `entry_price`
+        let sol_out = 418_528u64;
+        let exec_tps = tokens_per_sol::ui_tokens_per_sol(12_345_672_542, 6, sol_out);
+        let ex = ExitExecutableQuote {
+            tokens_per_sol: exec_tps,
+            pool_sourced: true,
+        };
+        let r = pos.should_exit(&c, Some(ex));
+        let (ty, _reason) = r.expect("STOP_LOSS must fire when loss is real");
+        assert_eq!(ty, "STOP_LOSS");
+    }
+
+    /// Orphaned scale-in: existing probe position + confirmed BUY without pending → full total for exits.
+    #[tokio::test]
+    async fn scope56_orphan_scale_in_applies_to_existing_position() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+
+        let ctx = Arc::new(MomentumContext {
+            run_id: "run-test".to_string(),
+            config: parking_lot::RwLock::new(MomentumConfig::default()),
+            nats: None,
+            jsonl_writer,
+            intent_counter: std::sync::atomic::AtomicU64::new(0),
+            pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
+            mint_infos: parking_lot::RwLock::new(HashMap::new()),
+            token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            positions: parking_lot::RwLock::new(HashMap::new()),
+            pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            live_pool_cache: LivePoolCache::new(),
+            position_kv: tokio::sync::OnceCell::new(),
+            orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+            tokens_tracked: std::sync::atomic::AtomicU64::new(0),
+            tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            intents_generated: std::sync::atomic::AtomicU64::new(0),
+            exits_generated: std::sync::atomic::AtomicU64::new(0),
+            last_event_slot: std::sync::atomic::AtomicU64::new(0),
+            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+        });
+
+        let mint = "9mR7mmX55n1F56rKBBcfMrRzMoJjaZnSRs6fV1GRpump";
+        let pool = "Pool9mR7ttttttttttttttttttttttttttttttttttt";
+        ctx.register_pool(mint, pool, "pump_amm", 1);
+        ctx.token_trackers.write().insert(
+            mint.to_string(),
+            TokenTracker::new(mint, pool, "pump_amm", 1, 0),
+        );
+
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool,
+            dex: "pump_amm",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 12_345_672_542,
+            sol_invested: 1_250_000,
+            token_program: None,
+            creator: None,
+        });
+
+        let scale_fill = 37_843_472_159u64;
+        let sol_spent = 3_750_000u64;
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("side".to_string(), "BUY".to_string());
+        let orphan = ExecutionResult {
+            header: RecordHeader::new("test", BUILD_VERSION, "run-test"),
+            execution_id: "ex-orphan".to_string(),
+            decision_id: "dec-orphan".to_string(),
+            intent_id: "int-orphan-scale-001".to_string(),
+            source: "momentum-bot".to_string(),
+            token_mint: Some(mint.to_string()),
+            signature: Some("sig-orphan".to_string()),
+            bundle_id: None,
+            status: ExecutionStatus::Confirmed,
+            fill_in: Some(ExplicitAmount::new(sol_spent, 9)),
+            fill_out: Some(ExplicitAmount::new(scale_fill, 6)),
+            fill_status: Some(FillStatus::Complete),
+            fill_unavailable_reason: None,
+            confirmed_slot: Some(1),
+            fees: None,
+            pnl: None,
+            wallet_sol_delta_lamports: Some(-(sol_spent as i128)),
+            error_message: None,
+            error_code: None,
+            latency_ms: Some(1),
+            metadata: meta,
+        };
+
+        Arc::clone(&ctx).handle_execution_result(&orphan);
+
+        let expected = 12_345_672_542u64.saturating_add(scale_fill);
+        {
+            let positions = ctx.positions.read();
+            let pos = positions.get(mint).expect("position after orphan scale");
+            assert_eq!(
+                pos.token_amount, expected,
+                "orphan scale-in must add to total"
+            );
+        }
+
+        // Second delivery with same intent_id (JetStream replay) must not double-count
+        Arc::clone(&ctx).handle_execution_result(&orphan);
+        assert_eq!(
+            ctx.positions.read().get(mint).unwrap().token_amount,
+            expected,
+            "duplicate ExecutionResult with same intent_id must not add twice"
+        );
     }
 }
 
