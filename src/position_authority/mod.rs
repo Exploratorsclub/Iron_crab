@@ -4,4 +4,7 @@
 
 mod state;
 
-pub use state::{PositionAuthority, PositionEvent, PositionState, PositionStatus, UpdateSource};
+pub use state::{
+    is_sol_or_wsol_mint, position_authority_drift_lockmanager, PositionAuthority, PositionEvent,
+    PositionState, PositionStatus, UpdateSource,
+};
