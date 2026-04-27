@@ -329,11 +329,8 @@ impl PositionAuthority {
                 e.token_program = token_program.to_string();
                 e.last_update_source = UpdateSource::WalletSnapshot;
                 if prev == balance_raw {
-                    e.status = if balance_raw > 0 {
-                        PositionStatus::Open
-                    } else {
-                        PositionStatus::Closed
-                    };
+                    // Invariant: balance_raw > 0 (zero balances remove the entry at function start).
+                    e.status = PositionStatus::Open;
                 } else {
                     e.balance_raw = balance_raw;
                     e.status = PositionStatus::ReconcileNeeded;
