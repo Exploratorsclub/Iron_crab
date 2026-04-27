@@ -3807,7 +3807,8 @@ impl MomentumContext {
             // === Orphaned buy recovery ===
             // If a confirmed BUY arrives after cleanup_stale_pending() removed
             // the pending intent (>2min), recover the position from the
-            // ExecutionResult + TokenTracker data.
+            // ExecutionResult. New positions still need TokenTracker (pool/dex);
+            // existing positions use `PositionTracker` (pool/dex/creator) — I-12.
             else if result.status == ExecutionStatus::Confirmed
                 && result.metadata.get("side").map(|s| s.as_str()) == Some("BUY")
             {
@@ -3859,7 +3860,7 @@ impl MomentumContext {
                                         .filter(|tp| !tp.is_empty())
                                 });
 
-                            // Reconstruct pool/dex/creator from TokenTracker (still alive in memory)
+                            // Optional TokenTracker: upgrade creator for pumpfun, or new-position routing.
                             let tracker_info: Option<(String, String, Option<String>)> = {
                                 let trackers = self.token_trackers.read();
                                 trackers.get(mint).map(|tr| {
@@ -3872,10 +3873,37 @@ impl MomentumContext {
                                 })
                             };
 
-                            let already_has_position = self.positions.read().contains_key(mint);
+                            let already_has_position: bool;
+                            let existing: Option<PositionTracker> = {
+                                let positions = self.positions.read();
+                                let has = positions.contains_key(mint);
+                                let snap = positions.get(mint).cloned();
+                                already_has_position = has;
+                                snap
+                            };
 
                             if already_has_position {
-                                if let Some((pool, dex, creator)) = tracker_info {
+                                // Existing position: pool/dex/creator from `PositionTracker` (restart-safe).
+                                // TokenTracker is optional (e.g. dev_wallet for missing pumpfun creator).
+                                let from_pos: Option<(String, String, Option<String>)> =
+                                    existing.as_ref().and_then(|pos| {
+                                        if pos.pool.is_empty() || pos.dex.is_empty() {
+                                            return None;
+                                        }
+                                        let pool = pos.pool.clone();
+                                        let dex = pos.dex.clone();
+                                        let mut creator = pos.creator.clone();
+                                        if pos.dex == "pumpfun" && creator.is_none() {
+                                            if let Some((_, tr_dex, tr_c)) = tracker_info.as_ref() {
+                                                if tr_dex == "pumpfun" {
+                                                    creator = tr_c.clone();
+                                                }
+                                            }
+                                        }
+                                        Some((pool, dex, creator))
+                                    });
+                                let used_position_routing = from_pos.is_some();
+                                if let Some((pool, dex, creator)) = from_pos.or(tracker_info) {
                                     info!(
                                         intent_id = %result.intent_id,
                                         mint = %mint,
@@ -3883,6 +3911,7 @@ impl MomentumContext {
                                         dex = %dex,
                                         sol_invested,
                                         token_amount_raw = fill_out.raw,
+                                        used_position_routing = used_position_routing,
                                         "⚠️ ORPHANED BUY APPLIED TO EXISTING POSITION — scale-in fill \
                                          recovered after pending intent was dropped"
                                     );
@@ -3904,9 +3933,8 @@ impl MomentumContext {
                                     warn!(
                                         intent_id = %result.intent_id,
                                         mint = %mint,
-                                        "Orphaned scale-in BUY: existing Momentum position but no \
-                                         TokenTracker — cannot apply fill (pool/dex unknown). \
-                                         I-12: not silently ignored"
+                                        "Orphaned scale-in BUY: could not resolve pool/dex (position \
+                                         empty and no TokenTracker). I-12: not silently ignored"
                                     );
                                 }
                             } else if let Some((pool, dex, creator)) = tracker_info {
@@ -8372,13 +8400,18 @@ mod tests {
     /// Orphaned scale-in: existing probe position + confirmed BUY without pending → full total for exits.
     #[tokio::test]
     async fn scope56_orphan_scale_in_applies_to_existing_position() {
+        let mut cfg = MomentumConfig::default();
+        cfg.hard_stop_loss_pct = 1_000.0;
+        cfg.take_profit_pct = 1_000.0;
+        cfg.max_hold_time_secs = 300;
+
         let tmp = TempDir::new().expect("tempdir");
         let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
         let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
 
         let ctx = Arc::new(MomentumContext {
             run_id: "run-test".to_string(),
-            config: parking_lot::RwLock::new(MomentumConfig::default()),
+            config: parking_lot::RwLock::new(cfg),
             nats: None,
             jsonl_writer,
             intent_counter: std::sync::atomic::AtomicU64::new(0),
@@ -8469,6 +8502,127 @@ mod tests {
             expected,
             "duplicate ExecutionResult with same intent_id must not add twice"
         );
+
+        // `check_for_exits` must size to full tracked total (not probe-only)
+        {
+            let mut w = ctx.positions.write();
+            let p = w.get_mut(mint).expect("position for time exit");
+            p.set_entry_time_ago(Duration::from_secs(400));
+        }
+        let exits = ctx.check_for_exits();
+        assert_eq!(exits.len(), 1, "expected one TIME_EXIT");
+        assert_eq!(exits[0].0, mint);
+        assert_eq!(
+            exits[0].5, expected,
+            "exit must use full position after orphan scale-in, not probe size"
+        );
+    }
+
+    /// Orphaned scale-in with no TokenTracker: `PositionTracker` alone supplies pool/dex.
+    #[tokio::test]
+    async fn scope56_orphan_scale_in_without_token_tracker_uses_position_routing() {
+        let mut cfg = MomentumConfig::default();
+        cfg.hard_stop_loss_pct = 1_000.0;
+        cfg.take_profit_pct = 1_000.0;
+        cfg.max_hold_time_secs = 300;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+
+        let ctx = Arc::new(MomentumContext {
+            run_id: "run-test".to_string(),
+            config: parking_lot::RwLock::new(cfg),
+            nats: None,
+            jsonl_writer,
+            intent_counter: std::sync::atomic::AtomicU64::new(0),
+            pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
+            mint_infos: parking_lot::RwLock::new(HashMap::new()),
+            token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            positions: parking_lot::RwLock::new(HashMap::new()),
+            pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            live_pool_cache: LivePoolCache::new(),
+            position_kv: tokio::sync::OnceCell::new(),
+            orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(HashSet::new()),
+            tokens_tracked: std::sync::atomic::AtomicU64::new(0),
+            tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            intents_generated: std::sync::atomic::AtomicU64::new(0),
+            exits_generated: std::sync::atomic::AtomicU64::new(0),
+            last_event_slot: std::sync::atomic::AtomicU64::new(0),
+            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+        });
+
+        let mint = "NoTrkMintttttttttttttttttttttttttttttttttttt";
+        let pool = "PoolNoTrktttttttttttttttttttttttttttttttttt";
+        ctx.register_pool(mint, pool, "pump_amm", 1);
+        // Deliberately no `token_trackers` entry
+
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool,
+            dex: "pump_amm",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 12_345_672_542,
+            sol_invested: 1_250_000,
+            token_program: None,
+            creator: None,
+        });
+
+        let scale_fill = 37_843_472_159u64;
+        let sol_spent = 3_750_000u64;
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("side".to_string(), "BUY".to_string());
+        let orphan = ExecutionResult {
+            header: RecordHeader::new("test", BUILD_VERSION, "run-test"),
+            execution_id: "ex-orphan-nt".to_string(),
+            decision_id: "dec-orphan-nt".to_string(),
+            intent_id: "int-orphan-scale-no-trk-001".to_string(),
+            source: "momentum-bot".to_string(),
+            token_mint: Some(mint.to_string()),
+            signature: Some("sig-orphan-nt".to_string()),
+            bundle_id: None,
+            status: ExecutionStatus::Confirmed,
+            fill_in: Some(ExplicitAmount::new(sol_spent, 9)),
+            fill_out: Some(ExplicitAmount::new(scale_fill, 6)),
+            fill_status: Some(FillStatus::Complete),
+            fill_unavailable_reason: None,
+            confirmed_slot: Some(1),
+            fees: None,
+            pnl: None,
+            wallet_sol_delta_lamports: Some(-(sol_spent as i128)),
+            error_message: None,
+            error_code: None,
+            latency_ms: Some(1),
+            metadata: meta,
+        };
+
+        Arc::clone(&ctx).handle_execution_result(&orphan);
+
+        let expected = 12_345_672_542u64.saturating_add(scale_fill);
+        assert_eq!(
+            ctx.positions.read().get(mint).unwrap().token_amount,
+            expected
+        );
+
+        Arc::clone(&ctx).handle_execution_result(&orphan);
+        assert_eq!(
+            ctx.positions.read().get(mint).unwrap().token_amount,
+            expected
+        );
+
+        {
+            let mut w = ctx.positions.write();
+            let p = w.get_mut(mint).expect("pos");
+            p.set_entry_time_ago(Duration::from_secs(400));
+        }
+        let exits = ctx.check_for_exits();
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].5, expected);
     }
 }
 
