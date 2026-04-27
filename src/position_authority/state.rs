@@ -3,6 +3,7 @@
 //! This module is **not** wired to production. Pure reducer for tests and future
 //! `position-manager` / JetStream consumption.
 
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 
 use crate::ipc::schema::{ExecutionResult, ExecutionStatus, MarketEventKind, NATIVE_SOL_MINT};
@@ -319,25 +320,40 @@ impl PositionAuthority {
             self.by_mint.remove(mint);
             return;
         }
-        let e = self
-            .by_mint
-            .entry(mint.to_string())
-            .or_insert_with(|| PositionState {
-                mint: mint.to_string(),
-                balance_raw: 0,
-                decimals,
-                token_program: token_program.to_string(),
-                ata: None,
-                buy_fills: Vec::new(),
-                sold_raw_total: 0,
-                status: PositionStatus::Closed,
-                last_update_source: UpdateSource::WalletSnapshot,
-            });
-        e.decimals = decimals;
-        e.token_program = token_program.to_string();
-        e.balance_raw = balance_raw;
-        e.status = PositionStatus::ReconcileNeeded;
-        e.last_update_source = UpdateSource::WalletSnapshot;
+
+        match self.by_mint.entry(mint.to_string()) {
+            Entry::Occupied(mut occ) => {
+                let e = occ.get_mut();
+                let prev = e.balance_raw;
+                e.decimals = decimals;
+                e.token_program = token_program.to_string();
+                e.last_update_source = UpdateSource::WalletSnapshot;
+                if prev == balance_raw {
+                    e.status = if balance_raw > 0 {
+                        PositionStatus::Open
+                    } else {
+                        PositionStatus::Closed
+                    };
+                } else {
+                    e.balance_raw = balance_raw;
+                    e.status = PositionStatus::ReconcileNeeded;
+                }
+            }
+            Entry::Vacant(v) => {
+                // `balance_raw > 0` here: recovered from wallet with no prior execution state.
+                v.insert(PositionState {
+                    mint: mint.to_string(),
+                    balance_raw,
+                    decimals,
+                    token_program: token_program.to_string(),
+                    ata: None,
+                    buy_fills: Vec::new(),
+                    sold_raw_total: 0,
+                    status: PositionStatus::ReconcileNeeded,
+                    last_update_source: UpdateSource::WalletSnapshot,
+                });
+            }
+        }
     }
 
     pub fn get(&self, mint: &str) -> Option<&PositionState> {
@@ -455,6 +471,30 @@ mod tests {
         assert_eq!(p.balance_raw, 250);
         assert_eq!(p.status, PositionStatus::ReconcileNeeded);
         assert_eq!(p.last_update_source, UpdateSource::WalletSnapshot);
+    }
+
+    #[test]
+    fn wallet_snapshot_matching_existing_position_keeps_open_not_reconcile() {
+        let m = mint();
+        let mut a = PositionAuthority::new();
+        a.apply(&buy(&m, 400, 6));
+        a.apply(&snap(&m, 400, 6));
+        let p = a.get(&m).expect("position");
+        assert_eq!(p.balance_raw, 400);
+        assert_eq!(p.status, PositionStatus::Open);
+        assert_eq!(a.reconcile_needed_positions_count(), 0);
+    }
+
+    #[test]
+    fn wallet_snapshot_different_existing_position_marks_reconcile_needed() {
+        let m = mint();
+        let mut a = PositionAuthority::new();
+        a.apply(&buy(&m, 400, 6));
+        a.apply(&snap(&m, 350, 6));
+        let p = a.get(&m).expect("position");
+        assert_eq!(p.balance_raw, 350);
+        assert_eq!(p.status, PositionStatus::ReconcileNeeded);
+        assert_eq!(a.reconcile_needed_positions_count(), 1);
     }
 
     #[test]
