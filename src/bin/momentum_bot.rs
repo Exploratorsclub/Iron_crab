@@ -933,6 +933,17 @@ impl PositionTracker {
                     pnl = self.pnl_pct();
                     drawdown = self.drawdown_from_ath_pct();
                 }
+                // Re-evaluate hard stop on corrected pnl: step 1 used stale current_price, so
+                // STOP_LOSS may not have run when a stale tick showed a fake gain and TP fired.
+                if pnl <= -config.hard_stop_loss_pct {
+                    return Some((
+                        "STOP_LOSS".to_string(),
+                        format!(
+                            "Hard stop hit: {:.1}% loss (limit: -{:.1}%)",
+                            pnl, config.hard_stop_loss_pct
+                        ),
+                    ));
+                }
                 warn!(
                     mint = %self.mint,
                     position_pool = %self.pool,
