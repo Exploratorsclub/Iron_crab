@@ -2371,9 +2371,77 @@ impl MomentumContext {
         }
     }
 
+    /// Scope 57 / I-13: Cache-side PumpFun migration signals (Geyser/JetStream — no RPC).
+    fn live_cache_pumpfun_complete_evidence(&self, mint: &str) -> bool {
+        let Ok(pk) = solana_sdk::pubkey::Pubkey::from_str(mint) else {
+            return false;
+        };
+        self.live_pool_cache
+            .pumpfun_bonding_curve_complete_for_mint(&pk)
+            || self.live_pool_cache.is_pumpfun_complete_for_mint(&pk) == Some(true)
+    }
+
     fn select_reconcile_pool(&self, mint: &str) -> Option<(String, String, Option<f64>)> {
         let pools = self.mint_pools.read();
         let pool_list = pools.get(mint)?;
+        let migration_evidence = self.live_cache_pumpfun_complete_evidence(mint)
+            || pool_list
+                .iter()
+                .any(|p| p.dex == "pumpfun" && p.bonding_curve_complete == Some(true));
+
+        let active_pumpfun: Vec<&PoolInfo> = pool_list
+            .iter()
+            .filter(|p| p.dex == "pumpfun" && p.bonding_curve_complete != Some(true))
+            .collect();
+
+        if !migration_evidence && !active_pumpfun.is_empty() {
+            let best = active_pumpfun
+                .into_iter()
+                .max_by_key(|p| p.last_trade_slot)?;
+            info!(
+                mint = %mint,
+                pool = %best.pool_address,
+                dex = %best.dex,
+                bonding_curve_complete = ?best.bonding_curve_complete,
+                "SCOPE57: recovery prefers PumpFun bonding pool — no bonding-curve complete/migration evidence (avoid routing residual to PumpSwap by newest slot)"
+            );
+            return Some((
+                best.pool_address.clone(),
+                best.dex.clone(),
+                best.last_trade_ratio,
+            ));
+        }
+
+        if migration_evidence {
+            info!(
+                mint = %mint,
+                "SCOPE57: migration/complete evidence present — PumpSwap reconciliation route allowed"
+            );
+        }
+
+        let has_pumpfun_row = pool_list.iter().any(|p| p.dex == "pumpfun");
+        let only_pumpswap_in_registry = pool_list.iter().all(|p| p.dex == "pump_amm");
+        if !migration_evidence && !has_pumpfun_row && only_pumpswap_in_registry {
+            let cache_incomplete_bc =
+                solana_sdk::pubkey::Pubkey::from_str(mint)
+                    .ok()
+                    .is_some_and(|pk| {
+                        self.live_pool_cache.is_pumpfun_complete_for_mint(&pk) == Some(false)
+                    });
+            if cache_incomplete_bc {
+                warn!(
+                    mint = %mint,
+                    "SCOPE57: refuse PumpSwap-only reconciliation — LivePoolCache reports incomplete PumpFun bonding curve but mint_pools has no PumpFun row"
+                );
+            } else {
+                warn!(
+                    mint = %mint,
+                    "SCOPE57: refuse PumpSwap-only reconciliation — registry lists only pump_amm pools and no migration evidence (cannot exclude active BC residual)"
+                );
+            }
+            return None;
+        }
+
         let best = pool_list.iter().max_by_key(|p| p.last_trade_slot)?;
         Some((
             best.pool_address.clone(),
@@ -2508,11 +2576,19 @@ impl MomentumContext {
         mint: &str,
         token_amount: u64,
         original_pool: &str,
+        original_dex: &str,
     ) -> Result<(String, String, Vec<String>, f64, usize)> {
+        // Scope 57: migration evidence before mint_pools lock (avoid deadlock if nested).
+        let cache_migration_evidence = self.live_cache_pumpfun_complete_evidence(mint);
         let pools = self.mint_pools.read();
         let candidates = pools
             .get(mint)
             .ok_or_else(|| anyhow::anyhow!("No pools known for mint {}", mint))?;
+
+        let pool_flag_migration_evidence = candidates
+            .iter()
+            .any(|p| p.dex == "pumpfun" && p.bonding_curve_complete == Some(true));
+        let complete_evidence = cache_migration_evidence || pool_flag_migration_evidence;
 
         let now = std::time::Instant::now();
 
@@ -2584,12 +2660,64 @@ impl MomentumContext {
             &preferred
         };
 
+        // Scope 57 / I-13: Do not route active PumpFun positions to PumpSwap without migration evidence.
+        let block_pumpswap_for_active_pumpfun = original_dex == "pumpfun" && !complete_evidence;
+
+        if original_dex == "pumpfun" && complete_evidence {
+            let has_pump_amm_candidate = usable.iter().any(|p| p.dex == "pump_amm");
+            if has_pump_amm_candidate {
+                info!(
+                    mint = %mint,
+                    "SCOPE57: PumpSwap exit route allowed — bonding curve complete / migration evidence"
+                );
+            }
+        }
+
+        let quote_pool_refs: Vec<&PoolInfo> = if block_pumpswap_for_active_pumpfun {
+            let filtered: Vec<&PoolInfo> = usable
+                .iter()
+                .copied()
+                .filter(|p| p.dex != "pump_amm")
+                .collect();
+            if filtered.is_empty() {
+                warn!(
+                    mint = %mint,
+                    original_pool = %original_pool,
+                    "SCOPE57: multi-pool usable set was PumpSwap-only — blocked for active PumpFun position (no migration evidence); widening to valid pools excluding PumpSwap"
+                );
+                let from_valid: Vec<&PoolInfo> = valid
+                    .iter()
+                    .copied()
+                    .filter(|p| p.dex != "pump_amm")
+                    .collect();
+                if from_valid.is_empty() {
+                    anyhow::bail!(
+                        "SCOPE57: no non-PumpSwap exit pool for mint {} while position is active PumpFun (bonding curve not evidenced complete)",
+                        mint
+                    );
+                }
+                from_valid
+            } else {
+                let blocked_count = usable.iter().filter(|p| p.dex == "pump_amm").count();
+                if blocked_count > 0 {
+                    warn!(
+                        mint = %mint,
+                        blocked_pump_amm_candidates = blocked_count,
+                        "SCOPE57: blocked PumpSwap candidate(s) — preferring PumpFun / non-PumpSwap until migration evidence"
+                    );
+                }
+                filtered
+            }
+        } else {
+            usable.to_vec()
+        };
+
         // FIX-21: Quote each pool using RESERVE-BASED calculation from LivePoolCache.
         // Fallback to last_trade_ratio only when cache has no data for a pool.
         let token_mint_pubkey = solana_sdk::pubkey::Pubkey::from_str(mint).ok();
 
         let mut quotes: Vec<(String, String, Vec<String>, f64, &str)> = Vec::new();
-        for p in usable {
+        for p in quote_pool_refs {
             let pool_pubkey = solana_sdk::pubkey::Pubkey::from_str(&p.pool_address).ok();
 
             // Try reserve-based quote from LivePoolCache first
@@ -7066,6 +7194,36 @@ mod tests {
     use ironcrab::ipc::{FillStatus, RecordHeader};
     use tempfile::TempDir;
 
+    fn empty_test_context(jsonl_writer: JsonlWriter) -> MomentumContext {
+        MomentumContext {
+            run_id: "test".to_string(),
+            config: parking_lot::RwLock::new(MomentumConfig::default()),
+            nats: None,
+            jsonl_writer,
+            intent_counter: std::sync::atomic::AtomicU64::new(0),
+            pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
+            mint_infos: parking_lot::RwLock::new(HashMap::new()),
+            token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            positions: parking_lot::RwLock::new(HashMap::new()),
+            pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            live_pool_cache: LivePoolCache::new(),
+            position_kv: tokio::sync::OnceCell::new(),
+            orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
+                ORPHANED_RECOVERED_INTENT_IDS_CAP,
+            )),
+            tokens_tracked: std::sync::atomic::AtomicU64::new(0),
+            tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            intents_generated: std::sync::atomic::AtomicU64::new(0),
+            exits_generated: std::sync::atomic::AtomicU64::new(0),
+            last_event_slot: std::sync::atomic::AtomicU64::new(0),
+            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
     #[test]
     fn buyer_quality_stats_top1_top3_and_repeat_ratio() {
         let mut cfg = MomentumConfig::default();
@@ -7232,7 +7390,7 @@ mod tests {
         }
 
         let (pool, _, _, _, _) = ctx
-            .find_best_sell_pool(mint, 1_000_000, "pool_migrated")
+            .find_best_sell_pool(mint, 1_000_000, "pool_migrated", "pumpfun")
             .unwrap();
         assert_eq!(pool, "pool_active", "Should select non-migrated pool");
     }
@@ -7288,12 +7446,164 @@ mod tests {
         }
 
         let (pool, _, _, _, _) = ctx
-            .find_best_sell_pool(mint, 1_000_000, "pool_failed")
+            .find_best_sell_pool(mint, 1_000_000, "pool_failed", "raydium")
             .unwrap();
         assert_eq!(
             pool, "pool_ok",
             "Should prefer pool without failures in cooldown"
         );
+    }
+
+    /// Scope 57: reconcile must not pick newest slot if that is PumpSwap while PumpFun BC is active.
+    #[test]
+    fn select_reconcile_pool_prefers_active_pumpfun_over_newer_pump_amm() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "y7bgE68ZWVodvVmMUWQhShAnjVTmJVGpdnC1wYspump";
+        let mut pf = PoolInfo::new("PF_BC_POOL".to_string(), "pumpfun".to_string(), 100);
+        pf.last_trade_slot = 100;
+        pf.last_trade_ratio = Some(1e-9);
+        pf.bonding_curve_complete = None;
+
+        let mut amm = PoolInfo::new(
+            "HS9UsHpMZLYzzbLwWXJfHzsRd8HmuzMLcutHwVKGt1P7".to_string(),
+            "pump_amm".to_string(),
+            500,
+        );
+        amm.last_trade_ratio = Some(5e-9);
+        amm.dex_pool_accounts = Some(vec!["x".to_string(), "y".to_string(), "z".to_string()]);
+
+        {
+            let mut pools = ctx.mint_pools.write();
+            pools.insert(mint.to_string(), vec![pf, amm]);
+        }
+
+        let (pool, dex, _) = ctx.select_reconcile_pool(mint).expect("reconcile pool");
+        assert_eq!(pool, "PF_BC_POOL");
+        assert_eq!(dex, "pumpfun");
+    }
+
+    #[test]
+    fn select_reconcile_pool_refuses_pumpswap_only_without_migration_evidence() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "MintOnlyAmm11111111111111111111111111111111";
+        let mut amm = PoolInfo::new("AMM_ONLY".to_string(), "pump_amm".to_string(), 500);
+        amm.last_trade_ratio = Some(1e-9);
+        amm.dex_pool_accounts = Some(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+
+        {
+            let mut pools = ctx.mint_pools.write();
+            pools.insert(mint.to_string(), vec![amm]);
+        }
+
+        assert!(
+            ctx.select_reconcile_pool(mint).is_none(),
+            "PumpSwap-only registry without complete evidence must not silently reconcile"
+        );
+    }
+
+    /// Scope 57: exit routing keeps PumpFun when migration is not evidenced (better PumpSwap quote ignored).
+    #[test]
+    fn find_best_sell_pool_keeps_original_pumpfun_when_not_complete() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "y7bgE68ZWVodvVmMUWQhShAnjVTmJVGpdnC1wYspump";
+        let mut pf = PoolInfo::new("PF_BC_POOL".to_string(), "pumpfun".to_string(), 100);
+        pf.last_trade_slot = 100;
+        pf.last_trade_ratio = Some(1e-9);
+
+        let mut amm = PoolInfo::new(
+            "HS9UsHpMZLYzzbLwWXJfHzsRd8HmuzMLcutHwVKGt1P7".to_string(),
+            "pump_amm".to_string(),
+            900,
+        );
+        amm.last_trade_ratio = Some(50e-9);
+        amm.dex_pool_accounts = Some(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+
+        {
+            let mut pools = ctx.mint_pools.write();
+            pools.insert(mint.to_string(), vec![pf, amm]);
+        }
+
+        let (pool, dex, _, _, _) = ctx
+            .find_best_sell_pool(mint, 1_000_000, "PF_BC_POOL", "pumpfun")
+            .expect("sell pool");
+        assert_eq!(pool, "PF_BC_POOL");
+        assert_eq!(dex, "pumpfun");
+    }
+
+    /// Scope 57: after bonding curve complete (pool flag), PumpSwap may win multi-pool exit.
+    #[test]
+    fn find_best_sell_pool_allows_pump_amm_after_pumpfun_complete() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "MintPumpComplete111111111111111111111111111";
+        let mut pf = PoolInfo::new("PF_OLD".to_string(), "pumpfun".to_string(), 50);
+        pf.bonding_curve_complete = Some(true);
+        pf.last_trade_ratio = Some(1e-9);
+        pf.dex_pool_accounts = Some(vec!["p1".to_string()]);
+
+        let mut amm = PoolInfo::new("AMM_NEW".to_string(), "pump_amm".to_string(), 500);
+        amm.last_trade_ratio = Some(3e-9);
+        amm.dex_pool_accounts = Some(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+
+        {
+            let mut pools = ctx.mint_pools.write();
+            pools.insert(mint.to_string(), vec![pf, amm]);
+        }
+
+        let (pool, dex, _, _, _) = ctx
+            .find_best_sell_pool(mint, 1_000_000, "PF_OLD", "pumpfun")
+            .expect("sell pool");
+        assert_eq!(pool, "AMM_NEW");
+        assert_eq!(dex, "pump_amm");
+    }
+
+    /// Regression: y7-class mint — newer HS9 PumpSwap must not beat PumpFun BC without complete evidence.
+    #[test]
+    fn scope57_y7_class_exit_does_not_use_pump_amm_without_complete_evidence() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "y7bgE68ZWVodvVmMUWQhShAnjVTmJVGpdnC1wYspump";
+        let mut pf = PoolInfo::new("PF_BC_Y7".to_string(), "pumpfun".to_string(), 200);
+        pf.last_trade_ratio = Some(2e-9);
+        pf.bonding_curve_complete = Some(false);
+
+        let mut amm = PoolInfo::new(
+            "HS9UsHpMZLYzzbLwWXJfHzsRd8HmuzMLcutHwVKGt1P7".to_string(),
+            "pump_amm".to_string(),
+            9_000_000,
+        );
+        amm.last_trade_ratio = Some(100e-9);
+        amm.dex_pool_accounts = Some(vec!["p".to_string(); 14]);
+
+        {
+            let mut pools = ctx.mint_pools.write();
+            pools.insert(mint.to_string(), vec![pf, amm]);
+        }
+
+        let (pool, dex, _, _, _) = ctx
+            .find_best_sell_pool(mint, 16_650_263_074, "PF_BC_Y7", "pumpfun")
+            .expect("sell pool");
+        assert_ne!(dex, "pump_amm");
+        assert_eq!(dex, "pumpfun");
+        assert_eq!(pool, "PF_BC_Y7");
     }
 
     #[test]
@@ -8753,7 +9063,7 @@ async fn generate_and_publish_exit_intent(
 
     // === MULTI-POOL ROUTING: Find best pool for exit ===
     let (pool, dex, pool_accounts, expected_sol, alternatives_checked, sell_routing) =
-        match ctx.find_best_sell_pool(mint, token_amount, original_pool) {
+        match ctx.find_best_sell_pool(mint, token_amount, original_pool, original_dex) {
             Ok((pool, dex, accounts, expected, alts)) => (
                 pool,
                 dex,
