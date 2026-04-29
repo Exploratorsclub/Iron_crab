@@ -1736,13 +1736,13 @@ async fn wait_for_usable_pump_amm_cache_state(
 
 /// Evidence tuple for PumpSwap cold-path force-refresh wait (Bug #34 / #36).
 type PumpAmmSlaveRecoveryEvidence = (
-    u64,           // cache entry slot
-    Option<u64>,   // base_reserve
-    Option<u64>,   // quote_reserve
-    usize,         // pool_accounts.len()
-    bool,          // sell_extended
+    u64,            // cache entry slot
+    Option<u64>,    // base_reserve
+    Option<u64>,    // quote_reserve
+    usize,          // pool_accounts.len()
+    bool,           // sell_extended
     Option<Pubkey>, // sell_third_meta
-    bool,          // sell_layout_ready
+    bool,           // sell_layout_ready
 );
 
 /// Snapshot of the PumpSwap SLAVE row for the specific `pool`.
@@ -12257,11 +12257,7 @@ mod execution_engine_tests {
         let before = pump_amm_slave_recovery_snapshot(&cache, &pool);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let ok = rt.block_on(wait_for_pump_amm_slave_after_recovery(
-            &cache,
-            &pool,
-            before,
-            80,
-            10,
+            &cache, &pool, before, 80, 10,
         ));
         assert!(
             !ok,
@@ -12313,7 +12309,10 @@ mod execution_engine_tests {
             }),
             2,
         );
-        cache.set_pump_amm_pool_accounts_readiness_authoritative(other_pool, DexPoolReadiness::Ready);
+        cache.set_pump_amm_pool_accounts_readiness_authoritative(
+            other_pool,
+            DexPoolReadiness::Ready,
+        );
         cache.set_pump_amm_sell_layout_ready(&other_pool, true);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
