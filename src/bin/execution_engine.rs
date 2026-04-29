@@ -1784,7 +1784,7 @@ async fn wait_for_pump_amm_slave_after_recovery(
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     while Instant::now() < deadline {
         let explicit_ready = cache
-            .get_explicit_jetstream_ready_pump_amm_pool_accounts_v14_for_pool_market(pool)
+            .get_explicit_jetstream_ready_pump_amm_pool_accounts_for_pool_market(pool)
             .is_some();
         if explicit_ready {
             let after = pump_amm_slave_recovery_snapshot(cache, pool);

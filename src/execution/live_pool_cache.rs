@@ -1578,14 +1578,12 @@ impl LivePoolCache {
         None
     }
 
-    /// Scope 51 follow-up: v14 `pool_accounts` for **this pool market** only when JetStream merged
-    /// [`DexPoolReadiness::Ready`] for that key — **no** legacy “effective ready” fallback inside
-    /// [`Self::pump_amm_effective_ready_for_cache_first_accounts`]. Used by cold-path tx rebuild so
-    /// logs and consumption cannot label a non-explicit-ready row as JetStream-authoritative.
-    ///
-    /// Multi-pool: callers must pass the intent’s `resources.pools[0]` (pool market), not a mint-only lookup.
+    /// Same JetStream explicit-ready contract as
+    /// [`Self::get_explicit_jetstream_ready_pump_amm_pool_accounts_v14_for_pool_market`], but allows
+    /// SELL’s 12-account layout as well as 14 (BUY / extended). Cold-path recovery must not require 14
+    /// only — see `pump_amm_hint_pool_cache_usable_for_tx_plan_builder` in execution_engine.
     #[must_use]
-    pub fn get_explicit_jetstream_ready_pump_amm_pool_accounts_v14_for_pool_market(
+    pub fn get_explicit_jetstream_ready_pump_amm_pool_accounts_for_pool_market(
         &self,
         pool_market: &Pubkey,
     ) -> Option<Vec<Pubkey>> {
@@ -1604,10 +1602,26 @@ impl LivePoolCache {
         if !self.pump_amm_sell_layout_complete_for_ready(pool_market) {
             return None;
         }
-        if s.pool_accounts.len() < 14 {
+        let n = s.pool_accounts.len();
+        if n != 12 && n != 14 {
             return None;
         }
         Some(s.pool_accounts.clone())
+    }
+
+    /// Scope 51 follow-up: v14 `pool_accounts` for **this pool market** only when JetStream merged
+    /// [`DexPoolReadiness::Ready`] for that key — **no** legacy “effective ready” fallback inside
+    /// [`Self::pump_amm_effective_ready_for_cache_first_accounts`]. Used by cold-path tx rebuild so
+    /// logs and consumption cannot label a non-explicit-ready row as JetStream-authoritative.
+    ///
+    /// Multi-pool: callers must pass the intent’s `resources.pools[0]` (pool market), not a mint-only lookup.
+    #[must_use]
+    pub fn get_explicit_jetstream_ready_pump_amm_pool_accounts_v14_for_pool_market(
+        &self,
+        pool_market: &Pubkey,
+    ) -> Option<Vec<Pubkey>> {
+        self.get_explicit_jetstream_ready_pump_amm_pool_accounts_for_pool_market(pool_market)
+            .filter(|a| a.len() >= 14)
     }
 
     /// I-24d / Bug #27: Readiness for PumpSwap quotes after authoritative `PoolCacheUpdate`.
