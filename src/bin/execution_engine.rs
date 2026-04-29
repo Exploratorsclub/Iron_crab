@@ -1734,6 +1734,69 @@ async fn wait_for_usable_pump_amm_cache_state(
     false
 }
 
+/// Evidence tuple for PumpSwap cold-path force-refresh wait (Bug #34 / #36).
+type PumpAmmSlaveRecoveryEvidence = (
+    u64,            // cache entry slot
+    Option<u64>,    // base_reserve
+    Option<u64>,    // quote_reserve
+    usize,          // pool_accounts.len()
+    bool,           // sell_extended
+    Option<Pubkey>, // sell_third_meta
+    bool,           // sell_layout_ready
+);
+
+/// Snapshot of the PumpSwap SLAVE row for the specific `pool`.
+#[inline]
+fn pump_amm_slave_recovery_snapshot(
+    cache: &LivePoolCache,
+    pool: &Pubkey,
+) -> Option<PumpAmmSlaveRecoveryEvidence> {
+    let (state, slot, _age_ms) = cache.get_with_metadata(pool)?;
+    let CachedPoolState::PumpAmm(s) = state else {
+        return None;
+    };
+    let (sell_extended, sell_third_meta) = cache.pump_amm_sell_extended_layout(pool);
+    let sell_layout_ready = cache.pump_amm_sell_layout_ready(pool);
+    Some((
+        slot,
+        s.base_reserve,
+        s.quote_reserve,
+        s.pool_accounts.len(),
+        sell_extended,
+        sell_third_meta,
+        sell_layout_ready,
+    ))
+}
+
+/// After `EnsurePumpAmmPoolAccounts(force_refresh=true)` + JetStream merge: bounded wait until
+/// the SLAVE cache shows this **specific** PumpSwap pool as explicitly JetStream-ready with a
+/// **fresh** snapshot vs `before`.
+///
+/// This avoids mint-level false positives where another pool for the same mint is ready, and
+/// blocks stale pre-existing ready rows from satisfying recovery immediately (Bug #34 / #36).
+async fn wait_for_pump_amm_slave_after_recovery(
+    cache: &LivePoolCache,
+    pool: &Pubkey,
+    before: Option<PumpAmmSlaveRecoveryEvidence>,
+    timeout_ms: u64,
+    poll_interval_ms: u64,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while Instant::now() < deadline {
+        let explicit_ready = cache
+            .get_explicit_jetstream_ready_pump_amm_pool_accounts_for_pool_market(pool)
+            .is_some();
+        if explicit_ready {
+            let after = pump_amm_slave_recovery_snapshot(cache, pool);
+            if after.is_some() && (before.is_none() || after != before) {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
+    }
+    false
+}
+
 /// PumpSwap cold-path pre-plan gate: must match [`tx_builder::build_tx_plan`] when
 /// `resources.accounts` is empty — it reads `cache.get(pool_market)` and requires ≥12 accounts
 /// (SELL accepts 12 or 14). Do **not** require 14 here; that would block valid 12-account SELL
@@ -9468,22 +9531,23 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             && intent.metadata.get("dex").map(|s| s.as_str()) == Some("pump_amm")
             && is_pump_amm_structural_sim_error(sim_result.error_code.as_deref())
         {
-            let base_mint_pk = match Pubkey::from_str(&intent.resources.input_mint) {
-                Ok(p) => p,
-                Err(_) => {
-                    break (
-                        tx_plan,
-                        plan_hash_str,
-                        sim_result,
-                        requires_bundle,
-                        bundle_tip_ix,
-                        wallet_pubkey,
-                        bundle_tip_lamports,
-                    )
-                }
-            };
+            if Pubkey::from_str(&intent.resources.input_mint).is_err() {
+                break (
+                    tx_plan,
+                    plan_hash_str,
+                    sim_result,
+                    requires_bundle,
+                    bundle_tip_ix,
+                    wallet_pubkey,
+                    bundle_tip_lamports,
+                );
+            }
             let pool_pk = pump_amm_pool_market_hint_pk(&intent, ctx);
             if let Some(pool_pk) = pool_pk {
+                let before_snap = ctx
+                    .live_pool_cache
+                    .as_ref()
+                    .and_then(|c| pump_amm_slave_recovery_snapshot(c, &pool_pk));
                 if let DiscoveryRequestOutcome::Ok = ctx
                     .request_discovery_and_wait(
                         &intent.resources.input_mint,
@@ -9493,9 +9557,10 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     .await
                 {
                     if let Some(cache) = ctx.live_pool_cache.as_ref() {
-                        if wait_for_usable_pump_amm_cache_state(
+                        if wait_for_pump_amm_slave_after_recovery(
                             cache,
-                            &base_mint_pk,
+                            &pool_pk,
+                            before_snap,
                             DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
                             DISCOVERY_CACHE_POLL_INTERVAL_MS,
                         )
@@ -9508,6 +9573,12 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                                 "PumpSwap cold-path recovery: simulation structural (6013/6023/Overflow family) — force-refresh pool_accounts (market-data RPC), rebuilding tx (one retry)"
                             );
                             continue;
+                        } else {
+                            warn!(
+                                intent_id = %intent.intent_id,
+                                pool = %pool_pk,
+                                "PumpSwap cold-path recovery: force-refresh reply was Ok, but SLAVE did not expose fresh explicit-ready pool snapshot before timeout"
+                            );
                         }
                     }
                 }
@@ -11538,12 +11609,13 @@ mod execution_engine_tests {
         is_regular_momentum_hot_path_sell, liquidation_pumpfun_sell_preference,
         max_open_positions_buy_gate, pump_amm_hint_pool_cache_usable_for_tx_plan_builder,
         pump_amm_liquidation_quote_timeout_str, pump_amm_pool_market_hint_merge,
-        record_pump_amm_hot_path_refresh_after_success, scope48_confirmed_sell_close_decision,
-        select_best_route, try_pump_amm_hot_path_refresh_publish,
-        wait_for_meteora_dlmm_slave_after_recovery,
+        pump_amm_slave_recovery_snapshot, record_pump_amm_hot_path_refresh_after_success,
+        scope48_confirmed_sell_close_decision, select_best_route,
+        try_pump_amm_hot_path_refresh_publish, wait_for_meteora_dlmm_slave_after_recovery,
         wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder,
-        wait_for_pumpfun_bonding_cache_refresh, DiscoveryRequestOutcome,
-        PumpAmmHotPathRefreshDecision, RouteCandidate, PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN,
+        wait_for_pump_amm_slave_after_recovery, wait_for_pumpfun_bonding_cache_refresh,
+        DiscoveryRequestOutcome, PumpAmmHotPathRefreshDecision, RouteCandidate,
+        PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN,
     };
     use ironcrab::execution::live_pool_cache::{
         CachedPoolState, LivePoolCache, MeteoraState, PumpAmmState, PumpFunState,
@@ -12156,6 +12228,152 @@ mod execution_engine_tests {
             10,
         ));
         assert!(ok, "wait must observe ≥12 accounts after background upsert");
+    }
+
+    #[test]
+    fn pump_amm_force_refresh_wait_requires_snapshot_change_vs_before() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(ironcrab::ipc::NATIVE_SOL_MINT).unwrap();
+        let accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        cache.upsert(
+            pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: base,
+                quote_mint: wsol,
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(1_000),
+                quote_reserve: Some(2_000),
+                pool_accounts: accounts,
+                creator: None,
+            }),
+            1,
+        );
+        cache.set_pump_amm_pool_accounts_readiness_authoritative(pool, DexPoolReadiness::Ready);
+        cache.set_pump_amm_sell_layout_ready(&pool, true);
+
+        let before = pump_amm_slave_recovery_snapshot(&cache, &pool);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ok = rt.block_on(wait_for_pump_amm_slave_after_recovery(
+            &cache, &pool, before, 80, 10,
+        ));
+        assert!(
+            !ok,
+            "stale explicit-ready snapshot must not satisfy force-refresh wait"
+        );
+    }
+
+    #[test]
+    fn pump_amm_force_refresh_wait_is_pool_specific_not_mint_wide() {
+        let cache = LivePoolCache::new();
+        let base = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(ironcrab::ipc::NATIVE_SOL_MINT).unwrap();
+        let target_pool = Pubkey::new_unique();
+        let other_pool = Pubkey::new_unique();
+        let accounts_target: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        let accounts_other: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        cache.upsert(
+            target_pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: base,
+                quote_mint: wsol,
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(1_000),
+                quote_reserve: Some(2_000),
+                pool_accounts: accounts_target,
+                creator: None,
+            }),
+            1,
+        );
+        cache.set_pump_amm_pool_accounts_readiness_authoritative(
+            target_pool,
+            DexPoolReadiness::Partial,
+        );
+        cache.set_pump_amm_sell_layout_ready(&target_pool, false);
+
+        cache.upsert(
+            other_pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: base,
+                quote_mint: wsol,
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(10_000),
+                quote_reserve: Some(20_000),
+                pool_accounts: accounts_other,
+                creator: None,
+            }),
+            2,
+        );
+        cache.set_pump_amm_pool_accounts_readiness_authoritative(
+            other_pool,
+            DexPoolReadiness::Ready,
+        );
+        cache.set_pump_amm_sell_layout_ready(&other_pool, true);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ok = rt.block_on(wait_for_pump_amm_slave_after_recovery(
+            &cache,
+            &target_pool,
+            None,
+            80,
+            10,
+        ));
+        assert!(
+            !ok,
+            "ready state from another pool for same mint must not satisfy target-pool wait"
+        );
+    }
+
+    #[test]
+    fn pump_amm_force_refresh_wait_succeeds_after_fresh_extended_layout_merge() {
+        let cache = std::sync::Arc::new(LivePoolCache::new());
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(ironcrab::ipc::NATIVE_SOL_MINT).unwrap();
+        let accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        cache.upsert(
+            pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: base,
+                quote_mint: wsol,
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(1_000),
+                quote_reserve: Some(2_000),
+                pool_accounts: accounts,
+                creator: None,
+            }),
+            1,
+        );
+        cache.set_pump_amm_pool_accounts_readiness_authoritative(pool, DexPoolReadiness::Ready);
+        cache.set_pump_amm_sell_layout_ready(&pool, true);
+
+        let before = pump_amm_slave_recovery_snapshot(cache.as_ref(), &pool);
+        let cache_clone = std::sync::Arc::clone(&cache);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let third = Pubkey::new_unique();
+            cache_clone.merge_pump_amm_sell_extended_layout(&pool, true, Some(third));
+            cache_clone.set_pump_amm_sell_layout_ready(&pool, true);
+        });
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ok = rt.block_on(wait_for_pump_amm_slave_after_recovery(
+            cache.as_ref(),
+            &pool,
+            before,
+            500,
+            10,
+        ));
+        assert!(
+            ok,
+            "fresh explicit-ready merge with extended sell metadata must satisfy force-refresh wait"
+        );
     }
 
     #[test]
