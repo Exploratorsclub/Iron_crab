@@ -236,6 +236,38 @@ fn is_cold_path_recovery_sell(intent: &TradeIntent) -> bool {
             .unwrap_or(false)
 }
 
+/// After a failed simulation, whether to run the synchronous market-data `Ensure*` recovery
+/// (JetStream + bounded cache wait + one rebuild) for this DEX slice.
+///
+/// **Liquidation / kill-switch SELL:** any sim failure qualifies — stale SLAVE data can surface as
+/// slippage, `6004`, etc., not only the structural 6013/6023/Overflow family.
+///
+/// **Other cold-path SELL** (e.g. `sell_all=true` without liquidation): structural signatures only,
+/// so we do not pay discovery/RPC on every quote-level failure.
+#[inline]
+fn cold_path_dex_sim_failure_triggers_discovery_recovery(
+    intent: &TradeIntent,
+    error_code: Option<&str>,
+    is_structural: fn(Option<&str>) -> bool,
+) -> bool {
+    let is_liquidation_sell = intent.side == TradeSide::Sell
+        && (intent
+            .metadata
+            .get("purpose")
+            .map(|v| v == "liquidation")
+            .unwrap_or(false)
+            || intent
+                .metadata
+                .get("kill_switch")
+                .map(|v| v == "true")
+                .unwrap_or(false));
+    if is_liquidation_sell {
+        true
+    } else {
+        is_structural(error_code)
+    }
+}
+
 /// Scope-1 async PumpSwap healing: only **regular momentum strategy** SELLs (hot path).
 ///
 /// Excludes cold-path / manual safety tooling (e.g. `sell-all` uses `source == "sell-all"` and
@@ -9526,10 +9558,15 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         // PumpSwap SELL: stale/wrong pool_accounts (creator vault, protocol fee recipient, …) → e.g. Custom(6023), Custom(6013).
         // Cold-path recovery: one EnsurePumpAmmPoolAccounts with force_refresh (RPC market parse).
         // Gate: `is_cold_path_recovery_sell` — liquidation, kill-switch, or explicit `sell_all=true` (not general momentum SELLs).
+        // Liquidation/kill-switch: any sim fail may indicate stale accounts (also 6004 / slippage); sell-all-only keeps structural gate.
         if !pump_amm_recovery_attempted
             && is_cold_path_recovery_sell(&intent)
             && intent.metadata.get("dex").map(|s| s.as_str()) == Some("pump_amm")
-            && is_pump_amm_structural_sim_error(sim_result.error_code.as_deref())
+            && cold_path_dex_sim_failure_triggers_discovery_recovery(
+                &intent,
+                sim_result.error_code.as_deref(),
+                is_pump_amm_structural_sim_error,
+            )
         {
             if Pubkey::from_str(&intent.resources.input_mint).is_err() {
                 break (
@@ -9570,7 +9607,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                             warn!(
                                 intent_id = %intent.intent_id,
                                 pool = %pool_pk,
-                                "PumpSwap cold-path recovery: simulation structural (6013/6023/Overflow family) — force-refresh pool_accounts (market-data RPC), rebuilding tx (one retry)"
+                                sim_error = ?sim_result.error_code,
+                                "PumpSwap cold-path recovery: simulation failed — force-refresh pool_accounts (market-data RPC), rebuilding tx (one retry)"
                             );
                             continue;
                         } else {
@@ -9587,11 +9625,16 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
         // PumpFun bonding curve SELL: stale virtual/real reserves or cashback layout → 6023/6024/Overflow.
         // Cold-path recovery: EnsurePumpfunBondingCurve with force_refresh (RPC in market-data), bounded JetStream wait, one retry.
+        // Liquidation/kill-switch: any sim fail triggers one recovery pass; sell-all-only keeps structural gate.
         if !pumpfun_bonding_recovery_attempted
             && is_cold_path_recovery_sell(&intent)
             && intent.metadata.get("dex").map(|s| s.as_str()) == Some("pumpfun")
             && intent.resources.pools.len() == 1
-            && is_pumpfun_bonding_curve_structural_sim_error(sim_result.error_code.as_deref())
+            && cold_path_dex_sim_failure_triggers_discovery_recovery(
+                &intent,
+                sim_result.error_code.as_deref(),
+                is_pumpfun_bonding_curve_structural_sim_error,
+            )
         {
             let base_mint_pk = match Pubkey::from_str(&intent.resources.input_mint) {
                 Ok(p) => p,
@@ -9652,7 +9695,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                                 mint = %intent.resources.input_mint,
                                 bonding_curve = %bonding_curve,
                                 sim_error = ?sim_result.error_code,
-                                "PumpFun liquidation: bonding-curve structural sim fail — force_refresh via market-data RPC, one tx rebuild retry"
+                                "PumpFun cold-path: bonding-curve sim failed — force_refresh via market-data RPC, one tx rebuild retry"
                             );
                             continue;
                         }
@@ -9663,11 +9706,16 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
         // Orca Whirlpool SELL (cold-path recovery slice via `is_cold_path_recovery_sell`): stale tick or vault evidence →
         // structural sim fail. I-24d: one EnsureOrcaWhirlpoolPoolState + bounded JetStream wait + one retry.
+        // Liquidation/kill-switch: any sim fail triggers one recovery pass; sell-all-only keeps structural gate.
         if !orca_recovery_attempted
             && is_cold_path_recovery_sell(&intent)
             && intent.metadata.get("dex").map(|s| s.as_str()) == Some("orca")
             && intent.resources.pools.len() == 1
-            && is_orca_structural_sim_error(sim_result.error_code.as_deref())
+            && cold_path_dex_sim_failure_triggers_discovery_recovery(
+                &intent,
+                sim_result.error_code.as_deref(),
+                is_orca_structural_sim_error,
+            )
         {
             if Pubkey::from_str(&intent.resources.input_mint).is_err() {
                 break (
@@ -9714,7 +9762,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 pool = %pool_pk,
                 sim_error = ?sim_result.error_code,
                 before_evidence = ?before_evidence,
-                "Orca cold-path: simulation structural fail — requesting EnsureOrcaWhirlpoolPoolState from market-data (bounded wait + one tx rebuild retry)"
+                "Orca cold-path: simulation failed — requesting EnsureOrcaWhirlpoolPoolState from market-data (bounded wait + one tx rebuild retry)"
             );
             if let DiscoveryRequestOutcome::Ok = ctx
                 .request_orca_whirlpool_recovery_and_wait(
@@ -11604,7 +11652,8 @@ async fn spawn_rebroadcast_loop(
 #[cfg(test)]
 mod execution_engine_tests {
     use super::{
-        apply_scope48_confirmed_sell_execution_metadata, is_cold_path_recovery_sell,
+        apply_scope48_confirmed_sell_execution_metadata,
+        cold_path_dex_sim_failure_triggers_discovery_recovery, is_cold_path_recovery_sell,
         is_pump_amm_structural_sim_error, is_pumpfun_bonding_curve_structural_sim_error,
         is_regular_momentum_hot_path_sell, liquidation_pumpfun_sell_preference,
         max_open_positions_buy_gate, pump_amm_hint_pool_cache_usable_for_tx_plan_builder,
@@ -11738,6 +11787,82 @@ mod execution_engine_tests {
         assert!(!liquidation_pumpfun_sell_preference(
             Some(&cache),
             &base_mint
+        ));
+    }
+
+    #[test]
+    fn cold_path_liquidation_sim_any_error_triggers_pump_amm_recovery_gate() {
+        let mut intent = TradeIntent::new(
+            "liq",
+            "v0.1.0",
+            "run-1",
+            "id-liq".to_string(),
+            "momentum-bot",
+            IntentTier::Tier1,
+            IntentOrigin::StrategyA,
+            ExplicitAmount::new(1_000_000, 6),
+            TradeResources {
+                input_mint: "Mint111111111111111111111111111111111111111".to_string(),
+                output_mint: ironcrab::ipc::NATIVE_SOL_MINT.to_string(),
+                pools: vec!["Pool123".to_string()],
+                accounts: vec![],
+                token_program: None,
+            },
+            0,
+            200,
+            TradeSide::Sell,
+            TradingRegime::Early,
+        );
+        intent
+            .metadata
+            .insert("purpose".to_string(), "liquidation".to_string());
+        assert!(cold_path_dex_sim_failure_triggers_discovery_recovery(
+            &intent,
+            Some("Custom(6004)"),
+            is_pump_amm_structural_sim_error
+        ));
+        assert!(cold_path_dex_sim_failure_triggers_discovery_recovery(
+            &intent,
+            None,
+            is_pump_amm_structural_sim_error
+        ));
+    }
+
+    #[test]
+    fn cold_path_sell_all_only_non_structural_sim_does_not_trigger_pump_amm_recovery_gate() {
+        let mut intent = TradeIntent::new(
+            "sell-all",
+            "v0.1.0",
+            "run-1",
+            "id-sa".to_string(),
+            "sell-all",
+            IntentTier::Tier1,
+            IntentOrigin::StrategyA,
+            ExplicitAmount::new(1_000_000, 6),
+            TradeResources {
+                input_mint: "Mint111111111111111111111111111111111111111".to_string(),
+                output_mint: ironcrab::ipc::NATIVE_SOL_MINT.to_string(),
+                pools: vec!["Pool123".to_string()],
+                accounts: vec![],
+                token_program: None,
+            },
+            0,
+            200,
+            TradeSide::Sell,
+            TradingRegime::Early,
+        );
+        intent
+            .metadata
+            .insert("sell_all".to_string(), "true".to_string());
+        assert!(!cold_path_dex_sim_failure_triggers_discovery_recovery(
+            &intent,
+            Some("Custom(6004)"),
+            is_pump_amm_structural_sim_error
+        ));
+        assert!(cold_path_dex_sim_failure_triggers_discovery_recovery(
+            &intent,
+            Some("Custom(6023)"),
+            is_pump_amm_structural_sim_error
         ));
     }
 
