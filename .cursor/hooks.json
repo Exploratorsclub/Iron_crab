@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "python3 .cursor/hooks/block-cross-repo-access.py",
+        "failClosed": true
+      }
+    ]
+  }
+}
