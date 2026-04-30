@@ -936,10 +936,10 @@ pub async fn build_tx_plan(
             let v12_fp = pool_accounts[13];
             let ix_fc = ixs[0].accounts[19].pubkey;
             let ix_fp = ixs[0].accounts[20].pubkey;
-            let fee_config_preserved = ix_fc == v12_fc && v12_fc != Pubkey::default();
-            let fee_program_preserved = ix_fp == v12_fp && v12_fp != Pubkey::default();
-            let fee_config_replaced_vs_v14 = ix_fc != v12_fc;
-            let fee_program_replaced_vs_v14 = ix_fp != v12_fp;
+            let fee_config_uses_global_constant = ix_fc == canonical_fee_cfg;
+            let fee_program_uses_expected = ix_fp == canonical_fee_prog;
+            let fee_config_differs_from_v14_row = v12_fc != ix_fc;
+            let fee_program_differs_from_v14_row = v12_fp != ix_fp;
             let pfr_preserved = ixs[0].accounts[9].pubkey == pool_accounts[6];
             let pfr_ta_preserved = ixs[0].accounts[10].pubkey == pool_accounts[7];
             let sell_csv: String = ixs[0]
@@ -961,19 +961,19 @@ pub async fn build_tx_plan(
                 base_token_program_override = ?token_program_override,
                 v14_csv = %PumpAmmPoolAccountsDiagnostic::format_v14_csv(&pool_accounts[..14]),
                 sell_ix_accounts_csv = %sell_csv,
-                v14_fee_config = %v12_fc,
-                v14_fee_program = %v12_fp,
+                v14_fee_config_row = %v12_fc,
+                v14_fee_program_row = %v12_fp,
                 sell_ix_fee_config_meta = %ix_fc,
                 sell_ix_fee_program_meta = %ix_fp,
-                fee_config_preserved_from_v14 = fee_config_preserved,
-                fee_program_preserved_from_v14 = fee_program_preserved,
+                fee_config_uses_global_constant = fee_config_uses_global_constant,
+                fee_program_matches_expected_fee_program = fee_program_uses_expected,
                 protocol_fee_recipient_preserved_from_v14 = pfr_preserved,
                 protocol_fee_recipient_ta_preserved_from_v14 = pfr_ta_preserved,
-                fee_config_differs_from_mainnet_constant = (v12_fc != canonical_fee_cfg),
-                fee_program_differs_from_expected = (v12_fp != canonical_fee_prog),
-                fee_config_replaced_vs_v14 = fee_config_replaced_vs_v14,
-                fee_program_replaced_vs_v14 = fee_program_replaced_vs_v14,
-                "Scope44: pump_amm SELL plan — ix metas must match authoritative v14; replacements vs v14 are simulation risks (Bug #35)"
+                v14_fee_config_differs_from_global_constant = (v12_fc != canonical_fee_cfg),
+                v14_fee_program_differs_from_expected = (v12_fp != canonical_fee_prog),
+                fee_config_differs_from_v14_row = fee_config_differs_from_v14_row,
+                fee_program_differs_from_v14_row = fee_program_differs_from_v14_row,
+                "Scope44: pump_amm SELL plan — meta #19/#20 must be global FeeConfig + fee_program (v14[12] is informational; wrong type → Custom 3002)"
             );
         }
 
