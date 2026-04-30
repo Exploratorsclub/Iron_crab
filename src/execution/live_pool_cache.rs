@@ -31,7 +31,6 @@
 //! - PumpFun Bonding: virtual reserves
 //! - PumpFun AMM (PumpSwap): reserves, pool accounts
 
-use crate::solana::dex::pumpfun_amm::pump_amm_authoritative_fee_metas_from_v14;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use solana_sdk::pubkey::Pubkey;
@@ -998,16 +997,7 @@ impl LivePoolCache {
         }
         let (requires_extended, third) = self.pump_amm_sell_extended_layout(pool_market);
         if requires_extended {
-            if third.filter(|p| *p != Pubkey::default()).is_none() {
-                return false;
-            }
-            let Some(entry) = self.pools.get(pool_market) else {
-                return false;
-            };
-            let CachedPoolState::PumpAmm(s) = &entry.value().state else {
-                return false;
-            };
-            pump_amm_authoritative_fee_metas_from_v14(&s.pool_accounts).is_some()
+            third.filter(|p| *p != Pubkey::default()).is_some()
         } else {
             true
         }
@@ -2606,7 +2596,8 @@ mod tests {
     }
 
     #[test]
-    fn test_pump_amm_extended_with_third_but_missing_fee_config_blocks_ready_gate() {
+    fn test_pump_amm_extended_sell_readiness_ignores_default_v14_fee_config() {
+        // Scope 59: global SELL fee_config does not use v14[12]; extended readiness must not require it.
         let cache = LivePoolCache::new();
         let pool_market = Pubkey::new_unique();
         let base_mint = Pubkey::new_unique();
@@ -2633,8 +2624,12 @@ mod tests {
         assert!(
             cache
                 .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
-                .is_none(),
-            "extended SELL must not be swap-ready until v14 fee_config/fee_program are non-default"
+                .is_some(),
+            "extended SELL must be swap-ready when third_meta + layout_ready + pool_accounts hold"
+        );
+        assert!(
+            cache.pump_amm_swap_accounts_ready_by_base_mint(&base_mint),
+            "readiness must not block on non-default v14[12] when SELL uses global fee_config"
         );
     }
 

@@ -30,8 +30,8 @@ const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const PUMPFUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 // Observed on-chain in PumpSwap/Pump.fun AMM swaps: `fee_program` is this program id.
 const PUMPFUN_AMM_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
-// Default `fee_config` pubkey used when v14 `pool_accounts[12]` is missing (fallback only).
-// Successful swaps usually carry an authoritative per-row `fee_config` in DexPoolAccounts (Scope 58).
+// Global Fee Program fee_config PDA — same for PumpSwap SELL ix meta #19 on successful mainnet txs.
+// v14 `pool_accounts[12]` may carry a different pubkey (cache/market row artifact); SELL must still use this constant (Scope 59).
 const PUMPFUN_AMM_FEE_CONFIG: &str = "5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx";
 
 /// Same strings as `build_swap_ix_from_pool_accounts` uses for fee metas (diagnostics / downstream).
@@ -103,26 +103,6 @@ fn pump_amm_resolve_protocol_fee_accounts(
         (true, true) => Err(anyhow!(
             "pump_amm: protocol_fee_recipient and protocol_fee_recipient_ta missing — cannot build swap ix without observed fee accounts"
         )),
-    }
-}
-
-/// Authoritative `fee_config` + `fee_program` from a v14 `DexPoolAccounts` row (indices [12]/[13]).
-///
-/// Used by JetStream readiness: extended SELL must not be marked ready until these are populated,
-/// otherwise the builder would fall back to constants and diverge from on-chain expectations.
-#[must_use]
-pub fn pump_amm_authoritative_fee_metas_from_v14(
-    pool_accounts: &[Pubkey],
-) -> Option<(Pubkey, Pubkey)> {
-    if pool_accounts.len() < 14 {
-        return None;
-    }
-    let fee_config = pool_accounts[12];
-    let fee_program = pool_accounts[13];
-    if fee_config == Pubkey::default() || fee_program == Pubkey::default() {
-        None
-    } else {
-        Some((fee_config, fee_program))
     }
 }
 
@@ -5093,17 +5073,11 @@ impl Dex for PumpFunAmmDex {
                 "pump_amm build_swap_ix: cached pool.event_authority != canonical; using canonical"
             );
         }
-        // SELL meta #19: use the same fee_config as the pool's authoritative market row / v14
-        // `pool_accounts` (Bug #35 / Scope 58). BUY meta #20 remains pool.fee_config (may differ).
-        let sell_fee_config = if pool.fee_config == Pubkey::default() {
-            warn!(
-                pool = %pool.pool_market,
-                "pump_amm build_swap_ix: cached pool.fee_config missing — falling back to PUMPFUN_AMM_FEE_CONFIG constant"
-            );
-            Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG)?
-        } else {
-            pool.fee_config
-        };
+        // SELL meta #19/#20: global Fee Program accounts (mainnet-constant). Cached `pool.fee_config`
+        // may differ from v14/market parse — using it as SELL meta #19 caused Anchor Custom(3002)
+        // (wrong account type vs program expectation); Scope 59 restores global constant semantics.
+        let sell_fee_config = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG)?;
+        let sell_fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
         let (protocol_fee_recipient, protocol_fee_recipient_ta) =
             pump_amm_resolve_protocol_fee_accounts(
                 pool.protocol_fee_recipient,
@@ -5157,7 +5131,7 @@ impl Dex for PumpFunAmmDex {
                 false,
             )); // 18
             metas.push(AccountMeta::new_readonly(sell_fee_config, false)); // 19
-            metas.push(AccountMeta::new_readonly(pool.fee_program, false)); // 20
+            metas.push(AccountMeta::new_readonly(sell_fee_program, false)); // 20
                                                                             // `pools_by_base` can be stale vs monotonic LivePoolCache (Geyser); prefer DashMap for extended SELL.
             let mut sell_requires_cashback_remaining = pool.sell_requires_cashback_remaining;
             let mut sell_cashback_third_meta = pool.sell_cashback_third_meta;
@@ -5277,13 +5251,12 @@ impl PumpFunAmmDex {
         let coin_creator_vault_authority = pool_accounts[10];
         let global_volume_accumulator = pool_accounts[11]; // REQUIRED for BUY!
 
-        // Bug #35 / Scope 58: Preserve authoritative v14 `fee_config` + `fee_program` from
-        // `pool_accounts` (Geyser / market-data / JetStream). Some pools use a pool-specific
-        // `fee_config` pubkey in successful extended SELLs; replacing it with the historical
-        // mainnet constant breaks simulation (Custom 6023).
+        // BUY uses pool row fee fields from v14 ([12]/[13]); SELL meta #19/#20 must use global
+        // Fee Program accounts (same as successful mainnet reference txs). v14[12] is not always
+        // the SELL fee_config account type — using it caused Custom(3002) (Scope 58 regression).
         let parsed_fee_config = pool_accounts[12];
         let parsed_fee_program = pool_accounts[13];
-        let fee_config = if parsed_fee_config == Pubkey::default() {
+        let buy_fee_config = if parsed_fee_config == Pubkey::default() {
             warn!(
                 "pump_amm build_swap_ix_from_pool_accounts: pool_accounts[12] fee_config missing — falling back to PUMPFUN_AMM_FEE_CONFIG constant"
             );
@@ -5291,7 +5264,7 @@ impl PumpFunAmmDex {
         } else {
             parsed_fee_config
         };
-        let fee_program = if parsed_fee_program == Pubkey::default() {
+        let buy_fee_program = if parsed_fee_program == Pubkey::default() {
             warn!(
                 "pump_amm build_swap_ix_from_pool_accounts: pool_accounts[13] fee_program missing — falling back to expected fee program id"
             );
@@ -5300,12 +5273,15 @@ impl PumpFunAmmDex {
             warn!(
                 from_pool_accounts = %parsed_fee_program,
                 expected = %expected_fee_program,
-                "pump_amm build_swap_ix_from_pool_accounts: pool_accounts[13] fee_program != expected; using pool_accounts value (authoritative)"
+                "pump_amm build_swap_ix_from_pool_accounts: pool_accounts[13] fee_program != expected; using pool_accounts value (authoritative for BUY)"
             );
             parsed_fee_program
         } else {
             parsed_fee_program
         };
+
+        let sell_fee_config = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG)?;
+        let sell_fee_program = expected_fee_program;
 
         let (expected_base, is_buy) = if input_mint == WSOL_MINT {
             (output_mint, true)
@@ -5384,8 +5360,8 @@ impl PumpFunAmmDex {
                 AccountMeta::new(coin_creator_vault_ata, false), // 17
                 AccountMeta::new_readonly(coin_creator_vault_authority, false), // 18
                 AccountMeta::new(user_vol, false),         // 19 - user volume accumulator
-                AccountMeta::new_readonly(fee_config, false), // 20
-                AccountMeta::new_readonly(fee_program, false), // 21
+                AccountMeta::new_readonly(buy_fee_config, false), // 20
+                AccountMeta::new_readonly(buy_fee_program, false), // 21
                 AccountMeta::new_readonly(program_id, false), // 22
             ]
         } else {
@@ -5416,8 +5392,8 @@ impl PumpFunAmmDex {
                 AccountMeta::new_readonly(program_id, false), // 16
                 AccountMeta::new(coin_creator_vault_ata, false), // 17
                 AccountMeta::new_readonly(coin_creator_vault_authority, false), // 18
-                AccountMeta::new_readonly(fee_config, false), // 19
-                AccountMeta::new_readonly(fee_program, false), // 20
+                AccountMeta::new_readonly(sell_fee_config, false), // 19
+                AccountMeta::new_readonly(sell_fee_program, false), // 20
             ];
             if sell_requires_cashback_remaining {
                 let Some(third) = sell_cashback_third_meta.filter(|p| *p != Pubkey::default())
@@ -6282,18 +6258,19 @@ mod tests {
         assert_eq!(ixs[0].accounts[10].pubkey, observed_pfr_ta);
     }
 
-    /// Scope 58 / Bug #35: extended SELL must preserve v14 `fee_config` when it differs from the historical mainnet constant.
+    /// Extended SELL (24 accounts): meta #19 must be global `PUMPFUN_AMM_FEE_CONFIG` even when v14[12]
+    /// is a different pubkey (SELL expects that account type; v12 alone caused Scope 58 Custom 3002).
     #[test]
-    fn test_pumpswap_sell_extended_preserves_authoritative_fee_config_from_v14() {
+    fn pumpswap_extended_sell_uses_global_fee_config() {
         let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
         let base_mint = Pubkey::new_unique();
         let user = Pubkey::new_unique();
         let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes());
         let third_meta = Pubkey::new_unique();
-        let pool_specific_fee_config =
+        let row_fee_config =
             Pubkey::from_str("DcsvhShq8ZaUyU7NtjskVRfKHW7DrSjdu7mkgpzoHyxB").unwrap();
         assert_ne!(
-            pool_specific_fee_config,
+            row_fee_config,
             Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap()
         );
         let fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap();
@@ -6313,7 +6290,7 @@ mod tests {
             Pubkey::new_unique(),
             Pubkey::new_unique(),
             Pubkey::new_unique(),
-            pool_specific_fee_config,
+            row_fee_config,
             fee_program,
         ];
         assert_eq!(pool_accounts.len(), 14);
@@ -6333,10 +6310,19 @@ mod tests {
 
         assert_eq!(ixs[0].accounts.len(), 24);
         assert_eq!(
-            ixs[0].accounts[19].pubkey, pool_specific_fee_config,
-            "SELL ix meta #19 must equal authoritative pool_accounts[12], not global constant"
+            ixs[0].accounts[19].pubkey,
+            Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap(),
+            "SELL ix meta #19 must use global FeeConfig constant, not v14[12]"
         );
         assert_eq!(ixs[0].accounts[20].pubkey, fee_program);
+        assert_eq!(ixs[0].accounts[23].pubkey, third_meta);
+    }
+
+    /// Regression guard (Scope 58): using `pool_accounts[12]` as SELL `fee_config` meta caused
+    /// Anchor `Custom(3002)` (wrong account type vs program). SELL must keep global `5PH…` + `pfee…`.
+    #[test]
+    fn pumpswap_sell_fee_config_scope58_custom3002_regression_guard() {
+        pumpswap_extended_sell_uses_global_fee_config();
     }
 
     /// SELL path: Token-2022 base mint — ix[11] must be Token-2022 program; user base ATA (ix[5]) must match derivation.
