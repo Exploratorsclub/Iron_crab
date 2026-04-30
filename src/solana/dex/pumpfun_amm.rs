@@ -511,7 +511,7 @@ struct SellLayoutObserveLimits {
 }
 
 struct SellLayoutObserveOutcome {
-    result: Result<PumpAmmAuthoritativeSellLayout>,
+    result: Result<PumpAmmSellReferenceObservation>,
     summary: PumpAmmSellLayoutExternalAttemptSummary,
 }
 
@@ -520,6 +520,27 @@ enum PumpAmmAuthoritativeSellLayout {
     Unknown,
     Base,
     Extended { third_meta: Pubkey },
+}
+
+/// Successful same-pool SELL reference from TX-history during `force_refresh` (Scope 60).
+/// Carries authoritative protocol fee metas from observed `sell` ix #9/#10 for v14 `[6]`/`[7]`.
+#[derive(Debug, Clone)]
+struct PumpAmmSellReferenceObservation {
+    layout: PumpAmmAuthoritativeSellLayout,
+    protocol_fee_recipient: Pubkey,
+    protocol_fee_recipient_ta: Pubkey,
+    reference_swap_signature: Option<String>,
+}
+
+impl PumpAmmSellReferenceObservation {
+    fn unknown() -> Self {
+        Self {
+            layout: PumpAmmAuthoritativeSellLayout::Unknown,
+            protocol_fee_recipient: Pubkey::default(),
+            protocol_fee_recipient_ta: Pubkey::default(),
+            reference_swap_signature: None,
+        }
+    }
 }
 
 fn local_history_probe_from_sell_layout_summary(
@@ -580,14 +601,15 @@ fn sell_layout_scan_termination_after_successful_tx_fetch(
 ///
 /// A newer **21-account** `sell` must not hide an older **24-account** extended `sell` for the same
 /// pool: `Extended` wins; `Base` is kept only until an `Extended` match appears.
-fn merge_pump_amm_authoritative_sell_layout_observation(
-    best: PumpAmmAuthoritativeSellLayout,
-    candidate: PumpAmmAuthoritativeSellLayout,
-) -> PumpAmmAuthoritativeSellLayout {
-    match candidate {
+/// Fee recipient fields always follow the winning layout’s reference row (Scope 60).
+fn merge_pump_amm_authoritative_sell_reference_observation(
+    best: PumpAmmSellReferenceObservation,
+    candidate: PumpAmmSellReferenceObservation,
+) -> PumpAmmSellReferenceObservation {
+    match candidate.layout {
         PumpAmmAuthoritativeSellLayout::Extended { .. } => candidate,
-        PumpAmmAuthoritativeSellLayout::Base => match best {
-            PumpAmmAuthoritativeSellLayout::Unknown => PumpAmmAuthoritativeSellLayout::Base,
+        PumpAmmAuthoritativeSellLayout::Base => match best.layout {
+            PumpAmmAuthoritativeSellLayout::Unknown => candidate,
             _ => best,
         },
         PumpAmmAuthoritativeSellLayout::Unknown => best,
@@ -598,17 +620,17 @@ fn merge_pump_amm_authoritative_sell_layout_observation(
 /// matching pool/mint `sell` layouts in **newest-first** order (one observation per outer step).
 ///
 /// Used by unit tests to lock the scan conflict without RPC; production calls this from the scan loop.
-fn fold_force_refresh_sell_layout_observations_newest_first(
-    mut best_layout: PumpAmmAuthoritativeSellLayout,
-    layouts_newest_first: impl IntoIterator<Item = PumpAmmAuthoritativeSellLayout>,
-) -> PumpAmmAuthoritativeSellLayout {
-    for layout in layouts_newest_first {
-        best_layout = merge_pump_amm_authoritative_sell_layout_observation(best_layout, layout);
-        if matches!(best_layout, PumpAmmAuthoritativeSellLayout::Extended { .. }) {
-            return best_layout;
+fn fold_force_refresh_sell_reference_observations_newest_first(
+    mut best: PumpAmmSellReferenceObservation,
+    observations_newest_first: impl IntoIterator<Item = PumpAmmSellReferenceObservation>,
+) -> PumpAmmSellReferenceObservation {
+    for obs in observations_newest_first {
+        best = merge_pump_amm_authoritative_sell_reference_observation(best, obs);
+        if matches!(best.layout, PumpAmmAuthoritativeSellLayout::Extended { .. }) {
+            return best;
         }
     }
-    best_layout
+    best
 }
 
 fn provider_status_from_anyhow_rpc(err: &anyhow::Error) -> PumpAmmSellLayoutProviderStatus {
@@ -1194,10 +1216,13 @@ impl PumpFunAmmDex {
         diagnostic: PumpAmmPoolAccountsDiagnostic,
     ) -> Result<PoolAccountsV14WithDiagnostic> {
         let (sell_layout_ready, force_refresh_sell_layout_diag) = if force_refresh {
-            let (layout, diag) = self
+            let (sell_obs, diag) = self
                 .resolve_authoritative_sell_layout_for_force_refresh(&pool, base_mint)
                 .await?;
-            match layout {
+            Self::apply_sell_reference_protocol_fee_recipients_for_force_refresh(
+                &mut pool, &sell_obs,
+            );
+            match sell_obs.layout {
                 PumpAmmAuthoritativeSellLayout::Unknown => (false, diag),
                 PumpAmmAuthoritativeSellLayout::Base => {
                     pool.sell_requires_cashback_remaining = false;
@@ -1224,26 +1249,33 @@ impl PumpFunAmmDex {
         })
     }
 
+    /// Scope 60: same-pool successful `sell` reference ix carries authoritative protocol fee metas (#9/#10).
+    /// Apply only when observation came from TX decode (signature present), not from stale cache-only hints.
+    fn apply_sell_reference_protocol_fee_recipients_for_force_refresh(
+        pool: &mut PumpAmmPoolStatic,
+        obs: &PumpAmmSellReferenceObservation,
+    ) {
+        if obs.layout == PumpAmmAuthoritativeSellLayout::Unknown {
+            return;
+        }
+        let Some(ref sig) = obs.reference_swap_signature else {
+            return;
+        };
+        if sig.is_empty() {
+            return;
+        }
+        pool.protocol_fee_recipient = obs.protocol_fee_recipient;
+        pool.protocol_fee_recipient_ta = obs.protocol_fee_recipient_ta;
+    }
+
     async fn resolve_authoritative_sell_layout_for_force_refresh(
         &self,
         pool: &PumpAmmPoolStatic,
         base_mint: Pubkey,
     ) -> Result<(
-        PumpAmmAuthoritativeSellLayout,
+        PumpAmmSellReferenceObservation,
         Option<PumpAmmForceRefreshSellLayoutDiag>,
     )> {
-        if pool.sell_requires_cashback_remaining {
-            if let Some(third_meta) = pool
-                .sell_cashback_third_meta
-                .filter(|p| *p != Pubkey::default())
-            {
-                return Ok((
-                    PumpAmmAuthoritativeSellLayout::Extended { third_meta },
-                    None,
-                ));
-            }
-        }
-
         let local_limits = SellLayoutObserveLimits {
             signatures_limit: 200,
             max_tx_fetch_attempts: 200,
@@ -1265,8 +1297,8 @@ impl PumpFunAmmDex {
             local_history_probe_from_sell_layout_summary(&local_outcome.summary);
 
         match local_outcome.result {
-            Ok(layout) if layout != PumpAmmAuthoritativeSellLayout::Unknown => {
-                return Ok((layout, None));
+            Ok(obs) if obs.layout != PumpAmmAuthoritativeSellLayout::Unknown => {
+                return Ok((obs, None));
             }
             Ok(_) => {}
             Err(e) => {
@@ -1296,7 +1328,7 @@ impl PumpFunAmmDex {
                 termination_reason,
                 last_external: None,
             };
-            return Ok((PumpAmmAuthoritativeSellLayout::Unknown, Some(diag)));
+            return Ok((PumpAmmSellReferenceObservation::unknown(), Some(diag)));
         };
 
         let local_one_sig_probe = match self
@@ -1329,7 +1361,7 @@ impl PumpFunAmmDex {
                     PumpAmmSellLayoutTerminationReason::ExternalSkippedLocalSigsPresent,
                 last_external: None,
             };
-            return Ok((PumpAmmAuthoritativeSellLayout::Unknown, Some(diag)));
+            return Ok((PumpAmmSellReferenceObservation::unknown(), Some(diag)));
         }
 
         let external_limits = SellLayoutObserveLimits {
@@ -1349,13 +1381,13 @@ impl PumpFunAmmDex {
 
         let timed = tokio::time::timeout(BOUNDED_EXTERNAL_SELL_LAYOUT_TIMEOUT, external_fut).await;
 
-        let (layout, summary_opt, timed_out) = match timed {
+        let (sell_obs, summary_opt, timed_out) = match timed {
             Ok(obs) => {
-                let layout = match obs.result {
-                    Ok(l) => l,
-                    Err(_) => PumpAmmAuthoritativeSellLayout::Unknown,
+                let out = match obs.result {
+                    Ok(v) => v,
+                    Err(_) => PumpAmmSellReferenceObservation::unknown(),
                 };
-                (layout, Some(obs.summary), false)
+                (out, Some(obs.summary), false)
             }
             Err(_) => {
                 warn!(
@@ -1365,12 +1397,12 @@ impl PumpFunAmmDex {
                     termination_reason = %PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalTimeoutBudgetExhausted.as_log_str(),
                     "pump_amm: bounded external SELL-layout observation timed out (outer budget)"
                 );
-                (PumpAmmAuthoritativeSellLayout::Unknown, None, true)
+                (PumpAmmSellReferenceObservation::unknown(), None, true)
             }
         };
 
         let termination_reason = force_refresh_external_termination_reason_after_attempt(
-            layout,
+            sell_obs.layout,
             timed_out,
             summary_opt.as_ref(),
         );
@@ -1396,7 +1428,7 @@ impl PumpFunAmmDex {
             last_external: summary_opt,
         };
 
-        Ok((layout, Some(diag)))
+        Ok((sell_obs, Some(diag)))
     }
 
     async fn observe_authoritative_sell_layout_from_tx_history_with_rpc(
@@ -1529,7 +1561,7 @@ impl PumpFunAmmDex {
             }
             summary.elapsed_total_ms = t0.elapsed().as_millis();
             return SellLayoutObserveOutcome {
-                result: Ok(PumpAmmAuthoritativeSellLayout::Unknown),
+                result: Ok(PumpAmmSellReferenceObservation::unknown()),
                 summary,
             };
         }
@@ -1537,7 +1569,7 @@ impl PumpFunAmmDex {
         let sell_layout_sell_disc = anchor_disc("sell");
         let sell_layout_buy_disc = anchor_disc("buy_exact_quote_in");
 
-        let mut best_layout = PumpAmmAuthoritativeSellLayout::Unknown;
+        let mut best_obs = PumpAmmSellReferenceObservation::unknown();
         let mut tx_attempts = 0usize;
         for s in &sigs {
             if tx_attempts >= limits.max_tx_fetch_attempts {
@@ -1685,10 +1717,11 @@ impl PumpFunAmmDex {
                         PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalPumpAmmSellAccountShapeUnsupported;
                     continue;
                 }
-                let Some((observed_pool, observed_base, layout)) =
-                    Self::pump_amm_sell_layout_observation_from_parsed_swap_ix(
+                let Some((observed_pool, observed_base, cand_obs)) =
+                    Self::pump_amm_sell_reference_observation_from_parsed_swap_ix(
                         &acc_strings,
                         &ix_data,
+                        Some(sig.clone()),
                     )
                 else {
                     if disc8 == sell_layout_sell_disc {
@@ -1717,19 +1750,41 @@ impl PumpFunAmmDex {
                     }
                     continue;
                 }
-                best_layout = fold_force_refresh_sell_layout_observations_newest_first(
-                    best_layout,
-                    std::iter::once(layout),
+                best_obs = fold_force_refresh_sell_reference_observations_newest_first(
+                    best_obs,
+                    std::iter::once(cand_obs),
                 );
-                if matches!(best_layout, PumpAmmAuthoritativeSellLayout::Extended { .. }) {
+                if matches!(
+                    best_obs.layout,
+                    PumpAmmAuthoritativeSellLayout::Extended { .. }
+                ) {
                     summary.termination_reason = PumpAmmSellLayoutTerminationReason::LayoutFound;
                     summary.elapsed_total_ms = t0.elapsed().as_millis();
+                    let sell_ix_account_count = match best_obs.layout {
+                        PumpAmmAuthoritativeSellLayout::Extended { .. } => 24u8,
+                        PumpAmmAuthoritativeSellLayout::Base => 21,
+                        PumpAmmAuthoritativeSellLayout::Unknown => 0,
+                    };
+                    let third_for_log = match best_obs.layout {
+                        PumpAmmAuthoritativeSellLayout::Extended { third_meta } => Some(third_meta),
+                        _ => None,
+                    };
                     info!(
                         pool = %pool_market,
                         base_mint = %base_mint,
                         log_ctx,
                         signature = %sig,
-                        layout = ?best_layout,
+                        layout = ?best_obs.layout,
+                        protocol_fee_recipient_source = "sell_reference_ix",
+                        reference_swap_signature = %best_obs.reference_swap_signature.as_deref().unwrap_or(""),
+                        sell_reference_protocol_fee_recipient = %best_obs.protocol_fee_recipient,
+                        sell_reference_protocol_fee_recipient_ta = %best_obs.protocol_fee_recipient_ta,
+                        final_v14_protocol_fee_slot_6 = %best_obs.protocol_fee_recipient,
+                        final_v14_protocol_fee_slot_7 = %best_obs.protocol_fee_recipient_ta,
+                        final_sell_ix_meta_9 = %best_obs.protocol_fee_recipient,
+                        final_sell_ix_meta_10 = %best_obs.protocol_fee_recipient_ta,
+                        sell_ix_account_count,
+                        third_meta = ?third_for_log,
                         transactions_fetched = summary.transactions_fetched,
                         pump_amm_instructions_seen = summary.pump_amm_instructions_seen,
                         sell_candidates_seen = summary.sell_candidates_seen,
@@ -1737,7 +1792,7 @@ impl PumpFunAmmDex {
                         "pump_amm: authoritative SELL-layout observed from successful swap tx (extended wins over newer base-only evidence)"
                     );
                     return SellLayoutObserveOutcome {
-                        result: Ok(best_layout),
+                        result: Ok(best_obs),
                         summary,
                     };
                 }
@@ -1761,14 +1816,33 @@ impl PumpFunAmmDex {
             }
         }
 
-        if best_layout != PumpAmmAuthoritativeSellLayout::Unknown {
+        if best_obs.layout != PumpAmmAuthoritativeSellLayout::Unknown {
             summary.termination_reason = PumpAmmSellLayoutTerminationReason::LayoutFound;
             summary.elapsed_total_ms = t0.elapsed().as_millis();
+            let third_for_log = match best_obs.layout {
+                PumpAmmAuthoritativeSellLayout::Extended { third_meta } => Some(third_meta),
+                _ => None,
+            };
+            let sell_ix_account_count = match best_obs.layout {
+                PumpAmmAuthoritativeSellLayout::Extended { .. } => 24u8,
+                PumpAmmAuthoritativeSellLayout::Base => 21,
+                PumpAmmAuthoritativeSellLayout::Unknown => 0,
+            };
             info!(
                 pool = %pool_market,
                 base_mint = %base_mint,
                 log_ctx,
-                layout = ?best_layout,
+                layout = ?best_obs.layout,
+                protocol_fee_recipient_source = "sell_reference_ix",
+                reference_swap_signature = %best_obs.reference_swap_signature.as_deref().unwrap_or(""),
+                sell_reference_protocol_fee_recipient = %best_obs.protocol_fee_recipient,
+                sell_reference_protocol_fee_recipient_ta = %best_obs.protocol_fee_recipient_ta,
+                final_v14_protocol_fee_slot_6 = %best_obs.protocol_fee_recipient,
+                final_v14_protocol_fee_slot_7 = %best_obs.protocol_fee_recipient_ta,
+                final_sell_ix_meta_9 = %best_obs.protocol_fee_recipient,
+                final_sell_ix_meta_10 = %best_obs.protocol_fee_recipient_ta,
+                sell_ix_account_count,
+                third_meta = ?third_for_log,
                 transactions_fetched = summary.transactions_fetched,
                 pump_amm_instructions_seen = summary.pump_amm_instructions_seen,
                 sell_candidates_seen = summary.sell_candidates_seen,
@@ -1776,7 +1850,7 @@ impl PumpFunAmmDex {
                 "pump_amm: authoritative SELL-layout observed after full bounded scan (base-only or no extended in window)"
             );
             return SellLayoutObserveOutcome {
-                result: Ok(best_layout),
+                result: Ok(best_obs),
                 summary,
             };
         }
@@ -1805,7 +1879,7 @@ impl PumpFunAmmDex {
         }
 
         SellLayoutObserveOutcome {
-            result: Ok(PumpAmmAuthoritativeSellLayout::Unknown),
+            result: Ok(PumpAmmSellReferenceObservation::unknown()),
             summary,
         }
     }
@@ -4447,10 +4521,12 @@ impl PumpFunAmmDex {
         None
     }
 
-    fn pump_amm_sell_layout_observation_from_parsed_swap_ix(
+    /// Parse a successful pool-matching `sell` ix into layout + authoritative protocol fee metas (#9/#10).
+    fn pump_amm_sell_reference_observation_from_parsed_swap_ix(
         acc_accounts: &[String],
         ix_data: &[u8],
-    ) -> Option<(Pubkey, Pubkey, PumpAmmAuthoritativeSellLayout)> {
+        reference_swap_signature: Option<String>,
+    ) -> Option<(Pubkey, Pubkey, PumpAmmSellReferenceObservation)> {
         let pool = Self::pump_amm_pool_static_from_parsed_swap_ix(acc_accounts, ix_data, |_| {
             Self::pump_amm_livepoolcache_diagnostic(
                 "sell_layout_observation",
@@ -4468,7 +4544,22 @@ impl PumpFunAmmDex {
             },
             _ => return None,
         };
-        Some((pool.pool_market, pool.base_mint, layout))
+        let obs = PumpAmmSellReferenceObservation {
+            layout,
+            protocol_fee_recipient: pool.protocol_fee_recipient,
+            protocol_fee_recipient_ta: pool.protocol_fee_recipient_ta,
+            reference_swap_signature,
+        };
+        Some((pool.pool_market, pool.base_mint, obs))
+    }
+
+    #[cfg(test)]
+    fn pump_amm_sell_layout_observation_from_parsed_swap_ix(
+        acc_accounts: &[String],
+        ix_data: &[u8],
+    ) -> Option<(Pubkey, Pubkey, PumpAmmAuthoritativeSellLayout)> {
+        Self::pump_amm_sell_reference_observation_from_parsed_swap_ix(acc_accounts, ix_data, None)
+            .map(|(pm, bm, o)| (pm, bm, o.layout))
     }
 
     async fn get_vault_amount(&self, ta: Pubkey) -> Result<u64> {
@@ -5634,39 +5725,78 @@ mod tests {
     }
 
     /// Scope 54: newer 21-account SELL in history must not erase extended (24-account) evidence.
+    /// Scope 60: fee recipient fields follow the winning reference row.
     #[test]
     fn scope54_merge_sell_layout_extended_wins_over_base() {
         let third = Pubkey::new_unique();
+        let pfr_base = Pubkey::new_unique();
+        let pfr_ta_base = Pubkey::new_unique();
+        let pfr_ext = Pubkey::new_unique();
+        let pfr_ta_ext = Pubkey::new_unique();
+        let base_obs = PumpAmmSellReferenceObservation {
+            layout: PumpAmmAuthoritativeSellLayout::Base,
+            protocol_fee_recipient: pfr_base,
+            protocol_fee_recipient_ta: pfr_ta_base,
+            reference_swap_signature: Some("sig_base".to_string()),
+        };
+        let ext_obs = PumpAmmSellReferenceObservation {
+            layout: PumpAmmAuthoritativeSellLayout::Extended { third_meta: third },
+            protocol_fee_recipient: pfr_ext,
+            protocol_fee_recipient_ta: pfr_ta_ext,
+            reference_swap_signature: Some("sig_ext".to_string()),
+        };
         assert_eq!(
-            merge_pump_amm_authoritative_sell_layout_observation(
-                PumpAmmAuthoritativeSellLayout::Base,
-                PumpAmmAuthoritativeSellLayout::Extended { third_meta: third },
-            ),
+            merge_pump_amm_authoritative_sell_reference_observation(
+                base_obs.clone(),
+                ext_obs.clone()
+            )
+            .layout,
             PumpAmmAuthoritativeSellLayout::Extended { third_meta: third }
         );
+        let merged =
+            merge_pump_amm_authoritative_sell_reference_observation(base_obs, ext_obs.clone());
+        assert_eq!(merged.protocol_fee_recipient, pfr_ext);
+        assert_eq!(merged.protocol_fee_recipient_ta, pfr_ta_ext);
+        assert_eq!(merged.reference_swap_signature.as_deref(), Some("sig_ext"));
+
+        let base_obs2 = PumpAmmSellReferenceObservation {
+            layout: PumpAmmAuthoritativeSellLayout::Base,
+            protocol_fee_recipient: pfr_base,
+            protocol_fee_recipient_ta: pfr_ta_base,
+            reference_swap_signature: Some("sig_base".to_string()),
+        };
+        let merged2 =
+            merge_pump_amm_authoritative_sell_reference_observation(ext_obs.clone(), base_obs2);
         assert_eq!(
-            merge_pump_amm_authoritative_sell_layout_observation(
-                PumpAmmAuthoritativeSellLayout::Extended { third_meta: third },
-                PumpAmmAuthoritativeSellLayout::Base,
-            ),
+            merged2.layout,
             PumpAmmAuthoritativeSellLayout::Extended { third_meta: third }
         );
+        assert_eq!(merged2.protocol_fee_recipient, pfr_ext);
     }
 
     #[test]
     fn scope54_merge_sell_layout_base_accumulates_from_unknown() {
+        let pfr = Pubkey::new_unique();
+        let base_obs = PumpAmmSellReferenceObservation {
+            layout: PumpAmmAuthoritativeSellLayout::Base,
+            protocol_fee_recipient: pfr,
+            protocol_fee_recipient_ta: Pubkey::new_unique(),
+            reference_swap_signature: Some("sig_b".to_string()),
+        };
         assert_eq!(
-            merge_pump_amm_authoritative_sell_layout_observation(
-                PumpAmmAuthoritativeSellLayout::Unknown,
-                PumpAmmAuthoritativeSellLayout::Base,
-            ),
+            merge_pump_amm_authoritative_sell_reference_observation(
+                PumpAmmSellReferenceObservation::unknown(),
+                base_obs.clone(),
+            )
+            .layout,
             PumpAmmAuthoritativeSellLayout::Base
         );
         assert_eq!(
-            merge_pump_amm_authoritative_sell_layout_observation(
-                PumpAmmAuthoritativeSellLayout::Base,
-                PumpAmmAuthoritativeSellLayout::Unknown,
-            ),
+            merge_pump_amm_authoritative_sell_reference_observation(
+                base_obs.clone(),
+                PumpAmmSellReferenceObservation::unknown(),
+            )
+            .layout,
             PumpAmmAuthoritativeSellLayout::Base
         );
     }
@@ -5678,17 +5808,34 @@ mod tests {
     #[test]
     fn scope54_force_refresh_sell_layout_fold_newest_base_then_older_extended() {
         let third = Pubkey::new_unique();
-        let layouts = [
-            PumpAmmAuthoritativeSellLayout::Base,
-            PumpAmmAuthoritativeSellLayout::Extended { third_meta: third },
+        let pfr_ext = Pubkey::new_unique();
+        let pfr_ta_ext = Pubkey::new_unique();
+        let obs = [
+            PumpAmmSellReferenceObservation {
+                layout: PumpAmmAuthoritativeSellLayout::Base,
+                protocol_fee_recipient: Pubkey::new_unique(),
+                protocol_fee_recipient_ta: Pubkey::new_unique(),
+                reference_swap_signature: Some("sig_newer_base".to_string()),
+            },
+            PumpAmmSellReferenceObservation {
+                layout: PumpAmmAuthoritativeSellLayout::Extended { third_meta: third },
+                protocol_fee_recipient: pfr_ext,
+                protocol_fee_recipient_ta: pfr_ta_ext,
+                reference_swap_signature: Some("sig_older_ext".to_string()),
+            },
         ];
-        let out = fold_force_refresh_sell_layout_observations_newest_first(
-            PumpAmmAuthoritativeSellLayout::Unknown,
-            layouts,
+        let out = fold_force_refresh_sell_reference_observations_newest_first(
+            PumpAmmSellReferenceObservation::unknown(),
+            obs,
         );
         assert_eq!(
-            out,
+            out.layout,
             PumpAmmAuthoritativeSellLayout::Extended { third_meta: third }
+        );
+        assert_eq!(out.protocol_fee_recipient, pfr_ext);
+        assert_eq!(
+            out.reference_swap_signature.as_deref(),
+            Some("sig_older_ext")
         );
     }
 
@@ -6146,6 +6293,165 @@ mod tests {
             observed.2,
             PumpAmmAuthoritativeSellLayout::Extended { third_meta }
         );
+    }
+
+    /// Scope 60: force_refresh reference SELL ix #9/#10 must overwrite wrong market-derived v14 `[6]`/`[7]`.
+    #[test]
+    fn scope60_force_refresh_apply_sell_reference_protocol_fee_recipients_to_pool() {
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let wrong_pfr = Pubkey::from_str("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV").unwrap();
+        let wrong_pfr_ta =
+            Pubkey::from_str("94qWNrtmfn42h3ZjUZwWvK1MEo9uVmmrBPd2hpNjYDjb").unwrap();
+        let auth_pfr = Pubkey::from_str("AVmoTthdrX6tKt4nDjco2D775W2YK3sDhxPcMmzUAmTY").unwrap();
+        let auth_pfr_ta = Pubkey::from_str("FGptqdxjahafaCzpZ1T6EDtCzYMv7Dyn5MgBLyB3VUFW").unwrap();
+        let third_meta = Pubkey::from_str("AktftA98kSWAxn6kVSoqBXBELUArjKu2H9WmKB48ULFY").unwrap();
+
+        let mut pool = PumpAmmPoolStatic {
+            pool_market,
+            global_config: Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap(),
+            base_mint,
+            quote_mint: wsol,
+            pool_base_vault: Pubkey::new_unique(),
+            pool_quote_vault: Pubkey::new_unique(),
+            protocol_fee_recipient: wrong_pfr,
+            protocol_fee_recipient_ta: wrong_pfr_ta,
+            event_authority: Pubkey::new_unique(),
+            coin_creator_vault_ata: Pubkey::new_unique(),
+            coin_creator_vault_authority: Pubkey::new_unique(),
+            global_volume_accumulator: Pubkey::new_unique(),
+            fee_config: Pubkey::new_unique(),
+            fee_program: Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(),
+            sell_requires_cashback_remaining: false,
+            sell_cashback_third_meta: None,
+            last_parse_diagnostics: None,
+        };
+
+        let mut account_keys: Vec<Pubkey> = (0..24).map(|_| Pubkey::new_unique()).collect();
+        account_keys[0] = pool_market;
+        account_keys[2] = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap();
+        account_keys[3] = base_mint;
+        account_keys[4] = wsol;
+        account_keys[9] = auth_pfr;
+        account_keys[10] = auth_pfr_ta;
+        account_keys[19] = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap();
+        account_keys[20] = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap();
+        account_keys[23] = third_meta;
+        let acc_strings: Vec<String> = account_keys.iter().map(ToString::to_string).collect();
+        let ix_data = pump_amm_sell_ix_discriminator().to_vec();
+
+        let (_, _, sell_obs) =
+            PumpFunAmmDex::pump_amm_sell_reference_observation_from_parsed_swap_ix(
+                &acc_strings,
+                &ix_data,
+                Some(
+                    "3TsEarZgfUg5BzfVzE7a7mdCyqTgsqXzmf3iCE9GnzzTFYP3SdzEWtGMzE9WXzAoWQgwaVnW3fVocqzZQP4j217A"
+                        .to_string(),
+                ),
+            )
+            .expect("reference observation");
+
+        assert_eq!(
+            sell_obs.layout,
+            PumpAmmAuthoritativeSellLayout::Extended { third_meta }
+        );
+
+        PumpFunAmmDex::apply_sell_reference_protocol_fee_recipients_for_force_refresh(
+            &mut pool, &sell_obs,
+        );
+        pool.sell_requires_cashback_remaining = true;
+        pool.sell_cashback_third_meta = Some(third_meta);
+
+        let v14 = pool.as_pool_accounts_v14();
+        assert_eq!(v14[6], auth_pfr);
+        assert_eq!(v14[7], auth_pfr_ta);
+        assert_ne!(v14[6], wrong_pfr);
+    }
+
+    /// Scope 60: builder keeps global SELL fee_config/fee_program (Scope 59) when v14 `[6]`/`[7]` match reference.
+    #[test]
+    fn scope60_extended_sell_preserves_reference_fee_metas_and_global_fee_slots() {
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let base_mint = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let auth_pfr = Pubkey::from_str("AVmoTthdrX6tKt4nDjco2D775W2YK3sDhxPcMmzUAmTY").unwrap();
+        let auth_pfr_ta = Pubkey::from_str("FGptqdxjahafaCzpZ1T6EDtCzYMv7Dyn5MgBLyB3VUFW").unwrap();
+        let third_meta = Pubkey::from_str("AktftA98kSWAxn6kVSoqBXBELUArjKu2H9WmKB48ULFY").unwrap();
+        let fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap();
+
+        let pool_accounts: Vec<Pubkey> = vec![
+            Pubkey::new_unique(),
+            Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap(),
+            base_mint,
+            wsol,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            auth_pfr,
+            auth_pfr_ta,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            fee_program,
+        ];
+        assert_eq!(pool_accounts.len(), 14);
+
+        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts(
+            &base_mint.to_string(),
+            WSOL_MINT,
+            1_000_000,
+            1,
+            user,
+            &pool_accounts,
+            None,
+            true,
+            Some(third_meta),
+        )
+        .expect("extended SELL");
+
+        assert_eq!(ixs[0].accounts.len(), 24);
+        assert_eq!(ixs[0].accounts[9].pubkey, auth_pfr);
+        assert_eq!(ixs[0].accounts[10].pubkey, auth_pfr_ta);
+        assert_eq!(
+            ixs[0].accounts[19].pubkey,
+            Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap()
+        );
+        assert_eq!(ixs[0].accounts[20].pubkey, fee_program);
+        assert_eq!(ixs[0].accounts[23].pubkey, third_meta);
+    }
+
+    /// Scope 60: without a TX-backed observation, apply must not rewrite protocol fee recipients.
+    #[test]
+    fn scope60_unknown_sell_observation_does_not_override_pool_fee_recipients() {
+        let wrong_pfr = Pubkey::new_unique();
+        let wrong_ta = Pubkey::new_unique();
+        let mut pool = PumpAmmPoolStatic {
+            pool_market: Pubkey::new_unique(),
+            global_config: Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap(),
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::from_str(WSOL_MINT).unwrap(),
+            pool_base_vault: Pubkey::new_unique(),
+            pool_quote_vault: Pubkey::new_unique(),
+            protocol_fee_recipient: wrong_pfr,
+            protocol_fee_recipient_ta: wrong_ta,
+            event_authority: Pubkey::new_unique(),
+            coin_creator_vault_ata: Pubkey::new_unique(),
+            coin_creator_vault_authority: Pubkey::new_unique(),
+            global_volume_accumulator: Pubkey::new_unique(),
+            fee_config: Pubkey::new_unique(),
+            fee_program: Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(),
+            sell_requires_cashback_remaining: false,
+            sell_cashback_third_meta: None,
+            last_parse_diagnostics: None,
+        };
+        PumpFunAmmDex::apply_sell_reference_protocol_fee_recipients_for_force_refresh(
+            &mut pool,
+            &PumpAmmSellReferenceObservation::unknown(),
+        );
+        assert_eq!(pool.protocol_fee_recipient, wrong_pfr);
+        assert_eq!(pool.protocol_fee_recipient_ta, wrong_ta);
     }
 
     /// Helius / some RPC encodings return `instruction.accounts` as base58 strings instead of indices.
