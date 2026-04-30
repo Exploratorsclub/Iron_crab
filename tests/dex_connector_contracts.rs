@@ -197,8 +197,6 @@ fn contract_pump_amm_build_ix_valid_accounts() {
         None,
         false,
         None,
-        None,
-        None,
     );
 
     assert!(result.is_ok());

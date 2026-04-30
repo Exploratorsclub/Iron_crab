@@ -166,8 +166,6 @@ fn test_build_swap_ix_with_cached_accounts() {
         None,
         false,
         None,
-        None,
-        None,
     );
 
     assert!(result.is_ok());

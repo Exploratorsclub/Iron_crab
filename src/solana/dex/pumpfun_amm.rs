@@ -5375,8 +5375,42 @@ impl PumpFunAmmDex {
     /// `base_token_program` - Optional token program override for the base token.
     /// Use `Some(TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb)` for Token-2022 tokens.
     /// Defaults to SPL Token if None.
+    ///
+    /// Stable public API (Eval / external callers): extended SELL without observed ix tail #21/#22
+    /// uses the legacy derived first-two metas + `sell_cashback_third_meta`. For the Scope 61
+    /// observed-tail path, use [`Self::build_swap_ix_from_pool_accounts_with_extended_tail`].
     #[allow(clippy::too_many_arguments)]
     pub fn build_swap_ix_from_pool_accounts(
+        input_mint: &str,
+        output_mint: &str,
+        amount_in: u64,
+        min_out: u64,
+        user: Pubkey,
+        pool_accounts: &[Pubkey],
+        base_token_program: Option<Pubkey>,
+        sell_requires_cashback_remaining: bool,
+        sell_cashback_third_meta: Option<Pubkey>,
+    ) -> Result<Vec<Instruction>> {
+        Self::build_swap_ix_from_pool_accounts_with_extended_tail(
+            input_mint,
+            output_mint,
+            amount_in,
+            min_out,
+            user,
+            pool_accounts,
+            base_token_program,
+            sell_requires_cashback_remaining,
+            sell_cashback_third_meta,
+            None,
+            None,
+        )
+    }
+
+    /// Same as [`Self::build_swap_ix_from_pool_accounts`] plus optional observed extended SELL
+    /// ix accounts #21/#22 (Scope 61). Cold-path / tx_builder only — not part of the stable
+    /// 9-arg public contract.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_swap_ix_from_pool_accounts_with_extended_tail(
         input_mint: &str,
         output_mint: &str,
         amount_in: u64,
@@ -6248,8 +6282,6 @@ mod tests {
             None,
             false,
             None,
-            None,
-            None,
         );
 
         assert!(result.is_ok());
@@ -6299,8 +6331,6 @@ mod tests {
             None,
             false,
             None,
-            None,
-            None,
         )
         .expect("SELL build");
 
@@ -6345,8 +6375,6 @@ mod tests {
             &pool_accounts,
             None,
             false,
-            None,
-            None,
             None,
         )
         .expect("SELL build");
@@ -6540,7 +6568,7 @@ mod tests {
         ];
         assert_eq!(pool_accounts.len(), 14);
 
-        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts(
+        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
             &base_mint.to_string(),
             WSOL_MINT,
             1_000_000,
@@ -6707,8 +6735,6 @@ mod tests {
             None,
             false,
             None,
-            None,
-            None,
         )
         .expect("SELL build");
 
@@ -6764,8 +6790,6 @@ mod tests {
             None,
             true,
             Some(third_meta),
-            None,
-            None,
         )
         .expect("extended SELL build");
 
@@ -6822,8 +6846,6 @@ mod tests {
             &pool_accounts,
             Some(token_2022),
             false,
-            None,
-            None,
             None,
         )
         .expect("SELL build Token-2022");
@@ -6926,8 +6948,6 @@ mod tests {
             None,
             false,
             None,
-            None,
-            None,
         )
         .expect_err("must not invent protocol fee accounts");
         assert!(
@@ -6949,8 +6969,6 @@ mod tests {
             &pool_accounts,
             None,
             false,
-            None,
-            None,
             None,
         )
         .expect("SELL build partial fee");

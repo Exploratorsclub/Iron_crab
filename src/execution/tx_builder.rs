@@ -905,7 +905,7 @@ pub async fn build_tx_plan(
             }
         }
 
-        let mut ixs = match PumpFunAmmDex::build_swap_ix_from_pool_accounts(
+        let mut ixs = match PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
             &intent.resources.input_mint,
             &intent.resources.output_mint,
             intent.required_capital.raw,
@@ -1710,7 +1710,7 @@ async fn build_hop_pump_amm(
     // Use static method with pool_accounts from cache
     // Note: Multi-hop arb doesn't pass token_program yet; Token-2022 arb tokens are rare.
     // TODO: If needed, add token_program to SwapHop struct for full Token-2022 arb support.
-    let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts(
+    let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
         &hop.input_mint,
         &hop.output_mint,
         amount_in,
@@ -1725,7 +1725,10 @@ async fn build_hop_pump_amm(
     )
     .map_err(|e| UnsupportedTxPlan {
         reason: RejectReason::UnsupportedIntent,
-        details: format!("pump_amm build_swap_ix_from_pool_accounts failed: {}", e),
+        details: format!(
+            "pump_amm build_swap_ix_from_pool_accounts_with_extended_tail failed: {}",
+            e
+        ),
     })?;
 
     Ok(ixs)
