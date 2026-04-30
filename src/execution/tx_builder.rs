@@ -1710,6 +1710,7 @@ async fn build_hop_pump_amm(
     // Use static method with pool_accounts from cache
     // Note: Multi-hop arb doesn't pass token_program yet; Token-2022 arb tokens are rare.
     // TODO: If needed, add token_program to SwapHop struct for full Token-2022 arb support.
+    let is_sell_hop = hop.output_mint == NATIVE_SOL_MINT;
     let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
         &hop.input_mint,
         &hop.output_mint,
@@ -1718,10 +1719,10 @@ async fn build_hop_pump_amm(
         wallet_pubkey,
         &pool_accounts,
         None, // Token-2022 not yet supported in multi-hop arb
-        sell_requires && hop.output_mint == NATIVE_SOL_MINT,
-        sell_third,
-        sell_t0,
-        sell_t1,
+        sell_requires && is_sell_hop,
+        if is_sell_hop { sell_third } else { None },
+        if is_sell_hop { sell_t0 } else { None },
+        if is_sell_hop { sell_t1 } else { None },
     )
     .map_err(|e| UnsupportedTxPlan {
         reason: RejectReason::UnsupportedIntent,
