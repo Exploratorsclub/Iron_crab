@@ -61,7 +61,9 @@ use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
 use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
-use ironcrab::solana::dex::pumpfun_amm::{PumpAmmPoolAccountsDiagnostic, PumpFunAmmDex};
+use ironcrab::solana::dex::pumpfun_amm::{
+    pump_amm_authoritative_fee_metas_from_v14, PumpAmmPoolAccountsDiagnostic, PumpFunAmmDex,
+};
 use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex_parser::{
     parse_account_update, parse_transaction_update_with_pool_lookup, DexType, OrcaPoolInfo,
@@ -231,16 +233,26 @@ fn raydium_cpmm_readiness_for_pool_cache_update(s: &RaydiumCpmmState) -> DexPool
 /// PumpSwap SELL-layout contract for JetStream / SLAVE SSOT.
 ///
 /// - Base-only SELL stays ready as long as the underlying refresh/observation says the base layout is usable.
-/// - Extended SELL is ready only when the observed third readonly meta is authoritatively known.
+/// - Extended SELL is ready only when the observed third readonly meta is authoritatively known **and**
+///   v14 `pool_accounts` carry non-default `fee_config` / `fee_program` (Scope 58 / Bug #35).
 fn pump_amm_sell_layout_publish_state(
     sell_requires_extended: bool,
     sell_cashback_third_meta: Option<Pubkey>,
     base_layout_ready: bool,
+    pool_accounts_v14: Option<&[Pubkey]>,
 ) -> (bool, DexPoolReadiness) {
+    let fee_metas_ready = if sell_requires_extended {
+        pool_accounts_v14
+            .and_then(pump_amm_authoritative_fee_metas_from_v14)
+            .is_some()
+    } else {
+        true
+    };
     let sell_layout_ready = if sell_requires_extended {
         sell_cashback_third_meta
             .filter(|p| *p != Pubkey::default())
             .is_some()
+            && fee_metas_ready
     } else {
         base_layout_ready
     };
@@ -262,6 +274,7 @@ fn pump_amm_sell_layout_state_for_ensure_publish(
     refresh_requires_extended: bool,
     refresh_third_meta: Option<Pubkey>,
     refresh_layout_ready: bool,
+    pool_accounts_v14: &[Pubkey],
 ) -> (bool, Option<Pubkey>, bool, DexPoolReadiness) {
     let (effective_requires_extended, effective_third_meta, base_layout_ready) = if force_refresh {
         (
@@ -282,6 +295,7 @@ fn pump_amm_sell_layout_state_for_ensure_publish(
         effective_requires_extended,
         effective_third_meta,
         base_layout_ready,
+        Some(pool_accounts_v14),
     );
     (
         effective_requires_extended,
@@ -5363,6 +5377,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
                     sell_cashback_remaining,
                     sell_cashback_third,
                     sell_layout_ready_from_refresh,
+                    &accounts,
                 );
 
             let (base_reserve, quote_reserve) =
@@ -8518,6 +8533,7 @@ async fn run_geyser_loop(
                             merged_flag,
                             merged_third,
                             true,
+                            Some(pool_accounts.as_slice()),
                         );
                         ctx.live_pool_cache
                             .set_pump_amm_sell_layout_ready(pool_address, sell_layout_ready);
@@ -9774,8 +9790,9 @@ mod discovery_tests {
 
     #[test]
     fn test_pump_amm_trade_publish_extended_without_third_meta_is_partial() {
+        let v14: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
         let (sell_layout_ready, dex_readiness) =
-            pump_amm_sell_layout_publish_state(true, None, true);
+            pump_amm_sell_layout_publish_state(true, None, true, Some(v14.as_slice()));
         assert!(
             !sell_layout_ready,
             "extended SELL without authoritative third meta must not be marked ready"
@@ -9785,8 +9802,15 @@ mod discovery_tests {
 
     #[test]
     fn test_pump_amm_trade_publish_extended_with_third_meta_is_ready() {
-        let (sell_layout_ready, dex_readiness) =
-            pump_amm_sell_layout_publish_state(true, Some(Pubkey::new_unique()), true);
+        let mut v14: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        v14[12] = Pubkey::from_str("DcsvhShq8ZaUyU7NtjskVRfKHW7DrSjdu7mkgpzoHyxB").unwrap();
+        v14[13] = Pubkey::from_str("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ").unwrap();
+        let (sell_layout_ready, dex_readiness) = pump_amm_sell_layout_publish_state(
+            true,
+            Some(Pubkey::new_unique()),
+            true,
+            Some(v14.as_slice()),
+        );
         assert!(
             sell_layout_ready,
             "extended SELL with authoritative third meta must be marked ready"
@@ -9797,6 +9821,7 @@ mod discovery_tests {
     #[test]
     fn test_pump_amm_force_refresh_base_overrides_stale_extended_cache_flag() {
         let stale_third = Pubkey::new_unique();
+        let pool_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
         let (effective_requires_extended, effective_third_meta, sell_layout_ready, dex_readiness) =
             pump_amm_sell_layout_state_for_ensure_publish(
                 true,
@@ -9805,6 +9830,7 @@ mod discovery_tests {
                 false,
                 None,
                 true,
+                &pool_accounts,
             );
         assert!(
             !effective_requires_extended,

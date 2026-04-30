@@ -932,6 +932,16 @@ pub async fn build_tx_plan(
                 Pubkey::from_str(PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR).unwrap_or_default();
             let canonical_fee_prog =
                 Pubkey::from_str(PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR).unwrap_or_default();
+            let v12_fc = pool_accounts[12];
+            let v12_fp = pool_accounts[13];
+            let ix_fc = ixs[0].accounts[19].pubkey;
+            let ix_fp = ixs[0].accounts[20].pubkey;
+            let fee_config_preserved = ix_fc == v12_fc && v12_fc != Pubkey::default();
+            let fee_program_preserved = ix_fp == v12_fp && v12_fp != Pubkey::default();
+            let fee_config_replaced_vs_v14 = ix_fc != v12_fc;
+            let fee_program_replaced_vs_v14 = ix_fp != v12_fp;
+            let pfr_preserved = ixs[0].accounts[9].pubkey == pool_accounts[6];
+            let pfr_ta_preserved = ixs[0].accounts[10].pubkey == pool_accounts[7];
             let sell_csv: String = ixs[0]
                 .accounts
                 .iter()
@@ -943,20 +953,27 @@ pub async fn build_tx_plan(
                 scope = "44",
                 dex = "pump_amm",
                 pool_accounts_source = pool_accounts_build_source,
-                sell_extended = sell_requires_cashback_remaining,
+                sell_extended = sell_requires_cashback_remaining && intent.side == TradeSide::Sell,
                 sell_cashback_third_meta = ?sell_cashback_third_meta,
+                sell_ix_account_count = ixs[0].accounts.len(),
                 pool = %pool_id,
                 input_mint = %intent.resources.input_mint,
                 base_token_program_override = ?token_program_override,
                 v14_csv = %PumpAmmPoolAccountsDiagnostic::format_v14_csv(&pool_accounts[..14]),
                 sell_ix_accounts_csv = %sell_csv,
-                v14_fee_config = %pool_accounts[12],
-                v14_fee_program = %pool_accounts[13],
-                sell_ix_fee_config_meta = %ixs[0].accounts[19].pubkey,
-                sell_ix_fee_program_meta = %ixs[0].accounts[20].pubkey,
-                fee_config_replaced = (pool_accounts[12] != canonical_fee_cfg),
-                fee_program_replaced = (pool_accounts[13] != canonical_fee_prog),
-                "Scope44: pump_amm SELL simulation plan — compare v14_csv + sell_ix_accounts_csv to ref TX; fee_config/fee_program in ix are builder constants"
+                v14_fee_config = %v12_fc,
+                v14_fee_program = %v12_fp,
+                sell_ix_fee_config_meta = %ix_fc,
+                sell_ix_fee_program_meta = %ix_fp,
+                fee_config_preserved_from_v14 = fee_config_preserved,
+                fee_program_preserved_from_v14 = fee_program_preserved,
+                protocol_fee_recipient_preserved_from_v14 = pfr_preserved,
+                protocol_fee_recipient_ta_preserved_from_v14 = pfr_ta_preserved,
+                fee_config_differs_from_mainnet_constant = (v12_fc != canonical_fee_cfg),
+                fee_program_differs_from_expected = (v12_fp != canonical_fee_prog),
+                fee_config_replaced_vs_v14 = fee_config_replaced_vs_v14,
+                fee_program_replaced_vs_v14 = fee_program_replaced_vs_v14,
+                "Scope44: pump_amm SELL plan — ix metas must match authoritative v14; replacements vs v14 are simulation risks (Bug #35)"
             );
         }
 

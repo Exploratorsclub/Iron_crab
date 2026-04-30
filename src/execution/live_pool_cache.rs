@@ -31,6 +31,7 @@
 //! - PumpFun Bonding: virtual reserves
 //! - PumpFun AMM (PumpSwap): reserves, pool accounts
 
+use crate::solana::dex::pumpfun_amm::pump_amm_authoritative_fee_metas_from_v14;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use solana_sdk::pubkey::Pubkey;
@@ -997,7 +998,16 @@ impl LivePoolCache {
         }
         let (requires_extended, third) = self.pump_amm_sell_extended_layout(pool_market);
         if requires_extended {
-            third.filter(|p| *p != Pubkey::default()).is_some()
+            if third.filter(|p| *p != Pubkey::default()).is_none() {
+                return false;
+            }
+            let Some(entry) = self.pools.get(pool_market) else {
+                return false;
+            };
+            let CachedPoolState::PumpAmm(s) = &entry.value().state else {
+                return false;
+            };
+            pump_amm_authoritative_fee_metas_from_v14(&s.pool_accounts).is_some()
         } else {
             true
         }
@@ -2592,6 +2602,39 @@ mod tests {
         assert!(
             !cache.base_mint_has_explicit_pump_amm_ready_pool(&base_mint),
             "mint-level explicit Ready gate must also reject incomplete extended SELL state"
+        );
+    }
+
+    #[test]
+    fn test_pump_amm_extended_with_third_but_missing_fee_config_blocks_ready_gate() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let mut pool_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        pool_accounts[12] = Pubkey::default();
+        pool_accounts[13] = Pubkey::new_unique();
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(1_000_000_000),
+                Some(50_000_000_000),
+                pool_accounts,
+            ),
+            100,
+        );
+        cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
+        cache.merge_pump_amm_sell_extended_layout(&pool_market, true, Some(Pubkey::new_unique()));
+        cache.set_pump_amm_sell_layout_ready(&pool_market, true);
+
+        assert!(
+            cache
+                .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
+                .is_none(),
+            "extended SELL must not be swap-ready until v14 fee_config/fee_program are non-default"
         );
     }
 
