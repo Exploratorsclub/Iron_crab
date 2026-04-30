@@ -436,8 +436,12 @@ pub struct LivePoolCache {
     /// **Not** part of [`PumpAmmState`] so external crates (Level-5 eval) keep stable struct literals.
     /// Monotonic flag: once true, never cleared.
     pump_amm_sell_extended_flag_by_market: DashMap<Pubkey, bool>,
-    /// Third trailing readonly meta for extended `sell` (from observed ix); set when authoritatively known.
+    /// Third trailing meta for extended `sell` (ix account #23, writable in observed reference).
     pump_amm_sell_extended_third_meta_by_market: DashMap<Pubkey, Pubkey>,
+    /// Observed extended SELL ix account #21 (readonly in reference); Scope 61.
+    pump_amm_sell_extended_tail_0_by_market: DashMap<Pubkey, Pubkey>,
+    /// Observed extended SELL ix account #22 (readonly in reference); Scope 61.
+    pump_amm_sell_extended_tail_1_by_market: DashMap<Pubkey, Pubkey>,
     /// PumpSwap pool-market -> whether the authoritative source has proven the current SELL layout
     /// is fully known. `false` means "do not treat this as sell-ready truth yet", even if
     /// pool_accounts/reserves are otherwise present.
@@ -480,6 +484,8 @@ impl LivePoolCache {
             meteora_dlmm_readiness_by_pool: DashMap::new(),
             pump_amm_sell_extended_flag_by_market: DashMap::new(),
             pump_amm_sell_extended_third_meta_by_market: DashMap::new(),
+            pump_amm_sell_extended_tail_0_by_market: DashMap::new(),
+            pump_amm_sell_extended_tail_1_by_market: DashMap::new(),
             pump_amm_sell_layout_ready_by_market: DashMap::new(),
         }
     }
@@ -905,7 +911,21 @@ impl LivePoolCache {
                 .get("pump_amm_sell_cashback_third_meta")
                 .and_then(|s| Pubkey::from_str(s).ok())
                 .filter(|pk| *pk != Pubkey::default());
-            self.set_pump_amm_sell_layout_authoritative(pool, requires_extended, third_meta);
+            let tail_0 = m
+                .get("pump_amm_sell_extended_tail_0")
+                .and_then(|s| Pubkey::from_str(s).ok())
+                .filter(|pk| *pk != Pubkey::default());
+            let tail_1 = m
+                .get("pump_amm_sell_extended_tail_1")
+                .and_then(|s| Pubkey::from_str(s).ok())
+                .filter(|pk| *pk != Pubkey::default());
+            self.set_pump_amm_sell_layout_authoritative(
+                pool,
+                requires_extended,
+                third_meta,
+                tail_0,
+                tail_1,
+            );
         } else {
             if m.get("pump_amm_sell_cashback_remaining")
                 .is_some_and(|v| v == "true")
@@ -921,6 +941,22 @@ impl LivePoolCache {
                     }
                 }
             }
+            if let Some(s) = m.get("pump_amm_sell_extended_tail_0") {
+                if let Ok(pk) = Pubkey::from_str(s) {
+                    if pk != Pubkey::default() {
+                        self.pump_amm_sell_extended_tail_0_by_market
+                            .insert(*pool, pk);
+                    }
+                }
+            }
+            if let Some(s) = m.get("pump_amm_sell_extended_tail_1") {
+                if let Ok(pk) = Pubkey::from_str(s) {
+                    if pk != Pubkey::default() {
+                        self.pump_amm_sell_extended_tail_1_by_market
+                            .insert(*pool, pk);
+                    }
+                }
+            }
         }
     }
 
@@ -930,6 +966,8 @@ impl LivePoolCache {
         pool: &Pubkey,
         requires_extended: bool,
         third_meta: Option<Pubkey>,
+        tail_0: Option<Pubkey>,
+        tail_1: Option<Pubkey>,
     ) {
         if requires_extended {
             self.pump_amm_sell_extended_flag_by_market
@@ -937,6 +975,14 @@ impl LivePoolCache {
         }
         if let Some(pk) = third_meta.filter(|p| *p != Pubkey::default()) {
             self.pump_amm_sell_extended_third_meta_by_market
+                .insert(*pool, pk);
+        }
+        if let Some(pk) = tail_0.filter(|p| *p != Pubkey::default()) {
+            self.pump_amm_sell_extended_tail_0_by_market
+                .insert(*pool, pk);
+        }
+        if let Some(pk) = tail_1.filter(|p| *p != Pubkey::default()) {
+            self.pump_amm_sell_extended_tail_1_by_market
                 .insert(*pool, pk);
         }
     }
@@ -953,6 +999,8 @@ impl LivePoolCache {
         pool: &Pubkey,
         requires_extended: bool,
         third_meta: Option<Pubkey>,
+        tail_0: Option<Pubkey>,
+        tail_1: Option<Pubkey>,
     ) {
         self.pump_amm_sell_extended_flag_by_market
             .insert(*pool, requires_extended);
@@ -966,11 +1014,32 @@ impl LivePoolCache {
                     .remove(pool);
             }
         }
+        match tail_0.filter(|p| *p != Pubkey::default()) {
+            Some(pk) => {
+                self.pump_amm_sell_extended_tail_0_by_market
+                    .insert(*pool, pk);
+            }
+            None => {
+                self.pump_amm_sell_extended_tail_0_by_market.remove(pool);
+            }
+        }
+        match tail_1.filter(|p| *p != Pubkey::default()) {
+            Some(pk) => {
+                self.pump_amm_sell_extended_tail_1_by_market
+                    .insert(*pool, pk);
+            }
+            None => {
+                self.pump_amm_sell_extended_tail_1_by_market.remove(pool);
+            }
+        }
     }
 
-    /// Extended PumpSwap `sell` layout: flag + third readonly meta (if known).
+    /// Extended PumpSwap `sell` layout: flag + observed tail pubkeys (if known).
     #[must_use]
-    pub fn pump_amm_sell_extended_layout(&self, pool_market: &Pubkey) -> (bool, Option<Pubkey>) {
+    pub fn pump_amm_sell_extended_layout(
+        &self,
+        pool_market: &Pubkey,
+    ) -> (bool, Option<Pubkey>, Option<Pubkey>, Option<Pubkey>) {
         let flag = self
             .pump_amm_sell_extended_flag_by_market
             .get(pool_market)
@@ -980,7 +1049,15 @@ impl LivePoolCache {
             .pump_amm_sell_extended_third_meta_by_market
             .get(pool_market)
             .map(|e| *e.value());
-        (flag, third)
+        let t0 = self
+            .pump_amm_sell_extended_tail_0_by_market
+            .get(pool_market)
+            .map(|e| *e.value());
+        let t1 = self
+            .pump_amm_sell_extended_tail_1_by_market
+            .get(pool_market)
+            .map(|e| *e.value());
+        (flag, third, t0, t1)
     }
 
     #[must_use]
@@ -995,9 +1072,13 @@ impl LivePoolCache {
         if !self.pump_amm_sell_layout_ready(pool_market) {
             return false;
         }
-        let (requires_extended, third) = self.pump_amm_sell_extended_layout(pool_market);
+        let (requires_extended, third, tail_0, tail_1) =
+            self.pump_amm_sell_extended_layout(pool_market);
         if requires_extended {
-            third.filter(|p| *p != Pubkey::default()).is_some()
+            let third_ok = third.filter(|p| *p != Pubkey::default()).is_some();
+            let tail_ok = tail_0.filter(|p| *p != Pubkey::default()).is_some()
+                && tail_1.filter(|p| *p != Pubkey::default()).is_some();
+            third_ok && tail_ok
         } else {
             true
         }
@@ -2548,7 +2629,7 @@ mod tests {
             100,
         );
         cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
-        cache.merge_pump_amm_sell_extended_layout(&pool_market, true, None);
+        cache.merge_pump_amm_sell_extended_layout(&pool_market, true, None, None, None);
         cache.set_pump_amm_sell_layout_ready(&pool_market, false);
 
         assert!(
@@ -2576,7 +2657,7 @@ mod tests {
             ),
             100,
         );
-        cache.merge_pump_amm_sell_extended_layout(&pool_market, true, None);
+        cache.merge_pump_amm_sell_extended_layout(&pool_market, true, None, None, None);
         cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
 
         assert!(
@@ -2592,6 +2673,42 @@ mod tests {
         assert!(
             !cache.base_mint_has_explicit_pump_amm_ready_pool(&base_mint),
             "mint-level explicit Ready gate must also reject incomplete extended SELL state"
+        );
+    }
+
+    #[test]
+    fn test_pump_amm_extended_flag_with_third_only_missing_tail_blocks_ready_gate() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let pool_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(1_000_000_000),
+                Some(50_000_000_000),
+                pool_accounts,
+            ),
+            100,
+        );
+        cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
+        // Legacy partial: extended flag + third only (no observed #21/#22) — Scope 61 must not count ready.
+        cache.merge_pump_amm_sell_extended_layout(
+            &pool_market,
+            true,
+            Some(Pubkey::new_unique()),
+            None,
+            None,
+        );
+        cache.set_pump_amm_sell_layout_ready(&pool_market, true);
+
+        assert!(
+            !cache.pump_amm_swap_accounts_ready_by_base_mint(&base_mint),
+            "extended SELL with third but missing tail0/tail1 must not count as swap-ready"
         );
     }
 
@@ -2618,14 +2735,17 @@ mod tests {
             100,
         );
         cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
-        cache.merge_pump_amm_sell_extended_layout(&pool_market, true, Some(Pubkey::new_unique()));
+        let t0 = Pubkey::new_unique();
+        let t1 = Pubkey::new_unique();
+        let t2 = Pubkey::new_unique();
+        cache.merge_pump_amm_sell_extended_layout(&pool_market, true, Some(t2), Some(t0), Some(t1));
         cache.set_pump_amm_sell_layout_ready(&pool_market, true);
 
         assert!(
             cache
                 .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
                 .is_some(),
-            "extended SELL must be swap-ready when third_meta + layout_ready + pool_accounts hold"
+            "extended SELL must be swap-ready when full tail + layout_ready + pool_accounts hold"
         );
         assert!(
             cache.pump_amm_swap_accounts_ready_by_base_mint(&base_mint),
@@ -2677,11 +2797,20 @@ mod tests {
         );
         meta.insert("pump_amm_sell_layout_ready".to_string(), "true".to_string());
 
-        cache.merge_pump_amm_sell_extended_layout(&pool_market, true, Some(stale_third));
+        let stale_t0 = Pubkey::new_unique();
+        let stale_t1 = Pubkey::new_unique();
+        cache.merge_pump_amm_sell_extended_layout(
+            &pool_market,
+            true,
+            Some(stale_third),
+            Some(stale_t0),
+            Some(stale_t1),
+        );
         cache.set_pump_amm_sell_layout_ready(&pool_market, false);
         cache.merge_pump_amm_sell_layout_from_metadata(&pool_market, Some(&meta));
 
-        let (requires_extended, third_meta) = cache.pump_amm_sell_extended_layout(&pool_market);
+        let (requires_extended, third_meta, t0, t1) =
+            cache.pump_amm_sell_extended_layout(&pool_market);
         assert!(
             !requires_extended,
             "authoritative base metadata must clear stale extended flag"
@@ -2689,6 +2818,10 @@ mod tests {
         assert!(
             third_meta.is_none(),
             "authoritative base metadata must clear stale third meta"
+        );
+        assert!(
+            t0.is_none() && t1.is_none(),
+            "authoritative base must clear stale tail metas"
         );
         assert!(
             cache.pump_amm_sell_layout_ready(&pool_market),

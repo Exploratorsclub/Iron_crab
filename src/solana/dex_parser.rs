@@ -97,8 +97,12 @@ pub enum ParsedDexEvent {
         token_program: Option<Pubkey>,
         /// PumpSwap only: observed `sell` used 24 accounts (three trailing cashback/volume metas).
         pump_amm_sell_requires_cashback_remaining: bool,
-        /// PumpSwap only: third trailing readonly meta from the observed ix (not user-derivable).
+        /// PumpSwap only: third trailing meta from the observed ix (ix #23; not user-derivable alone).
         pump_amm_sell_cashback_third_meta: Option<Pubkey>,
+        /// PumpSwap only: observed extended SELL ix account #21 (Scope 61).
+        pump_amm_sell_extended_tail_0: Option<Pubkey>,
+        /// PumpSwap only: observed extended SELL ix account #22 (Scope 61).
+        pump_amm_sell_extended_tail_1: Option<Pubkey>,
     },
     /// Liquidity removed (potential rug)
     LiquidityRemoved {
@@ -508,6 +512,8 @@ fn parse_raydium_swap(
         token_program: None, // Raydium uses SPL Token, but we don't trade there for momentum
         pump_amm_sell_requires_cashback_remaining: false,
         pump_amm_sell_cashback_third_meta: None,
+        pump_amm_sell_extended_tail_0: None,
+        pump_amm_sell_extended_tail_1: None,
     })
 }
 
@@ -738,6 +744,8 @@ fn parse_orca_transaction(
         token_program,
         pump_amm_sell_requires_cashback_remaining: false,
         pump_amm_sell_cashback_third_meta: None,
+        pump_amm_sell_extended_tail_0: None,
+        pump_amm_sell_extended_tail_1: None,
     })
 }
 
@@ -1007,6 +1015,8 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
         token_program,
         pump_amm_sell_requires_cashback_remaining: false,
         pump_amm_sell_cashback_third_meta: None,
+        pump_amm_sell_extended_tail_0: None,
+        pump_amm_sell_extended_tail_1: None,
     })
 }
 
@@ -1129,6 +1139,14 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         update.instruction_accounts.get(23).copied()
     } else {
         None
+    };
+    let (sell_extended_tail_0, sell_extended_tail_1) = if sell_requires_cashback_remaining {
+        (
+            update.instruction_accounts.get(21).copied(),
+            update.instruction_accounts.get(22).copied(),
+        )
+    } else {
+        (None, None)
     };
     if sell_requires_cashback_remaining && sell_cashback_third_meta.is_none() {
         return None;
@@ -1287,6 +1305,8 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         token_program,
         pump_amm_sell_requires_cashback_remaining: sell_requires_cashback_remaining,
         pump_amm_sell_cashback_third_meta: sell_cashback_third_meta,
+        pump_amm_sell_extended_tail_0: sell_extended_tail_0,
+        pump_amm_sell_extended_tail_1: sell_extended_tail_1,
     })
 }
 
@@ -1607,6 +1627,8 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
         token_program: None, // Meteora uses SPL Token, not relevant for momentum trading
         pump_amm_sell_requires_cashback_remaining: false,
         pump_amm_sell_cashback_third_meta: None,
+        pump_amm_sell_extended_tail_0: None,
+        pump_amm_sell_extended_tail_1: None,
     })
 }
 
@@ -1735,6 +1757,8 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
         token_program: None, // Raydium CPMM uses SPL Token, not relevant for momentum trading
         pump_amm_sell_requires_cashback_remaining: false,
         pump_amm_sell_cashback_third_meta: None,
+        pump_amm_sell_extended_tail_0: None,
+        pump_amm_sell_extended_tail_1: None,
     })
 }
 
@@ -1955,6 +1979,8 @@ mod tests {
         let fee_config = Pubkey::from_str("5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx").unwrap();
         let fee_program = Pubkey::from_str("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ").unwrap();
 
+        let tail0 = Pubkey::new_unique();
+        let tail1 = Pubkey::new_unique();
         let third_trailing = Pubkey::new_unique();
         let instruction_accounts = vec![
             pool_market,
@@ -1978,8 +2004,8 @@ mod tests {
             coin_creator_vault_authority,
             fee_config,
             fee_program,
-            Pubkey::new_unique(),
-            Pubkey::new_unique(),
+            tail0,
+            tail1,
             third_trailing,
         ];
         assert_eq!(instruction_accounts.len(), 24);
@@ -2038,10 +2064,14 @@ mod tests {
             ParsedDexEvent::Trade {
                 pump_amm_sell_requires_cashback_remaining,
                 pump_amm_sell_cashback_third_meta,
+                pump_amm_sell_extended_tail_0,
+                pump_amm_sell_extended_tail_1,
                 ..
             } => {
                 assert!(pump_amm_sell_requires_cashback_remaining);
                 assert_eq!(pump_amm_sell_cashback_third_meta, Some(third_trailing));
+                assert_eq!(pump_amm_sell_extended_tail_0, Some(tail0));
+                assert_eq!(pump_amm_sell_extended_tail_1, Some(tail1));
             }
             _ => panic!("expected Trade"),
         }

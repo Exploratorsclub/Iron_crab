@@ -1773,7 +1773,9 @@ type PumpAmmSlaveRecoveryEvidence = (
     Option<u64>,    // quote_reserve
     usize,          // pool_accounts.len()
     bool,           // sell_extended
-    Option<Pubkey>, // sell_third_meta
+    Option<Pubkey>, // sell_third_meta (ix #23)
+    Option<Pubkey>, // sell_extended_tail_0 (ix #21)
+    Option<Pubkey>, // sell_extended_tail_1 (ix #22)
     bool,           // sell_layout_ready
 );
 
@@ -1787,7 +1789,8 @@ fn pump_amm_slave_recovery_snapshot(
     let CachedPoolState::PumpAmm(s) = state else {
         return None;
     };
-    let (sell_extended, sell_third_meta) = cache.pump_amm_sell_extended_layout(pool);
+    let (sell_extended, sell_third_meta, sell_tail_0, sell_tail_1) =
+        cache.pump_amm_sell_extended_layout(pool);
     let sell_layout_ready = cache.pump_amm_sell_layout_ready(pool);
     Some((
         slot,
@@ -1796,6 +1799,8 @@ fn pump_amm_slave_recovery_snapshot(
         s.pool_accounts.len(),
         sell_extended,
         sell_third_meta,
+        sell_tail_0,
+        sell_tail_1,
         sell_layout_ready,
     ))
 }
@@ -12483,7 +12488,15 @@ mod execution_engine_tests {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(30));
             let third = Pubkey::new_unique();
-            cache_clone.merge_pump_amm_sell_extended_layout(&pool, true, Some(third));
+            let t0 = Pubkey::new_unique();
+            let t1 = Pubkey::new_unique();
+            cache_clone.merge_pump_amm_sell_extended_layout(
+                &pool,
+                true,
+                Some(third),
+                Some(t0),
+                Some(t1),
+            );
             cache_clone.set_pump_amm_sell_layout_ready(&pool, true);
         });
 

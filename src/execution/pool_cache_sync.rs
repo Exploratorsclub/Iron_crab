@@ -1180,9 +1180,10 @@ mod tests {
         update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
 
         assert!(apply_pool_cache_update(&cache, &update));
-        let (flag, third) = cache.pump_amm_sell_extended_layout(&pool_market);
+        let (flag, third, t0, t1) = cache.pump_amm_sell_extended_layout(&pool_market);
         assert!(flag);
         assert!(third.is_some());
+        assert!(t0.is_none() && t1.is_none());
     }
 
     #[test]
