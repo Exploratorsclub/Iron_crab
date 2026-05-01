@@ -761,9 +761,14 @@ pub async fn build_tx_plan(
         // - 12 accounts: SELL format (no volume accumulators)
         // - 14 accounts: BUY format (with global_volume_accumulator + user_volume_accumulator)
         let accounts_len = intent.resources.accounts.len();
-        let (sell_requires_cashback_remaining, sell_cashback_third_meta) = cache
+        let (
+            sell_requires_cashback_remaining,
+            sell_cashback_third_meta,
+            sell_extended_tail_0,
+            sell_extended_tail_1,
+        ) = cache
             .map(|c| c.pump_amm_sell_extended_layout(&pool_id))
-            .unwrap_or((false, None));
+            .unwrap_or((false, None, None, None));
 
         let mut pool_accounts_build_source = if accounts_len == 0 {
             "slave_livepoolcache"
@@ -775,12 +780,15 @@ pub async fn build_tx_plan(
             if let Some(cache) = cache {
                 if let Some(CachedPoolState::PumpAmm(amm_state)) = cache.get(&pool_id) {
                     if amm_state.pool_accounts.len() >= 12 {
-                        let (sell_ext, sell_third) = cache.pump_amm_sell_extended_layout(&pool_id);
+                        let (sell_ext, sell_third, sell_t0, sell_t1) =
+                            cache.pump_amm_sell_extended_layout(&pool_id);
                         tracing::warn!(
                             pool = %pool_id,
                             accounts_len = amm_state.pool_accounts.len(),
                             sell_cashback_remaining = sell_ext,
                             sell_cashback_third_meta = ?sell_third,
+                            sell_extended_tail_0 = ?sell_t0,
+                            sell_extended_tail_1 = ?sell_t1,
                             "pump_amm: using cached pool_accounts (intent missing accounts)"
                         );
                         amm_state.pool_accounts.clone()
@@ -897,7 +905,7 @@ pub async fn build_tx_plan(
             }
         }
 
-        let mut ixs = match PumpFunAmmDex::build_swap_ix_from_pool_accounts(
+        let mut ixs = match PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
             &intent.resources.input_mint,
             &intent.resources.output_mint,
             intent.required_capital.raw,
@@ -908,6 +916,16 @@ pub async fn build_tx_plan(
             sell_requires_cashback_remaining && intent.side == TradeSide::Sell,
             if intent.side == TradeSide::Sell {
                 sell_cashback_third_meta
+            } else {
+                None
+            },
+            if intent.side == TradeSide::Sell {
+                sell_extended_tail_0
+            } else {
+                None
+            },
+            if intent.side == TradeSide::Sell {
+                sell_extended_tail_1
             } else {
                 None
             },
@@ -948,6 +966,14 @@ pub async fn build_tx_plan(
                 .map(|m| m.pubkey.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
+            let sell_ext_tail_src =
+                if sell_extended_tail_0.is_some() && sell_extended_tail_1.is_some() {
+                    "livepoolcache_observed_tail"
+                } else if sell_requires_cashback_remaining && intent.side == TradeSide::Sell {
+                    "derived_first_two_metas"
+                } else {
+                    "n/a"
+                };
             info!(
                 intent_id = %intent.intent_id,
                 scope = "44",
@@ -955,6 +981,13 @@ pub async fn build_tx_plan(
                 pool_accounts_source = pool_accounts_build_source,
                 sell_extended = sell_requires_cashback_remaining && intent.side == TradeSide::Sell,
                 sell_cashback_third_meta = ?sell_cashback_third_meta,
+                sell_extended_tail_source = sell_ext_tail_src,
+                sell_extended_tail_0 = ?sell_extended_tail_0,
+                sell_extended_tail_1 = ?sell_extended_tail_1,
+                sell_extended_tail_2 = ?sell_cashback_third_meta,
+                sell_ix_meta_21 = %ixs[0].accounts.get(21).map(|m| m.pubkey.to_string()).unwrap_or_default(),
+                sell_ix_meta_22 = %ixs[0].accounts.get(22).map(|m| m.pubkey.to_string()).unwrap_or_default(),
+                sell_ix_meta_23 = %ixs[0].accounts.get(23).map(|m| m.pubkey.to_string()).unwrap_or_default(),
                 sell_ix_account_count = ixs[0].accounts.len(),
                 pool = %pool_id,
                 input_mint = %intent.resources.input_mint,
@@ -1623,17 +1656,24 @@ async fn build_hop_pump_amm(
     cache: Option<&SharedLivePoolCache>,
 ) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
     // PumpSwap AMM (graduated tokens) - get pool_accounts from cache
-    let (pool_accounts, sell_requires, sell_third) = if let Some(cache) = cache {
+    let (pool_accounts, sell_requires, sell_third, sell_t0, sell_t1) = if let Some(cache) = cache {
         match cache.get(pool_address) {
             Some(CachedPoolState::PumpAmm(amm_state)) => {
-                let (sell_requires, sell_third) = cache.pump_amm_sell_extended_layout(pool_address);
+                let (sell_requires, sell_third, sell_t0, sell_t1) =
+                    cache.pump_amm_sell_extended_layout(pool_address);
                 if amm_state.pool_accounts.len() >= 14 {
                     tracing::debug!(
                         pool = %pool_address,
                         accounts_len = amm_state.pool_accounts.len(),
                         "multi-hop pump_amm: using cached pool_accounts"
                     );
-                    (amm_state.pool_accounts.clone(), sell_requires, sell_third)
+                    (
+                        amm_state.pool_accounts.clone(),
+                        sell_requires,
+                        sell_third,
+                        sell_t0,
+                        sell_t1,
+                    )
                 } else {
                     return Err(UnsupportedTxPlan {
                         reason: RejectReason::UnsupportedIntent,
@@ -1670,7 +1710,8 @@ async fn build_hop_pump_amm(
     // Use static method with pool_accounts from cache
     // Note: Multi-hop arb doesn't pass token_program yet; Token-2022 arb tokens are rare.
     // TODO: If needed, add token_program to SwapHop struct for full Token-2022 arb support.
-    let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts(
+    let is_sell_hop = hop.output_mint == NATIVE_SOL_MINT;
+    let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
         &hop.input_mint,
         &hop.output_mint,
         amount_in,
@@ -1678,12 +1719,17 @@ async fn build_hop_pump_amm(
         wallet_pubkey,
         &pool_accounts,
         None, // Token-2022 not yet supported in multi-hop arb
-        sell_requires && hop.output_mint == NATIVE_SOL_MINT,
-        sell_third,
+        sell_requires && is_sell_hop,
+        if is_sell_hop { sell_third } else { None },
+        if is_sell_hop { sell_t0 } else { None },
+        if is_sell_hop { sell_t1 } else { None },
     )
     .map_err(|e| UnsupportedTxPlan {
         reason: RejectReason::UnsupportedIntent,
-        details: format!("pump_amm build_swap_ix_from_pool_accounts failed: {}", e),
+        details: format!(
+            "pump_amm build_swap_ix_from_pool_accounts_with_extended_tail failed: {}",
+            e
+        ),
     })?;
 
     Ok(ixs)
@@ -2099,6 +2145,8 @@ mod tests {
         let base_mint = Pubkey::new_unique();
         let quote_mint = Pubkey::from_str(NATIVE_SOL_MINT).expect("wsol mint");
         let third_meta = Pubkey::new_unique();
+        let tail0 = Pubkey::new_unique();
+        let tail1 = Pubkey::new_unique();
 
         let mut ready_v14: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
         ready_v14[0] = pool_market;
@@ -2125,7 +2173,13 @@ mod tests {
             100,
         );
         cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
-        cache.merge_pump_amm_sell_extended_layout(&pool_market, true, Some(third_meta));
+        cache.merge_pump_amm_sell_extended_layout(
+            &pool_market,
+            true,
+            Some(third_meta),
+            Some(tail0),
+            Some(tail1),
+        );
 
         let mut intent = base_intent();
         intent
@@ -2157,6 +2211,11 @@ mod tests {
             sell_ix.accounts.len()
         );
         assert_eq!(sell_ix.accounts.last().unwrap().pubkey, third_meta);
+        assert_eq!(sell_ix.accounts[21].pubkey, tail0);
+        assert_eq!(sell_ix.accounts[22].pubkey, tail1);
+        assert!(!sell_ix.accounts[21].is_writable);
+        assert!(!sell_ix.accounts[22].is_writable);
+        assert!(sell_ix.accounts[23].is_writable);
     }
 
     /// Two PumpSwap pools for the same base mint: only the intent’s `pools[0]` row (explicit Ready)
@@ -2169,6 +2228,10 @@ mod tests {
         let quote_mint = Pubkey::from_str(NATIVE_SOL_MINT).expect("wsol mint");
         let third_other = Pubkey::new_unique();
         let third_target = Pubkey::new_unique();
+        let t0_other = Pubkey::new_unique();
+        let t1_other = Pubkey::new_unique();
+        let t0_target = Pubkey::new_unique();
+        let t1_target = Pubkey::new_unique();
 
         let mut v14_other: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
         v14_other[0] = pool_other;
@@ -2200,7 +2263,13 @@ mod tests {
             }),
             100,
         );
-        cache.merge_pump_amm_sell_extended_layout(&pool_other, true, Some(third_other));
+        cache.merge_pump_amm_sell_extended_layout(
+            &pool_other,
+            true,
+            Some(third_other),
+            Some(t0_other),
+            Some(t1_other),
+        );
 
         // Target pool: explicit JetStream Ready (force_refresh / PoolCacheUpdate path).
         cache.upsert(
@@ -2218,7 +2287,13 @@ mod tests {
             100,
         );
         cache.merge_pump_amm_pool_accounts_readiness(pool_target, DexPoolReadiness::Ready);
-        cache.merge_pump_amm_sell_extended_layout(&pool_target, true, Some(third_target));
+        cache.merge_pump_amm_sell_extended_layout(
+            &pool_target,
+            true,
+            Some(third_target),
+            Some(t0_target),
+            Some(t1_target),
+        );
 
         let mut intent = base_intent();
         intent

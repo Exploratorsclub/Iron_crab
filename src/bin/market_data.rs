@@ -231,18 +231,25 @@ fn raydium_cpmm_readiness_for_pool_cache_update(s: &RaydiumCpmmState) -> DexPool
 /// PumpSwap SELL-layout contract for JetStream / SLAVE SSOT.
 ///
 /// - Base-only SELL stays ready as long as the underlying refresh/observation says the base layout is usable.
-/// - Extended SELL is ready when the observed third readonly meta is known and base layout is ready.
-///   SELL ix fee_config uses the global mainnet constant — readiness must not depend on v14[12] (Scope 59).
+/// - Extended SELL is ready when the full observed tail (#21/#22/#23) is known and base layout is ready.
 fn pump_amm_sell_layout_publish_state(
     sell_requires_extended: bool,
     sell_cashback_third_meta: Option<Pubkey>,
+    sell_extended_tail_0: Option<Pubkey>,
+    sell_extended_tail_1: Option<Pubkey>,
     base_layout_ready: bool,
 ) -> (bool, DexPoolReadiness) {
     let sell_layout_ready = if sell_requires_extended {
-        sell_cashback_third_meta
+        let third_ok = sell_cashback_third_meta
+            .filter(|p| *p != Pubkey::default())
+            .is_some();
+        let tail_ok = sell_extended_tail_0
             .filter(|p| *p != Pubkey::default())
             .is_some()
-            && base_layout_ready
+            && sell_extended_tail_1
+                .filter(|p| *p != Pubkey::default())
+                .is_some();
+        third_ok && tail_ok && base_layout_ready
     } else {
         base_layout_ready
     };
@@ -257,18 +264,38 @@ fn pump_amm_sell_layout_publish_state(
 /// Resolve PumpSwap SELL-layout state for the EnsurePumpAmmPoolAccounts publish path.
 ///
 /// `force_refresh=true` is authoritative and must be able to override stale monotonic cache hints.
+#[allow(clippy::too_many_arguments)]
 fn pump_amm_sell_layout_state_for_ensure_publish(
     force_refresh: bool,
     cached_requires_extended: bool,
     cached_third_meta: Option<Pubkey>,
+    cached_tail_0: Option<Pubkey>,
+    cached_tail_1: Option<Pubkey>,
     refresh_requires_extended: bool,
     refresh_third_meta: Option<Pubkey>,
+    refresh_tail_0: Option<Pubkey>,
+    refresh_tail_1: Option<Pubkey>,
     refresh_layout_ready: bool,
-) -> (bool, Option<Pubkey>, bool, DexPoolReadiness) {
-    let (effective_requires_extended, effective_third_meta, base_layout_ready) = if force_refresh {
+) -> (
+    bool,
+    Option<Pubkey>,
+    Option<Pubkey>,
+    Option<Pubkey>,
+    bool,
+    DexPoolReadiness,
+) {
+    let (
+        effective_requires_extended,
+        effective_third_meta,
+        effective_tail_0,
+        effective_tail_1,
+        base_layout_ready,
+    ) = if force_refresh {
         (
             refresh_requires_extended,
             refresh_third_meta.filter(|p| *p != Pubkey::default()),
+            refresh_tail_0.filter(|p| *p != Pubkey::default()),
+            refresh_tail_1.filter(|p| *p != Pubkey::default()),
             refresh_layout_ready,
         )
     } else {
@@ -277,17 +304,27 @@ fn pump_amm_sell_layout_state_for_ensure_publish(
             refresh_third_meta
                 .or(cached_third_meta)
                 .filter(|p| *p != Pubkey::default()),
+            refresh_tail_0
+                .or(cached_tail_0)
+                .filter(|p| *p != Pubkey::default()),
+            refresh_tail_1
+                .or(cached_tail_1)
+                .filter(|p| *p != Pubkey::default()),
             refresh_layout_ready,
         )
     };
     let (sell_layout_ready, dex_readiness) = pump_amm_sell_layout_publish_state(
         effective_requires_extended,
         effective_third_meta,
+        effective_tail_0,
+        effective_tail_1,
         base_layout_ready,
     );
     (
         effective_requires_extended,
         effective_third_meta,
+        effective_tail_0,
+        effective_tail_1,
         sell_layout_ready,
         dex_readiness,
     )
@@ -5325,6 +5362,8 @@ async fn handle_ensure_pump_amm_pool_accounts(
         Ok(Some(wrapped)) if wrapped.accounts.len() >= 14 => {
             let sell_cashback_remaining = wrapped.sell_requires_cashback_remaining;
             let sell_cashback_third = wrapped.sell_cashback_third_meta;
+            let sell_tail_0 = wrapped.sell_extended_tail_0;
+            let sell_tail_1 = wrapped.sell_extended_tail_1;
             let sell_layout_ready_from_refresh = wrapped.sell_layout_ready;
             let pump_amm_force_refresh_sell_diag = wrapped.force_refresh_sell_layout_diag;
             let accounts = wrapped.accounts;
@@ -5354,18 +5393,28 @@ async fn handle_ensure_pump_amm_pool_accounts(
                 CachedPoolState::PumpAmm(s) => s.creator,
                 _ => None,
             });
-            let (ext_flag_cache, ext_third_cache) = ctx
+            let (ext_flag_cache, ext_third_cache, ext_t0_cache, ext_t1_cache) = ctx
                 .live_pool_cache
                 .pump_amm_sell_extended_layout(&pool_address);
-            let (sell_flag_merged, third_merged, sell_layout_ready, dex_readiness) =
-                pump_amm_sell_layout_state_for_ensure_publish(
-                    force_refresh,
-                    ext_flag_cache,
-                    ext_third_cache,
-                    sell_cashback_remaining,
-                    sell_cashback_third,
-                    sell_layout_ready_from_refresh,
-                );
+            let (
+                sell_flag_merged,
+                third_merged,
+                tail0_merged,
+                tail1_merged,
+                sell_layout_ready,
+                dex_readiness,
+            ) = pump_amm_sell_layout_state_for_ensure_publish(
+                force_refresh,
+                ext_flag_cache,
+                ext_third_cache,
+                ext_t0_cache,
+                ext_t1_cache,
+                sell_cashback_remaining,
+                sell_cashback_third,
+                sell_tail_0,
+                sell_tail_1,
+                sell_layout_ready_from_refresh,
+            );
 
             let (base_reserve, quote_reserve) =
                 match resolve_pump_amm_reserves_for_ensure_discovery(
@@ -5419,12 +5468,16 @@ async fn handle_ensure_pump_amm_pool_accounts(
                     &pool_address,
                     sell_flag_merged,
                     third_merged,
+                    tail0_merged,
+                    tail1_merged,
                 );
             } else {
                 ctx.live_pool_cache.merge_pump_amm_sell_extended_layout(
                     &pool_address,
                     sell_flag_merged,
                     third_merged,
+                    tail0_merged,
+                    tail1_merged,
                 );
             }
             ctx.live_pool_cache
@@ -5470,6 +5523,12 @@ async fn handle_ensure_pump_amm_pool_accounts(
                         "pump_amm_sell_cashback_third_meta".to_string(),
                         pk.to_string(),
                     );
+                }
+                if let Some(pk) = tail0_merged {
+                    meta.insert("pump_amm_sell_extended_tail_0".to_string(), pk.to_string());
+                }
+                if let Some(pk) = tail1_merged {
+                    meta.insert("pump_amm_sell_extended_tail_1".to_string(), pk.to_string());
                 }
                 if let Some(creator) = creator_opt {
                     meta.insert("creator".to_string(), creator.to_string());
@@ -5533,6 +5592,8 @@ async fn handle_ensure_pump_amm_pool_accounts(
                             pool_address = %pool_address_str,
                             sell_cashback_remaining = sell_flag_merged,
                             sell_cashback_third_meta = ?third_merged,
+                            sell_extended_tail_0 = ?tail0_merged,
+                            sell_extended_tail_1 = ?tail1_merged,
                             "I-24d Discovery: force_refresh result published as Partial (authoritative SELL layout unresolved)"
                         );
                     }
@@ -5543,6 +5604,8 @@ async fn handle_ensure_pump_amm_pool_accounts(
                             pool_address = %pool_address_str,
                             sell_cashback_remaining = sell_flag_merged,
                             sell_cashback_third_meta = ?third_merged,
+                            sell_extended_tail_0 = ?tail0_merged,
+                            sell_extended_tail_1 = ?tail1_merged,
                             "I-24d Discovery: terminal outcome ok (non-force-refresh publish may remain Partial)"
                         );
                     }
@@ -7736,7 +7799,7 @@ async fn run_geyser_loop(
                                     let accounts_str: Vec<String> = effective_pool_accounts.iter().map(|p| p.to_string()).collect();
                                     meta.insert("pool_accounts".to_string(), accounts_str.join(","));
                                 }
-                                let (ext_flag, ext_third) = ctx
+                                let (ext_flag, ext_third, ext_t0, ext_t1) = ctx
                                     .live_pool_cache
                                     .pump_amm_sell_extended_layout(&account_update.pubkey);
                                 if ext_flag {
@@ -7750,6 +7813,18 @@ async fn run_geyser_loop(
                                 {
                                     meta.insert(
                                         "pump_amm_sell_cashback_third_meta".to_string(),
+                                        pk.to_string(),
+                                    );
+                                }
+                                if let Some(pk) = ext_t0.filter(|p| *p != Pubkey::default()) {
+                                    meta.insert(
+                                        "pump_amm_sell_extended_tail_0".to_string(),
+                                        pk.to_string(),
+                                    );
+                                }
+                                if let Some(pk) = ext_t1.filter(|p| *p != Pubkey::default()) {
+                                    meta.insert(
+                                        "pump_amm_sell_extended_tail_1".to_string(),
                                         pk.to_string(),
                                     );
                                 }
@@ -8406,13 +8481,15 @@ async fn run_geyser_loop(
                     pool_accounts: Some(pool_accounts),
                     pump_amm_sell_requires_cashback_remaining,
                     pump_amm_sell_cashback_third_meta,
+                    pump_amm_sell_extended_tail_0,
+                    pump_amm_sell_extended_tail_1,
                     ..
                 }) = parsed_event.as_ref()
                 {
                     // Merge when this trade is extended OR cache already knows extended layout
                     // (e.g. prior Geyser observation / JetStream). Skipping when the trade is a
                     // standard 21-account sell would drop a true extended flag from the MASTER cache.
-                    let (ext_flag_prior, ext_third_prior) = ctx
+                    let (ext_flag_prior, ext_third_prior, ext_t0_prior, ext_t1_prior) = ctx
                         .live_pool_cache
                         .pump_amm_sell_extended_layout(pool_address);
                     let merge_requires = *pump_amm_sell_requires_cashback_remaining
@@ -8420,11 +8497,20 @@ async fn run_geyser_loop(
                     let merge_third = (*pump_amm_sell_cashback_third_meta)
                         .filter(|p| *p != Pubkey::default())
                         .or(ext_third_prior);
-                    if merge_requires || merge_third.is_some() {
+                    let merge_t0 = (*pump_amm_sell_extended_tail_0)
+                        .filter(|p| *p != Pubkey::default())
+                        .or(ext_t0_prior);
+                    let merge_t1 = (*pump_amm_sell_extended_tail_1)
+                        .filter(|p| *p != Pubkey::default())
+                        .or(ext_t1_prior);
+                    if merge_requires || merge_third.is_some() || merge_t0.is_some() || merge_t1.is_some()
+                    {
                         ctx.live_pool_cache.merge_pump_amm_sell_extended_layout(
                             pool_address,
                             merge_requires,
                             merge_third,
+                            merge_t0,
+                            merge_t1,
                         );
                     }
                     // v1 order (see MarketEventKind::DexPoolAccounts docs): base_mint at [2], quote_mint at [3]
@@ -8510,15 +8596,23 @@ async fn run_geyser_loop(
                     // when the parsed Geyser state has empty pool_accounts.
                     if pool_accounts.len() >= 14 {
                         ctx.live_pool_cache.set_pump_amm_pool_accounts(pool_address, pool_accounts.clone());
-                        let (ext_flag, ext_third) =
+                        let (ext_flag, ext_third, ext_t0, ext_t1) =
                             ctx.live_pool_cache.pump_amm_sell_extended_layout(pool_address);
                         let merged_flag = ext_flag || *pump_amm_sell_requires_cashback_remaining;
                         let merged_third = ext_third
                             .or(*pump_amm_sell_cashback_third_meta)
                             .filter(|p| *p != Pubkey::default());
+                        let merged_t0 = ext_t0
+                            .or(*pump_amm_sell_extended_tail_0)
+                            .filter(|p| *p != Pubkey::default());
+                        let merged_t1 = ext_t1
+                            .or(*pump_amm_sell_extended_tail_1)
+                            .filter(|p| *p != Pubkey::default());
                         let (sell_layout_ready, dex_readiness) = pump_amm_sell_layout_publish_state(
                             merged_flag,
                             merged_third,
+                            merged_t0,
+                            merged_t1,
                             true,
                         );
                         ctx.live_pool_cache
@@ -8560,6 +8654,12 @@ async fn run_geyser_loop(
                                     "pump_amm_sell_cashback_third_meta".to_string(),
                                     pk.to_string(),
                                 );
+                            }
+                            if let Some(pk) = merged_t0 {
+                                meta.insert("pump_amm_sell_extended_tail_0".to_string(), pk.to_string());
+                            }
+                            if let Some(pk) = merged_t1 {
+                                meta.insert("pump_amm_sell_extended_tail_1".to_string(), pk.to_string());
                             }
                             pool_update.metadata = Some(meta);
                             pool_update.set_dex_readiness_in_metadata(dex_readiness);
@@ -9777,7 +9877,7 @@ mod discovery_tests {
     #[test]
     fn test_pump_amm_trade_publish_extended_without_third_meta_is_partial() {
         let (sell_layout_ready, dex_readiness) =
-            pump_amm_sell_layout_publish_state(true, None, true);
+            pump_amm_sell_layout_publish_state(true, None, None, None, true);
         assert!(
             !sell_layout_ready,
             "extended SELL without authoritative third meta must not be marked ready"
@@ -9786,13 +9886,29 @@ mod discovery_tests {
     }
 
     #[test]
-    fn test_pump_amm_trade_publish_extended_with_third_meta_is_ready() {
-        // v14[12]/[13] may differ from global SELL fee_config — readiness must not depend on them (Scope 59).
+    fn test_pump_amm_trade_publish_extended_with_third_only_missing_tail_is_partial() {
         let (sell_layout_ready, dex_readiness) =
-            pump_amm_sell_layout_publish_state(true, Some(Pubkey::new_unique()), true);
+            pump_amm_sell_layout_publish_state(true, Some(Pubkey::new_unique()), None, None, true);
+        assert!(
+            !sell_layout_ready,
+            "extended SELL with third but missing tail0/tail1 must not be marked ready"
+        );
+        assert_eq!(dex_readiness, DexPoolReadiness::Partial);
+    }
+
+    #[test]
+    fn test_pump_amm_trade_publish_extended_with_full_tail_is_ready() {
+        // v14[12]/[13] may differ from global SELL fee_config — readiness must not depend on them (Scope 59).
+        let (sell_layout_ready, dex_readiness) = pump_amm_sell_layout_publish_state(
+            true,
+            Some(Pubkey::new_unique()),
+            Some(Pubkey::new_unique()),
+            Some(Pubkey::new_unique()),
+            true,
+        );
         assert!(
             sell_layout_ready,
-            "extended SELL with authoritative third meta must be marked ready"
+            "extended SELL with full observed tail must be marked ready"
         );
         assert_eq!(dex_readiness, DexPoolReadiness::Ready);
     }
@@ -9800,15 +9916,27 @@ mod discovery_tests {
     #[test]
     fn test_pump_amm_force_refresh_base_overrides_stale_extended_cache_flag() {
         let stale_third = Pubkey::new_unique();
-        let (effective_requires_extended, effective_third_meta, sell_layout_ready, dex_readiness) =
-            pump_amm_sell_layout_state_for_ensure_publish(
-                true,
-                true,
-                Some(stale_third),
-                false,
-                None,
-                true,
-            );
+        let stale_t0 = Pubkey::new_unique();
+        let stale_t1 = Pubkey::new_unique();
+        let (
+            effective_requires_extended,
+            effective_third_meta,
+            effective_tail_0,
+            effective_tail_1,
+            sell_layout_ready,
+            dex_readiness,
+        ) = pump_amm_sell_layout_state_for_ensure_publish(
+            true,
+            true,
+            Some(stale_third),
+            Some(stale_t0),
+            Some(stale_t1),
+            false,
+            None,
+            None,
+            None,
+            true,
+        );
         assert!(
             !effective_requires_extended,
             "authoritative force_refresh base result must override stale extended cache flag"
@@ -9817,6 +9945,7 @@ mod discovery_tests {
             effective_third_meta.is_none(),
             "authoritative base result must discard stale third meta"
         );
+        assert!(effective_tail_0.is_none() && effective_tail_1.is_none());
         assert!(
             sell_layout_ready,
             "base layout proven by force_refresh stays ready"
