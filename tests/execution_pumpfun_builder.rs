@@ -1,4 +1,4 @@
-use ironcrab::solana::dex::pumpfun::PumpFunDex;
+use ironcrab::solana::dex::pumpfun::{PumpFunDex, PUMPFUN_BUYBACK_FEE_RECIPIENT};
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::{execution::tx_builder, ipc};
 use solana_sdk::instruction::AccountMeta;
@@ -85,12 +85,17 @@ async fn test_pumpfun_build_buy_ix_pure_derivation() {
         "limit BUY must use buy discriminator"
     );
 
-    // Post-cashback-upgrade (Feb 2026): BUY requires 17 accounts (bonding_curve_v2 as last).
+    // Apr 2026 fee-recipient upgrade: 18 accounts (bonding_curve_v2 + writable buyback recipient).
     assert_eq!(
         ix.accounts.len(),
-        17,
-        "BUY ix must have 17 accounts (bonding_curve_v2 required since Feb 2026)"
+        18,
+        "BUY ix must have 18 accounts (buyback fee recipient after bonding_curve_v2)"
     );
+    let buyback = Pubkey::from_str(PUMPFUN_BUYBACK_FEE_RECIPIENT).expect("buyback pubkey");
+    let tail = ix.accounts.last().expect("tail account");
+    assert_eq!(tail.pubkey, buyback);
+    assert!(tail.is_writable);
+    assert!(!tail.is_signer);
 
     // Keep AccountMeta imported to avoid unused import warning changes across Solana versions.
     let _ = AccountMeta::new_readonly(Pubkey::default(), false);
@@ -147,6 +152,17 @@ async fn test_pumpfun_market_order_buy() {
         0u8,
         "track_volume OptionBool(false) must serialize as final byte 0"
     );
+
+    assert_eq!(
+        ix.accounts.len(),
+        18,
+        "market-order BUY must have 18 accounts"
+    );
+    let buyback = Pubkey::from_str(PUMPFUN_BUYBACK_FEE_RECIPIENT).expect("buyback pubkey");
+    let tail = ix.accounts.last().expect("tail account");
+    assert_eq!(tail.pubkey, buyback);
+    assert!(tail.is_writable);
+    assert!(!tail.is_signer);
 }
 
 #[tokio::test]
@@ -228,11 +244,17 @@ async fn test_tx_builder_supports_pumpfun_sell_pure_derivation() {
 
     assert!(!ix.data.is_empty(), "instruction data must not be empty");
 
-    // Post-cashback-upgrade (Feb 2026): SELL has 15 (non-cashback) or 16 (cashback) accounts.
-    assert!(
-        ix.accounts.len() >= 15,
-        "SELL ix must have at least 15 accounts (bonding_curve_v2 required since Feb 2026)"
+    // Non-cashback SELL: 16 accounts (bonding_curve_v2 + buyback fee recipient).
+    assert_eq!(
+        ix.accounts.len(),
+        16,
+        "non-cashback SELL must have 16 accounts"
     );
+    let buyback = Pubkey::from_str(PUMPFUN_BUYBACK_FEE_RECIPIENT).expect("buyback pubkey");
+    let tail = ix.accounts.last().expect("tail account");
+    assert_eq!(tail.pubkey, buyback);
+    assert!(tail.is_writable);
+    assert!(!tail.is_signer);
 }
 
 /// Regression test for Bug #25: Cold Path must verify cashback_enabled via RPC even on Cache-HIT.
