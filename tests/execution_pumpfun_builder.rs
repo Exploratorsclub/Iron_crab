@@ -67,6 +67,24 @@ async fn test_pumpfun_build_buy_ix_pure_derivation() {
     // Ensure we didn't accidentally construct empty data.
     assert!(!ix.data.is_empty(), "instruction data must not be empty");
 
+    // IDL `buy`: discriminator + amount + max_sol_cost + track_volume (OptionBool = 1 byte)
+    assert_eq!(
+        ix.data.len(),
+        25,
+        "BUY instruction data must be 25 bytes (incl. track_volume OptionBool)"
+    );
+    assert_eq!(
+        *ix.data.last().expect("data non-empty"),
+        0u8,
+        "track_volume OptionBool(false) must serialize as final byte 0"
+    );
+    let buy_disc: [u8; 8] = ix.data[0..8].try_into().expect("discriminator");
+    assert_eq!(
+        buy_disc,
+        [0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea],
+        "limit BUY must use buy discriminator"
+    );
+
     // Post-cashback-upgrade (Feb 2026): BUY requires 17 accounts (bonding_curve_v2 as last).
     assert_eq!(
         ix.accounts.len(),
@@ -118,6 +136,16 @@ async fn test_pumpfun_market_order_buy() {
         discriminator,
         [56, 252, 116, 8, 158, 223, 205, 95],
         "market order must use buy_exact_sol_in discriminator"
+    );
+    assert_eq!(
+        ix.data.len(),
+        25,
+        "buy_exact_sol_in data must be 25 bytes (incl. track_volume OptionBool)"
+    );
+    assert_eq!(
+        *ix.data.last().expect("data non-empty"),
+        0u8,
+        "track_volume OptionBool(false) must serialize as final byte 0"
     );
 }
 

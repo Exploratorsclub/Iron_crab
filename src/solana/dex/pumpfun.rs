@@ -59,6 +59,10 @@ pub const PUMPFUN_EVENT_AUTHORITY: &str = "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7
 /// Pump.fun fee program (new accounts added to protocol)
 pub const PUMPFUN_FEE_PROGRAM: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 
+/// Borsh serialization of IDL `OptionBool` with inner `false` (one bool field → 1 byte).
+/// Pump.fun `buy` / `buy_exact_sol_in` require this as the third instruction-data argument.
+const TRACK_VOLUME_OPTION_BOOL_FALSE: u8 = 0;
+
 /// Fee config seed constant (32 bytes from IDL)
 pub const FEE_CONFIG_SEED: [u8; 32] = [
     1, 86, 224, 246, 147, 102, 90, 207, 68, 219, 21, 104, 191, 23, 91, 170, 81, 137, 203, 151, 245,
@@ -362,7 +366,7 @@ impl PumpFunDex {
     /// Build buy instruction (SOL → Token)
     /// Instruction discriminator: 0x66063d1201daebea (8 bytes)
     ///
-    /// UPDATED: Now requires 16 accounts (protocol update added fee-related accounts)
+    /// UPDATED: Now requires 17 accounts (bonding_curve_v2 last; protocol update added fee-related accounts)
     #[allow(clippy::too_many_arguments)]
     pub fn build_buy_ix(
         &self,
@@ -403,12 +407,19 @@ impl PumpFunDex {
             "pump.fun BUY: derived PDAs for instruction"
         );
 
-        // Instruction data: discriminator (8 bytes) + amount (8 bytes) + max_cost (8 bytes)
-        let mut data = Vec::with_capacity(24);
+        // Instruction data: discriminator (8) + amount (8) + max_sol_cost (8) + track_volume OptionBool (1)
+        let mut data = Vec::with_capacity(25);
         // Discriminator for "global:buy" = 66063d1201daebea
         data.extend_from_slice(&[0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea]);
         data.extend_from_slice(&amount_in.to_le_bytes());
         data.extend_from_slice(&max_sol_cost.to_le_bytes());
+        data.push(TRACK_VOLUME_OPTION_BOOL_FALSE);
+
+        debug!(
+            token_mint = %token_mint,
+            track_volume = false,
+            "pump.fun BUY: instruction data includes track_volume (OptionBool)"
+        );
 
         Ok(Instruction {
             program_id: self.program_id,
@@ -479,11 +490,18 @@ impl PumpFunDex {
         let fee_program = Pubkey::from_str(PUMPFUN_FEE_PROGRAM)?;
         let (bonding_curve_v2, _) = Self::derive_bonding_curve_v2(token_mint);
 
-        // Data: discriminator(8) + sol_amount(8) + min_tokens_out(8)
-        let mut data = Vec::with_capacity(24);
+        // Data: discriminator(8) + spendable_sol_in(8) + min_tokens_out(8) + track_volume OptionBool(1)
+        let mut data = Vec::with_capacity(25);
         data.extend_from_slice(&[56, 252, 116, 8, 158, 223, 205, 95]);
         data.extend_from_slice(&sol_amount.to_le_bytes());
         data.extend_from_slice(&min_tokens_out.to_le_bytes());
+        data.push(TRACK_VOLUME_OPTION_BOOL_FALSE);
+
+        debug!(
+            token_mint = %token_mint,
+            track_volume = false,
+            "pump.fun buy_exact_sol_in: instruction data includes track_volume (OptionBool)"
+        );
 
         Ok(Instruction {
             program_id: self.program_id,
@@ -1427,6 +1445,99 @@ mod tests {
         assert!(
             !vault.is_on_curve(),
             "Creator vault PDA should be off-curve (no private key)"
+        );
+    }
+
+    #[test]
+    fn test_build_buy_ix_data_includes_track_volume_false() {
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:8899"));
+        let mut dex = PumpFunDex::new(rpc, None).expect("PumpFunDex::new");
+        let wallet =
+            Pubkey::from_str("Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM").expect("wallet");
+        dex.set_user_authority(wallet);
+
+        let creator =
+            Pubkey::from_str("2tFqgkJX6kqz8q6o9tFv3oJ9nQx7n1m3fHk2m8f3oKpZ").expect("creator");
+        let token_mint =
+            Pubkey::from_str("9xQeWvG816bUx9EPfKJb9N9dKz5wW7Yy2hBzXv4mQ4kG").expect("mint");
+        let (bonding_curve, _) = dex.derive_bonding_curve(&token_mint);
+        let token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let (associated_bonding_curve, _) =
+            dex.derive_associated_bonding_curve(&bonding_curve, &token_mint, &token_program);
+        let user_token_account =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &sdk_pubkey_to_spl(&wallet),
+                &sdk_pubkey_to_spl(&token_mint),
+                &sdk_pubkey_to_spl(&token_program),
+            );
+        let user_token_account = Pubkey::new_from_array(user_token_account.to_bytes());
+
+        let ix = dex
+            .build_buy_ix(
+                &token_mint,
+                &bonding_curve,
+                &associated_bonding_curve,
+                &user_token_account,
+                &creator,
+                &token_program,
+                1_000_000,
+                1_050_000,
+            )
+            .expect("build_buy_ix");
+
+        assert_eq!(ix.data.len(), 25);
+        assert_eq!(
+            ix.data[24], 0,
+            "track_volume=false → OptionBool encodes as 0"
+        );
+    }
+
+    #[test]
+    fn test_build_buy_exact_sol_ix_data_includes_track_volume_false() {
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:8899"));
+        let mut dex = PumpFunDex::new(rpc, None).expect("PumpFunDex::new");
+        let wallet =
+            Pubkey::from_str("Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM").expect("wallet");
+        dex.set_user_authority(wallet);
+
+        let creator =
+            Pubkey::from_str("2tFqgkJX6kqz8q6o9tFv3oJ9nQx7n1m3fHk2m8f3oKpZ").expect("creator");
+        let token_mint =
+            Pubkey::from_str("9xQeWvG816bUx9EPfKJb9N9dKz5wW7Yy2hBzXv4mQ4kG").expect("mint");
+        let (bonding_curve, _) = dex.derive_bonding_curve(&token_mint);
+        let token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let (associated_bonding_curve, _) =
+            dex.derive_associated_bonding_curve(&bonding_curve, &token_mint, &token_program);
+        let user_token_account =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &sdk_pubkey_to_spl(&wallet),
+                &sdk_pubkey_to_spl(&token_mint),
+                &sdk_pubkey_to_spl(&token_program),
+            );
+        let user_token_account = Pubkey::new_from_array(user_token_account.to_bytes());
+
+        let ix = dex
+            .build_buy_exact_sol_ix(
+                &token_mint,
+                &bonding_curve,
+                &associated_bonding_curve,
+                &user_token_account,
+                &creator,
+                &token_program,
+                1_250_000,
+                1,
+            )
+            .expect("build_buy_exact_sol_ix");
+
+        assert_eq!(ix.data.len(), 25);
+        assert_eq!(
+            ix.data[0..8],
+            [56, 252, 116, 8, 158, 223, 205, 95],
+            "buy_exact_sol_in discriminator"
+        );
+        assert_eq!(
+            ix.data[24], 0,
+            "track_volume=false → OptionBool encodes as 0"
         );
     }
 }
