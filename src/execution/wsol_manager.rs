@@ -444,8 +444,6 @@ impl WsolManager {
                                 snapshot_wsol_lamports = incoming_wsol,
                                 "WSOL ATA RPC resync failed; keeping pending-wrap floor until snapshot catches up"
                             );
-                            self.pending_wrap_rpc_resync_done
-                                .store(false, Ordering::SeqCst);
                         }
                     }
                 }
