@@ -430,8 +430,8 @@ impl WsolManager {
                             WSOL_BALANCE_LAMPORTS.store(b, Ordering::Relaxed);
                             debug!(
                                 sol = sol as f64 / LAMPORTS_PER_SOL as f64,
-                                wsol = Some(incoming_wsol as f64 / LAMPORTS_PER_SOL as f64),
-                                "Balance update received from JetStream"
+                                wsol = Some(b as f64 / LAMPORTS_PER_SOL as f64),
+                                "WSOL balance applied after pending-wrap RPC resync (cold path)"
                             );
                             return self.check_and_act().await;
                         }
