@@ -211,6 +211,23 @@ impl Treasury {
         Ok(rpc.rpc.get_balance(&self.pubkey()).await?)
     }
 
+    /// Read WSOL (native mint) ATA balance in lamports via RPC (cold-path / bounded resync only).
+    pub async fn fetch_wsol_ata_balance_lamports(&self, rpc: &SolanaRpc) -> Result<u64> {
+        let wsol_mint_sdk = SdkPubkey::new_from_array(spl_token::native_mint::id().to_bytes());
+        let owner = self.pubkey();
+        let ata = spl_to_sdk(&get_associated_token_address_with_program_id(
+            &sdk_to_spl(&owner),
+            &sdk_to_spl(&wsol_mint_sdk),
+            &spl_token_program_id(),
+        ));
+        let bal = rpc.rpc.get_token_account_balance(&ata).await?;
+        let amt = bal
+            .amount
+            .parse::<u64>()
+            .map_err(|e| anyhow!("parse WSOL token account amount: {}", e))?;
+        Ok(amt)
+    }
+
     /// Determine token program for a given mint (spl-token vs token-2022); returns **SDK** Pubkey
     pub async fn token_program_for_mint(
         &self,
