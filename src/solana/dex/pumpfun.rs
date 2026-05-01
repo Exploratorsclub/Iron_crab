@@ -464,18 +464,9 @@ impl PumpFunDex {
         })
     }
 
-    /// Build `buy_exact_sol_in` instruction (market order: exact SOL in, min tokens out).
-    ///
-    /// **Legacy / stable public contract:** instruction data is **24 bytes**
-    /// (8-byte discriminator + two `u64`s). This matches older callers and external
-    /// invariant tests that assert that length.
-    ///
-    /// **Current on-chain IDL** appends `track_volume: OptionBool` (1 byte). For execution
-    /// against live Pump.fun, use [`Self::build_buy_exact_sol_ix_with_track_volume`] or
-    /// [`Self::build_swap_ix_async_with_slippage`] with `market_order = true` (runtime path).
-    ///
-    /// Discriminator: `[56, 252, 116, 8, 158, 223, 205, 95]`. Account layout matches
-    /// [`Self::build_buy_ix`] (17 accounts including `bonding_curve_v2` last).
+    /// Build buy_exact_sol_in instruction (Market Order: exact SOL in, min tokens out = 1)
+    /// Instruction discriminator: [56, 252, 116, 8, 158, 223, 205, 95] (buy_exact_sol_in)
+    /// Account layout: IDENTICAL to build_buy_ix (17 accounts including bonding_curve_v2)
     #[allow(clippy::too_many_arguments)]
     pub fn build_buy_exact_sol_ix(
         &self,
@@ -488,61 +479,6 @@ impl PumpFunDex {
         sol_amount: u64,
         min_tokens_out: u64,
     ) -> Result<Instruction> {
-        self.build_buy_exact_sol_ix_impl(
-            token_mint,
-            bonding_curve,
-            associated_bonding_curve,
-            user_token_account,
-            creator,
-            token_program,
-            sol_amount,
-            min_tokens_out,
-            false,
-        )
-    }
-
-    /// `buy_exact_sol_in` with current IDL `track_volume: OptionBool` appended (`false` → 1 byte `0`).
-    ///
-    /// **Not** the legacy 24-byte public contract — used by the execution hot path for
-    /// `market_order` buys so simulation matches on-chain (e.g. avoids `Custom(6062)`).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn build_buy_exact_sol_ix_with_track_volume(
-        &self,
-        token_mint: &Pubkey,
-        bonding_curve: &Pubkey,
-        associated_bonding_curve: &Pubkey,
-        user_token_account: &Pubkey,
-        creator: &Pubkey,
-        token_program: &Pubkey,
-        sol_amount: u64,
-        min_tokens_out: u64,
-    ) -> Result<Instruction> {
-        self.build_buy_exact_sol_ix_impl(
-            token_mint,
-            bonding_curve,
-            associated_bonding_curve,
-            user_token_account,
-            creator,
-            token_program,
-            sol_amount,
-            min_tokens_out,
-            true,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn build_buy_exact_sol_ix_impl(
-        &self,
-        token_mint: &Pubkey,
-        bonding_curve: &Pubkey,
-        associated_bonding_curve: &Pubkey,
-        user_token_account: &Pubkey,
-        creator: &Pubkey,
-        token_program: &Pubkey,
-        sol_amount: u64,
-        min_tokens_out: u64,
-        include_track_volume: bool,
-    ) -> Result<Instruction> {
         let user = self
             .user_authority
             .ok_or_else(|| anyhow!("user authority not set"))?;
@@ -554,19 +490,18 @@ impl PumpFunDex {
         let fee_program = Pubkey::from_str(PUMPFUN_FEE_PROGRAM)?;
         let (bonding_curve_v2, _) = Self::derive_bonding_curve_v2(token_mint);
 
-        let data_len = 24usize + usize::from(include_track_volume);
-        let mut data = Vec::with_capacity(data_len);
+        // Data: discriminator(8) + spendable_sol_in(8) + min_tokens_out(8) + track_volume OptionBool(1)
+        let mut data = Vec::with_capacity(25);
         data.extend_from_slice(&[56, 252, 116, 8, 158, 223, 205, 95]);
         data.extend_from_slice(&sol_amount.to_le_bytes());
         data.extend_from_slice(&min_tokens_out.to_le_bytes());
-        if include_track_volume {
-            data.push(TRACK_VOLUME_OPTION_BOOL_FALSE);
-            debug!(
-                token_mint = %token_mint,
-                track_volume = false,
-                "pump.fun buy_exact_sol_in: instruction data includes track_volume (OptionBool)"
-            );
-        }
+        data.push(TRACK_VOLUME_OPTION_BOOL_FALSE);
+
+        debug!(
+            token_mint = %token_mint,
+            track_volume = false,
+            "pump.fun buy_exact_sol_in: instruction data includes track_volume (OptionBool)"
+        );
 
         Ok(Instruction {
             program_id: self.program_id,
@@ -1373,7 +1308,7 @@ impl PumpFunDex {
                     min_tokens_out = 1u64,
                     "pump.fun MARKET ORDER BUY: exact SOL in, min tokens out = 1"
                 );
-                self.build_buy_exact_sol_ix_with_track_volume(
+                self.build_buy_exact_sol_ix(
                     &token_mint,
                     &bonding_curve,
                     &associated_bonding_curve,
@@ -1558,7 +1493,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_buy_exact_sol_ix_legacy_public_contract_24_bytes() {
+    fn test_build_buy_exact_sol_ix_data_includes_track_volume_false() {
         let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:8899"));
         let mut dex = PumpFunDex::new(rpc, None).expect("PumpFunDex::new");
         let wallet =
@@ -1593,55 +1528,6 @@ mod tests {
                 1,
             )
             .expect("build_buy_exact_sol_ix");
-
-        assert_eq!(
-            ix.data.len(),
-            24,
-            "public legacy contract: no track_volume byte"
-        );
-        assert_eq!(
-            ix.data[0..8],
-            [56, 252, 116, 8, 158, 223, 205, 95],
-            "buy_exact_sol_in discriminator"
-        );
-    }
-
-    #[test]
-    fn test_build_buy_exact_sol_ix_with_track_volume_current_idl_25_bytes() {
-        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:8899"));
-        let mut dex = PumpFunDex::new(rpc, None).expect("PumpFunDex::new");
-        let wallet =
-            Pubkey::from_str("Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM").expect("wallet");
-        dex.set_user_authority(wallet);
-
-        let creator =
-            Pubkey::from_str("2tFqgkJX6kqz8q6o9tFv3oJ9nQx7n1m3fHk2m8f3oKpZ").expect("creator");
-        let token_mint =
-            Pubkey::from_str("9xQeWvG816bUx9EPfKJb9N9dKz5wW7Yy2hBzXv4mQ4kG").expect("mint");
-        let (bonding_curve, _) = dex.derive_bonding_curve(&token_mint);
-        let token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
-        let (associated_bonding_curve, _) =
-            dex.derive_associated_bonding_curve(&bonding_curve, &token_mint, &token_program);
-        let user_token_account =
-            spl_associated_token_account::get_associated_token_address_with_program_id(
-                &sdk_pubkey_to_spl(&wallet),
-                &sdk_pubkey_to_spl(&token_mint),
-                &sdk_pubkey_to_spl(&token_program),
-            );
-        let user_token_account = Pubkey::new_from_array(user_token_account.to_bytes());
-
-        let ix = dex
-            .build_buy_exact_sol_ix_with_track_volume(
-                &token_mint,
-                &bonding_curve,
-                &associated_bonding_curve,
-                &user_token_account,
-                &creator,
-                &token_program,
-                1_250_000,
-                1,
-            )
-            .expect("build_buy_exact_sol_ix_with_track_volume");
 
         assert_eq!(ix.data.len(), 25);
         assert_eq!(
