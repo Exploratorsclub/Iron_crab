@@ -59,6 +59,11 @@ pub const PUMPFUN_EVENT_AUTHORITY: &str = "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7
 /// Pump.fun fee program (new accounts added to protocol)
 pub const PUMPFUN_FEE_PROGRAM: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 
+/// One of Pump.fun's documented buyback/fee recipient accounts (Apr 2026 breaking fee-recipient upgrade).
+/// Must be appended **after** `bonding_curve_v2` on bonding-curve BUY/SELL; must be writable on-chain.
+/// See: pump-public-docs `BREAKING_FEE_RECIPIENT.md`.
+pub const PUMPFUN_BUYBACK_FEE_RECIPIENT: &str = "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD";
+
 /// Borsh serialization of IDL `OptionBool` with inner `false` (one bool field → 1 byte).
 /// Pump.fun `buy` / `buy_exact_sol_in` require this as the third instruction-data argument.
 const TRACK_VOLUME_OPTION_BOOL_FALSE: u8 = 0;
@@ -252,7 +257,7 @@ impl PumpFunDex {
     }
 
     /// Derive bonding curve v2 PDA (required since Feb 2026 cashback upgrade).
-    /// Must be included as last account in BUY and SELL instructions.
+    /// In BUY/SELL account lists it appears before the buyback fee recipient (Apr 2026 layout).
     pub fn derive_bonding_curve_v2(token_mint: &Pubkey) -> (Pubkey, u8) {
         let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).expect("valid pumpfun program id");
         Pubkey::find_program_address(&[b"bonding-curve-v2", token_mint.as_ref()], &program_id)
@@ -366,7 +371,7 @@ impl PumpFunDex {
     /// Build buy instruction (SOL → Token)
     /// Instruction discriminator: 0x66063d1201daebea (8 bytes)
     ///
-    /// UPDATED: Now requires 17 accounts (bonding_curve_v2 last; protocol update added fee-related accounts)
+    /// UPDATED: 18 accounts — `bonding_curve_v2` then writable buyback fee recipient (Apr 2026).
     #[allow(clippy::too_many_arguments)]
     pub fn build_buy_ix(
         &self,
@@ -390,6 +395,7 @@ impl PumpFunDex {
         let (fee_config, fc_bump) = Self::derive_fee_config();
         let fee_program = Pubkey::from_str(PUMPFUN_FEE_PROGRAM)?;
         let (bonding_curve_v2, _) = Self::derive_bonding_curve_v2(token_mint);
+        let buyback_fee_recipient = Pubkey::from_str(PUMPFUN_BUYBACK_FEE_RECIPIENT)?;
 
         // Log derived PDAs for debugging
         debug!(
@@ -459,6 +465,8 @@ impl PumpFunDex {
                 AccountMeta::new_readonly(fee_program, false),
                 // #17 (16): Bonding Curve V2 - readonly (required since Feb 2026 cashback upgrade)
                 AccountMeta::new_readonly(bonding_curve_v2, false),
+                // #18 (17): Buyback / fee recipient — writable, after bonding_curve_v2 (Apr 2026)
+                AccountMeta::new(buyback_fee_recipient, false),
             ],
             data,
         })
@@ -466,7 +474,7 @@ impl PumpFunDex {
 
     /// Build buy_exact_sol_in instruction (Market Order: exact SOL in, min tokens out = 1)
     /// Instruction discriminator: [56, 252, 116, 8, 158, 223, 205, 95] (buy_exact_sol_in)
-    /// Account layout: IDENTICAL to build_buy_ix (17 accounts including bonding_curve_v2)
+    /// Account layout: IDENTICAL to build_buy_ix (18 accounts)
     #[allow(clippy::too_many_arguments)]
     pub fn build_buy_exact_sol_ix(
         &self,
@@ -489,6 +497,7 @@ impl PumpFunDex {
         let (fee_config, _) = Self::derive_fee_config();
         let fee_program = Pubkey::from_str(PUMPFUN_FEE_PROGRAM)?;
         let (bonding_curve_v2, _) = Self::derive_bonding_curve_v2(token_mint);
+        let buyback_fee_recipient = Pubkey::from_str(PUMPFUN_BUYBACK_FEE_RECIPIENT)?;
 
         // Data: discriminator(8) + spendable_sol_in(8) + min_tokens_out(8) + track_volume OptionBool(1)
         let mut data = Vec::with_capacity(25);
@@ -523,6 +532,7 @@ impl PumpFunDex {
                 AccountMeta::new_readonly(fee_config, false),
                 AccountMeta::new_readonly(fee_program, false),
                 AccountMeta::new_readonly(bonding_curve_v2, false),
+                AccountMeta::new(buyback_fee_recipient, false),
             ],
             data,
         })
@@ -531,7 +541,7 @@ impl PumpFunDex {
     /// Build sell instruction (Token → SOL)
     /// Instruction discriminator: 0x33e685a4017f83ad (8 bytes)
     ///
-    /// Account count: 15 (non-cashback) or 16 (cashback). bonding_curve_v2 is always last.
+    /// Account count: 16 (non-cashback) or 17 (cashback). Last account is buyback fee recipient.
     #[allow(clippy::too_many_arguments)]
     pub fn build_sell_ix(
         &self,
@@ -554,6 +564,7 @@ impl PumpFunDex {
         let (fee_config, _) = Self::derive_fee_config();
         let fee_program = Pubkey::from_str(PUMPFUN_FEE_PROGRAM)?;
         let (bonding_curve_v2, _) = Self::derive_bonding_curve_v2(token_mint);
+        let buyback_fee_recipient = Pubkey::from_str(PUMPFUN_BUYBACK_FEE_RECIPIENT)?;
         let (user_volume_accumulator, _) = self.derive_user_volume_accumulator(&user);
 
         // Instruction data: discriminator (8 bytes) + amount (8 bytes) + min_output (8 bytes)
@@ -584,7 +595,8 @@ impl PumpFunDex {
         if cashback_enabled {
             accounts.push(AccountMeta::new(user_volume_accumulator, false)); // 14: user_volume_accumulator
         }
-        accounts.push(AccountMeta::new_readonly(bonding_curve_v2, false)); // 14 or 15: bonding_curve_v2
+        accounts.push(AccountMeta::new_readonly(bonding_curve_v2, false)); // before buyback recipient
+        accounts.push(AccountMeta::new(buyback_fee_recipient, false)); // last: buyback fee recipient
 
         Ok(Instruction {
             program_id: self.program_id,
@@ -1490,6 +1502,21 @@ mod tests {
             ix.data[24], 0,
             "track_volume=false → OptionBool encodes as 0"
         );
+
+        assert_eq!(
+            ix.accounts.len(),
+            18,
+            "BUY must have 18 accounts (buyback fee recipient after v2)"
+        );
+        let expected_buyback =
+            Pubkey::from_str(PUMPFUN_BUYBACK_FEE_RECIPIENT).expect("buyback pubkey");
+        let (bonding_curve_v2, _) = PumpFunDex::derive_bonding_curve_v2(&token_mint);
+        assert_eq!(ix.accounts[16].pubkey, bonding_curve_v2);
+        assert!(!ix.accounts[16].is_writable, "bonding_curve_v2 is readonly");
+        let tail = ix.accounts.last().expect("buyback tail");
+        assert_eq!(tail.pubkey, expected_buyback);
+        assert!(tail.is_writable, "buyback fee recipient must be writable");
+        assert!(!tail.is_signer);
     }
 
     #[test]
@@ -1539,5 +1566,120 @@ mod tests {
             ix.data[24], 0,
             "track_volume=false → OptionBool encodes as 0"
         );
+
+        assert_eq!(
+            ix.accounts.len(),
+            18,
+            "buy_exact_sol_in must have 18 accounts (buyback fee recipient after v2)"
+        );
+        let expected_buyback =
+            Pubkey::from_str(PUMPFUN_BUYBACK_FEE_RECIPIENT).expect("buyback pubkey");
+        let (bonding_curve_v2, _) = PumpFunDex::derive_bonding_curve_v2(&token_mint);
+        assert_eq!(ix.accounts[16].pubkey, bonding_curve_v2);
+        assert!(!ix.accounts[16].is_writable);
+        let tail = ix.accounts.last().expect("buyback tail");
+        assert_eq!(tail.pubkey, expected_buyback);
+        assert!(tail.is_writable);
+        assert!(!tail.is_signer);
+    }
+
+    #[test]
+    fn test_build_sell_ix_non_cashback_tail_buyback_fee_recipient() {
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:8899"));
+        let mut dex = PumpFunDex::new(rpc, None).expect("PumpFunDex::new");
+        let wallet =
+            Pubkey::from_str("Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM").expect("wallet");
+        dex.set_user_authority(wallet);
+
+        let creator =
+            Pubkey::from_str("2tFqgkJX6kqz8q6o9tFv3oJ9nQx7n1m3fHk2m8f3oKpZ").expect("creator");
+        let token_mint =
+            Pubkey::from_str("9xQeWvG816bUx9EPfKJb9N9dKz5wW7Yy2hBzXv4mQ4kG").expect("mint");
+        let (bonding_curve, _) = dex.derive_bonding_curve(&token_mint);
+        let token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let (associated_bonding_curve, _) =
+            dex.derive_associated_bonding_curve(&bonding_curve, &token_mint, &token_program);
+        let user_token_account =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &sdk_pubkey_to_spl(&wallet),
+                &sdk_pubkey_to_spl(&token_mint),
+                &sdk_pubkey_to_spl(&token_program),
+            );
+        let user_token_account = Pubkey::new_from_array(user_token_account.to_bytes());
+
+        let ix = dex
+            .build_sell_ix(
+                &token_mint,
+                &bonding_curve,
+                &associated_bonding_curve,
+                &user_token_account,
+                &creator,
+                &token_program,
+                1_000_000,
+                1,
+                false,
+            )
+            .expect("build_sell_ix non-cashback");
+
+        assert_eq!(ix.accounts.len(), 16);
+        let expected_buyback =
+            Pubkey::from_str(PUMPFUN_BUYBACK_FEE_RECIPIENT).expect("buyback pubkey");
+        let (bonding_curve_v2, _) = PumpFunDex::derive_bonding_curve_v2(&token_mint);
+        assert_eq!(ix.accounts[14].pubkey, bonding_curve_v2);
+        assert!(!ix.accounts[14].is_writable);
+        let tail = ix.accounts.last().expect("buyback tail");
+        assert_eq!(tail.pubkey, expected_buyback);
+        assert!(tail.is_writable);
+        assert!(!tail.is_signer);
+    }
+
+    #[test]
+    fn test_build_sell_ix_cashback_tail_buyback_fee_recipient() {
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:8899"));
+        let mut dex = PumpFunDex::new(rpc, None).expect("PumpFunDex::new");
+        let wallet =
+            Pubkey::from_str("Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM").expect("wallet");
+        dex.set_user_authority(wallet);
+
+        let creator =
+            Pubkey::from_str("2tFqgkJX6kqz8q6o9tFv3oJ9nQx7n1m3fHk2m8f3oKpZ").expect("creator");
+        let token_mint =
+            Pubkey::from_str("9xQeWvG816bUx9EPfKJb9N9dKz5wW7Yy2hBzXv4mQ4kG").expect("mint");
+        let (bonding_curve, _) = dex.derive_bonding_curve(&token_mint);
+        let token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let (associated_bonding_curve, _) =
+            dex.derive_associated_bonding_curve(&bonding_curve, &token_mint, &token_program);
+        let user_token_account =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &sdk_pubkey_to_spl(&wallet),
+                &sdk_pubkey_to_spl(&token_mint),
+                &sdk_pubkey_to_spl(&token_program),
+            );
+        let user_token_account = Pubkey::new_from_array(user_token_account.to_bytes());
+
+        let ix = dex
+            .build_sell_ix(
+                &token_mint,
+                &bonding_curve,
+                &associated_bonding_curve,
+                &user_token_account,
+                &creator,
+                &token_program,
+                1_000_000,
+                1,
+                true,
+            )
+            .expect("build_sell_ix cashback");
+
+        assert_eq!(ix.accounts.len(), 17);
+        let expected_buyback =
+            Pubkey::from_str(PUMPFUN_BUYBACK_FEE_RECIPIENT).expect("buyback pubkey");
+        let (bonding_curve_v2, _) = PumpFunDex::derive_bonding_curve_v2(&token_mint);
+        assert_eq!(ix.accounts[15].pubkey, bonding_curve_v2);
+        assert!(!ix.accounts[15].is_writable);
+        let tail = ix.accounts.last().expect("buyback tail");
+        assert_eq!(tail.pubkey, expected_buyback);
+        assert!(tail.is_writable);
+        assert!(!tail.is_signer);
     }
 }
