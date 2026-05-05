@@ -1,6 +1,1140 @@
-# IronCrab — BUGS_FIXES
+# IronCrab — Bug-Tracker & Fixes
 
-## FIX-45 Momentum Drawdown from ATH falsch (2025-04-XX)
+Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
+
+---
+
+## 1. BEHOBENE BUGS (Fixes deployed/committed)
+
+### FIX-01: Revert fehlerhafter Commits → `e341c04b`
+**Datum**: 2026-02-09
+**Problem**: 18 Commits (bis `b22bb0a9`) hatten ungewollt die Liquidation zerstört und Architekturprinzipien verletzt (RPC-Calls im Hot Path).
+**Fix**: Hard-Reset auf `e341c04b`, danach selektive Re-Integration.
+
+### FIX-02: Multi-DEX Retry-Pfad für Liquidation
+**Datum**: 2026-02-09
+**Problem**: Bei `BondingCurveComplete` (Error 6005) wurde nur ein DEX versucht. Zweiter Token wurde nicht über PumpSwap AMM probiert.
+**Fix**: Liquidation versucht jetzt Multi-Pool zuerst, PumpFun als Fallback. Alle DEXes werden durchprobiert.
+
+### FIX-44: 6005-Retry-Mechanismus in Liquidation (ARCHITECTURE_AUDIT A.4)
+**Datum**: 2026-02-25
+**Problem**: Wenn eine Liquidation-Sell-Route über PumpFun Bonding Curve gewählt wurde und die Simulation mit 6005 (BondingCurveComplete) fehlschlägt, wurde der Intent verworfen statt mit PumpSwap AMM zu retrien.
+**Fix**: Automatischer Retry: Bei Sim-Fail mit 6005 und dex=pumpfun wird `mark_pumpfun_complete_for_mint` gesetzt, eine frische PumpSwap-Quote geholt und ein neuer Intent mit pump_amm erstellt und verarbeitet. Library-Funktion `ironcrab::execution::error_detection::is_6005_bonding_curve_complete` für Fehlererkennung.
+
+### FIX-03: Grafana Liquidation als "buy" angezeigt
+**Datum**: 2026-02-09
+**Problem**: Liquidation-Sells wurden im Dashboard als "buy" klassifiziert.
+**Fix**: `side`-Feld korrekt in ExecutionResult Metadata gesetzt.
+
+### FIX-04: PnL-Berechnung >100% Verlust
+**Datum**: 2026-02-09
+**Problem**: PnL zeigte >100% Verlust für erfolgreich verkaufte Tokens.
+**Fix**: PnL-Berechnung in `trades_server.py` korrigiert (Division durch korrekte Basis).
+
+### FIX-05: Geyser Reconnect bei neuer ATA
+**Datum**: 2026-02-11
+**Problem**: Jedes Mal wenn ein Token gekauft wurde und eine neue ATA erstellt wurde, musste der gesamte Geyser-Stream reconnecten (`subscribe_once()`).
+**Fix**: Migration von `subscribe_once()` zu `subscribe_with_request()` + `SinkExt` in 3 Modulen. Neue ATAs werden dynamisch hinzugefügt ohne Stream-Reconnect.
+
+### FIX-06: Bonding Curve Exit Signal für Momentum-Bot
+**Datum**: 2026-02-11
+**Problem**: Kein Exit-Signal basierend auf Bonding-Curve-Fortschritt. Tokens konnten nicht automatisch verkauft werden bevor die Curve migriert.
+**Fix**: Neuer konfigurierbarer `bonding_curve_exit_threshold` (Default 98%) mit Hot-Reload via UI. Basiert auf Geyser-Daten, keine RPC-Calls.
+
+### FIX-07: Grafana Dashboard — Run-basierte Trades & 24h PnL
+**Datum**: 2026-02-11
+**Problem**: Dashboard zeigte nur 20 Trades; kein 24h PnL-Wert.
+**Fix**: Alle Trades des aktuellen Runs + letzte 20 vom vorigen Run. Neue Panels für Wallet-Delta und Realized PnL.
+
+### FIX-08: WALLET_TOTAL_SOL_LAMPARTS Metrik (Locked Capital)
+**Datum**: 2026-02-11
+**Problem**: Metrik enthielt nur unlocked SOL, nicht das in Trades gebundene Kapital.
+**Fix**: `total_sol()` + `wsol_balance()` aus LockManager statt nur `available_sol()`.
+
+### FIX-09: Sensitive Credentials in Version Control
+**Datum**: 2026-02-11
+**Problem**: Server-IP, Username und Port in `.github/copilot-instructions.md`.
+**Fix**: Credentials durch Platzhalter ersetzt.
+
+### FIX-10: WsolManager Konsistenz (LockManager.available_wsol)
+**Datum**: 2026-02-12
+**Problem**: `fetch_and_update_balances()` aktualisierte Prometheus-Gauge aber nicht `LockManager.available_wsol`.
+**Fix**: WSOL-Updates werden konsistent über LockManager propagiert.
+
+### FIX-11: WsolManager RPC-Fallback entfernt
+**Datum**: 2026-02-12
+**Problem**: 60s RPC-Polling im NATS-Modus verletzte Geyser-First-Architektur.
+**Fix**: RPC-Fallback und Polling-Only-Modus entfernt. WsolManager arbeitet vollständig über NATS/Geyser-Events.
+
+### FIX-12: Doppelter JetStream Consumer in execution-engine
+**Datum**: 2026-02-12
+**Problem**: `execution_engine` erstellte zwei separate ephemere JetStream-Consumer für `POOL_CACHE` Updates → Race Conditions, verpasste Updates, Delays.
+**Fix**: Einzelner Consumer wird wiederverwendet für Bootstrap und Runtime.
+**Commit**: `a29ecfb6`
+
+### FIX-13: RPC-Fallback für Creator bei Liquidation
+**Datum**: 2026-02-12
+**Problem**: PumpFun-Liquidation scheiterte wenn Creator nicht im LivePoolCache war.
+**Fix**: Bei Liquidation wird Creator per RPC nachgeladen falls nicht im Cache (Cold Path — architekturkonform).
+**Commit**: `a29ecfb6`
+
+### FIX-14: Ghost Positions durch stale JetStream Snapshots
+**Datum**: 2026-02-12
+**Problem**: `MAX_BOOTSTRAP_MINTS=30` begrenzte den Bootstrap. Stale non-zero JetStream-Einträge blieben bestehen → falsche Open-Position-Anzeige.
+**Fix**: Step 2.5 in market-data Bootstrap: Alle verbleibenden JetStream-Einträge werden enumeriert, zero-balance Overrides für nicht abgedeckte non-zero Mints publiziert.
+**Commit**: `43941752`
+
+### FIX-15: Hardcoded quote_mint in DEX-Parsern (Bug H)
+**Datum**: 2026-02-12
+**Problem**: `parse_meteora_transaction()`, `parse_raydium_cpmm_transaction()` und `parse_raydium_v4_swap()` setzten `quote_mint = SOL_MINT_PUBKEY` hardcoded → false Arbitrage-Signale für non-SOL Pairs.
+**Fix**: Dynamische quote_mint-Extraktion aus Transaction-Token-Balances.
+**Commit**: `0b1b724e`
+
+### FIX-16: Initiales WalletBalanceUpdate bei market-data Startup
+**Datum**: 2026-02-13
+**Problem**: execution-engine startete mit Default 1.0 SOL und wurde erst beim ersten Geyser-Event aktualisiert → falsche WSOL/SOL-Anzeige, kein Wrapping.
+**Fix**: market-data publiziert beim Bootstrap ein initiales `WalletBalanceUpdate` mit SOL+WSOL-Balances.
+**Commit**: `c1e8d667`
+
+### FIX-17: fill_in/fill_out Accuracy (False Take-Profit Triggers)
+**Datum**: 2026-02-13
+**Schweregrad**: CRITICAL
+**Problem**: Bei BUY mit `lamport_noise=true` fiel `fill_in` auf `intent.required_capital` zurück → bis zu 29x falsch. SELL `fill_out` war immer `None` bei ATA-Lifecycle. Falsche entry_price → falsche Take-Profit/Stop-Loss Entscheidungen.
+**Fix**: Dreistufige Fallback-Kette: (1) Inner-Instruction-Parsing für System.transfer, (2) Rent-Adjusted Lamport Delta, (3) intent capital als letzter Ausweg. Dashboard PnL konsistent auf wallet_delta umgestellt.
+**Dateien**: `src/bin/execution_engine.rs`, `scripts/trades_server.py`
+
+### FIX-18: Bug B — Orphaned Buy Recovery
+**Datum**: 2026-02-13
+**Problem**: Race Condition: `cleanup_stale_pending()` entfernte pending intent bevor `ExecutionResult` ankam → Position nie erstellt → kein Sell.
+**Fix**: Orphaned Buy Recovery: Wenn confirmed BUY ohne pending intent → Position aus ExecutionResult + TokenTracker rekonstruieren.
+**Dateien**: `src/bin/momentum_bot.rs`
+
+### FIX-19: Bug C — Sell-Retry nach Failure/Timeout
+**Datum**: 2026-02-13
+**Problem**: `exit_generated` wurde bei Sell-Failures nicht zurückgesetzt → kein Retry bis `max_hold_time` + `reconcile_timed_exits()`.
+**Fix**: Unconditional Reset von `exit_generated` in Failed/Timeout Handlern für Sell-Side. Gilt für normalen und orphaned Pfad.
+**Dateien**: `src/bin/momentum_bot.rs`
+
+### FIX-23: PumpSwap AMM Geyser-First Discovery (P1 Cherry-Pick)
+**Datum**: 2026-02-14
+**Problem**: `discover_pool_static()` ging direkt zu RPC (`getProgramAccounts` + `getMultipleAccounts`) — ~500-3000ms Latenz — obwohl der LivePoolCache bereits alle 14 Pool-Accounts hatte.
+**Fix**: LivePoolCache-Check am Anfang von `discover_pool_static()`: Konstruiert `PumpAmmPoolStatic` direkt aus den 14 gecachten `pool_accounts` (ZERO RPC). RPC-Fallback bleibt für uncached Pools. Zusätzlich: Bounds-Check in `pool_accounts_v1_for_base_mint()` von `>= 12` auf `>= 14` korrigiert (verhindert Out-of-Bounds Panics).
+**Dateien**: `src/solana/dex/pumpfun_amm.rs`
+
+### FIX-PNL: CRITICAL — Invertierte PnL-Formel (tokens_per_sol)
+**Datum**: 2026-02-14
+**Schweregrad**: CRITICAL — Alle Exit-Signale (Take-Profit, Stop-Loss, Drawdown) waren invertiert
+**Problem**: `pnl_pct()`, `update_price()`, `drawdown_from_ath_pct()` und `add_investment()` in `momentum_bot.rs` verwendeten Formeln für `SOL_per_token` Preise, obwohl intern `tokens_per_SOL` Preise verwendet werden (höherer Wert = billigerer Token). Folge:
+- Take-Profit feuerte bei Verlusten, Stop-Loss bei Gewinnen
+- `highest_price` trackte den teuersten Preis (höchster `tokens_per_sol` = billigster Token) statt den besten Preis für den Holder
+- Server-Log-Evidenz: "TAKE_PROFIT +167%" bei tatsächlich -20% PnL
+
+**Fix**:
+- `pnl_pct()`: `((current - entry) / entry) * 100` → `((entry / current) - 1) * 100`
+- `update_price()`: `if new > highest` → `if new < highest` (niedrigster tokens_per_sol = bester Preis)
+- `drawdown_from_ath_pct()`: `((highest - current) / highest) * 100` → `((current / highest) - 1) * 100`
+- `add_investment()`: `.max()` → `.min()` für highest_price Tracking
+**Dateien**: `src/bin/momentum_bot.rs`
+**Commit**: `31b0d56c`
+
+### FIX-24: Ghost Open Positions + Wallet Balance Bootstrap
+**Datum**: 2026-02-17
+**Problem A — Ghost Open Positions**: Nach einem Neustart zeigte `OPEN_POSITIONS_GAUGE` 8-10 statt der tatsächlich offenen Positionen (~1). Bootstrap las stale JetStream Wallet-Snapshots mit Non-Zero-Balances für bereits verkaufte Tokens → `open_positions = 8`. Geyser korrigierte die Balances auf 0 in LockManager, aber `open_positions` wurde NUR bei bestätigten BUY/SELL Trades aktualisiert, nicht bei Balance-Transitionen via Geyser.
+
+**Problem B — Wallet Balance Start = 1.0 SOL**: `initial_sol_lamports` CLI-Argument hatte Default 1 SOL (hardcoded). Die initiale `WalletBalanceUpdate` von market-data ging über Core NATS (fire-and-forget), execution-engine hatte ggf. noch nicht subscribed → Message verloren.
+
+**Problem C — Doppelter JetStream Consumer**: Zwei unabhängige Consumers für `WALLET_SNAPSHOT`-Stream: Background-Task (tokio::spawn) + Main-Loop-Handler. Redundant.
+
+**Fix**:
+1. Main-Loop Balance-Transitionen: `non-zero → 0` decrementiert `open_positions`, `0 → non-zero` inkrementiert
+2. SOL/WSOL JetStream Bootstrap: `bootstrap_token_balances_from_wallet_snapshot()` liest jetzt auch SOL (`NATIVE_SOL` Sentinel) und WSOL aus JetStream
+3. market-data publiziert SOL/WSOL als WalletBalanceSnapshot zu JetStream (persistent, kein fire-and-forget)
+4. Redundanten Background-Task entfernt (single consumer im Main-Loop)
+**Dateien**: `src/bin/execution_engine.rs`, `src/bin/market_data.rs`
+**Commits**: `5b359806`, `e5b2a0eb`
+
+### FIX-26: Market-Data WSOL-Seeding & Pool-Propagation (Rest)
+**Datum**: 2026-02-18
+**Problem**: Nach FIX-16 + FIX-24 waren noch 4 Punkte aus dem P2 Cherry-Pick "WSOL-Seeding & Pool-Propagation" offen:
+
+1. **SELL → JetStream zero-balance + ATA Untracking**: Geyser liefert keine Updates für geschlossene/gelöschte Token Accounts. Bei einem confirmed SELL mit `close_token_ata=true` blieb ein staler non-zero JetStream-Eintrag bestehen → Ghost Positions nach Restart.
+2. **PumpAmm `pool_accounts` an `creator` gekoppelt**: `PoolCacheUpdate` Metadata für PumpAmm wurde nur propagiert wenn `creator` vorhanden war. Downstream (SLAVE Caches) benötigen `pool_accounts` unabhängig vom Creator.
+3. **Kein MASTER LivePoolCache Fallback**: Wenn Geyser-Parse leere `pool_accounts` lieferte, gab es keinen Fallback auf den MASTER Cache.
+4. **Stille `continue` bei fehlender Metadata**: Fehlende `token_account`/`token_program` in `ExecutionResult` wurde ohne Warnung übersprungen.
+
+**Fix**:
+1. Im ExecutionResult-Handler: Bei confirmed SELL → `WalletBalanceSnapshot(balance_raw: 0)` an JetStream + Core NATS publizieren + ATA aus Geyser-Tracking entfernen
+2. PumpAmm PoolCacheUpdate Metadata: `pool_accounts` und `creator` jetzt unabhängig voneinander propagiert
+3. DexPoolAccounts → MASTER LivePoolCache populieren; PoolCacheUpdate-Builder nutzt Fallback auf MASTER Cache via `get_pump_amm_pool_accounts()`
+4. `warn!` Logs bei fehlender `token_account`/`token_program` Metadata
+
+**Dateien**: `src/bin/market_data.rs`, `src/execution/live_pool_cache.rs`
+
+### FIX-29: Audit-B — Raydium RPC-Elimination (Serum-Account Caching)
+**Datum**: 2026-02-18
+**Problem**: Raydium Swaps hatten zwei RPC-Bottlenecks im Hot Path:
+1. `load_pool_from_geyser()` mit 20 RPC-Retries × 500ms = bis zu 10s Latenz
+2. `fetch_and_populate_serum_accounts()` wurde **immer** aufgerufen (auch bei Cache-Hit), obwohl Serum/OpenBook Accounts statisch sind
+
+**Root Cause**: Serum/OpenBook Market Accounts (bids, asks, event_queue) wurden nie gecacht. Jeder Raydium Trade brauchte einen RPC-Call für diese statischen Daten.
+
+**Fix**:
+1. `live_pool_cache.rs`: `set_raydium_serum_accounts()` Methode hinzugefügt
+2. `pool_cache_sync.rs`: Serum-Metadata (`serum_bids`, `serum_asks`, `serum_event_queue`, `market_id`) aus PoolCacheUpdate parsen
+3. `tx_builder.rs`: Serum-Accounts aus Cache nutzen, RPC nur bei Cache-Miss. Nach RPC-Fetch in SLAVE Cache zurückschreiben
+4. `market_data.rs`: Einmaliger Cold Path RPC pro Pool via `tokio::spawn`, Ergebnis in MASTER Cache + PoolCacheUpdate Metadata propagiert. `raydium_serum_fetched` Set verhindert doppelte Fetches
+5. `raydium.rs`: Retry-Count 20→3, Delay 500→300ms. Max Latenz 10s→0.9s
+
+**Ergebnis**: Raydium Swaps auf bekannten Pools: **ZERO RPC-Calls im Hot Path**. Neue Pools: 1x RPC in market-data (Cold Path), danach gecacht und via NATS propagiert.
+**Dateien**: `src/execution/live_pool_cache.rs`, `src/execution/pool_cache_sync.rs`, `src/execution/tx_builder.rs`, `src/bin/market_data.rs`, `src/solana/dex/raydium.rs`
+
+### FIX-28: TX-Builder Cache-capped min_out (P2 Cherry-Pick)
+**Datum**: 2026-02-18
+**Problem**: Bei PumpFun BUY-Transaktionen wurde `min_out` aus dem TradeIntent direkt übernommen, ohne gegen einen frischen Cache-Quote zu prüfen. Wenn sich die Bonding Curve zwischen Intent-Erstellung und TX-Build verschob (schnelle Kursbewegungen), war `min_out` zu hoch → Error 6002 ("Too much SOL required" / SlippageExceeded) on-chain.
+**Root Cause**: `build_tx_plan()` nutzte `min_out` aus dem Intent ohne Capping. Die `calculate_fresh_min_out()` Infrastruktur existierte bereits, wurde aber nur aufgerufen wenn `min_out` im Intent **fehlte**.
+**Fix**: Beide Werte (Intent + Cache) werden berechnet. Bei zwei vorhandenen Werten wird das Minimum (konservativere) verwendet. Logging zeigt das Delta in Prozent wenn gecappt wird. Kein Fallback geändert — wenn nur ein Wert verfügbar ist, wird er wie bisher verwendet.
+**Datei**: `src/execution/tx_builder.rs`
+
+### FIX-27: Fehlende `[[bin]]` Einträge in Cargo.toml
+**Datum**: 2026-02-18
+**Problem**: `autobins = false` in `Cargo.toml` deaktiviert automatische Binary-Erkennung. `src/bin/burn_manual_keyless.rs` und `src/bin/manual_swap.rs` hatten gültige `#[tokio::main] async fn main()` Funktionen, waren aber nicht in den `[[bin]]` Sektionen deklariert → konnten nicht gebaut werden.
+**Fix**: `[[bin]]` Einträge für `burn-manual-keyless` und `manual-swap` hinzugefügt.
+**Datei**: `Cargo.toml`
+
+### FIX-25: DEX-Normalisierung + Creator-Scope (P2 Cherry-Pick)
+**Datum**: 2026-02-18
+**Problem 1 — Nicht-kanonische DEX-Namen**: Drei separate `DexType` Enums mit unterschiedlichen `to_string()` Outputs. `arbitrage/types.rs` produzierte `"raydium_amm_v4"` (statt `"raydium"`) und `"pump_swap_amm"` (statt `"pump_amm"`). Consumer-Code hatte ~25 defensive Multi-Varianten-Checks für Varianten die nie ankamen.
+
+**Problem 2 — Creator für pump_amm erzwungen**: `momentum_bot.rs` erzwang Creator für `pump_amm`/`pumpswap`/`PumpFunAmm` bei BUY und SELL Intents (`ok_or_else → Error`), obwohl `tx_builder.rs` den Creator NUR für `pumpfun` (Bonding Curve) verwendet. PumpSwap AMM nutzt `pool_accounts` (14 Accounts), nicht den Creator.
+
+**Fix**:
+1. `arbitrage/types.rs`: `as_str()` auf kanonische Namen korrigiert (`"raydium"`, `"pump_amm"`)
+2. `market_data.rs`: Hardcoded `"pump_amm"` → `DexType::PumpFunAmm.to_string()`
+3. `momentum_bot.rs`: SELL Creator-Scope korrigiert — Creator nur für `"pumpfun"` Pflicht, optional für andere DEXes
+4. `ipc/schema.rs`: Doc-Kommentar aktualisiert
+5. Viele Consumer-Bereinigungen waren bereits in früheren Fixes erfolgt (execution_engine, cross_dex_handler, tx_builder, pool_cache_sync)
+**Dateien**: `src/arbitrage/types.rs`, `src/bin/market_data.rs`, `src/bin/momentum_bot.rs`, `src/ipc/schema.rs`
+
+---
+
+## 2. BEKANNTE OFFENE ISSUES
+
+### ISSUE-1: `duplicate field slot` Deserialisierungsfehler
+**Schweregrad**: NIEDRIG (Warn-Level, verhindert einzelne Events)
+**Symptom**: `Failed to deserialize MarketEvent error=duplicate field 'slot' at line 1 column 295` in momentum-bot und arb-strategy.
+**Root Cause**: `MarketEvent` hat `slot: Option<u64>` auf Top-Level UND `#[serde(flatten)]` auf `kind: MarketEventKind`. `LatestBlockhash { slot: u64 }` kollidierte mit dem Top-Level `slot` beim Serialisieren.
+**Fix**: `#[serde(rename = "blockhash_slot")]` auf `LatestBlockhash.slot` — JSON-Feld heißt jetzt `"blockhash_slot"`, Rust-Feld bleibt `slot`.
+**Status**: ✅ BEHOBEN
+**Datei**: `src/ipc/schema.rs`
+
+### ISSUE-2: DEX-Name Inkonsistenz + Creator für pump_amm unnötig (P2 Cherry-Pick)
+**Schweregrad**: MITTEL — Führt zu Ad-hoc-Workarounds, potentiellen Routing-Fehlern und unnötigen Creator-Lookups
+**Status**: ✅ BEHOBEN — FIX-25
+
+### ISSUE-3: Fehlende automatische Retention für trade_logs (market_events)
+**Schweregrad**: HOCH — Produktionsvorfall 2026-02-21: Root-Partition 100% voll, Deploy fehlgeschlagen
+**Symptom**: `market_events-YYYYMMDD.jsonl` wachsen ungebremst (~85–110 GB/Tag). Ohne Rotation füllt sich die Disk.
+**Root Cause**: STORAGE_CONVENTIONS definiert 7–30 Tage Retention, aber es existiert **kein Janitor/Cron** für automatische Löschung. Rotation läuft nicht asynchron.
+**Status**: ⏳ OFFEN — Manuelle Bereinigung durchgeführt (48 alte Dateien gelöscht, ~2,8 TB freigegeben). Automatische Retention noch einzuführen.
+**Fix**: Cron/Janitor implementieren: JSONL-Dateien in `trade_logs/market_events/`, `trade_logs/intents/`, etc. älter als 7–14 Tage löschen. Asynchron, außerhalb Hot Path.
+**Referenz**: STORAGE_CONVENTIONS.md §5 Retention
+
+---
+
+#### Analyse
+
+**Root Cause**: Drei separate `DexType` Enums mit unterschiedlichen String-Outputs:
+
+| Enum | Datei | Raydium V4 | PumpSwap AMM |
+|------|-------|------------|--------------|
+| `dex_parser::DexType` | `dex_parser.rs:118` | `"raydium"` ✅ | `"pump_amm"` ✅ |
+| `geyser_pool_discovery::DexType` | `geyser_pool_discovery.rs:707` | `"raydium"` ✅ | (kein PumpFunAmm) |
+| `arbitrage::types::DexType` | `arbitrage/types.rs:23` | `"raydium_amm_v4"` ❌ | `"pump_swap_amm"` ❌ |
+
+Die Quellen (`market-data` via `dex_parser::DexType::to_string()`) produzieren **bereits korrekte kanonische Namen**. Das Chaos entsteht durch:
+
+1. **`arbitrage/types.rs` ist eine QUELLE nicht-kanonischer Namen** — `as_str()` (Z.52) gibt `"raydium_amm_v4"` statt `"raydium"` zurück, (Z.57) gibt `"pump_swap_amm"` statt `"pump_amm"` zurück
+2. **Defensive Multi-Varianten-Checks im momentum_bot** — akzeptieren Varianten die nie ankommen (`"pumpswap"`, `"PumpFunAmm"`, `"pumpfunamm"`, `"pump-amm"`, `"meteora-dlmm"`, `"meteoradlmm"`)
+3. **`contains("pump")` Wildcard-Match** — in `execution_engine.rs:1537` und `cross_dex_handler.rs:114` (unsauber)
+4. **Creator fälschlich für pump_amm erzwungen** — `momentum_bot.rs` Z.5826-5829 und Z.6901-6904 erzwingen Creator für `pump_amm`, obwohl `tx_builder.rs` ihn NUR für `pumpfun` benötigt
+
+**Alle 25+ nicht-kanonischen Referenzen** (gruppiert):
+
+| Datei | Zeile(n) | Nicht-kanonische Varianten | Art |
+|-------|----------|---------------------------|-----|
+| `arbitrage/types.rs` | 37 | `"raydium_amm"`, `"raydium_amm_v4"` | Consumer (from_str) |
+| `arbitrage/types.rs` | 39 | `"orca_whirlpool"` | Consumer (from_str) |
+| `arbitrage/types.rs` | 40 | `"meteora"` | Consumer (from_str) |
+| `arbitrage/types.rs` | 42 | `"pumpswap"`, `"pump_swap_amm"` | Consumer (from_str) |
+| `arbitrage/types.rs` | 52 | `"raydium_amm_v4"` | **SOURCE** (as_str) |
+| `arbitrage/types.rs` | 57 | `"pump_swap_amm"` | **SOURCE** (as_str) |
+| `momentum_bot.rs` | 2251-2257 | `"pumpfunamm"`, `"pumpswap"`, `"pump-amm"`, `"meteora-dlmm"`, `"meteoradlmm"` | Consumer |
+| `momentum_bot.rs` | 2285-2288 | `"pumpfunamm"`, `"pumpswap"`, `"pump-amm"` | Consumer |
+| `momentum_bot.rs` | 5683-5686 | `"pumpfunamm"`, `"pumpswap"`, `"pump-amm"` | Consumer |
+| `momentum_bot.rs` | 5827-5829 | `"pump_amm"`, `"pumpswap"`, `"PumpFunAmm"` (case-insensitive) | Consumer |
+| `momentum_bot.rs` | 6679 | `"pump_amm"` (case-insensitive) | Consumer |
+| `momentum_bot.rs` | 6902-6904 | `"pump_amm"`, `"pumpswap"`, `"PumpFunAmm"` (case-insensitive) | Consumer |
+| `execution_engine.rs` | 1537 | `contains("pump")` | Consumer (Wildcard) |
+| `execution_engine.rs` | 5070 | `"PumpFunAmm"` | Consumer |
+| `cross_dex_handler.rs` | 114 | `contains("pump")` | Consumer (Wildcard) |
+| `tx_builder.rs` | 1183 | `"raydium_amm"`, `"raydium_amm_v4"` | Consumer |
+| `tx_builder.rs` | 1205 | `"orca_whirlpool"` | Consumer |
+| `tx_builder.rs` | 1217 | `"meteora"` | Consumer |
+| `pool_cache_sync.rs` | 57 | `"raydium_amm"` | Consumer |
+| `market_data.rs` | 2832 | `"pump_amm"` (hardcoded statt DexType) | Source (korrekt aber inkonsistent) |
+
+---
+
+#### FIX-25 Plan: DEX-Normalisierung an der Quelle + Consumer-Bereinigung
+
+**Ziel**: Alle Quellen produzieren kanonische Namen. Alle Consumer vergleichen nur mit kanonischen Namen. Kein neues Workaround-Modul — das Problem wird an der Wurzel behoben.
+
+**Keine RPC-Calls. Keine neuen NATS Topics. Keine Architektur-Änderung.**
+
+---
+
+**Teil 1: Quellen korrigieren** — Nicht-kanonische SOURCES fixen
+
+| Datei | Zeile | Alt | Neu |
+|-------|-------|-----|-----|
+| `arbitrage/types.rs` | 52 | `Self::RaydiumAmmV4 => "raydium_amm_v4"` | `Self::RaydiumAmmV4 => "raydium"` |
+| `arbitrage/types.rs` | 57 | `Self::PumpSwapAmm => "pump_swap_amm"` | `Self::PumpSwapAmm => "pump_amm"` |
+| `market_data.rs` | 2832 | `dex: "pump_amm".to_string()` | `dex: DexType::PumpFunAmm.to_string()` |
+
+**Risiko**: Minimal — Die Consumer akzeptieren bereits die kanonischen Namen.
+
+---
+
+**Teil 2: Consumer bereinigen** — Multi-Varianten-Checks durch einfache `==` ersetzen
+
+Da alle Quellen nach Teil 1 kanonische Namen produzieren, können die defensiven Fallback-Varianten entfernt werden.
+
+**`momentum_bot.rs`** (~6 Stellen):
+
+| Zeile (ca.) | Alt | Neu |
+|-------------|-----|-----|
+| 2247-2258 | `dex_requires_pool_accounts()` mit `to_ascii_lowercase()` + 7 Varianten | `dex == "pump_amm" \|\| dex == "meteora_dlmm"` |
+| 2284-2288 | `is_pump_amm` mit `to_ascii_lowercase()` + 4 Varianten | `dex == "pump_amm"` |
+| 5682-5686 | `is_pump_amm` mit `to_ascii_lowercase()` + 4 Varianten | `dex == "pump_amm"` |
+| 5826-5829 | `eq_ignore_ascii_case()` für 3 Varianten | `dex == "pumpfun"` (siehe Teil 3) |
+| 6679 | `eq_ignore_ascii_case("pump_amm")` | `dex == "pump_amm"` |
+| 6901-6904 | `eq_ignore_ascii_case()` für 3 Varianten | `dex == "pumpfun"` (siehe Teil 3) |
+
+**`execution_engine.rs`** (2 Stellen):
+
+| Zeile | Alt | Neu |
+|-------|-----|-----|
+| 1537 | `dex_lower.contains("pump") \|\| dex_lower == "pumpfun" \|\| dex_lower == "pump_amm"` | `dex == "pumpfun" \|\| dex == "pump_amm"` |
+| 5070 | `dex == "pump_amm" \|\| dex == "PumpFunAmm"` | `dex == "pump_amm"` |
+
+**`cross_dex_handler.rs`** (1 Stelle):
+
+| Zeile | Alt | Neu |
+|-------|-----|-----|
+| 114 | `dex_lower.contains("pump") \|\| dex_lower == "pumpfun" \|\| dex_lower == "pump_amm"` | `dex == "pumpfun" \|\| dex == "pump_amm"` |
+
+**`tx_builder.rs`** (3 Stellen):
+
+| Zeile | Alt | Neu |
+|-------|-----|-----|
+| 1183 | `"raydium" \| "raydium_amm" \| "raydium_amm_v4"` | `"raydium"` |
+| 1205 | `"orca" \| "orca_whirlpool"` | `"orca"` |
+| 1217 | `"meteora_dlmm" \| "meteora"` | `"meteora_dlmm"` |
+
+**`pool_cache_sync.rs`** (1 Stelle):
+
+| Zeile | Alt | Neu |
+|-------|-----|-----|
+| 57 | `"raydium_amm" \| "raydium"` | `"raydium"` |
+
+**`arbitrage/types.rs`** (from_str — hier bewusst Toleranz behalten):
+
+Die `from_str()` Varianten (`"raydium_amm"`, `"pumpswap"`, etc.) können optional bleiben als Parsing-Toleranz für alte JetStream-Einträge. Da `as_str()` (Teil 1) jetzt kanonisch ist, fließen keine neuen nicht-kanonischen Strings mehr ins System.
+
+---
+
+**Teil 3: Creator-Scope korrigieren** (momentum_bot.rs — 2 Stellen)
+
+**Problem**: Creator wird für `pump_amm` erzwungen (Error wenn fehlend), obwohl `tx_builder.rs` ihn NUR für `pumpfun` verwendet. PumpSwap AMM nutzt `pool_accounts` (14 Accounts), nicht den Creator.
+
+**`generate_and_publish_entry_intent()`** (Z.~5826):
+```rust
+// ALT: Creator Pflicht für pumpfun + pump_amm + pumpswap + PumpFunAmm
+if effective_dex == "pumpfun"
+    || effective_dex.eq_ignore_ascii_case("pump_amm")
+    || effective_dex.eq_ignore_ascii_case("pumpswap")
+    || effective_dex.eq_ignore_ascii_case("PumpFunAmm")
+{
+    let creator = creator_opt.ok_or_else(|| ...)?;  // ERROR wenn fehlt
+    intent.metadata.insert("creator", creator);
+}
+
+// NEU: Creator Pflicht NUR für pumpfun (Bonding Curve)
+if effective_dex == "pumpfun" {
+    let creator = creator_opt.ok_or_else(|| ...)?;
+    intent.metadata.insert("creator".to_string(), creator);
+} else if let Some(creator) = creator_opt {
+    intent.metadata.insert("creator".to_string(), creator);
+}
+```
+
+**`generate_and_publish_exit_intent()`** (Z.~6901): Identische Änderung.
+
+---
+
+**Zusammenfassung**:
+
+| Datei | Änderungen | Risiko |
+|-------|------------|--------|
+| `src/arbitrage/types.rs` | `as_str()` auf kanonische Namen korrigieren | Minimal — Consumer akzeptieren bereits |
+| `src/bin/market_data.rs` | Hardcoded String → `DexType::to_string()` | Minimal — selber Wert |
+| `src/bin/momentum_bot.rs` | ~6 Multi-Varianten-Checks vereinfachen + Creator-Scope (2 Stellen) | Mittel — mechanisch |
+| `src/bin/execution_engine.rs` | 2 Stellen: `contains("pump")` + `"PumpFunAmm"` entfernen | Niedrig |
+| `src/solana/cross_dex_handler.rs` | 1 Stelle: `contains("pump")` entfernen | Niedrig |
+| `src/execution/tx_builder.rs` | 3 Stellen: Fallback-Varianten entfernen | Niedrig |
+| `src/execution/pool_cache_sync.rs` | 1 Stelle: `"raydium_amm"` Fallback entfernen | Niedrig |
+
+**Kein neues Modul. Kein Workaround. Korrektur an der Wurzel.**
+
+**Erwartete Wirkung**:
+- Alle DEX-Quellen produzieren kanonische Namen → keine Normalisierung nötig
+- ~25 nicht-kanonische Referenzen entfernt → Code lesbarer und wartbarer
+- Creator nur noch für `pumpfun` (Bonding Curve) erzwungen
+- `pump_amm` Intents funktionieren auch ohne Creator (aktueller Fehler behoben)
+- `arb_strategy` erhält korrekte DEX-Namen (kein separater Fix nötig)
+
+---
+
+## 3. OFFENE BUGS (Analyse erforderlich / Fix ausstehend)
+
+### BUG-A: PumpFun Custom(6023) — Intermittierende Sell-Fehler
+**Schweregrad**: HOCH
+**Betroffene Tokens** (2026-02-13 Run): `64HemTH7`, `34c3bPRz`
+**Symptom**: Momentum-Bot Sell-Versuche scheitern wiederholt mit `Custom(6023)` ("NotEnoughTokensToSell"), obwohl Liquidation auf denselben Tokens erfolgreich ist.
+
+**Root Cause (detailliert)**:
+
+Drei zusammenwirkende Probleme verhindern erfolgreiche SELLs bei migrierten PumpFun-Tokens:
+
+1. **`find_best_sell_pool()` ist DEX-agnostisch** — Die Pool-Auswahl im Momentum-Bot basiert nur auf `last_trade_ratio` und `last_updated`. Es gibt **keinen Check ob eine PumpFun Bonding Curve `complete=true`** ist. Wenn ein Token migriert wird, hat der PumpFun-Pool oft noch aktuelle Trade-Daten (von vor der Migration) und wird weiter als "bester" Pool ausgewählt.
+
+2. **Kein Pool-Failure-Tracking** — Wenn ein SELL auf einem Pool scheitert, wird `exit_generated=false` zurückgesetzt (Bug-C Fix), aber der gescheiterte Pool wird **nicht markiert**. Beim nächsten Tick wählt `find_best_sell_pool()` denselben Pool erneut aus → endlose Wiederholung des selben Fehlers.
+
+3. **Kein Multi-Pool-Fallback in der Execution Engine für normale SELLs** — Die Liquidation hat einen 3-Phasen-Routing-Pfad (Multi-Pool → LivePoolCache → PumpFun-Fallback). Normale SELL-Intents vom Momentum-Bot verwenden **nur** den vom Intent spezifizierten DEX. Wenn dieser scheitert, wird der Intent abgelehnt — kein automatischer Versuch mit alternativen DEXes.
+
+**Warum Liquidation funktioniert**: Der `handle_sell_liquidation()`-Pfad probiert in Phase 1 zuerst PumpSwap AMM, Meteora, Raydium und Orca. Für migrierte Tokens findet er den PumpSwap-AMM-Pool und verkauft dort erfolgreich.
+
+**Hinweis BUG-I**: Der Guard in `pumpfun.rs` (Zeile 888-902: `real_reserves == 0 && virtual_reserves > 0 → return Ok(None)`) **existiert bereits** im aktuellen Code. Der Architecture Audit Status "REGRESSION DURCH REVERT" ist **veraltet**. Dieser Guard fängt den Fall ab, wenn die Migration im Cache sichtbar ist. Bug-A tritt auf, wenn die Migration im Cache **noch nicht sichtbar** ist oder `real_token_reserves` nur stale (nicht 0) sind.
+
+**Status**: ✅ BEHOBEN — FIX-20 (Pool-Migration & Failure-Tracking) + FIX-21 (Reserve-basiertes Quoting)
+
+---
+
+#### FIX-20 Plan: Bug-A — PumpFun Sell-Failure mit Pool-Migration & Failure-Tracking
+
+**Ziel**: Momentum-Bot soll migrierte PumpFun-Pools automatisch meiden und bei wiederholten Sell-Fehlern auf alternative Pools wechseln.
+
+**Keine RPC-Calls im Hot Path.** Alle Daten kommen aus Geyser/NATS Events.
+
+---
+
+**Teil 1: `PoolInfo` struct erweitern** (momentum_bot.rs)
+
+```rust
+struct PoolInfo {
+    pool_address: String,
+    dex: String,
+    dex_pool_accounts: Option<Vec<String>>,
+    first_seen_slot: u64,
+    last_trade_slot: u64,
+    last_trade_ratio: Option<f64>,
+    last_updated: std::time::Instant,
+    // --- NEU ---
+    /// PumpFun bonding curve complete flag (None = nicht PumpFun oder unbekannt)
+    bonding_curve_complete: Option<bool>,
+    /// Anzahl fehlgeschlagener SELL-Versuche auf diesem Pool
+    sell_fail_count: u32,
+    /// Zeitpunkt des letzten SELL-Fehlers
+    last_sell_fail_at: Option<std::time::Instant>,
+}
+```
+
+`PoolInfo::new()` initialisiert die neuen Felder mit `None`/`0`/`None`.
+
+---
+
+**Teil 2: BondingCurveProgress → Pool-Migration erkennen** (momentum_bot.rs)
+
+Im `MarketEventKind::BondingCurveProgress` Handler (~Zeile 7093):
+
+```rust
+MarketEventKind::BondingCurveProgress { mint, progress_bps, complete, .. } => {
+    // Bestehend: Position-Tracker updaten
+    let mut positions = ctx.positions.write();
+    if let Some(pos) = positions.get_mut(mint.as_str()) {
+        pos.bonding_curve_progress_bps = Some(*progress_bps);
+    }
+    drop(positions);
+
+    // NEU: Pool-Migration-Status in mint_pools aktualisieren
+    if *complete {
+        let mut pools = ctx.mint_pools.write();
+        if let Some(pool_list) = pools.get_mut(mint.as_str()) {
+            for pool in pool_list.iter_mut() {
+                if pool.dex == "pumpfun" {
+                    pool.bonding_curve_complete = Some(true);
+                    warn!(
+                        mint = %mint,
+                        pool = %pool.pool_address,
+                        "PumpFun pool marked as migrated (bonding curve complete)"
+                    );
+                }
+            }
+        }
+    }
+}
+```
+
+---
+
+**Teil 3: Sell-Failure → Pool-Failure-Count erhöhen** (momentum_bot.rs)
+
+Im `ExecutionStatus::Failed` und `ExecutionStatus::Timeout` Handler für Sell-Side:
+(Im bestehenden Block der Bug-C Fix-Logik, nach `exit_generated = false`)
+
+```rust
+} else if pending.side == TradeSide::Sell {
+    // [Bestehend: Bug-C Fix] Reset exit_generated
+    let mut positions = self.positions.write();
+    if let Some(pos) = positions.get_mut(&pending.mint) {
+        pos.exit_generated = false;
+        pos.exit_generated_at = None;
+    }
+    drop(positions);
+
+    // NEU: Pool-Failure-Count erhöhen
+    let mut pools = self.mint_pools.write();
+    if let Some(pool_list) = pools.get_mut(&pending.mint) {
+        if let Some(pool_info) = pool_list.iter_mut().find(|p| p.pool_address == pending.pool) {
+            pool_info.sell_fail_count += 1;
+            pool_info.last_sell_fail_at = Some(Instant::now());
+            warn!(
+                mint = %pending.mint,
+                pool = %pending.pool,
+                dex = %pending.dex,
+                sell_fail_count = pool_info.sell_fail_count,
+                "Pool sell failure tracked — will prefer alternatives on retry"
+            );
+        }
+    }
+}
+```
+
+**Wichtig**: Auch im Orphaned-Sell-Recovery-Pfad (wenn `pending_opt.is_none()` und `exit_generated` Reset erfolgt) den gleichen Pool-Failure-Count inkrementieren. Dafür muss der Pool aus dem `ExecutionResult`-Metadaten oder aus der Position extrahiert werden.
+
+---
+
+**Teil 4: `find_best_sell_pool()` — Exclusion-Logik** (momentum_bot.rs)
+
+```rust
+fn find_best_sell_pool(&self, mint: &str, token_amount: u64, original_pool: &str)
+    -> Result<(String, String, Vec<String>, f64, usize)>
+{
+    let pools = self.mint_pools.read();
+    let candidates = pools
+        .get(mint)
+        .ok_or_else(|| anyhow::anyhow!("No pools known for mint {}", mint))?;
+
+    let now = std::time::Instant::now();
+    let max_age = std::time::Duration::from_secs(300);
+    let fail_cooldown = std::time::Duration::from_secs(120);  // NEU
+    const MAX_FAIL_COUNT: u32 = 3;                             // NEU
+
+    // Phase 1: Filter gültige Pools
+    let valid: Vec<_> = candidates
+        .iter()
+        .filter(|p| {
+            p.dex_pool_accounts.is_some()
+                && p.last_trade_ratio.is_some()
+                && now.duration_since(p.last_updated) < max_age
+        })
+        .collect();
+
+    // Phase 2: Exclusion (migrierte + kürzlich gescheiterte Pools)
+    let preferred: Vec<_> = valid.iter()
+        .filter(|p| {
+            // Skip: PumpFun-Pool mit bestätigter Migration
+            if p.bonding_curve_complete == Some(true) {
+                return false;
+            }
+            // Skip: Pool mit >= MAX_FAIL_COUNT Fehlern im Cooldown-Fenster
+            if p.sell_fail_count >= MAX_FAIL_COUNT {
+                if let Some(last_fail) = p.last_sell_fail_at {
+                    if now.duration_since(last_fail) < fail_cooldown {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .collect();
+
+    // Phase 3: Wenn alle excludiert → Fallback auf Pool mit niedrigstem fail_count
+    let usable = if preferred.is_empty() {
+        warn!(mint = %mint, valid_count = valid.len(),
+            "All pools excluded by migration/failure — using best-available fallback");
+        &valid
+    } else {
+        &preferred
+    };
+
+    // [Bestehender Code: Quotes berechnen, beste Route wählen]
+    // ...
+}
+```
+
+---
+
+**Teil 5: Sell-Success → Failure-Count zurücksetzen** (momentum_bot.rs)
+
+Im `ExecutionStatus::Confirmed` Handler für `TradeSide::Sell`:
+
+```rust
+// NEU: Bei erfolgreichem Sell den Failure-Count des Pools zurücksetzen
+let mut pools = self.mint_pools.write();
+if let Some(pool_list) = pools.get_mut(&pending.mint) {
+    if let Some(pool_info) = pool_list.iter_mut().find(|p| p.pool_address == pending.pool) {
+        if pool_info.sell_fail_count > 0 {
+            info!(
+                mint = %pending.mint, pool = %pending.pool,
+                old_fail_count = pool_info.sell_fail_count,
+                "Sell succeeded — resetting pool failure count"
+            );
+            pool_info.sell_fail_count = 0;
+            pool_info.last_sell_fail_at = None;
+        }
+    }
+}
+```
+
+---
+
+**Zusammenfassung der Änderungen**:
+
+| Datei | Änderung | Risiko |
+|-------|----------|--------|
+| `src/bin/momentum_bot.rs` | `PoolInfo` struct: 3 neue Felder | Minimal — rein additiv |
+| `src/bin/momentum_bot.rs` | `BondingCurveProgress` Handler: Pool-Migration-Flag setzen | Minimal — nur Metadata |
+| `src/bin/momentum_bot.rs` | `ExecutionStatus::Failed/Timeout` Sell: Pool-Fail-Count | Niedrig — neben bestehendem Bug-C Fix |
+| `src/bin/momentum_bot.rs` | `find_best_sell_pool()`: Exclusion-Filter | Mittel — Kern-Routing-Logik, aber mit Fallback |
+| `src/bin/momentum_bot.rs` | `ExecutionStatus::Confirmed` Sell: Fail-Count Reset | Minimal — rein additiv |
+
+**Kein RPC im Hot Path. Keine neuen NATS Topics. Keine Architektur-Änderung.**
+
+**Erwartete Wirkung**: Migrierte PumpFun-Pools werden nach dem `BondingCurveProgress` Event sofort gemieden. Selbst ohne dieses Event werden Pools nach 3 gescheiterten Sells für 120s ausgeschlossen, sodass der Bot auf PumpSwap AMM, Meteora, Raydium oder Orca wechselt.
+
+---
+
+#### FIX-21: Reserve-basiertes Multi-Pool-Routing (SLAVE LivePoolCache)
+**Datum**: 2026-02-13
+**Problem**: FIX-20 behebt die Exclusion-Logik, aber `find_best_sell_pool()` und `find_best_buy_pool()` nutzen weiterhin `last_trade_ratio` (grobe Approximation aus dem letzten beobachteten Trade) statt echter Reserve-basierter Quotes. Das führt zu suboptimaler Pool-Auswahl.
+
+**Root Cause**: Der Momentum-Bot hatte keinen Zugriff auf den `LivePoolCache`, der in `market-data` (MASTER) und `execution-engine` (SLAVE) vorhanden war. Die Pool-Auswahl war daher nicht datengetrieben.
+
+**Lösung**:
+1. **Shared Modul** `src/execution/pool_cache_sync.rs` — Extrahiert `build_minimal_pool_state()`, `apply_pool_cache_update()` und `bootstrap_pool_cache_from_jetstream()` aus `execution_engine.rs` in ein wiederverwendbares Modul.
+2. **SLAVE LivePoolCache im Momentum-Bot** — `MomentumContext` bekommt einen eigenen `LivePoolCache`, der beim Start aus JetStream gebootstrapt und laufend per `PoolCacheUpdate` Events aktualisiert wird.
+3. **Reserve-basiertes Quoting** — Neue `quote_output_amount()` API in `quote_calculator.rs` berechnet Output-Beträge direkt aus `CachedPoolState` (ohne `TradeIntent`). `find_best_sell_pool()` und `find_best_buy_pool()` nutzen primär Cache-Quotes, Fallback auf `last_trade_ratio`.
+
+**Dateien**:
+| Datei | Änderung |
+|-------|----------|
+| `src/execution/pool_cache_sync.rs` | NEU — Shared Bootstrap/Sync |
+| `src/execution/mod.rs` | Modul registriert |
+| `src/execution/quote_calculator.rs` | `quote_output_amount()` API |
+| `src/bin/execution_engine.rs` | Nutzt shared Modul |
+| `src/bin/momentum_bot.rs` | LivePoolCache + JetStream Consumer + reserve-basierte Quotes |
+
+**Kein RPC im Hot Path. Keine neuen NATS Topics. Architektur-konform (SLAVE Cache Pattern).**
+
+### ~~BUG-B: Momentum-Bot verliert Position — Kein Sell-Intent generiert~~ ✅ BEHOBEN
+**Schweregrad**: KRITISCH → **BEHOBEN** (2026-02-13)
+**Fix**: Orphaned Buy Recovery in `handle_execution_result()`: Wenn ein `ExecutionResult` mit `status == Confirmed` und `side == BUY` eintrifft aber kein `pending_intent` existiert, wird die Position aus `ExecutionResult` Metadaten + `TokenTracker` rekonstruiert.
+**Dateien**: `src/bin/momentum_bot.rs`
+
+### ~~BUG-C: Momentum-Bot Retry-Bug — Ein Versuch, dann Aufgabe~~ ✅ BEHOBEN
+**Schweregrad**: HOCH → **BEHOBEN** (2026-02-13)
+**Fix**: `exit_generated` wird jetzt in `ExecutionStatus::Failed` und `ExecutionStatus::Timeout` Handlern für Sell-Side-Trades zurückgesetzt. Gilt sowohl für den normalen Pending-Intent-Pfad als auch für den Orphaned-Sell-Recovery-Pfad (konsistentes unconditional Reset).
+**Dateien**: `src/bin/momentum_bot.rs`
+
+### ~~BUG-D: Falscher Creator im Cache → ConstraintSeeds bei SELL~~ ✅ BEHOBEN
+**Schweregrad**: HOCH → **BEHOBEN** (2026-02-14, FIX-22)
+**Betroffene Tokens** (2026-02-13 Run): `64HemTH7`, `34c3bPRz`
+**Symptom**: Alle Momentum-Bot SELL-Versuche scheiterten mit `Custom(2006)` (ConstraintSeeds) weil der `creator_vault` PDA aus einem falschen Creator abgeleitet wurde. Liquidation per RPC-Fallback funktionierte.
+
+**Root Cause (detailliert)**:
+
+Zwei zusammenwirkende Fehler:
+
+1. **`instruction_accounts[7]` ist nicht immer der Creator**: `parse_pumpfun_create()` und `geyser_pool_discovery` extrahieren den Creator aus `instruction_accounts[7]` der CREATE-Transaktion. Bei Tokens die über CPI (Bundler, Launchpads) erstellt werden, kann der Account an Index 7 von der Bonding-Curve-Account-Daten (`data[49..81]`) abweichen.
+
+2. **First-Write-Wins Cache blockiert Korrektur**: In `market_data.rs`:
+   - `PoolCreated` Handler schreibt `creator_cache[mint]` **unconditional** (Zeile 2638)
+   - `BondingCurveUpdate` Handler hat `contains_key`-Guard → **SKIP** wenn PoolCreated zuerst kam
+   - `DevWalletIdentified` aus BondingCurveUpdate wird **nicht emittiert** → autoritativer Creator erreicht Momentum-Bot nie
+
+**Server-Log-Evidenz**:
+
+| Token | Momentum-Bot Creator | Korrekter Creator (RPC) | Sell-Ergebnis |
+|-------|---------------------|------------------------|---------------|
+| `64HemTH7` | `Ca8hHy...WMynz` | `B62Dvk...JhMYo` | ~20x `Custom(2006)` |
+| `34c3bPRz` | `E77jVj...q1UP` | `GfBB85...4dqf` | ~20x `Custom(2006)` |
+
+**Fix**: FIX-22 (siehe unten)
+
+#### FIX-22: Autoritative Creator-Quelle + LivePoolCache Cross-Check
+**Datum**: 2026-02-14
+**Problem**: Falscher Creator in `creator_cache` und `TokenTracker.dev_wallet` durch nicht-autoritativen `instruction_accounts[7]` bei CPI-erstellten Tokens. `BondingCurveUpdate` (autoritativ) wurde durch `contains_key`-Guard blockiert.
+
+**Lösung (2 Teile)**:
+
+1. **market_data.rs — BondingCurveUpdate als autoritative Quelle**:
+   - `pool_creator_cache`: `contains_key`-Guard entfernt → immer überschreiben
+   - `creator_cache`: `contains_key`-Guard ersetzt durch Mismatch-Detection → immer überschreiben
+   - `DevWalletIdentified`: Wird emittiert wenn Creator neu oder **anders** (Korrektur-Event)
+   - WARN-Log bei Mismatch für Produktions-Diagnostik
+
+2. **momentum_bot.rs — LivePoolCache Cross-Check**:
+   - Neue Methode `resolve_authoritative_creator()` auf `MomentumContext`
+   - Bei Entry- und Exit-Intents: Creator aus `TokenTracker.dev_wallet` wird gegen `LivePoolCache.get_pumpfun_creator()` geprüft
+   - LivePoolCache-Wert (Geyser-Account-Daten) hat Vorrang → korrigiert auch TokenTracker
+   - Fallback: TokenTracker-Wert wenn LivePoolCache den Token nicht kennt
+
+**Dateien**:
+| Datei | Änderung |
+|-------|----------|
+| `src/bin/market_data.rs` | BondingCurveUpdate: autoritative Cache-Writes + Mismatch-WARN |
+| `src/bin/momentum_bot.rs` | `resolve_authoritative_creator()` + Cross-Check bei Entry/Exit |
+
+**Kein RPC im Hot Path. Keine neuen NATS Topics.**
+
+---
+
+### BUG-30: Exit-Logic Gesamtproblem — Take Profit feuert nicht, Timed Exit überschritten, Momentum unzuverlässig
+**Schweregrad**: KRITISCH
+**Datum**: 2026-02-19
+**Symptome**:
+- Take Profit bei +81% PnL nicht ausgelöst (Config war 30%)
+- Timed Exit bei 656s statt max 300s
+- Momentum Exit unzuverlässig (5 Bot-Sells überstimmen 2 echte Buys)
+
+**Root Cause — 6 miteinander verflochtene Bugs:**
+
+**BUG-30a: Position Price nur aus Trade Events (KRITISCH — Phase 1)**
+`current_price` wird ausschließlich von `MarketEventKind::Trade` Events aktualisiert (`momentum_bot.rs` Z.7184). Kein Update aus `PoolCacheUpdate` Reserves. Wenn keine Trades für einen Token kommen, bleibt `current_price` bei `entry_price` → PnL = 0% → Take Profit feuert nie. Das Dashboard zeigt korrekte PnL aus Fill-Daten, der Bot berechnet intern 0%.
+
+**BUG-30b: Pending BUY blockiert ALLE Exit-Checks (KRITISCH — Phase 1)**
+`check_for_exits()` überspringt Positionen mit pending BUY komplett (`momentum_bot.rs` Z.2855: `continue`), inklusive STOP_LOSS, TAKE_PROFIT und TIME_EXIT. Wenn ein Scale-In-BUY pending ist und die Execution Engine sequentiell arbeitet (BUG-30e), kann der BUY minutenlang pending bleiben. In dieser Zeit feuert kein Exit.
+
+**BUG-30c: Reconciliation erfordert exit_generated==true (HOCH — Phase 1)**
+`collect_timed_exit_reconcile_candidates()` überspringt Positionen mit `exit_generated==false` (`momentum_bot.rs` Z.2950). Wenn der initiale Exit wegen pending BUY (BUG-30b) nie generiert wurde, greift die Reconciliation nicht. Diese Positionen bleiben indefinit offen.
+
+**BUG-30d: Momentum Exit nur Count-basiert, kein Volumen (MITTEL — Phase 1)**
+`buy_ratio = buy_count / total` (`momentum_bot.rs` Z.732-734) ignoriert das SOL-Volumen der Trades. `TradeEvent.sol_amount` existiert, wird aber nicht genutzt. 5 Bot-Sells à 0.001 SOL überstimmen 2 echte Buys à 10 SOL. Volumengewichtete Berechnung erkennt echte Kaufkraft vs. Wash Trading.
+
+**BUG-30e: Sequentielle Intent-Verarbeitung in Execution Engine (KRITISCH — Phase 2)**
+`process_intent()` in `execution_engine.rs` awaits `confirm_signature_status()` (bis 30s Timeout) pro Intent. Bei Queue-Tiefe 5 wartet Intent #5 bis zu 150s. Dies verstärkt BUG-30b massiv: Pending BUYs bleiben minutenlang in der Queue, während alle Exits blockiert sind. Fix: Fire-and-Forget TX Sending + Parallele Verarbeitung.
+
+**BUG-30f: RPC-Polling TX Confirmation + TPU Leader Cache Stale (HOCH — Phase 3)**
+TX Confirmation nutzt `get_signature_statuses()` Polling mit exponential Backoff statt Geyser Subscription. `GeyserTxConfirm` Modul existiert (`geyser_tx_confirm.rs`), wird aber nur für ATA-Watching genutzt. TPU WebSocket hat kein Keepalive → Leader Cache wird stale → TX an falschen Validator → 7-100s bis Landing. Fix: Geyser-basierte Confirmation + TPU WS Keepalive.
+
+**Status**: BUG-30a bis BUG-30d → ✅ BEHOBEN (FIX-30, Phase 1) | BUG-30e → ✅ BEHOBEN (FIX-31, Phase 2) | BUG-30f → ✅ BEHOBEN (FIX-32, Phase 3)
+
+---
+
+### FIX-30: Phase 1 — Exit-Logic Überholung (BUG-30a bis BUG-30d)
+**Datum**: 2026-02-19
+
+**Änderungen in `src/bin/momentum_bot.rs`:**
+
+1. **Preis-Update aus Pool-Reserves** (BUG-30a): Nach `apply_pool_cache_update()` im PoolCacheUpdate-Processing wird `tokens_per_sol` aus `base_reserve / quote_reserve` berechnet und `update_position_price()` aufgerufen. Take Profit, Stop Loss und Trailing Stop reagieren sofort auf Preisänderungen aus Geyser Pool-State.
+
+2. **Exit-Checks nicht bei pending BUY blockieren** (BUG-30b): `pending_buy_mints` Block in `check_for_exits()` komplett entfernt. Alle Exits feuern sofort. Bei Exit wird der pending BUY für die betroffene Mint aus `pending_intents` entfernt. Orphaned Buy Recovery (Z.3155-3247) fängt später confirmte BUYs ab.
+
+3. **Reconciliation-Fix** (BUG-30c): `collect_timed_exit_reconcile_candidates()` behandelt jetzt auch Positionen mit `exit_generated==false`. Bestehende `pending_sells`-Prüfung verhindert doppelte SELLs.
+
+4. **Volumengewichtete Momentum-Berechnung** (BUG-30d): `buy_ratio` in `should_exit()` nutzt `buy_sol_volume / total_sol_volume` statt `buy_count / total_count`. Fallback auf Count bei `total_vol == 0`.
+
+---
+
+### FIX-31: Phase 2 — Parallele Intent-Verarbeitung (BUG-30e)
+**Datum**: 2026-02-19
+
+**Problem**: `process_intent()` blockierte die Main-Loop der Execution Engine komplett, weil `confirm_signature_status()` (RPC-Polling) bis zu 30s pro Intent wartete. Bei 5 queued Intents dauerte es bis zu 150s bis der letzte verarbeitet wurde. Dies verstärkte BUG-30b massiv (Exits wurden durch blockierte Main-Loop verzögert).
+
+**Änderungen in `src/bin/execution_engine.rs`:**
+
+1. **Neues Config-Feld `max_concurrent_intents`** (u32, default: 4, range: 1-16): Startup-only Parameter, steuert die maximale Anzahl parallel verarbeiteter Intents. Hot-Reload wird acknowledged aber erfordert Neustart.
+
+2. **Semaphore-basierte Concurrency-Kontrolle**: `intent_semaphore: Arc<tokio::sync::Semaphore>` in `ExecutionContext` begrenzt parallele Verarbeitung. LockManager's `try_lock_resource()` / `try_lock_capital()` verhindert Konflikte bei gleichzeitigen Intents für denselben Mint oder bei Kapitalüberschreitung.
+
+3. **tokio::spawn + JoinSet**: Intents werden via `task_set.spawn()` parallel verarbeitet statt sequentiell awaited. Completed Tasks werden im Periodic Tick via `try_join_next()` gedraint.
+
+4. **Graceful Shutdown**: Bei Shutdown wird `intent_semaphore.close()` aufgerufen (verhindert neue Akquisen), dann werden alle In-Flight Tasks mit 60s Timeout via `task_set.join_next()` abgewartet. Bei Timeout: `task_set.abort_all()`.
+
+5. **Signer Send-Safety**: `let signer: &dyn Signer` Typ-Annotationen entfernt — `treasury.signer_ref()` gibt `&(dyn Signer + Send + Sync)` zurück, die explizite Annotation auf `&dyn Signer` strippte die Send+Sync Bounds und verhinderte `tokio::spawn`.
+
+**Änderungen in `src/metrics.rs`:**
+
+6. **Neue Metrik `CONCURRENT_INTENTS_GAUGE`** (AtomicU64): Zeigt die aktuelle Anzahl parallel laufender Intents im Prometheus-Endpoint (`ironcrab_concurrent_intents`).
+
+**Thread-Safety**: Alle shared State in `ExecutionContext` war bereits thread-safe (LockManager: `parking_lot::RwLock`, RPC: `Arc<SolanaRpc>` mit AdaptiveLimiter, JSONL Writers: `Mutex`, alle Prometheus-Counter: `Atomic*`, Config: `RwLock`). `process_intent()` selbst brauchte keine internen Änderungen.
+
+---
+
+### FIX-32: Phase 3 — TX Latenz Optimierung / Geyser-basierte Confirmation (BUG-30f)
+**Datum**: 2026-02-19
+
+**Problem**: TX Confirmation nutzte `get_signature_statuses()` RPC-Polling mit exponentiellem Backoff (50ms→1000ms). Beobachtete Latenzen: 7-100s. Zusätzlich: TPU WebSocket hatte kein proaktives Keepalive, Leader Cache wurde stale, TXs gingen an falsche Validatoren.
+
+**Änderungen in `src/solana/geyser_tx_confirm.rs`:**
+
+1. **Zweiter Geyser-Stream für TX Confirmation**: `run_tx_watcher()` startet einen dedizierten Geyser `transactions_status`-Stream gefiltert auf `account_include: [wallet_pubkey]`. Verarbeitet `UpdateOneof::TransactionStatus` und `UpdateOneof::Transaction`. O(1) HashMap-Lookup für Signature-Matching.
+
+2. **Erweitertes `TxConfirmationResult`**: Neue Felder `error: Option<String>` (Fehlergrund bei failed TX) und `elapsed_ms: u64` (Latenz für Metriken).
+
+3. **`with_geyser()` erweitert**: Nimmt jetzt `wallet_pubkey: Pubkey` als Parameter. Startet sowohl ATA-Watcher als auch TX-Watcher.
+
+4. **`register_tx()` sendet `WatchTx` Command**: Informiert den TX-Watcher-Task über neue Signatures (aktuell subscribed der Stream alle Wallet-TXs und matcht per HashMap).
+
+5. **`on_transaction_failed()`**: Neue Methode für on-chain fehlgeschlagene TXs (Slippage, etc.).
+
+6. **Auto-Reconnect und Timeout-Cleanup**: TX-Watcher reconnected automatisch bei Stream-Disconnects. Periodischer Cleanup alle 5s für timed-out Signatures.
+
+**Änderungen in `src/bin/execution_engine.rs`:**
+
+7. **`confirm_signature_status()` refactored**: Geyser-First Strategie mit RPC-Polling Fallback. `confirm_via_geyser()` nutzt `tokio::select!` auf oneshot::Receiver vs. Timeout. `confirm_via_rpc_polling()` enthält die bisherige Polling-Logik als Fallback.
+
+8. **Separate Rebroadcast-Task**: `spawn_rebroadcast_loop()` läuft parallel zur Confirmation (konfigurierbar: `rebroadcast_interval_ms`, `max_rebroadcasts`).
+
+9. **Neue Config-Felder**: `geyser_confirm_enabled` (bool, default: true), `rebroadcast_interval_ms` (u64, default: 2000), `max_rebroadcasts` (u32, default: 5). Alle hot-reloadable.
+
+10. **`tx_confirm: Arc<GeyserTxConfirm>` in ExecutionContext**: Initialisiert beim Startup mit Geyser URL und Wallet-Pubkey falls verfügbar.
+
+**Änderungen in `src/solana/tpu_client.rs`:**
+
+11. **`TPU_CACHE_STALE_TOTAL` Metrik**: Inkrementiert in `check_leader_cache_health()` bei Staleness-Detection.
+
+12. **`TPU_RECONNECT_TOTAL` Metrik**: Inkrementiert in `reconnect()` bei erfolgreichem Reconnect.
+
+**Änderungen in `src/solana/tx_sender.rs`:**
+
+13. **Reconnect Rate-Limit gesenkt**: Von 30s auf 15s in `send_via_tpu()` und `spawn_health_check_task()`.
+
+**Änderungen in `src/metrics.rs`:**
+
+14. **Neue Metriken**: `TX_CONFIRM_GEYSER_TOTAL`, `TX_CONFIRM_RPC_FALLBACK_TOTAL`, `TX_CONFIRM_LATENCY_MS`, `TPU_RECONNECT_TOTAL`, `TPU_CACHE_STALE_TOTAL`, `GEYSER_TX_WATCHER_CONNECTED`.
+
+### FIX-33: Fehlende DexPoolAccounts bei SELL Exits
+
+**Datum**: 2026-02-11  
+**Schweregrad**: CRITICAL — Gekaufte Tokens konnten nicht verkauft werden  
+**Symptom**: `Custom(6023)` ("NotEnoughTokensToSell") und `Custom(11)` bei SELL-Transaktionen. Logs: "Missing DexPoolAccounts for exit intent; falling back to empty accounts".
+
+**Root Cause**: `update_pool_trade_data()` aktualisierte nur existierende Einträge in `mint_pools`, erstellte aber keine neuen. Pools die nur über Trade-Events entdeckt wurden fehlten. Zusätzlich nutzte `generate_and_publish_exit_intent()` den PositionTracker nicht als Fallback.
+
+**Fix (3 Ebenen)**:
+
+1. **Pool-Auto-Registrierung** (`momentum_bot.rs`): `update_pool_trade_data()` erstellt jetzt automatisch neue `PoolInfo`-Einträge wenn ein Pool für einen Mint unbekannt ist.
+2. **PositionTracker-Fallback** (`momentum_bot.rs`): `generate_and_publish_exit_intent()` nutzt jetzt `mint_pools` für den spezifischen Pool als primäre Quelle, dann `try_get_dex_pool_accounts_for_mint()`, mit Warnung statt Abbruch wenn beides fehlt.
+3. **TX-Builder Fallback** (`tx_builder.rs`): Bereits implementiert für PumpSwap AMM (LivePoolCache-Fallback Z.605-614). Keine zusätzlichen Änderungen nötig.
+
+**Dateien**: `src/bin/momentum_bot.rs`
+
+### FIX-34: Token ATA-Erstellung für BUY bei 3 DEX-Pfaden (Token-2022)
+
+**Datum**: 2026-02-11  
+**Schweregrad**: CRITICAL — BUY-Transaktionen scheiterten an fehlender ATA  
+**Symptom**: `Custom(2)` auf `ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL` (Associated Token Program) bei BUY-Simulationen.
+
+**Root Cause**: PumpSwap AMM, Orca und Raydium BUY-Pfade in `tx_builder.rs` erstellten keine Token-ATA vor dem Swap. Für Token-2022 muss `create_associated_token_account_idempotent` mit der korrekten `token_program_id` aufgerufen werden.
+
+**Fix**:
+
+- **FIX-34a PumpSwap AMM**: `create_associated_token_account_idempotent` als erste Instruction bei BUYs, mit `intent.resources.token_program` für Token-2022.
+- **FIX-34b Orca**: ATA-Erstellung bei BUYs + hardcoded `spl_token::id()` durch dynamisches `intent.resources.token_program` ersetzt.
+- **FIX-34c Raydium**: ATA-Erstellung bei BUYs + hardcoded `spl_token::id()` durch dynamisches `intent.resources.token_program` ersetzt.
+
+Alle drei Pfade erstellen WSOL-ATA bei SELLs (für empfangene SOL).
+
+**Dateien**: `src/execution/tx_builder.rs`
+
+### FIX-35: Position-Reconciliation nach Restart (Lazy Reconciliation)
+
+**Datum**: 2026-02-11  
+**Schweregrad**: MEDIUM — Alte Positionen wurden nach Restart nicht getracked  
+**Symptom**: Tokens im Wallet sichtbar aber nicht vom Bot verwaltet. `build_reconciled_position()` scheitert wenn `mint_pools` nach Restart noch leer ist.
+
+**Root Cause**: `mint_pools` ist in-memory. Nach Restart sind Pool-Infos erst verfügbar wenn PoolCreated/DexPoolAccounts Events eintreffen. WalletBalanceSnapshots können aber vorher verarbeitet werden.
+
+**Fix**: `orphaned_mints: HashMap<String, (u64, u8)>` im `MomentumContext`. Wenn `build_reconciled_position()` scheitert, wird der Mint mit `(balance_raw, decimals)` gespeichert. Bei jedem `register_pool()` wird geprüft ob ein orphaned Mint jetzt reconciled werden kann. Balance=0 Snapshots entfernen Mints aus dem Set.
+
+**Dateien**: `src/bin/momentum_bot.rs`
+
+### FIX-36: WSOL wird als tradeable Position getrackt
+
+**Datum**: 2026-02-11  
+**Schweregrad**: HIGH — Verursacht falsche "Open Positions", Endlos-SELL-Intents und Intent-Rejections  
+**Symptom**: WSOL (`So11111111111111111111111111111111111111112`) wurde durch `WalletBalanceSnapshot` als Token-Position reconciled. Daraufhin versuchte der Bot wiederholt WSOL per `TIMED_EXIT` zu verkaufen, was jedes Mal mit `SIM_INSUFFICIENT_BALANCE` oder `Custom(11)` scheiterte. Dies verfälschte die "Open Positions"-Anzeige und flutete den Intent-Stream mit sinnlosen Sells.
+
+**Root Cause**: `WalletBalanceSnapshot`-Handler und `build_reconciled_position()` filterten WSOL nicht aus. Da WSOL immer eine Wallet-Balance hat, wurde es als unbekannte Position interpretiert und reconciled.
+
+**Fix**: 
+1. Early-return im `WalletBalanceSnapshot`-Handler: SOL-Mint wird sofort übersprungen
+2. Guard in `build_reconciled_position()`: gibt `None` zurück für SOL/WSOL
+3. Erkennt alle drei SOL-Varianten: `So11111111111111111111111111111111111111112` (WSOL), `NATIVE_SOL` (market-data Label), `11111111111111111111111111111111` (System Program)
+
+**Dateien**: `src/bin/momentum_bot.rs`
+
+### FIX-37: Owner-Scan Mints werden bei vollem Bootstrap-Cap ignoriert
+
+**Datum**: 2026-02-19  
+**Schweregrad**: HIGH — Wallet-Tokens werden beim Startup nicht erkannt  
+**Symptom**: Nach Restart zeigt Bot 0 Positionen obwohl 2 Token-2022 Tokens (ANDREW, TRUMPIUS) in der Wallet sind. `mints_in_wallet=0` im Log obwohl `getTokenAccountsByOwner` die Tokens findet.
+
+**Root Cause**: `MAX_BOOTSTRAP_MINTS = 30`. JetStream Recovery füllt 30 Plätze mit stale Mints aus alten Snapshots. Die anschließende Owner-Scan Merge-Logik prüft `known_mints.len() < MAX_BOOTSTRAP_MINTS` — da bereits 30 Mints vorhanden, werden reale Wallet-Tokens nicht hinzugefügt und somit nie verarbeitet.
+
+**Fix**: Owner-Scan Mints mit realer Wallet-Balance umgehen das `MAX_BOOTSTRAP_MINTS`-Cap. Sie repräsentieren tatsächliche Wallet-Inhalte und haben immer Vorrang vor stale JetStream-Einträgen.
+
+**Dateien**: `src/bin/market_data.rs`
+
+### FIX-38: Wrong-Pool Price Pollution → falsche TAKE_PROFIT (realer Verlust)
+
+**Datum**: 2026-02-21  
+**Schweregrad**: CRITICAL — TAKE_PROFIT feuert bei +200% laut Bot, tatsächlicher PnL negativ  
+**Symptom**: Trades mit "Take profit hit: +205% gain" im Detail, aber PnL (SOL) und PnL % negativ. Oft ~1 Sekunde nach Probe-Buy.
+
+**Root Cause**: `update_position_price()` akzeptierte Preis-Updates von **beliebigen** Pools. Bei Multi-Pool-Tokens (Bonding Curve + AMM) wurde `current_price` mit Daten eines anderen Pools überschrieben → falsches `pnl_pct()` → TAKE_PROFIT trotz realem Verlust.
+
+**Fix**:
+1. **Pool-Matching**: Trade- und PoolCacheUpdate-Updates nur anwenden, wenn `source_pool == position.pool`
+2. **take_profit_min_hold_secs** (Default 5): TAKE_PROFIT erst nach Mindest-Haltedauer möglich
+
+**Dateien**: `src/bin/momentum_bot.rs`, `src/config.rs`  
+**Details**: `docs/TAKE_PROFIT_FALSE_GAIN_FIX_20260221.md`
+
+---
+
+## 4. BEKANNTE ARCHITEKTUR-PROBLEME (aus Architecture Audit)
+
+Diese Bugs sind im Detail in `docs/ARCHITECTURE_AUDIT_2026-02-07.md` dokumentiert:
+
+| ID | Problem | Schweregrad | Status |
+|----|---------|-------------|--------|
+| Audit-A | Killswitch-Liquidation überspringt Tokens | ⚠️ TEILWEISE BEHOBEN | FIX-02, FIX-12, FIX-13 |
+| Audit-B | `load_pool_from_geyser()` macht 20 RPC-Retries | ✅ FIXED (FIX-29) | Serum-Caching, RPC-Elimination Hot Path |
+| Audit-C | PumpFunAmmDex eigene RPC-Infrastruktur | ✅ BEHOBEN | Hot Path: Cache-Miss→None; Cold Path: SolanaRpc statt reqwest |
+| Audit-D | Token-Decimals immer per RPC | ✅ BEHOBEN | token_utils nur Cold Path; Hot Path nutzt mint_infos/TokenMintInfo; LivePoolCache für execution_engine; RPC in sell_all/wallet akzeptabel |
+| Audit-E | `cleanup_wallet_after_liquidation()` per RPC | ✅ AKZEPTIERT | Cold Path; RPC für autoritativen Zustand nötig – alle leeren ATAs müssen zuverlässig geschlossen werden |
+| Audit-F | Orca Reserve-Fetching 5min TTL + RPC | ✅ BEHOBEN | LivePoolCache einzige Quelle; Cache-Miss→statische Reserves (kein RPC); RPC nur Cold Path (`live_pool_cache.is_none()`) |
+| Audit-G | Stale JetStream Wallet-Snapshots | ✅ BEHOBEN | FIX-14 |
+| Audit-H | Hardcoded quote_mint in DEX-Parsern | ✅ BEHOBEN | FIX-15 |
+| Audit-I | PumpFun SELL stale Quote für migrierte Tokens | ✅ BEHOBEN | Guard in pumpfun.rs (Z.888-902). Restprobleme → BUG-A/FIX-20 |
+
+---
+
+## FIX-17: CRITICAL — fill_in/fill_out Accuracy (False Take-Profit Triggers)
+
+**Datum**: 2026-02-13  
+**Schweregrad**: CRITICAL — Bot traf Trading-Entscheidungen auf Basis falscher Preisdaten
+
+### Problem
+Bei BUY-Trades mit `lamport_noise=true` (ATA wird erstellt) fiel `fill_in` auf `intent.required_capital` zurück.
+Dies war katastrophal falsch wenn die DEX weniger SOL akzeptiert als beabsichtigt (z.B. PumpFun Bonding Curve fast voll):
+
+- **D39XKvFT**: `fill_in` = 0.00125 SOL (intent), **real**: 0.000043 SOL → **28.6x Fehler**
+- Falsche `entry_price` → Momentum-Bot sah +2949.3% Gain statt real ~6.5%
+- Take-Profit wurde fälschlicherweise ausgelöst, Token mit Verlust verkauft
+
+Bei SELL-Trades war `fill_out` immer `None` wenn `lamport_noise=true` (ATA geschlossen), weil der
+native SOL Fallback durch das Lifecycle-Noise-Gate blockiert wurde.
+
+### Root Cause
+`compute_intent_fills_best_effort()` in `execution_engine.rs`:
+- Zeile 424-428 (alt): `lamport_noise → fill_in = intent.required_capital` (kann 29x falsch sein)
+- Zeile 439 (alt): `lamport_noise → fill_out = None` (SELL SOL-Erlös fehlt komplett)
+
+### Fix
+Neue dreistufige Fallback-Kette für native SOL-Legs mit `lamport_noise`:
+
+1. **Inner Instruction Parsing** (`extract_swap_sol_from_inner_instructions`):
+   - Parst `meta.inner_instructions` nach System Program `transfer` Instruktionen
+   - Filtert `createAccount` aus (das ist ATA-Rent, kein Swap)
+   - Genaueste Methode: erfasst Swap-Betrag + DEX-Fees (ohne ATA-Rent)
+
+2. **Rent-Adjusted Lamport Delta**:
+   - `compute_wallet_lamport_delta_best_effort` gibt jetzt auch `rent_adjustment` zurück
+   - Bereinigtes Delta = `raw_delta + rent_created - rent_refunded`
+   - Entfernt ~96% des Errors (ATA-Rent ist ~2.04M lamports)
+
+3. **intent.required_capital** (letzter Ausweg mit WARN-Log)
+
+### Dashboard PnL
+`trades_server.py`: SELL proceeds nutzt jetzt explizit `wallet_delta` (konsistent mit BUY cost).
+ATA-Rent hebt sich auf. Dashboard zeigt realen Wallet-Impact inklusive aller Fees.
+
+### Dateien
+- `src/bin/execution_engine.rs`: `compute_wallet_lamport_delta_best_effort`, `extract_swap_sol_from_inner_instructions`, `compute_intent_fills_best_effort`
+- `scripts/trades_server.py`: PnL-Berechnung in 3 Blöcken (run, last, 24h)
+
+---
+
+## FIX-38: Token-2022 Simulation State-Lag Bypass
+
+**Status:** ✅ FIXED
+
+### Problem
+Seit PumpFun auf Token-2022 migriert hat, scheitern BUY- und SELL-Simulationen häufig:
+
+- **Custom(2) auf BUY (Instruction 0):** `create_associated_token_account_idempotent` ruft Token-2022's `GetAccountDataSize` auf, das den Mint-Account lesen muss. Bei neu erstellten Tokens ist der Mint-Account im lokalen RPC-Node noch nicht synchronisiert → "Invalid Mint".
+- **Custom(6023) auf SELL (Instruction 1):** PumpFun "NotEnoughTokensToSell" — der BUY wurde gerade on-chain bestätigt, aber die lokale Simulation sieht noch 0 Tokens im ATA.
+
+### Root Cause
+Der lokale Agave-Validator (non-voting RPC) hinkt der Chain um 1-5 Sekunden hinterher. Simulationen für brandneue Tokens (BUY) oder frisch gekaufte Tokens (SELL) nutzen veralteten State. Die on-chain Validators haben den aktuellen State.
+
+**Beweis:**
+- Derselbe Token-2022 Mint (`2yXRu77p...pump`) wurde on-chain erfolgreich mit Token-2022 ATA gekauft (GetAccountDataSize = 170 bytes, InitializeImmutableOwner + InitializeAccount3).
+- Spätere BUYs für andere Token-2022 Mints scheitern identisch in der Simulation.
+- Alle geprüften Mints sind verifiziert Token-2022 (`owner=TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`).
+
+### Fix
+Simulation-Bypass für zwei spezifische, transiente Fehlermuster:
+
+1. `InstructionError(0, Custom(2))` + `side=Buy` → Token-2022 ATA state lag
+2. `Custom(6023)` + `side=Sell` + `dex=pumpfun` → Balance state lag
+
+Bei Erkennung: Simulation als "passed" markieren mit Bypass-Reason, TX direkt senden.
+
+**Risiko:** Minimal — bei echtem Fehler (Mint existiert wirklich nicht) scheitert die TX on-chain, Kosten = TX-Fee (~0.000005 SOL). PumpFun BUY hat max_sol_cost Slippage-Schutz.
+
+### Dateien
+- `src/bin/execution_engine.rs`: Simulation-Bypass-Logik nach `simulate_transaction()`
+
+---
+
+## FIX-40: INTENTS_EXECUTED nur Confirmed + WsolManager erst nach Trade
+
+**Status:** ✅ FIXED
+
+### Problem 1: Keine "executed" Intents bei Slippage-TX
+TX on-chain mit Slippage = `FailedConfirmed`. `INTENTS_EXECUTED_TOTAL` zählte nur `Confirmed`, nicht `FailedConfirmed`.
+
+### Problem 2: WsolManager wickelt erst nach dem ersten Trade
+WsolManager ist event-getrieben und führt `check_and_act()` nur bei `WalletBalanceUpdate`-NATS-Nachricht aus. Nach Killswitch-Reset wurde keine WalletBalanceUpdate gesendet → WsolManager wartet auf die nächste Geyser-Update (nach Trade) → keine WSOL vor dem ersten Trade.
+
+### Fix
+1. `INTENTS_EXECUTED_TOTAL`: Zählt jetzt `Confirmed` **und** `FailedConfirmed` (TX on-chain = executed).
+2. Bei `ResetKillSwitch`: Publish `WalletBalanceUpdate` mit aktuellen LockManager-Balances an `wallet_balance_topic` → WsolManager erhält sofort Trigger und kann wrap.
+
+### Dateien
+- `src/bin/execution_engine.rs`: INTENTS_EXECUTED_TOTAL-Logik; WalletBalanceUpdate bei ResetKillSwitch
+- `docs/INTENTS_EXECUTED_AND_WSOL_KILLSWITCH_ANALYSIS.md`: Analyse
+
+---
+
+## FIX-41: Meteora DLMM „out=0“ / BalanceUpdated partielle Updates überschreiben Reserves
+
+**Status:** ✅ FIXED  
+**Datum:** 2026-02-22
+
+### Problem
+Quote-Berechnung schlug fehl mit `meteora: missing reserves (in=19892667585, out=0)`. Der SLAVE LivePoolCache erhielt `PoolCacheUpdate::BalanceUpdated` mit nur einem Vault (base oder quote); der andere Wert war 0. Durch vollständiges Ersetzen des Pool-States wurde die andere Reserve mit 0 überschrieben → Quote-Calculator bekam `out=0`.
+
+### Root Cause
+market-data publiziert BalanceUpdated, wenn ein einzelnes Vault ein Geyser-Update erhält. Wenn das andere Vault noch nicht aktualisiert wurde, steht in `tracked_vaults` dafür `last_balance=0`. Das ergibt partielle Updates `(base, 0)` oder `(0, quote)`. `apply_pool_cache_update` hat den kompletten Pool-State ersetzt statt zu mergen.
+
+### Fix
+Bei `BalanceUpdated`: Vor dem Upsert mit dem bestehenden Cache-Stand mergen. Wenn `update.base_reserve > 0` und `update.quote_reserve == 0`, wird der bestehende `quote_reserve` aus dem Cache beibehalten (und umgekehrt). So wird kein bekannter Wert mit 0 überschrieben.
+
+### Dateien
+- `src/execution/pool_cache_sync.rs`: `extract_reserves()`, `build_minimal_pool_state_with_reserves()`, Merge-Logik in `apply_pool_cache_update()`
+
+---
+
+## FIX-39: TAKE_PROFIT Dashboard PnL invertiert (SELL proceeds falsch)
+
+**Status:** ✅ FIXED
+
+### Problem
+TAKE_PROFIT-Trades zeigten im Dashboard fälschlich Verlust (negative PnL), obwohl der Detail-Text "+176.3% gain" anzeigte. Die PnL-Spalten (SOL, %) waren invertiert.
+
+### Root Cause
+Für SELL-Trades nutzte `trades_server.py` **wallet_sol_delta** als primäre Quelle für `proceeds_sol`. Bei PumpSwap/PumpFun-SELL ist der Swap-Output **WSOL** (Token), nicht native SOL. `wallet_sol_delta` misst nur native SOL (Rent-Rückerstattung ~0.002 SOL minus Fees) — **nicht** die tatsächlichen Swap-Erlöse. Dadurch wurde z.B. 0.002 SOL als proceeds verwendet statt 0.015 SOL → pnl_sol = 0.002 - 0.01 = -0.008 (fälschlicher Verlust).
+
+### Fix
+SELL `proceeds_sol` nutzt jetzt **value_sol (fill_out)** als primäre Quelle — das sind die tatsächlichen Swap-Erlöse (WSOL/SOL). `wallet_delta` nur als Fallback wenn `value_sol` fehlt.
+
+### Dateien
+- `scripts/trades_server.py`: SELL proceeds = value_sol (fill_out) statt wallet_delta in allen 3 PnL-Berechnungsblöcken
+
+---
+
+## FIX-43: (REVERTED) Momentum falscher TAKE_PROFIT — Pool-Filter
+
+**Status:** ❌ REVERTED (falsche Ursachenannahme)  
+**Datum:** 2026-02-23
+
+### Problem
+Der Momentum-Bot triggert TAKE_PROFIT mit „+173 % gain“, aber der tatsächliche Verkauf on-chain ergibt Verlust.
+
+### Ursprüngliche Annahme (falsch)
+`current_price` von „falschem Pool“ (Meteora/PumpSwap statt Bonding Curve).
+
+### Korrektur
+- Token auf Bonding Curve: Es gibt **keinen** anderen Pool — nur die Bonding Curve.
+- Migrierte Token: Multi-Pool wählt den besten verfügbaren Pool.
+- Der Pool-Filter war daher nicht die richtige Lösung; die eigentliche Ursache des falschen PnL ist weiterhin ungeklärt.
+
+---
+
+## FIX-42: TAKE_PROFIT falsche Verluste (Dashboard) — BUY cost nutzte wallet_delta statt fill_in
+
+**Status:** ✅ FIXED  
+**Datum:** 2026-02-23
+
+### Problem
+TAKE_PROFIT-Trades zeigten weiterhin fälschlich hohe Verluste (z.B. -64 %), obwohl der Bot „+173 % gain“ meldete. FIX-39 hatte nur SELL proceeds auf value_sol umgestellt; BUY cost nutzte weiterhin wallet_delta.
+
+### Root Cause
+Asymmetrie: BUY cost = wallet_delta (native SOL), SELL proceeds = value_sol (fill_out). Bei WSOL-BUYs misst wallet_delta nicht den Swap-Betrag (nur Rent/Fees) → falsche Cost-Basis → systematische PnL-Fehler.
+
+### Fix
+BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap verwendete SOL/WSOL-Menge. wallet_delta nur als Fallback. BUY und SELL verwenden damit konsistent die Fills.
+
+### Dateien
+- `scripts/trades_server.py`: BUY cost = value_sol (fill_in) bevorzugt in allen 3 PnL-Blöcken
+- `docs/TAKE_PROFIT_PNL_ANALYSIS_20260223.md`: Analyse
+
+---
+
+## 5. VERLORENE ÄNDERUNGEN DURCH REVERT (Cherry-Pick Status)
+
+| Priorität | Beschreibung | Status |
+|-----------|-------------|--------|
+| **CRITICAL** | fill_in/fill_out Accuracy (FIX-17) | ✅ FIXED |
+| **CRITICAL** | Invertierte PnL-Formel (FIX-PNL) | ✅ FIXED |
+| P1 | PumpSwap AMM Geyser-First Integration | ✅ FIXED (FIX-23) |
+| P1 | PumpFun SELL migrierte Tokens → `Ok(None)` | ✅ FIXED (Guard in pumpfun.rs) |
+| P1 | `emit_sim_failed_decision()` → `Err` für Retry | ✅ FIXED |
+| P1 | Ghost Positions + Wallet Balance Bootstrap | ✅ FIXED (FIX-24) |
+| P2 | Creator-Handling & DEX-Normalisierung | ✅ FIXED (FIX-25) |
+| P2 | Market-Data WSOL-Seeding & Pool-Propagation | ✅ FIXED (FIX-16 + FIX-24 + FIX-26) |
+| P2 | TX-Builder Cache-capped min_out | ✅ FIXED (FIX-28) |
+| P3 | `available_trading_capital_lamports` Metrik | ✅ FIXED (Grafana Label bereits korrigiert auf "Available WSOL") |
+
+---
+
+## FIX-45: Momentum Drawdown from ATH falsch (2025-04-XX)
 
 | Symptom | Trailing Stop zeigt -1986% from ATH bei realen -2.4%, PnL korrekt (-1.2%). |
 |---------|--------------------------------------------------------------------------|
