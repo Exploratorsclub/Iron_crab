@@ -123,9 +123,26 @@ impl ExplicitAmount {
         Self::from_ui(Decimal::from_f64_retain(sol).unwrap_or(Decimal::ZERO), 9)
     }
 
+    /// Human-readable amount as `f64` for calculations (I-15).
+    ///
+    /// Prefers explicit `ui` when present and convertible; if missing (e.g. JSON without `ui`),
+    /// derives from `raw` / `decimals` so callers never silently treat a valid fill as zero.
+    pub fn ui_f64(&self) -> f64 {
+        if let Some(ui) = self.ui {
+            if let Some(f) = ui.to_f64() {
+                return f;
+            }
+        }
+        let scale = Decimal::from(10u64.pow(self.decimals as u32));
+        if scale.is_zero() {
+            return 0.0;
+        }
+        (Decimal::from(self.raw) / scale).to_f64().unwrap_or(0.0)
+    }
+
     /// Get UI value as f64 (for calculations)
     pub fn as_f64(&self) -> f64 {
-        self.ui.and_then(|d| d.to_f64()).unwrap_or(0.0)
+        self.ui_f64()
     }
 }
 
@@ -2073,6 +2090,21 @@ mod tests {
         assert_eq!(amt.raw, 1_000_000_000);
         assert_eq!(amt.decimals, 9);
         assert_eq!(amt.ui, Some(Decimal::from(1)));
+    }
+
+    #[test]
+    fn explicit_amount_ui_f64_derives_from_raw_when_ui_missing() {
+        let json = r#"{"raw":500000000,"decimals":9}"#;
+        let amt: ExplicitAmount = serde_json::from_str(json).expect("deserialize");
+        assert!(amt.ui.is_none());
+        assert!((amt.ui_f64() - 0.5).abs() < 1e-9);
+        assert!((amt.as_f64() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn explicit_amount_ui_f64_matches_constructor_ui() {
+        let amt = ExplicitAmount::new(1_234_567_890, 9);
+        assert!((amt.ui_f64() - amt.as_f64()).abs() < 1e-12);
     }
 
     #[test]

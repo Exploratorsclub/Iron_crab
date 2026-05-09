@@ -1143,3 +1143,15 @@ BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap 
 | **Betroffene Module** | momentum-bot, position.rs |
 | **Regression-Prüfung** | PnL und Drawdown nutzen dieselbe Preisquelle (tokens_per_sol), Formeln konsistent. |
 | **Tags** | [momentum, drawdown, ath, fix] |
+
+---
+
+## FIX-46: Momentum Cost Basis / Scale-In `entry_price` und `ExplicitAmount` ohne `ui`
+
+| Symptom | Decision Records: extreme Trailing/TP-Prozente (−80 % from ATH, +300 % TP) bei real nahezu flat/Verlust; Dashboard spiegelt Backend. |
+|---------|----------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | (1) `PositionTracker::add_investment` gewichtete Scale-In mit `current_price` (Mark) statt Fill-`tokens_per_sol` der neuen Tranche. (2) `ExplicitAmount::as_f64()` lieferte bei deserialisierten Fills ohne `ui` **0** — `entry_price` aus `tok_ui/sol_ui` wurde falsch. |
+| **Fix** | `add_investment(additional_sol, fill_entry_tps)`; `open_position` reicht Fill-`p.entry_price` durch. `ExplicitAmount::ui_f64()` leitet aus `raw`/`decimals` ab; `as_f64()` delegiert dorthin; BUY-Bestätigung und Orphan-Recovery nutzen `ui_f64()` für Fill-UI. |
+| **Betroffene Module** | `src/bin/momentum_bot.rs`, `src/ipc/schema.rs` |
+| **Regression-Prüfung** | Unit-Test: gewichteter Scale-In-Blend nutzt Fill-`tokens_per_sol` statt Marktpreis; `ExplicitAmount` ohne `ui` in JSON. |
+| **Tags** | [momentum, scale-in, entry_price, explicit_amount, i-15] |
