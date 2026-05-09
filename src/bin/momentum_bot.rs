@@ -839,17 +839,24 @@ impl PositionTracker {
         self.highest_price = tokens_per_sol::updated_highest_price(self.highest_price, new_price);
     }
 
-    fn add_investment(&mut self, additional_sol: u64) {
+    /// Scale-in: blend `entry_price` (tokens_per_sol) by SOL weight using the **fill** tps for
+    /// the new tranche — not `current_price` (mark can diverge and blew up TP/ATH decision text).
+    fn add_investment(&mut self, additional_sol: u64, fill_entry_tps: f64) {
         if additional_sol == 0 {
             return;
         }
 
-        // Heuristic: weighted-average entry price based on SOL invested.
-        // Exact fill price/token amount is not available from ExecutionResult today.
+        let leg_tps = if fill_entry_tps > 0.0 && fill_entry_tps.is_finite() {
+            fill_entry_tps
+        } else {
+            // Defensive: missing fill tps — keep prior entry for this leg's weight (avoid 0).
+            self.entry_price
+        };
+
         let old_sol = self.sol_invested.max(1);
         let new_sol = old_sol.saturating_add(additional_sol).max(1);
         let new_entry = ((self.entry_price * (old_sol as f64))
-            + (self.current_price * (additional_sol as f64)))
+            + (leg_tps * (additional_sol as f64)))
             / (new_sol as f64);
 
         self.sol_invested = self.sol_invested.saturating_add(additional_sol);
@@ -3301,7 +3308,7 @@ impl MomentumContext {
             let mut positions = self.positions.write();
             if let Some(pos) = positions.get_mut(p.mint) {
                 pos.token_amount = pos.token_amount.saturating_add(p.token_amount);
-                pos.add_investment(p.sol_invested);
+                pos.add_investment(p.sol_invested, p.entry_price);
                 // Scope 50: Scale-in increases total held — any prior exit intent was sized for
                 // the old total (often probe-only). Reset exit latch so the next exit uses the
                 // combined amount; avoids selling probe while scale-in tokens remain.
@@ -4013,10 +4020,10 @@ impl MomentumContext {
                             let sol_ui = result
                                 .fill_in
                                 .as_ref()
-                                .map(|a| a.as_f64())
+                                .map(|a| a.ui_f64())
                                 .unwrap_or(sol_invested as f64 / 1e9)
                                 .max(0.0);
-                            let tok_ui = fill_out.as_f64().max(0.0);
+                            let tok_ui = fill_out.ui_f64().max(0.0);
                             let entry_price = if sol_ui > 0.0 { tok_ui / sol_ui } else { 1.0 };
 
                             let token_program = result
@@ -4312,10 +4319,10 @@ impl MomentumContext {
                         let sol_ui_for_price = result
                             .fill_in
                             .as_ref()
-                            .map(|a| a.as_f64())
+                            .map(|a| a.ui_f64())
                             .unwrap_or(sol_invested_raw as f64 / 1_000_000_000.0)
                             .max(0.0);
-                        let tok_ui = fill_out.as_f64().max(0.0);
+                        let tok_ui = fill_out.ui_f64().max(0.0);
                         let entry_price = if sol_ui_for_price > 0.0 {
                             tok_ui / sol_ui_for_price
                         } else {
@@ -7222,6 +7229,19 @@ mod tests {
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Scale-in must blend fill `tokens_per_sol` for the new leg, not `current_price` (mark).
+    #[test]
+    fn scale_in_entry_price_blends_fill_tps_not_mark_price() {
+        let mut pos = PositionTracker::new("mint", "pool", "dex", 100.0, 6, 1_000_000, 500_000_000);
+        pos.current_price = 10.0;
+        pos.add_investment(500_000_000, 300.0);
+        assert!(
+            (pos.entry_price - 200.0).abs() < 1e-6,
+            "expected weighted entry ~200 tps, got {}",
+            pos.entry_price
+        );
     }
 
     #[test]
