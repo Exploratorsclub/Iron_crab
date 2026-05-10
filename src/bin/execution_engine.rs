@@ -10191,6 +10191,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     } else {
         DecisionOutcome::Rejected
     };
+    // Slot of the confirmed transaction when known (bundle status, Geyser confirm, or RPC status).
+    let mut tx_landing_slot: Option<u64> = None;
 
     if config.send_enabled && sent_anything {
         if requires_bundle {
@@ -10226,6 +10228,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                                     status.transactions.len()
                                 )),
                             });
+                            tx_landing_slot = Some(status.slot);
                             final_outcome = DecisionOutcome::Confirmed;
                         }
                         Err(e) => {
@@ -10267,7 +10270,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 )
                 .await
                 {
-                    Ok(ConfirmOutcome::Confirmed { details }) => {
+                    Ok(ConfirmOutcome::Confirmed { details, slot }) => {
+                        tx_landing_slot = slot;
                         checks.push(CheckResult {
                             check_name: "confirm".to_string(),
                             passed: true,
@@ -10276,7 +10280,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                         });
                         final_outcome = DecisionOutcome::Confirmed;
                     }
-                    Ok(ConfirmOutcome::FailedConfirmed { details }) => {
+                    Ok(ConfirmOutcome::FailedConfirmed { details, slot }) => {
+                        tx_landing_slot = slot;
                         checks.push(CheckResult {
                             check_name: "confirm".to_string(),
                             passed: false,
@@ -10630,6 +10635,13 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             }
 
             exec.status = status;
+            if exec.status == ExecutionStatus::Confirmed {
+                if let Some(slot) = tx_landing_slot {
+                    exec.confirmed_slot = Some(slot);
+                    exec.metadata
+                        .insert("confirmed_slot".to_string(), slot.to_string());
+                }
+            }
             // Scope 48: always classify confirmed SELL for market-data, even when fill RPC path
             // was skipped (no signature / parse failure / missing wallet).
             if intent.side == TradeSide::Sell && exec.status == ExecutionStatus::Confirmed {
@@ -11395,9 +11407,18 @@ fn build_input_snapshots(intent: &TradeIntent) -> std::collections::HashMap<Stri
 }
 
 enum ConfirmOutcome {
-    Confirmed { details: String },
-    FailedConfirmed { details: String },
-    TimeoutSent { details: String },
+    Confirmed {
+        details: String,
+        /// Execution landing slot when known (Geyser, RPC status, or bundle watcher).
+        slot: Option<u64>,
+    },
+    FailedConfirmed {
+        details: String,
+        slot: Option<u64>,
+    },
+    TimeoutSent {
+        details: String,
+    },
 }
 
 /// FIX-32: Geyser-first TX confirmation with RPC-polling fallback.
@@ -11478,6 +11499,7 @@ async fn confirm_via_geyser(
                             "method=geyser slot={} elapsed_ms={elapsed_ms} signature={signature_base58}",
                             confirm.slot,
                         ),
+                        slot: Some(confirm.slot),
                     })
                 }
                 Ok(confirm) if confirm.error.is_some() => {
@@ -11489,6 +11511,7 @@ async fn confirm_via_geyser(
                             confirm.error.as_deref().unwrap_or("unknown"),
                             confirm.slot,
                         ),
+                        slot: Some(confirm.slot),
                     })
                 }
                 Ok(_confirm) => {
@@ -11565,6 +11588,7 @@ async fn confirm_via_rpc_polling(
                         st.confirmation_status,
                         start.elapsed().as_millis()
                     ),
+                    slot: Some(st.slot),
                 });
             }
 
@@ -11588,10 +11612,12 @@ async fn confirm_via_rpc_polling(
                 TX_CONFIRM_LATENCY_MS.store(elapsed_ms, Ordering::Relaxed);
                 return Ok(ConfirmOutcome::Confirmed {
                     details: format!(
-                        "method=rpc_polling confirmations={:?} confirmation_status={:?} elapsed_ms={elapsed_ms}",
+                        "method=rpc_polling confirmations={:?} confirmation_status={:?} slot={} elapsed_ms={elapsed_ms}",
                         st.confirmations,
                         st.confirmation_status,
+                        st.slot,
                     ),
+                    slot: Some(st.slot),
                 });
             }
         }

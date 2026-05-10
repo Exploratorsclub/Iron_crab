@@ -507,6 +507,10 @@ struct PositionTracker {
     bonding_curve_progress_bps: Option<u32>,
     /// PumpFun creator (for BC-SELL; only when dex == pumpfun)
     creator: Option<String>,
+    /// Geyser/RPC confirmed slot of the entry BUY (0 = unknown / legacy).
+    entry_confirmed_slot: u64,
+    /// Last slot at which we applied a position price update (monotonic).
+    last_price_slot: u64,
 }
 
 /// Executable (reserve-based) `tokens_per_sol` for the position's pool, when available.
@@ -694,12 +698,18 @@ struct PersistedPosition {
     /// PumpFun creator (for BC-SELL; only when dex == pumpfun)
     #[serde(default)]
     creator: Option<String>,
+    /// Geyser/RPC slot of confirmed BUY (0 = unknown)
+    #[serde(default)]
+    entry_confirmed_slot: u64,
+    /// Last slot applied to `current_price` / `highest_price`
+    #[serde(default)]
+    last_price_slot: u64,
     /// Schema version for forward compatibility
     schema_version: u8,
 }
 
 impl PersistedPosition {
-    const CURRENT_SCHEMA_VERSION: u8 = 2;
+    const CURRENT_SCHEMA_VERSION: u8 = 3;
 
     /// Convert from PositionTracker to PersistedPosition
     fn from_tracker(tracker: &PositionTracker) -> Self {
@@ -733,6 +743,8 @@ impl PersistedPosition {
             token_program: tracker.token_program.clone(),
             bonding_curve_progress_bps: tracker.bonding_curve_progress_bps,
             creator: tracker.creator.clone(),
+            entry_confirmed_slot: tracker.entry_confirmed_slot,
+            last_price_slot: tracker.last_price_slot,
             schema_version: Self::CURRENT_SCHEMA_VERSION,
         }
     }
@@ -779,12 +791,27 @@ impl PersistedPosition {
             token_program: self.token_program.clone(),
             bonding_curve_progress_bps: self.bonding_curve_progress_bps,
             creator: self.creator.clone(),
+            entry_confirmed_slot: self.entry_confirmed_slot,
+            last_price_slot: self.last_price_slot,
         }
     }
 }
 
 /// JetStream KV bucket name for position state
 const POSITION_KV_BUCKET: &str = "POSITIONS";
+
+/// Extract BUY confirmation slot for Scope 1 price-update gating (I-13 companion).
+fn entry_confirmed_slot_from_execution(result: &ExecutionResult) -> u64 {
+    result
+        .confirmed_slot
+        .or_else(|| {
+            result
+                .metadata
+                .get("confirmed_slot")
+                .and_then(|s| s.parse::<u64>().ok())
+        })
+        .unwrap_or(0)
+}
 
 impl PositionTracker {
     fn new(
@@ -818,6 +845,8 @@ impl PositionTracker {
             token_program: None,
             bonding_curve_progress_bps: None,
             creator: None,
+            entry_confirmed_slot: 0,
+            last_price_slot: 0,
         }
     }
 
@@ -2075,6 +2104,8 @@ struct OpenPositionParams<'a> {
     token_program: Option<String>,
     /// PumpFun creator (for BC-SELL when dex == pumpfun)
     creator: Option<String>,
+    /// Confirmed landing slot of the BUY tx (`ExecutionResult.confirmed_slot`).
+    entry_confirmed_slot: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3326,6 +3357,7 @@ impl MomentumContext {
                 if pos.creator.is_none() && p.creator.is_some() && pos.dex == "pumpfun" {
                     pos.creator = p.creator.clone();
                 }
+                pos.entry_confirmed_slot = pos.entry_confirmed_slot.max(p.entry_confirmed_slot);
                 info!(
                     mint = %p.mint,
                     additional_sol = p.sol_invested,
@@ -3352,7 +3384,14 @@ impl MomentumContext {
                         new_tracker.set_creator(c);
                     }
                 }
+                new_tracker.entry_confirmed_slot = p.entry_confirmed_slot;
                 positions.insert(p.mint.to_string(), new_tracker.clone());
+                if p.entry_confirmed_slot == 0 {
+                    warn!(
+                        mint = %p.mint,
+                        "Position opened without confirmed BUY slot — slot-monotonic price gating disabled (Scope 1)"
+                    );
+                }
                 info!(
                     mint = %p.mint,
                     entry_price = p.entry_price,
@@ -3374,12 +3413,14 @@ impl MomentumContext {
     /// Update position price from market trade or pool reserves.
     /// If `source_pool` is Some, only update when position.pool matches (prevents wrong-pool
     /// price pollution for multi-pool tokens, e.g. bonding curve + AMM). INVARIANTS.md I-13.
+    /// `source_slot`: Geyser/update slot; required when `entry_confirmed_slot > 0` (Scope 1).
     fn update_position_price(
         &self,
         mint: &str,
         new_price: f64,
         trade: Option<TradeEvent>,
         source_pool: Option<&str>,
+        source_slot: Option<u64>,
     ) {
         let mut positions = self.positions.write();
         if let Some(pos) = positions.get_mut(mint) {
@@ -3395,7 +3436,40 @@ impl MomentumContext {
                 );
                 return;
             }
+
+            if pos.entry_confirmed_slot > 0 {
+                let Some(slot) = source_slot else {
+                    trace!(
+                        mint = %mint,
+                        entry_confirmed_slot = pos.entry_confirmed_slot,
+                        "Skipping price update: missing source_slot while slot gate active"
+                    );
+                    return;
+                };
+                if slot <= pos.entry_confirmed_slot {
+                    trace!(
+                        mint = %mint,
+                        entry_confirmed_slot = pos.entry_confirmed_slot,
+                        source_slot = slot,
+                        "Skipping price update: event slot not after entry BUY confirm slot"
+                    );
+                    return;
+                }
+                if slot <= pos.last_price_slot {
+                    trace!(
+                        mint = %mint,
+                        last_price_slot = pos.last_price_slot,
+                        source_slot = slot,
+                        "Skipping price update: non-monotonic slot sequence"
+                    );
+                    return;
+                }
+            }
+
             pos.update_price(new_price);
+            if let Some(s) = source_slot {
+                pos.last_price_slot = s;
+            }
             if let Some(t) = trade {
                 pos.record_trade(t);
             }
@@ -4104,6 +4178,9 @@ impl MomentumContext {
                                         sol_invested,
                                         token_program,
                                         creator,
+                                        entry_confirmed_slot: entry_confirmed_slot_from_execution(
+                                            result,
+                                        ),
                                     });
                                 } else {
                                     self.orphaned_recovered_intent_ids
@@ -4138,6 +4215,9 @@ impl MomentumContext {
                                     sol_invested,
                                     token_program,
                                     creator,
+                                    entry_confirmed_slot: entry_confirmed_slot_from_execution(
+                                        result,
+                                    ),
                                 });
                             } else {
                                 self.orphaned_recovered_intent_ids
@@ -4418,6 +4498,7 @@ impl MomentumContext {
                             sol_invested,
                             token_program: resolved_token_program,
                             creator,
+                            entry_confirmed_slot: entry_confirmed_slot_from_execution(result),
                         });
                     }
                     TradeSide::Sell => {
@@ -5611,6 +5692,14 @@ async fn recover_positions_from_jsonl(
                 sol_invested,
             );
 
+            let max_buy_slot = execs
+                .iter()
+                .filter_map(|e| e.confirmed_slot)
+                .max()
+                .unwrap_or(0);
+            tracker.entry_confirmed_slot = max_buy_slot;
+            tracker.last_price_slot = max_buy_slot;
+
             // Override entry_time to match actual trade time
             tracker.entry_time = entry_time_estimate;
             tracker.current_price = entry_price; // Will update from market events
@@ -6707,6 +6796,7 @@ async fn main() -> Result<()> {
                                                         tokens_per_sol,
                                                         None,
                                                         Some(&update.pool_address),
+                                                        Some(update.geyser_slot),
                                                     );
                                                 }
                                             }
@@ -7229,6 +7319,41 @@ mod tests {
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Scope 1: Pre-entry/batched trades must not move `current_price`; slots must be monotonic.
+    #[tokio::test]
+    async fn scope1_slot_gate_position_price_updates() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+
+        ctx.open_position(OpenPositionParams {
+            mint: "m1",
+            pool: "poolA",
+            dex: "raydium",
+            entry_price: 10.0,
+            token_decimals: 6,
+            token_amount: 1_000_000,
+            sol_invested: 1_000_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 500,
+        });
+
+        ctx.update_position_price("m1", 9.0, None, Some("poolA"), Some(400));
+        assert_eq!(ctx.positions.read().get("m1").unwrap().current_price, 10.0);
+
+        ctx.update_position_price("m1", 8.0, None, Some("poolA"), Some(501));
+        assert_eq!(ctx.positions.read().get("m1").unwrap().current_price, 8.0);
+        assert_eq!(ctx.positions.read().get("m1").unwrap().last_price_slot, 501);
+
+        ctx.update_position_price("m1", 7.0, None, Some("poolA"), Some(501));
+        assert_eq!(ctx.positions.read().get("m1").unwrap().current_price, 8.0);
+
+        ctx.update_position_price("m1", 6.5, None, Some("poolA"), Some(502));
+        assert_eq!(ctx.positions.read().get("m1").unwrap().current_price, 6.5);
     }
 
     /// Scale-in must blend fill `tokens_per_sol` for the new leg, not `current_price` (mark).
@@ -8264,6 +8389,7 @@ mod tests {
             sol_invested: 1_000_000,
             token_program: None,
             creator: None,
+            entry_confirmed_slot: 100,
         });
         ctx.mark_exit_generated("mintX");
         assert!(ctx.positions.read().get("mintX").unwrap().exit_generated);
@@ -8278,6 +8404,7 @@ mod tests {
             sol_invested: 2_000_000,
             token_program: None,
             creator: None,
+            entry_confirmed_slot: 200,
         });
         {
             let pos = ctx.positions.read().get("mintX").unwrap().clone();
@@ -8362,6 +8489,7 @@ mod tests {
             sol_invested: 1_000_000,
             token_program: None,
             creator: None,
+            entry_confirmed_slot: 0,
         });
         ctx.mark_exit_generated("mintY");
 
@@ -8460,6 +8588,7 @@ mod tests {
             sol_invested: 1,
             token_program: None,
             creator: None,
+            entry_confirmed_slot: 0,
         });
         ctx.mark_exit_generated("mintZ");
         ctx.register_sell_intent("sell-z-1", "mintZ", "poolZ", "raydium", 1_000);
@@ -8862,6 +8991,7 @@ mod tests {
             sol_invested: 1_250_000,
             token_program: None,
             creator: None,
+            entry_confirmed_slot: 0,
         });
 
         let scale_fill = 37_843_472_159u64;
@@ -8982,6 +9112,7 @@ mod tests {
             sol_invested: 1_250_000,
             token_program: None,
             creator: None,
+            entry_confirmed_slot: 0,
         });
 
         let scale_fill = 37_843_472_159u64;
@@ -9738,7 +9869,13 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     token_amount: token_raw,
                     signature: sig.clone(),
                 };
-                ctx.update_position_price(mint, tokens_per_sol, Some(trade), Some(pool_address));
+                ctx.update_position_price(
+                    mint,
+                    tokens_per_sol,
+                    Some(trade),
+                    Some(pool_address),
+                    event.slot,
+                );
             }
 
             if is_dev {
