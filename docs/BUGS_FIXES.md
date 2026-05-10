@@ -1123,6 +1123,28 @@ BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap 
 
 ---
 
+## FIX-47: Momentum — BondingCurveProgress vor BUY-Confirm ging verloren (Pending-Entry-Lifecycle)
+
+**Status:** ✅ FIXED  
+**Datum:** 2026-05-10
+
+### Problem
+`BondingCurveProgress` wurde nur auf eine bestehende `PositionTracker`-Zeile geschrieben. Trifft der Geyser-State vor der BUY-Bestätigung / vor `ExecutionResult` ein, ging der Fortschritt (z. B. 10000 bps + complete) verloren — kein `BONDING_CURVE_EXIT`, später z. B. nur `TIME_EXIT`.
+
+### Fix
+- Globales `latest_bonding_by_mint` mit slot-/ts-monotonem Merge.
+- Nach erfolgreichem JetStream-Publish: `PendingBuyEntry` (keine Position, kein Position-Count).
+- Bei Confirm: Snapshot auf `open_position` über `initial_bonding`; Lifecycle-Eintrag entfernen; optional `process_exit_signals` per `tokio::spawn` nach erfolgreichem Open.
+- Failed/Timeout BUY und fehlendes `fill_out`: Lifecycle bereinigen; `cleanup_stale_pending` räumt Lifecycle für abgelaufene BUY-Pendings mit auf.
+
+### Dateien
+- `src/bin/momentum_bot.rs`
+
+### Tags
+[momentum, pumpfun, bonding_curve, geyser, i-4, scope-a]
+
+---
+
 ## 5. VERLORENE ÄNDERUNGEN DURCH REVERT (Cherry-Pick Status)
 
 | Priorität | Beschreibung | Status |
