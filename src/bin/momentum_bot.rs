@@ -2133,7 +2133,6 @@ struct PendingBuyEntry {
     slot_seen_at_ms: u64,
     creator: Option<String>,
     token_program: Option<String>,
-    latest_bonding: Option<CachedBondingCurveState>,
 }
 
 /// Returns true if `(new_slot, new_ts)` is strictly after `(old_slot, old_ts)` for Geyser ordering.
@@ -4090,7 +4089,7 @@ impl MomentumContext {
     }
 
     /// Merge a Geyser `BondingCurveProgress` observation (slot-/ts-monotonic). Updates global
-    /// cache, mirrors into active pending BUY entry for the mint, and syncs open positions.
+    /// cache and syncs open positions.
     fn merge_bonding_curve_progress_geyser(
         &self,
         mint: &str,
@@ -4124,11 +4123,6 @@ impl MomentumContext {
         }
 
         let snapshot = self.latest_bonding_by_mint.read().get(mint).cloned();
-        if let Some(intent_id) = self.pending_buy_mint_index.read().get(mint).cloned() {
-            if let Some(e) = self.pending_buy_entries.write().get_mut(&intent_id) {
-                e.latest_bonding = snapshot.clone();
-            }
-        }
 
         let mut positions = self.positions.write();
         if let Some(pos) = positions.get_mut(mint) {
@@ -4140,7 +4134,6 @@ impl MomentumContext {
 
     /// After successful BUY intent JetStream publish: track lifecycle + bonding cache (not a position).
     fn register_pending_buy_entry_after_publish(&self, meta: PendingBuyPublishMeta<'_>) {
-        let latest_bonding = self.latest_bonding_by_mint.read().get(meta.mint).cloned();
         let mut entries = self.pending_buy_entries.write();
         let mut index = self.pending_buy_mint_index.write();
         if let Some(old_id) = index
@@ -4164,7 +4157,6 @@ impl MomentumContext {
                 slot_seen_at_ms: meta.slot_seen_at_ms,
                 creator: meta.creator,
                 token_program: meta.token_program,
-                latest_bonding,
             },
         );
         debug!(
@@ -5006,13 +4998,16 @@ impl MomentumContext {
     fn cleanup_stale_pending(&self) {
         let mut pending = self.pending_intents.write();
         let cutoff = Duration::from_secs(120);
+        let now = Instant::now();
         let before = pending.len();
         let stale_buy_intent_ids: Vec<String> = pending
             .iter()
-            .filter(|(_, p)| p.created_at.elapsed() >= cutoff && p.side == TradeSide::Buy)
+            .filter(|(_, p)| {
+                now.saturating_duration_since(p.created_at) >= cutoff && p.side == TradeSide::Buy
+            })
             .map(|(id, _)| id.clone())
             .collect();
-        pending.retain(|_, p| p.created_at.elapsed() < cutoff);
+        pending.retain(|_, p| now.saturating_duration_since(p.created_at) < cutoff);
         let removed = before - pending.len();
         drop(pending);
         for id in stale_buy_intent_ids {
