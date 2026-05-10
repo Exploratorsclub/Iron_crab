@@ -2093,6 +2093,62 @@ struct PendingIntent {
     created_at: Instant,
 }
 
+/// Parameters for registering a pending BUY lifecycle entry after JetStream publish.
+struct PendingBuyPublishMeta<'a> {
+    intent_id: &'a str,
+    mint: &'a str,
+    pool: &'a str,
+    dex: &'a str,
+    intended_sol: u64,
+    entry_kind: Option<EntryKind>,
+    signal_slot: u64,
+    slot_seen_at_ms: u64,
+    creator: Option<String>,
+    token_program: Option<String>,
+}
+
+/// Geyser bonding-curve snapshot for a mint (merged slot-/ts-monotonic).
+#[derive(Debug, Clone)]
+struct CachedBondingCurveState {
+    progress_bps: u32,
+    /// Preserved for migration / exit routing extensions; progress alone drives `BONDING_CURVE_EXIT`.
+    #[allow(dead_code)]
+    complete: bool,
+    slot: u64,
+    ts_unix_ms: u64,
+}
+
+/// Pending BUY lifecycle (not a wallet position): holds bonding/migration state between
+/// successful intent publish and ExecutionResult / `open_position`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct PendingBuyEntry {
+    mint: String,
+    pool: String,
+    dex: String,
+    entry_kind: Option<EntryKind>,
+    intended_sol: u64,
+    intent_id: String,
+    signal_slot: u64,
+    slot_seen_at_ms: u64,
+    creator: Option<String>,
+    token_program: Option<String>,
+}
+
+/// Returns true if `(new_slot, new_ts)` is strictly after `(old_slot, old_ts)` for Geyser ordering.
+fn bonding_geyser_observation_is_newer(
+    new_slot: u64,
+    new_ts: u64,
+    old_slot: u64,
+    old_ts: u64,
+) -> bool {
+    match new_slot.cmp(&old_slot) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => new_ts > old_ts,
+    }
+}
+
 struct OpenPositionParams<'a> {
     mint: &'a str,
     pool: &'a str,
@@ -2106,6 +2162,8 @@ struct OpenPositionParams<'a> {
     creator: Option<String>,
     /// Confirmed landing slot of the BUY tx (`ExecutionResult.confirmed_slot`).
     entry_confirmed_slot: u64,
+    /// Latest PumpFun bonding progress seen on Geyser before/at confirm (optional).
+    initial_bonding: Option<CachedBondingCurveState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2188,6 +2246,12 @@ struct MomentumContext {
     positions: parking_lot::RwLock<HashMap<String, PositionTracker>>,
     /// Pending intents awaiting execution results (intent_id -> PendingIntent)
     pending_intents: parking_lot::RwLock<HashMap<String, PendingIntent>>,
+    /// Latest `BondingCurveProgress` per mint (Geyser slot/ts monotonic).
+    latest_bonding_by_mint: parking_lot::RwLock<HashMap<String, CachedBondingCurveState>>,
+    /// Pending BUY lifecycle entries (intent_id -> entry), after successful JetStream publish.
+    pending_buy_entries: parking_lot::RwLock<HashMap<String, PendingBuyEntry>>,
+    /// At most one active pending BUY per mint: mint -> intent_id.
+    pending_buy_mint_index: parking_lot::RwLock<HashMap<String, String>>,
     /// Multi-pool registry: All known pools per mint (mint -> Vec<PoolInfo>)
     mint_pools: parking_lot::RwLock<HashMap<String, Vec<PoolInfo>>>,
     /// SLAVE LivePoolCache — populated from JetStream PoolCacheUpdate events.
@@ -3358,6 +3422,12 @@ impl MomentumContext {
                     pos.creator = p.creator.clone();
                 }
                 pos.entry_confirmed_slot = pos.entry_confirmed_slot.max(p.entry_confirmed_slot);
+                if let Some(ref snap) = p.initial_bonding {
+                    pos.bonding_curve_progress_bps = Some(
+                        snap.progress_bps
+                            .max(pos.bonding_curve_progress_bps.unwrap_or(0)),
+                    );
+                }
                 info!(
                     mint = %p.mint,
                     additional_sol = p.sol_invested,
@@ -3385,6 +3455,9 @@ impl MomentumContext {
                     }
                 }
                 new_tracker.entry_confirmed_slot = p.entry_confirmed_slot;
+                if let Some(ref snap) = p.initial_bonding {
+                    new_tracker.bonding_curve_progress_bps = Some(snap.progress_bps);
+                }
                 positions.insert(p.mint.to_string(), new_tracker.clone());
                 if p.entry_confirmed_slot == 0 {
                     warn!(
@@ -3494,6 +3567,12 @@ impl MomentumContext {
                 hold_time_secs = hold_secs,
                 "📉 Position closed"
             );
+        }
+
+        // Drop bonding cache for this mint when the position is gone, unless a BUY is already
+        // pending again (re-entry lifecycle must keep latest_bonding for confirm/open).
+        if !self.pending_buy_mint_index.read().contains_key(mint) {
+            self.latest_bonding_by_mint.write().remove(mint);
         }
 
         // Delete from KV asynchronously (fire-and-forget)
@@ -4015,6 +4094,134 @@ impl MomentumContext {
         debug!(intent_id = %intent_id, mint = %mint, "Registered pending SELL intent");
     }
 
+    /// Merge a Geyser `BondingCurveProgress` observation (slot-/ts-monotonic). Updates global
+    /// cache and syncs open positions.
+    fn merge_bonding_curve_progress_geyser(
+        &self,
+        mint: &str,
+        progress_bps: u32,
+        complete: bool,
+        slot: u64,
+        ts_unix_ms: u64,
+    ) {
+        let cache_relevant = {
+            let positions = self.positions.read();
+            let pending_idx = self.pending_buy_mint_index.read();
+            positions.contains_key(mint) || pending_idx.contains_key(mint)
+        };
+
+        if !cache_relevant {
+            self.latest_bonding_by_mint.write().remove(mint);
+            return;
+        }
+
+        {
+            let mut map = self.latest_bonding_by_mint.write();
+            let accept = match map.get(mint) {
+                None => true,
+                Some(prev) => bonding_geyser_observation_is_newer(
+                    slot,
+                    ts_unix_ms,
+                    prev.slot,
+                    prev.ts_unix_ms,
+                ),
+            };
+            if accept {
+                map.insert(
+                    mint.to_string(),
+                    CachedBondingCurveState {
+                        progress_bps,
+                        complete,
+                        slot,
+                        ts_unix_ms,
+                    },
+                );
+            }
+        }
+
+        let snapshot = self.latest_bonding_by_mint.read().get(mint).cloned();
+
+        let mut positions = self.positions.write();
+        if let Some(pos) = positions.get_mut(mint) {
+            if let Some(ref latest) = snapshot {
+                // Progress can theoretically move backward on a newer slot (bad parse / race);
+                // never regress below the best-known in-position value (matches scale-in max-guard).
+                pos.bonding_curve_progress_bps = Some(
+                    latest
+                        .progress_bps
+                        .max(pos.bonding_curve_progress_bps.unwrap_or(0)),
+                );
+            }
+        }
+    }
+
+    /// After successful BUY intent JetStream publish: track lifecycle + bonding cache (not a position).
+    fn register_pending_buy_entry_after_publish(&self, meta: PendingBuyPublishMeta<'_>) {
+        let mut entries = self.pending_buy_entries.write();
+        let mut index = self.pending_buy_mint_index.write();
+        if let Some(old_id) = index
+            .get(meta.mint)
+            .filter(|&id| id != meta.intent_id)
+            .cloned()
+        {
+            entries.remove(&old_id);
+        }
+        index.insert(meta.mint.to_string(), meta.intent_id.to_string());
+        entries.insert(
+            meta.intent_id.to_string(),
+            PendingBuyEntry {
+                mint: meta.mint.to_string(),
+                pool: meta.pool.to_string(),
+                dex: meta.dex.to_string(),
+                entry_kind: meta.entry_kind,
+                intended_sol: meta.intended_sol,
+                intent_id: meta.intent_id.to_string(),
+                signal_slot: meta.signal_slot,
+                slot_seen_at_ms: meta.slot_seen_at_ms,
+                creator: meta.creator,
+                token_program: meta.token_program,
+            },
+        );
+        debug!(
+            intent_id = %meta.intent_id,
+            mint = %meta.mint,
+            "Registered pending BUY entry lifecycle (post-publish)"
+        );
+    }
+
+    fn remove_pending_buy_entry_by_intent(&self, intent_id: &str) {
+        let mut entries = self.pending_buy_entries.write();
+        if let Some(e) = entries.remove(intent_id) {
+            let mut index = self.pending_buy_mint_index.write();
+            if index.get(&e.mint).map(|id| id.as_str()) == Some(intent_id) {
+                index.remove(&e.mint);
+            }
+            debug!(
+                intent_id = %intent_id,
+                mint = %e.mint,
+                "Removed pending BUY entry lifecycle"
+            );
+            if self.positions.read().get(&e.mint).is_none() {
+                self.latest_bonding_by_mint.write().remove(&e.mint);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn test_pending_buy_entry_present(&self, intent_id: &str, mint: &str) -> bool {
+        self.pending_buy_entries.read().contains_key(intent_id)
+            && self
+                .pending_buy_mint_index
+                .read()
+                .get(mint)
+                .map(|s| s.as_str())
+                == Some(intent_id)
+    }
+
+    fn clone_latest_bonding_snapshot(&self, mint: &str) -> Option<CachedBondingCurveState> {
+        self.latest_bonding_by_mint.read().get(mint).cloned()
+    }
+
     /// Handle execution result from execution-engine
     fn handle_execution_result(self: &Arc<Self>, result: &ExecutionResult) {
         // Find the pending intent by id (source is not authoritative).
@@ -4168,6 +4375,8 @@ impl MomentumContext {
                                         "⚠️ ORPHANED BUY APPLIED TO EXISTING POSITION — scale-in fill \
                                          recovered after pending intent was dropped"
                                     );
+                                    let initial_bonding = self.clone_latest_bonding_snapshot(mint);
+                                    self.remove_pending_buy_entry_by_intent(&result.intent_id);
                                     self.open_position(OpenPositionParams {
                                         mint,
                                         pool: &pool,
@@ -4181,8 +4390,14 @@ impl MomentumContext {
                                         entry_confirmed_slot: entry_confirmed_slot_from_execution(
                                             result,
                                         ),
+                                        initial_bonding,
+                                    });
+                                    let ctx_exit = Arc::clone(self);
+                                    tokio::spawn(async move {
+                                        ctx_exit.process_exit_signals().await;
                                     });
                                 } else {
+                                    self.remove_pending_buy_entry_by_intent(&result.intent_id);
                                     self.orphaned_recovered_intent_ids
                                         .write()
                                         .remove(&result.intent_id);
@@ -4205,6 +4420,8 @@ impl MomentumContext {
                                      creating position from ExecutionResult"
                                 );
 
+                                let initial_bonding = self.clone_latest_bonding_snapshot(mint);
+                                self.remove_pending_buy_entry_by_intent(&result.intent_id);
                                 self.open_position(OpenPositionParams {
                                     mint,
                                     pool: &pool,
@@ -4218,8 +4435,14 @@ impl MomentumContext {
                                     entry_confirmed_slot: entry_confirmed_slot_from_execution(
                                         result,
                                     ),
+                                    initial_bonding,
+                                });
+                                let ctx_exit = Arc::clone(self);
+                                tokio::spawn(async move {
+                                    ctx_exit.process_exit_signals().await;
                                 });
                             } else {
+                                self.remove_pending_buy_entry_by_intent(&result.intent_id);
                                 self.orphaned_recovered_intent_ids
                                     .write()
                                     .remove(&result.intent_id);
@@ -4232,6 +4455,7 @@ impl MomentumContext {
                             }
                         }
                     } else {
+                        self.remove_pending_buy_entry_by_intent(&result.intent_id);
                         warn!(
                             intent_id = %result.intent_id,
                             mint = %mint,
@@ -4375,6 +4599,7 @@ impl MomentumContext {
                                 }
                             }
 
+                            self.remove_pending_buy_entry_by_intent(&result.intent_id);
                             return;
                         };
 
@@ -4488,6 +4713,8 @@ impl MomentumContext {
                         self.orphaned_recovered_intent_ids
                             .write()
                             .insert(result.intent_id.clone());
+                        let initial_bonding = self.clone_latest_bonding_snapshot(&pending.mint);
+                        self.remove_pending_buy_entry_by_intent(&result.intent_id);
                         self.open_position(OpenPositionParams {
                             mint: &pending.mint,
                             pool: &pending.pool,
@@ -4499,6 +4726,11 @@ impl MomentumContext {
                             token_program: resolved_token_program,
                             creator,
                             entry_confirmed_slot: entry_confirmed_slot_from_execution(result),
+                            initial_bonding,
+                        });
+                        let ctx_exit = Arc::clone(self);
+                        tokio::spawn(async move {
+                            ctx_exit.process_exit_signals().await;
                         });
                     }
                     TradeSide::Sell => {
@@ -4617,6 +4849,7 @@ impl MomentumContext {
                 );
                 // Don't open position on failure. For entry intents, stop retry-spam.
                 if pending.side == TradeSide::Buy {
+                    self.remove_pending_buy_entry_by_intent(&result.intent_id);
                     let mut trackers = self.token_trackers.write();
                     if let Some(tr) = trackers.get_mut(&pending.mint) {
                         tr.reject(format!(
@@ -4704,6 +4937,7 @@ impl MomentumContext {
                     "⏱️ Execution TIMEOUT"
                 );
                 if pending.side == TradeSide::Buy {
+                    self.remove_pending_buy_entry_by_intent(&result.intent_id);
                     let mut trackers = self.token_trackers.write();
                     if let Some(tr) = trackers.get_mut(&pending.mint) {
                         tr.reject(format!(
@@ -4793,9 +5027,21 @@ impl MomentumContext {
     fn cleanup_stale_pending(&self) {
         let mut pending = self.pending_intents.write();
         let cutoff = Duration::from_secs(120);
+        let now = Instant::now();
         let before = pending.len();
-        pending.retain(|_, p| p.created_at.elapsed() < cutoff);
+        let stale_buy_intent_ids: Vec<String> = pending
+            .iter()
+            .filter(|(_, p)| {
+                now.saturating_duration_since(p.created_at) >= cutoff && p.side == TradeSide::Buy
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        pending.retain(|_, p| now.saturating_duration_since(p.created_at) < cutoff);
         let removed = before - pending.len();
+        drop(pending);
+        for id in stale_buy_intent_ids {
+            self.remove_pending_buy_entry_by_intent(&id);
+        }
         if removed > 0 {
             debug!(removed = removed, "Cleaned up stale pending intents");
         }
@@ -6086,6 +6332,9 @@ async fn main() -> Result<()> {
         token_trackers: parking_lot::RwLock::new(HashMap::new()),
         positions: parking_lot::RwLock::new(recovered_positions),
         pending_intents: parking_lot::RwLock::new(HashMap::new()),
+        latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+        pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
+        pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
         mint_pools: parking_lot::RwLock::new(HashMap::new()),
         live_pool_cache,
         position_kv: tokio::sync::OnceCell::new(),
@@ -7262,10 +7511,12 @@ async fn generate_and_publish_buy_intent(
     ctx.jsonl_writer.write(&intent)?;
 
     // Publish to JetStream (persistent; avoids execution-engine startup race with Core NATS)
+    let mut publish_ok = ctx.nats.is_none();
     if let Some(ref nats) = ctx.nats {
         match nats.jetstream_publish(TOPIC_TRADE_INTENTS, &intent).await {
             Ok(true) => {
                 NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                publish_ok = true;
             }
             Ok(false) => {
                 NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -7279,6 +7530,22 @@ async fn generate_and_publish_buy_intent(
                 return Err(e);
             }
         }
+    }
+
+    if publish_ok {
+        let meta_creator = intent.metadata.get("creator").cloned();
+        ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
+            intent_id: &intent_id,
+            mint: &signal.mint,
+            pool: &effective_pool,
+            dex: &effective_dex,
+            intended_sol: signal.sol_amount,
+            entry_kind: Some(signal.kind),
+            signal_slot: slot,
+            slot_seen_at_ms: ts_ms,
+            creator: meta_creator,
+            token_program: token_program_override.clone(),
+        });
     }
 
     Ok(())
@@ -7305,6 +7572,9 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
@@ -7340,6 +7610,7 @@ mod tests {
             token_program: None,
             creator: None,
             entry_confirmed_slot: 500,
+            initial_bonding: None,
         });
 
         ctx.update_position_price("m1", 9.0, None, Some("poolA"), Some(400));
@@ -7504,6 +7775,9 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
@@ -7559,6 +7833,9 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
@@ -7791,6 +8068,9 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
@@ -8045,6 +8325,9 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
@@ -8150,6 +8433,9 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
@@ -8223,6 +8509,9 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
@@ -8284,6 +8573,9 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
@@ -8360,6 +8652,9 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
@@ -8390,6 +8685,7 @@ mod tests {
             token_program: None,
             creator: None,
             entry_confirmed_slot: 100,
+            initial_bonding: None,
         });
         ctx.mark_exit_generated("mintX");
         assert!(ctx.positions.read().get("mintX").unwrap().exit_generated);
@@ -8405,6 +8701,7 @@ mod tests {
             token_program: None,
             creator: None,
             entry_confirmed_slot: 200,
+            initial_bonding: None,
         });
         {
             let pos = ctx.positions.read().get("mintX").unwrap().clone();
@@ -8464,6 +8761,9 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
@@ -8490,6 +8790,7 @@ mod tests {
             token_program: None,
             creator: None,
             entry_confirmed_slot: 0,
+            initial_bonding: None,
         });
         ctx.mark_exit_generated("mintY");
 
@@ -8563,6 +8864,9 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
@@ -8589,6 +8893,7 @@ mod tests {
             token_program: None,
             creator: None,
             entry_confirmed_slot: 0,
+            initial_bonding: None,
         });
         ctx.mark_exit_generated("mintZ");
         ctx.register_sell_intent("sell-z-1", "mintZ", "poolZ", "raydium", 1_000);
@@ -8647,6 +8952,9 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
@@ -8710,6 +9018,9 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
@@ -8764,6 +9075,9 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
@@ -8958,6 +9272,9 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
@@ -8992,6 +9309,7 @@ mod tests {
             token_program: None,
             creator: None,
             entry_confirmed_slot: 0,
+            initial_bonding: None,
         });
 
         let scale_fill = 37_843_472_159u64;
@@ -9082,6 +9400,9 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
+            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
@@ -9113,6 +9434,7 @@ mod tests {
             token_program: None,
             creator: None,
             entry_confirmed_slot: 0,
+            initial_bonding: None,
         });
 
         let scale_fill = 37_843_472_159u64;
@@ -9165,6 +9487,252 @@ mod tests {
         let exits = ctx.check_for_exits();
         assert_eq!(exits.len(), 1);
         assert_eq!(exits[0].5, expected);
+    }
+
+    /// Scope A: BondingCurveProgress at 100% before `open_position` is merged via `initial_bonding`.
+    #[tokio::test]
+    async fn pending_bonding_complete_before_open_applied_at_confirm() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+
+        let mint = "mintBC";
+        ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
+            intent_id: "int-bc",
+            mint,
+            pool: "poolBC",
+            dex: "pumpfun",
+            intended_sol: 1_000_000,
+            entry_kind: Some(EntryKind::Probe),
+            signal_slot: 1,
+            slot_seen_at_ms: 1,
+            creator: None,
+            token_program: None,
+        });
+        ctx.merge_bonding_curve_progress_geyser(mint, 10_000, true, 500, 1000);
+        ctx.merge_bonding_curve_progress_geyser(mint, 5_000, false, 400, 2000);
+
+        let snap = ctx.clone_latest_bonding_snapshot(mint).expect("bonding");
+        assert_eq!(snap.progress_bps, 10_000);
+        assert!(snap.complete);
+
+        let initial = ctx.clone_latest_bonding_snapshot(mint);
+        ctx.remove_pending_buy_entry_by_intent("int-bc");
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "poolBC",
+            dex: "pumpfun",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 1_000_000,
+            sol_invested: 1_000_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 600,
+            initial_bonding: initial,
+        });
+        let pos = ctx.positions.read().get(mint).expect("pos").clone();
+        assert_eq!(pos.bonding_curve_progress_bps, Some(10_000));
+    }
+
+    #[test]
+    fn bonding_geyser_rejects_stale_lower_slot_update() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        let mint = "mStale";
+        ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
+            intent_id: "int-stale",
+            mint,
+            pool: "poolS",
+            dex: "pumpfun",
+            intended_sol: 1_000_000,
+            entry_kind: Some(EntryKind::Probe),
+            signal_slot: 10,
+            slot_seen_at_ms: 20,
+            creator: None,
+            token_program: None,
+        });
+        ctx.merge_bonding_curve_progress_geyser(mint, 10_000, true, 200, 10);
+        ctx.merge_bonding_curve_progress_geyser(mint, 3_000, false, 100, 99);
+        let s = ctx.clone_latest_bonding_snapshot(mint).unwrap();
+        assert_eq!(s.progress_bps, 10_000);
+    }
+
+    #[test]
+    fn failed_buy_removes_pending_buy_lifecycle() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
+            intent_id: "int-1",
+            mint: "mintA",
+            pool: "poolA",
+            dex: "pumpfun",
+            intended_sol: 1_000_000,
+            entry_kind: Some(EntryKind::Probe),
+            signal_slot: 10,
+            slot_seen_at_ms: 20,
+            creator: None,
+            token_program: None,
+        });
+        assert!(ctx.test_pending_buy_entry_present("int-1", "mintA"));
+        ctx.remove_pending_buy_entry_by_intent("int-1");
+        assert!(!ctx.test_pending_buy_entry_present("int-1", "mintA"));
+    }
+
+    /// Newer-slot Geyser update with lower `progress_bps` must not regress position bonding (max-guard).
+    #[tokio::test]
+    async fn bonding_position_sync_max_guard_newer_slot_lower_progress() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let mint = "mintMaxGuard";
+
+        ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
+            intent_id: "int-mg",
+            mint,
+            pool: "poolMG",
+            dex: "pumpfun",
+            intended_sol: 1_000_000,
+            entry_kind: Some(EntryKind::Probe),
+            signal_slot: 1,
+            slot_seen_at_ms: 1,
+            creator: None,
+            token_program: None,
+        });
+        ctx.merge_bonding_curve_progress_geyser(mint, 10_000, true, 100, 1);
+        let initial = ctx.clone_latest_bonding_snapshot(mint);
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "poolMG",
+            dex: "pumpfun",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 1,
+            sol_invested: 1,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 150,
+            initial_bonding: initial,
+        });
+        ctx.remove_pending_buy_entry_by_intent("int-mg");
+
+        assert_eq!(
+            ctx.positions
+                .read()
+                .get(mint)
+                .unwrap()
+                .bonding_curve_progress_bps,
+            Some(10_000)
+        );
+
+        // Higher slot but lower progress — cache accepts (slot-monotonic); position must not regress.
+        ctx.merge_bonding_curve_progress_geyser(mint, 3_000, false, 200, 2);
+        assert_eq!(
+            ctx.clone_latest_bonding_snapshot(mint)
+                .unwrap()
+                .progress_bps,
+            3_000
+        );
+        assert_eq!(
+            ctx.positions
+                .read()
+                .get(mint)
+                .unwrap()
+                .bonding_curve_progress_bps,
+            Some(10_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn close_position_clears_latest_bonding_without_pending_buy() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let mint = "mintClr";
+
+        ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
+            intent_id: "int-clr",
+            mint,
+            pool: "poolClr",
+            dex: "pumpfun",
+            intended_sol: 1_000_000,
+            entry_kind: Some(EntryKind::Probe),
+            signal_slot: 1,
+            slot_seen_at_ms: 1,
+            creator: None,
+            token_program: None,
+        });
+        ctx.merge_bonding_curve_progress_geyser(mint, 8_000, false, 10, 1);
+        let initial = ctx.clone_latest_bonding_snapshot(mint);
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "poolClr",
+            dex: "pumpfun",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 1,
+            sol_invested: 1,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 20,
+            initial_bonding: initial,
+        });
+        ctx.remove_pending_buy_entry_by_intent("int-clr");
+
+        Arc::clone(&ctx).close_position(mint);
+        assert!(ctx.clone_latest_bonding_snapshot(mint).is_none());
+    }
+
+    #[tokio::test]
+    async fn close_position_keeps_latest_bonding_when_pending_buy_exists() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let mint = "mintKeep";
+
+        ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
+            intent_id: "int-reentry",
+            mint,
+            pool: "poolKeep",
+            dex: "pumpfun",
+            intended_sol: 2_000_000,
+            entry_kind: Some(EntryKind::Probe),
+            signal_slot: 1,
+            slot_seen_at_ms: 2,
+            creator: None,
+            token_program: None,
+        });
+        ctx.merge_bonding_curve_progress_geyser(mint, 9_000, false, 50, 1);
+
+        let initial = ctx.clone_latest_bonding_snapshot(mint);
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "poolKeep",
+            dex: "pumpfun",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 1,
+            sol_invested: 1,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 60,
+            initial_bonding: initial,
+        });
+
+        Arc::clone(&ctx).close_position(mint);
+        let snap = ctx
+            .clone_latest_bonding_snapshot(mint)
+            .expect("bonding kept for pending BUY");
+        assert_eq!(snap.progress_bps, 9_000);
+        assert!(ctx.test_pending_buy_entry_present("int-reentry", mint));
     }
 }
 
@@ -10143,21 +10711,21 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             }
         }
 
-        MarketEventKind::BondingCurveProgress { mint, progress_bps, complete, .. } => {
-            // Update the position tracker if we hold this mint
-            let mut positions = ctx.positions.write();
-            if let Some(pos) = positions.get_mut(mint.as_str()) {
-                let old = pos.bonding_curve_progress_bps;
-                pos.bonding_curve_progress_bps = Some(*progress_bps);
-                debug!(
-                    mint = %mint,
-                    progress_bps = progress_bps,
-                    complete = complete,
-                    old_bps = ?old,
-                    "Updated bonding curve progress for position"
-                );
-            }
-            drop(positions);
+        MarketEventKind::BondingCurveProgress {
+            mint,
+            progress_bps,
+            complete,
+            ..
+        } => {
+            let slot = event.slot.unwrap_or(0);
+            let ts_unix_ms = event.header.ts_unix_ms;
+            ctx.merge_bonding_curve_progress_geyser(
+                mint.as_str(),
+                *progress_bps,
+                *complete,
+                slot,
+                ts_unix_ms,
+            );
 
             // FIX-20: Mark PumpFun pools as migrated when bonding curve completes.
             // This prevents find_best_sell_pool() from selecting a completed PumpFun
