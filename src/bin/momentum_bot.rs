@@ -3571,6 +3571,12 @@ impl MomentumContext {
             );
         }
 
+        // Drop bonding cache for this mint when the position is gone, unless a BUY is already
+        // pending again (re-entry lifecycle must keep latest_bonding for confirm/open).
+        if !self.pending_buy_mint_index.read().contains_key(mint) {
+            self.latest_bonding_by_mint.write().remove(mint);
+        }
+
         // Delete from KV asynchronously (fire-and-forget)
         let ctx = Arc::clone(self);
         tokio::spawn(async move {
@@ -4140,7 +4146,13 @@ impl MomentumContext {
         let mut positions = self.positions.write();
         if let Some(pos) = positions.get_mut(mint) {
             if let Some(ref latest) = snapshot {
-                pos.bonding_curve_progress_bps = Some(latest.progress_bps);
+                // Progress can theoretically move backward on a newer slot (bad parse / race);
+                // never regress below the best-known in-position value (matches scale-in max-guard).
+                pos.bonding_curve_progress_bps = Some(
+                    latest
+                        .progress_bps
+                        .max(pos.bonding_curve_progress_bps.unwrap_or(0)),
+                );
             }
         }
     }
@@ -9572,6 +9584,130 @@ mod tests {
         assert!(ctx.test_pending_buy_entry_present("int-1", "mintA"));
         ctx.remove_pending_buy_entry_by_intent("int-1");
         assert!(!ctx.test_pending_buy_entry_present("int-1", "mintA"));
+    }
+
+    /// Newer-slot Geyser update with lower `progress_bps` must not regress position bonding (max-guard).
+    #[tokio::test]
+    async fn bonding_position_sync_max_guard_newer_slot_lower_progress() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let mint = "mintMaxGuard";
+
+        ctx.merge_bonding_curve_progress_geyser(mint, 10_000, true, 100, 1);
+        let initial = ctx.clone_latest_bonding_snapshot(mint);
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "poolMG",
+            dex: "pumpfun",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 1,
+            sol_invested: 1,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 150,
+            initial_bonding: initial,
+        });
+        assert_eq!(
+            ctx.positions
+                .read()
+                .get(mint)
+                .unwrap()
+                .bonding_curve_progress_bps,
+            Some(10_000)
+        );
+
+        // Higher slot but lower progress — cache accepts (slot-monotonic); position must not regress.
+        ctx.merge_bonding_curve_progress_geyser(mint, 3_000, false, 200, 2);
+        assert_eq!(
+            ctx.clone_latest_bonding_snapshot(mint)
+                .unwrap()
+                .progress_bps,
+            3_000
+        );
+        assert_eq!(
+            ctx.positions
+                .read()
+                .get(mint)
+                .unwrap()
+                .bonding_curve_progress_bps,
+            Some(10_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn close_position_clears_latest_bonding_without_pending_buy() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let mint = "mintClr";
+
+        ctx.merge_bonding_curve_progress_geyser(mint, 8_000, false, 10, 1);
+        let initial = ctx.clone_latest_bonding_snapshot(mint);
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "poolClr",
+            dex: "pumpfun",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 1,
+            sol_invested: 1,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 20,
+            initial_bonding: initial,
+        });
+
+        Arc::clone(&ctx).close_position(mint);
+        assert!(ctx.clone_latest_bonding_snapshot(mint).is_none());
+    }
+
+    #[tokio::test]
+    async fn close_position_keeps_latest_bonding_when_pending_buy_exists() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let mint = "mintKeep";
+
+        ctx.merge_bonding_curve_progress_geyser(mint, 9_000, false, 50, 1);
+        ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
+            intent_id: "int-reentry",
+            mint,
+            pool: "poolKeep",
+            dex: "pumpfun",
+            intended_sol: 2_000_000,
+            entry_kind: Some(EntryKind::Probe),
+            signal_slot: 1,
+            slot_seen_at_ms: 2,
+            creator: None,
+            token_program: None,
+        });
+
+        let initial = ctx.clone_latest_bonding_snapshot(mint);
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "poolKeep",
+            dex: "pumpfun",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 1,
+            sol_invested: 1,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 60,
+            initial_bonding: initial,
+        });
+
+        Arc::clone(&ctx).close_position(mint);
+        let snap = ctx
+            .clone_latest_bonding_snapshot(mint)
+            .expect("bonding kept for pending BUY");
+        assert_eq!(snap.progress_bps, 9_000);
+        assert!(ctx.test_pending_buy_entry_present("int-reentry", mint));
     }
 }
 
