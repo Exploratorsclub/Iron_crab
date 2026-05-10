@@ -1183,3 +1183,15 @@ BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap 
 | **Betroffene Module** | `src/bin/momentum_bot.rs`, `src/ipc/schema.rs` |
 | **Regression-Prüfung** | Unit-Test: gewichteter Scale-In-Blend nutzt Fill-`tokens_per_sol` statt Marktpreis; `ExplicitAmount` ohne `ui` in JSON. |
 | **Tags** | [momentum, scale-in, entry_price, explicit_amount, i-15] |
+
+---
+
+## FIX-47: Momentum price-based exits (TP/SL/Trailing) binden an ausführbare LivePoolCache-Quotes (Scope D)
+
+| Symptom | TAKE_PROFIT / STOP_LOSS / TRAILING_STOP triggern auf Trade-Ratio-`current_price` oder verzerrte Ticks; ausführbarer PumpSwap-Exit erst spät im `find_best_sell_pool`, nicht in der Exit-Entscheidung. |
+|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | `exit_action_for_price_signal` erlaubte SL/Trailing ohne `ExitExecutableQuote`; `executable_exit_quote` nutzte nur `position.pool` statt bester erlaubter Multi-Pool-Route. |
+| **Fix** | (1) TP/SL/Trailing nur bei gültigem Reserve-Quote für `token_amount`; sonst Suppress (`NoExecutableQuote`). (2) `executable_exit_quote` wählt max SOL-out unter denselben Filtern wie `find_best_sell_pool` (inkl. Migration/PumpSwap nach Evidence). (3) Mark-Update aus Quote nur wenn `marks_position_pool` (I-13). Reason-Strings nutzen executable PnL/Drawdown. |
+| **Betroffene Module** | `src/bin/momentum_bot.rs` |
+| **TODO / Follow-up** | Striktere Freshness-Grenze (z. B. `cache_age_ms`) für price-based exits optional ergänzen — Metadaten (`source_slot`, `cache_age_ms`) sind im Quote bereits mitgeführt. |
+| **Tags** | [momentum, exit, live_pool_cache, i-13, i-16, scope-d] |

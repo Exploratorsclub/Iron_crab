@@ -513,14 +513,24 @@ struct PositionTracker {
     last_price_slot: u64,
 }
 
-/// Executable (reserve-based) `tokens_per_sol` for the position's pool, when available.
+/// Executable (reserve-based) `tokens_per_sol` for selling `position.token_amount`, when available.
 /// I-7: from LivePoolCache in-process only — no RPC.
-#[derive(Debug, Clone, Copy)]
+/// I-13: If `marks_position_pool` is false (e.g. PumpSwap quote while position.pool is still PumpFun BC),
+/// this quote is only for exit decisions — never apply `tokens_per_sol` as `current_price` on the position.
+#[derive(Debug, Clone)]
 struct ExitExecutableQuote {
     /// tokens_per_sol (UI): token_ui / sol_ui, matching `entry_price` / `current_price` (I-14).
     tokens_per_sol: f64,
-    /// True when `tokens_per_sol` was computed from LivePoolCache for `position.pool`.
+    /// True when `tokens_per_sol` was computed from LivePoolCache reserve math (not a trade-ratio spike).
     pool_sourced: bool,
+    /// Pool this quote was computed from (best SOL-out route among eligible cached pools).
+    quote_pool: String,
+    quote_dex: String,
+    /// When true, it is safe to refresh mark-to-market from `tokens_per_sol` (`quote_pool == position.pool`).
+    marks_position_pool: bool,
+    /// Geyser slot from `LivePoolCache` metadata when available.
+    source_slot: Option<u64>,
+    cache_age_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -534,19 +544,22 @@ enum ExitPriceValidationAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitRejectionReason {
     StaleOrWrongPrice,
-    /// TAKE_PROFIT: executable / pool not trustworthy for a gain exit
-    TakeProfitNotValidated,
+    /// No valid reserve quote for this position size — price-based exit must not fire (I-16).
+    NoExecutableQuote,
 }
 
 /// Pure helper: decide whether a price-based exit should be suppressed when a pool-correct
 /// executable quote exists. I-14: `pnl_pct` / drawdown use `tokens_per_sol`.
+///
+/// Scope D: `TAKE_PROFIT`, `STOP_LOSS`, and `TRAILING_STOP` require a valid executable quote;
+/// they never fire on `current_price` / trade-ratio noise alone.
 fn exit_action_for_price_signal(
     entry_price: f64,
     highest_price: f64,
     current_price: f64,
     exit_type: &str,
     config: &MomentumConfig,
-    exit_quote: Option<ExitExecutableQuote>,
+    exit_quote: Option<&ExitExecutableQuote>,
 ) -> (
     ExitPriceValidationAction,
     f64,
@@ -556,38 +569,21 @@ fn exit_action_for_price_signal(
     let current_pnl = tokens_per_sol::pnl_pct(entry_price, current_price);
     let q = match exit_quote {
         None => {
-            if exit_type == "TAKE_PROFIT" && current_pnl >= config.take_profit_pct {
-                // No pool quote to confirm gain — do not fire TP on `current_price` alone (I-13)
-                return (
-                    ExitPriceValidationAction::Suppress,
-                    current_pnl,
-                    current_pnl,
-                    Some(ExitRejectionReason::TakeProfitNotValidated),
-                );
-            }
             return (
-                ExitPriceValidationAction::Allow,
+                ExitPriceValidationAction::Suppress,
                 current_pnl,
                 current_pnl,
-                None,
+                Some(ExitRejectionReason::NoExecutableQuote),
             );
         }
         Some(q) => q,
     };
     if !q.pool_sourced || q.tokens_per_sol <= 0.0 {
-        if exit_type == "TAKE_PROFIT" && current_pnl >= config.take_profit_pct {
-            return (
-                ExitPriceValidationAction::Suppress,
-                current_pnl,
-                current_pnl,
-                Some(ExitRejectionReason::TakeProfitNotValidated),
-            );
-        }
         return (
-            ExitPriceValidationAction::Allow,
+            ExitPriceValidationAction::Suppress,
             current_pnl,
             current_pnl,
-            None,
+            Some(ExitRejectionReason::NoExecutableQuote),
         );
     }
 
@@ -922,12 +918,12 @@ impl PositionTracker {
         tokens_per_sol::drawdown_from_ath_pct(self.highest_price, self.current_price)
     }
 
-    /// Check if we should exit this position. `exit_quote` is a reserve-based pool quote from
-    /// `LivePoolCache` for the position's pool (I-7: no RPC).
+    /// Check if we should exit this position. `exit_quote` is a reserve-based quote for selling
+    /// `token_amount` from `LivePoolCache` (I-7: no RPC).
     fn should_exit(
         &mut self,
         config: &MomentumConfig,
-        exit_quote: Option<ExitExecutableQuote>,
+        exit_quote: Option<&ExitExecutableQuote>,
     ) -> Option<(String, String)> {
         // Returns: Some((exit_type, reason)) or None
 
@@ -955,7 +951,10 @@ impl PositionTracker {
                 exit_quote,
             );
             if action == ExitPriceValidationAction::Suppress {
-                if let Some(q) = exit_quote.filter(|q| q.pool_sourced && q.tokens_per_sol > 0.0) {
+                if let Some(q) = exit_quote
+                    .as_ref()
+                    .filter(|q| q.pool_sourced && q.tokens_per_sol > 0.0 && q.marks_position_pool)
+                {
                     self.update_price(q.tokens_per_sol);
                     pnl = self.pnl_pct();
                     drawdown = self.drawdown_from_ath_pct();
@@ -989,8 +988,8 @@ impl PositionTracker {
                 return Some((
                     "STOP_LOSS".to_string(),
                     format!(
-                        "Hard stop hit: {:.1}% loss (limit: -{:.1}%)",
-                        pnl, config.hard_stop_loss_pct
+                        "Hard stop hit: {:.1}% executable loss (limit: -{:.1}%)",
+                        exec_pnl, config.hard_stop_loss_pct
                     ),
                 ));
             }
@@ -1007,21 +1006,28 @@ impl PositionTracker {
                 exit_quote,
             );
             if action == ExitPriceValidationAction::Suppress {
-                if let Some(q) = exit_quote.filter(|q| q.pool_sourced && q.tokens_per_sol > 0.0) {
+                if let Some(q) = exit_quote
+                    .as_ref()
+                    .filter(|q| q.pool_sourced && q.tokens_per_sol > 0.0 && q.marks_position_pool)
+                {
                     self.update_price(q.tokens_per_sol);
                     pnl = self.pnl_pct();
                     drawdown = self.drawdown_from_ath_pct();
                 }
-                // Re-evaluate hard stop on corrected pnl: step 1 used stale current_price, so
-                // STOP_LOSS may not have run when a stale tick showed a fake gain and TP fired.
-                if pnl <= -config.hard_stop_loss_pct {
-                    return Some((
-                        "STOP_LOSS".to_string(),
-                        format!(
-                            "Hard stop hit: {:.1}% loss (limit: -{:.1}%)",
-                            pnl, config.hard_stop_loss_pct
-                        ),
-                    ));
+                if let Some(q) = exit_quote
+                    .as_ref()
+                    .filter(|q| q.pool_sourced && q.tokens_per_sol > 0.0)
+                {
+                    let ep = tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol);
+                    if ep <= -config.hard_stop_loss_pct {
+                        return Some((
+                            "STOP_LOSS".to_string(),
+                            format!(
+                                "Hard stop hit: {:.1}% executable loss (limit: -{:.1}%)",
+                                ep, config.hard_stop_loss_pct
+                            ),
+                        ));
+                    }
                 }
                 warn!(
                     mint = %self.mint,
@@ -1068,8 +1074,8 @@ impl PositionTracker {
                 return Some((
                     "TAKE_PROFIT".to_string(),
                     format!(
-                        "Take profit hit: +{:.1}% gain (target: +{:.1}%)",
-                        pnl, config.take_profit_pct
+                        "Take profit hit: +{:.1}% executable gain (target: +{:.1}%)",
+                        exec_pnl, config.take_profit_pct
                     ),
                 ));
             }
@@ -1113,11 +1119,13 @@ impl PositionTracker {
                 exit_quote,
             );
             if action == ExitPriceValidationAction::Suppress {
-                if let Some(q) = exit_quote.filter(|q| q.pool_sourced && q.tokens_per_sol > 0.0) {
+                if let Some(q) = exit_quote
+                    .as_ref()
+                    .filter(|q| q.pool_sourced && q.tokens_per_sol > 0.0 && q.marks_position_pool)
+                {
                     self.update_price(q.tokens_per_sol);
                     pnl = self.pnl_pct();
                     drawdown = self.drawdown_from_ath_pct();
-                    // Same invariant as STOP_LOSS/TAKE_PROFIT suppress; not used below this block.
                     let _ = drawdown;
                 }
                 warn!(
@@ -1146,11 +1154,19 @@ impl PositionTracker {
                     decision = "allow",
                     "TRAILING_STOP trigger (exit price validated against pool quote when available)"
                 );
+                let q_exec = exit_quote
+                    .as_ref()
+                    .expect("TRAILING_STOP allow implies executable quote");
+                let exec_dd = tokens_per_sol::drawdown_from_ath_pct(
+                    self.highest_price,
+                    q_exec.tokens_per_sol,
+                );
+                let exec_pnl_tr = tokens_per_sol::pnl_pct(self.entry_price, q_exec.tokens_per_sol);
                 return Some((
                     "TRAILING_STOP".to_string(),
                     format!(
-                        "Trailing stop hit: -{:.1}% from ATH (limit: -{:.1}%), P&L: {:.1}%",
-                        drawdown, config.trailing_stop_pct, pnl
+                        "Trailing stop hit: -{:.1}% executable drawdown from ATH (limit: -{:.1}%), executable P&L: {:.1}%",
+                        exec_dd, config.trailing_stop_pct, exec_pnl_tr
                     ),
                 ));
             }
@@ -2283,28 +2299,213 @@ impl MomentumContext {
         format!("int-{}-{:06}", &self.run_id[..8], n)
     }
 
-    /// Single-pool SELL quote from `LivePoolCache` for the position’s pool (I-7: in-process, no RPC).
+    /// Same pool filtering as `find_best_sell_pool` (Scope 57 / I-13), shared for exit quotes.
+    fn filtered_exit_quote_pool_refs<'a>(
+        &self,
+        mint: &str,
+        original_pool: &str,
+        original_dex: &str,
+        candidates: &'a [PoolInfo],
+    ) -> Result<Vec<&'a PoolInfo>, anyhow::Error> {
+        let cache_migration_evidence = self.live_cache_pumpfun_complete_evidence(mint);
+        let pool_flag_migration_evidence = candidates
+            .iter()
+            .any(|p| p.dex == "pumpfun" && p.bonding_curve_complete == Some(true));
+        let complete_evidence = cache_migration_evidence || pool_flag_migration_evidence;
+
+        let now = std::time::Instant::now();
+        let fail_cooldown = std::time::Duration::from_secs(120);
+        const MAX_FAIL_COUNT: u32 = 3;
+
+        let valid: Vec<_> = candidates
+            .iter()
+            .filter(|p| {
+                let has_accounts = p.dex_pool_accounts.is_some();
+                let has_ratio = p.last_trade_ratio.is_some();
+                let is_pumpfun = p.dex == "pumpfun";
+                has_accounts || (is_pumpfun && has_ratio)
+            })
+            .collect();
+
+        if valid.is_empty() {
+            anyhow::bail!("No pools with valid data (accounts or pumpfun+ratio)");
+        }
+
+        let preferred: Vec<_> = valid
+            .iter()
+            .copied()
+            .filter(|p| {
+                if p.bonding_curve_complete == Some(true) {
+                    debug!(
+                        mint = %mint,
+                        pool = %p.pool_address,
+                        "find_best_sell_pool: skipping migrated PumpFun pool"
+                    );
+                    return false;
+                }
+                if p.sell_fail_count >= MAX_FAIL_COUNT {
+                    if let Some(last_fail) = p.last_sell_fail_at {
+                        if now.duration_since(last_fail) < fail_cooldown {
+                            debug!(
+                                mint = %mint,
+                                pool = %p.pool_address,
+                                dex = %p.dex,
+                                sell_fail_count = p.sell_fail_count,
+                                "find_best_sell_pool: skipping pool ({}x failures in cooldown)",
+                                p.sell_fail_count
+                            );
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .collect();
+
+        let usable = if preferred.is_empty() {
+            warn!(
+                mint = %mint,
+                valid_count = valid.len(),
+                "FIX-20: All pools excluded by migration/failure filters — using best-available fallback"
+            );
+            &valid
+        } else {
+            &preferred
+        };
+
+        let block_pumpswap_for_active_pumpfun = original_dex == "pumpfun" && !complete_evidence;
+
+        if original_dex == "pumpfun" && complete_evidence {
+            let has_pump_amm_candidate = usable.iter().any(|p| p.dex == "pump_amm");
+            if has_pump_amm_candidate {
+                info!(
+                    mint = %mint,
+                    "SCOPE57: PumpSwap exit route allowed — bonding curve complete / migration evidence"
+                );
+            }
+        }
+
+        let quote_pool_refs: Vec<&PoolInfo> = if block_pumpswap_for_active_pumpfun {
+            let filtered: Vec<&PoolInfo> = usable
+                .iter()
+                .copied()
+                .filter(|p| p.dex != "pump_amm")
+                .collect();
+            if filtered.is_empty() {
+                warn!(
+                    mint = %mint,
+                    original_pool = %original_pool,
+                    "SCOPE57: multi-pool usable set was PumpSwap-only — blocked for active PumpFun position (no migration evidence); widening to valid pools excluding PumpSwap"
+                );
+                let from_valid: Vec<&PoolInfo> = valid
+                    .iter()
+                    .copied()
+                    .filter(|p| p.dex != "pump_amm")
+                    .collect();
+                if from_valid.is_empty() {
+                    anyhow::bail!(
+                        "SCOPE57: no non-PumpSwap exit pool for mint {} while position is active PumpFun (bonding curve not evidenced complete)",
+                        mint
+                    );
+                }
+                from_valid
+            } else {
+                let blocked_count = usable.iter().filter(|p| p.dex == "pump_amm").count();
+                if blocked_count > 0 {
+                    warn!(
+                        mint = %mint,
+                        blocked_pump_amm_candidates = blocked_count,
+                        "SCOPE57: blocked PumpSwap candidate(s) — preferring PumpFun / non-PumpSwap until migration evidence"
+                    );
+                }
+                filtered
+            }
+        } else {
+            usable.to_vec()
+        };
+
+        Ok(quote_pool_refs)
+    }
+
+    /// Best reserve-based SELL quote from `LivePoolCache` for `pos.token_amount` (I-7: no RPC).
+    /// Chooses max SOL-out among pools allowed by `filtered_exit_quote_pool_refs` (same as sell routing).
+    /// I-13: PumpSwap quote after migration does not update position mark unless `marks_position_pool`.
     fn executable_exit_quote(&self, pos: &PositionTracker) -> Option<ExitExecutableQuote> {
-        if pos.pool.is_empty() {
-            return None;
-        }
-        let pool_pk = solana_sdk::pubkey::Pubkey::from_str(&pos.pool).ok()?;
-        let state = self.live_pool_cache.get(&pool_pk)?;
         let token_mint = solana_sdk::pubkey::Pubkey::from_str(&pos.mint).ok()?;
-        let sol_out =
-            quote_calculator::quote_output_amount(&state, pos.token_amount, &token_mint).ok()?;
-        if sol_out == 0 {
+        if pos.pool.is_empty() || pos.token_amount == 0 {
             return None;
         }
-        // I-14: same units as `entry_price` (tok_ui/sol_ui), not raw_token/raw_lamports.
-        let tps = tokens_per_sol::ui_tokens_per_sol(pos.token_amount, pos.token_decimals, sol_out);
-        if !tps.is_finite() || tps <= 0.0 {
-            return None;
+
+        let registry_pools: Vec<PoolInfo> = {
+            let pools_guard = self.mint_pools.read();
+            if let Some(candidates) = pools_guard.get(&pos.mint) {
+                match self.filtered_exit_quote_pool_refs(&pos.mint, &pos.pool, &pos.dex, candidates)
+                {
+                    Ok(v) => v.into_iter().cloned().collect(),
+                    Err(_) => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            }
+        };
+
+        let mut try_pools: Vec<(String, String)> = registry_pools
+            .into_iter()
+            .map(|p| (p.pool_address, p.dex))
+            .collect();
+
+        if try_pools.iter().all(|(a, _)| *a != pos.pool) {
+            try_pools.push((pos.pool.clone(), pos.dex.clone()));
         }
-        Some(ExitExecutableQuote {
-            tokens_per_sol: tps,
-            pool_sourced: true,
-        })
+
+        let mut seen = std::collections::HashSet::<String>::new();
+        try_pools.retain(|(addr, _)| seen.insert(addr.clone()));
+
+        let mut best: Option<(ExitExecutableQuote, u64)> = None;
+
+        for (pool_addr, dex) in try_pools {
+            let pool_pk = solana_sdk::pubkey::Pubkey::from_str(&pool_addr).ok()?;
+            let meta = self.live_pool_cache.get_with_metadata(&pool_pk)?;
+            let (state, slot, age_ms) = meta;
+            let sol_out =
+                quote_calculator::quote_output_amount(&state, pos.token_amount, &token_mint)
+                    .ok()?;
+            if sol_out == 0 {
+                continue;
+            }
+            let tps =
+                tokens_per_sol::ui_tokens_per_sol(pos.token_amount, pos.token_decimals, sol_out);
+            if !tps.is_finite() || tps <= 0.0 {
+                continue;
+            }
+            let marks_position_pool = pool_addr == pos.pool;
+            let candidate = ExitExecutableQuote {
+                tokens_per_sol: tps,
+                pool_sourced: true,
+                quote_pool: pool_addr.clone(),
+                quote_dex: dex.clone(),
+                marks_position_pool,
+                source_slot: Some(slot),
+                cache_age_ms: Some(age_ms),
+            };
+            debug!(
+                mint = %pos.mint,
+                quote_pool = %candidate.quote_pool,
+                quote_dex = %candidate.quote_dex,
+                source_slot = ?candidate.source_slot,
+                cache_age_ms = ?candidate.cache_age_ms,
+                marks_position_pool,
+                sol_out_lamports = sol_out,
+                "executable_exit_quote candidate"
+            );
+            match best {
+                None => best = Some((candidate, sol_out)),
+                Some((_, best_sol)) if sol_out > best_sol => best = Some((candidate, sol_out)),
+                _ => {}
+            }
+        }
+
+        best.map(|(q, _)| q)
     }
 
     /// A.2: Normalize DEX names for execution-engine compatibility (pumpswap/PumpFunAmm → pump_amm)
@@ -2680,139 +2881,13 @@ impl MomentumContext {
         original_pool: &str,
         original_dex: &str,
     ) -> Result<(String, String, Vec<String>, f64, usize)> {
-        // Scope 57: migration evidence before mint_pools lock (avoid deadlock if nested).
-        let cache_migration_evidence = self.live_cache_pumpfun_complete_evidence(mint);
         let pools = self.mint_pools.read();
         let candidates = pools
             .get(mint)
             .ok_or_else(|| anyhow::anyhow!("No pools known for mint {}", mint))?;
 
-        let pool_flag_migration_evidence = candidates
-            .iter()
-            .any(|p| p.dex == "pumpfun" && p.bonding_curve_complete == Some(true));
-        let complete_evidence = cache_migration_evidence || pool_flag_migration_evidence;
-
-        let now = std::time::Instant::now();
-
-        // FIX-20 constants
-        let fail_cooldown = std::time::Duration::from_secs(120);
-        const MAX_FAIL_COUNT: u32 = 3;
-
-        // Phase 1: Basic validity filter.
-        // A.2: 5min-Freshness removed — stale pools are valid for exit.
-        // A.2: For pumpfun, dex_pool_accounts can be None (EE derives from mint+creator).
-        // Other DEXes need dex_pool_accounts. Need accounts OR (pumpfun + last_trade_ratio for quote).
-        let valid: Vec<_> = candidates
-            .iter()
-            .filter(|p| {
-                let has_accounts = p.dex_pool_accounts.is_some();
-                let has_ratio = p.last_trade_ratio.is_some();
-                let is_pumpfun = p.dex == "pumpfun";
-                has_accounts || (is_pumpfun && has_ratio)
-            })
-            .collect();
-
-        if valid.is_empty() {
-            anyhow::bail!("No pools with valid data (accounts or pumpfun+ratio)");
-        }
-
-        // Phase 2 (FIX-20): Exclude migrated PumpFun pools + pools with repeated failures
-        let preferred: Vec<_> = valid
-            .iter()
-            .copied()
-            .filter(|p| {
-                // Skip: PumpFun pool with confirmed migration (would fail with 6023)
-                if p.bonding_curve_complete == Some(true) {
-                    debug!(
-                        mint = %mint,
-                        pool = %p.pool_address,
-                        "find_best_sell_pool: skipping migrated PumpFun pool"
-                    );
-                    return false;
-                }
-                // Skip: Pool with >= MAX_FAIL_COUNT failures within cooldown window
-                if p.sell_fail_count >= MAX_FAIL_COUNT {
-                    if let Some(last_fail) = p.last_sell_fail_at {
-                        if now.duration_since(last_fail) < fail_cooldown {
-                            debug!(
-                                mint = %mint,
-                                pool = %p.pool_address,
-                                dex = %p.dex,
-                                sell_fail_count = p.sell_fail_count,
-                                "find_best_sell_pool: skipping pool ({}x failures in cooldown)",
-                                p.sell_fail_count
-                            );
-                            return false;
-                        }
-                    }
-                }
-                true
-            })
-            .collect();
-
-        // Phase 3 (FIX-20): Fallback if all preferred pools excluded
-        let usable = if preferred.is_empty() {
-            warn!(
-                mint = %mint,
-                valid_count = valid.len(),
-                "FIX-20: All pools excluded by migration/failure filters — using best-available fallback"
-            );
-            &valid
-        } else {
-            &preferred
-        };
-
-        // Scope 57 / I-13: Do not route active PumpFun positions to PumpSwap without migration evidence.
-        let block_pumpswap_for_active_pumpfun = original_dex == "pumpfun" && !complete_evidence;
-
-        if original_dex == "pumpfun" && complete_evidence {
-            let has_pump_amm_candidate = usable.iter().any(|p| p.dex == "pump_amm");
-            if has_pump_amm_candidate {
-                info!(
-                    mint = %mint,
-                    "SCOPE57: PumpSwap exit route allowed — bonding curve complete / migration evidence"
-                );
-            }
-        }
-
-        let quote_pool_refs: Vec<&PoolInfo> = if block_pumpswap_for_active_pumpfun {
-            let filtered: Vec<&PoolInfo> = usable
-                .iter()
-                .copied()
-                .filter(|p| p.dex != "pump_amm")
-                .collect();
-            if filtered.is_empty() {
-                warn!(
-                    mint = %mint,
-                    original_pool = %original_pool,
-                    "SCOPE57: multi-pool usable set was PumpSwap-only — blocked for active PumpFun position (no migration evidence); widening to valid pools excluding PumpSwap"
-                );
-                let from_valid: Vec<&PoolInfo> = valid
-                    .iter()
-                    .copied()
-                    .filter(|p| p.dex != "pump_amm")
-                    .collect();
-                if from_valid.is_empty() {
-                    anyhow::bail!(
-                        "SCOPE57: no non-PumpSwap exit pool for mint {} while position is active PumpFun (bonding curve not evidenced complete)",
-                        mint
-                    );
-                }
-                from_valid
-            } else {
-                let blocked_count = usable.iter().filter(|p| p.dex == "pump_amm").count();
-                if blocked_count > 0 {
-                    warn!(
-                        mint = %mint,
-                        blocked_pump_amm_candidates = blocked_count,
-                        "SCOPE57: blocked PumpSwap candidate(s) — preferring PumpFun / non-PumpSwap until migration evidence"
-                    );
-                }
-                filtered
-            }
-        } else {
-            usable.to_vec()
-        };
+        let quote_pool_refs =
+            self.filtered_exit_quote_pool_refs(mint, original_pool, original_dex, candidates)?;
 
         // FIX-21: Quote each pool using RESERVE-BASED calculation from LivePoolCache.
         // Fallback to last_trade_ratio only when cache has no data for a pool.
@@ -3802,7 +3877,7 @@ impl MomentumContext {
             }
 
             let exit_q = self.executable_exit_quote(pos);
-            if let Some((exit_type, reason)) = pos.should_exit(&config, exit_q) {
+            if let Some((exit_type, reason)) = pos.should_exit(&config, exit_q.as_ref()) {
                 // Note: exit_generated is set by caller after successful publish
                 exits.push((
                     mint.clone(),
@@ -3963,20 +4038,24 @@ impl MomentumContext {
             let (exit_type, reason) = {
                 let mut positions = self.positions.write();
                 if let Some(pos) = positions.get_mut(&candidate.mint) {
-                    pos.should_exit(&config, exit_q).unwrap_or_else(|| {
-                        (
-                            "TIME_EXIT".to_string(),
-                            match candidate.last_exit_age_secs {
-                                Some(age) => format!(
-                                    "Timed exit reconcile: hold={}s, last_exit_age={}s",
-                                    candidate.hold_secs, age
-                                ),
-                                None => {
-                                    format!("Timed exit reconcile: hold={}s", candidate.hold_secs)
-                                }
-                            },
-                        )
-                    })
+                    pos.should_exit(&config, exit_q.as_ref())
+                        .unwrap_or_else(|| {
+                            (
+                                "TIME_EXIT".to_string(),
+                                match candidate.last_exit_age_secs {
+                                    Some(age) => format!(
+                                        "Timed exit reconcile: hold={}s, last_exit_age={}s",
+                                        candidate.hold_secs, age
+                                    ),
+                                    None => {
+                                        format!(
+                                            "Timed exit reconcile: hold={}s",
+                                            candidate.hold_secs
+                                        )
+                                    }
+                                },
+                            )
+                        })
                 } else {
                     // Position removed, skip
                     continue;
@@ -9127,6 +9206,18 @@ mod tests {
         c
     }
 
+    fn sample_exit_quote(tokens_per_sol: f64) -> ExitExecutableQuote {
+        ExitExecutableQuote {
+            tokens_per_sol,
+            pool_sourced: true,
+            quote_pool: "p".to_string(),
+            quote_dex: "dex".to_string(),
+            marks_position_pool: true,
+            source_slot: None,
+            cache_age_ms: None,
+        }
+    }
+
     /// Production-like: stale tps would trip hard stop, executable tps is profitable.
     #[test]
     fn hard_stop_suppressed_when_executable_quote_profitable() {
@@ -9139,11 +9230,8 @@ mod tests {
         pos.current_price = stale;
         pos.highest_price = stale.min(pos.highest_price);
         // Exec ~3,692,386 tps → pnl = (5.7M/3.7M-1)*100 = +~55% (I-14)
-        let ex = ExitExecutableQuote {
-            tokens_per_sol: 3_692_386.0,
-            pool_sourced: true,
-        };
-        let r = pos.should_exit(&c, Some(ex));
+        let ex = sample_exit_quote(3_692_386.0);
+        let r = pos.should_exit(&c, Some(&ex));
         assert!(r.is_none(), "expected STOP_LOSS suppression, got {:?}", r);
     }
 
@@ -9159,12 +9247,25 @@ mod tests {
         pos.highest_price = entry;
 
         // Executable also very high tps → also deep loss; allow STOP_LOSS
-        let ex = ExitExecutableQuote {
-            tokens_per_sol: 12_000_000.0,
-            pool_sourced: true,
-        };
-        let (ty, _reason) = pos.should_exit(&c, Some(ex)).expect("STOP_LOSS");
+        let ex = sample_exit_quote(12_000_000.0);
+        let (ty, _reason) = pos.should_exit(&c, Some(&ex)).expect("STOP_LOSS");
         assert_eq!(ty, "STOP_LOSS");
+    }
+
+    /// Scope D: paper stop-loss from trade-derived `current_price` alone cannot fire without a quote.
+    #[test]
+    fn hard_stop_not_fired_without_executable_quote() {
+        let mut c = make_exit_config();
+        c.hard_stop_loss_pct = 50.0;
+        let entry = 100.0;
+        let mut pos = PositionTracker::new("m", "p", "dex", entry, 6, 1_000_000, 0);
+        pos.current_price = 300.0; // I-14: higher tps vs entry ⇒ loss
+        let r = pos.should_exit(&c, None);
+        assert!(
+            r.is_none(),
+            "STOP_LOSS must not fire without executable quote, got {:?}",
+            r
+        );
     }
 
     /// TP: `current` shows gain but no pool quote to confirm (or would disagree) → no TP
@@ -9187,11 +9288,8 @@ mod tests {
         );
 
         // Stale: exec says we are not at take-profit
-        let ex = ExitExecutableQuote {
-            tokens_per_sol: 95.0,
-            pool_sourced: true,
-        };
-        let r1 = pos.should_exit(&c, Some(ex));
+        let ex = sample_exit_quote(95.0);
+        let r1 = pos.should_exit(&c, Some(&ex));
         assert!(r1.is_none(), "expected TP suppression, got {:?}", r1);
     }
 
@@ -9241,8 +9339,13 @@ mod tests {
         let ex = ExitExecutableQuote {
             tokens_per_sol: exec_tps,
             pool_sourced: true,
+            quote_pool: "p9".to_string(),
+            quote_dex: "dex".to_string(),
+            marks_position_pool: true,
+            source_slot: None,
+            cache_age_ms: None,
         };
-        let r = pos.should_exit(&c, Some(ex));
+        let r = pos.should_exit(&c, Some(&ex));
         let (ty, _reason) = r.expect("STOP_LOSS must fire when loss is real");
         assert_eq!(ty, "STOP_LOSS");
     }
