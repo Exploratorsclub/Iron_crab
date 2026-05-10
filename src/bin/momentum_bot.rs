@@ -3558,8 +3558,6 @@ impl MomentumContext {
             positions.remove(mint)
         };
 
-        self.latest_bonding_by_mint.write().remove(mint);
-
         if let Some(pos) = removed {
             let pnl = pos.pnl_pct();
             let hold_secs = pos.entry_time.elapsed().as_secs();
@@ -9595,6 +9593,18 @@ mod tests {
         let ctx = Arc::new(empty_test_context(jsonl_writer));
         let mint = "mintMaxGuard";
 
+        ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
+            intent_id: "int-mg",
+            mint,
+            pool: "poolMG",
+            dex: "pumpfun",
+            intended_sol: 1_000_000,
+            entry_kind: Some(EntryKind::Probe),
+            signal_slot: 1,
+            slot_seen_at_ms: 1,
+            creator: None,
+            token_program: None,
+        });
         ctx.merge_bonding_curve_progress_geyser(mint, 10_000, true, 100, 1);
         let initial = ctx.clone_latest_bonding_snapshot(mint);
         ctx.open_position(OpenPositionParams {
@@ -9610,6 +9620,8 @@ mod tests {
             entry_confirmed_slot: 150,
             initial_bonding: initial,
         });
+        ctx.remove_pending_buy_entry_by_intent("int-mg");
+
         assert_eq!(
             ctx.positions
                 .read()
@@ -9645,6 +9657,18 @@ mod tests {
         let ctx = Arc::new(empty_test_context(jsonl_writer));
         let mint = "mintClr";
 
+        ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
+            intent_id: "int-clr",
+            mint,
+            pool: "poolClr",
+            dex: "pumpfun",
+            intended_sol: 1_000_000,
+            entry_kind: Some(EntryKind::Probe),
+            signal_slot: 1,
+            slot_seen_at_ms: 1,
+            creator: None,
+            token_program: None,
+        });
         ctx.merge_bonding_curve_progress_geyser(mint, 8_000, false, 10, 1);
         let initial = ctx.clone_latest_bonding_snapshot(mint);
         ctx.open_position(OpenPositionParams {
@@ -9660,6 +9684,7 @@ mod tests {
             entry_confirmed_slot: 20,
             initial_bonding: initial,
         });
+        ctx.remove_pending_buy_entry_by_intent("int-clr");
 
         Arc::clone(&ctx).close_position(mint);
         assert!(ctx.clone_latest_bonding_snapshot(mint).is_none());
@@ -9673,7 +9698,6 @@ mod tests {
         let ctx = Arc::new(empty_test_context(jsonl_writer));
         let mint = "mintKeep";
 
-        ctx.merge_bonding_curve_progress_geyser(mint, 9_000, false, 50, 1);
         ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
             intent_id: "int-reentry",
             mint,
@@ -9686,6 +9710,7 @@ mod tests {
             creator: None,
             token_program: None,
         });
+        ctx.merge_bonding_curve_progress_geyser(mint, 9_000, false, 50, 1);
 
         let initial = ctx.clone_latest_bonding_snapshot(mint);
         ctx.open_position(OpenPositionParams {
