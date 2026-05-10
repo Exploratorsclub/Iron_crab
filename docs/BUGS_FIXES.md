@@ -103,6 +103,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Fix**: Dreistufige Fallback-Kette: (1) Inner-Instruction-Parsing für System.transfer, (2) Rent-Adjusted Lamport Delta, (3) intent capital als letzter Ausweg. Dashboard PnL konsistent auf wallet_delta umgestellt.
 **Dateien**: `src/bin/execution_engine.rs`, `scripts/trades_server.py`
 
+### FIX-SCOPE1: Momentum Preisupdates Slot-monoton (plan_momentum_price_integrity Scope 1)
+**Datum**: 2026-05-10
+**Problem**: Alte Trades (niedriger Geyser-Slot) konnten nach BUY-Bestätigung verarbeitet werden und `current_price`/`tokens_per_sol` für offene Positionen verfälschen → Schein-TAKE_PROFIT bei real negativem PnL (Event-Zeit vs. Slot-Reihenfolge).
+**Fix**: `ExecutionResult.confirmed_slot` + Metadata-Spiegel wird beim Confirm gesetzt (Bundle-/Geyser-/RPC-Slot). `PositionTracker` erhält `entry_confirmed_slot` und `last_price_slot`; `update_position_price` akzeptiert nur Updates mit `source_slot > entry_confirmed_slot` und strikt monoton steigend; Pool-Match (I-13) unverändert. Trade- und PoolCache-Pfade reichen Geyser-Slot durch.
+**Dateien**: `src/bin/execution_engine.rs`, `src/bin/momentum_bot.rs`
+
 ### FIX-18: Bug B — Orphaned Buy Recovery
 **Datum**: 2026-02-13
 **Problem**: Race Condition: `cleanup_stale_pending()` entfernte pending intent bevor `ExecutionResult` ankam → Position nie erstellt → kein Sell.
