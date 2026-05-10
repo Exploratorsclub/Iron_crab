@@ -2464,12 +2464,18 @@ impl MomentumContext {
         let mut best: Option<(ExitExecutableQuote, u64)> = None;
 
         for (pool_addr, dex) in try_pools {
-            let pool_pk = solana_sdk::pubkey::Pubkey::from_str(&pool_addr).ok()?;
-            let meta = self.live_pool_cache.get_with_metadata(&pool_pk)?;
-            let (state, slot, age_ms) = meta;
-            let sol_out =
+            let Ok(pool_pk) = solana_sdk::pubkey::Pubkey::from_str(&pool_addr) else {
+                continue;
+            };
+            let Some((state, slot, age_ms)) = self.live_pool_cache.get_with_metadata(&pool_pk)
+            else {
+                continue;
+            };
+            let Ok(sol_out) =
                 quote_calculator::quote_output_amount(&state, pos.token_amount, &token_mint)
-                    .ok()?;
+            else {
+                continue;
+            };
             if sol_out == 0 {
                 continue;
             }
