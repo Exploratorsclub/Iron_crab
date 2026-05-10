@@ -4371,6 +4371,7 @@ impl MomentumContext {
                                         ctx_exit.process_exit_signals().await;
                                     });
                                 } else {
+                                    self.remove_pending_buy_entry_by_intent(&result.intent_id);
                                     self.orphaned_recovered_intent_ids
                                         .write()
                                         .remove(&result.intent_id);
@@ -4415,6 +4416,7 @@ impl MomentumContext {
                                     ctx_exit.process_exit_signals().await;
                                 });
                             } else {
+                                self.remove_pending_buy_entry_by_intent(&result.intent_id);
                                 self.orphaned_recovered_intent_ids
                                     .write()
                                     .remove(&result.intent_id);
@@ -4427,6 +4429,7 @@ impl MomentumContext {
                             }
                         }
                     } else {
+                        self.remove_pending_buy_entry_by_intent(&result.intent_id);
                         warn!(
                             intent_id = %result.intent_id,
                             mint = %mint,
