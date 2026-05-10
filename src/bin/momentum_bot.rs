@@ -2134,6 +2134,26 @@ struct CachedBondingCurveState {
     ts_unix_ms: u64,
 }
 
+/// Scope B: last observed PumpFun bonding-curve **complete** (migration) signal for a mint.
+/// Slot-/timestamp-monotonic merge only; complements LivePoolCache when rows are not yet present.
+#[derive(Debug, Clone)]
+struct CachedPumpfunMigrationCompleteEvidence {
+    slot: u64,
+    ts_unix_ms: u64,
+}
+
+/// Scope B: reserve-derived `tokens_per_sol` hint from `PoolCacheUpdate` for a `(token_mint, pool)`.
+/// Applied only with I-13 pool match and the same slot gates as `update_position_price`.
+#[derive(Debug, Clone)]
+struct CachedPoolReservePriceHint {
+    pool_address: String,
+    #[allow(dead_code)]
+    dex: String,
+    tokens_per_sol: f64,
+    slot: u64,
+    ts_unix_ms: u64,
+}
+
 /// Pending BUY lifecycle (not a wallet position): holds bonding/migration state between
 /// successful intent publish and ExecutionResult / `open_position`.
 #[derive(Debug, Clone)]
@@ -2264,6 +2284,13 @@ struct MomentumContext {
     pending_intents: parking_lot::RwLock<HashMap<String, PendingIntent>>,
     /// Latest `BondingCurveProgress` per mint (Geyser slot/ts monotonic).
     latest_bonding_by_mint: parking_lot::RwLock<HashMap<String, CachedBondingCurveState>>,
+    /// Scope B: latest PumpFun migration (`complete`) evidence per mint (Geyser slot/ts monotonic).
+    latest_pumpfun_migration_complete_by_mint:
+        parking_lot::RwLock<HashMap<String, CachedPumpfunMigrationCompleteEvidence>>,
+    /// Scope B: latest reserve-derived mark `tokens_per_sol` per `(token_mint, pool)` from JetStream
+    /// `PoolCacheUpdate` (slot/ts monotonic). Not a wallet or capital truth — only for position marks.
+    latest_pool_reserve_price_hint_by_mint_pool:
+        parking_lot::RwLock<HashMap<(String, String), CachedPoolReservePriceHint>>,
     /// Pending BUY lifecycle entries (intent_id -> entry), after successful JetStream publish.
     pending_buy_entries: parking_lot::RwLock<HashMap<String, PendingBuyEntry>>,
     /// At most one active pending BUY per mint: mint -> intent_id.
@@ -2579,6 +2606,8 @@ impl MomentumContext {
         if let Some((balance_raw, decimals)) = orphan_data {
             if let Some(reconciled) = self.build_reconciled_position(mint, balance_raw, decimals) {
                 let hold_secs = reconciled.entry_time.elapsed().as_secs();
+                let mut reconciled = reconciled;
+                self.apply_latest_sticky_state_to_position(mint, &mut reconciled);
                 self.positions
                     .write()
                     .insert(mint.to_string(), reconciled.clone());
@@ -2651,6 +2680,8 @@ impl MomentumContext {
                 if let Some(reconciled) =
                     self.build_reconciled_position(mint, balance_raw, decimals)
                 {
+                    let mut reconciled = reconciled;
+                    self.apply_latest_sticky_state_to_position(mint, &mut reconciled);
                     self.positions
                         .write()
                         .insert(mint.to_string(), reconciled.clone());
@@ -2680,13 +2711,20 @@ impl MomentumContext {
         }
     }
 
-    /// Scope 57 / I-13: Cache-side PumpFun migration signals (Geyser/JetStream — no RPC).
+    /// Scope 57 / I-13: Cache-side PumpFun migration signals (Geyser/JetStream — no RPC),
+    /// plus Scope B sticky migration evidence when LivePoolCache rows are not yet present.
     fn live_cache_pumpfun_complete_evidence(&self, mint: &str) -> bool {
+        let sticky = self
+            .latest_pumpfun_migration_complete_by_mint
+            .read()
+            .contains_key(mint);
         let Ok(pk) = solana_sdk::pubkey::Pubkey::from_str(mint) else {
-            return false;
+            return sticky;
         };
-        self.live_pool_cache
-            .pumpfun_bonding_curve_complete_for_mint(&pk)
+        sticky
+            || self
+                .live_pool_cache
+                .pumpfun_bonding_curve_complete_for_mint(&pk)
             || self.live_pool_cache.is_pumpfun_complete_for_mint(&pk) == Some(true)
     }
 
@@ -2808,6 +2846,8 @@ impl MomentumContext {
                 .checked_sub(Duration::from_secs(config.max_hold_time_secs))
                 .unwrap_or_else(Instant::now);
         }
+
+        self.apply_latest_sticky_state_to_position(mint, &mut tracker);
 
         Some(tracker)
     }
@@ -3518,7 +3558,6 @@ impl MomentumContext {
                     token_program = ?pos.token_program,
                     "📈 Position scaled in"
                 );
-                pos.clone()
             } else {
                 let mut new_tracker = PositionTracker::new(
                     p.mint,
@@ -3539,7 +3578,7 @@ impl MomentumContext {
                 if let Some(ref snap) = p.initial_bonding {
                     new_tracker.bonding_curve_progress_bps = Some(snap.progress_bps);
                 }
-                positions.insert(p.mint.to_string(), new_tracker.clone());
+                positions.insert(p.mint.to_string(), new_tracker);
                 if p.entry_confirmed_slot == 0 {
                     warn!(
                         mint = %p.mint,
@@ -3553,8 +3592,12 @@ impl MomentumContext {
                     token_program = ?p.token_program,
                     "📈 Position opened"
                 );
-                new_tracker
             }
+            let _ = self.apply_latest_sticky_state_to_position(
+                p.mint,
+                positions.get_mut(p.mint).expect("position"),
+            );
+            positions.get(p.mint).expect("position").clone()
         };
 
         // Persist to KV asynchronously (fire-and-forget)
@@ -3655,6 +3698,8 @@ impl MomentumContext {
         if !self.pending_buy_mint_index.read().contains_key(mint) {
             self.latest_bonding_by_mint.write().remove(mint);
         }
+
+        self.clear_scope_b_sticky_state_for_mint(mint);
 
         // Delete from KV asynchronously (fire-and-forget)
         let ctx = Arc::clone(self);
@@ -4197,6 +4242,9 @@ impl MomentumContext {
 
         if !cache_relevant {
             self.latest_bonding_by_mint.write().remove(mint);
+            if complete {
+                self.merge_pumpfun_migration_complete_evidence(mint, slot, ts_unix_ms);
+            }
             return;
         }
 
@@ -4221,6 +4269,9 @@ impl MomentumContext {
                         ts_unix_ms,
                     },
                 );
+                if complete {
+                    self.merge_pumpfun_migration_complete_evidence(mint, slot, ts_unix_ms);
+                }
             }
         }
 
@@ -4305,6 +4356,215 @@ impl MomentumContext {
 
     fn clone_latest_bonding_snapshot(&self, mint: &str) -> Option<CachedBondingCurveState> {
         self.latest_bonding_by_mint.read().get(mint).cloned()
+    }
+
+    /// Scope B: remove sticky pool hints + migration evidence when a position closes.
+    fn clear_scope_b_sticky_state_for_mint(&self, mint: &str) {
+        self.latest_pumpfun_migration_complete_by_mint
+            .write()
+            .remove(mint);
+        self.latest_pool_reserve_price_hint_by_mint_pool
+            .write()
+            .retain(|key, _| key.0 != mint);
+    }
+
+    /// Scope B: record PumpFun bonding-curve `complete` (migration) with slot-/ts-monotonic merge.
+    pub(crate) fn merge_pumpfun_migration_complete_evidence(
+        &self,
+        mint: &str,
+        slot: u64,
+        ts_unix_ms: u64,
+    ) {
+        let mut map = self.latest_pumpfun_migration_complete_by_mint.write();
+        let accept = match map.get(mint) {
+            None => true,
+            Some(prev) => {
+                bonding_geyser_observation_is_newer(slot, ts_unix_ms, prev.slot, prev.ts_unix_ms)
+            }
+        };
+        if accept {
+            map.insert(
+                mint.to_string(),
+                CachedPumpfunMigrationCompleteEvidence { slot, ts_unix_ms },
+            );
+        }
+    }
+
+    /// Scope B: migration evidence from execution-engine observations (6005, etc.) when Geyser slot
+    /// metadata may be missing — uses `ExecutionResult.confirmed_slot` or last event slot.
+    fn record_pumpfun_migration_complete_evidence_from_execution_observation(
+        &self,
+        mint: &str,
+        result: &ExecutionResult,
+    ) {
+        let slot = result
+            .confirmed_slot
+            .unwrap_or_else(|| {
+                self.last_event_slot
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .max(
+                self.last_event_slot
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
+        let ts_wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let ts = ts_wall.max(
+            self.last_event_ts_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        self.merge_pumpfun_migration_complete_evidence(mint, slot, ts);
+    }
+
+    /// Scope B: merge a `PoolCacheUpdate` into the sticky reserve mark map (same monotonic rules as bonding).
+    pub(crate) fn merge_latest_pool_reserve_price_hint_from_update(
+        &self,
+        update: &ironcrab::ipc::PoolCacheUpdate,
+    ) {
+        if update.base_reserve == 0 || update.quote_reserve == 0 {
+            return;
+        }
+        const SOL_WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+        let (token_mint, token_reserve, sol_reserve, decimals) =
+            if update.base_mint == SOL_WSOL_MINT {
+                let decimals = self
+                    .mint_infos
+                    .read()
+                    .get(&update.quote_mint)
+                    .map(|m| m.decimals)
+                    .unwrap_or(6);
+                (
+                    update.quote_mint.clone(),
+                    update.quote_reserve,
+                    update.base_reserve,
+                    decimals,
+                )
+            } else {
+                let decimals = self
+                    .mint_infos
+                    .read()
+                    .get(&update.base_mint)
+                    .map(|m| m.decimals)
+                    .unwrap_or(6);
+                (
+                    update.base_mint.clone(),
+                    update.base_reserve,
+                    update.quote_reserve,
+                    decimals,
+                )
+            };
+        let token_ui = token_reserve as f64 / 10f64.powi(decimals as i32);
+        let sol_ui = sol_reserve as f64 / 1_000_000_000.0;
+        if sol_ui <= 0.0 || !sol_ui.is_finite() || token_ui <= 0.0 || !token_ui.is_finite() {
+            return;
+        }
+        let tokens_per_sol = token_ui / sol_ui;
+        if !tokens_per_sol.is_finite() || tokens_per_sol <= 0.0 {
+            return;
+        }
+        let key = (token_mint, update.pool_address.clone());
+        let mut map = self.latest_pool_reserve_price_hint_by_mint_pool.write();
+        let accept = match map.get(&key) {
+            None => true,
+            Some(prev) => bonding_geyser_observation_is_newer(
+                update.geyser_slot,
+                update.header.ts_unix_ms,
+                prev.slot,
+                prev.ts_unix_ms,
+            ),
+        };
+        if accept {
+            map.insert(
+                key,
+                CachedPoolReservePriceHint {
+                    pool_address: update.pool_address.clone(),
+                    dex: update.dex.clone(),
+                    tokens_per_sol,
+                    slot: update.geyser_slot,
+                    ts_unix_ms: update.header.ts_unix_ms,
+                },
+            );
+        }
+    }
+
+    /// Scope B: apply `mint_infos`, cached bonding max-guard, and pool reserve hints to one position.
+    /// Respects I-13 and Scope-1 slot monotonicity. Returns true when bonding or mark price changed
+    /// (caller may trigger `process_exit_signals`).
+    pub(crate) fn apply_latest_sticky_state_to_position(
+        &self,
+        mint: &str,
+        pos: &mut PositionTracker,
+    ) -> bool {
+        let mut exit_maybe = false;
+
+        if let Some(mi) = self.mint_infos.read().get(mint) {
+            if mi.decimals > 0 && pos.token_decimals == 0 {
+                pos.token_decimals = mi.decimals;
+            }
+            if pos
+                .token_program
+                .as_ref()
+                .map(|s| s.is_empty())
+                .unwrap_or(true)
+                && !mi.token_program.is_empty()
+            {
+                pos.token_program = Some(mi.token_program.clone());
+            }
+        }
+
+        if let Some(latest) = self.latest_bonding_by_mint.read().get(mint) {
+            let merged_bps = latest
+                .progress_bps
+                .max(pos.bonding_curve_progress_bps.unwrap_or(0));
+            if pos.bonding_curve_progress_bps != Some(merged_bps) {
+                pos.bonding_curve_progress_bps = Some(merged_bps);
+                exit_maybe = true;
+            }
+        }
+
+        let hint_key = (mint.to_string(), pos.pool.clone());
+        if let Some(hint) = self
+            .latest_pool_reserve_price_hint_by_mint_pool
+            .read()
+            .get(&hint_key)
+            .cloned()
+        {
+            if Self::try_apply_reserve_hint_as_position_price(pos, &hint) {
+                exit_maybe = true;
+            }
+        }
+
+        exit_maybe
+    }
+
+    fn try_apply_reserve_hint_as_position_price(
+        pos: &mut PositionTracker,
+        hint: &CachedPoolReservePriceHint,
+    ) -> bool {
+        if !ironcrab::execution::position_utils::should_apply_position_price_update(
+            &pos.pool,
+            Some(&hint.pool_address),
+        ) {
+            return false;
+        }
+        if pos.entry_confirmed_slot > 0 {
+            if hint.slot <= pos.entry_confirmed_slot {
+                return false;
+            }
+            if hint.slot <= pos.last_price_slot {
+                return false;
+            }
+        }
+        if hint.tokens_per_sol <= 0.0 || !hint.tokens_per_sol.is_finite() {
+            return false;
+        }
+        pos.update_price(hint.tokens_per_sol);
+        if hint.slot > 0 {
+            pos.last_price_slot = pos.last_price_slot.max(hint.slot);
+        }
+        true
     }
 
     /// Handle execution result from execution-engine
@@ -4606,6 +4866,9 @@ impl MomentumContext {
                                 }
                             }
                         }
+                        self.record_pumpfun_migration_complete_evidence_from_execution_observation(
+                            mint, result,
+                        );
                     }
 
                     // FIX-20: Track pool failure for orphaned sell path too.
@@ -4992,6 +5255,10 @@ impl MomentumContext {
                                 }
                             }
                         }
+                        self.record_pumpfun_migration_complete_evidence_from_execution_observation(
+                            &pending.mint,
+                            result,
+                        );
                     }
 
                     // FIX-20: Track pool failure so find_best_sell_pool() prefers alternatives.
@@ -5079,6 +5346,10 @@ impl MomentumContext {
                                 }
                             }
                         }
+                        self.record_pumpfun_migration_complete_evidence_from_execution_observation(
+                            &pending.mint,
+                            result,
+                        );
                     }
 
                     // FIX-20: Track pool failure so find_best_sell_pool() prefers alternatives.
@@ -6072,7 +6343,7 @@ async fn recover_positions_from_jsonl(
 }
 
 /// Bootstrap WalletBalanceSnapshot events from JetStream (race-free recovery)
-async fn bootstrap_wallet_snapshot_from_jetstream(ctx: &MomentumContext) -> Result<usize> {
+async fn bootstrap_wallet_snapshot_from_jetstream(ctx: &Arc<MomentumContext>) -> Result<usize> {
     use async_nats::jetstream;
     use futures::StreamExt;
     use std::collections::HashSet;
@@ -6418,6 +6689,8 @@ async fn main() -> Result<()> {
         positions: parking_lot::RwLock::new(recovered_positions),
         pending_intents: parking_lot::RwLock::new(HashMap::new()),
         latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+        latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
+        latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
         pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
         pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
         mint_pools: parking_lot::RwLock::new(HashMap::new()),
@@ -6794,11 +7067,17 @@ async fn main() -> Result<()> {
                             }
 
                             // Process the event
-                            if let Err(e) = process_market_event(&ctx, &event).await {
-                                warn!(error = %e, event_id = %event.event_id, "Failed to process market event");
-                            } else if matches!(event.kind, MarketEventKind::Trade { .. }) {
-                                // Event-driven: Trade updates position price → check exits immediately (<500ms)
-                                ctx.process_exit_signals().await;
+                            match process_market_event(&ctx, &event).await {
+                                Ok(need_exit) => {
+                                    if need_exit
+                                        || matches!(event.kind, MarketEventKind::Trade { .. })
+                                    {
+                                        ctx.process_exit_signals().await;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, event_id = %event.event_id, "Failed to process market event");
+                                }
                             }
                         }
                         Err(e) => {
@@ -7021,8 +7300,15 @@ async fn main() -> Result<()> {
                                         match serde_json::from_slice::<MarketEvent>(&msg.payload) {
                                             Ok(event) => {
                                                 if let MarketEventKind::WalletBalanceSnapshot { .. } = &event.kind {
-                                                    if let Err(e) = process_market_event(&ctx, &event).await {
-                                                        warn!(error = %e, "Failed to process WalletBalanceSnapshot from JetStream");
+                                                    match process_market_event(&ctx, &event).await {
+                                                        Ok(need_exit) => {
+                                                            if need_exit {
+                                                                ctx.process_exit_signals().await;
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(error = %e, "Failed to process WalletBalanceSnapshot from JetStream");
+                                                        }
                                                     }
                                                 }
                                             }
@@ -7082,6 +7368,7 @@ async fn main() -> Result<()> {
                                     Ok(msg) => {
                                         if let Ok(update) = serde_json::from_slice::<ironcrab::ipc::PoolCacheUpdate>(&msg.payload) {
                                             pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, &update);
+                                            ctx.merge_latest_pool_reserve_price_hint_from_update(&update);
                                             // FIX-30a: Update position price from pool reserves
                                             // tokens_per_sol = token_amount / sol_amount (higher = cheaper token)
                                             // Convention: base=token, quote=SOL. If base=SOL (inverted DEX convention),
@@ -7103,6 +7390,20 @@ async fn main() -> Result<()> {
                                                         .unwrap_or(6);
                                                     (update.base_mint.clone(), update.base_reserve, update.quote_reserve, decimals)
                                                 };
+                                                if let Ok(mint_pk) = solana_sdk::pubkey::Pubkey::from_str(&token_mint) {
+                                                    if ctx.live_pool_cache.is_pumpfun_complete_for_mint(&mint_pk)
+                                                        == Some(true)
+                                                        || ctx
+                                                            .live_pool_cache
+                                                            .pumpfun_bonding_curve_complete_for_mint(&mint_pk)
+                                                    {
+                                                        ctx.merge_pumpfun_migration_complete_evidence(
+                                                            &token_mint,
+                                                            update.geyser_slot,
+                                                            update.header.ts_unix_ms,
+                                                        );
+                                                    }
+                                                }
                                                 let token_ui = token_reserve as f64 / 10f64.powi(token_decimals as i32);
                                                 let sol_ui = sol_reserve as f64 / 1_000_000_000.0;
                                                 if sol_ui > 0.0 {
@@ -7640,7 +7941,7 @@ async fn generate_and_publish_buy_intent(
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
-    use ironcrab::ipc::{FillStatus, RecordHeader};
+    use ironcrab::ipc::{FillStatus, PoolCacheUpdate, PoolCacheUpdateType, RecordHeader};
     use tempfile::TempDir;
 
     fn empty_test_context(jsonl_writer: JsonlWriter) -> MomentumContext {
@@ -7658,6 +7959,8 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
@@ -7674,6 +7977,238 @@ mod tests {
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+    fn pool_cache_update_stub(
+        mint: &str,
+        pool: &str,
+        token_reserve_raw: u64,
+        sol_lamports: u64,
+        geyser_slot: u64,
+        ts_unix_ms: u64,
+    ) -> PoolCacheUpdate {
+        let mut header = RecordHeader::new("test", BUILD_VERSION, "run");
+        header.ts_unix_ms = ts_unix_ms;
+        PoolCacheUpdate {
+            header,
+            update_type: PoolCacheUpdateType::BalanceUpdated,
+            pool_address: pool.to_string(),
+            dex: "raydium".to_string(),
+            base_mint: mint.to_string(),
+            quote_mint: WSOL_MINT.to_string(),
+            base_reserve: token_reserve_raw,
+            quote_reserve: sol_lamports,
+            liquidity_lamports: None,
+            geyser_slot,
+            metadata: None,
+        }
+    }
+
+    /// Scope B: older-slot `PoolCacheUpdate` must not replace a newer sticky reserve hint.
+    #[tokio::test]
+    async fn sticky_pool_reserve_hint_rejects_stale_slot_merge_by_apply() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let mint = "MintStickyPool";
+        ctx.record_mint_info(
+            mint,
+            MintInfo {
+                token_program: String::new(),
+                decimals: 6,
+                supply: 0,
+                mint_authority: None,
+                freeze_authority: None,
+                last_updated: Instant::now(),
+            },
+        );
+        ctx.merge_latest_pool_reserve_price_hint_from_update(&pool_cache_update_stub(
+            mint,
+            "poolA",
+            2_000_000,
+            1_000_000_000,
+            300,
+            1,
+        ));
+        ctx.merge_latest_pool_reserve_price_hint_from_update(&pool_cache_update_stub(
+            mint,
+            "poolA",
+            99_000_000,
+            1_000_000_000,
+            100,
+            2,
+        ));
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "poolA",
+            dex: "raydium",
+            entry_price: 50.0,
+            token_decimals: 6,
+            token_amount: 1_000_000,
+            sol_invested: 1_000_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 200,
+            initial_bonding: None,
+        });
+        let pos = ctx.positions.read().get(mint).unwrap().clone();
+        assert!(
+            (pos.current_price - 2.0).abs() < 0.05,
+            "expected newer-slot sticky tps ~2.0, got {}",
+            pos.current_price
+        );
+        assert_eq!(pos.last_price_slot, 300);
+    }
+
+    /// Scope B: reserve hint merged before BUY open applies on `open_position` when slot ordering allows.
+    #[tokio::test]
+    async fn sticky_pool_reserve_hint_applies_on_open_after_confirm_slot() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let mint = "MintOpenApply";
+        ctx.record_mint_info(
+            mint,
+            MintInfo {
+                token_program: String::new(),
+                decimals: 6,
+                supply: 0,
+                mint_authority: None,
+                freeze_authority: None,
+                last_updated: Instant::now(),
+            },
+        );
+        ctx.merge_latest_pool_reserve_price_hint_from_update(&pool_cache_update_stub(
+            mint,
+            "poolA",
+            1_000_000,
+            1_000_000_000,
+            600,
+            3,
+        ));
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "poolA",
+            dex: "raydium",
+            entry_price: 50.0,
+            token_decimals: 6,
+            token_amount: 1_000_000,
+            sol_invested: 1_000_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 500,
+            initial_bonding: None,
+        });
+        let pos = ctx.positions.read().get(mint).unwrap().clone();
+        assert!(
+            (pos.current_price - 1.0).abs() < 0.02,
+            "expected sticky pool mark near 1.0 tps, got {}",
+            pos.current_price
+        );
+        assert_eq!(pos.last_price_slot, 600);
+    }
+
+    /// Scope B: sticky hint for a different pool must not move the position mark (I-13).
+    #[tokio::test]
+    async fn sticky_pool_reserve_hint_wrong_pool_not_applied() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let mint = "MintOtherPool";
+        ctx.record_mint_info(
+            mint,
+            MintInfo {
+                token_program: String::new(),
+                decimals: 6,
+                supply: 0,
+                mint_authority: None,
+                freeze_authority: None,
+                last_updated: Instant::now(),
+            },
+        );
+        ctx.merge_latest_pool_reserve_price_hint_from_update(&pool_cache_update_stub(
+            mint,
+            "poolB",
+            1_000_000,
+            1_000_000_000,
+            600,
+            1,
+        ));
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "poolA",
+            dex: "raydium",
+            entry_price: 44.0,
+            token_decimals: 6,
+            token_amount: 1_000_000,
+            sol_invested: 1_000_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 400,
+            initial_bonding: None,
+        });
+        let pos = ctx.positions.read().get(mint).unwrap().clone();
+        assert!(
+            (pos.current_price - 44.0).abs() < 0.001,
+            "wrong-pool hint must not move mark, got {}",
+            pos.current_price
+        );
+    }
+
+    /// Scope B: `TokenMintInfo` cached in `mint_infos` upgrades an open position via apply.
+    #[tokio::test]
+    async fn sticky_mint_info_token_program_applied_when_mint_info_arrives() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let mint = "MintTP";
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "p1",
+            dex: "raydium",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 1,
+            sol_invested: 1,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 0,
+            initial_bonding: None,
+        });
+        ctx.record_mint_info(
+            mint,
+            MintInfo {
+                token_program: "TokenzQdBNbLqP7VEhdkAS6EPFLC1PHnBqCXEpPxuEb".to_string(),
+                decimals: 6,
+                supply: 1,
+                mint_authority: None,
+                freeze_authority: None,
+                last_updated: Instant::now(),
+            },
+        );
+        let mut pos = ctx.positions.read().get(mint).unwrap().clone();
+        ctx.apply_latest_sticky_state_to_position(mint, &mut pos);
+        assert_eq!(
+            pos.token_program.as_deref(),
+            Some("TokenzQdBNbLqP7VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+        );
+    }
+
+    #[test]
+    fn sticky_pumpfun_migration_complete_surfaces_in_evidence_probe() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        let mint = "NotAValidPubkeyString";
+        ctx.merge_pumpfun_migration_complete_evidence(mint, 10, 20);
+        assert!(ctx.live_cache_pumpfun_complete_evidence(mint));
     }
 
     /// Scope 1: Pre-entry/batched trades must not move `current_price`; slots must be monotonic.
@@ -7861,6 +8396,8 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
@@ -7919,6 +8456,8 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
@@ -8154,6 +8693,8 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
@@ -8411,6 +8952,8 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
@@ -8519,6 +9062,8 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
@@ -8595,6 +9140,8 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
@@ -8659,6 +9206,8 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
@@ -8738,6 +9287,8 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
@@ -8847,6 +9398,8 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
@@ -8950,6 +9503,8 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
@@ -9038,6 +9593,8 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
@@ -9104,6 +9661,8 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
@@ -9161,6 +9720,8 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
@@ -9382,6 +9943,8 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
@@ -9510,6 +10073,8 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
@@ -10249,8 +10814,9 @@ async fn generate_and_publish_exit_intent(
     Ok(())
 }
 
-/// Process a MarketEvent and update token trackers
-async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Result<()> {
+/// Process a MarketEvent and update token trackers.
+/// Returns `Ok(true)` when the caller should run `process_exit_signals()` (bonding/price-relevant sticky apply).
+async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -> Result<bool> {
     // K Phase 1: Slot-to-Send Latency - store for intent metadata propagation
     if let Some(slot) = event.slot {
         ctx.last_event_slot
@@ -10647,6 +11213,15 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     last_updated: Instant::now(),
                 },
             );
+            let exit_maybe = {
+                let mut positions = ctx.positions.write();
+                if let Some(pos) = positions.get_mut(mint) {
+                    ctx.apply_latest_sticky_state_to_position(mint, pos)
+                } else {
+                    false
+                }
+            };
+            return Ok(exit_maybe);
         }
 
         MarketEventKind::SlotUpdate { current_slot } => {
@@ -10669,7 +11244,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                 || mint == "11111111111111111111111111111111"
             {
                 debug!(mint = %mint, balance_raw = *balance_raw, "Ignoring SOL/WSOL WalletBalanceSnapshot (not a tradeable position)");
-                return Ok(());
+                return Ok(false);
             }
 
             if *balance_raw == 0 {
@@ -10701,9 +11276,10 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                         balance_raw = *balance_raw,
                         "✅ WalletBalanceSnapshot: position verified in wallet"
                     );
-                } else if let Some(reconciled) =
+                } else if let Some(mut reconciled) =
                     ctx.build_reconciled_position(mint, *balance_raw, *decimals)
                 {
+                    ctx.apply_latest_sticky_state_to_position(mint, &mut reconciled);
                     let hold_secs = reconciled.entry_time.elapsed().as_secs();
                     {
                         let mut positions = ctx.positions.write();
@@ -10718,6 +11294,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                         "🧭 Wallet snapshot reconciled into position (timed exit will apply)"
                     );
                     ctx.save_position_to_kv(mint, &reconciled).await;
+                    return Ok(true);
                 } else {
                     // Wallet has tokens but no pool known yet. Store as orphaned so
                     // we can reconcile later when PoolCreated/DexPoolAccounts arrives.
@@ -10835,6 +11412,9 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                 slot,
                 ts_unix_ms,
             );
+            if *complete {
+                ctx.merge_pumpfun_migration_complete_evidence(mint.as_str(), slot, ts_unix_ms);
+            }
 
             // FIX-20: Mark PumpFun pools as migrated when bonding curve completes.
             // This prevents find_best_sell_pool() from selecting a completed PumpFun
@@ -10861,5 +11441,5 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
         }
     }
 
-    Ok(())
+    Ok(false)
 }

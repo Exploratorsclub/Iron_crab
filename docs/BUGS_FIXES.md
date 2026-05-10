@@ -109,6 +109,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Fix**: `ExecutionResult.confirmed_slot` + Metadata-Spiegel wird beim Confirm gesetzt (Bundle-/Geyser-/RPC-Slot). `PositionTracker` erhält `entry_confirmed_slot` und `last_price_slot`; `update_position_price` akzeptiert nur Updates mit `source_slot > entry_confirmed_slot` und strikt monoton steigend; Pool-Match (I-13) unverändert. Trade- und PoolCache-Pfade reichen Geyser-Slot durch.
 **Dateien**: `src/bin/execution_engine.rs`, `src/bin/momentum_bot.rs`
 
+### FIX-SCOPE-B: Momentum „sticky latest state“ (Lifecycle Scope B, non-bonding)
+**Datum**: 2026-05-10
+**Problem**: Neben `BondingCurveProgress` (Scope A) konnten weitere Geyser-/JetStream-Zustände (PumpFun-Migration, reserve-basierte Pool-Marks, `TokenMintInfo`) vor Positionserstellung ankommen und fehlten bei späterem BUY-open, Orphan-Recovery oder Wallet-Reconcile — gleiche Klasse Race wie beim Bonding-Snapshot.
+**Fix**: Slot-/ts-monotone Maps für PumpFun-Migration (`complete`) und reserve-basierte `(mint, pool)`-Preis-Hints aus `PoolCacheUpdate`; `live_cache_pumpfun_complete_evidence` berücksichtigt die Migration-Sticky-Map; gemeinsamer `apply_latest_sticky_state_to_position` nach `open_position`, Reconcile-Pfaden, `TokenMintInfo`, plus bestehende PoolCache- und 6005-Pfade schreiben die Sticky-Maps; I-13 und Scope-1-Slot-Gates beim Apply; `close_position` räumt Sticky (nicht `mint_infos` / nicht Bonding-Duplikat).
+**Dateien**: `src/bin/momentum_bot.rs`
+
 ### FIX-18: Bug B — Orphaned Buy Recovery
 **Datum**: 2026-02-13
 **Problem**: Race Condition: `cleanup_stale_pending()` entfernte pending intent bevor `ExecutionResult` ankam → Position nie erstellt → kein Sell.
