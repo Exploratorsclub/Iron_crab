@@ -3558,6 +3558,8 @@ impl MomentumContext {
             positions.remove(mint)
         };
 
+        self.latest_bonding_by_mint.write().remove(mint);
+
         if let Some(pos) = removed {
             let pnl = pos.pnl_pct();
             let hold_secs = pos.entry_time.elapsed().as_secs();
@@ -4098,6 +4100,17 @@ impl MomentumContext {
         slot: u64,
         ts_unix_ms: u64,
     ) {
+        let cache_relevant = {
+            let positions = self.positions.read();
+            let pending_idx = self.pending_buy_mint_index.read();
+            positions.contains_key(mint) || pending_idx.contains_key(mint)
+        };
+
+        if !cache_relevant {
+            self.latest_bonding_by_mint.write().remove(mint);
+            return;
+        }
+
         {
             let mut map = self.latest_bonding_by_mint.write();
             let accept = match map.get(mint) {
@@ -4178,6 +4191,9 @@ impl MomentumContext {
                 mint = %e.mint,
                 "Removed pending BUY entry lifecycle"
             );
+            if self.positions.read().get(&e.mint).is_none() {
+                self.latest_bonding_by_mint.write().remove(&e.mint);
+            }
         }
     }
 
@@ -9472,6 +9488,18 @@ mod tests {
         let ctx = Arc::new(empty_test_context(jsonl_writer));
 
         let mint = "mintBC";
+        ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
+            intent_id: "int-bc",
+            mint,
+            pool: "poolBC",
+            dex: "pumpfun",
+            intended_sol: 1_000_000,
+            entry_kind: Some(EntryKind::Probe),
+            signal_slot: 1,
+            slot_seen_at_ms: 1,
+            creator: None,
+            token_program: None,
+        });
         ctx.merge_bonding_curve_progress_geyser(mint, 10_000, true, 500, 1000);
         ctx.merge_bonding_curve_progress_geyser(mint, 5_000, false, 400, 2000);
 
@@ -9480,6 +9508,7 @@ mod tests {
         assert!(snap.complete);
 
         let initial = ctx.clone_latest_bonding_snapshot(mint);
+        ctx.remove_pending_buy_entry_by_intent("int-bc");
         ctx.open_position(OpenPositionParams {
             mint,
             pool: "poolBC",
@@ -9504,6 +9533,18 @@ mod tests {
         let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
         let ctx = empty_test_context(jsonl_writer);
         let mint = "mStale";
+        ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
+            intent_id: "int-stale",
+            mint,
+            pool: "poolS",
+            dex: "pumpfun",
+            intended_sol: 1_000_000,
+            entry_kind: Some(EntryKind::Probe),
+            signal_slot: 10,
+            slot_seen_at_ms: 20,
+            creator: None,
+            token_program: None,
+        });
         ctx.merge_bonding_curve_progress_geyser(mint, 10_000, true, 200, 10);
         ctx.merge_bonding_curve_progress_geyser(mint, 3_000, false, 100, 99);
         let s = ctx.clone_latest_bonding_snapshot(mint).unwrap();
