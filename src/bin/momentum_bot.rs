@@ -4247,9 +4247,6 @@ impl MomentumContext {
 
         if !cache_relevant {
             self.latest_bonding_by_mint.write().remove(mint);
-            if complete {
-                self.merge_pumpfun_migration_complete_evidence(mint, slot, ts_unix_ms);
-            }
             return;
         }
 
@@ -4274,9 +4271,6 @@ impl MomentumContext {
                         ts_unix_ms,
                     },
                 );
-                if complete {
-                    self.merge_pumpfun_migration_complete_evidence(mint, slot, ts_unix_ms);
-                }
             }
         }
 
