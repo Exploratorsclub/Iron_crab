@@ -7121,7 +7121,13 @@ async fn main() -> Result<()> {
                             }
                             let scope_c_obs_latency =
                                 momentum_scope_c_price_sensitive_market_kind(&event.kind);
-                            let scope_c_latency_t0 = scope_c_obs_latency.then(Instant::now);
+                            let (scope_c_latency_t0, last_ev_slot_before) = if scope_c_obs_latency {
+                                let t0 = Instant::now();
+                                let snap = ctx.last_event_slot.load(Ordering::Relaxed);
+                                (Some(t0), snap)
+                            } else {
+                                (None, 0u64)
+                            };
 
                             // Process the event
                             match process_market_event(&ctx, &event).await {
@@ -7139,15 +7145,15 @@ async fn main() -> Result<()> {
 
                             if let Some(t0) = scope_c_latency_t0 {
                                 let duration_ms = t0.elapsed().as_millis() as u64;
-                                let last_ev_slot = ctx.last_event_slot.load(Ordering::Relaxed);
                                 let ev_sl = event_slot.unwrap_or(0);
                                 debug!(
                                     momentum_scope_c = "market_event_latency",
                                     market_kind = momentum_scope_c_market_kind_tag(&event.kind),
                                     duration_ms,
                                     event_slot = ev_sl,
-                                    last_event_slot = last_ev_slot,
-                                    slot_delta_vs_head = last_ev_slot.saturating_sub(ev_sl),
+                                    last_event_slot = last_ev_slot_before,
+                                    slot_delta_vs_head = last_ev_slot_before
+                                        .saturating_sub(ev_sl),
                                     event_id = %event.event_id,
                                     "Momentum trade/bonding-related MarketEvent processed",
                                 );
