@@ -83,7 +83,10 @@ const ORPHANED_RECOVERED_INTENT_IDS_CAP: usize = 50_000;
 const EXECUTION_RESULT_SCHEDULED_DRAIN_MAX: usize = 16;
 /// Extra bounded drain after trade/bonding-related `MarketEvent`s (anti-starvation).
 const EXECUTION_RESULT_INTERLEAVED_DRAIN_MAX: usize = 8;
-const EXECUTION_RESULT_FETCH_EXPIRES: Duration = Duration::from_millis(80);
+/// JetStream `expires` for the dedicated `select!` drain arm only — may block up to this long when the stream is empty (acceptable on the idle poll path).
+const EXECUTION_RESULT_SCHEDULED_FETCH_EXPIRES: Duration = Duration::from_millis(80);
+/// JetStream `expires` for drains **awaited inside** MarketEvent / PoolCache arms — must stay short so empty streams do not add multi‑10ms stalls on hot paths.
+const EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES: Duration = Duration::from_millis(3);
 /// Smaller batches reduce single-arm starvation of other `tokio::select!` branches.
 const POOL_CACHE_UPDATE_FETCH_MAX: usize = 48;
 const POOL_CACHE_UPDATE_FETCH_EXPIRES: Duration = Duration::from_millis(50);
@@ -7157,7 +7160,7 @@ async fn main() -> Result<()> {
                                         consumer,
                                         &ctx,
                                         EXECUTION_RESULT_INTERLEAVED_DRAIN_MAX,
-                                        EXECUTION_RESULT_FETCH_EXPIRES,
+                                        EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES,
                                         last_slot,
                                         "after_market_event",
                                     )
@@ -7321,7 +7324,7 @@ async fn main() -> Result<()> {
                         consumer,
                         &ctx,
                         EXECUTION_RESULT_SCHEDULED_DRAIN_MAX,
-                        EXECUTION_RESULT_FETCH_EXPIRES,
+                        EXECUTION_RESULT_SCHEDULED_FETCH_EXPIRES,
                         last_slot,
                         "scheduled_select_arm",
                     )
@@ -7510,7 +7513,7 @@ async fn main() -> Result<()> {
                                         er_consumer,
                                         &ctx,
                                         EXECUTION_RESULT_INTERLEAVED_DRAIN_MAX,
-                                        EXECUTION_RESULT_FETCH_EXPIRES,
+                                        EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES,
                                         last_slot,
                                         "after_pool_cache_batch",
                                     )
@@ -8033,6 +8036,9 @@ fn execution_result_ingest_lag_ms(result: &ExecutionResult, now_ms: u64) -> u64 
 }
 
 /// Bounded JetStream pull for `ExecutionResult` — no busy-wait, at most `max_messages` per call.
+///
+/// `fetch_expires`: use `EXECUTION_RESULT_SCHEDULED_FETCH_EXPIRES` from the dedicated `select!` arm;
+/// use `EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES` when this runs inside MarketEvent / PoolCache handlers.
 async fn drain_execution_results(
     consumer: &async_nats::jetstream::consumer::Consumer<
         async_nats::jetstream::consumer::pull::Config,
@@ -8057,6 +8063,7 @@ async fn drain_execution_results(
             trace!(
                 momentum_scope_c = "execution_result_drain",
                 interleave_source,
+                fetch_expires_ms = fetch_expires.as_millis() as u64,
                 error = %e,
                 "ExecutionResult JetStream fetch failed (may be empty)"
             );
@@ -8129,6 +8136,11 @@ async fn drain_execution_results(
             processed_count = processed,
             max_messages,
             fetch_expires_ms = fetch_expires.as_millis() as u64,
+            fetch_expires_profile = if fetch_expires <= EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES {
+                "interleaved"
+            } else {
+                "scheduled"
+            },
             last_head_slot,
             "ExecutionResult bounded drain completed"
         );
@@ -10855,6 +10867,15 @@ mod tests {
         };
         assert_eq!(execution_result_ingest_lag_ms(&er, 10_050), 50);
         assert_eq!(execution_result_ingest_lag_ms(&er, 9_000), 0);
+    }
+
+    #[test]
+    fn scope_c_interleaved_jetstream_expires_stays_short_vs_scheduled() {
+        assert!(EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES <= Duration::from_millis(5));
+        assert!(EXECUTION_RESULT_SCHEDULED_FETCH_EXPIRES >= Duration::from_millis(50));
+        assert!(
+            EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES < EXECUTION_RESULT_SCHEDULED_FETCH_EXPIRES
+        );
     }
 }
 
