@@ -3490,6 +3490,8 @@ impl MomentumContext {
         let mut mint_emitted_entry_this_tick: HashSet<String> = HashSet::new();
         // PumpFun migration gate may reject multiple pool rows per mint in one pass — metric is mint-level.
         let mut pumpfun_migration_blacklist_metric_mints: HashSet<String> = HashSet::new();
+        // `should_generate_intent` strategy rejections: same mint can have multiple pool-scoped trackers.
+        let mut strategy_rejection_blacklist_metric_mints: HashSet<String> = HashSet::new();
 
         let probe_sol = ((config.default_position_lamports as f64) * config.probe_buy_pct)
             .round()
@@ -3557,7 +3559,10 @@ impl MomentumContext {
             ) {
                 let was_not_rejected = tracker.was_not_rejected();
                 let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
-                if was_not_rejected && tracker.is_rejected() {
+                if was_not_rejected
+                    && tracker.is_rejected()
+                    && strategy_rejection_blacklist_metric_mints.insert(mint.clone())
+                {
                     self.tokens_blacklisted
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -3612,7 +3617,10 @@ impl MomentumContext {
 
                 let was_not_rejected = tracker.was_not_rejected();
                 let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
-                if was_not_rejected && tracker.is_rejected() {
+                if was_not_rejected
+                    && tracker.is_rejected()
+                    && strategy_rejection_blacklist_metric_mints.insert(mint.clone())
+                {
                     self.tokens_blacklisted
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
