@@ -7145,15 +7145,15 @@ async fn main() -> Result<()> {
 
                             if let Some(t0) = scope_c_latency_t0 {
                                 let duration_ms = t0.elapsed().as_millis() as u64;
-                                let ev_sl = event_slot.unwrap_or(0);
+                                let slot_delta_vs_head =
+                                    event_slot.map(|s| last_ev_slot_before.saturating_sub(s));
                                 debug!(
                                     momentum_scope_c = "market_event_latency",
                                     market_kind = momentum_scope_c_market_kind_tag(&event.kind),
                                     duration_ms,
-                                    event_slot = ev_sl,
+                                    event_slot = ?event_slot,
                                     last_event_slot = last_ev_slot_before,
-                                    slot_delta_vs_head = last_ev_slot_before
-                                        .saturating_sub(ev_sl),
+                                    slot_delta_vs_head = ?slot_delta_vs_head,
                                     event_id = %event.event_id,
                                     "Momentum trade/bonding-related MarketEvent processed",
                                 );
@@ -7421,7 +7421,6 @@ async fn main() -> Result<()> {
             _ = async {
                 use futures::StreamExt;
                 if let Some(ref mut consumer) = pool_cache_consumer_opt {
-                    let batch_t0 = Instant::now();
                     match consumer
                         .fetch()
                         .max_messages(POOL_CACHE_UPDATE_FETCH_MAX)
@@ -7433,7 +7432,9 @@ async fn main() -> Result<()> {
                             let mut batch_messages: u32 = 0;
                             let mut msg_count = 0u32;
                             let mut position_price_updates_applied = 0u32;
+                            let mut batch_ms: u64 = 0;
                             while let Some(msg_result) = messages.next().await {
+                                let work_t0 = Instant::now();
                                 match msg_result {
                                     Ok(msg) => {
                                         batch_messages = batch_messages.saturating_add(1);
@@ -7498,8 +7499,8 @@ async fn main() -> Result<()> {
                                         trace!(error = %e, "PoolCacheUpdate fetch error");
                                     }
                                 }
+                                batch_ms = batch_ms.saturating_add(work_t0.elapsed().as_millis() as u64);
                             }
-                            let batch_ms = batch_t0.elapsed().as_millis() as u64;
                             let last_ev_slot = ctx.last_event_slot.load(Ordering::Relaxed);
                             if batch_messages > 0 {
                                 debug!(
