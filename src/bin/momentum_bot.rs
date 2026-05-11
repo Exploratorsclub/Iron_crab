@@ -7432,6 +7432,7 @@ async fn main() -> Result<()> {
                         Ok(mut messages) => {
                             let mut batch_messages: u32 = 0;
                             let mut msg_count = 0u32;
+                            let mut position_price_updates_applied = 0u32;
                             while let Some(msg_result) = messages.next().await {
                                 match msg_result {
                                     Ok(msg) => {
@@ -7486,6 +7487,8 @@ async fn main() -> Result<()> {
                                                     Some(&update.pool_address),
                                                     Some(update.geyser_slot),
                                                 );
+                                                position_price_updates_applied =
+                                                    position_price_updates_applied.saturating_add(1);
                                             }
                                             msg_count += 1;
                                         }
@@ -7502,7 +7505,7 @@ async fn main() -> Result<()> {
                                 debug!(
                                     momentum_scope_c = "pool_cache_batch",
                                     batch_messages,
-                                    position_price_updates = msg_count,
+                                    position_price_updates = position_price_updates_applied,
                                     duration_ms = batch_ms,
                                     fetch_max = POOL_CACHE_UPDATE_FETCH_MAX,
                                     last_event_slot = last_ev_slot,
