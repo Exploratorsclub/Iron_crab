@@ -2335,7 +2335,7 @@ struct MomentumContext {
     /// Scope 56: in-memory idempotency for duplicate JetStream / replayed ExecutionResults
     /// on the orphaned-BUY path (no durable store in this scope).
     orphaned_recovered_intent_ids: parking_lot::RwLock<BoundedIntentIdCache>,
-    /// Stats
+    /// Stats — **unique mints** with at least one pool-scoped tracker row (not one increment per pool row).
     tokens_tracked: std::sync::atomic::AtomicU64,
     /// Prometheus / heartbeat: **unique tokens (mints)** that crossed into a rejected/blacklisted
     /// strategy state — **not** one increment per pool-scoped `TokenTracker` row. Multi-pool mints
@@ -3336,6 +3336,8 @@ impl MomentumContext {
         let config = self.config.read().clone();
         let mut trackers = self.token_trackers.write();
         let key = Self::tracker_storage_key(mint, pool);
+        let mint_already_tracked = trackers.values().any(|t| t.mint == mint);
+        let mint_already_rejected = trackers.values().any(|t| t.mint == mint && t.is_rejected());
         use std::collections::hash_map::Entry;
         match trackers.entry(key) {
             Entry::Occupied(_) => false,
@@ -3348,9 +3350,9 @@ impl MomentumContext {
                 {
                     let was_not_rejected = tracker.was_not_rejected();
                     tracker.set_dev_info(&dev_wallet, supply_pct, &config);
-                    // Single new row per call — `tokens_blacklisted` is mint-level; no multi-row
-                    // dedupe needed here (contrast `record_dev_info`).
-                    if was_not_rejected && tracker.is_rejected() {
+                    // Mint-level metric: pending dev may reject every new pool row for this mint —
+                    // bump only on the first tracker row that introduces a rejected state for the mint.
+                    if was_not_rejected && tracker.is_rejected() && !mint_already_rejected {
                         self.tokens_blacklisted
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -3366,8 +3368,10 @@ impl MomentumContext {
                     }
                 }
 
-                self.tokens_tracked
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !mint_already_tracked {
+                    self.tokens_tracked
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 true // New tracker created
             }
         }
@@ -9743,6 +9747,75 @@ mod tests {
             1,
             "tokens_blacklisted counts blacklisted mints, not pool-scoped tracker rows"
         );
+    }
+
+    /// `tokens_tracked` counts unique mints: two pool rows from `get_or_create_tracker` → +1 total.
+    #[test]
+    fn tokens_tracked_unique_mint_two_pool_rows_via_get_or_create_tracker() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "MintTracked777777777777777777777777777777777";
+        let p1 = "poolTrk711111111111111111111111111111111111";
+        let p2 = "poolTrk7222222222222222222222222222222222222";
+
+        let before = ctx.tokens_tracked.load(Ordering::Relaxed);
+        assert!(ctx.get_or_create_tracker(mint, p1, "raydium", 1, 0));
+        assert!(ctx.get_or_create_tracker(mint, p2, "orca", 1, 0));
+        assert!(!ctx.get_or_create_tracker(mint, p1, "raydium", 1, 0));
+        let after = ctx.tokens_tracked.load(Ordering::Relaxed);
+        assert_eq!(
+            after.saturating_sub(before),
+            1,
+            "tokens_tracked is per-mint, not per pool-scoped tracker row"
+        );
+    }
+
+    /// Pending dev applied inside `get_or_create_tracker`: two pool rows for same mint → +1 blacklist total.
+    #[test]
+    fn tokens_blacklisted_unique_mint_pending_dev_two_pool_rows_via_get_or_create_tracker() {
+        let mut cfg = MomentumConfig::default();
+        cfg.max_dev_supply_pct = 50.0;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg;
+
+        let mint = "MintPendingDev888888888888888888888888888888";
+        let p1 = "poolDev811111111111111111111111111111111111";
+        let p2 = "poolDev822222222222222222222222222222222222";
+
+        ctx.pending_dev_info.write().insert(
+            mint.to_string(),
+            (
+                "DevWallet8888888888888888888888888888888888".to_string(),
+                99.0,
+            ),
+        );
+
+        let before_bl = ctx.tokens_blacklisted.load(Ordering::Relaxed);
+        let before_tr = ctx.tokens_tracked.load(Ordering::Relaxed);
+        assert!(ctx.get_or_create_tracker(mint, p1, "raydium", 1, 0));
+        assert!(ctx.get_or_create_tracker(mint, p2, "orca", 1, 0));
+        let after_bl = ctx.tokens_blacklisted.load(Ordering::Relaxed);
+        let after_tr = ctx.tokens_tracked.load(Ordering::Relaxed);
+
+        assert_eq!(after_bl.saturating_sub(before_bl), 1);
+        assert_eq!(after_tr.saturating_sub(before_tr), 1);
+
+        let trackers = ctx.token_trackers.read();
+        assert!(trackers
+            .get(&MomentumContext::tracker_storage_key(mint, p1))
+            .unwrap()
+            .is_rejected());
+        assert!(trackers
+            .get(&MomentumContext::tracker_storage_key(mint, p2))
+            .unwrap()
+            .is_rejected());
     }
 
     /// `tokens_blacklisted` is mint-level: one LP-removal event rejects two pool rows → +1 not +2.
