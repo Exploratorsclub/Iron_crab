@@ -3336,20 +3336,17 @@ impl MomentumContext {
         match trackers.entry(key) {
             Entry::Occupied(_) => false,
             Entry::Vacant(v) => {
-                v.insert(TokenTracker::new(mint, pool, dex, slot, liquidity));
+                let tracker = v.insert(TokenTracker::new(mint, pool, dex, slot, liquidity));
 
-                let tk = Self::tracker_storage_key(mint, pool);
                 // Apply any dev wallet info that arrived before the tracker existed.
                 if let Some((dev_wallet, supply_pct)) =
                     self.pending_dev_info.read().get(mint).cloned()
                 {
-                    if let Some(tracker) = trackers.get_mut(&tk) {
-                        let was_not_rejected = tracker.was_not_rejected();
-                        tracker.set_dev_info(&dev_wallet, supply_pct, &config);
-                        if was_not_rejected && tracker.is_rejected() {
-                            self.tokens_blacklisted
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
+                    let was_not_rejected = tracker.was_not_rejected();
+                    tracker.set_dev_info(&dev_wallet, supply_pct, &config);
+                    if was_not_rejected && tracker.is_rejected() {
+                        self.tokens_blacklisted
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
 
@@ -3358,10 +3355,8 @@ impl MomentumContext {
                     self.pending_pool_accounts.read().get(mint).cloned()
                 {
                     if pool_addr == pool {
-                        if let Some(tracker) = trackers.get_mut(&tk) {
-                            tracker.dex = dex_name;
-                            tracker.dex_pool_accounts = Some(accounts);
-                        }
+                        tracker.dex = dex_name;
+                        tracker.dex_pool_accounts = Some(accounts);
                     }
                 }
 
@@ -3406,6 +3401,7 @@ impl MomentumContext {
         }
 
         let mut trackers = self.token_trackers.write();
+        let mut any_new_blacklist_this_event = false;
         for tracker in trackers.values_mut() {
             if tracker.mint != mint {
                 continue;
@@ -3413,9 +3409,12 @@ impl MomentumContext {
             let was_not_rejected = tracker.was_not_rejected();
             tracker.set_dev_info(dev_wallet, supply_pct, &config);
             if was_not_rejected && tracker.is_rejected() {
-                self.tokens_blacklisted
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                any_new_blacklist_this_event = true;
             }
+        }
+        if any_new_blacklist_this_event {
+            self.tokens_blacklisted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         // A.2: Also update position creator when dex is pumpfun (for BC-SELL after restart)
         {
@@ -3432,6 +3431,7 @@ impl MomentumContext {
     /// Record LP removal for a token
     fn record_lp_removal(&self, mint: &str) {
         let mut trackers = self.token_trackers.write();
+        let mut any_new_blacklist_this_event = false;
         for tracker in trackers.values_mut() {
             if tracker.mint != mint {
                 continue;
@@ -3439,9 +3439,12 @@ impl MomentumContext {
             let was_not_rejected = tracker.was_not_rejected();
             tracker.record_lp_removal();
             if was_not_rejected && tracker.is_rejected() {
-                self.tokens_blacklisted
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                any_new_blacklist_this_event = true;
             }
+        }
+        if any_new_blacklist_this_event {
+            self.tokens_blacklisted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -3474,6 +3477,7 @@ impl MomentumContext {
         // At most one entry signal (probe or scale-in) per mint per `check_for_signals` call.
         // `pending_buy_mint_index` updates after publish; sibling snapshot is pre-loop — both can miss same-tick races.
         let mut mint_emitted_entry_this_tick: HashSet<String> = HashSet::new();
+        let mut pumpfun_migration_blacklist_metric_mints: HashSet<String> = HashSet::new();
 
         let probe_sol = ((config.default_position_lamports as f64) * config.probe_buy_pct)
             .round()
@@ -3516,8 +3520,10 @@ impl MomentumContext {
                         dex = %tracker.dex,
                         "REJECT_PUMPFUN_BONDING_COMPLETE: skip entry — migrated bonding curve / complete evidence (pump_amm unaffected)"
                     );
-                    self.tokens_blacklisted
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if pumpfun_migration_blacklist_metric_mints.insert(mint.clone()) {
+                        self.tokens_blacklisted
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 continue;
             }
