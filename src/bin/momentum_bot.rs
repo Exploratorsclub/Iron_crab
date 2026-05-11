@@ -7432,11 +7432,13 @@ async fn main() -> Result<()> {
                             let mut batch_messages: u32 = 0;
                             let mut msg_count = 0u32;
                             let mut position_price_updates_applied = 0u32;
-                            let mut batch_ms: u64 = 0;
+                            // Per-message work only (excludes JetStream batch fetch / expires idle above).
+                            // Accumulate `Duration` so sub-ms work is not truncated away before logging.
+                            let mut pool_cache_process_accounted: Duration = Duration::ZERO;
                             while let Some(msg_result) = messages.next().await {
-                                let work_t0 = Instant::now();
                                 match msg_result {
                                     Ok(msg) => {
+                                        let msg_work_t0 = Instant::now();
                                         batch_messages = batch_messages.saturating_add(1);
                                         if let Ok(update) = serde_json::from_slice::<ironcrab::ipc::PoolCacheUpdate>(&msg.payload) {
                                             pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, &update);
@@ -7494,23 +7496,30 @@ async fn main() -> Result<()> {
                                             msg_count += 1;
                                         }
                                         let _ = msg.ack().await;
+                                        pool_cache_process_accounted = pool_cache_process_accounted
+                                            .saturating_add(msg_work_t0.elapsed());
                                     }
                                     Err(e) => {
                                         trace!(error = %e, "PoolCacheUpdate fetch error");
                                     }
                                 }
-                                batch_ms = batch_ms.saturating_add(work_t0.elapsed().as_millis() as u64);
                             }
+                            let micros_u128 = pool_cache_process_accounted.as_micros();
+                            let proc_us: u64 = micros_u128.min(u128::from(u64::MAX)) as u64;
+                            // Ceil(ms) from total microseconds: (µs + 999) / 1000 with truncating division.
+                            let proc_ms_ceil: u64 = ((micros_u128.saturating_add(999)) / 1000)
+                                .min(u128::from(u64::MAX)) as u64;
                             let last_ev_slot = ctx.last_event_slot.load(Ordering::Relaxed);
                             if batch_messages > 0 {
                                 debug!(
                                     momentum_scope_c = "pool_cache_batch",
                                     batch_messages,
                                     position_price_updates = position_price_updates_applied,
-                                    duration_ms = batch_ms,
+                                    processing_duration_us = proc_us,
+                                    processing_duration_ms_ceil = proc_ms_ceil,
                                     fetch_max = POOL_CACHE_UPDATE_FETCH_MAX,
                                     last_event_slot = last_ev_slot,
-                                    "SLAVE CACHE: PoolCacheUpdate batch timing",
+                                    "SLAVE CACHE: PoolCacheUpdate batch timing (processing only, excludes batch fetch wait)",
                                 );
                             }
                             if msg_count > 0 {
