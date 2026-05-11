@@ -1201,3 +1201,15 @@ BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap 
 | **Betroffene Module** | `src/bin/momentum_bot.rs` |
 | **TODO / Follow-up** | Striktere Freshness-Grenze (z. B. `cache_age_ms`) für price-based exits optional ergänzen — Metadaten (`source_slot`, `cache_age_ms`) sind im Quote bereits mitgeführt. |
 | **Tags** | [momentum, exit, live_pool_cache, i-13, i-16, scope-d] |
+
+---
+
+## FIX-48: Momentum Scope C — priorisierte / bounded `ExecutionResult`-Drains und Event-Latenz-Logs
+
+| Symptom | `ExecutionResult`-JetStream-Verarbeitung kann hinter grossen `PoolCacheUpdate`-Batches oder dichten Trade/Bonding-`MarketEvent`s verzögert werden; Lifecycle-/Positionsupdates kommen zu spät. |
+|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | `tokio::select!`-Arm zog bis zu 50 `ExecutionResult`s pro Aktivierung; Pool-Cache-Fetch verarbeitete bis zu 100 Updates in einem Rutsch — wenig Zwischenraum fuer faire Interleaving mit anderen Armen. |
+| **Fix** | (1) `drain_execution_results`: bounded Pull (`max_messages` 16 scheduled / 8 interleaved), strukturierte `trace!`/`debug!` mit stabilen Feldern (`momentum_scope_c`, `ingest_lag_ms`, `slot_lag_vs_last_event_slot`, `fetch_expires_profile`). (2) **Zwei JetStream-`expires`-Werte:** `EXECUTION_RESULT_SCHEDULED_FETCH_EXPIRES` (~80ms) nur im dedizierten `select!`-Arm; `EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES` (wenige ms) für `after_market_event` / `after_pool_cache_batch`, damit leere Streams die Hot-Path-Arme nicht spürbar blockieren. (3) Pool-Cache-Fetch-Limit 48; Batch-Dauer und Message-Zahlen geloggt; MarketEvent-Latenz für schwere Kinds. |
+| **Betroffene Module** | `src/bin/momentum_bot.rs` |
+| **Regression-Prüfung** | `process_exit_signals` unmittelbar nach Pool-Cache-Preis-Updates unverändert; Scope-D Quote-Gating unangetastet; Unit-Tests fuer Scope-C-Hilfsfunktionen. |
+| **Tags** | [momentum, jetstream, execution_result, latency, scope-c, i-24a] |
