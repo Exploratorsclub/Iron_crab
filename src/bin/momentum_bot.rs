@@ -78,6 +78,16 @@ const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// JetStream replay dedup for orphaned BUY path — bounded so memory does not grow forever.
 const ORPHANED_RECOVERED_INTENT_IDS_CAP: usize = 50_000;
 
+// --- Scope C (momentum event lifecycle): bounded ExecutionResult drains + observability ---
+/// Max `ExecutionResult` messages per `tokio::select!` activation (fairness vs MarketEvent / PoolCache).
+const EXECUTION_RESULT_SCHEDULED_DRAIN_MAX: usize = 16;
+/// Extra bounded drain after trade/bonding-related `MarketEvent`s (anti-starvation).
+const EXECUTION_RESULT_INTERLEAVED_DRAIN_MAX: usize = 8;
+const EXECUTION_RESULT_FETCH_EXPIRES: Duration = Duration::from_millis(80);
+/// Smaller batches reduce single-arm starvation of other `tokio::select!` branches.
+const POOL_CACHE_UPDATE_FETCH_MAX: usize = 48;
+const POOL_CACHE_UPDATE_FETCH_EXPIRES: Duration = Duration::from_millis(50);
+
 /// [`HashSet`] insert/remove with LRU eviction when size exceeds `cap` (new inserts only).
 struct BoundedIntentIdCache {
     set: HashSet<String>,
@@ -7102,9 +7112,13 @@ async fn main() -> Result<()> {
                     // Deserialize MarketEvent
                     match serde_json::from_slice::<MarketEvent>(&nats_msg.payload) {
                         Ok(event) => {
-                            if let Some(slot) = event.slot {
+                            let event_slot = event.slot;
+                            if let Some(slot) = event_slot {
                                 last_slot = slot;
                             }
+                            let scope_c_obs_latency =
+                                momentum_scope_c_price_sensitive_market_kind(&event.kind);
+                            let scope_c_latency_t0 = scope_c_obs_latency.then(Instant::now);
 
                             // Process the event
                             match process_market_event(&ctx, &event).await {
@@ -7117,6 +7131,37 @@ async fn main() -> Result<()> {
                                 }
                                 Err(e) => {
                                     warn!(error = %e, event_id = %event.event_id, "Failed to process market event");
+                                }
+                            }
+
+                            if let Some(t0) = scope_c_latency_t0 {
+                                let duration_ms = t0.elapsed().as_millis() as u64;
+                                let last_ev_slot = ctx.last_event_slot.load(Ordering::Relaxed);
+                                let ev_sl = event_slot.unwrap_or(0);
+                                debug!(
+                                    momentum_scope_c = "market_event_latency",
+                                    market_kind = momentum_scope_c_market_kind_tag(&event.kind),
+                                    duration_ms,
+                                    event_slot = ev_sl,
+                                    last_event_slot = last_ev_slot,
+                                    slot_delta_vs_head = last_ev_slot.saturating_sub(ev_sl),
+                                    event_id = %event.event_id,
+                                    "Momentum trade/bonding-related MarketEvent processed",
+                                );
+                            }
+
+                            // Scope C: bounded ExecutionResult drain after heavy market paths (anti-starvation).
+                            if scope_c_obs_latency {
+                                if let Some(ref consumer) = execution_js_consumer {
+                                    let _n = drain_execution_results(
+                                        consumer,
+                                        &ctx,
+                                        EXECUTION_RESULT_INTERLEAVED_DRAIN_MAX,
+                                        EXECUTION_RESULT_FETCH_EXPIRES,
+                                        last_slot,
+                                        "after_market_event",
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -7269,51 +7314,18 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Handle ExecutionResults (position management) via JetStream
+            // Handle ExecutionResults (position management) via JetStream — bounded drain (Scope C).
             _ = async {
-                use futures::StreamExt;
                 if let Some(ref consumer) = execution_js_consumer {
-                    match consumer
-                        .fetch()
-                        .max_messages(50)
-                        .expires(std::time::Duration::from_millis(100))
-                        .messages()
-                        .await
-                    {
-                        Ok(mut messages) => {
-                            while let Some(msg_result) = messages.next().await {
-                                match msg_result {
-                                    Ok(msg) => {
-                                        ironcrab::metrics::record_activity();
-                                        NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                        match serde_json::from_slice::<ExecutionResult>(&msg.payload) {
-                                            Ok(result) => {
-                                                debug!(
-                                                    intent_id = %result.intent_id,
-                                                    status = ?result.status,
-                                                    source = %result.source,
-                                                    "Received ExecutionResult"
-                                                );
-                                                ctx.handle_execution_result(&result);
-                                            }
-                                            Err(e) => {
-                                                warn!(error = %e, "Failed to deserialize ExecutionResult");
-                                            }
-                                        }
-                                        if let Err(e) = msg.ack().await {
-                                            warn!(error = %e, "Failed to ack ExecutionResult");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, "ExecutionResult fetch error");
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            debug!(error = %e, "ExecutionResult stream fetch failed (may be empty)");
-                        }
-                    }
+                    let _ = drain_execution_results(
+                        consumer,
+                        &ctx,
+                        EXECUTION_RESULT_SCHEDULED_DRAIN_MAX,
+                        EXECUTION_RESULT_FETCH_EXPIRES,
+                        last_slot,
+                        "scheduled_select_arm",
+                    )
+                    .await;
                 } else {
                     std::future::pending::<()>().await
                 }
@@ -7400,12 +7412,21 @@ async fn main() -> Result<()> {
             _ = async {
                 use futures::StreamExt;
                 if let Some(ref mut consumer) = pool_cache_consumer_opt {
-                    match consumer.fetch().max_messages(100).expires(std::time::Duration::from_millis(50)).messages().await {
+                    let batch_t0 = Instant::now();
+                    match consumer
+                        .fetch()
+                        .max_messages(POOL_CACHE_UPDATE_FETCH_MAX)
+                        .expires(POOL_CACHE_UPDATE_FETCH_EXPIRES)
+                        .messages()
+                        .await
+                    {
                         Ok(mut messages) => {
+                            let mut batch_messages: u32 = 0;
                             let mut msg_count = 0u32;
                             while let Some(msg_result) = messages.next().await {
                                 match msg_result {
                                     Ok(msg) => {
+                                        batch_messages = batch_messages.saturating_add(1);
                                         if let Ok(update) = serde_json::from_slice::<ironcrab::ipc::PoolCacheUpdate>(&msg.payload) {
                                             pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, &update);
                                             // FIX-30a: Single derive for sticky hint + live mark (same validation).
@@ -7466,10 +7487,35 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             }
+                            let batch_ms = batch_t0.elapsed().as_millis() as u64;
+                            let last_ev_slot = ctx.last_event_slot.load(Ordering::Relaxed);
+                            if batch_messages > 0 {
+                                debug!(
+                                    momentum_scope_c = "pool_cache_batch",
+                                    batch_messages,
+                                    position_price_updates = msg_count,
+                                    duration_ms = batch_ms,
+                                    fetch_max = POOL_CACHE_UPDATE_FETCH_MAX,
+                                    last_event_slot = last_ev_slot,
+                                    "SLAVE CACHE: PoolCacheUpdate batch timing",
+                                );
+                            }
                             if msg_count > 0 {
                                 trace!(updates = msg_count, "SLAVE CACHE: processed PoolCacheUpdates");
                                 // Event-driven: check exits immediately after price update (<500ms reaction)
                                 ctx.process_exit_signals().await;
+                                // Scope C: yield a bounded ExecutionResult drain after heavy pool-cache work.
+                                if let Some(ref er_consumer) = execution_js_consumer {
+                                    let _n = drain_execution_results(
+                                        er_consumer,
+                                        &ctx,
+                                        EXECUTION_RESULT_INTERLEAVED_DRAIN_MAX,
+                                        EXECUTION_RESULT_FETCH_EXPIRES,
+                                        last_slot,
+                                        "after_pool_cache_batch",
+                                    )
+                                    .await;
+                                }
                             }
                         }
                         Err(e) => {
@@ -7957,6 +8003,138 @@ async fn generate_and_publish_buy_intent(
     }
 
     Ok(())
+}
+
+/// Scope C: trade / pool discovery / bonding events that can be heavy and should log latency.
+#[inline]
+fn momentum_scope_c_price_sensitive_market_kind(kind: &MarketEventKind) -> bool {
+    matches!(
+        kind,
+        MarketEventKind::Trade { .. }
+            | MarketEventKind::PoolCreated { .. }
+            | MarketEventKind::BondingCurveProgress { .. }
+    )
+}
+
+#[inline]
+fn momentum_scope_c_market_kind_tag(kind: &MarketEventKind) -> &'static str {
+    match kind {
+        MarketEventKind::PoolCreated { .. } => "PoolCreated",
+        MarketEventKind::Trade { .. } => "Trade",
+        MarketEventKind::BondingCurveProgress { .. } => "BondingCurveProgress",
+        _ => "Other",
+    }
+}
+
+/// Wall-clock lag from producer `RecordHeader.ts_unix_ms` to momentum-bot ingest (ms).
+#[inline]
+fn execution_result_ingest_lag_ms(result: &ExecutionResult, now_ms: u64) -> u64 {
+    now_ms.saturating_sub(result.header.ts_unix_ms)
+}
+
+/// Bounded JetStream pull for `ExecutionResult` — no busy-wait, at most `max_messages` per call.
+async fn drain_execution_results(
+    consumer: &async_nats::jetstream::consumer::Consumer<
+        async_nats::jetstream::consumer::pull::Config,
+    >,
+    ctx: &Arc<MomentumContext>,
+    max_messages: usize,
+    fetch_expires: Duration,
+    last_head_slot: u64,
+    interleave_source: &'static str,
+) -> u32 {
+    use futures::StreamExt;
+
+    let mut messages = match consumer
+        .fetch()
+        .max_messages(max_messages)
+        .expires(fetch_expires)
+        .messages()
+        .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            trace!(
+                momentum_scope_c = "execution_result_drain",
+                interleave_source,
+                error = %e,
+                "ExecutionResult JetStream fetch failed (may be empty)"
+            );
+            return 0;
+        }
+    };
+
+    let mut processed: u32 = 0;
+    while let Some(msg_res) = messages.next().await {
+        match msg_res {
+            Ok(msg) => {
+                ironcrab::metrics::record_activity();
+                NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                match serde_json::from_slice::<ExecutionResult>(&msg.payload) {
+                    Ok(result) => {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let ingest_lag_ms = execution_result_ingest_lag_ms(&result, now_ms);
+                        let slot_lag_vs_head = result
+                            .confirmed_slot
+                            .map(|c| last_head_slot.saturating_sub(c));
+                        trace!(
+                            momentum_scope_c = "execution_result_msg",
+                            interleave_source,
+                            intent_id = %result.intent_id,
+                            status = ?result.status,
+                            ingest_lag_ms,
+                            confirmed_slot = ?result.confirmed_slot,
+                            slot_lag_vs_last_event_slot = ?slot_lag_vs_head,
+                            producer_ts_unix_ms = result.header.ts_unix_ms,
+                        );
+                        ctx.handle_execution_result(&result);
+                        processed = processed.saturating_add(1);
+                    }
+                    Err(e) => {
+                        warn!(
+                            momentum_scope_c = "execution_result_drain",
+                            interleave_source,
+                            error = %e,
+                            "Failed to deserialize ExecutionResult"
+                        );
+                    }
+                }
+                if let Err(e) = msg.ack().await {
+                    warn!(
+                        momentum_scope_c = "execution_result_drain",
+                        interleave_source,
+                        error = %e,
+                        "Failed to ack ExecutionResult"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    momentum_scope_c = "execution_result_drain",
+                    interleave_source,
+                    error = %e,
+                    "ExecutionResult stream message error"
+                );
+            }
+        }
+    }
+
+    if processed > 0 {
+        debug!(
+            momentum_scope_c = "execution_result_drain",
+            interleave_source,
+            processed_count = processed,
+            max_messages,
+            fetch_expires_ms = fetch_expires.as_millis() as u64,
+            last_head_slot,
+            "ExecutionResult bounded drain completed"
+        );
+    }
+
+    processed
 }
 
 #[cfg(test)]
@@ -10617,6 +10795,66 @@ mod tests {
         assert!(ctx.test_has_migration_sticky(mint));
         assert!(ctx.test_has_pool_reserve_hint(mint, "poolKeepB"));
         assert!(ctx.test_pending_buy_entry_present("int-scopeb-pend", mint));
+    }
+
+    #[test]
+    fn scope_c_price_sensitive_market_kinds() {
+        assert!(!momentum_scope_c_price_sensitive_market_kind(
+            &MarketEventKind::SlotUpdate { current_slot: 42 }
+        ));
+        assert!(momentum_scope_c_price_sensitive_market_kind(
+            &MarketEventKind::BondingCurveProgress {
+                mint: "mint".into(),
+                bonding_curve: "bc".into(),
+                progress_bps: 1,
+                complete: false,
+            }
+        ));
+        assert_eq!(
+            momentum_scope_c_market_kind_tag(&MarketEventKind::SlotUpdate { current_slot: 0 }),
+            "Other"
+        );
+        assert_eq!(
+            momentum_scope_c_market_kind_tag(&MarketEventKind::BondingCurveProgress {
+                mint: "m".into(),
+                bonding_curve: "b".into(),
+                progress_bps: 0,
+                complete: false,
+            }),
+            "BondingCurveProgress"
+        );
+    }
+
+    #[test]
+    fn scope_c_execution_result_ingest_lag_ms_saturates() {
+        use ironcrab::ipc::ExecutionStatus;
+        let mut h = RecordHeader::new("c", BUILD_VERSION, "r");
+        h.ts_unix_ms = 10_000;
+        let er = ExecutionResult {
+            header: h,
+            execution_id: "e".into(),
+            decision_id: "d".into(),
+            intent_id: "i".into(),
+            source: "momentum-bot".into(),
+            token_mint: None,
+            signature: None,
+            bundle_id: None,
+            status: ExecutionStatus::Confirmed,
+            fill_in: None,
+            fill_out: None,
+            fill_status: None,
+            fill_unavailable_reason: None,
+            confirmed_slot: Some(99),
+            fees: None,
+            pnl: None,
+            wallet_sol_delta_lamports: None,
+            error_message: None,
+            error_code: None,
+            latency_ms: None,
+            metadata: Default::default(),
+        };
+        assert_eq!(execution_result_ingest_lag_ms(&er, 10_050), 50);
+        assert_eq!(execution_result_ingest_lag_ms(&er, 9_000), 0);
     }
 }
 
