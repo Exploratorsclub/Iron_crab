@@ -2185,6 +2185,15 @@ fn bonding_geyser_observation_is_newer(
     }
 }
 
+/// `PoolCacheUpdate` reserve marks require exactly one WSOL leg so reserves map to token vs SOL (I-14).
+#[inline]
+fn pool_cache_has_exactly_one_wsol_leg(base_mint: &str, quote_mint: &str) -> bool {
+    const WSOL: &str = "So11111111111111111111111111111111111111112";
+    let base = base_mint == WSOL;
+    let quote = quote_mint == WSOL;
+    base ^ quote
+}
+
 struct OpenPositionParams<'a> {
     mint: &'a str,
     pool: &'a str,
@@ -3695,11 +3704,11 @@ impl MomentumContext {
 
         // Drop bonding cache for this mint when the position is gone, unless a BUY is already
         // pending again (re-entry lifecycle must keep latest_bonding for confirm/open).
+        // Same for Scope B sticky maps (migration + pool reserve hints).
         if !self.pending_buy_mint_index.read().contains_key(mint) {
             self.latest_bonding_by_mint.write().remove(mint);
+            self.clear_scope_b_sticky_state_for_mint(mint);
         }
-
-        self.clear_scope_b_sticky_state_for_mint(mint);
 
         // Delete from KV asynchronously (fire-and-forget)
         let ctx = Arc::clone(self);
@@ -4368,6 +4377,20 @@ impl MomentumContext {
             .retain(|key, _| key.0 != mint);
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_has_pool_reserve_hint(&self, mint: &str, pool: &str) -> bool {
+        self.latest_pool_reserve_price_hint_by_mint_pool
+            .read()
+            .contains_key(&(mint.to_string(), pool.to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_has_migration_sticky(&self, mint: &str) -> bool {
+        self.latest_pumpfun_migration_complete_by_mint
+            .read()
+            .contains_key(mint)
+    }
+
     /// Scope B: record PumpFun bonding-curve `complete` (migration) with slot-/ts-monotonic merge.
     pub(crate) fn merge_pumpfun_migration_complete_evidence(
         &self,
@@ -4424,6 +4447,9 @@ impl MomentumContext {
         update: &ironcrab::ipc::PoolCacheUpdate,
     ) {
         if update.base_reserve == 0 || update.quote_reserve == 0 {
+            return;
+        }
+        if !pool_cache_has_exactly_one_wsol_leg(&update.base_mint, &update.quote_mint) {
             return;
         }
         const SOL_WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -7373,7 +7399,13 @@ async fn main() -> Result<()> {
                                             // tokens_per_sol = token_amount / sol_amount (higher = cheaper token)
                                             // Convention: base=token, quote=SOL. If base=SOL (inverted DEX convention),
                                             // swap so we always compute token/sol for the position's token.
-                                            if update.base_reserve > 0 && update.quote_reserve > 0 {
+                                            if update.base_reserve > 0
+                                                && update.quote_reserve > 0
+                                                && pool_cache_has_exactly_one_wsol_leg(
+                                                    &update.base_mint,
+                                                    &update.quote_mint,
+                                                )
+                                            {
                                                 const SOL_WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
                                                 let (token_mint, token_reserve, sol_reserve, token_decimals) = if update.base_mint == SOL_WSOL_MINT {
                                                     // Base is SOL → quote is token. tokens_per_sol = quote/base.
@@ -8004,6 +8036,105 @@ mod tests {
             geyser_slot,
             metadata: None,
         }
+    }
+
+    fn pool_cache_update_two_tokens_no_wsol(
+        base_mint: &str,
+        quote_mint: &str,
+        pool: &str,
+        base_reserve: u64,
+        quote_reserve: u64,
+        geyser_slot: u64,
+        ts_unix_ms: u64,
+    ) -> PoolCacheUpdate {
+        let mut header = RecordHeader::new("test", BUILD_VERSION, "run");
+        header.ts_unix_ms = ts_unix_ms;
+        PoolCacheUpdate {
+            header,
+            update_type: PoolCacheUpdateType::BalanceUpdated,
+            pool_address: pool.to_string(),
+            dex: "raydium".to_string(),
+            base_mint: base_mint.to_string(),
+            quote_mint: quote_mint.to_string(),
+            base_reserve,
+            quote_reserve,
+            liquidity_lamports: None,
+            geyser_slot,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn sticky_pool_reserve_hint_non_wsol_pair_not_cached() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        ctx.merge_latest_pool_reserve_price_hint_from_update(
+            &pool_cache_update_two_tokens_no_wsol(
+                "MintTokenLegA",
+                "MintTokenLegB",
+                "poolNonSol",
+                1_000_000_000,
+                1_000_000_000,
+                500,
+                1,
+            ),
+        );
+        assert!(!ctx.test_has_pool_reserve_hint("MintTokenLegA", "poolNonSol"));
+        assert!(!ctx.test_has_pool_reserve_hint("MintTokenLegB", "poolNonSol"));
+    }
+
+    /// Non-SOL/WSOL pair must not later move an opened position mark (I-14 / wrong quote leg).
+    #[tokio::test]
+    async fn sticky_pool_reserve_hint_non_wsol_pair_does_not_move_later_position_mark() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let mint = "MintLaterPos";
+        ctx.record_mint_info(
+            mint,
+            MintInfo {
+                token_program: String::new(),
+                decimals: 6,
+                supply: 0,
+                mint_authority: None,
+                freeze_authority: None,
+                last_updated: Instant::now(),
+            },
+        );
+        ctx.merge_latest_pool_reserve_price_hint_from_update(
+            &pool_cache_update_two_tokens_no_wsol(
+                mint,
+                "OtherMintNoWsol",
+                "poolNonSol",
+                1,
+                1,
+                900,
+                1,
+            ),
+        );
+        assert!(!ctx.test_has_pool_reserve_hint(mint, "poolNonSol"));
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "poolNonSol",
+            dex: "raydium",
+            entry_price: 77.0,
+            token_decimals: 6,
+            token_amount: 1,
+            sol_invested: 1,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 800,
+            initial_bonding: None,
+        });
+        let pos = ctx.positions.read().get(mint).unwrap().clone();
+        assert!(
+            (pos.current_price - 77.0).abs() < 0.001,
+            "non-WSOL PoolCache pair must not seed sticky hint; mark stayed entry, got {}",
+            pos.current_price
+        );
     }
 
     /// Scope B: older-slot `PoolCacheUpdate` must not replace a newer sticky reserve hint.
@@ -10360,8 +10491,33 @@ mod tests {
         });
         ctx.remove_pending_buy_entry_by_intent("int-clr");
 
+        ctx.record_mint_info(
+            mint,
+            MintInfo {
+                token_program: String::new(),
+                decimals: 6,
+                supply: 0,
+                mint_authority: None,
+                freeze_authority: None,
+                last_updated: Instant::now(),
+            },
+        );
+        ctx.merge_pumpfun_migration_complete_evidence(mint, 400, 10);
+        ctx.merge_latest_pool_reserve_price_hint_from_update(&pool_cache_update_stub(
+            mint,
+            "poolClr",
+            1_000_000,
+            1_000_000_000,
+            410,
+            10,
+        ));
+        assert!(ctx.test_has_migration_sticky(mint));
+        assert!(ctx.test_has_pool_reserve_hint(mint, "poolClr"));
+
         Arc::clone(&ctx).close_position(mint);
         assert!(ctx.clone_latest_bonding_snapshot(mint).is_none());
+        assert!(!ctx.test_has_migration_sticky(mint));
+        assert!(!ctx.test_has_pool_reserve_hint(mint, "poolClr"));
     }
 
     #[tokio::test]
@@ -10407,6 +10563,70 @@ mod tests {
             .expect("bonding kept for pending BUY");
         assert_eq!(snap.progress_bps, 9_000);
         assert!(ctx.test_pending_buy_entry_present("int-reentry", mint));
+    }
+
+    #[tokio::test]
+    async fn close_position_keeps_scope_b_sticky_when_pending_buy_exists() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let mint = "mintScopeBKeep";
+
+        ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
+            intent_id: "int-scopeb-pend",
+            mint,
+            pool: "poolKeepB",
+            dex: "pumpfun",
+            intended_sol: 1_000_000,
+            entry_kind: Some(EntryKind::Probe),
+            signal_slot: 1,
+            slot_seen_at_ms: 1,
+            creator: None,
+            token_program: None,
+        });
+        ctx.record_mint_info(
+            mint,
+            MintInfo {
+                token_program: String::new(),
+                decimals: 6,
+                supply: 0,
+                mint_authority: None,
+                freeze_authority: None,
+                last_updated: Instant::now(),
+            },
+        );
+        ctx.merge_pumpfun_migration_complete_evidence(mint, 111, 5);
+        ctx.merge_latest_pool_reserve_price_hint_from_update(&pool_cache_update_stub(
+            mint,
+            "poolKeepB",
+            1_000_000,
+            1_000_000_000,
+            220,
+            6,
+        ));
+        assert!(ctx.test_has_migration_sticky(mint));
+        assert!(ctx.test_has_pool_reserve_hint(mint, "poolKeepB"));
+
+        let initial = ctx.clone_latest_bonding_snapshot(mint);
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "poolKeepB",
+            dex: "pumpfun",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 1,
+            sol_invested: 1,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 50,
+            initial_bonding: initial,
+        });
+
+        Arc::clone(&ctx).close_position(mint);
+        assert!(ctx.test_has_migration_sticky(mint));
+        assert!(ctx.test_has_pool_reserve_hint(mint, "poolKeepB"));
+        assert!(ctx.test_pending_buy_entry_present("int-scopeb-pend", mint));
     }
 }
 
