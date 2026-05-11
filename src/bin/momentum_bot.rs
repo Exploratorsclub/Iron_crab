@@ -4338,6 +4338,7 @@ impl MomentumContext {
             );
             if self.positions.read().get(&e.mint).is_none() {
                 self.latest_bonding_by_mint.write().remove(&e.mint);
+                self.clear_scope_b_sticky_state_for_mint(&e.mint);
             }
         }
     }
