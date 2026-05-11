@@ -7194,7 +7194,7 @@ async fn main() -> Result<()> {
                                 for event in events_to_process {
                                     let event_slot = event.slot;
                                     if let Some(slot) = event_slot {
-                                        last_slot = slot;
+                                        last_slot = last_slot.max(slot);
                                     }
                                     let scope_c_obs_latency =
                                         momentum_scope_c_price_sensitive_market_kind(&event.kind);
