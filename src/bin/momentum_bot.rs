@@ -7688,10 +7688,14 @@ async fn main() -> Result<()> {
                                     last_event_slot = last_ev_slot,
                                     max_slot_lag_vs_head = ?max_slot_lag_vs_head,
                                     execution_results_drained_after_batch = execution_results_drained,
-                                    decision_gate_shard_hint_permille = stale_price_path_candidates
-                                        .saturating_mul(1000)
-                                        .checked_div(batch_messages)
-                                        .unwrap_or(0),
+                                    decision_gate_shard_hint_permille = {
+                                        let derivable_total = stale_price_path_candidates
+                                            .saturating_add(coalesced_price_path_keys);
+                                        stale_price_path_candidates
+                                            .saturating_mul(1000)
+                                            .checked_div(derivable_total)
+                                            .unwrap_or(0)
+                                    },
                                     "SLAVE CACHE: PoolCacheUpdate batch (processing only, excludes batch fetch wait)",
                                 );
                             }
