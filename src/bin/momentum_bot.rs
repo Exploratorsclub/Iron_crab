@@ -2301,7 +2301,9 @@ struct MomentumContext {
     pending_pool_accounts: parking_lot::RwLock<HashMap<String, PendingPoolAccounts>>,
     /// Mint metadata (authority/supply/decimals) can arrive independently of pool creation.
     mint_infos: parking_lot::RwLock<HashMap<String, MintInfo>>,
-    /// Token trackers for strategy filters (mint -> tracker)
+    /// Token trackers for strategy filters — **pool-scoped** key `(mint, pool)` via
+    /// [`MomentumContext::tracker_storage_key`] so entry signals cannot reference a stale pool
+    /// after migration / multi-pool activity on the same mint.
     token_trackers: parking_lot::RwLock<HashMap<String, TokenTracker>>,
     /// Position trackers for exit strategy (mint -> position)
     positions: parking_lot::RwLock<HashMap<String, PositionTracker>>,
@@ -2573,6 +2575,31 @@ impl MomentumContext {
             "pumpfun" | "PumpFun" => "pumpfun".to_string(),
             _ => dex.to_string(),
         }
+    }
+
+    /// Stable composite map key: one [`TokenTracker`] row per traded pool (same mint, different pools).
+    #[inline]
+    fn tracker_storage_key(mint: &str, pool: &str) -> String {
+        format!("{mint}\x1f{pool}")
+    }
+
+    /// PumpFun bonding curve completed / migrated — do not emit BUY intents for this **pumpfun** pool.
+    /// Uses `mint_pools` row + LivePoolCache/sticky evidence only (no RPC). Never applies to `pump_amm`.
+    fn pumpfun_entry_blocked_by_migration(&self, mint: &str, pool: &str, dex: &str) -> bool {
+        if dex != "pumpfun" {
+            return false;
+        }
+        let pool_row_complete = self
+            .mint_pools
+            .read()
+            .get(mint)
+            .and_then(|list| {
+                list.iter()
+                    .find(|p| p.pool_address == pool)
+                    .map(|p| p.bonding_curve_complete == Some(true))
+            })
+            .unwrap_or(false);
+        pool_row_complete || self.live_cache_pumpfun_complete_evidence(mint)
     }
 
     /// Record first-seen slot for a pool
@@ -2851,10 +2878,11 @@ impl MomentumContext {
             .filter(|tp| !tp.is_empty());
         // A.2: Resolve creator for pumpfun (BC-SELL after wallet reconciliation)
         if dex == "pumpfun" {
+            let tk = Self::tracker_storage_key(mint, &pool);
             let tracker_creator = self
                 .token_trackers
                 .read()
-                .get(mint)
+                .get(&tk)
                 .and_then(|t| t.dev_wallet.clone());
             if let Some(creator) = self.resolve_authoritative_creator(mint, tracker_creator) {
                 tracker.set_creator(&creator);
@@ -2909,8 +2937,10 @@ impl MomentumContext {
                 // Correct the TokenTracker for future calls
                 let config = self.config.read().clone();
                 let mut trackers = self.token_trackers.write();
-                if let Some(t) = trackers.get_mut(mint) {
-                    t.set_dev_info(cache, 0.0, &config);
+                for t in trackers.values_mut() {
+                    if t.mint == mint {
+                        t.set_dev_info(cache, 0.0, &config);
+                    }
                 }
                 cache_creator
             }
@@ -3188,14 +3218,22 @@ impl MomentumContext {
         dex == "pump_amm" || dex == "meteora_dlmm"
     }
 
-    fn try_get_dex_pool_accounts_for_mint(&self, mint: &str) -> Option<Vec<String>> {
+    fn try_get_dex_pool_accounts_for_mint_pool(
+        &self,
+        mint: &str,
+        pool: &str,
+    ) -> Option<Vec<String>> {
+        let key = Self::tracker_storage_key(mint, pool);
         let trackers = self.token_trackers.read();
         trackers
-            .get(mint)
+            .get(&key)
             .and_then(|t| t.dex_pool_accounts.clone())
             .or_else(|| {
                 let pending = self.pending_pool_accounts.read();
-                pending.get(mint).map(|(_, _, a)| a.clone())
+                pending
+                    .get(mint)
+                    .filter(|(_, p, _)| p == pool)
+                    .map(|(_, _, a)| a.clone())
             })
     }
 
@@ -3266,18 +3304,10 @@ impl MomentumContext {
             );
         }
 
-        // Apply immediately if tracker exists.
+        // Apply immediately if tracker exists for this pool row.
         let mut trackers = self.token_trackers.write();
-        if let Some(tracker) = trackers.get_mut(token_mint) {
-            if tracker.pool != pool_address {
-                debug!(
-                    mint = %token_mint,
-                    tracker_pool = %tracker.pool,
-                    event_pool = %pool_address,
-                    "DexPoolAccounts pool mismatch; keeping pending copy"
-                );
-                return;
-            }
+        let tk = Self::tracker_storage_key(token_mint, pool_address);
+        if let Some(tracker) = trackers.get_mut(&tk) {
             tracker.dex = dex.clone(); // A.2: Ensure normalized DEX
             tracker.dex_pool_accounts = Some(accounts.to_vec());
             debug!(
@@ -3301,49 +3331,53 @@ impl MomentumContext {
     ) -> bool {
         let config = self.config.read().clone();
         let mut trackers = self.token_trackers.write();
-        if trackers.contains_key(mint) {
-            false // Already exists
-        } else {
-            trackers.insert(
-                mint.to_string(),
-                TokenTracker::new(mint, pool, dex, slot, liquidity),
-            );
+        let key = Self::tracker_storage_key(mint, pool);
+        use std::collections::hash_map::Entry;
+        match trackers.entry(key) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(v) => {
+                v.insert(TokenTracker::new(mint, pool, dex, slot, liquidity));
 
-            // Apply any dev wallet info that arrived before the tracker existed.
-            if let Some((dev_wallet, supply_pct)) = self.pending_dev_info.read().get(mint).cloned()
-            {
-                if let Some(tracker) = trackers.get_mut(mint) {
-                    let was_not_rejected = tracker.was_not_rejected();
-                    tracker.set_dev_info(&dev_wallet, supply_pct, &config);
-                    if was_not_rejected && tracker.is_rejected() {
-                        self.tokens_blacklisted
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let tk = Self::tracker_storage_key(mint, pool);
+                // Apply any dev wallet info that arrived before the tracker existed.
+                if let Some((dev_wallet, supply_pct)) =
+                    self.pending_dev_info.read().get(mint).cloned()
+                {
+                    if let Some(tracker) = trackers.get_mut(&tk) {
+                        let was_not_rejected = tracker.was_not_rejected();
+                        tracker.set_dev_info(&dev_wallet, supply_pct, &config);
+                        if was_not_rejected && tracker.is_rejected() {
+                            self.tokens_blacklisted
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
-            }
 
-            // Apply any DexPoolAccounts that arrived before the tracker existed.
-            if let Some((dex_name, pool_addr, accounts)) =
-                self.pending_pool_accounts.read().get(mint).cloned()
-            {
-                if let Some(tracker) = trackers.get_mut(mint) {
-                    if tracker.pool == pool_addr {
-                        tracker.dex = dex_name;
-                        tracker.dex_pool_accounts = Some(accounts);
+                // Apply any DexPoolAccounts that arrived before the tracker existed.
+                if let Some((dex_name, pool_addr, accounts)) =
+                    self.pending_pool_accounts.read().get(mint).cloned()
+                {
+                    if pool_addr == pool {
+                        if let Some(tracker) = trackers.get_mut(&tk) {
+                            tracker.dex = dex_name;
+                            tracker.dex_pool_accounts = Some(accounts);
+                        }
                     }
                 }
-            }
 
-            self.tokens_tracked
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            true // New tracker created
+                self.tokens_tracked
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                true // New tracker created
+            }
         }
     }
 
-    /// Record a trade for a token
+    /// Record a trade for a token **on a specific pool** (pool-scoped tracker row).
+    #[allow(clippy::too_many_arguments)] // MarketEvent trade fields — keep explicit for hot path clarity
     fn record_trade(
         &self,
         mint: &str,
+        pool: &str,
         trader: &str,
         is_buy: bool,
         sol_amount: u64,
@@ -3352,7 +3386,8 @@ impl MomentumContext {
     ) {
         let config = self.config.read().clone();
         let mut trackers = self.token_trackers.write();
-        if let Some(tracker) = trackers.get_mut(mint) {
+        let key = Self::tracker_storage_key(mint, pool);
+        if let Some(tracker) = trackers.get_mut(&key) {
             let was_not_rejected = tracker.was_not_rejected();
             tracker.record_trade(trader, is_buy, sol_amount, token_amount, signature, &config);
             if was_not_rejected && tracker.is_rejected() {
@@ -3371,7 +3406,10 @@ impl MomentumContext {
         }
 
         let mut trackers = self.token_trackers.write();
-        if let Some(tracker) = trackers.get_mut(mint) {
+        for tracker in trackers.values_mut() {
+            if tracker.mint != mint {
+                continue;
+            }
             let was_not_rejected = tracker.was_not_rejected();
             tracker.set_dev_info(dev_wallet, supply_pct, &config);
             if was_not_rejected && tracker.is_rejected() {
@@ -3394,7 +3432,10 @@ impl MomentumContext {
     /// Record LP removal for a token
     fn record_lp_removal(&self, mint: &str) {
         let mut trackers = self.token_trackers.write();
-        if let Some(tracker) = trackers.get_mut(mint) {
+        for tracker in trackers.values_mut() {
+            if tracker.mint != mint {
+                continue;
+            }
             let was_not_rejected = tracker.was_not_rejected();
             tracker.record_lp_removal();
             if was_not_rejected && tracker.is_rejected() {
@@ -3409,6 +3450,25 @@ impl MomentumContext {
         // Returns entry intents (probe + optional scale-in)
         let config = self.config.read().clone();
         let mint_infos = self.mint_infos.read();
+        let positions = self.positions.read();
+        let pending_buy_index = self.pending_buy_mint_index.read();
+        let pending_buy_entries = self.pending_buy_entries.read();
+
+        // Snapshot pools that already have an entry BUY in-flight (avoid overlapping mutable borrows).
+        let sibling_entry_busy: Vec<(String, String)> = {
+            let trackers_ro = self.token_trackers.read();
+            trackers_ro
+                .values()
+                .filter(|t| {
+                    matches!(
+                        t.state,
+                        TrackerState::ProbeBuyPending { .. } | TrackerState::ScaleInPending { .. }
+                    )
+                })
+                .map(|t| (t.mint.clone(), t.pool.clone()))
+                .collect()
+        };
+
         let mut trackers = self.token_trackers.write();
         let mut signals = Vec::new();
 
@@ -3417,13 +3477,57 @@ impl MomentumContext {
             .clamp(0.0, config.default_position_lamports as f64) as u64;
         let scale_sol = config.default_position_lamports.saturating_sub(probe_sol);
 
-        for (mint, tracker) in trackers.iter_mut() {
+        for tracker in trackers.values_mut() {
+            let mint = tracker.mint.clone();
+
+            // I-13 / multi-pool: only the position's pool may continue entry/scale on this mint.
+            if let Some(pos) = positions.get(&mint) {
+                if tracker.pool != pos.pool {
+                    continue;
+                }
+            }
+
+            // At most one pending BUY per mint — ignore other pool trackers while one is in-flight.
+            if let Some(intent_id) = pending_buy_index.get(&mint) {
+                let pending_pool = pending_buy_entries
+                    .get(intent_id.as_str())
+                    .map(|e| e.pool.as_str());
+                if pending_pool != Some(tracker.pool.as_str()) {
+                    continue;
+                }
+            }
+
             // Skip tokens in terminal states
             if tracker.is_entry_complete() {
                 continue;
             }
 
-            let mint_info = mint_infos.get(mint);
+            // Completed / migrated PumpFun bonding curve on this pool (or mint-level cache evidence).
+            if self.pumpfun_entry_blocked_by_migration(&mint, &tracker.pool, &tracker.dex) {
+                let was_not_rejected = tracker.was_not_rejected();
+                tracker.reject("REJECT_PUMPFUN_BONDING_COMPLETE");
+                if was_not_rejected && tracker.is_rejected() {
+                    warn!(
+                        mint = %mint,
+                        pool = %tracker.pool,
+                        dex = %tracker.dex,
+                        "REJECT_PUMPFUN_BONDING_COMPLETE: skip entry — migrated bonding curve / complete evidence (pump_amm unaffected)"
+                    );
+                    self.tokens_blacklisted
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                continue;
+            }
+
+            // Another pool for this mint already has an entry BUY in-flight — serialize mint-level entry.
+            if sibling_entry_busy
+                .iter()
+                .any(|(m, p)| m == &mint && p.as_str() != tracker.pool.as_str())
+            {
+                continue;
+            }
+
+            let mint_info = mint_infos.get(&mint);
 
             // 1) Probe-buy stage (Discovery or Validation state)
             if matches!(
@@ -3456,7 +3560,7 @@ impl MomentumContext {
                         sent_at: Instant::now(),
                     };
                     signals.push(EntrySignal {
-                        mint: mint.clone(),
+                        mint,
                         pool: tracker.pool.clone(),
                         dex: tracker.dex.clone(),
                         sol_amount: probe_sol,
@@ -3505,7 +3609,7 @@ impl MomentumContext {
                         sent_at: Instant::now(),
                     };
                     signals.push(EntrySignal {
-                        mint: mint.clone(),
+                        mint,
                         pool: tracker.pool.clone(),
                         dex: tracker.dex.clone(),
                         sol_amount: scale_sol,
@@ -3526,8 +3630,8 @@ impl MomentumContext {
             self.positions.read().keys().cloned().collect();
         let mut trackers = self.token_trackers.write();
         let cutoff = Duration::from_secs(300); // 5 minutes
-        trackers.retain(|mint, tracker| {
-            open_mints.contains(mint)
+        trackers.retain(|_, tracker| {
+            open_mints.contains(&tracker.mint)
                 || tracker.first_seen.elapsed() < cutoff
                 || !tracker.state.is_terminal()
         });
@@ -3861,37 +3965,57 @@ impl MomentumContext {
 
         let tracker_signals: HashMap<String, TrackerExitSignals> = {
             let trackers = self.token_trackers.read();
-            trackers
-                .iter()
-                .map(|(mint, t)| {
-                    let mut dev_sold_at: Option<Instant> = None;
-                    let mut dev_sold_sig: Option<String> = None;
-                    let mut dev_sold_sol: Option<u64> = None;
+            let mut by_mint: HashMap<String, TrackerExitSignals> = HashMap::new();
+            for t in trackers.values() {
+                let mint_key = t.mint.clone();
+                let mut dev_sold_at: Option<Instant> = None;
+                let mut dev_sold_sig: Option<String> = None;
+                let mut dev_sold_sol: Option<u64> = None;
 
-                    if let Some(dev) = t.dev_wallet.as_ref() {
-                        if let Some(last) = t
-                            .trades
-                            .iter()
-                            .rev()
-                            .find(|tr| !tr.is_buy && tr.trader == *dev)
-                        {
-                            dev_sold_at = Some(last.timestamp);
-                            dev_sold_sig = Some(last.signature.clone());
-                            dev_sold_sol = Some(last.sol_amount);
+                if let Some(dev) = t.dev_wallet.as_ref() {
+                    if let Some(last) = t
+                        .trades
+                        .iter()
+                        .rev()
+                        .find(|tr| !tr.is_buy && tr.trader == *dev)
+                    {
+                        dev_sold_at = Some(last.timestamp);
+                        dev_sold_sig = Some(last.signature.clone());
+                        dev_sold_sol = Some(last.sol_amount);
+                    }
+                }
+
+                let incoming = TrackerExitSignals {
+                    lp_removed_at: t.lp_removal_time,
+                    dev_sold_at,
+                    dev_sold_sig,
+                    dev_sold_sol,
+                };
+
+                use std::collections::hash_map::Entry;
+                match by_mint.entry(mint_key) {
+                    Entry::Occupied(mut o) => {
+                        let e = o.get_mut();
+                        e.lp_removed_at = match (e.lp_removed_at, incoming.lp_removed_at) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (Some(a), None) => Some(a),
+                            (None, Some(b)) => Some(b),
+                            (None, None) => None,
+                        };
+                        if let Some(b) = incoming.dev_sold_at {
+                            if e.dev_sold_at.map(|a| b > a).unwrap_or(true) {
+                                e.dev_sold_at = Some(b);
+                                e.dev_sold_sig = incoming.dev_sold_sig;
+                                e.dev_sold_sol = incoming.dev_sold_sol;
+                            }
                         }
                     }
-
-                    (
-                        mint.clone(),
-                        TrackerExitSignals {
-                            lp_removed_at: t.lp_removal_time,
-                            dev_sold_at,
-                            dev_sold_sig,
-                            dev_sold_sol,
-                        },
-                    )
-                })
-                .collect()
+                    Entry::Vacant(v) => {
+                        v.insert(incoming);
+                    }
+                }
+            }
+            by_mint
         };
 
         // FIX-30b: No longer block exit checks on pending BUY intents.
@@ -4725,15 +4849,51 @@ impl MomentumContext {
 
                             // Optional TokenTracker: upgrade creator for pumpfun, or new-position routing.
                             let tracker_info: Option<(String, String, Option<String>)> = {
+                                let pending_snap = self
+                                    .pending_buy_entries
+                                    .read()
+                                    .get(&result.intent_id)
+                                    .cloned();
                                 let trackers = self.token_trackers.read();
-                                trackers.get(mint).map(|tr| {
-                                    let creator = if tr.dex == "pumpfun" {
-                                        tr.dev_wallet.clone()
+                                if let Some(ref e) = pending_snap {
+                                    let tk = Self::tracker_storage_key(&e.mint, &e.pool);
+                                    let creator = if e.dex == "pumpfun" {
+                                        trackers.get(&tk).and_then(|tr| tr.dev_wallet.clone())
                                     } else {
                                         None
                                     };
-                                    (tr.pool.clone(), tr.dex.clone(), creator)
-                                })
+                                    Some((e.pool.clone(), e.dex.clone(), creator))
+                                } else if let Some(pool_addr) = result
+                                    .metadata
+                                    .get("pool")
+                                    .cloned()
+                                    .or_else(|| result.metadata.get("pools").cloned())
+                                {
+                                    let tk = Self::tracker_storage_key(
+                                        mint.as_str(),
+                                        pool_addr.as_str(),
+                                    );
+                                    trackers.get(&tk).map(|tr| {
+                                        let creator = if tr.dex == "pumpfun" {
+                                            tr.dev_wallet.clone()
+                                        } else {
+                                            None
+                                        };
+                                        (tr.pool.clone(), tr.dex.clone(), creator)
+                                    })
+                                } else {
+                                    trackers
+                                        .values()
+                                        .find(|t| t.mint == mint.as_str())
+                                        .map(|tr| {
+                                            let creator = if tr.dex == "pumpfun" {
+                                                tr.dev_wallet.clone()
+                                            } else {
+                                                None
+                                            };
+                                            (tr.pool.clone(), tr.dex.clone(), creator)
+                                        })
+                                }
                             };
 
                             let already_has_position: bool;
@@ -4992,7 +5152,8 @@ impl MomentumContext {
                             // For probe entry, this means we cannot establish a position safely.
                             // For scale-in, keep the existing position but don't adjust sizing.
                             let mut trackers = self.token_trackers.write();
-                            if let Some(tr) = trackers.get_mut(&pending.mint) {
+                            let tk = Self::tracker_storage_key(&pending.mint, &pending.pool);
+                            if let Some(tr) = trackers.get_mut(&tk) {
                                 match pending.entry_kind {
                                     Some(EntryKind::ScaleIn) => {
                                         tr.state = TrackerState::PositionOpenFull {
@@ -5056,7 +5217,8 @@ impl MomentumContext {
                         // Mark entry stage fill.
                         {
                             let mut trackers = self.token_trackers.write();
-                            if let Some(tr) = trackers.get_mut(&pending.mint) {
+                            let tk = Self::tracker_storage_key(&pending.mint, &pending.pool);
+                            if let Some(tr) = trackers.get_mut(&tk) {
                                 match pending.entry_kind {
                                     Some(EntryKind::Probe) => {
                                         tr.state = TrackerState::PositionOpenProbe {
@@ -5107,9 +5269,10 @@ impl MomentumContext {
                         // #endregion
                         // A.2: Resolve creator for pumpfun BC-SELL (Position → TokenTracker)
                         let creator = if pending.dex == "pumpfun" {
+                            let tk = Self::tracker_storage_key(&pending.mint, &pending.pool);
                             self.token_trackers
                                 .read()
-                                .get(&pending.mint)
+                                .get(&tk)
                                 .and_then(|t| t.dev_wallet.clone())
                         } else {
                             None
@@ -5257,7 +5420,8 @@ impl MomentumContext {
                 if pending.side == TradeSide::Buy {
                     self.remove_pending_buy_entry_by_intent(&result.intent_id);
                     let mut trackers = self.token_trackers.write();
-                    if let Some(tr) = trackers.get_mut(&pending.mint) {
+                    let tk = Self::tracker_storage_key(&pending.mint, &pending.pool);
+                    if let Some(tr) = trackers.get_mut(&tk) {
                         tr.reject(format!(
                             "Entry execution failed ({:?})",
                             pending.entry_kind.unwrap_or(EntryKind::Probe)
@@ -5349,7 +5513,8 @@ impl MomentumContext {
                 if pending.side == TradeSide::Buy {
                     self.remove_pending_buy_entry_by_intent(&result.intent_id);
                     let mut trackers = self.token_trackers.write();
-                    if let Some(tr) = trackers.get_mut(&pending.mint) {
+                    let tk = Self::tracker_storage_key(&pending.mint, &pending.pool);
+                    if let Some(tr) = trackers.get_mut(&tk) {
                         tr.reject(format!(
                             "Entry execution timeout ({:?})",
                             pending.entry_kind.unwrap_or(EntryKind::Probe)
@@ -7838,7 +8003,8 @@ async fn generate_and_publish_buy_intent(
     // FIX-22: Cross-check creator with LivePoolCache (authoritative)
     let (creator_opt, last_trade_ratio_opt) = {
         let trackers = ctx.token_trackers.read();
-        let tracker = trackers.get(&signal.mint);
+        let tk = MomentumContext::tracker_storage_key(&signal.mint, &signal.pool);
+        let tracker = trackers.get(&tk);
         let tracker_creator = tracker.and_then(|t| t.dev_wallet.clone());
         let ratio = tracker.and_then(|t| t.last_trade_ratio());
         drop(trackers);
@@ -7907,12 +8073,14 @@ async fn generate_and_publish_buy_intent(
         // Multi-pool routing already provided validated accounts
         accounts
     } else if dex_requires_accounts {
-        let dex_pool_accounts_opt = ctx.try_get_dex_pool_accounts_for_mint(&signal.mint);
+        let dex_pool_accounts_opt =
+            ctx.try_get_dex_pool_accounts_for_mint_pool(&signal.mint, &effective_pool);
         let Some(accounts) = dex_pool_accounts_opt else {
             // Roll back stage markers so we can try again when DexPoolAccounts arrives.
             {
                 let mut trackers = ctx.token_trackers.write();
-                if let Some(tr) = trackers.get_mut(&signal.mint) {
+                let sk = MomentumContext::tracker_storage_key(&signal.mint, &signal.pool);
+                if let Some(tr) = trackers.get_mut(&sk) {
                     match signal.kind {
                         EntryKind::Probe => tr.state = TrackerState::Validation,
                         EntryKind::ScaleIn => {
@@ -7981,7 +8149,8 @@ async fn generate_and_publish_buy_intent(
             // Roll back stage markers so we can try again when a usable trade ratio arrives.
             {
                 let mut trackers = ctx.token_trackers.write();
-                if let Some(tr) = trackers.get_mut(&signal.mint) {
+                let sk = MomentumContext::tracker_storage_key(&signal.mint, &signal.pool);
+                if let Some(tr) = trackers.get_mut(&sk) {
                     match signal.kind {
                         EntryKind::Probe => tr.state = TrackerState::Validation,
                         EntryKind::ScaleIn => {
@@ -9303,7 +9472,7 @@ mod tests {
         {
             let mut trackers = ctx.token_trackers.write();
             trackers.insert(
-                "mint".to_string(),
+                MomentumContext::tracker_storage_key("mint", "pool"),
                 TokenTracker::new("mint", "pool", "dex", 1, 0),
             );
         }
@@ -9318,7 +9487,9 @@ mod tests {
         // Mark probe as filled.
         {
             let mut trackers = ctx.token_trackers.write();
-            let t = trackers.get_mut("mint").unwrap();
+            let t = trackers
+                .get_mut(&MomentumContext::tracker_storage_key("mint", "pool"))
+                .unwrap();
             assert!(matches!(t.state, TrackerState::ProbeBuyPending { .. }));
             t.state = TrackerState::PositionOpenProbe {
                 filled_at: Instant::now(),
@@ -9333,9 +9504,170 @@ mod tests {
 
         {
             let trackers = ctx.token_trackers.read();
-            let t = trackers.get("mint").unwrap();
+            let t = trackers
+                .get(&MomentumContext::tracker_storage_key("mint", "pool"))
+                .unwrap();
             assert!(matches!(t.state, TrackerState::ScaleInPending { .. }));
         }
+    }
+
+    /// Pool-scoped trackers: activity on `pump_amm` must not emit a stale `pumpfun` probe for the same mint.
+    #[test]
+    fn pool_scoped_entry_probe_targets_active_pool_not_legacy_pumpfun_row() {
+        let cfg = {
+            let mut c = MomentumConfig::default();
+            c.default_position_lamports = 1_000;
+            c.probe_buy_pct = 0.25;
+            c.early_min_liquidity_sol = 0.0;
+            c.min_unique_buyers = 0;
+            c.min_trades_per_sec = 0.0;
+            c.min_buy_dominance = 0.0;
+            c.min_sol_inflow_lamports = 0;
+            c.require_mint_authority_renounced = false;
+            c.require_freeze_authority_none = false;
+            c.top1_buyer_share_cap = 1.0;
+            c.top3_buyer_share_cap = 1.0;
+            c.repeat_buyer_min_ratio = 0.0;
+            c.min_trade_size_lamports = 0;
+            c.small_buy_ratio_cap = 1.0;
+            c
+        };
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "MintPoolScoped111111111111111111111111111111";
+        let pool_pf = "PumpPfLegacy11111111111111111111111111111111";
+        let pool_amm = "pAMMActive111111111111111111111111111111111";
+
+        ctx.token_trackers.write().insert(
+            MomentumContext::tracker_storage_key(mint, pool_pf),
+            TokenTracker::new(mint, pool_pf, "pumpfun", 1, 30_000_000_000),
+        );
+
+        ctx.register_pool(mint, pool_pf, "pumpfun", 1);
+        {
+            let mut pools = ctx.mint_pools.write();
+            let list = pools.entry(mint.to_string()).or_default();
+            if let Some(pi) = list.iter_mut().find(|p| p.pool_address == pool_pf) {
+                pi.bonding_curve_complete = Some(true);
+            }
+        }
+
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let mut tr = TokenTracker::new(mint, pool_amm, "pump_amm", 1, 0);
+            for i in 0..20 {
+                tr.record_trade(
+                    &format!("buyer{i:03}"),
+                    true,
+                    200_000_000,
+                    2_000_000,
+                    &format!("sig{i:03}"),
+                    &cfg,
+                );
+            }
+            trackers.insert(MomentumContext::tracker_storage_key(mint, pool_amm), tr);
+        }
+
+        let signals = ctx.check_for_signals();
+        assert_eq!(signals.len(), 1, "expected single probe for pump_amm pool");
+        assert_eq!(signals[0].mint, mint);
+        assert_eq!(signals[0].pool, pool_amm);
+        assert_eq!(signals[0].dex, "pump_amm");
+    }
+
+    /// Completed pumpfun pool + mint migration evidence must not probe BUY on pumpfun; pump_amm remains eligible.
+    #[test]
+    fn pumpfun_complete_blocks_probe_while_pump_amm_remains_eligible() {
+        let cfg = {
+            let mut c = MomentumConfig::default();
+            c.default_position_lamports = 1_000;
+            c.probe_buy_pct = 0.25;
+            c.early_min_liquidity_sol = 0.0;
+            c.min_unique_buyers = 0;
+            c.min_trades_per_sec = 0.0;
+            c.min_buy_dominance = 0.0;
+            c.min_sol_inflow_lamports = 0;
+            c.require_mint_authority_renounced = false;
+            c.require_freeze_authority_none = false;
+            c.top1_buyer_share_cap = 1.0;
+            c.top3_buyer_share_cap = 1.0;
+            c.repeat_buyer_min_ratio = 0.0;
+            c.min_trade_size_lamports = 0;
+            c.small_buy_ratio_cap = 1.0;
+            c
+        };
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "MintMigEvidence222222222222222222222222222222";
+        let pool_pf = "PumpPfDead2222222222222222222222222222222222";
+        let pool_amm = "pAMMAlive2222222222222222222222222222222222";
+
+        ctx.register_pool(mint, pool_pf, "pumpfun", 1);
+        ctx.register_pool(mint, pool_amm, "pump_amm", 2);
+        {
+            let mut pools = ctx.mint_pools.write();
+            let list = pools.get_mut(mint).expect("pools");
+            for p in list.iter_mut() {
+                if p.pool_address == pool_pf {
+                    p.bonding_curve_complete = Some(true);
+                }
+            }
+        }
+
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let mut tr_pf = TokenTracker::new(mint, pool_pf, "pumpfun", 1, 30_000_000_000);
+            for i in 0..20 {
+                tr_pf.record_trade(
+                    &format!("bp{i:03}"),
+                    true,
+                    200_000_000,
+                    2_000_000,
+                    &format!("spf{i:03}"),
+                    &cfg,
+                );
+            }
+            trackers.insert(MomentumContext::tracker_storage_key(mint, pool_pf), tr_pf);
+
+            let mut tr_amm = TokenTracker::new(mint, pool_amm, "pump_amm", 1, 0);
+            for i in 0..20 {
+                tr_amm.record_trade(
+                    &format!("ba{i:03}"),
+                    true,
+                    200_000_000,
+                    2_000_000,
+                    &format!("sam{i:03}"),
+                    &cfg,
+                );
+            }
+            trackers.insert(MomentumContext::tracker_storage_key(mint, pool_amm), tr_amm);
+        }
+
+        ctx.merge_pumpfun_migration_complete_evidence(mint, 99, 1);
+
+        let signals = ctx.check_for_signals();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].pool, pool_amm);
+        assert_eq!(signals[0].dex, "pump_amm");
+
+        let pf_rejected = {
+            let trackers = ctx.token_trackers.read();
+            trackers
+                .get(&MomentumContext::tracker_storage_key(mint, pool_pf))
+                .expect("pf tracker")
+                .is_rejected()
+        };
+        assert!(pf_rejected);
     }
 
     #[test]
@@ -9563,7 +9895,10 @@ mod tests {
             let mut trackers = ctx.token_trackers.write();
             let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 0);
             tracker.record_trade("w", true, 1_000_000_000, 1_000_000, "sig", &cfg);
-            trackers.insert("mint".to_string(), tracker);
+            trackers.insert(
+                MomentumContext::tracker_storage_key("mint", "pool"),
+                tracker,
+            );
         }
 
         // Seed MintInfo so intent generation has decimals.
@@ -9685,7 +10020,10 @@ mod tests {
             if let Some(last) = tracker.trades.last_mut() {
                 last.timestamp = Instant::now() - Duration::from_secs(1);
             }
-            trackers.insert("mint".to_string(), tracker);
+            trackers.insert(
+                MomentumContext::tracker_storage_key("mint", "pool"),
+                tracker,
+            );
         }
 
         let exits = ctx.check_for_exits();
@@ -9760,7 +10098,10 @@ mod tests {
             let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 0);
             tracker.record_lp_removal();
             tracker.lp_removal_time = Some(Instant::now() - Duration::from_secs(1));
-            trackers.insert("mint".to_string(), tracker);
+            trackers.insert(
+                MomentumContext::tracker_storage_key("mint", "pool"),
+                tracker,
+            );
         }
 
         let exits = ctx.check_for_exits();
@@ -10272,7 +10613,7 @@ mod tests {
         let wsol = "So11111111111111111111111111111111111111112";
 
         ctx.token_trackers.write().insert(
-            mint.to_string(),
+            MomentumContext::tracker_storage_key(mint, pool),
             TokenTracker::new(mint, pool, "pump_amm", 1, 0),
         );
 
@@ -10280,7 +10621,8 @@ mod tests {
         ctx.record_dex_pool_accounts("pump_amm", pool, mint, wsol, &short);
 
         assert!(
-            ctx.try_get_dex_pool_accounts_for_mint(mint).is_none(),
+            ctx.try_get_dex_pool_accounts_for_mint_pool(mint, pool)
+                .is_none(),
             "short PumpSwap account list must not satisfy BUY"
         );
         assert!(ctx.pending_pool_accounts.read().get(mint).is_none());
@@ -10331,7 +10673,7 @@ mod tests {
         let wsol = "So11111111111111111111111111111111111111112";
 
         ctx.token_trackers.write().insert(
-            mint.to_string(),
+            MomentumContext::tracker_storage_key(mint, pool),
             TokenTracker::new(mint, pool, "pump_amm", 1, 0),
         );
 
@@ -10341,7 +10683,7 @@ mod tests {
         ctx.record_dex_pool_accounts("pump_amm", pool, mint, wsol, &accounts);
 
         let got = ctx
-            .try_get_dex_pool_accounts_for_mint(mint)
+            .try_get_dex_pool_accounts_for_mint_pool(mint, pool)
             .expect("full verified PumpSwap account set should be available for BUY");
         assert_eq!(got.len(), 14);
         assert_eq!(got[0], pool);
@@ -10553,7 +10895,7 @@ mod tests {
         let pool = "Pool9mR7ttttttttttttttttttttttttttttttttttt";
         ctx.register_pool(mint, pool, "pump_amm", 1);
         ctx.token_trackers.write().insert(
-            mint.to_string(),
+            MomentumContext::tracker_storage_key(mint, pool),
             TokenTracker::new(mint, pool, "pump_amm", 1, 0),
         );
 
@@ -11386,7 +11728,7 @@ async fn generate_and_publish_exit_intent(
                     .and_then(|list| list.iter().find(|p| p.pool_address == original_pool))
                     .and_then(|p| p.dex_pool_accounts.clone())
             }
-            .or_else(|| ctx.try_get_dex_pool_accounts_for_mint(mint))
+            .or_else(|| ctx.try_get_dex_pool_accounts_for_mint_pool(mint, original_pool))
             .unwrap_or_else(|| {
                 warn!(
                     mint = %mint,
@@ -11438,15 +11780,16 @@ async fn generate_and_publish_exit_intent(
 
     let intent_id = ctx.next_intent_id();
 
-    // FIX-22 / A.2: Creator resolution order — Position → TokenTracker → LivePoolCache
+    // FIX-22 / A.2: Creator resolution order — Position → TokenTracker (same pool row) → LivePoolCache
     let (creator_opt, last_trade_ratio_opt) = {
-        let position_creator = ctx
-            .positions
-            .read()
-            .get(mint)
-            .and_then(|p| p.creator.clone());
+        let positions = ctx.positions.read();
+        let position_creator = positions.get(mint).and_then(|p| p.creator.clone());
+        let position_pool = positions.get(mint).map(|p| p.pool.clone());
+        drop(positions);
         let trackers = ctx.token_trackers.read();
-        let tracker = trackers.get(mint);
+        let tracker = position_pool
+            .as_ref()
+            .and_then(|pool| trackers.get(&MomentumContext::tracker_storage_key(mint, pool)));
         let tracker_creator = tracker.and_then(|t| t.dev_wallet.clone());
         let ratio = tracker.and_then(|t| t.last_trade_ratio());
         drop(trackers);
@@ -11818,7 +12161,10 @@ async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -
         } => {
             // P1: Trade-based Token Discovery
             // If we missed the PoolCreated event (Geyser filter issues), discover via first trade
-            let tracker_exists = ctx.token_trackers.read().contains_key(mint);
+            let tracker_exists = ctx
+                .token_trackers
+                .read()
+                .contains_key(&MomentumContext::tracker_storage_key(mint, pool_address));
 
             if !tracker_exists && *is_buy && *sol_amount > 0 {
                 // Use DEX from event if available, otherwise infer from pool_address pattern
@@ -11874,16 +12220,26 @@ async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -
             ctx.update_pool_trade_data(mint, pool_address, event_dex, sol_lamports, token_raw, event.slot.unwrap_or(0));
 
             // Check if this trader is the dev wallet and record dev behavior
-            let is_dev = {
-                let trackers = ctx.token_trackers.read();
-                trackers
-                    .get(mint)
-                    .and_then(|t| t.dev_wallet.as_ref())
-                    .map(|dw| dw == trader)
-                    .unwrap_or(false)
-            };
+            let is_dev = trade_creator.as_ref().is_some_and(|c| c.as_str() == trader.as_str())
+                || {
+                    let trackers = ctx.token_trackers.read();
+                    trackers.values().any(|t| {
+                        t.mint == *mint
+                            && t.dev_wallet
+                                .as_ref()
+                                .is_some_and(|dw| dw.as_str() == trader.as_str())
+                    })
+                };
 
-            ctx.record_trade(mint, trader, *is_buy, sol_lamports, token_raw, &sig);
+            ctx.record_trade(
+                mint,
+                pool_address,
+                trader,
+                *is_buy,
+                sol_lamports,
+                token_raw,
+                &sig,
+            );
 
             // P1: If Trade event carries token_program (from PumpFun Geyser parsing), cache it.
             // This enables deterministic ATA creation without waiting for TokenMintInfo event.
@@ -11962,7 +12318,8 @@ async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -
             if let Some(ref creator) = trade_creator {
                 let config = ctx.config.read().clone();
                 let mut trackers = ctx.token_trackers.write();
-                if let Some(tracker) = trackers.get_mut(mint) {
+                let tk = MomentumContext::tracker_storage_key(mint, pool_address);
+                if let Some(tracker) = trackers.get_mut(&tk) {
                     if tracker.dev_wallet.is_none() {
                         tracker.set_dev_info(creator, 0.0, &config);
                         debug!(
@@ -12027,7 +12384,8 @@ async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -
             if is_dev {
                 // Record dev trade behavior in tracker
                 let mut trackers = ctx.token_trackers.write();
-                if let Some(tracker) = trackers.get_mut(mint) {
+                let tk = MomentumContext::tracker_storage_key(mint, pool_address);
+                if let Some(tracker) = trackers.get_mut(&tk) {
                     if *is_buy {
                         tracker.dev_rebought = true;
                         info!(mint = %mint, trader = %trader, "📈 Dev rebuy detected - positive signal");

@@ -1225,3 +1225,15 @@ BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap 
 | **Betroffene Module** | `src/bin/momentum_bot.rs` |
 | **Regression-Pruefung** | Neue Unit-Tests fuer Bonding-Coalescing, Pool-Winner-Auswahl, Stale-Zaehlung und I-13 Pool-Match; `cargo test` / `cargo clippy --all-targets -D warnings`. |
 | **Tags** | [momentum, scope-c, coalescing, observability, jetstream, i-13, i-16] |
+
+---
+
+## FIX-50: Momentum Entry — pool-scoped `TokenTracker` + PumpFun-Migration-Gate (kein stale `pumpfun`-Probe)
+
+| Symptom | Probe-BUY-Intents auf alter `pumpfun` Bonding-Curve-Adresse nach Migration; Execution verwirft mit `UNSUPPORTED_INTENT` / „bonding curve is complete (migrated)“. Frische `pump_amm`-Aktivitaet desselben Mints wurde auf den Mint-gescopten Tracker aggregiert und falscher Pool im Signal ausgegeben. |
+|---------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | `token_trackers` war nur mint-keyed; `record_trade` aktualisierte immer dieselbe Tracker-Zeile; `EntrySignal.pool` kam aus `tracker.pool` beim ersten Pool — Pool-wechsel/Migration verschmutzten die Entry-Entscheidung (Failure-Pattern `momentum_pool_scoped_entry`). |
+| **Fix** | (1) Map-Key `(mint, pool)` via `tracker_storage_key`; Trades/Creator/Dev-Flows pool-gezielt; mint-weite Guards (Position-Pool I-13, max. ein pending BUY pro Mint, Serialisierung wenn anderer Pool `ProbeBuyPending`/`ScaleInPending`). (2) Vor BUY-Signal: `pumpfun_entry_blocked_by_migration` aus `mint_pools`-Row und Geyser/LivePoolCache-Evidence — nur fuer `dex == pumpfun`; `pump_amm`/andere DEX unberuehrt. (3) BUY-/Exit-Hilfen: `try_get_dex_pool_accounts_for_mint_pool`, ExecutionResult- und Exit-Pfade auf Pool-Key. |
+| **Betroffene Module** | `src/bin/momentum_bot.rs` |
+| **Regression-Pruefung** | `pool_scoped_entry_probe_targets_active_pool_not_legacy_pumpfun_row`, `pumpfun_complete_blocks_probe_while_pump_amm_remains_eligible`; `cargo fmt`, `cargo clippy --all-targets -D warnings`, `cargo test`. |
+| **Tags** | [momentum, entry, pumpfun, migration, multi-pool, i-13, i-16, i-7] |
