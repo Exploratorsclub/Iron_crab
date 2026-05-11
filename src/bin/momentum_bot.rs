@@ -3471,6 +3471,9 @@ impl MomentumContext {
 
         let mut trackers = self.token_trackers.write();
         let mut signals = Vec::new();
+        // At most one entry signal (probe or scale-in) per mint per `check_for_signals` call.
+        // `pending_buy_mint_index` updates after publish; sibling snapshot is pre-loop — both can miss same-tick races.
+        let mut mint_emitted_entry_this_tick: HashSet<String> = HashSet::new();
 
         let probe_sol = ((config.default_position_lamports as f64) * config.probe_buy_pct)
             .round()
@@ -3542,6 +3545,9 @@ impl MomentumContext {
                 }
 
                 if should_trade {
+                    if mint_emitted_entry_this_tick.contains(&mint) {
+                        continue;
+                    }
                     if probe_sol == 0 {
                         warn!(
                             mint = %mint,
@@ -3559,6 +3565,7 @@ impl MomentumContext {
                     tracker.state = TrackerState::ProbeBuyPending {
                         sent_at: Instant::now(),
                     };
+                    mint_emitted_entry_this_tick.insert(mint.clone());
                     signals.push(EntrySignal {
                         mint,
                         pool: tracker.pool.clone(),
@@ -3593,6 +3600,9 @@ impl MomentumContext {
                 }
 
                 if should_trade {
+                    if mint_emitted_entry_this_tick.contains(&mint) {
+                        continue;
+                    }
                     if scale_sol == 0 {
                         warn!(
                             mint = %mint,
@@ -3608,6 +3618,7 @@ impl MomentumContext {
                     tracker.state = TrackerState::ScaleInPending {
                         sent_at: Instant::now(),
                     };
+                    mint_emitted_entry_this_tick.insert(mint.clone());
                     signals.push(EntrySignal {
                         mint,
                         pool: tracker.pool.clone(),
@@ -9668,6 +9679,66 @@ mod tests {
                 .is_rejected()
         };
         assert!(pf_rejected);
+    }
+
+    /// Two eligible pool trackers for the same mint must not both emit in one `check_for_signals` call.
+    #[test]
+    fn check_for_signals_serializes_mint_entry_one_signal_per_tick_two_pools() {
+        let cfg = {
+            let mut c = MomentumConfig::default();
+            c.default_position_lamports = 1_000;
+            c.probe_buy_pct = 0.25;
+            c.early_min_liquidity_sol = 0.0;
+            c.min_unique_buyers = 0;
+            c.min_trades_per_sec = 0.0;
+            c.min_buy_dominance = 0.0;
+            c.min_sol_inflow_lamports = 0;
+            c.require_mint_authority_renounced = false;
+            c.require_freeze_authority_none = false;
+            c.top1_buyer_share_cap = 1.0;
+            c.top3_buyer_share_cap = 1.0;
+            c.repeat_buyer_min_ratio = 0.0;
+            c.min_trade_size_lamports = 0;
+            c.small_buy_ratio_cap = 1.0;
+            c
+        };
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "MintDupGuard333333333333333333333333333333";
+        let pool_a = "RayPool333333333333333333333333333333333333";
+        let pool_b = "OrcaPool33333333333333333333333333333333333";
+
+        {
+            let mut trackers = ctx.token_trackers.write();
+            for (pool, dex, buyer_prefix) in [(pool_a, "raydium", "ra"), (pool_b, "orca", "oc")] {
+                let mut tr = TokenTracker::new(mint, pool, dex, 1, 0);
+                for i in 0..20 {
+                    tr.record_trade(
+                        &format!("{buyer_prefix}{i:03}"),
+                        true,
+                        200_000_000,
+                        2_000_000,
+                        &format!("sig{dex}{i:03}"),
+                        &cfg,
+                    );
+                }
+                trackers.insert(MomentumContext::tracker_storage_key(mint, pool), tr);
+            }
+        }
+
+        let signals = ctx.check_for_signals();
+        assert_eq!(
+            signals.iter().filter(|s| s.mint == mint).count(),
+            1,
+            "mint-level duplicate guard: expected exactly one entry signal for mint"
+        );
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].kind, EntryKind::Probe);
     }
 
     #[test]
