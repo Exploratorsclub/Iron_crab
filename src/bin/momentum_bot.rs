@@ -2615,8 +2615,6 @@ impl MomentumContext {
         if let Some((balance_raw, decimals)) = orphan_data {
             if let Some(reconciled) = self.build_reconciled_position(mint, balance_raw, decimals) {
                 let hold_secs = reconciled.entry_time.elapsed().as_secs();
-                let mut reconciled = reconciled;
-                self.apply_latest_sticky_state_to_position(mint, &mut reconciled);
                 self.positions
                     .write()
                     .insert(mint.to_string(), reconciled.clone());
@@ -2689,8 +2687,6 @@ impl MomentumContext {
                 if let Some(reconciled) =
                     self.build_reconciled_position(mint, balance_raw, decimals)
                 {
-                    let mut reconciled = reconciled;
-                    self.apply_latest_sticky_state_to_position(mint, &mut reconciled);
                     self.positions
                         .write()
                         .insert(mint.to_string(), reconciled.clone());
@@ -4441,19 +4437,19 @@ impl MomentumContext {
         self.merge_pumpfun_migration_complete_evidence(mint, slot, ts);
     }
 
-    /// Scope B: merge a `PoolCacheUpdate` into the sticky reserve mark map (same monotonic rules as bonding).
-    pub(crate) fn merge_latest_pool_reserve_price_hint_from_update(
+    /// Shared reserve → `tokens_per_sol` pipeline for sticky hints and live position marks (single validation).
+    fn derive_tokens_per_sol_from_pool_cache_update(
         &self,
         update: &ironcrab::ipc::PoolCacheUpdate,
-    ) {
+    ) -> Option<(String, f64, u8, f64, f64)> {
         if update.base_reserve == 0 || update.quote_reserve == 0 {
-            return;
+            return None;
         }
         if !pool_cache_has_exactly_one_wsol_leg(&update.base_mint, &update.quote_mint) {
-            return;
+            return None;
         }
         const SOL_WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
-        let (token_mint, token_reserve, sol_reserve, decimals) =
+        let (token_mint, token_reserve, sol_reserve, token_decimals) =
             if update.base_mint == SOL_WSOL_MINT {
                 let decimals = self
                     .mint_infos
@@ -4481,16 +4477,25 @@ impl MomentumContext {
                     decimals,
                 )
             };
-        let token_ui = token_reserve as f64 / 10f64.powi(decimals as i32);
+        let token_ui = token_reserve as f64 / 10f64.powi(token_decimals as i32);
         let sol_ui = sol_reserve as f64 / 1_000_000_000.0;
         if sol_ui <= 0.0 || !sol_ui.is_finite() || token_ui <= 0.0 || !token_ui.is_finite() {
-            return;
+            return None;
         }
         let tokens_per_sol = token_ui / sol_ui;
         if !tokens_per_sol.is_finite() || tokens_per_sol <= 0.0 {
-            return;
+            return None;
         }
-        let key = (token_mint, update.pool_address.clone());
+        Some((token_mint, tokens_per_sol, token_decimals, token_ui, sol_ui))
+    }
+
+    fn merge_latest_pool_reserve_price_hint_from_derived(
+        &self,
+        update: &ironcrab::ipc::PoolCacheUpdate,
+        token_mint: &str,
+        tokens_per_sol: f64,
+    ) {
+        let key = (token_mint.to_string(), update.pool_address.clone());
         let mut map = self.latest_pool_reserve_price_hint_by_mint_pool.write();
         let accept = match map.get(&key) {
             None => true,
@@ -4513,6 +4518,20 @@ impl MomentumContext {
                 },
             );
         }
+    }
+
+    /// Scope B: merge a `PoolCacheUpdate` into the sticky reserve mark map (same monotonic rules as bonding).
+    #[cfg(test)]
+    pub(crate) fn merge_latest_pool_reserve_price_hint_from_update(
+        &self,
+        update: &ironcrab::ipc::PoolCacheUpdate,
+    ) {
+        let Some((ref token_mint, tokens_per_sol, _, _, _)) =
+            self.derive_tokens_per_sol_from_pool_cache_update(update)
+        else {
+            return;
+        };
+        self.merge_latest_pool_reserve_price_hint_from_derived(update, token_mint, tokens_per_sol);
     }
 
     /// Scope B: apply `mint_infos`, cached bonding max-guard, and pool reserve hints to one position.
@@ -7394,34 +7413,15 @@ async fn main() -> Result<()> {
                                     Ok(msg) => {
                                         if let Ok(update) = serde_json::from_slice::<ironcrab::ipc::PoolCacheUpdate>(&msg.payload) {
                                             pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, &update);
-                                            ctx.merge_latest_pool_reserve_price_hint_from_update(&update);
-                                            // FIX-30a: Update position price from pool reserves
-                                            // tokens_per_sol = token_amount / sol_amount (higher = cheaper token)
-                                            // Convention: base=token, quote=SOL. If base=SOL (inverted DEX convention),
-                                            // swap so we always compute token/sol for the position's token.
-                                            if update.base_reserve > 0
-                                                && update.quote_reserve > 0
-                                                && pool_cache_has_exactly_one_wsol_leg(
-                                                    &update.base_mint,
-                                                    &update.quote_mint,
-                                                )
+                                            // FIX-30a: Single derive for sticky hint + live mark (same validation).
+                                            if let Some((token_mint, tokens_per_sol, _, token_ui, sol_ui)) =
+                                                ctx.derive_tokens_per_sol_from_pool_cache_update(&update)
                                             {
-                                                const SOL_WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
-                                                let (token_mint, token_reserve, sol_reserve, token_decimals) = if update.base_mint == SOL_WSOL_MINT {
-                                                    // Base is SOL → quote is token. tokens_per_sol = quote/base.
-                                                    let decimals = ctx.mint_infos.read()
-                                                        .get(&update.quote_mint)
-                                                        .map(|m| m.decimals)
-                                                        .unwrap_or(6);
-                                                    (update.quote_mint.clone(), update.quote_reserve, update.base_reserve, decimals)
-                                                } else {
-                                                    // Normal: base is token, quote is SOL.
-                                                    let decimals = ctx.mint_infos.read()
-                                                        .get(&update.base_mint)
-                                                        .map(|m| m.decimals)
-                                                        .unwrap_or(6);
-                                                    (update.base_mint.clone(), update.base_reserve, update.quote_reserve, decimals)
-                                                };
+                                                ctx.merge_latest_pool_reserve_price_hint_from_derived(
+                                                    &update,
+                                                    &token_mint,
+                                                    tokens_per_sol,
+                                                );
                                                 if let Ok(mint_pk) = solana_sdk::pubkey::Pubkey::from_str(&token_mint) {
                                                     if ctx.live_pool_cache.is_pumpfun_complete_for_mint(&mint_pk)
                                                         == Some(true)
@@ -7436,36 +7436,31 @@ async fn main() -> Result<()> {
                                                         );
                                                     }
                                                 }
-                                                let token_ui = token_reserve as f64 / 10f64.powi(token_decimals as i32);
-                                                let sol_ui = sol_reserve as f64 / 1_000_000_000.0;
-                                                if sol_ui > 0.0 {
-                                                    let tokens_per_sol = token_ui / sol_ui;
-                                                    // #region agent log
-                                                    dbg_log(
-                                                        "momentum_bot.rs:PoolCache_price_update",
-                                                        "PoolCacheUpdate updating position price",
-                                                        serde_json::json!({
-                                                            "mint": token_mint,
-                                                            "pool": update.pool_address,
-                                                            "dex": update.dex,
-                                                            "base_reserve": update.base_reserve,
-                                                            "quote_reserve": update.quote_reserve,
-                                                            "base_mint": update.base_mint,
-                                                            "token_ui": token_ui,
-                                                            "sol_ui": sol_ui,
-                                                            "tokens_per_sol": tokens_per_sol
-                                                        }),
-                                                        "H-E",
-                                                    );
-                                                    // #endregion
-                                                    ctx.update_position_price(
-                                                        &token_mint,
-                                                        tokens_per_sol,
-                                                        None,
-                                                        Some(&update.pool_address),
-                                                        Some(update.geyser_slot),
-                                                    );
-                                                }
+                                                // #region agent log
+                                                dbg_log(
+                                                    "momentum_bot.rs:PoolCache_price_update",
+                                                    "PoolCacheUpdate updating position price",
+                                                    serde_json::json!({
+                                                        "mint": token_mint,
+                                                        "pool": update.pool_address,
+                                                        "dex": update.dex,
+                                                        "base_reserve": update.base_reserve,
+                                                        "quote_reserve": update.quote_reserve,
+                                                        "base_mint": update.base_mint,
+                                                        "token_ui": token_ui,
+                                                        "sol_ui": sol_ui,
+                                                        "tokens_per_sol": tokens_per_sol
+                                                    }),
+                                                    "H-E",
+                                                );
+                                                // #endregion
+                                                ctx.update_position_price(
+                                                    &token_mint,
+                                                    tokens_per_sol,
+                                                    None,
+                                                    Some(&update.pool_address),
+                                                    Some(update.geyser_slot),
+                                                );
                                             }
                                             msg_count += 1;
                                         }
@@ -11496,10 +11491,9 @@ async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -
                         balance_raw = *balance_raw,
                         "✅ WalletBalanceSnapshot: position verified in wallet"
                     );
-                } else if let Some(mut reconciled) =
+                } else if let Some(reconciled) =
                     ctx.build_reconciled_position(mint, *balance_raw, *decimals)
                 {
-                    ctx.apply_latest_sticky_state_to_position(mint, &mut reconciled);
                     let hold_secs = reconciled.entry_time.elapsed().as_secs();
                     {
                         let mut positions = ctx.positions.write();
