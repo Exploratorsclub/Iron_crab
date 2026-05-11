@@ -90,8 +90,11 @@ const EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES: Duration = Duration::from_mill
 /// Smaller batches reduce single-arm starvation of other `tokio::select!` branches.
 const POOL_CACHE_UPDATE_FETCH_MAX: usize = 48;
 const POOL_CACHE_UPDATE_FETCH_EXPIRES: Duration = Duration::from_millis(50);
+/// Adjacent `BondingCurveProgress` messages on Core NATS: bounded coalesce before strategy work.
+const BONDING_CURVE_PROGRESS_STREAK_MAX: usize = 32;
 
-/// [`HashSet`] insert/remove with LRU eviction when size exceeds `cap` (new inserts only).
+/// WSOL-leg reserve-derived `(token_mint, tokens_per_sol, token_decimals, token_ui, sol_ui)` from `PoolCacheUpdate`.
+type PoolCacheDerivedTps = Option<(String, f64, u8, f64, f64)>;
 struct BoundedIntentIdCache {
     set: HashSet<String>,
     order: VecDeque<String>,
@@ -3636,7 +3639,7 @@ impl MomentumContext {
         trade: Option<TradeEvent>,
         source_pool: Option<&str>,
         source_slot: Option<u64>,
-    ) {
+    ) -> bool {
         let mut positions = self.positions.write();
         if let Some(pos) = positions.get_mut(mint) {
             if !ironcrab::execution::position_utils::should_apply_position_price_update(
@@ -3649,7 +3652,7 @@ impl MomentumContext {
                     source_pool = ?source_pool,
                     "Skipping price update: source pool != position pool"
                 );
-                return;
+                return false;
             }
 
             if pos.entry_confirmed_slot > 0 {
@@ -3659,7 +3662,7 @@ impl MomentumContext {
                         entry_confirmed_slot = pos.entry_confirmed_slot,
                         "Skipping price update: missing source_slot while slot gate active"
                     );
-                    return;
+                    return false;
                 };
                 if slot <= pos.entry_confirmed_slot {
                     trace!(
@@ -3668,7 +3671,7 @@ impl MomentumContext {
                         source_slot = slot,
                         "Skipping price update: event slot not after entry BUY confirm slot"
                     );
-                    return;
+                    return false;
                 }
                 if slot <= pos.last_price_slot {
                     trace!(
@@ -3677,7 +3680,7 @@ impl MomentumContext {
                         source_slot = slot,
                         "Skipping price update: non-monotonic slot sequence"
                     );
-                    return;
+                    return false;
                 }
             }
 
@@ -3688,7 +3691,9 @@ impl MomentumContext {
             if let Some(t) = trade {
                 pos.record_trade(t);
             }
+            return true;
         }
+        false
     }
 
     /// Close position (after sell executed)
@@ -7114,63 +7119,145 @@ async fn main() -> Result<()> {
 
                     // Deserialize MarketEvent
                     match serde_json::from_slice::<MarketEvent>(&nats_msg.payload) {
-                        Ok(event) => {
-                            let event_slot = event.slot;
-                            if let Some(slot) = event_slot {
-                                last_slot = slot;
-                            }
-                            let scope_c_obs_latency =
-                                momentum_scope_c_price_sensitive_market_kind(&event.kind);
-                            let (scope_c_latency_t0, last_ev_slot_before) = if scope_c_obs_latency {
-                                let t0 = Instant::now();
-                                let snap = ctx.last_event_slot.load(Ordering::Relaxed);
-                                (Some(t0), snap)
-                            } else {
-                                (None, 0u64)
-                            };
+                        Ok(first_event) => {
+                            use futures::FutureExt;
 
-                            // Process the event
-                            match process_market_event(&ctx, &event).await {
-                                Ok(need_exit) => {
-                                    if need_exit
-                                        || matches!(event.kind, MarketEventKind::Trade { .. })
+                            let mut pending_market_events = VecDeque::new();
+                            pending_market_events.push_back(first_event);
+
+                            while let Some(event) = pending_market_events.pop_front() {
+                                let events_to_process: Vec<MarketEvent> =
+                                    if matches!(&event.kind, MarketEventKind::BondingCurveProgress { .. })
                                     {
-                                        ctx.process_exit_signals().await;
+                                        let mut streak = vec![event];
+                                        while streak.len() < BONDING_CURVE_PROGRESS_STREAK_MAX {
+                                            let Some(ref mut sub) = subscription else {
+                                                break;
+                                            };
+                                            match sub.next().now_or_never() {
+                                                Some(Some(nm)) => {
+                                                    NATS_MESSAGES_RECEIVED_TOTAL
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                    events_received += 1;
+                                                    match serde_json::from_slice::<MarketEvent>(
+                                                        &nm.payload,
+                                                    ) {
+                                                        Ok(next_e) => {
+                                                            if matches!(
+                                                                next_e.kind,
+                                                                MarketEventKind::BondingCurveProgress {
+                                                                    ..
+                                                                }
+                                                            ) {
+                                                                streak.push(next_e);
+                                                            } else {
+                                                                pending_market_events
+                                                                    .push_front(next_e);
+                                                                break;
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(
+                                                                error = %e,
+                                                                "Failed to deserialize MarketEvent (bonding streak)"
+                                                            );
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                Some(None) => break,
+                                                None => break,
+                                            }
+                                        }
+                                        let (coalesced, streak_stats) =
+                                            coalesce_bonding_curve_progress_streak(streak);
+                                        if streak_stats.raw_messages > streak_stats.emitted_events {
+                                            let ratio_permille = (streak_stats.stale_dropped as u64)
+                                                .saturating_mul(1000)
+                                                .checked_div(streak_stats.raw_messages as u64)
+                                                .unwrap_or(0);
+                                            debug!(
+                                                momentum_scope_c = "bonding_curve_streak_coalesce",
+                                                raw_streak_messages = streak_stats.raw_messages,
+                                                emitted_after_coalesce = streak_stats.emitted_events,
+                                                stale_dropped = streak_stats.stale_dropped,
+                                                max_streak_cap = BONDING_CURVE_PROGRESS_STREAK_MAX,
+                                                decision_gate_stale_ratio_permille = ratio_permille,
+                                                "Momentum Scope C: coalesced adjacent BondingCurveProgress burst (per-mint latest-wins)",
+                                            );
+                                        }
+                                        coalesced
+                                    } else {
+                                        vec![event]
+                                    };
+
+                                for event in events_to_process {
+                                    let event_slot = event.slot;
+                                    if let Some(slot) = event_slot {
+                                        last_slot = slot;
                                     }
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, event_id = %event.event_id, "Failed to process market event");
-                                }
-                            }
+                                    let scope_c_obs_latency =
+                                        momentum_scope_c_price_sensitive_market_kind(&event.kind);
+                                    let (scope_c_latency_t0, last_ev_slot_before) =
+                                        if scope_c_obs_latency {
+                                            let t0 = Instant::now();
+                                            let snap =
+                                                ctx.last_event_slot.load(Ordering::Relaxed);
+                                            (Some(t0), snap)
+                                        } else {
+                                            (None, 0u64)
+                                        };
 
-                            if let Some(t0) = scope_c_latency_t0 {
-                                let duration_ms = t0.elapsed().as_millis() as u64;
-                                let slot_delta_vs_head =
-                                    event_slot.map(|s| last_ev_slot_before.saturating_sub(s));
-                                debug!(
-                                    momentum_scope_c = "market_event_latency",
-                                    market_kind = momentum_scope_c_market_kind_tag(&event.kind),
-                                    duration_ms,
-                                    event_slot = ?event_slot,
-                                    last_event_slot = last_ev_slot_before,
-                                    slot_delta_vs_head = ?slot_delta_vs_head,
-                                    event_id = %event.event_id,
-                                    "Momentum trade/bonding-related MarketEvent processed",
-                                );
-                            }
+                                    match process_market_event(&ctx, &event).await {
+                                        Ok(need_exit) => {
+                                            if need_exit
+                                                || matches!(
+                                                    event.kind,
+                                                    MarketEventKind::Trade { .. }
+                                                )
+                                            {
+                                                ctx.process_exit_signals().await;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                error = %e,
+                                                event_id = %event.event_id,
+                                                "Failed to process market event"
+                                            );
+                                        }
+                                    }
 
-                            // Scope C: bounded ExecutionResult drain after heavy market paths (anti-starvation).
-                            if scope_c_obs_latency {
-                                if let Some(ref consumer) = execution_js_consumer {
-                                    let _n = drain_execution_results(
-                                        consumer,
-                                        &ctx,
-                                        EXECUTION_RESULT_INTERLEAVED_DRAIN_MAX,
-                                        EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES,
-                                        last_slot,
-                                        "after_market_event",
-                                    )
-                                    .await;
+                                    if let Some(t0) = scope_c_latency_t0 {
+                                        let duration_ms = t0.elapsed().as_millis() as u64;
+                                        let slot_delta_vs_head = event_slot
+                                            .map(|s| last_ev_slot_before.saturating_sub(s));
+                                        debug!(
+                                            momentum_scope_c = "market_event_latency",
+                                            market_kind =
+                                                momentum_scope_c_market_kind_tag(&event.kind),
+                                            duration_ms,
+                                            event_slot = ?event_slot,
+                                            last_event_slot = last_ev_slot_before,
+                                            slot_delta_vs_head = ?slot_delta_vs_head,
+                                            event_id = %event.event_id,
+                                            "Momentum trade/bonding-related MarketEvent processed",
+                                        );
+                                    }
+
+                                    if scope_c_obs_latency {
+                                        if let Some(ref consumer) = execution_js_consumer {
+                                            let _n = drain_execution_results(
+                                                consumer,
+                                                &ctx,
+                                                EXECUTION_RESULT_INTERLEAVED_DRAIN_MAX,
+                                                EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES,
+                                                last_slot,
+                                                "after_market_event",
+                                            )
+                                            .await;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -7429,106 +7516,147 @@ async fn main() -> Result<()> {
                         .await
                     {
                         Ok(mut messages) => {
+                            let mut execution_results_drained: u32 = 0;
                             let mut batch_messages: u32 = 0;
-                            let mut msg_count = 0u32;
-                            let mut position_price_updates_applied = 0u32;
-                            // Per-message work only (excludes JetStream batch fetch / expires idle above).
-                            // Accumulate `Duration` so sub-ms work is not truncated away before logging.
+                            let mut msg_count: u32 = 0;
+                            let mut position_price_updates_applied: u32 = 0;
                             let mut pool_cache_process_accounted: Duration = Duration::ZERO;
+                            let mut batch_items: Vec<(
+                                async_nats::jetstream::message::Message,
+                                ironcrab::ipc::PoolCacheUpdate,
+                            )> = Vec::new();
+
                             while let Some(msg_result) = messages.next().await {
                                 match msg_result {
                                     Ok(msg) => {
-                                        let msg_work_t0 = Instant::now();
                                         batch_messages = batch_messages.saturating_add(1);
-                                        if let Ok(update) = serde_json::from_slice::<ironcrab::ipc::PoolCacheUpdate>(&msg.payload) {
-                                            pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, &update);
-                                            // FIX-30a: Single derive for sticky hint + live mark (same validation).
-                                            if let Some((token_mint, tokens_per_sol, _, token_ui, sol_ui)) =
-                                                ctx.derive_tokens_per_sol_from_pool_cache_update(&update)
-                                            {
-                                                ctx.merge_latest_pool_reserve_price_hint_from_derived(
-                                                    &update,
-                                                    &token_mint,
-                                                    tokens_per_sol,
-                                                );
-                                                if let Ok(mint_pk) = solana_sdk::pubkey::Pubkey::from_str(&token_mint) {
-                                                    if ctx.live_pool_cache.is_pumpfun_complete_for_mint(&mint_pk)
-                                                        == Some(true)
-                                                        || ctx
-                                                            .live_pool_cache
-                                                            .pumpfun_bonding_curve_complete_for_mint(&mint_pk)
-                                                    {
-                                                        ctx.merge_pumpfun_migration_complete_evidence(
-                                                            &token_mint,
-                                                            update.geyser_slot,
-                                                            update.header.ts_unix_ms,
-                                                        );
-                                                    }
-                                                }
-                                                // #region agent log
-                                                dbg_log(
-                                                    "momentum_bot.rs:PoolCache_price_update",
-                                                    "PoolCacheUpdate updating position price",
-                                                    serde_json::json!({
-                                                        "mint": token_mint,
-                                                        "pool": update.pool_address,
-                                                        "dex": update.dex,
-                                                        "base_reserve": update.base_reserve,
-                                                        "quote_reserve": update.quote_reserve,
-                                                        "base_mint": update.base_mint,
-                                                        "token_ui": token_ui,
-                                                        "sol_ui": sol_ui,
-                                                        "tokens_per_sol": tokens_per_sol
-                                                    }),
-                                                    "H-E",
-                                                );
-                                                // #endregion
-                                                ctx.update_position_price(
-                                                    &token_mint,
-                                                    tokens_per_sol,
-                                                    None,
-                                                    Some(&update.pool_address),
-                                                    Some(update.geyser_slot),
-                                                );
-                                                position_price_updates_applied =
-                                                    position_price_updates_applied.saturating_add(1);
-                                            }
-                                            msg_count += 1;
+                                        if let Ok(update) = serde_json::from_slice::<
+                                            ironcrab::ipc::PoolCacheUpdate,
+                                        >(&msg.payload)
+                                        {
+                                            batch_items.push((msg, update));
+                                            msg_count = msg_count.saturating_add(1);
+                                        } else {
+                                            let _ = msg.ack().await;
                                         }
-                                        let _ = msg.ack().await;
-                                        pool_cache_process_accounted = pool_cache_process_accounted
-                                            .saturating_add(msg_work_t0.elapsed());
                                     }
                                     Err(e) => {
                                         trace!(error = %e, "PoolCacheUpdate fetch error");
                                     }
                                 }
                             }
-                            let micros_u128 = pool_cache_process_accounted.as_micros();
-                            let proc_us: u64 = micros_u128.min(u128::from(u64::MAX)) as u64;
-                            // Ceil(ms) from total microseconds: (µs + 999) / 1000 with truncating division.
-                            let proc_ms_ceil: u64 = ((micros_u128.saturating_add(999)) / 1000)
-                                .min(u128::from(u64::MAX)) as u64;
-                            let last_ev_slot = ctx.last_event_slot.load(Ordering::Relaxed);
-                            if batch_messages > 0 {
-                                debug!(
-                                    momentum_scope_c = "pool_cache_batch",
-                                    batch_messages,
-                                    position_price_updates = position_price_updates_applied,
-                                    processing_duration_us = proc_us,
-                                    processing_duration_ms_ceil = proc_ms_ceil,
-                                    fetch_max = POOL_CACHE_UPDATE_FETCH_MAX,
-                                    last_event_slot = last_ev_slot,
-                                    "SLAVE CACHE: PoolCacheUpdate batch timing (processing only, excludes batch fetch wait)",
+
+                            let phase1_t0 = Instant::now();
+                            for (_, update) in &batch_items {
+                                pool_cache_sync::apply_pool_cache_update(
+                                    &ctx.live_pool_cache,
+                                    update,
                                 );
                             }
+                            pool_cache_process_accounted = pool_cache_process_accounted
+                                .saturating_add(phase1_t0.elapsed());
+
+                            let derived: Vec<PoolCacheDerivedTps> = batch_items
+                                .iter()
+                                .map(|(_, u)| ctx.derive_tokens_per_sol_from_pool_cache_update(u))
+                                .collect();
+                            let updates_for_winners: Vec<ironcrab::ipc::PoolCacheUpdate> =
+                                batch_items.iter().map(|(_, u)| u.clone()).collect();
+                            let (price_winners, stale_price_path_candidates) =
+                                select_pool_cache_batch_price_path_winners(
+                                    &updates_for_winners,
+                                    &derived,
+                                );
+
+                            let phase2_t0 = Instant::now();
+                            let coalesced_price_path_keys = price_winners.len() as u32;
+                            let unique_pools_touched: u32 = batch_items
+                                .iter()
+                                .map(|(_, u)| u.pool_address.as_str())
+                                .collect::<HashSet<_>>()
+                                .len() as u32;
+                            let mut max_slot_lag_vs_head: Option<u64> = None;
+                            if last_slot > 0 {
+                                for (_, u) in &batch_items {
+                                    if u.geyser_slot > 0 {
+                                        let lag = last_slot.saturating_sub(u.geyser_slot);
+                                        max_slot_lag_vs_head = Some(
+                                            max_slot_lag_vs_head.unwrap_or(0).max(lag),
+                                        );
+                                    }
+                                }
+                            }
+
+                            for (_, idx) in price_winners {
+                                let (_, ref update) = batch_items[idx];
+                                let Some(Some((ref token_mint, tokens_per_sol, _, token_ui, sol_ui))) =
+                                    derived.get(idx)
+                                else {
+                                    continue;
+                                };
+                                ctx.merge_latest_pool_reserve_price_hint_from_derived(
+                                    update,
+                                    token_mint,
+                                    *tokens_per_sol,
+                                );
+                                if let Ok(mint_pk) =
+                                    solana_sdk::pubkey::Pubkey::from_str(token_mint)
+                                {
+                                    if ctx.live_pool_cache.is_pumpfun_complete_for_mint(&mint_pk)
+                                        == Some(true)
+                                        || ctx
+                                            .live_pool_cache
+                                            .pumpfun_bonding_curve_complete_for_mint(&mint_pk)
+                                    {
+                                        ctx.merge_pumpfun_migration_complete_evidence(
+                                            token_mint,
+                                            update.geyser_slot,
+                                            update.header.ts_unix_ms,
+                                        );
+                                    }
+                                }
+                                dbg_log(
+                                    "momentum_bot.rs:PoolCache_price_update",
+                                    "PoolCacheUpdate updating position price",
+                                    serde_json::json!({
+                                        "mint": token_mint,
+                                        "pool": update.pool_address,
+                                        "dex": update.dex,
+                                        "base_reserve": update.base_reserve,
+                                        "quote_reserve": update.quote_reserve,
+                                        "base_mint": update.base_mint,
+                                        "token_ui": token_ui,
+                                        "sol_ui": sol_ui,
+                                        "tokens_per_sol": tokens_per_sol
+                                    }),
+                                    "H-E",
+                                );
+                                if ctx.update_position_price(
+                                    token_mint,
+                                    *tokens_per_sol,
+                                    None,
+                                    Some(update.pool_address.as_str()),
+                                    Some(update.geyser_slot),
+                                ) {
+                                    position_price_updates_applied =
+                                        position_price_updates_applied.saturating_add(1);
+                                }
+                            }
+                            pool_cache_process_accounted = pool_cache_process_accounted
+                                .saturating_add(phase2_t0.elapsed());
+
+                            for (msg, _) in batch_items {
+                                let _ = msg.ack().await;
+                            }
+
+                            let last_ev_slot = ctx.last_event_slot.load(Ordering::Relaxed);
                             if msg_count > 0 {
                                 trace!(updates = msg_count, "SLAVE CACHE: processed PoolCacheUpdates");
                                 // Event-driven: check exits immediately after price update (<500ms reaction)
                                 ctx.process_exit_signals().await;
                                 // Scope C: yield a bounded ExecutionResult drain after heavy pool-cache work.
                                 if let Some(ref er_consumer) = execution_js_consumer {
-                                    let _n = drain_execution_results(
+                                    execution_results_drained = drain_execution_results(
                                         er_consumer,
                                         &ctx,
                                         EXECUTION_RESULT_INTERLEAVED_DRAIN_MAX,
@@ -7538,6 +7666,34 @@ async fn main() -> Result<()> {
                                     )
                                     .await;
                                 }
+                            }
+
+                            let micros_u128 = pool_cache_process_accounted.as_micros();
+                            let proc_us: u64 = micros_u128.min(u128::from(u64::MAX)) as u64;
+                            // Ceil(ms) from total microseconds: (µs + 999) / 1000 with truncating division.
+                            let proc_ms_ceil: u64 = ((micros_u128.saturating_add(999)) / 1000)
+                                .min(u128::from(u64::MAX)) as u64;
+                            if batch_messages > 0 {
+                                debug!(
+                                    momentum_scope_c = "pool_cache_batch",
+                                    batch_messages,
+                                    msg_count_deserialized = msg_count,
+                                    unique_pools_touched,
+                                    coalesced_price_path_keys,
+                                    stale_price_path_candidates,
+                                    position_price_updates = position_price_updates_applied,
+                                    processing_duration_us = proc_us,
+                                    processing_duration_ms_ceil = proc_ms_ceil,
+                                    fetch_max = POOL_CACHE_UPDATE_FETCH_MAX,
+                                    last_event_slot = last_ev_slot,
+                                    max_slot_lag_vs_head = ?max_slot_lag_vs_head,
+                                    execution_results_drained_after_batch = execution_results_drained,
+                                    decision_gate_shard_hint_permille = stale_price_path_candidates
+                                        .saturating_mul(1000)
+                                        .checked_div(batch_messages)
+                                        .unwrap_or(0),
+                                    "SLAVE CACHE: PoolCacheUpdate batch (processing only, excludes batch fetch wait)",
+                                );
                             }
                         }
                         Err(e) => {
@@ -8027,7 +8183,6 @@ async fn generate_and_publish_buy_intent(
     Ok(())
 }
 
-/// Scope C: trade / pool discovery / bonding events that can be heavy and should log latency.
 #[inline]
 fn momentum_scope_c_price_sensitive_market_kind(kind: &MarketEventKind) -> bool {
     matches!(
@@ -8046,6 +8201,104 @@ fn momentum_scope_c_market_kind_tag(kind: &MarketEventKind) -> &'static str {
         MarketEventKind::BondingCurveProgress { .. } => "BondingCurveProgress",
         _ => "Other",
     }
+}
+
+/// Stats for Scope C bonding burst coalescing on Core NATS (per-mint latest Geyser slot/ts wins).
+#[derive(Debug, Clone, Copy, Default)]
+struct BondingStreakCoalesceStats {
+    raw_messages: u32,
+    emitted_events: u32,
+    stale_dropped: u32,
+}
+
+/// Collapse a bounded streak of `BondingCurveProgress` events to one event per mint (deterministic mint order).
+fn coalesce_bonding_curve_progress_streak(
+    streak: Vec<MarketEvent>,
+) -> (Vec<MarketEvent>, BondingStreakCoalesceStats) {
+    let raw_messages = streak.len() as u32;
+    if streak.is_empty() {
+        return (Vec::new(), BondingStreakCoalesceStats::default());
+    }
+    let mut best_by_mint: HashMap<String, usize> = HashMap::new();
+    for (i, e) in streak.iter().enumerate() {
+        let MarketEventKind::BondingCurveProgress { mint, .. } = &e.kind else {
+            continue;
+        };
+        match best_by_mint.get(mint.as_str()) {
+            None => {
+                best_by_mint.insert(mint.clone(), i);
+            }
+            Some(&wi) => {
+                let cand = &streak[i];
+                let prev = &streak[wi];
+                let s_c = cand.slot.unwrap_or(0);
+                let t_c = cand.header.ts_unix_ms;
+                let s_p = prev.slot.unwrap_or(0);
+                let t_p = prev.header.ts_unix_ms;
+                if bonding_geyser_observation_is_newer(s_c, t_c, s_p, t_p)
+                    || (s_c == s_p && t_c == t_p && i > wi)
+                {
+                    best_by_mint.insert(mint.clone(), i);
+                }
+            }
+        }
+    }
+    let mut key_index: Vec<(String, usize)> = best_by_mint.into_iter().collect();
+    key_index.sort_by(|a, b| a.0.cmp(&b.0));
+    let emitted: Vec<MarketEvent> = key_index
+        .into_iter()
+        .map(|(_, idx)| streak[idx].clone())
+        .collect();
+    let emitted_events = emitted.len() as u32;
+    let stale_dropped = raw_messages.saturating_sub(emitted_events);
+    (
+        emitted,
+        BondingStreakCoalesceStats {
+            raw_messages,
+            emitted_events,
+            stale_dropped,
+        },
+    )
+}
+
+/// Phase-2 winner per `pool_address` for reserve-derived marks / `update_position_price` in one JetStream batch.
+/// Caller must apply every `PoolCacheUpdate` to `LivePoolCache` in arrival order before using winners here.
+///
+/// `derived[i]` must be `Some` iff `ctx.derive_tokens_per_sol_from_pool_cache_update(&updates[i]).is_some()`.
+fn select_pool_cache_batch_price_path_winners(
+    updates: &[ironcrab::ipc::PoolCacheUpdate],
+    derived: &[PoolCacheDerivedTps],
+) -> (HashMap<String, usize>, u32) {
+    debug_assert_eq!(updates.len(), derived.len());
+    let mut derive_ok_per_pool: HashMap<String, usize> = HashMap::new();
+    let mut derive_ok_total: u32 = 0;
+    for (idx, update) in updates.iter().enumerate() {
+        if derived.get(idx).and_then(|d| d.as_ref()).is_none() {
+            continue;
+        }
+        derive_ok_total = derive_ok_total.saturating_add(1);
+        let pool = update.pool_address.clone();
+        match derive_ok_per_pool.get(&pool) {
+            None => {
+                derive_ok_per_pool.insert(pool, idx);
+            }
+            Some(&best_idx) => {
+                let best_u = &updates[best_idx];
+                let s_c = update.geyser_slot;
+                let t_c = update.header.ts_unix_ms;
+                let s_p = best_u.geyser_slot;
+                let t_p = best_u.header.ts_unix_ms;
+                if bonding_geyser_observation_is_newer(s_c, t_c, s_p, t_p)
+                    || (s_c == s_p && t_c == t_p && idx > best_idx)
+                {
+                    derive_ok_per_pool.insert(pool, idx);
+                }
+            }
+        }
+    }
+    let winner_count = derive_ok_per_pool.len() as u32;
+    let stale = derive_ok_total.saturating_sub(winner_count);
+    (derive_ok_per_pool, stale)
 }
 
 /// Wall-clock lag from producer `RecordHeader.ts_unix_ms` to momentum-bot ingest (ms).
@@ -10895,6 +11148,164 @@ mod tests {
         assert!(
             EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES < EXECUTION_RESULT_SCHEDULED_FETCH_EXPIRES
         );
+    }
+
+    fn mk_bonding_progress_event(
+        mint: &str,
+        slot: Option<u64>,
+        ts_unix_ms: u64,
+        progress_bps: u32,
+    ) -> MarketEvent {
+        let mut header = RecordHeader::new("test", BUILD_VERSION, "run");
+        header.ts_unix_ms = ts_unix_ms;
+        MarketEvent {
+            header,
+            event_id: format!("evt-{ts_unix_ms}-{progress_bps}"),
+            source: "geyser".into(),
+            slot,
+            kind: MarketEventKind::BondingCurveProgress {
+                mint: mint.to_string(),
+                bonding_curve: "bc1".into(),
+                progress_bps,
+                complete: false,
+            },
+        }
+    }
+
+    #[test]
+    fn scope_c_bonding_streak_coalesce_picks_latest_slot_per_mint() {
+        let streak = vec![
+            mk_bonding_progress_event("MintA", Some(10), 1, 1_000),
+            mk_bonding_progress_event("MintA", Some(12), 1, 2_000),
+            mk_bonding_progress_event("MintA", Some(11), 1, 3_000),
+        ];
+        let (out, stats) = coalesce_bonding_curve_progress_streak(streak);
+        assert_eq!(stats.raw_messages, 3);
+        assert_eq!(stats.emitted_events, 1);
+        assert_eq!(stats.stale_dropped, 2);
+        let MarketEventKind::BondingCurveProgress { progress_bps, .. } = &out[0].kind else {
+            panic!("expected BondingCurveProgress");
+        };
+        assert_eq!(*progress_bps, 2_000);
+        assert_eq!(out[0].slot, Some(12));
+    }
+
+    #[test]
+    fn scope_c_bonding_streak_missing_slot_does_not_replace_slotted() {
+        let streak = vec![
+            mk_bonding_progress_event("MintB", Some(100), 1, 1_000),
+            mk_bonding_progress_event("MintB", None, 9_999, 9_000),
+        ];
+        let (out, _) = coalesce_bonding_curve_progress_streak(streak);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].slot, Some(100));
+    }
+
+    #[test]
+    fn scope_c_bonding_streak_two_mints_both_emitted_sorted() {
+        let streak = vec![
+            mk_bonding_progress_event("Zmint", Some(1), 1, 100),
+            mk_bonding_progress_event("Amint", Some(2), 1, 200),
+        ];
+        let (out, stats) = coalesce_bonding_curve_progress_streak(streak);
+        assert_eq!(stats.stale_dropped, 0);
+        assert_eq!(out.len(), 2);
+        let MarketEventKind::BondingCurveProgress { mint, .. } = &out[0].kind else {
+            panic!();
+        };
+        assert_eq!(mint, "Amint");
+    }
+
+    #[test]
+    fn scope_c_pool_cache_price_path_winner_and_stale_derive_count() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        ctx.record_mint_info(
+            "TokM",
+            MintInfo {
+                token_program: String::new(),
+                decimals: 6,
+                supply: 0,
+                mint_authority: None,
+                freeze_authority: None,
+                last_updated: Instant::now(),
+            },
+        );
+        let updates = vec![
+            pool_cache_update_stub("TokM", "poolP", 1_000_000, 1_000_000_000, 10, 1),
+            pool_cache_update_stub("TokM", "poolP", 2_000_000, 1_000_000_000, 30, 2),
+            pool_cache_update_stub("TokM", "poolP", 3_000_000, 1_000_000_000, 20, 3),
+        ];
+        let derived: Vec<PoolCacheDerivedTps> = updates
+            .iter()
+            .map(|u| ctx.derive_tokens_per_sol_from_pool_cache_update(u))
+            .collect();
+        let (winners, stale) = select_pool_cache_batch_price_path_winners(&updates, &derived);
+        assert_eq!(winners.get("poolP").copied(), Some(1));
+        assert_eq!(stale, 2);
+    }
+
+    #[tokio::test]
+    async fn scope_c_pool_cache_coalesced_price_respects_position_pool_only() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let mint = "TokPool";
+        ctx.record_mint_info(
+            mint,
+            MintInfo {
+                token_program: String::new(),
+                decimals: 6,
+                supply: 0,
+                mint_authority: None,
+                freeze_authority: None,
+                last_updated: Instant::now(),
+            },
+        );
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "posPool",
+            dex: "raydium",
+            entry_price: 10.0,
+            token_decimals: 6,
+            token_amount: 1_000_000,
+            sol_invested: 1_000_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 100,
+            initial_bonding: None,
+        });
+        let updates = vec![
+            pool_cache_update_stub(mint, "wrongPool", 5_000_000, 1_000_000_000, 200, 1),
+            pool_cache_update_stub(mint, "posPool", 2_000_000, 1_000_000_000, 201, 2),
+        ];
+        let derived: Vec<PoolCacheDerivedTps> = updates
+            .iter()
+            .map(|u| ctx.derive_tokens_per_sol_from_pool_cache_update(u))
+            .collect();
+        let (winners, _) = select_pool_cache_batch_price_path_winners(&updates, &derived);
+        let mut applied: u32 = 0;
+        for (_, idx) in winners {
+            let update = &updates[idx];
+            let Some(Some((ref token_mint, tps, _, _, _))) = derived.get(idx) else {
+                continue;
+            };
+            if ctx.update_position_price(
+                token_mint,
+                *tps,
+                None,
+                Some(update.pool_address.as_str()),
+                Some(update.geyser_slot),
+            ) {
+                applied = applied.saturating_add(1);
+            }
+        }
+        assert_eq!(applied, 1);
+        let pos = ctx.positions.read().get(mint).unwrap().clone();
+        assert_eq!(pos.last_price_slot, 201);
     }
 }
 

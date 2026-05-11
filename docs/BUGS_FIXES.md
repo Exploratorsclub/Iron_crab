@@ -1213,3 +1213,15 @@ BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap 
 | **Betroffene Module** | `src/bin/momentum_bot.rs` |
 | **Regression-Prüfung** | `process_exit_signals` unmittelbar nach Pool-Cache-Preis-Updates unverändert; Scope-D Quote-Gating unangetastet; Unit-Tests fuer Scope-C-Hilfsfunktionen. |
 | **Tags** | [momentum, jetstream, execution_result, latency, scope-c, i-24a] |
+
+---
+
+## FIX-49: Momentum Scope C — Latest-State-Coalescing (Bonding + PoolCache) und Lag-/Backlog-Decision-Gate
+
+| Symptom | Dichte `BondingCurveProgress`- und `PoolCacheUpdate`-Bursts erzeugen redundante Strategie-/Preisarbeit; Observability zeigte Verarbeitungsdauer, aber wenig belastbare Kennzahlen fuer spaeteres Sharding. |
+|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | Core-NATS verarbeitet je `select!`-Runde nur ein MarketEvent; PoolCache-JetStream wendete fuer jede Nachricht sofort den teuren Reserve-/Positions-Preis-Pfad an, obwohl `LivePoolCache` bereits slot-/merge-faehig ist und `merge_bonding_curve_progress_geyser` ohnehin monoton arbeitet. |
+| **Fix** | (1) **BondingCurveProgress:** Bis zu 32 aufeinanderfolgende Nachrichten per `now_or_never` ziehen, pro Mint per Geyser `(slot, ts)` auf einen Gewinner reduzieren, deterministisch nach Mint sortiert ausfuehren; strukturiertes `debug!` mit `stale_dropped` und `decision_gate_stale_ratio_permille`. (2) **PoolCacheUpdate:** Zwei Phasen — alle Updates in Batch-Reihenfolge auf `LivePoolCache` anwenden, danach hoechstens **einen** WSOL-abgeleiteten Preis-/Sticky-Pfad pro `pool_address` und Batch (gleiche Monotonie-Regel wie Scope B); `position_price_updates` zaehlt nur noch tatsaechlich angewendete `update_position_price`-Updates (`bool`-Rueckgabe). Erweiterte Batch-Logs: `unique_pools_touched`, `coalesced_price_path_keys`, `stale_price_path_candidates`, `max_slot_lag_vs_head` (nur wenn `last_slot` und Update-Slot > 0), `execution_results_drained_after_batch`, `decision_gate_shard_hint_permille`. (3) `update_position_price` liefert `bool` fuer saubere Metrik. |
+| **Betroffene Module** | `src/bin/momentum_bot.rs` |
+| **Regression-Pruefung** | Neue Unit-Tests fuer Bonding-Coalescing, Pool-Winner-Auswahl, Stale-Zaehlung und I-13 Pool-Match; `cargo test` / `cargo clippy --all-targets -D warnings`. |
+| **Tags** | [momentum, scope-c, coalescing, observability, jetstream, i-13, i-16] |
