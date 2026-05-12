@@ -3496,6 +3496,19 @@ impl MomentumContext {
         }
     }
 
+    /// True if some **other** pool-scoped tracker row for `mint` is already rejected (used so
+    /// `tokens_blacklisted` stays mint-level across `check_for_signals` / `record_trade` boundaries).
+    #[inline]
+    fn any_other_pool_tracker_rejected_for_mint(
+        trackers: &HashMap<String, TokenTracker>,
+        mint: &str,
+        exclude_pool: &str,
+    ) -> bool {
+        trackers
+            .values()
+            .any(|t| t.mint == mint && t.pool.as_str() != exclude_pool && t.is_rejected())
+    }
+
     /// Check if any tracked token should generate an intent
     fn check_for_signals(&self) -> Vec<EntrySignal> {
         // Returns entry intents (probe + optional scale-in)
@@ -3551,12 +3564,24 @@ impl MomentumContext {
             .clamp(0.0, config.default_position_lamports as f64) as u64;
         let scale_sol = config.default_position_lamports.saturating_sub(probe_sol);
 
-        for tracker in trackers.values_mut() {
-            let mint = tracker.mint.clone();
+        // Deterministic iteration: `HashMap::values_mut()` order is arbitrary and can flip which
+        // pool "wins" when multiple tracker rows are eligible for the same mint in one tick.
+        let mut tracker_keys: Vec<String> = trackers.keys().cloned().collect();
+        tracker_keys.sort_unstable();
+
+        'tracker_keys: for key in tracker_keys {
+            let mint = match trackers.get(&key) {
+                Some(t) => t.mint.clone(),
+                None => continue,
+            };
 
             // I-13 / multi-pool: only the position's pool may continue entry/scale on this mint.
             if let Some(pos) = positions.get(&mint) {
-                if tracker.pool != pos.pool {
+                let same_pool = trackers
+                    .get(&key)
+                    .map(|t| t.pool == pos.pool)
+                    .unwrap_or(false);
+                if !same_pool {
                     continue;
                 }
             }
@@ -3564,7 +3589,11 @@ impl MomentumContext {
             // At most one pending BUY per mint — ignore other pool trackers while one is in-flight.
             if let Some(intent_id) = pending_buy_index.get(&mint) {
                 if let Some(entry) = pending_buy_entries.get(intent_id.as_str()) {
-                    if entry.pool.as_str() != tracker.pool.as_str() {
+                    let pool_matches_pending = trackers
+                        .get(&key)
+                        .map(|t| entry.pool.as_str() == t.pool.as_str())
+                        .unwrap_or(false);
+                    if !pool_matches_pending {
                         continue;
                     }
                 }
@@ -3572,24 +3601,44 @@ impl MomentumContext {
             }
 
             // Skip tokens in terminal states
-            if tracker.is_entry_complete() {
-                continue;
+            match trackers.get(&key) {
+                None => continue,
+                Some(t) if t.is_entry_complete() => continue,
+                Some(_) => {}
             }
 
+            let (this_pool, dex_for_migration) = match trackers.get(&key) {
+                Some(t) => (t.pool.clone(), t.dex.clone()),
+                None => continue,
+            };
+
             // Completed / migrated PumpFun bonding curve on this pool (or mint-level cache evidence).
-            if self.pumpfun_entry_blocked_by_migration(&mint, &tracker.pool, &tracker.dex) {
-                let was_not_rejected = tracker.was_not_rejected();
-                tracker.reject("REJECT_PUMPFUN_BONDING_COMPLETE");
-                if was_not_rejected && tracker.is_rejected() {
-                    warn!(
-                        mint = %mint,
-                        pool = %tracker.pool,
-                        dex = %tracker.dex,
-                        "REJECT_PUMPFUN_BONDING_COMPLETE: skip entry — migrated bonding curve / complete evidence (pump_amm unaffected)"
-                    );
-                    if check_for_signals_blacklist_metric_mints.insert(mint.clone()) {
-                        self.tokens_blacklisted
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.pumpfun_entry_blocked_by_migration(&mint, &this_pool, &dex_for_migration) {
+                let no_prior_sibling_rejected = !Self::any_other_pool_tracker_rejected_for_mint(
+                    &trackers,
+                    &mint,
+                    this_pool.as_str(),
+                );
+                let was_not_rejected = trackers
+                    .get(&key)
+                    .expect("tracker key from iteration")
+                    .was_not_rejected();
+                {
+                    let tracker = trackers.get_mut(&key).expect("tracker key from iteration");
+                    tracker.reject("REJECT_PUMPFUN_BONDING_COMPLETE");
+                    if was_not_rejected && tracker.is_rejected() {
+                        warn!(
+                            mint = %mint,
+                            pool = %tracker.pool,
+                            dex = %tracker.dex,
+                            "REJECT_PUMPFUN_BONDING_COMPLETE: skip entry — migrated bonding curve / complete evidence (pump_amm unaffected)"
+                        );
+                        if no_prior_sibling_rejected
+                            && check_for_signals_blacklist_metric_mints.insert(mint.clone())
+                        {
+                            self.tokens_blacklisted
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
                 continue;
@@ -3598,7 +3647,7 @@ impl MomentumContext {
             // Another pool for this mint already has an entry BUY in-flight — serialize mint-level entry.
             if sibling_entry_busy
                 .iter()
-                .any(|(m, p)| m == &mint && p.as_str() != tracker.pool.as_str())
+                .any(|(m, p)| m == &mint && p.as_str() != this_pool.as_str())
             {
                 continue;
             }
@@ -3606,53 +3655,61 @@ impl MomentumContext {
             let mint_info = mint_infos.get(&mint);
 
             // 1) Probe-buy stage (Discovery or Validation state)
-            if matches!(
-                tracker.state,
-                TrackerState::Discovery | TrackerState::Validation
-            ) {
-                let was_not_rejected = tracker.was_not_rejected();
-                let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
-                if was_not_rejected
-                    && tracker.is_rejected()
-                    && check_for_signals_blacklist_metric_mints.insert(mint.clone())
+            let in_probe_stage = trackers
+                .get(&key)
+                .map(|t| matches!(t.state, TrackerState::Discovery | TrackerState::Validation))
+                .unwrap_or(false);
+            if in_probe_stage {
+                let no_prior_sibling_rejected = !Self::any_other_pool_tracker_rejected_for_mint(
+                    &trackers,
+                    &mint,
+                    this_pool.as_str(),
+                );
                 {
-                    self.tokens_blacklisted
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
+                    let tracker = trackers.get_mut(&key).expect("tracker key from iteration");
+                    let was_not_rejected = tracker.was_not_rejected();
+                    let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
+                    if was_not_rejected
+                        && tracker.is_rejected()
+                        && no_prior_sibling_rejected
+                        && check_for_signals_blacklist_metric_mints.insert(mint.clone())
+                    {
+                        self.tokens_blacklisted
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
 
-                if should_trade {
-                    if mint_emitted_entry_this_tick.contains(&mint) {
-                        continue;
-                    }
-                    if probe_sol == 0 {
-                        warn!(
-                            mint = %mint,
-                            pool = %tracker.pool,
-                            dex = %tracker.dex,
-                            default_position_lamports = config.default_position_lamports,
-                            probe_buy_pct = config.probe_buy_pct,
-                            "Entry signal suppressed: probe_sol rounds to 0; increase default_position_lamports or probe_buy_pct"
-                        );
-                        tracker.state = TrackerState::PositionOpenFull {
-                            filled_at: Instant::now(),
+                    if should_trade {
+                        if mint_emitted_entry_this_tick.contains(&mint) {
+                            continue 'tracker_keys;
+                        }
+                        if probe_sol == 0 {
+                            warn!(
+                                mint = %mint,
+                                pool = %tracker.pool,
+                                dex = %tracker.dex,
+                                default_position_lamports = config.default_position_lamports,
+                                probe_buy_pct = config.probe_buy_pct,
+                                "Entry signal suppressed: probe_sol rounds to 0; increase default_position_lamports or probe_buy_pct"
+                            );
+                            tracker.state = TrackerState::PositionOpenFull {
+                                filled_at: Instant::now(),
+                            };
+                            continue 'tracker_keys;
+                        }
+                        tracker.state = TrackerState::ProbeBuyPending {
+                            sent_at: Instant::now(),
                         };
-                        continue;
-                    }
-                    tracker.state = TrackerState::ProbeBuyPending {
-                        sent_at: Instant::now(),
-                    };
-                    mint_emitted_entry_this_tick.insert(mint.clone());
-                    signals.push(EntrySignal {
-                        mint,
-                        pool: tracker.pool.clone(),
-                        dex: tracker.dex.clone(),
-                        sol_amount: probe_sol,
-                        kind: EntryKind::Probe,
-                        reason: format!("ENTER_PROBE_BUY: {reason}"),
-                    });
-                } else {
-                    // Move to validation state if not yet there
-                    if matches!(tracker.state, TrackerState::Discovery) {
+                        mint_emitted_entry_this_tick.insert(mint.clone());
+                        signals.push(EntrySignal {
+                            mint,
+                            pool: tracker.pool.clone(),
+                            dex: tracker.dex.clone(),
+                            sol_amount: probe_sol,
+                            kind: EntryKind::Probe,
+                            reason: format!("ENTER_PROBE_BUY: {reason}"),
+                        });
+                    } else if matches!(tracker.state, TrackerState::Discovery) {
+                        // Move to validation state if not yet there
                         tracker.state = TrackerState::Validation;
                     }
                 }
@@ -3660,52 +3717,66 @@ impl MomentumContext {
             }
 
             // 2) Scale-in stage (only after probe fill, within confirm window)
-            if let TrackerState::PositionOpenProbe { filled_at } = tracker.state {
+            let probe_filled_at = trackers.get(&key).and_then(|t| match t.state {
+                TrackerState::PositionOpenProbe { filled_at } => Some(filled_at),
+                _ => None,
+            });
+            if let Some(filled_at) = probe_filled_at {
                 let now = Instant::now();
                 if now.duration_since(filled_at).as_secs() > config.scale_in_confirm_window_secs {
                     // Confirmation window expired: keep probe position only.
+                    let tracker = trackers.get_mut(&key).expect("tracker key from iteration");
                     tracker.state = TrackerState::PositionOpenFull { filled_at };
                     continue;
                 }
 
-                let was_not_rejected = tracker.was_not_rejected();
-                let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
-                if was_not_rejected
-                    && tracker.is_rejected()
-                    && check_for_signals_blacklist_metric_mints.insert(mint.clone())
+                let no_prior_sibling_rejected = !Self::any_other_pool_tracker_rejected_for_mint(
+                    &trackers,
+                    &mint,
+                    this_pool.as_str(),
+                );
                 {
-                    self.tokens_blacklisted
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
+                    let tracker = trackers.get_mut(&key).expect("tracker key from iteration");
+                    let was_not_rejected = tracker.was_not_rejected();
+                    let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
+                    if was_not_rejected
+                        && tracker.is_rejected()
+                        && no_prior_sibling_rejected
+                        && check_for_signals_blacklist_metric_mints.insert(mint.clone())
+                    {
+                        self.tokens_blacklisted
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
 
-                if should_trade {
-                    if mint_emitted_entry_this_tick.contains(&mint) {
-                        continue;
+                    if should_trade {
+                        if mint_emitted_entry_this_tick.contains(&mint) {
+                            continue 'tracker_keys;
+                        }
+                        if scale_sol == 0 {
+                            warn!(
+                                mint = %mint,
+                                pool = %tracker.pool,
+                                dex = %tracker.dex,
+                                default_position_lamports = config.default_position_lamports,
+                                probe_buy_pct = config.probe_buy_pct,
+                                "Scale-in suppressed: scale_sol is 0 (after probe rounding); increase default_position_lamports or adjust probe_buy_pct"
+                            );
+                            tracker.state = TrackerState::PositionOpenFull { filled_at };
+                            continue 'tracker_keys;
+                        }
+                        tracker.state = TrackerState::ScaleInPending {
+                            sent_at: Instant::now(),
+                        };
+                        mint_emitted_entry_this_tick.insert(mint.clone());
+                        signals.push(EntrySignal {
+                            mint,
+                            pool: tracker.pool.clone(),
+                            dex: tracker.dex.clone(),
+                            sol_amount: scale_sol,
+                            kind: EntryKind::ScaleIn,
+                            reason: format!("ENTER_SCALE_IN: {reason}"),
+                        });
                     }
-                    if scale_sol == 0 {
-                        warn!(
-                            mint = %mint,
-                            pool = %tracker.pool,
-                            dex = %tracker.dex,
-                            default_position_lamports = config.default_position_lamports,
-                            probe_buy_pct = config.probe_buy_pct,
-                            "Scale-in suppressed: scale_sol is 0 (after probe rounding); increase default_position_lamports or adjust probe_buy_pct"
-                        );
-                        tracker.state = TrackerState::PositionOpenFull { filled_at };
-                        continue;
-                    }
-                    tracker.state = TrackerState::ScaleInPending {
-                        sent_at: Instant::now(),
-                    };
-                    mint_emitted_entry_this_tick.insert(mint.clone());
-                    signals.push(EntrySignal {
-                        mint,
-                        pool: tracker.pool.clone(),
-                        dex: tracker.dex.clone(),
-                        sol_amount: scale_sol,
-                        kind: EntryKind::ScaleIn,
-                        reason: format!("ENTER_SCALE_IN: {reason}"),
-                    });
                 }
             }
         }
