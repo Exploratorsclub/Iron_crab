@@ -2587,8 +2587,14 @@ impl MomentumContext {
         format!("{mint}\x1f{pool}")
     }
 
-    /// PumpFun bonding curve completed / migrated — do not emit BUY intents for this **pumpfun** pool.
-    /// Uses `mint_pools` row + LivePoolCache/sticky evidence only (no RPC). Never applies to `pump_amm`.
+    /// Returns `true` only for **`dex == "pumpfun"`** bonding-curve entry: do not emit BUY intents when
+    /// this PumpFun pool is complete/migrated. **Early return for any other DEX** (Raydium, Orca,
+    /// `pump_amm`, …): mint-wide LivePoolCache / sticky migration evidence is **never** applied to
+    /// non-PumpFun pools — that evidence is intentionally conservative for **PumpFun-only** entry when
+    /// per-pool `bonding_curve_complete` is missing or stale; it must **not** block `pump_amm` or other
+    /// venues for the same mint (I-13 / pool ownership stays per tracker row).
+    ///
+    /// Evidence is Geyser/cache-only (no RPC): `mint_pools` row for this pool + [`Self::live_cache_pumpfun_complete_evidence`].
     fn pumpfun_entry_blocked_by_migration(&self, mint: &str, pool: &str, dex: &str) -> bool {
         if dex != "pumpfun" {
             return false;
@@ -3493,25 +3499,22 @@ impl MomentumContext {
         let pending_buy_index = self.pending_buy_mint_index.read();
         let pending_buy_entries = self.pending_buy_entries.read();
 
-        // Snapshot pools that already have an entry BUY in-flight (avoid overlapping mutable borrows).
-        let sibling_entry_busy: Vec<(String, String)> = {
-            let trackers_ro = self.token_trackers.read();
-            trackers_ro
-                .values()
-                .filter(|t| {
-                    matches!(
-                        t.state,
-                        TrackerState::ProbeBuyPending { .. } | TrackerState::ScaleInPending { .. }
-                    )
-                })
-                .map(|t| (t.mint.clone(), t.pool.clone()))
-                .collect()
-        };
-
         let mut trackers = self.token_trackers.write();
+        // Under the same write lock as the signal loop: pending probe/scale-in pools for mint-level serialization.
+        let sibling_entry_busy: Vec<(String, String)> = trackers
+            .values()
+            .filter(|t| {
+                matches!(
+                    t.state,
+                    TrackerState::ProbeBuyPending { .. } | TrackerState::ScaleInPending { .. }
+                )
+            })
+            .map(|t| (t.mint.clone(), t.pool.clone()))
+            .collect();
+
         let mut signals = Vec::new();
         // At most one entry signal (probe or scale-in) per mint per `check_for_signals` call.
-        // `pending_buy_mint_index` updates after publish; sibling snapshot is pre-loop — both can miss same-tick races.
+        // `pending_buy_mint_index` updates after publish; `mint_emitted_entry_this_tick` covers same-tick races.
         let mut mint_emitted_entry_this_tick: HashSet<String> = HashSet::new();
         // PumpFun migration gate may reject multiple pool rows per mint in one pass — metric is mint-level.
         let mut pumpfun_migration_blacklist_metric_mints: HashSet<String> = HashSet::new();
@@ -9730,6 +9733,32 @@ mod tests {
                 .is_rejected()
         };
         assert!(pf_rejected);
+    }
+
+    /// Contract: [`MomentumContext::pumpfun_entry_blocked_by_migration`] is PumpFun-only; mint-wide
+    /// migration evidence must not affect `pump_amm` eligibility via this helper.
+    #[test]
+    fn pumpfun_entry_blocked_by_migration_never_true_for_pump_amm_with_sticky_evidence() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "MintPFAmmGate444444444444444444444444444444";
+        let pool_pf = "poolPFgate444444444444444444444444444444444";
+        let pool_amm = "poolAMMgate44444444444444444444444444444444";
+
+        ctx.register_pool(mint, pool_pf, "pumpfun", 1);
+        ctx.merge_pumpfun_migration_complete_evidence(mint, 100, 1);
+
+        assert!(
+            !ctx.pumpfun_entry_blocked_by_migration(mint, pool_amm, "pump_amm"),
+            "dex guard: pump_amm must not consult mint-wide PumpFun complete evidence in this helper"
+        );
+        assert!(
+            ctx.pumpfun_entry_blocked_by_migration(mint, pool_pf, "pumpfun"),
+            "pumpfun may use mint-wide evidence when pool row is not yet marked bonding_curve_complete"
+        );
     }
 
     /// `tokens_blacklisted` is mint-level: one `record_dev_info` event rejects two pool rows → +1 not +2.
