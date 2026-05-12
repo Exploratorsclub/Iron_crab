@@ -3516,10 +3516,9 @@ impl MomentumContext {
         // At most one entry signal (probe or scale-in) per mint per `check_for_signals` call.
         // `pending_buy_mint_index` updates after publish; `mint_emitted_entry_this_tick` covers same-tick races.
         let mut mint_emitted_entry_this_tick: HashSet<String> = HashSet::new();
-        // PumpFun migration gate may reject multiple pool rows per mint in one pass — metric is mint-level.
-        let mut pumpfun_migration_blacklist_metric_mints: HashSet<String> = HashSet::new();
-        // `should_generate_intent` strategy rejections: same mint can have multiple pool-scoped trackers.
-        let mut strategy_rejection_blacklist_metric_mints: HashSet<String> = HashSet::new();
+        // Mint-level observability: at most one `tokens_blacklisted` bump per mint per pass across
+        // PumpFun migration rejects and `should_generate_intent` strategy rejects (separate trackers).
+        let mut check_for_signals_blacklist_metric_mints: HashSet<String> = HashSet::new();
 
         let probe_sol = ((config.default_position_lamports as f64) * config.probe_buy_pct)
             .round()
@@ -3562,7 +3561,7 @@ impl MomentumContext {
                         dex = %tracker.dex,
                         "REJECT_PUMPFUN_BONDING_COMPLETE: skip entry — migrated bonding curve / complete evidence (pump_amm unaffected)"
                     );
-                    if pumpfun_migration_blacklist_metric_mints.insert(mint.clone()) {
+                    if check_for_signals_blacklist_metric_mints.insert(mint.clone()) {
                         self.tokens_blacklisted
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -3589,7 +3588,7 @@ impl MomentumContext {
                 let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
                 if was_not_rejected
                     && tracker.is_rejected()
-                    && strategy_rejection_blacklist_metric_mints.insert(mint.clone())
+                    && check_for_signals_blacklist_metric_mints.insert(mint.clone())
                 {
                     self.tokens_blacklisted
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3647,7 +3646,7 @@ impl MomentumContext {
                 let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
                 if was_not_rejected
                     && tracker.is_rejected()
-                    && strategy_rejection_blacklist_metric_mints.insert(mint.clone())
+                    && check_for_signals_blacklist_metric_mints.insert(mint.clone())
                 {
                     self.tokens_blacklisted
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10094,6 +10093,162 @@ mod tests {
         );
     }
 
+    /// `tokens_blacklisted`: at most one bump per mint per `check_for_signals` across PumpFun migration + strategy reject.
+    #[test]
+    fn tokens_blacklisted_at_most_once_per_check_for_signals_migration_plus_strategy() {
+        let cfg = {
+            let mut c = MomentumConfig::default();
+            c.default_position_lamports = 1_000;
+            c.probe_buy_pct = 0.25;
+            c.early_min_liquidity_sol = 0.0;
+            c.min_unique_buyers = 0;
+            c.min_trades_per_sec = 0.0;
+            c.min_buy_dominance = 0.0;
+            c.min_sol_inflow_lamports = 0;
+            c.require_mint_authority_renounced = true;
+            c.require_freeze_authority_none = false;
+            c.top1_buyer_share_cap = 1.0;
+            c.top3_buyer_share_cap = 1.0;
+            c.repeat_buyer_min_ratio = 0.0;
+            c.min_trade_size_lamports = 0;
+            c.small_buy_ratio_cap = 1.0;
+            c
+        };
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "MintBlDedupeMigStr7777777777777777777777777";
+        let pool_pf = "poolPFDedMig777777777777777777777777777777";
+        let pool_or = "poolOrcaDedMig7777777777777777777777777777";
+
+        ctx.register_pool(mint, pool_pf, "pumpfun", 1);
+        ctx.register_pool(mint, pool_or, "orca", 2);
+        {
+            let mut pools = ctx.mint_pools.write();
+            let list = pools.get_mut(mint).expect("pools");
+            for p in list.iter_mut() {
+                if p.pool_address == pool_pf {
+                    p.bonding_curve_complete = Some(true);
+                }
+            }
+        }
+        ctx.merge_pumpfun_migration_complete_evidence(mint, 99, 1);
+
+        ctx.record_mint_info(
+            mint,
+            MintInfo {
+                token_program: "spl-token".to_string(),
+                decimals: 6,
+                supply: 1,
+                mint_authority: Some("auth1".to_string()),
+                freeze_authority: None,
+                last_updated: Instant::now(),
+            },
+        );
+
+        {
+            let mut trackers = ctx.token_trackers.write();
+            for (pool, dex) in [(pool_pf, "pumpfun"), (pool_or, "orca")] {
+                let mut tr = TokenTracker::new(mint, pool, dex, 1, 30_000_000_000);
+                for i in 0..20 {
+                    tr.record_trade(
+                        &format!("u{i:03}"),
+                        true,
+                        200_000_000,
+                        2_000_000,
+                        &format!("sx{i}"),
+                        &cfg,
+                    );
+                }
+                trackers.insert(MomentumContext::tracker_storage_key(mint, pool), tr);
+            }
+        }
+
+        let before = ctx.tokens_blacklisted.load(Ordering::Relaxed);
+        let _ = ctx.check_for_signals();
+        let after = ctx.tokens_blacklisted.load(Ordering::Relaxed);
+        assert_eq!(
+            after.saturating_sub(before),
+            1,
+            "mint-level metric: single bump per check_for_signals across migration + strategy paths"
+        );
+    }
+
+    /// Trade `creator` applies mint-wide before `record_trade`: sibling pool dev sell early rejects.
+    #[test]
+    fn trade_creator_mint_wide_dev_sell_early_rejects_sibling_pool_tracker() {
+        let mut cfg = MomentumConfig::default();
+        cfg.cto_enabled = false;
+        cfg.dev_early_sell_window_secs = 300;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        *ctx.config.write() = cfg.clone();
+
+        const WSOL: &str = "So11111111111111111111111111111111111111112";
+        let mint = "MintTradDevSibling666666666666666666666666666";
+        let pool_a = "poolDevSib6111111111111111111111111111111111";
+        let pool_b = "poolDevSib6222222222222222222222222222222222";
+        let dev = "DevWbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let mut tr_a = TokenTracker::new(mint, pool_a, "pumpfun", 1, 30_000_000_000);
+            tr_a.record_trade("buyer01", true, 500_000_000, 1_000_000, "sig0", &cfg);
+            trackers.insert(MomentumContext::tracker_storage_key(mint, pool_a), tr_a);
+
+            let mut tr_b = TokenTracker::new(mint, pool_b, "pumpfun", 1, 30_000_000_000);
+            tr_b.record_trade("buyer02", true, 500_000_000, 1_000_000, "sig0b", &cfg);
+            trackers.insert(MomentumContext::tracker_storage_key(mint, pool_b), tr_b);
+        }
+
+        let evt = MarketEvent {
+            header: RecordHeader::new("test", BUILD_VERSION, "run"),
+            event_id: "ev-dev-sell-sibling".into(),
+            source: "geyser".into(),
+            slot: Some(42),
+            kind: MarketEventKind::Trade {
+                pool_address: pool_b.to_string(),
+                mint: mint.to_string(),
+                quote_mint: WSOL.to_string(),
+                trader: dev.to_string(),
+                is_buy: false,
+                sol_amount: 50_000_000,
+                token_amount: 1,
+                token_decimals: 6,
+                signature: Some("sig-ds".into()),
+                dex: "pumpfun".into(),
+                creator: Some(dev.to_string()),
+                token_program: None,
+            },
+        };
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            process_market_event(&ctx, &evt)
+                .await
+                .expect("process trade");
+        });
+
+        let sibling_rejected = {
+            let trackers = ctx.token_trackers.read();
+            trackers
+                .get(&MomentumContext::tracker_storage_key(mint, pool_b))
+                .expect("sibling tracker")
+                .is_rejected()
+        };
+        assert!(
+            sibling_rejected,
+            "sibling pool tracker should reject dev sell early after mint-wide creator from Trade"
+        );
+    }
+
     /// Trade-driven reject: `tokens_blacklisted` bumps at most once per mint across pool rows.
     #[test]
     fn tokens_blacklisted_trade_rejection_once_per_mint_two_pool_trackers() {
@@ -12687,6 +12842,38 @@ async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -
             // Update trade data in multi-pool registry
             ctx.update_pool_trade_data(mint, pool_address, event_dex, sol_lamports, token_raw, event.slot.unwrap_or(0));
 
+            // P1: Trade `creator` is mint-level PumpFun metadata (Geyser / market-data cache, no RPC).
+            // Apply to every pool-scoped tracker for this mint **before** `record_trade` so sibling pools
+            // run the same `dev_wallet` / dev_sell_early / `REJECT_DEV_SELL_EARLY` logic as the pool that
+            // received the Trade event.
+            if let Some(ref creator) = trade_creator {
+                let config = ctx.config.read().clone();
+                let mut trackers = ctx.token_trackers.write();
+                for tracker in trackers.values_mut() {
+                    if tracker.mint.as_str() != mint.as_str() {
+                        continue;
+                    }
+                    if tracker.dev_wallet.is_none() {
+                        tracker.set_dev_info(creator, 0.0, &config);
+                        debug!(
+                            mint = %mint,
+                            pool = %tracker.pool,
+                            creator = %creator,
+                            "Set dev_wallet from Trade event (creator_cache, mint-wide)"
+                        );
+                    }
+                }
+                drop(trackers);
+                // A.2: Propagate creator to position for pumpfun (BC exit after restart)
+                let mut positions = ctx.positions.write();
+                if let Some(pos) = positions.get_mut(mint) {
+                    if pos.dex == "pumpfun" && pos.creator.is_none() {
+                        pos.set_creator(creator);
+                        debug!(mint = %mint, creator = %creator, "A.2: Set creator on position from Trade event");
+                    }
+                }
+            }
+
             // Check if this trader is the dev wallet and record dev behavior
             let is_dev = trade_creator.as_ref().is_some_and(|c| c.as_str() == trader.as_str())
                 || {
@@ -12777,34 +12964,6 @@ async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -
                         decimals = *trade_token_decimals,
                         "📦 Decimals cached from Trade event (token_program unknown)"
                     );
-                }
-            }
-
-            // P1: If Trade event carries creator (from market-data cache), set it on tracker.
-            // This enables intent building without waiting for separate DevWalletIdentified event.
-            // A.2: Also set on position for pumpfun BC-SELL (persisted for restart).
-            if let Some(ref creator) = trade_creator {
-                let config = ctx.config.read().clone();
-                let mut trackers = ctx.token_trackers.write();
-                let tk = MomentumContext::tracker_storage_key(mint, pool_address);
-                if let Some(tracker) = trackers.get_mut(&tk) {
-                    if tracker.dev_wallet.is_none() {
-                        tracker.set_dev_info(creator, 0.0, &config);
-                        debug!(
-                            mint = %mint,
-                            creator = %creator,
-                            "Set dev_wallet from Trade event (creator_cache)"
-                        );
-                    }
-                }
-                drop(trackers);
-                // A.2: Propagate creator to position for pumpfun (BC exit after restart)
-                let mut positions = ctx.positions.write();
-                if let Some(pos) = positions.get_mut(mint) {
-                    if pos.dex == "pumpfun" && pos.creator.is_none() {
-                        pos.set_creator(creator);
-                        debug!(mint = %mint, creator = %creator, "A.2: Set creator on position from Trade event");
-                    }
                 }
             }
 
