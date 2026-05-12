@@ -12931,7 +12931,20 @@ async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -
                 .read()
                 .contains_key(&MomentumContext::tracker_storage_key(mint, pool_address));
 
-            if !tracker_exists && *is_buy && *sol_amount > 0 {
+            // Before trade-based tracker creation: dev sell on an untracked pool still needs a row so
+            // `record_trade` and exit-signal merge see it (dev_wallet from siblings or creator==trader).
+            let is_dev = trade_creator.as_ref().is_some_and(|c| c.as_str() == trader.as_str())
+                || {
+                    let trackers = ctx.token_trackers.read();
+                    trackers.values().any(|t| {
+                        t.mint == *mint
+                            && t.dev_wallet
+                                .as_ref()
+                                .is_some_and(|dw| dw.as_str() == trader.as_str())
+                    })
+                };
+
+            if !tracker_exists && *sol_amount > 0 && (*is_buy || is_dev) {
                 // Use DEX from event if available, otherwise infer from pool_address pattern
                 let slot = event.slot.unwrap_or(0);
                 let dex_raw = if !event_dex.is_empty() && event_dex != "unknown" {
@@ -13015,18 +13028,6 @@ async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -
                     }
                 }
             }
-
-            // Check if this trader is the dev wallet and record dev behavior
-            let is_dev = trade_creator.as_ref().is_some_and(|c| c.as_str() == trader.as_str())
-                || {
-                    let trackers = ctx.token_trackers.read();
-                    trackers.values().any(|t| {
-                        t.mint == *mint
-                            && t.dev_wallet
-                                .as_ref()
-                                .is_some_and(|dw| dw.as_str() == trader.as_str())
-                    })
-                };
 
             ctx.record_trade(
                 mint,
