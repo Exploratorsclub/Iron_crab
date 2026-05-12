@@ -3399,6 +3399,7 @@ impl MomentumContext {
         let mut trackers = self.token_trackers.write();
         let key = Self::tracker_storage_key(mint, pool);
         let mint_already_rejected = trackers.values().any(|t| t.mint == mint && t.is_rejected());
+        let mut sync_sibling_dev_sell_early = false;
         if let Some(tracker) = trackers.get_mut(&key) {
             let was_not_rejected = tracker.was_not_rejected();
             tracker.record_trade(trader, is_buy, sol_amount, token_amount, signature, &config);
@@ -3406,6 +3407,29 @@ impl MomentumContext {
             if was_not_rejected && tracker.is_rejected() && !mint_already_rejected {
                 self.tokens_blacklisted
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            sync_sibling_dev_sell_early =
+                tracker.blacklist_reason.as_deref() == Some("REJECT_DEV_SELL_EARLY");
+        }
+        // Same-mint sibling pools: one pool's dev-sell-early reject must apply to all pool rows
+        // (Trade event is per-pool; mint-wide creator was applied before `record_trade`).
+        if sync_sibling_dev_sell_early {
+            let Some(source_dev) = trackers.get(&key).and_then(|t| t.dev_wallet.clone()) else {
+                return;
+            };
+            for t in trackers.values_mut() {
+                if t.mint != mint || t.pool.as_str() == pool {
+                    continue;
+                }
+                if t.is_rejected() {
+                    continue;
+                }
+                if t.dev_wallet.as_deref() != Some(source_dev.as_str()) {
+                    continue;
+                }
+                t.dev_sold = true;
+                t.dev_sold_early = true;
+                t.reject("REJECT_DEV_SELL_EARLY");
             }
         }
     }
@@ -3418,23 +3442,25 @@ impl MomentumContext {
             pending.insert(mint.to_string(), (dev_wallet.to_string(), supply_pct));
         }
 
-        let mut trackers = self.token_trackers.write();
-        // `tokens_blacklisted` counts strategy-blacklisted **mints**, not pool rows: one DevWallet
-        // event may reject several pool-scoped trackers — increment at most once per mint per call.
-        let mut any_new_blacklist_this_event = false;
-        for tracker in trackers.values_mut() {
-            if tracker.mint != mint {
-                continue;
+        {
+            let mut trackers = self.token_trackers.write();
+            // `tokens_blacklisted` counts strategy-blacklisted **mints**, not pool rows: one DevWallet
+            // event may reject several pool-scoped trackers — increment at most once per mint per call.
+            let mut any_new_blacklist_this_event = false;
+            for tracker in trackers.values_mut() {
+                if tracker.mint != mint {
+                    continue;
+                }
+                let was_not_rejected = tracker.was_not_rejected();
+                tracker.set_dev_info(dev_wallet, supply_pct, &config);
+                if was_not_rejected && tracker.is_rejected() {
+                    any_new_blacklist_this_event = true;
+                }
             }
-            let was_not_rejected = tracker.was_not_rejected();
-            tracker.set_dev_info(dev_wallet, supply_pct, &config);
-            if was_not_rejected && tracker.is_rejected() {
-                any_new_blacklist_this_event = true;
+            if any_new_blacklist_this_event {
+                self.tokens_blacklisted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-        }
-        if any_new_blacklist_this_event {
-            self.tokens_blacklisted
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         // A.2: Also update position creator when dex is pumpfun (for BC-SELL after restart)
         {
@@ -10239,13 +10265,13 @@ mod tests {
         let sibling_rejected = {
             let trackers = ctx.token_trackers.read();
             trackers
-                .get(&MomentumContext::tracker_storage_key(mint, pool_b))
-                .expect("sibling tracker")
+                .get(&MomentumContext::tracker_storage_key(mint, pool_a))
+                .expect("sibling pool_a tracker (did not receive Trade)")
                 .is_rejected()
         };
         assert!(
             sibling_rejected,
-            "sibling pool tracker should reject dev sell early after mint-wide creator from Trade"
+            "pool_a sibling tracker should reject dev sell early after mint-wide creator from Trade on pool_b"
         );
     }
 
