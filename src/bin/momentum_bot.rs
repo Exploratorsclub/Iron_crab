@@ -2338,10 +2338,11 @@ struct MomentumContext {
     /// Stats — **unique mints** with at least one pool-scoped tracker row (not one increment per pool row).
     tokens_tracked: std::sync::atomic::AtomicU64,
     /// Prometheus / heartbeat: **unique tokens (mints)** that crossed into a rejected/blacklisted
-    /// strategy state — **not** one increment per pool-scoped `TokenTracker` row. Multi-pool mints
-    /// dedupe per originating event or `check_for_signals` pass where applicable (see
-    /// `record_dev_info`, `record_lp_removal`, PumpFun migration gate).
+    /// strategy state — **not** one increment per pool-scoped `TokenTracker` row. Deduped
+    /// process-wide via [`Self::record_token_blacklisted_once`] and [`Self::blacklisted_mints_for_metric`].
     tokens_blacklisted: std::sync::atomic::AtomicU64,
+    /// Mints already counted in `tokens_blacklisted` in this process (cross-handler metric dedupe).
+    blacklisted_mints_for_metric: parking_lot::RwLock<HashSet<String>>,
     intents_generated: std::sync::atomic::AtomicU64,
     exits_generated: std::sync::atomic::AtomicU64,
     /// K Phase 1: Last event slot/ts for Slot-to-Send Latency propagation
@@ -2350,6 +2351,16 @@ struct MomentumContext {
 }
 
 impl MomentumContext {
+    /// Increment [`Self::tokens_blacklisted`] at most once per mint for this process (metric dedupe).
+    /// Tracker rows may still reject independently; this is observability only.
+    fn record_token_blacklisted_once(&self, mint: &str) {
+        let mut seen = self.blacklisted_mints_for_metric.write();
+        if seen.insert(mint.to_string()) {
+            self.tokens_blacklisted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn next_intent_id(&self) -> String {
         let n = self
             .intent_counter
@@ -3343,7 +3354,6 @@ impl MomentumContext {
         let mut trackers = self.token_trackers.write();
         let key = Self::tracker_storage_key(mint, pool);
         let mint_already_tracked = trackers.values().any(|t| t.mint == mint);
-        let mint_already_rejected = trackers.values().any(|t| t.mint == mint && t.is_rejected());
         use std::collections::hash_map::Entry;
         match trackers.entry(key) {
             Entry::Occupied(_) => false,
@@ -3356,11 +3366,8 @@ impl MomentumContext {
                 {
                     let was_not_rejected = tracker.was_not_rejected();
                     tracker.set_dev_info(&dev_wallet, supply_pct, &config);
-                    // Mint-level metric: pending dev may reject every new pool row for this mint —
-                    // bump only on the first tracker row that introduces a rejected state for the mint.
-                    if was_not_rejected && tracker.is_rejected() && !mint_already_rejected {
-                        self.tokens_blacklisted
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if was_not_rejected && tracker.is_rejected() {
+                        self.record_token_blacklisted_once(mint);
                     }
                 }
 
@@ -3398,15 +3405,12 @@ impl MomentumContext {
         let config = self.config.read().clone();
         let mut trackers = self.token_trackers.write();
         let key = Self::tracker_storage_key(mint, pool);
-        let mint_already_rejected = trackers.values().any(|t| t.mint == mint && t.is_rejected());
         let mut sync_sibling_dev_sell_early = false;
         if let Some(tracker) = trackers.get_mut(&key) {
             let was_not_rejected = tracker.was_not_rejected();
             tracker.record_trade(trader, is_buy, sol_amount, token_amount, signature, &config);
-            // Mint-level metric: only count the first pool row that pushes this mint into rejected.
-            if was_not_rejected && tracker.is_rejected() && !mint_already_rejected {
-                self.tokens_blacklisted
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if was_not_rejected && tracker.is_rejected() {
+                self.record_token_blacklisted_once(mint);
             }
             sync_sibling_dev_sell_early =
                 tracker.blacklist_reason.as_deref() == Some("REJECT_DEV_SELL_EARLY");
@@ -3442,24 +3446,15 @@ impl MomentumContext {
             pending.insert(mint.to_string(), (dev_wallet.to_string(), supply_pct));
         }
 
-        {
-            let mut trackers = self.token_trackers.write();
-            // `tokens_blacklisted` counts strategy-blacklisted **mints**, not pool rows: one DevWallet
-            // event may reject several pool-scoped trackers — increment at most once per mint per call.
-            let mut any_new_blacklist_this_event = false;
-            for tracker in trackers.values_mut() {
-                if tracker.mint != mint {
-                    continue;
-                }
-                let was_not_rejected = tracker.was_not_rejected();
-                tracker.set_dev_info(dev_wallet, supply_pct, &config);
-                if was_not_rejected && tracker.is_rejected() {
-                    any_new_blacklist_this_event = true;
-                }
+        let mut trackers = self.token_trackers.write();
+        for tracker in trackers.values_mut() {
+            if tracker.mint != mint {
+                continue;
             }
-            if any_new_blacklist_this_event {
-                self.tokens_blacklisted
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let was_not_rejected = tracker.was_not_rejected();
+            tracker.set_dev_info(dev_wallet, supply_pct, &config);
+            if was_not_rejected && tracker.is_rejected() {
+                self.record_token_blacklisted_once(mint);
             }
         }
         // A.2: Also update position creator when dex is pumpfun (for BC-SELL after restart)
@@ -3477,9 +3472,6 @@ impl MomentumContext {
     /// Record LP removal for a token
     fn record_lp_removal(&self, mint: &str) {
         let mut trackers = self.token_trackers.write();
-        // Same mint-level semantics as `record_dev_info`: one LP-removal event → at most one
-        // `tokens_blacklisted` bump even when multiple pool trackers reject.
-        let mut any_new_blacklist_this_event = false;
         for tracker in trackers.values_mut() {
             if tracker.mint != mint {
                 continue;
@@ -3487,26 +3479,9 @@ impl MomentumContext {
             let was_not_rejected = tracker.was_not_rejected();
             tracker.record_lp_removal();
             if was_not_rejected && tracker.is_rejected() {
-                any_new_blacklist_this_event = true;
+                self.record_token_blacklisted_once(mint);
             }
         }
-        if any_new_blacklist_this_event {
-            self.tokens_blacklisted
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    /// True if some **other** pool-scoped tracker row for `mint` is already rejected (used so
-    /// `tokens_blacklisted` stays mint-level across `check_for_signals` / `record_trade` boundaries).
-    #[inline]
-    fn any_other_pool_tracker_rejected_for_mint(
-        trackers: &HashMap<String, TokenTracker>,
-        mint: &str,
-        exclude_pool: &str,
-    ) -> bool {
-        trackers
-            .values()
-            .any(|t| t.mint == mint && t.pool.as_str() != exclude_pool && t.is_rejected())
     }
 
     /// Check if any tracked token should generate an intent
@@ -3555,9 +3530,6 @@ impl MomentumContext {
         // At most one entry signal (probe or scale-in) per mint per `check_for_signals` call.
         // `pending_buy_mint_index` updates after publish; `mint_emitted_entry_this_tick` covers same-tick races.
         let mut mint_emitted_entry_this_tick: HashSet<String> = HashSet::new();
-        // Mint-level observability: at most one `tokens_blacklisted` bump per mint per pass across
-        // PumpFun migration rejects and `should_generate_intent` strategy rejects (separate trackers).
-        let mut check_for_signals_blacklist_metric_mints: HashSet<String> = HashSet::new();
 
         let probe_sol = ((config.default_position_lamports as f64) * config.probe_buy_pct)
             .round()
@@ -3614,11 +3586,6 @@ impl MomentumContext {
 
             // Completed / migrated PumpFun bonding curve on this pool (or mint-level cache evidence).
             if self.pumpfun_entry_blocked_by_migration(&mint, &this_pool, &dex_for_migration) {
-                let no_prior_sibling_rejected = !Self::any_other_pool_tracker_rejected_for_mint(
-                    &trackers,
-                    &mint,
-                    this_pool.as_str(),
-                );
                 let was_not_rejected = trackers
                     .get(&key)
                     .expect("tracker key from iteration")
@@ -3633,12 +3600,7 @@ impl MomentumContext {
                             dex = %tracker.dex,
                             "REJECT_PUMPFUN_BONDING_COMPLETE: skip entry — migrated bonding curve / complete evidence (pump_amm unaffected)"
                         );
-                        if no_prior_sibling_rejected
-                            && check_for_signals_blacklist_metric_mints.insert(mint.clone())
-                        {
-                            self.tokens_blacklisted
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
+                        self.record_token_blacklisted_once(&mint);
                     }
                 }
                 continue;
@@ -3660,22 +3622,12 @@ impl MomentumContext {
                 .map(|t| matches!(t.state, TrackerState::Discovery | TrackerState::Validation))
                 .unwrap_or(false);
             if in_probe_stage {
-                let no_prior_sibling_rejected = !Self::any_other_pool_tracker_rejected_for_mint(
-                    &trackers,
-                    &mint,
-                    this_pool.as_str(),
-                );
                 {
                     let tracker = trackers.get_mut(&key).expect("tracker key from iteration");
                     let was_not_rejected = tracker.was_not_rejected();
                     let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
-                    if was_not_rejected
-                        && tracker.is_rejected()
-                        && no_prior_sibling_rejected
-                        && check_for_signals_blacklist_metric_mints.insert(mint.clone())
-                    {
-                        self.tokens_blacklisted
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if was_not_rejected && tracker.is_rejected() {
+                        self.record_token_blacklisted_once(&mint);
                     }
 
                     if should_trade {
@@ -3730,22 +3682,12 @@ impl MomentumContext {
                     continue;
                 }
 
-                let no_prior_sibling_rejected = !Self::any_other_pool_tracker_rejected_for_mint(
-                    &trackers,
-                    &mint,
-                    this_pool.as_str(),
-                );
                 {
                     let tracker = trackers.get_mut(&key).expect("tracker key from iteration");
                     let was_not_rejected = tracker.was_not_rejected();
                     let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
-                    if was_not_rejected
-                        && tracker.is_rejected()
-                        && no_prior_sibling_rejected
-                        && check_for_signals_blacklist_metric_mints.insert(mint.clone())
-                    {
-                        self.tokens_blacklisted
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if was_not_rejected && tracker.is_rejected() {
+                        self.record_token_blacklisted_once(&mint);
                     }
 
                     if should_trade {
@@ -7086,6 +7028,7 @@ async fn main() -> Result<()> {
         )),
         tokens_tracked: std::sync::atomic::AtomicU64::new(0),
         tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+        blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
         intents_generated: std::sync::atomic::AtomicU64::new(0),
         exits_generated: std::sync::atomic::AtomicU64::new(0),
         last_event_slot: std::sync::atomic::AtomicU64::new(0),
@@ -8790,6 +8733,7 @@ mod tests {
             )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
@@ -9326,6 +9270,7 @@ mod tests {
             )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
@@ -9386,6 +9331,7 @@ mod tests {
             )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
@@ -9623,6 +9569,7 @@ mod tests {
             )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
@@ -10390,6 +10337,92 @@ mod tests {
             .is_rejected());
     }
 
+    /// `tokens_blacklisted` dedupes across handlers: `record_trade` then `check_for_signals` → +1 total.
+    #[test]
+    fn tokens_blacklisted_once_per_mint_across_record_trade_then_check_for_signals() {
+        let mut cfg = MomentumConfig::default();
+        cfg.max_single_dump_lamports = 1;
+        cfg.default_position_lamports = 1_000;
+        cfg.probe_buy_pct = 0.25;
+        cfg.early_min_liquidity_sol = 0.0;
+        cfg.min_unique_buyers = 0;
+        cfg.min_trades_per_sec = 0.0;
+        cfg.min_buy_dominance = 0.0;
+        cfg.min_sol_inflow_lamports = 0;
+        cfg.require_mint_authority_renounced = true;
+        cfg.require_freeze_authority_none = false;
+        cfg.top1_buyer_share_cap = 1.0;
+        cfg.top3_buyer_share_cap = 1.0;
+        cfg.repeat_buyer_min_ratio = 0.0;
+        cfg.min_trade_size_lamports = 0;
+        cfg.small_buy_ratio_cap = 1.0;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "MintCrossFn8888888888888888888888888888888";
+        let pool_dump = "poolDump8888888888888888888888888888888888";
+        let pool_strat = "poolStrat888888888888888888888888888888888";
+
+        ctx.record_mint_info(
+            mint,
+            MintInfo {
+                token_program: "spl-token".to_string(),
+                decimals: 6,
+                supply: 1,
+                mint_authority: Some("mauth".to_string()),
+                freeze_authority: None,
+                last_updated: Instant::now(),
+            },
+        );
+
+        {
+            let mut trackers = ctx.token_trackers.write();
+            for (pool, dex) in [(pool_dump, "raydium"), (pool_strat, "orca")] {
+                let mut tr = TokenTracker::new(mint, pool, dex, 1, 30_000_000_000);
+                for i in 0..20 {
+                    tr.record_trade(
+                        &format!("xf{i:03}"),
+                        true,
+                        200_000_000,
+                        2_000_000,
+                        &format!("sxg{i}"),
+                        &cfg,
+                    );
+                }
+                trackers.insert(MomentumContext::tracker_storage_key(mint, pool), tr);
+            }
+        }
+
+        let before = ctx.tokens_blacklisted.load(Ordering::Relaxed);
+        ctx.record_trade(
+            mint,
+            pool_dump,
+            "dumptrader",
+            false,
+            10_000_000_000,
+            1,
+            "sig-dump-cross",
+        );
+        let _ = ctx.check_for_signals();
+        let after = ctx.tokens_blacklisted.load(Ordering::Relaxed);
+        assert_eq!(
+            after.saturating_sub(before),
+            1,
+            "same mint: first handler counts the metric; later rejections must not increment again"
+        );
+
+        assert!(ctx
+            .token_trackers
+            .read()
+            .get(&MomentumContext::tracker_storage_key(mint, pool_strat))
+            .expect("strat pool")
+            .is_rejected());
+    }
+
     #[test]
     fn dump_recovery_waits_then_allows_after_stabilization() {
         let mut cfg = MomentumConfig::default();
@@ -10604,6 +10637,7 @@ mod tests {
             )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
@@ -10717,6 +10751,7 @@ mod tests {
             )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
@@ -10798,6 +10833,7 @@ mod tests {
             )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
@@ -10867,6 +10903,7 @@ mod tests {
             )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
@@ -10948,6 +10985,7 @@ mod tests {
             )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
@@ -11059,6 +11097,7 @@ mod tests {
             )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
@@ -11164,6 +11203,7 @@ mod tests {
             )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
@@ -11254,6 +11294,7 @@ mod tests {
             )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
@@ -11322,6 +11363,7 @@ mod tests {
             )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
@@ -11382,6 +11424,7 @@ mod tests {
             )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
@@ -11605,6 +11648,7 @@ mod tests {
             )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
@@ -11735,6 +11779,7 @@ mod tests {
             )),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
