@@ -3392,11 +3392,12 @@ impl MomentumContext {
         let config = self.config.read().clone();
         let mut trackers = self.token_trackers.write();
         let key = Self::tracker_storage_key(mint, pool);
+        let mint_already_rejected = trackers.values().any(|t| t.mint == mint && t.is_rejected());
         if let Some(tracker) = trackers.get_mut(&key) {
             let was_not_rejected = tracker.was_not_rejected();
             tracker.record_trade(trader, is_buy, sol_amount, token_amount, signature, &config);
-            // One tracker row per call — mint-level metric (trade-driven reject is per pool row).
-            if was_not_rejected && tracker.is_rejected() {
+            // Mint-level metric: only count the first pool row that pushes this mint into rejected.
+            if was_not_rejected && tracker.is_rejected() && !mint_already_rejected {
                 self.tokens_blacklisted
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -3469,6 +3470,26 @@ impl MomentumContext {
         let config = self.config.read().clone();
         let mint_infos = self.mint_infos.read();
         let positions = self.positions.read();
+
+        // JetStream / lifecycle edges can leave `pending_buy_mint_index` pointing at a removed
+        // `pending_buy_entries` row. A missing entry must not block every pool tracker for the mint.
+        {
+            let entries = self.pending_buy_entries.read();
+            let mut index = self.pending_buy_mint_index.write();
+            index.retain(|mint_key, intent_id| {
+                if entries.contains_key(intent_id.as_str()) {
+                    true
+                } else {
+                    warn!(
+                        mint = %mint_key,
+                        intent_id = %intent_id,
+                        "Stale pending_buy_mint_index: intent missing from pending_buy_entries — dropping index entry"
+                    );
+                    false
+                }
+            });
+        }
+
         let pending_buy_index = self.pending_buy_mint_index.read();
         let pending_buy_entries = self.pending_buy_entries.read();
 
@@ -3514,12 +3535,12 @@ impl MomentumContext {
 
             // At most one pending BUY per mint — ignore other pool trackers while one is in-flight.
             if let Some(intent_id) = pending_buy_index.get(&mint) {
-                let pending_pool = pending_buy_entries
-                    .get(intent_id.as_str())
-                    .map(|e| e.pool.as_str());
-                if pending_pool != Some(tracker.pool.as_str()) {
-                    continue;
+                if let Some(entry) = pending_buy_entries.get(intent_id.as_str()) {
+                    if entry.pool.as_str() != tracker.pool.as_str() {
+                        continue;
+                    }
                 }
+                // If `intent_id` is missing from entries, index was stale; pruned above — do not block.
             }
 
             // Skip tokens in terminal states
@@ -9977,6 +9998,115 @@ mod tests {
         );
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].kind, EntryKind::Probe);
+    }
+
+    /// Stale `pending_buy_mint_index` (intent_id not in `pending_buy_entries`) must not block entry.
+    #[test]
+    fn check_for_signals_prunes_stale_pending_buy_mint_index() {
+        let cfg = {
+            let mut c = MomentumConfig::default();
+            c.default_position_lamports = 1_000;
+            c.probe_buy_pct = 0.25;
+            c.early_min_liquidity_sol = 0.0;
+            c.min_unique_buyers = 0;
+            c.min_trades_per_sec = 0.0;
+            c.min_buy_dominance = 0.0;
+            c.min_sol_inflow_lamports = 0;
+            c.require_mint_authority_renounced = false;
+            c.require_freeze_authority_none = false;
+            c.top1_buyer_share_cap = 1.0;
+            c.top3_buyer_share_cap = 1.0;
+            c.repeat_buyer_min_ratio = 0.0;
+            c.min_trade_size_lamports = 0;
+            c.small_buy_ratio_cap = 1.0;
+            c
+        };
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "MintStalePending9999999999999999999999999999";
+        let pool_a = "RayPool999999999999999999999999999999999999";
+        let pool_b = "OrcaPool99999999999999999999999999999999999";
+
+        {
+            let mut trackers = ctx.token_trackers.write();
+            for (pool, dex, buyer_prefix) in [(pool_a, "raydium", "s9"), (pool_b, "orca", "s8")] {
+                let mut tr = TokenTracker::new(mint, pool, dex, 1, 0);
+                for i in 0..20 {
+                    tr.record_trade(
+                        &format!("{buyer_prefix}{i:03}"),
+                        true,
+                        200_000_000,
+                        2_000_000,
+                        &format!("sigst{i:03}"),
+                        &cfg,
+                    );
+                }
+                trackers.insert(MomentumContext::tracker_storage_key(mint, pool), tr);
+            }
+        }
+
+        ctx.pending_buy_mint_index.write().insert(
+            mint.to_string(),
+            "ghost-intent-not-in-pending-buy-entries".to_string(),
+        );
+        assert!(ctx.pending_buy_mint_index.read().contains_key(mint));
+
+        let signals = ctx.check_for_signals();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].mint, mint);
+        assert!(
+            !ctx.pending_buy_mint_index.read().contains_key(mint),
+            "stale index entry should be pruned"
+        );
+    }
+
+    /// Trade-driven reject: `tokens_blacklisted` bumps at most once per mint across pool rows.
+    #[test]
+    fn tokens_blacklisted_trade_rejection_once_per_mint_two_pool_trackers() {
+        let mut cfg = MomentumConfig::default();
+        cfg.max_single_dump_lamports = 1;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg;
+
+        let mint = "MintTradeBl00000000000000000000000000000000";
+        let p1 = "poolTrBl0111111111111111111111111111111111";
+        let p2 = "poolTrBl0222222222222222222222222222222222";
+
+        {
+            let mut trackers = ctx.token_trackers.write();
+            trackers.insert(
+                MomentumContext::tracker_storage_key(mint, p1),
+                TokenTracker::new(mint, p1, "raydium", 1, 0),
+            );
+            trackers.insert(
+                MomentumContext::tracker_storage_key(mint, p2),
+                TokenTracker::new(mint, p2, "orca", 1, 0),
+            );
+        }
+
+        let before = ctx.tokens_blacklisted.load(Ordering::Relaxed);
+        ctx.record_trade(mint, p1, "dumper1", false, 10_000_000_000, 1, "dump_sig_1");
+        ctx.record_trade(mint, p2, "dumper2", false, 10_000_000_000, 1, "dump_sig_2");
+        let after = ctx.tokens_blacklisted.load(Ordering::Relaxed);
+        assert_eq!(after.saturating_sub(before), 1);
+        let trackers = ctx.token_trackers.read();
+        assert!(trackers
+            .get(&MomentumContext::tracker_storage_key(mint, p1))
+            .unwrap()
+            .is_rejected());
+        assert!(trackers
+            .get(&MomentumContext::tracker_storage_key(mint, p2))
+            .unwrap()
+            .is_rejected());
     }
 
     #[test]
