@@ -2108,7 +2108,7 @@ impl TokenTracker {
             return self.record_wait_filter_rejection_and_return(
                 &FILTER_REJECTED_INFLOW,
                 reason,
-                "WAIT_BUYER_WINDOW",
+                "WAIT_NET_SOL_INFLOW",
             );
         }
 
