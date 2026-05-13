@@ -43,6 +43,7 @@ use ironcrab::ipc::{
     ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExecutionResult, ExecutionStatus,
     ExplicitAmount, IntentOrigin, IntentTier, MarketEvent, MarketEventKind,
     TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide, TradingRegime,
+    NATIVE_SOL_MINT,
 };
 use ironcrab::metrics::{
     serve_metrics, set_readiness_nats_connected, MetricsComponent, EXITS_GENERATED_TOTAL,
@@ -74,6 +75,22 @@ use sd_notify::NotifyState;
 
 /// Build version for decision records
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Mainnet USDC — never a Momentum entry candidate when `base_mint` / trade `mint`.
+const MOMENTUM_NON_TRADEABLE_USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+/// Mainnet USDT
+const MOMENTUM_NON_TRADEABLE_USDT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+/// System program id (native SOL / sentinel mint keys in some paths).
+const MOMENTUM_SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
+
+/// Quote / wrapped-native / stable mints must not become pool-scoped Momentum entry trackers.
+fn is_non_tradeable_momentum_mint(mint: &str) -> bool {
+    mint == NATIVE_SOL_MINT
+        || mint == "NATIVE_SOL"
+        || mint == MOMENTUM_SYSTEM_PROGRAM_ID
+        || mint == MOMENTUM_NON_TRADEABLE_USDC
+        || mint == MOMENTUM_NON_TRADEABLE_USDT
+}
 
 /// JetStream replay dedup for orphaned BUY path — bounded so memory does not grow forever.
 const ORPHANED_RECOVERED_INTENT_IDS_CAP: usize = 50_000;
@@ -1368,6 +1385,9 @@ struct TokenTracker {
     state: TrackerState,
     /// Reason for rejection (only set when state == Rejected)
     blacklist_reason: Option<String>,
+
+    /// Last WAIT_* filter class used for metrics/log dedupe (hot path CPU / NATS backpressure).
+    last_wait_filter_obs_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1409,7 +1429,13 @@ impl TokenTracker {
             cto_recovery_confirmed: false,
             state: TrackerState::Discovery,
             blacklist_reason: None,
+            last_wait_filter_obs_key: None,
         }
+    }
+
+    #[cfg(test)]
+    fn last_wait_filter_obs_key_for_test(&self) -> Option<&str> {
+        self.last_wait_filter_obs_key.as_deref()
     }
 
     // =========================================================================
@@ -1431,6 +1457,7 @@ impl TokenTracker {
 
     /// Transition to Rejected state with reason
     fn reject(&mut self, reason: impl Into<String>) {
+        self.last_wait_filter_obs_key = None;
         self.state = TrackerState::Rejected;
         self.blacklist_reason = Some(reason.into());
     }
@@ -1882,6 +1909,36 @@ impl TokenTracker {
         }
     }
 
+    /// Emit FILTER_REJECTED_* + warn for a repeating non-terminal WAIT; dedupe identical wait classes.
+    fn record_wait_filter_rejection_and_return(
+        &mut self,
+        category_counter: &std::sync::atomic::AtomicU64,
+        reason: String,
+        dedupe_class: &'static str,
+    ) -> (bool, String) {
+        if self.last_wait_filter_obs_key.as_deref() == Some(dedupe_class) {
+            trace!(
+                mint = %self.mint,
+                pool = %self.pool,
+                dex = %self.dex,
+                reason = %reason,
+                "Filter wait (deduped observability)"
+            );
+            return (false, reason);
+        }
+        self.last_wait_filter_obs_key = Some(dedupe_class.to_string());
+        category_counter.fetch_add(1, Ordering::Relaxed);
+        FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            mint = %self.mint,
+            pool = %self.pool,
+            dex = %self.dex,
+            reason = %reason,
+            "🚫 Filter rejected"
+        );
+        (false, reason)
+    }
+
     /// Check all 4 filters and return if we should trade
     fn should_generate_intent(
         &mut self,
@@ -1919,14 +1976,15 @@ impl TokenTracker {
 
         // Filter 1: Liquidity Check
         if metrics.initial_liquidity_sol < config.early_min_liquidity_sol {
-            FILTER_REJECTED_LIQUIDITY.fetch_add(1, Ordering::Relaxed);
-            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             let reason = format!(
                 "WAIT_INSUFFICIENT_LIQUIDITY: liq {:.2} SOL < {:.2} SOL",
                 metrics.initial_liquidity_sol, config.early_min_liquidity_sol
             );
-            warn!(mint = %self.mint, pool = %self.pool, dex = %self.dex, reason = %reason, "🚫 Filter rejected");
-            return (false, reason);
+            return self.record_wait_filter_rejection_and_return(
+                &FILTER_REJECTED_LIQUIDITY,
+                reason,
+                "WAIT_INSUFFICIENT_LIQUIDITY",
+            );
         }
 
         // Filter 1b: LP removal
@@ -1940,37 +1998,40 @@ impl TokenTracker {
 
         // Filter 2: Buyer Velocity
         if metrics.unique_buyers_in_window < config.min_unique_buyers {
-            FILTER_REJECTED_VELOCITY.fetch_add(1, Ordering::Relaxed);
-            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             let reason = format!(
                 "WAIT_BUYER_WINDOW: buyers {} < {}",
                 metrics.unique_buyers_in_window, config.min_unique_buyers
             );
-            warn!(mint = %self.mint, pool = %self.pool, dex = %self.dex, reason = %reason, "🚫 Filter rejected");
-            return (false, reason);
+            return self.record_wait_filter_rejection_and_return(
+                &FILTER_REJECTED_VELOCITY,
+                reason,
+                "WAIT_BUYER_WINDOW",
+            );
         }
 
         if metrics.trades_per_sec < config.min_trades_per_sec {
-            FILTER_REJECTED_VELOCITY.fetch_add(1, Ordering::Relaxed);
-            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             let reason = format!(
                 "WAIT_BUYER_WINDOW: trades_per_sec {:.3} < {:.3}",
                 metrics.trades_per_sec, config.min_trades_per_sec
             );
-            warn!(mint = %self.mint, pool = %self.pool, dex = %self.dex, reason = %reason, "🚫 Filter rejected");
-            return (false, reason);
+            return self.record_wait_filter_rejection_and_return(
+                &FILTER_REJECTED_VELOCITY,
+                reason,
+                "WAIT_BUYER_WINDOW",
+            );
         }
 
         if metrics.buy_dominance < config.min_buy_dominance {
-            FILTER_REJECTED_VELOCITY.fetch_add(1, Ordering::Relaxed);
-            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             let reason = format!(
                 "WAIT_BUYER_WINDOW: buy dominance {:.0}% < {:.0}%",
                 metrics.buy_dominance * 100.0,
                 config.min_buy_dominance * 100.0
             );
-            warn!(mint = %self.mint, pool = %self.pool, dex = %self.dex, reason = %reason, "🚫 Filter rejected");
-            return (false, reason);
+            return self.record_wait_filter_rejection_and_return(
+                &FILTER_REJECTED_VELOCITY,
+                reason,
+                "WAIT_BUYER_WINDOW",
+            );
         }
 
         // Filter 2c: Micro-buy spam (anti-bot)
@@ -2039,15 +2100,16 @@ impl TokenTracker {
 
         // Filter 3: SOL Inflow
         if metrics.net_sol_inflow < config.min_sol_inflow_lamports {
-            FILTER_REJECTED_INFLOW.fetch_add(1, Ordering::Relaxed);
-            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             let reason = format!(
                 "WAIT_BUYER_WINDOW: net inflow {:.2} SOL < {:.2} SOL",
                 metrics.net_sol_inflow as f64 / 1_000_000_000.0,
                 config.min_sol_inflow_lamports as f64 / 1_000_000_000.0
             );
-            warn!(mint = %self.mint, pool = %self.pool, dex = %self.dex, reason = %reason, "🚫 Filter rejected");
-            return (false, reason);
+            return self.record_wait_filter_rejection_and_return(
+                &FILTER_REJECTED_INFLOW,
+                reason,
+                "WAIT_NET_SOL_INFLOW",
+            );
         }
 
         // Filter 3b: Dump-recovery gating (WAIT until recovery confirms after a dump)
@@ -2070,6 +2132,7 @@ impl TokenTracker {
         }
 
         // All filters passed!
+        self.last_wait_filter_obs_key = None;
         FILTER_PASSED_TOTAL.fetch_add(1, Ordering::Relaxed);
         let reason = format!(
             "All filters passed: liq={:.1}SOL, buyers={}, vel={:.2}/s, dom={:.0}%, inflow={:.1}SOL, bq(top1={:.0}%,top3={:.0}%,repeat={:.0}%,vol={:.2}SOL)",
@@ -3350,6 +3413,9 @@ impl MomentumContext {
         slot: u64,
         liquidity: u64,
     ) -> bool {
+        if is_non_tradeable_momentum_mint(mint) {
+            return false;
+        }
         let config = self.config.read().clone();
         let mut trackers = self.token_trackers.write();
         let key = Self::tracker_storage_key(mint, pool);
@@ -8742,6 +8808,158 @@ mod tests {
     }
 
     const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+    const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+
+    #[test]
+    fn get_or_create_tracker_skips_non_tradeable_mints() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+
+        let before_tracked = ctx.tokens_tracked.load(Ordering::Relaxed);
+        let cases = [
+            (WSOL_MINT, "poolNt1"),
+            ("NATIVE_SOL", "poolNt2"),
+            ("11111111111111111111111111111111", "poolNt3"),
+            (USDC_MINT, "poolNt4"),
+            (USDT_MINT, "poolNt5"),
+        ];
+        for (mint, pool) in cases {
+            assert!(
+                !ctx.get_or_create_tracker(mint, pool, "raydium", 1, 10_000_000_000),
+                "non-tradeable mint must not create tracker: {mint}"
+            );
+        }
+        assert_eq!(
+            ctx.tokens_tracked.load(Ordering::Relaxed),
+            before_tracked,
+            "tokens_tracked must not bump for skipped mints"
+        );
+        assert!(
+            ctx.token_trackers.read().is_empty(),
+            "no pool-scoped rows for quote/native/stable mints"
+        );
+    }
+
+    #[test]
+    fn wait_filter_obs_dedupes_repeated_same_wait_class() {
+        let mut cfg = MomentumConfig::default();
+        cfg.early_min_liquidity_sol = 100.0;
+        let mut tracker = TokenTracker::new(
+            "MintWaitDedup11111111111111111111111111",
+            "poolWaitDedup",
+            "pumpfun",
+            1,
+            1_000_000_000,
+        );
+
+        let (_st1, r1) = tracker.should_generate_intent(&cfg, None);
+        assert!(r1.contains("WAIT_INSUFFICIENT_LIQUIDITY"));
+        assert_eq!(
+            tracker.last_wait_filter_obs_key_for_test(),
+            Some("WAIT_INSUFFICIENT_LIQUIDITY")
+        );
+
+        let (_st2, r2) = tracker.should_generate_intent(&cfg, None);
+        assert!(r2.contains("WAIT_INSUFFICIENT_LIQUIDITY"));
+        assert_eq!(
+            tracker.last_wait_filter_obs_key_for_test(),
+            Some("WAIT_INSUFFICIENT_LIQUIDITY")
+        );
+
+        cfg.early_min_liquidity_sol = 0.0;
+        cfg.min_unique_buyers = 99;
+        cfg.min_trades_per_sec = 0.0;
+        cfg.min_buy_dominance = 0.0;
+        cfg.min_sol_inflow_lamports = 0;
+        cfg.require_mint_authority_renounced = false;
+        cfg.require_freeze_authority_none = false;
+        cfg.top1_buyer_share_cap = 1.0;
+        cfg.top3_buyer_share_cap = 1.0;
+        cfg.repeat_buyer_min_ratio = 0.0;
+        cfg.min_trade_size_lamports = 0;
+        cfg.small_buy_ratio_cap = 1.0;
+
+        let (_st3, r3) = tracker.should_generate_intent(&cfg, None);
+        assert!(r3.contains("WAIT_BUYER_WINDOW"));
+        assert_eq!(
+            tracker.last_wait_filter_obs_key_for_test(),
+            Some("WAIT_BUYER_WINDOW"),
+            "new wait class after liquidity gate passes must update dedupe key"
+        );
+    }
+
+    #[test]
+    fn check_for_signals_emits_probe_for_tradeable_pumpfun_style_mint() {
+        let cfg = {
+            let mut c = MomentumConfig::default();
+            c.default_position_lamports = 1_000;
+            c.probe_buy_pct = 0.25;
+            c.early_min_liquidity_sol = 0.0;
+            c.min_unique_buyers = 0;
+            c.min_trades_per_sec = 0.0;
+            c.min_buy_dominance = 0.0;
+            c.min_sol_inflow_lamports = 0;
+            c.require_mint_authority_renounced = false;
+            c.require_freeze_authority_none = false;
+            c.top1_buyer_share_cap = 1.0;
+            c.top3_buyer_share_cap = 1.0;
+            c.repeat_buyer_min_ratio = 0.0;
+            c.min_trade_size_lamports = 0;
+            c.small_buy_ratio_cap = 1.0;
+            c
+        };
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "MintHotfixRegPump4444444444444444444444444444";
+        let pool = "pumpPoolHotfixReg4444444444444444444444444444";
+
+        assert!(ctx.get_or_create_tracker(mint, pool, "pumpfun", 1, 30_000_000_000));
+
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let tr = trackers
+                .get_mut(&MomentumContext::tracker_storage_key(mint, pool))
+                .expect("tracker");
+            for i in 0..20 {
+                tr.record_trade(
+                    &format!("pf{i:03}"),
+                    true,
+                    200_000_000,
+                    2_000_000,
+                    &format!("sighot{i:03}"),
+                    &cfg,
+                );
+            }
+        }
+
+        let signals = ctx.check_for_signals();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].mint, mint);
+        assert_eq!(signals[0].pool, pool);
+        assert_eq!(signals[0].kind, EntryKind::Probe);
+    }
+
+    #[test]
+    fn is_non_tradeable_momentum_mint_covers_known_quote_assets() {
+        assert!(is_non_tradeable_momentum_mint(WSOL_MINT));
+        assert!(is_non_tradeable_momentum_mint("NATIVE_SOL"));
+        assert!(is_non_tradeable_momentum_mint(
+            "11111111111111111111111111111111"
+        ));
+        assert!(is_non_tradeable_momentum_mint(USDC_MINT));
+        assert!(is_non_tradeable_momentum_mint(USDT_MINT));
+        assert!(!is_non_tradeable_momentum_mint(
+            "MintRealTokenHotfix111111111111111111"
+        ));
+    }
 
     fn pool_cache_update_stub(
         mint: &str,
@@ -12944,7 +13162,11 @@ async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -
                     })
                 };
 
-            if !tracker_exists && *sol_amount > 0 && (*is_buy || is_dev) {
+            if !tracker_exists
+                && *sol_amount > 0
+                && (*is_buy || is_dev)
+                && !is_non_tradeable_momentum_mint(mint)
+            {
                 // Use DEX from event if available, otherwise infer from pool_address pattern
                 let slot = event.slot.unwrap_or(0);
                 let dex_raw = if !event_dex.is_empty() && event_dex != "unknown" {
