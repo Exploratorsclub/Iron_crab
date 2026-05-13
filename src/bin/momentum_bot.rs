@@ -25,7 +25,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
@@ -114,6 +114,9 @@ const CORE_MARKET_EVENTS_INGEST_DRAIN_MAX: usize = 48;
 const WALLET_SNAPSHOT_FETCH_MAX: usize = 16;
 /// Adjacent `BondingCurveProgress` messages on Core NATS: bounded coalesce before strategy work.
 const BONDING_CURVE_PROGRESS_STREAK_MAX: usize = 32;
+
+/// Periodic full entry scan as safety net if dirty marks were missed (default tick interval 500ms → ~10s).
+const ENTRY_SIGNAL_FULL_SCAN_EVERY_TICKS: u64 = 20;
 
 /// WSOL-leg reserve-derived `(token_mint, tokens_per_sol, token_decimals, token_ui, sol_ui)` from `PoolCacheUpdate`.
 type PoolCacheDerivedTps = Option<(String, f64, u8, f64, f64)>;
@@ -2373,6 +2376,12 @@ struct MomentumContext {
     /// [`MomentumContext::tracker_storage_key`] so entry signals cannot reference a stale pool
     /// after migration / multi-pool activity on the same mint.
     token_trackers: parking_lot::RwLock<HashMap<String, TokenTracker>>,
+    /// Mint → pool-scoped tracker storage keys for same-mint iteration without scanning all rows.
+    tracker_keys_by_mint: parking_lot::RwLock<HashMap<String, BTreeSet<String>>>,
+    /// Tracker rows that need entry evaluation on the next strategy tick(s).
+    dirty_entry_tracker_keys: parking_lot::RwLock<BTreeSet<String>>,
+    /// Increments each strategy tick; drives periodic full entry scan.
+    entry_signal_eval_tick: std::sync::atomic::AtomicU64,
     /// Position trackers for exit strategy (mint -> position)
     positions: parking_lot::RwLock<HashMap<String, PositionTracker>>,
     /// Pending intents awaiting execution results (intent_id -> PendingIntent)
@@ -2666,6 +2675,147 @@ impl MomentumContext {
         format!("{mint}\x1f{pool}")
     }
 
+    fn refresh_tracker_keys_by_mint_index_from_map(
+        &self,
+        trackers: &HashMap<String, TokenTracker>,
+    ) {
+        let mut map: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for (k, t) in trackers {
+            map.entry(t.mint.clone()).or_default().insert(k.clone());
+        }
+        *self.tracker_keys_by_mint.write() = map;
+    }
+
+    fn register_tracker_key_for_mint_index(&self, mint: &str, key: &str) {
+        self.tracker_keys_by_mint
+            .write()
+            .entry(mint.to_string())
+            .or_default()
+            .insert(key.to_string());
+    }
+
+    fn mark_entry_eval_dirty_key(&self, key: &str) {
+        self.dirty_entry_tracker_keys
+            .write()
+            .insert(key.to_string());
+    }
+
+    fn mark_entry_eval_dirty_for_mint(&self, mint: &str) {
+        let map = self.tracker_keys_by_mint.read();
+        let Some(keys) = map.get(mint) else {
+            return;
+        };
+        let mut dirty = self.dirty_entry_tracker_keys.write();
+        for k in keys {
+            dirty.insert(k.clone());
+        }
+    }
+
+    /// After `check_for_signals*` advanced a tracker to `ProbeBuyPending` / `ScaleInPending` but
+    /// intent generation or publish failed: revert to an evaluable state and re-queue entry
+    /// evaluation for this mint (all pools) so siblings are not blocked by a stuck `*Pending` row.
+    pub(crate) fn unwind_stale_entry_pending_after_publish_failure(&self, signal: &EntrySignal) {
+        let sk = Self::tracker_storage_key(&signal.mint, &signal.pool);
+        let mut trackers = self.token_trackers.write();
+        if let Some(tr) = trackers.get_mut(&sk) {
+            match signal.kind {
+                EntryKind::Probe => {
+                    if matches!(tr.state, TrackerState::ProbeBuyPending { .. }) {
+                        tr.state = TrackerState::Validation;
+                    }
+                }
+                EntryKind::ScaleIn => {
+                    if matches!(tr.state, TrackerState::ScaleInPending { .. }) {
+                        tr.state = TrackerState::PositionOpenProbe {
+                            filled_at: Instant::now(),
+                        };
+                    }
+                }
+            }
+        }
+        drop(trackers);
+        self.mark_entry_eval_dirty_for_mint(&signal.mint);
+    }
+
+    /// Same-mint tracker keys for hot-path reads; falls back to a mint-only map scan if the index
+    /// is empty (e.g. tests that insert `TokenTracker` rows directly).
+    fn tracker_storage_keys_for_mint_readonly_resilient(
+        &self,
+        mint: &str,
+        trackers: &HashMap<String, TokenTracker>,
+    ) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .tracker_keys_by_mint
+            .read()
+            .get(mint)
+            .map(|s| {
+                s.iter()
+                    .filter(|k| trackers.contains_key(*k))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !keys.is_empty() {
+            keys.sort_unstable();
+            return keys;
+        }
+        let mut v: Vec<String> = trackers
+            .iter()
+            .filter(|(_, t)| t.mint == mint)
+            .map(|(k, _)| k.clone())
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Sibling pool rows for same mint (excluding `exclude_pool` composite key), with index + mint-only fallback.
+    fn sibling_tracker_storage_keys_same_mint_excluding_pool(
+        &self,
+        mint: &str,
+        exclude_pool: &str,
+        trackers: &HashMap<String, TokenTracker>,
+    ) -> Vec<String> {
+        let self_key = Self::tracker_storage_key(mint, exclude_pool);
+        let keys: Vec<String> = self
+            .tracker_keys_by_mint
+            .read()
+            .get(mint)
+            .map(|s| {
+                s.iter()
+                    .filter(|k| *k != &self_key && trackers.contains_key(*k))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !keys.is_empty() {
+            return keys;
+        }
+        trackers
+            .iter()
+            .filter(|(_, t)| t.mint == mint && t.pool.as_str() != exclude_pool)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// JetStream / lifecycle edges can leave `pending_buy_mint_index` pointing at a removed
+    /// `pending_buy_entries` row. A missing entry must not block every pool tracker for the mint.
+    fn prune_stale_pending_buy_mint_index(&self) {
+        let entries = self.pending_buy_entries.read();
+        let mut index = self.pending_buy_mint_index.write();
+        index.retain(|mint_key, intent_id| {
+            if entries.contains_key(intent_id.as_str()) {
+                true
+            } else {
+                warn!(
+                    mint = %mint_key,
+                    intent_id = %intent_id,
+                    "Stale pending_buy_mint_index: intent missing from pending_buy_entries — dropping index entry"
+                );
+                false
+            }
+        });
+    }
+
     /// Returns `true` only for **`dex == "pumpfun"`** bonding-curve entry: do not emit BUY intents when
     /// this PumpFun pool is complete/migrated. **Early return for any other DEX** (Raydium, Orca,
     /// `pump_amm`, …): mint-wide LivePoolCache / sticky migration evidence is **never** applied to
@@ -2712,6 +2862,7 @@ impl MomentumContext {
         );
         let mut infos = self.mint_infos.write();
         infos.insert(mint.to_string(), info);
+        self.mark_entry_eval_dirty_for_mint(mint);
     }
 
     /// Register or update a pool in the multi-pool registry.
@@ -3026,11 +3177,16 @@ impl MomentumContext {
                 // Correct the TokenTracker for future calls
                 let config = self.config.read().clone();
                 let mut trackers = self.token_trackers.write();
-                for t in trackers.values_mut() {
+                let keys = self.tracker_storage_keys_for_mint_readonly_resilient(mint, &trackers);
+                for key in keys {
+                    let Some(t) = trackers.get_mut(&key) else {
+                        continue;
+                    };
                     if t.mint == mint {
                         t.set_dev_info(cache, 0.0, &config);
                     }
                 }
+                self.mark_entry_eval_dirty_for_mint(mint);
                 cache_creator
             }
             (Some(_cache), Some(_tracker)) => {
@@ -3399,6 +3555,7 @@ impl MomentumContext {
         if let Some(tracker) = trackers.get_mut(&tk) {
             tracker.dex = dex.clone(); // A.2: Ensure normalized DEX
             tracker.dex_pool_accounts = Some(accounts.to_vec());
+            self.mark_entry_eval_dirty_key(&tk);
             debug!(
                 mint = %token_mint,
                 pool = %pool_address,
@@ -3421,15 +3578,21 @@ impl MomentumContext {
         if is_non_tradeable_momentum_mint(mint) {
             return false;
         }
+        let mint_already_tracked = self
+            .tracker_keys_by_mint
+            .read()
+            .get(mint)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
         let config = self.config.read().clone();
         let mut trackers = self.token_trackers.write();
         let key = Self::tracker_storage_key(mint, pool);
-        let mint_already_tracked = trackers.values().any(|t| t.mint == mint);
         use std::collections::hash_map::Entry;
-        match trackers.entry(key) {
+        match trackers.entry(key.clone()) {
             Entry::Occupied(_) => false,
             Entry::Vacant(v) => {
                 let tracker = v.insert(TokenTracker::new(mint, pool, dex, slot, liquidity));
+                self.register_tracker_key_for_mint_index(mint, &key);
 
                 // Apply any dev wallet info that arrived before the tracker existed.
                 if let Some((dev_wallet, supply_pct)) =
@@ -3456,6 +3619,7 @@ impl MomentumContext {
                     self.tokens_tracked
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                self.mark_entry_eval_dirty_key(&key);
                 true // New tracker created
             }
         }
@@ -3486,14 +3650,20 @@ impl MomentumContext {
             sync_sibling_dev_sell_early =
                 tracker.blacklist_reason.as_deref() == Some("REJECT_DEV_SELL_EARLY");
         }
+        self.mark_entry_eval_dirty_key(&key);
         // Same-mint sibling pools: one pool's dev-sell-early reject must apply to all pool rows
         // (Trade event is per-pool; mint-wide creator was applied before `record_trade`).
         if sync_sibling_dev_sell_early {
             let Some(source_dev) = trackers.get(&key).and_then(|t| t.dev_wallet.clone()) else {
                 return;
             };
-            for t in trackers.values_mut() {
-                if t.mint != mint || t.pool.as_str() == pool {
+            let sibling_keys =
+                self.sibling_tracker_storage_keys_same_mint_excluding_pool(mint, pool, &trackers);
+            for sk in sibling_keys {
+                let Some(t) = trackers.get_mut(&sk) else {
+                    continue;
+                };
+                if t.pool.as_str() == pool {
                     continue;
                 }
                 if t.is_rejected() {
@@ -3505,6 +3675,7 @@ impl MomentumContext {
                 t.dev_sold = true;
                 t.dev_sold_early = true;
                 t.reject("REJECT_DEV_SELL_EARLY");
+                self.mark_entry_eval_dirty_key(&sk);
             }
         }
     }
@@ -3518,16 +3689,24 @@ impl MomentumContext {
         }
 
         let mut trackers = self.token_trackers.write();
-        for tracker in trackers.values_mut() {
-            if tracker.mint != mint {
+        self.refresh_tracker_keys_by_mint_index_from_map(&trackers);
+        let keys: Vec<String> = self
+            .tracker_keys_by_mint
+            .read()
+            .get(mint)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        for key in keys {
+            let Some(tracker) = trackers.get_mut(&key) else {
                 continue;
-            }
+            };
             let was_not_rejected = tracker.was_not_rejected();
             tracker.set_dev_info(dev_wallet, supply_pct, &config);
             if was_not_rejected && tracker.is_rejected() {
                 self.record_token_blacklisted_once(mint);
             }
         }
+        self.mark_entry_eval_dirty_for_mint(mint);
         // A.2: Also update position creator when dex is pumpfun (for BC-SELL after restart)
         {
             let mut positions = self.positions.write();
@@ -3543,48 +3722,115 @@ impl MomentumContext {
     /// Record LP removal for a token
     fn record_lp_removal(&self, mint: &str) {
         let mut trackers = self.token_trackers.write();
-        for tracker in trackers.values_mut() {
-            if tracker.mint != mint {
+        self.refresh_tracker_keys_by_mint_index_from_map(&trackers);
+        let keys: Vec<String> = self
+            .tracker_keys_by_mint
+            .read()
+            .get(mint)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        for key in keys {
+            let Some(tracker) = trackers.get_mut(&key) else {
                 continue;
-            }
+            };
             let was_not_rejected = tracker.was_not_rejected();
             tracker.record_lp_removal();
             if was_not_rejected && tracker.is_rejected() {
                 self.record_token_blacklisted_once(mint);
             }
         }
+        self.mark_entry_eval_dirty_for_mint(mint);
     }
 
-    /// Check if any tracked token should generate an intent
+    /// Check if any tracked token should generate an intent (full scan; tests + compatibility).
+    #[cfg(test)]
     fn check_for_signals(&self) -> Vec<EntrySignal> {
-        // Returns entry intents (probe + optional scale-in)
+        self.prune_stale_pending_buy_mint_index();
         let config = self.config.read().clone();
         let mint_infos = self.mint_infos.read();
         let positions = self.positions.read();
-
-        // JetStream / lifecycle edges can leave `pending_buy_mint_index` pointing at a removed
-        // `pending_buy_entries` row. A missing entry must not block every pool tracker for the mint.
-        {
-            let entries = self.pending_buy_entries.read();
-            let mut index = self.pending_buy_mint_index.write();
-            index.retain(|mint_key, intent_id| {
-                if entries.contains_key(intent_id.as_str()) {
-                    true
-                } else {
-                    warn!(
-                        mint = %mint_key,
-                        intent_id = %intent_id,
-                        "Stale pending_buy_mint_index: intent missing from pending_buy_entries — dropping index entry"
-                    );
-                    false
-                }
-            });
-        }
-
         let pending_buy_index = self.pending_buy_mint_index.read();
         let pending_buy_entries = self.pending_buy_entries.read();
-
         let mut trackers = self.token_trackers.write();
+        self.refresh_tracker_keys_by_mint_index_from_map(&trackers);
+        let mut tracker_keys: Vec<String> = trackers.keys().cloned().collect();
+        tracker_keys.sort_unstable();
+        self.check_for_signals_eval_sorted_tracker_keys(
+            &config,
+            &mint_infos,
+            &positions,
+            &pending_buy_index,
+            &pending_buy_entries,
+            &mut trackers,
+            &tracker_keys,
+        )
+    }
+
+    /// Strategy tick: evaluate dirty tracker rows first; periodic full scan as safety net.
+    fn check_for_signals_dirty_priority_tick(&self) -> Vec<EntrySignal> {
+        self.prune_stale_pending_buy_mint_index();
+        let config = self.config.read().clone();
+        let mint_infos = self.mint_infos.read();
+        let positions = self.positions.read();
+        let pending_buy_index = self.pending_buy_mint_index.read();
+        let pending_buy_entries = self.pending_buy_entries.read();
+        let mut trackers = self.token_trackers.write();
+
+        let prev = self.entry_signal_eval_tick.fetch_add(1, Ordering::Relaxed);
+        let do_full_scan = prev.wrapping_add(1) % ENTRY_SIGNAL_FULL_SCAN_EVERY_TICKS == 0;
+
+        if do_full_scan {
+            self.dirty_entry_tracker_keys.write().clear();
+            self.refresh_tracker_keys_by_mint_index_from_map(&trackers);
+            let mut tracker_keys: Vec<String> = trackers.keys().cloned().collect();
+            tracker_keys.sort_unstable();
+            return self.check_for_signals_eval_sorted_tracker_keys(
+                &config,
+                &mint_infos,
+                &positions,
+                &pending_buy_index,
+                &pending_buy_entries,
+                &mut trackers,
+                &tracker_keys,
+            );
+        }
+
+        let mut dirty_keys: Vec<String> = {
+            let mut d = self.dirty_entry_tracker_keys.write();
+            let keys: Vec<_> = d.iter().cloned().collect();
+            d.clear();
+            keys
+        };
+        dirty_keys.sort_unstable();
+        dirty_keys.dedup();
+        dirty_keys.retain(|k| trackers.contains_key(k));
+
+        if dirty_keys.is_empty() {
+            return Vec::new();
+        }
+
+        self.check_for_signals_eval_sorted_tracker_keys(
+            &config,
+            &mint_infos,
+            &positions,
+            &pending_buy_index,
+            &pending_buy_entries,
+            &mut trackers,
+            &dirty_keys,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_for_signals_eval_sorted_tracker_keys(
+        &self,
+        config: &MomentumConfig,
+        mint_infos: &HashMap<String, MintInfo>,
+        positions: &HashMap<String, PositionTracker>,
+        pending_buy_index: &HashMap<String, String>,
+        pending_buy_entries: &HashMap<String, PendingBuyEntry>,
+        trackers: &mut HashMap<String, TokenTracker>,
+        tracker_keys: &[String],
+    ) -> Vec<EntrySignal> {
         // Under the same write lock as the signal loop: pending probe/scale-in pools for mint-level serialization.
         let sibling_entry_busy: Vec<(String, String)> = trackers
             .values()
@@ -3598,7 +3844,7 @@ impl MomentumContext {
             .collect();
 
         let mut signals = Vec::new();
-        // At most one entry signal (probe or scale-in) per mint per `check_for_signals` call.
+        // At most one entry signal (probe or scale-in) per mint per evaluation pass.
         // `pending_buy_mint_index` updates after publish; `mint_emitted_entry_this_tick` covers same-tick races.
         let mut mint_emitted_entry_this_tick: HashSet<String> = HashSet::new();
 
@@ -3607,13 +3853,8 @@ impl MomentumContext {
             .clamp(0.0, config.default_position_lamports as f64) as u64;
         let scale_sol = config.default_position_lamports.saturating_sub(probe_sol);
 
-        // Deterministic iteration: `HashMap::values_mut()` order is arbitrary and can flip which
-        // pool "wins" when multiple tracker rows are eligible for the same mint in one tick.
-        let mut tracker_keys: Vec<String> = trackers.keys().cloned().collect();
-        tracker_keys.sort_unstable();
-
         'tracker_keys: for key in tracker_keys {
-            let mint = match trackers.get(&key) {
+            let mint = match trackers.get(key) {
                 Some(t) => t.mint.clone(),
                 None => continue,
             };
@@ -3621,7 +3862,7 @@ impl MomentumContext {
             // I-13 / multi-pool: only the position's pool may continue entry/scale on this mint.
             if let Some(pos) = positions.get(&mint) {
                 let same_pool = trackers
-                    .get(&key)
+                    .get(key)
                     .map(|t| t.pool == pos.pool)
                     .unwrap_or(false);
                 if !same_pool {
@@ -3633,10 +3874,11 @@ impl MomentumContext {
             if let Some(intent_id) = pending_buy_index.get(&mint) {
                 if let Some(entry) = pending_buy_entries.get(intent_id.as_str()) {
                     let pool_matches_pending = trackers
-                        .get(&key)
+                        .get(key)
                         .map(|t| entry.pool.as_str() == t.pool.as_str())
                         .unwrap_or(false);
                     if !pool_matches_pending {
+                        self.mark_entry_eval_dirty_key(key);
                         continue;
                     }
                 }
@@ -3644,13 +3886,13 @@ impl MomentumContext {
             }
 
             // Skip tokens in terminal states
-            match trackers.get(&key) {
+            match trackers.get(key) {
                 None => continue,
                 Some(t) if t.is_entry_complete() => continue,
                 Some(_) => {}
             }
 
-            let (this_pool, dex_for_migration) = match trackers.get(&key) {
+            let (this_pool, dex_for_migration) = match trackers.get(key) {
                 Some(t) => (t.pool.clone(), t.dex.clone()),
                 None => continue,
             };
@@ -3658,11 +3900,11 @@ impl MomentumContext {
             // Completed / migrated PumpFun bonding curve on this pool (or mint-level cache evidence).
             if self.pumpfun_entry_blocked_by_migration(&mint, &this_pool, &dex_for_migration) {
                 let was_not_rejected = trackers
-                    .get(&key)
+                    .get(key)
                     .expect("tracker key from iteration")
                     .was_not_rejected();
                 {
-                    let tracker = trackers.get_mut(&key).expect("tracker key from iteration");
+                    let tracker = trackers.get_mut(key).expect("tracker key from iteration");
                     tracker.reject("REJECT_PUMPFUN_BONDING_COMPLETE");
                     if was_not_rejected && tracker.is_rejected() {
                         warn!(
@@ -3682,6 +3924,7 @@ impl MomentumContext {
                 .iter()
                 .any(|(m, p)| m == &mint && p.as_str() != this_pool.as_str())
             {
+                self.mark_entry_eval_dirty_key(key);
                 continue;
             }
 
@@ -3689,20 +3932,21 @@ impl MomentumContext {
 
             // 1) Probe-buy stage (Discovery or Validation state)
             let in_probe_stage = trackers
-                .get(&key)
+                .get(key)
                 .map(|t| matches!(t.state, TrackerState::Discovery | TrackerState::Validation))
                 .unwrap_or(false);
             if in_probe_stage {
                 {
-                    let tracker = trackers.get_mut(&key).expect("tracker key from iteration");
+                    let tracker = trackers.get_mut(key).expect("tracker key from iteration");
                     let was_not_rejected = tracker.was_not_rejected();
-                    let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
+                    let (should_trade, reason) = tracker.should_generate_intent(config, mint_info);
                     if was_not_rejected && tracker.is_rejected() {
                         self.record_token_blacklisted_once(&mint);
                     }
 
                     if should_trade {
                         if mint_emitted_entry_this_tick.contains(&mint) {
+                            self.mark_entry_eval_dirty_key(key);
                             continue 'tracker_keys;
                         }
                         if probe_sol == 0 {
@@ -3740,7 +3984,7 @@ impl MomentumContext {
             }
 
             // 2) Scale-in stage (only after probe fill, within confirm window)
-            let probe_filled_at = trackers.get(&key).and_then(|t| match t.state {
+            let probe_filled_at = trackers.get(key).and_then(|t| match t.state {
                 TrackerState::PositionOpenProbe { filled_at } => Some(filled_at),
                 _ => None,
             });
@@ -3748,21 +3992,22 @@ impl MomentumContext {
                 let now = Instant::now();
                 if now.duration_since(filled_at).as_secs() > config.scale_in_confirm_window_secs {
                     // Confirmation window expired: keep probe position only.
-                    let tracker = trackers.get_mut(&key).expect("tracker key from iteration");
+                    let tracker = trackers.get_mut(key).expect("tracker key from iteration");
                     tracker.state = TrackerState::PositionOpenFull { filled_at };
                     continue;
                 }
 
                 {
-                    let tracker = trackers.get_mut(&key).expect("tracker key from iteration");
+                    let tracker = trackers.get_mut(key).expect("tracker key from iteration");
                     let was_not_rejected = tracker.was_not_rejected();
-                    let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
+                    let (should_trade, reason) = tracker.should_generate_intent(config, mint_info);
                     if was_not_rejected && tracker.is_rejected() {
                         self.record_token_blacklisted_once(&mint);
                     }
 
                     if should_trade {
                         if mint_emitted_entry_this_tick.contains(&mint) {
+                            self.mark_entry_eval_dirty_key(key);
                             continue 'tracker_keys;
                         }
                         if scale_sol == 0 {
@@ -3809,6 +4054,28 @@ impl MomentumContext {
                 || tracker.first_seen.elapsed() < cutoff
                 || !tracker.state.is_terminal()
         });
+        self.refresh_tracker_keys_by_mint_index_from_map(&trackers);
+        self.dirty_entry_tracker_keys
+            .write()
+            .retain(|k| trackers.contains_key(k));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_sorted_tracker_storage_keys_for_mint(&self, mint: &str) -> Vec<String> {
+        self.tracker_keys_by_mint
+            .read()
+            .get(mint)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_resync_tracker_indexes(&self) {
+        let snap = self.token_trackers.read();
+        self.refresh_tracker_keys_by_mint_index_from_map(&snap);
+        self.dirty_entry_tracker_keys
+            .write()
+            .retain(|k| snap.contains_key(k));
     }
 
     // =========================================================================
@@ -4604,6 +4871,7 @@ impl MomentumContext {
                 );
             }
         }
+        self.mark_entry_eval_dirty_for_mint(mint);
     }
 
     /// After successful BUY intent JetStream publish: track lifecycle + bonding cache (not a position).
@@ -4638,24 +4906,33 @@ impl MomentumContext {
             mint = %meta.mint,
             "Registered pending BUY entry lifecycle (post-publish)"
         );
+        self.mark_entry_eval_dirty_for_mint(meta.mint);
     }
 
     fn remove_pending_buy_entry_by_intent(&self, intent_id: &str) {
-        let mut entries = self.pending_buy_entries.write();
-        if let Some(e) = entries.remove(intent_id) {
-            let mut index = self.pending_buy_mint_index.write();
-            if index.get(&e.mint).map(|id| id.as_str()) == Some(intent_id) {
-                index.remove(&e.mint);
+        let removed_mint = {
+            let mut entries = self.pending_buy_entries.write();
+            if let Some(e) = entries.remove(intent_id) {
+                let mut index = self.pending_buy_mint_index.write();
+                if index.get(&e.mint).map(|id| id.as_str()) == Some(intent_id) {
+                    index.remove(&e.mint);
+                }
+                debug!(
+                    intent_id = %intent_id,
+                    mint = %e.mint,
+                    "Removed pending BUY entry lifecycle"
+                );
+                if self.positions.read().get(&e.mint).is_none() {
+                    self.latest_bonding_by_mint.write().remove(&e.mint);
+                    self.clear_scope_b_sticky_state_for_mint(&e.mint);
+                }
+                Some(e.mint)
+            } else {
+                None
             }
-            debug!(
-                intent_id = %intent_id,
-                mint = %e.mint,
-                "Removed pending BUY entry lifecycle"
-            );
-            if self.positions.read().get(&e.mint).is_none() {
-                self.latest_bonding_by_mint.write().remove(&e.mint);
-                self.clear_scope_b_sticky_state_for_mint(&e.mint);
-            }
+        };
+        if let Some(m) = removed_mint {
+            self.mark_entry_eval_dirty_for_mint(&m);
         }
     }
 
@@ -4705,18 +4982,28 @@ impl MomentumContext {
         slot: u64,
         ts_unix_ms: u64,
     ) {
-        let mut map = self.latest_pumpfun_migration_complete_by_mint.write();
-        let accept = match map.get(mint) {
-            None => true,
-            Some(prev) => {
-                bonding_geyser_observation_is_newer(slot, ts_unix_ms, prev.slot, prev.ts_unix_ms)
+        let mut merged = false;
+        {
+            let mut map = self.latest_pumpfun_migration_complete_by_mint.write();
+            let accept = match map.get(mint) {
+                None => true,
+                Some(prev) => bonding_geyser_observation_is_newer(
+                    slot,
+                    ts_unix_ms,
+                    prev.slot,
+                    prev.ts_unix_ms,
+                ),
+            };
+            if accept {
+                map.insert(
+                    mint.to_string(),
+                    CachedPumpfunMigrationCompleteEvidence { slot, ts_unix_ms },
+                );
+                merged = true;
             }
-        };
-        if accept {
-            map.insert(
-                mint.to_string(),
-                CachedPumpfunMigrationCompleteEvidence { slot, ts_unix_ms },
-            );
+        }
+        if merged {
+            self.mark_entry_eval_dirty_for_mint(mint);
         }
     }
 
@@ -5339,6 +5626,7 @@ impl MomentumContext {
                                     }
                                 }
                             }
+                            self.mark_entry_eval_dirty_key(&tk);
 
                             self.remove_pending_buy_entry_by_intent(&result.intent_id);
                             return;
@@ -5407,6 +5695,7 @@ impl MomentumContext {
                                     None => {}
                                 }
                             }
+                            self.mark_entry_eval_dirty_key(&tk);
                         }
 
                         // Resolve token_program for this mint:
@@ -5601,6 +5890,7 @@ impl MomentumContext {
                             pending.entry_kind.unwrap_or(EntryKind::Probe)
                         ));
                     }
+                    self.mark_entry_eval_dirty_key(&tk);
                 } else if pending.side == TradeSide::Sell {
                     // Reset exit_generated so the next strategy tick retries the sell.
                     let mut positions = self.positions.write();
@@ -5694,6 +5984,7 @@ impl MomentumContext {
                             pending.entry_kind.unwrap_or(EntryKind::Probe)
                         ));
                     }
+                    self.mark_entry_eval_dirty_key(&tk);
                 } else if pending.side == TradeSide::Sell {
                     // Reset exit_generated so the next strategy tick retries the sell.
                     let mut positions = self.positions.write();
@@ -7085,6 +7376,9 @@ async fn main() -> Result<()> {
         pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
         mint_infos: parking_lot::RwLock::new(HashMap::new()),
         token_trackers: parking_lot::RwLock::new(HashMap::new()),
+        tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
+        dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+        entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
         positions: parking_lot::RwLock::new(recovered_positions),
         pending_intents: parking_lot::RwLock::new(HashMap::new()),
         latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -8050,7 +8344,7 @@ async fn main() -> Result<()> {
                     || !ctx.pending_buy_entries.read().is_empty();
                 if need_entry_scan {
                     // === Check for ENTRY signals ===
-                    let signals = ctx.check_for_signals();
+                    let signals = ctx.check_for_signals_dirty_priority_tick();
                     for s in signals {
                         info!(
                             mint = %s.mint,
@@ -8141,12 +8435,24 @@ async fn generate_and_publish_buy_intent(
     ctx: &MomentumContext,
     signal: &EntrySignal,
 ) -> Result<()> {
+    let intent_id = ctx.next_intent_id();
+    let result = generate_and_publish_buy_intent_inner(ctx, signal, &intent_id).await;
+    if result.is_err() {
+        ctx.pending_intents.write().remove(&intent_id);
+        ctx.unwind_stale_entry_pending_after_publish_failure(signal);
+    }
+    result
+}
+
+async fn generate_and_publish_buy_intent_inner(
+    ctx: &MomentumContext,
+    signal: &EntrySignal,
+    intent_id: &str,
+) -> Result<()> {
     let max_slippage = { ctx.config.read().early_max_slippage_bps };
 
     // Assume SOL (So11111...) as quote mint for PumpFun/meme tokens
     let sol_mint = "So11111111111111111111111111111111111111112";
-
-    let intent_id = ctx.next_intent_id();
 
     // Multi-Pool Routing: For ScaleIn entries, find the best pool (price > speed)
     // For Probe entries, use original pool (speed is critical)
@@ -8250,23 +8556,6 @@ async fn generate_and_publish_buy_intent(
         let dex_pool_accounts_opt =
             ctx.try_get_dex_pool_accounts_for_mint_pool(&signal.mint, &effective_pool);
         let Some(accounts) = dex_pool_accounts_opt else {
-            // Roll back stage markers so we can try again when DexPoolAccounts arrives.
-            {
-                let mut trackers = ctx.token_trackers.write();
-                let sk = MomentumContext::tracker_storage_key(&signal.mint, &signal.pool);
-                if let Some(tr) = trackers.get_mut(&sk) {
-                    match signal.kind {
-                        EntryKind::Probe => tr.state = TrackerState::Validation,
-                        EntryKind::ScaleIn => {
-                            if let TrackerState::ScaleInPending { .. } = tr.state {
-                                tr.state = TrackerState::PositionOpenProbe {
-                                    filled_at: Instant::now(),
-                                };
-                            }
-                        }
-                    }
-                }
-            }
             warn!(
                 mint = %signal.mint,
                 pool = %effective_pool,
@@ -8320,23 +8609,6 @@ async fn generate_and_publish_buy_intent(
     let (last_sol_lamports, last_token_amount) = match last_trade_ratio_opt {
         Some(v) => v,
         None => {
-            // Roll back stage markers so we can try again when a usable trade ratio arrives.
-            {
-                let mut trackers = ctx.token_trackers.write();
-                let sk = MomentumContext::tracker_storage_key(&signal.mint, &signal.pool);
-                if let Some(tr) = trackers.get_mut(&sk) {
-                    match signal.kind {
-                        EntryKind::Probe => tr.state = TrackerState::Validation,
-                        EntryKind::ScaleIn => {
-                            if let TrackerState::ScaleInPending { .. } = tr.state {
-                                tr.state = TrackerState::PositionOpenProbe {
-                                    filled_at: Instant::now(),
-                                };
-                            }
-                        }
-                    }
-                }
-            }
             warn!(
                 mint = %signal.mint,
                 pool = %signal.pool,
@@ -8371,7 +8643,7 @@ async fn generate_and_publish_buy_intent(
         "momentum-bot",
         BUILD_VERSION,
         &ctx.run_id,
-        intent_id.clone(),
+        intent_id.to_string(),
         "momentum-bot",
         IntentTier::Tier1,
         IntentOrigin::StrategyA,
@@ -8464,16 +8736,6 @@ async fn generate_and_publish_buy_intent(
             .insert("slot_seen_at_ms".to_string(), ts_ms.to_string());
     }
 
-    // Register pending intent BEFORE publishing
-    ctx.register_buy_intent(
-        &intent_id,
-        &signal.mint,
-        &effective_pool,
-        &effective_dex,
-        signal.sol_amount,
-        Some(signal.kind),
-    );
-
     info!(
         intent_id = %intent.intent_id,
         pool = %effective_pool,
@@ -8486,8 +8748,18 @@ async fn generate_and_publish_buy_intent(
         "🚀 Generated BUY TradeIntent"
     );
 
-    // Write to JSONL (P0 requirement)
+    // Write to JSONL (P0 requirement) before registering in-memory pending correlation state.
     ctx.jsonl_writer.write(&intent)?;
+
+    // Register pending intent for execution-result correlation (after durable local write).
+    ctx.register_buy_intent(
+        intent_id,
+        &signal.mint,
+        &effective_pool,
+        &effective_dex,
+        signal.sol_amount,
+        Some(signal.kind),
+    );
 
     // Publish to JetStream (persistent; avoids execution-engine startup race with Core NATS)
     let mut publish_ok = ctx.nats.is_none();
@@ -8514,7 +8786,7 @@ async fn generate_and_publish_buy_intent(
     if publish_ok {
         let meta_creator = intent.metadata.get("creator").cloned();
         ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
-            intent_id: &intent_id,
+            intent_id,
             mint: &signal.mint,
             pool: &effective_pool,
             dex: &effective_dex,
@@ -8846,7 +9118,8 @@ mod tests {
 
     fn empty_test_context(jsonl_writer: JsonlWriter) -> MomentumContext {
         MomentumContext {
-            run_id: "test".to_string(),
+            // `next_intent_id` prefixes with `run_id[..8]`; keep at least 8 chars.
+            run_id: "run-test00".to_string(),
             config: parking_lot::RwLock::new(MomentumConfig::default()),
             nats: None,
             jsonl_writer,
@@ -8856,6 +9129,9 @@ mod tests {
             pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -9018,6 +9294,382 @@ mod tests {
         assert_eq!(signals[0].mint, mint);
         assert_eq!(signals[0].pool, pool);
         assert_eq!(signals[0].kind, EntryKind::Probe);
+    }
+
+    #[test]
+    fn mint_index_registers_two_pool_rows_same_mint_and_resync_prunes() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "MintIdxTwin22222222222222222222222222222";
+        let pool_a = "poolIdxA22222222222222222222222222222222";
+        let pool_b = "poolIdxB22222222222222222222222222222222";
+
+        assert!(ctx.get_or_create_tracker(mint, pool_a, "pumpfun", 1, 30_000_000_000));
+        assert!(ctx.get_or_create_tracker(mint, pool_b, "raydium", 1, 10_000_000_000));
+
+        let keys = ctx.test_sorted_tracker_storage_keys_for_mint(mint);
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&MomentumContext::tracker_storage_key(mint, pool_a)));
+        assert!(keys.contains(&MomentumContext::tracker_storage_key(mint, pool_b)));
+
+        let k_remove = MomentumContext::tracker_storage_key(mint, pool_a);
+        assert!(ctx.token_trackers.write().remove(&k_remove).is_some());
+        ctx.test_resync_tracker_indexes();
+
+        let keys_after = ctx.test_sorted_tracker_storage_keys_for_mint(mint);
+        assert_eq!(keys_after.len(), 1);
+        assert_eq!(
+            keys_after[0],
+            MomentumContext::tracker_storage_key(mint, pool_b)
+        );
+    }
+
+    #[test]
+    fn record_dev_info_same_mint_index_leaves_other_mint_untouched() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint_a = "MintIdxSameA33333333333333333333333333333";
+        let mint_b = "MintIdxOtherB3333333333333333333333333333";
+        let pool_a1 = "poolIdxSameA133333333333333333333333333333";
+        let pool_a2 = "poolIdxSameA233333333333333333333333333333";
+        let pool_b1 = "poolIdxOtherB13333333333333333333333333333";
+
+        assert!(ctx.get_or_create_tracker(mint_a, pool_a1, "pumpfun", 1, 30_000_000_000));
+        assert!(ctx.get_or_create_tracker(mint_a, pool_a2, "raydium", 1, 10_000_000_000));
+        assert!(ctx.get_or_create_tracker(mint_b, pool_b1, "pumpfun", 1, 30_000_000_000));
+
+        ctx.record_dev_info(mint_a, "DevWalletSame333333333333333333333333333", 1.0);
+
+        let trackers = ctx.token_trackers.read();
+        assert!(trackers
+            .get(&MomentumContext::tracker_storage_key(mint_b, pool_b1))
+            .expect("mint_b tracker")
+            .dev_wallet
+            .is_none());
+
+        let dev_a1 = trackers
+            .get(&MomentumContext::tracker_storage_key(mint_a, pool_a1))
+            .expect("mint_a pool1")
+            .dev_wallet
+            .clone();
+        let dev_a2 = trackers
+            .get(&MomentumContext::tracker_storage_key(mint_a, pool_a2))
+            .expect("mint_a pool2")
+            .dev_wallet
+            .clone();
+        drop(trackers);
+        assert_eq!(
+            dev_a1.as_deref(),
+            Some("DevWalletSame333333333333333333333333333")
+        );
+        assert_eq!(
+            dev_a2.as_deref(),
+            Some("DevWalletSame333333333333333333333333333")
+        );
+    }
+
+    #[test]
+    fn dirty_entry_tick_evaluates_only_dirty_tracker_row() {
+        let cfg = {
+            let mut c = MomentumConfig::default();
+            c.default_position_lamports = 1_000;
+            c.probe_buy_pct = 0.25;
+            c.early_min_liquidity_sol = 0.0;
+            c.min_unique_buyers = 0;
+            c.min_trades_per_sec = 0.0;
+            c.min_buy_dominance = 0.0;
+            c.min_sol_inflow_lamports = 0;
+            c.require_mint_authority_renounced = false;
+            c.require_freeze_authority_none = false;
+            c.top1_buyer_share_cap = 1.0;
+            c.top3_buyer_share_cap = 1.0;
+            c.repeat_buyer_min_ratio = 0.0;
+            c.min_trade_size_lamports = 0;
+            c.small_buy_ratio_cap = 1.0;
+            c
+        };
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "MintDirtyEval555555555555555555555555555";
+        let pool_hot = "poolDirtyHot55555555555555555555555555555";
+        let pool_cold = "poolDirtyCold5555555555555555555555555555";
+
+        assert!(ctx.get_or_create_tracker(mint, pool_hot, "pumpfun", 1, 30_000_000_000));
+        assert!(ctx.get_or_create_tracker(mint, pool_cold, "pumpfun", 1, 30_000_000_000));
+
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let tr = trackers
+                .get_mut(&MomentumContext::tracker_storage_key(mint, pool_hot))
+                .expect("hot");
+            for i in 0..20 {
+                tr.record_trade(
+                    &format!("pf{i:03}"),
+                    true,
+                    200_000_000,
+                    2_000_000,
+                    &format!("sighot{i:03}"),
+                    &cfg,
+                );
+            }
+        }
+        ctx.dirty_entry_tracker_keys.write().clear();
+        let hot_key = MomentumContext::tracker_storage_key(mint, pool_hot);
+        ctx.mark_entry_eval_dirty_key(&hot_key);
+        ctx.entry_signal_eval_tick
+            .store(17, std::sync::atomic::Ordering::Relaxed);
+
+        let signals = ctx.check_for_signals_dirty_priority_tick();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].pool, pool_hot);
+
+        let mut cfg_cold = cfg.clone();
+        cfg_cold.min_unique_buyers = 99;
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let cold = trackers
+                .get_mut(&MomentumContext::tracker_storage_key(mint, pool_cold))
+                .expect("cold");
+            cold.record_trade(
+                "onlyOneBuyerColdPath5555555555555555555",
+                true,
+                200_000_000,
+                2_000_000,
+                "sigcold1",
+                &cfg_cold,
+            );
+        }
+        ctx.dirty_entry_tracker_keys.write().clear();
+        ctx.mark_entry_eval_dirty_key(&MomentumContext::tracker_storage_key(mint, pool_cold));
+        ctx.entry_signal_eval_tick
+            .store(17, std::sync::atomic::Ordering::Relaxed);
+
+        let signals_cold_only = ctx.check_for_signals_dirty_priority_tick();
+        assert!(
+            signals_cold_only.is_empty(),
+            "cold pool with insufficient buyers must not emit when only it is dirty"
+        );
+    }
+
+    #[test]
+    fn dirty_same_mint_second_pool_key_stays_dirty_when_first_pool_emits_this_tick() {
+        let cfg = {
+            let mut c = MomentumConfig::default();
+            c.default_position_lamports = 1_000;
+            c.probe_buy_pct = 0.25;
+            c.early_min_liquidity_sol = 0.0;
+            c.min_unique_buyers = 0;
+            c.min_trades_per_sec = 0.0;
+            c.min_buy_dominance = 0.0;
+            c.min_sol_inflow_lamports = 0;
+            c.require_mint_authority_renounced = false;
+            c.require_freeze_authority_none = false;
+            c.top1_buyer_share_cap = 1.0;
+            c.top3_buyer_share_cap = 1.0;
+            c.repeat_buyer_min_ratio = 0.0;
+            c.min_trade_size_lamports = 0;
+            c.small_buy_ratio_cap = 1.0;
+            c
+        };
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "MintDirtySib6666666666666666666666666666";
+        // Lexicographic order on storage key uses pool string; `aaa` sorts before `zzz`.
+        let pool_first = "aaaPoolSib666666666666666666666666666666";
+        let pool_second = "zzzPoolSib666666666666666666666666666666";
+
+        assert!(ctx.get_or_create_tracker(mint, pool_first, "pumpfun", 1, 30_000_000_000));
+        assert!(ctx.get_or_create_tracker(mint, pool_second, "pumpfun", 1, 30_000_000_000));
+
+        for pool in [pool_first, pool_second] {
+            let mut trackers = ctx.token_trackers.write();
+            let tr = trackers
+                .get_mut(&MomentumContext::tracker_storage_key(mint, pool))
+                .expect("tracker");
+            for i in 0..20 {
+                tr.record_trade(
+                    &format!("pf{i:03}"),
+                    true,
+                    200_000_000,
+                    2_000_000,
+                    &format!("sig{i:03}_{pool}"),
+                    &cfg,
+                );
+            }
+        }
+
+        ctx.dirty_entry_tracker_keys.write().clear();
+        ctx.mark_entry_eval_dirty_key(&MomentumContext::tracker_storage_key(mint, pool_first));
+        ctx.mark_entry_eval_dirty_key(&MomentumContext::tracker_storage_key(mint, pool_second));
+        ctx.entry_signal_eval_tick
+            .store(17, std::sync::atomic::Ordering::Relaxed);
+
+        let signals = ctx.check_for_signals_dirty_priority_tick();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].pool, pool_first);
+
+        let key_second = MomentumContext::tracker_storage_key(mint, pool_second);
+        assert!(
+            ctx.dirty_entry_tracker_keys.read().contains(&key_second),
+            "second same-mint pool must stay dirty for a follow-up tick when capped at one emit/tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_buy_pumpfun_missing_creator_unwinds_probe_pending_and_skips_pending_intent() {
+        let cfg = {
+            let mut c = MomentumConfig::default();
+            c.default_position_lamports = 1_000;
+            c.probe_buy_pct = 0.25;
+            c.early_min_liquidity_sol = 0.0;
+            c.min_unique_buyers = 0;
+            c.min_trades_per_sec = 0.0;
+            c.min_buy_dominance = 0.0;
+            c.min_sol_inflow_lamports = 0;
+            c.require_mint_authority_renounced = false;
+            c.require_freeze_authority_none = false;
+            c.top1_buyer_share_cap = 1.0;
+            c.top3_buyer_share_cap = 1.0;
+            c.repeat_buyer_min_ratio = 0.0;
+            c.min_trade_size_lamports = 0;
+            c.small_buy_ratio_cap = 1.0;
+            c
+        };
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg;
+
+        let mint = "MintUnwindPF7777777777777777777777777777";
+        let pool = "poolUnwindPf7777777777777777777777777777";
+
+        assert!(ctx.get_or_create_tracker(mint, pool, "pumpfun", 1, 30_000_000_000));
+
+        let sk = MomentumContext::tracker_storage_key(mint, pool);
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let tr = trackers.get_mut(&sk).expect("tracker");
+            for i in 0..8 {
+                tr.record_trade(
+                    &format!("pf{i:03}"),
+                    true,
+                    200_000_000,
+                    2_000_000,
+                    &format!("sigunw{i:03}"),
+                    &ctx.config.read(),
+                );
+            }
+            tr.state = TrackerState::ProbeBuyPending {
+                sent_at: Instant::now(),
+            };
+            assert!(
+                tr.dev_wallet.is_none(),
+                "test expects missing pumpfun creator"
+            );
+        }
+
+        let signal = EntrySignal {
+            mint: mint.to_string(),
+            pool: pool.to_string(),
+            dex: "pumpfun".to_string(),
+            sol_amount: 250,
+            kind: EntryKind::Probe,
+            reason: "ENTER_PROBE_BUY: test unwind".to_string(),
+        };
+
+        assert!(
+            generate_and_publish_buy_intent(&ctx, &signal)
+                .await
+                .is_err(),
+            "missing creator must fail pumpfun BUY build"
+        );
+
+        let trackers = ctx.token_trackers.read();
+        let st = &trackers.get(&sk).expect("tracker post-unwind").state;
+        assert!(
+            matches!(st, TrackerState::Validation),
+            "probe pending must unwind to Validation; got {st:?}"
+        );
+        drop(trackers);
+        assert!(
+            ctx.pending_intents.read().is_empty(),
+            "JSONL/register_buy_intent must not run after creator failure — no ghost pending_intents row"
+        );
+    }
+
+    #[test]
+    fn unwind_probe_and_scale_in_pending_restores_evaluable_states() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "MintUnwindManual88888888888888888888888888";
+        let pool = "poolUnwindMan88888888888888888888888888888";
+        assert!(ctx.get_or_create_tracker(mint, pool, "raydium", 1, 10_000_000_000));
+
+        let sk = MomentumContext::tracker_storage_key(mint, pool);
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let tr = trackers.get_mut(&sk).unwrap();
+            tr.state = TrackerState::ProbeBuyPending {
+                sent_at: Instant::now(),
+            };
+        }
+        ctx.unwind_stale_entry_pending_after_publish_failure(&EntrySignal {
+            mint: mint.to_string(),
+            pool: pool.to_string(),
+            dex: "raydium".to_string(),
+            sol_amount: 1,
+            kind: EntryKind::Probe,
+            reason: "t".to_string(),
+        });
+        {
+            let trackers = ctx.token_trackers.read();
+            assert!(matches!(
+                trackers.get(&sk).unwrap().state,
+                TrackerState::Validation
+            ));
+        }
+
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let tr = trackers.get_mut(&sk).unwrap();
+            tr.state = TrackerState::ScaleInPending {
+                sent_at: Instant::now(),
+            };
+        }
+        ctx.unwind_stale_entry_pending_after_publish_failure(&EntrySignal {
+            mint: mint.to_string(),
+            pool: pool.to_string(),
+            dex: "raydium".to_string(),
+            sol_amount: 1,
+            kind: EntryKind::ScaleIn,
+            reason: "t".to_string(),
+        });
+        let trackers = ctx.token_trackers.read();
+        assert!(matches!(
+            trackers.get(&sk).unwrap().state,
+            TrackerState::PositionOpenProbe { .. }
+        ));
     }
 
     #[test]
@@ -9545,6 +10197,9 @@ mod tests {
             pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -9606,6 +10261,9 @@ mod tests {
             pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -9844,6 +10502,9 @@ mod tests {
             pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -10912,6 +11573,9 @@ mod tests {
             pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -11026,6 +11690,9 @@ mod tests {
             pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -11108,6 +11775,9 @@ mod tests {
             pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -11178,6 +11848,9 @@ mod tests {
             pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -11260,6 +11933,9 @@ mod tests {
             pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -11372,6 +12048,9 @@ mod tests {
             pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -11478,6 +12157,9 @@ mod tests {
             pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -11569,6 +12251,9 @@ mod tests {
             pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -11638,6 +12323,9 @@ mod tests {
             pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -11699,6 +12387,9 @@ mod tests {
             pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -11923,6 +12614,9 @@ mod tests {
             pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12054,6 +12748,9 @@ mod tests {
             pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -13327,11 +14024,13 @@ async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -
             let is_dev = trade_creator.as_ref().is_some_and(|c| c.as_str() == trader.as_str())
                 || {
                     let trackers = ctx.token_trackers.read();
-                    trackers.values().any(|t| {
-                        t.mint == *mint
-                            && t.dev_wallet
+                    let keys = ctx.tracker_storage_keys_for_mint_readonly_resilient(mint.as_str(), &trackers);
+                    keys.iter().any(|k| {
+                        trackers.get(k).is_some_and(|t| {
+                            t.dev_wallet
                                 .as_ref()
                                 .is_some_and(|dw| dw.as_str() == trader.as_str())
+                        })
                     })
                 };
 
@@ -13399,7 +14098,12 @@ async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -
             if let Some(ref creator) = trade_creator {
                 let config = ctx.config.read().clone();
                 let mut trackers = ctx.token_trackers.write();
-                for tracker in trackers.values_mut() {
+                let keys =
+                    ctx.tracker_storage_keys_for_mint_readonly_resilient(mint.as_str(), &trackers);
+                for key in keys {
+                    let Some(tracker) = trackers.get_mut(&key) else {
+                        continue;
+                    };
                     if tracker.mint.as_str() != mint.as_str() {
                         continue;
                     }
@@ -13414,6 +14118,7 @@ async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -
                     }
                 }
                 drop(trackers);
+                ctx.mark_entry_eval_dirty_for_mint(mint);
                 // A.2: Propagate creator to position for pumpfun (BC exit after restart)
                 let mut positions = ctx.positions.write();
                 if let Some(pos) = positions.get_mut(mint) {
@@ -13503,6 +14208,10 @@ async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -
                         "📦 Decimals cached from Trade event (token_program unknown)"
                     );
                 }
+            }
+
+            if trade_token_program.is_some() || *trade_token_decimals != 9 {
+                ctx.mark_entry_eval_dirty_for_mint(mint);
             }
 
             // Update open position price estimate (tokens_UI per SOL_UI) based on trade ratio.
@@ -13858,6 +14567,7 @@ async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -
                         }
                     }
                 }
+                ctx.mark_entry_eval_dirty_for_mint(mint.as_str());
             }
         }
 
