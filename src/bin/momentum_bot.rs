@@ -105,8 +105,13 @@ const EXECUTION_RESULT_SCHEDULED_FETCH_EXPIRES: Duration = Duration::from_millis
 /// JetStream `expires` for drains **awaited inside** MarketEvent / PoolCache arms — must stay short so empty streams do not add multi‑10ms stalls on hot paths.
 const EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES: Duration = Duration::from_millis(3);
 /// Smaller batches reduce single-arm starvation of other `tokio::select!` branches.
-const POOL_CACHE_UPDATE_FETCH_MAX: usize = 48;
+const POOL_CACHE_UPDATE_FETCH_MAX: usize = 32;
 const POOL_CACHE_UPDATE_FETCH_EXPIRES: Duration = Duration::from_millis(50);
+/// Core NATS `TOPIC_MARKET_EVENTS`: drain immediately queued messages per select activation
+/// so JetStream arms cannot starve the high-volume MarketEvents subscriber (slow-consumer stall).
+const CORE_MARKET_EVENTS_INGEST_DRAIN_MAX: usize = 48;
+/// Wallet snapshot JetStream pull cap per `select!` activation (fairness vs Core MarketEvents).
+const WALLET_SNAPSHOT_FETCH_MAX: usize = 16;
 /// Adjacent `BondingCurveProgress` messages on Core NATS: bounded coalesce before strategy work.
 const BONDING_CURVE_PROGRESS_STREAK_MAX: usize = 32;
 
@@ -6840,7 +6845,9 @@ async fn main() -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("momentum_bot=info".parse()?)
-                .add_directive("ironcrab=info".parse()?),
+                .add_directive("ironcrab=info".parse()?)
+                // async_nats logs slow-consumer INFO lines per dropped message — journald amplification.
+                .add_directive("async_nats=warn".parse()?),
         )
         .init();
 
@@ -7438,7 +7445,9 @@ async fn main() -> Result<()> {
                 let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
             }
 
-            // Process incoming MarketEvents from NATS
+            // Process incoming MarketEvents from NATS (Core NATS — first client subscription is
+            // typically MarketEvents; `async_nats` "slow consumers for subscription N" correlates
+            // with this high-volume path when JetStream arms monopolize the runtime).
             msg = async {
                 if let Some(ref mut sub) = subscription {
                     sub.next().await
@@ -7452,154 +7461,118 @@ async fn main() -> Result<()> {
                     NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     events_received += 1;
 
-                    // Deserialize MarketEvent
-                    match serde_json::from_slice::<MarketEvent>(&nats_msg.payload) {
-                        Ok(first_event) => {
-                            use futures::FutureExt;
+                    use futures::FutureExt;
 
-                            let mut pending_market_events = VecDeque::new();
-                            pending_market_events.push_back(first_event);
-
-                            while let Some(event) = pending_market_events.pop_front() {
-                                let events_to_process: Vec<MarketEvent> =
-                                    if matches!(&event.kind, MarketEventKind::BondingCurveProgress { .. })
-                                    {
-                                        let mut streak = vec![event];
-                                        while streak.len() < BONDING_CURVE_PROGRESS_STREAK_MAX {
-                                            let Some(ref mut sub) = subscription else {
-                                                break;
-                                            };
-                                            match sub.next().now_or_never() {
-                                                Some(Some(nm)) => {
-                                                    NATS_MESSAGES_RECEIVED_TOTAL
-                                                        .fetch_add(1, Ordering::Relaxed);
-                                                    events_received += 1;
-                                                    match serde_json::from_slice::<MarketEvent>(
-                                                        &nm.payload,
-                                                    ) {
-                                                        Ok(next_e) => {
-                                                            if matches!(
-                                                                next_e.kind,
-                                                                MarketEventKind::BondingCurveProgress {
-                                                                    ..
-                                                                }
-                                                            ) {
-                                                                streak.push(next_e);
-                                                            } else {
-                                                                pending_market_events
-                                                                    .push_front(next_e);
-                                                                break;
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            warn!(
-                                                                error = %e,
-                                                                "Failed to deserialize MarketEvent (bonding streak)"
-                                                            );
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                                Some(None) => break,
-                                                None => break,
-                                            }
-                                        }
-                                        let (coalesced, streak_stats) =
-                                            coalesce_bonding_curve_progress_streak(streak);
-                                        if streak_stats.raw_messages > streak_stats.emitted_events {
-                                            let ratio_permille = (streak_stats.stale_dropped as u64)
-                                                .saturating_mul(1000)
-                                                .checked_div(streak_stats.raw_messages as u64)
-                                                .unwrap_or(0);
-                                            debug!(
-                                                momentum_scope_c = "bonding_curve_streak_coalesce",
-                                                raw_streak_messages = streak_stats.raw_messages,
-                                                emitted_after_coalesce = streak_stats.emitted_events,
-                                                stale_dropped = streak_stats.stale_dropped,
-                                                max_streak_cap = BONDING_CURVE_PROGRESS_STREAK_MAX,
-                                                decision_gate_stale_ratio_permille = ratio_permille,
-                                                "Momentum Scope C: coalesced adjacent BondingCurveProgress burst (per-mint latest-wins)",
-                                            );
-                                        }
-                                        coalesced
-                                    } else {
-                                        vec![event]
-                                    };
-
-                                for event in events_to_process {
-                                    let event_slot = event.slot;
-                                    if let Some(slot) = event_slot {
-                                        last_slot = last_slot.max(slot);
-                                    }
-                                    let scope_c_obs_latency =
-                                        momentum_scope_c_price_sensitive_market_kind(&event.kind);
-                                    let (scope_c_latency_t0, last_ev_slot_before) =
-                                        if scope_c_obs_latency {
-                                            let t0 = Instant::now();
-                                            let snap =
-                                                ctx.last_event_slot.load(Ordering::Relaxed);
-                                            (Some(t0), snap)
-                                        } else {
-                                            (None, 0u64)
-                                        };
-
-                                    match process_market_event(&ctx, &event).await {
-                                        Ok(need_exit) => {
-                                            if need_exit
-                                                || matches!(
-                                                    event.kind,
-                                                    MarketEventKind::Trade { .. }
-                                                )
-                                            {
-                                                ctx.process_exit_signals().await;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                error = %e,
-                                                event_id = %event.event_id,
-                                                "Failed to process market event"
-                                            );
-                                        }
-                                    }
-
-                                    if let Some(t0) = scope_c_latency_t0 {
-                                        let duration_ms = t0.elapsed().as_millis() as u64;
-                                        let slot_delta_vs_head = event_slot
-                                            .map(|s| last_ev_slot_before.saturating_sub(s));
-                                        debug!(
-                                            momentum_scope_c = "market_event_latency",
-                                            market_kind =
-                                                momentum_scope_c_market_kind_tag(&event.kind),
-                                            duration_ms,
-                                            event_slot = ?event_slot,
-                                            last_event_slot = last_ev_slot_before,
-                                            slot_delta_vs_head = ?slot_delta_vs_head,
-                                            event_id = %event.event_id,
-                                            "Momentum trade/bonding-related MarketEvent processed",
-                                        );
-                                    }
-
-                                    if scope_c_obs_latency {
-                                        if let Some(ref consumer) = execution_js_consumer {
-                                            let _n = drain_execution_results(
-                                                consumer,
-                                                &ctx,
-                                                EXECUTION_RESULT_INTERLEAVED_DRAIN_MAX,
-                                                EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES,
-                                                last_slot,
-                                                "after_market_event",
-                                            )
-                                            .await;
-                                        }
-                                    }
-                                }
+                    let mut raw_chunks: Vec<Vec<u8>> = vec![nats_msg.payload];
+                    while raw_chunks.len() < CORE_MARKET_EVENTS_INGEST_DRAIN_MAX {
+                        let Some(ref mut sub) = subscription else {
+                            break;
+                        };
+                        match sub.next().now_or_never() {
+                            Some(Some(nm)) => {
+                                NATS_MESSAGES_RECEIVED_TOTAL
+                                    .fetch_add(1, Ordering::Relaxed);
+                                events_received += 1;
+                                raw_chunks.push(nm.payload);
                             }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Failed to deserialize MarketEvent");
+                            Some(None) | None => break,
                         }
                     }
+
+                    let drain_count = raw_chunks.len();
+                    if drain_count > 1 {
+                        trace!(
+                            momentum_scope_c = "core_market_events_ingest_drain",
+                            drain_count,
+                            cap = CORE_MARKET_EVENTS_INGEST_DRAIN_MAX,
+                            "Drained multiple Core NATS MarketEvent payloads in one select activation"
+                        );
+                    }
+
+                    let mut deserialized: Vec<MarketEvent> = Vec::new();
+                    for pl in raw_chunks {
+                        match serde_json::from_slice::<MarketEvent>(&pl) {
+                            Ok(e) => deserialized.push(e),
+                            Err(e) => {
+                                warn!(error = %e, "Failed to deserialize MarketEvent");
+                            }
+                        }
+                    }
+
+                    let events_to_run =
+                        flatten_market_events_for_ingest_ordered_batch(deserialized);
+
+                    for event in events_to_run {
+                        let event_slot = event.slot;
+                        if let Some(slot) = event_slot {
+                            last_slot = last_slot.max(slot);
+                        }
+                        let scope_c_obs_latency =
+                            momentum_scope_c_price_sensitive_market_kind(&event.kind);
+                        let (scope_c_latency_t0, last_ev_slot_before) =
+                            if scope_c_obs_latency {
+                                let t0 = Instant::now();
+                                let snap = ctx.last_event_slot.load(Ordering::Relaxed);
+                                (Some(t0), snap)
+                            } else {
+                                (None, 0u64)
+                            };
+
+                        match process_market_event(&ctx, &event).await {
+                            Ok(need_exit) => {
+                                if need_exit
+                                    || matches!(
+                                        event.kind,
+                                        MarketEventKind::Trade { .. }
+                                    )
+                                {
+                                    ctx.process_exit_signals().await;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    event_id = %event.event_id,
+                                    "Failed to process market event"
+                                );
+                            }
+                        }
+
+                        if let Some(t0) = scope_c_latency_t0 {
+                            let duration_ms = t0.elapsed().as_millis() as u64;
+                            let slot_delta_vs_head = event_slot
+                                .map(|s| last_ev_slot_before.saturating_sub(s));
+                            debug!(
+                                momentum_scope_c = "market_event_latency",
+                                market_kind =
+                                    momentum_scope_c_market_kind_tag(&event.kind),
+                                duration_ms,
+                                event_slot = ?event_slot,
+                                last_event_slot = last_ev_slot_before,
+                                slot_delta_vs_head = ?slot_delta_vs_head,
+                                event_id = %event.event_id,
+                                "Momentum trade/bonding-related MarketEvent processed",
+                            );
+                        }
+
+                        if scope_c_obs_latency {
+                            if let Some(ref consumer) = execution_js_consumer {
+                                let _n = drain_execution_results(
+                                    consumer,
+                                    &ctx,
+                                    EXECUTION_RESULT_INTERLEAVED_DRAIN_MAX,
+                                    EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES,
+                                    last_slot,
+                                    "after_market_event",
+                                )
+                                .await;
+                            }
+                        }
+                    }
+
+                    // Return to the scheduler so PoolCache / strategy ticks get fair poll slots
+                    // after a large ingest batch.
+                    tokio::task::yield_now().await;
                 }
             }
 
@@ -7769,7 +7742,7 @@ async fn main() -> Result<()> {
                     #[allow(clippy::single_match)]
                     match consumer
                         .fetch()
-                        .max_messages(100)
+                        .max_messages(WALLET_SNAPSHOT_FETCH_MAX)
                         .expires(std::time::Duration::from_millis(100))
                         .messages()
                         .await
@@ -7808,6 +7781,7 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             }
+                            tokio::task::yield_now().await;
                         }
                         Err(_) => {}
                     }
@@ -8033,6 +8007,7 @@ async fn main() -> Result<()> {
                                     },
                                     "SLAVE CACHE: PoolCacheUpdate batch (processing only, excludes batch fetch wait)",
                                 );
+                                tokio::task::yield_now().await;
                             }
                         }
                         Err(e) => {
@@ -8049,28 +8024,35 @@ async fn main() -> Result<()> {
             _ = strategy_interval.tick() => {
                 ironcrab::metrics::record_activity();
 
-                // === Check for ENTRY signals ===
-                let signals = ctx.check_for_signals();
-                for s in signals {
-                    info!(
-                        mint = %s.mint,
-                        pool = %s.pool,
-                        dex = %s.dex,
-                        kind = ?s.kind,
-                        sol_amount = s.sol_amount,
-                        reason = %s.reason,
-                        "🎯 ENTRY SIGNAL DETECTED"
-                    );
+                let need_entry_scan = !ctx.token_trackers.read().is_empty()
+                    || !ctx.pending_buy_entries.read().is_empty();
+                if need_entry_scan {
+                    // === Check for ENTRY signals ===
+                    let signals = ctx.check_for_signals();
+                    for s in signals {
+                        info!(
+                            mint = %s.mint,
+                            pool = %s.pool,
+                            dex = %s.dex,
+                            kind = ?s.kind,
+                            sol_amount = s.sol_amount,
+                            reason = %s.reason,
+                            "🎯 ENTRY SIGNAL DETECTED"
+                        );
 
-                    if let Err(e) = generate_and_publish_buy_intent(&ctx, &s).await {
-                        error!(error = %e, mint = %s.mint, "Failed to generate/publish buy intent");
-                    } else {
-                        ctx.intents_generated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Err(e) = generate_and_publish_buy_intent(&ctx, &s).await {
+                            error!(error = %e, mint = %s.mint, "Failed to generate/publish buy intent");
+                        } else {
+                            ctx.intents_generated
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
 
                 // === Check for EXIT signals (fallback; primary = event-driven on PoolCacheUpdate/Trade) ===
-                ctx.process_exit_signals().await;
+                if ctx.position_count() > 0 {
+                    ctx.process_exit_signals().await;
+                }
             }
 
             // Timed-exit reconciliation (retry exits that were generated but never confirmed)
@@ -8602,6 +8584,52 @@ fn coalesce_bonding_curve_progress_streak(
             stale_dropped,
         },
     )
+}
+
+/// Expand an ordered ingest batch: preserves non-BCP event order; consecutive
+/// `BondingCurveProgress` runs are coalesced in chunks of at most
+/// [`BONDING_CURVE_PROGRESS_STREAK_MAX`] (same semantics as the legacy
+/// subscription streak reader).
+fn flatten_market_events_for_ingest_ordered_batch(input: Vec<MarketEvent>) -> Vec<MarketEvent> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < input.len() {
+        if matches!(input[i].kind, MarketEventKind::BondingCurveProgress { .. }) {
+            let start = i;
+            while i < input.len()
+                && matches!(input[i].kind, MarketEventKind::BondingCurveProgress { .. })
+            {
+                i += 1;
+            }
+            let mut slice = &input[start..i];
+            while !slice.is_empty() {
+                let take = slice.len().min(BONDING_CURVE_PROGRESS_STREAK_MAX);
+                let chunk: Vec<MarketEvent> = slice[..take].to_vec();
+                slice = &slice[take..];
+                let (coalesced, streak_stats) = coalesce_bonding_curve_progress_streak(chunk);
+                if streak_stats.raw_messages > streak_stats.emitted_events {
+                    let ratio_permille = (streak_stats.stale_dropped as u64)
+                        .saturating_mul(1000)
+                        .checked_div(streak_stats.raw_messages as u64)
+                        .unwrap_or(0);
+                    debug!(
+                        momentum_scope_c = "bonding_curve_streak_coalesce",
+                        raw_streak_messages = streak_stats.raw_messages,
+                        emitted_after_coalesce = streak_stats.emitted_events,
+                        stale_dropped = streak_stats.stale_dropped,
+                        max_streak_cap = BONDING_CURVE_PROGRESS_STREAK_MAX,
+                        decision_gate_stale_ratio_permille = ratio_permille,
+                        "Momentum Scope C: coalesced BondingCurveProgress burst in ingest batch (per-mint latest-wins)",
+                    );
+                }
+                out.extend(coalesced);
+            }
+        } else {
+            out.push(input[i].clone());
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Phase-2 winner per `pool_address` for reserve-derived marks / `update_position_price` in one JetStream batch.
@@ -12543,6 +12571,76 @@ mod tests {
             panic!();
         };
         assert_eq!(mint, "Amint");
+    }
+
+    fn mk_dummy_trade_event_for_flatten(event_id: &str) -> MarketEvent {
+        let mut header = RecordHeader::new("test", BUILD_VERSION, "run");
+        header.ts_unix_ms = 1;
+        MarketEvent {
+            header,
+            event_id: event_id.into(),
+            source: "geyser".into(),
+            slot: Some(1),
+            kind: MarketEventKind::Trade {
+                pool_address: "poolFlat1".into(),
+                mint: "MintFlatX".into(),
+                quote_mint: "So11111111111111111111111111111111111111112".into(),
+                trader: "trFlat".into(),
+                is_buy: true,
+                sol_amount: 1,
+                token_amount: 1,
+                token_decimals: 6,
+                signature: None,
+                dex: "pumpfun".into(),
+                creator: None,
+                token_program: None,
+            },
+        }
+    }
+
+    #[test]
+    fn scope_c_flatten_ingest_batch_preserves_order_mixed_trade_and_bcp() {
+        let v = vec![
+            mk_dummy_trade_event_for_flatten("e0"),
+            mk_bonding_progress_event("MintZ", Some(1), 1, 100),
+            mk_bonding_progress_event("MintZ", Some(5), 2, 500),
+            mk_dummy_trade_event_for_flatten("e1"),
+        ];
+        let out = flatten_market_events_for_ingest_ordered_batch(v);
+        assert_eq!(out.len(), 3);
+        assert!(matches!(out[0].kind, MarketEventKind::Trade { .. }));
+        assert!(matches!(
+            out[1].kind,
+            MarketEventKind::BondingCurveProgress { .. }
+        ));
+        assert_eq!(out[1].slot, Some(5));
+        assert!(matches!(out[2].kind, MarketEventKind::Trade { .. }));
+    }
+
+    #[test]
+    fn scope_c_flatten_ingest_batch_chunks_long_bcp_streak() {
+        let mut v = Vec::new();
+        for i in 0_u64..40 {
+            v.push(mk_bonding_progress_event(
+                "MintLong",
+                Some(i + 1),
+                i,
+                (i as u32).saturating_add(10),
+            ));
+        }
+        let out = flatten_market_events_for_ingest_ordered_batch(v);
+        assert_eq!(out.len(), 2);
+        let MarketEventKind::BondingCurveProgress { progress_bps, .. } = &out[0].kind else {
+            panic!("expected BCP");
+        };
+        assert_eq!(*progress_bps, 41);
+        let MarketEventKind::BondingCurveProgress {
+            progress_bps: p2, ..
+        } = &out[1].kind
+        else {
+            panic!("expected BCP");
+        };
+        assert_eq!(*p2, 49);
     }
 
     #[test]

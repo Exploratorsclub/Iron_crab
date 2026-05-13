@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-MOM-NATS-FAIRNESS: Momentum Core-NATS MarketEvents Slow-Consumer-Stall
+**Datum**: 2026-05-13  
+**Problem**: In `momentum_bot` verarbeitete der `tokio::select!`-Hauptloop pro Aktivierung praktisch nur **eine** Core-NATS-MarketEvent-Nachricht (außer kleinen `BondingCurveProgress`-Streaks per `now_or_never`), während JetStream-Arme (PoolCache, Wallet-Snapshots) große Batches und der 500-ms-Strategy-Tick viel CPU banden. Folge: Client-Buffer wächst, `async_nats` meldet massenhaft Slow-Consumer, `last_slot`/Ingest stagnieren.  
+**Fix**: Gebündeltes, kappenbegrenztes Draining (`CORE_MARKET_EVENTS_INGEST_DRAIN_MAX`) mit erhaltener Reihenfolge; `flatten_market_events_for_ingest_ordered_batch` für BCP-Coalescing wie zuvor; etwas kleinere PoolCache-/Wallet-Fetch-Kappen; `tokio::task::yield_now` nach schweren Armen; Strategy-Tick überspringt `check_for_signals` ohne Tracker/Pending-BUY und `process_exit_signals` ohne offene Positionen; Default-Tracing `async_nats=warn` gegen INFO-Log-Sturm (Nebenmaßnahme).  
+**Dateien**: `src/bin/momentum_bot.rs`
+
 ### FIX-01: Revert fehlerhafter Commits → `e341c04b`
 **Datum**: 2026-02-09
 **Problem**: 18 Commits (bis `b22bb0a9`) hatten ungewollt die Liquidation zerstört und Architekturprinzipien verletzt (RPC-Calls im Hot Path).
