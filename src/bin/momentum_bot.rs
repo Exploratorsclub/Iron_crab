@@ -58,7 +58,8 @@ use ironcrab::nats::{
     ensure_trade_intents_stream, execution_results_consumer_config,
     wallet_snapshot_consumer_config, wallet_snapshot_live_consumer_config, NatsClient, NatsConfig,
     CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME, STREAM_NAME, TOPIC_EXECUTION_RESULTS,
-    TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS, WALLET_SNAPSHOT_STREAM_NAME,
+    TOPIC_MARKET_EVENTS, TOPIC_MOMENTUM_MARKET_EVENTS, TOPIC_TRADE_INTENTS,
+    WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::solana::dex_parser::SOL_MINT_PUBKEY;
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
@@ -107,8 +108,9 @@ const EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES: Duration = Duration::from_mill
 /// Smaller batches reduce single-arm starvation of other `tokio::select!` branches.
 const POOL_CACHE_UPDATE_FETCH_MAX: usize = 32;
 const POOL_CACHE_UPDATE_FETCH_EXPIRES: Duration = Duration::from_millis(50);
-/// Core NATS `TOPIC_MARKET_EVENTS`: drain immediately queued messages per select activation
-/// so JetStream arms cannot starve the high-volume MarketEvents subscriber (slow-consumer stall).
+/// Core NATS market-events subject (full fan-out). Momentum-bot prefers [`TOPIC_MOMENTUM_MARKET_EVENTS`].
+/// Drain immediately queued messages per select activation so JetStream arms cannot starve the
+/// high-volume MarketEvents subscriber (slow-consumer stall).
 const CORE_MARKET_EVENTS_INGEST_DRAIN_MAX: usize = 48;
 /// Wallet snapshot JetStream pull cap per `select!` activation (fairness vs Core MarketEvents).
 const WALLET_SNAPSHOT_FETCH_MAX: usize = 16;
@@ -7509,16 +7511,36 @@ async fn main() -> Result<()> {
     // Keep readiness fresh even when idle.
     ironcrab::metrics::record_activity();
 
-    // Subscribe to MarketEvents from NATS
+    // Subscribe to Momentum-filtered MarketEvents (reduces Core NATS fan-in vs full stream).
     let mut subscription = if let Some(ref nats) = ctx.nats {
-        match nats.subscribe(TOPIC_MARKET_EVENTS).await {
+        match nats.subscribe(TOPIC_MOMENTUM_MARKET_EVENTS).await {
             Ok(sub) => {
-                info!(topic = TOPIC_MARKET_EVENTS, "Subscribed to MarketEvents");
+                info!(
+                    topic = TOPIC_MOMENTUM_MARKET_EVENTS,
+                    "Subscribed to Momentum-filtered MarketEvents"
+                );
                 Some(sub)
             }
             Err(e) => {
-                warn!(error = %e, "Failed to subscribe to NATS, running in offline mode");
-                None
+                warn!(
+                    error = %e,
+                    momentum_topic = TOPIC_MOMENTUM_MARKET_EVENTS,
+                    fallback_topic = TOPIC_MARKET_EVENTS,
+                    "Failed to subscribe to momentum MarketEvents topic; falling back to core MarketEvents topic"
+                );
+                match nats.subscribe(TOPIC_MARKET_EVENTS).await {
+                    Ok(sub) => {
+                        info!(
+                            topic = TOPIC_MARKET_EVENTS,
+                            "Subscribed to MarketEvents (fallback)"
+                        );
+                        Some(sub)
+                    }
+                    Err(e2) => {
+                        warn!(error = %e2, "Failed to subscribe to NATS, running in offline mode");
+                        None
+                    }
+                }
             }
         }
     } else {

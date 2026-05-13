@@ -55,7 +55,7 @@ use ironcrab::nats::{
     pool_subject, wallet_snapshot_consumer_config, wallet_snapshot_subject, NatsClient, NatsConfig,
     CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME, TOPIC_CONTROL_REQUESTS,
     TOPIC_CONTROL_RESPONSES, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
-    TOPIC_PRIORITY_FEE_SAMPLES, WALLET_SNAPSHOT_STREAM_NAME,
+    TOPIC_MOMENTUM_MARKET_EVENTS, TOPIC_PRIORITY_FEE_SAMPLES, WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
@@ -109,6 +109,91 @@ const PUMPFUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const PUMPFUN_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const METEORA_DLMM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const METEORA_CPMM: &str = "cpmmpPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D";
+
+/// Wrapped SOL mint (same as default quote in many events).
+const WRAPPED_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+/// Subset of [`MarketEventKind`] mirrored to [`TOPIC_MOMENTUM_MARKET_EVENTS`] in addition to core.
+///
+/// Conservative: noise kinds stay core-only. `WalletSnapshotComplete` is included because
+/// momentum-bot reconciles ghost positions from it (JetStream does not replace this signal).
+pub(crate) fn market_event_is_momentum_nats_relevant(kind: &MarketEventKind) -> bool {
+    match kind {
+        MarketEventKind::Trade { .. }
+        | MarketEventKind::PoolCreated { .. }
+        | MarketEventKind::BondingCurveProgress { .. }
+        | MarketEventKind::TokenMintInfo { .. }
+        | MarketEventKind::DexPoolAccounts { .. }
+        | MarketEventKind::DevWalletIdentified { .. }
+        | MarketEventKind::LiquidityRemoved { .. }
+        | MarketEventKind::WalletSnapshotComplete { .. } => true,
+
+        MarketEventKind::PoolStateUpdate {
+            dex, quote_mint, ..
+        } => {
+            let dex_lc = dex.to_ascii_lowercase();
+            let pump_line = matches!(
+                dex_lc.as_str(),
+                "pumpfun" | "pump_amm" | "pumpfunamm" | "pumpfun_amm"
+            );
+            if !pump_line {
+                return false;
+            }
+            let q = quote_mint.as_str();
+            q == NATIVE_SOL_MINT || q == WRAPPED_SOL_MINT
+        }
+
+        MarketEventKind::LatestBlockhash { .. }
+        | MarketEventKind::BinArrayUpdate { .. }
+        | MarketEventKind::SlotUpdate { .. }
+        | MarketEventKind::WalletBalanceSnapshot { .. }
+        | MarketEventKind::PriceUpdate { .. }
+        | MarketEventKind::SwapObserved { .. }
+        | MarketEventKind::AccountUpdate { .. }
+        | MarketEventKind::TransactionDetected { .. }
+        | MarketEventKind::WalletActivity { .. }
+        | MarketEventKind::EarlyBuyerDetected { .. }
+        | MarketEventKind::InsiderAlert { .. } => false,
+    }
+}
+
+/// Publish one logical market event to core NATS and, when [`market_event_is_momentum_nats_relevant`], to momentum subject.
+///
+/// Counts one [`MARKET_EVENTS_PUBLISHED_TOTAL`] per successful core delivery; [`NATS_MESSAGES_PUBLISHED_TOTAL`]
+/// once per successful NATS publish (core plus optional second message).
+pub(crate) async fn publish_market_event_core_and_momentum(
+    nats: &NatsClient,
+    event: &MarketEvent,
+) -> bool {
+    if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, event).await {
+        warn!(
+            error = %e,
+            event_id = %event.event_id,
+            "Failed to publish market event to NATS (core)"
+        );
+        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+
+    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+
+    if market_event_is_momentum_nats_relevant(&event.kind) {
+        if let Err(e) = nats.publish(TOPIC_MOMENTUM_MARKET_EVENTS, event).await {
+            warn!(
+                error = %e,
+                event_id = %event.event_id,
+                topic = TOPIC_MOMENTUM_MARKET_EVENTS,
+                "Failed to publish market event to NATS (momentum fan-out)"
+            );
+            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        } else {
+            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    true
+}
 
 /// Raydium CPMM: `PoolCacheUpdate` uses normalized base/quote (non-SOL first). JetStream vault
 /// metadata must list vault pubkeys in the same order as `base_mint` / `quote_mint` so SLAVE
@@ -4637,9 +4722,7 @@ async fn publish_wallet_snapshot(
     );
 
     if let Some(ref nats) = ctx.nats {
-        if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &complete_event).await {
-            warn!(error = %e, "Failed to publish WalletSnapshotComplete (bootstrap)");
-        }
+        let _ = publish_market_event_core_and_momentum(nats, &complete_event).await;
     }
     if let Err(e) = ctx.jsonl_writer.write(&complete_event) {
         warn!(error = %e, "Failed to write WalletSnapshotComplete (bootstrap) to JSONL");
@@ -6396,13 +6479,7 @@ async fn run_geyser_loop(
 
                 // Publish to NATS
                 if let Some(ref nats) = ctx.nats {
-                    if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &mint_event).await {
-                        warn!(error = %e, "Failed to publish TokenMintInfo event to NATS");
-                        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    }
+                    let _ = publish_market_event_core_and_momentum(nats, &mint_event).await;
                 }
             }
 
@@ -6933,13 +7010,7 @@ async fn run_geyser_loop(
                         }
 
                         if let Some(ref nats) = ctx.nats {
-                            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &mint_event).await {
-                                warn!(error = %e, "Failed to publish TokenMintInfo event to NATS");
-                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            }
+                            let _ = publish_market_event_core_and_momentum(nats, &mint_event).await;
                         }
                     }
                 }
@@ -7135,13 +7206,8 @@ async fn run_geyser_loop(
                                     }
 
                                     if let Some(ref nats) = ctx.nats {
-                                        if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &state_event).await {
-                                            warn!(error = %e, "Failed to publish PoolStateUpdate event to NATS");
-                                            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                        } else {
-                                            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                            MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                        }
+                                        let _ =
+                                            publish_market_event_core_and_momentum(nats, &state_event).await;
                                     }
                                 }
                             }
@@ -7192,13 +7258,8 @@ async fn run_geyser_loop(
                                     }
 
                                     if let Some(ref nats) = ctx.nats {
-                                        if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &bin_event).await {
-                                            warn!(error = %e, "Failed to publish BinArrayUpdate event to NATS");
-                                            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                        } else {
-                                            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                            MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                        }
+                                        let _ =
+                                            publish_market_event_core_and_momentum(nats, &bin_event).await;
                                     }
                                 }
                             }
@@ -7774,12 +7835,7 @@ async fn run_geyser_loop(
                                         error!(error = %e, "Failed to write BondingCurveProgress event to JSONL");
                                     }
 
-                                    if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &curve_event).await {
-                                        warn!(error = %e, "Failed to publish BondingCurveProgress to NATS");
-                                    } else {
-                                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                        MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                    }
+                                    let _ = publish_market_event_core_and_momentum(nats, &curve_event).await;
                                 }
                             }
                             CachedPoolState::PumpAmm(s) => {
@@ -8029,13 +8085,7 @@ async fn run_geyser_loop(
                             }
 
                             if let Some(ref nats) = ctx.nats {
-                                if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &dev_event).await {
-                                    warn!(error = %e, "Failed to publish DevWalletIdentified to NATS");
-                                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                } else {
-                                    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                    MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                }
+                                let _ = publish_market_event_core_and_momentum(nats, &dev_event).await;
                             }
                         }
                     }
@@ -8159,13 +8209,7 @@ async fn run_geyser_loop(
 
                 // Publish to NATS
                 if let Some(ref nats) = ctx.nats {
-                    if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &event).await {
-                        warn!(error = %e, "Failed to publish account event to NATS");
-                        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    }
+                    let _ = publish_market_event_core_and_momentum(nats, &event).await;
                 }
             }
 
@@ -8364,13 +8408,7 @@ async fn run_geyser_loop(
                     }
 
                     if let Some(ref nats) = ctx.nats {
-                        if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &dev_event).await {
-                            warn!(error = %e, "Failed to publish dev wallet event to NATS");
-                            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        }
+                        let _ = publish_market_event_core_and_momentum(nats, &dev_event).await;
                     }
                 }
 
@@ -8459,13 +8497,8 @@ async fn run_geyser_loop(
                             error!(error = %e, "Failed to write pump_amm PoolCreated (create_pool) to JSONL");
                         }
                         if let Some(ref nats) = ctx.nats {
-                            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &pool_created_event).await {
-                                warn!(error = %e, "Failed to publish pump_amm PoolCreated (create_pool) to NATS");
-                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            }
+                            let _ =
+                                publish_market_event_core_and_momentum(nats, &pool_created_event).await;
                         }
                         ctx.pool_mint_map.write().insert(pool_address.to_string(), base_mint.clone());
                     }
@@ -8550,13 +8583,8 @@ async fn run_geyser_loop(
                         }
 
                         if let Some(ref nats) = ctx.nats {
-                            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &pool_created_event).await {
-                                warn!(error = %e, "Failed to publish pump_amm PoolCreated event to NATS");
-                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            }
+                            let _ =
+                                publish_market_event_core_and_momentum(nats, &pool_created_event).await;
                         }
                     }
 
@@ -8582,13 +8610,7 @@ async fn run_geyser_loop(
                     }
 
                     if let Some(ref nats) = ctx.nats {
-                        if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &accounts_event).await {
-                            warn!(error = %e, "Failed to publish DexPoolAccounts event to NATS");
-                            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        }
+                        let _ = publish_market_event_core_and_momentum(nats, &accounts_event).await;
                     }
 
                     // FIX-26: Also populate MASTER LivePoolCache with pool_accounts.
@@ -8708,13 +8730,7 @@ async fn run_geyser_loop(
                             }
 
                             if let Some(ref nats) = ctx.nats {
-                                if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &accounts_event).await
-                                {
-                                    warn!(error = %e, "Failed to publish DexPoolAccounts event to NATS");
-                                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                } else {
-                                    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                    MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                if publish_market_event_core_and_momentum(nats, &accounts_event).await {
                                     debug!(
                                         dex = %dex,
                                         pool = %pool_address,
@@ -8801,13 +8817,7 @@ async fn run_geyser_loop(
 
                 // Publish to NATS
                 if let Some(ref nats) = ctx.nats {
-                    if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &event).await {
-                        warn!(error = %e, "Failed to publish tx event to NATS");
-                        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    }
+                    let _ = publish_market_event_core_and_momentum(nats, &event).await;
                 }
             }
 
@@ -8884,13 +8894,7 @@ async fn run_geyser_loop(
 
                 // Publish to NATS
                 if let Some(ref nats) = ctx.nats {
-                    if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &event).await {
-                        warn!(error = %e, "Failed to publish pool discovery event to NATS");
-                        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    }
+                    let _ = publish_market_event_core_and_momentum(nats, &event).await;
                 }
 
                 // Emit DevWalletIdentified for Pump.fun pools where we know the creator
@@ -8917,12 +8921,7 @@ async fn run_geyser_loop(
                         }
 
                         if let Some(ref nats) = ctx.nats {
-                            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &dev_event).await {
-                                warn!(error = %e, "Failed to publish dev wallet event to NATS");
-                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            if publish_market_event_core_and_momentum(nats, &dev_event).await {
                                 info!(
                                     mint = %pool_event.base_mint,
                                     creator = %creator,
@@ -8989,12 +8988,7 @@ async fn run_geyser_loop(
                     }
 
                     if let Some(ref nats) = ctx.nats {
-                        if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &accounts_event).await {
-                            warn!(error = %e, "Failed to publish DexPoolAccounts event to NATS");
-                            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        if publish_market_event_core_and_momentum(nats, &accounts_event).await {
                             debug!(
                                 dex = %pool_event.dex_type,
                                 pool = %pool_event.pool_address,
@@ -10355,5 +10349,165 @@ mod wsol_ata_update_tests {
             wsol_ata_balance_lamports_from_geyser_data(&data),
             Some(1_000_000_000)
         );
+    }
+}
+
+/// Momentum NATS subject fan-out classification (see `TOPIC_MOMENTUM_MARKET_EVENTS`).
+#[cfg(test)]
+mod momentum_nats_subject_tests {
+    use super::market_event_is_momentum_nats_relevant;
+    use ironcrab::ipc::{MarketEventKind, NATIVE_SOL_MINT};
+
+    fn sample_trade() -> MarketEventKind {
+        MarketEventKind::Trade {
+            pool_address: "pool1".into(),
+            mint: "mint1".into(),
+            quote_mint: NATIVE_SOL_MINT.into(),
+            trader: "trader1".into(),
+            is_buy: true,
+            sol_amount: 1,
+            token_amount: 1,
+            token_decimals: 6,
+            signature: None,
+            dex: "pumpfun".into(),
+            creator: None,
+            token_program: None,
+        }
+    }
+
+    #[test]
+    fn momentum_relevance_always_true_for_core_entry_exit_kinds() {
+        assert!(market_event_is_momentum_nats_relevant(&sample_trade()));
+        assert!(market_event_is_momentum_nats_relevant(
+            &MarketEventKind::PoolCreated {
+                pool_address: "p".into(),
+                base_mint: "m".into(),
+                quote_mint: NATIVE_SOL_MINT.into(),
+                dex: "raydium".into(),
+                initial_liquidity_sol: None,
+            }
+        ));
+        assert!(market_event_is_momentum_nats_relevant(
+            &MarketEventKind::BondingCurveProgress {
+                mint: "m".into(),
+                bonding_curve: "bc".into(),
+                progress_bps: 100,
+                complete: false,
+            }
+        ));
+        assert!(market_event_is_momentum_nats_relevant(
+            &MarketEventKind::TokenMintInfo {
+                mint: "m".into(),
+                token_program: "tp".into(),
+                decimals: 6,
+                supply: 0,
+                mint_authority: None,
+                freeze_authority: None,
+            }
+        ));
+        assert!(market_event_is_momentum_nats_relevant(
+            &MarketEventKind::DexPoolAccounts {
+                dex: "orca".into(),
+                pool_address: "p".into(),
+                base_mint: "m".into(),
+                quote_mint: NATIVE_SOL_MINT.into(),
+                accounts: vec![],
+            }
+        ));
+        assert!(market_event_is_momentum_nats_relevant(
+            &MarketEventKind::DevWalletIdentified {
+                mint: "m".into(),
+                dev_wallet: "d".into(),
+                supply_percentage: 0.0,
+            }
+        ));
+        assert!(market_event_is_momentum_nats_relevant(
+            &MarketEventKind::LiquidityRemoved {
+                pool_address: "p".into(),
+                mint: "m".into(),
+                sol_amount: 0,
+                token_amount: 0,
+                signature: None,
+            }
+        ));
+        assert!(market_event_is_momentum_nats_relevant(
+            &MarketEventKind::WalletSnapshotComplete {
+                mints_in_wallet: vec![],
+                wallet: "w".into(),
+                is_periodic: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn momentum_relevance_false_for_explicit_noise_kinds() {
+        assert!(!market_event_is_momentum_nats_relevant(
+            &MarketEventKind::LatestBlockhash {
+                blockhash: "h".into(),
+                slot: 1,
+                block_height: 1,
+            }
+        ));
+        assert!(!market_event_is_momentum_nats_relevant(
+            &MarketEventKind::BinArrayUpdate {
+                pool_address: "p".into(),
+                bin_array_index: 0,
+                bins: vec![],
+                update_slot: 1,
+            }
+        ));
+        assert!(!market_event_is_momentum_nats_relevant(
+            &MarketEventKind::SlotUpdate { current_slot: 1 }
+        ));
+        assert!(!market_event_is_momentum_nats_relevant(
+            &MarketEventKind::WalletBalanceSnapshot {
+                mint: "m".into(),
+                balance_raw: 0,
+                decimals: 6,
+                token_program: "tp".into(),
+            }
+        ));
+    }
+
+    #[test]
+    fn pool_state_update_only_pump_line_sol_quoted() {
+        let ps_pump_sol = MarketEventKind::PoolStateUpdate {
+            pool_address: "p".into(),
+            dex: "pumpfun".into(),
+            reserve_base: 1,
+            reserve_quote: 1,
+            base_mint: "m".into(),
+            quote_mint: NATIVE_SOL_MINT.into(),
+            update_slot: 1,
+            active_id: None,
+            bin_step: None,
+        };
+        assert!(market_event_is_momentum_nats_relevant(&ps_pump_sol));
+
+        let ps_ray = MarketEventKind::PoolStateUpdate {
+            pool_address: "p".into(),
+            dex: "raydium".into(),
+            reserve_base: 1,
+            reserve_quote: 1,
+            base_mint: "m".into(),
+            quote_mint: NATIVE_SOL_MINT.into(),
+            update_slot: 1,
+            active_id: None,
+            bin_step: None,
+        };
+        assert!(!market_event_is_momentum_nats_relevant(&ps_ray));
+
+        let ps_pump_usdc = MarketEventKind::PoolStateUpdate {
+            pool_address: "p".into(),
+            dex: "pump_amm".into(),
+            reserve_base: 1,
+            reserve_quote: 1,
+            base_mint: "m".into(),
+            quote_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+            update_slot: 1,
+            active_id: None,
+            bin_step: None,
+        };
+        assert!(!market_event_is_momentum_nats_relevant(&ps_pump_usdc));
     }
 }
