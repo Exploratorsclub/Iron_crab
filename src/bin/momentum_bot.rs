@@ -7502,6 +7502,7 @@ async fn main() -> Result<()> {
                     let events_to_run =
                         flatten_market_events_for_ingest_ordered_batch(deserialized);
 
+                    let mut batch_had_price_sensitive_market_event = false;
                     for event in events_to_run {
                         let event_slot = event.slot;
                         if let Some(slot) = event_slot {
@@ -7509,6 +7510,9 @@ async fn main() -> Result<()> {
                         }
                         let scope_c_obs_latency =
                             momentum_scope_c_price_sensitive_market_kind(&event.kind);
+                        if scope_c_obs_latency {
+                            batch_had_price_sensitive_market_event = true;
+                        }
                         let (scope_c_latency_t0, last_ev_slot_before) =
                             if scope_c_obs_latency {
                                 let t0 = Instant::now();
@@ -7520,12 +7524,15 @@ async fn main() -> Result<()> {
 
                         match process_market_event(&ctx, &event).await {
                             Ok(need_exit) => {
-                                if need_exit
-                                    || matches!(
-                                        event.kind,
-                                        MarketEventKind::Trade { .. }
-                                    )
-                                {
+                                let is_trade = matches!(
+                                    event.kind,
+                                    MarketEventKind::Trade { .. }
+                                );
+                                if should_invoke_exit_signals_after_market_event_processing(
+                                    need_exit,
+                                    is_trade,
+                                    ctx.position_count(),
+                                ) {
                                     ctx.process_exit_signals().await;
                                 }
                             }
@@ -7555,18 +7562,31 @@ async fn main() -> Result<()> {
                             );
                         }
 
-                        if scope_c_obs_latency {
-                            if let Some(ref consumer) = execution_js_consumer {
-                                let _n = drain_execution_results(
-                                    consumer,
-                                    &ctx,
-                                    EXECUTION_RESULT_INTERLEAVED_DRAIN_MAX,
-                                    EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES,
-                                    last_slot,
-                                    "after_market_event",
-                                )
-                                .await;
-                            }
+                    }
+
+                    if let Some(ref consumer) = execution_js_consumer {
+                        if market_events_batch_wants_interleaved_execution_result_drain(
+                            batch_had_price_sensitive_market_event,
+                            ctx.position_count(),
+                            ctx.pending_count(),
+                        ) {
+                            let _n = drain_execution_results(
+                                consumer,
+                                &ctx,
+                                EXECUTION_RESULT_INTERLEAVED_DRAIN_MAX,
+                                EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES,
+                                last_slot,
+                                "after_market_event_batch",
+                            )
+                            .await;
+                        } else if batch_had_price_sensitive_market_event {
+                            trace!(
+                                momentum_scope_c = "core_market_events_ingest",
+                                batch_price_sensitive = batch_had_price_sensitive_market_event,
+                                positions = ctx.position_count(),
+                                pending_intents = ctx.pending_count(),
+                                "Skipped interleaved ExecutionResult drain (no positions / pending intents)"
+                            );
                         }
                     }
 
@@ -7758,7 +7778,7 @@ async fn main() -> Result<()> {
                                                 if let MarketEventKind::WalletBalanceSnapshot { .. } = &event.kind {
                                                     match process_market_event(&ctx, &event).await {
                                                         Ok(need_exit) => {
-                                                            if need_exit {
+                                                            if need_exit && ctx.position_count() > 0 {
                                                                 ctx.process_exit_signals().await;
                                                             }
                                                         }
@@ -7962,7 +7982,9 @@ async fn main() -> Result<()> {
                             if msg_count > 0 {
                                 trace!(updates = msg_count, "SLAVE CACHE: processed PoolCacheUpdates");
                                 // Event-driven: check exits immediately after price update (<500ms reaction)
-                                ctx.process_exit_signals().await;
+                                if ctx.position_count() > 0 {
+                                    ctx.process_exit_signals().await;
+                                }
                                 // Scope C: yield a bounded ExecutionResult drain after heavy pool-cache work.
                                 if let Some(ref er_consumer) = execution_js_consumer {
                                     execution_results_drained = drain_execution_results(
@@ -8518,6 +8540,28 @@ fn momentum_scope_c_price_sensitive_market_kind(kind: &MarketEventKind) -> bool 
     )
 }
 
+/// After a Core NATS MarketEvents ingest batch: run at most one bounded ExecutionResult drain
+/// when the batch had price-sensitive work **and** there is execution-relevant state (fills,
+/// open positions). Avoids `O(batch_len)` JetStream fetch latency on idle discovery.
+#[inline]
+fn market_events_batch_wants_interleaved_execution_result_drain(
+    batch_had_price_sensitive_event: bool,
+    position_count: usize,
+    pending_execution_intents: usize,
+) -> bool {
+    batch_had_price_sensitive_event && (position_count > 0 || pending_execution_intents > 0)
+}
+
+/// `process_exit_signals` only applies to open positions; skip the scan when empty (hot path).
+#[inline]
+fn should_invoke_exit_signals_after_market_event_processing(
+    need_exit: bool,
+    is_trade: bool,
+    position_count: usize,
+) -> bool {
+    position_count > 0 && (need_exit || is_trade)
+}
+
 #[inline]
 fn momentum_scope_c_market_kind_tag(kind: &MarketEventKind) -> &'static str {
     match kind {
@@ -8681,7 +8725,8 @@ fn execution_result_ingest_lag_ms(result: &ExecutionResult, now_ms: u64) -> u64 
 /// Bounded JetStream pull for `ExecutionResult` — no busy-wait, at most `max_messages` per call.
 ///
 /// `fetch_expires`: use `EXECUTION_RESULT_SCHEDULED_FETCH_EXPIRES` from the dedicated `select!` arm;
-/// use `EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES` when this runs inside MarketEvent / PoolCache handlers.
+/// use `EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES` when this runs after a MarketEvents ingest batch
+/// or PoolCache batch (bounded interleaved drain).
 async fn drain_execution_results(
     consumer: &async_nats::jetstream::consumer::Consumer<
         async_nats::jetstream::consumer::pull::Config,
@@ -12464,6 +12509,36 @@ mod tests {
             }),
             "BondingCurveProgress"
         );
+    }
+
+    #[test]
+    fn market_events_batch_interleaved_drain_decision_once_per_batch_semantics() {
+        // Multiple price-sensitive events in one batch still map to one drain decision:
+        // eligibility is OR of batch flag with state, not per-event.
+        assert!(!market_events_batch_wants_interleaved_execution_result_drain(false, 0, 0));
+        assert!(!market_events_batch_wants_interleaved_execution_result_drain(true, 0, 0));
+        assert!(market_events_batch_wants_interleaved_execution_result_drain(true, 1, 0));
+        assert!(market_events_batch_wants_interleaved_execution_result_drain(true, 0, 1));
+        assert!(!market_events_batch_wants_interleaved_execution_result_drain(false, 5, 5));
+    }
+
+    #[test]
+    fn exit_signals_after_market_event_skipped_without_positions() {
+        assert!(!should_invoke_exit_signals_after_market_event_processing(
+            true, false, 0
+        ));
+        assert!(!should_invoke_exit_signals_after_market_event_processing(
+            false, true, 0
+        ));
+        assert!(should_invoke_exit_signals_after_market_event_processing(
+            true, false, 1
+        ));
+        assert!(should_invoke_exit_signals_after_market_event_processing(
+            false, true, 1
+        ));
+        assert!(should_invoke_exit_signals_after_market_event_processing(
+            true, true, 2
+        ));
     }
 
     #[test]

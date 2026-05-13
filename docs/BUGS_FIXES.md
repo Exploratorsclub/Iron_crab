@@ -12,6 +12,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Fix**: Gebündeltes, kappenbegrenztes Draining (`CORE_MARKET_EVENTS_INGEST_DRAIN_MAX`) mit erhaltener Reihenfolge; `flatten_market_events_for_ingest_ordered_batch` für BCP-Coalescing wie zuvor; etwas kleinere PoolCache-/Wallet-Fetch-Kappen; `tokio::task::yield_now` nach schweren Armen; Strategy-Tick überspringt `check_for_signals` ohne Tracker/Pending-BUY und `process_exit_signals` ohne offene Positionen; Default-Tracing `async_nats=warn` gegen INFO-Log-Sturm (Nebenmaßnahme).  
 **Dateien**: `src/bin/momentum_bot.rs`
 
+### FIX-MOM-INGEST-THROUGHPUT: MarketEvents-Batch — ein interleaved ExecutionResult-Drain, Exit-Scan nur mit Positionen
+**Datum**: 2026-05-13  
+**Problem**: Nach FIX-MOM-NATS-FAIRNESS lief der Ingest wieder, aber der Durchsatz blieb niedrig: Pro Event im 48er-Drain wurden `process_exit_signals().await` (auch ohne offene Position) und ein JetStream-`ExecutionResult`-Fetch mit kurzem `expires` ausgeführt — amortisiert bis zu ~48× Fetch-Latenz pro Batch.  
+**Fix**: `drain_execution_results` (interleaved) höchstens **einmal** nach vollständiger Verarbeitung eines MarketEvents-Batches, nur wenn das Batch preissensitiv war und Positionen oder ausstehende Execution-Intents existieren; `process_exit_signals` in MarketEvents-, PoolCache- und Wallet-Snapshot-Pfaden nur bei `position_count() > 0`. Geplanter `select!`-Arm für ExecutionResults unverändert.  
+**Dateien**: `src/bin/momentum_bot.rs`
+
 ### FIX-01: Revert fehlerhafter Commits → `e341c04b`
 **Datum**: 2026-02-09
 **Problem**: 18 Commits (bis `b22bb0a9`) hatten ungewollt die Liquidation zerstört und Architekturprinzipien verletzt (RPC-Calls im Hot Path).
