@@ -157,35 +157,59 @@ pub(crate) fn market_event_is_momentum_nats_relevant(kind: &MarketEventKind) -> 
 /// Publish one logical market event to core NATS and, when [`market_event_is_momentum_nats_relevant`], to momentum subject.
 ///
 /// Counts one [`MARKET_EVENTS_PUBLISHED_TOTAL`] per successful core delivery; [`NATS_MESSAGES_PUBLISHED_TOTAL`]
-/// once per successful NATS publish (core plus optional second message).
+/// once per successful NATS publish (core plus optional second message). [`NatsClient::publish`] may return
+/// `Ok(false)` when the message is dropped (no client, NATS error, timeout/backpressure); that is not success.
 pub(crate) async fn publish_market_event_core_and_momentum(
     nats: &NatsClient,
     event: &MarketEvent,
 ) -> bool {
-    if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, event).await {
-        warn!(
-            error = %e,
-            event_id = %event.event_id,
-            "Failed to publish market event to NATS (core)"
-        );
-        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-
-    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-    MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-
-    if market_event_is_momentum_nats_relevant(&event.kind) {
-        if let Err(e) = nats.publish(TOPIC_MOMENTUM_MARKET_EVENTS, event).await {
+    match nats.publish(TOPIC_MARKET_EVENTS, event).await {
+        Ok(true) => {
+            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(false) => {
+            warn!(
+                event_id = %event.event_id,
+                topic = TOPIC_MARKET_EVENTS,
+                "Market event publish to NATS (core) dropped or failed"
+            );
+            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        Err(e) => {
             warn!(
                 error = %e,
                 event_id = %event.event_id,
-                topic = TOPIC_MOMENTUM_MARKET_EVENTS,
-                "Failed to publish market event to NATS (momentum fan-out)"
+                "Failed to publish market event to NATS (core)"
             );
             NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-        } else {
-            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+    }
+
+    if market_event_is_momentum_nats_relevant(&event.kind) {
+        match nats.publish(TOPIC_MOMENTUM_MARKET_EVENTS, event).await {
+            Ok(true) => {
+                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {
+                warn!(
+                    event_id = %event.event_id,
+                    topic = TOPIC_MOMENTUM_MARKET_EVENTS,
+                    "Market event publish to NATS (momentum fan-out) dropped or failed"
+                );
+                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    event_id = %event.event_id,
+                    topic = TOPIC_MOMENTUM_MARKET_EVENTS,
+                    "Failed to publish market event to NATS (momentum fan-out)"
+                );
+                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
