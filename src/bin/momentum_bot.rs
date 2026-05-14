@@ -592,9 +592,11 @@ fn exit_executable_quote_is_usable(q: &ExitExecutableQuote) -> bool {
     q.pool_sourced && q.tokens_per_sol > 0.0 && q.tokens_per_sol.is_finite()
 }
 
-/// When a **valid** executable quote exists: suppress firing because `current_price` is more
-/// aggressive than the executable (trade spike / stale mark), but the pool quote disagrees.
-/// Quote-first triggers call this only after the executable condition for that exit is met.
+/// When a **valid** executable quote exists and the caller already determined the executable
+/// exit threshold is met (quote-first): suppress only when **both** mark and executable breach
+/// the same band, and the executable is **more extreme** than the mark (reserve looks worse /
+/// more aggressive than mark-to-market). If the mark is still inside the band, quote-first
+/// intentionally still exits on the executable alone (see tests).
 fn suppress_price_exit_stale_aggressive_current(
     exit_type: &str,
     entry_price: f64,
@@ -610,11 +612,19 @@ fn suppress_price_exit_stale_aggressive_current(
 
     match exit_type {
         "STOP_LOSS" => {
-            current_pnl <= -config.hard_stop_loss_pct && exec_pnl > -config.hard_stop_loss_pct
+            current_pnl <= -config.hard_stop_loss_pct
+                && exec_pnl <= -config.hard_stop_loss_pct
+                && exec_pnl < current_pnl
         }
-        "TAKE_PROFIT" => current_pnl >= config.take_profit_pct && exec_pnl < config.take_profit_pct,
+        "TAKE_PROFIT" => {
+            current_pnl >= config.take_profit_pct
+                && exec_pnl >= config.take_profit_pct
+                && exec_pnl > current_pnl
+        }
         "TRAILING_STOP" => {
-            current_dd >= config.trailing_stop_pct && exec_dd < config.trailing_stop_pct
+            current_dd >= config.trailing_stop_pct
+                && exec_dd >= config.trailing_stop_pct
+                && exec_dd > current_dd
         }
         _ => false,
     }
