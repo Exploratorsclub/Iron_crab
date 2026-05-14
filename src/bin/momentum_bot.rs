@@ -920,6 +920,16 @@ impl PositionTracker {
                     ),
                 ));
             }
+        } else if let Some(q) = exit_quote {
+            // `valid_q` is None but a quote exists → not pool-sourced / non-finite / otherwise unusable.
+            debug!(
+                mint = %self.mint,
+                position_pool = %self.pool,
+                reason = "UNUSABLE_EXECUTABLE_QUOTE",
+                pool_sourced = q.pool_sourced,
+                tokens_per_sol = q.tokens_per_sol,
+                "price_exit_skipped_unusable_executable_quote"
+            );
         } else if pnl <= -config.hard_stop_loss_pct {
             debug!(
                 mint = %self.mint,
@@ -928,17 +938,6 @@ impl PositionTracker {
                 current_pnl_pct = %format!("{:.4}", pnl),
                 "price_exit_skipped_no_executable_quote"
             );
-        } else if let Some(q) = exit_quote {
-            if !exit_executable_quote_is_usable(q) {
-                debug!(
-                    mint = %self.mint,
-                    position_pool = %self.pool,
-                    reason = "UNUSABLE_EXECUTABLE_QUOTE",
-                    pool_sourced = q.pool_sourced,
-                    tokens_per_sol = q.tokens_per_sol,
-                    "price_exit_skipped_unusable_executable_quote"
-                );
-            }
         }
 
         // 2. Take profit — quote-first: executable gain must meet target after min hold.
@@ -984,13 +983,25 @@ impl PositionTracker {
                     ));
                 }
             } else if pnl >= config.take_profit_pct {
-                debug!(
-                    mint = %self.mint,
-                    position_pool = %self.pool,
-                    reason = "NO_EXECUTABLE_QUOTE",
-                    current_pnl_pct = %format!("{:.4}", pnl),
-                    "price_exit_skipped_no_executable_quote"
-                );
+                if let Some(q) = exit_quote {
+                    // Mark at target but no usable executable quote — distinguish missing vs unusable.
+                    debug!(
+                        mint = %self.mint,
+                        position_pool = %self.pool,
+                        reason = "UNUSABLE_EXECUTABLE_QUOTE",
+                        pool_sourced = q.pool_sourced,
+                        tokens_per_sol = q.tokens_per_sol,
+                        "price_exit_skipped_unusable_executable_quote"
+                    );
+                } else {
+                    debug!(
+                        mint = %self.mint,
+                        position_pool = %self.pool,
+                        reason = "NO_EXECUTABLE_QUOTE",
+                        current_pnl_pct = %format!("{:.4}", pnl),
+                        "price_exit_skipped_no_executable_quote"
+                    );
+                }
             }
         }
 
