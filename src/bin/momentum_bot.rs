@@ -99,6 +99,9 @@ const ORPHANED_RECOVERED_INTENT_IDS_CAP: usize = 50_000;
 /// Core NATS delivers no publisher discovery: subscribing to [`TOPIC_MOMENTUM_MARKET_EVENTS`]
 /// succeeds even when market-data does not publish there yet. If no message arrives within this
 /// window, subscribe to [`TOPIC_MARKET_EVENTS`] so rolling deploys do not starve silently.
+///
+/// `sd_notify(READY)` is sent only after this probe (see main loop startup) so systemd
+/// `WatchdogSec` in `docs/systemd/momentum-bot.service` does not elapse during the wait.
 const MOMENTUM_MARKET_EVENTS_FIRST_MSG_FALLBACK: Duration = Duration::from_secs(30);
 
 // --- Scope C (momentum event lifecycle): bounded ExecutionResult drains + observability ---
@@ -7505,17 +7508,6 @@ async fn main() -> Result<()> {
     // === Main Loop: Process MarketEvents from NATS ===
     info!("Entering main event loop");
 
-    // P1 Crash Isolation: Signal systemd that we're ready
-    #[cfg(unix)]
-    {
-        // NOTE: Do NOT unset NOTIFY_SOCKET here; we need it for Watchdog pings.
-        let _ = sd_notify::notify(false, &[NotifyState::Ready]);
-        debug!("Sent sd_notify READY to systemd");
-    }
-
-    // Keep readiness fresh even when idle.
-    ironcrab::metrics::record_activity();
-
     let mut pending_market_nats_message: Option<NatsMessage> = None;
 
     // Subscribe to Momentum-filtered MarketEvents (reduces Core NATS fan-in vs full stream).
@@ -7809,6 +7801,17 @@ async fn main() -> Result<()> {
     // Graceful shutdown handling
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
+
+    // Defer READY until after NATS setup (including momentum first-message probe). With
+    // Type=notify + WatchdogSec, READY starts the watchdog; the probe can block ~30s without
+    // the main loop's periodic WATCHDOG pings yet.
+    ironcrab::metrics::record_activity();
+    #[cfg(unix)]
+    {
+        // NOTIFY_SOCKET must stay set for Watchdog pings in the main loop.
+        let _ = sd_notify::notify(false, &[NotifyState::Ready]);
+        debug!("Sent sd_notify READY to systemd");
+    }
 
     loop {
         tokio::select! {
