@@ -11,6 +11,10 @@ pub const TOPIC_VERSION: &str = "v1";
 /// Market events from market-data service
 pub const TOPIC_MARKET_EVENTS: &str = "ironcrab.v1.market_events";
 
+/// Momentum-filtered market events (subset of [`TOPIC_MARKET_EVENTS`] payloads).
+/// Other consumers keep using the core topic; momentum-bot prefers this subject to reduce fan-in.
+pub const TOPIC_MOMENTUM_MARKET_EVENTS: &str = "ironcrab.v1.market_events.momentum";
+
 /// Trade intents from strategy bots
 pub const TOPIC_TRADE_INTENTS: &str = "ironcrab.v1.trade_intents";
 
@@ -79,6 +83,7 @@ pub fn config_topic(component: &str) -> String {
 pub fn all_topics() -> Vec<&'static str> {
     vec![
         TOPIC_MARKET_EVENTS,
+        TOPIC_MOMENTUM_MARKET_EVENTS,
         TOPIC_TRADE_INTENTS,
         TOPIC_EXECUTION_RESULTS,
         TOPIC_CONTROL_REQUESTS,
@@ -106,6 +111,14 @@ mod tests {
     fn test_topic_format() {
         assert!(TOPIC_MARKET_EVENTS.starts_with(TOPIC_PREFIX));
         assert!(TOPIC_MARKET_EVENTS.contains(TOPIC_VERSION));
+    }
+
+    #[test]
+    fn test_momentum_market_events_topic_versioned() {
+        assert!(TOPIC_MOMENTUM_MARKET_EVENTS.starts_with(TOPIC_PREFIX));
+        assert!(TOPIC_MOMENTUM_MARKET_EVENTS.contains(TOPIC_VERSION));
+        assert!(TOPIC_MOMENTUM_MARKET_EVENTS.starts_with(TOPIC_MARKET_EVENTS));
+        assert!(TOPIC_MOMENTUM_MARKET_EVENTS.len() > TOPIC_MARKET_EVENTS.len());
     }
 
     #[test]
