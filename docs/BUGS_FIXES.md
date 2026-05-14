@@ -18,6 +18,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Fix**: `drain_execution_results` (interleaved) höchstens **einmal** nach vollständiger Verarbeitung eines MarketEvents-Batches, nur wenn das Batch preissensitiv war und Positionen oder ausstehende Execution-Intents existieren; `process_exit_signals` in MarketEvents-, PoolCache- und Wallet-Snapshot-Pfaden nur bei `position_count() > 0`. Geplanter `select!`-Arm für ExecutionResults unverändert.  
 **Dateien**: `src/bin/momentum_bot.rs`
 
+### FIX-MOM-QUOTE-FIRST-PRICE-EXITS: STOP/TP/Trailing aus LivePoolCache-Quote
+**Datum**: 2026-05-14  
+**Problem**: `STOP_LOSS`/`TAKE_PROFIT`/`TRAILING_STOP` trippen nur, wenn `current_price` die Schwelle erreichte; die validierte `ExitExecutableQuote` widersprach oft nicht rechtzeitig. Positions fielen durch zu `TIME_EXIT`, obwohl die ausführbare Reserve-Quote schon weit unter Stop lag (Mark vs. tatsächlicher Sell-Preis).  
+**Fix**: Quote-first: bei nutzbarer `ExitExecutableQuote` (pool_sourced, finite `tokens_per_sol`) entscheiden diese Exits primär nach executable PnL bzw. executable Drawdown; ohne Quote feuern sie nicht aus Trade-/Mark-Rauschen. Stale-Suppression bleibt (aggressiver `current_price` vs. executable). `TIME_EXIT` unverändert; Reporting-PnL nutzt weiter die Quote wenn vorhanden.  
+**Dateien**: `src/bin/momentum_bot.rs`
+
 ### FIX-01: Revert fehlerhafter Commits → `e341c04b`
 **Datum**: 2026-02-09
 **Problem**: 18 Commits (bis `b22bb0a9`) hatten ungewollt die Liquidation zerstört und Architekturprinzipien verletzt (RPC-Calls im Hot Path).

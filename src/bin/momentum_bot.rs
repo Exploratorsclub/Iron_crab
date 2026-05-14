@@ -568,6 +568,8 @@ struct PositionTracker {
 /// I-7: from LivePoolCache in-process only — no RPC.
 /// I-13: If `marks_position_pool` is false (e.g. PumpSwap quote while position.pool is still PumpFun BC),
 /// this quote is only for exit decisions — never apply `tokens_per_sol` as `current_price` on the position.
+/// Price exits (`STOP_LOSS` / `TAKE_PROFIT` / `TRAILING_STOP`) are **quote-first**: they trigger from a
+/// usable executable quote when present; they do not use `current_price` alone (see `should_exit`).
 #[derive(Debug, Clone)]
 struct ExitExecutableQuote {
     /// tokens_per_sol (UI): token_ui / sol_ui, matching `entry_price` / `current_price` (I-14).
@@ -584,109 +586,38 @@ struct ExitExecutableQuote {
     cache_age_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExitPriceValidationAction {
-    /// Use `current_price`-based PnL for this exit.
-    Allow,
-    /// Do not emit this price-based exit this tick (stale/wrong `current_price` vs executable).
-    Suppress,
+/// Reserve-based quote is usable for quote-first price exits (I-14, I-15, I-16).
+#[inline]
+fn exit_executable_quote_is_usable(q: &ExitExecutableQuote) -> bool {
+    q.pool_sourced && q.tokens_per_sol > 0.0 && q.tokens_per_sol.is_finite()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExitRejectionReason {
-    StaleOrWrongPrice,
-    /// No valid reserve quote for this position size — price-based exit must not fire (I-16).
-    NoExecutableQuote,
-}
-
-/// Pure helper: decide whether a price-based exit should be suppressed when a pool-correct
-/// executable quote exists. I-14: `pnl_pct` / drawdown use `tokens_per_sol`.
-///
-/// Scope D: `TAKE_PROFIT`, `STOP_LOSS`, and `TRAILING_STOP` require a valid executable quote;
-/// they never fire on `current_price` / trade-ratio noise alone.
-fn exit_action_for_price_signal(
+/// When a **valid** executable quote exists: suppress firing because `current_price` is more
+/// aggressive than the executable (trade spike / stale mark), but the pool quote disagrees.
+/// Quote-first triggers call this only after the executable condition for that exit is met.
+fn suppress_price_exit_stale_aggressive_current(
+    exit_type: &str,
     entry_price: f64,
     highest_price: f64,
     current_price: f64,
-    exit_type: &str,
     config: &MomentumConfig,
-    exit_quote: Option<&ExitExecutableQuote>,
-) -> (
-    ExitPriceValidationAction,
-    f64,
-    f64,
-    Option<ExitRejectionReason>,
-) {
+    exec_pnl: f64,
+    exec_tokens_per_sol: f64,
+) -> bool {
     let current_pnl = tokens_per_sol::pnl_pct(entry_price, current_price);
-    let q = match exit_quote {
-        None => {
-            return (
-                ExitPriceValidationAction::Suppress,
-                current_pnl,
-                current_pnl,
-                Some(ExitRejectionReason::NoExecutableQuote),
-            );
-        }
-        Some(q) => q,
-    };
-    if !q.pool_sourced || q.tokens_per_sol <= 0.0 {
-        return (
-            ExitPriceValidationAction::Suppress,
-            current_pnl,
-            current_pnl,
-            Some(ExitRejectionReason::NoExecutableQuote),
-        );
-    }
-
-    let executable_pnl_val = tokens_per_sol::pnl_pct(entry_price, q.tokens_per_sol);
     let current_dd = tokens_per_sol::drawdown_from_ath_pct(highest_price, current_price);
-    let exec_dd = tokens_per_sol::drawdown_from_ath_pct(highest_price, q.tokens_per_sol);
+    let exec_dd = tokens_per_sol::drawdown_from_ath_pct(highest_price, exec_tokens_per_sol);
 
-    // STOP_LOSS: `current` says at/beyond hard stop, but executable says we are not — suppress
-    if exit_type == "STOP_LOSS"
-        && current_pnl <= -config.hard_stop_loss_pct
-        && executable_pnl_val > -config.hard_stop_loss_pct
-    {
-        return (
-            ExitPriceValidationAction::Suppress,
-            current_pnl,
-            executable_pnl_val,
-            Some(ExitRejectionReason::StaleOrWrongPrice),
-        );
+    match exit_type {
+        "STOP_LOSS" => {
+            current_pnl <= -config.hard_stop_loss_pct && exec_pnl > -config.hard_stop_loss_pct
+        }
+        "TAKE_PROFIT" => current_pnl >= config.take_profit_pct && exec_pnl < config.take_profit_pct,
+        "TRAILING_STOP" => {
+            current_dd >= config.trailing_stop_pct && exec_dd < config.trailing_stop_pct
+        }
+        _ => false,
     }
-
-    // TAKE_PROFIT: require executable to confirm the gain target
-    if exit_type == "TAKE_PROFIT"
-        && current_pnl >= config.take_profit_pct
-        && executable_pnl_val < config.take_profit_pct
-    {
-        return (
-            ExitPriceValidationAction::Suppress,
-            current_pnl,
-            executable_pnl_val,
-            Some(ExitRejectionReason::StaleOrWrongPrice),
-        );
-    }
-
-    // TRAILING_STOP: `current` says drawdown limit hit, executable disagrees
-    if exit_type == "TRAILING_STOP"
-        && current_dd >= config.trailing_stop_pct
-        && exec_dd < config.trailing_stop_pct
-    {
-        return (
-            ExitPriceValidationAction::Suppress,
-            current_pnl,
-            executable_pnl_val,
-            Some(ExitRejectionReason::StaleOrWrongPrice),
-        );
-    }
-
-    (
-        ExitPriceValidationAction::Allow,
-        current_pnl,
-        executable_pnl_val,
-        None,
-    )
 }
 
 #[derive(Clone, Debug)]
@@ -971,6 +902,9 @@ impl PositionTracker {
 
     /// Check if we should exit this position. `exit_quote` is a reserve-based quote for selling
     /// `token_amount` from `LivePoolCache` (I-7: no RPC).
+    ///
+    /// Quote-first (price exits): `STOP_LOSS`, `TAKE_PROFIT`, and `TRAILING_STOP` trigger from a
+    /// **usable** executable reserve quote when present; `current_price` alone never trips these.
     fn should_exit(
         &mut self,
         config: &MomentumConfig,
@@ -978,157 +912,172 @@ impl PositionTracker {
     ) -> Option<(String, String)> {
         // Returns: Some((exit_type, reason)) or None
 
-        // Mut: refreshed after `update_price` in validation suppress paths so trailing/activation
-        // do not use stale pnl/drawdown vs updated self.current_price (see f7477a89).
+        let valid_q = exit_quote.filter(|q| exit_executable_quote_is_usable(q));
         let mut pnl = self.pnl_pct();
-        let mut drawdown = self.drawdown_from_ath_pct();
         let hold_secs = self.entry_time.elapsed().as_secs();
 
-        let pnl_for_reporting = match exit_quote {
-            Some(q) if q.pool_sourced && q.tokens_per_sol > 0.0 => {
-                tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol)
-            }
-            _ => pnl,
-        };
+        let pnl_for_reporting = valid_q
+            .map(|q| tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol))
+            .unwrap_or(pnl);
 
-        // 1. Hard Stop Loss - validate against executable quote when available (stale `current_price`)
-        if pnl <= -config.hard_stop_loss_pct {
-            let (action, current_pnl, exec_pnl, rejection) = exit_action_for_price_signal(
-                self.entry_price,
-                self.highest_price,
-                self.current_price,
-                "STOP_LOSS",
-                config,
-                exit_quote,
-            );
-            if action == ExitPriceValidationAction::Suppress {
-                if let Some(q) = exit_quote
-                    .as_ref()
-                    .filter(|q| q.pool_sourced && q.tokens_per_sol > 0.0 && q.marks_position_pool)
-                {
-                    self.update_price(q.tokens_per_sol);
-                    pnl = self.pnl_pct();
-                    drawdown = self.drawdown_from_ath_pct();
+        // 1. Hard stop — quote-first: executable PnL must breach threshold (I-14, I-16).
+        if let Some(q) = valid_q {
+            let exec_pnl = tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol);
+            if exec_pnl <= -config.hard_stop_loss_pct {
+                let current_pnl = pnl;
+                if suppress_price_exit_stale_aggressive_current(
+                    "STOP_LOSS",
+                    self.entry_price,
+                    self.highest_price,
+                    self.current_price,
+                    config,
+                    exec_pnl,
+                    q.tokens_per_sol,
+                ) {
+                    if q.marks_position_pool {
+                        self.update_price(q.tokens_per_sol);
+                        pnl = self.pnl_pct();
+                    }
+                    debug!(
+                        mint = %self.mint,
+                        position_pool = %self.pool,
+                        quote_pool = %q.quote_pool,
+                        quote_dex = %q.quote_dex,
+                        entry_price = self.entry_price,
+                        current_price = self.current_price,
+                        executable_tokens_per_sol = q.tokens_per_sol,
+                        current_pnl_pct = %format!("{:.4}", current_pnl),
+                        executable_pnl_pct = %format!("{:.4}", exec_pnl),
+                        exit_type = "STOP_LOSS",
+                        decision = "suppress",
+                        reason = "STALE_AGGRESSIVE_CURRENT_VS_EXECUTABLE",
+                        "exit_signal_suppressed_stale_price"
+                    );
+                } else {
+                    info!(
+                        mint = %self.mint,
+                        position_pool = %self.pool,
+                        quote_pool = %q.quote_pool,
+                        quote_dex = %q.quote_dex,
+                        entry_price = self.entry_price,
+                        current_price = self.current_price,
+                        executable_tokens_per_sol = q.tokens_per_sol,
+                        current_pnl_pct = %format!("{:.4}", current_pnl),
+                        executable_pnl_pct = %format!("{:.4}", exec_pnl),
+                        exit_type = "STOP_LOSS",
+                        "STOP_LOSS trigger (quote-first executable reserve PnL)"
+                    );
+                    return Some((
+                        "STOP_LOSS".to_string(),
+                        format!(
+                            "Hard stop hit: {:.1}% executable loss (limit: -{:.1}%)",
+                            exec_pnl, config.hard_stop_loss_pct
+                        ),
+                    ));
                 }
-                warn!(
+            }
+        } else if pnl <= -config.hard_stop_loss_pct {
+            debug!(
+                mint = %self.mint,
+                position_pool = %self.pool,
+                reason = "NO_EXECUTABLE_QUOTE",
+                current_pnl_pct = %format!("{:.4}", pnl),
+                "price_exit_skipped_no_executable_quote"
+            );
+        } else if let Some(q) = exit_quote {
+            if !exit_executable_quote_is_usable(q) {
+                debug!(
                     mint = %self.mint,
                     position_pool = %self.pool,
-                    entry_price = self.entry_price,
-                    current_price = self.current_price,
-                    executable_tokens_per_sol = ?exit_quote.map(|q| q.tokens_per_sol),
-                    current_pnl_pct = %format!("{:.4}", current_pnl),
-                    executable_pnl_pct = %format!("{:.4}", exec_pnl),
-                    exit_type_original = "STOP_LOSS",
-                    decision = "suppress",
-                    ?rejection,
-                    "exit_signal_suppressed_stale_price"
+                    reason = "UNUSABLE_EXECUTABLE_QUOTE",
+                    pool_sourced = q.pool_sourced,
+                    tokens_per_sol = q.tokens_per_sol,
+                    "price_exit_skipped_unusable_executable_quote"
                 );
-            } else {
-                info!(
-                    mint = %self.mint,
-                    position_pool = %self.pool,
-                    entry_price = self.entry_price,
-                    current_price = self.current_price,
-                    executable_tokens_per_sol = ?exit_quote.map(|q| q.tokens_per_sol),
-                    current_pnl_pct = %format!("{:.4}", current_pnl),
-                    executable_pnl_pct = %format!("{:.4}", exec_pnl),
-                    exit_type_original = "STOP_LOSS",
-                    decision = "allow",
-                    "STOP_LOSS trigger (exit price validated against pool quote when available)"
-                );
-                return Some((
-                    "STOP_LOSS".to_string(),
-                    format!(
-                        "Hard stop hit: {:.1}% executable loss (limit: -{:.1}%)",
-                        exec_pnl, config.hard_stop_loss_pct
-                    ),
-                ));
             }
         }
 
-        // 2. Take Profit - lock in gains (only after min hold to avoid wrong-pool price spike)
-        if hold_secs >= config.take_profit_min_hold_secs && pnl >= config.take_profit_pct {
-            let (action, current_pnl, exec_pnl, rejection) = exit_action_for_price_signal(
-                self.entry_price,
-                self.highest_price,
-                self.current_price,
-                "TAKE_PROFIT",
-                config,
-                exit_quote,
-            );
-            if action == ExitPriceValidationAction::Suppress {
-                if let Some(q) = exit_quote
-                    .as_ref()
-                    .filter(|q| q.pool_sourced && q.tokens_per_sol > 0.0 && q.marks_position_pool)
-                {
-                    self.update_price(q.tokens_per_sol);
-                    pnl = self.pnl_pct();
-                    drawdown = self.drawdown_from_ath_pct();
-                }
-                if let Some(q) = exit_quote
-                    .as_ref()
-                    .filter(|q| q.pool_sourced && q.tokens_per_sol > 0.0)
-                {
-                    let ep = tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol);
-                    if ep <= -config.hard_stop_loss_pct {
+        // 2. Take profit — quote-first: executable gain must meet target after min hold.
+        if hold_secs >= config.take_profit_min_hold_secs {
+            if let Some(q) = valid_q {
+                let exec_pnl = tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol);
+                if exec_pnl >= config.take_profit_pct {
+                    let current_pnl = pnl;
+                    if suppress_price_exit_stale_aggressive_current(
+                        "TAKE_PROFIT",
+                        self.entry_price,
+                        self.highest_price,
+                        self.current_price,
+                        config,
+                        exec_pnl,
+                        q.tokens_per_sol,
+                    ) {
+                        if q.marks_position_pool {
+                            self.update_price(q.tokens_per_sol);
+                            pnl = self.pnl_pct();
+                        }
+                        debug!(
+                            mint = %self.mint,
+                            position_pool = %self.pool,
+                            quote_pool = %q.quote_pool,
+                            quote_dex = %q.quote_dex,
+                            entry_price = self.entry_price,
+                            current_price = self.current_price,
+                            executable_tokens_per_sol = q.tokens_per_sol,
+                            current_pnl_pct = %format!("{:.4}", current_pnl),
+                            executable_pnl_pct = %format!("{:.4}", exec_pnl),
+                            exit_type = "TAKE_PROFIT",
+                            decision = "suppress",
+                            reason = "STALE_AGGRESSIVE_CURRENT_VS_EXECUTABLE",
+                            "exit_signal_suppressed_stale_price"
+                        );
+                    } else {
+                        // #region agent log
+                        dbg_log(
+                            "momentum_bot.rs:should_exit_TAKE_PROFIT",
+                            "TAKE_PROFIT trigger - capturing pnl inputs",
+                            serde_json::json!({
+                                "mint": self.mint,
+                                "entry_price": self.entry_price,
+                                "current_price": self.current_price,
+                                "highest_price": self.highest_price,
+                                "pnl_pct": pnl,
+                                "take_profit_pct": config.take_profit_pct,
+                                "ratio_entry_over_current": self.entry_price / self.current_price
+                            }),
+                            "H-ALL",
+                        );
+                        // #endregion
+                        info!(
+                            mint = %self.mint,
+                            position_pool = %self.pool,
+                            quote_pool = %q.quote_pool,
+                            quote_dex = %q.quote_dex,
+                            entry_price = self.entry_price,
+                            current_price = self.current_price,
+                            executable_tokens_per_sol = q.tokens_per_sol,
+                            current_pnl_pct = %format!("{:.4}", current_pnl),
+                            executable_pnl_pct = %format!("{:.4}", exec_pnl),
+                            exit_type = "TAKE_PROFIT",
+                            "TAKE_PROFIT trigger (quote-first executable reserve PnL)"
+                        );
                         return Some((
-                            "STOP_LOSS".to_string(),
+                            "TAKE_PROFIT".to_string(),
                             format!(
-                                "Hard stop hit: {:.1}% executable loss (limit: -{:.1}%)",
-                                ep, config.hard_stop_loss_pct
+                                "Take profit hit: +{:.1}% executable gain (target: +{:.1}%)",
+                                exec_pnl, config.take_profit_pct
                             ),
                         ));
                     }
                 }
-                warn!(
+            } else if pnl >= config.take_profit_pct {
+                debug!(
                     mint = %self.mint,
                     position_pool = %self.pool,
-                    entry_price = self.entry_price,
-                    current_price = self.current_price,
-                    executable_tokens_per_sol = ?exit_quote.map(|q| q.tokens_per_sol),
-                    current_pnl_pct = %format!("{:.4}", current_pnl),
-                    executable_pnl_pct = %format!("{:.4}", exec_pnl),
-                    exit_type_original = "TAKE_PROFIT",
-                    decision = "suppress",
-                    ?rejection,
-                    "exit_signal_suppressed_stale_price"
+                    reason = "NO_EXECUTABLE_QUOTE",
+                    current_pnl_pct = %format!("{:.4}", pnl),
+                    "price_exit_skipped_no_executable_quote"
                 );
-            } else {
-                // #region agent log
-                dbg_log(
-                    "momentum_bot.rs:should_exit_TAKE_PROFIT",
-                    "TAKE_PROFIT trigger - capturing pnl inputs",
-                    serde_json::json!({
-                        "mint": self.mint,
-                        "entry_price": self.entry_price,
-                        "current_price": self.current_price,
-                        "highest_price": self.highest_price,
-                        "pnl_pct": pnl,
-                        "take_profit_pct": config.take_profit_pct,
-                        "ratio_entry_over_current": self.entry_price / self.current_price
-                    }),
-                    "H-ALL",
-                );
-                // #endregion
-                info!(
-                    mint = %self.mint,
-                    position_pool = %self.pool,
-                    entry_price = self.entry_price,
-                    current_price = self.current_price,
-                    executable_tokens_per_sol = ?exit_quote.map(|q| q.tokens_per_sol),
-                    current_pnl_pct = %format!("{:.4}", current_pnl),
-                    executable_pnl_pct = %format!("{:.4}", exec_pnl),
-                    exit_type_original = "TAKE_PROFIT",
-                    decision = "allow",
-                    "TAKE_PROFIT trigger (exit price validated against pool quote when available)"
-                );
-                return Some((
-                    "TAKE_PROFIT".to_string(),
-                    format!(
-                        "Take profit hit: +{:.1}% executable gain (target: +{:.1}%)",
-                        exec_pnl, config.take_profit_pct
-                    ),
-                ));
             }
         }
 
@@ -1155,71 +1104,90 @@ impl PositionTracker {
             }
         }
 
-        // 3. Trailing Stop - activate after profit threshold
-        if pnl >= config.trailing_activation_pct {
+        // 3. Trailing stop — quote-first drawdown vs ATH when a usable executable exists (I-13, I-14).
+        if let Some(q) = valid_q {
+            if q.marks_position_pool {
+                self.highest_price =
+                    tokens_per_sol::updated_highest_price(self.highest_price, q.tokens_per_sol);
+            }
+        }
+
+        let activation_pnl = valid_q
+            .map(|q| tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol))
+            .unwrap_or(pnl);
+        if activation_pnl >= config.trailing_activation_pct {
             self.trailing_active = true;
         }
 
-        if self.trailing_active && drawdown >= config.trailing_stop_pct {
-            let (action, current_pnl, exec_pnl, rejection) = exit_action_for_price_signal(
-                self.entry_price,
-                self.highest_price,
-                self.current_price,
-                "TRAILING_STOP",
-                config,
-                exit_quote,
-            );
-            if action == ExitPriceValidationAction::Suppress {
-                if let Some(q) = exit_quote
-                    .as_ref()
-                    .filter(|q| q.pool_sourced && q.tokens_per_sol > 0.0 && q.marks_position_pool)
-                {
-                    self.update_price(q.tokens_per_sol);
-                    pnl = self.pnl_pct();
-                    drawdown = self.drawdown_from_ath_pct();
-                    let _ = drawdown;
+        if self.trailing_active {
+            if let Some(q) = valid_q {
+                let exec_dd =
+                    tokens_per_sol::drawdown_from_ath_pct(self.highest_price, q.tokens_per_sol);
+                if exec_dd >= config.trailing_stop_pct {
+                    let exec_pnl = tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol);
+                    let current_pnl = pnl;
+                    if suppress_price_exit_stale_aggressive_current(
+                        "TRAILING_STOP",
+                        self.entry_price,
+                        self.highest_price,
+                        self.current_price,
+                        config,
+                        exec_pnl,
+                        q.tokens_per_sol,
+                    ) {
+                        if q.marks_position_pool {
+                            self.update_price(q.tokens_per_sol);
+                            pnl = self.pnl_pct();
+                        }
+                        debug!(
+                            mint = %self.mint,
+                            position_pool = %self.pool,
+                            quote_pool = %q.quote_pool,
+                            quote_dex = %q.quote_dex,
+                            entry_price = self.entry_price,
+                            current_price = self.current_price,
+                            executable_tokens_per_sol = q.tokens_per_sol,
+                            current_pnl_pct = %format!("{:.4}", current_pnl),
+                            executable_pnl_pct = %format!("{:.4}", exec_pnl),
+                            exit_type = "TRAILING_STOP",
+                            decision = "suppress",
+                            reason = "STALE_AGGRESSIVE_CURRENT_VS_EXECUTABLE",
+                            "exit_signal_suppressed_stale_price"
+                        );
+                    } else {
+                        info!(
+                            mint = %self.mint,
+                            position_pool = %self.pool,
+                            quote_pool = %q.quote_pool,
+                            quote_dex = %q.quote_dex,
+                            entry_price = self.entry_price,
+                            current_price = self.current_price,
+                            executable_tokens_per_sol = q.tokens_per_sol,
+                            current_pnl_pct = %format!("{:.4}", current_pnl),
+                            executable_pnl_pct = %format!("{:.4}", exec_pnl),
+                            exit_type = "TRAILING_STOP",
+                            "TRAILING_STOP trigger (quote-first executable drawdown)"
+                        );
+                        return Some((
+                            "TRAILING_STOP".to_string(),
+                            format!(
+                                "Trailing stop hit: -{:.1}% executable drawdown from ATH (limit: -{:.1}%), executable P&L: {:.1}%",
+                                exec_dd, config.trailing_stop_pct, exec_pnl
+                            ),
+                        ));
+                    }
                 }
-                warn!(
-                    mint = %self.mint,
-                    position_pool = %self.pool,
-                    entry_price = self.entry_price,
-                    current_price = self.current_price,
-                    executable_tokens_per_sol = ?exit_quote.map(|q| q.tokens_per_sol),
-                    current_pnl_pct = %format!("{:.4}", current_pnl),
-                    executable_pnl_pct = %format!("{:.4}", exec_pnl),
-                    exit_type_original = "TRAILING_STOP",
-                    decision = "suppress",
-                    ?rejection,
-                    "exit_signal_suppressed_stale_price"
-                );
             } else {
-                info!(
-                    mint = %self.mint,
-                    position_pool = %self.pool,
-                    entry_price = self.entry_price,
-                    current_price = self.current_price,
-                    executable_tokens_per_sol = ?exit_quote.map(|q| q.tokens_per_sol),
-                    current_pnl_pct = %format!("{:.4}", current_pnl),
-                    executable_pnl_pct = %format!("{:.4}", exec_pnl),
-                    exit_type_original = "TRAILING_STOP",
-                    decision = "allow",
-                    "TRAILING_STOP trigger (exit price validated against pool quote when available)"
-                );
-                let q_exec = exit_quote
-                    .as_ref()
-                    .expect("TRAILING_STOP allow implies executable quote");
-                let exec_dd = tokens_per_sol::drawdown_from_ath_pct(
-                    self.highest_price,
-                    q_exec.tokens_per_sol,
-                );
-                let exec_pnl_tr = tokens_per_sol::pnl_pct(self.entry_price, q_exec.tokens_per_sol);
-                return Some((
-                    "TRAILING_STOP".to_string(),
-                    format!(
-                        "Trailing stop hit: -{:.1}% executable drawdown from ATH (limit: -{:.1}%), executable P&L: {:.1}%",
-                        exec_dd, config.trailing_stop_pct, exec_pnl_tr
-                    ),
-                ));
+                let drawdown = self.drawdown_from_ath_pct();
+                if drawdown >= config.trailing_stop_pct {
+                    debug!(
+                        mint = %self.mint,
+                        position_pool = %self.pool,
+                        reason = "NO_EXECUTABLE_QUOTE",
+                        current_drawdown_pct = %format!("{:.4}", drawdown),
+                        "trailing_stop_skipped_no_executable_quote"
+                    );
+                }
             }
         }
 
@@ -12598,6 +12566,57 @@ mod tests {
         );
     }
 
+    /// Quote-first: executable reserve shows deep loss while `current_price` mark is only mildly off.
+    #[test]
+    fn stop_loss_quote_first_fires_on_executable_even_if_current_pnl_mild() {
+        let mut c = make_exit_config();
+        c.hard_stop_loss_pct = 20.0;
+        c.take_profit_pct = 1_000.0;
+        let entry = 100.0;
+        let mut pos = PositionTracker::new("m", "p", "dex", entry, 6, 1_000_000, 0);
+        pos.current_price = 110.0; // ~-9.1% PnL vs entry
+        pos.highest_price = entry;
+        let ex = sample_exit_quote(250.0); // executable ~-150% loss
+        let (ty, _) = pos.should_exit(&c, Some(&ex)).expect("STOP_LOSS");
+        assert_eq!(ty, "STOP_LOSS");
+    }
+
+    /// Quote-first: `current_price` looks past hard stop but executable is better — do not exit.
+    #[test]
+    fn stop_loss_not_fired_when_only_current_pnl_past_stop_executable_disagrees() {
+        let mut c = make_exit_config();
+        c.hard_stop_loss_pct = 20.0;
+        c.take_profit_pct = 1_000.0;
+        let entry = 100.0;
+        let mut pos = PositionTracker::new("m", "p", "dex", entry, 6, 1_000_000, 0);
+        pos.current_price = 300.0; // mark looks like huge loss
+        pos.highest_price = entry;
+        let ex = sample_exit_quote(105.0); // executable only mild loss vs -20% threshold
+        assert!(pos.should_exit(&c, Some(&ex)).is_none());
+    }
+
+    /// Wrong-pool executable may still drive STOP decision but must not overwrite `current_price` (I-13).
+    #[test]
+    fn stop_loss_wrong_pool_executable_does_not_update_current_price() {
+        let mut c = make_exit_config();
+        c.hard_stop_loss_pct = 20.0;
+        c.take_profit_pct = 1_000.0;
+        let entry = 100.0;
+        let mut pos = PositionTracker::new("m", "pos_pool", "dex", entry, 6, 1_000_000, 0);
+        pos.current_price = 110.0;
+        pos.highest_price = entry;
+        let mut ex = sample_exit_quote(250.0);
+        ex.marks_position_pool = false;
+        ex.quote_pool = "other_pool".to_string();
+        let before = pos.current_price;
+        let (ty, _) = pos.should_exit(&c, Some(&ex)).expect("STOP_LOSS");
+        assert_eq!(ty, "STOP_LOSS");
+        assert_eq!(
+            pos.current_price, before,
+            "alternate-pool quote must not refresh mark"
+        );
+    }
+
     /// TP: `current` shows gain but no pool quote to confirm (or would disagree) → no TP
     #[test]
     fn take_profit_not_allowed_from_stale_or_unvalidated_quote() {
@@ -12623,6 +12642,27 @@ mod tests {
         assert!(r1.is_none(), "expected TP suppression, got {:?}", r1);
     }
 
+    /// Quote-first: executable shows take-profit even when `current_price` has not crossed.
+    #[test]
+    fn take_profit_fires_from_executable_quote_when_hold_met() {
+        let mut c = make_exit_config();
+        c.take_profit_pct = 20.0;
+        c.take_profit_min_hold_secs = 0;
+        c.hard_stop_loss_pct = 200.0;
+        let entry = 100.0;
+        let mut pos = PositionTracker::new("m", "p", "dex", entry, 6, 1_000_000, 0);
+        pos.current_price = 130.0; // mark-only loss vs entry
+        pos.highest_price = entry;
+        let ex = sample_exit_quote(40.0); // executable large gain vs entry
+        let (ty, reason) = pos.should_exit(&c, Some(&ex)).expect("TAKE_PROFIT");
+        assert_eq!(ty, "TAKE_PROFIT");
+        assert!(
+            reason.contains("executable"),
+            "reason should reflect executable: {}",
+            reason
+        );
+    }
+
     #[test]
     fn time_exit_still_allowed_without_price_validation() {
         let c = make_exit_config();
@@ -12638,6 +12678,22 @@ mod tests {
             reason.contains("Max hold time exceeded")
                 && !reason.to_lowercase().contains("hard stop"),
             "TIME_EXIT should not be framed as hard stop: {}",
+            reason
+        );
+    }
+
+    #[test]
+    fn time_exit_reporting_pnl_uses_executable_when_quote_valid() {
+        let c = make_exit_config();
+        let entry = 100.0;
+        let mut pos = PositionTracker::new("m", "p", "dex", entry, 6, 1_000_000, 0);
+        pos.set_entry_time_ago(Duration::from_secs(c.max_hold_time_secs + 1));
+        pos.current_price = entry;
+        let ex = sample_exit_quote(80.0);
+        let (_, reason) = pos.should_exit(&c, Some(&ex)).expect("time exit");
+        assert!(
+            reason.contains("25.0%") || reason.contains("25.0"),
+            "expected executable-backed reporting PnL in reason: {}",
             reason
         );
     }
