@@ -7536,6 +7536,7 @@ async fn main() -> Result<()> {
                             fallback_topic = TOPIC_MARKET_EVENTS,
                             "Momentum MarketEvents subscription ended before first message; falling back to core MarketEvents topic"
                         );
+                        drop(sub);
                         match nats.subscribe(TOPIC_MARKET_EVENTS).await {
                             Ok(sub) => {
                                 info!(
@@ -7557,6 +7558,7 @@ async fn main() -> Result<()> {
                             wait_secs = MOMENTUM_MARKET_EVENTS_FIRST_MSG_FALLBACK.as_secs(),
                             "No message on momentum MarketEvents topic within wait window (likely no publisher or version skew); falling back to core MarketEvents topic"
                         );
+                        drop(sub);
                         match nats.subscribe(TOPIC_MARKET_EVENTS).await {
                             Ok(sub) => {
                                 info!(
