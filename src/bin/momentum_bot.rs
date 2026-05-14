@@ -880,6 +880,7 @@ impl PositionTracker {
     /// Quote-first (price exits): `STOP_LOSS`, `TAKE_PROFIT`, and `TRAILING_STOP` trigger from a
     /// **usable** executable reserve quote when present. `current_price` alone never trips these;
     /// there is no secondary “stale mark” suppression on those quote-first paths.
+    /// `TRAILING_STOP` evaluates executable drawdown only when `marks_position_pool` (I-13).
     fn should_exit(
         &mut self,
         config: &MomentumConfig,
@@ -1038,7 +1039,9 @@ impl PositionTracker {
             }
         }
 
+        // Trailing activation: executable PnL only when quote marks position pool (I-13).
         let activation_pnl = valid_q
+            .filter(|q| q.marks_position_pool)
             .map(|q| tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol))
             .unwrap_or(pnl);
         if activation_pnl >= config.trailing_activation_pct {
@@ -1047,30 +1050,47 @@ impl PositionTracker {
 
         if self.trailing_active {
             if let Some(q) = valid_q {
-                let exec_dd =
-                    tokens_per_sol::drawdown_from_ath_pct(self.highest_price, q.tokens_per_sol);
-                if exec_dd >= config.trailing_stop_pct {
-                    let exec_pnl = tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol);
-                    info!(
-                        mint = %self.mint,
-                        position_pool = %self.pool,
-                        quote_pool = %q.quote_pool,
-                        quote_dex = %q.quote_dex,
-                        entry_price = self.entry_price,
-                        current_price = self.current_price,
-                        executable_tokens_per_sol = q.tokens_per_sol,
-                        current_pnl_pct = %format!("{:.4}", pnl),
-                        executable_pnl_pct = %format!("{:.4}", exec_pnl),
-                        exit_type = "TRAILING_STOP",
-                        "TRAILING_STOP trigger (quote-first executable drawdown)"
-                    );
-                    return Some((
-                        "TRAILING_STOP".to_string(),
-                        format!(
-                            "Trailing stop hit: -{:.1}% executable drawdown from ATH (limit: -{:.1}%), executable P&L: {:.1}%",
-                            exec_dd, config.trailing_stop_pct, exec_pnl
-                        ),
-                    ));
+                if !q.marks_position_pool {
+                    let exec_dd =
+                        tokens_per_sol::drawdown_from_ath_pct(self.highest_price, q.tokens_per_sol);
+                    if exec_dd >= config.trailing_stop_pct {
+                        debug!(
+                            mint = %self.mint,
+                            position_pool = %self.pool,
+                            quote_pool = %q.quote_pool,
+                            quote_dex = %q.quote_dex,
+                            reason = "TRAILING_STOP_SKIPPED_QUOTE_NOT_POSITION_POOL",
+                            executable_drawdown_pct = %format!("{:.4}", exec_dd),
+                            trailing_stop_pct = config.trailing_stop_pct,
+                            "trailing_stop_skipped_alternate_pool_quote"
+                        );
+                    }
+                } else {
+                    let exec_dd =
+                        tokens_per_sol::drawdown_from_ath_pct(self.highest_price, q.tokens_per_sol);
+                    if exec_dd >= config.trailing_stop_pct {
+                        let exec_pnl = tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol);
+                        info!(
+                            mint = %self.mint,
+                            position_pool = %self.pool,
+                            quote_pool = %q.quote_pool,
+                            quote_dex = %q.quote_dex,
+                            entry_price = self.entry_price,
+                            current_price = self.current_price,
+                            executable_tokens_per_sol = q.tokens_per_sol,
+                            current_pnl_pct = %format!("{:.4}", pnl),
+                            executable_pnl_pct = %format!("{:.4}", exec_pnl),
+                            exit_type = "TRAILING_STOP",
+                            "TRAILING_STOP trigger (quote-first executable drawdown)"
+                        );
+                        return Some((
+                            "TRAILING_STOP".to_string(),
+                            format!(
+                                "Trailing stop hit: -{:.1}% executable drawdown from ATH (limit: -{:.1}%), executable P&L: {:.1}%",
+                                exec_dd, config.trailing_stop_pct, exec_pnl
+                            ),
+                        ));
+                    }
                 }
             } else {
                 let drawdown = self.drawdown_from_ath_pct();
@@ -12386,7 +12406,7 @@ mod tests {
         assert_eq!(got[0], pool);
     }
 
-    // --- Exit price validation (stale `current_price` vs pool executable quote) ---
+    // --- Quote-first price exits (ExitExecutableQuote, I-13 pool context) ---
 
     fn make_exit_config() -> MomentumConfig {
         let mut c = MomentumConfig::default();
@@ -12411,9 +12431,9 @@ mod tests {
         }
     }
 
-    /// Production-like: stale tps would trip hard stop, executable tps is profitable.
+    /// Production-like: bad mark would look stopped out; executable shows gain — no STOP (quote-first).
     #[test]
-    fn hard_stop_suppressed_when_executable_quote_profitable() {
+    fn hard_stop_not_fired_when_executable_profitable_despite_bad_mark() {
         let mut c = make_exit_config();
         c.hard_stop_loss_pct = 50.0; // "Hard stop" threshold includes -50.3% class
 
@@ -12425,7 +12445,11 @@ mod tests {
         // Exec ~3,692,386 tps → pnl = (5.7M/3.7M-1)*100 = +~55% (I-14)
         let ex = sample_exit_quote(3_692_386.0);
         let r = pos.should_exit(&c, Some(&ex));
-        assert!(r.is_none(), "expected STOP_LOSS suppression, got {:?}", r);
+        assert!(
+            r.is_none(),
+            "expected no STOP_LOSS when executable is not past threshold, got {:?}",
+            r
+        );
     }
 
     #[test]
@@ -12510,6 +12534,49 @@ mod tests {
             pos.current_price, before,
             "alternate-pool quote must not refresh mark"
         );
+    }
+
+    /// I-13: alternate-pool executable must not drive TRAILING_STOP vs position-pool ATH.
+    #[test]
+    fn trailing_stop_skipped_when_executable_quote_not_position_pool() {
+        let mut c = make_exit_config();
+        c.trailing_stop_pct = 15.0;
+        c.trailing_activation_pct = 1.0;
+        c.hard_stop_loss_pct = 99.0;
+        c.take_profit_pct = 1_000.0;
+        let entry = 100.0;
+        let mut pos = PositionTracker::new("m", "pos_pool", "dex", entry, 6, 1_000_000, 0);
+        pos.trailing_active = true;
+        pos.highest_price = entry;
+        pos.current_price = 102.0;
+        let mut ex = sample_exit_quote(250.0);
+        ex.marks_position_pool = false;
+        ex.quote_pool = "other_pool".to_string();
+        assert!(
+            pos.should_exit(&c, Some(&ex)).is_none(),
+            "wrong-pool executable must not trip TRAILING vs position ATH"
+        );
+    }
+
+    #[test]
+    fn trailing_stop_fires_when_position_pool_executable_drawdown_exceeds_limit() {
+        let mut c = make_exit_config();
+        c.trailing_stop_pct = 15.0;
+        c.trailing_activation_pct = 1.0;
+        c.hard_stop_loss_pct = 99.0;
+        c.take_profit_pct = 1_000.0;
+        let entry = 100.0;
+        let mut pos = PositionTracker::new("m", "pos_pool", "dex", entry, 6, 1_000_000, 0);
+        pos.trailing_active = true;
+        pos.highest_price = entry;
+        pos.current_price = 102.0;
+        let mut ex = sample_exit_quote(250.0);
+        ex.marks_position_pool = true;
+        ex.quote_pool = "pos_pool".to_string();
+        let (ty, _) = pos
+            .should_exit(&c, Some(&ex))
+            .expect("TRAILING_STOP from position-pool quote");
+        assert_eq!(ty, "TRAILING_STOP");
     }
 
     /// TP: `current` shows gain but no pool quote to confirm (or would disagree) → no TP
