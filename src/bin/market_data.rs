@@ -110,9 +110,6 @@ const PUMPFUN_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const METEORA_DLMM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const METEORA_CPMM: &str = "cpmmpPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D";
 
-/// Wrapped SOL mint (same as default quote in many events).
-const WRAPPED_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
-
 /// Subset of [`MarketEventKind`] mirrored to [`TOPIC_MOMENTUM_MARKET_EVENTS`] in addition to core.
 ///
 /// Conservative: noise kinds stay core-only. `WalletSnapshotComplete` is included because
@@ -140,7 +137,7 @@ pub(crate) fn market_event_is_momentum_nats_relevant(kind: &MarketEventKind) -> 
                 return false;
             }
             let q = quote_mint.as_str();
-            q == NATIVE_SOL_MINT || q == WRAPPED_SOL_MINT
+            q == NATIVE_SOL_MINT
         }
 
         MarketEventKind::LatestBlockhash { .. }
