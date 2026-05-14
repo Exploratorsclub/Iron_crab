@@ -176,7 +176,8 @@ Conditional exits:
 - Trailing stop after activation threshold.
 - Momentum fade (buy ratio below threshold in recent window).
 
----
+**Quote-first price exits (STOP_LOSS / TAKE_PROFIT / TRAILING_STOP):** these fire only when a usable **executable reserve quote** breaches the configured threshold. **Current-price-only** triggers for those exits are disabled; the trade-ratio mark may diverge for logging but is not the trigger source.
+
 
 ## 5) Required Signals & Data Sources
 
