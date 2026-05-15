@@ -46,12 +46,15 @@ use ironcrab::ipc::{
     NATIVE_SOL_MINT,
 };
 use ironcrab::metrics::{
-    serve_metrics, set_readiness_nats_connected, MetricsComponent, EXITS_GENERATED_TOTAL,
-    FILTER_PASSED_TOTAL, FILTER_REJECTED_BUYER_QUALITY, FILTER_REJECTED_DEV_BEHAVIOR,
-    FILTER_REJECTED_INFLOW, FILTER_REJECTED_LIQUIDITY, FILTER_REJECTED_TOTAL,
-    FILTER_REJECTED_VELOCITY, INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL,
-    NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
-    POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
+    record_momentum_full_scan_signal_eval_us, record_momentum_ingest_to_process_us,
+    record_momentum_nats_batch_prepare_us, record_momentum_signal_eval_us, serve_metrics,
+    set_readiness_nats_connected, try_record_momentum_event_to_ingest_ms,
+    try_record_momentum_event_to_intent_publish_ms, wall_clock_unix_ms_now, MetricsComponent,
+    EXITS_GENERATED_TOTAL, FILTER_PASSED_TOTAL, FILTER_REJECTED_BUYER_QUALITY,
+    FILTER_REJECTED_DEV_BEHAVIOR, FILTER_REJECTED_INFLOW, FILTER_REJECTED_LIQUIDITY,
+    FILTER_REJECTED_TOTAL, FILTER_REJECTED_VELOCITY, INTENTS_GENERATED_TOTAL,
+    MARKET_EVENTS_CONSUMED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
+    NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -198,6 +201,23 @@ fn dbg_log(location: &str, message: &str, data: serde_json::Value, hypothesis_id
 }
 // #endregion
 
+/// Drop guard: records `momentum_process_market_event_us` (full async scope of `process_market_event`).
+struct MomentumProcessMarketEventTimer(std::time::Instant);
+impl Drop for MomentumProcessMarketEventTimer {
+    fn drop(&mut self) {
+        let us = self.0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        ironcrab::metrics::record_momentum_process_market_event_us(us);
+    }
+}
+
+/// Drop guard: records `momentum_record_trade_us` for hot-path `MomentumContext::record_trade`.
+struct MomentumRecordTradeTimer(std::time::Instant);
+impl Drop for MomentumRecordTradeTimer {
+    fn drop(&mut self) {
+        let us = self.0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        ironcrab::metrics::record_momentum_record_trade_us(us);
+    }
+}
 #[derive(Parser, Debug)]
 #[command(name = "momentum-bot")]
 #[command(about = "IronCrab Strategy Plane – Momentum policy and TradeIntent generation")]
@@ -3530,6 +3550,7 @@ impl MomentumContext {
         token_amount: u64,
         signature: &str,
     ) {
+        let _rt = MomentumRecordTradeTimer(Instant::now());
         let config = self.config.read().clone();
         let mut trackers = self.token_trackers.write();
         let key = Self::tracker_storage_key(mint, pool);
@@ -3677,7 +3698,8 @@ impl MomentumContext {
             self.refresh_tracker_keys_by_mint_index_from_map(&trackers);
             let mut tracker_keys: Vec<String> = trackers.keys().cloned().collect();
             tracker_keys.sort_unstable();
-            return self.check_for_signals_eval_sorted_tracker_keys(
+            let eval_t0 = Instant::now();
+            let signals = self.check_for_signals_eval_sorted_tracker_keys(
                 &config,
                 &mint_infos,
                 &positions,
@@ -3686,6 +3708,10 @@ impl MomentumContext {
                 &mut trackers,
                 &tracker_keys,
             );
+            record_momentum_full_scan_signal_eval_us(
+                eval_t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+            );
+            return signals;
         }
 
         let mut dirty_keys: Vec<String> = {
@@ -3702,7 +3728,8 @@ impl MomentumContext {
             return Vec::new();
         }
 
-        self.check_for_signals_eval_sorted_tracker_keys(
+        let eval_t0 = Instant::now();
+        let signals = self.check_for_signals_eval_sorted_tracker_keys(
             &config,
             &mint_infos,
             &positions,
@@ -3710,7 +3737,11 @@ impl MomentumContext {
             &pending_buy_entries,
             &mut trackers,
             &dirty_keys,
-        )
+        );
+        record_momentum_signal_eval_us(
+            eval_t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+        );
+        signals
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4514,7 +4545,11 @@ impl MomentumContext {
 
     /// Check for exit signals and publish intents. Call on every price-updating event
     /// (PoolCacheUpdate, Trade) for sub-500ms reaction; strategy_interval is fallback.
-    async fn process_exit_signals(self: &Arc<Self>) {
+    /// `source_event_ts_unix_ms`: reserved for a future path where each published exit intent is
+    /// provably tied to one `MarketEvent` header (per-mint causality). **Broad** `check_for_exits()`
+    /// runs must pass `None` so `momentum_event_to_intent_publish_ms` is not filled with a
+    /// non-causal timestamp. Today all call sites use `None`.
+    async fn process_exit_signals(self: &Arc<Self>, source_event_ts_unix_ms: Option<u64>) {
         let exits = self.check_for_exits();
         for (mint, pool, dex, exit_type, reason, token_amount) in exits {
             info!(
@@ -4534,6 +4569,7 @@ impl MomentumContext {
                 &exit_type,
                 &reason,
                 token_amount,
+                source_event_ts_unix_ms,
             )
             .await
             {
@@ -4612,6 +4648,7 @@ impl MomentumContext {
                 &exit_type,
                 &reason,
                 candidate.token_amount,
+                None,
             )
             .await
             {
@@ -5311,7 +5348,7 @@ impl MomentumContext {
                                     });
                                     let ctx_exit = Arc::clone(self);
                                     tokio::spawn(async move {
-                                        ctx_exit.process_exit_signals().await;
+                                        ctx_exit.process_exit_signals(None).await;
                                     });
                                 } else {
                                     self.remove_pending_buy_entry_by_intent(&result.intent_id);
@@ -5356,7 +5393,7 @@ impl MomentumContext {
                                 });
                                 let ctx_exit = Arc::clone(self);
                                 tokio::spawn(async move {
-                                    ctx_exit.process_exit_signals().await;
+                                    ctx_exit.process_exit_signals(None).await;
                                 });
                             } else {
                                 self.remove_pending_buy_entry_by_intent(&result.intent_id);
@@ -5655,7 +5692,7 @@ impl MomentumContext {
                         });
                         let ctx_exit = Arc::clone(self);
                         tokio::spawn(async move {
-                            ctx_exit.process_exit_signals().await;
+                            ctx_exit.process_exit_signals(None).await;
                         });
                     }
                     TradeSide::Sell => {
@@ -6981,10 +7018,20 @@ async fn bootstrap_wallet_snapshot_from_jetstream(ctx: &Arc<MomentumContext>) ->
 
             if let MarketEventKind::WalletBalanceSnapshot { mint, .. } = &event.kind {
                 snapshot_mints.insert(mint.clone());
-                if let Err(e) = process_market_event(ctx, &event).await {
-                    warn!(error = %e, "Failed to apply WalletBalanceSnapshot");
-                } else {
-                    recovered += 1;
+                // JetStream bootstrap/replay: do not mix historical `ts_unix_ms` into
+                // `momentum_event_to_ingest_ms` (live Core NATS ingest SLO only).
+                let ingest_t0 = Instant::now();
+                let apply_res = process_market_event(ctx, &event).await;
+                record_momentum_ingest_to_process_us(
+                    ingest_t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                );
+                match apply_res {
+                    Err(e) => {
+                        warn!(error = %e, "Failed to apply WalletBalanceSnapshot");
+                    }
+                    Ok(_) => {
+                        recovered += 1;
+                    }
                 }
             }
 
@@ -7375,6 +7422,7 @@ async fn main() -> Result<()> {
                 &exit_type,
                 &reason,
                 token_amount,
+                None,
             )
             .await
             {
@@ -7755,6 +7803,7 @@ async fn main() -> Result<()> {
                         );
                     }
 
+                    let batch_prep_t0 = Instant::now();
                     let mut deserialized: Vec<MarketEvent> = Vec::new();
                     for pl in raw_chunks {
                         match serde_json::from_slice::<MarketEvent>(&pl) {
@@ -7767,6 +7816,13 @@ async fn main() -> Result<()> {
 
                     let events_to_run =
                         flatten_market_events_for_ingest_ordered_batch(deserialized);
+
+                    record_momentum_nats_batch_prepare_us(
+                        batch_prep_t0
+                            .elapsed()
+                            .as_micros()
+                            .min(u128::from(u64::MAX)) as u64,
+                    );
 
                     let mut batch_had_price_sensitive_market_event = false;
                     for event in events_to_run {
@@ -7788,8 +7844,17 @@ async fn main() -> Result<()> {
                                 (None, 0u64)
                             };
 
+                        let now_ms = wall_clock_unix_ms_now();
+                        try_record_momentum_event_to_ingest_ms(now_ms, event.header.ts_unix_ms);
+                        let ingest_t0 = Instant::now();
                         match process_market_event(&ctx, &event).await {
                             Ok(need_exit) => {
+                                record_momentum_ingest_to_process_us(
+                                    ingest_t0
+                                        .elapsed()
+                                        .as_micros()
+                                        .min(u128::from(u64::MAX)) as u64,
+                                );
                                 let is_trade = matches!(
                                     event.kind,
                                     MarketEventKind::Trade { .. }
@@ -7799,10 +7864,19 @@ async fn main() -> Result<()> {
                                     is_trade,
                                     ctx.position_count(),
                                 ) {
-                                    ctx.process_exit_signals().await;
+                                    // `check_for_exits()` scans all positions — one MarketEvent ts is not
+                                    // causal per mint/pool. Omit `momentum_event_to_intent_publish_ms` here
+                                    // until per-exit causality is threaded (PR-124 follow-up).
+                                    ctx.process_exit_signals(None).await;
                                 }
                             }
                             Err(e) => {
+                                record_momentum_ingest_to_process_us(
+                                    ingest_t0
+                                        .elapsed()
+                                        .as_micros()
+                                        .min(u128::from(u64::MAX)) as u64,
+                                );
                                 warn!(
                                     error = %e,
                                     event_id = %event.event_id,
@@ -8042,13 +8116,28 @@ async fn main() -> Result<()> {
                                         match serde_json::from_slice::<MarketEvent>(&msg.payload) {
                                             Ok(event) => {
                                                 if let MarketEventKind::WalletBalanceSnapshot { .. } = &event.kind {
+                                                    let ingest_t0 = Instant::now();
                                                     match process_market_event(&ctx, &event).await {
                                                         Ok(need_exit) => {
+                                                            record_momentum_ingest_to_process_us(
+                                                                ingest_t0
+                                                                    .elapsed()
+                                                                    .as_micros()
+                                                                    .min(u128::from(u64::MAX))
+                                                                    as u64,
+                                                            );
                                                             if need_exit && ctx.position_count() > 0 {
-                                                                ctx.process_exit_signals().await;
+                                                                ctx.process_exit_signals(None).await;
                                                             }
                                                         }
                                                         Err(e) => {
+                                                            record_momentum_ingest_to_process_us(
+                                                                ingest_t0
+                                                                    .elapsed()
+                                                                    .as_micros()
+                                                                    .min(u128::from(u64::MAX))
+                                                                    as u64,
+                                                            );
                                                             warn!(error = %e, "Failed to process WalletBalanceSnapshot from JetStream");
                                                         }
                                                     }
@@ -8249,7 +8338,7 @@ async fn main() -> Result<()> {
                                 trace!(updates = msg_count, "SLAVE CACHE: processed PoolCacheUpdates");
                                 // Event-driven: check exits immediately after price update (<500ms reaction)
                                 if ctx.position_count() > 0 {
-                                    ctx.process_exit_signals().await;
+                                    ctx.process_exit_signals(None).await;
                                 }
                                 // Scope C: yield a bounded ExecutionResult drain after heavy pool-cache work.
                                 if let Some(ref er_consumer) = execution_js_consumer {
@@ -8339,7 +8428,7 @@ async fn main() -> Result<()> {
 
                 // === Check for EXIT signals (fallback; primary = event-driven on PoolCacheUpdate/Trade) ===
                 if ctx.position_count() > 0 {
-                    ctx.process_exit_signals().await;
+                    ctx.process_exit_signals(None).await;
                 }
             }
 
@@ -11984,6 +12073,7 @@ mod tests {
             "TIME_EXIT",
             "test",
             14_099_749_285,
+            None,
         )
         .await
         .expect("exit intent");
@@ -13708,6 +13798,7 @@ mod tests {
 }
 
 /// Generate and publish a SELL intent for position exit
+#[allow(clippy::too_many_arguments)]
 async fn generate_and_publish_exit_intent(
     ctx: &MomentumContext,
     mint: &str,
@@ -13716,6 +13807,10 @@ async fn generate_and_publish_exit_intent(
     exit_type: &str,
     reason: &str,
     token_amount: u64,
+    // When `Some`, successful publish records `momentum_event_to_intent_publish_ms` only if this
+    // timestamp is causal for this intent (same decision chain). Use `None` for timer/reconcile,
+    // bootstrap, and any `check_for_exits()`-driven scan where one event is not tied to each exit.
+    source_event_ts_unix_ms: Option<u64>,
 ) -> Result<()> {
     // Authoritative sell size: open position total at publish time (handles probe+scale-in
     // and races where the caller still had a stale hint amount).
@@ -14094,6 +14189,10 @@ async fn generate_and_publish_exit_intent(
         match nats.jetstream_publish(TOPIC_TRADE_INTENTS, &intent).await {
             Ok(true) => {
                 NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                let now_ms = wall_clock_unix_ms_now();
+                if let Some(ts) = source_event_ts_unix_ms {
+                    try_record_momentum_event_to_intent_publish_ms(now_ms, ts);
+                }
             }
             Ok(false) => {
                 NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -14115,6 +14214,7 @@ async fn generate_and_publish_exit_intent(
 /// Process a MarketEvent and update token trackers.
 /// Returns `Ok(true)` when the caller should run `process_exit_signals()` (bonding/price-relevant sticky apply).
 async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -> Result<bool> {
+    let _mt = MomentumProcessMarketEventTimer(Instant::now());
     // K Phase 1: Slot-to-Send Latency - store for intent metadata propagation
     if let Some(slot) = event.slot {
         ctx.last_event_slot
