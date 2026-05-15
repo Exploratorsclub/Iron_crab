@@ -7849,6 +7849,12 @@ async fn main() -> Result<()> {
                         let ingest_t0 = Instant::now();
                         match process_market_event(&ctx, &event).await {
                             Ok(need_exit) => {
+                                record_momentum_ingest_to_process_us(
+                                    ingest_t0
+                                        .elapsed()
+                                        .as_micros()
+                                        .min(u128::from(u64::MAX)) as u64,
+                                );
                                 let is_trade = matches!(
                                     event.kind,
                                     MarketEventKind::Trade { .. }
@@ -7865,6 +7871,12 @@ async fn main() -> Result<()> {
                                 }
                             }
                             Err(e) => {
+                                record_momentum_ingest_to_process_us(
+                                    ingest_t0
+                                        .elapsed()
+                                        .as_micros()
+                                        .min(u128::from(u64::MAX)) as u64,
+                                );
                                 warn!(
                                     error = %e,
                                     event_id = %event.event_id,
@@ -7872,12 +7884,6 @@ async fn main() -> Result<()> {
                                 );
                             }
                         }
-                        record_momentum_ingest_to_process_us(
-                            ingest_t0
-                                .elapsed()
-                                .as_micros()
-                                .min(u128::from(u64::MAX)) as u64,
-                        );
 
                         if let Some(t0) = scope_c_latency_t0 {
                             let duration_ms = t0.elapsed().as_millis() as u64;

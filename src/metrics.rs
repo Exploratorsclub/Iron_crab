@@ -341,7 +341,6 @@ fn record_histogram_u64_into(
     for (i, b) in buckets.iter().enumerate() {
         if v <= *b {
             bucket_counts[i].fetch_add(1, Ordering::Relaxed);
-            break;
         }
     }
 }
