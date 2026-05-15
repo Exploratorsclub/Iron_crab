@@ -46,7 +46,10 @@ use ironcrab::ipc::{
     NATIVE_SOL_MINT,
 };
 use ironcrab::metrics::{
-    record_momentum_full_scan_signal_eval_us, record_momentum_ingest_to_process_us,
+    record_momentum_core_market_events_ingest_drain_batch,
+    record_momentum_core_market_events_processed_kind,
+    record_momentum_core_market_events_received_kind, record_momentum_full_scan_signal_eval_us,
+    record_momentum_ingest_to_process_us, record_momentum_market_events_seen_slot,
     record_momentum_nats_batch_prepare_us, record_momentum_signal_eval_us, serve_metrics,
     set_readiness_nats_connected, try_record_momentum_event_to_ingest_ms,
     try_record_momentum_event_to_intent_publish_ms,
@@ -113,21 +116,63 @@ const MOMENTUM_MARKET_EVENTS_FIRST_MSG_FALLBACK: Duration = Duration::from_secs(
 const EXECUTION_RESULT_SCHEDULED_DRAIN_MAX: usize = 16;
 /// Extra bounded drain after trade/bonding-related `MarketEvent`s (anti-starvation).
 const EXECUTION_RESULT_INTERLEAVED_DRAIN_MAX: usize = 8;
-/// JetStream `expires` for the dedicated `select!` drain arm only — may block up to this long when the stream is empty (acceptable on the idle poll path).
-const EXECUTION_RESULT_SCHEDULED_FETCH_EXPIRES: Duration = Duration::from_millis(80);
+/// JetStream `expires` for the dedicated `select!` drain arm — bounded wait when the stream is empty.
+/// Paired with [`EXECUTION_RESULT_SCHEDULED_POLL_INTERVAL`]: the arm runs on a timer, not every select poll.
+const EXECUTION_RESULT_SCHEDULED_FETCH_EXPIRES: Duration = Duration::from_millis(12);
+/// Poll `ExecutionResult` JetStream at most on this interval so idle fetches do not starve Core NATS.
+const EXECUTION_RESULT_SCHEDULED_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// JetStream `expires` for drains **awaited inside** MarketEvent / PoolCache arms — must stay short so empty streams do not add multi‑10ms stalls on hot paths.
 const EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES: Duration = Duration::from_millis(3);
 /// Smaller batches reduce single-arm starvation of other `tokio::select!` branches.
 const POOL_CACHE_UPDATE_FETCH_MAX: usize = 32;
-const POOL_CACHE_UPDATE_FETCH_EXPIRES: Duration = Duration::from_millis(50);
+/// Short idle wait so PoolCache fetches do not monopolize the runtime vs Core NATS MarketEvents.
+const POOL_CACHE_UPDATE_FETCH_EXPIRES: Duration = Duration::from_millis(8);
 /// Core NATS market-events subject (full fan-out). Momentum-bot prefers [`TOPIC_MOMENTUM_MARKET_EVENTS`].
 /// Drain immediately queued messages per select activation so JetStream arms cannot starve the
-/// high-volume MarketEvents subscriber (slow-consumer stall).
-const CORE_MARKET_EVENTS_INGEST_DRAIN_MAX: usize = 48;
+/// high-volume MarketEvents subscriber (slow-consumer stall). Adaptive cap may raise this toward
+/// [`CORE_MARKET_EVENTS_INGEST_DRAIN_CAP_CEILING`] when slot backlog is high.
+const CORE_MARKET_EVENTS_INGEST_DRAIN_MAX: usize = 96;
+const CORE_MARKET_EVENTS_INGEST_DRAIN_CAP_CEILING: usize = 320;
 /// Wallet snapshot JetStream pull cap per `select!` activation (fairness vs Core MarketEvents).
 const WALLET_SNAPSHOT_FETCH_MAX: usize = 16;
 /// Adjacent `BondingCurveProgress` messages on Core NATS: bounded coalesce before strategy work.
 const BONDING_CURVE_PROGRESS_STREAK_MAX: usize = 32;
+
+#[inline]
+fn momentum_core_market_event_kind_core_nats_label(kind: &MarketEventKind) -> &'static str {
+    match kind {
+        MarketEventKind::PoolCreated { .. } => "PoolCreated",
+        MarketEventKind::Trade { .. } => "Trade",
+        MarketEventKind::BondingCurveProgress { .. } => "BondingCurveProgress",
+        MarketEventKind::DexPoolAccounts { .. } => "DexPoolAccounts",
+        MarketEventKind::WalletBalanceSnapshot { .. } => "WalletBalanceSnapshot",
+        MarketEventKind::SlotUpdate { .. } => "SlotUpdate",
+        _ => "Other",
+    }
+}
+
+/// Adaptive Core NATS drain cap: raises toward [`CORE_MARKET_EVENTS_INGEST_DRAIN_CAP_CEILING`] when
+/// slot backlog (`latest_seen - last_processed`) is large.
+#[inline]
+fn core_market_events_ingest_drain_cap_for_backlog(backlog_slots: u64) -> usize {
+    let bonus = (backlog_slots as usize).min(224);
+    CORE_MARKET_EVENTS_INGEST_DRAIN_MAX
+        .saturating_add(bonus)
+        .min(CORE_MARKET_EVENTS_INGEST_DRAIN_CAP_CEILING)
+}
+
+#[inline]
+fn core_market_events_ingest_drain_cap_now() -> usize {
+    use ironcrab::metrics::{
+        momentum_slot_backlog_saturating, MOMENTUM_MARKET_EVENTS_LAST_PROCESSED_SLOT,
+        MOMENTUM_MARKET_EVENTS_LATEST_SEEN_SLOT,
+    };
+    let latest = MOMENTUM_MARKET_EVENTS_LATEST_SEEN_SLOT.load(Ordering::Relaxed);
+    let processed = MOMENTUM_MARKET_EVENTS_LAST_PROCESSED_SLOT.load(Ordering::Relaxed);
+    core_market_events_ingest_drain_cap_for_backlog(momentum_slot_backlog_saturating(
+        latest, processed,
+    ))
+}
 
 /// Periodic full entry scan as safety net if dirty marks were missed (default tick interval 500ms → ~10s).
 const ENTRY_SIGNAL_FULL_SCAN_EVERY_TICKS: u64 = 20;
@@ -7951,6 +7996,10 @@ async fn main() -> Result<()> {
     let mut strategy_interval = tokio::time::interval(std::time::Duration::from_millis(500));
     let mut activity_interval = tokio::time::interval(std::time::Duration::from_secs(10));
     let mut reconcile_interval = tokio::time::interval(std::time::Duration::from_secs(15));
+    let mut execution_result_scheduled_interval =
+        tokio::time::interval(EXECUTION_RESULT_SCHEDULED_POLL_INTERVAL);
+    execution_result_scheduled_interval
+        .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut events_received: u64 = 0;
     let mut last_slot: u64 = 0;
 
@@ -7971,6 +8020,7 @@ async fn main() -> Result<()> {
 
     loop {
         tokio::select! {
+            biased;
             // Keep /ready fresh even if there are no events.
             _ = activity_interval.tick() => {
                 ironcrab::metrics::record_activity();
@@ -7978,6 +8028,11 @@ async fn main() -> Result<()> {
                 // P1 Crash Isolation: Ping systemd watchdog frequently enough.
                 #[cfg(unix)]
                 let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
+            }
+
+            _ = &mut shutdown => {
+                info!("Shutdown signal received");
+                break;
             }
 
             // Process incoming MarketEvents from NATS (Core NATS — first client subscription is
@@ -8000,8 +8055,9 @@ async fn main() -> Result<()> {
 
                     use futures::FutureExt;
 
+                    let effective_cap = core_market_events_ingest_drain_cap_now();
                     let mut raw_chunks: Vec<Vec<u8>> = vec![nats_msg.payload];
-                    while raw_chunks.len() < CORE_MARKET_EVENTS_INGEST_DRAIN_MAX {
+                    while raw_chunks.len() < effective_cap {
                         let Some(ref mut sub) = subscription else {
                             break;
                         };
@@ -8021,7 +8077,9 @@ async fn main() -> Result<()> {
                         trace!(
                             momentum_scope_c = "core_market_events_ingest_drain",
                             drain_count,
-                            cap = CORE_MARKET_EVENTS_INGEST_DRAIN_MAX,
+                            effective_cap,
+                            floor_cap = CORE_MARKET_EVENTS_INGEST_DRAIN_MAX,
+                            ceiling_cap = CORE_MARKET_EVENTS_INGEST_DRAIN_CAP_CEILING,
                             "Drained multiple Core NATS MarketEvent payloads in one select activation"
                         );
                     }
@@ -8049,9 +8107,12 @@ async fn main() -> Result<()> {
 
                     let mut batch_had_price_sensitive_market_event = false;
                     for event in events_to_run {
+                        let kind_lbl = momentum_core_market_event_kind_core_nats_label(&event.kind);
+                        record_momentum_core_market_events_received_kind(kind_lbl);
                         let event_slot = event.slot;
                         if let Some(slot) = event_slot {
                             last_slot = last_slot.max(slot);
+                            record_momentum_market_events_seen_slot(slot);
                         }
                         let scope_c_obs_latency =
                             momentum_scope_c_price_sensitive_market_kind(&event.kind);
@@ -8076,6 +8137,7 @@ async fn main() -> Result<()> {
                         let ingest_t0 = Instant::now();
                         match process_market_event(&ctx, &event).await {
                             Ok(need_exit) => {
+                                record_momentum_core_market_events_processed_kind(kind_lbl);
                                 record_momentum_ingest_to_process_us(
                                     ingest_t0
                                         .elapsed()
@@ -8130,6 +8192,8 @@ async fn main() -> Result<()> {
                         }
 
                     }
+
+                    record_momentum_core_market_events_ingest_drain_batch(drain_count, effective_cap);
 
                     if let Some(ref consumer) = execution_js_consumer {
                         if market_events_batch_wants_interleaved_execution_result_drain(
@@ -8257,7 +8321,7 @@ async fn main() -> Result<()> {
             msg = async {
                 use futures::StreamExt;
                 if let Some(ref mut consumer) = config_js_consumer {
-                    match consumer.fetch().max_messages(1).expires(std::time::Duration::from_millis(100)).messages().await {
+                    match consumer.fetch().max_messages(1).expires(std::time::Duration::from_millis(25)).messages().await {
                         Ok(mut messages) => {
                             if let Some(Ok(msg)) = messages.next().await {
                                 Some(msg)
@@ -8306,7 +8370,7 @@ async fn main() -> Result<()> {
             }
 
             // Handle ExecutionResults (position management) via JetStream — bounded drain (Scope C).
-            _ = async {
+            _ = execution_result_scheduled_interval.tick(), if execution_js_consumer.is_some() => {
                 if let Some(ref consumer) = execution_js_consumer {
                     let _ = drain_execution_results(
                         consumer,
@@ -8317,10 +8381,8 @@ async fn main() -> Result<()> {
                         "scheduled_select_arm",
                     )
                     .await;
-                } else {
-                    std::future::pending::<()>().await
                 }
-            } => {}
+            }
 
             // Process live WalletBalanceSnapshot from JetStream (SSOT for bot state)
             _ = async {
@@ -8330,7 +8392,7 @@ async fn main() -> Result<()> {
                     match consumer
                         .fetch()
                         .max_messages(WALLET_SNAPSHOT_FETCH_MAX)
-                        .expires(std::time::Duration::from_millis(100))
+                        .expires(std::time::Duration::from_millis(25))
                         .messages()
                         .await
                     {
@@ -8342,7 +8404,12 @@ async fn main() -> Result<()> {
                                         NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
                                         match serde_json::from_slice::<MarketEvent>(&msg.payload) {
                                             Ok(event) => {
-                                                if let MarketEventKind::WalletBalanceSnapshot { .. } = &event.kind {
+                                                if let MarketEventKind::WalletBalanceSnapshot { .. } =
+                                                    &event.kind
+                                                {
+                                                    if let Some(s) = event.slot {
+                                                        record_momentum_market_events_seen_slot(s);
+                                                    }
                                                     let ingest_t0 = Instant::now();
                                                     match process_market_event(&ctx, &event).await {
                                                         Ok(need_exit) => {
@@ -8707,11 +8774,6 @@ async fn main() -> Result<()> {
                 // Cleanup old trackers and stale pending intents
                 ctx.cleanup_old_trackers();
                 ctx.cleanup_stale_pending();
-            }
-
-            _ = &mut shutdown => {
-                info!("Shutdown signal received");
-                break;
             }
         }
     }
@@ -13868,9 +13930,25 @@ mod tests {
     #[test]
     fn scope_c_interleaved_jetstream_expires_stays_short_vs_scheduled() {
         assert!(EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES <= Duration::from_millis(5));
-        assert!(EXECUTION_RESULT_SCHEDULED_FETCH_EXPIRES >= Duration::from_millis(50));
+        assert!(EXECUTION_RESULT_SCHEDULED_FETCH_EXPIRES >= Duration::from_millis(8));
         assert!(
             EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES < EXECUTION_RESULT_SCHEDULED_FETCH_EXPIRES
+        );
+    }
+
+    #[test]
+    fn core_market_events_ingest_drain_cap_respects_floor_ceiling_and_backlog_bonus() {
+        assert_eq!(
+            core_market_events_ingest_drain_cap_for_backlog(0),
+            CORE_MARKET_EVENTS_INGEST_DRAIN_MAX
+        );
+        assert_eq!(
+            core_market_events_ingest_drain_cap_for_backlog(10),
+            CORE_MARKET_EVENTS_INGEST_DRAIN_MAX + 10
+        );
+        assert_eq!(
+            core_market_events_ingest_drain_cap_for_backlog(10_000),
+            CORE_MARKET_EVENTS_INGEST_DRAIN_CAP_CEILING
         );
     }
 
@@ -14525,6 +14603,7 @@ async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -
     if let Some(slot) = event.slot {
         ctx.last_event_slot
             .store(slot, std::sync::atomic::Ordering::Relaxed);
+        ironcrab::metrics::record_momentum_market_events_processed_slot(slot);
     }
     ctx.last_event_ts_ms.store(
         event.header.ts_unix_ms,
