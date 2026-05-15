@@ -357,6 +357,8 @@ pub fn momentum_event_ts_latency_delta_ms(now_ms: u64, event_ts_ms: u64) -> Opti
     Some(now_ms.saturating_sub(event_ts_ms))
 }
 
+/// Records producer→momentum wall latency for **live** Core NATS MarketEvent ingest.
+/// Do **not** call from JetStream bootstrap/replay recovery (historical `ts_unix_ms` would skew p95/p99).
 #[inline]
 pub fn try_record_momentum_event_to_ingest_ms(now_ms: u64, event_ts_ms: u64) {
     if let Some(ms) = momentum_event_ts_latency_delta_ms(now_ms, event_ts_ms) {
@@ -371,8 +373,10 @@ pub fn try_record_momentum_event_to_ingest_ms(now_ms: u64, event_ts_ms: u64) {
     }
 }
 
-/// Call only after a successful JetStream publish when `event_ts_ms` is the producer time of the
-/// triggering `MarketEvent` (never from a timer / global latch).
+/// Call only after a successful JetStream publish when `event_ts_ms` is the **causal**
+/// `MarketEvent.header.ts_unix_ms` for that intent (same mint/pool decision chain). Never pass a
+/// timestamp from an unrelated event or a broad multi-position scan — use `None` at the call site
+/// instead of calling this helper.
 #[inline]
 pub fn try_record_momentum_event_to_intent_publish_ms(now_ms: u64, event_ts_ms: u64) {
     if let Some(ms) = momentum_event_ts_latency_delta_ms(now_ms, event_ts_ms) {
@@ -2287,6 +2291,24 @@ mod momentum_latency_metrics_tests {
         assert_eq!(
             MOMENTUM_LATENCY_EVENT_TS_INVALID_TOTAL.load(Ordering::Relaxed),
             2
+        );
+    }
+
+    #[test]
+    fn event_to_intent_publish_records_when_explicit_causal_ts_used() {
+        reset_momentum_latency_metrics_for_test();
+        try_record_momentum_event_to_intent_publish_ms(5_000, 4_000);
+        assert_eq!(
+            MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_COUNT.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_SUM.load(Ordering::Relaxed),
+            1_000
+        );
+        assert_eq!(
+            MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_BUCKET_COUNTS[8].load(Ordering::Relaxed),
+            1
         );
     }
 

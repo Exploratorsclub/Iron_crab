@@ -26,7 +26,7 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ### MOM-OBS-LATENCY: Prometheus-Histogramme für Momentum-Hot-Path- und E2E-Latenzen
 **Datum**: 2026-05-15  
-**Zweck** (kein Bugfix): Operative Messbarkeit nach Throughput-Slices — `momentum_event_to_ingest_ms`, `momentum_event_to_intent_publish_ms` (nur wenn auslösendes `MarketEvent.ts_unix_ms` explizit mitgegeben wird), interne µs-Histogramme für `process_market_event`, `record_trade`, Signal-Eval (dirty vs. Full-Scan), NATS-Batch-Deserialize/Flatten; Counter `momentum_latency_event_ts_invalid_total` bei `ts_unix_ms==0` oder Werte in der „Zukunft“ vs. lokaler Wanduhr. Keine Strategie-/RPC-/Topic-Änderungen.  
+**Zweck** (kein Bugfix): Operative Messbarkeit nach Throughput-Slices — `momentum_event_to_ingest_ms`, `momentum_event_to_intent_publish_ms` (nur mit kausalem `MarketEvent.ts_unix_ms`; aktuell füllt momentum-bot diese Intent-Histogramme nicht, bis Exit-Pfade pro Intent ein explizites Event-Ts führen), interne µs-Histogramme für `process_market_event`, `record_trade`, Signal-Eval (dirty vs. Full-Scan), NATS-Batch-Deserialize/Flatten; Counter `momentum_latency_event_ts_invalid_total` bei `ts_unix_ms==0` oder Werte in der „Zukunft“ vs. lokaler Wanduhr. **`momentum_event_to_ingest_ms`**: nur Live-Ingest aus dem Core-NATS-MarketEvents-Arm — **kein** JetStream-Wallet-Snapshot-Bootstrap (`bootstrap_wallet_snapshot_from_jetstream`), damit historische Replay-Timestamps die SLO nicht verfälschen. Keine Strategie-/RPC-/Topic-Änderungen.  
 **Dateien**: `src/metrics.rs`, `src/bin/momentum_bot.rs`
 
 ### FIX-01: Revert fehlerhafter Commits → `e341c04b`

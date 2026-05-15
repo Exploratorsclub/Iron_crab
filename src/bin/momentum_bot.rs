@@ -4545,8 +4545,10 @@ impl MomentumContext {
 
     /// Check for exit signals and publish intents. Call on every price-updating event
     /// (PoolCacheUpdate, Trade) for sub-500ms reaction; strategy_interval is fallback.
-    /// `source_event_ts_unix_ms`: producer `MarketEvent` header time when this run is triggered
-    /// directly from that event chain; `None` for timer/reconcile/bootstrap paths (no E2E intent metric).
+    /// `source_event_ts_unix_ms`: reserved for a future path where each published exit intent is
+    /// provably tied to one `MarketEvent` header (per-mint causality). **Broad** `check_for_exits()`
+    /// runs must pass `None` so `momentum_event_to_intent_publish_ms` is not filled with a
+    /// non-causal timestamp. Today all call sites use `None`.
     async fn process_exit_signals(self: &Arc<Self>, source_event_ts_unix_ms: Option<u64>) {
         let exits = self.check_for_exits();
         for (mint, pool, dex, exit_type, reason, token_amount) in exits {
@@ -7016,8 +7018,8 @@ async fn bootstrap_wallet_snapshot_from_jetstream(ctx: &Arc<MomentumContext>) ->
 
             if let MarketEventKind::WalletBalanceSnapshot { mint, .. } = &event.kind {
                 snapshot_mints.insert(mint.clone());
-                let now_ms = wall_clock_unix_ms_now();
-                try_record_momentum_event_to_ingest_ms(now_ms, event.header.ts_unix_ms);
+                // JetStream bootstrap/replay: do not mix historical `ts_unix_ms` into
+                // `momentum_event_to_ingest_ms` (live Core NATS ingest SLO only).
                 let ingest_t0 = Instant::now();
                 let apply_res = process_market_event(ctx, &event).await;
                 record_momentum_ingest_to_process_us(
@@ -7856,8 +7858,10 @@ async fn main() -> Result<()> {
                                     is_trade,
                                     ctx.position_count(),
                                 ) {
-                                    ctx.process_exit_signals(Some(event.header.ts_unix_ms))
-                                        .await;
+                                    // `check_for_exits()` scans all positions — one MarketEvent ts is not
+                                    // causal per mint/pool. Omit `momentum_event_to_intent_publish_ms` here
+                                    // until per-exit causality is threaded (PR-124 follow-up).
+                                    ctx.process_exit_signals(None).await;
                                 }
                             }
                             Err(e) => {
@@ -8122,10 +8126,7 @@ async fn main() -> Result<()> {
                                                                     as u64,
                                                             );
                                                             if need_exit && ctx.position_count() > 0 {
-                                                                ctx.process_exit_signals(Some(
-                                                                    event.header.ts_unix_ms,
-                                                                ))
-                                                                .await;
+                                                                ctx.process_exit_signals(None).await;
                                                             }
                                                         }
                                                         Err(e) => {
@@ -13805,8 +13806,9 @@ async fn generate_and_publish_exit_intent(
     exit_type: &str,
     reason: &str,
     token_amount: u64,
-    // When `Some`, successful publish records `momentum_event_to_intent_publish_ms`.
-    // Use `None` for timer/reconcile/bootstrap paths (no E2E sample).
+    // When `Some`, successful publish records `momentum_event_to_intent_publish_ms` only if this
+    // timestamp is causal for this intent (same decision chain). Use `None` for timer/reconcile,
+    // bootstrap, and any `check_for_exits()`-driven scan where one event is not tied to each exit.
     source_event_ts_unix_ms: Option<u64>,
 ) -> Result<()> {
     // Authoritative sell size: open position total at publish time (handles probe+scale-in
