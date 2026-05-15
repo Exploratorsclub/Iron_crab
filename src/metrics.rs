@@ -245,6 +245,21 @@ pub static MOMENTUM_EVENT_TO_INGEST_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Laz
 pub static MOMENTUM_EVENT_TO_INGEST_MS_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MOMENTUM_EVENT_TO_INGEST_MS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+/// JetStream `PoolCacheUpdate.header.ts_unix_ms` → momentum ingest (same buckets as Core NATS).
+/// Separates replay / JetStream delivery skew from [`try_record_momentum_event_to_ingest_ms`], which
+/// must remain **Core NATS live MarketEvents only** (see `docs/BUGS_FIXES.md`).
+pub static MOMENTUM_JS_POOLCACHE_EVENT_TO_INGEST_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+pub static MOMENTUM_JS_POOLCACHE_EVENT_TO_INGEST_MS_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_JS_POOLCACHE_EVENT_TO_INGEST_MS_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// Same buckets: wall-clock from event `ts_unix_ms` to successful TradeIntent publish (only when
 /// the causative `MarketEvent` timestamp is passed explicitly — no global `last_event_ts` guess).
 pub static MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
@@ -372,6 +387,21 @@ pub fn try_record_momentum_event_to_ingest_ms(now_ms: u64, event_ts_ms: u64) {
     }
 }
 
+/// JetStream `PoolCacheUpdate` (or other JS pool-cache payloads with `RecordHeader.ts_unix_ms`).
+#[inline]
+pub fn try_record_momentum_jetstream_poolcache_event_to_ingest_ms(now_ms: u64, event_ts_ms: u64) {
+    if let Some(ms) = momentum_event_ts_latency_delta_ms(now_ms, event_ts_ms) {
+        record_histogram_u64_into(
+            MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS,
+            &MOMENTUM_JS_POOLCACHE_EVENT_TO_INGEST_MS_BUCKET_COUNTS,
+            &MOMENTUM_JS_POOLCACHE_EVENT_TO_INGEST_MS_SUM,
+            &MOMENTUM_JS_POOLCACHE_EVENT_TO_INGEST_MS_COUNT,
+            ms,
+            MOMENTUM_LATENCY_MS_SUM_CAP,
+        );
+    }
+}
+
 /// Call only after a successful JetStream publish when `event_ts_ms` is the **causal**
 /// `MarketEvent.header.ts_unix_ms` for that intent (same mint/pool decision chain). Never pass a
 /// timestamp from an unrelated event or a broad multi-position scan — use `None` at the call site
@@ -478,6 +508,11 @@ fn reset_momentum_latency_metrics_for_test() {
     }
     MOMENTUM_EVENT_TO_INGEST_MS_SUM.store(0, Ordering::Relaxed);
     MOMENTUM_EVENT_TO_INGEST_MS_COUNT.store(0, Ordering::Relaxed);
+    for c in MOMENTUM_JS_POOLCACHE_EVENT_TO_INGEST_MS_BUCKET_COUNTS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+    MOMENTUM_JS_POOLCACHE_EVENT_TO_INGEST_MS_SUM.store(0, Ordering::Relaxed);
+    MOMENTUM_JS_POOLCACHE_EVENT_TO_INGEST_MS_COUNT.store(0, Ordering::Relaxed);
     for c in MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_BUCKET_COUNTS.iter() {
         c.store(0, Ordering::Relaxed);
     }
@@ -1291,6 +1326,14 @@ async fn metrics_response() -> Response<Body> {
         &MOMENTUM_EVENT_TO_INGEST_MS_BUCKET_COUNTS,
         &MOMENTUM_EVENT_TO_INGEST_MS_SUM,
         &MOMENTUM_EVENT_TO_INGEST_MS_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "momentum_jetstream_poolcache_event_to_ingest_ms",
+        MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS,
+        &MOMENTUM_JS_POOLCACHE_EVENT_TO_INGEST_MS_BUCKET_COUNTS,
+        &MOMENTUM_JS_POOLCACHE_EVENT_TO_INGEST_MS_SUM,
+        &MOMENTUM_JS_POOLCACHE_EVENT_TO_INGEST_MS_COUNT,
     );
     append_momentum_latency_histogram_prometheus(
         &mut out,
@@ -2267,6 +2310,20 @@ pub fn record_activity() {
 #[cfg(test)]
 mod momentum_latency_metrics_tests {
     use super::*;
+
+    #[test]
+    fn jetstream_poolcache_event_to_ingest_places_sample() {
+        reset_momentum_latency_metrics_for_test();
+        try_record_momentum_jetstream_poolcache_event_to_ingest_ms(200, 50);
+        assert_eq!(
+            MOMENTUM_JS_POOLCACHE_EVENT_TO_INGEST_MS_COUNT.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            MOMENTUM_JS_POOLCACHE_EVENT_TO_INGEST_MS_SUM.load(Ordering::Relaxed),
+            150
+        );
+    }
 
     #[test]
     fn event_to_ingest_places_sample_in_expected_bucket() {

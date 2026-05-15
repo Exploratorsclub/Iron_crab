@@ -29,6 +29,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Zweck** (kein Bugfix): Operative Messbarkeit nach Throughput-Slices — `momentum_event_to_ingest_ms`, `momentum_event_to_intent_publish_ms` (nur mit kausalem `MarketEvent.ts_unix_ms`; aktuell füllt momentum-bot diese Intent-Histogramme nicht, bis Exit-Pfade pro Intent ein explizites Event-Ts führen), interne µs-Histogramme für `process_market_event`, `record_trade`, Signal-Eval (dirty vs. Full-Scan), NATS-Batch-Deserialize/Flatten; Counter `momentum_latency_event_ts_invalid_total` bei `ts_unix_ms==0` oder Werte in der „Zukunft“ vs. lokaler Wanduhr. **`momentum_event_to_ingest_ms`**: nur Live-Ingest aus dem Core-NATS-MarketEvents-Arm — **kein** JetStream-Wallet-Snapshot-Bootstrap (`bootstrap_wallet_snapshot_from_jetstream`), damit historische Replay-Timestamps die SLO nicht verfälschen. Keine Strategie-/RPC-/Topic-Änderungen.  
 **Dateien**: `src/metrics.rs`, `src/bin/momentum_bot.rs`
 
+### FIX-MOM-EXIT-QUOTE-GUARDS: Frische Reserve-Quotes + getrennte Ingest-Latenzen
+**Datum**: 2026-05-15  
+**Problem**: `momentum_event_to_ingest_ms` wirkte extrem hoch, ohne klare Trennung von JetStream-`PoolCacheUpdate`-Timestamps vs. Core-NATS; price-based Exits konnten theoretisch auf sehr alten Cache-Zeilen oder nicht verifizierten SOL-Paaren basieren.  
+**Fix**: Harte Guards für price-based Exits (`cache_age_ms` ≤ 4s, Slot vs. `entry_confirmed_slot`/`last_price_slot`, Token-Program-Pseudopool-Adressen, optionale DexPoolAccounts-WSOL+Mint-Prüfung in `executable_exit_quote`); strukturierte `momentum_exit_price_decision`-Logs (allow/suppress/skip); neues Histogramm `momentum_jetstream_poolcache_event_to_ingest_ms` parallel zu `momentum_event_to_ingest_ms` (nur Core NATS).  
+**Dateien**: `src/bin/momentum_bot.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-01: Revert fehlerhafter Commits → `e341c04b`
 **Datum**: 2026-02-09
 **Problem**: 18 Commits (bis `b22bb0a9`) hatten ungewollt die Liquidation zerstört und Architekturprinzipien verletzt (RPC-Calls im Hot Path).
