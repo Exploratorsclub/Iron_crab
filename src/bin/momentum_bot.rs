@@ -1210,15 +1210,6 @@ impl PositionTracker {
                             event_or_check_source,
                             MomentumExitPriceLogLevel::Warn,
                         );
-                    } else {
-                        debug!(
-                            mint = %self.mint,
-                            position_pool = %self.pool,
-                            reason = "UNUSABLE_EXECUTABLE_QUOTE",
-                            pool_sourced = q.pool_sourced,
-                            tokens_per_sol = q.tokens_per_sol,
-                            "price_exit_skipped_unusable_executable_quote"
-                        );
                     }
                 } else {
                     log_momentum_exit_price_decision(
