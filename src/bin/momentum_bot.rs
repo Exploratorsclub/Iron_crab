@@ -8116,11 +8116,6 @@ async fn main() -> Result<()> {
                                         match serde_json::from_slice::<MarketEvent>(&msg.payload) {
                                             Ok(event) => {
                                                 if let MarketEventKind::WalletBalanceSnapshot { .. } = &event.kind {
-                                                    let now_ms = wall_clock_unix_ms_now();
-                                                    try_record_momentum_event_to_ingest_ms(
-                                                        now_ms,
-                                                        event.header.ts_unix_ms,
-                                                    );
                                                     let ingest_t0 = Instant::now();
                                                     match process_market_event(&ctx, &event).await {
                                                         Ok(need_exit) => {
