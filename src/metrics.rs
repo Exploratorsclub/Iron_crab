@@ -232,6 +232,287 @@ pub static FILTER_REJECTED_INFLOW: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new
 pub static FILTER_REJECTED_DEV_BEHAVIOR: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MARKET_EVENTS_CONSUMED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+// --- momentum-bot hot-path latency (Prometheus histograms; momentum-bot process only) ---
+/// Producer `RecordHeader.ts_unix_ms` → momentum ingest (`now_ms`), milliseconds.
+const MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS: &[u64] =
+    &[1, 5, 10, 25, 50, 100, 250, 500, 1000, 2000, 5000];
+pub static MOMENTUM_EVENT_TO_INGEST_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+pub static MOMENTUM_EVENT_TO_INGEST_MS_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_EVENT_TO_INGEST_MS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// Same buckets: wall-clock from event `ts_unix_ms` to successful TradeIntent publish (only when
+/// the causative `MarketEvent` timestamp is passed explicitly — no global `last_event_ts` guess).
+pub static MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+pub static MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+const MOMENTUM_INTERNAL_US_BUCKETS: &[u64] = &[
+    50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000, 250000,
+];
+pub static MOMENTUM_INGEST_TO_PROCESS_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    MOMENTUM_INTERNAL_US_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+pub static MOMENTUM_INGEST_TO_PROCESS_US_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_INGEST_TO_PROCESS_US_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub static MOMENTUM_PROCESS_MARKET_EVENT_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    MOMENTUM_INTERNAL_US_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+pub static MOMENTUM_PROCESS_MARKET_EVENT_US_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_PROCESS_MARKET_EVENT_US_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub static MOMENTUM_RECORD_TRADE_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    MOMENTUM_INTERNAL_US_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+pub static MOMENTUM_RECORD_TRADE_US_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_RECORD_TRADE_US_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub static MOMENTUM_SIGNAL_EVAL_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    MOMENTUM_INTERNAL_US_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+pub static MOMENTUM_SIGNAL_EVAL_US_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_SIGNAL_EVAL_US_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub static MOMENTUM_FULL_SCAN_SIGNAL_EVAL_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MOMENTUM_INTERNAL_US_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+pub static MOMENTUM_FULL_SCAN_SIGNAL_EVAL_US_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_FULL_SCAN_SIGNAL_EVAL_US_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Deserialize + `flatten_market_events_for_ingest_ordered_batch` for one Core NATS activation.
+pub static MOMENTUM_NATS_BATCH_PREPARE_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    MOMENTUM_INTERNAL_US_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+pub static MOMENTUM_NATS_BATCH_PREPARE_US_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_NATS_BATCH_PREPARE_US_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub static MOMENTUM_LATENCY_EVENT_TS_INVALID_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+const MOMENTUM_LATENCY_MS_SUM_CAP: u64 = 1_000_000;
+const MOMENTUM_LATENCY_US_SUM_CAP: u64 = 60_000_000;
+
+#[inline]
+fn record_histogram_u64_into(
+    buckets: &[u64],
+    bucket_counts: &[AtomicU64],
+    sum: &AtomicU64,
+    count: &AtomicU64,
+    value: u64,
+    sum_cap: u64,
+) {
+    let v = value.min(sum_cap);
+    sum.fetch_add(v, Ordering::Relaxed);
+    count.fetch_add(1, Ordering::Relaxed);
+    for (i, b) in buckets.iter().enumerate() {
+        if v <= *b {
+            bucket_counts[i].fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+    }
+}
+
+/// `event_ts_ms` must be from the causative `MarketEvent` header. Returns `now_ms - event_ts_ms`
+/// when the timestamp is usable (non-zero, not after `now_ms`). Otherwise increments
+/// [`MOMENTUM_LATENCY_EVENT_TS_INVALID_TOTAL`] and returns `None` (no histogram sample).
+pub fn momentum_event_ts_latency_delta_ms(now_ms: u64, event_ts_ms: u64) -> Option<u64> {
+    if event_ts_ms == 0 || event_ts_ms > now_ms {
+        MOMENTUM_LATENCY_EVENT_TS_INVALID_TOTAL.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    Some(now_ms.saturating_sub(event_ts_ms))
+}
+
+#[inline]
+pub fn try_record_momentum_event_to_ingest_ms(now_ms: u64, event_ts_ms: u64) {
+    if let Some(ms) = momentum_event_ts_latency_delta_ms(now_ms, event_ts_ms) {
+        record_histogram_u64_into(
+            MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS,
+            &MOMENTUM_EVENT_TO_INGEST_MS_BUCKET_COUNTS,
+            &MOMENTUM_EVENT_TO_INGEST_MS_SUM,
+            &MOMENTUM_EVENT_TO_INGEST_MS_COUNT,
+            ms,
+            MOMENTUM_LATENCY_MS_SUM_CAP,
+        );
+    }
+}
+
+/// Call only after a successful JetStream publish when `event_ts_ms` is the producer time of the
+/// triggering `MarketEvent` (never from a timer / global latch).
+#[inline]
+pub fn try_record_momentum_event_to_intent_publish_ms(now_ms: u64, event_ts_ms: u64) {
+    if let Some(ms) = momentum_event_ts_latency_delta_ms(now_ms, event_ts_ms) {
+        record_histogram_u64_into(
+            MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS,
+            &MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_BUCKET_COUNTS,
+            &MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_SUM,
+            &MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_COUNT,
+            ms,
+            MOMENTUM_LATENCY_MS_SUM_CAP,
+        );
+    }
+}
+
+#[inline]
+pub fn record_momentum_ingest_to_process_us(us: u64) {
+    record_histogram_u64_into(
+        MOMENTUM_INTERNAL_US_BUCKETS,
+        &MOMENTUM_INGEST_TO_PROCESS_US_BUCKET_COUNTS,
+        &MOMENTUM_INGEST_TO_PROCESS_US_SUM,
+        &MOMENTUM_INGEST_TO_PROCESS_US_COUNT,
+        us,
+        MOMENTUM_LATENCY_US_SUM_CAP,
+    );
+}
+
+#[inline]
+pub fn record_momentum_process_market_event_us(us: u64) {
+    record_histogram_u64_into(
+        MOMENTUM_INTERNAL_US_BUCKETS,
+        &MOMENTUM_PROCESS_MARKET_EVENT_US_BUCKET_COUNTS,
+        &MOMENTUM_PROCESS_MARKET_EVENT_US_SUM,
+        &MOMENTUM_PROCESS_MARKET_EVENT_US_COUNT,
+        us,
+        MOMENTUM_LATENCY_US_SUM_CAP,
+    );
+}
+
+#[inline]
+pub fn record_momentum_record_trade_us(us: u64) {
+    record_histogram_u64_into(
+        MOMENTUM_INTERNAL_US_BUCKETS,
+        &MOMENTUM_RECORD_TRADE_US_BUCKET_COUNTS,
+        &MOMENTUM_RECORD_TRADE_US_SUM,
+        &MOMENTUM_RECORD_TRADE_US_COUNT,
+        us,
+        MOMENTUM_LATENCY_US_SUM_CAP,
+    );
+}
+
+#[inline]
+pub fn record_momentum_signal_eval_us(us: u64) {
+    record_histogram_u64_into(
+        MOMENTUM_INTERNAL_US_BUCKETS,
+        &MOMENTUM_SIGNAL_EVAL_US_BUCKET_COUNTS,
+        &MOMENTUM_SIGNAL_EVAL_US_SUM,
+        &MOMENTUM_SIGNAL_EVAL_US_COUNT,
+        us,
+        MOMENTUM_LATENCY_US_SUM_CAP,
+    );
+}
+
+#[inline]
+pub fn record_momentum_full_scan_signal_eval_us(us: u64) {
+    record_histogram_u64_into(
+        MOMENTUM_INTERNAL_US_BUCKETS,
+        &MOMENTUM_FULL_SCAN_SIGNAL_EVAL_US_BUCKET_COUNTS,
+        &MOMENTUM_FULL_SCAN_SIGNAL_EVAL_US_SUM,
+        &MOMENTUM_FULL_SCAN_SIGNAL_EVAL_US_COUNT,
+        us,
+        MOMENTUM_LATENCY_US_SUM_CAP,
+    );
+}
+
+#[inline]
+pub fn record_momentum_nats_batch_prepare_us(us: u64) {
+    record_histogram_u64_into(
+        MOMENTUM_INTERNAL_US_BUCKETS,
+        &MOMENTUM_NATS_BATCH_PREPARE_US_BUCKET_COUNTS,
+        &MOMENTUM_NATS_BATCH_PREPARE_US_SUM,
+        &MOMENTUM_NATS_BATCH_PREPARE_US_COUNT,
+        us,
+        MOMENTUM_LATENCY_US_SUM_CAP,
+    );
+}
+
+/// Wall-clock milliseconds since UNIX epoch (for momentum E2E latency vs `RecordHeader.ts_unix_ms`).
+#[inline]
+pub fn wall_clock_unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn reset_momentum_latency_metrics_for_test() {
+    for c in MOMENTUM_EVENT_TO_INGEST_MS_BUCKET_COUNTS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+    MOMENTUM_EVENT_TO_INGEST_MS_SUM.store(0, Ordering::Relaxed);
+    MOMENTUM_EVENT_TO_INGEST_MS_COUNT.store(0, Ordering::Relaxed);
+    for c in MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_BUCKET_COUNTS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+    MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_SUM.store(0, Ordering::Relaxed);
+    MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_COUNT.store(0, Ordering::Relaxed);
+    for c in MOMENTUM_INGEST_TO_PROCESS_US_BUCKET_COUNTS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+    MOMENTUM_INGEST_TO_PROCESS_US_SUM.store(0, Ordering::Relaxed);
+    MOMENTUM_INGEST_TO_PROCESS_US_COUNT.store(0, Ordering::Relaxed);
+    for c in MOMENTUM_PROCESS_MARKET_EVENT_US_BUCKET_COUNTS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+    MOMENTUM_PROCESS_MARKET_EVENT_US_SUM.store(0, Ordering::Relaxed);
+    MOMENTUM_PROCESS_MARKET_EVENT_US_COUNT.store(0, Ordering::Relaxed);
+    for c in MOMENTUM_RECORD_TRADE_US_BUCKET_COUNTS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+    MOMENTUM_RECORD_TRADE_US_SUM.store(0, Ordering::Relaxed);
+    MOMENTUM_RECORD_TRADE_US_COUNT.store(0, Ordering::Relaxed);
+    for c in MOMENTUM_SIGNAL_EVAL_US_BUCKET_COUNTS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+    MOMENTUM_SIGNAL_EVAL_US_SUM.store(0, Ordering::Relaxed);
+    MOMENTUM_SIGNAL_EVAL_US_COUNT.store(0, Ordering::Relaxed);
+    for c in MOMENTUM_FULL_SCAN_SIGNAL_EVAL_US_BUCKET_COUNTS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+    MOMENTUM_FULL_SCAN_SIGNAL_EVAL_US_SUM.store(0, Ordering::Relaxed);
+    MOMENTUM_FULL_SCAN_SIGNAL_EVAL_US_COUNT.store(0, Ordering::Relaxed);
+    for c in MOMENTUM_NATS_BATCH_PREPARE_US_BUCKET_COUNTS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+    MOMENTUM_NATS_BATCH_PREPARE_US_SUM.store(0, Ordering::Relaxed);
+    MOMENTUM_NATS_BATCH_PREPARE_US_COUNT.store(0, Ordering::Relaxed);
+    MOMENTUM_LATENCY_EVENT_TS_INVALID_TOTAL.store(0, Ordering::Relaxed);
+}
+
 // --- execution-engine service metrics ---
 pub static INTENTS_RECEIVED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static INTENTS_EXECUTED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -881,6 +1162,26 @@ pub fn record_slippage(_slippage_bps: f64) {
     // Could add a separate histogram for slippage if needed
 }
 
+/// Append `_bucket{le=...}`, `_sum`, `_count` lines (same layout as `tx_slot_to_send_ms`).
+fn append_momentum_latency_histogram_prometheus(
+    out: &mut String,
+    metric: &str,
+    buckets: &[u64],
+    counts: &[AtomicU64],
+    sum: &AtomicU64,
+    count: &AtomicU64,
+) {
+    let c = count.load(Ordering::Relaxed);
+    let s = sum.load(Ordering::Relaxed);
+    for (i, b) in buckets.iter().enumerate() {
+        let v = counts[i].load(Ordering::Relaxed);
+        out.push_str(&format!("{}_bucket{{le=\"{}\"}} {}\n", metric, b, v));
+    }
+    out.push_str(&format!("{}_bucket{{le=\"+Inf\"}} {}\n", metric, c));
+    out.push_str(&format!("{}_sum {}\n", metric, s));
+    out.push_str(&format!("{}_count {}\n", metric, c));
+}
+
 async fn metrics_response() -> Response<Body> {
     // Build Prometheus exposition text
     let mut out = String::with_capacity(8192);
@@ -975,6 +1276,74 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_events_consumed_total",
         MARKET_EVENTS_CONSUMED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_latency_event_ts_invalid_total",
+        MOMENTUM_LATENCY_EVENT_TS_INVALID_TOTAL.load(Ordering::Relaxed)
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "momentum_event_to_ingest_ms",
+        MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS,
+        &MOMENTUM_EVENT_TO_INGEST_MS_BUCKET_COUNTS,
+        &MOMENTUM_EVENT_TO_INGEST_MS_SUM,
+        &MOMENTUM_EVENT_TO_INGEST_MS_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "momentum_event_to_intent_publish_ms",
+        MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS,
+        &MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_BUCKET_COUNTS,
+        &MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_SUM,
+        &MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "momentum_ingest_to_process_us",
+        MOMENTUM_INTERNAL_US_BUCKETS,
+        &MOMENTUM_INGEST_TO_PROCESS_US_BUCKET_COUNTS,
+        &MOMENTUM_INGEST_TO_PROCESS_US_SUM,
+        &MOMENTUM_INGEST_TO_PROCESS_US_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "momentum_process_market_event_us",
+        MOMENTUM_INTERNAL_US_BUCKETS,
+        &MOMENTUM_PROCESS_MARKET_EVENT_US_BUCKET_COUNTS,
+        &MOMENTUM_PROCESS_MARKET_EVENT_US_SUM,
+        &MOMENTUM_PROCESS_MARKET_EVENT_US_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "momentum_record_trade_us",
+        MOMENTUM_INTERNAL_US_BUCKETS,
+        &MOMENTUM_RECORD_TRADE_US_BUCKET_COUNTS,
+        &MOMENTUM_RECORD_TRADE_US_SUM,
+        &MOMENTUM_RECORD_TRADE_US_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "momentum_signal_eval_us",
+        MOMENTUM_INTERNAL_US_BUCKETS,
+        &MOMENTUM_SIGNAL_EVAL_US_BUCKET_COUNTS,
+        &MOMENTUM_SIGNAL_EVAL_US_SUM,
+        &MOMENTUM_SIGNAL_EVAL_US_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "momentum_full_scan_signal_eval_us",
+        MOMENTUM_INTERNAL_US_BUCKETS,
+        &MOMENTUM_FULL_SCAN_SIGNAL_EVAL_US_BUCKET_COUNTS,
+        &MOMENTUM_FULL_SCAN_SIGNAL_EVAL_US_SUM,
+        &MOMENTUM_FULL_SCAN_SIGNAL_EVAL_US_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "momentum_nats_batch_prepare_us",
+        MOMENTUM_INTERNAL_US_BUCKETS,
+        &MOMENTUM_NATS_BATCH_PREPARE_US_BUCKET_COUNTS,
+        &MOMENTUM_NATS_BATCH_PREPARE_US_SUM,
+        &MOMENTUM_NATS_BATCH_PREPARE_US_COUNT,
     );
 
     // --- execution-engine service ---
@@ -1890,4 +2259,46 @@ pub fn record_activity() {
         .unwrap()
         .as_secs();
     LAST_ACTIVITY_TS.store(now, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod momentum_latency_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn event_to_ingest_places_sample_in_expected_bucket() {
+        reset_momentum_latency_metrics_for_test();
+        try_record_momentum_event_to_ingest_ms(100, 40);
+        assert_eq!(MOMENTUM_EVENT_TO_INGEST_MS_COUNT.load(Ordering::Relaxed), 1);
+        assert_eq!(MOMENTUM_EVENT_TO_INGEST_MS_SUM.load(Ordering::Relaxed), 60);
+        // 60 ms → first bucket with le >= 60 is 100 (index 5 in [1,5,10,25,50,100,...])
+        assert_eq!(
+            MOMENTUM_EVENT_TO_INGEST_MS_BUCKET_COUNTS[5].load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_event_ts_does_not_record_histogram_but_bumps_invalid() {
+        reset_momentum_latency_metrics_for_test();
+        try_record_momentum_event_to_ingest_ms(1_000, 0);
+        try_record_momentum_event_to_ingest_ms(500, 600);
+        assert_eq!(MOMENTUM_EVENT_TO_INGEST_MS_COUNT.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            MOMENTUM_LATENCY_EVENT_TS_INVALID_TOTAL.load(Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[test]
+    fn internal_us_histogram_records_sum_and_bucket() {
+        reset_momentum_latency_metrics_for_test();
+        record_momentum_signal_eval_us(800);
+        assert_eq!(MOMENTUM_SIGNAL_EVAL_US_COUNT.load(Ordering::Relaxed), 1);
+        assert_eq!(MOMENTUM_SIGNAL_EVAL_US_SUM.load(Ordering::Relaxed), 800);
+        assert_eq!(
+            MOMENTUM_SIGNAL_EVAL_US_BUCKET_COUNTS[4].load(Ordering::Relaxed),
+            1
+        );
+    }
 }
