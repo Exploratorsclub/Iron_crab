@@ -128,6 +128,10 @@ const EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES: Duration = Duration::from_mill
 const POOL_CACHE_UPDATE_FETCH_MAX: usize = 32;
 /// Short idle wait so PoolCache fetches do not monopolize the runtime vs Core NATS MarketEvents.
 const POOL_CACHE_UPDATE_FETCH_EXPIRES: Duration = Duration::from_millis(8);
+/// JetStream `expires` for PoolCache pulls **awaited inside** Core NATS ingest (interleave after each batch) —
+/// must stay short so empty streams do not add multi‑10ms stalls on hot paths (same rationale as
+/// [`EXECUTION_RESULT_INTERLEAVED_FETCH_EXPIRES`]).
+const POOL_CACHE_UPDATE_INTERLEAVED_FETCH_EXPIRES: Duration = Duration::from_millis(3);
 /// Core NATS market-events subject (full fan-out). Momentum-bot prefers [`TOPIC_MOMENTUM_MARKET_EVENTS`].
 /// Drain immediately queued messages per select activation so JetStream arms cannot starve the
 /// high-volume MarketEvents subscriber (slow-consumer stall). Adaptive cap raises toward
@@ -9402,7 +9406,7 @@ async fn momentum_interleave_jetstream_after_core_market_batch(
     let Ok(mut messages) = consumer
         .fetch()
         .max_messages(POOL_CACHE_UPDATE_INTERLEAVE_AFTER_CORE_MAX)
-        .expires(POOL_CACHE_UPDATE_FETCH_EXPIRES)
+        .expires(POOL_CACHE_UPDATE_INTERLEAVED_FETCH_EXPIRES)
         .messages()
         .await
     else {
