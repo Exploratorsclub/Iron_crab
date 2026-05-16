@@ -8094,15 +8094,15 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    let events_to_run =
-                        flatten_market_events_for_ingest_ordered_batch(deserialized);
-
                     let mut max_dequeued_slot_this_batch: u64 = 0;
-                    for ev in &events_to_run {
+                    for ev in &deserialized {
                         if let Some(s) = ev.slot {
                             max_dequeued_slot_this_batch = max_dequeued_slot_this_batch.max(s);
                         }
                     }
+
+                    let events_to_run =
+                        flatten_market_events_for_ingest_ordered_batch(deserialized);
                     if max_dequeued_slot_this_batch > 0 {
                         record_momentum_market_events_subscription_max_dequeued_slot(
                             max_dequeued_slot_this_batch,
