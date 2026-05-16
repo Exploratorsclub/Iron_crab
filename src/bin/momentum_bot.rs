@@ -28,7 +28,7 @@ use clap::Parser;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
@@ -48,8 +48,8 @@ use ironcrab::ipc::{
 use ironcrab::metrics::{
     momentum_event_ts_latency_delta_ms, record_momentum_core_market_events_ingest_drain_batch,
     record_momentum_core_market_events_processed_kind,
-    record_momentum_core_market_events_received_kind, record_momentum_full_scan_signal_eval_us,
-    record_momentum_ingest_to_process_us, record_momentum_market_events_last_applied_slot,
+    record_momentum_core_market_events_received_kind, record_momentum_ingest_to_process_us,
+    record_momentum_market_events_last_applied_slot,
     record_momentum_market_events_subscription_max_dequeued_slot,
     record_momentum_nats_batch_prepare_us, record_momentum_signal_eval_us, serve_metrics,
     set_momentum_bot_process_start_unix_sec,
@@ -191,37 +191,6 @@ fn core_market_events_ingest_drain_cap_now() -> usize {
     let streak = ironcrab::metrics::MOMENTUM_CORE_MARKET_EVENTS_INGEST_CONSECUTIVE_CAP_HIT_STREAK
         .load(Ordering::Relaxed);
     core_market_events_ingest_drain_cap_for_streak(streak)
-}
-
-/// Periodic full entry scan as safety net if dirty marks were missed (default tick interval 500ms → ~10s).
-const ENTRY_SIGNAL_FULL_SCAN_EVERY_TICKS: u64 = 20;
-/// Max tracker keys per periodic safety-net pass (amortizes CPU + `token_trackers` write-lock time).
-const ENTRY_SIGNAL_FULL_SCAN_KEYS_BUDGET: usize = 48;
-
-/// `prev` = value of `entry_signal_eval_tick` **before** `fetch_add(1)` on a strategy tick.
-#[inline]
-fn entry_signal_periodic_full_scan_gate(prev_tick_before_increment: u64) -> bool {
-    prev_tick_before_increment
-        .wrapping_add(1)
-        .rem_euclid(ENTRY_SIGNAL_FULL_SCAN_EVERY_TICKS)
-        == 0
-}
-
-/// Round-robin bounds for one budgeted full-scan chunk over `n` sorted tracker keys.
-/// Returns `(start_index, chunk_len, next_cursor)` with `chunk_len <= budget.min(n)`.
-#[inline]
-fn entry_full_scan_round_robin_chunk_bounds(
-    n: usize,
-    cursor: usize,
-    budget: usize,
-) -> (usize, usize, usize) {
-    if n == 0 || budget == 0 {
-        return (0, 0, cursor % n.max(1));
-    }
-    let start = cursor % n;
-    let chunk_len = budget.min(n);
-    let next_cursor = (start + chunk_len) % n;
-    (start, chunk_len, next_cursor)
 }
 
 /// WSOL-leg reserve-derived `(token_mint, tokens_per_sol, token_decimals, token_ui, sol_ui)` from `PoolCacheUpdate`.
@@ -2590,8 +2559,6 @@ struct MomentumContext {
     dirty_entry_tracker_keys: parking_lot::RwLock<BTreeSet<String>>,
     /// Pool-scoped (`mint\x1fpool`) cooldown after PumpFun BUY failed: missing creator — avoids dirty→signal hot loop (I‑12).
     pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock<HashMap<String, Instant>>,
-    /// Increments each strategy tick; drives periodic full entry scan.
-    entry_signal_eval_tick: std::sync::atomic::AtomicU64,
     /// Position trackers for exit strategy (mint -> position)
     positions: parking_lot::RwLock<HashMap<String, PositionTracker>>,
     /// Pending intents awaiting execution results (intent_id -> PendingIntent)
@@ -2635,10 +2602,6 @@ struct MomentumContext {
     /// K Phase 1: Last event slot/ts for Slot-to-Send Latency propagation
     last_event_slot: std::sync::atomic::AtomicU64,
     last_event_ts_ms: std::sync::atomic::AtomicU64,
-    /// Core NATS ingest last batch filled the adaptive drain cap — defer periodic full entry scan.
-    core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool,
-    /// Round-robin cursor for budgeted periodic entry full-scan safety net.
-    entry_signal_full_scan_cursor: AtomicUsize,
 }
 
 impl MomentumContext {
@@ -4037,20 +4000,9 @@ impl MomentumContext {
         )
     }
 
-    /// Strategy tick: evaluate dirty tracker rows first; periodic full scan as safety net.
+    /// Strategy tick: evaluate **only** pool-scoped tracker rows marked dirty (event-driven entry path).
     fn check_for_signals_dirty_priority_tick(&self) -> Vec<EntrySignal> {
         self.prune_stale_pending_buy_mint_index();
-        let config = self.config.read().clone();
-        let mint_infos = self.mint_infos.read();
-        let positions = self.positions.read();
-        let pending_buy_index = self.pending_buy_mint_index.read();
-        let pending_buy_entries = self.pending_buy_entries.read();
-
-        let prev = self.entry_signal_eval_tick.fetch_add(1, Ordering::Relaxed);
-        let periodic_full_scan_gate = entry_signal_periodic_full_scan_gate(prev);
-        let defer_periodic_full_scan = self
-            .core_market_events_ingest_last_batch_hit_drain_cap
-            .load(Ordering::Relaxed);
 
         let mut dirty_keys: Vec<String> = {
             let mut d = self.dirty_entry_tracker_keys.write();
@@ -4060,55 +4012,15 @@ impl MomentumContext {
         };
         dirty_keys.sort_unstable();
         dirty_keys.dedup();
-
-        if periodic_full_scan_gate && !defer_periodic_full_scan {
-            let mut trackers = self.token_trackers.write();
-            dirty_keys.retain(|k| trackers.contains_key(k));
-            self.refresh_tracker_keys_by_mint_index_from_map(&trackers);
-            let mut all_keys: Vec<String> = trackers.keys().cloned().collect();
-            all_keys.sort_unstable();
-            let n = all_keys.len();
-            let chunk_keys: Vec<String> = if n == 0 {
-                vec![]
-            } else {
-                let cursor = self.entry_signal_full_scan_cursor.load(Ordering::Relaxed);
-                let (start, chunk_len, next_cursor) = entry_full_scan_round_robin_chunk_bounds(
-                    n,
-                    cursor,
-                    ENTRY_SIGNAL_FULL_SCAN_KEYS_BUDGET,
-                );
-                self.entry_signal_full_scan_cursor
-                    .store(next_cursor, Ordering::Relaxed);
-                (0..chunk_len)
-                    .map(|i| all_keys[(start + i) % n].clone())
-                    .collect()
-            };
-
-            let mut combined: Vec<String> = dirty_keys;
-            combined.extend(chunk_keys);
-            combined.sort_unstable();
-            combined.dedup();
-            combined.retain(|k| trackers.contains_key(k));
-
-            if combined.is_empty() {
-                return Vec::new();
-            }
-
-            let eval_t0 = Instant::now();
-            let signals = self.check_for_signals_eval_sorted_tracker_keys(
-                &config,
-                &mint_infos,
-                &positions,
-                &pending_buy_index,
-                &pending_buy_entries,
-                &mut trackers,
-                &combined,
-            );
-            record_momentum_full_scan_signal_eval_us(
-                eval_t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-            );
-            return signals;
+        if dirty_keys.is_empty() {
+            return Vec::new();
         }
+
+        let config = self.config.read().clone();
+        let mint_infos = self.mint_infos.read();
+        let positions = self.positions.read();
+        let pending_buy_index = self.pending_buy_mint_index.read();
+        let pending_buy_entries = self.pending_buy_entries.read();
 
         let mut trackers = self.token_trackers.write();
         dirty_keys.retain(|k| trackers.contains_key(k));
@@ -7720,7 +7632,6 @@ async fn main() -> Result<()> {
         tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
         dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
         pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-        entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
         positions: parking_lot::RwLock::new(recovered_positions),
         pending_intents: parking_lot::RwLock::new(HashMap::new()),
         latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -7742,8 +7653,6 @@ async fn main() -> Result<()> {
         exits_generated: std::sync::atomic::AtomicU64::new(0),
         last_event_slot: std::sync::atomic::AtomicU64::new(0),
         last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-        core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
-        entry_signal_full_scan_cursor: AtomicUsize::new(0),
     });
 
     // === P0: Wallet snapshot recovery from JetStream ===
@@ -8215,10 +8124,6 @@ async fn main() -> Result<()> {
 
                     let drain_count = raw_chunks.len();
                     let drain_hit_cap = drain_count >= effective_cap;
-                    ctx.core_market_events_ingest_last_batch_hit_drain_cap.store(
-                        drain_hit_cap,
-                        Ordering::Relaxed,
-                    );
                     if drain_count > 1 {
                         trace!(
                             momentum_scope_c = "core_market_events_ingest_drain",
@@ -9772,7 +9677,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -9794,8 +9698,6 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
-            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         }
     }
 
@@ -10070,8 +9972,6 @@ mod tests {
         ctx.dirty_entry_tracker_keys.write().clear();
         let hot_key = MomentumContext::tracker_storage_key(mint, pool_hot);
         ctx.mark_entry_eval_dirty_key(&hot_key);
-        ctx.entry_signal_eval_tick
-            .store(17, std::sync::atomic::Ordering::Relaxed);
 
         let signals = ctx.check_for_signals_dirty_priority_tick();
         assert_eq!(signals.len(), 1);
@@ -10095,8 +9995,6 @@ mod tests {
         }
         ctx.dirty_entry_tracker_keys.write().clear();
         ctx.mark_entry_eval_dirty_key(&MomentumContext::tracker_storage_key(mint, pool_cold));
-        ctx.entry_signal_eval_tick
-            .store(17, std::sync::atomic::Ordering::Relaxed);
 
         let signals_cold_only = ctx.check_for_signals_dirty_priority_tick();
         assert!(
@@ -10160,8 +10058,6 @@ mod tests {
         ctx.dirty_entry_tracker_keys.write().clear();
         ctx.mark_entry_eval_dirty_key(&MomentumContext::tracker_storage_key(mint, pool_first));
         ctx.mark_entry_eval_dirty_key(&MomentumContext::tracker_storage_key(mint, pool_second));
-        ctx.entry_signal_eval_tick
-            .store(17, std::sync::atomic::Ordering::Relaxed);
 
         let signals = ctx.check_for_signals_dirty_priority_tick();
         assert_eq!(signals.len(), 1);
@@ -10849,7 +10745,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -10871,8 +10766,6 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
-            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         let mint = "So11111111111111111111111111111111111111112";
@@ -10916,7 +10809,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -10938,8 +10830,6 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
-            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -11160,7 +11050,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -11182,8 +11071,6 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
-            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         // Insert a fresh tracker.
@@ -12234,7 +12121,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12256,8 +12142,6 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
-            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         // Seed tracker with a last_trade_ratio so intent generation can compute min_out.
@@ -12354,7 +12238,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12376,8 +12259,6 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
-            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         // Open a position.
@@ -12442,7 +12323,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12464,8 +12344,6 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
-            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         // Open a position.
@@ -12518,7 +12396,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12540,8 +12417,6 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
-            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         let now = Instant::now();
@@ -12606,7 +12481,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12628,8 +12502,6 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
-            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         });
 
         ctx.register_pool("mintX", "poolX", "raydium", 1);
@@ -12725,7 +12597,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12747,8 +12618,6 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
-            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         });
 
         ctx.open_position(OpenPositionParams {
@@ -12837,7 +12706,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12859,8 +12727,6 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
-            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         });
 
         ctx.open_position(OpenPositionParams {
@@ -12934,7 +12800,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12956,8 +12821,6 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
-            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         // Seed pool registry so reconciliation can pick a pool.
@@ -13009,7 +12872,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -13031,8 +12893,6 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
-            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         let mint = "TokenMint1111111111111111111111111111111111";
@@ -13076,7 +12936,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -13098,8 +12957,6 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
-            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         let mint = "TokenMint2222222222222222222222222222222222";
@@ -13607,7 +13464,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -13629,8 +13485,6 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
-            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         });
 
         let mint = "9mR7mmX55n1F56rKBBcfMrRzMoJjaZnSRs6fV1GRpump";
@@ -13744,7 +13598,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -13766,8 +13619,6 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
-            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         });
 
         let mint = "NoTrkMintttttttttttttttttttttttttttttttttttt";
@@ -14216,21 +14067,15 @@ mod tests {
     }
 
     #[test]
-    fn entry_signal_periodic_full_scan_gate_every_n_ticks() {
-        assert!(!entry_signal_periodic_full_scan_gate(0));
-        assert!(!entry_signal_periodic_full_scan_gate(17));
-        assert!(entry_signal_periodic_full_scan_gate(19));
-    }
-
-    #[test]
-    fn entry_full_scan_round_robin_chunk_bounds_smoke() {
-        let (s, len, next) = entry_full_scan_round_robin_chunk_bounds(10, 8, 48);
-        assert_eq!((s, len, next), (8, 10, 8));
-        let (s2, len2, next2) = entry_full_scan_round_robin_chunk_bounds(5, 3, 2);
-        assert_eq!((s2, len2, next2), (3, 2, 0));
-        let (s3, len3, next3) = entry_full_scan_round_robin_chunk_bounds(0, 9, 10);
-        assert_eq!((s3, len3), (0, 0));
-        assert_eq!(next3, 0);
+    fn strategy_entry_tick_returns_empty_without_dirty_markers() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        assert!(
+            ctx.check_for_signals_dirty_priority_tick().is_empty(),
+            "no periodic fallback: empty dirty set must not evaluate trackers"
+        );
     }
 
     #[test]
@@ -14253,7 +14098,7 @@ mod tests {
     }
 
     #[test]
-    fn periodic_full_scan_deferred_still_evaluates_dirty_keys() {
+    fn strategy_entry_tick_evaluates_only_explicitly_dirty_tracker() {
         let cfg = {
             let mut c = MomentumConfig::default();
             c.default_position_lamports = 1_000;
@@ -14300,10 +14145,6 @@ mod tests {
         }
         ctx.dirty_entry_tracker_keys.write().clear();
         ctx.mark_entry_eval_dirty_key(&MomentumContext::tracker_storage_key(mint, pool));
-        ctx.entry_signal_eval_tick
-            .store(19, std::sync::atomic::Ordering::Relaxed);
-        ctx.core_market_events_ingest_last_batch_hit_drain_cap
-            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let signals = ctx.check_for_signals_dirty_priority_tick();
         assert_eq!(signals.len(), 1);
