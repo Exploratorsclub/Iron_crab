@@ -9,7 +9,7 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 ### FIX-MOM-POOLCACHE-LIVE-ONLY-2026-05-16: Momentum kein globales POOL_CACHE LastPerSubject-Replay
 **Datum**: 2026-05-16  
 **Problem**: `momentum-bot` nutzte `bootstrap_pool_cache_from_jetstream` mit `LastPerSubject` und übernahm denselben Consumer — hunderttausende Snapshot-Messages erzeugten JetStream-Backpressure und blockierten die Core-NATS-Verarbeitung trotz priorisierter Strategy-Fixes.  
-**Fix**: Runtime-Consumer mit `DeliverPolicy::New` und durable `momentum-bot-pool-cache-live` (`pool_cache_live_consumer_config`); kein globaler Bootstrap mehr. Offene Positionen triggern bounded/deduped `Ensure*` ControlRequests an `market-data` (Startup + Retry-Tick wenn keine executable Quote).  
+**Fix**: Runtime-Consumer mit `DeliverPolicy::New` und durable `momentum-bot-pool-cache-live` (`pool_cache_live_consumer_config`); kein globaler Bootstrap mehr. Offene Positionen triggern bounded/deduped `Ensure*` ControlRequests an `market-data` (Startup + Retry-Tick wenn keine executable Quote). **PumpFun-Positionen:** parallel `EnsurePumpfunBondingCurve(force_refresh_pumpfun)` und `EnsurePumpAmmPoolAccounts(force_refresh)` **ohne** `pool_address_hint` auf der Bonding-Curve-Adresse (PumpAmm-Discovery für Migration/Exit); reine `pump_amm`-Positionen unverändert mit Pool-Hint.  
 **Dateien**: `src/bin/momentum_bot.rs`, `src/nats/jetstream.rs`, `docs/BUGS_FIXES.md`
 
 ### FIX-MOM-STRATEGY-INGEST-2026-05-16: Strategy-Tick vs. Core-NATS-Drain (PR111-Follow-up, PR128 erweitert)

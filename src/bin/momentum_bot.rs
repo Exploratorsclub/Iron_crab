@@ -115,7 +115,11 @@ const OPEN_POSITION_POOL_RECOVERY_RETRY_MAX_PER_TICK: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenPositionPoolRecoveryKind {
     PumpfunBonding,
+    /// PumpSwap pool_accounts refresh when the position already references the PumpAmm market pool.
     PumpAmmAccounts,
+    /// After migration off bonding curve: discover PumpAmm state without treating the bonding-curve
+    /// pubkey as a PumpAmm `pool_address_hint` (market-data derives/finds the AMM pool from mint).
+    PumpAmmMigrationProbe,
     OrcaWhirlpool,
     MeteoraDlmm,
     RaydiumAmm,
@@ -123,19 +127,39 @@ enum OpenPositionPoolRecoveryKind {
     MeteoraCpmm,
 }
 
-/// Maps [`MomentumContext::normalize_dex_for_execution_engine`] output to a market-data Ensure* path.
-fn open_position_pool_recovery_kind_for_normalized_dex(
+/// Ensure* recovery channels per normalized DEX (see [`MomentumContext::normalize_dex_for_execution_engine`]).
+///
+/// PumpFun positions get **two** bounded channels: bonding-curve refresh plus PumpAmm discovery so
+/// post-migration exits are not stuck on stale curve-only JetStream state.
+const OPEN_POSITION_RECOVERY_PUMPFUN: &[OpenPositionPoolRecoveryKind] = &[
+    OpenPositionPoolRecoveryKind::PumpfunBonding,
+    OpenPositionPoolRecoveryKind::PumpAmmMigrationProbe,
+];
+const OPEN_POSITION_RECOVERY_PUMP_AMM: &[OpenPositionPoolRecoveryKind] =
+    &[OpenPositionPoolRecoveryKind::PumpAmmAccounts];
+const OPEN_POSITION_RECOVERY_ORCA: &[OpenPositionPoolRecoveryKind] =
+    &[OpenPositionPoolRecoveryKind::OrcaWhirlpool];
+const OPEN_POSITION_RECOVERY_METEORA_DLMM: &[OpenPositionPoolRecoveryKind] =
+    &[OpenPositionPoolRecoveryKind::MeteoraDlmm];
+const OPEN_POSITION_RECOVERY_RAYDIUM_AMM: &[OpenPositionPoolRecoveryKind] =
+    &[OpenPositionPoolRecoveryKind::RaydiumAmm];
+const OPEN_POSITION_RECOVERY_RAYDIUM_CPMM: &[OpenPositionPoolRecoveryKind] =
+    &[OpenPositionPoolRecoveryKind::RaydiumCpmm];
+const OPEN_POSITION_RECOVERY_METEORA_CPMM: &[OpenPositionPoolRecoveryKind] =
+    &[OpenPositionPoolRecoveryKind::MeteoraCpmm];
+
+fn open_position_pool_recovery_kinds_for_normalized_dex(
     dex: &str,
-) -> Option<OpenPositionPoolRecoveryKind> {
+) -> &'static [OpenPositionPoolRecoveryKind] {
     match dex {
-        "pumpfun" => Some(OpenPositionPoolRecoveryKind::PumpfunBonding),
-        "pump_amm" => Some(OpenPositionPoolRecoveryKind::PumpAmmAccounts),
-        "orca" => Some(OpenPositionPoolRecoveryKind::OrcaWhirlpool),
-        "meteora_dlmm" => Some(OpenPositionPoolRecoveryKind::MeteoraDlmm),
-        "raydium" => Some(OpenPositionPoolRecoveryKind::RaydiumAmm),
-        "raydium_cpmm" => Some(OpenPositionPoolRecoveryKind::RaydiumCpmm),
-        "meteora_cpmm" => Some(OpenPositionPoolRecoveryKind::MeteoraCpmm),
-        _ => None,
+        "pumpfun" => OPEN_POSITION_RECOVERY_PUMPFUN,
+        "pump_amm" => OPEN_POSITION_RECOVERY_PUMP_AMM,
+        "orca" => OPEN_POSITION_RECOVERY_ORCA,
+        "meteora_dlmm" => OPEN_POSITION_RECOVERY_METEORA_DLMM,
+        "raydium" => OPEN_POSITION_RECOVERY_RAYDIUM_AMM,
+        "raydium_cpmm" => OPEN_POSITION_RECOVERY_RAYDIUM_CPMM,
+        "meteora_cpmm" => OPEN_POSITION_RECOVERY_METEORA_CPMM,
+        _ => &[],
     }
 }
 
@@ -2911,19 +2935,18 @@ impl MomentumContext {
     fn build_open_position_pool_control_request(
         run_id: &str,
         mint: &str,
-        pool: &str,
-        dex_raw: &str,
-    ) -> Option<(ControlRequest, OpenPositionPoolRecoveryKind)> {
-        let dex_norm = Self::normalize_dex_for_execution_engine(dex_raw);
-        let kind = open_position_pool_recovery_kind_for_normalized_dex(dex_norm.as_str())?;
+        position_pool: &str,
+        recovery_kind: OpenPositionPoolRecoveryKind,
+    ) -> (ControlRequest, OpenPositionPoolRecoveryKind) {
         let request_id = format!("mom-pool-rec-{}", Uuid::new_v4());
-        let kind_enum = match kind {
+        let kind_enum = match recovery_kind {
             OpenPositionPoolRecoveryKind::PumpfunBonding => {
                 ControlRequestKind::EnsurePumpfunBondingCurve {
                     base_mint: mint.to_string(),
                 }
             }
-            OpenPositionPoolRecoveryKind::PumpAmmAccounts => {
+            OpenPositionPoolRecoveryKind::PumpAmmAccounts
+            | OpenPositionPoolRecoveryKind::PumpAmmMigrationProbe => {
                 ControlRequestKind::EnsurePumpAmmPoolAccounts {
                     base_mint: mint.to_string(),
                 }
@@ -2962,36 +2985,39 @@ impl MomentumContext {
             "market-data",
             kind_enum,
         );
-        match kind {
+        match recovery_kind {
             OpenPositionPoolRecoveryKind::PumpfunBonding => {
                 req.force_refresh_pumpfun = true;
             }
             OpenPositionPoolRecoveryKind::PumpAmmAccounts => {
-                req.pool_address_hint = Some(pool.to_string());
+                req.pool_address_hint = Some(position_pool.to_string());
+                req.force_refresh = true;
+            }
+            OpenPositionPoolRecoveryKind::PumpAmmMigrationProbe => {
                 req.force_refresh = true;
             }
             OpenPositionPoolRecoveryKind::OrcaWhirlpool => {
-                req.pool_address_hint = Some(pool.to_string());
+                req.pool_address_hint = Some(position_pool.to_string());
                 req.force_refresh_orca = true;
             }
             OpenPositionPoolRecoveryKind::MeteoraDlmm => {
-                req.pool_address_hint = Some(pool.to_string());
+                req.pool_address_hint = Some(position_pool.to_string());
                 req.force_refresh_meteora_dlmm = true;
             }
             OpenPositionPoolRecoveryKind::RaydiumAmm => {
-                req.pool_address_hint = Some(pool.to_string());
+                req.pool_address_hint = Some(position_pool.to_string());
                 req.force_refresh_raydium_amm = true;
             }
             OpenPositionPoolRecoveryKind::RaydiumCpmm => {
-                req.pool_address_hint = Some(pool.to_string());
+                req.pool_address_hint = Some(position_pool.to_string());
                 req.force_refresh_raydium_cpmm = true;
             }
             OpenPositionPoolRecoveryKind::MeteoraCpmm => {
-                req.pool_address_hint = Some(pool.to_string());
+                req.pool_address_hint = Some(position_pool.to_string());
                 req.force_refresh_meteora_cpmm = true;
             }
         }
-        Some((req, kind))
+        (req, recovery_kind)
     }
 
     async fn publish_open_position_pool_recovery_if_allowed(
@@ -3007,9 +3033,9 @@ impl MomentumContext {
         if pool.is_empty() {
             return;
         }
-        let Some((req, kind)) =
-            Self::build_open_position_pool_control_request(self.run_id.as_str(), mint, pool, dex)
-        else {
+        let dex_norm = Self::normalize_dex_for_execution_engine(dex);
+        let kinds = open_position_pool_recovery_kinds_for_normalized_dex(dex_norm.as_str());
+        if kinds.is_empty() {
             info!(
                 mint = %mint,
                 pool = %pool,
@@ -3018,59 +3044,67 @@ impl MomentumContext {
                 "Momentum open-position pool recovery skipped: unsupported dex for Ensure* discovery"
             );
             return;
-        };
-        let key = open_position_pool_recovery_dedupe_key(mint, pool, kind);
-        let now = Instant::now();
-        {
-            let map = self.open_position_pool_recovery_last_sent.read();
-            if let Some(prev) = map.get(&key) {
-                if now.duration_since(*prev) < OPEN_POSITION_POOL_RECOVERY_COOLDOWN {
-                    debug!(
+        }
+        for &recovery_kind in kinds {
+            let (req, kind) = Self::build_open_position_pool_control_request(
+                self.run_id.as_str(),
+                mint,
+                pool,
+                recovery_kind,
+            );
+            let key = open_position_pool_recovery_dedupe_key(mint, pool, kind);
+            let now = Instant::now();
+            {
+                let map = self.open_position_pool_recovery_last_sent.read();
+                if let Some(prev) = map.get(&key) {
+                    if now.duration_since(*prev) < OPEN_POSITION_POOL_RECOVERY_COOLDOWN {
+                        debug!(
+                            mint = %mint,
+                            pool = %pool,
+                            dex = %dex,
+                            reason = reason_tag,
+                            request_kind = ?kind,
+                            "Momentum open-position pool recovery deferred: cooldown"
+                        );
+                        continue;
+                    }
+                }
+            }
+            {
+                self.open_position_pool_recovery_last_sent
+                    .write()
+                    .insert(key, now);
+            }
+            match nats.publish(TOPIC_CONTROL_REQUESTS, &req).await {
+                Ok(true) => {
+                    info!(
                         mint = %mint,
                         pool = %pool,
                         dex = %dex,
-                        reason = reason_tag,
                         request_kind = ?kind,
-                        "Momentum open-position pool recovery deferred: cooldown"
+                        reason = reason_tag,
+                        "Momentum open-position pool recovery requested"
                     );
-                    return;
                 }
-            }
-        }
-        {
-            self.open_position_pool_recovery_last_sent
-                .write()
-                .insert(key, now);
-        }
-        match nats.publish(TOPIC_CONTROL_REQUESTS, &req).await {
-            Ok(true) => {
-                info!(
-                    mint = %mint,
-                    pool = %pool,
-                    dex = %dex,
-                    request_kind = ?kind,
-                    reason = reason_tag,
-                    "Momentum open-position pool recovery requested"
-                );
-            }
-            Ok(false) => {
-                warn!(
-                    mint = %mint,
-                    pool = %pool,
-                    request_kind = ?kind,
-                    reason = reason_tag,
-                    "Momentum open-position pool recovery publish dropped (NATS publish returned false)"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    mint = %mint,
-                    pool = %pool,
-                    request_kind = ?kind,
-                    reason = reason_tag,
-                    error = %e,
-                    "Momentum open-position pool recovery publish failed"
-                );
+                Ok(false) => {
+                    warn!(
+                        mint = %mint,
+                        pool = %pool,
+                        request_kind = ?kind,
+                        reason = reason_tag,
+                        "Momentum open-position pool recovery publish dropped (NATS publish returned false)"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        mint = %mint,
+                        pool = %pool,
+                        request_kind = ?kind,
+                        reason = reason_tag,
+                        error = %e,
+                        "Momentum open-position pool recovery publish failed"
+                    );
+                }
             }
         }
     }
@@ -9934,33 +9968,52 @@ mod tests {
     }
 
     #[test]
-    fn open_position_pool_recovery_kind_mapping() {
+    fn open_position_pool_recovery_kinds_mapping() {
         assert_eq!(
-            open_position_pool_recovery_kind_for_normalized_dex("pumpfun"),
-            Some(OpenPositionPoolRecoveryKind::PumpfunBonding)
+            open_position_pool_recovery_kinds_for_normalized_dex("pumpfun"),
+            &[
+                OpenPositionPoolRecoveryKind::PumpfunBonding,
+                OpenPositionPoolRecoveryKind::PumpAmmMigrationProbe,
+            ]
         );
         assert_eq!(
-            open_position_pool_recovery_kind_for_normalized_dex("pump_amm"),
-            Some(OpenPositionPoolRecoveryKind::PumpAmmAccounts)
+            open_position_pool_recovery_kinds_for_normalized_dex("pump_amm"),
+            &[OpenPositionPoolRecoveryKind::PumpAmmAccounts]
         );
-        assert!(open_position_pool_recovery_kind_for_normalized_dex("unknown_dex").is_none());
+        assert!(open_position_pool_recovery_kinds_for_normalized_dex("unknown_dex").is_empty());
     }
 
     #[test]
-    fn open_position_recovery_control_request_pumpfun_sets_force_refresh_pumpfun() {
+    fn open_position_recovery_pumpfun_emits_bonding_and_pump_amm_migration_probe() {
         use ironcrab::ipc::ControlRequestKind;
-        let (req, k) = MomentumContext::build_open_position_pool_control_request(
+        let bonding = MomentumContext::build_open_position_pool_control_request(
             "runidxxxx",
             "MintMintMintMintMintMintMintMintMintMintMintMint",
             "CrveCrveCrveCrveCrveCrveCrveCrveCrveCrveCrveCrve",
-            "pumpfun",
-        )
-        .expect("pumpfun supported");
-        assert_eq!(k, OpenPositionPoolRecoveryKind::PumpfunBonding);
-        assert!(req.force_refresh_pumpfun);
+            OpenPositionPoolRecoveryKind::PumpfunBonding,
+        );
+        assert_eq!(bonding.1, OpenPositionPoolRecoveryKind::PumpfunBonding);
+        assert!(bonding.0.force_refresh_pumpfun);
         assert!(matches!(
-            req.kind,
+            bonding.0.kind,
             ControlRequestKind::EnsurePumpfunBondingCurve { .. }
+        ));
+
+        let amm_probe = MomentumContext::build_open_position_pool_control_request(
+            "runidxxxx",
+            "MintMintMintMintMintMintMintMintMintMintMintMint",
+            "CrveCrveCrveCrveCrveCrveCrveCrveCrveCrveCrveCrve",
+            OpenPositionPoolRecoveryKind::PumpAmmMigrationProbe,
+        );
+        assert_eq!(
+            amm_probe.1,
+            OpenPositionPoolRecoveryKind::PumpAmmMigrationProbe
+        );
+        assert!(amm_probe.0.force_refresh);
+        assert!(amm_probe.0.pool_address_hint.is_none());
+        assert!(matches!(
+            amm_probe.0.kind,
+            ControlRequestKind::EnsurePumpAmmPoolAccounts { .. }
         ));
     }
 
@@ -9971,9 +10024,8 @@ mod tests {
             "runidxxxx",
             "MintMintMintMintMintMintMintMintMintMintMintMint",
             "PoolPoolPoolPoolPoolPoolPoolPoolPoolPoolPoolPool",
-            "pumpswap",
-        )
-        .expect("pumpswap normalized");
+            OpenPositionPoolRecoveryKind::PumpAmmAccounts,
+        );
         assert_eq!(k, OpenPositionPoolRecoveryKind::PumpAmmAccounts);
         assert!(req.force_refresh);
         assert_eq!(
