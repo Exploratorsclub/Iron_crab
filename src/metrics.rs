@@ -346,7 +346,9 @@ const MOMENTUM_LATENCY_US_SUM_CAP: u64 = 60_000_000;
 /// buffer). This is **not** an independent live-chain head; see `momentum_market_events_internal_slot_delta_slots`.
 pub static MOMENTUM_MARKET_EVENTS_SUBSCRIPTION_MAX_DEQUEUED_SLOT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
-/// Last `MarketEvent.slot` applied in `process_market_event` (mirrors strategy `last_event_slot`).
+/// Last `MarketEvent.slot` from **Core NATS ingest** observed after entering `process_market_event` with
+/// subscription-slot metrics enabled (mirrors strategy `last_event_slot` for that path; JetStream wallet
+/// snapshots do not advance this gauge — see `momentum_market_events_internal_slot_delta_slots`).
 pub static MOMENTUM_MARKET_EVENTS_LAST_APPLIED_SLOT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// Histogram samples where true `producer→ingest` ms exceeded [`MOMENTUM_LATENCY_MS_SUM_CAP`] (sum was clamped).

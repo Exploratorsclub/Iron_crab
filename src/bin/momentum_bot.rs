@@ -7293,7 +7293,7 @@ async fn bootstrap_wallet_snapshot_from_jetstream(ctx: &Arc<MomentumContext>) ->
                 // JetStream bootstrap/replay: do not mix historical `ts_unix_ms` into
                 // `momentum_event_to_ingest_ms` (live Core NATS ingest SLO only).
                 let ingest_t0 = Instant::now();
-                let apply_res = process_market_event(ctx, &event).await;
+                let apply_res = process_market_event(ctx, &event, false).await;
                 record_momentum_ingest_to_process_us(
                     ingest_t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
                 );
@@ -8145,7 +8145,7 @@ async fn main() -> Result<()> {
                         // via `try_record_momentum_jetstream_poolcache_event_to_ingest_ms`.
                         try_record_momentum_event_to_ingest_ms(now_ms, event.header.ts_unix_ms);
                         let ingest_t0 = Instant::now();
-                        match process_market_event(&ctx, &event).await {
+                        match process_market_event(&ctx, &event, true).await {
                             Ok(need_exit) => {
                                 record_momentum_core_market_events_processed_kind(kind_lbl);
                                 record_momentum_ingest_to_process_us(
@@ -8399,7 +8399,9 @@ async fn main() -> Result<()> {
                                                     &event.kind
                                                 {
                                                     let ingest_t0 = Instant::now();
-                                                    match process_market_event(&ctx, &event).await {
+                                                    match process_market_event(&ctx, &event, false)
+                                                        .await
+                                                    {
                                                         Ok(need_exit) => {
                                                             record_momentum_ingest_to_process_us(
                                                                 ingest_t0
@@ -11680,7 +11682,7 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         rt.block_on(async {
-            process_market_event(&ctx, &evt)
+            process_market_event(&ctx, &evt, true)
                 .await
                 .expect("process trade");
         });
@@ -14695,13 +14697,24 @@ async fn generate_and_publish_exit_intent(
 
 /// Process a MarketEvent and update token trackers.
 /// Returns `Ok(true)` when the caller should run `process_exit_signals()` (bonding/price-relevant sticky apply).
-async fn process_market_event(ctx: &Arc<MomentumContext>, event: &MarketEvent) -> Result<bool> {
+///
+/// When `update_core_nats_subscription_slot_metrics` is true, updates
+/// [`record_momentum_market_events_last_applied_slot`] for Core NATS backlog gauges; JetStream wallet
+/// snapshot bootstrap/live replay must pass `false` so `momentum_market_events_internal_slot_delta_slots`
+/// stays Core-NATS-scoped while `ctx.last_event_slot` still advances for strategy state on every path.
+async fn process_market_event(
+    ctx: &Arc<MomentumContext>,
+    event: &MarketEvent,
+    update_core_nats_subscription_slot_metrics: bool,
+) -> Result<bool> {
     let _mt = MomentumProcessMarketEventTimer(Instant::now());
     // K Phase 1: Slot-to-Send Latency - store for intent metadata propagation
     if let Some(slot) = event.slot {
         ctx.last_event_slot
             .store(slot, std::sync::atomic::Ordering::Relaxed);
-        record_momentum_market_events_last_applied_slot(slot);
+        if update_core_nats_subscription_slot_metrics {
+            record_momentum_market_events_last_applied_slot(slot);
+        }
     }
     ctx.last_event_ts_ms.store(
         event.header.ts_unix_ms,
