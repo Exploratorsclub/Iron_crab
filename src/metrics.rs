@@ -4,7 +4,7 @@ use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Recent trade record for dashboard display
@@ -341,12 +341,13 @@ pub static MOMENTUM_LATENCY_EVENT_TS_INVALID_TOTAL: Lazy<AtomicU64> =
 pub const MOMENTUM_LATENCY_MS_SUM_CAP: u64 = 1_000_000;
 const MOMENTUM_LATENCY_US_SUM_CAP: u64 = 60_000_000;
 
-// --- momentum-bot Core NATS ingest throughput / backlog (bounded labels / scalar gauges) ---
-/// Max `MarketEvent.slot` observed on Core NATS ingest (Momentum subject) before processing.
-pub static MOMENTUM_MARKET_EVENTS_LATEST_SEEN_SLOT: Lazy<AtomicU64> =
+// --- momentum-bot Core NATS ingest throughput / observability (bounded labels / scalar gauges) ---
+/// Max `MarketEvent.slot` observed on **dequeued** Core NATS payloads in momentum-bot (subscription
+/// buffer). This is **not** an independent live-chain head; see `momentum_market_events_internal_slot_delta_slots`.
+pub static MOMENTUM_MARKET_EVENTS_SUBSCRIPTION_MAX_DEQUEUED_SLOT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// Last `MarketEvent.slot` applied in `process_market_event` (mirrors strategy `last_event_slot`).
-pub static MOMENTUM_MARKET_EVENTS_LAST_PROCESSED_SLOT: Lazy<AtomicU64> =
+pub static MOMENTUM_MARKET_EVENTS_LAST_APPLIED_SLOT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// Histogram samples where true `producer→ingest` ms exceeded [`MOMENTUM_LATENCY_MS_SUM_CAP`] (sum was clamped).
 pub static MOMENTUM_EVENT_TO_INGEST_MS_SUM_CAPPED_SAMPLES_TOTAL: Lazy<AtomicU64> =
@@ -360,6 +361,9 @@ pub static MOMENTUM_CORE_MARKET_EVENTS_INGEST_DRAINED_MESSAGES_TOTAL: Lazy<Atomi
 /// Batches where `drained_messages >= effective_cap` (saturation signal).
 pub static MOMENTUM_CORE_MARKET_EVENTS_INGEST_DRAIN_CAP_HIT_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Consecutive ingest batches that hit the drain cap (resets on a non-cap batch). Drives adaptive cap.
+pub static MOMENTUM_CORE_MARKET_EVENTS_INGEST_CONSECUTIVE_CAP_HIT_STREAK: Lazy<AtomicU32> =
+    Lazy::new(|| AtomicU32::new(0));
 
 // Per-kind counters (static label keys via metric name — no dynamic labels).
 pub static MOMENTUM_CORE_MARKET_EVENTS_RECV_TRADE_TOTAL: Lazy<AtomicU64> =
@@ -373,6 +377,10 @@ pub static MOMENTUM_CORE_MARKET_EVENTS_RECV_DEX_POOL_ACCOUNTS_TOTAL: Lazy<Atomic
 pub static MOMENTUM_CORE_MARKET_EVENTS_RECV_WALLET_BALANCE_SNAPSHOT_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static MOMENTUM_CORE_MARKET_EVENTS_RECV_SLOT_UPDATE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_CORE_MARKET_EVENTS_RECV_POOL_STATE_UPDATE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_CORE_MARKET_EVENTS_RECV_TOKEN_MINT_INFO_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static MOMENTUM_CORE_MARKET_EVENTS_RECV_OTHER_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -389,22 +397,30 @@ pub static MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_WALLET_BALANCE_SNAPSHOT_TOTAL: 
     Lazy::new(|| AtomicU64::new(0));
 pub static MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_SLOT_UPDATE_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_POOL_STATE_UPDATE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_TOKEN_MINT_INFO_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_OTHER_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// `max_dequeued_slot` / `last_applied_slot` are momentum-bot-local (subscription vs applied). **Not** a live NATS/chain head lag.
 #[inline]
-pub fn momentum_slot_backlog_saturating(latest_seen_slot: u64, last_processed_slot: u64) -> u64 {
-    latest_seen_slot.saturating_sub(last_processed_slot)
+pub fn momentum_internal_subscription_slot_delta_saturating(
+    max_dequeued_slot: u64,
+    last_applied_slot: u64,
+) -> u64 {
+    max_dequeued_slot.saturating_sub(last_applied_slot)
 }
 
 #[inline]
-pub fn record_momentum_market_events_seen_slot(slot: u64) {
-    MOMENTUM_MARKET_EVENTS_LATEST_SEEN_SLOT.fetch_max(slot, Ordering::Relaxed);
+pub fn record_momentum_market_events_subscription_max_dequeued_slot(slot: u64) {
+    MOMENTUM_MARKET_EVENTS_SUBSCRIPTION_MAX_DEQUEUED_SLOT.fetch_max(slot, Ordering::Relaxed);
 }
 
 #[inline]
-pub fn record_momentum_market_events_processed_slot(slot: u64) {
-    MOMENTUM_MARKET_EVENTS_LAST_PROCESSED_SLOT.fetch_max(slot, Ordering::Relaxed);
+pub fn record_momentum_market_events_last_applied_slot(slot: u64) {
+    MOMENTUM_MARKET_EVENTS_LAST_APPLIED_SLOT.fetch_max(slot, Ordering::Relaxed);
 }
 
 #[inline]
@@ -414,6 +430,19 @@ pub fn record_momentum_core_market_events_ingest_drain_batch(drained: usize, eff
         .fetch_add(drained as u64, Ordering::Relaxed);
     if drained >= effective_cap {
         MOMENTUM_CORE_MARKET_EVENTS_INGEST_DRAIN_CAP_HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let mut cur =
+            MOMENTUM_CORE_MARKET_EVENTS_INGEST_CONSECUTIVE_CAP_HIT_STREAK.load(Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_add(1).min(10_000);
+            match MOMENTUM_CORE_MARKET_EVENTS_INGEST_CONSECUTIVE_CAP_HIT_STREAK
+                .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(c) => cur = c,
+            }
+        }
+    } else {
+        MOMENTUM_CORE_MARKET_EVENTS_INGEST_CONSECUTIVE_CAP_HIT_STREAK.store(0, Ordering::Relaxed);
     }
 }
 
@@ -433,6 +462,12 @@ pub fn record_momentum_core_market_events_received_kind(kind: &'static str) {
             .fetch_add(1, Ordering::Relaxed),
         "SlotUpdate" => {
             MOMENTUM_CORE_MARKET_EVENTS_RECV_SLOT_UPDATE_TOTAL.fetch_add(1, Ordering::Relaxed)
+        }
+        "PoolStateUpdate" => {
+            MOMENTUM_CORE_MARKET_EVENTS_RECV_POOL_STATE_UPDATE_TOTAL.fetch_add(1, Ordering::Relaxed)
+        }
+        "TokenMintInfo" => {
+            MOMENTUM_CORE_MARKET_EVENTS_RECV_TOKEN_MINT_INFO_TOTAL.fetch_add(1, Ordering::Relaxed)
         }
         _ => MOMENTUM_CORE_MARKET_EVENTS_RECV_OTHER_TOTAL.fetch_add(1, Ordering::Relaxed),
     };
@@ -460,6 +495,10 @@ pub fn record_momentum_core_market_events_processed_kind(kind: &'static str) {
         "SlotUpdate" => {
             MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_SLOT_UPDATE_TOTAL.fetch_add(1, Ordering::Relaxed)
         }
+        "PoolStateUpdate" => MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_POOL_STATE_UPDATE_TOTAL
+            .fetch_add(1, Ordering::Relaxed),
+        "TokenMintInfo" => MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_TOKEN_MINT_INFO_TOTAL
+            .fetch_add(1, Ordering::Relaxed),
         _ => MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_OTHER_TOTAL.fetch_add(1, Ordering::Relaxed),
     };
 }
@@ -676,17 +715,20 @@ fn reset_momentum_latency_metrics_for_test() {
     MOMENTUM_NATS_BATCH_PREPARE_US_COUNT.store(0, Ordering::Relaxed);
     MOMENTUM_LATENCY_EVENT_TS_INVALID_TOTAL.store(0, Ordering::Relaxed);
     MOMENTUM_EVENT_TO_INGEST_MS_SUM_CAPPED_SAMPLES_TOTAL.store(0, Ordering::Relaxed);
-    MOMENTUM_MARKET_EVENTS_LATEST_SEEN_SLOT.store(0, Ordering::Relaxed);
-    MOMENTUM_MARKET_EVENTS_LAST_PROCESSED_SLOT.store(0, Ordering::Relaxed);
+    MOMENTUM_MARKET_EVENTS_SUBSCRIPTION_MAX_DEQUEUED_SLOT.store(0, Ordering::Relaxed);
+    MOMENTUM_MARKET_EVENTS_LAST_APPLIED_SLOT.store(0, Ordering::Relaxed);
     MOMENTUM_CORE_MARKET_EVENTS_INGEST_DRAIN_BATCHES_TOTAL.store(0, Ordering::Relaxed);
     MOMENTUM_CORE_MARKET_EVENTS_INGEST_DRAINED_MESSAGES_TOTAL.store(0, Ordering::Relaxed);
     MOMENTUM_CORE_MARKET_EVENTS_INGEST_DRAIN_CAP_HIT_TOTAL.store(0, Ordering::Relaxed);
+    MOMENTUM_CORE_MARKET_EVENTS_INGEST_CONSECUTIVE_CAP_HIT_STREAK.store(0, Ordering::Relaxed);
     MOMENTUM_CORE_MARKET_EVENTS_RECV_TRADE_TOTAL.store(0, Ordering::Relaxed);
     MOMENTUM_CORE_MARKET_EVENTS_RECV_POOL_CREATED_TOTAL.store(0, Ordering::Relaxed);
     MOMENTUM_CORE_MARKET_EVENTS_RECV_BONDING_CURVE_PROGRESS_TOTAL.store(0, Ordering::Relaxed);
     MOMENTUM_CORE_MARKET_EVENTS_RECV_DEX_POOL_ACCOUNTS_TOTAL.store(0, Ordering::Relaxed);
     MOMENTUM_CORE_MARKET_EVENTS_RECV_WALLET_BALANCE_SNAPSHOT_TOTAL.store(0, Ordering::Relaxed);
     MOMENTUM_CORE_MARKET_EVENTS_RECV_SLOT_UPDATE_TOTAL.store(0, Ordering::Relaxed);
+    MOMENTUM_CORE_MARKET_EVENTS_RECV_POOL_STATE_UPDATE_TOTAL.store(0, Ordering::Relaxed);
+    MOMENTUM_CORE_MARKET_EVENTS_RECV_TOKEN_MINT_INFO_TOTAL.store(0, Ordering::Relaxed);
     MOMENTUM_CORE_MARKET_EVENTS_RECV_OTHER_TOTAL.store(0, Ordering::Relaxed);
     MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_TRADE_TOTAL.store(0, Ordering::Relaxed);
     MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_POOL_CREATED_TOTAL.store(0, Ordering::Relaxed);
@@ -694,6 +736,8 @@ fn reset_momentum_latency_metrics_for_test() {
     MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_DEX_POOL_ACCOUNTS_TOTAL.store(0, Ordering::Relaxed);
     MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_WALLET_BALANCE_SNAPSHOT_TOTAL.store(0, Ordering::Relaxed);
     MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_SLOT_UPDATE_TOTAL.store(0, Ordering::Relaxed);
+    MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_POOL_STATE_UPDATE_TOTAL.store(0, Ordering::Relaxed);
+    MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_TOKEN_MINT_INFO_TOTAL.store(0, Ordering::Relaxed);
     MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_OTHER_TOTAL.store(0, Ordering::Relaxed);
 }
 
@@ -1469,16 +1513,24 @@ async fn metrics_response() -> Response<Body> {
         "momentum_event_to_ingest_ms_sum_capped_samples_total",
         MOMENTUM_EVENT_TO_INGEST_MS_SUM_CAPPED_SAMPLES_TOTAL.load(Ordering::Relaxed)
     );
-    let latest_seen_slot = MOMENTUM_MARKET_EVENTS_LATEST_SEEN_SLOT.load(Ordering::Relaxed);
-    let last_processed_slot = MOMENTUM_MARKET_EVENTS_LAST_PROCESSED_SLOT.load(Ordering::Relaxed);
-    line!("momentum_market_events_latest_seen_slot", latest_seen_slot);
+    let max_dequeued_slot =
+        MOMENTUM_MARKET_EVENTS_SUBSCRIPTION_MAX_DEQUEUED_SLOT.load(Ordering::Relaxed);
+    let last_applied_slot = MOMENTUM_MARKET_EVENTS_LAST_APPLIED_SLOT.load(Ordering::Relaxed);
     line!(
-        "momentum_market_events_last_processed_slot",
-        last_processed_slot
+        "momentum_market_events_subscription_max_dequeued_slot",
+        max_dequeued_slot
     );
     line!(
-        "momentum_market_events_slot_backlog_slots",
-        momentum_slot_backlog_saturating(latest_seen_slot, last_processed_slot)
+        "momentum_market_events_last_applied_slot",
+        last_applied_slot
+    );
+    line!(
+        "momentum_market_events_internal_slot_delta_slots",
+        momentum_internal_subscription_slot_delta_saturating(max_dequeued_slot, last_applied_slot)
+    );
+    line!(
+        "momentum_core_market_events_ingest_consecutive_cap_hit_streak",
+        MOMENTUM_CORE_MARKET_EVENTS_INGEST_CONSECUTIVE_CAP_HIT_STREAK.load(Ordering::Relaxed)
     );
     line!(
         "momentum_core_market_events_ingest_drain_batches_total",
@@ -1517,6 +1569,14 @@ async fn metrics_response() -> Response<Body> {
         MOMENTUM_CORE_MARKET_EVENTS_RECV_SLOT_UPDATE_TOTAL.load(Ordering::Relaxed)
     );
     line!(
+        "momentum_core_market_events_received_pool_state_update_total",
+        MOMENTUM_CORE_MARKET_EVENTS_RECV_POOL_STATE_UPDATE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_core_market_events_received_token_mint_info_total",
+        MOMENTUM_CORE_MARKET_EVENTS_RECV_TOKEN_MINT_INFO_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
         "momentum_core_market_events_received_other_total",
         MOMENTUM_CORE_MARKET_EVENTS_RECV_OTHER_TOTAL.load(Ordering::Relaxed)
     );
@@ -1543,6 +1603,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "momentum_core_market_events_processed_slot_update_total",
         MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_SLOT_UPDATE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_core_market_events_processed_pool_state_update_total",
+        MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_POOL_STATE_UPDATE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_core_market_events_processed_token_mint_info_total",
+        MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_TOKEN_MINT_INFO_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "momentum_core_market_events_processed_other_total",
@@ -2610,11 +2678,17 @@ mod momentum_latency_metrics_tests {
     }
 
     #[test]
-    fn momentum_slot_backlog_saturates_when_latest_before_processed() {
-        assert_eq!(momentum_slot_backlog_saturating(100, 50), 50);
-        assert_eq!(momentum_slot_backlog_saturating(50, 100), 0);
+    fn internal_subscription_slot_delta_saturates() {
         assert_eq!(
-            momentum_slot_backlog_saturating(u64::MAX, u64::MAX - 10),
+            momentum_internal_subscription_slot_delta_saturating(100, 50),
+            50
+        );
+        assert_eq!(
+            momentum_internal_subscription_slot_delta_saturating(50, 100),
+            0
+        );
+        assert_eq!(
+            momentum_internal_subscription_slot_delta_saturating(u64::MAX, u64::MAX - 10),
             10
         );
     }
@@ -2637,21 +2711,27 @@ mod momentum_latency_metrics_tests {
     }
 
     #[test]
-    fn core_market_events_ingest_drain_batch_records_cap_hit() {
+    fn core_market_events_ingest_drain_batch_records_cap_hit_and_streak() {
         reset_momentum_latency_metrics_for_test();
         record_momentum_core_market_events_ingest_drain_batch(10, 48);
+        assert_eq!(
+            MOMENTUM_CORE_MARKET_EVENTS_INGEST_CONSECUTIVE_CAP_HIT_STREAK.load(Ordering::Relaxed),
+            0
+        );
+        record_momentum_core_market_events_ingest_drain_batch(48, 48);
         record_momentum_core_market_events_ingest_drain_batch(48, 48);
         assert_eq!(
-            MOMENTUM_CORE_MARKET_EVENTS_INGEST_DRAIN_BATCHES_TOTAL.load(Ordering::Relaxed),
+            MOMENTUM_CORE_MARKET_EVENTS_INGEST_DRAIN_CAP_HIT_TOTAL.load(Ordering::Relaxed),
             2
         );
         assert_eq!(
-            MOMENTUM_CORE_MARKET_EVENTS_INGEST_DRAINED_MESSAGES_TOTAL.load(Ordering::Relaxed),
-            58
+            MOMENTUM_CORE_MARKET_EVENTS_INGEST_CONSECUTIVE_CAP_HIT_STREAK.load(Ordering::Relaxed),
+            2
         );
+        record_momentum_core_market_events_ingest_drain_batch(10, 48);
         assert_eq!(
-            MOMENTUM_CORE_MARKET_EVENTS_INGEST_DRAIN_CAP_HIT_TOTAL.load(Ordering::Relaxed),
-            1
+            MOMENTUM_CORE_MARKET_EVENTS_INGEST_CONSECUTIVE_CAP_HIT_STREAK.load(Ordering::Relaxed),
+            0
         );
     }
 }
