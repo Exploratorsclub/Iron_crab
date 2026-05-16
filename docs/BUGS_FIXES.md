@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-MOM-POOLCACHE-LIVE-ONLY-2026-05-16: Momentum kein globales POOL_CACHE LastPerSubject-Replay
+**Datum**: 2026-05-16  
+**Problem**: `momentum-bot` nutzte `bootstrap_pool_cache_from_jetstream` mit `LastPerSubject` und übernahm denselben Consumer — hunderttausende Snapshot-Messages erzeugten JetStream-Backpressure und blockierten die Core-NATS-Verarbeitung trotz priorisierter Strategy-Fixes.  
+**Fix**: Runtime-Consumer mit `DeliverPolicy::New` und durable `momentum-bot-pool-cache-live` (`pool_cache_live_consumer_config`); kein globaler Bootstrap mehr. Offene Positionen triggern bounded/deduped `Ensure*` ControlRequests an `market-data` (Startup + Retry-Tick wenn keine executable Quote).  
+**Dateien**: `src/bin/momentum_bot.rs`, `src/nats/jetstream.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-MOM-STRATEGY-INGEST-2026-05-16: Strategy-Tick vs. Core-NATS-Drain (PR111-Follow-up, PR128 erweitert)
 **Datum**: 2026-05-16 (Follow-up: strikt event-/dirty-getrieben, kein periodischer Hot-Path-Scan)  
 **Problem**: Periodischer Entry-Full-/Safety-Scan über viele TokenTracker hielt `token_trackers` unter Write-Lock und band zusammen mit `MissedTickBehavior::Burst` auf dem 500-ms-Strategy-Intervall den Core-NATS-Ingest; Momentum verarbeitete nur noch niedrige zweistellige Events/s trotz schnellem `process_market_event`. Auch ein **budgetierter** periodischer Scan bleibt Hot-Path-Scheduler-Zeit und kann NATS-Drain erneut verdrängen (Regression-Klasse wie PR121).  

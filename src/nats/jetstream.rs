@@ -352,6 +352,23 @@ pub fn slave_consumer_config() -> jetstream::consumer::pull::Config {
     }
 }
 
+/// Consumer config for live `POOL_CACHE` updates only (`DeliverPolicy::New`).
+///
+/// Used by **momentum-bot** so the runtime does not replay the per-subject last snapshot for every
+/// pool in the stream (hundreds of thousands of messages). Cold-path tools (execution-engine,
+/// `sell_all_keyless`, arb-strategy known-pools bootstrap) continue to use
+/// `slave_consumer_config` / `pool_cache_sync::bootstrap_pool_cache_from_jetstream`.
+pub fn pool_cache_live_consumer_config() -> jetstream::consumer::pull::Config {
+    jetstream::consumer::pull::Config {
+        deliver_policy: jetstream::consumer::DeliverPolicy::New,
+        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+        durable_name: Some("momentum-bot-pool-cache-live".to_string()),
+        max_ack_pending: 1000,
+        filter_subject: "ironcrab.pool_cache.>".to_string(),
+        ..Default::default()
+    }
+}
+
 /// Consumer config for wallet snapshot recovery (LastPerSubject)
 pub fn wallet_snapshot_consumer_config() -> jetstream::consumer::pull::Config {
     jetstream::consumer::pull::Config {
@@ -409,5 +426,25 @@ mod tests {
     #[test]
     fn test_stream_name() {
         assert_eq!(STREAM_NAME, "POOL_CACHE");
+    }
+
+    #[test]
+    fn pool_cache_live_consumer_uses_new_deliver_policy() {
+        let live = pool_cache_live_consumer_config();
+        assert!(matches!(
+            live.deliver_policy,
+            jetstream::consumer::DeliverPolicy::New
+        ));
+        assert_eq!(
+            live.durable_name.as_deref(),
+            Some("momentum-bot-pool-cache-live")
+        );
+        assert_eq!(live.filter_subject, "ironcrab.pool_cache.>");
+
+        let slave = slave_consumer_config();
+        assert!(matches!(
+            slave.deliver_policy,
+            jetstream::consumer::DeliverPolicy::LastPerSubject
+        ));
     }
 }
