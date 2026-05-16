@@ -46,14 +46,15 @@ use ironcrab::ipc::{
     NATIVE_SOL_MINT,
 };
 use ironcrab::metrics::{
-    record_momentum_core_market_events_ingest_drain_batch,
+    momentum_event_ts_latency_delta_ms, record_momentum_core_market_events_ingest_drain_batch,
     record_momentum_core_market_events_processed_kind,
     record_momentum_core_market_events_received_kind, record_momentum_full_scan_signal_eval_us,
     record_momentum_ingest_to_process_us, record_momentum_market_events_last_applied_slot,
     record_momentum_market_events_subscription_max_dequeued_slot,
     record_momentum_nats_batch_prepare_us, record_momentum_signal_eval_us, serve_metrics,
-    set_readiness_nats_connected, try_record_momentum_event_to_ingest_ms,
-    try_record_momentum_event_to_intent_publish_ms,
+    set_momentum_bot_process_start_unix_sec,
+    set_momentum_market_events_ingest_max_wall_lag_ms_last_batch, set_readiness_nats_connected,
+    try_record_momentum_event_to_ingest_ms, try_record_momentum_event_to_intent_publish_ms,
     try_record_momentum_jetstream_poolcache_event_to_ingest_ms, wall_clock_unix_ms_now,
     MetricsComponent, EXITS_GENERATED_TOTAL, FILTER_PASSED_TOTAL, FILTER_REJECTED_BUYER_QUALITY,
     FILTER_REJECTED_DEV_BEHAVIOR, FILTER_REJECTED_INFLOW, FILTER_REJECTED_LIQUIDITY,
@@ -111,6 +112,20 @@ const ORPHANED_RECOVERED_INTENT_IDS_CAP: usize = 50_000;
 /// `sd_notify(READY)` is sent only after this probe (see main loop startup) so systemd
 /// `WatchdogSec` in `docs/systemd/momentum-bot.service` does not elapse during the wait.
 const MOMENTUM_MARKET_EVENTS_FIRST_MSG_FALLBACK: Duration = Duration::from_secs(30);
+
+/// JetStream publish / other failures still re-queue dirty evaluation; PumpFun missing creator does not.
+const ERR_PUMPFUN_MISSING_CREATOR_BUY: &str =
+    "cannot generate pumpfun intent: missing dev_wallet/creator";
+
+#[inline]
+fn err_chain_contains_pumpfun_missing_creator_buy(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.to_string().contains(ERR_PUMPFUN_MISSING_CREATOR_BUY))
+}
+
+/// Yield + watchdog ping every N Core NATS events so long ingest batches cannot starve
+/// `tokio::select!` (WatchdogSec / activity) for tens of seconds.
+const CORE_MARKET_EVENTS_INGEST_COOPERATIVE_YIELD_INTERVAL: usize = 32;
 
 // --- Scope C (momentum event lifecycle): bounded ExecutionResult drains + observability ---
 /// Max `ExecutionResult` messages per `tokio::select!` activation (fairness vs MarketEvent / PoolCache).
@@ -2545,6 +2560,8 @@ struct MomentumContext {
     tracker_keys_by_mint: parking_lot::RwLock<HashMap<String, BTreeSet<String>>>,
     /// Tracker rows that need entry evaluation on the next strategy tick(s).
     dirty_entry_tracker_keys: parking_lot::RwLock<BTreeSet<String>>,
+    /// Pool-scoped (`mint\x1fpool`) cooldown after PumpFun BUY failed: missing creator — avoids dirty→signal hot loop (I‑12).
+    pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock<HashMap<String, Instant>>,
     /// Increments each strategy tick; drives periodic full entry scan.
     entry_signal_eval_tick: std::sync::atomic::AtomicU64,
     /// Position trackers for exit strategy (mint -> position)
@@ -2895,9 +2912,13 @@ impl MomentumContext {
     }
 
     /// After `check_for_signals*` advanced a tracker to `ProbeBuyPending` / `ScaleInPending` but
-    /// intent generation or publish failed: revert to an evaluable state and re-queue entry
+    /// intent generation or publish failed: revert to an evaluable state and optionally re-queue entry
     /// evaluation for this mint (all pools) so siblings are not blocked by a stuck `*Pending` row.
-    pub(crate) fn unwind_stale_entry_pending_after_publish_failure(&self, signal: &EntrySignal) {
+    pub(crate) fn unwind_stale_entry_pending_after_publish_failure(
+        &self,
+        signal: &EntrySignal,
+        requeue_dirty: bool,
+    ) {
         let sk = Self::tracker_storage_key(&signal.mint, &signal.pool);
         let mut trackers = self.token_trackers.write();
         if let Some(tr) = trackers.get_mut(&sk) {
@@ -2917,7 +2938,39 @@ impl MomentumContext {
             }
         }
         drop(trackers);
-        self.mark_entry_eval_dirty_for_mint(&signal.mint);
+        if requeue_dirty {
+            self.mark_entry_eval_dirty_for_mint(&signal.mint);
+        }
+    }
+
+    /// After PumpFun BUY failed for missing creator: suppress entry re-eval for this pool row until cooldown or dev info.
+    pub(crate) fn pumpfun_buy_missing_creator_suppress_arm_key(&self, mint: &str, pool: &str) {
+        const COOLDOWN: Duration = Duration::from_secs(45);
+        let k = Self::tracker_storage_key(mint, pool);
+        self.pumpfun_buy_missing_creator_suppress_until
+            .write()
+            .insert(k, Instant::now() + COOLDOWN);
+    }
+
+    pub(crate) fn pumpfun_buy_missing_creator_suppress_clear_for_mint(&self, mint: &str) {
+        let prefix = format!("{mint}\x1f");
+        self.pumpfun_buy_missing_creator_suppress_until
+            .write()
+            .retain(|k, _| !k.starts_with(&prefix));
+    }
+
+    /// True while pool-scoped PumpFun creator-missing BUY suppress is active (expires lazily on check).
+    fn pumpfun_buy_missing_creator_suppress_active_key(&self, key: &str) -> bool {
+        let mut m = self.pumpfun_buy_missing_creator_suppress_until.write();
+        let now = Instant::now();
+        match m.get(key) {
+            Some(until) if *until > now => true,
+            Some(_) => {
+                m.remove(key);
+                false
+            }
+            None => false,
+        }
     }
 
     /// Same-mint tracker keys for hot-path reads; falls back to a mint-only map scan if the index
@@ -3369,6 +3422,7 @@ impl MomentumContext {
                         t.set_dev_info(cache, 0.0, &config);
                     }
                 }
+                self.pumpfun_buy_missing_creator_suppress_clear_for_mint(mint);
                 self.mark_entry_eval_dirty_for_mint(mint);
                 cache_creator
             }
@@ -3890,6 +3944,7 @@ impl MomentumContext {
                 self.record_token_blacklisted_once(mint);
             }
         }
+        self.pumpfun_buy_missing_creator_suppress_clear_for_mint(mint);
         self.mark_entry_eval_dirty_for_mint(mint);
         // A.2: Also update position creator when dex is pumpfun (for BC-SELL after restart)
         {
@@ -4084,6 +4139,14 @@ impl MomentumContext {
                 None => continue,
                 Some(t) if t.is_entry_complete() => continue,
                 Some(_) => {}
+            }
+
+            if self.pumpfun_buy_missing_creator_suppress_active_key(key) {
+                if let Some(t) = trackers.get(key) {
+                    if t.dex == "pumpfun" && t.dev_wallet.is_none() {
+                        continue;
+                    }
+                }
             }
 
             let (this_pool, dex_for_migration) = match trackers.get(key) {
@@ -7364,6 +7427,9 @@ async fn main() -> Result<()> {
         metrics_port = args.metrics_port,
         "Starting momentum-bot service"
     );
+    if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        set_momentum_bot_process_start_unix_sec(d.as_secs());
+    }
 
     // Start metrics server
     let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
@@ -7590,6 +7656,7 @@ async fn main() -> Result<()> {
         token_trackers: parking_lot::RwLock::new(HashMap::new()),
         tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
         dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+        pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
         entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
         positions: parking_lot::RwLock::new(recovered_positions),
         pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -8007,9 +8074,10 @@ async fn main() -> Result<()> {
     let mut events_received: u64 = 0;
     let mut last_slot: u64 = 0;
 
-    // Graceful shutdown handling
-    let shutdown = tokio::signal::ctrl_c();
-    tokio::pin!(shutdown);
+    // Graceful shutdown: `ctrl_c` listens for SIGINT. For systemd, set `KillSignal=SIGINT` in the
+    // unit file so `systemctl stop` delivers SIGINT and this path runs (JSONL flush).
+    let shutdown_sigint = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown_sigint);
 
     // Defer READY until after NATS setup (including momentum first-message probe). With
     // Type=notify + WatchdogSec, READY starts the watchdog; the probe can block ~30s without
@@ -8033,8 +8101,12 @@ async fn main() -> Result<()> {
                 let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
             }
 
-            _ = &mut shutdown => {
-                info!("Shutdown signal received");
+            _ = &mut shutdown_sigint => {
+                info!(
+                    run_id = %run_id,
+                    signal = "SIGINT",
+                    "momentum-bot controlled shutdown (use KillSignal=SIGINT in systemd for graceful stop)"
+                );
                 break;
             }
 
@@ -8120,7 +8192,8 @@ async fn main() -> Result<()> {
                             .min(u128::from(u64::MAX)) as u64,
                     );
 
-                    for event in events_to_run {
+                    let mut max_ingest_wall_lag_ms: u64 = 0;
+                    for (idx, event) in events_to_run.into_iter().enumerate() {
                         let kind_lbl = momentum_core_market_event_kind_core_nats_label(&event.kind);
                         record_momentum_core_market_events_received_kind(kind_lbl);
                         let event_slot = event.slot;
@@ -8144,6 +8217,11 @@ async fn main() -> Result<()> {
                         // necessarily momentum backlog. JetStream pool-cache lag is tracked separately
                         // via `try_record_momentum_jetstream_poolcache_event_to_ingest_ms`.
                         try_record_momentum_event_to_ingest_ms(now_ms, event.header.ts_unix_ms);
+                        if let Some(ms) =
+                            momentum_event_ts_latency_delta_ms(now_ms, event.header.ts_unix_ms)
+                        {
+                            max_ingest_wall_lag_ms = max_ingest_wall_lag_ms.max(ms);
+                        }
                         let ingest_t0 = Instant::now();
                         match process_market_event(&ctx, &event, true).await {
                             Ok(need_exit) => {
@@ -8201,7 +8279,18 @@ async fn main() -> Result<()> {
                             );
                         }
 
+                        if (idx + 1).rem_euclid(CORE_MARKET_EVENTS_INGEST_COOPERATIVE_YIELD_INTERVAL)
+                            == 0
+                        {
+                            #[cfg(unix)]
+                            {
+                                let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
+                            }
+                            tokio::task::yield_now().await;
+                        }
                     }
+
+                    set_momentum_market_events_ingest_max_wall_lag_ms_last_batch(max_ingest_wall_lag_ms);
 
                     record_momentum_core_market_events_ingest_drain_batch(drain_count, effective_cap);
 
@@ -8216,7 +8305,7 @@ async fn main() -> Result<()> {
                     // Return to the scheduler so other `select!` arms (strategy ticks, etc.) get poll slots.
                     tokio::task::yield_now().await;
                 }
-            }
+            },
 
             // P1: Handle Control Commands (manual position cleanup, etc.)
             msg = async {
@@ -8652,6 +8741,7 @@ async fn main() -> Result<()> {
         }
     }
 
+    info!(run_id = %run_id, "momentum-bot main loop ended; flushing JSONL");
     // Flush JSONL on shutdown
     ctx.jsonl_writer.flush()?;
     info!(run_id = %run_id, "momentum-bot shutdown complete");
@@ -8666,9 +8756,21 @@ async fn generate_and_publish_buy_intent(
 ) -> Result<()> {
     let intent_id = ctx.next_intent_id();
     let result = generate_and_publish_buy_intent_inner(ctx, signal, &intent_id).await;
-    if result.is_err() {
+    if let Err(ref e) = result {
         ctx.pending_intents.write().remove(&intent_id);
-        ctx.unwind_stale_entry_pending_after_publish_failure(signal);
+        let requeue_dirty = !err_chain_contains_pumpfun_missing_creator_buy(e);
+        ctx.unwind_stale_entry_pending_after_publish_failure(signal, requeue_dirty);
+        if !requeue_dirty {
+            ctx.pumpfun_buy_missing_creator_suppress_arm_key(&signal.mint, &signal.pool);
+            ironcrab::metrics::record_momentum_entry_buy_suppressed_missing_creator();
+            warn!(
+                mint = %signal.mint,
+                pool = %signal.pool,
+                reason = "ENTRY_BUY_DEFERRED_MISSING_CREATOR",
+                cooldown_secs = 45_u64,
+                "PumpFun BUY deferred: missing dev_wallet/creator — bounded suppress (no immediate dirty re-queue)"
+            );
+        }
     }
     result
 }
@@ -8933,9 +9035,8 @@ async fn generate_and_publish_buy_intent_inner(
     }
 
     if effective_dex == "pumpfun" {
-        let creator = creator_opt.ok_or_else(|| {
-            anyhow::anyhow!("cannot generate pumpfun intent: missing dev_wallet/creator")
-        })?;
+        let creator =
+            creator_opt.ok_or_else(|| anyhow::anyhow!(ERR_PUMPFUN_MISSING_CREATOR_BUY))?;
         intent.metadata.insert("creator".to_string(), creator);
     } else if let Some(creator) = creator_opt {
         intent.metadata.insert("creator".to_string(), creator);
@@ -9586,6 +9687,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
             entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -10089,14 +10191,17 @@ mod tests {
                 sent_at: Instant::now(),
             };
         }
-        ctx.unwind_stale_entry_pending_after_publish_failure(&EntrySignal {
-            mint: mint.to_string(),
-            pool: pool.to_string(),
-            dex: "raydium".to_string(),
-            sol_amount: 1,
-            kind: EntryKind::Probe,
-            reason: "t".to_string(),
-        });
+        ctx.unwind_stale_entry_pending_after_publish_failure(
+            &EntrySignal {
+                mint: mint.to_string(),
+                pool: pool.to_string(),
+                dex: "raydium".to_string(),
+                sol_amount: 1,
+                kind: EntryKind::Probe,
+                reason: "t".to_string(),
+            },
+            true,
+        );
         {
             let trackers = ctx.token_trackers.read();
             assert!(matches!(
@@ -10112,14 +10217,17 @@ mod tests {
                 sent_at: Instant::now(),
             };
         }
-        ctx.unwind_stale_entry_pending_after_publish_failure(&EntrySignal {
-            mint: mint.to_string(),
-            pool: pool.to_string(),
-            dex: "raydium".to_string(),
-            sol_amount: 1,
-            kind: EntryKind::ScaleIn,
-            reason: "t".to_string(),
-        });
+        ctx.unwind_stale_entry_pending_after_publish_failure(
+            &EntrySignal {
+                mint: mint.to_string(),
+                pool: pool.to_string(),
+                dex: "raydium".to_string(),
+                sol_amount: 1,
+                kind: EntryKind::ScaleIn,
+                reason: "t".to_string(),
+            },
+            true,
+        );
         let trackers = ctx.token_trackers.read();
         assert!(matches!(
             trackers.get(&sk).unwrap().state,
@@ -10654,6 +10762,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
             entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -10718,6 +10827,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
             entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -10959,6 +11069,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
             entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -12030,6 +12141,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
             entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -12147,6 +12259,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
             entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -12232,6 +12345,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
             entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -12305,6 +12419,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
             entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -12390,6 +12505,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
             entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -12506,6 +12622,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
             entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -12615,6 +12732,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
             entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -12709,6 +12827,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
             entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -12781,6 +12900,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
             entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -12845,6 +12965,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
             entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -13373,6 +13494,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
             entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -13507,6 +13629,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
+            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
             entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),

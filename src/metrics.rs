@@ -213,6 +213,9 @@ fn parse_csv_line(line: &str) -> Option<RecentTrade> {
 // --- market-data service metrics ---
 pub static MARKET_EVENTS_RECEIVED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MARKET_EVENTS_PUBLISHED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Successful publishes to `ironcrab.v1.market_events.momentum` (market-data only).
+pub static MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static POOLS_DISCOVERED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static POOLS_TRACKED_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TOKENS_TRACKED_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -366,6 +369,34 @@ pub static MOMENTUM_CORE_MARKET_EVENTS_INGEST_DRAIN_CAP_HIT_TOTAL: Lazy<AtomicU6
 /// Consecutive ingest batches that hit the drain cap (resets on a non-cap batch). Drives adaptive cap.
 pub static MOMENTUM_CORE_MARKET_EVENTS_INGEST_CONSECUTIVE_CAP_HIT_STREAK: Lazy<AtomicU32> =
     Lazy::new(|| AtomicU32::new(0));
+
+/// Max `producer_ts → ingest` wall lag (ms) observed in the **last completed** Core NATS ingest batch
+/// (after flatten/coalesce). Complements `momentum_market_events_internal_slot_delta_slots`, which
+/// can stay near zero while this gauge shows multi‑second/minute backlog.
+pub static MOMENTUM_MARKET_EVENTS_INGEST_MAX_WALL_LAG_MS_LAST_BATCH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// `UNIX_EPOCH` seconds when momentum-bot main set the gauge (0 before first set).
+pub static MOMENTUM_BOT_PROCESS_START_UNIX_SEC: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// PumpFun BUY suppressed: missing creator/dev_wallet after bounded unwind (I‑12 / hot‑path fairness).
+pub static MOMENTUM_ENTRY_BUY_SUPPRESSED_MISSING_CREATOR_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn set_momentum_market_events_ingest_max_wall_lag_ms_last_batch(ms: u64) {
+    MOMENTUM_MARKET_EVENTS_INGEST_MAX_WALL_LAG_MS_LAST_BATCH.store(ms, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_momentum_bot_process_start_unix_sec(sec: u64) {
+    MOMENTUM_BOT_PROCESS_START_UNIX_SEC.store(sec, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_momentum_entry_buy_suppressed_missing_creator() {
+    MOMENTUM_ENTRY_BUY_SUPPRESSED_MISSING_CREATOR_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
 
 // Per-kind counters (static label keys via metric name — no dynamic labels).
 pub static MOMENTUM_CORE_MARKET_EVENTS_RECV_TRADE_TOTAL: Lazy<AtomicU64> =
@@ -1438,6 +1469,10 @@ async fn metrics_response() -> Response<Body> {
         MARKET_EVENTS_PUBLISHED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
+        "market_events_momentum_fanout_published_total",
+        MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
         "pools_discovered_total",
         POOLS_DISCOVERED_TOTAL.load(Ordering::Relaxed)
     );
@@ -1529,6 +1564,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "momentum_market_events_internal_slot_delta_slots",
         momentum_internal_subscription_slot_delta_saturating(max_dequeued_slot, last_applied_slot)
+    );
+    line!(
+        "momentum_market_events_ingest_max_wall_lag_ms_last_batch",
+        MOMENTUM_MARKET_EVENTS_INGEST_MAX_WALL_LAG_MS_LAST_BATCH.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_bot_process_start_unix_seconds",
+        MOMENTUM_BOT_PROCESS_START_UNIX_SEC.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_entry_buy_suppressed_missing_creator_total",
+        MOMENTUM_ENTRY_BUY_SUPPRESSED_MISSING_CREATOR_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "momentum_core_market_events_ingest_consecutive_cap_hit_streak",

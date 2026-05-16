@@ -46,8 +46,9 @@ use ironcrab::ipc::{
 use ironcrab::metrics::{
     serve_metrics, set_readiness_control_sub_active, set_readiness_mode,
     set_readiness_nats_connected, update_readiness_market_data_current, MetricsComponent,
-    MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
-    NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
+    MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
+    MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
+    POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -192,6 +193,7 @@ pub(crate) async fn publish_market_event_core_and_momentum(
         match nats.publish(TOPIC_MOMENTUM_MARKET_EVENTS, event).await {
             Ok(true) => {
                 NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
             }
             Ok(false) => {
                 warn!(

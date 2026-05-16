@@ -28,6 +28,10 @@ Environment=RUST_LOG=info,momentum_bot=info
 # WICHTIG: Keine Wallet-Keys! momentum-bot exit(1) wenn Keys erkannt werden.
 # Environment=KEYPAIR_PATH=  # NICHT SETZEN!
 
+# Graceful stop: deliver SIGINT so `tokio::signal::ctrl_c` runs and JSONL flushes (SIGTERM in
+# `tokio::select!` caused rustc never-type inference issues in this binary).
+KillSignal=SIGINT
+
 # P1 Crash Isolation: Watchdog for liveness detection
 WatchdogSec=30
 # Restart on failure
