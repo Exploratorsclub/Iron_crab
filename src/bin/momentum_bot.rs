@@ -28,7 +28,7 @@ use clap::Parser;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
@@ -195,6 +195,34 @@ fn core_market_events_ingest_drain_cap_now() -> usize {
 
 /// Periodic full entry scan as safety net if dirty marks were missed (default tick interval 500ms → ~10s).
 const ENTRY_SIGNAL_FULL_SCAN_EVERY_TICKS: u64 = 20;
+/// Max tracker keys per periodic safety-net pass (amortizes CPU + `token_trackers` write-lock time).
+const ENTRY_SIGNAL_FULL_SCAN_KEYS_BUDGET: usize = 48;
+
+/// `prev` = value of `entry_signal_eval_tick` **before** `fetch_add(1)` on a strategy tick.
+#[inline]
+fn entry_signal_periodic_full_scan_gate(prev_tick_before_increment: u64) -> bool {
+    prev_tick_before_increment
+        .wrapping_add(1)
+        .rem_euclid(ENTRY_SIGNAL_FULL_SCAN_EVERY_TICKS)
+        == 0
+}
+
+/// Round-robin bounds for one budgeted full-scan chunk over `n` sorted tracker keys.
+/// Returns `(start_index, chunk_len, next_cursor)` with `chunk_len <= budget.min(n)`.
+#[inline]
+fn entry_full_scan_round_robin_chunk_bounds(
+    n: usize,
+    cursor: usize,
+    budget: usize,
+) -> (usize, usize, usize) {
+    if n == 0 || budget == 0 {
+        return (0, 0, cursor % n.max(1));
+    }
+    let start = cursor % n;
+    let chunk_len = budget.min(n);
+    let next_cursor = (start + chunk_len) % n;
+    (start, chunk_len, next_cursor)
+}
 
 /// WSOL-leg reserve-derived `(token_mint, tokens_per_sol, token_decimals, token_ui, sol_ui)` from `PoolCacheUpdate`.
 type PoolCacheDerivedTps = Option<(String, f64, u8, f64, f64)>;
@@ -2607,6 +2635,10 @@ struct MomentumContext {
     /// K Phase 1: Last event slot/ts for Slot-to-Send Latency propagation
     last_event_slot: std::sync::atomic::AtomicU64,
     last_event_ts_ms: std::sync::atomic::AtomicU64,
+    /// Core NATS ingest last batch filled the adaptive drain cap — defer periodic full entry scan.
+    core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool,
+    /// Round-robin cursor for budgeted periodic entry full-scan safety net.
+    entry_signal_full_scan_cursor: AtomicUsize,
 }
 
 impl MomentumContext {
@@ -4013,31 +4045,12 @@ impl MomentumContext {
         let positions = self.positions.read();
         let pending_buy_index = self.pending_buy_mint_index.read();
         let pending_buy_entries = self.pending_buy_entries.read();
-        let mut trackers = self.token_trackers.write();
 
         let prev = self.entry_signal_eval_tick.fetch_add(1, Ordering::Relaxed);
-        let do_full_scan = prev.wrapping_add(1) % ENTRY_SIGNAL_FULL_SCAN_EVERY_TICKS == 0;
-
-        if do_full_scan {
-            self.dirty_entry_tracker_keys.write().clear();
-            self.refresh_tracker_keys_by_mint_index_from_map(&trackers);
-            let mut tracker_keys: Vec<String> = trackers.keys().cloned().collect();
-            tracker_keys.sort_unstable();
-            let eval_t0 = Instant::now();
-            let signals = self.check_for_signals_eval_sorted_tracker_keys(
-                &config,
-                &mint_infos,
-                &positions,
-                &pending_buy_index,
-                &pending_buy_entries,
-                &mut trackers,
-                &tracker_keys,
-            );
-            record_momentum_full_scan_signal_eval_us(
-                eval_t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-            );
-            return signals;
-        }
+        let periodic_full_scan_gate = entry_signal_periodic_full_scan_gate(prev);
+        let defer_periodic_full_scan = self
+            .core_market_events_ingest_last_batch_hit_drain_cap
+            .load(Ordering::Relaxed);
 
         let mut dirty_keys: Vec<String> = {
             let mut d = self.dirty_entry_tracker_keys.write();
@@ -4047,8 +4060,58 @@ impl MomentumContext {
         };
         dirty_keys.sort_unstable();
         dirty_keys.dedup();
-        dirty_keys.retain(|k| trackers.contains_key(k));
 
+        if periodic_full_scan_gate && !defer_periodic_full_scan {
+            let mut trackers = self.token_trackers.write();
+            dirty_keys.retain(|k| trackers.contains_key(k));
+            self.refresh_tracker_keys_by_mint_index_from_map(&trackers);
+            let mut all_keys: Vec<String> = trackers.keys().cloned().collect();
+            all_keys.sort_unstable();
+            let n = all_keys.len();
+            let chunk_keys: Vec<String> = if n == 0 {
+                vec![]
+            } else {
+                let cursor = self.entry_signal_full_scan_cursor.load(Ordering::Relaxed);
+                let (start, chunk_len, next_cursor) = entry_full_scan_round_robin_chunk_bounds(
+                    n,
+                    cursor,
+                    ENTRY_SIGNAL_FULL_SCAN_KEYS_BUDGET,
+                );
+                self.entry_signal_full_scan_cursor
+                    .store(next_cursor, Ordering::Relaxed);
+                (0..chunk_len)
+                    .map(|i| all_keys[(start + i) % n].clone())
+                    .collect()
+            };
+
+            let mut combined: Vec<String> = dirty_keys;
+            combined.extend(chunk_keys);
+            combined.sort_unstable();
+            combined.dedup();
+            combined.retain(|k| trackers.contains_key(k));
+
+            if combined.is_empty() {
+                return Vec::new();
+            }
+
+            let eval_t0 = Instant::now();
+            let signals = self.check_for_signals_eval_sorted_tracker_keys(
+                &config,
+                &mint_infos,
+                &positions,
+                &pending_buy_index,
+                &pending_buy_entries,
+                &mut trackers,
+                &combined,
+            );
+            record_momentum_full_scan_signal_eval_us(
+                eval_t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+            );
+            return signals;
+        }
+
+        let mut trackers = self.token_trackers.write();
+        dirty_keys.retain(|k| trackers.contains_key(k));
         if dirty_keys.is_empty() {
             return Vec::new();
         }
@@ -7679,6 +7742,8 @@ async fn main() -> Result<()> {
         exits_generated: std::sync::atomic::AtomicU64::new(0),
         last_event_slot: std::sync::atomic::AtomicU64::new(0),
         last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+        core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
+        entry_signal_full_scan_cursor: AtomicUsize::new(0),
     });
 
     // === P0: Wallet snapshot recovery from JetStream ===
@@ -8065,6 +8130,7 @@ async fn main() -> Result<()> {
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     // 500ms fallback when no price updates; primary path is event-driven (PoolCacheUpdate, Trade)
     let mut strategy_interval = tokio::time::interval(std::time::Duration::from_millis(500));
+    strategy_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut activity_interval = tokio::time::interval(std::time::Duration::from_secs(10));
     let mut reconcile_interval = tokio::time::interval(std::time::Duration::from_secs(15));
     let mut execution_result_scheduled_interval =
@@ -8123,12 +8189,12 @@ async fn main() -> Result<()> {
                     std::future::pending::<Option<NatsMessage>>().await
                 }
             } => {
-                if let Some(nats_msg) = msg {
+                let mut nats_msg_opt = msg;
+                use futures::FutureExt;
+                while let Some(nats_msg) = nats_msg_opt.take() {
                     ironcrab::metrics::record_activity();
                     NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     events_received += 1;
-
-                    use futures::FutureExt;
 
                     let effective_cap = core_market_events_ingest_drain_cap_now();
                     let mut raw_chunks: Vec<Vec<u8>> = vec![nats_msg.payload];
@@ -8148,6 +8214,11 @@ async fn main() -> Result<()> {
                     }
 
                     let drain_count = raw_chunks.len();
+                    let drain_hit_cap = drain_count >= effective_cap;
+                    ctx.core_market_events_ingest_last_batch_hit_drain_cap.store(
+                        drain_hit_cap,
+                        Ordering::Relaxed,
+                    );
                     if drain_count > 1 {
                         trace!(
                             momentum_scope_c = "core_market_events_ingest_drain",
@@ -8304,6 +8375,19 @@ async fn main() -> Result<()> {
 
                     // Return to the scheduler so other `select!` arms (strategy ticks, etc.) get poll slots.
                     tokio::task::yield_now().await;
+
+                    nats_msg_opt = if drain_hit_cap {
+                        if let Some(ref mut sub) = subscription {
+                            match sub.next().now_or_never() {
+                                Some(Some(nm)) => Some(nm),
+                                Some(None) | None => None,
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                 }
             },
 
@@ -9710,6 +9794,8 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
+            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         }
     }
 
@@ -10785,6 +10871,8 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
+            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         let mint = "So11111111111111111111111111111111111111112";
@@ -10850,6 +10938,8 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
+            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -11092,6 +11182,8 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
+            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         // Insert a fresh tracker.
@@ -12164,6 +12256,8 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
+            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         // Seed tracker with a last_trade_ratio so intent generation can compute min_out.
@@ -12282,6 +12376,8 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
+            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         // Open a position.
@@ -12368,6 +12464,8 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
+            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         // Open a position.
@@ -12442,6 +12540,8 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
+            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         let now = Instant::now();
@@ -12528,6 +12628,8 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
+            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         });
 
         ctx.register_pool("mintX", "poolX", "raydium", 1);
@@ -12645,6 +12747,8 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
+            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         });
 
         ctx.open_position(OpenPositionParams {
@@ -12755,6 +12859,8 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
+            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         });
 
         ctx.open_position(OpenPositionParams {
@@ -12850,6 +12956,8 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
+            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         // Seed pool registry so reconciliation can pick a pool.
@@ -12923,6 +13031,8 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
+            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         let mint = "TokenMint1111111111111111111111111111111111";
@@ -12988,6 +13098,8 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
+            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         };
 
         let mint = "TokenMint2222222222222222222222222222222222";
@@ -13517,6 +13629,8 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
+            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         });
 
         let mint = "9mR7mmX55n1F56rKBBcfMrRzMoJjaZnSRs6fV1GRpump";
@@ -13652,6 +13766,8 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            core_market_events_ingest_last_batch_hit_drain_cap: AtomicBool::new(false),
+            entry_signal_full_scan_cursor: AtomicUsize::new(0),
         });
 
         let mint = "NoTrkMintttttttttttttttttttttttttttttttttttt";
@@ -14100,6 +14216,24 @@ mod tests {
     }
 
     #[test]
+    fn entry_signal_periodic_full_scan_gate_every_n_ticks() {
+        assert!(!entry_signal_periodic_full_scan_gate(0));
+        assert!(!entry_signal_periodic_full_scan_gate(17));
+        assert!(entry_signal_periodic_full_scan_gate(19));
+    }
+
+    #[test]
+    fn entry_full_scan_round_robin_chunk_bounds_smoke() {
+        let (s, len, next) = entry_full_scan_round_robin_chunk_bounds(10, 8, 48);
+        assert_eq!((s, len, next), (8, 10, 8));
+        let (s2, len2, next2) = entry_full_scan_round_robin_chunk_bounds(5, 3, 2);
+        assert_eq!((s2, len2, next2), (3, 2, 0));
+        let (s3, len3, next3) = entry_full_scan_round_robin_chunk_bounds(0, 9, 10);
+        assert_eq!((s3, len3), (0, 0));
+        assert_eq!(next3, 0);
+    }
+
+    #[test]
     fn exit_signals_after_market_event_skipped_without_positions() {
         assert!(!should_invoke_exit_signals_after_market_event_processing(
             true, false, 0
@@ -14116,6 +14250,64 @@ mod tests {
         assert!(should_invoke_exit_signals_after_market_event_processing(
             true, true, 2
         ));
+    }
+
+    #[test]
+    fn periodic_full_scan_deferred_still_evaluates_dirty_keys() {
+        let cfg = {
+            let mut c = MomentumConfig::default();
+            c.default_position_lamports = 1_000;
+            c.probe_buy_pct = 0.25;
+            c.early_min_liquidity_sol = 0.0;
+            c.min_unique_buyers = 0;
+            c.min_trades_per_sec = 0.0;
+            c.min_buy_dominance = 0.0;
+            c.min_sol_inflow_lamports = 0;
+            c.require_mint_authority_renounced = false;
+            c.require_freeze_authority_none = false;
+            c.top1_buyer_share_cap = 1.0;
+            c.top3_buyer_share_cap = 1.0;
+            c.repeat_buyer_min_ratio = 0.0;
+            c.min_trade_size_lamports = 0;
+            c.small_buy_ratio_cap = 1.0;
+            c
+        };
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "MintDeferScan777777777777777777777777777";
+        let pool = "poolDeferScan777777777777777777777777777";
+        assert!(ctx.get_or_create_tracker(mint, pool, "pumpfun", 1, 30_000_000_000));
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let tr = trackers
+                .get_mut(&MomentumContext::tracker_storage_key(mint, pool))
+                .expect("tracker");
+            for i in 0..20 {
+                tr.record_trade(
+                    &format!("pf{i:03}"),
+                    true,
+                    200_000_000,
+                    2_000_000,
+                    &format!("sig{i:03}"),
+                    &cfg,
+                );
+            }
+        }
+        ctx.dirty_entry_tracker_keys.write().clear();
+        ctx.mark_entry_eval_dirty_key(&MomentumContext::tracker_storage_key(mint, pool));
+        ctx.entry_signal_eval_tick
+            .store(19, std::sync::atomic::Ordering::Relaxed);
+        ctx.core_market_events_ingest_last_batch_hit_drain_cap
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let signals = ctx.check_for_signals_dirty_priority_tick();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].pool, pool);
     }
 
     #[test]
