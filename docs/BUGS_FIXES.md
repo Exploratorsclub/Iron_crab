@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-MOM-STRATEGY-INGEST-2026-05-16: Strategy-Tick vs. Core-NATS-Drain (PR111-Follow-up, PR128 erweitert)
+**Datum**: 2026-05-16 (Follow-up: strikt event-/dirty-getrieben, kein periodischer Hot-Path-Scan)  
+**Problem**: Periodischer Entry-Full-/Safety-Scan über viele TokenTracker hielt `token_trackers` unter Write-Lock und band zusammen mit `MissedTickBehavior::Burst` auf dem 500-ms-Strategy-Intervall den Core-NATS-Ingest; Momentum verarbeitete nur noch niedrige zweistellige Events/s trotz schnellem `process_market_event`. Auch ein **budgetierter** periodischer Scan bleibt Hot-Path-Scheduler-Zeit und kann NATS-Drain erneut verdrängen (Regression-Klasse wie PR121).  
+**Fix**: (1) `strategy_interval` mit `MissedTickBehavior::Skip`. (2) **Kein** periodischer Entry-Scan mehr im Live-Hot-Path — `check_for_signals_dirty_priority_tick` wertet **ausschließlich** explizit dirty-markierte Pool-Tracker aus; leeres Dirty-Set → sofortiger Return. (3) Nach gesättigtem Core-NATS-Batch (`drain_count == effective_cap`) weiterhin optional sofort nächste Nachricht in derselben `select!`-Aktivierung ziehen (Drain-Priorität). Korrektheit über vollständiges `mark_entry_eval_dirty_*` auf den MarketEvent-/State-Pfaden, nicht über einen Scan-Ersatz.  
+**Dateien**: `src/bin/momentum_bot.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-MOM-NATS-FAIRNESS: Momentum Core-NATS MarketEvents Slow-Consumer-Stall
 **Datum**: 2026-05-13  
 **Problem**: In `momentum_bot` verarbeitete der `tokio::select!`-Hauptloop pro Aktivierung praktisch nur **eine** Core-NATS-MarketEvent-Nachricht (außer kleinen `BondingCurveProgress`-Streaks per `now_or_never`), während JetStream-Arme (PoolCache, Wallet-Snapshots) große Batches und der 500-ms-Strategy-Tick viel CPU banden. Folge: Client-Buffer wächst, `async_nats` meldet massenhaft Slow-Consumer, `last_slot`/Ingest stagnieren.  

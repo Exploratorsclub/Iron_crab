@@ -48,8 +48,8 @@ use ironcrab::ipc::{
 use ironcrab::metrics::{
     momentum_event_ts_latency_delta_ms, record_momentum_core_market_events_ingest_drain_batch,
     record_momentum_core_market_events_processed_kind,
-    record_momentum_core_market_events_received_kind, record_momentum_full_scan_signal_eval_us,
-    record_momentum_ingest_to_process_us, record_momentum_market_events_last_applied_slot,
+    record_momentum_core_market_events_received_kind, record_momentum_ingest_to_process_us,
+    record_momentum_market_events_last_applied_slot,
     record_momentum_market_events_subscription_max_dequeued_slot,
     record_momentum_nats_batch_prepare_us, record_momentum_signal_eval_us, serve_metrics,
     set_momentum_bot_process_start_unix_sec,
@@ -192,9 +192,6 @@ fn core_market_events_ingest_drain_cap_now() -> usize {
         .load(Ordering::Relaxed);
     core_market_events_ingest_drain_cap_for_streak(streak)
 }
-
-/// Periodic full entry scan as safety net if dirty marks were missed (default tick interval 500ms → ~10s).
-const ENTRY_SIGNAL_FULL_SCAN_EVERY_TICKS: u64 = 20;
 
 /// WSOL-leg reserve-derived `(token_mint, tokens_per_sol, token_decimals, token_ui, sol_ui)` from `PoolCacheUpdate`.
 type PoolCacheDerivedTps = Option<(String, f64, u8, f64, f64)>;
@@ -2562,8 +2559,6 @@ struct MomentumContext {
     dirty_entry_tracker_keys: parking_lot::RwLock<BTreeSet<String>>,
     /// Pool-scoped (`mint\x1fpool`) cooldown after PumpFun BUY failed: missing creator — avoids dirty→signal hot loop (I‑12).
     pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock<HashMap<String, Instant>>,
-    /// Increments each strategy tick; drives periodic full entry scan.
-    entry_signal_eval_tick: std::sync::atomic::AtomicU64,
     /// Position trackers for exit strategy (mint -> position)
     positions: parking_lot::RwLock<HashMap<String, PositionTracker>>,
     /// Pending intents awaiting execution results (intent_id -> PendingIntent)
@@ -4005,39 +4000,9 @@ impl MomentumContext {
         )
     }
 
-    /// Strategy tick: evaluate dirty tracker rows first; periodic full scan as safety net.
+    /// Strategy tick: evaluate **only** pool-scoped tracker rows marked dirty (event-driven entry path).
     fn check_for_signals_dirty_priority_tick(&self) -> Vec<EntrySignal> {
         self.prune_stale_pending_buy_mint_index();
-        let config = self.config.read().clone();
-        let mint_infos = self.mint_infos.read();
-        let positions = self.positions.read();
-        let pending_buy_index = self.pending_buy_mint_index.read();
-        let pending_buy_entries = self.pending_buy_entries.read();
-        let mut trackers = self.token_trackers.write();
-
-        let prev = self.entry_signal_eval_tick.fetch_add(1, Ordering::Relaxed);
-        let do_full_scan = prev.wrapping_add(1) % ENTRY_SIGNAL_FULL_SCAN_EVERY_TICKS == 0;
-
-        if do_full_scan {
-            self.dirty_entry_tracker_keys.write().clear();
-            self.refresh_tracker_keys_by_mint_index_from_map(&trackers);
-            let mut tracker_keys: Vec<String> = trackers.keys().cloned().collect();
-            tracker_keys.sort_unstable();
-            let eval_t0 = Instant::now();
-            let signals = self.check_for_signals_eval_sorted_tracker_keys(
-                &config,
-                &mint_infos,
-                &positions,
-                &pending_buy_index,
-                &pending_buy_entries,
-                &mut trackers,
-                &tracker_keys,
-            );
-            record_momentum_full_scan_signal_eval_us(
-                eval_t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-            );
-            return signals;
-        }
 
         let mut dirty_keys: Vec<String> = {
             let mut d = self.dirty_entry_tracker_keys.write();
@@ -4047,8 +4012,18 @@ impl MomentumContext {
         };
         dirty_keys.sort_unstable();
         dirty_keys.dedup();
-        dirty_keys.retain(|k| trackers.contains_key(k));
+        if dirty_keys.is_empty() {
+            return Vec::new();
+        }
 
+        let config = self.config.read().clone();
+        let mint_infos = self.mint_infos.read();
+        let positions = self.positions.read();
+        let pending_buy_index = self.pending_buy_mint_index.read();
+        let pending_buy_entries = self.pending_buy_entries.read();
+
+        let mut trackers = self.token_trackers.write();
+        dirty_keys.retain(|k| trackers.contains_key(k));
         if dirty_keys.is_empty() {
             return Vec::new();
         }
@@ -7657,7 +7632,6 @@ async fn main() -> Result<()> {
         tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
         dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
         pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-        entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
         positions: parking_lot::RwLock::new(recovered_positions),
         pending_intents: parking_lot::RwLock::new(HashMap::new()),
         latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -8065,6 +8039,7 @@ async fn main() -> Result<()> {
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     // 500ms fallback when no price updates; primary path is event-driven (PoolCacheUpdate, Trade)
     let mut strategy_interval = tokio::time::interval(std::time::Duration::from_millis(500));
+    strategy_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut activity_interval = tokio::time::interval(std::time::Duration::from_secs(10));
     let mut reconcile_interval = tokio::time::interval(std::time::Duration::from_secs(15));
     let mut execution_result_scheduled_interval =
@@ -8123,12 +8098,12 @@ async fn main() -> Result<()> {
                     std::future::pending::<Option<NatsMessage>>().await
                 }
             } => {
-                if let Some(nats_msg) = msg {
+                let mut nats_msg_opt = msg;
+                use futures::FutureExt;
+                while let Some(nats_msg) = nats_msg_opt.take() {
                     ironcrab::metrics::record_activity();
                     NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     events_received += 1;
-
-                    use futures::FutureExt;
 
                     let effective_cap = core_market_events_ingest_drain_cap_now();
                     let mut raw_chunks: Vec<Vec<u8>> = vec![nats_msg.payload];
@@ -8148,6 +8123,7 @@ async fn main() -> Result<()> {
                     }
 
                     let drain_count = raw_chunks.len();
+                    let drain_hit_cap = drain_count >= effective_cap;
                     if drain_count > 1 {
                         trace!(
                             momentum_scope_c = "core_market_events_ingest_drain",
@@ -8304,6 +8280,19 @@ async fn main() -> Result<()> {
 
                     // Return to the scheduler so other `select!` arms (strategy ticks, etc.) get poll slots.
                     tokio::task::yield_now().await;
+
+                    nats_msg_opt = if drain_hit_cap {
+                        if let Some(ref mut sub) = subscription {
+                            match sub.next().now_or_never() {
+                                Some(Some(nm)) => Some(nm),
+                                Some(None) | None => None,
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                 }
             },
 
@@ -9688,7 +9677,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -9984,8 +9972,6 @@ mod tests {
         ctx.dirty_entry_tracker_keys.write().clear();
         let hot_key = MomentumContext::tracker_storage_key(mint, pool_hot);
         ctx.mark_entry_eval_dirty_key(&hot_key);
-        ctx.entry_signal_eval_tick
-            .store(17, std::sync::atomic::Ordering::Relaxed);
 
         let signals = ctx.check_for_signals_dirty_priority_tick();
         assert_eq!(signals.len(), 1);
@@ -10009,8 +9995,6 @@ mod tests {
         }
         ctx.dirty_entry_tracker_keys.write().clear();
         ctx.mark_entry_eval_dirty_key(&MomentumContext::tracker_storage_key(mint, pool_cold));
-        ctx.entry_signal_eval_tick
-            .store(17, std::sync::atomic::Ordering::Relaxed);
 
         let signals_cold_only = ctx.check_for_signals_dirty_priority_tick();
         assert!(
@@ -10074,8 +10058,6 @@ mod tests {
         ctx.dirty_entry_tracker_keys.write().clear();
         ctx.mark_entry_eval_dirty_key(&MomentumContext::tracker_storage_key(mint, pool_first));
         ctx.mark_entry_eval_dirty_key(&MomentumContext::tracker_storage_key(mint, pool_second));
-        ctx.entry_signal_eval_tick
-            .store(17, std::sync::atomic::Ordering::Relaxed);
 
         let signals = ctx.check_for_signals_dirty_priority_tick();
         assert_eq!(signals.len(), 1);
@@ -10763,7 +10745,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -10828,7 +10809,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -11070,7 +11050,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12142,7 +12121,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12260,7 +12238,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12346,7 +12323,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12420,7 +12396,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12506,7 +12481,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12623,7 +12597,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12733,7 +12706,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12828,7 +12800,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12901,7 +12872,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -12966,7 +12936,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -13495,7 +13464,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -13630,7 +13598,6 @@ mod tests {
             tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
             dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
             pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            entry_signal_eval_tick: std::sync::atomic::AtomicU64::new(0),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
@@ -14100,6 +14067,18 @@ mod tests {
     }
 
     #[test]
+    fn strategy_entry_tick_returns_empty_without_dirty_markers() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        assert!(
+            ctx.check_for_signals_dirty_priority_tick().is_empty(),
+            "no periodic fallback: empty dirty set must not evaluate trackers"
+        );
+    }
+
+    #[test]
     fn exit_signals_after_market_event_skipped_without_positions() {
         assert!(!should_invoke_exit_signals_after_market_event_processing(
             true, false, 0
@@ -14116,6 +14095,60 @@ mod tests {
         assert!(should_invoke_exit_signals_after_market_event_processing(
             true, true, 2
         ));
+    }
+
+    #[test]
+    fn strategy_entry_tick_evaluates_only_explicitly_dirty_tracker() {
+        let cfg = {
+            let mut c = MomentumConfig::default();
+            c.default_position_lamports = 1_000;
+            c.probe_buy_pct = 0.25;
+            c.early_min_liquidity_sol = 0.0;
+            c.min_unique_buyers = 0;
+            c.min_trades_per_sec = 0.0;
+            c.min_buy_dominance = 0.0;
+            c.min_sol_inflow_lamports = 0;
+            c.require_mint_authority_renounced = false;
+            c.require_freeze_authority_none = false;
+            c.top1_buyer_share_cap = 1.0;
+            c.top3_buyer_share_cap = 1.0;
+            c.repeat_buyer_min_ratio = 0.0;
+            c.min_trade_size_lamports = 0;
+            c.small_buy_ratio_cap = 1.0;
+            c
+        };
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "MintDeferScan777777777777777777777777777";
+        let pool = "poolDeferScan777777777777777777777777777";
+        assert!(ctx.get_or_create_tracker(mint, pool, "pumpfun", 1, 30_000_000_000));
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let tr = trackers
+                .get_mut(&MomentumContext::tracker_storage_key(mint, pool))
+                .expect("tracker");
+            for i in 0..20 {
+                tr.record_trade(
+                    &format!("pf{i:03}"),
+                    true,
+                    200_000_000,
+                    2_000_000,
+                    &format!("sig{i:03}"),
+                    &cfg,
+                );
+            }
+        }
+        ctx.dirty_entry_tracker_keys.write().clear();
+        ctx.mark_entry_eval_dirty_key(&MomentumContext::tracker_storage_key(mint, pool));
+
+        let signals = ctx.check_for_signals_dirty_priority_tick();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].pool, pool);
     }
 
     #[test]
