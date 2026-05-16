@@ -8394,9 +8394,6 @@ async fn main() -> Result<()> {
                                                 if let MarketEventKind::WalletBalanceSnapshot { .. } =
                                                     &event.kind
                                                 {
-                                                    if let Some(s) = event.slot {
-                                                        record_momentum_market_events_subscription_max_dequeued_slot(s);
-                                                    }
                                                     let ingest_t0 = Instant::now();
                                                     match process_market_event(&ctx, &event).await {
                                                         Ok(need_exit) => {
