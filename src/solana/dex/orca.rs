@@ -306,6 +306,70 @@ impl Orca {
         None
     }
 
+    /// Cold-path only: verifies the three Whirlpool tick-array PDAs used by
+    /// [`Self::build_swap_ix_async`] exist on-chain (same derivation when using cached tick data).
+    ///
+    /// Intended for liquidation / kill-switch multi-pool routing — **not** for hot-path callers
+    /// (I-7). May perform one batched `get_multiple_accounts` (same shape as swap build validation).
+    pub async fn cold_path_validate_whirlpool_tick_arrays_for_pool_swap(
+        &self,
+        pool_id: &Pubkey,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+    ) -> Result<(), String> {
+        let pool = self
+            .pools
+            .get(pool_id)
+            .map(|e| e.value().clone())
+            .ok_or_else(|| format!("orca pool {pool_id} not loaded in connector"))?;
+
+        let a_to_b = if pool.base_mint == *input_mint && pool.quote_mint == *output_mint {
+            true
+        } else if pool.base_mint == *output_mint && pool.quote_mint == *input_mint {
+            false
+        } else {
+            return Err("mint pair does not match whirlpool token A/B".to_string());
+        };
+
+        let tick_now = pool
+            .tick_current_index
+            .ok_or_else(|| format!("no tick_current_index for pool {pool_id}"))?;
+        let spacing =
+            pool.tick_spacing
+                .ok_or_else(|| format!("no tick_spacing for pool {pool_id}"))? as i32;
+
+        let (tick_array_0, tick_array_1, tick_array_2, _, _, _) =
+            whirlpool_swap_tick_array_pdas_for_cached_swap(pool_id, tick_now, spacing, a_to_b);
+
+        tracing::debug!(
+            pool = %pool_id,
+            tick_array_0 = %tick_array_0,
+            tick_array_1 = %tick_array_1,
+            tick_array_2 = %tick_array_2,
+            "orca: routing preflight tick array PDAs (cold path)"
+        );
+
+        match self
+            .rpc
+            .rpc
+            .get_multiple_accounts(&[tick_array_0, tick_array_1, tick_array_2])
+            .await
+        {
+            Ok(accounts) => {
+                let missing: Vec<usize> = accounts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, acct)| if acct.is_none() { Some(idx) } else { None })
+                    .collect();
+                if !missing.is_empty() {
+                    return Err(format!("missing_tick_array_accounts missing={missing:?}"));
+                }
+                Ok(())
+            }
+            Err(e) => Err(format!("tick_array_rpc_validation_failed: {e}")),
+        }
+    }
+
     pub fn insert_mock_pool(
         &self,
         base: Pubkey,
@@ -1320,85 +1384,19 @@ impl Dex for Orca {
             )
         })? as i32;
 
-        let ticks_per_array = spacing * TICK_ARRAY_SIZE;
-
-        let current_array_start = get_tick_array_start_index(tick_now, spacing);
-
-        // Calculate position within current tick array (0 to ticks_per_array-1)
-        let position_in_array = (tick_now - current_array_start).abs();
-        let array_boundary_margin = ticks_per_array / 4; // 25% margin from boundary
+        let (tick_array_0, tick_array_1, tick_array_2, start0, start1, start2) =
+            whirlpool_swap_tick_array_pdas_for_cached_swap(&pool_id, tick_now, spacing, a_to_b);
 
         tracing::debug!(
             pool = %pool_id,
             tick_spacing = spacing,
             tick_current = tick_now,
             cached_tick = ?pool.tick_current_index,
-            current_array_start = current_array_start,
-            position_in_array = position_in_array,
-            a_to_b = a_to_b,
-            "orca: calculating tick arrays with FRESH tick from chain"
-        );
-
-        // IMPROVED: Select tick arrays to handle price movement in EITHER direction.
-        //
-        // Problem: Between fetch_current_tick() and simulation, price may move.
-        // If we only select arrays in the swap direction, we fail with Error 6023.
-        //
-        // Solution: Always include the current array PLUS arrays in BOTH directions.
-        // - tick_array_0: Current array (always contains current tick)
-        // - tick_array_1: Array in swap direction (primary movement)
-        // - tick_array_2: Array in OPPOSITE direction (handle reverse movement)
-        //
-        // This handles ~2 arrays worth of price movement in either direction.
-        let (tick_array_0, tick_array_1, tick_array_2, start0, start1, start2) = {
-            let s0 = current_array_start;
-            // Primary direction based on swap type
-            let s_primary = if a_to_b {
-                s0 - ticks_per_array
-            } else {
-                s0 + ticks_per_array
-            };
-            // Opposite direction to handle price reversal
-            let s_opposite = if a_to_b {
-                s0 + ticks_per_array
-            } else {
-                s0 - ticks_per_array
-            };
-
-            // If tick is near the boundary in primary direction, extend further in that direction
-            let near_low_boundary = position_in_array < array_boundary_margin;
-            let near_high_boundary = position_in_array > (ticks_per_array - array_boundary_margin);
-
-            let (s1, s2) = if a_to_b && near_low_boundary {
-                // A→B swap, tick near low boundary - extend further in decreasing direction
-                (s_primary, s_primary - ticks_per_array)
-            } else if !a_to_b && near_high_boundary {
-                // B→A swap, tick near high boundary - extend further in increasing direction
-                (s_primary, s_primary + ticks_per_array)
-            } else {
-                // Normal case: cover both directions
-                (s_primary, s_opposite)
-            };
-
-            (
-                derive_tick_array_pda(&pool_id, s0),
-                derive_tick_array_pda(&pool_id, s1),
-                derive_tick_array_pda(&pool_id, s2),
-                s0,
-                s1,
-                s2,
-            )
-        };
-
-        tracing::debug!(
-            pool = %pool_id,
-            tick_array_0 = %tick_array_0,
-            tick_array_1 = %tick_array_1,
-            tick_array_2 = %tick_array_2,
             start0 = start0,
             start1 = start1,
             start2 = start2,
-            "orca: derived tick array PDAs (async with fresh tick)"
+            a_to_b = a_to_b,
+            "orca: derived tick array PDAs (async with cached tick)"
         );
 
         // Validate tick arrays exist to avoid InvalidTickArraySequence (6023)
@@ -1656,6 +1654,64 @@ impl Orca {
 /// Orca Whirlpool constants
 const TICK_ARRAY_SIZE: i32 = 88; // Number of ticks per TickArray
 
+/// Tick-array PDAs for a Whirlpool exact-in swap using **cached** tick data — must stay aligned
+/// with [`Orca::build_swap_ix_async`].
+fn whirlpool_swap_tick_array_pdas_for_cached_swap(
+    pool_id: &Pubkey,
+    tick_now: i32,
+    tick_spacing: i32,
+    a_to_b: bool,
+) -> (Pubkey, Pubkey, Pubkey, i32, i32, i32) {
+    let spacing = tick_spacing;
+    let ticks_per_array = spacing * TICK_ARRAY_SIZE;
+    let current_array_start = get_tick_array_start_index(tick_now, spacing);
+    let position_in_array = (tick_now - current_array_start).abs();
+    let array_boundary_margin = ticks_per_array / 4;
+
+    let (tick_array_0, tick_array_1, tick_array_2, start0, start1, start2) = {
+        let s0 = current_array_start;
+        let s_primary = if a_to_b {
+            s0 - ticks_per_array
+        } else {
+            s0 + ticks_per_array
+        };
+        let s_opposite = if a_to_b {
+            s0 + ticks_per_array
+        } else {
+            s0 - ticks_per_array
+        };
+
+        let near_low_boundary = position_in_array < array_boundary_margin;
+        let near_high_boundary = position_in_array > (ticks_per_array - array_boundary_margin);
+
+        let (s1, s2) = if a_to_b && near_low_boundary {
+            (s_primary, s_primary - ticks_per_array)
+        } else if !a_to_b && near_high_boundary {
+            (s_primary, s_primary + ticks_per_array)
+        } else {
+            (s_primary, s_opposite)
+        };
+
+        (
+            derive_tick_array_pda(pool_id, s0),
+            derive_tick_array_pda(pool_id, s1),
+            derive_tick_array_pda(pool_id, s2),
+            s0,
+            s1,
+            s2,
+        )
+    };
+
+    (
+        tick_array_0,
+        tick_array_1,
+        tick_array_2,
+        start0,
+        start1,
+        start2,
+    )
+}
+
 fn derive_tick_array_pda(pool: &Pubkey, start_tick_index: i32) -> Pubkey {
     let seeds: &[&[u8]] = &[
         b"tick_array",
@@ -1778,5 +1834,19 @@ mod tests {
             "expected RPC/fallback/failed in error, got: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn whirlpool_cached_swap_tick_pdas_stable() {
+        let pool = Pubkey::new_unique();
+        let (a, b, c, _, _, _) =
+            super::whirlpool_swap_tick_array_pdas_for_cached_swap(&pool, 0, 64, true);
+        let (a2, b2, c2, _, _, _) =
+            super::whirlpool_swap_tick_array_pdas_for_cached_swap(&pool, 0, 64, true);
+        assert_eq!(a, a2);
+        assert_eq!(b, b2);
+        assert_eq!(c, c2);
+        assert_ne!(a, b);
+        assert_ne!(b, c);
     }
 }
