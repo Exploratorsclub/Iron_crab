@@ -55,7 +55,7 @@ Component name: `execution-engine`
 |-----|------|---------|-------|-------------|
 | `simulation_timeout_ms` | u64 | 2000 | 100-30000 | Simulation timeout (ms) |
 | `confirmation_timeout_ms` | u64 | 30000 | 500-300000 | Confirmation timeout after send (ms) |
-| `confirm_commitment` | string | "finalized" | finalized, confirmed | Commitment level for TX confirmation. "finalized" (INVARIANTS D.2): Position only from finalized executions. "confirmed": faster but reorg risk. Geyser uses startup value; RPC polling uses hot-reload value. |
+| `confirm_commitment` | string | "confirmed" | finalized, confirmed | Commitment level for TX confirmation. Default `"confirmed"`: lower confirmation latency with **reorg risk** (slot can still reorganize). `"finalized"`: typical ~12–15s extra latency, stronger fork resistance. Geyser subscription uses the value at engine startup (restart to apply a default change consistently); RPC polling uses the hot-reloaded config value. |
 | `send_enabled` | bool | false | true/false | If true, engine signs and submits transactions |
 
 ### Validation Rules

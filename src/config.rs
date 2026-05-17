@@ -128,8 +128,8 @@ pub struct ExecutionEngineCfg {
     /// Fee Policy Configuration (priority fees, compute limits)
     #[serde(default)]
     pub fee_policy: Option<FeePolicyCfg>,
-    /// Commitment level for TX confirmation: "finalized" (default, safe) or "confirmed" (faster, reorg risk).
-    /// INVARIANTS D.2: Position only from finalized executions when set to "finalized".
+    /// Commitment level for TX confirmation: `"confirmed"` (default, faster, reorg risk) or `"finalized"` (slower, lower reorg risk).
+    /// When set to `"finalized"`, confirmation accepts only finalized on-chain status (stricter than `"confirmed"`).
     #[serde(default)]
     pub confirm_commitment: Option<String>,
 }
