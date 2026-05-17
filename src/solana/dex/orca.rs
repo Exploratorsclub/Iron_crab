@@ -1712,12 +1712,13 @@ fn whirlpool_swap_tick_array_pdas_for_cached_swap(
     )
 }
 
+/// Tick-array PDA seeds must match Orca Whirlpool on-chain + `@orca-so/whirlpools-sdk`
+/// [`getTickArrayAddress`]: Anchor uses `start_tick_index.to_string().as_bytes()` (decimal ASCII),
+/// **not** `i32::to_le_bytes()`. Fixed and dynamic tick arrays share the same seed layout
+/// (`programs/whirlpool`: `initialize_tick_array`, `initialize_dynamic_tick_array`).
 fn derive_tick_array_pda(pool: &Pubkey, start_tick_index: i32) -> Pubkey {
-    let seeds: &[&[u8]] = &[
-        b"tick_array",
-        pool.as_ref(),
-        &start_tick_index.to_le_bytes(),
-    ];
+    let start_tick_str = start_tick_index.to_string();
+    let seeds: &[&[u8]] = &[b"tick_array", pool.as_ref(), start_tick_str.as_bytes()];
     Pubkey::find_program_address(seeds, &Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap()).0
 }
 
@@ -1726,20 +1727,12 @@ fn derive_oracle_pda(pool: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(seeds, &Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap()).0
 }
 
-/// Calculate the start tick index of the TickArray containing `tick_index`.
-/// TickArrays are aligned on boundaries of `tick_spacing * TICK_ARRAY_SIZE`.
-///
-/// IMPORTANT: Orca Whirlpool tick arrays are indexed by their start_tick_index.
-/// For negative ticks, we need floor division to get the correct array.
+/// First tick index of the tick array that contains `tick_index`.
+/// Matches `@orca-so/whirlpools-core` / on-chain Orca: `tick_index.div_euclid(spacing).div_euclid(88) * spacing * 88`.
 fn get_tick_array_start_index(tick_index: i32, tick_spacing: i32) -> i32 {
-    let ticks_per_array = tick_spacing * TICK_ARRAY_SIZE;
-    // Use euclidean div (floor division) to handle negative tick indices correctly
-    // Example with tick_spacing=64, TICK_ARRAY_SIZE=88:
-    //   ticks_per_array = 5632
-    //   tick_index=100 -> array_index=0 -> start=0
-    //   tick_index=-100 -> array_index=-1 -> start=-5632
-    let array_index = tick_index.div_euclid(ticks_per_array);
-    array_index * ticks_per_array
+    let ts = tick_spacing;
+    let real_index = tick_index.div_euclid(ts).div_euclid(TICK_ARRAY_SIZE);
+    real_index * ts * TICK_ARRAY_SIZE
 }
 
 /// Validate that a tick array start index contains the given tick
@@ -1848,5 +1841,34 @@ mod tests {
         assert_eq!(c, c2);
         assert_ne!(a, b);
         assert_ne!(b, c);
+    }
+
+    /// Orca on-chain + TS SDK use Anchor seeds with decimal `start_tick_index` ASCII, not i32 LE.
+    #[test]
+    fn tick_array_pda_uses_anchor_decimal_string_seed() {
+        let pool = Pubkey::new_unique();
+        let start = -704i32;
+        let correct = super::derive_tick_array_pda(&pool, start);
+        let wrong_seeds: &[&[u8]] = &[b"tick_array", pool.as_ref(), &start.to_le_bytes()];
+        let wrong = Pubkey::find_program_address(
+            wrong_seeds,
+            &Pubkey::from_str(super::ORCA_WHIRLPOOL_PROGRAM).unwrap(),
+        )
+        .0;
+        assert_ne!(
+            correct, wrong,
+            "Orca tick_array PDA must not use to_le_bytes() as seed"
+        );
+    }
+
+    /// Parity with `@orca-so/whirlpools-core` `getTickArrayStartTickIndex` (see orca-so/whirlpools tick.rs tests).
+    #[test]
+    fn get_tick_array_start_index_matches_orca_core_examples() {
+        assert_eq!(super::get_tick_array_start_index(0, 8), 0);
+        assert_eq!(super::get_tick_array_start_index(740, 8), 704);
+        assert_eq!(super::get_tick_array_start_index(-624, 8), -704);
+        assert_eq!(super::get_tick_array_start_index(338433, 128), 337920);
+        assert_eq!(super::get_tick_array_start_index(-337409, 128), -337920);
+        assert_ne!(super::get_tick_array_start_index(2354285, 8), 2353573);
     }
 }
