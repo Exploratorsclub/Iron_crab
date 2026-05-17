@@ -2656,8 +2656,10 @@ pub fn record_activity() {
 #[cfg(test)]
 mod momentum_latency_metrics_tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn jetstream_poolcache_event_to_ingest_places_sample() {
         reset_momentum_latency_metrics_for_test();
         try_record_momentum_jetstream_poolcache_event_to_ingest_ms(200, 50);
@@ -2672,6 +2674,7 @@ mod momentum_latency_metrics_tests {
     }
 
     #[test]
+    #[serial]
     fn event_to_ingest_places_sample_in_expected_bucket() {
         reset_momentum_latency_metrics_for_test();
         try_record_momentum_event_to_ingest_ms(100, 40);
@@ -2685,6 +2688,7 @@ mod momentum_latency_metrics_tests {
     }
 
     #[test]
+    #[serial]
     fn invalid_event_ts_does_not_record_histogram_but_bumps_invalid() {
         reset_momentum_latency_metrics_for_test();
         try_record_momentum_event_to_ingest_ms(1_000, 0);
@@ -2697,6 +2701,7 @@ mod momentum_latency_metrics_tests {
     }
 
     #[test]
+    #[serial]
     fn event_to_intent_publish_records_when_explicit_causal_ts_used() {
         reset_momentum_latency_metrics_for_test();
         try_record_momentum_event_to_intent_publish_ms(5_000, 4_000);
@@ -2715,6 +2720,7 @@ mod momentum_latency_metrics_tests {
     }
 
     #[test]
+    #[serial]
     fn internal_us_histogram_records_sum_and_bucket() {
         reset_momentum_latency_metrics_for_test();
         record_momentum_signal_eval_us(800);
@@ -2743,6 +2749,7 @@ mod momentum_latency_metrics_tests {
     }
 
     #[test]
+    #[serial]
     fn event_to_ingest_counts_sum_capped_samples_when_latency_exceeds_histogram_sum_cap() {
         reset_momentum_latency_metrics_for_test();
         let now = MOMENTUM_LATENCY_MS_SUM_CAP + 500_000;
@@ -2760,6 +2767,7 @@ mod momentum_latency_metrics_tests {
     }
 
     #[test]
+    #[serial]
     fn core_market_events_ingest_drain_batch_records_cap_hit_and_streak() {
         reset_momentum_latency_metrics_for_test();
         record_momentum_core_market_events_ingest_drain_batch(10, 48);

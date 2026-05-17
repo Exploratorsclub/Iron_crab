@@ -104,6 +104,7 @@ Component name: `momentum-bot`
 |-----|------|---------|-------|-------------|
 | `probe_buy_pct` | f64 | 0.25 | 0.0-1.0 | Fraction of `default_position_lamports` used for probe buy |
 | `scale_in_confirm_window_secs` | u64 | 30 | > 0 | Time window to confirm post-probe before scale-in |
+| `scale_in_min_probe_executable_pnl_pct` | f64 | 0.0 | finite | **Scale-in only:** minimum executable probe PnL in percent (I-14 `pnl_pct` vs probe `entry_price` on `executable_exit_quote`). Scale-in is emitted only if `exec_pnl >` this value (strict inequality; default `0.0` requires strictly positive executable PnL). No blacklist on wait. |
 
 ### Buyer Quality (Concentration / Repeat Buyers)
 
