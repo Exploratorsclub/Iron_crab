@@ -2826,7 +2826,15 @@ impl MomentumContext {
     /// Best reserve-based SELL quote from `LivePoolCache` for `pos.token_amount` (I-7: no RPC).
     /// Chooses max SOL-out among pools allowed by `filtered_exit_quote_pool_refs` (same as sell routing).
     /// I-13: PumpSwap quote after migration does not update position mark unless `marks_position_pool`.
-    fn executable_exit_quote(&self, pos: &PositionTracker) -> Option<ExitExecutableQuote> {
+    ///
+    /// When `token_trackers` is `Some`, DexPoolAccount lookups use that map instead of
+    /// `self.token_trackers.read()` — required when the caller already holds `token_trackers.write()`
+    /// (e.g. scale-in gate inside `check_for_signals_eval_sorted_tracker_keys`).
+    fn executable_exit_quote(
+        &self,
+        pos: &PositionTracker,
+        token_trackers: Option<&HashMap<String, TokenTracker>>,
+    ) -> Option<ExitExecutableQuote> {
         let token_mint = solana_sdk::pubkey::Pubkey::from_str(&pos.mint).ok()?;
         if pos.pool.is_empty() || pos.token_amount == 0 {
             return None;
@@ -2893,10 +2901,10 @@ impl MomentumContext {
                 source_slot: Some(slot),
                 cache_age_ms: Some(age_ms),
             };
-            let merged_accounts: Option<Vec<String>> = pool_row
-                .dex_pool_accounts
-                .clone()
-                .or_else(|| self.try_get_dex_pool_accounts_for_mint_pool(&pos.mint, &pool_addr));
+            let merged_accounts: Option<Vec<String>> =
+                pool_row.dex_pool_accounts.clone().or_else(|| {
+                    self.dex_pool_accounts_for_mint_pool(&pos.mint, &pool_addr, token_trackers)
+                });
             if let Some(reason) =
                 exit_quote_price_exit_guard_violation(pos, &candidate, merged_accounts.as_deref())
             {
@@ -3135,7 +3143,7 @@ impl MomentumContext {
                 if pos.pool.is_empty() || pos.token_amount == 0 {
                     continue;
                 }
-                if self.executable_exit_quote(pos).is_some() {
+                if self.executable_exit_quote(pos, None).is_some() {
                     continue;
                 }
                 rows.push((mint.clone(), pos.pool.clone(), pos.dex.clone()));
@@ -3986,23 +3994,40 @@ impl MomentumContext {
         dex == "pump_amm" || dex == "meteora_dlmm"
     }
 
+    /// Resolve cached Dex pool accounts for `(mint, pool)`.
+    ///
+    /// When `trackers_override` is `Some`, reads from that map only (no `token_trackers.read()`),
+    /// so callers that already hold `token_trackers.write()` avoid deadlock.
+    fn dex_pool_accounts_for_mint_pool(
+        &self,
+        mint: &str,
+        pool: &str,
+        trackers_override: Option<&HashMap<String, TokenTracker>>,
+    ) -> Option<Vec<String>> {
+        let key = Self::tracker_storage_key(mint, pool);
+        let from_tracker = match trackers_override {
+            Some(map) => map.get(&key).and_then(|t| t.dex_pool_accounts.clone()),
+            None => self
+                .token_trackers
+                .read()
+                .get(&key)
+                .and_then(|t| t.dex_pool_accounts.clone()),
+        };
+        from_tracker.or_else(|| {
+            let pending = self.pending_pool_accounts.read();
+            pending
+                .get(mint)
+                .filter(|(_, p, _)| p == pool)
+                .map(|(_, _, a)| a.clone())
+        })
+    }
+
     fn try_get_dex_pool_accounts_for_mint_pool(
         &self,
         mint: &str,
         pool: &str,
     ) -> Option<Vec<String>> {
-        let key = Self::tracker_storage_key(mint, pool);
-        let trackers = self.token_trackers.read();
-        trackers
-            .get(&key)
-            .and_then(|t| t.dex_pool_accounts.clone())
-            .or_else(|| {
-                let pending = self.pending_pool_accounts.read();
-                pending
-                    .get(mint)
-                    .filter(|(_, p, _)| p == pool)
-                    .map(|(_, _, a)| a.clone())
-            })
+        self.dex_pool_accounts_for_mint_pool(mint, pool, None)
     }
 
     /// Cache verified `DexPoolAccounts` from market-data for deterministic BUY IX building.
@@ -4531,7 +4556,7 @@ impl MomentumContext {
                     self.mark_entry_eval_dirty_key(key);
                     continue;
                 };
-                let Some(ex_q) = self.executable_exit_quote(pos) else {
+                let Some(ex_q) = self.executable_exit_quote(pos, Some(trackers)) else {
                     trace!(
                         mint = %mint,
                         pool = %this_pool,
@@ -5073,7 +5098,7 @@ impl MomentumContext {
                 }
             }
 
-            let exit_q = self.executable_exit_quote(pos);
+            let exit_q = self.executable_exit_quote(pos, None);
             if let Some((exit_type, reason)) =
                 pos.should_exit(&config, exit_q.as_ref(), "exit_scan")
             {
@@ -5237,7 +5262,7 @@ impl MomentumContext {
                 let positions = self.positions.read();
                 positions
                     .get(&candidate.mint)
-                    .and_then(|p| self.executable_exit_quote(p))
+                    .and_then(|p| self.executable_exit_quote(p, None))
             };
             let (exit_type, reason) = {
                 let mut positions = self.positions.write();
