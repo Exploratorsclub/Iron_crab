@@ -123,7 +123,7 @@ impl GeyserTxConfirm {
     /// 1. ATA watcher: subscribes to specific ATA account updates
     /// 2. TX watcher: subscribes to `transactions_status` filtered by `wallet_pubkey`
     ///
-    /// `confirm_commitment`: "finalized" (INVARIANTS D.2, safe) or "confirmed" (faster, reorg risk).
+    /// `confirm_commitment`: `"confirmed"` (engine default, faster, reorg risk) or `"finalized"` (slower, stricter).
     /// Geyser uses startup value; hot-reload does not affect subscription.
     pub fn with_geyser(
         timeout_secs: u64,

@@ -1432,7 +1432,7 @@ struct ExecutionConfig {
     // === FIX-32: Geyser TX Confirmation ===
     /// Use Geyser for TX confirmation instead of RPC polling (requires geyser_grpc_url)
     geyser_confirm_enabled: bool,
-    /// Commitment for TX confirmation: "finalized" (default, INVARIANTS D.2) or "confirmed"
+    /// Commitment for TX confirmation: `"confirmed"` (default, lower latency, reorg risk) or `"finalized"` (slower, stricter finality).
     confirm_commitment: String,
     /// Rebroadcast interval during confirmation wait (ms)
     rebroadcast_interval_ms: u64,
@@ -1491,9 +1491,9 @@ impl Default for ExecutionConfig {
             wsol_dry_run: false,
             // FIX-31: Parallel intent processing
             max_concurrent_intents: 4,
-            // FIX-32: Geyser TX confirmation defaults (INVARIANTS D.2: finalized)
+            // FIX-32: Geyser TX confirmation defaults (product default: confirmed — see CONFIG_SCHEMA)
             geyser_confirm_enabled: true,
-            confirm_commitment: "finalized".to_string(),
+            confirm_commitment: "confirmed".to_string(),
             rebroadcast_interval_ms: 2_000,
             max_rebroadcasts: 5,
             // Account Janitor defaults
@@ -6337,10 +6337,10 @@ async fn main() -> Result<()> {
             .and_then(|fp| fp.liquidation_max_priority_fee_micro_lamports),
         liquidation_max_tx_cost_lamports: fee_policy_cfg
             .and_then(|fp| fp.liquidation_max_tx_cost_lamports),
-        // INVARIANTS D.2: confirm_commitment (default finalized)
+        // confirm_commitment: default confirmed (faster confirmation; reorg risk). Use "finalized" in config for stricter finality.
         confirm_commitment: exec_eng_cfg
             .and_then(|e| e.confirm_commitment.clone())
-            .unwrap_or_else(|| "finalized".to_string()),
+            .unwrap_or_else(|| "confirmed".to_string()),
         ..Default::default()
     };
 
@@ -11546,7 +11546,8 @@ async fn confirm_via_geyser(
 }
 
 /// RPC-polling fallback: exponential backoff polling of `get_signature_statuses()`.
-/// INVARIANTS D.2: When confirm_commitment == "finalized", only Finalized status is accepted.
+/// When `confirm_commitment == "finalized"`, only `Finalized` RPC status counts as confirmed;
+/// with default `"confirmed"`, `Confirmed` or `Finalized` is accepted (reorg risk vs latency trade-off).
 async fn confirm_via_rpc_polling(
     ctx: &ExecutionContext,
     signature_base58: &str,
