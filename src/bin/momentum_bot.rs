@@ -4541,8 +4541,7 @@ impl MomentumContext {
                     continue;
                 };
                 let exec_pnl = tokens_per_sol::pnl_pct(pos.entry_price, ex_q.tokens_per_sol);
-                let gate_ok = exec_pnl
-                    .partial_cmp(&config.scale_in_min_probe_executable_pnl_pct)
+                let gate_ok = exec_pnl.partial_cmp(&config.scale_in_min_probe_executable_pnl_pct)
                     == Some(std::cmp::Ordering::Greater);
                 if !gate_ok {
                     trace!(
