@@ -40,10 +40,10 @@ use ironcrab::execution::pool_cache_sync;
 use ironcrab::execution::quote_calculator;
 use ironcrab::execution::tokens_per_sol;
 use ironcrab::ipc::{
-    ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExecutionResult, ExecutionStatus,
-    ExplicitAmount, IntentOrigin, IntentTier, MarketEvent, MarketEventKind,
-    TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide, TradingRegime,
-    NATIVE_SOL_MINT,
+    ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ControlRequest, ControlRequestKind,
+    ExecutionResult, ExecutionStatus, ExplicitAmount, IntentOrigin, IntentTier, MarketEvent,
+    MarketEventKind, TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide,
+    TradingRegime, NATIVE_SOL_MINT,
 };
 use ironcrab::metrics::{
     momentum_event_ts_latency_delta_ms, record_momentum_core_market_events_ingest_drain_batch,
@@ -65,10 +65,11 @@ use ironcrab::metrics::{
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
     ensure_trade_intents_stream, execution_results_consumer_config,
-    wallet_snapshot_consumer_config, wallet_snapshot_live_consumer_config, NatsClient, NatsConfig,
-    NatsMessage, CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME, STREAM_NAME,
-    TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_MOMENTUM_MARKET_EVENTS,
-    TOPIC_TRADE_INTENTS, WALLET_SNAPSHOT_STREAM_NAME,
+    pool_cache_live_consumer_config, wallet_snapshot_consumer_config,
+    wallet_snapshot_live_consumer_config, NatsClient, NatsConfig, NatsMessage, CONFIG_STREAM_NAME,
+    EXECUTION_RESULTS_STREAM_NAME, STREAM_NAME, TOPIC_CONTROL_REQUESTS, TOPIC_EXECUTION_RESULTS,
+    TOPIC_MARKET_EVENTS, TOPIC_MOMENTUM_MARKET_EVENTS, TOPIC_TRADE_INTENTS,
+    WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::solana::dex_parser::SOL_MINT_PUBKEY;
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
@@ -104,6 +105,71 @@ fn is_non_tradeable_momentum_mint(mint: &str) -> bool {
 
 /// JetStream replay dedup for orphaned BUY path — bounded so memory does not grow forever.
 const ORPHANED_RECOVERED_INTENT_IDS_CAP: usize = 50_000;
+
+/// Cooldown between repeated `Ensure*` ControlRequests for the same open-position pool recovery key.
+const OPEN_POSITION_POOL_RECOVERY_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Max recovery publishes per timed reconcile tick when executable quotes are still missing.
+const OPEN_POSITION_POOL_RECOVERY_RETRY_MAX_PER_TICK: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenPositionPoolRecoveryKind {
+    PumpfunBonding,
+    /// PumpSwap pool_accounts refresh when the position already references the PumpAmm market pool.
+    PumpAmmAccounts,
+    /// After migration off bonding curve: discover PumpAmm state without treating the bonding-curve
+    /// pubkey as a PumpAmm `pool_address_hint` (market-data derives/finds the AMM pool from mint).
+    PumpAmmMigrationProbe,
+    OrcaWhirlpool,
+    MeteoraDlmm,
+    RaydiumAmm,
+    RaydiumCpmm,
+    MeteoraCpmm,
+}
+
+/// Ensure* recovery channels per normalized DEX (see [`MomentumContext::normalize_dex_for_execution_engine`]).
+///
+/// PumpFun positions get **two** bounded channels: bonding-curve refresh plus PumpAmm discovery so
+/// post-migration exits are not stuck on stale curve-only JetStream state.
+const OPEN_POSITION_RECOVERY_PUMPFUN: &[OpenPositionPoolRecoveryKind] = &[
+    OpenPositionPoolRecoveryKind::PumpfunBonding,
+    OpenPositionPoolRecoveryKind::PumpAmmMigrationProbe,
+];
+const OPEN_POSITION_RECOVERY_PUMP_AMM: &[OpenPositionPoolRecoveryKind] =
+    &[OpenPositionPoolRecoveryKind::PumpAmmAccounts];
+const OPEN_POSITION_RECOVERY_ORCA: &[OpenPositionPoolRecoveryKind] =
+    &[OpenPositionPoolRecoveryKind::OrcaWhirlpool];
+const OPEN_POSITION_RECOVERY_METEORA_DLMM: &[OpenPositionPoolRecoveryKind] =
+    &[OpenPositionPoolRecoveryKind::MeteoraDlmm];
+const OPEN_POSITION_RECOVERY_RAYDIUM_AMM: &[OpenPositionPoolRecoveryKind] =
+    &[OpenPositionPoolRecoveryKind::RaydiumAmm];
+const OPEN_POSITION_RECOVERY_RAYDIUM_CPMM: &[OpenPositionPoolRecoveryKind] =
+    &[OpenPositionPoolRecoveryKind::RaydiumCpmm];
+const OPEN_POSITION_RECOVERY_METEORA_CPMM: &[OpenPositionPoolRecoveryKind] =
+    &[OpenPositionPoolRecoveryKind::MeteoraCpmm];
+
+fn open_position_pool_recovery_kinds_for_normalized_dex(
+    dex: &str,
+) -> &'static [OpenPositionPoolRecoveryKind] {
+    match dex {
+        "pumpfun" => OPEN_POSITION_RECOVERY_PUMPFUN,
+        "pump_amm" => OPEN_POSITION_RECOVERY_PUMP_AMM,
+        "orca" => OPEN_POSITION_RECOVERY_ORCA,
+        "meteora_dlmm" => OPEN_POSITION_RECOVERY_METEORA_DLMM,
+        "raydium" => OPEN_POSITION_RECOVERY_RAYDIUM_AMM,
+        "raydium_cpmm" => OPEN_POSITION_RECOVERY_RAYDIUM_CPMM,
+        "meteora_cpmm" => OPEN_POSITION_RECOVERY_METEORA_CPMM,
+        _ => &[],
+    }
+}
+
+fn open_position_pool_recovery_dedupe_key(
+    mint: &str,
+    pool: &str,
+    kind: OpenPositionPoolRecoveryKind,
+) -> String {
+    format!("{mint}\x1f{pool}\x1f{kind:?}")
+}
 
 /// Core NATS delivers no publisher discovery: subscribing to [`TOPIC_MOMENTUM_MARKET_EVENTS`]
 /// succeeds even when market-data does not publish there yet. If no message arrives within this
@@ -2578,9 +2644,11 @@ struct MomentumContext {
     pending_buy_mint_index: parking_lot::RwLock<HashMap<String, String>>,
     /// Multi-pool registry: All known pools per mint (mint -> Vec<PoolInfo>)
     mint_pools: parking_lot::RwLock<HashMap<String, Vec<PoolInfo>>>,
-    /// SLAVE LivePoolCache — populated from JetStream PoolCacheUpdate events.
+    /// SLAVE LivePoolCache — live `PoolCacheUpdate` from JetStream after start (no global snapshot replay).
     /// Provides reserve-based quoting for multi-pool routing (FIX-21).
     live_pool_cache: LivePoolCache,
+    /// Dedupe / cooldown for startup + retry `Ensure*` ControlRequests to `market-data` for open positions.
+    open_position_pool_recovery_last_sent: parking_lot::RwLock<HashMap<String, Instant>>,
     /// JetStream KV Store for position persistence (initialized lazily)
     position_kv: tokio::sync::OnceCell<async_nats::jetstream::kv::Store>,
     /// Mints with non-zero wallet balance that could not be reconciled at bootstrap
@@ -2861,6 +2929,224 @@ impl MomentumContext {
             "pumpswap" | "PumpFunAmm" | "PumpFun AMM" => "pump_amm".to_string(),
             "pumpfun" | "PumpFun" => "pumpfun".to_string(),
             _ => dex.to_string(),
+        }
+    }
+
+    fn build_open_position_pool_control_request(
+        run_id: &str,
+        mint: &str,
+        position_pool: &str,
+        recovery_kind: OpenPositionPoolRecoveryKind,
+    ) -> (ControlRequest, OpenPositionPoolRecoveryKind) {
+        let request_id = format!("mom-pool-rec-{}", Uuid::new_v4());
+        let kind_enum = match recovery_kind {
+            OpenPositionPoolRecoveryKind::PumpfunBonding => {
+                ControlRequestKind::EnsurePumpfunBondingCurve {
+                    base_mint: mint.to_string(),
+                }
+            }
+            OpenPositionPoolRecoveryKind::PumpAmmAccounts
+            | OpenPositionPoolRecoveryKind::PumpAmmMigrationProbe => {
+                ControlRequestKind::EnsurePumpAmmPoolAccounts {
+                    base_mint: mint.to_string(),
+                }
+            }
+            OpenPositionPoolRecoveryKind::OrcaWhirlpool => {
+                ControlRequestKind::EnsureOrcaWhirlpoolPoolState {
+                    base_mint: mint.to_string(),
+                }
+            }
+            OpenPositionPoolRecoveryKind::MeteoraDlmm => {
+                ControlRequestKind::EnsureMeteoraDlmmPoolState {
+                    base_mint: mint.to_string(),
+                }
+            }
+            OpenPositionPoolRecoveryKind::RaydiumAmm => {
+                ControlRequestKind::EnsureRaydiumAmmPoolState {
+                    base_mint: mint.to_string(),
+                }
+            }
+            OpenPositionPoolRecoveryKind::RaydiumCpmm => {
+                ControlRequestKind::EnsureRaydiumCpmmPoolState {
+                    base_mint: mint.to_string(),
+                }
+            }
+            OpenPositionPoolRecoveryKind::MeteoraCpmm => {
+                ControlRequestKind::EnsureMeteoraCpmmPoolState {
+                    base_mint: mint.to_string(),
+                }
+            }
+        };
+        let mut req = ControlRequest::new(
+            "momentum-bot",
+            BUILD_VERSION,
+            run_id,
+            request_id,
+            "market-data",
+            kind_enum,
+        );
+        match recovery_kind {
+            OpenPositionPoolRecoveryKind::PumpfunBonding => {
+                req.force_refresh_pumpfun = true;
+            }
+            OpenPositionPoolRecoveryKind::PumpAmmAccounts => {
+                req.pool_address_hint = Some(position_pool.to_string());
+                req.force_refresh = true;
+            }
+            OpenPositionPoolRecoveryKind::PumpAmmMigrationProbe => {
+                req.force_refresh = true;
+            }
+            OpenPositionPoolRecoveryKind::OrcaWhirlpool => {
+                req.pool_address_hint = Some(position_pool.to_string());
+                req.force_refresh_orca = true;
+            }
+            OpenPositionPoolRecoveryKind::MeteoraDlmm => {
+                req.pool_address_hint = Some(position_pool.to_string());
+                req.force_refresh_meteora_dlmm = true;
+            }
+            OpenPositionPoolRecoveryKind::RaydiumAmm => {
+                req.pool_address_hint = Some(position_pool.to_string());
+                req.force_refresh_raydium_amm = true;
+            }
+            OpenPositionPoolRecoveryKind::RaydiumCpmm => {
+                req.pool_address_hint = Some(position_pool.to_string());
+                req.force_refresh_raydium_cpmm = true;
+            }
+            OpenPositionPoolRecoveryKind::MeteoraCpmm => {
+                req.pool_address_hint = Some(position_pool.to_string());
+                req.force_refresh_meteora_cpmm = true;
+            }
+        }
+        (req, recovery_kind)
+    }
+
+    async fn publish_open_position_pool_recovery_if_allowed(
+        self: &Arc<Self>,
+        mint: &str,
+        pool: &str,
+        dex: &str,
+        reason_tag: &'static str,
+    ) {
+        let Some(nats) = self.nats.as_ref() else {
+            return;
+        };
+        if pool.is_empty() {
+            return;
+        }
+        let dex_norm = Self::normalize_dex_for_execution_engine(dex);
+        let kinds = open_position_pool_recovery_kinds_for_normalized_dex(dex_norm.as_str());
+        if kinds.is_empty() {
+            info!(
+                mint = %mint,
+                pool = %pool,
+                dex = %dex,
+                reason = reason_tag,
+                "Momentum open-position pool recovery skipped: unsupported dex for Ensure* discovery"
+            );
+            return;
+        }
+        for &recovery_kind in kinds {
+            let (req, kind) = Self::build_open_position_pool_control_request(
+                self.run_id.as_str(),
+                mint,
+                pool,
+                recovery_kind,
+            );
+            let key = open_position_pool_recovery_dedupe_key(mint, pool, kind);
+            let now = Instant::now();
+            {
+                let map = self.open_position_pool_recovery_last_sent.read();
+                if let Some(prev) = map.get(&key) {
+                    if now.duration_since(*prev) < OPEN_POSITION_POOL_RECOVERY_COOLDOWN {
+                        debug!(
+                            mint = %mint,
+                            pool = %pool,
+                            dex = %dex,
+                            reason = reason_tag,
+                            request_kind = ?kind,
+                            "Momentum open-position pool recovery deferred: cooldown"
+                        );
+                        continue;
+                    }
+                }
+            }
+            {
+                self.open_position_pool_recovery_last_sent
+                    .write()
+                    .insert(key, now);
+            }
+            match nats.publish(TOPIC_CONTROL_REQUESTS, &req).await {
+                Ok(true) => {
+                    info!(
+                        mint = %mint,
+                        pool = %pool,
+                        dex = %dex,
+                        request_kind = ?kind,
+                        reason = reason_tag,
+                        "Momentum open-position pool recovery requested"
+                    );
+                }
+                Ok(false) => {
+                    warn!(
+                        mint = %mint,
+                        pool = %pool,
+                        request_kind = ?kind,
+                        reason = reason_tag,
+                        "Momentum open-position pool recovery publish dropped (NATS publish returned false)"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        mint = %mint,
+                        pool = %pool,
+                        request_kind = ?kind,
+                        reason = reason_tag,
+                        error = %e,
+                        "Momentum open-position pool recovery publish failed"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn schedule_open_position_pool_recoveries(self: &Arc<Self>, reason_tag: &'static str) {
+        let rows: Vec<(String, String, String)> = {
+            let g = self.positions.read();
+            g.iter()
+                .map(|(m, p)| (m.clone(), p.pool.clone(), p.dex.clone()))
+                .collect()
+        };
+        for (mint, pool, dex) in rows {
+            self.publish_open_position_pool_recovery_if_allowed(&mint, &pool, &dex, reason_tag)
+                .await;
+        }
+    }
+
+    async fn tick_open_position_pool_recovery_retries(self: &Arc<Self>) {
+        let mut rows: Vec<(String, String, String)> = Vec::new();
+        {
+            let positions = self.positions.read();
+            for (mint, pos) in positions.iter() {
+                if pos.pool.is_empty() || pos.token_amount == 0 {
+                    continue;
+                }
+                if self.executable_exit_quote(pos).is_some() {
+                    continue;
+                }
+                rows.push((mint.clone(), pos.pool.clone(), pos.dex.clone()));
+            }
+        }
+        for (mint, pool, dex) in rows
+            .into_iter()
+            .take(OPEN_POSITION_POOL_RECOVERY_RETRY_MAX_PER_TICK)
+        {
+            self.publish_open_position_pool_recovery_if_allowed(
+                &mint,
+                &pool,
+                &dex,
+                "quote_missing_retry",
+            )
+            .await;
         }
     }
 
@@ -7641,6 +7927,7 @@ async fn main() -> Result<()> {
         pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
         mint_pools: parking_lot::RwLock::new(HashMap::new()),
         live_pool_cache,
+        open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
         position_kv: tokio::sync::OnceCell::new(),
         orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
         orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
@@ -7662,55 +7949,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    // === FIX-21: Bootstrap SLAVE LivePoolCache from JetStream (ASYNC) ===
-    // Bootstrap runs in a background task to avoid blocking startup.
-    // With 688k+ pool entries, synchronous bootstrap takes >90s which
-    // exceeds systemd's startup timeout. The service starts immediately;
-    // until bootstrap completes, find_best_*_pool() falls back to last_trade_ratio.
-    let bootstrap_consumer_rx = {
-        let (tx, rx) = tokio::sync::oneshot::channel::<
-            Option<
-                async_nats::jetstream::consumer::Consumer<
-                    async_nats::jetstream::consumer::pull::Config,
-                >,
-            >,
-        >();
-
-        if ctx.nats.is_some() {
-            let ctx_clone = Arc::clone(&ctx);
-            tokio::spawn(async move {
-                let nats = match ctx_clone.nats.as_ref() {
-                    Some(n) => n,
-                    None => {
-                        warn!("NATS cleared before bootstrap started, skipping pool cache sync");
-                        let _ = tx.send(None);
-                        return;
-                    }
-                };
-                match pool_cache_sync::bootstrap_pool_cache_from_jetstream(
-                    nats,
-                    &ctx_clone.live_pool_cache,
-                )
-                .await
-                {
-                    Ok((recovered, consumer)) => {
-                        info!(
-                            pools_recovered = recovered,
-                            "MOMENTUM SLAVE CACHE: bootstrap complete (async)"
-                        );
-                        let _ = tx.send(consumer);
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "MOMENTUM SLAVE CACHE: bootstrap failed");
-                        let _ = tx.send(None);
-                    }
-                }
-            });
-        } else {
-            let _ = tx.send(None);
-        }
-        rx
-    };
+    // Open positions: request authoritative pool rows from market-data (bounded, deduped; no RPC here).
+    ctx.schedule_open_position_pool_recoveries("startup").await;
 
     // === CRITICAL: Check for immediate exits after position recovery ===
     // Recovered positions might already violate max_hold_time or stop-loss
@@ -8007,6 +8247,47 @@ async fn main() -> Result<()> {
         None
     };
 
+    // JetStream consumer for live PoolCacheUpdate only (`DeliverPolicy::New` — no global snapshot replay).
+    let mut pool_cache_consumer_opt = if let Some(ref nats) = ctx.nats {
+        use async_nats::jetstream;
+
+        let jetstream = jetstream::new(nats.client().clone());
+        match jetstream.get_stream(STREAM_NAME).await {
+            Ok(stream) => match stream
+                .create_consumer(pool_cache_live_consumer_config())
+                .await
+            {
+                Ok(consumer) => {
+                    info!(
+                        stream = STREAM_NAME,
+                        deliver_policy = "New",
+                        durable = "momentum-bot-pool-cache-live",
+                        "Momentum PoolCache live consumer created deliver_policy=New"
+                    );
+                    Some(consumer)
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        stream = STREAM_NAME,
+                        "Failed to create JetStream POOL_CACHE live consumer"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    stream = STREAM_NAME,
+                    "POOL_CACHE JetStream stream not found (market-data may not be running)"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Subscribe to Control Commands (manual position cleanup, etc.)
     let mut control_subscription = if let Some(ref nats) = ctx.nats {
         match nats.subscribe(TOPIC_CONTROL_COMMANDS).await {
@@ -8025,15 +8306,6 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-
-    // FIX-21: JetStream consumer for incremental PoolCacheUpdates (SLAVE cache sync)
-    // The bootstrap runs asynchronously. We start with no consumer and wait for
-    // the bootstrap to finish, then reuse its consumer for incremental updates.
-    // This avoids replaying all 688k+ messages twice.
-    let mut pool_cache_consumer_opt: Option<
-        async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>,
-    > = None;
-    let mut bootstrap_consumer_rx = Some(bootstrap_consumer_rx);
 
     // Heartbeat and stats tracking
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -8527,30 +8799,7 @@ async fn main() -> Result<()> {
                 }
             } => {}
 
-            // FIX-21: Receive bootstrap consumer when async bootstrap completes
-            result = async {
-                match bootstrap_consumer_rx.as_mut() {
-                    Some(rx) => rx.await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                // Consume the rx so this arm doesn't fire again
-                bootstrap_consumer_rx = None;
-                match result {
-                    Ok(Some(consumer)) => {
-                        info!(stream = STREAM_NAME, "SLAVE CACHE: bootstrap consumer ready, switching to incremental sync");
-                        pool_cache_consumer_opt = Some(consumer);
-                    }
-                    Ok(None) => {
-                        debug!("SLAVE CACHE: bootstrap completed without consumer");
-                    }
-                    Err(_) => {
-                        warn!("SLAVE CACHE: bootstrap task dropped (sender gone)");
-                    }
-                }
-            }
-
-            // FIX-21: Process incremental PoolCacheUpdates (SLAVE cache sync)
+            // FIX-21: Process incremental PoolCacheUpdates (live JetStream consumer, `DeliverPolicy::New`)
             _ = async {
                 use futures::StreamExt;
                 if let Some(ref mut consumer) = pool_cache_consumer_opt {
@@ -8687,6 +8936,7 @@ async fn main() -> Result<()> {
             _ = reconcile_interval.tick() => {
                 ironcrab::metrics::record_activity();
                 ctx.reconcile_timed_exits().await;
+                ctx.tick_open_position_pool_recovery_retries().await;
             }
 
             // Periodic heartbeat
@@ -9686,6 +9936,7 @@ mod tests {
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
+            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
@@ -9699,6 +9950,92 @@ mod tests {
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    #[test]
+    fn momentum_pool_cache_live_consumer_is_new_not_last_per_subject() {
+        use async_nats::jetstream;
+        let live = ironcrab::nats::pool_cache_live_consumer_config();
+        assert!(matches!(
+            live.deliver_policy,
+            jetstream::consumer::DeliverPolicy::New
+        ));
+        let slave = ironcrab::nats::slave_consumer_config();
+        assert!(matches!(
+            slave.deliver_policy,
+            jetstream::consumer::DeliverPolicy::LastPerSubject
+        ));
+    }
+
+    #[test]
+    fn open_position_pool_recovery_kinds_mapping() {
+        assert_eq!(
+            open_position_pool_recovery_kinds_for_normalized_dex("pumpfun"),
+            &[
+                OpenPositionPoolRecoveryKind::PumpfunBonding,
+                OpenPositionPoolRecoveryKind::PumpAmmMigrationProbe,
+            ]
+        );
+        assert_eq!(
+            open_position_pool_recovery_kinds_for_normalized_dex("pump_amm"),
+            &[OpenPositionPoolRecoveryKind::PumpAmmAccounts]
+        );
+        assert!(open_position_pool_recovery_kinds_for_normalized_dex("unknown_dex").is_empty());
+    }
+
+    #[test]
+    fn open_position_recovery_pumpfun_emits_bonding_and_pump_amm_migration_probe() {
+        use ironcrab::ipc::ControlRequestKind;
+        let bonding = MomentumContext::build_open_position_pool_control_request(
+            "runidxxxx",
+            "MintMintMintMintMintMintMintMintMintMintMintMint",
+            "CrveCrveCrveCrveCrveCrveCrveCrveCrveCrveCrveCrve",
+            OpenPositionPoolRecoveryKind::PumpfunBonding,
+        );
+        assert_eq!(bonding.1, OpenPositionPoolRecoveryKind::PumpfunBonding);
+        assert!(bonding.0.force_refresh_pumpfun);
+        assert!(matches!(
+            bonding.0.kind,
+            ControlRequestKind::EnsurePumpfunBondingCurve { .. }
+        ));
+
+        let amm_probe = MomentumContext::build_open_position_pool_control_request(
+            "runidxxxx",
+            "MintMintMintMintMintMintMintMintMintMintMintMint",
+            "CrveCrveCrveCrveCrveCrveCrveCrveCrveCrveCrveCrve",
+            OpenPositionPoolRecoveryKind::PumpAmmMigrationProbe,
+        );
+        assert_eq!(
+            amm_probe.1,
+            OpenPositionPoolRecoveryKind::PumpAmmMigrationProbe
+        );
+        assert!(amm_probe.0.force_refresh);
+        assert!(amm_probe.0.pool_address_hint.is_none());
+        assert!(matches!(
+            amm_probe.0.kind,
+            ControlRequestKind::EnsurePumpAmmPoolAccounts { .. }
+        ));
+    }
+
+    #[test]
+    fn open_position_recovery_control_request_pump_amm_pool_hint_and_force_refresh() {
+        use ironcrab::ipc::ControlRequestKind;
+        let (req, k) = MomentumContext::build_open_position_pool_control_request(
+            "runidxxxx",
+            "MintMintMintMintMintMintMintMintMintMintMintMint",
+            "PoolPoolPoolPoolPoolPoolPoolPoolPoolPoolPoolPool",
+            OpenPositionPoolRecoveryKind::PumpAmmAccounts,
+        );
+        assert_eq!(k, OpenPositionPoolRecoveryKind::PumpAmmAccounts);
+        assert!(req.force_refresh);
+        assert_eq!(
+            req.pool_address_hint.as_deref(),
+            Some("PoolPoolPoolPoolPoolPoolPoolPoolPoolPoolPoolPool")
+        );
+        assert!(matches!(
+            req.kind,
+            ControlRequestKind::EnsurePumpAmmPoolAccounts { .. }
+        ));
     }
 
     const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -10754,6 +11091,7 @@ mod tests {
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
+            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
@@ -10818,6 +11156,7 @@ mod tests {
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
+            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
@@ -11059,6 +11398,7 @@ mod tests {
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
+            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
@@ -12130,6 +12470,7 @@ mod tests {
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
+            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
@@ -12247,6 +12588,7 @@ mod tests {
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
+            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
@@ -12332,6 +12674,7 @@ mod tests {
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
+            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
@@ -12405,6 +12748,7 @@ mod tests {
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
+            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
@@ -12490,6 +12834,7 @@ mod tests {
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
+            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
@@ -12606,6 +12951,7 @@ mod tests {
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
+            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
@@ -12715,6 +13061,7 @@ mod tests {
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
+            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
@@ -12809,6 +13156,7 @@ mod tests {
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
+            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
@@ -12881,6 +13229,7 @@ mod tests {
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
+            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
@@ -12945,6 +13294,7 @@ mod tests {
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
+            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
@@ -13473,6 +13823,7 @@ mod tests {
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
+            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
@@ -13607,6 +13958,7 @@ mod tests {
             pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
+            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
