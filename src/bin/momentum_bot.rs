@@ -436,6 +436,9 @@ struct MomentumConfig {
     probe_buy_pct: f64,
     /// Time window (seconds) after probe fill to allow scale-in confirmation
     scale_in_confirm_window_secs: u64,
+    /// Minimum `tokens_per_sol::pnl_pct(entry_price, executable_exit_quote)` (I-14) to allow
+    /// scale-in; compared as strictly `exec_pnl > this` (default `0.0`).
+    scale_in_min_probe_executable_pnl_pct: f64,
 
     // === Buyer Quality (anti-bot / concentration) ===
     /// Cap for top-1 buyer share (0.0..=1.0)
@@ -534,6 +537,7 @@ impl Default for MomentumConfig {
             // Momentum v2 Entry
             probe_buy_pct: 0.25,
             scale_in_confirm_window_secs: 30,
+            scale_in_min_probe_executable_pnl_pct: 0.0,
 
             // Buyer Quality
             top1_buyer_share_cap: 0.35,
@@ -588,6 +592,7 @@ impl MomentumConfig {
             default_position_lamports: cfg.default_position_lamports,
             probe_buy_pct: cfg.probe_buy_pct,
             scale_in_confirm_window_secs: cfg.scale_in_confirm_window_secs,
+            scale_in_min_probe_executable_pnl_pct: cfg.scale_in_min_probe_executable_pnl_pct,
             test_allowlist: HashSet::new(), // Not in TOML config
             max_dev_supply_pct: cfg.max_dev_supply_pct,
             lp_removal_window_secs: cfg.lp_removal_window_secs,
@@ -2821,7 +2826,15 @@ impl MomentumContext {
     /// Best reserve-based SELL quote from `LivePoolCache` for `pos.token_amount` (I-7: no RPC).
     /// Chooses max SOL-out among pools allowed by `filtered_exit_quote_pool_refs` (same as sell routing).
     /// I-13: PumpSwap quote after migration does not update position mark unless `marks_position_pool`.
-    fn executable_exit_quote(&self, pos: &PositionTracker) -> Option<ExitExecutableQuote> {
+    ///
+    /// When `token_trackers` is `Some`, DexPoolAccount lookups use that map instead of
+    /// `self.token_trackers.read()` — required when the caller already holds `token_trackers.write()`
+    /// (e.g. scale-in gate inside `check_for_signals_eval_sorted_tracker_keys`).
+    fn executable_exit_quote(
+        &self,
+        pos: &PositionTracker,
+        token_trackers: Option<&HashMap<String, TokenTracker>>,
+    ) -> Option<ExitExecutableQuote> {
         let token_mint = solana_sdk::pubkey::Pubkey::from_str(&pos.mint).ok()?;
         if pos.pool.is_empty() || pos.token_amount == 0 {
             return None;
@@ -2888,10 +2901,10 @@ impl MomentumContext {
                 source_slot: Some(slot),
                 cache_age_ms: Some(age_ms),
             };
-            let merged_accounts: Option<Vec<String>> = pool_row
-                .dex_pool_accounts
-                .clone()
-                .or_else(|| self.try_get_dex_pool_accounts_for_mint_pool(&pos.mint, &pool_addr));
+            let merged_accounts: Option<Vec<String>> =
+                pool_row.dex_pool_accounts.clone().or_else(|| {
+                    self.dex_pool_accounts_for_mint_pool(&pos.mint, &pool_addr, token_trackers)
+                });
             if let Some(reason) =
                 exit_quote_price_exit_guard_violation(pos, &candidate, merged_accounts.as_deref())
             {
@@ -3130,7 +3143,7 @@ impl MomentumContext {
                 if pos.pool.is_empty() || pos.token_amount == 0 {
                     continue;
                 }
-                if self.executable_exit_quote(pos).is_some() {
+                if self.executable_exit_quote(pos, None).is_some() {
                     continue;
                 }
                 rows.push((mint.clone(), pos.pool.clone(), pos.dex.clone()));
@@ -3981,23 +3994,40 @@ impl MomentumContext {
         dex == "pump_amm" || dex == "meteora_dlmm"
     }
 
+    /// Resolve cached Dex pool accounts for `(mint, pool)`.
+    ///
+    /// When `trackers_override` is `Some`, reads from that map only (no `token_trackers.read()`),
+    /// so callers that already hold `token_trackers.write()` avoid deadlock.
+    fn dex_pool_accounts_for_mint_pool(
+        &self,
+        mint: &str,
+        pool: &str,
+        trackers_override: Option<&HashMap<String, TokenTracker>>,
+    ) -> Option<Vec<String>> {
+        let key = Self::tracker_storage_key(mint, pool);
+        let from_tracker = match trackers_override {
+            Some(map) => map.get(&key).and_then(|t| t.dex_pool_accounts.clone()),
+            None => self
+                .token_trackers
+                .read()
+                .get(&key)
+                .and_then(|t| t.dex_pool_accounts.clone()),
+        };
+        from_tracker.or_else(|| {
+            let pending = self.pending_pool_accounts.read();
+            pending
+                .get(mint)
+                .filter(|(_, p, _)| p == pool)
+                .map(|(_, _, a)| a.clone())
+        })
+    }
+
     fn try_get_dex_pool_accounts_for_mint_pool(
         &self,
         mint: &str,
         pool: &str,
     ) -> Option<Vec<String>> {
-        let key = Self::tracker_storage_key(mint, pool);
-        let trackers = self.token_trackers.read();
-        trackers
-            .get(&key)
-            .and_then(|t| t.dex_pool_accounts.clone())
-            .or_else(|| {
-                let pending = self.pending_pool_accounts.read();
-                pending
-                    .get(mint)
-                    .filter(|(_, p, _)| p == pool)
-                    .map(|(_, _, a)| a.clone())
-            })
+        self.dex_pool_accounts_for_mint_pool(mint, pool, None)
     }
 
     /// Cache verified `DexPoolAccounts` from market-data for deterministic BUY IX building.
@@ -4512,6 +4542,41 @@ impl MomentumContext {
                     // Confirmation window expired: keep probe position only.
                     let tracker = trackers.get_mut(key).expect("tracker key from iteration");
                     tracker.state = TrackerState::PositionOpenFull { filled_at };
+                    continue;
+                }
+
+                // Scale-in gate (I-14, I-7): same `executable_exit_quote` quality as exits — no RPC.
+                // Require strictly `exec_pnl > scale_in_min_probe_executable_pnl_pct` (default 0 ⇒ underwater probe never scales in).
+                let Some(pos) = positions.get(&mint) else {
+                    trace!(
+                        mint = %mint,
+                        pool = %this_pool,
+                        "SCALE_IN_WAIT: missing PositionTracker for mint"
+                    );
+                    self.mark_entry_eval_dirty_key(key);
+                    continue;
+                };
+                let Some(ex_q) = self.executable_exit_quote(pos, Some(trackers)) else {
+                    trace!(
+                        mint = %mint,
+                        pool = %this_pool,
+                        "SCALE_IN_WAIT: no executable_exit_quote"
+                    );
+                    self.mark_entry_eval_dirty_key(key);
+                    continue;
+                };
+                let exec_pnl = tokens_per_sol::pnl_pct(pos.entry_price, ex_q.tokens_per_sol);
+                let gate_ok = exec_pnl.partial_cmp(&config.scale_in_min_probe_executable_pnl_pct)
+                    == Some(std::cmp::Ordering::Greater);
+                if !gate_ok {
+                    trace!(
+                        mint = %mint,
+                        pool = %this_pool,
+                        exec_pnl_pct = exec_pnl,
+                        min_required = config.scale_in_min_probe_executable_pnl_pct,
+                        "SCALE_IN_WAIT: executable probe PnL not above threshold"
+                    );
+                    self.mark_entry_eval_dirty_key(key);
                     continue;
                 }
 
@@ -5033,7 +5098,7 @@ impl MomentumContext {
                 }
             }
 
-            let exit_q = self.executable_exit_quote(pos);
+            let exit_q = self.executable_exit_quote(pos, None);
             if let Some((exit_type, reason)) =
                 pos.should_exit(&config, exit_q.as_ref(), "exit_scan")
             {
@@ -5197,7 +5262,7 @@ impl MomentumContext {
                 let positions = self.positions.read();
                 positions
                     .get(&candidate.mint)
-                    .and_then(|p| self.executable_exit_quote(p))
+                    .and_then(|p| self.executable_exit_quote(p, None))
             };
             let (exit_type, reason) = {
                 let mut positions = self.positions.write();
@@ -6729,6 +6794,19 @@ impl MomentumContext {
                         }
                     } else {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "scale_in_min_probe_executable_pnl_pct" => {
+                    if let Some(v) = value.as_f64() {
+                        if v.is_finite() {
+                            config.scale_in_min_probe_executable_pnl_pct = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be finite".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
                     }
                 }
 
@@ -11350,14 +11428,13 @@ mod tests {
 
     #[test]
     fn probe_then_scale_signal_flow() {
-        let mut cfg = MomentumConfig::default();
+        use solana_sdk::pubkey::Pubkey;
 
-        // Make the entry sizing deterministic.
+        let mut cfg = MomentumConfig::default();
         cfg.default_position_lamports = 1_000;
         cfg.probe_buy_pct = 0.25;
         cfg.scale_in_confirm_window_secs = 30;
-
-        // Disable other gates to isolate probe/scale state machine.
+        cfg.scale_in_min_probe_executable_pnl_pct = 0.0;
         cfg.early_min_liquidity_sol = 0.0;
         cfg.min_unique_buyers = 0;
         cfg.min_trades_per_sec = 0.0;
@@ -11374,86 +11451,369 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
         let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        *ctx.config.write() = cfg;
 
-        let ctx = MomentumContext {
-            run_id: "12345678".to_string(),
-            config: parking_lot::RwLock::new(cfg),
-            nats: None,
-            jsonl_writer,
-            intent_counter: std::sync::atomic::AtomicU64::new(0),
-            pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
-            pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
-            pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
-            mint_infos: parking_lot::RwLock::new(HashMap::new()),
-            token_trackers: parking_lot::RwLock::new(HashMap::new()),
-            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
-            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
-            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            positions: parking_lot::RwLock::new(HashMap::new()),
-            pending_intents: parking_lot::RwLock::new(HashMap::new()),
-            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
-            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
-            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
-            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
-            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
-            mint_pools: parking_lot::RwLock::new(HashMap::new()),
-            live_pool_cache: LivePoolCache::new(),
-            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
-            position_kv: tokio::sync::OnceCell::new(),
-            orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
-                ORPHANED_RECOVERED_INTENT_IDS_CAP,
-            )),
-            tokens_tracked: std::sync::atomic::AtomicU64::new(0),
-            tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
-            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
-            intents_generated: std::sync::atomic::AtomicU64::new(0),
-            exits_generated: std::sync::atomic::AtomicU64::new(0),
-            last_event_slot: std::sync::atomic::AtomicU64::new(0),
-            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-        };
+        let mint = Pubkey::new_from_array([0xA1u8; 32]).to_string();
+        let pool = Pubkey::new_from_array([0xB2u8; 32]).to_string();
+        let sk = MomentumContext::tracker_storage_key(&mint, &pool);
 
-        // Insert a fresh tracker.
+        ctx.record_mint_info(
+            &mint,
+            MintInfo {
+                token_program: String::new(),
+                decimals: 6,
+                supply: 0,
+                mint_authority: None,
+                freeze_authority: None,
+                last_updated: Instant::now(),
+            },
+        );
+
         {
             let mut trackers = ctx.token_trackers.write();
-            trackers.insert(
-                MomentumContext::tracker_storage_key("mint", "pool"),
-                TokenTracker::new("mint", "pool", "dex", 1, 0),
-            );
+            trackers.insert(sk.clone(), TokenTracker::new(&mint, &pool, "raydium", 1, 0));
+        }
+        {
+            let mut pi = PoolInfo::new(pool.clone(), "raydium".to_string(), 100);
+            pi.dex_pool_accounts = Some(vec![]);
+            ctx.mint_pools.write().insert(mint.clone(), vec![pi]);
         }
 
-        // First pass should emit a probe signal.
         let signals = ctx.check_for_signals();
         assert_eq!(signals.len(), 1);
-        assert_eq!(signals[0].mint, "mint");
+        assert_eq!(signals[0].mint, mint);
         assert_eq!(signals[0].kind, EntryKind::Probe);
         assert_eq!(signals[0].sol_amount, 250);
 
-        // Mark probe as filled.
         {
             let mut trackers = ctx.token_trackers.write();
-            let t = trackers
-                .get_mut(&MomentumContext::tracker_storage_key("mint", "pool"))
-                .unwrap();
+            let t = trackers.get_mut(&sk).unwrap();
             assert!(matches!(t.state, TrackerState::ProbeBuyPending { .. }));
             t.state = TrackerState::PositionOpenProbe {
                 filled_at: Instant::now(),
             };
         }
 
-        // Second pass should emit scale-in signal.
+        {
+            let mut pos_map = ctx.positions.write();
+            pos_map.insert(
+                mint.clone(),
+                PositionTracker::new(
+                    &mint,
+                    &pool,
+                    "raydium",
+                    5_727_593.0,
+                    6,
+                    7_159_492_133,
+                    250_000_000,
+                ),
+            );
+        }
+
+        let upd = pool_cache_update_stub(
+            &mint,
+            &pool,
+            10_000_000_000_000u64,
+            1_000_000_000_000u64,
+            900_000_000u64,
+            1,
+        );
+        assert!(
+            pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, &upd),
+            "pool cache apply failed"
+        );
+
         let signals = ctx.check_for_signals();
-        assert_eq!(signals.len(), 1);
+        assert_eq!(
+            signals.len(),
+            1,
+            "expected scale-in when executable quote shows probe-side gain"
+        );
         assert_eq!(signals[0].kind, EntryKind::ScaleIn);
         assert_eq!(signals[0].sol_amount, 750);
 
+        let trackers = ctx.token_trackers.read();
+        let t = trackers.get(&sk).unwrap();
+        assert!(matches!(t.state, TrackerState::ScaleInPending { .. }));
+    }
+
+    #[test]
+    fn scale_in_blocked_when_executable_probe_pnl_not_positive() {
+        use solana_sdk::pubkey::Pubkey;
+
+        let mut cfg = MomentumConfig::default();
+        cfg.default_position_lamports = 1_000;
+        cfg.probe_buy_pct = 0.25;
+        cfg.early_min_liquidity_sol = 0.0;
+        cfg.min_unique_buyers = 0;
+        cfg.min_trades_per_sec = 0.0;
+        cfg.min_buy_dominance = 0.0;
+        cfg.min_sol_inflow_lamports = 0;
+        cfg.require_mint_authority_renounced = false;
+        cfg.require_freeze_authority_none = false;
+        cfg.top1_buyer_share_cap = 1.0;
+        cfg.top3_buyer_share_cap = 1.0;
+        cfg.repeat_buyer_min_ratio = 0.0;
+        cfg.min_trade_size_lamports = 0;
+        cfg.small_buy_ratio_cap = 1.0;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        *ctx.config.write() = cfg;
+
+        let mint = Pubkey::new_from_array([0xC3u8; 32]).to_string();
+        let pool = Pubkey::new_from_array([0xD4u8; 32]).to_string();
+        let sk = MomentumContext::tracker_storage_key(&mint, &pool);
+
+        ctx.record_mint_info(
+            &mint,
+            MintInfo {
+                token_program: String::new(),
+                decimals: 6,
+                supply: 0,
+                mint_authority: None,
+                freeze_authority: None,
+                last_updated: Instant::now(),
+            },
+        );
+
+        ctx.token_trackers
+            .write()
+            .insert(sk.clone(), TokenTracker::new(&mint, &pool, "raydium", 1, 0));
         {
-            let trackers = ctx.token_trackers.read();
-            let t = trackers
-                .get(&MomentumContext::tracker_storage_key("mint", "pool"))
-                .unwrap();
-            assert!(matches!(t.state, TrackerState::ScaleInPending { .. }));
+            let mut pi = PoolInfo::new(pool.clone(), "raydium".to_string(), 100);
+            pi.dex_pool_accounts = Some(vec![]);
+            ctx.mint_pools.write().insert(mint.clone(), vec![pi]);
         }
+
+        assert!(ctx.check_for_signals().len() == 1);
+
+        {
+            let mut trackers = ctx.token_trackers.write();
+            trackers.get_mut(&sk).unwrap().state = TrackerState::PositionOpenProbe {
+                filled_at: Instant::now(),
+            };
+        }
+
+        {
+            let mut pos_map = ctx.positions.write();
+            pos_map.insert(
+                mint.clone(),
+                PositionTracker::new(
+                    &mint,
+                    &pool,
+                    "raydium",
+                    5_727_593.0,
+                    6,
+                    7_159_492_133,
+                    250_000_000,
+                ),
+            );
+        }
+
+        // Illiquid side: selling the probe size yields very little SOL → high `tokens_per_sol` vs entry → underwater on I-14.
+        let upd = pool_cache_update_stub(
+            &mint,
+            &pool,
+            100_000_000_000_000u64,
+            50_000u64,
+            900_000_001u64,
+            1,
+        );
+        assert!(pool_cache_sync::apply_pool_cache_update(
+            &ctx.live_pool_cache,
+            &upd
+        ));
+
+        ctx.dirty_entry_tracker_keys.write().clear();
+        assert!(
+            ctx.check_for_signals().is_empty(),
+            "scale-in must not fire when executable probe PnL is not strictly positive"
+        );
+        assert!(
+            ctx.dirty_entry_tracker_keys.read().contains(&sk),
+            "WAIT path must re-queue entry eval via dirty key"
+        );
+        let trackers = ctx.token_trackers.read();
+        assert!(matches!(
+            trackers.get(&sk).unwrap().state,
+            TrackerState::PositionOpenProbe { .. }
+        ));
+    }
+
+    #[test]
+    fn scale_in_blocked_without_live_pool_quote_marks_dirty() {
+        use solana_sdk::pubkey::Pubkey;
+
+        let mut cfg = MomentumConfig::default();
+        cfg.default_position_lamports = 1_000;
+        cfg.probe_buy_pct = 0.25;
+        cfg.early_min_liquidity_sol = 0.0;
+        cfg.min_unique_buyers = 0;
+        cfg.min_trades_per_sec = 0.0;
+        cfg.min_buy_dominance = 0.0;
+        cfg.min_sol_inflow_lamports = 0;
+        cfg.require_mint_authority_renounced = false;
+        cfg.require_freeze_authority_none = false;
+        cfg.top1_buyer_share_cap = 1.0;
+        cfg.top3_buyer_share_cap = 1.0;
+        cfg.repeat_buyer_min_ratio = 0.0;
+        cfg.min_trade_size_lamports = 0;
+        cfg.small_buy_ratio_cap = 1.0;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        *ctx.config.write() = cfg;
+
+        let mint = Pubkey::new_from_array([0xE5u8; 32]).to_string();
+        let pool = Pubkey::new_from_array([0xF6u8; 32]).to_string();
+        let sk = MomentumContext::tracker_storage_key(&mint, &pool);
+
+        ctx.record_mint_info(
+            &mint,
+            MintInfo {
+                token_program: String::new(),
+                decimals: 6,
+                supply: 0,
+                mint_authority: None,
+                freeze_authority: None,
+                last_updated: Instant::now(),
+            },
+        );
+
+        ctx.token_trackers
+            .write()
+            .insert(sk.clone(), TokenTracker::new(&mint, &pool, "raydium", 1, 0));
+        {
+            let mut pi = PoolInfo::new(pool.clone(), "raydium".to_string(), 100);
+            pi.dex_pool_accounts = Some(vec![]);
+            ctx.mint_pools.write().insert(mint.clone(), vec![pi]);
+        }
+
+        assert_eq!(ctx.check_for_signals().len(), 1);
+        {
+            let mut trackers = ctx.token_trackers.write();
+            trackers.get_mut(&sk).unwrap().state = TrackerState::PositionOpenProbe {
+                filled_at: Instant::now(),
+            };
+        }
+        {
+            let mut pos_map = ctx.positions.write();
+            pos_map.insert(
+                mint.clone(),
+                PositionTracker::new(
+                    &mint,
+                    &pool,
+                    "raydium",
+                    5_727_593.0,
+                    6,
+                    7_159_492_133,
+                    250_000_000,
+                ),
+            );
+        }
+
+        ctx.dirty_entry_tracker_keys.write().clear();
+        assert!(ctx.check_for_signals().is_empty());
+        assert!(ctx.dirty_entry_tracker_keys.read().contains(&sk));
+    }
+
+    #[test]
+    fn scale_in_blocked_when_min_executable_pnl_threshold_not_met() {
+        use solana_sdk::pubkey::Pubkey;
+
+        let mut cfg = MomentumConfig::default();
+        cfg.default_position_lamports = 1_000;
+        cfg.probe_buy_pct = 0.25;
+        cfg.scale_in_min_probe_executable_pnl_pct = 1.0e12;
+        cfg.early_min_liquidity_sol = 0.0;
+        cfg.min_unique_buyers = 0;
+        cfg.min_trades_per_sec = 0.0;
+        cfg.min_buy_dominance = 0.0;
+        cfg.min_sol_inflow_lamports = 0;
+        cfg.require_mint_authority_renounced = false;
+        cfg.require_freeze_authority_none = false;
+        cfg.top1_buyer_share_cap = 1.0;
+        cfg.top3_buyer_share_cap = 1.0;
+        cfg.repeat_buyer_min_ratio = 0.0;
+        cfg.min_trade_size_lamports = 0;
+        cfg.small_buy_ratio_cap = 1.0;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        *ctx.config.write() = cfg;
+
+        let mint = Pubkey::new_from_array([0x11u8; 32]).to_string();
+        let pool = Pubkey::new_from_array([0x22u8; 32]).to_string();
+        let sk = MomentumContext::tracker_storage_key(&mint, &pool);
+
+        ctx.record_mint_info(
+            &mint,
+            MintInfo {
+                token_program: String::new(),
+                decimals: 6,
+                supply: 0,
+                mint_authority: None,
+                freeze_authority: None,
+                last_updated: Instant::now(),
+            },
+        );
+
+        ctx.token_trackers
+            .write()
+            .insert(sk.clone(), TokenTracker::new(&mint, &pool, "raydium", 1, 0));
+        {
+            let mut pi = PoolInfo::new(pool.clone(), "raydium".to_string(), 100);
+            pi.dex_pool_accounts = Some(vec![]);
+            ctx.mint_pools.write().insert(mint.clone(), vec![pi]);
+        }
+
+        assert_eq!(ctx.check_for_signals().len(), 1);
+        {
+            let mut trackers = ctx.token_trackers.write();
+            trackers.get_mut(&sk).unwrap().state = TrackerState::PositionOpenProbe {
+                filled_at: Instant::now(),
+            };
+        }
+        {
+            let mut pos_map = ctx.positions.write();
+            pos_map.insert(
+                mint.clone(),
+                PositionTracker::new(
+                    &mint,
+                    &pool,
+                    "raydium",
+                    5_727_593.0,
+                    6,
+                    7_159_492_133,
+                    250_000_000,
+                ),
+            );
+        }
+
+        let upd = pool_cache_update_stub(
+            &mint,
+            &pool,
+            10_000_000_000_000u64,
+            1_000_000_000_000u64,
+            900_000_002u64,
+            1,
+        );
+        assert!(pool_cache_sync::apply_pool_cache_update(
+            &ctx.live_pool_cache,
+            &upd
+        ));
+
+        ctx.dirty_entry_tracker_keys.write().clear();
+        assert!(ctx.check_for_signals().is_empty());
+        assert!(ctx.dirty_entry_tracker_keys.read().contains(&sk));
     }
 
     /// Pool-scoped trackers: activity on `pump_amm` must not emit a stale `pumpfun` probe for the same mint.

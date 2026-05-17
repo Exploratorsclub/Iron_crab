@@ -576,6 +576,11 @@ pub struct MomentumCfg {
     /// Default: 30s.
     #[serde(default = "default_scale_in_confirm_window_secs")]
     pub scale_in_confirm_window_secs: u64,
+    /// Minimum executable probe PnL (percent, I-14 `tokens_per_sol::pnl_pct`) required before
+    /// emitting a scale-in BUY. Compared strictly as `exec_pnl > this` (default `0.0` ⇒ must be
+    /// strictly profitable vs probe `entry_price` on an `executable_exit_quote`). Scale-in only.
+    #[serde(default = "default_scale_in_min_probe_executable_pnl_pct")]
+    pub scale_in_min_probe_executable_pnl_pct: f64,
 
     // === Filter 1: Liquidity Check ===
     /// Max dev supply percentage (e.g., 90.0 = 90%). Default: 90%
@@ -766,6 +771,9 @@ fn default_probe_buy_pct() -> f64 {
 fn default_scale_in_confirm_window_secs() -> u64 {
     30
 }
+fn default_scale_in_min_probe_executable_pnl_pct() -> f64 {
+    0.0
+}
 fn default_max_dev_supply_pct() -> f64 {
     90.0
 }
@@ -900,6 +908,7 @@ impl Default for MomentumCfg {
             default_position_lamports: default_position_lamports(),
             probe_buy_pct: default_probe_buy_pct(),
             scale_in_confirm_window_secs: default_scale_in_confirm_window_secs(),
+            scale_in_min_probe_executable_pnl_pct: default_scale_in_min_probe_executable_pnl_pct(),
             max_dev_supply_pct: default_max_dev_supply_pct(),
             lp_removal_window_secs: default_lp_removal_window(),
             min_unique_buyers: default_min_unique_buyers(),
