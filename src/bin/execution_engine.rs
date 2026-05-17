@@ -1653,20 +1653,208 @@ struct RouteCandidate {
     pool_id: String,
     accounts: Vec<String>,
     creator: Option<String>,
+    /// When `Some`, this is already the engine `min_out` in lamports (LivePoolCache quote path)
+    /// and must not be run through slippage scaling again in multi-pool fallback.
+    execution_min_out_lamports: Option<u64>,
 }
 
-fn select_best_route(candidates: Vec<RouteCandidate>) -> Option<RouteCandidate> {
-    let mut best: Option<RouteCandidate> = None;
-    for candidate in candidates {
-        let replace = best
-            .as_ref()
-            .map(|b| candidate.amount_out > b.amount_out)
-            .unwrap_or(true);
-        if replace {
-            best = Some(candidate);
+/// JSON array of additional buildable routes (same shape as [`RouteCandidate`]) for cold-path
+/// multi-pool SELL fallback after `build_tx_plan` Unsupported (liquidation / kill-switch).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MultiPoolFallbackRouteWire {
+    dex: String,
+    pool_id: String,
+    amount_out: u64,
+    accounts: Vec<String>,
+    #[serde(default)]
+    creator: Option<String>,
+    #[serde(default)]
+    execution_min_out_lamports: Option<u64>,
+}
+
+const MULTI_POOL_FALLBACK_ROUTES_JSON_META_KEY: &str = "multi_pool_fallback_routes_json";
+
+fn sort_route_candidates_by_amount_out(mut v: Vec<RouteCandidate>) -> Vec<RouteCandidate> {
+    v.sort_by(|a, b| b.amount_out.cmp(&a.amount_out));
+    v
+}
+
+/// Cold-path liquidation: drop routes that would fail the same structural gates as
+/// `tx_builder::build_tx_plan` (Orca tick-array RPC check, PumpSwap SLAVE ≥12 accounts, Meteora
+/// explicit Ready). Preserves descending `amount_out` order among survivors.
+async fn liquidation_filter_multi_pool_buildable_candidates(
+    live_cache: Option<&LivePoolCache>,
+    orca: &Orca,
+    mint: &Pubkey,
+    sol_mint: &Pubkey,
+    candidates: Vec<RouteCandidate>,
+    quote_attempts: &mut Vec<String>,
+) -> Vec<RouteCandidate> {
+    let ordered = sort_route_candidates_by_amount_out(candidates);
+    let mut out = Vec::new();
+    for c in ordered {
+        match c.dex.as_str() {
+            "orca" => {
+                let Ok(pool_pk) = Pubkey::from_str(&c.pool_id) else {
+                    quote_attempts.push(format!("orca=skip bad_pool_pubkey pool={}", c.pool_id));
+                    continue;
+                };
+                match orca
+                    .cold_path_validate_whirlpool_tick_arrays_for_pool_swap(
+                        &pool_pk, mint, sol_mint,
+                    )
+                    .await
+                {
+                    Ok(()) => out.push(c),
+                    Err(reason) => {
+                        info!(
+                            dex = %c.dex,
+                            pool = %c.pool_id,
+                            reason = %reason,
+                            "routing skipped orca: not buildable; selected next if any"
+                        );
+                        quote_attempts.push(format!(
+                            "orca=skip not_buildable pool={} reason={reason}",
+                            c.pool_id
+                        ));
+                    }
+                }
+            }
+            "pump_amm" => {
+                let Ok(pool_pk) = Pubkey::from_str(&c.pool_id) else {
+                    quote_attempts
+                        .push(format!("pump_amm=skip bad_pool_pubkey pool={}", c.pool_id));
+                    continue;
+                };
+                if !c.accounts.is_empty() {
+                    if let Ok(first) = Pubkey::from_str(&c.accounts[0]) {
+                        if first != pool_pk {
+                            info!(
+                                pool_hint = %c.pool_id,
+                                accounts0 = %first,
+                                "routing skipped pump_amm: not buildable (reason=pool_account_mismatch); selected next if any"
+                            );
+                            quote_attempts.push(format!(
+                                "pump_amm=skip not_buildable pool_mismatch pool={}",
+                                c.pool_id
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                let cache_ok = live_cache.is_some_and(|cache| {
+                    pump_amm_hint_pool_cache_usable_for_tx_plan_builder(cache, &pool_pk)
+                });
+                if !cache_ok {
+                    info!(
+                        pool = %c.pool_id,
+                        "routing skipped pump_amm: not buildable (reason=slave_pool_accounts_not_ready); selected next if any"
+                    );
+                    quote_attempts.push(format!(
+                        "pump_amm=skip not_buildable no_builder_ready_cache pool={}",
+                        c.pool_id
+                    ));
+                    continue;
+                }
+                out.push(c);
+            }
+            "meteora_dlmm" => {
+                let Ok(pool_pk) = Pubkey::from_str(&c.pool_id) else {
+                    quote_attempts.push(format!("meteora=skip bad_pool_pubkey pool={}", c.pool_id));
+                    continue;
+                };
+                let ready = live_cache
+                    .map(|cache| cache.meteora_dlmm_pool_explicitly_ready(&pool_pk))
+                    .unwrap_or(false);
+                if !ready {
+                    info!(
+                        pool = %c.pool_id,
+                        "routing skipped meteora_dlmm: not buildable (reason=no_explicit_ready); selected next if any"
+                    );
+                    quote_attempts.push(format!(
+                        "meteora=skip not_buildable no_explicit_ready pool={}",
+                        c.pool_id
+                    ));
+                    continue;
+                }
+                out.push(c);
+            }
+            _ => out.push(c),
         }
     }
-    best
+    out
+}
+
+fn liquidation_store_multi_pool_fallback_metadata(
+    metadata: &mut HashMap<String, String>,
+    buildable: &[RouteCandidate],
+) {
+    if buildable.len() <= 1 {
+        metadata.remove(MULTI_POOL_FALLBACK_ROUTES_JSON_META_KEY);
+        return;
+    }
+    let tail: Vec<MultiPoolFallbackRouteWire> = buildable
+        .iter()
+        .skip(1)
+        .map(|c| MultiPoolFallbackRouteWire {
+            dex: c.dex.clone(),
+            pool_id: c.pool_id.clone(),
+            amount_out: c.amount_out,
+            accounts: c.accounts.clone(),
+            creator: c.creator.clone(),
+            execution_min_out_lamports: c.execution_min_out_lamports,
+        })
+        .collect();
+    if let Ok(json) = serde_json::to_string(&tail) {
+        metadata.insert(MULTI_POOL_FALLBACK_ROUTES_JSON_META_KEY.to_string(), json);
+    }
+}
+
+/// After `build_tx_plan` returns Unsupported for a cold-path multi-pool sell: apply the next
+/// pre-filtered buildable route (if any). Returns true when `intent` was updated for a retry.
+fn take_next_multi_pool_buildable_fallback_route(intent: &mut TradeIntent) -> bool {
+    if intent.metadata.get("sell_routing").map(|s| s.as_str()) != Some("multi_pool") {
+        return false;
+    }
+    let json = match intent
+        .metadata
+        .get(MULTI_POOL_FALLBACK_ROUTES_JSON_META_KEY)
+    {
+        Some(j) if !j.is_empty() => j.clone(),
+        _ => return false,
+    };
+    let mut routes: Vec<MultiPoolFallbackRouteWire> = match serde_json::from_str(&json) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if routes.is_empty() {
+        return false;
+    }
+    let next = routes.remove(0);
+    let rest = serde_json::to_string(&routes).unwrap_or_else(|_| "[]".to_string());
+    intent
+        .metadata
+        .insert(MULTI_POOL_FALLBACK_ROUTES_JSON_META_KEY.to_string(), rest);
+
+    let min_lamports = next.execution_min_out_lamports.unwrap_or_else(|| {
+        let keep_bps = 10_000u64.saturating_sub(intent.max_slippage_bps as u64);
+        ((next.amount_out as u128) * (keep_bps as u128) / 10_000u128) as u64
+    });
+    intent.metadata.insert("dex".to_string(), next.dex.clone());
+    intent.resources.pools = vec![next.pool_id.clone()];
+    intent.resources.accounts = next.accounts.clone();
+    match &next.creator {
+        Some(c) => {
+            intent.metadata.insert("creator".to_string(), c.clone());
+        }
+        None => {
+            intent.metadata.remove("creator");
+        }
+    }
+    intent.execution = Some(TradeExecutionConstraints {
+        min_out: Some(ExplicitAmount::new(min_lamports, 9)),
+    });
+    true
 }
 
 /// Guard timeout for `PumpFunAmmDex::quote_exact_in` in liquidation / 6005-retry.
@@ -3766,6 +3954,7 @@ impl ExecutionContext {
                                 pool_id,
                                 accounts,
                                 creator: None,
+                                execution_min_out_lamports: None,
                             });
                         };
 
@@ -4167,7 +4356,17 @@ impl ExecutionContext {
                         }
                     }
 
-                    if let Some(best_route) = select_best_route(candidates) {
+                    let buildable = liquidation_filter_multi_pool_buildable_candidates(
+                        ctx.live_pool_cache.as_deref(),
+                        &orca,
+                        &mint,
+                        &sol_mint,
+                        candidates,
+                        &mut quote_attempts,
+                    )
+                    .await;
+                    if let Some(best_route) = buildable.first().cloned() {
+                        liquidation_store_multi_pool_fallback_metadata(&mut metadata, &buildable);
                         metadata.insert("sell_routing".to_string(), "multi_pool".to_string());
                         metadata.insert("dex".to_string(), best_route.dex.clone());
                         if let Some(creator) = best_route.creator.clone() {
@@ -4334,10 +4533,24 @@ impl ExecutionContext {
                                     CachedPoolState::PumpFun(s) => Some(s.creator.to_string()),
                                     _ => None,
                                 },
+                                execution_min_out_lamports: Some(min_out),
                             });
                         }
 
-                        if let Some(best_route) = select_best_route(candidates) {
+                        let buildable = liquidation_filter_multi_pool_buildable_candidates(
+                            ctx.live_pool_cache.as_deref(),
+                            &orca,
+                            &mint,
+                            &sol_mint,
+                            candidates,
+                            &mut quote_attempts,
+                        )
+                        .await;
+                        if let Some(best_route) = buildable.first().cloned() {
+                            liquidation_store_multi_pool_fallback_metadata(
+                                &mut metadata,
+                                &buildable,
+                            );
                             metadata.insert("sell_routing".to_string(), "multi_pool".to_string());
                             metadata.insert("dex".to_string(), best_route.dex.clone());
                             if let Some(creator) = best_route.creator.clone() {
@@ -8403,7 +8616,7 @@ fn max_open_positions_buy_gate(
 }
 
 /// Process a single TradeIntent through the execution pipeline
-async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<()> {
+async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Result<()> {
     ctx.record_intent_received();
 
     // Keep Prometheus counters aligned with persisted decision/intents logs.
@@ -9105,6 +9318,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     let mut pump_amm_recovery_attempted = false;
     let mut pumpfun_bonding_recovery_attempted = false;
     let mut orca_recovery_attempted = false;
+    let mut multi_pool_tx_plan_fallback_attempted = false;
     let (
         tx_plan,
         plan_hash_str,
@@ -9113,11 +9327,12 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         bundle_tip_ix,
         wallet_pubkey,
         bundle_tip_lamports,
-    ) = loop {
+    ) = 'tx_plan_retry: loop {
         if pump_amm_preplan_discovery_attempted
             || pump_amm_recovery_attempted
             || pumpfun_bonding_recovery_attempted
             || orca_recovery_attempted
+            || multi_pool_tx_plan_fallback_attempted
         {
             checks.truncate(checks_len_before_tx_plan_build);
         }
@@ -9361,6 +9576,22 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                         (plan, plan_hash_str)
                     }
                     tx_builder::TxPlanOutcome::Unsupported(u) => {
+                        if is_cold_path_recovery_sell(&intent)
+                            && take_next_multi_pool_buildable_fallback_route(&mut intent)
+                        {
+                            multi_pool_tx_plan_fallback_attempted = true;
+                            info!(
+                                intent_id = %intent.intent_id,
+                                details = %u.details,
+                                dex = %intent
+                                    .metadata
+                                    .get("dex")
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("?"),
+                                "multi_pool: tx_plan UnsupportedIntent — switching to next pre-filtered buildable route, retrying plan build"
+                            );
+                            continue 'tx_plan_retry;
+                        }
                         checks.push(CheckResult {
                             check_name: "tx_plan".to_string(),
                             passed: false,
@@ -11688,11 +11919,13 @@ mod execution_engine_tests {
         cold_path_dex_sim_failure_triggers_discovery_recovery, is_cold_path_recovery_sell,
         is_pump_amm_structural_sim_error, is_pumpfun_bonding_curve_structural_sim_error,
         is_regular_momentum_hot_path_sell, liquidation_pumpfun_sell_preference,
-        max_open_positions_buy_gate, pump_amm_hint_pool_cache_usable_for_tx_plan_builder,
+        liquidation_store_multi_pool_fallback_metadata, max_open_positions_buy_gate,
+        pump_amm_hint_pool_cache_usable_for_tx_plan_builder,
         pump_amm_liquidation_quote_timeout_str, pump_amm_pool_market_hint_merge,
         pump_amm_slave_recovery_snapshot, record_pump_amm_hot_path_refresh_after_success,
-        scope48_confirmed_sell_close_decision, select_best_route,
-        try_pump_amm_hot_path_refresh_publish, wait_for_meteora_dlmm_slave_after_recovery,
+        scope48_confirmed_sell_close_decision, sort_route_candidates_by_amount_out,
+        take_next_multi_pool_buildable_fallback_route, try_pump_amm_hot_path_refresh_publish,
+        wait_for_meteora_dlmm_slave_after_recovery,
         wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder,
         wait_for_pump_amm_slave_after_recovery, wait_for_pumpfun_bonding_cache_refresh,
         DiscoveryRequestOutcome, PumpAmmHotPathRefreshDecision, RouteCandidate,
@@ -12542,7 +12775,7 @@ mod execution_engine_tests {
     }
 
     #[test]
-    fn select_best_route_prefers_highest_and_keeps_first_on_tie() {
+    fn sort_route_candidates_prefers_highest_and_keeps_first_on_tie() {
         let candidates = vec![
             RouteCandidate {
                 dex: "raydium".to_string(),
@@ -12550,6 +12783,7 @@ mod execution_engine_tests {
                 pool_id: "pool-1".to_string(),
                 accounts: vec!["a1".to_string()],
                 creator: None,
+                execution_min_out_lamports: None,
             },
             RouteCandidate {
                 dex: "orca".to_string(),
@@ -12557,6 +12791,7 @@ mod execution_engine_tests {
                 pool_id: "pool-2".to_string(),
                 accounts: vec!["a2".to_string()],
                 creator: None,
+                execution_min_out_lamports: None,
             },
             RouteCandidate {
                 dex: "pump_amm".to_string(),
@@ -12564,13 +12799,84 @@ mod execution_engine_tests {
                 pool_id: "pool-3".to_string(),
                 accounts: vec!["a3".to_string()],
                 creator: None,
+                execution_min_out_lamports: None,
             },
         ];
 
-        let best = select_best_route(candidates).expect("expected a best route");
+        let sorted = sort_route_candidates_by_amount_out(candidates);
+        let best = sorted.first().expect("expected a best route");
         assert_eq!(best.dex, "orca");
         assert_eq!(best.pool_id, "pool-2");
         assert_eq!(best.amount_out, 200);
+    }
+
+    #[test]
+    fn multi_pool_fallback_take_next_updates_intent_and_drains_queue() {
+        use super::BUILD_VERSION;
+        use ironcrab::solana::dex_parser::SOL_MINT;
+
+        let mut intent = TradeIntent::new_sell(
+            "execution-engine",
+            BUILD_VERSION,
+            "run",
+            "id-mp-fb".to_string(),
+            "execution-engine",
+            IntentTier::Tier0,
+            IntentOrigin::ExecutionMevB,
+            "mint".to_string(),
+            6,
+            SOL_MINT.to_string(),
+            1_000,
+            0,
+            100,
+            TradingRegime::NotApplicable,
+        );
+        intent
+            .metadata
+            .insert("sell_routing".to_string(), "multi_pool".to_string());
+        intent
+            .metadata
+            .insert("dex".to_string(), "orca".to_string());
+        intent.resources.pools = vec!["orca_pool".to_string()];
+
+        let buildable = vec![
+            RouteCandidate {
+                dex: "orca".to_string(),
+                amount_out: 200,
+                pool_id: "orca_pool".to_string(),
+                accounts: vec![],
+                creator: None,
+                execution_min_out_lamports: None,
+            },
+            RouteCandidate {
+                dex: "pump_amm".to_string(),
+                amount_out: 100,
+                pool_id: "pump_pool".to_string(),
+                accounts: vec!["acct".to_string()],
+                creator: None,
+                execution_min_out_lamports: None,
+            },
+        ];
+        let mut md = std::collections::HashMap::new();
+        liquidation_store_multi_pool_fallback_metadata(&mut md, &buildable);
+        intent.metadata.extend(md);
+
+        assert!(take_next_multi_pool_buildable_fallback_route(&mut intent));
+        assert_eq!(
+            intent.metadata.get("dex").map(String::as_str),
+            Some("pump_amm")
+        );
+        assert_eq!(intent.resources.pools, vec!["pump_pool".to_string()]);
+        assert_eq!(intent.resources.accounts, vec!["acct".to_string()]);
+        let min = intent
+            .execution
+            .as_ref()
+            .and_then(|e| e.min_out.as_ref())
+            .expect("min_out");
+        assert_eq!(min.decimals, 9);
+        assert_eq!(min.raw, 99);
+
+        assert!(!take_next_multi_pool_buildable_fallback_route(&mut intent));
     }
 
     #[test]
