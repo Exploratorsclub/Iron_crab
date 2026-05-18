@@ -5245,9 +5245,13 @@ impl MomentumContext {
 
                     let lp_after_entry =
                         pos.entry_confirmed_slot > 0 && lp_s > pos.entry_confirmed_slot;
+                    // Legacy: `last_price_slot` advances on every mark — comparing exit slots to it
+                    // suppresses hard exits once any newer trade arrived.
                     let lp_after_entry_legacy = pos.entry_confirmed_slot == 0
-                        && lp_s > pos.last_price_slot
-                        && pos.last_price_slot > 0;
+                        && sig
+                            .lp_removal_observed_at
+                            .map(|obs| obs.checked_duration_since(pos.entry_time).is_some())
+                            .unwrap_or(false);
                     let lp_after_entry_no_slot_meta = pos.entry_confirmed_slot == 0
                         && pos.last_price_slot == 0
                         && sig
@@ -5302,8 +5306,10 @@ impl MomentumContext {
                     let dev_after_buy =
                         pos.entry_confirmed_slot > 0 && ds > pos.entry_confirmed_slot;
                     let dev_after_buy_legacy = pos.entry_confirmed_slot == 0
-                        && ds > pos.last_price_slot
-                        && pos.last_price_slot > 0;
+                        && sig
+                            .dev_sell_observed_at
+                            .map(|obs| obs.checked_duration_since(pos.entry_time).is_some())
+                            .unwrap_or(false);
                     let dev_after_buy_no_slot_meta = pos.entry_confirmed_slot == 0
                         && pos.last_price_slot == 0
                         && sig
