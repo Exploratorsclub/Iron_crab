@@ -2167,7 +2167,8 @@ impl TokenTracker {
     /// Record LP removal (`slot`: `MarketEvent.slot` when known).
     fn record_lp_removal(&mut self, slot: Option<u64>) {
         self.lp_removed = true;
-        self.lp_removal_slot = slot.or(self.lp_removal_slot);
+        // Treat slot 0 as unknown so wallclock LP exit path is not blocked.
+        self.lp_removal_slot = slot.filter(|&s| s > 0).or(self.lp_removal_slot);
         self.lp_removal_observed_at.get_or_insert_with(Instant::now);
         self.reject("REJECT_LP_REMOVED");
         warn!(mint = %self.mint, lp_removal_slot = ?self.lp_removal_slot, "LP removed - blacklisting");
@@ -5252,16 +5253,8 @@ impl MomentumContext {
                             .lp_removal_observed_at
                             .map(|obs| obs.checked_duration_since(pos.entry_time).is_some())
                             .unwrap_or(false);
-                    let lp_after_entry_no_slot_meta = pos.entry_confirmed_slot == 0
-                        && pos.last_price_slot == 0
-                        && sig
-                            .lp_removal_observed_at
-                            .map(|obs| obs.checked_duration_since(pos.entry_time).is_some())
-                            .unwrap_or(false);
 
-                    if lp_chain_recent
-                        && (lp_after_entry || lp_after_entry_legacy || lp_after_entry_no_slot_meta)
-                    {
+                    if lp_chain_recent && (lp_after_entry || lp_after_entry_legacy) {
                         // Note: exit_generated is set by caller after successful publish
                         exits.push((
                             mint.clone(),
@@ -5310,14 +5303,8 @@ impl MomentumContext {
                             .dev_sell_observed_at
                             .map(|obs| obs.checked_duration_since(pos.entry_time).is_some())
                             .unwrap_or(false);
-                    let dev_after_buy_no_slot_meta = pos.entry_confirmed_slot == 0
-                        && pos.last_price_slot == 0
-                        && sig
-                            .dev_sell_observed_at
-                            .map(|obs| obs.checked_duration_since(pos.entry_time).is_some())
-                            .unwrap_or(false);
 
-                    if dev_after_buy || dev_after_buy_legacy || dev_after_buy_no_slot_meta {
+                    if dev_after_buy || dev_after_buy_legacy {
                         let sig_s = sig.dev_sold_sig.as_deref().unwrap_or("<unknown>");
                         let sol = sig.dev_sold_sol.unwrap_or(0);
                         // Note: exit_generated is set by caller after successful publish
