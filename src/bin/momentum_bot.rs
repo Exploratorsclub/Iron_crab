@@ -5139,10 +5139,9 @@ impl MomentumContext {
                         .rev()
                         .find(|tr| !tr.is_buy && tr.trader == *dev)
                     {
+                        dev_sell_observed_at = Some(last.timestamp);
                         if last.slot > 0 {
                             dev_sell_slot = Some(last.slot);
-                        } else {
-                            dev_sell_observed_at = Some(last.timestamp);
                         }
                         dev_sold_sig = Some(last.signature.clone());
                         dev_sold_sol = Some(last.sol_amount);
@@ -5178,7 +5177,8 @@ impl MomentumContext {
                         if let Some(b) = incoming.dev_sell_slot {
                             if e.dev_sell_slot.map(|a| b > a).unwrap_or(true) {
                                 e.dev_sell_slot = Some(b);
-                                e.dev_sell_observed_at = None;
+                                e.dev_sell_observed_at =
+                                    incoming.dev_sell_observed_at.or(e.dev_sell_observed_at);
                                 e.dev_sold_sig = incoming.dev_sold_sig;
                                 e.dev_sold_sol = incoming.dev_sold_sol;
                             }
@@ -5229,8 +5229,16 @@ impl MomentumContext {
                     let lp_after_entry_legacy = pos.entry_confirmed_slot == 0
                         && lp_s > pos.last_price_slot
                         && pos.last_price_slot > 0;
+                    let lp_after_entry_no_slot_meta = pos.entry_confirmed_slot == 0
+                        && pos.last_price_slot == 0
+                        && sig
+                            .lp_removal_observed_at
+                            .map(|obs| obs.checked_duration_since(pos.entry_time).is_some())
+                            .unwrap_or(false);
 
-                    if lp_chain_recent && (lp_after_entry || lp_after_entry_legacy) {
+                    if lp_chain_recent
+                        && (lp_after_entry || lp_after_entry_legacy || lp_after_entry_no_slot_meta)
+                    {
                         // Note: exit_generated is set by caller after successful publish
                         exits.push((
                             mint.clone(),
@@ -5253,7 +5261,6 @@ impl MomentumContext {
                     let lp_after_entry = pos.entry_confirmed_slot > 0
                         && obs.checked_duration_since(pos.entry_time).is_some();
                     let lp_after_entry_legacy = pos.entry_confirmed_slot == 0
-                        && pos.last_price_slot > 0
                         && obs.checked_duration_since(pos.entry_time).is_some();
 
                     if lp_chain_recent && (lp_after_entry || lp_after_entry_legacy) {
@@ -5278,8 +5285,14 @@ impl MomentumContext {
                     let dev_after_buy_legacy = pos.entry_confirmed_slot == 0
                         && ds > pos.last_price_slot
                         && pos.last_price_slot > 0;
+                    let dev_after_buy_no_slot_meta = pos.entry_confirmed_slot == 0
+                        && pos.last_price_slot == 0
+                        && sig
+                            .dev_sell_observed_at
+                            .map(|obs| obs.checked_duration_since(pos.entry_time).is_some())
+                            .unwrap_or(false);
 
-                    if dev_after_buy || dev_after_buy_legacy {
+                    if dev_after_buy || dev_after_buy_legacy || dev_after_buy_no_slot_meta {
                         let sig_s = sig.dev_sold_sig.as_deref().unwrap_or("<unknown>");
                         let sol = sig.dev_sold_sol.unwrap_or(0);
                         // Note: exit_generated is set by caller after successful publish
@@ -5301,7 +5314,6 @@ impl MomentumContext {
                     let dev_after_buy = pos.entry_confirmed_slot > 0
                         && dev_obs.checked_duration_since(pos.entry_time).is_some();
                     let dev_after_buy_legacy = pos.entry_confirmed_slot == 0
-                        && pos.last_price_slot > 0
                         && dev_obs.checked_duration_since(pos.entry_time).is_some();
 
                     if dev_after_buy || dev_after_buy_legacy {
