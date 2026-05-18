@@ -1656,6 +1656,9 @@ struct TokenTracker {
     lp_removed: bool,
     /// Geyser slot of the LP removal event when known (`MarketEvent.slot`).
     lp_removal_slot: Option<u64>,
+    /// When LP removal was first observed (always set in `record_lp_removal`) — hard-exit fallback
+    /// when `lp_removal_slot` is unknown (I-7: no RPC; wallclock only).
+    lp_removal_observed_at: Option<Instant>,
 
     /// Highest trade slot observed on this pool row (for chain-window head fallback).
     max_trade_slot: u64,
@@ -1710,6 +1713,7 @@ impl TokenTracker {
             dev_rebought: false,
             lp_removed: false,
             lp_removal_slot: None,
+            lp_removal_observed_at: None,
             max_trade_slot: 0,
             dump_observed_slot: None,
             recovery_started_slot: None,
@@ -2164,6 +2168,7 @@ impl TokenTracker {
     fn record_lp_removal(&mut self, slot: Option<u64>) {
         self.lp_removed = true;
         self.lp_removal_slot = slot.or(self.lp_removal_slot);
+        self.lp_removal_observed_at.get_or_insert_with(Instant::now);
         self.reject("REJECT_LP_REMOVED");
         warn!(mint = %self.mint, lp_removal_slot = ?self.lp_removal_slot, "LP removed - blacklisting");
     }
@@ -5110,7 +5115,9 @@ impl MomentumContext {
         #[derive(Clone, Debug)]
         struct TrackerExitSignals {
             lp_removal_slot: Option<u64>,
+            lp_removal_observed_at: Option<Instant>,
             dev_sell_slot: Option<u64>,
+            dev_sell_observed_at: Option<Instant>,
             dev_sold_sig: Option<String>,
             dev_sold_sol: Option<u64>,
         }
@@ -5121,6 +5128,7 @@ impl MomentumContext {
             for t in trackers.values() {
                 let mint_key = t.mint.clone();
                 let mut dev_sell_slot: Option<u64> = None;
+                let mut dev_sell_observed_at: Option<Instant> = None;
                 let mut dev_sold_sig: Option<String> = None;
                 let mut dev_sold_sol: Option<u64> = None;
 
@@ -5133,6 +5141,8 @@ impl MomentumContext {
                     {
                         if last.slot > 0 {
                             dev_sell_slot = Some(last.slot);
+                        } else {
+                            dev_sell_observed_at = Some(last.timestamp);
                         }
                         dev_sold_sig = Some(last.signature.clone());
                         dev_sold_sol = Some(last.sol_amount);
@@ -5141,7 +5151,9 @@ impl MomentumContext {
 
                 let incoming = TrackerExitSignals {
                     lp_removal_slot: t.lp_removal_slot,
+                    lp_removal_observed_at: t.lp_removal_observed_at,
                     dev_sell_slot,
+                    dev_sell_observed_at,
                     dev_sold_sig,
                     dev_sold_sol,
                 };
@@ -5156,11 +5168,31 @@ impl MomentumContext {
                             (None, Some(b)) => Some(b),
                             (None, None) => None,
                         };
+                        e.lp_removal_observed_at =
+                            match (e.lp_removal_observed_at, incoming.lp_removal_observed_at) {
+                                (Some(a), Some(b)) => Some(a.min(b)),
+                                (Some(a), None) => Some(a),
+                                (None, Some(b)) => Some(b),
+                                (None, None) => None,
+                            };
                         if let Some(b) = incoming.dev_sell_slot {
                             if e.dev_sell_slot.map(|a| b > a).unwrap_or(true) {
                                 e.dev_sell_slot = Some(b);
+                                e.dev_sell_observed_at = None;
                                 e.dev_sold_sig = incoming.dev_sold_sig;
                                 e.dev_sold_sol = incoming.dev_sold_sol;
+                            }
+                        } else if let Some(in_obs) = incoming.dev_sell_observed_at {
+                            if e.dev_sell_slot.is_none() {
+                                let replace = e
+                                    .dev_sell_observed_at
+                                    .map(|cur| in_obs > cur)
+                                    .unwrap_or(true);
+                                if replace {
+                                    e.dev_sell_observed_at = Some(in_obs);
+                                    e.dev_sold_sig = incoming.dev_sold_sig;
+                                    e.dev_sold_sol = incoming.dev_sold_sol;
+                                }
                             }
                         }
                     }
@@ -5213,6 +5245,31 @@ impl MomentumContext {
                         ));
                         continue;
                     }
+                } else if let Some(obs) = sig.lp_removal_observed_at {
+                    // Slot unknown (e.g. Geyser `event.slot` missing): wallclock window + post-entry
+                    // ordering so LP_REMOVAL hard exits cannot be skipped silently.
+                    let lp_chain_recent = config.lp_removal_window_secs == 0
+                        || obs.elapsed().as_secs() <= config.lp_removal_window_secs;
+                    let lp_after_entry = pos.entry_confirmed_slot > 0
+                        && obs.checked_duration_since(pos.entry_time).is_some();
+                    let lp_after_entry_legacy = pos.entry_confirmed_slot == 0
+                        && pos.last_price_slot > 0
+                        && obs.checked_duration_since(pos.entry_time).is_some();
+
+                    if lp_chain_recent && (lp_after_entry || lp_after_entry_legacy) {
+                        exits.push((
+                            mint.clone(),
+                            pos.pool.clone(),
+                            pos.dex.clone(),
+                            "LP_REMOVAL".to_string(),
+                            format!(
+                                "LP removed post-entry (lp_slot=unknown, wallclock, entry_confirmed_slot={}, head_slot={})",
+                                pos.entry_confirmed_slot, chain_head_slot
+                            ),
+                            pos.token_amount,
+                        ));
+                        continue;
+                    }
                 }
 
                 if let Some(ds) = sig.dev_sell_slot {
@@ -5234,6 +5291,30 @@ impl MomentumContext {
                             format!(
                                 "Dev sold post-entry (dev_sell_slot={}, entry_confirmed_slot={}, sig={}, sol={:.4})",
                                 ds, pos.entry_confirmed_slot, sig_s,
+                                sol as f64 / 1_000_000_000.0
+                            ),
+                            pos.token_amount,
+                        ));
+                        continue;
+                    }
+                } else if let Some(dev_obs) = sig.dev_sell_observed_at {
+                    let dev_after_buy = pos.entry_confirmed_slot > 0
+                        && dev_obs.checked_duration_since(pos.entry_time).is_some();
+                    let dev_after_buy_legacy = pos.entry_confirmed_slot == 0
+                        && pos.last_price_slot > 0
+                        && dev_obs.checked_duration_since(pos.entry_time).is_some();
+
+                    if dev_after_buy || dev_after_buy_legacy {
+                        let sig_s = sig.dev_sold_sig.as_deref().unwrap_or("<unknown>");
+                        let sol = sig.dev_sold_sol.unwrap_or(0);
+                        exits.push((
+                            mint.clone(),
+                            pos.pool.clone(),
+                            pos.dex.clone(),
+                            "DEV_SELL".to_string(),
+                            format!(
+                                "Dev sold post-entry (dev_sell_slot=unknown, wallclock, entry_confirmed_slot={}, sig={}, sol={:.4})",
+                                pos.entry_confirmed_slot, sig_s,
                                 sol as f64 / 1_000_000_000.0
                             ),
                             pos.token_amount,
