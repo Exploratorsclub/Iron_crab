@@ -5274,12 +5274,9 @@ impl MomentumContext {
                     // ordering so LP_REMOVAL hard exits cannot be skipped silently.
                     let lp_chain_recent = config.lp_removal_window_secs == 0
                         || obs.elapsed().as_secs() <= config.lp_removal_window_secs;
-                    let lp_after_entry = pos.entry_confirmed_slot > 0
-                        && obs.checked_duration_since(pos.entry_time).is_some();
-                    let lp_after_entry_legacy = pos.entry_confirmed_slot == 0
-                        && obs.checked_duration_since(pos.entry_time).is_some();
+                    let lp_post_entry = obs.checked_duration_since(pos.entry_time).is_some();
 
-                    if lp_chain_recent && (lp_after_entry || lp_after_entry_legacy) {
+                    if lp_chain_recent && lp_post_entry {
                         exits.push((
                             mint.clone(),
                             pos.pool.clone(),
@@ -5323,12 +5320,9 @@ impl MomentumContext {
                         continue;
                     }
                 } else if let Some(dev_obs) = sig.dev_sell_observed_at {
-                    let dev_after_buy = pos.entry_confirmed_slot > 0
-                        && dev_obs.checked_duration_since(pos.entry_time).is_some();
-                    let dev_after_buy_legacy = pos.entry_confirmed_slot == 0
-                        && dev_obs.checked_duration_since(pos.entry_time).is_some();
+                    let dev_post_buy = dev_obs.checked_duration_since(pos.entry_time).is_some();
 
-                    if dev_after_buy || dev_after_buy_legacy {
+                    if dev_post_buy {
                         let sig_s = sig.dev_sold_sig.as_deref().unwrap_or("<unknown>");
                         let sol = sig.dev_sold_sol.unwrap_or(0);
                         exits.push((
@@ -16426,7 +16420,8 @@ async fn process_market_event(
 
         MarketEventKind::SlotUpdate { current_slot } => {
             // Advance chain head even when the flattened `MarketEvent.slot` is absent (I-16 / burst-safe filters).
-            ctx.last_event_slot.store(
+            // Monotonic: ignore stale SlotUpdate (redelivery / reorder) so chain head never regresses.
+            ctx.last_event_slot.fetch_max(
                 *current_slot,
                 std::sync::atomic::Ordering::Relaxed,
             );
