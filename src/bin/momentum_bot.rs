@@ -2217,8 +2217,10 @@ impl TokenTracker {
         let total_trades = self.buy_count + self.sell_count;
         let mut min_sl = u64::MAX;
         let mut max_sl = 0u64;
+        let mut trades_with_chain_slot = 0u32;
         for t in &self.trades {
             if t.slot > 0 {
+                trades_with_chain_slot = trades_with_chain_slot.saturating_add(1);
                 min_sl = min_sl.min(t.slot);
                 max_sl = max_sl.max(t.slot);
             }
@@ -2229,7 +2231,7 @@ impl TokenTracker {
             1u64
         };
         let chain_secs = (chain_span_slots as f64) * (MOMENTUM_APPROX_SLOT_MS as f64 / 1000.0);
-        let trades_per_sec = (total_trades as f64) / chain_secs.max(1e-9);
+        let trades_per_sec = (trades_with_chain_slot as f64) / chain_secs.max(1e-9);
 
         let buy_dominance = if total_trades > 0 {
             self.buy_count as f64 / total_trades as f64
