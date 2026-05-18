@@ -2784,6 +2784,24 @@ struct MomentumContext {
     last_event_ts_ms: std::sync::atomic::AtomicU64,
 }
 
+/// Merge `lp_removal_observed_at` across sibling pool trackers for the same mint (wallclock LP_REMOVAL path).
+///
+/// Per tracker, [`TokenTracker::record_lp_removal`] records the **first** local observation (`get_or_insert_with(Instant::now)`).
+/// For mint-level hard-exit gating we take the **latest** sibling observation (legacy parity with `lp_removed_at` max-merge),
+/// so `obs.elapsed()` vs `lp_removal_window_secs` is not skewed toward “too old” as with `min` (which could suppress exits).
+#[inline]
+fn merge_lp_removal_observed_at_mint_aggregate(
+    existing: Option<Instant>,
+    incoming: Option<Instant>,
+) -> Option<Instant> {
+    match (existing, incoming) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 impl MomentumContext {
     /// Increment [`Self::tokens_blacklisted`] at most once per mint for this process (metric dedupe).
     /// Tracker rows may still reject independently; this is observability only.
@@ -5169,13 +5187,12 @@ impl MomentumContext {
                             (None, Some(b)) => Some(b),
                             (None, None) => None,
                         };
-                        e.lp_removal_observed_at =
-                            match (e.lp_removal_observed_at, incoming.lp_removal_observed_at) {
-                                (Some(a), Some(b)) => Some(a.min(b)),
-                                (Some(a), None) => Some(a),
-                                (None, Some(b)) => Some(b),
-                                (None, None) => None,
-                            };
+                        // LP wallclock aggregate: latest wins (see [`merge_lp_removal_observed_at_mint_aggregate`]).
+                        e.lp_removal_observed_at = merge_lp_removal_observed_at_mint_aggregate(
+                            e.lp_removal_observed_at,
+                            incoming.lp_removal_observed_at,
+                        );
+                        // dev_sell_observed_at: already “latest wins” (higher slot branch + `in_obs > cur` below).
                         if let Some(b) = incoming.dev_sell_slot {
                             if e.dev_sell_slot.map(|a| b > a).unwrap_or(true) {
                                 e.dev_sell_slot = Some(b);
@@ -10274,6 +10291,29 @@ mod tests {
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    #[test]
+    fn lp_removal_observed_at_mint_merge_uses_max_for_wallclock_recency() {
+        let base = Instant::now();
+        let earlier = base.checked_sub(Duration::from_secs(120)).expect("instant");
+        let later = base.checked_sub(Duration::from_secs(2)).expect("instant");
+        assert_eq!(
+            merge_lp_removal_observed_at_mint_aggregate(Some(earlier), Some(later)),
+            Some(later)
+        );
+        let window_secs = 10u64;
+        let merged = merge_lp_removal_observed_at_mint_aggregate(Some(earlier), Some(later))
+            .expect("merged");
+        assert!(
+            merged.elapsed().as_secs() <= window_secs,
+            "max-merge keeps LP removal observation recent for wallclock window gating"
+        );
+        let min_bug = earlier.min(later);
+        assert!(
+            min_bug.elapsed().as_secs() > window_secs,
+            "min-merge would treat LP removal as outside window and suppress hard exit"
+        );
     }
 
     #[test]
