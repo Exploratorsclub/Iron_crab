@@ -6,6 +6,11 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-MOM-LP-OBSERVED-AT-MINT-MERGE-MAX-2026-05-18: LP-Removal Wallclock — Mint-Aggregat `max` statt `min` (PR #134 Follow-up)
+**Datum**: 2026-05-18  
+**Problem**: Beim Merge von `TrackerExitSignals` pro Mint über mehrere Pool-Tracker war `lp_removal_observed_at` mit `min` zusammengeführt — das verschärfte das Wallclock-Fenster künstlich und konnte LP-Hard-Exits still unterdrücken (Bugbot Low auf PR #134).  
+**Fix**: Mint-Aggregat nutzt wieder **`max`** (späteste Sibling-Beobachtung), analog zur Legacy-Logik für `lp_removed_at`; Unit-Test gegen `min`-Regression.
+
 ### FIX-MOM-ENTRY-FILTERS-CHAIN-SLOT-2026-05-17: Momentum Entry-/Filter-Fenster vs. Ingest-Burst (Kettenzeit)
 **Datum**: 2026-05-17  
 **Problem**: `TokenTracker` und Entry-Filter nutzten `Instant::now()` beim Ingest für Fenster (Käufer, Inflow, Velocity, Microbuy/Buyer-Quality). Bei NATS-/Market-Data-Bursts wirkten viele historische Trades gleichzeitig „frisch“ — Filter bestanden, obwohl die Kette schon lange stillstand (Chart vs. Geyser-Slot).  
