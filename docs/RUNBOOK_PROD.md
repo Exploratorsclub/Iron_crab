@@ -146,6 +146,30 @@ journalctl -u execution-engine -n 100 --no-pager
 | Control Plane API | `http://localhost:8080` | REST API |
 | Trades API | `http://localhost:9899/trades` | Grafana Infinity |
 
+### Pipeline-Latenz (Prometheus-Histogramme, A–I)
+
+Segmentierte End-to-End-Latenzen über die drei Prozesse **market-data → momentum-bot → execution-engine**.
+Alle Werte nutzen konsistent `RecordHeader.ts_unix_ms` bzw. Geyser-`Instant::now()`-Startpunkte am Publish-Pfad; Details in `docs/BUGS_FIXES.md` (Eintrag **PIPELINE-LATENCY-METRICS**).
+
+| Segment | Metrik (Präfix je nach Export) | Kurzinterpretation |
+|--------|--------------------------------|---------------------|
+| A | `market_data_geyser_to_publish_ms_*` (Suffix `_trade`, `_bonding_curve`, …) | Geyser-Eingang bis erfolgreicher Core-NATS-Publish |
+| B | `market_data_slot_lag_at_publish_slots_*` | Slot-Differenz am Publish (market-data) |
+| C | `momentum_event_to_ingest_ms_*` | MarketEvent-Producer-Zeit bis Momentum-Ingest (nur Core NATS) |
+| D | `momentum_intent_header_to_publish_ms_*` | Intent-Header-Zeit bis JetStream-TradeIntent-Publish |
+| E | `momentum_publish_to_intent_ms_*` | Kausales Event-`ts_unix_ms` bis Intent-Header (Momentum-intern) |
+| F | `execution_intent_header_to_receive_ms_*` | Intent-Header bis erster Zeile `process_intent` |
+| G | `execution_process_intent_us_*` | Gesamtdauer `process_intent` (Mikrosekunden) |
+| H | `execution_intent_to_confirm_ms_*` | Intent-Header bis bestätigtes On-Chain-Outcome |
+| I | `execution_slot_lag_at_send_slots_*` | `cached_blockhash.slot` minus Intent-Metadaten-`slot` nach erfolgreichem Send |
+
+Beispiel **rate()** über 5m (Namen an eueren `job`/Labels anpassen):
+
+```promql
+histogram_quantile(0.99, sum(rate(momentum_intent_header_to_publish_ms_bucket[5m])) by (le))
+histogram_quantile(0.99, sum(rate(execution_process_intent_us_bucket[5m])) by (le)) / 1e6
+```
+
 ### PumpSwap Async-Healing Metrics
 
 Im `execution-engine`-Metrics-Endpoint sind fuer den Hot-Path-Healing-Pfad jetzt

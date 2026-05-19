@@ -20,11 +20,12 @@
 use anyhow::Result;
 use clap::Parser;
 use solana_sdk::pubkey::Pubkey;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -44,11 +45,14 @@ use ironcrab::ipc::{
     POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use ironcrab::metrics::{
-    serve_metrics, set_readiness_control_sub_active, set_readiness_mode,
-    set_readiness_nats_connected, update_readiness_market_data_current, MetricsComponent,
-    MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
-    MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
-    POOLS_TRACKED_GAUGE,
+    market_data_bump_geyser_head_slot, record_market_data_geyser_to_publish_on_success,
+    record_market_data_trade_after_bonding_publish_ms, serve_metrics,
+    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
+    update_readiness_market_data_current, wall_clock_unix_ms_now, MarketDataLatencySegment,
+    MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
+    MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL,
+    MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
+    NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -155,19 +159,80 @@ pub(crate) fn market_event_is_momentum_nats_relevant(kind: &MarketEventKind) -> 
     }
 }
 
+/// Optional Geyser→core-publish latency trace (same `recv_at` for all publishes from one Geyser message).
+#[derive(Clone, Copy)]
+pub(crate) struct MarketEventCorePublishTrace {
+    pub recv_at: Instant,
+    pub cold_path: bool,
+    pub segment: MarketDataLatencySegment,
+}
+
+#[inline]
+fn market_data_publish_segment(kind: &MarketEventKind) -> MarketDataLatencySegment {
+    match kind {
+        MarketEventKind::Trade { .. } => MarketDataLatencySegment::Trade,
+        MarketEventKind::BondingCurveProgress { .. } => MarketDataLatencySegment::BondingCurve,
+        MarketEventKind::PoolCreated { .. } => MarketDataLatencySegment::PoolCreated,
+        _ => MarketDataLatencySegment::Other,
+    }
+}
+
 /// Publish one logical market event to core NATS and, when [`market_event_is_momentum_nats_relevant`], to momentum subject.
 ///
 /// Counts one [`MARKET_EVENTS_PUBLISHED_TOTAL`] per successful core delivery; [`NATS_MESSAGES_PUBLISHED_TOTAL`]
 /// once per successful NATS publish (core plus optional second message). [`NatsClient::publish`] may return
 /// `Ok(false)` when the message is dropped (no client, NATS error, timeout/backpressure); that is not success.
-pub(crate) async fn publish_market_event_core_and_momentum(
+pub(crate) async fn publish_market_event_core_and_momentum_ex(
     nats: &NatsClient,
     event: &MarketEvent,
+    trace: Option<MarketEventCorePublishTrace>,
+    ctx: Option<&MarketDataContext>,
 ) -> bool {
     match nats.publish(TOPIC_MARKET_EVENTS, event).await {
         Ok(true) => {
             NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
             MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            if let Some(t) = trace {
+                record_market_data_geyser_to_publish_on_success(
+                    t.recv_at,
+                    t.segment,
+                    t.cold_path,
+                    event.slot,
+                );
+            }
+            if let Some(ctx) = ctx {
+                let now_ms = wall_clock_unix_ms_now();
+                match &event.kind {
+                    MarketEventKind::Trade {
+                        pool_address, dex, ..
+                    } if dex == "pumpfun" => {
+                        MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS.store(now_ms, Ordering::Relaxed);
+                        if let Ok(pk) = Pubkey::from_str(pool_address) {
+                            if let Some(last) = ctx
+                                .bonding_curve_publish_times
+                                .lock()
+                                .last_bonding_wall_ms(&pk)
+                            {
+                                if now_ms >= last {
+                                    record_market_data_trade_after_bonding_publish_ms(
+                                        now_ms.saturating_sub(last),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    MarketEventKind::BondingCurveProgress { bonding_curve, .. } => {
+                        MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS
+                            .store(now_ms, Ordering::Relaxed);
+                        if let Ok(pk) = Pubkey::from_str(bonding_curve) {
+                            ctx.bonding_curve_publish_times
+                                .lock()
+                                .record_bonding_publish(pk, now_ms);
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         Ok(false) => {
             warn!(
@@ -536,6 +601,46 @@ struct Args {
     wallet_snapshot_only: bool,
 }
 
+/// Bounded map: bonding-curve pubkey → wall ms of last successful `BondingCurveProgress` core publish.
+const BONDING_CURVE_PUBLISH_MAP_CAP: usize = 10_000;
+
+#[derive(Debug)]
+struct BondingCurvePublishTimes {
+    insert_order: VecDeque<Pubkey>,
+    last_wall_ms: HashMap<Pubkey, u64>,
+}
+
+impl BondingCurvePublishTimes {
+    fn new() -> Self {
+        Self {
+            insert_order: VecDeque::new(),
+            last_wall_ms: HashMap::new(),
+        }
+    }
+
+    fn record_bonding_publish(&mut self, curve: Pubkey, wall_ms: u64) {
+        use std::collections::hash_map::Entry;
+        match self.last_wall_ms.entry(curve) {
+            Entry::Occupied(mut e) => {
+                e.insert(wall_ms);
+            }
+            Entry::Vacant(_) => {
+                while self.insert_order.len() >= BONDING_CURVE_PUBLISH_MAP_CAP {
+                    if let Some(evicted) = self.insert_order.pop_front() {
+                        self.last_wall_ms.remove(&evicted);
+                    }
+                }
+                self.insert_order.push_back(curve);
+                self.last_wall_ms.insert(curve, wall_ms);
+            }
+        }
+    }
+
+    fn last_bonding_wall_ms(&self, curve: &Pubkey) -> Option<u64> {
+        self.last_wall_ms.get(curve).copied()
+    }
+}
+
 /// Runtime context for market-data
 struct MarketDataContext {
     run_id: String,
@@ -618,6 +723,9 @@ struct MarketDataContext {
     /// Only emit when progress changes by >= 50 bps or complete flag changes.
     last_emitted_curve_progress:
         parking_lot::RwLock<std::collections::HashMap<Pubkey, (u32, bool)>>,
+
+    /// Last bonding-curve publish time (wall ms) for `market_data_trade_after_bonding_publish_ms`.
+    bonding_curve_publish_times: parking_lot::Mutex<BondingCurvePublishTimes>,
 
     /// PumpSwap / PumpFun AMM cold-path helper; set at Geyser-loop start before wallet snapshot.
     /// Used for background wallet-bootstrap DEX verification (watchdog-safe).
@@ -4143,6 +4251,7 @@ async fn publish_wallet_snapshot(
         Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID).expect("valid associated token program");
 
     let wallet_str = wallet.to_string();
+    let wallet_snapshot_bootstrap_started_at = Instant::now();
 
     // 1) Discover known mints from JetStream (LastPerSubject) for this wallet.
     //    This avoids any RPC owner-scan and gives us stable coverage over restarts.
@@ -4745,7 +4854,17 @@ async fn publish_wallet_snapshot(
     );
 
     if let Some(ref nats) = ctx.nats {
-        let _ = publish_market_event_core_and_momentum(nats, &complete_event).await;
+        let _ = publish_market_event_core_and_momentum_ex(
+            nats,
+            &complete_event,
+            Some(MarketEventCorePublishTrace {
+                recv_at: wallet_snapshot_bootstrap_started_at,
+                cold_path: true,
+                segment: MarketDataLatencySegment::Other,
+            }),
+            None,
+        )
+        .await;
     }
     if let Err(e) = ctx.jsonl_writer.write(&complete_event) {
         warn!(error = %e, "Failed to write WalletSnapshotComplete (bootstrap) to JSONL");
@@ -5137,6 +5256,7 @@ async fn main() -> Result<()> {
         tracked_wallet_mint_decimals: parking_lot::RwLock::new(std::collections::HashMap::new()),
         execution_results_deduper: parking_lot::Mutex::new(ExecutionResultDeduper::default()),
         last_emitted_curve_progress: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        bonding_curve_publish_times: parking_lot::Mutex::new(BondingCurvePublishTimes::new()),
         pump_amm_dex: parking_lot::RwLock::new(None),
         helius_rpc,
     });
@@ -6495,6 +6615,7 @@ async fn run_geyser_loop(
 
             // Proactive mint metadata (decimals/supply) fetched via RPC.
             Some(mint_event) = mint_info_rx.recv() => {
+                let mint_geyser_recv_at = Instant::now();
                 // Write to JSONL
                 if let Err(e) = ctx.jsonl_writer.write(&mint_event) {
                     error!(error = %e, "Failed to write TokenMintInfo event to JSONL");
@@ -6502,7 +6623,18 @@ async fn run_geyser_loop(
 
                 // Publish to NATS
                 if let Some(ref nats) = ctx.nats {
-                    let _ = publish_market_event_core_and_momentum(nats, &mint_event).await;
+                    let seg = market_data_publish_segment(&mint_event.kind);
+                    let _ = publish_market_event_core_and_momentum_ex(
+                        nats,
+                        &mint_event,
+                        Some(MarketEventCorePublishTrace {
+                            recv_at: mint_geyser_recv_at,
+                            cold_path: true,
+                            segment: seg,
+                        }),
+                        Some(ctx.as_ref()),
+                    )
+                    .await;
                 }
             }
 
@@ -6798,6 +6930,8 @@ async fn run_geyser_loop(
 
             // Account updates (pool state changes)
             Ok(account_update) = account_rx.recv() => {
+                let account_geyser_recv_at = Instant::now();
+                market_data_bump_geyser_head_slot(account_update.slot);
                 account_count += 1;
                 ironcrab::metrics::record_activity();
 
@@ -7033,7 +7167,17 @@ async fn run_geyser_loop(
                         }
 
                         if let Some(ref nats) = ctx.nats {
-                            let _ = publish_market_event_core_and_momentum(nats, &mint_event).await;
+                            let _ = publish_market_event_core_and_momentum_ex(
+                                nats,
+                                &mint_event,
+                                Some(MarketEventCorePublishTrace {
+                                    recv_at: account_geyser_recv_at,
+                                    cold_path: false,
+                                    segment: MarketDataLatencySegment::Other,
+                                }),
+                                Some(ctx.as_ref()),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -7229,8 +7373,17 @@ async fn run_geyser_loop(
                                     }
 
                                     if let Some(ref nats) = ctx.nats {
-                                        let _ =
-                                            publish_market_event_core_and_momentum(nats, &state_event).await;
+                                        let _ = publish_market_event_core_and_momentum_ex(
+                                            nats,
+                                            &state_event,
+                                            Some(MarketEventCorePublishTrace {
+                                                recv_at: account_geyser_recv_at,
+                                                cold_path: false,
+                                                segment: MarketDataLatencySegment::Other,
+                                            }),
+                                            Some(ctx.as_ref()),
+                                        )
+                                        .await;
                                     }
                                 }
                             }
@@ -7281,8 +7434,17 @@ async fn run_geyser_loop(
                                     }
 
                                     if let Some(ref nats) = ctx.nats {
-                                        let _ =
-                                            publish_market_event_core_and_momentum(nats, &bin_event).await;
+                                        let _ = publish_market_event_core_and_momentum_ex(
+                                            nats,
+                                            &bin_event,
+                                            Some(MarketEventCorePublishTrace {
+                                                recv_at: account_geyser_recv_at,
+                                                cold_path: false,
+                                                segment: MarketDataLatencySegment::Other,
+                                            }),
+                                            Some(ctx.as_ref()),
+                                        )
+                                        .await;
                                     }
                                 }
                             }
@@ -7858,7 +8020,17 @@ async fn run_geyser_loop(
                                         error!(error = %e, "Failed to write BondingCurveProgress event to JSONL");
                                     }
 
-                                    let _ = publish_market_event_core_and_momentum(nats, &curve_event).await;
+                                    let _ = publish_market_event_core_and_momentum_ex(
+                                        nats,
+                                        &curve_event,
+                                        Some(MarketEventCorePublishTrace {
+                                            recv_at: account_geyser_recv_at,
+                                            cold_path: false,
+                                            segment: MarketDataLatencySegment::BondingCurve,
+                                        }),
+                                        Some(ctx.as_ref()),
+                                    )
+                                    .await;
                                 }
                             }
                             CachedPoolState::PumpAmm(s) => {
@@ -8108,7 +8280,17 @@ async fn run_geyser_loop(
                             }
 
                             if let Some(ref nats) = ctx.nats {
-                                let _ = publish_market_event_core_and_momentum(nats, &dev_event).await;
+                                let _ = publish_market_event_core_and_momentum_ex(
+                                    nats,
+                                    &dev_event,
+                                    Some(MarketEventCorePublishTrace {
+                                        recv_at: account_geyser_recv_at,
+                                        cold_path: false,
+                                        segment: MarketDataLatencySegment::Other,
+                                    }),
+                                    Some(ctx.as_ref()),
+                                )
+                                .await;
                             }
                         }
                     }
@@ -8232,12 +8414,24 @@ async fn run_geyser_loop(
 
                 // Publish to NATS
                 if let Some(ref nats) = ctx.nats {
-                    let _ = publish_market_event_core_and_momentum(nats, &event).await;
+                    let seg = market_data_publish_segment(&event.kind);
+                    let _ = publish_market_event_core_and_momentum_ex(
+                        nats,
+                        &event,
+                        Some(MarketEventCorePublishTrace {
+                            recv_at: account_geyser_recv_at,
+                            cold_path: false,
+                            segment: seg,
+                        }),
+                        Some(ctx.as_ref()),
+                    )
+                    .await;
                 }
             }
 
             // Blockhash updates from Geyser blocks_meta
             Ok(bh_update) = blockhash_rx.recv() => {
+                market_data_bump_geyser_head_slot(bh_update.slot);
                 let event = MarketEvent::new(
                     "market-data",
                     BUILD_VERSION,
@@ -8260,6 +8454,8 @@ async fn run_geyser_loop(
 
             // Transaction updates (pool creations, swaps)
             Ok(tx_update) = transaction_rx.recv() => {
+                let tx_geyser_recv_at = Instant::now();
+                market_data_bump_geyser_head_slot(tx_update.slot);
                 tx_count += 1;
                 ironcrab::metrics::record_activity();
 
@@ -8431,7 +8627,17 @@ async fn run_geyser_loop(
                     }
 
                     if let Some(ref nats) = ctx.nats {
-                        let _ = publish_market_event_core_and_momentum(nats, &dev_event).await;
+                        let _ = publish_market_event_core_and_momentum_ex(
+                            nats,
+                            &dev_event,
+                            Some(MarketEventCorePublishTrace {
+                                recv_at: tx_geyser_recv_at,
+                                cold_path: false,
+                                segment: MarketDataLatencySegment::Other,
+                            }),
+                            Some(ctx.as_ref()),
+                        )
+                        .await;
                     }
                 }
 
@@ -8520,8 +8726,17 @@ async fn run_geyser_loop(
                             error!(error = %e, "Failed to write pump_amm PoolCreated (create_pool) to JSONL");
                         }
                         if let Some(ref nats) = ctx.nats {
-                            let _ =
-                                publish_market_event_core_and_momentum(nats, &pool_created_event).await;
+                            let _ = publish_market_event_core_and_momentum_ex(
+                                nats,
+                                &pool_created_event,
+                                Some(MarketEventCorePublishTrace {
+                                    recv_at: tx_geyser_recv_at,
+                                    cold_path: false,
+                                    segment: MarketDataLatencySegment::PoolCreated,
+                                }),
+                                Some(ctx.as_ref()),
+                            )
+                            .await;
                         }
                         ctx.pool_mint_map.write().insert(pool_address.to_string(), base_mint.clone());
                     }
@@ -8606,12 +8821,18 @@ async fn run_geyser_loop(
                         }
 
                         if let Some(ref nats) = ctx.nats {
-                            let _ =
-                                publish_market_event_core_and_momentum(nats, &pool_created_event).await;
+                            let _ = publish_market_event_core_and_momentum_ex(
+                                nats,
+                                &pool_created_event,
+                                Some(MarketEventCorePublishTrace {
+                                    recv_at: tx_geyser_recv_at,
+                                    cold_path: false,
+                                    segment: MarketDataLatencySegment::PoolCreated,
+                                }),
+                                Some(ctx.as_ref()),
+                            )
+                            .await;
                         }
-                    }
-
-                    // Always emit DexPoolAccounts on pump_amm trades
                     let accounts_event = MarketEvent::new(
                         "market-data",
                         BUILD_VERSION,
@@ -8633,10 +8854,18 @@ async fn run_geyser_loop(
                     }
 
                     if let Some(ref nats) = ctx.nats {
-                        let _ = publish_market_event_core_and_momentum(nats, &accounts_event).await;
+                        let _ = publish_market_event_core_and_momentum_ex(
+                            nats,
+                            &accounts_event,
+                            Some(MarketEventCorePublishTrace {
+                                recv_at: tx_geyser_recv_at,
+                                cold_path: false,
+                                segment: MarketDataLatencySegment::Other,
+                            }),
+                            Some(ctx.as_ref()),
+                        )
+                        .await;
                     }
-
-                    // FIX-26: Also populate MASTER LivePoolCache with pool_accounts.
                     // Ensures the Geyser PoolCacheUpdate builder can use these as fallback
                     // when the parsed Geyser state has empty pool_accounts.
                     if pool_accounts.len() >= 14 {
@@ -8718,6 +8947,7 @@ async fn run_geyser_loop(
                         }
                     }
                 }
+                }
 
                 // For non-pump_amm DEXes: emit DexPoolAccounts on first trade if pool_accounts present.
                 if let Some(ParsedDexEvent::Trade {
@@ -8753,7 +8983,18 @@ async fn run_geyser_loop(
                             }
 
                             if let Some(ref nats) = ctx.nats {
-                                if publish_market_event_core_and_momentum(nats, &accounts_event).await {
+                                if publish_market_event_core_and_momentum_ex(
+                                    nats,
+                                    &accounts_event,
+                                    Some(MarketEventCorePublishTrace {
+                                        recv_at: tx_geyser_recv_at,
+                                        cold_path: false,
+                                        segment: MarketDataLatencySegment::Other,
+                                    }),
+                                    None,
+                                )
+                                .await
+                                {
                                     debug!(
                                         dex = %dex,
                                         pool = %pool_address,
@@ -8840,12 +9081,25 @@ async fn run_geyser_loop(
 
                 // Publish to NATS
                 if let Some(ref nats) = ctx.nats {
-                    let _ = publish_market_event_core_and_momentum(nats, &event).await;
+                    let seg = market_data_publish_segment(&event.kind);
+                    let _ = publish_market_event_core_and_momentum_ex(
+                        nats,
+                        &event,
+                        Some(MarketEventCorePublishTrace {
+                            recv_at: tx_geyser_recv_at,
+                            cold_path: false,
+                            segment: seg,
+                        }),
+                        Some(ctx.as_ref()),
+                    )
+                    .await;
                 }
             }
 
             // Pool Discovery Events (Geyser-based pool creation events)
             Ok(pool_event) = pool_discovery_rx.recv() => {
+                let pool_discovery_recv_at = Instant::now();
+                market_data_bump_geyser_head_slot(pool_event.slot);
                 ironcrab::metrics::record_activity();
 
                 info!(
@@ -8917,7 +9171,17 @@ async fn run_geyser_loop(
 
                 // Publish to NATS
                 if let Some(ref nats) = ctx.nats {
-                    let _ = publish_market_event_core_and_momentum(nats, &event).await;
+                    let _ = publish_market_event_core_and_momentum_ex(
+                        nats,
+                        &event,
+                        Some(MarketEventCorePublishTrace {
+                            recv_at: pool_discovery_recv_at,
+                            cold_path: false,
+                            segment: market_data_publish_segment(&event.kind),
+                        }),
+                        Some(ctx.as_ref()),
+                    )
+                    .await;
                 }
 
                 // Emit DevWalletIdentified for Pump.fun pools where we know the creator
@@ -8944,7 +9208,18 @@ async fn run_geyser_loop(
                         }
 
                         if let Some(ref nats) = ctx.nats {
-                            if publish_market_event_core_and_momentum(nats, &dev_event).await {
+                            if publish_market_event_core_and_momentum_ex(
+                                nats,
+                                &dev_event,
+                                Some(MarketEventCorePublishTrace {
+                                    recv_at: pool_discovery_recv_at,
+                                    cold_path: false,
+                                    segment: market_data_publish_segment(&dev_event.kind),
+                                }),
+                                None,
+                            )
+                            .await
+                            {
                                 info!(
                                     mint = %pool_event.base_mint,
                                     creator = %creator,
@@ -9011,7 +9286,18 @@ async fn run_geyser_loop(
                     }
 
                     if let Some(ref nats) = ctx.nats {
-                        if publish_market_event_core_and_momentum(nats, &accounts_event).await {
+                        if publish_market_event_core_and_momentum_ex(
+                            nats,
+                            &accounts_event,
+                            Some(MarketEventCorePublishTrace {
+                                recv_at: pool_discovery_recv_at,
+                                cold_path: false,
+                                segment: market_data_publish_segment(&accounts_event.kind),
+                            }),
+                            None,
+                        )
+                        .await
+                        {
                             debug!(
                                 dex = %pool_event.dex_type,
                                 pool = %pool_event.pool_address,

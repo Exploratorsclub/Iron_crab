@@ -67,8 +67,14 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ### MOM-OBS-LATENCY: Prometheus-Histogramme für Momentum-Hot-Path- und E2E-Latenzen
 **Datum**: 2026-05-15  
-**Zweck** (kein Bugfix): Operative Messbarkeit nach Throughput-Slices — `momentum_event_to_ingest_ms`, `momentum_event_to_intent_publish_ms` (nur mit kausalem `MarketEvent.ts_unix_ms`; aktuell füllt momentum-bot diese Intent-Histogramme nicht, bis Exit-Pfade pro Intent ein explizites Event-Ts führen), interne µs-Histogramme für `process_market_event`, `record_trade`, Signal-Eval (dirty vs. Full-Scan), NATS-Batch-Deserialize/Flatten; Counter `momentum_latency_event_ts_invalid_total` bei `ts_unix_ms==0` oder Werte in der „Zukunft“ vs. lokaler Wanduhr. **`momentum_event_to_ingest_ms`**: nur Live-Ingest aus dem Core-NATS-MarketEvents-Arm — **kein** JetStream-Wallet-Snapshot-Bootstrap (`bootstrap_wallet_snapshot_from_jetstream`), damit historische Replay-Timestamps die SLO nicht verfälschen. Keine Strategie-/RPC-/Topic-Änderungen.  
+**Zweck** (kein Bugfix): Operative Messbarkeit nach Throughput-Slices — `momentum_event_to_ingest_ms`, `momentum_event_to_intent_publish_ms` (nur mit kausalem `MarketEvent.ts_unix_ms`; Exit-Pfade setzen `source_event_ts_unix_ms` explizit), interne µs-Histogramme für `process_market_event`, `record_trade`, Signal-Eval (dirty vs. Full-Scan), NATS-Batch-Deserialize/Flatten; Counter `momentum_latency_event_ts_invalid_total` bei `ts_unix_ms==0` oder Werte in der „Zukunft“ vs. lokaler Wanduhr. **`momentum_event_to_ingest_ms`**: nur Live-Ingest aus dem Core-NATS-MarketEvents-Arm — **kein** JetStream-Wallet-Snapshot-Bootstrap (`bootstrap_wallet_snapshot_from_jetstream`), damit historische Replay-Timestamps die SLO nicht verfälschen. Keine Strategie-/RPC-/Topic-Änderungen.  
+**Follow-up (PIPELINE-LATENCY-METRICS, 2026-05-19)**: Zusätzlich `momentum_intent_header_to_publish_ms_*` und `momentum_publish_to_intent_ms_*` bei erfolgreichem JetStream-Publish von BUY/SELL; segmentierte market-data-/execution-Histogramme siehe **PIPELINE-LATENCY-METRICS**.  
 **Dateien**: `src/metrics.rs`, `src/bin/momentum_bot.rs`
+
+### PIPELINE-LATENCY-METRICS: segmentierte Histogramme market-data → momentum → execution
+**Datum**: 2026-05-19  
+**Zweck** (Observability only): Kette A–I in `docs/RUNBOOK_PROD.md` — Geyser→Core-Publish (market-data), Momentum-Ingest und Intent-Publish, execution `process_intent` bis Confirm sowie Slot-Lag am Send. Kein Trading-Verhalten, kein Hot-Path-RPC.  
+**Dateien**: `src/metrics.rs`, `src/bin/market_data.rs`, `src/bin/momentum_bot.rs`, `src/bin/execution_engine.rs`, `docs/RUNBOOK_PROD.md`, `docs/BUGS_FIXES.md`
 
 ### FIX-MOM-EXIT-QUOTE-GUARDS: Frische Reserve-Quotes + getrennte Ingest-Latenzen
 **Datum**: 2026-05-15  
