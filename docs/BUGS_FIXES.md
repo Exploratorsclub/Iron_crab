@@ -6,6 +6,17 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-MOM-LP-OBSERVED-AT-MINT-MERGE-MAX-2026-05-18: LP-Removal Wallclock — Mint-Aggregat `max` statt `min` (PR #134 Follow-up)
+**Datum**: 2026-05-18  
+**Problem**: Beim Merge von `TrackerExitSignals` pro Mint über mehrere Pool-Tracker war `lp_removal_observed_at` mit `min` zusammengeführt — das verschärfte das Wallclock-Fenster künstlich und konnte LP-Hard-Exits still unterdrücken (Bugbot Low auf PR #134).  
+**Fix**: Mint-Aggregat nutzt wieder **`max`** (späteste Sibling-Beobachtung), analog zur Legacy-Logik für `lp_removed_at`; Unit-Test gegen `min`-Regression.
+
+### FIX-MOM-ENTRY-FILTERS-CHAIN-SLOT-2026-05-17: Momentum Entry-/Filter-Fenster vs. Ingest-Burst (Kettenzeit)
+**Datum**: 2026-05-17  
+**Problem**: `TokenTracker` und Entry-Filter nutzten `Instant::now()` beim Ingest für Fenster (Käufer, Inflow, Velocity, Microbuy/Buyer-Quality). Bei NATS-/Market-Data-Bursts wirkten viele historische Trades gleichzeitig „frisch“ — Filter bestanden, obwohl die Kette schon lange stillstand (Chart vs. Geyser-Slot).  
+**Fix**: Fenster und Raten über **Geyser-`slot`** normiert (`MarketEvent.slot`, Head `last_event_slot`); Sekunden-Konfig → Slot-Spanne via `MOMENTUM_APPROX_SLOT_MS` (~400 ms/Slot), **kein** `getBlockTime`/RPC im Hot Path. **`DEV_SELL`** / LP-Post-Entry-Hard-Exits: **Slot** des Dev-Sells bzw. LP-Removal vs. `entry_confirmed_slot` (Fallback-Doku bei Slot 0). `RecordHeader.ts_unix_ms` unverändert nur für Transport-/Latenzmetriken. Unit-Test: gleicher Ingest-Instant, weit auseinanderliegende Slots — kein künstliches 10 s-Wallclock-Fenster.  
+**Dateien**: `src/bin/momentum_bot.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-MOM-POOLCACHE-LIVE-ONLY-2026-05-16: Momentum kein globales POOL_CACHE LastPerSubject-Replay
 **Datum**: 2026-05-16  
 **Problem**: `momentum-bot` nutzte `bootstrap_pool_cache_from_jetstream` mit `LastPerSubject` und übernahm denselben Consumer — hunderttausende Snapshot-Messages erzeugten JetStream-Backpressure und blockierten die Core-NATS-Verarbeitung trotz priorisierter Strategy-Fixes.  

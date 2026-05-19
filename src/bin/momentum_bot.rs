@@ -646,12 +646,38 @@ impl MomentumConfig {
 /// Tracks a single trade event
 #[derive(Debug, Clone)]
 struct TradeEvent {
+    /// Legacy ingest-time clock — **not** used for strategy windows (burst-safe filters use [`Self::slot`]).
+    #[allow(dead_code)]
     timestamp: Instant,
+    /// Geyser / `MarketEvent.slot` for this trade. `0` = unknown (excluded from chain-window stats).
+    slot: u64,
     trader: String,
     is_buy: bool,
     sol_amount: u64,   // in lamports
     token_amount: u64, // raw token units
     signature: String,
+}
+
+/// Approximate median ms per finalized slot for translating config **seconds** windows into **slot spans**
+/// when no per-trade wall clock must be used (I-7: no `getBlockTime` on hot path).
+const MOMENTUM_APPROX_SLOT_MS: u64 = 400;
+
+#[inline]
+fn momentum_secs_to_slot_span(secs: u64) -> u64 {
+    if secs == 0 {
+        return 0;
+    }
+    secs.saturating_mul(1000)
+        .saturating_div(MOMENTUM_APPROX_SLOT_MS)
+        .max(1)
+}
+
+#[inline]
+fn momentum_trade_in_chain_slot_window(trade_slot: u64, head_slot: u64, window_slots: u64) -> bool {
+    if trade_slot == 0 || head_slot == 0 || window_slots == 0 {
+        return false;
+    }
+    head_slot.saturating_sub(trade_slot) <= window_slots
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1231,6 +1257,7 @@ impl PositionTracker {
         config: &MomentumConfig,
         exit_quote: Option<&ExitExecutableQuote>,
         event_or_check_source: &str,
+        chain_head_slot: u64,
     ) -> Option<(String, String)> {
         let structural_q = exit_quote.filter(|q| exit_executable_quote_is_usable(q));
         let price_exit_q =
@@ -1475,12 +1502,12 @@ impl PositionTracker {
         // 5. Momentum Exit - selling pressure detected
         // FIX-30d: Volume-weighted momentum ratio instead of trade-count ratio.
         // Prevents small bot-sells from overwhelming real buy volume.
-        let momentum_window = Duration::from_secs(config.momentum_exit_window_secs);
-        let now = Instant::now();
+        let momentum_window_slots = momentum_secs_to_slot_span(config.momentum_exit_window_secs);
+        let head = chain_head_slot.max(1);
         let recent: Vec<_> = self
             .recent_trades
             .iter()
-            .filter(|t| now.duration_since(t.timestamp) < momentum_window)
+            .filter(|t| momentum_trade_in_chain_slot_window(t.slot, head, momentum_window_slots))
             .collect();
 
         if recent.len() >= config.momentum_exit_min_trades as usize {
@@ -1627,11 +1654,18 @@ struct TokenTracker {
 
     // LP tracking
     lp_removed: bool,
-    lp_removal_time: Option<Instant>,
+    /// Geyser slot of the LP removal event when known (`MarketEvent.slot`).
+    lp_removal_slot: Option<u64>,
+    /// When LP removal was first observed (always set in `record_lp_removal`) — hard-exit fallback
+    /// when `lp_removal_slot` is unknown (I-7: no RPC; wallclock only).
+    lp_removal_observed_at: Option<Instant>,
 
-    // Dump-recovery gating (pre-entry)
-    dump_observed_at: Option<Instant>,
-    recovery_started_at: Option<Instant>,
+    /// Highest trade slot observed on this pool row (for chain-window head fallback).
+    max_trade_slot: u64,
+
+    // Dump-recovery gating (pre-entry), chain-time aware (slot / head slot)
+    dump_observed_slot: Option<u64>,
+    recovery_started_slot: Option<u64>,
 
     // CTO mode (pre-entry dev-sell handling)
     cto_started_at: Option<Instant>,
@@ -1678,9 +1712,11 @@ impl TokenTracker {
             dev_sold_early: false,
             dev_rebought: false,
             lp_removed: false,
-            lp_removal_time: None,
-            dump_observed_at: None,
-            recovery_started_at: None,
+            lp_removal_slot: None,
+            lp_removal_observed_at: None,
+            max_trade_slot: 0,
+            dump_observed_slot: None,
+            recovery_started_slot: None,
             cto_started_at: None,
             cto_recovery_confirmed: false,
             state: TrackerState::Discovery,
@@ -1723,16 +1759,28 @@ impl TokenTracker {
         !self.is_rejected()
     }
 
+    /// Monotonic chain head for slot-window filters: max(latest Geyser slot seen by bot, this row).
+    #[inline]
+    fn chain_head_for_filters(&self, ctx_head_slot: u64) -> u64 {
+        let local = self.max_trade_slot.max(self.first_slot);
+        if ctx_head_slot > 0 {
+            ctx_head_slot.max(local)
+        } else {
+            local.max(1)
+        }
+    }
+
     fn dump_recovery_window_stats_at(
         &self,
         config: &MomentumConfig,
-        now: Instant,
+        head_slot: u64,
     ) -> Option<(f64, i128, u32)> {
         if config.dump_recovery_window_secs == 0 {
             return None;
         }
 
-        let window = Duration::from_secs(config.dump_recovery_window_secs);
+        let window_slots = momentum_secs_to_slot_span(config.dump_recovery_window_secs);
+        let hs = self.chain_head_for_filters(head_slot);
         let mut buy_count: u32 = 0;
         let mut sell_count: u32 = 0;
         let mut buy_vol: u64 = 0;
@@ -1741,7 +1789,7 @@ impl TokenTracker {
         for t in self
             .trades
             .iter()
-            .filter(|t| now.duration_since(t.timestamp) < window)
+            .filter(|t| momentum_trade_in_chain_slot_window(t.slot, hs, window_slots))
         {
             if t.is_buy {
                 buy_count = buy_count.saturating_add(1);
@@ -1765,10 +1813,10 @@ impl TokenTracker {
     fn dump_recovery_wait_reason(
         &mut self,
         config: &MomentumConfig,
-        now: Instant,
+        head_slot: u64,
     ) -> Option<String> {
         let (buy_dominance, net_inflow, samples) =
-            self.dump_recovery_window_stats_at(config, now)?;
+            self.dump_recovery_window_stats_at(config, head_slot)?;
 
         // Require a minimum sample size to avoid flapping on tiny windows.
         let min_samples = config.min_unique_buyers.max(5);
@@ -1776,35 +1824,38 @@ impl TokenTracker {
             return None;
         }
 
-        let window = Duration::from_secs(config.dump_recovery_window_secs);
+        let window_slots = momentum_secs_to_slot_span(config.dump_recovery_window_secs);
+        let hs = self.chain_head_for_filters(head_slot);
 
-        // Expire old dump flags once the window rolls over.
-        if let Some(dump_at) = self.dump_observed_at {
-            if now.duration_since(dump_at) > window {
-                self.dump_observed_at = None;
-                self.recovery_started_at = None;
+        // Expire old dump flags once the chain window rolled past the observation slot.
+        if let Some(ds) = self.dump_observed_slot {
+            if hs.saturating_sub(ds) > window_slots {
+                self.dump_observed_slot = None;
+                self.recovery_started_slot = None;
             }
         }
 
         // Dump detected = net outflow in the recovery window.
         if net_inflow < 0 {
-            self.dump_observed_at = Some(now);
-            self.recovery_started_at = None;
+            self.dump_observed_slot = Some(hs);
+            self.recovery_started_slot = None;
             return Some(format!(
-                "WAIT_CONFIRMATION: dump detected (net_inflow={:.2} SOL over {}s)",
+                "WAIT_CONFIRMATION: dump detected (net_inflow={:.2} SOL over ~{}s / {} slots @ head_slot {})",
                 net_inflow as f64 / 1_000_000_000.0,
-                config.dump_recovery_window_secs
+                config.dump_recovery_window_secs,
+                window_slots,
+                hs
             ));
         }
 
         // If we haven't observed a dump, don't gate on recovery.
-        self.dump_observed_at?;
+        self.dump_observed_slot?;
 
         let recovery_ok = buy_dominance >= config.dump_recovery_min_buy_dominance
             && net_inflow >= config.dump_recovery_min_net_inflow_lamports as i128;
 
         if !recovery_ok {
-            self.recovery_started_at = None;
+            self.recovery_started_slot = None;
             return Some(format!(
                 "WAIT_CONFIRMATION: dump recovery not confirmed yet (dom={:.0}% < {:.0}%, inflow={:.2} SOL < {:.2} SOL)",
                 buy_dominance * 100.0,
@@ -1814,31 +1865,34 @@ impl TokenTracker {
             ));
         }
 
-        let start = self.recovery_started_at.get_or_insert(now);
-        if now.duration_since(*start).as_secs() < config.dump_recovery_min_recovery_secs {
+        let recovery_min_slots = momentum_secs_to_slot_span(config.dump_recovery_min_recovery_secs);
+        let rs = self.recovery_started_slot.get_or_insert(hs);
+        if hs.saturating_sub(*rs) < recovery_min_slots {
             return Some(format!(
-                "WAIT_CONFIRMATION: dump recovery stabilizing ({}/{}s)",
-                now.duration_since(*start).as_secs(),
+                "WAIT_CONFIRMATION: dump recovery stabilizing ({} / {} slots, ~{}s)",
+                hs.saturating_sub(*rs),
+                recovery_min_slots,
                 config.dump_recovery_min_recovery_secs
             ));
         }
 
         // Recovery confirmed.
-        self.dump_observed_at = None;
-        self.recovery_started_at = None;
+        self.dump_observed_slot = None;
+        self.recovery_started_slot = None;
         None
     }
 
     fn cto_confirm_stats_at(
         &self,
         config: &MomentumConfig,
-        now: Instant,
+        head_slot: u64,
     ) -> Option<(u32, f64, i128, u32)> {
         if config.cto_confirm_window_secs == 0 {
             return None;
         }
 
-        let window = Duration::from_secs(config.cto_confirm_window_secs);
+        let window_slots = momentum_secs_to_slot_span(config.cto_confirm_window_secs);
+        let hs = self.chain_head_for_filters(head_slot);
         let mut unique_buyers: HashSet<&str> = HashSet::new();
         let mut buy_count: u32 = 0;
         let mut sell_count: u32 = 0;
@@ -1848,7 +1902,7 @@ impl TokenTracker {
         for t in self
             .trades
             .iter()
-            .filter(|t| now.duration_since(t.timestamp) < window)
+            .filter(|t| momentum_trade_in_chain_slot_window(t.slot, hs, window_slots))
         {
             if t.is_buy {
                 buy_count = buy_count.saturating_add(1);
@@ -1870,7 +1924,12 @@ impl TokenTracker {
         Some((unique_buyers.len() as u32, buy_dominance, net_inflow, total))
     }
 
-    fn cto_wait_reason(&mut self, config: &MomentumConfig, now: Instant) -> Option<String> {
+    fn cto_wait_reason(
+        &mut self,
+        config: &MomentumConfig,
+        head_slot: u64,
+        now: Instant,
+    ) -> Option<String> {
         if !config.cto_enabled {
             return None;
         }
@@ -1887,7 +1946,7 @@ impl TokenTracker {
             ));
         }
 
-        let Some((buyers, dom, net_inflow, samples)) = self.cto_confirm_stats_at(config, now)
+        let Some((buyers, dom, net_inflow, samples)) = self.cto_confirm_stats_at(config, head_slot)
         else {
             return Some("CTO_WAIT_RECOVERY: awaiting confirmation window data".to_string());
         };
@@ -1933,7 +1992,8 @@ impl TokenTracker {
         None
     }
 
-    /// Record a trade event
+    /// Record a trade event (`trade_slot`: Geyser tx slot from `MarketEvent.slot`, `0` if unknown).
+    #[allow(clippy::too_many_arguments)] // Trade fields + slot + config — explicit for tracker clarity
     fn record_trade(
         &mut self,
         trader: &str,
@@ -1941,10 +2001,15 @@ impl TokenTracker {
         sol_amount: u64,
         token_amount: u64,
         signature: &str,
+        trade_slot: u64,
         config: &MomentumConfig,
     ) {
+        if trade_slot > 0 {
+            self.max_trade_slot = self.max_trade_slot.max(trade_slot);
+        }
         let trade = TradeEvent {
             timestamp: Instant::now(),
+            slot: trade_slot,
             trader: trader.to_string(),
             is_buy,
             sol_amount,
@@ -1978,8 +2043,17 @@ impl TokenTracker {
                     info!(mint = %self.mint, "Dev rebought - positive signal");
                 } else if !is_buy {
                     self.dev_sold = true;
-                    let age = self.first_seen.elapsed();
-                    if age.as_secs() < config.dev_early_sell_window_secs {
+                    let early_by_slot = self.first_slot > 0
+                        && trade_slot > 0
+                        && trade_slot.saturating_sub(self.first_slot)
+                            < momentum_secs_to_slot_span(config.dev_early_sell_window_secs);
+                    let early_fallback_wallclock = self.first_slot == 0 || trade_slot == 0;
+                    let early = if early_fallback_wallclock {
+                        self.first_seen.elapsed().as_secs() < config.dev_early_sell_window_secs
+                    } else {
+                        early_by_slot
+                    };
+                    if early {
                         self.dev_sold_early = true;
 
                         if config.cto_enabled {
@@ -1988,16 +2062,20 @@ impl TokenTracker {
                             self.cto_started_at.get_or_insert_with(Instant::now);
                             warn!(
                                 mint = %self.mint,
-                                age_secs = age.as_secs(),
-                                "Dev sold early - CTO candidate"
+                                dev_sell_slot = trade_slot,
+                                first_slot = self.first_slot,
+                                "Dev sold early - CTO candidate (chain-slot timing; wall fallback={})",
+                                early_fallback_wallclock
                             );
                         } else {
                             // No CTO mode: hard reject.
                             self.reject("REJECT_DEV_SELL_EARLY");
                             warn!(
                                 mint = %self.mint,
-                                age_secs = age.as_secs(),
-                                "Dev sold early - blacklisting"
+                                dev_sell_slot = trade_slot,
+                                first_slot = self.first_slot,
+                                "Dev sold early - blacklisting (chain-slot timing; wall fallback={})",
+                                early_fallback_wallclock
                             );
                         }
                     }
@@ -2017,21 +2095,16 @@ impl TokenTracker {
             .map(|t| (t.sol_amount, t.token_amount))
     }
 
-    fn buyer_quality_stats(&self, config: &MomentumConfig) -> BuyerQualityStats {
-        self.buyer_quality_stats_at(config, Instant::now())
-    }
-
-    fn micro_buy_stats_at(&self, config: &MomentumConfig, now: Instant) -> (u32, u32, f64) {
-        let buyer_window = Duration::from_secs(config.buyer_window_secs);
+    fn micro_buy_stats_at(&self, config: &MomentumConfig, head_slot: u64) -> (u32, u32, f64) {
+        let buyer_window_slots = momentum_secs_to_slot_span(config.buyer_window_secs);
+        let hs = self.chain_head_for_filters(head_slot);
 
         let mut total_buys: u32 = 0;
         let mut small_buys: u32 = 0;
 
-        for trade in self
-            .trades
-            .iter()
-            .filter(|t| t.is_buy && now.duration_since(t.timestamp) < buyer_window)
-        {
+        for trade in self.trades.iter().filter(|t| {
+            t.is_buy && momentum_trade_in_chain_slot_window(t.slot, hs, buyer_window_slots)
+        }) {
             total_buys = total_buys.saturating_add(1);
             if trade.sol_amount < config.min_trade_size_lamports {
                 small_buys = small_buys.saturating_add(1);
@@ -2047,17 +2120,16 @@ impl TokenTracker {
         (total_buys, small_buys, ratio)
     }
 
-    fn buyer_quality_stats_at(&self, config: &MomentumConfig, now: Instant) -> BuyerQualityStats {
-        let buyer_window = Duration::from_secs(config.buyer_window_secs);
+    fn buyer_quality_stats_at(&self, config: &MomentumConfig, head_slot: u64) -> BuyerQualityStats {
+        let buyer_window_slots = momentum_secs_to_slot_span(config.buyer_window_secs);
+        let hs = self.chain_head_for_filters(head_slot);
 
         let mut per_wallet: HashMap<String, (u64, u32)> = HashMap::new();
         let mut total_buy_volume_lamports: u64 = 0;
 
-        for trade in self
-            .trades
-            .iter()
-            .filter(|t| t.is_buy && now.duration_since(t.timestamp) < buyer_window)
-        {
+        for trade in self.trades.iter().filter(|t| {
+            t.is_buy && momentum_trade_in_chain_slot_window(t.slot, hs, buyer_window_slots)
+        }) {
             let entry = per_wallet.entry(trade.trader.clone()).or_insert((0, 0));
             entry.0 = entry.0.saturating_add(trade.sol_amount);
             entry.1 = entry.1.saturating_add(1);
@@ -2092,12 +2164,14 @@ impl TokenTracker {
         }
     }
 
-    /// Record LP removal
-    fn record_lp_removal(&mut self) {
+    /// Record LP removal (`slot`: `MarketEvent.slot` when known).
+    fn record_lp_removal(&mut self, slot: Option<u64>) {
         self.lp_removed = true;
-        self.lp_removal_time = Some(Instant::now());
+        // Treat slot 0 as unknown so wallclock LP exit path is not blocked.
+        self.lp_removal_slot = slot.filter(|&s| s > 0).or(self.lp_removal_slot);
+        self.lp_removal_observed_at.get_or_insert_with(Instant::now);
         self.reject("REJECT_LP_REMOVED");
-        warn!(mint = %self.mint, "LP removed - blacklisting");
+        warn!(mint = %self.mint, lp_removal_slot = ?self.lp_removal_slot, "LP removed - blacklisting");
     }
 
     /// Set dev wallet and supply percentage
@@ -2114,30 +2188,25 @@ impl TokenTracker {
         }
     }
 
-    /// Calculate metrics for strategy decision
-    fn calculate_metrics(&self, config: &MomentumConfig) -> TokenMetrics {
-        let age = self.first_seen.elapsed();
-        let age_secs = age.as_secs().max(1) as f64;
-
-        // Keep first_slot as a recorded attribute (useful for debugging/forensics).
-        let _first_slot = self.first_slot;
-
-        // Filter recent trades within windows
-        let now = Instant::now();
-        let buyer_window = Duration::from_secs(config.buyer_window_secs);
-        let inflow_window = Duration::from_secs(config.inflow_window_secs);
+    /// Calculate metrics for strategy decision (chain-slot windows vs `head_slot`, burst-safe).
+    fn calculate_metrics(&self, config: &MomentumConfig, head_slot: u64) -> TokenMetrics {
+        let hs = self.chain_head_for_filters(head_slot);
+        let buyer_window_slots = momentum_secs_to_slot_span(config.buyer_window_secs);
+        let inflow_window_slots = momentum_secs_to_slot_span(config.inflow_window_secs);
 
         let recent_buyers: HashSet<_> = self
             .trades
             .iter()
-            .filter(|t| t.is_buy && now.duration_since(t.timestamp) < buyer_window)
+            .filter(|t| {
+                t.is_buy && momentum_trade_in_chain_slot_window(t.slot, hs, buyer_window_slots)
+            })
             .map(|t| t.trader.clone())
             .collect();
 
         let (recent_buy_vol, recent_sell_vol) = self
             .trades
             .iter()
-            .filter(|t| now.duration_since(t.timestamp) < inflow_window)
+            .filter(|t| momentum_trade_in_chain_slot_window(t.slot, hs, inflow_window_slots))
             .fold((0u64, 0u64), |(b, s), t| {
                 if t.is_buy {
                     (b + t.sol_amount, s)
@@ -2147,7 +2216,24 @@ impl TokenTracker {
             });
 
         let total_trades = self.buy_count + self.sell_count;
-        let trades_per_sec = total_trades as f64 / age_secs;
+        let mut min_sl = u64::MAX;
+        let mut max_sl = 0u64;
+        let mut trades_with_chain_slot = 0u32;
+        for t in &self.trades {
+            if t.slot > 0 {
+                trades_with_chain_slot = trades_with_chain_slot.saturating_add(1);
+                min_sl = min_sl.min(t.slot);
+                max_sl = max_sl.max(t.slot);
+            }
+        }
+        let chain_span_slots = if min_sl != u64::MAX {
+            max_sl.saturating_sub(min_sl).max(1)
+        } else {
+            1u64
+        };
+        let chain_secs = (chain_span_slots as f64) * (MOMENTUM_APPROX_SLOT_MS as f64 / 1000.0);
+        let trades_per_sec = (trades_with_chain_slot as f64) / chain_secs.max(1e-9);
+
         let buy_dominance = if total_trades > 0 {
             self.buy_count as f64 / total_trades as f64
         } else {
@@ -2195,11 +2281,14 @@ impl TokenTracker {
         (false, reason)
     }
 
-    /// Check all 4 filters and return if we should trade
+    /// Check all 4 filters and return if we should trade.
+    /// `chain_head_slot`: latest Geyser slot seen by momentum (trades + `SlotUpdate`); drives burst-safe windows.
     fn should_generate_intent(
         &mut self,
         config: &MomentumConfig,
         mint_info: Option<&MintInfo>,
+        chain_head_slot: u64,
+        wall_now: Instant,
     ) -> (bool, String) {
         // Already in terminal state
         if self.is_entry_complete() {
@@ -2228,7 +2317,25 @@ impl TokenTracker {
             }
         }
 
-        let metrics = self.calculate_metrics(config);
+        let metrics = self.calculate_metrics(config, chain_head_slot);
+
+        // Observability: slot span actually covered by configured windows (one line per pass-through).
+        let hs = self.chain_head_for_filters(chain_head_slot);
+        let bw = momentum_secs_to_slot_span(config.buyer_window_secs);
+        let iw = momentum_secs_to_slot_span(config.inflow_window_secs);
+        let cover = bw.max(iw);
+        let (mut smin, mut smax) = (u64::MAX, 0u64);
+        for t in &self.trades {
+            if t.slot > 0 && momentum_trade_in_chain_slot_window(t.slot, hs, cover) {
+                smin = smin.min(t.slot);
+                smax = smax.max(t.slot);
+            }
+        }
+        let chain_obs = if smin != u64::MAX {
+            format!("trade_slots~{}..{} head={}", smin, smax, hs)
+        } else {
+            format!("trade_slots=none head={}", hs)
+        };
 
         // Filter 1: Liquidity Check
         if metrics.initial_liquidity_sol < config.early_min_liquidity_sol {
@@ -2292,7 +2399,7 @@ impl TokenTracker {
 
         // Filter 2c: Micro-buy spam (anti-bot)
         let (total_buys, small_buys, small_buy_ratio) =
-            self.micro_buy_stats_at(config, Instant::now());
+            self.micro_buy_stats_at(config, chain_head_slot);
         let min_samples = config.min_unique_buyers.max(5);
         if total_buys >= min_samples && small_buy_ratio > config.small_buy_ratio_cap {
             FILTER_REJECTED_BUYER_QUALITY.fetch_add(1, Ordering::Relaxed);
@@ -2310,7 +2417,7 @@ impl TokenTracker {
         }
 
         // Filter 2b: Buyer Quality (anti-bot / concentration)
-        let bq = self.buyer_quality_stats(config);
+        let bq = self.buyer_quality_stats_at(config, chain_head_slot);
 
         if bq.top1_share > config.top1_buyer_share_cap {
             FILTER_REJECTED_BUYER_QUALITY.fetch_add(1, Ordering::Relaxed);
@@ -2369,14 +2476,14 @@ impl TokenTracker {
         }
 
         // Filter 3b: Dump-recovery gating (WAIT until recovery confirms after a dump)
-        if let Some(wait_reason) = self.dump_recovery_wait_reason(config, Instant::now()) {
+        if let Some(wait_reason) = self.dump_recovery_wait_reason(config, chain_head_slot) {
             return (false, wait_reason);
         }
 
         // Filter 4: Dev Behavior (pre-entry)
         if metrics.dev_sold_early {
             if config.cto_enabled {
-                if let Some(wait) = self.cto_wait_reason(config, Instant::now()) {
+                if let Some(wait) = self.cto_wait_reason(config, chain_head_slot, wall_now) {
                     return (false, wait);
                 }
             } else {
@@ -2391,7 +2498,7 @@ impl TokenTracker {
         self.last_wait_filter_obs_key = None;
         FILTER_PASSED_TOTAL.fetch_add(1, Ordering::Relaxed);
         let reason = format!(
-            "All filters passed: liq={:.1}SOL, buyers={}, vel={:.2}/s, dom={:.0}%, inflow={:.1}SOL, bq(top1={:.0}%,top3={:.0}%,repeat={:.0}%,vol={:.2}SOL)",
+            "All filters passed: liq={:.1}SOL, buyers={}, vel={:.2}/s (chain-time), dom={:.0}%, inflow={:.1}SOL, bq(top1={:.0}%,top3={:.0}%,repeat={:.0}%,vol={:.2}SOL) | {}",
             metrics.initial_liquidity_sol,
             metrics.unique_buyers_in_window,
             metrics.trades_per_sec,
@@ -2400,7 +2507,8 @@ impl TokenTracker {
             bq.top1_share * 100.0,
             bq.top3_share * 100.0,
             bq.repeat_buyer_ratio * 100.0,
-            bq.total_buy_volume_lamports as f64 / 1_000_000_000.0
+            bq.total_buy_volume_lamports as f64 / 1_000_000_000.0,
+            chain_obs
         );
 
         (true, reason)
@@ -2675,6 +2783,24 @@ struct MomentumContext {
     /// K Phase 1: Last event slot/ts for Slot-to-Send Latency propagation
     last_event_slot: std::sync::atomic::AtomicU64,
     last_event_ts_ms: std::sync::atomic::AtomicU64,
+}
+
+/// Merge `lp_removal_observed_at` across sibling pool trackers for the same mint (wallclock LP_REMOVAL path).
+///
+/// Per tracker, [`TokenTracker::record_lp_removal`] records the **first** local observation (`get_or_insert_with(Instant::now)`).
+/// For mint-level hard-exit gating we take the **latest** sibling observation (legacy parity with `lp_removed_at` max-merge),
+/// so `obs.elapsed()` vs `lp_removal_window_secs` is not skewed toward “too old” as with `min` (which could suppress exits).
+#[inline]
+fn merge_lp_removal_observed_at_mint_aggregate(
+    existing: Option<Instant>,
+    incoming: Option<Instant>,
+) -> Option<Instant> {
+    match (existing, incoming) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
 impl MomentumContext {
@@ -4184,6 +4310,7 @@ impl MomentumContext {
         sol_amount: u64,
         token_amount: u64,
         signature: &str,
+        trade_slot: u64,
     ) {
         let _rt = MomentumRecordTradeTimer(Instant::now());
         let config = self.config.read().clone();
@@ -4192,7 +4319,15 @@ impl MomentumContext {
         let mut sync_sibling_dev_sell_early = false;
         if let Some(tracker) = trackers.get_mut(&key) {
             let was_not_rejected = tracker.was_not_rejected();
-            tracker.record_trade(trader, is_buy, sol_amount, token_amount, signature, &config);
+            tracker.record_trade(
+                trader,
+                is_buy,
+                sol_amount,
+                token_amount,
+                signature,
+                trade_slot,
+                &config,
+            );
             if was_not_rejected && tracker.is_rejected() {
                 self.record_token_blacklisted_once(mint);
             }
@@ -4269,8 +4404,8 @@ impl MomentumContext {
         }
     }
 
-    /// Record LP removal for a token
-    fn record_lp_removal(&self, mint: &str) {
+    /// Record LP removal for a token (`slot`: `MarketEvent.slot` when known).
+    fn record_lp_removal(&self, mint: &str, slot: Option<u64>) {
         let mut trackers = self.token_trackers.write();
         self.refresh_tracker_keys_by_mint_index_from_map(&trackers);
         let keys: Vec<String> = self
@@ -4284,7 +4419,7 @@ impl MomentumContext {
                 continue;
             };
             let was_not_rejected = tracker.was_not_rejected();
-            tracker.record_lp_removal();
+            tracker.record_lp_removal(slot);
             if was_not_rejected && tracker.is_rejected() {
                 self.record_token_blacklisted_once(mint);
             }
@@ -4305,6 +4440,7 @@ impl MomentumContext {
         self.refresh_tracker_keys_by_mint_index_from_map(&trackers);
         let mut tracker_keys: Vec<String> = trackers.keys().cloned().collect();
         tracker_keys.sort_unstable();
+        let chain_head_slot = self.last_event_slot.load(Ordering::Relaxed);
         self.check_for_signals_eval_sorted_tracker_keys(
             &config,
             &mint_infos,
@@ -4313,6 +4449,7 @@ impl MomentumContext {
             &pending_buy_entries,
             &mut trackers,
             &tracker_keys,
+            chain_head_slot,
         )
     }
 
@@ -4345,6 +4482,7 @@ impl MomentumContext {
         }
 
         let eval_t0 = Instant::now();
+        let chain_head_slot = self.last_event_slot.load(Ordering::Relaxed);
         let signals = self.check_for_signals_eval_sorted_tracker_keys(
             &config,
             &mint_infos,
@@ -4353,6 +4491,7 @@ impl MomentumContext {
             &pending_buy_entries,
             &mut trackers,
             &dirty_keys,
+            chain_head_slot,
         );
         record_momentum_signal_eval_us(
             eval_t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
@@ -4370,7 +4509,9 @@ impl MomentumContext {
         pending_buy_entries: &HashMap<String, PendingBuyEntry>,
         trackers: &mut HashMap<String, TokenTracker>,
         tracker_keys: &[String],
+        chain_head_slot: u64,
     ) -> Vec<EntrySignal> {
+        let wall_now = Instant::now();
         // Under the same write lock as the signal loop: pending probe/scale-in pools for mint-level serialization.
         let sibling_entry_busy: Vec<(String, String)> = trackers
             .values()
@@ -4487,7 +4628,12 @@ impl MomentumContext {
                 {
                     let tracker = trackers.get_mut(key).expect("tracker key from iteration");
                     let was_not_rejected = tracker.was_not_rejected();
-                    let (should_trade, reason) = tracker.should_generate_intent(config, mint_info);
+                    let (should_trade, reason) = tracker.should_generate_intent(
+                        config,
+                        mint_info,
+                        chain_head_slot,
+                        wall_now,
+                    );
                     if was_not_rejected && tracker.is_rejected() {
                         self.record_token_blacklisted_once(&mint);
                     }
@@ -4583,7 +4729,12 @@ impl MomentumContext {
                 {
                     let tracker = trackers.get_mut(key).expect("tracker key from iteration");
                     let was_not_rejected = tracker.was_not_rejected();
-                    let (should_trade, reason) = tracker.should_generate_intent(config, mint_info);
+                    let (should_trade, reason) = tracker.should_generate_intent(
+                        config,
+                        mint_info,
+                        chain_head_slot,
+                        wall_now,
+                    );
                     if was_not_rejected && tracker.is_rejected() {
                         self.record_token_blacklisted_once(&mint);
                     }
@@ -4975,14 +5126,19 @@ impl MomentumContext {
     fn check_for_exits(&self) -> Vec<(String, String, String, String, String, u64)> {
         // Returns: Vec<(mint, pool, dex, exit_type, reason, token_amount)>
         let config = self.config.read().clone();
-        let now = Instant::now();
+        let chain_head_slot = self
+            .last_event_slot
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(1);
 
         // Snapshot tracker-derived hard-exit signals BEFORE locking positions,
         // to avoid lock-order deadlocks (market event handling locks trackers then positions).
         #[derive(Clone, Debug)]
         struct TrackerExitSignals {
-            lp_removed_at: Option<Instant>,
-            dev_sold_at: Option<Instant>,
+            lp_removal_slot: Option<u64>,
+            lp_removal_observed_at: Option<Instant>,
+            dev_sell_slot: Option<u64>,
+            dev_sell_observed_at: Option<Instant>,
             dev_sold_sig: Option<String>,
             dev_sold_sol: Option<u64>,
         }
@@ -4992,7 +5148,8 @@ impl MomentumContext {
             let mut by_mint: HashMap<String, TrackerExitSignals> = HashMap::new();
             for t in trackers.values() {
                 let mint_key = t.mint.clone();
-                let mut dev_sold_at: Option<Instant> = None;
+                let mut dev_sell_slot: Option<u64> = None;
+                let mut dev_sell_observed_at: Option<Instant> = None;
                 let mut dev_sold_sig: Option<String> = None;
                 let mut dev_sold_sol: Option<u64> = None;
 
@@ -5003,15 +5160,20 @@ impl MomentumContext {
                         .rev()
                         .find(|tr| !tr.is_buy && tr.trader == *dev)
                     {
-                        dev_sold_at = Some(last.timestamp);
+                        dev_sell_observed_at = Some(last.timestamp);
+                        if last.slot > 0 {
+                            dev_sell_slot = Some(last.slot);
+                        }
                         dev_sold_sig = Some(last.signature.clone());
                         dev_sold_sol = Some(last.sol_amount);
                     }
                 }
 
                 let incoming = TrackerExitSignals {
-                    lp_removed_at: t.lp_removal_time,
-                    dev_sold_at,
+                    lp_removal_slot: t.lp_removal_slot,
+                    lp_removal_observed_at: t.lp_removal_observed_at,
+                    dev_sell_slot,
+                    dev_sell_observed_at,
                     dev_sold_sig,
                     dev_sold_sol,
                 };
@@ -5020,17 +5182,37 @@ impl MomentumContext {
                 match by_mint.entry(mint_key) {
                     Entry::Occupied(mut o) => {
                         let e = o.get_mut();
-                        e.lp_removed_at = match (e.lp_removed_at, incoming.lp_removed_at) {
+                        e.lp_removal_slot = match (e.lp_removal_slot, incoming.lp_removal_slot) {
                             (Some(a), Some(b)) => Some(a.max(b)),
                             (Some(a), None) => Some(a),
                             (None, Some(b)) => Some(b),
                             (None, None) => None,
                         };
-                        if let Some(b) = incoming.dev_sold_at {
-                            if e.dev_sold_at.map(|a| b > a).unwrap_or(true) {
-                                e.dev_sold_at = Some(b);
+                        // LP wallclock aggregate: latest wins (see [`merge_lp_removal_observed_at_mint_aggregate`]).
+                        e.lp_removal_observed_at = merge_lp_removal_observed_at_mint_aggregate(
+                            e.lp_removal_observed_at,
+                            incoming.lp_removal_observed_at,
+                        );
+                        // dev_sell_observed_at: already “latest wins” (higher slot branch + `in_obs > cur` below).
+                        if let Some(b) = incoming.dev_sell_slot {
+                            if e.dev_sell_slot.map(|a| b > a).unwrap_or(true) {
+                                e.dev_sell_slot = Some(b);
+                                e.dev_sell_observed_at =
+                                    incoming.dev_sell_observed_at.or(e.dev_sell_observed_at);
                                 e.dev_sold_sig = incoming.dev_sold_sig;
                                 e.dev_sold_sol = incoming.dev_sold_sol;
+                            }
+                        } else if let Some(in_obs) = incoming.dev_sell_observed_at {
+                            if e.dev_sell_slot.is_none() {
+                                let replace = e
+                                    .dev_sell_observed_at
+                                    .map(|cur| in_obs > cur)
+                                    .unwrap_or(true);
+                                if replace {
+                                    e.dev_sell_observed_at = Some(in_obs);
+                                    e.dev_sold_sig = incoming.dev_sold_sig;
+                                    e.dev_sold_sol = incoming.dev_sold_sol;
+                                }
                             }
                         }
                     }
@@ -5057,27 +5239,69 @@ impl MomentumContext {
 
             // Hard exits (post-entry): dev sells, LP removed.
             if let Some(sig) = tracker_signals.get(mint) {
-                if let Some(lp_at) = sig.lp_removed_at {
-                    let within_window = config.lp_removal_window_secs == 0
-                        || now.duration_since(lp_at)
-                            <= Duration::from_secs(config.lp_removal_window_secs);
+                if let Some(lp_s) = sig.lp_removal_slot {
+                    let lp_window_slots = momentum_secs_to_slot_span(config.lp_removal_window_secs);
+                    let lp_chain_recent = config.lp_removal_window_secs == 0
+                        || chain_head_slot.saturating_sub(lp_s) <= lp_window_slots;
 
-                    if lp_at > pos.entry_time && within_window {
+                    let lp_after_entry =
+                        pos.entry_confirmed_slot > 0 && lp_s > pos.entry_confirmed_slot;
+                    // Legacy: `last_price_slot` advances on every mark — comparing exit slots to it
+                    // suppresses hard exits once any newer trade arrived.
+                    let lp_after_entry_legacy = pos.entry_confirmed_slot == 0
+                        && sig
+                            .lp_removal_observed_at
+                            .map(|obs| obs.checked_duration_since(pos.entry_time).is_some())
+                            .unwrap_or(false);
+
+                    if lp_chain_recent && (lp_after_entry || lp_after_entry_legacy) {
                         // Note: exit_generated is set by caller after successful publish
                         exits.push((
                             mint.clone(),
                             pos.pool.clone(),
                             pos.dex.clone(),
                             "LP_REMOVAL".to_string(),
-                            "LP removed post-entry".to_string(),
+                            format!(
+                                "LP removed post-entry (lp_slot={}, entry_confirmed_slot={}, head_slot={})",
+                                lp_s, pos.entry_confirmed_slot, chain_head_slot
+                            ),
+                            pos.token_amount,
+                        ));
+                        continue;
+                    }
+                } else if let Some(obs) = sig.lp_removal_observed_at {
+                    // Slot unknown (e.g. Geyser `event.slot` missing): wallclock window + post-entry
+                    // ordering so LP_REMOVAL hard exits cannot be skipped silently.
+                    let lp_chain_recent = config.lp_removal_window_secs == 0
+                        || obs.elapsed().as_secs() <= config.lp_removal_window_secs;
+                    let lp_post_entry = obs.checked_duration_since(pos.entry_time).is_some();
+
+                    if lp_chain_recent && lp_post_entry {
+                        exits.push((
+                            mint.clone(),
+                            pos.pool.clone(),
+                            pos.dex.clone(),
+                            "LP_REMOVAL".to_string(),
+                            format!(
+                                "LP removed post-entry (lp_slot=unknown, wallclock, entry_confirmed_slot={}, head_slot={})",
+                                pos.entry_confirmed_slot, chain_head_slot
+                            ),
                             pos.token_amount,
                         ));
                         continue;
                     }
                 }
 
-                if let Some(dev_at) = sig.dev_sold_at {
-                    if dev_at > pos.entry_time {
+                if let Some(ds) = sig.dev_sell_slot {
+                    let dev_after_buy =
+                        pos.entry_confirmed_slot > 0 && ds > pos.entry_confirmed_slot;
+                    let dev_after_buy_legacy = pos.entry_confirmed_slot == 0
+                        && sig
+                            .dev_sell_observed_at
+                            .map(|obs| obs.checked_duration_since(pos.entry_time).is_some())
+                            .unwrap_or(false);
+
+                    if dev_after_buy || dev_after_buy_legacy {
                         let sig_s = sig.dev_sold_sig.as_deref().unwrap_or("<unknown>");
                         let sol = sig.dev_sold_sol.unwrap_or(0);
                         // Note: exit_generated is set by caller after successful publish
@@ -5087,8 +5311,28 @@ impl MomentumContext {
                             pos.dex.clone(),
                             "DEV_SELL".to_string(),
                             format!(
-                                "Dev sold post-entry (sig={}, sol={:.4})",
-                                sig_s,
+                                "Dev sold post-entry (dev_sell_slot={}, entry_confirmed_slot={}, sig={}, sol={:.4})",
+                                ds, pos.entry_confirmed_slot, sig_s,
+                                sol as f64 / 1_000_000_000.0
+                            ),
+                            pos.token_amount,
+                        ));
+                        continue;
+                    }
+                } else if let Some(dev_obs) = sig.dev_sell_observed_at {
+                    let dev_post_buy = dev_obs.checked_duration_since(pos.entry_time).is_some();
+
+                    if dev_post_buy {
+                        let sig_s = sig.dev_sold_sig.as_deref().unwrap_or("<unknown>");
+                        let sol = sig.dev_sold_sol.unwrap_or(0);
+                        exits.push((
+                            mint.clone(),
+                            pos.pool.clone(),
+                            pos.dex.clone(),
+                            "DEV_SELL".to_string(),
+                            format!(
+                                "Dev sold post-entry (dev_sell_slot=unknown, wallclock, entry_confirmed_slot={}, sig={}, sol={:.4})",
+                                pos.entry_confirmed_slot, sig_s,
                                 sol as f64 / 1_000_000_000.0
                             ),
                             pos.token_amount,
@@ -5100,7 +5344,7 @@ impl MomentumContext {
 
             let exit_q = self.executable_exit_quote(pos, None);
             if let Some((exit_type, reason)) =
-                pos.should_exit(&config, exit_q.as_ref(), "exit_scan")
+                pos.should_exit(&config, exit_q.as_ref(), "exit_scan", chain_head_slot)
             {
                 // Note: exit_generated is set by caller after successful publish
                 exits.push((
@@ -5264,27 +5508,33 @@ impl MomentumContext {
                     .get(&candidate.mint)
                     .and_then(|p| self.executable_exit_quote(p, None))
             };
+            let chain_head_slot = self
+                .last_event_slot
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(1);
             let (exit_type, reason) = {
                 let mut positions = self.positions.write();
                 if let Some(pos) = positions.get_mut(&candidate.mint) {
-                    pos.should_exit(&config, exit_q.as_ref(), "timed_exit_reconcile")
-                        .unwrap_or_else(|| {
-                            (
-                                "TIME_EXIT".to_string(),
-                                match candidate.last_exit_age_secs {
-                                    Some(age) => format!(
-                                        "Timed exit reconcile: hold={}s, last_exit_age={}s",
-                                        candidate.hold_secs, age
-                                    ),
-                                    None => {
-                                        format!(
-                                            "Timed exit reconcile: hold={}s",
-                                            candidate.hold_secs
-                                        )
-                                    }
-                                },
-                            )
-                        })
+                    pos.should_exit(
+                        &config,
+                        exit_q.as_ref(),
+                        "timed_exit_reconcile",
+                        chain_head_slot,
+                    )
+                    .unwrap_or_else(|| {
+                        (
+                            "TIME_EXIT".to_string(),
+                            match candidate.last_exit_age_secs {
+                                Some(age) => format!(
+                                    "Timed exit reconcile: hold={}s, last_exit_age={}s",
+                                    candidate.hold_secs, age
+                                ),
+                                None => {
+                                    format!("Timed exit reconcile: hold={}s", candidate.hold_secs)
+                                }
+                            },
+                        )
+                    })
                 } else {
                     // Position removed, skip
                     continue;
@@ -10031,6 +10281,29 @@ mod tests {
     }
 
     #[test]
+    fn lp_removal_observed_at_mint_merge_uses_max_for_wallclock_recency() {
+        let base = Instant::now();
+        let earlier = base.checked_sub(Duration::from_secs(120)).expect("instant");
+        let later = base.checked_sub(Duration::from_secs(2)).expect("instant");
+        assert_eq!(
+            merge_lp_removal_observed_at_mint_aggregate(Some(earlier), Some(later)),
+            Some(later)
+        );
+        let window_secs = 10u64;
+        let merged = merge_lp_removal_observed_at_mint_aggregate(Some(earlier), Some(later))
+            .expect("merged");
+        assert!(
+            merged.elapsed().as_secs() <= window_secs,
+            "max-merge keeps LP removal observation recent for wallclock window gating"
+        );
+        let min_bug = earlier.min(later);
+        assert!(
+            min_bug.elapsed().as_secs() > window_secs,
+            "min-merge would treat LP removal as outside window and suppress hard exit"
+        );
+    }
+
+    #[test]
     fn momentum_pool_cache_live_consumer_is_new_not_last_per_subject() {
         use async_nats::jetstream;
         let live = ironcrab::nats::pool_cache_live_consumer_config();
@@ -10164,14 +10437,14 @@ mod tests {
             1_000_000_000,
         );
 
-        let (_st1, r1) = tracker.should_generate_intent(&cfg, None);
+        let (_st1, r1) = tracker.should_generate_intent(&cfg, None, 50_000, Instant::now());
         assert!(r1.contains("WAIT_INSUFFICIENT_LIQUIDITY"));
         assert_eq!(
             tracker.last_wait_filter_obs_key_for_test(),
             Some("WAIT_INSUFFICIENT_LIQUIDITY")
         );
 
-        let (_st2, r2) = tracker.should_generate_intent(&cfg, None);
+        let (_st2, r2) = tracker.should_generate_intent(&cfg, None, 50_000, Instant::now());
         assert!(r2.contains("WAIT_INSUFFICIENT_LIQUIDITY"));
         assert_eq!(
             tracker.last_wait_filter_obs_key_for_test(),
@@ -10191,7 +10464,7 @@ mod tests {
         cfg.min_trade_size_lamports = 0;
         cfg.small_buy_ratio_cap = 1.0;
 
-        let (_st3, r3) = tracker.should_generate_intent(&cfg, None);
+        let (_st3, r3) = tracker.should_generate_intent(&cfg, None, 50_000, Instant::now());
         assert!(r3.contains("WAIT_BUYER_WINDOW"));
         assert_eq!(
             tracker.last_wait_filter_obs_key_for_test(),
@@ -10244,6 +10517,7 @@ mod tests {
                     200_000_000,
                     2_000_000,
                     &format!("sighot{i:03}"),
+                    1 + i as u64,
                     &cfg,
                 );
             }
@@ -10380,6 +10654,7 @@ mod tests {
                     200_000_000,
                     2_000_000,
                     &format!("sighot{i:03}"),
+                    1 + i as u64,
                     &cfg,
                 );
             }
@@ -10405,6 +10680,7 @@ mod tests {
                 200_000_000,
                 2_000_000,
                 "sigcold1",
+                42,
                 &cfg_cold,
             );
         }
@@ -10465,6 +10741,7 @@ mod tests {
                     200_000_000,
                     2_000_000,
                     &format!("sig{i:03}_{pool}"),
+                    1 + i as u64,
                     &cfg,
                 );
             }
@@ -10528,6 +10805,7 @@ mod tests {
                     200_000_000,
                     2_000_000,
                     &format!("sigunw{i:03}"),
+                    1 + i as u64,
                     &ctx.config.read(),
                 );
             }
@@ -11036,6 +11314,7 @@ mod tests {
             // Wallet A: 3 buys totaling 100
             TradeEvent {
                 timestamp: now - Duration::from_secs(1),
+                slot: 1000,
                 trader: "A".to_string(),
                 is_buy: true,
                 sol_amount: 50,
@@ -11044,6 +11323,7 @@ mod tests {
             },
             TradeEvent {
                 timestamp: now - Duration::from_secs(2),
+                slot: 1001,
                 trader: "A".to_string(),
                 is_buy: true,
                 sol_amount: 30,
@@ -11052,6 +11332,7 @@ mod tests {
             },
             TradeEvent {
                 timestamp: now - Duration::from_secs(3),
+                slot: 1002,
                 trader: "A".to_string(),
                 is_buy: true,
                 sol_amount: 20,
@@ -11061,6 +11342,7 @@ mod tests {
             // Wallet B: 1 buy 50
             TradeEvent {
                 timestamp: now - Duration::from_secs(4),
+                slot: 1003,
                 trader: "B".to_string(),
                 is_buy: true,
                 sol_amount: 50,
@@ -11070,6 +11352,7 @@ mod tests {
             // Wallet C: 1 buy 50
             TradeEvent {
                 timestamp: now - Duration::from_secs(5),
+                slot: 1004,
                 trader: "C".to_string(),
                 is_buy: true,
                 sol_amount: 50,
@@ -11079,6 +11362,7 @@ mod tests {
             // Wallet D: 1 sell (ignored)
             TradeEvent {
                 timestamp: now - Duration::from_secs(6),
+                slot: 1005,
                 trader: "D".to_string(),
                 is_buy: false,
                 sol_amount: 999,
@@ -11087,7 +11371,7 @@ mod tests {
             },
         ];
 
-        let bq = tracker.buyer_quality_stats_at(&cfg, now);
+        let bq = tracker.buyer_quality_stats_at(&cfg, 1050);
         assert_eq!(bq.unique_buyers, 3);
         assert_eq!(bq.total_buy_volume_lamports, 200);
 
@@ -11097,6 +11381,52 @@ mod tests {
 
         // Repeat buyers: A only => 1/3
         assert!((bq.repeat_buyer_ratio - (1.0 / 3.0)).abs() < 1e-9);
+    }
+
+    /// Many trades ingested with the same wall clock but **distant Geyser slots** must not look like
+    /// one dense activity burst in short buyer/inflow windows (NATS replay safety).
+    #[test]
+    fn chain_slot_windows_ignore_ingest_burst_wallclock_overlap() {
+        let mut cfg = MomentumConfig::default();
+        cfg.buyer_window_secs = 10;
+        cfg.early_min_liquidity_sol = 0.0;
+        cfg.min_unique_buyers = 3;
+        cfg.min_trades_per_sec = 0.0;
+        cfg.min_buy_dominance = 0.0;
+        cfg.min_sol_inflow_lamports = 0;
+        cfg.require_mint_authority_renounced = false;
+        cfg.require_freeze_authority_none = false;
+        cfg.top1_buyer_share_cap = 1.0;
+        cfg.top3_buyer_share_cap = 1.0;
+        cfg.repeat_buyer_min_ratio = 0.0;
+        cfg.min_trade_size_lamports = 0;
+        cfg.small_buy_ratio_cap = 1.0;
+        cfg.dump_recovery_window_secs = 0;
+        cfg.cto_enabled = false;
+
+        let now = Instant::now();
+        let mut tracker = TokenTracker::new("m", "p", "d", 1, 0);
+        for (i, sl) in [0u64, 10_000, 20_000, 30_000, 40_000]
+            .into_iter()
+            .enumerate()
+        {
+            tracker.trades.push(TradeEvent {
+                timestamp: now,
+                slot: sl,
+                trader: format!("u{i}"),
+                is_buy: true,
+                sol_amount: 1_000_000,
+                token_amount: 1,
+                signature: format!("s{i}"),
+            });
+            tracker.buy_count = tracker.buy_count.saturating_add(1);
+            tracker.total_buy_volume = tracker.total_buy_volume.saturating_add(1_000_000);
+        }
+
+        let head = 40_005u64;
+        let metrics = tracker.calculate_metrics(&cfg, head);
+        // ~10s window ≈ 25 slots @ 400ms/slot — only the trade near `head` counts.
+        assert_eq!(metrics.unique_buyers_in_window, 1);
     }
 
     #[test]
@@ -11127,15 +11457,31 @@ mod tests {
         for i in 0..7 {
             let trader = format!("w{i}");
             let sig = format!("s{i}");
-            tracker.record_trade(trader.as_str(), true, 50, 1, sig.as_str(), &cfg);
+            tracker.record_trade(
+                trader.as_str(),
+                true,
+                50,
+                1,
+                sig.as_str(),
+                10 + i as u64,
+                &cfg,
+            );
         }
         for i in 7..10 {
             let trader = format!("w{i}");
             let sig = format!("s{i}");
-            tracker.record_trade(trader.as_str(), true, 200, 1, sig.as_str(), &cfg);
+            tracker.record_trade(
+                trader.as_str(),
+                true,
+                200,
+                1,
+                sig.as_str(),
+                10 + i as u64,
+                &cfg,
+            );
         }
 
-        let (should_trade, reason) = tracker.should_generate_intent(&cfg, None);
+        let (should_trade, reason) = tracker.should_generate_intent(&cfg, None, 25, Instant::now());
         assert!(!should_trade);
         assert!(reason.contains("REJECT_MICRO_BUY_SPAM"));
     }
@@ -11872,6 +12218,7 @@ mod tests {
                     200_000_000,
                     2_000_000,
                     &format!("sig{i:03}"),
+                    1 + i as u64,
                     &cfg,
                 );
             }
@@ -11939,6 +12286,7 @@ mod tests {
                     200_000_000,
                     2_000_000,
                     &format!("spf{i:03}"),
+                    1 + i as u64,
                     &cfg,
                 );
             }
@@ -11952,6 +12300,7 @@ mod tests {
                     200_000_000,
                     2_000_000,
                     &format!("sam{i:03}"),
+                    1 + i as u64,
                     &cfg,
                 );
             }
@@ -12133,7 +12482,7 @@ mod tests {
         }
 
         let before = ctx.tokens_blacklisted.load(Ordering::Relaxed);
-        ctx.record_lp_removal(mint);
+        ctx.record_lp_removal(mint, Some(99));
         let after = ctx.tokens_blacklisted.load(Ordering::Relaxed);
         assert_eq!(after.saturating_sub(before), 1);
         let trackers = ctx.token_trackers.read();
@@ -12252,6 +12601,7 @@ mod tests {
                         200_000_000,
                         2_000_000,
                         &format!("sig{dex}{i:03}"),
+                        1 + i as u64,
                         &cfg,
                     );
                 }
@@ -12312,6 +12662,7 @@ mod tests {
                         200_000_000,
                         2_000_000,
                         &format!("sigst{i:03}"),
+                        1 + i as u64,
                         &cfg,
                     );
                 }
@@ -12402,6 +12753,7 @@ mod tests {
                         200_000_000,
                         2_000_000,
                         &format!("sx{i}"),
+                        1 + i as u64,
                         &cfg,
                     );
                 }
@@ -12441,11 +12793,11 @@ mod tests {
         {
             let mut trackers = ctx.token_trackers.write();
             let mut tr_a = TokenTracker::new(mint, pool_a, "pumpfun", 1, 30_000_000_000);
-            tr_a.record_trade("buyer01", true, 500_000_000, 1_000_000, "sig0", &cfg);
+            tr_a.record_trade("buyer01", true, 500_000_000, 1_000_000, "sig0", 10, &cfg);
             trackers.insert(MomentumContext::tracker_storage_key(mint, pool_a), tr_a);
 
             let mut tr_b = TokenTracker::new(mint, pool_b, "pumpfun", 1, 30_000_000_000);
-            tr_b.record_trade("buyer02", true, 500_000_000, 1_000_000, "sig0b", &cfg);
+            tr_b.record_trade("buyer02", true, 500_000_000, 1_000_000, "sig0b", 11, &cfg);
             trackers.insert(MomentumContext::tracker_storage_key(mint, pool_b), tr_b);
         }
 
@@ -12519,8 +12871,26 @@ mod tests {
         }
 
         let before = ctx.tokens_blacklisted.load(Ordering::Relaxed);
-        ctx.record_trade(mint, p1, "dumper1", false, 10_000_000_000, 1, "dump_sig_1");
-        ctx.record_trade(mint, p2, "dumper2", false, 10_000_000_000, 1, "dump_sig_2");
+        ctx.record_trade(
+            mint,
+            p1,
+            "dumper1",
+            false,
+            10_000_000_000,
+            1,
+            "dump_sig_1",
+            100,
+        );
+        ctx.record_trade(
+            mint,
+            p2,
+            "dumper2",
+            false,
+            10_000_000_000,
+            1,
+            "dump_sig_2",
+            101,
+        );
         let after = ctx.tokens_blacklisted.load(Ordering::Relaxed);
         assert_eq!(after.saturating_sub(before), 1);
         let trackers = ctx.token_trackers.read();
@@ -12587,6 +12957,7 @@ mod tests {
                         200_000_000,
                         2_000_000,
                         &format!("sxg{i}"),
+                        1 + i as u64,
                         &cfg,
                     );
                 }
@@ -12603,6 +12974,7 @@ mod tests {
             10_000_000_000,
             1,
             "sig-dump-cross",
+            500,
         );
         let _ = ctx.check_for_signals();
         let after = ctx.tokens_blacklisted.load(Ordering::Relaxed);
@@ -12638,45 +13010,37 @@ mod tests {
         cfg.min_trade_size_lamports = 0;
         cfg.small_buy_ratio_cap = 1.0;
 
-        // Dump recovery params
+        // Dump recovery params (window translated to ~slot span via MOMENTUM_APPROX_SLOT_MS)
         cfg.dump_recovery_window_secs = 30;
         cfg.dump_recovery_min_buy_dominance = 0.60;
         cfg.dump_recovery_min_net_inflow_lamports = 100;
         cfg.dump_recovery_min_recovery_secs = 10;
 
-        let now = Instant::now();
-        let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 0);
+        let mut tracker = TokenTracker::new("mint", "pool", "dex", 5000, 0);
 
-        // Create a dump: mostly sells in the window.
-        for i in 0..5 {
-            tracker.record_trade("w", false, 200, 1, &format!("sd{i}"), &cfg);
+        // Dump: net outflow in chain window (slots near head 5050).
+        for i in 0..5u64 {
+            tracker.record_trade("w", false, 200, 1, &format!("sd{i}"), 5001 + i, &cfg);
         }
-        for (i, t) in tracker.trades.iter_mut().enumerate() {
-            t.timestamp = now - Duration::from_secs(5 + i as u64);
-        }
-
-        let (should_trade, reason) = tracker.should_generate_intent(&cfg, None);
+        let (should_trade, reason) =
+            tracker.should_generate_intent(&cfg, None, 5050, Instant::now());
         assert!(!should_trade);
         assert!(reason.contains("WAIT_CONFIRMATION"));
 
-        // Add recovery: net inflow positive + buy dominance above threshold.
-        // 8 buys vs 5 sells => dominance ~61.5%.
-        for i in 0..8 {
-            tracker.record_trade("w", true, 300, 1, &format!("rb{i}"), &cfg);
-        }
-        // Make recovery trades within the window.
-        for (i, t) in tracker.trades.iter_mut().enumerate() {
-            t.timestamp = now - Duration::from_secs(1 + (i as u64 % 10));
+        // Recovery: strong buy flow in same chain window.
+        for i in 0..8u64 {
+            tracker.record_trade("w", true, 300, 1, &format!("rb{i}"), 5010 + i, &cfg);
         }
 
-        // First evaluation should still WAIT because min_recovery_secs hasn't elapsed.
-        let (should_trade, reason) = tracker.should_generate_intent(&cfg, None);
+        // Still stabilizing on slots (min_recovery_secs → slot span).
+        let (should_trade, reason) =
+            tracker.should_generate_intent(&cfg, None, 5070, Instant::now());
         assert!(!should_trade);
         assert!(reason.contains("WAIT_CONFIRMATION"));
 
-        // Force stabilization window to be satisfied.
-        tracker.recovery_started_at = Some(now - Duration::from_secs(11));
-        let (should_trade, _reason) = tracker.should_generate_intent(&cfg, None);
+        // Enough head advancement vs recovery start slot.
+        let (should_trade, _reason) =
+            tracker.should_generate_intent(&cfg, None, 5100, Instant::now());
         assert!(should_trade);
     }
 
@@ -12705,10 +13069,11 @@ mod tests {
         tracker.dev_wallet = Some("dev".to_string());
 
         // Dev sells early.
-        tracker.record_trade("dev", false, 1_000, 1, "sig", &cfg);
+        tracker.record_trade("dev", false, 1_000, 1, "sig", 50, &cfg);
         assert!(tracker.dev_sold_early);
 
-        let (should_trade, reason) = tracker.should_generate_intent(&cfg, None);
+        let (should_trade, reason) =
+            tracker.should_generate_intent(&cfg, None, 50_000, Instant::now());
         assert!(!should_trade);
         assert_eq!(reason, "REJECT_DEV_SELL_EARLY");
         assert!(tracker.is_rejected());
@@ -12734,7 +13099,7 @@ mod tests {
 
         cfg.cto_enabled = true;
         cfg.cto_entry_delay_secs = 10;
-        cfg.cto_confirm_window_secs = 30;
+        cfg.cto_confirm_window_secs = 120;
         cfg.cto_min_unique_buyers = 2;
         cfg.cto_min_buy_dominance = 0.60;
         cfg.cto_min_net_inflow_lamports = 100;
@@ -12748,37 +13113,35 @@ mod tests {
         tracker.dev_wallet = Some("dev".to_string());
 
         // Dev sells early -> CTO candidate.
-        tracker.record_trade("dev", false, 200, 1, "sd", &cfg);
+        tracker.record_trade("dev", false, 200, 1, "sd", 120, &cfg);
         assert!(tracker.dev_sold_early);
 
         // Before delay: WAIT.
         tracker.cto_started_at = Some(now);
-        let (should_trade, reason) = tracker.should_generate_intent(&cfg, None);
+        let (should_trade, reason) =
+            tracker.should_generate_intent(&cfg, None, 50_000, Instant::now());
         assert!(!should_trade);
         assert!(reason.contains("CTO_WAIT_RECOVERY"));
 
         // After delay, but without confirmation trades: still WAIT.
         tracker.cto_started_at = Some(now - Duration::from_secs(11));
-        let (should_trade, reason) = tracker.should_generate_intent(&cfg, None);
+        let (should_trade, reason) =
+            tracker.should_generate_intent(&cfg, None, 50_000, Instant::now());
         assert!(!should_trade);
         assert!(reason.contains("CTO_WAIT_RECOVERY"));
 
         // Add recovery trades in confirm window: include the initial dev sell as well.
         // With 6 sells total (dev + 5), we need >=9 buys to hit >=60% buy dominance.
         for i in 0..5 {
-            tracker.record_trade("w", false, 50, 1, &format!("s{i}"), &cfg);
+            tracker.record_trade("w", false, 50, 1, &format!("s{i}"), 130 + i, &cfg);
         }
         for i in 0..9 {
             let buyer = format!("b{i}");
-            tracker.record_trade(&buyer, true, 120, 1, &format!("b{i}"), &cfg);
+            tracker.record_trade(&buyer, true, 120, 1, &format!("bb{i}"), 140 + i, &cfg);
         }
 
-        // Force all trades into confirm window.
-        for (i, t) in tracker.trades.iter_mut().enumerate() {
-            t.timestamp = now - Duration::from_secs(1 + (i as u64 % 10));
-        }
-
-        let (should_trade, _reason) = tracker.should_generate_intent(&cfg, None);
+        let (should_trade, _reason) =
+            tracker.should_generate_intent(&cfg, None, 400, Instant::now());
         assert!(should_trade);
         assert!(tracker.cto_recovery_confirmed);
     }
@@ -12849,7 +13212,7 @@ mod tests {
         {
             let mut trackers = ctx.token_trackers.write();
             let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 0);
-            tracker.record_trade("w", true, 1_000_000_000, 1_000_000, "sig", &cfg);
+            tracker.record_trade("w", true, 1_000_000_000, 1_000_000, "sig", 1, &cfg);
             trackers.insert(
                 MomentumContext::tracker_storage_key("mint", "pool"),
                 tracker,
@@ -12968,6 +13331,8 @@ mod tests {
             let mut positions = ctx.positions.write();
             let mut pos = PositionTracker::new("mint", "pool", "dex", 1.0, 6, 123, 1_000);
             pos.entry_time = Instant::now() - Duration::from_secs(10);
+            pos.entry_confirmed_slot = 100;
+            pos.last_price_slot = 150;
             positions.insert("mint".to_string(), pos);
         }
 
@@ -12976,15 +13341,14 @@ mod tests {
             let mut trackers = ctx.token_trackers.write();
             let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 0);
             tracker.dev_wallet = Some("dev".to_string());
-            tracker.record_trade("dev", false, 2_000_000_000, 1, "devsig", &cfg);
-            if let Some(last) = tracker.trades.last_mut() {
-                last.timestamp = Instant::now() - Duration::from_secs(1);
-            }
+            tracker.record_trade("dev", false, 2_000_000_000, 1, "devsig", 200, &cfg);
             trackers.insert(
                 MomentumContext::tracker_storage_key("mint", "pool"),
                 tracker,
             );
         }
+        ctx.last_event_slot
+            .store(250, std::sync::atomic::Ordering::Relaxed);
 
         let exits = ctx.check_for_exits();
         assert_eq!(exits.len(), 1);
@@ -13054,6 +13418,8 @@ mod tests {
             let mut positions = ctx.positions.write();
             let mut pos = PositionTracker::new("mint", "pool", "dex", 1.0, 6, 123, 1_000);
             pos.entry_time = Instant::now() - Duration::from_secs(10);
+            pos.entry_confirmed_slot = 10;
+            pos.last_price_slot = 20;
             positions.insert("mint".to_string(), pos);
         }
 
@@ -13061,19 +13427,24 @@ mod tests {
         {
             let mut trackers = ctx.token_trackers.write();
             let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 0);
-            tracker.record_lp_removal();
-            tracker.lp_removal_time = Some(Instant::now() - Duration::from_secs(1));
+            tracker.record_lp_removal(Some(50));
             trackers.insert(
                 MomentumContext::tracker_storage_key("mint", "pool"),
                 tracker,
             );
         }
+        ctx.last_event_slot
+            .store(60, std::sync::atomic::Ordering::Relaxed);
 
         let exits = ctx.check_for_exits();
         assert_eq!(exits.len(), 1);
         assert_eq!(exits[0].0, "mint");
         assert_eq!(exits[0].3, "LP_REMOVAL");
-        assert_eq!(exits[0].4, "LP removed post-entry");
+        assert!(
+            exits[0].4.contains("LP removed post-entry"),
+            "reason={}",
+            exits[0].4
+        );
     }
 
     #[test]
@@ -13728,7 +14099,7 @@ mod tests {
         pos.highest_price = stale.min(pos.highest_price);
         // Exec ~3,692,386 tps → pnl = (5.7M/3.7M-1)*100 = +~55% (I-14)
         let ex = sample_exit_quote(3_692_386.0);
-        let r = pos.should_exit(&c, Some(&ex), "test");
+        let r = pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64);
         assert!(
             r.is_none(),
             "expected no STOP_LOSS when executable is not past threshold, got {:?}",
@@ -13749,7 +14120,9 @@ mod tests {
 
         // Executable also very high tps → also deep loss; allow STOP_LOSS
         let ex = sample_exit_quote(12_000_000.0);
-        let (ty, _reason) = pos.should_exit(&c, Some(&ex), "test").expect("STOP_LOSS");
+        let (ty, _reason) = pos
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            .expect("STOP_LOSS");
         assert_eq!(ty, "STOP_LOSS");
     }
 
@@ -13761,7 +14134,7 @@ mod tests {
         let entry = 100.0;
         let mut pos = PositionTracker::new("m", "p", "dex", entry, 6, 1_000_000, 0);
         pos.current_price = 300.0; // I-14: higher tps vs entry ⇒ loss
-        let r = pos.should_exit(&c, None, "test");
+        let r = pos.should_exit(&c, None, "test", 9_000_000_000u64);
         assert!(
             r.is_none(),
             "STOP_LOSS must not fire without executable quote, got {:?}",
@@ -13780,7 +14153,9 @@ mod tests {
         pos.current_price = 110.0; // ~-9.1% PnL vs entry
         pos.highest_price = entry;
         let ex = sample_exit_quote(250.0); // executable ~-150% loss
-        let (ty, _) = pos.should_exit(&c, Some(&ex), "test").expect("STOP_LOSS");
+        let (ty, _) = pos
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            .expect("STOP_LOSS");
         assert_eq!(ty, "STOP_LOSS");
     }
 
@@ -13795,7 +14170,9 @@ mod tests {
         pos.current_price = 300.0; // mark looks like huge loss
         pos.highest_price = entry;
         let ex = sample_exit_quote(105.0); // executable only mild loss vs -20% threshold
-        assert!(pos.should_exit(&c, Some(&ex), "test").is_none());
+        assert!(pos
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            .is_none());
     }
 
     /// Wrong-pool executable may still drive STOP decision but must not overwrite `current_price` (I-13).
@@ -13812,7 +14189,9 @@ mod tests {
         ex.marks_position_pool = false;
         ex.quote_pool = "other_pool".to_string();
         let before = pos.current_price;
-        let (ty, _) = pos.should_exit(&c, Some(&ex), "test").expect("STOP_LOSS");
+        let (ty, _) = pos
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            .expect("STOP_LOSS");
         assert_eq!(ty, "STOP_LOSS");
         assert_eq!(
             pos.current_price, before,
@@ -13837,7 +14216,8 @@ mod tests {
         ex.marks_position_pool = false;
         ex.quote_pool = "other_pool".to_string();
         assert!(
-            pos.should_exit(&c, Some(&ex), "test").is_none(),
+            pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+                .is_none(),
             "wrong-pool executable must not trip TRAILING vs position ATH"
         );
     }
@@ -13858,7 +14238,7 @@ mod tests {
         ex.marks_position_pool = true;
         ex.quote_pool = "pos_pool".to_string();
         let (ty, _) = pos
-            .should_exit(&c, Some(&ex), "test")
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
             .expect("TRAILING_STOP from position-pool quote");
         assert_eq!(ty, "TRAILING_STOP");
     }
@@ -13875,7 +14255,7 @@ mod tests {
         pos.current_price = 50.0; // pnl = +100%
 
         // No pool quote: suppress TP
-        let r0 = pos.should_exit(&c, None, "test");
+        let r0 = pos.should_exit(&c, None, "test", 9_000_000_000u64);
         assert!(
             r0.is_none(),
             "expected TP suppressed without quote, got {:?}",
@@ -13884,7 +14264,7 @@ mod tests {
 
         // Stale: exec says we are not at take-profit
         let ex = sample_exit_quote(95.0);
-        let r1 = pos.should_exit(&c, Some(&ex), "test");
+        let r1 = pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64);
         assert!(r1.is_none(), "expected TP suppression, got {:?}", r1);
     }
 
@@ -13900,7 +14280,9 @@ mod tests {
         pos.current_price = 130.0; // mark-only loss vs entry
         pos.highest_price = entry;
         let ex = sample_exit_quote(40.0); // executable large gain vs entry
-        let (ty, reason) = pos.should_exit(&c, Some(&ex), "test").expect("TAKE_PROFIT");
+        let (ty, reason) = pos
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            .expect("TAKE_PROFIT");
         assert_eq!(ty, "TAKE_PROFIT");
         assert!(
             reason.contains("executable"),
@@ -13934,7 +14316,9 @@ mod tests {
             "expected ~-50% exec pnl, got {}",
             exe_pnl
         );
-        let (ty, _) = pos.should_exit(&c, Some(&ex), "test").expect("STOP_LOSS");
+        let (ty, _) = pos
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            .expect("STOP_LOSS");
         assert_eq!(ty, "STOP_LOSS");
     }
 
@@ -13964,7 +14348,9 @@ mod tests {
             "expected ~+60% exec pnl, got {}",
             exe_pnl
         );
-        let (ty, _) = pos.should_exit(&c, Some(&ex), "test").expect("TAKE_PROFIT");
+        let (ty, _) = pos
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            .expect("TAKE_PROFIT");
         assert_eq!(ty, "TAKE_PROFIT");
     }
 
@@ -13998,7 +14384,7 @@ mod tests {
         );
         let ex = sample_exit_quote(exec_tps);
         let (ty, _) = pos
-            .should_exit(&c, Some(&ex), "test")
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
             .expect("TRAILING_STOP");
         assert_eq!(ty, "TRAILING_STOP");
     }
@@ -14012,7 +14398,9 @@ mod tests {
         // Flat PnL so we reach TIME_EXIT (not hard stop) with no pool quote
         pos.current_price = entry;
 
-        let (ty, reason) = pos.should_exit(&c, None, "test").expect("time exit");
+        let (ty, reason) = pos
+            .should_exit(&c, None, "test", 9_000_000_000u64)
+            .expect("time exit");
         assert_eq!(ty, "TIME_EXIT");
         assert!(
             reason.contains("Max hold time exceeded")
@@ -14030,7 +14418,9 @@ mod tests {
         pos.set_entry_time_ago(Duration::from_secs(c.max_hold_time_secs + 1));
         pos.current_price = entry;
         let ex = sample_exit_quote(80.0);
-        let (_, reason) = pos.should_exit(&c, Some(&ex), "test").expect("time exit");
+        let (_, reason) = pos
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            .expect("time exit");
         assert!(
             reason.contains("25.0%") || reason.contains("25.0"),
             "expected executable-backed reporting PnL in reason: {}",
@@ -14050,7 +14440,8 @@ mod tests {
         let mut ex = sample_exit_quote(250.0);
         ex.source_slot = Some(400);
         assert!(
-            pos.should_exit(&c, Some(&ex), "test").is_none(),
+            pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+                .is_none(),
             "older on-chain slot than BUY confirm must not authorize price exit"
         );
     }
@@ -14067,7 +14458,8 @@ mod tests {
         let mut ex = sample_exit_quote(250.0);
         ex.cache_age_ms = Some(EXIT_QUOTE_MAX_CACHE_AGE_MS + 1);
         assert!(
-            pos.should_exit(&c, Some(&ex), "test").is_none(),
+            pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+                .is_none(),
             "stale reserve snapshot must not drive STOP_LOSS"
         );
     }
@@ -14084,7 +14476,8 @@ mod tests {
         let mut ex = sample_exit_quote(250.0);
         ex.quote_pool = SPL_TOKEN_PROGRAM.to_string();
         assert!(
-            pos.should_exit(&c, Some(&ex), "test").is_none(),
+            pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+                .is_none(),
             "Token program address must not be treated as a pool id for exits"
         );
     }
@@ -14143,7 +14536,7 @@ mod tests {
             source_slot: Some(900_000_000),
             cache_age_ms: Some(0),
         };
-        let r = pos.should_exit(&c, Some(&ex), "test");
+        let r = pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64);
         let (ty, _reason) = r.expect("STOP_LOSS must fire when loss is real");
         assert_eq!(ty, "STOP_LOSS");
     }
@@ -14851,6 +15244,7 @@ mod tests {
                     200_000_000,
                     2_000_000,
                     &format!("sig{i:03}"),
+                    1 + i as u64,
                     &cfg,
                 );
             }
@@ -15800,6 +16194,7 @@ async fn process_market_event(
                 sol_lamports,
                 token_raw,
                 &sig,
+                event.slot.unwrap_or(0),
             );
 
             // P1: If Trade event carries token_program (from PumpFun Geyser parsing), cache it.
@@ -15903,6 +16298,7 @@ async fn process_market_event(
                 // #endregion
                 let trade = TradeEvent {
                     timestamp: Instant::now(),
+                    slot: event.slot.unwrap_or(0),
                     trader: trader.to_string(),
                     is_buy: *is_buy,
                     sol_amount: sol_lamports,
@@ -15951,7 +16347,7 @@ async fn process_market_event(
         } => {
             // LP removal - potential rug signal
             let sol_lamports = *sol_amount;
-            ctx.record_lp_removal(mint);
+            ctx.record_lp_removal(mint, event.slot);
 
             warn!(
                 pool = %pool_address,
@@ -16023,6 +16419,12 @@ async fn process_market_event(
         }
 
         MarketEventKind::SlotUpdate { current_slot } => {
+            // Advance chain head even when the flattened `MarketEvent.slot` is absent (I-16 / burst-safe filters).
+            // Monotonic: ignore stale SlotUpdate (redelivery / reorder) so chain head never regresses.
+            ctx.last_event_slot.fetch_max(
+                *current_slot,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             debug!(current_slot, "Slot update");
         }
 
