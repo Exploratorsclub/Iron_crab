@@ -586,6 +586,12 @@ const EXECUTION_PROCESS_INTENT_US_BUCKETS: &[u64] = &[
     50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000, 250000, 500_000, 1_000_000,
     2_000_000, 5_000_000, 10_000_000, 20_000_000, 30_000_000, 45_000_000, 60_000_000,
 ];
+/// Intent header → on-chain confirm (ms). Upper range matches [`EXECUTION_PROCESS_INTENT_US_BUCKETS`]
+/// (60s) so `histogram_quantile` stays meaningful vs default confirmation timeouts (~15s+).
+const EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS: &[u64] = &[
+    1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 7_500, 10_000, 15_000, 20_000, 30_000,
+    45_000, 60_000,
+];
 pub static MOMENTUM_INGEST_TO_PROCESS_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
     MOMENTUM_INTERNAL_US_BUCKETS
         .iter()
@@ -1123,7 +1129,7 @@ pub static EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_COUNT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
 pub static EXECUTION_INTENT_TO_CONFIRM_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
-    MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS
+    EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS
         .iter()
         .map(|_| AtomicU64::new(0))
         .collect()
@@ -1779,7 +1785,7 @@ pub fn try_record_execution_intent_header_to_receive_ms(now_ms: u64, intent_head
 pub fn try_record_execution_intent_to_confirm_ms(now_ms: u64, intent_header_ts_ms: u64) {
     if let Some(ms) = momentum_event_ts_latency_delta_ms(now_ms, intent_header_ts_ms) {
         record_histogram_u64_into(
-            MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS,
+            EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS,
             EXECUTION_INTENT_TO_CONFIRM_MS_BUCKET_COUNTS.as_slice(),
             &EXECUTION_INTENT_TO_CONFIRM_MS_SUM,
             &EXECUTION_INTENT_TO_CONFIRM_MS_COUNT,
@@ -2324,7 +2330,7 @@ async fn metrics_response() -> Response<Body> {
     append_momentum_latency_histogram_prometheus(
         &mut out,
         "execution_intent_to_confirm_ms",
-        MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS,
+        EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS,
         &EXECUTION_INTENT_TO_CONFIRM_MS_BUCKET_COUNTS,
         &EXECUTION_INTENT_TO_CONFIRM_MS_SUM,
         &EXECUTION_INTENT_TO_CONFIRM_MS_COUNT,

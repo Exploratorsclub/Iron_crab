@@ -623,6 +623,10 @@ impl BondingCurvePublishTimes {
         match self.last_wall_ms.entry(curve) {
             Entry::Occupied(mut e) => {
                 e.insert(wall_ms);
+                // Refresh eviction order: otherwise a still-active curve stays at an old deque
+                // position and can be popped while newer keys retain slots.
+                self.insert_order.retain(|k| *k != curve);
+                self.insert_order.push_back(curve);
             }
             Entry::Vacant(_) => {
                 while self.insert_order.len() >= BONDING_CURVE_PUBLISH_MAP_CAP {
