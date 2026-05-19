@@ -8833,6 +8833,7 @@ async fn run_geyser_loop(
                             )
                             .await;
                         }
+                    }
                     let accounts_event = MarketEvent::new(
                         "market-data",
                         BUILD_VERSION,
@@ -8946,7 +8947,6 @@ async fn run_geyser_loop(
                             }
                         }
                     }
-                }
                 }
 
                 // For non-pump_amm DEXes: emit DexPoolAccounts on first trade if pool_accounts present.

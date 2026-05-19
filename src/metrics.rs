@@ -581,6 +581,11 @@ pub static MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_COUNT: Lazy<AtomicU64> =
 const MOMENTUM_INTERNAL_US_BUCKETS: &[u64] = &[
     50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000, 250000,
 ];
+/// Full `process_intent` wall time (µs): includes simulation, send, and confirmation (seconds-scale).
+const EXECUTION_PROCESS_INTENT_US_BUCKETS: &[u64] = &[
+    50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000, 250000, 500_000, 1_000_000,
+    2_000_000, 5_000_000, 10_000_000, 20_000_000, 30_000_000, 45_000_000, 60_000_000,
+];
 pub static MOMENTUM_INGEST_TO_PROCESS_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
     MOMENTUM_INTERNAL_US_BUCKETS
         .iter()
@@ -1127,7 +1132,7 @@ pub static EXECUTION_INTENT_TO_CONFIRM_MS_SUM: Lazy<AtomicU64> = Lazy::new(|| At
 pub static EXECUTION_INTENT_TO_CONFIRM_MS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 pub static EXECUTION_PROCESS_INTENT_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
-    MOMENTUM_INTERNAL_US_BUCKETS
+    EXECUTION_PROCESS_INTENT_US_BUCKETS
         .iter()
         .map(|_| AtomicU64::new(0))
         .collect()
@@ -1788,7 +1793,7 @@ pub fn try_record_execution_intent_to_confirm_ms(now_ms: u64, intent_header_ts_m
 #[inline]
 pub fn record_execution_process_intent_us(us: u64) {
     record_histogram_u64_into(
-        MOMENTUM_INTERNAL_US_BUCKETS,
+        EXECUTION_PROCESS_INTENT_US_BUCKETS,
         EXECUTION_PROCESS_INTENT_US_BUCKET_COUNTS.as_slice(),
         &EXECUTION_PROCESS_INTENT_US_SUM,
         &EXECUTION_PROCESS_INTENT_US_COUNT,
@@ -2327,7 +2332,7 @@ async fn metrics_response() -> Response<Body> {
     append_momentum_latency_histogram_prometheus(
         &mut out,
         "execution_process_intent_us",
-        MOMENTUM_INTERNAL_US_BUCKETS,
+        EXECUTION_PROCESS_INTENT_US_BUCKETS,
         &EXECUTION_PROCESS_INTENT_US_BUCKET_COUNTS,
         &EXECUTION_PROCESS_INTENT_US_SUM,
         &EXECUTION_PROCESS_INTENT_US_COUNT,
