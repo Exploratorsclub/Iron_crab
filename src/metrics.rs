@@ -1118,7 +1118,7 @@ pub static TX_SLOT_TO_SEND_MS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::n
 // --- execution-engine pipeline latency (histograms; complements TX_CONFIRM_LATENCY_MS gauge) ---
 pub static EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
     Lazy::new(|| {
-        MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS
+        EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS
             .iter()
             .map(|_| AtomicU64::new(0))
             .collect()
@@ -1770,7 +1770,7 @@ pub fn record_tx_slot_to_send_ms(ms: u64) {
 pub fn try_record_execution_intent_header_to_receive_ms(now_ms: u64, intent_header_ts_ms: u64) {
     if let Some(ms) = momentum_event_ts_latency_delta_ms(now_ms, intent_header_ts_ms) {
         record_histogram_u64_into(
-            MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS,
+            EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS,
             EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_BUCKET_COUNTS.as_slice(),
             &EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_SUM,
             &EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_COUNT,
@@ -2322,7 +2322,7 @@ async fn metrics_response() -> Response<Body> {
     append_momentum_latency_histogram_prometheus(
         &mut out,
         "execution_intent_header_to_receive_ms",
-        MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS,
+        EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS,
         &EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_BUCKET_COUNTS,
         &EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_SUM,
         &EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_COUNT,
