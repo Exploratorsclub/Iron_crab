@@ -79,14 +79,20 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 ### INGEST-LAG-METRICS: Geyser-Listener vs. market-data Broadcast (2026-05-20)
 **Datum**: 2026-05-20  
 **Zweck** (Observability only): Trennung von (a) Zeit in `tokio::sync::broadcast` + Event-Loop-Scheduling zwischen Geyser-Listener-`send` und market-data-`recv` und (b) Wall-Zeit `market_data_trade_after_bonding_publish_ms` (B★) sowie (c) reiner Ketten-Abstand `market_data_bonding_to_trade_slot_delta_slots` (Geyser-Slots, I-16). **Kein** `getSlot`/`getBlockTime`/`getTransaction` pro Event; nur `Instant` und bestehende `slot`-Felder.  
-**Metriken**: `market_data_tx_channel_lag_ms`, `market_data_account_channel_lag_ms`, `market_data_tx_broadcast_lagged_total`, `market_data_account_broadcast_lagged_total`, `market_data_bonding_to_trade_slot_delta_slots`, `market_data_tx_broadcast_queue_depth` (Fairness-Follow-up).  
+**Metriken**: `market_data_tx_channel_lag_ms`, `market_data_account_channel_lag_ms`, `market_data_tx_broadcast_lagged_total`, `market_data_account_broadcast_lagged_total`, `market_data_bonding_to_trade_slot_delta_slots`, `market_data_tx_broadcast_queue_depth`, `market_data_account_broadcast_queue_depth` (Account-Fairness).  
 **Dateien**: `src/solana/geyser_listener.rs`, `src/bin/market_data.rs`, `src/metrics.rs`, `docs/RUNBOOK_PROD.md`, `docs/BUGS_FIXES.md`  
-**Follow-up**: Fairness umgesetzt in **MARKET-DATA-TX-INGEST-FAIRNESS** (dedizierter Tx-Ingest-Task). Optional: Account-Arm bounded drain separat, falls `market_data_account_channel_lag_ms` p50 weiter hoch bleibt.
+**Follow-up**: Fairness umgesetzt in **MARKET-DATA-TX-INGEST-FAIRNESS** (dedizierter Tx-Ingest-Task) und **MARKET-DATA-ACCOUNT-INGEST-FAIRNESS** (dedizierter Account-Ingest-Task).
 
 ### MARKET-DATA-TX-INGEST-FAIRNESS: dedizierter Geyser-Tx-Consumer (Option A)
 **Datum**: 2026-05-20  
 **Problem**: `market_data_tx_channel_lag_ms` p50/p99 extrem hoch trotz ~0,5 ms `market_data_geyser_to_publish_ms_trade` p50 — `transaction_rx.recv()` im gemeinsamen `tokio::select!` kam zu selten, wenn der Account-Arm lange arbeitete (Backlog im `broadcast`-Buffer; MATRIX-Muster: kleines Slot-Delta + große Wall-Lag).  
 **Fix**: **Option A** — `tokio::spawn` eines dedizierten Tasks, der ausschließlich `transaction_rx.recv()` schleift und die bisherige Tx-Verarbeitung in `handle_geyser_transaction` ausführt; Haupt-`select!` ohne Tx-Arm. Bei `RecvError::Closed` beendet ein `watch`-Signal die Geyser-Schleife (`listener_handle.abort()`). Neue Gauge `market_data_tx_broadcast_queue_depth` (Restlänge im Tx-`broadcast`-Receiver nach jedem `recv`). Keine neuen RPC-Calls, keine NATS-Schema-Änderungen.  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `docs/RUNBOOK_PROD.md`, `docs/BUGS_FIXES.md`
+
+### MARKET-DATA-ACCOUNT-INGEST-FAIRNESS: dedizierter Geyser-Account-Consumer (Option A)
+**Datum**: 2026-05-20  
+**Problem**: `market_data_account_channel_lag_ms` p50/p99 hoch trotz schnellem Publish (`market_data_geyser_to_publish_ms_*`) — `account_rx.recv()` im gemeinsamen `tokio::select!` kam zu selten, wenn JetStream-, Control- und andere Arme lange arbeiteten (Backlog im Account-`broadcast`-Buffer; B★ groß bei kleinem Slot-Delta).  
+**Fix**: **Option A** — `tokio::spawn` eines dedizierten Tasks, der ausschließlich `account_rx.recv()` schleift und die bisherige Account-Verarbeitung in `handle_geyser_account` ausführt; Haupt-`select!` ohne Account-Arm. Bei `RecvError::Closed` beendet ein zweites `watch`-Signal die Geyser-Schleife (`listener_handle.abort()`). Neue Gauge `market_data_account_broadcast_queue_depth` (Restlänge nach jedem `recv`). Zusätzlich: `parking_lot`-Guards so begrenzt, dass der Account-Ingest-Task `Send` bleibt (keine Guards über `.await`). Keine neuen RPC-Calls im Hot-Path, keine NATS-Schema-Änderungen.  
 **Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `docs/RUNBOOK_PROD.md`, `docs/BUGS_FIXES.md`
 
 ### FIX-MOM-EXIT-QUOTE-GUARDS: Frische Reserve-Quotes + getrennte Ingest-Latenzen

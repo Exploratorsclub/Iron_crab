@@ -157,6 +157,7 @@ Alle Werte nutzen konsistent `RecordHeader.ts_unix_ms` bzw. Geyser-`Instant::now
 |--------|--------|-------------------|
 | Channel-Queue | `market_data_tx_channel_lag_ms`, `market_data_account_channel_lag_ms` | Zeit zwischen Listener-`send` und market-data-`recv` (Broadcast + Tokio-Scheduling), **kein** Netzwerk danach |
 | Tx-Broadcast-Backlog (Gauge) | `market_data_tx_broadcast_queue_depth` | Nach jedem erfolgreichen Tx-`recv` im **dedizierten Tx-Ingest-Task**: verbleibende Nachrichten im `broadcast`-Receiver (sollte unter Last ~0 bleiben; siehe **MARKET-DATA-TX-INGEST-FAIRNESS**) |
+| Account-Broadcast-Backlog (Gauge) | `market_data_account_broadcast_queue_depth` | Nach jedem erfolgreichen Account-`recv` im **dedizierten Account-Ingest-Task**: verbleibende Nachrichten im Account-`broadcast`-Receiver (sollte unter Last ~0 bleiben; siehe **MARKET-DATA-ACCOUNT-INGEST-FAIRNESS**) |
 | Drops | `market_data_tx_broadcast_lagged_total`, `market_data_account_broadcast_lagged_total` | Summe der übersprungenen Nachrichten bei `RecvError::Lagged` |
 | Ketten vs. Wall | `market_data_bonding_to_trade_slot_delta_slots` | Slot-Delta letztes `BondingCurveProgress` → nächstes Pump.fun-`Trade` (I-16: Geyser-Slots) |
 
@@ -174,6 +175,16 @@ histogram_quantile(0.50, sum(rate(market_data_tx_channel_lag_ms_bucket[5m])) by 
 histogram_quantile(0.99, sum(rate(market_data_tx_channel_lag_ms_bucket[5m])) by (le))
 market_data_tx_broadcast_queue_depth
 histogram_quantile(0.50, sum(rate(market_data_geyser_to_publish_ms_trade_bucket[5m])) by (le))
+```
+
+**Prod-Gate (Account-Ingest-Fairness, nach Deploy):** Ziel ist deutlich niedriger `market_data_account_channel_lag_ms` (p50 Richtung **unter 50 ms**, p99 **unter 200 ms** Stretch) bei gleichzeitig niedrigem `market_data_account_broadcast_queue_depth` und `market_data_account_broadcast_lagged_total == 0`; Tx-Metriken (`market_data_tx_channel_lag_ms`, `market_data_tx_broadcast_queue_depth`) ohne Regression. Optional B★ (`market_data_trade_after_bonding_publish_ms`) und `market_data_bonding_to_trade_slot_delta_slots` beobachten.
+
+```promql
+histogram_quantile(0.50, sum(rate(market_data_account_channel_lag_ms_bucket[5m])) by (le))
+histogram_quantile(0.99, sum(rate(market_data_account_channel_lag_ms_bucket[5m])) by (le))
+market_data_account_broadcast_queue_depth
+market_data_account_broadcast_lagged_total
+histogram_quantile(0.50, sum(rate(market_data_tx_channel_lag_ms_bucket[5m])) by (le))
 ```
 
 | Segment | Metrik (Präfix je nach Export) | Kurzinterpretation |
