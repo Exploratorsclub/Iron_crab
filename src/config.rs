@@ -95,15 +95,10 @@ pub fn migrate_momentum_trade_velocity_keys_in_table(
         min_trades_per_min = converted,
         "`min_trades_per_sec` is deprecated; converted to `min_trades_per_min` (×60; value was trades/s, not trades/min)"
     );
-    let line = format!("min_trades_per_min = {converted}\n");
-    let mini: toml::Value = toml::from_str(&line).unwrap_or_else(|e| {
-        panic!("invalid migrated min_trades_per_min {converted}: {e}");
-    });
-    let v = mini
-        .get("min_trades_per_min")
-        .cloned()
-        .unwrap_or_else(|| panic!("migrated fragment missing min_trades_per_min"));
-    table.insert("min_trades_per_min".to_string(), v);
+    table.insert(
+        "min_trades_per_min".to_string(),
+        toml::Value::Float(converted),
+    );
 }
 
 fn momentum_cfg_from_toml_value(val: toml::Value) -> Result<MomentumCfg, String> {
@@ -662,7 +657,8 @@ pub struct MomentumCfg {
     #[serde(default = "default_buyer_window")]
     pub buyer_window_secs: u64,
     /// Min trades per minute for momentum (burst-safe chain-slot window; see momentum-bot).
-    /// Default: 30.0 (≈ 0.5 trades/s). Deprecated TOML key `min_trades_per_sec` is converted ×60.
+    /// Default: 12.0 (= 0.2 trades/s × 60; same serde fallback as legacy `min_trades_per_sec` default).
+    /// Deprecated TOML key `min_trades_per_sec` is converted ×60.
     #[serde(default = "default_min_trades_per_min")]
     pub min_trades_per_min: f64,
     /// Min buy dominance ratio (buys / total). Default: 0.5 (was 0.6, too strict)
@@ -852,8 +848,8 @@ fn default_buyer_window() -> u64 {
     30
 } // Extended from 20
 fn default_min_trades_per_min() -> f64 {
-    30.0
-} // ≈ 0.5 trades/s; relaxed vs older per-second defaults
+    12.0
+} // 0.2 trades/s × 60; matches legacy default_min_trades_per_sec (relaxed from 0.5/s)
 fn default_min_buy_dominance() -> f64 {
     0.5
 } // Relaxed from 0.6
