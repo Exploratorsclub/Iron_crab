@@ -222,6 +222,307 @@ pub static TOKENS_TRACKED_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0
 pub static GEYSER_RECONNECTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static GEYSER_ERRORS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+// --- market-data: Geyser recv → Core NATS publish (hot path observability, no RPC) ---
+/// Monotonic Geyser chain head (max slot seen on market-data ingest paths). I-16: not RPC `getSlot`.
+pub static MARKET_DATA_GEYSER_HEAD_SLOT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+const MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS: &[u64] = &[
+    1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2000, 5000, 10_000, 30_000, 60_000,
+];
+const MARKET_DATA_LATENCY_MS_SUM_CAP: u64 = 600_000;
+
+const MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS: &[u64] = &[0, 1, 2, 3, 5, 10, 20, 50, 100, 200];
+
+/// Segment for `market_data_geyser_to_publish_ms_*` / slot lag histogram families (no dynamic labels).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarketDataLatencySegment {
+    Trade,
+    BondingCurve,
+    PoolCreated,
+    Other,
+}
+
+static MARKET_DATA_GEYSER_TO_PUBLISH_MS_TRADE_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_GEYSER_TO_PUBLISH_MS_TRADE_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_GEYSER_TO_PUBLISH_MS_TRADE_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+static MARKET_DATA_GEYSER_TO_PUBLISH_MS_BONDING_CURVE_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_GEYSER_TO_PUBLISH_MS_BONDING_CURVE_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_GEYSER_TO_PUBLISH_MS_BONDING_CURVE_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+static MARKET_DATA_GEYSER_TO_PUBLISH_MS_POOL_CREATED_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_GEYSER_TO_PUBLISH_MS_POOL_CREATED_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_GEYSER_TO_PUBLISH_MS_POOL_CREATED_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+static MARKET_DATA_GEYSER_TO_PUBLISH_MS_OTHER_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_GEYSER_TO_PUBLISH_MS_OTHER_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_GEYSER_TO_PUBLISH_MS_OTHER_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+static MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_TRADE_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_TRADE_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_TRADE_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+static MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_BONDING_CURVE_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_BONDING_CURVE_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_BONDING_CURVE_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+static MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_POOL_CREATED_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_POOL_CREATED_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_POOL_CREATED_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+static MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_OTHER_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_OTHER_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_OTHER_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Pump.fun: wall ms between last `BondingCurveProgress` publish and next `Trade` publish (same bonding curve / pool).
+static MARKET_DATA_TRADE_AFTER_BONDING_PUBLISH_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_TRADE_AFTER_BONDING_PUBLISH_MS_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TRADE_AFTER_BONDING_PUBLISH_MS_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Update monotonic Geyser head slot (max). Safe from any market-data ingest arm.
+#[inline]
+pub fn market_data_bump_geyser_head_slot(slot: u64) {
+    if slot == 0 {
+        return;
+    }
+    let _ = MARKET_DATA_GEYSER_HEAD_SLOT.fetch_max(slot, Ordering::Relaxed);
+}
+
+/// Record wall ms delta for pump.fun trade after last bonding publish (bounded map hit only).
+#[inline]
+pub fn record_market_data_trade_after_bonding_publish_ms(delta_ms: u64) {
+    record_histogram_u64_into(
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+        &MARKET_DATA_TRADE_AFTER_BONDING_PUBLISH_MS_BUCKET_COUNTS,
+        &MARKET_DATA_TRADE_AFTER_BONDING_PUBLISH_MS_SUM,
+        &MARKET_DATA_TRADE_AFTER_BONDING_PUBLISH_MS_COUNT,
+        delta_ms,
+        MARKET_DATA_LATENCY_MS_SUM_CAP,
+    );
+}
+
+/// After successful core `TOPIC_MARKET_EVENTS` publish (`publish_market_event_core_and_momentum_ex` path).
+#[inline]
+pub fn record_market_data_geyser_to_publish_on_success(
+    recv_at: Instant,
+    segment: MarketDataLatencySegment,
+    cold_path: bool,
+    event_slot: Option<u64>,
+) {
+    if cold_path {
+        return;
+    }
+    let elapsed_ms = recv_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    match segment {
+        MarketDataLatencySegment::Trade => record_histogram_u64_into(
+            MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+            &MARKET_DATA_GEYSER_TO_PUBLISH_MS_TRADE_BUCKET_COUNTS,
+            &MARKET_DATA_GEYSER_TO_PUBLISH_MS_TRADE_SUM,
+            &MARKET_DATA_GEYSER_TO_PUBLISH_MS_TRADE_COUNT,
+            elapsed_ms,
+            MARKET_DATA_LATENCY_MS_SUM_CAP,
+        ),
+        MarketDataLatencySegment::BondingCurve => record_histogram_u64_into(
+            MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+            &MARKET_DATA_GEYSER_TO_PUBLISH_MS_BONDING_CURVE_BUCKET_COUNTS,
+            &MARKET_DATA_GEYSER_TO_PUBLISH_MS_BONDING_CURVE_SUM,
+            &MARKET_DATA_GEYSER_TO_PUBLISH_MS_BONDING_CURVE_COUNT,
+            elapsed_ms,
+            MARKET_DATA_LATENCY_MS_SUM_CAP,
+        ),
+        MarketDataLatencySegment::PoolCreated => record_histogram_u64_into(
+            MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+            &MARKET_DATA_GEYSER_TO_PUBLISH_MS_POOL_CREATED_BUCKET_COUNTS,
+            &MARKET_DATA_GEYSER_TO_PUBLISH_MS_POOL_CREATED_SUM,
+            &MARKET_DATA_GEYSER_TO_PUBLISH_MS_POOL_CREATED_COUNT,
+            elapsed_ms,
+            MARKET_DATA_LATENCY_MS_SUM_CAP,
+        ),
+        MarketDataLatencySegment::Other => record_histogram_u64_into(
+            MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+            &MARKET_DATA_GEYSER_TO_PUBLISH_MS_OTHER_BUCKET_COUNTS,
+            &MARKET_DATA_GEYSER_TO_PUBLISH_MS_OTHER_SUM,
+            &MARKET_DATA_GEYSER_TO_PUBLISH_MS_OTHER_COUNT,
+            elapsed_ms,
+            MARKET_DATA_LATENCY_MS_SUM_CAP,
+        ),
+    };
+    let es = match event_slot {
+        Some(s) if s > 0 => s,
+        _ => return,
+    };
+    let head = MARKET_DATA_GEYSER_HEAD_SLOT.load(Ordering::Relaxed);
+    if head == 0 || head < es {
+        return;
+    }
+    let lag = head.saturating_sub(es);
+    match segment {
+        MarketDataLatencySegment::Trade => record_histogram_u64_into(
+            MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS,
+            &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_TRADE_BUCKET_COUNTS,
+            &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_TRADE_SUM,
+            &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_TRADE_COUNT,
+            lag,
+            u64::MAX,
+        ),
+        MarketDataLatencySegment::BondingCurve => record_histogram_u64_into(
+            MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS,
+            &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_BONDING_CURVE_BUCKET_COUNTS,
+            &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_BONDING_CURVE_SUM,
+            &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_BONDING_CURVE_COUNT,
+            lag,
+            u64::MAX,
+        ),
+        MarketDataLatencySegment::PoolCreated => record_histogram_u64_into(
+            MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS,
+            &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_POOL_CREATED_BUCKET_COUNTS,
+            &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_POOL_CREATED_SUM,
+            &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_POOL_CREATED_COUNT,
+            lag,
+            u64::MAX,
+        ),
+        MarketDataLatencySegment::Other => record_histogram_u64_into(
+            MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS,
+            &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_OTHER_BUCKET_COUNTS,
+            &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_OTHER_SUM,
+            &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_OTHER_COUNT,
+            lag,
+            u64::MAX,
+        ),
+    };
+}
+
+// --- momentum-bot: intent header → JetStream publish (header.ts = TradeIntent::new wall time) ---
+pub static MOMENTUM_INTENT_HEADER_TO_PUBLISH_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+pub static MOMENTUM_INTENT_HEADER_TO_PUBLISH_MS_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_INTENT_HEADER_TO_PUBLISH_MS_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Causal `MarketEvent.header.ts_unix_ms` → `TradeIntent.header.ts_unix_ms` (entry path only).
+pub static MOMENTUM_PUBLISH_TO_INTENT_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+pub static MOMENTUM_PUBLISH_TO_INTENT_MS_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_PUBLISH_TO_INTENT_MS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn try_record_momentum_intent_header_to_publish_ms(now_ms: u64, intent_header_ts_ms: u64) {
+    if let Some(ms) = momentum_event_ts_latency_delta_ms(now_ms, intent_header_ts_ms) {
+        record_histogram_u64_into(
+            MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS,
+            MOMENTUM_INTENT_HEADER_TO_PUBLISH_MS_BUCKET_COUNTS.as_slice(),
+            &MOMENTUM_INTENT_HEADER_TO_PUBLISH_MS_SUM,
+            &MOMENTUM_INTENT_HEADER_TO_PUBLISH_MS_COUNT,
+            ms,
+            MOMENTUM_LATENCY_MS_SUM_CAP,
+        );
+    }
+}
+
+/// Wall time from causal market-event publish timestamp to intent `RecordHeader` time.
+#[inline]
+pub fn try_record_momentum_publish_to_intent_ms(intent_header_ts_ms: u64, causal_event_ts_ms: u64) {
+    if causal_event_ts_ms == 0 || causal_event_ts_ms > intent_header_ts_ms {
+        MOMENTUM_LATENCY_EVENT_TS_INVALID_TOTAL.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let ms = intent_header_ts_ms.saturating_sub(causal_event_ts_ms);
+    record_histogram_u64_into(
+        MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS,
+        MOMENTUM_PUBLISH_TO_INTENT_MS_BUCKET_COUNTS.as_slice(),
+        &MOMENTUM_PUBLISH_TO_INTENT_MS_SUM,
+        &MOMENTUM_PUBLISH_TO_INTENT_MS_COUNT,
+        ms,
+        MOMENTUM_LATENCY_MS_SUM_CAP,
+    );
+}
+
 // --- momentum-bot service metrics ---
 pub static INTENTS_GENERATED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// Exit/SELL intents generated by momentum-bot (separate from BUY intents)
@@ -279,6 +580,17 @@ pub static MOMENTUM_EVENT_TO_INTENT_PUBLISH_MS_COUNT: Lazy<AtomicU64> =
 
 const MOMENTUM_INTERNAL_US_BUCKETS: &[u64] = &[
     50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000, 250000,
+];
+/// Full `process_intent` wall time (µs): includes simulation, send, and confirmation (seconds-scale).
+const EXECUTION_PROCESS_INTENT_US_BUCKETS: &[u64] = &[
+    50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000, 250000, 500_000, 1_000_000,
+    2_000_000, 5_000_000, 10_000_000, 20_000_000, 30_000_000, 45_000_000, 60_000_000,
+];
+/// Intent header → on-chain confirm (ms). Upper range matches [`EXECUTION_PROCESS_INTENT_US_BUCKETS`]
+/// (60s) so `histogram_quantile` stays meaningful vs default confirmation timeouts (~15s+).
+const EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS: &[u64] = &[
+    1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 7_500, 10_000, 15_000, 20_000, 30_000,
+    45_000, 60_000,
 ];
 pub static MOMENTUM_INGEST_TO_PROCESS_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
     MOMENTUM_INTERNAL_US_BUCKETS
@@ -802,6 +1114,48 @@ pub static TX_SLOT_TO_SEND_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(||
 });
 pub static TX_SLOT_TO_SEND_MS_SUM_MS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TX_SLOT_TO_SEND_MS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+// --- execution-engine pipeline latency (histograms; complements TX_CONFIRM_LATENCY_MS gauge) ---
+pub static EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+pub static EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub static EXECUTION_INTENT_TO_CONFIRM_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+pub static EXECUTION_INTENT_TO_CONFIRM_MS_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static EXECUTION_INTENT_TO_CONFIRM_MS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub static EXECUTION_PROCESS_INTENT_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    EXECUTION_PROCESS_INTENT_US_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+pub static EXECUTION_PROCESS_INTENT_US_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static EXECUTION_PROCESS_INTENT_US_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub static EXECUTION_SLOT_LAG_AT_SEND_SLOTS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+pub static EXECUTION_SLOT_LAG_AT_SEND_SLOTS_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static EXECUTION_SLOT_LAG_AT_SEND_SLOTS_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 pub static TPU_RECONNECT_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TPU_CACHE_STALE_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static GEYSER_TX_WATCHER_CONNECTED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
@@ -1411,6 +1765,62 @@ pub fn record_tx_slot_to_send_ms(ms: u64) {
     }
 }
 
+/// `TradeIntent.header.ts_unix_ms` → first line of `process_intent` (JetStream / consumer skew).
+#[inline]
+pub fn try_record_execution_intent_header_to_receive_ms(now_ms: u64, intent_header_ts_ms: u64) {
+    if let Some(ms) = momentum_event_ts_latency_delta_ms(now_ms, intent_header_ts_ms) {
+        record_histogram_u64_into(
+            EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS,
+            EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_BUCKET_COUNTS.as_slice(),
+            &EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_SUM,
+            &EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_COUNT,
+            ms,
+            MOMENTUM_LATENCY_MS_SUM_CAP,
+        );
+    }
+}
+
+/// Intent header time → on-chain confirm observation (wall), histogram for p99 (vs scalar gauge).
+#[inline]
+pub fn try_record_execution_intent_to_confirm_ms(now_ms: u64, intent_header_ts_ms: u64) {
+    if let Some(ms) = momentum_event_ts_latency_delta_ms(now_ms, intent_header_ts_ms) {
+        record_histogram_u64_into(
+            EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS,
+            EXECUTION_INTENT_TO_CONFIRM_MS_BUCKET_COUNTS.as_slice(),
+            &EXECUTION_INTENT_TO_CONFIRM_MS_SUM,
+            &EXECUTION_INTENT_TO_CONFIRM_MS_COUNT,
+            ms,
+            MOMENTUM_LATENCY_MS_SUM_CAP,
+        );
+    }
+}
+
+/// Total `process_intent` wall time (microseconds).
+#[inline]
+pub fn record_execution_process_intent_us(us: u64) {
+    record_histogram_u64_into(
+        EXECUTION_PROCESS_INTENT_US_BUCKETS,
+        EXECUTION_PROCESS_INTENT_US_BUCKET_COUNTS.as_slice(),
+        &EXECUTION_PROCESS_INTENT_US_SUM,
+        &EXECUTION_PROCESS_INTENT_US_COUNT,
+        us,
+        MOMENTUM_LATENCY_US_SUM_CAP,
+    );
+}
+
+/// `cached_blockhash.slot` (Geyser-fed) minus intent metadata `slot` at successful send.
+#[inline]
+pub fn record_execution_slot_lag_at_send_slots(lag_slots: u64) {
+    record_histogram_u64_into(
+        MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS,
+        EXECUTION_SLOT_LAG_AT_SEND_SLOTS_BUCKET_COUNTS.as_slice(),
+        &EXECUTION_SLOT_LAG_AT_SEND_SLOTS_SUM,
+        &EXECUTION_SLOT_LAG_AT_SEND_SLOTS_COUNT,
+        lag_slots,
+        u64::MAX,
+    );
+}
+
 /// Record price impact measurement (basis points)
 pub fn record_price_impact(_price_impact_bps: f64) {
     // For now, we'll just track in the trade success metrics
@@ -1491,6 +1901,90 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "geyser_errors_total",
         GEYSER_ERRORS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_head_slot",
+        MARKET_DATA_GEYSER_HEAD_SLOT.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_last_trade_publish_ts_unix_ms",
+        MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_last_bonding_curve_publish_ts_unix_ms",
+        MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS.load(Ordering::Relaxed)
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_geyser_to_publish_ms_trade",
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+        &MARKET_DATA_GEYSER_TO_PUBLISH_MS_TRADE_BUCKET_COUNTS,
+        &MARKET_DATA_GEYSER_TO_PUBLISH_MS_TRADE_SUM,
+        &MARKET_DATA_GEYSER_TO_PUBLISH_MS_TRADE_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_geyser_to_publish_ms_bonding_curve",
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+        &MARKET_DATA_GEYSER_TO_PUBLISH_MS_BONDING_CURVE_BUCKET_COUNTS,
+        &MARKET_DATA_GEYSER_TO_PUBLISH_MS_BONDING_CURVE_SUM,
+        &MARKET_DATA_GEYSER_TO_PUBLISH_MS_BONDING_CURVE_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_geyser_to_publish_ms_pool_created",
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+        &MARKET_DATA_GEYSER_TO_PUBLISH_MS_POOL_CREATED_BUCKET_COUNTS,
+        &MARKET_DATA_GEYSER_TO_PUBLISH_MS_POOL_CREATED_SUM,
+        &MARKET_DATA_GEYSER_TO_PUBLISH_MS_POOL_CREATED_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_geyser_to_publish_ms_other",
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+        &MARKET_DATA_GEYSER_TO_PUBLISH_MS_OTHER_BUCKET_COUNTS,
+        &MARKET_DATA_GEYSER_TO_PUBLISH_MS_OTHER_SUM,
+        &MARKET_DATA_GEYSER_TO_PUBLISH_MS_OTHER_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_slot_lag_at_publish_slots_trade",
+        MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS,
+        &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_TRADE_BUCKET_COUNTS,
+        &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_TRADE_SUM,
+        &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_TRADE_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_slot_lag_at_publish_slots_bonding_curve",
+        MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS,
+        &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_BONDING_CURVE_BUCKET_COUNTS,
+        &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_BONDING_CURVE_SUM,
+        &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_BONDING_CURVE_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_slot_lag_at_publish_slots_pool_created",
+        MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS,
+        &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_POOL_CREATED_BUCKET_COUNTS,
+        &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_POOL_CREATED_SUM,
+        &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_POOL_CREATED_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_slot_lag_at_publish_slots_other",
+        MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS,
+        &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_OTHER_BUCKET_COUNTS,
+        &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_OTHER_SUM,
+        &MARKET_DATA_SLOT_LAG_AT_PUBLISH_SLOTS_OTHER_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_trade_after_bonding_publish_ms",
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+        &MARKET_DATA_TRADE_AFTER_BONDING_PUBLISH_MS_BUCKET_COUNTS,
+        &MARKET_DATA_TRADE_AFTER_BONDING_PUBLISH_MS_SUM,
+        &MARKET_DATA_TRADE_AFTER_BONDING_PUBLISH_MS_COUNT,
     );
 
     // --- momentum-bot service ---
@@ -1691,6 +2185,22 @@ async fn metrics_response() -> Response<Body> {
     );
     append_momentum_latency_histogram_prometheus(
         &mut out,
+        "momentum_intent_header_to_publish_ms",
+        MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS,
+        &MOMENTUM_INTENT_HEADER_TO_PUBLISH_MS_BUCKET_COUNTS,
+        &MOMENTUM_INTENT_HEADER_TO_PUBLISH_MS_SUM,
+        &MOMENTUM_INTENT_HEADER_TO_PUBLISH_MS_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "momentum_publish_to_intent_ms",
+        MOMENTUM_EVENT_TO_LATENCY_MS_BUCKETS,
+        &MOMENTUM_PUBLISH_TO_INTENT_MS_BUCKET_COUNTS,
+        &MOMENTUM_PUBLISH_TO_INTENT_MS_SUM,
+        &MOMENTUM_PUBLISH_TO_INTENT_MS_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
         "momentum_ingest_to_process_us",
         MOMENTUM_INTERNAL_US_BUCKETS,
         &MOMENTUM_INGEST_TO_PROCESS_US_BUCKET_COUNTS,
@@ -1809,6 +2319,38 @@ async fn metrics_response() -> Response<Body> {
     ));
     out.push_str(&format!("tx_slot_to_send_ms_sum {}\n", sts_sum));
     out.push_str(&format!("tx_slot_to_send_ms_count {}\n", sts_count));
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "execution_intent_header_to_receive_ms",
+        EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS,
+        &EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_BUCKET_COUNTS,
+        &EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_SUM,
+        &EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "execution_intent_to_confirm_ms",
+        EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS,
+        &EXECUTION_INTENT_TO_CONFIRM_MS_BUCKET_COUNTS,
+        &EXECUTION_INTENT_TO_CONFIRM_MS_SUM,
+        &EXECUTION_INTENT_TO_CONFIRM_MS_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "execution_process_intent_us",
+        EXECUTION_PROCESS_INTENT_US_BUCKETS,
+        &EXECUTION_PROCESS_INTENT_US_BUCKET_COUNTS,
+        &EXECUTION_PROCESS_INTENT_US_SUM,
+        &EXECUTION_PROCESS_INTENT_US_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "execution_slot_lag_at_send_slots",
+        MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS,
+        &EXECUTION_SLOT_LAG_AT_SEND_SLOTS_BUCKET_COUNTS,
+        &EXECUTION_SLOT_LAG_AT_SEND_SLOTS_SUM,
+        &EXECUTION_SLOT_LAG_AT_SEND_SLOTS_COUNT,
+    );
     line!(
         "tpu_reconnect_total",
         TPU_RECONNECT_TOTAL.load(Ordering::Relaxed)

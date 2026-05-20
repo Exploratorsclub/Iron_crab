@@ -55,8 +55,10 @@ use ironcrab::metrics::{
     set_momentum_bot_process_start_unix_sec,
     set_momentum_market_events_ingest_max_wall_lag_ms_last_batch, set_readiness_nats_connected,
     try_record_momentum_event_to_ingest_ms, try_record_momentum_event_to_intent_publish_ms,
-    try_record_momentum_jetstream_poolcache_event_to_ingest_ms, wall_clock_unix_ms_now,
-    MetricsComponent, EXITS_GENERATED_TOTAL, FILTER_PASSED_TOTAL, FILTER_REJECTED_BUYER_QUALITY,
+    try_record_momentum_intent_header_to_publish_ms,
+    try_record_momentum_jetstream_poolcache_event_to_ingest_ms,
+    try_record_momentum_publish_to_intent_ms, wall_clock_unix_ms_now, MetricsComponent,
+    EXITS_GENERATED_TOTAL, FILTER_PASSED_TOTAL, FILTER_REJECTED_BUYER_QUALITY,
     FILTER_REJECTED_DEV_BEHAVIOR, FILTER_REJECTED_INFLOW, FILTER_REJECTED_LIQUIDITY,
     FILTER_REJECTED_TOTAL, FILTER_REJECTED_VELOCITY, INTENTS_GENERATED_TOTAL,
     MARKET_EVENTS_CONSUMED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
@@ -8792,6 +8794,9 @@ async fn main() -> Result<()> {
                         // Large values often mean **stale producer timestamps** or clock skew — not
                         // necessarily momentum backlog. JetStream pool-cache lag is tracked separately
                         // via `try_record_momentum_jetstream_poolcache_event_to_ingest_ms`.
+                        // Pipeline note: this is the **market-data → momentum** segment; downstream
+                        // JetStream intent latency uses `try_record_momentum_intent_header_to_publish_ms`
+                        // / `try_record_momentum_publish_to_intent_ms` / `try_record_momentum_event_to_intent_publish_ms`.
                         try_record_momentum_event_to_ingest_ms(now_ms, event.header.ts_unix_ms);
                         if let Some(ms) =
                             momentum_event_ts_latency_delta_ms(now_ms, event.header.ts_unix_ms)
@@ -9664,6 +9669,11 @@ async fn generate_and_publish_buy_intent_inner(
         match nats.jetstream_publish(TOPIC_TRADE_INTENTS, &intent).await {
             Ok(true) => {
                 NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                let now_ms = wall_clock_unix_ms_now();
+                try_record_momentum_intent_header_to_publish_ms(now_ms, intent.header.ts_unix_ms);
+                if ts_ms > 0 && ts_ms <= intent.header.ts_unix_ms {
+                    try_record_momentum_publish_to_intent_ms(intent.header.ts_unix_ms, ts_ms);
+                }
                 publish_ok = true;
             }
             Ok(false) => {
@@ -15936,6 +15946,10 @@ async fn generate_and_publish_exit_intent(
             Ok(true) => {
                 NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                 let now_ms = wall_clock_unix_ms_now();
+                try_record_momentum_intent_header_to_publish_ms(now_ms, intent.header.ts_unix_ms);
+                if ts_ms > 0 && ts_ms <= intent.header.ts_unix_ms {
+                    try_record_momentum_publish_to_intent_ms(intent.header.ts_unix_ms, ts_ms);
+                }
                 if let Some(ts) = source_event_ts_unix_ms {
                     try_record_momentum_event_to_intent_publish_ms(now_ms, ts);
                 }

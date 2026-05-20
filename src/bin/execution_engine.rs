@@ -70,17 +70,20 @@ use ironcrab::ipc::{
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
+    record_execution_process_intent_us, record_execution_slot_lag_at_send_slots,
     record_recent_trade, record_tx_slot_to_send_ms, serve_metrics,
     set_readiness_control_response_sub_active, set_readiness_control_sub_active,
     set_readiness_mode, set_readiness_nats_connected, set_readiness_state_paths_initialized,
-    update_readiness_execution_engine_current, MetricsComponent, RecentTrade, ACTIVE_CAPITAL_LOCKS,
-    ACTIVE_RESOURCE_LOCKS, AVAILABLE_SOL_LAMPORTS, CONCURRENT_INTENTS_GAUGE,
-    INTENTS_EXECUTED_TOTAL, INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL,
-    JITO_BUNDLES_LANDED_TOTAL, JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL,
-    JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL, KILL_SWITCH_ACTIVE,
-    NATS_MESSAGES_RECEIVED_TOTAL, OPEN_POSITIONS_GAUGE, POSITION_AUTHORITY_DRIFT_LOCKMANAGER,
-    POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE, POSITION_AUTHORITY_OPEN_GAUGE,
-    POSITION_AUTHORITY_RECONCILE_NEEDED_GAUGE, PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_FAIL_TOTAL,
+    try_record_execution_intent_header_to_receive_ms, try_record_execution_intent_to_confirm_ms,
+    update_readiness_execution_engine_current, wall_clock_unix_ms_now, MetricsComponent,
+    RecentTrade, ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS, AVAILABLE_SOL_LAMPORTS,
+    CONCURRENT_INTENTS_GAUGE, INTENTS_EXECUTED_TOTAL, INTENTS_RECEIVED_TOTAL,
+    INTENTS_REJECTED_TOTAL, JITO_BUNDLES_LANDED_TOTAL, JITO_BUNDLES_REJECTED_TOTAL,
+    JITO_BUNDLES_SUBMITTED_TOTAL, JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL,
+    KILL_SWITCH_ACTIVE, NATS_MESSAGES_RECEIVED_TOTAL, OPEN_POSITIONS_GAUGE,
+    POSITION_AUTHORITY_DRIFT_LOCKMANAGER, POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE,
+    POSITION_AUTHORITY_OPEN_GAUGE, POSITION_AUTHORITY_RECONCILE_NEEDED_GAUGE,
+    PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_FAIL_TOTAL,
     PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_SUCCESS_TOTAL,
     PUMPSWAP_HOT_PATH_HEALING_COOLDOWN_SUPPRESSED_TOTAL,
     PUMPSWAP_HOT_PATH_HEALING_SKIPPED_NO_NATS_TOTAL, PUMPSWAP_HOT_PATH_HEALING_TRIGGER_TOTAL,
@@ -8615,8 +8618,37 @@ fn max_open_positions_buy_gate(
     (passed, details)
 }
 
+/// After a successful send: `cached_blockhash.slot` minus intent metadata `slot` (Geyser chain position).
+#[inline]
+fn record_execution_slot_lag_at_send_if_applicable(ctx: &ExecutionContext, intent: &TradeIntent) {
+    let Some(intent_slot) = intent
+        .metadata
+        .get("slot")
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+    else {
+        return;
+    };
+    let Some(cached) = ctx.cached_blockhash.read().clone() else {
+        return;
+    };
+    if cached.slot >= intent_slot {
+        record_execution_slot_lag_at_send_slots(cached.slot - intent_slot);
+    }
+}
+
 /// Process a single TradeIntent through the execution pipeline
 async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Result<()> {
+    try_record_execution_intent_header_to_receive_ms(
+        wall_clock_unix_ms_now(),
+        intent.header.ts_unix_ms,
+    );
+    let process_intent_started = Instant::now();
+    let _process_intent_duration = scopeguard::guard(process_intent_started, |t| {
+        let us = t.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        record_execution_process_intent_us(us);
+    });
+
     ctx.record_intent_received();
 
     // Keep Prometheus counters aligned with persisted decision/intents logs.
@@ -10295,6 +10327,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                             .unwrap_or(0);
                         record_tx_slot_to_send_ms(now_ms.saturating_sub(seen));
                     }
+                    record_execution_slot_lag_at_send_if_applicable(ctx, &intent);
                     checks.push(CheckResult {
                         check_name: "send".to_string(),
                         passed: true,
@@ -10349,6 +10382,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                             .unwrap_or(0);
                         record_tx_slot_to_send_ms(now_ms.saturating_sub(seen));
                     }
+                    record_execution_slot_lag_at_send_if_applicable(ctx, &intent);
                     send_signature = Some(result.signature.clone());
                     send_method_used = Some(result.method.clone());
                     sent_tx = Some(result.tx);
@@ -10867,6 +10901,10 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
 
             exec.status = status;
             if exec.status == ExecutionStatus::Confirmed {
+                try_record_execution_intent_to_confirm_ms(
+                    wall_clock_unix_ms_now(),
+                    intent.header.ts_unix_ms,
+                );
                 if let Some(slot) = tx_landing_slot {
                     exec.confirmed_slot = Some(slot);
                     exec.metadata
