@@ -156,6 +156,7 @@ Alle Werte nutzen konsistent `RecordHeader.ts_unix_ms` bzw. Geyser-`Instant::now
 | Signal | Metrik | Kurzinterpretation |
 |--------|--------|-------------------|
 | Channel-Queue | `market_data_tx_channel_lag_ms`, `market_data_account_channel_lag_ms` | Zeit zwischen Listener-`send` und market-data-`recv` (Broadcast + Tokio-Scheduling), **kein** Netzwerk danach |
+| Tx-Broadcast-Backlog (Gauge) | `market_data_tx_broadcast_queue_depth` | Nach jedem erfolgreichen Tx-`recv` im **dedizierten Tx-Ingest-Task**: verbleibende Nachrichten im `broadcast`-Receiver (sollte unter Last ~0 bleiben; siehe **MARKET-DATA-TX-INGEST-FAIRNESS**) |
 | Drops | `market_data_tx_broadcast_lagged_total`, `market_data_account_broadcast_lagged_total` | Summe der übersprungenen Nachrichten bei `RecvError::Lagged` |
 | Ketten vs. Wall | `market_data_bonding_to_trade_slot_delta_slots` | Slot-Delta letztes `BondingCurveProgress` → nächstes Pump.fun-`Trade` (I-16: Geyser-Slots) |
 
@@ -165,6 +166,15 @@ Alle Werte nutzen konsistent `RecordHeader.ts_unix_ms` bzw. Geyser-`Instant::now
 - Channel-Lag **niedrig**, aber `market_data_trade_after_bonding_publish_ms` (**B★**) weiter hoch → eher Geyser/Subscription/Vor market-data.
 - `market_data_bonding_to_trade_slot_delta_slots` **hoch** → kettenbedingte Lücke zwischen Bonding- und Trade-Sicht.
 - Slot-Delta **klein**, B★ **groß** → Wall-Lag ohne Slot-Erklärung (MATRIX-Muster: Scheduling/Stream).
+
+**Prod-Gate (Tx-Ingest-Fairness, nach Deploy):** Ziel ist niedriger `market_data_tx_channel_lag_ms` bei gleichzeitig niedrigem `market_data_tx_broadcast_queue_depth` und **ohne** Regression bei `market_data_geyser_to_publish_ms_trade` (Publish-Pfad unverändert schnell). Beispiel-PromQL (5m-Fenster, Namen an `job` anpassen):
+
+```promql
+histogram_quantile(0.50, sum(rate(market_data_tx_channel_lag_ms_bucket[5m])) by (le))
+histogram_quantile(0.99, sum(rate(market_data_tx_channel_lag_ms_bucket[5m])) by (le))
+market_data_tx_broadcast_queue_depth
+histogram_quantile(0.50, sum(rate(market_data_geyser_to_publish_ms_trade_bucket[5m])) by (le))
+```
 
 | Segment | Metrik (Präfix je nach Export) | Kurzinterpretation |
 |--------|--------------------------------|---------------------|
