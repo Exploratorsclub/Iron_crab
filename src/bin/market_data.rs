@@ -50,7 +50,8 @@ use ironcrab::metrics::{
     record_market_data_bonding_to_trade_slot_delta_slots,
     record_market_data_geyser_to_publish_on_success,
     record_market_data_trade_after_bonding_publish_ms, record_market_data_tx_broadcast_lagged,
-    record_market_data_tx_channel_lag_ms, serve_metrics, set_market_data_tx_broadcast_queue_depth,
+    record_market_data_tx_channel_lag_ms, serve_metrics,
+    set_market_data_account_broadcast_queue_depth, set_market_data_tx_broadcast_queue_depth,
     set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
     update_readiness_market_data_current, wall_clock_unix_ms_now, MarketDataLatencySegment,
     MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
@@ -86,7 +87,9 @@ use spl_token_2022::extension::StateWithExtensions;
 
 /// NATS topic for config reload (P1: Runtime Configuration via UI)
 const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
-use ironcrab::solana::geyser_listener::{GeyserListener, GeyserTransactionUpdate};
+use ironcrab::solana::geyser_listener::{
+    GeyserAccountUpdate, GeyserListener, GeyserTransactionUpdate,
+};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
 /// ExecutionResult dedup: prevents replay storms from re-tracking the same ATA/mint over and over.
@@ -6217,6 +6220,1575 @@ async fn publish_control_response(
     }
 }
 
+/// Geyser account ingest (dedizierter Task-Fairness, siehe MARKET-DATA-ACCOUNT-INGEST-FAIRNESS).
+/// STOP-CHECK: keine neuen RPC-Calls im Hot-Path; Cold-Path-RPC nur in bestehenden `tokio::spawn`-Pfaden.
+async fn handle_geyser_account(
+    ctx: Arc<MarketDataContext>,
+    run_id: &str,
+    account_update: GeyserAccountUpdate,
+    account_count: &AtomicU64,
+    rpc: Arc<SolanaRpc>,
+    recv_at: Instant,
+) {
+    let account_geyser_recv_at = recv_at;
+    market_data_bump_geyser_head_slot(account_update.slot);
+    account_count.fetch_add(1, Ordering::Relaxed);
+    ironcrab::metrics::record_activity();
+
+    // === WsolManager Support: Wallet Balance Updates ===
+    // Track SOL (native) and WSOL (ATA) balance changes for WsolManager
+    if let Some(ref tracked_wallet) = ctx.tracked_wallet {
+        let is_wallet_account = account_update.pubkey == tracked_wallet.wallet;
+        let is_wsol_ata = account_update.pubkey == tracked_wallet.wsol_ata;
+        let is_token_ata = ctx
+            .tracked_wallet_token_accounts
+            .read()
+            .contains(&account_update.pubkey);
+
+        if is_wallet_account || is_wsol_ata {
+            // Parse balance based on account type
+            let (new_sol, new_wsol, balance_changed) = if is_wallet_account {
+                // Native SOL account - balance is in lamports field
+                let lamports = account_update.lamports;
+                let prev = tracked_wallet
+                    .last_sol_balance
+                    .swap(lamports, Ordering::Relaxed);
+                let wsol = tracked_wallet.last_wsol_balance.load(Ordering::Relaxed);
+                let has_wsol = tracked_wallet.wsol_seen.load(Ordering::Relaxed);
+                let wsol_value = if has_wsol { Some(wsol) } else { None };
+                (lamports, wsol_value, lamports != prev)
+            } else {
+                // WSOL ATA - parse token account balance.
+                // When the ATA is closed (unwrap), Geyser often delivers an update with
+                // `data` empty (account gone) — not parseable as SPL token state.
+                // That means WSOL=0. Previously we `continue`d and kept a stale balance
+                // with no zero WalletBalanceSnapshot to JetStream.
+                let Some(balance) =
+                    wsol_ata_balance_lamports_from_geyser_data(&account_update.data)
+                else {
+                    return;
+                };
+                let prev = tracked_wallet
+                    .last_wsol_balance
+                    .swap(balance, Ordering::Relaxed);
+                tracked_wallet.wsol_seen.store(true, Ordering::Relaxed);
+                let sol = tracked_wallet.last_sol_balance.load(Ordering::Relaxed);
+                (sol, Some(balance), balance != prev)
+            };
+
+            if balance_changed {
+                let wallet_str = tracked_wallet.wallet.to_string();
+
+                // Publish SOL + WSOL as WalletBalanceSnapshot to JetStream (SSOT)
+                if let Some(ref nats) = ctx.nats {
+                    let sol_snapshot = MarketEvent::new(
+                        "market-data",
+                        BUILD_VERSION,
+                        run_id,
+                        format!("geyser_wallet_sol_{}", account_update.slot),
+                        "geyser_wallet_update",
+                        Some(account_update.slot),
+                        MarketEventKind::WalletBalanceSnapshot {
+                            mint: "NATIVE_SOL".to_string(),
+                            balance_raw: new_sol,
+                            decimals: 9,
+                            token_program: "system".to_string(),
+                        },
+                    );
+                    let sol_subject = wallet_snapshot_subject(&wallet_str, "NATIVE_SOL");
+                    if let Err(e) = nats.jetstream_publish(&sol_subject, &sol_snapshot).await {
+                        warn!(error = %e, "Failed to publish native SOL WalletBalanceSnapshot to JetStream");
+                        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    if let Some(wsol) = new_wsol {
+                        let wsol_snapshot = MarketEvent::new(
+                            "market-data",
+                            BUILD_VERSION,
+                            run_id,
+                            format!("geyser_wallet_wsol_{}", account_update.slot),
+                            "geyser_wallet_update",
+                            Some(account_update.slot),
+                            MarketEventKind::WalletBalanceSnapshot {
+                                mint: WSOL_MINT.to_string(),
+                                balance_raw: wsol,
+                                decimals: 9,
+                                token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+                                    .to_string(),
+                            },
+                        );
+                        let wsol_subject = wallet_snapshot_subject(&wallet_str, WSOL_MINT);
+                        if let Err(e) = nats.jetstream_publish(&wsol_subject, &wsol_snapshot).await
+                        {
+                            warn!(error = %e, "Failed to publish WSOL WalletBalanceSnapshot to JetStream");
+                            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+
+                    info!(
+                        wallet = %wallet_str,
+                        sol_lamports = new_sol,
+                        wsol_lamports = ?new_wsol,
+                        slot = account_update.slot,
+                        "WalletBalanceSnapshot (SOL/WSOL) published to JetStream"
+                    );
+                }
+            }
+        } else if is_token_ata
+            && (account_update.owner.to_bytes() == spl_token::ID.to_bytes()
+                || account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes())
+        {
+            let (mint, balance_raw) = if account_update.owner.to_bytes() == spl_token::ID.to_bytes()
+            {
+                match spl_token::state::Account::unpack(&account_update.data) {
+                    Ok(acc) => (Pubkey::new_from_array(acc.mint.to_bytes()), acc.amount),
+                    Err(_) => return,
+                }
+            } else {
+                // Token-2022 accounts may have extensions (data > 165 bytes).
+                // Use StateWithExtensions instead of Pack::unpack.
+                match StateWithExtensions::<spl_token_2022::state::Account>::unpack(
+                    &account_update.data,
+                ) {
+                    Ok(state) => (
+                        Pubkey::new_from_array(state.base.mint.to_bytes()),
+                        state.base.amount,
+                    ),
+                    Err(_) => return,
+                }
+            };
+
+            let decimals = ctx
+                .tracked_wallet_mint_decimals
+                .read()
+                .get(&mint)
+                .copied()
+                .unwrap_or_else(|| {
+                    // This should only happen for accounts created after initial scan.
+                    // Log a warning so we can track if this becomes a problem.
+                    warn!(
+                        mint = %mint,
+                        account = %account_update.pubkey,
+                        "Decimals not cached for token account, using default 6"
+                    );
+                    6
+                });
+
+            let mint_str = mint.to_string();
+            let event = MarketEvent::new(
+                "market-data",
+                BUILD_VERSION,
+                run_id,
+                ctx.next_event_id(),
+                "geyser_wallet_update",
+                Some(account_update.slot),
+                MarketEventKind::WalletBalanceSnapshot {
+                    mint: mint_str.clone(),
+                    balance_raw,
+                    decimals,
+                    token_program: account_update.owner.to_string(),
+                },
+            );
+
+            if let Some(ref nats) = ctx.nats {
+                let subject =
+                    wallet_snapshot_subject(&tracked_wallet.wallet.to_string(), &mint_str);
+                if let Err(e) = nats.jetstream_publish(&subject, &event).await {
+                    warn!(
+                        error = %e,
+                        mint = %mint_str,
+                        "Failed to publish WalletBalanceSnapshot to JetStream"
+                    );
+                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            if let Err(e) = ctx.jsonl_writer.write(&event) {
+                warn!(error = %e, "Failed to write WalletBalanceSnapshot to JSONL");
+            }
+        }
+    }
+
+    // Tracked mint updates (Token mint authority/freeze info)
+    if (account_update.owner.to_bytes() == spl_token::ID.to_bytes()
+        || account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes())
+        && ctx.tracked_mints.read().contains(&account_update.pubkey)
+    {
+        if let Some((decimals, supply, mint_authority, freeze_authority)) =
+            try_parse_mint_account(&account_update.owner, &account_update.data)
+        {
+            // Decimals-Policy: TokenMintInfo from Geyser is authoritative.
+            // Keep wallet decimals cache warm so WalletBalanceSnapshot never needs the 6-decimal fallback.
+            ctx.tracked_wallet_mint_decimals
+                .write()
+                .insert(account_update.pubkey, decimals);
+
+            // PR1: Also populate MASTER LivePoolCache mint_decimals (Single Source of Truth).
+            // This keeps LivePoolCache consistent with tracked_wallet_mint_decimals.
+            ctx.live_pool_cache
+                .set_mint_decimals(account_update.pubkey, decimals);
+
+            let is_token_2022 = account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes();
+
+            let mint_event = MarketEvent::new(
+                "market-data",
+                BUILD_VERSION,
+                run_id,
+                ctx.next_event_id(),
+                "geyser",
+                Some(account_update.slot),
+                MarketEventKind::TokenMintInfo {
+                    mint: account_update.pubkey.to_string(),
+                    token_program: account_update.owner.to_string(),
+                    decimals,
+                    supply,
+                    mint_authority,
+                    freeze_authority,
+                },
+            );
+
+            // Log Token-2022 mints explicitly (debugging)
+            if is_token_2022 {
+                info!(
+                    mint = %account_update.pubkey,
+                    token_program = %account_update.owner,
+                    decimals,
+                    supply,
+                    "TokenMintInfo: Token-2022 mint detected via Geyser"
+                );
+            } else {
+                debug!(
+                    mint = %account_update.pubkey,
+                    token_program = %account_update.owner,
+                    decimals,
+                    "TokenMintInfo: SPL Token mint via Geyser"
+                );
+            }
+
+            if let Err(e) = ctx.jsonl_writer.write(&mint_event) {
+                error!(error = %e, "Failed to write TokenMintInfo event to JSONL");
+            }
+
+            if let Some(ref nats) = ctx.nats {
+                let _ = publish_market_event_core_and_momentum_ex(
+                    nats,
+                    &mint_event,
+                    Some(MarketEventCorePublishTrace {
+                        recv_at: account_geyser_recv_at,
+                        cold_path: false,
+                        segment: MarketDataLatencySegment::Other,
+                    }),
+                    Some(ctx.as_ref()),
+                )
+                .await;
+            }
+        }
+    }
+
+    // Vault account updates → emit PoolStateUpdate (Geyser-based reserve balances)
+    // This eliminates the need for RPC calls to fetch vault balances.
+    if account_update.owner.to_bytes() == spl_token::ID.to_bytes()
+        || account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes()
+    {
+        // Clone data from lock scope to avoid holding lock across await
+        let vault_info_opt = ctx
+            .tracked_vaults
+            .read()
+            .get(&account_update.pubkey)
+            .cloned();
+        if let Some(vault_info) = vault_info_opt {
+            // Parse token account to get balance
+            if let Some(balance) = try_parse_token_account_balance(&account_update.data) {
+                // Check if balance changed (avoid spamming unchanged updates)
+                let prev_balance = vault_info
+                    .last_balance
+                    .swap(balance, std::sync::atomic::Ordering::Relaxed);
+                if balance != prev_balance {
+                    // We need both vault balances to emit a complete PoolStateUpdate.
+                    // For now, emit partial updates - consumers should merge base+quote.
+                    // Future: Track both vaults and emit only when both are known.
+                    let (reserve_base, reserve_quote) = if vault_info.is_base_vault {
+                        (balance, 0u64) // Partial: only base known
+                    } else {
+                        (0u64, balance) // Partial: only quote known
+                    };
+
+                    // Try to get the other vault's balance for a complete update
+                    let complete_update = {
+                        let vaults = ctx.tracked_vaults.read();
+                        vaults
+                            .values()
+                            .find(|v| {
+                                v.pool_address == vault_info.pool_address
+                                    && v.is_base_vault != vault_info.is_base_vault
+                            })
+                            .map(|other| {
+                                let other_balance = other
+                                    .last_balance
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                if vault_info.is_base_vault {
+                                    (balance, other_balance)
+                                } else {
+                                    (other_balance, balance)
+                                }
+                            })
+                    };
+
+                    let (final_base, final_quote) =
+                        complete_update.unwrap_or((reserve_base, reserve_quote));
+
+                    // Only emit if we have at least one non-zero balance
+                    if final_base > 0 || final_quote > 0 {
+                        // MASTER CACHE: Update vault balance in LivePoolCache
+                        ctx.live_pool_cache.update_vault_balance(
+                            &account_update.pubkey,
+                            balance,
+                            account_update.slot,
+                        );
+
+                        // Publish PoolCacheUpdate::BalanceUpdated to JetStream (persistent state)
+                        if let Some(ref nats) = ctx.nats {
+                            let mut balance_update = PoolCacheUpdate::new_balance_updated(
+                                "market-data",
+                                BUILD_VERSION,
+                                run_id,
+                                vault_info.pool_address.to_string(),
+                                vault_info.dex.clone(),
+                                vault_info.base_mint.to_string(),
+                                vault_info.quote_mint.to_string(),
+                                final_base,
+                                final_quote,
+                                account_update.slot,
+                            );
+                            if vault_info.dex == "raydium_cpmm" {
+                                if let Some(CachedPoolState::RaydiumCpmm(ref s)) =
+                                    ctx.live_pool_cache.get(&vault_info.pool_address)
+                                {
+                                    let mut meta = std::collections::HashMap::new();
+                                    meta.insert(
+                                        POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY.to_string(),
+                                        raydium_cpmm_vaults_for_pool_cache_update(s),
+                                    );
+                                    balance_update.metadata = Some(meta);
+                                    let readiness = raydium_cpmm_readiness_for_pool_cache_update(s);
+                                    balance_update.set_dex_readiness_in_metadata(readiness);
+                                    ctx.live_pool_cache.merge_raydium_cpmm_pool_readiness(
+                                        vault_info.pool_address,
+                                        readiness,
+                                    );
+                                }
+                            }
+                            if vault_info.dex == "meteora_cpmm" {
+                                if let Some(CachedPoolState::MeteoraCpmm(ref s)) =
+                                    ctx.live_pool_cache.get(&vault_info.pool_address)
+                                {
+                                    let mut meta =
+                                        balance_update.metadata.take().unwrap_or_default();
+                                    meta.insert(
+                                        POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY.to_string(),
+                                        meteora_cpmm_vaults_for_pool_cache_update(s),
+                                    );
+                                    meta.insert(
+                                        POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY
+                                            .to_string(),
+                                        meteora_cpmm_onchain_mints_for_pool_cache_update(s),
+                                    );
+                                    balance_update.metadata = Some(meta);
+                                    let readiness = meteora_cpmm_readiness_for_pool_cache_update(s);
+                                    balance_update.set_dex_readiness_in_metadata(readiness);
+                                    ctx.live_pool_cache.merge_meteora_cpmm_pool_readiness(
+                                        vault_info.pool_address,
+                                        readiness,
+                                    );
+                                }
+                            }
+                            if vault_info.dex == "raydium" {
+                                if let Some(CachedPoolState::RaydiumAmm(ref s)) =
+                                    ctx.live_pool_cache.get(&vault_info.pool_address)
+                                {
+                                    let readiness = raydium_amm_readiness_for_pool_cache_update(s);
+                                    balance_update.set_dex_readiness_in_metadata(readiness);
+                                    ctx.live_pool_cache.merge_raydium_amm_pool_readiness(
+                                        vault_info.pool_address,
+                                        readiness,
+                                    );
+                                }
+                            }
+                            if vault_info.dex == "orca" {
+                                if let Some(CachedPoolState::Orca(ref s)) =
+                                    ctx.live_pool_cache.get(&vault_info.pool_address)
+                                {
+                                    let mut meta =
+                                        balance_update.metadata.take().unwrap_or_default();
+                                    for (k, v) in orca_metadata_for_pool_cache_update(s) {
+                                        meta.insert(k, v);
+                                    }
+                                    balance_update.metadata = Some(meta);
+                                    let readiness = orca_readiness_for_pool_cache_update(s);
+                                    balance_update.set_dex_readiness_in_metadata(readiness);
+                                    ctx.live_pool_cache.merge_orca_pool_readiness(
+                                        vault_info.pool_address,
+                                        readiness,
+                                    );
+                                }
+                            }
+                            if vault_info.dex == "meteora_dlmm" {
+                                if let Some(CachedPoolState::Meteora(ref s)) =
+                                    ctx.live_pool_cache.get(&vault_info.pool_address)
+                                {
+                                    let mut meta =
+                                        balance_update.metadata.take().unwrap_or_default();
+                                    for (k, v) in meteora_dlmm_metadata_for_pool_cache_update(s) {
+                                        meta.insert(k, v);
+                                    }
+                                    balance_update.metadata = Some(meta);
+                                    let readiness = meteora_dlmm_readiness_for_pool_cache_update(s);
+                                    balance_update.set_dex_readiness_in_metadata(readiness);
+                                    ctx.live_pool_cache.merge_meteora_dlmm_pool_readiness(
+                                        vault_info.pool_address,
+                                        readiness,
+                                    );
+                                }
+                            }
+                            let subject = pool_subject(&vault_info.pool_address.to_string());
+                            if let Err(e) = nats.jetstream_publish(&subject, &balance_update).await
+                            {
+                                warn!(error = %e, "Failed to publish PoolCacheUpdate::BalanceUpdated to JetStream");
+                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                info!(pool = %vault_info.pool_address, slot = account_update.slot, "MASTER CACHE: Published PoolCacheUpdate::BalanceUpdated to JetStream");
+                            }
+                        }
+
+                        // Publish MarketEvent::PoolStateUpdate (existing logic for strategies)
+                        let state_event = MarketEvent::new(
+                            "market-data",
+                            BUILD_VERSION,
+                            run_id,
+                            ctx.next_event_id(),
+                            "geyser_vault",
+                            Some(account_update.slot),
+                            MarketEventKind::PoolStateUpdate {
+                                pool_address: vault_info.pool_address.to_string(),
+                                dex: vault_info.dex.clone(),
+                                reserve_base: final_base,
+                                reserve_quote: final_quote,
+                                base_mint: vault_info.base_mint.to_string(),
+                                quote_mint: vault_info.quote_mint.to_string(),
+                                update_slot: account_update.slot,
+                                // DLMM-specific fields (Option D)
+                                active_id: vault_info.active_id,
+                                bin_step: vault_info.bin_step,
+                            },
+                        );
+
+                        if let Err(e) = ctx.jsonl_writer.write(&state_event) {
+                            error!(error = %e, "Failed to write PoolStateUpdate event to JSONL");
+                        }
+
+                        if let Some(ref nats) = ctx.nats {
+                            let _ = publish_market_event_core_and_momentum_ex(
+                                nats,
+                                &state_event,
+                                Some(MarketEventCorePublishTrace {
+                                    recv_at: account_geyser_recv_at,
+                                    cold_path: false,
+                                    segment: MarketDataLatencySegment::Other,
+                                }),
+                                Some(ctx.as_ref()),
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Bin Array account updates → emit BinArrayUpdate (Geyser-based liquidity distribution)
+    // This eliminates the need for RPC calls to fetch Meteora DLMM bin arrays.
+    let dlmm_program =
+        Pubkey::from_str(METEORA_DLMM_PROGRAM).expect("Invalid METEORA_DLMM_PROGRAM constant");
+    if account_update.owner == dlmm_program {
+        let bin_array_info_opt = ctx
+            .tracked_bin_arrays
+            .read()
+            .get(&account_update.pubkey)
+            .cloned();
+        if let Some(bin_array_info) = bin_array_info_opt {
+            // Parse bin array to extract liquidity distribution
+            match BinArray::parse(&account_update.data, bin_array_info.bin_step) {
+                Ok(parsed_array) => {
+                    // Convert to compact BinData (only bins with liquidity)
+                    let bins: Vec<BinData> = parsed_array
+                        .bins
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, bin)| bin.amount_x > 0 || bin.amount_y > 0)
+                        .map(|(offset, bin)| BinData {
+                            offset: offset as u8,
+                            amount_x: bin.amount_x,
+                            amount_y: bin.amount_y,
+                        })
+                        .collect();
+
+                    // Only emit if there's any liquidity
+                    if !bins.is_empty() {
+                        let bin_event = MarketEvent::new(
+                            "market-data",
+                            BUILD_VERSION,
+                            run_id,
+                            ctx.next_event_id(),
+                            "geyser_bin_array",
+                            Some(account_update.slot),
+                            MarketEventKind::BinArrayUpdate {
+                                pool_address: bin_array_info.pool_address.to_string(),
+                                bin_array_index: bin_array_info.bin_array_index,
+                                bins,
+                                update_slot: account_update.slot,
+                            },
+                        );
+
+                        if let Err(e) = ctx.jsonl_writer.write(&bin_event) {
+                            error!(error = %e, "Failed to write BinArrayUpdate event to JSONL");
+                        }
+
+                        if let Some(ref nats) = ctx.nats {
+                            let _ = publish_market_event_core_and_momentum_ex(
+                                nats,
+                                &bin_event,
+                                Some(MarketEventCorePublishTrace {
+                                    recv_at: account_geyser_recv_at,
+                                    cold_path: false,
+                                    segment: MarketDataLatencySegment::Other,
+                                }),
+                                Some(ctx.as_ref()),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        error = %e,
+                        pubkey = %account_update.pubkey,
+                        "Failed to parse bin array account"
+                    );
+                }
+            }
+        }
+    }
+
+    // MASTER CACHE: Try to parse as DEX pool state and upsert into LivePoolCache
+    if let Some(mut cached_state) = parse_pool_account(&account_update.owner, &account_update.data)
+    {
+        // P2#7: Enrich PumpFun token_mint from pool_mint_map when parse returns default
+        if let CachedPoolState::PumpFun(ref mut s) = &mut cached_state {
+            if s.token_mint == Pubkey::default() {
+                let pool_str = account_update.pubkey.to_string();
+                if let Some(mint_str) = ctx.pool_mint_map.read().get(&pool_str).cloned() {
+                    if let Ok(mint_pk) = Pubkey::from_str(&mint_str) {
+                        s.token_mint = mint_pk;
+                        debug!(
+                            pool = %pool_str,
+                            mint = %mint_str,
+                            "P2#7: Enriched PumpFun token_mint from pool_mint_map"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Update MASTER LivePoolCache (Single Source of Truth)
+        ctx.live_pool_cache.upsert(
+            account_update.pubkey,
+            cached_state.clone(),
+            account_update.slot,
+        );
+
+        // Raydium CPMM: register vault ATAs for Geyser reserve updates (enables non-RPC reserve path).
+        if let CachedPoolState::RaydiumCpmm(s) = &cached_state {
+            let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+            let (base_mint_v, quote_mint_v, coin_vault, pc_vault) = if s.token_1_mint == sol {
+                (
+                    s.token_0_mint,
+                    s.token_1_mint,
+                    s.token_0_vault,
+                    s.token_1_vault,
+                )
+            } else if s.token_0_mint == sol {
+                (
+                    s.token_1_mint,
+                    s.token_0_mint,
+                    s.token_1_vault,
+                    s.token_0_vault,
+                )
+            } else {
+                (
+                    s.token_0_mint,
+                    s.token_1_mint,
+                    s.token_0_vault,
+                    s.token_1_vault,
+                )
+            };
+            let dex_str = "raydium_cpmm".to_string();
+            let mut vaults_changed = false;
+            {
+                let mut vaults = ctx.tracked_vaults.write();
+                vaults.entry(coin_vault).or_insert_with(|| {
+                    vaults_changed = true;
+                    VaultInfo {
+                        pool_address: account_update.pubkey,
+                        dex: dex_str.clone(),
+                        base_mint: base_mint_v,
+                        quote_mint: quote_mint_v,
+                        is_base_vault: true,
+                        last_balance: std::sync::atomic::AtomicU64::new(0),
+                        active_id: None,
+                        bin_step: None,
+                    }
+                });
+                vaults.entry(pc_vault).or_insert_with(|| {
+                    vaults_changed = true;
+                    VaultInfo {
+                        pool_address: account_update.pubkey,
+                        dex: dex_str,
+                        base_mint: base_mint_v,
+                        quote_mint: quote_mint_v,
+                        is_base_vault: false,
+                        last_balance: std::sync::atomic::AtomicU64::new(0),
+                        active_id: None,
+                        bin_step: None,
+                    }
+                });
+            }
+            if vaults_changed {
+                let vault_list: Vec<Pubkey> = ctx.tracked_vaults.read().keys().copied().collect();
+                let _ = ctx.tracked_vaults_tx.send(vault_list);
+                debug!(
+                    pool = %account_update.pubkey,
+                    coin_vault = %coin_vault,
+                    pc_vault = %pc_vault,
+                    "Registered Raydium CPMM vaults for Geyser reserve subscription"
+                );
+            }
+        }
+
+        // Meteora CPMM: register vault ATAs for Geyser reserve updates (same pattern as Raydium CPMM).
+        if ctx.config.read().enable_meteora_cpmm {
+            if let CachedPoolState::MeteoraCpmm(s) = &cached_state {
+                let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+                let (base_mint_v, quote_mint_v, vault_base, vault_quote) = if s.token_1_mint == sol
+                {
+                    (
+                        s.token_0_mint,
+                        s.token_1_mint,
+                        s.token_0_vault,
+                        s.token_1_vault,
+                    )
+                } else if s.token_0_mint == sol {
+                    (
+                        s.token_1_mint,
+                        s.token_0_mint,
+                        s.token_1_vault,
+                        s.token_0_vault,
+                    )
+                } else {
+                    (
+                        s.token_0_mint,
+                        s.token_1_mint,
+                        s.token_0_vault,
+                        s.token_1_vault,
+                    )
+                };
+                let dex_str = "meteora_cpmm".to_string();
+                let mut vaults_changed = false;
+                {
+                    let mut vaults = ctx.tracked_vaults.write();
+                    vaults.entry(vault_base).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: account_update.pubkey,
+                            dex: dex_str.clone(),
+                            base_mint: base_mint_v,
+                            quote_mint: quote_mint_v,
+                            is_base_vault: true,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            active_id: None,
+                            bin_step: None,
+                        }
+                    });
+                    vaults.entry(vault_quote).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: account_update.pubkey,
+                            dex: dex_str,
+                            base_mint: base_mint_v,
+                            quote_mint: quote_mint_v,
+                            is_base_vault: false,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            active_id: None,
+                            bin_step: None,
+                        }
+                    });
+                }
+                if vaults_changed {
+                    let vault_list: Vec<Pubkey> =
+                        ctx.tracked_vaults.read().keys().copied().collect();
+                    let _ = ctx.tracked_vaults_tx.send(vault_list);
+                    debug!(
+                        pool = %account_update.pubkey,
+                        vault_base = %vault_base,
+                        vault_quote = %vault_quote,
+                        "Registered Meteora CPMM vaults for Geyser reserve subscription"
+                    );
+                }
+            }
+        }
+
+        // Meteora DLMM: register reserve vault ATAs (on-chain token_x / token_y order).
+        if ctx.config.read().enable_meteora_dlmm {
+            if let CachedPoolState::Meteora(s) = &cached_state {
+                let dex_str = "meteora_dlmm".to_string();
+                let mut vaults_changed = false;
+                {
+                    let mut vaults = ctx.tracked_vaults.write();
+                    vaults.entry(s.reserve_x).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: account_update.pubkey,
+                            dex: dex_str.clone(),
+                            base_mint: s.token_x_mint,
+                            quote_mint: s.token_y_mint,
+                            is_base_vault: true,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            active_id: Some(s.active_id),
+                            bin_step: Some(s.bin_step),
+                        }
+                    });
+                    vaults.entry(s.reserve_y).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: account_update.pubkey,
+                            dex: dex_str,
+                            base_mint: s.token_x_mint,
+                            quote_mint: s.token_y_mint,
+                            is_base_vault: false,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            active_id: Some(s.active_id),
+                            bin_step: Some(s.bin_step),
+                        }
+                    });
+                }
+                if vaults_changed {
+                    let vault_list: Vec<Pubkey> =
+                        ctx.tracked_vaults.read().keys().copied().collect();
+                    let _ = ctx.tracked_vaults_tx.send(vault_list);
+                    debug!(
+                        pool = %account_update.pubkey,
+                        reserve_x = %s.reserve_x,
+                        reserve_y = %s.reserve_y,
+                        "Registered Meteora DLMM vaults for Geyser reserve subscription"
+                    );
+                }
+            }
+        }
+
+        // FIX-29: One-time Cold Path RPC to fetch Serum/OpenBook accounts for Raydium AMM.
+        // These are static (never change) — fetch once, cache forever.
+        if let CachedPoolState::RaydiumAmm(ref s) = cached_state {
+            if s.serum_bids.is_none() && s.market_id != Pubkey::default() {
+                let pool_pk = account_update.pubkey;
+                let already_fetched = ctx.raydium_serum_fetched.read().contains(&pool_pk);
+                if !already_fetched {
+                    ctx.raydium_serum_fetched.write().insert(pool_pk);
+                    let rpc = Arc::clone(&rpc);
+                    let cache = Arc::clone(&ctx.live_pool_cache);
+                    let market_id = s.market_id;
+                    let run_id_spawn = ctx.run_id.clone();
+                    let nats_spawn = ctx.nats.as_ref().map(|n| n.clone_for_spawned_publish());
+                    tokio::spawn(async move {
+                        match rpc.get_account_retry(&market_id).await {
+                            Ok(account) => {
+                                if let Some((bids, asks, eq, _bv, _qv)) =
+                                    ironcrab::solana::dex::raydium::Raydium::parse_serum_market_accounts(&account.data)
+                                {
+                                    if let (Some(b), Some(a), Some(e)) = (bids, asks, eq) {
+                                        cache.set_raydium_serum_accounts(&pool_pk, b, a, e);
+                                        let readiness =
+                                            match cache.get(&pool_pk).as_ref() {
+                                                Some(CachedPoolState::RaydiumAmm(st)) => {
+                                                    raydium_amm_readiness_for_pool_cache_update(st)
+                                                }
+                                                _ => DexPoolReadiness::Observed,
+                                            };
+                                        cache.merge_raydium_amm_pool_readiness(pool_pk, readiness);
+                                        if let Some(ref nats) = nats_spawn {
+                                            // `geyser_slot` must match the cache entry's last update slot (vault /
+                                            // pool upserts), not the original discovery event — RPC may finish much
+                                            // later while reserves already advanced on newer Geyser updates.
+                                            if let Some((
+                                                CachedPoolState::RaydiumAmm(st),
+                                                pool_slot,
+                                                _age_ms,
+                                            )) = cache.get_with_metadata(&pool_pk)
+                                            {
+                                                let mut pool_update =
+                                                    PoolCacheUpdate::new_balance_updated(
+                                                        "market-data",
+                                                        BUILD_VERSION,
+                                                        &run_id_spawn,
+                                                        pool_pk.to_string(),
+                                                        "raydium".to_string(),
+                                                        st.base_mint.to_string(),
+                                                        st.quote_mint.to_string(),
+                                                        st.coin_reserve.unwrap_or(0),
+                                                        st.pc_reserve.unwrap_or(0),
+                                                        pool_slot,
+                                                    );
+                                                let mut meta = std::collections::HashMap::new();
+                                                if st.market_id != Pubkey::default() {
+                                                    meta.insert(
+                                                        "market_id".to_string(),
+                                                        st.market_id.to_string(),
+                                                    );
+                                                }
+                                                if let (Some(bids), Some(asks), Some(eq)) = (
+                                                    st.serum_bids,
+                                                    st.serum_asks,
+                                                    st.serum_event_queue,
+                                                ) {
+                                                    meta.insert(
+                                                        "serum_bids".to_string(),
+                                                        bids.to_string(),
+                                                    );
+                                                    meta.insert(
+                                                        "serum_asks".to_string(),
+                                                        asks.to_string(),
+                                                    );
+                                                    meta.insert(
+                                                        "serum_event_queue".to_string(),
+                                                        eq.to_string(),
+                                                    );
+                                                }
+                                                if !meta.is_empty() {
+                                                    pool_update.metadata = Some(meta);
+                                                }
+                                                pool_update.set_dex_readiness_in_metadata(readiness);
+                                                let subject =
+                                                    pool_subject(&pool_pk.to_string());
+                                                if let Err(e) = nats
+                                                    .jetstream_publish(&subject, &pool_update)
+                                                    .await
+                                                {
+                                                    warn!(
+                                                        error = %e,
+                                                        "Failed to publish Raydium AMM PoolCacheUpdate after serum fetch"
+                                                    );
+                                                    NATS_ERRORS_TOTAL
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                } else {
+                                                    NATS_MESSAGES_PUBLISHED_TOTAL
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    pool = %pool_pk,
+                                    market_id = %market_id,
+                                    error = %e,
+                                    "FIX-29: Failed to fetch serum market account (will retry on next trade)"
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+        }
+
+        // Extract mint and reserve info from cached_state for PoolCacheUpdate
+        let (base_mint, quote_mint, base_reserve, quote_reserve) = match &cached_state {
+            CachedPoolState::Orca(s) => (
+                s.token_mint_a,
+                s.token_mint_b,
+                s.vault_a_balance.unwrap_or(0),
+                s.vault_b_balance.unwrap_or(0),
+            ),
+            CachedPoolState::RaydiumAmm(s) => (
+                s.base_mint,
+                s.quote_mint,
+                s.coin_reserve.unwrap_or(0),
+                s.pc_reserve.unwrap_or(0),
+            ),
+            CachedPoolState::RaydiumCpmm(s) => {
+                let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+                if s.token_1_mint == sol {
+                    (
+                        s.token_0_mint,
+                        s.token_1_mint,
+                        s.reserve_0.unwrap_or(0),
+                        s.reserve_1.unwrap_or(0),
+                    )
+                } else if s.token_0_mint == sol {
+                    (
+                        s.token_1_mint,
+                        s.token_0_mint,
+                        s.reserve_1.unwrap_or(0),
+                        s.reserve_0.unwrap_or(0),
+                    )
+                } else {
+                    (
+                        s.token_0_mint,
+                        s.token_1_mint,
+                        s.reserve_0.unwrap_or(0),
+                        s.reserve_1.unwrap_or(0),
+                    )
+                }
+            }
+            CachedPoolState::Meteora(s) => (
+                s.token_x_mint,
+                s.token_y_mint,
+                s.reserve_x_balance.unwrap_or(0),
+                s.reserve_y_balance.unwrap_or(0),
+            ),
+            CachedPoolState::PumpAmm(s) => {
+                // Cache creator for migrated PumpFun tokens (from AMM pool account)
+                if let Some(creator) = s.creator {
+                    let mint_str = s.base_mint.to_string();
+                    let pool_str = account_update.pubkey.to_string();
+                    let creator_str = creator.to_string();
+
+                    // Cache in pool_creator_cache (pool -> creator)
+                    {
+                        let mut pool_creator = ctx.pool_creator_cache.write();
+                        if !pool_creator.contains_key(&pool_str) {
+                            pool_creator.insert(pool_str.clone(), creator_str.clone());
+                            debug!(
+                                pool = %pool_str,
+                                creator = %creator_str,
+                                "Cached creator from PumpAmm pool account (pool_creator_cache)"
+                            );
+                        }
+                    }
+
+                    // Also cache in creator_cache (mint -> creator)
+                    {
+                        let mut creator_cache = ctx.creator_cache.write();
+                        if !creator_cache.contains_key(&mint_str) {
+                            creator_cache.insert(mint_str.clone(), creator_str.clone());
+                            info!(
+                                mint = %mint_str,
+                                pool = %pool_str,
+                                creator = %creator_str,
+                                "Cached creator from PumpAmm pool account (migrated token)"
+                            );
+                        }
+                    }
+                }
+                // A.1 Phase 2.1: Register PumpAmm vaults for Geyser subscription (base/quote reserve updates)
+                {
+                    let dex_str = "pump_amm".to_string();
+                    let mut vaults_changed = false;
+                    {
+                        let mut vaults = ctx.tracked_vaults.write();
+                        vaults.entry(s.pool_base_token_account).or_insert_with(|| {
+                            vaults_changed = true;
+                            VaultInfo {
+                                pool_address: account_update.pubkey,
+                                dex: dex_str.clone(),
+                                base_mint: s.base_mint,
+                                quote_mint: s.quote_mint,
+                                is_base_vault: true,
+                                last_balance: std::sync::atomic::AtomicU64::new(0),
+                                active_id: None,
+                                bin_step: None,
+                            }
+                        });
+                        vaults.entry(s.pool_quote_token_account).or_insert_with(|| {
+                            vaults_changed = true;
+                            VaultInfo {
+                                pool_address: account_update.pubkey,
+                                dex: dex_str,
+                                base_mint: s.base_mint,
+                                quote_mint: s.quote_mint,
+                                is_base_vault: false,
+                                last_balance: std::sync::atomic::AtomicU64::new(0),
+                                active_id: None,
+                                bin_step: None,
+                            }
+                        });
+                    }
+                    if vaults_changed {
+                        let vault_list: Vec<Pubkey> =
+                            ctx.tracked_vaults.read().keys().copied().collect();
+                        let _ = ctx.tracked_vaults_tx.send(vault_list);
+                        debug!(
+                            pool = %account_update.pubkey,
+                            base_vault = %s.pool_base_token_account,
+                            quote_vault = %s.pool_quote_token_account,
+                            "A.1: Registered PumpAmm vaults for Geyser reserve subscription"
+                        );
+                    }
+                }
+                {
+                    let (base_r, quote_r) = if s.base_reserve.is_none() || s.quote_reserve.is_none()
+                    {
+                        let base_vault = s.pool_base_token_account;
+                        let quote_vault = s.pool_quote_token_account;
+                        let base_bal = match rpc.get_account_opt_retry(&base_vault).await {
+                            Ok(Some(acc)) => {
+                                try_parse_token_account_balance(&acc.data).unwrap_or(0)
+                            }
+                            _ => 0,
+                        };
+                        let quote_bal = match rpc.get_account_opt_retry(&quote_vault).await {
+                            Ok(Some(acc)) => {
+                                try_parse_token_account_balance(&acc.data).unwrap_or(0)
+                            }
+                            _ => 0,
+                        };
+                        if base_bal > 0 || quote_bal > 0 {
+                            info!(
+                                pool = %account_update.pubkey,
+                                base_vault = %base_vault,
+                                quote_vault = %quote_vault,
+                                base_bal,
+                                quote_bal,
+                                "pump_amm: pre-loaded vault balances via RPC (Cold Start Bootstrap)"
+                            );
+                        }
+                        (base_bal, quote_bal)
+                    } else {
+                        (s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0))
+                    };
+                    (s.base_mint, s.quote_mint, base_r, quote_r)
+                }
+            }
+            CachedPoolState::PumpFun(s) => (
+                s.token_mint,
+                Pubkey::default(),
+                s.virtual_token_reserves,
+                s.virtual_sol_reserves,
+            ),
+            CachedPoolState::MeteoraCpmm(s) => {
+                let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+                if s.token_1_mint == sol {
+                    (s.token_0_mint, s.token_1_mint, s.reserve_0, s.reserve_1)
+                } else if s.token_0_mint == sol {
+                    (s.token_1_mint, s.token_0_mint, s.reserve_1, s.reserve_0)
+                } else {
+                    (s.token_0_mint, s.token_1_mint, s.reserve_0, s.reserve_1)
+                }
+            }
+        };
+
+        // Publish PoolCacheUpdate to JetStream (Single Source of Truth for pool state)
+        if let Some(ref nats) = ctx.nats {
+            let mut pool_update = PoolCacheUpdate::new_pool_discovered(
+                "market-data",
+                BUILD_VERSION,
+                run_id,
+                account_update.pubkey.to_string(),
+                cached_state.dex_name().to_string(),
+                base_mint.to_string(),
+                quote_mint.to_string(),
+                base_reserve,
+                quote_reserve,
+                Some(0), // liquidity_lamports not available from account data
+                account_update.slot,
+            );
+
+            // Propagate DEX-specific metadata to SLAVE caches via PoolCacheUpdate.metadata.
+            // This ensures execution-engine receives creator, pool accounts, etc. from Geyser
+            // without needing RPC fallbacks.
+            match &cached_state {
+                CachedPoolState::PumpFun(s) => {
+                    // SLAVE minimal state uses quote_mint for SOL side; must not be default.
+                    pool_update.quote_mint = NATIVE_SOL_MINT.to_string();
+                    // Always propagate real_reserves + complete for SELL validation
+                    // in execution-engine's SLAVE cache.
+                    let mut meta = std::collections::HashMap::new();
+                    if s.creator != Pubkey::default() {
+                        meta.insert("creator".to_string(), s.creator.to_string());
+                    }
+                    meta.insert(
+                        "associated_bonding_curve".to_string(),
+                        s.associated_bonding_curve.to_string(),
+                    );
+                    meta.insert("complete".to_string(), s.complete.to_string());
+                    meta.insert(
+                        "real_token_reserves".to_string(),
+                        s.real_token_reserves.to_string(),
+                    );
+                    meta.insert(
+                        "real_sol_reserves".to_string(),
+                        s.real_sol_reserves.to_string(),
+                    );
+                    meta.insert(
+                        "cashback_enabled".to_string(),
+                        s.cashback_enabled.to_string(),
+                    );
+                    pool_update.metadata = Some(meta);
+                    // Geyser-fed bonding curve: observation / partial only — not cold-path verified Ready.
+                    pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Partial);
+                    ctx.live_pool_cache.merge_pumpfun_bonding_readiness(
+                        account_update.pubkey,
+                        DexPoolReadiness::Partial,
+                    );
+
+                    // === BondingCurveProgress event for momentum-bot exit signal ===
+                    // PumpFun initial real_token_reserves = 793_100_000_000_000
+                    const INITIAL_REAL_TOKEN_RESERVES: u64 = 793_100_000_000_000;
+                    let tokens_sold =
+                        INITIAL_REAL_TOKEN_RESERVES.saturating_sub(s.real_token_reserves);
+                    let progress_bps = ((tokens_sold as u128 * 10_000)
+                        / INITIAL_REAL_TOKEN_RESERVES as u128)
+                        as u32;
+                    let progress_bps = progress_bps.min(10_000);
+
+                    // Throttle: only emit when progress changes by >= 50 bps or complete changes
+                    let should_emit = {
+                        let cache = ctx.last_emitted_curve_progress.read();
+                        match cache.get(&account_update.pubkey) {
+                            Some(&(last_bps, last_complete)) => {
+                                progress_bps.abs_diff(last_bps) >= 50 || s.complete != last_complete
+                            }
+                            None => true,
+                        }
+                    };
+
+                    if should_emit {
+                        ctx.last_emitted_curve_progress
+                            .write()
+                            .insert(account_update.pubkey, (progress_bps, s.complete));
+
+                        let curve_event = MarketEvent::new(
+                            "market-data",
+                            BUILD_VERSION,
+                            run_id,
+                            ctx.next_event_id(),
+                            "geyser_bonding_curve",
+                            Some(account_update.slot),
+                            MarketEventKind::BondingCurveProgress {
+                                mint: s.token_mint.to_string(),
+                                bonding_curve: account_update.pubkey.to_string(),
+                                progress_bps,
+                                complete: s.complete,
+                            },
+                        );
+
+                        if let Err(e) = ctx.jsonl_writer.write(&curve_event) {
+                            error!(error = %e, "Failed to write BondingCurveProgress event to JSONL");
+                        }
+
+                        let _ = publish_market_event_core_and_momentum_ex(
+                            nats,
+                            &curve_event,
+                            Some(MarketEventCorePublishTrace {
+                                recv_at: account_geyser_recv_at,
+                                cold_path: false,
+                                segment: MarketDataLatencySegment::BondingCurve,
+                            }),
+                            Some(ctx.as_ref()),
+                        )
+                        .await;
+                    }
+                }
+                CachedPoolState::PumpAmm(s) => {
+                    let mut meta = std::collections::HashMap::new();
+                    if let Some(creator) = s.creator {
+                        meta.insert("creator".to_string(), creator.to_string());
+                    }
+                    // FIX-26: pool_accounts from Geyser parse, or fallback to MASTER cache
+                    let effective_pool_accounts = if !s.pool_accounts.is_empty() {
+                        s.pool_accounts.clone()
+                    } else {
+                        ctx.live_pool_cache
+                            .get_pump_amm_pool_accounts(&account_update.pubkey)
+                            .unwrap_or_default()
+                    };
+                    if !effective_pool_accounts.is_empty() {
+                        let accounts_str: Vec<String> = effective_pool_accounts
+                            .iter()
+                            .map(|p| p.to_string())
+                            .collect();
+                        meta.insert("pool_accounts".to_string(), accounts_str.join(","));
+                    }
+                    let (ext_flag, ext_third, ext_t0, ext_t1) = ctx
+                        .live_pool_cache
+                        .pump_amm_sell_extended_layout(&account_update.pubkey);
+                    if ext_flag {
+                        meta.insert(
+                            "pump_amm_sell_cashback_remaining".to_string(),
+                            "true".to_string(),
+                        );
+                    }
+                    if let Some(pk) = ext_third.filter(|p| *p != Pubkey::default()) {
+                        meta.insert(
+                            "pump_amm_sell_cashback_third_meta".to_string(),
+                            pk.to_string(),
+                        );
+                    }
+                    if let Some(pk) = ext_t0.filter(|p| *p != Pubkey::default()) {
+                        meta.insert("pump_amm_sell_extended_tail_0".to_string(), pk.to_string());
+                    }
+                    if let Some(pk) = ext_t1.filter(|p| *p != Pubkey::default()) {
+                        meta.insert("pump_amm_sell_extended_tail_1".to_string(), pk.to_string());
+                    }
+                    if !meta.is_empty() {
+                        pool_update.metadata = Some(meta);
+                    }
+                    // Geyser-fed accounts + reserves: stronger than observation-only, not Ready until verified trade/discovery.
+                    pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Partial);
+                    ctx.live_pool_cache.merge_pump_amm_pool_accounts_readiness(
+                        account_update.pubkey,
+                        DexPoolReadiness::Partial,
+                    );
+                }
+                CachedPoolState::RaydiumAmm(s) => {
+                    // FIX-29: Always propagate market_id (from Geyser parse),
+                    // plus serum accounts when available (from async RPC fetch)
+                    let mut meta = std::collections::HashMap::new();
+                    if s.market_id != Pubkey::default() {
+                        meta.insert("market_id".to_string(), s.market_id.to_string());
+                    }
+                    if let (Some(bids), Some(asks), Some(eq)) =
+                        (s.serum_bids, s.serum_asks, s.serum_event_queue)
+                    {
+                        meta.insert("serum_bids".to_string(), bids.to_string());
+                        meta.insert("serum_asks".to_string(), asks.to_string());
+                        meta.insert("serum_event_queue".to_string(), eq.to_string());
+                    }
+                    if !meta.is_empty() {
+                        pool_update.metadata = Some(meta);
+                    }
+                    let readiness = raydium_amm_readiness_for_pool_cache_update(s);
+                    pool_update.set_dex_readiness_in_metadata(readiness);
+                    ctx.live_pool_cache
+                        .merge_raydium_amm_pool_readiness(account_update.pubkey, readiness);
+                }
+                CachedPoolState::RaydiumCpmm(s) => {
+                    let mut meta = std::collections::HashMap::new();
+                    meta.insert(
+                        POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY.to_string(),
+                        raydium_cpmm_vaults_for_pool_cache_update(s),
+                    );
+                    pool_update.metadata = Some(meta);
+                    let readiness = raydium_cpmm_readiness_for_pool_cache_update(s);
+                    pool_update.set_dex_readiness_in_metadata(readiness);
+                    ctx.live_pool_cache
+                        .merge_raydium_cpmm_pool_readiness(account_update.pubkey, readiness);
+                }
+                CachedPoolState::MeteoraCpmm(s) => {
+                    let mut meta = std::collections::HashMap::new();
+                    meta.insert(
+                        POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY.to_string(),
+                        meteora_cpmm_vaults_for_pool_cache_update(s),
+                    );
+                    meta.insert(
+                        POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY.to_string(),
+                        meteora_cpmm_onchain_mints_for_pool_cache_update(s),
+                    );
+                    pool_update.metadata = Some(meta);
+                    let readiness = meteora_cpmm_readiness_for_pool_cache_update(s);
+                    pool_update.set_dex_readiness_in_metadata(readiness);
+                    ctx.live_pool_cache
+                        .merge_meteora_cpmm_pool_readiness(account_update.pubkey, readiness);
+                }
+                CachedPoolState::Orca(s) => {
+                    pool_update.metadata = Some(orca_metadata_for_pool_cache_update(s));
+                    let readiness = orca_readiness_for_pool_cache_update(s);
+                    pool_update.set_dex_readiness_in_metadata(readiness);
+                    ctx.live_pool_cache
+                        .merge_orca_pool_readiness(account_update.pubkey, readiness);
+                }
+                CachedPoolState::Meteora(s) => {
+                    pool_update.metadata = Some(meteora_dlmm_metadata_for_pool_cache_update(s));
+                    let readiness = meteora_dlmm_readiness_for_pool_cache_update(s);
+                    pool_update.set_dex_readiness_in_metadata(readiness);
+                    ctx.live_pool_cache
+                        .merge_meteora_dlmm_pool_readiness(account_update.pubkey, readiness);
+                }
+            }
+            // P3 #13: Propagate base_decimals and quote_decimals to SLAVE caches (all DEX types)
+            {
+                let mut meta = pool_update.metadata.as_ref().cloned().unwrap_or_default();
+                if let Some(d) = ctx.live_pool_cache.get_mint_decimals(&base_mint) {
+                    meta.insert("base_decimals".to_string(), d.to_string());
+                }
+                // For quote: use quote_mint, or when default (PumpFun) use SOL
+                let quote_for_decimals = if quote_mint == Pubkey::default() {
+                    Pubkey::from_str(NATIVE_SOL_MINT).ok()
+                } else {
+                    Some(quote_mint)
+                };
+                if let Some(q) = quote_for_decimals {
+                    if let Some(d) = ctx.live_pool_cache.get_mint_decimals(&q) {
+                        meta.insert("quote_decimals".to_string(), d.to_string());
+                    } else if q == Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default() {
+                        meta.insert("quote_decimals".to_string(), "9".to_string());
+                    }
+                }
+                if !meta.is_empty() {
+                    pool_update.metadata = Some(meta);
+                }
+            }
+            let subject = pool_subject(&account_update.pubkey.to_string());
+            if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
+                warn!(error = %e, "Failed to publish PoolCacheUpdate to JetStream");
+                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            } else {
+                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    // Try to parse as DEX pool event (for MarketEvents - existing logic)
+    let parsed = parse_account_update(&account_update);
+
+    // Special handling for PumpFun BondingCurveUpdate: cache creator
+    if let Some(ParsedDexEvent::BondingCurveUpdate {
+        pool_address,
+        creator,
+        virtual_token_reserves,
+        virtual_sol_reserves,
+        real_token_reserves,
+        real_sol_reserves,
+        complete,
+        cashback_enabled,
+        slot,
+    }) = &parsed
+    {
+        let pool_str = pool_address.to_string();
+        let creator_str = creator.to_string();
+
+        // Cache pool -> creator mapping (AUTHORITATIVE: bonding curve account data)
+        // FIX-22: Always overwrite — on-chain account data is the source of truth.
+        {
+            let mut pool_creator = ctx.pool_creator_cache.write();
+            pool_creator.insert(pool_str.clone(), creator_str.clone());
+        }
+
+        // If we know the mint for this pool, also update creator_cache (mint -> creator)
+        // and emit DevWalletIdentified event.
+        // FIX-22: Always overwrite cache with authoritative bonding curve data.
+        // PoolCreated events may set a wrong creator (instruction_accounts[7] can differ
+        // from on-chain creator for CPI/bundler creates). BondingCurveUpdate is authoritative.
+        let mint_opt = ctx.pool_mint_map.read().get(&pool_str).cloned();
+        if let Some(mint) = mint_opt {
+            let existing = {
+                let mut creator_cache = ctx.creator_cache.write();
+                let existing = creator_cache.get(&mint).cloned();
+                creator_cache.insert(mint.clone(), creator_str.clone());
+                existing
+            };
+
+            // Emit DevWalletIdentified if creator is new or CHANGED (correction)
+            let should_emit = match &existing {
+                None => true,
+                Some(old) if old != &creator_str => {
+                    warn!(
+                        mint = %mint,
+                        pool = %pool_str,
+                        old_creator = %old,
+                        new_creator = %creator_str,
+                        "FIX-22: Creator mismatch detected — BondingCurve account data overwrites stale cache value"
+                    );
+                    true
+                }
+                _ => false,
+            };
+
+            if should_emit {
+                info!(
+                    mint = %mint,
+                    pool = %pool_str,
+                    creator = %creator_str,
+                    corrected = existing.is_some(),
+                    "Creator cached from BondingCurve account update (authoritative)"
+                );
+
+                // Emit DevWalletIdentified event
+                let dev_event = MarketEvent::new(
+                    "market-data",
+                    BUILD_VERSION,
+                    run_id,
+                    ctx.next_event_id(),
+                    "geyser",
+                    Some(*slot),
+                    MarketEventKind::DevWalletIdentified {
+                        mint: mint.clone(),
+                        dev_wallet: creator_str.clone(),
+                        supply_percentage: 0.0, // Not computed from account data
+                    },
+                );
+
+                if let Err(e) = ctx.jsonl_writer.write(&dev_event) {
+                    error!(error = %e, "Failed to write DevWalletIdentified to JSONL");
+                }
+
+                if let Some(ref nats) = ctx.nats {
+                    let _ = publish_market_event_core_and_momentum_ex(
+                        nats,
+                        &dev_event,
+                        Some(MarketEventCorePublishTrace {
+                            recv_at: account_geyser_recv_at,
+                            cold_path: false,
+                            segment: MarketDataLatencySegment::Other,
+                        }),
+                        Some(ctx.as_ref()),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        // P2#7: BondingCurveUpdate fallback when parse_pool_account failed.
+        // Ensure LivePoolCache/SLAVE receives creator so Liquidation/PumpFunDex skip RPC.
+        let needs_fallback = ctx
+            .live_pool_cache
+            .get(pool_address)
+            .is_none_or(|s| !matches!(s, CachedPoolState::PumpFun(_)));
+        if needs_fallback {
+            let base_mint_pk = ctx
+                .pool_mint_map
+                .read()
+                .get(&pool_str)
+                .and_then(|m| Pubkey::from_str(m).ok())
+                .unwrap_or_default();
+            let base_mint = base_mint_pk.to_string();
+            let minimal_state = CachedPoolState::PumpFun(PumpFunState {
+                token_mint: base_mint_pk,
+                bonding_curve: *pool_address,
+                associated_bonding_curve: Pubkey::default(),
+                virtual_token_reserves: *virtual_token_reserves,
+                virtual_sol_reserves: *virtual_sol_reserves,
+                real_token_reserves: *real_token_reserves,
+                real_sol_reserves: *real_sol_reserves,
+                complete: *complete,
+                creator: *creator,
+                cashback_enabled: *cashback_enabled,
+            });
+            ctx.live_pool_cache
+                .upsert(*pool_address, minimal_state, *slot);
+
+            let mut pool_update = PoolCacheUpdate::new_pool_discovered(
+                "market-data",
+                BUILD_VERSION,
+                run_id,
+                pool_str.clone(),
+                "pumpfun".to_string(),
+                base_mint.clone(),
+                NATIVE_SOL_MINT.to_string(),
+                *virtual_token_reserves,
+                *virtual_sol_reserves,
+                Some(0),
+                *slot,
+            );
+            let mut meta = std::collections::HashMap::new();
+            meta.insert("creator".to_string(), creator_str.clone());
+            meta.insert("complete".to_string(), complete.to_string());
+            meta.insert(
+                "real_token_reserves".to_string(),
+                real_token_reserves.to_string(),
+            );
+            meta.insert(
+                "real_sol_reserves".to_string(),
+                real_sol_reserves.to_string(),
+            );
+            meta.insert("cashback_enabled".to_string(), cashback_enabled.to_string());
+            // P3 #13: base_decimals and quote_decimals (PumpFun quote = SOL)
+            if let Some(d) = ctx.live_pool_cache.get_mint_decimals(&base_mint_pk) {
+                meta.insert("base_decimals".to_string(), d.to_string());
+            }
+            if let Ok(sol_pk) = Pubkey::from_str(NATIVE_SOL_MINT) {
+                if let Some(d) = ctx.live_pool_cache.get_mint_decimals(&sol_pk) {
+                    meta.insert("quote_decimals".to_string(), d.to_string());
+                } else {
+                    meta.insert("quote_decimals".to_string(), "9".to_string());
+                }
+            }
+            pool_update.metadata = Some(meta);
+            // Fallback path: weaker than full Geyser parse — observed only.
+            pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Observed);
+            ctx.live_pool_cache
+                .merge_pumpfun_bonding_readiness(*pool_address, DexPoolReadiness::Observed);
+
+            if let Some(ref nats) = ctx.nats {
+                let subject = pool_subject(&pool_str);
+                if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
+                    warn!(error = %e, pool = %pool_str, "P2#7: Failed to publish BondingCurveUpdate fallback PoolCacheUpdate");
+                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        pool = %pool_str,
+                        creator = %creator_str,
+                        "P2#7: Published BondingCurveUpdate fallback PoolCacheUpdate"
+                    );
+                }
+            }
+        }
+
+        // Don't emit the BondingCurveUpdate as a MarketEvent - it's internal
+        return;
+    }
+
+    let event_kind = if let Some(parsed) = parsed {
+        debug!(slot = account_update.slot, "Parsed DEX account update");
+        parsed.to_market_event_kind()
+    } else {
+        // Fallback to raw event for unknown accounts
+        MarketEventKind::AccountUpdate {
+            pubkey: account_update.pubkey.to_string(),
+            owner: account_update.owner.to_string(),
+            data_len: account_update.data.len(),
+        }
+    };
+
+    let event = MarketEvent::new(
+        "market-data",
+        BUILD_VERSION,
+        run_id,
+        ctx.next_event_id(),
+        "geyser",
+        Some(account_update.slot),
+        event_kind,
+    );
+
+    // Write to JSONL
+    if let Err(e) = ctx.jsonl_writer.write(&event) {
+        error!(error = %e, "Failed to write account event to JSONL");
+    }
+
+    // Publish to NATS
+    if let Some(ref nats) = ctx.nats {
+        let seg = market_data_publish_segment(&event.kind);
+        let _ = publish_market_event_core_and_momentum_ex(
+            nats,
+            &event,
+            Some(MarketEventCorePublishTrace {
+                recv_at: account_geyser_recv_at,
+                cold_path: false,
+                segment: seg,
+            }),
+            Some(ctx.as_ref()),
+        )
+        .await;
+    }
+}
 /// Geyser transaction ingest (dedizierte Task-Fairness, siehe MARKET-DATA-TX-INGEST-FAIRNESS).
 /// STOP-CHECK: keine neuen RPC-Calls; gleiche Logik wie zuvor im `select!`-Arm.
 async fn handle_geyser_transaction(
@@ -7013,7 +8585,7 @@ async fn run_geyser_loop(
     }
 
     // Start legacy GeyserListener for transaction parsing (will be phased out in favor of pool discovery)
-    let (listener, mut account_rx, transaction_rx, mut blockhash_rx) =
+    let (listener, account_rx, transaction_rx, mut blockhash_rx) =
         GeyserListener::new_with_tracked_accounts(
             geyser_url.to_string(),
             program_ids,
@@ -7031,7 +8603,7 @@ async fn run_geyser_loop(
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
-    let mut account_count = 0u64;
+    let account_count = Arc::new(AtomicU64::new(0));
     let tx_count = Arc::new(AtomicU64::new(0));
     let mut last_heartbeat = std::time::Instant::now();
     let mut activity_interval = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -7129,11 +8701,58 @@ async fn run_geyser_loop(
         }
     });
 
+    // Option A (MARKET-DATA-ACCOUNT-INGEST-FAIRNESS): dedizierter Tokio-Task für Geyser-Accounts.
+    // Verhindert, dass `account_rx.recv()` hinter JetStream-/Control-`select!`-Armen verhungert
+    // (p50 `market_data_account_channel_lag_ms` war ~2s bei gleichzeitig schnellem Trade-Publish).
+    let (geyser_account_stream_stopped_tx, mut geyser_account_stream_stopped_rx) =
+        watch::channel(false);
+    let ctx_geyser_acc = Arc::clone(&ctx);
+    let run_id_geyser_acc = run_id.to_string();
+    let account_count_geyser_acc = Arc::clone(&account_count);
+    let rpc_geyser_acc = Arc::clone(&rpc);
+    let mut account_rx_geyser = account_rx;
+    tokio::spawn(async move {
+        loop {
+            match account_rx_geyser.recv().await {
+                Ok(account_update) => {
+                    let recv_at = Instant::now();
+                    record_market_data_account_channel_lag_ms(account_update.grpc_recv_at, recv_at);
+                    set_market_data_account_broadcast_queue_depth(account_rx_geyser.len());
+                    handle_geyser_account(
+                        Arc::clone(&ctx_geyser_acc),
+                        run_id_geyser_acc.as_str(),
+                        account_update,
+                        account_count_geyser_acc.as_ref(),
+                        Arc::clone(&rpc_geyser_acc),
+                        recv_at,
+                    )
+                    .await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    record_market_data_account_broadcast_lagged(n);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    warn!("Geyser account broadcast channel closed");
+                    let _ = geyser_account_stream_stopped_tx.send(true);
+                    break;
+                }
+            }
+        }
+    });
+
     loop {
         tokio::select! {
             _ = geyser_tx_stream_stopped_rx.changed() => {
                 if *geyser_tx_stream_stopped_rx.borrow() {
                     warn!("Geyser transaction stream ended; stopping market-data Geyser loop");
+                    listener_handle.abort();
+                    break;
+                }
+            }
+
+            _ = geyser_account_stream_stopped_rx.changed() => {
+                if *geyser_account_stream_stopped_rx.borrow() {
+                    warn!("Geyser account stream ended; stopping market-data Geyser loop");
                     listener_handle.abort();
                     break;
                 }
@@ -7668,1522 +9287,6 @@ async fn run_geyser_loop(
                 }
             } => {}
 
-            // Account updates (pool state changes)
-            account_rx_res = account_rx.recv() => {
-                match account_rx_res {
-                    Ok(account_update) => {
-                let recv_at = Instant::now();
-                record_market_data_account_channel_lag_ms(
-                    account_update.grpc_recv_at,
-                    recv_at,
-                );
-                let account_geyser_recv_at = recv_at;
-                market_data_bump_geyser_head_slot(account_update.slot);
-                account_count += 1;
-                ironcrab::metrics::record_activity();
-
-                // === WsolManager Support: Wallet Balance Updates ===
-                // Track SOL (native) and WSOL (ATA) balance changes for WsolManager
-                if let Some(ref tracked_wallet) = ctx.tracked_wallet {
-                    let is_wallet_account = account_update.pubkey == tracked_wallet.wallet;
-                    let is_wsol_ata = account_update.pubkey == tracked_wallet.wsol_ata;
-                    let is_token_ata = ctx
-                        .tracked_wallet_token_accounts
-                        .read()
-                        .contains(&account_update.pubkey);
-
-                    if is_wallet_account || is_wsol_ata {
-                        // Parse balance based on account type
-                        let (new_sol, new_wsol, balance_changed) = if is_wallet_account {
-                            // Native SOL account - balance is in lamports field
-                            let lamports = account_update.lamports;
-                            let prev = tracked_wallet.last_sol_balance.swap(lamports, Ordering::Relaxed);
-                            let wsol = tracked_wallet.last_wsol_balance.load(Ordering::Relaxed);
-                            let has_wsol = tracked_wallet.wsol_seen.load(Ordering::Relaxed);
-                            let wsol_value = if has_wsol { Some(wsol) } else { None };
-                            (lamports, wsol_value, lamports != prev)
-                        } else {
-                            // WSOL ATA - parse token account balance.
-                            // When the ATA is closed (unwrap), Geyser often delivers an update with
-                            // `data` empty (account gone) — not parseable as SPL token state.
-                            // That means WSOL=0. Previously we `continue`d and kept a stale balance
-                            // with no zero WalletBalanceSnapshot to JetStream.
-                            let Some(balance) = wsol_ata_balance_lamports_from_geyser_data(&account_update.data) else {
-                                continue;
-                            };
-                            let prev = tracked_wallet.last_wsol_balance.swap(balance, Ordering::Relaxed);
-                            tracked_wallet.wsol_seen.store(true, Ordering::Relaxed);
-                            let sol = tracked_wallet.last_sol_balance.load(Ordering::Relaxed);
-                            (sol, Some(balance), balance != prev)
-                        };
-
-                        if balance_changed {
-                            let wallet_str = tracked_wallet.wallet.to_string();
-
-                            // Publish SOL + WSOL as WalletBalanceSnapshot to JetStream (SSOT)
-                            if let Some(ref nats) = ctx.nats {
-                                let sol_snapshot = MarketEvent::new(
-                                    "market-data",
-                                    BUILD_VERSION,
-                                    run_id,
-                                    format!("geyser_wallet_sol_{}", account_update.slot),
-                                    "geyser_wallet_update",
-                                    Some(account_update.slot),
-                                    MarketEventKind::WalletBalanceSnapshot {
-                                        mint: "NATIVE_SOL".to_string(),
-                                        balance_raw: new_sol,
-                                        decimals: 9,
-                                        token_program: "system".to_string(),
-                                    },
-                                );
-                                let sol_subject = wallet_snapshot_subject(&wallet_str, "NATIVE_SOL");
-                                if let Err(e) = nats.jetstream_publish(&sol_subject, &sol_snapshot).await {
-                                    warn!(error = %e, "Failed to publish native SOL WalletBalanceSnapshot to JetStream");
-                                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                } else {
-                                    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                }
-
-                                if let Some(wsol) = new_wsol {
-                                    let wsol_snapshot = MarketEvent::new(
-                                        "market-data",
-                                        BUILD_VERSION,
-                                        run_id,
-                                        format!("geyser_wallet_wsol_{}", account_update.slot),
-                                        "geyser_wallet_update",
-                                        Some(account_update.slot),
-                                        MarketEventKind::WalletBalanceSnapshot {
-                                            mint: WSOL_MINT.to_string(),
-                                            balance_raw: wsol,
-                                            decimals: 9,
-                                            token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
-                                        },
-                                    );
-                                    let wsol_subject = wallet_snapshot_subject(&wallet_str, WSOL_MINT);
-                                    if let Err(e) = nats.jetstream_publish(&wsol_subject, &wsol_snapshot).await {
-                                        warn!(error = %e, "Failed to publish WSOL WalletBalanceSnapshot to JetStream");
-                                        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                    } else {
-                                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                }
-
-                                info!(
-                                    wallet = %wallet_str,
-                                    sol_lamports = new_sol,
-                                    wsol_lamports = ?new_wsol,
-                                    slot = account_update.slot,
-                                    "WalletBalanceSnapshot (SOL/WSOL) published to JetStream"
-                                );
-                            }
-                        }
-                    } else if is_token_ata
-                        && (account_update.owner.to_bytes() == spl_token::ID.to_bytes()
-                            || account_update.owner.to_bytes()
-                                == spl_token_2022::ID.to_bytes())
-                    {
-                        let (mint, balance_raw) = if account_update.owner.to_bytes()
-                            == spl_token::ID.to_bytes()
-                        {
-                            match spl_token::state::Account::unpack(&account_update.data) {
-                                Ok(acc) => (Pubkey::new_from_array(acc.mint.to_bytes()), acc.amount),
-                                Err(_) => continue,
-                            }
-                        } else {
-                            // Token-2022 accounts may have extensions (data > 165 bytes).
-                            // Use StateWithExtensions instead of Pack::unpack.
-                            match StateWithExtensions::<spl_token_2022::state::Account>::unpack(&account_update.data) {
-                                Ok(state) => (Pubkey::new_from_array(state.base.mint.to_bytes()), state.base.amount),
-                                Err(_) => continue,
-                            }
-                        };
-
-                        let decimals = ctx
-                            .tracked_wallet_mint_decimals
-                            .read()
-                            .get(&mint)
-                            .copied()
-                            .unwrap_or_else(|| {
-                                // This should only happen for accounts created after initial scan.
-                                // Log a warning so we can track if this becomes a problem.
-                                warn!(
-                                    mint = %mint,
-                                    account = %account_update.pubkey,
-                                    "Decimals not cached for token account, using default 6"
-                                );
-                                6
-                            });
-
-                        let mint_str = mint.to_string();
-                        let event = MarketEvent::new(
-                            "market-data",
-                            BUILD_VERSION,
-                            run_id,
-                            ctx.next_event_id(),
-                            "geyser_wallet_update",
-                            Some(account_update.slot),
-                            MarketEventKind::WalletBalanceSnapshot {
-                                mint: mint_str.clone(),
-                                balance_raw,
-                                decimals,
-                                token_program: account_update.owner.to_string(),
-                            },
-                        );
-
-                        if let Some(ref nats) = ctx.nats {
-                            let subject = wallet_snapshot_subject(
-                                &tracked_wallet.wallet.to_string(),
-                                &mint_str,
-                            );
-                            if let Err(e) = nats.jetstream_publish(&subject, &event).await {
-                                warn!(
-                                    error = %e,
-                                    mint = %mint_str,
-                                    "Failed to publish WalletBalanceSnapshot to JetStream"
-                                );
-                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-
-                        if let Err(e) = ctx.jsonl_writer.write(&event) {
-                            warn!(error = %e, "Failed to write WalletBalanceSnapshot to JSONL");
-                        }
-                    }
-                }
-
-                // Tracked mint updates (Token mint authority/freeze info)
-                if (account_update.owner.to_bytes() == spl_token::ID.to_bytes()
-                    || account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes())
-                    && ctx.tracked_mints.read().contains(&account_update.pubkey)
-                {
-                    if let Some((decimals, supply, mint_authority, freeze_authority)) =
-                        try_parse_mint_account(&account_update.owner, &account_update.data)
-                    {
-                        // Decimals-Policy: TokenMintInfo from Geyser is authoritative.
-                        // Keep wallet decimals cache warm so WalletBalanceSnapshot never needs the 6-decimal fallback.
-                        ctx.tracked_wallet_mint_decimals
-                            .write()
-                            .insert(account_update.pubkey, decimals);
-
-                        // PR1: Also populate MASTER LivePoolCache mint_decimals (Single Source of Truth).
-                        // This keeps LivePoolCache consistent with tracked_wallet_mint_decimals.
-                        ctx.live_pool_cache.set_mint_decimals(account_update.pubkey, decimals);
-
-                        let is_token_2022 = account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes();
-
-                        let mint_event = MarketEvent::new(
-                            "market-data",
-                            BUILD_VERSION,
-                            run_id,
-                            ctx.next_event_id(),
-                            "geyser",
-                            Some(account_update.slot),
-                            MarketEventKind::TokenMintInfo {
-                                mint: account_update.pubkey.to_string(),
-                                token_program: account_update.owner.to_string(),
-                                decimals,
-                                supply,
-                                mint_authority,
-                                freeze_authority,
-                            },
-                        );
-
-                        // Log Token-2022 mints explicitly (debugging)
-                        if is_token_2022 {
-                            info!(
-                                mint = %account_update.pubkey,
-                                token_program = %account_update.owner,
-                                decimals,
-                                supply,
-                                "TokenMintInfo: Token-2022 mint detected via Geyser"
-                            );
-                        } else {
-                            debug!(
-                                mint = %account_update.pubkey,
-                                token_program = %account_update.owner,
-                                decimals,
-                                "TokenMintInfo: SPL Token mint via Geyser"
-                            );
-                        }
-
-                        if let Err(e) = ctx.jsonl_writer.write(&mint_event) {
-                            error!(error = %e, "Failed to write TokenMintInfo event to JSONL");
-                        }
-
-                        if let Some(ref nats) = ctx.nats {
-                            let _ = publish_market_event_core_and_momentum_ex(
-                                nats,
-                                &mint_event,
-                                Some(MarketEventCorePublishTrace {
-                                    recv_at: account_geyser_recv_at,
-                                    cold_path: false,
-                                    segment: MarketDataLatencySegment::Other,
-                                }),
-                                Some(ctx.as_ref()),
-                            )
-                            .await;
-                        }
-                    }
-                }
-
-                // Vault account updates → emit PoolStateUpdate (Geyser-based reserve balances)
-                // This eliminates the need for RPC calls to fetch vault balances.
-                if account_update.owner.to_bytes() == spl_token::ID.to_bytes()
-                    || account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes()
-                {
-                    // Clone data from lock scope to avoid holding lock across await
-                    let vault_info_opt = ctx.tracked_vaults.read().get(&account_update.pubkey).cloned();
-                    if let Some(vault_info) = vault_info_opt {
-                        // Parse token account to get balance
-                        if let Some(balance) = try_parse_token_account_balance(&account_update.data) {
-                            // Check if balance changed (avoid spamming unchanged updates)
-                            let prev_balance = vault_info.last_balance.swap(balance, std::sync::atomic::Ordering::Relaxed);
-                            if balance != prev_balance {
-                                // We need both vault balances to emit a complete PoolStateUpdate.
-                                // For now, emit partial updates - consumers should merge base+quote.
-                                // Future: Track both vaults and emit only when both are known.
-                                let (reserve_base, reserve_quote) = if vault_info.is_base_vault {
-                                    (balance, 0u64) // Partial: only base known
-                                } else {
-                                    (0u64, balance) // Partial: only quote known
-                                };
-
-                                // Try to get the other vault's balance for a complete update
-                                let vaults = ctx.tracked_vaults.read();
-                                let complete_update = vaults.values()
-                                    .find(|v| v.pool_address == vault_info.pool_address && v.is_base_vault != vault_info.is_base_vault)
-                                    .map(|other| {
-                                        let other_balance = other.last_balance.load(std::sync::atomic::Ordering::Relaxed);
-                                        if vault_info.is_base_vault {
-                                            (balance, other_balance)
-                                        } else {
-                                            (other_balance, balance)
-                                        }
-                                    });
-                                drop(vaults);
-
-                                let (final_base, final_quote) = complete_update.unwrap_or((reserve_base, reserve_quote));
-
-                                // Only emit if we have at least one non-zero balance
-                                if final_base > 0 || final_quote > 0 {
-                                    // MASTER CACHE: Update vault balance in LivePoolCache
-                                    ctx.live_pool_cache.update_vault_balance(&account_update.pubkey, balance, account_update.slot);
-
-                                    // Publish PoolCacheUpdate::BalanceUpdated to JetStream (persistent state)
-                                    if let Some(ref nats) = ctx.nats {
-                                        let mut balance_update = PoolCacheUpdate::new_balance_updated(
-                                            "market-data",
-                                            BUILD_VERSION,
-                                            run_id,
-                                            vault_info.pool_address.to_string(),
-                                            vault_info.dex.clone(),
-                                            vault_info.base_mint.to_string(),
-                                            vault_info.quote_mint.to_string(),
-                                            final_base,
-                                            final_quote,
-                                            account_update.slot,
-                                        );
-                                        if vault_info.dex == "raydium_cpmm" {
-                                            if let Some(CachedPoolState::RaydiumCpmm(ref s)) =
-                                                ctx.live_pool_cache.get(&vault_info.pool_address)
-                                            {
-                                                let mut meta = std::collections::HashMap::new();
-                                                meta.insert(
-                                                    POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY.to_string(),
-                                                    raydium_cpmm_vaults_for_pool_cache_update(s),
-                                                );
-                                                balance_update.metadata = Some(meta);
-                                                let readiness =
-                                                    raydium_cpmm_readiness_for_pool_cache_update(s);
-                                                balance_update.set_dex_readiness_in_metadata(readiness);
-                                                ctx.live_pool_cache.merge_raydium_cpmm_pool_readiness(
-                                                    vault_info.pool_address,
-                                                    readiness,
-                                                );
-                                            }
-                                        }
-                                        if vault_info.dex == "meteora_cpmm" {
-                                            if let Some(CachedPoolState::MeteoraCpmm(ref s)) =
-                                                ctx.live_pool_cache.get(&vault_info.pool_address)
-                                            {
-                                                let mut meta = balance_update.metadata.take().unwrap_or_default();
-                                                meta.insert(
-                                                    POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY.to_string(),
-                                                    meteora_cpmm_vaults_for_pool_cache_update(s),
-                                                );
-                                                meta.insert(
-                                                    POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY.to_string(),
-                                                    meteora_cpmm_onchain_mints_for_pool_cache_update(s),
-                                                );
-                                                balance_update.metadata = Some(meta);
-                                                let readiness =
-                                                    meteora_cpmm_readiness_for_pool_cache_update(s);
-                                                balance_update.set_dex_readiness_in_metadata(readiness);
-                                                ctx.live_pool_cache.merge_meteora_cpmm_pool_readiness(
-                                                    vault_info.pool_address,
-                                                    readiness,
-                                                );
-                                            }
-                                        }
-                                        if vault_info.dex == "raydium" {
-                                            if let Some(CachedPoolState::RaydiumAmm(ref s)) =
-                                                ctx.live_pool_cache.get(&vault_info.pool_address)
-                                            {
-                                                let readiness =
-                                                    raydium_amm_readiness_for_pool_cache_update(s);
-                                                balance_update.set_dex_readiness_in_metadata(readiness);
-                                                ctx.live_pool_cache.merge_raydium_amm_pool_readiness(
-                                                    vault_info.pool_address,
-                                                    readiness,
-                                                );
-                                            }
-                                        }
-                                        if vault_info.dex == "orca" {
-                                            if let Some(CachedPoolState::Orca(ref s)) =
-                                                ctx.live_pool_cache.get(&vault_info.pool_address)
-                                            {
-                                                let mut meta = balance_update
-                                                    .metadata
-                                                    .take()
-                                                    .unwrap_or_default();
-                                                for (k, v) in orca_metadata_for_pool_cache_update(s) {
-                                                    meta.insert(k, v);
-                                                }
-                                                balance_update.metadata = Some(meta);
-                                                let readiness =
-                                                    orca_readiness_for_pool_cache_update(s);
-                                                balance_update.set_dex_readiness_in_metadata(readiness);
-                                                ctx.live_pool_cache.merge_orca_pool_readiness(
-                                                    vault_info.pool_address,
-                                                    readiness,
-                                                );
-                                            }
-                                        }
-                                        if vault_info.dex == "meteora_dlmm" {
-                                            if let Some(CachedPoolState::Meteora(ref s)) =
-                                                ctx.live_pool_cache.get(&vault_info.pool_address)
-                                            {
-                                                let mut meta = balance_update
-                                                    .metadata
-                                                    .take()
-                                                    .unwrap_or_default();
-                                                for (k, v) in meteora_dlmm_metadata_for_pool_cache_update(s) {
-                                                    meta.insert(k, v);
-                                                }
-                                                balance_update.metadata = Some(meta);
-                                                let readiness =
-                                                    meteora_dlmm_readiness_for_pool_cache_update(s);
-                                                balance_update.set_dex_readiness_in_metadata(readiness);
-                                                ctx.live_pool_cache.merge_meteora_dlmm_pool_readiness(
-                                                    vault_info.pool_address,
-                                                    readiness,
-                                                );
-                                            }
-                                        }
-                                        let subject = pool_subject(&vault_info.pool_address.to_string());
-                                        if let Err(e) = nats.jetstream_publish(&subject, &balance_update).await {
-                                            warn!(error = %e, "Failed to publish PoolCacheUpdate::BalanceUpdated to JetStream");
-                                            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                        } else {
-                                            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                            info!(pool = %vault_info.pool_address, slot = account_update.slot, "MASTER CACHE: Published PoolCacheUpdate::BalanceUpdated to JetStream");
-                                        }
-                                    }
-
-                                    // Publish MarketEvent::PoolStateUpdate (existing logic for strategies)
-                                    let state_event = MarketEvent::new(
-                                        "market-data",
-                                        BUILD_VERSION,
-                                        run_id,
-                                        ctx.next_event_id(),
-                                        "geyser_vault",
-                                        Some(account_update.slot),
-                                        MarketEventKind::PoolStateUpdate {
-                                            pool_address: vault_info.pool_address.to_string(),
-                                            dex: vault_info.dex.clone(),
-                                            reserve_base: final_base,
-                                            reserve_quote: final_quote,
-                                            base_mint: vault_info.base_mint.to_string(),
-                                            quote_mint: vault_info.quote_mint.to_string(),
-                                            update_slot: account_update.slot,
-                                            // DLMM-specific fields (Option D)
-                                            active_id: vault_info.active_id,
-                                            bin_step: vault_info.bin_step,
-                                        },
-                                    );
-
-                                    if let Err(e) = ctx.jsonl_writer.write(&state_event) {
-                                        error!(error = %e, "Failed to write PoolStateUpdate event to JSONL");
-                                    }
-
-                                    if let Some(ref nats) = ctx.nats {
-                                        let _ = publish_market_event_core_and_momentum_ex(
-                                            nats,
-                                            &state_event,
-                                            Some(MarketEventCorePublishTrace {
-                                                recv_at: account_geyser_recv_at,
-                                                cold_path: false,
-                                                segment: MarketDataLatencySegment::Other,
-                                            }),
-                                            Some(ctx.as_ref()),
-                                        )
-                                        .await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Bin Array account updates → emit BinArrayUpdate (Geyser-based liquidity distribution)
-                // This eliminates the need for RPC calls to fetch Meteora DLMM bin arrays.
-                let dlmm_program = Pubkey::from_str(METEORA_DLMM_PROGRAM)
-                    .expect("Invalid METEORA_DLMM_PROGRAM constant");
-                if account_update.owner == dlmm_program {
-                    if let Some(bin_array_info) = ctx.tracked_bin_arrays.read().get(&account_update.pubkey).cloned() {
-                        // Parse bin array to extract liquidity distribution
-                        match BinArray::parse(&account_update.data, bin_array_info.bin_step) {
-                            Ok(parsed_array) => {
-                                // Convert to compact BinData (only bins with liquidity)
-                                let bins: Vec<BinData> = parsed_array.bins
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(_, bin)| bin.amount_x > 0 || bin.amount_y > 0)
-                                    .map(|(offset, bin)| BinData {
-                                        offset: offset as u8,
-                                        amount_x: bin.amount_x,
-                                        amount_y: bin.amount_y,
-                                    })
-                                    .collect();
-
-                                // Only emit if there's any liquidity
-                                if !bins.is_empty() {
-                                    let bin_event = MarketEvent::new(
-                                        "market-data",
-                                        BUILD_VERSION,
-                                        run_id,
-                                        ctx.next_event_id(),
-                                        "geyser_bin_array",
-                                        Some(account_update.slot),
-                                        MarketEventKind::BinArrayUpdate {
-                                            pool_address: bin_array_info.pool_address.to_string(),
-                                            bin_array_index: bin_array_info.bin_array_index,
-                                            bins,
-                                            update_slot: account_update.slot,
-                                        },
-                                    );
-
-                                    if let Err(e) = ctx.jsonl_writer.write(&bin_event) {
-                                        error!(error = %e, "Failed to write BinArrayUpdate event to JSONL");
-                                    }
-
-                                    if let Some(ref nats) = ctx.nats {
-                                        let _ = publish_market_event_core_and_momentum_ex(
-                                            nats,
-                                            &bin_event,
-                                            Some(MarketEventCorePublishTrace {
-                                                recv_at: account_geyser_recv_at,
-                                                cold_path: false,
-                                                segment: MarketDataLatencySegment::Other,
-                                            }),
-                                            Some(ctx.as_ref()),
-                                        )
-                                        .await;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                debug!(
-                                    error = %e,
-                                    pubkey = %account_update.pubkey,
-                                    "Failed to parse bin array account"
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // MASTER CACHE: Try to parse as DEX pool state and upsert into LivePoolCache
-                if let Some(mut cached_state) = parse_pool_account(&account_update.owner, &account_update.data) {
-                    // P2#7: Enrich PumpFun token_mint from pool_mint_map when parse returns default
-                    if let CachedPoolState::PumpFun(ref mut s) = &mut cached_state {
-                        if s.token_mint == Pubkey::default() {
-                            let pool_str = account_update.pubkey.to_string();
-                            if let Some(mint_str) = ctx.pool_mint_map.read().get(&pool_str).cloned() {
-                                if let Ok(mint_pk) = Pubkey::from_str(&mint_str) {
-                                    s.token_mint = mint_pk;
-                                    debug!(
-                                        pool = %pool_str,
-                                        mint = %mint_str,
-                                        "P2#7: Enriched PumpFun token_mint from pool_mint_map"
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    // Update MASTER LivePoolCache (Single Source of Truth)
-                    ctx.live_pool_cache.upsert(account_update.pubkey, cached_state.clone(), account_update.slot);
-
-                    // Raydium CPMM: register vault ATAs for Geyser reserve updates (enables non-RPC reserve path).
-                    if let CachedPoolState::RaydiumCpmm(s) = &cached_state {
-                        let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
-                        let (base_mint_v, quote_mint_v, coin_vault, pc_vault) =
-                            if s.token_1_mint == sol {
-                                (s.token_0_mint, s.token_1_mint, s.token_0_vault, s.token_1_vault)
-                            } else if s.token_0_mint == sol {
-                                (s.token_1_mint, s.token_0_mint, s.token_1_vault, s.token_0_vault)
-                            } else {
-                                (s.token_0_mint, s.token_1_mint, s.token_0_vault, s.token_1_vault)
-                            };
-                        let dex_str = "raydium_cpmm".to_string();
-                        let mut vaults_changed = false;
-                        {
-                            let mut vaults = ctx.tracked_vaults.write();
-                            vaults.entry(coin_vault).or_insert_with(|| {
-                                vaults_changed = true;
-                                VaultInfo {
-                                    pool_address: account_update.pubkey,
-                                    dex: dex_str.clone(),
-                                    base_mint: base_mint_v,
-                                    quote_mint: quote_mint_v,
-                                    is_base_vault: true,
-                                    last_balance: std::sync::atomic::AtomicU64::new(0),
-                                    active_id: None,
-                                    bin_step: None,
-                                }
-                            });
-                            vaults.entry(pc_vault).or_insert_with(|| {
-                                vaults_changed = true;
-                                VaultInfo {
-                                    pool_address: account_update.pubkey,
-                                    dex: dex_str,
-                                    base_mint: base_mint_v,
-                                    quote_mint: quote_mint_v,
-                                    is_base_vault: false,
-                                    last_balance: std::sync::atomic::AtomicU64::new(0),
-                                    active_id: None,
-                                    bin_step: None,
-                                }
-                            });
-                        }
-                        if vaults_changed {
-                            let vault_list: Vec<Pubkey> =
-                                ctx.tracked_vaults.read().keys().copied().collect();
-                            let _ = ctx.tracked_vaults_tx.send(vault_list);
-                            debug!(
-                                pool = %account_update.pubkey,
-                                coin_vault = %coin_vault,
-                                pc_vault = %pc_vault,
-                                "Registered Raydium CPMM vaults for Geyser reserve subscription"
-                            );
-                        }
-                    }
-
-                    // Meteora CPMM: register vault ATAs for Geyser reserve updates (same pattern as Raydium CPMM).
-                    if ctx.config.read().enable_meteora_cpmm {
-                        if let CachedPoolState::MeteoraCpmm(s) = &cached_state {
-                            let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
-                            let (base_mint_v, quote_mint_v, vault_base, vault_quote) =
-                                if s.token_1_mint == sol {
-                                    (s.token_0_mint, s.token_1_mint, s.token_0_vault, s.token_1_vault)
-                                } else if s.token_0_mint == sol {
-                                    (s.token_1_mint, s.token_0_mint, s.token_1_vault, s.token_0_vault)
-                                } else {
-                                    (s.token_0_mint, s.token_1_mint, s.token_0_vault, s.token_1_vault)
-                                };
-                            let dex_str = "meteora_cpmm".to_string();
-                            let mut vaults_changed = false;
-                            {
-                                let mut vaults = ctx.tracked_vaults.write();
-                                vaults.entry(vault_base).or_insert_with(|| {
-                                    vaults_changed = true;
-                                    VaultInfo {
-                                        pool_address: account_update.pubkey,
-                                        dex: dex_str.clone(),
-                                        base_mint: base_mint_v,
-                                        quote_mint: quote_mint_v,
-                                        is_base_vault: true,
-                                        last_balance: std::sync::atomic::AtomicU64::new(0),
-                                        active_id: None,
-                                        bin_step: None,
-                                    }
-                                });
-                                vaults.entry(vault_quote).or_insert_with(|| {
-                                    vaults_changed = true;
-                                    VaultInfo {
-                                        pool_address: account_update.pubkey,
-                                        dex: dex_str,
-                                        base_mint: base_mint_v,
-                                        quote_mint: quote_mint_v,
-                                        is_base_vault: false,
-                                        last_balance: std::sync::atomic::AtomicU64::new(0),
-                                        active_id: None,
-                                        bin_step: None,
-                                    }
-                                });
-                            }
-                            if vaults_changed {
-                                let vault_list: Vec<Pubkey> =
-                                    ctx.tracked_vaults.read().keys().copied().collect();
-                                let _ = ctx.tracked_vaults_tx.send(vault_list);
-                                debug!(
-                                    pool = %account_update.pubkey,
-                                    vault_base = %vault_base,
-                                    vault_quote = %vault_quote,
-                                    "Registered Meteora CPMM vaults for Geyser reserve subscription"
-                                );
-                            }
-                        }
-                    }
-
-                    // Meteora DLMM: register reserve vault ATAs (on-chain token_x / token_y order).
-                    if ctx.config.read().enable_meteora_dlmm {
-                        if let CachedPoolState::Meteora(s) = &cached_state {
-                            let dex_str = "meteora_dlmm".to_string();
-                            let mut vaults_changed = false;
-                            {
-                                let mut vaults = ctx.tracked_vaults.write();
-                                vaults.entry(s.reserve_x).or_insert_with(|| {
-                                    vaults_changed = true;
-                                    VaultInfo {
-                                        pool_address: account_update.pubkey,
-                                        dex: dex_str.clone(),
-                                        base_mint: s.token_x_mint,
-                                        quote_mint: s.token_y_mint,
-                                        is_base_vault: true,
-                                        last_balance: std::sync::atomic::AtomicU64::new(0),
-                                        active_id: Some(s.active_id),
-                                        bin_step: Some(s.bin_step),
-                                    }
-                                });
-                                vaults.entry(s.reserve_y).or_insert_with(|| {
-                                    vaults_changed = true;
-                                    VaultInfo {
-                                        pool_address: account_update.pubkey,
-                                        dex: dex_str,
-                                        base_mint: s.token_x_mint,
-                                        quote_mint: s.token_y_mint,
-                                        is_base_vault: false,
-                                        last_balance: std::sync::atomic::AtomicU64::new(0),
-                                        active_id: Some(s.active_id),
-                                        bin_step: Some(s.bin_step),
-                                    }
-                                });
-                            }
-                            if vaults_changed {
-                                let vault_list: Vec<Pubkey> =
-                                    ctx.tracked_vaults.read().keys().copied().collect();
-                                let _ = ctx.tracked_vaults_tx.send(vault_list);
-                                debug!(
-                                    pool = %account_update.pubkey,
-                                    reserve_x = %s.reserve_x,
-                                    reserve_y = %s.reserve_y,
-                                    "Registered Meteora DLMM vaults for Geyser reserve subscription"
-                                );
-                            }
-                        }
-                    }
-
-                    // FIX-29: One-time Cold Path RPC to fetch Serum/OpenBook accounts for Raydium AMM.
-                    // These are static (never change) — fetch once, cache forever.
-                    if let CachedPoolState::RaydiumAmm(ref s) = cached_state {
-                        if s.serum_bids.is_none() && s.market_id != Pubkey::default() {
-                            let pool_pk = account_update.pubkey;
-                            let already_fetched = ctx.raydium_serum_fetched.read().contains(&pool_pk);
-                            if !already_fetched {
-                                ctx.raydium_serum_fetched.write().insert(pool_pk);
-                                let rpc = Arc::clone(&rpc);
-                                let cache = Arc::clone(&ctx.live_pool_cache);
-                                let market_id = s.market_id;
-                                let run_id_spawn = ctx.run_id.clone();
-                                let nats_spawn = ctx
-                                    .nats
-                                    .as_ref()
-                                    .map(|n| n.clone_for_spawned_publish());
-                                tokio::spawn(async move {
-                                    match rpc.get_account_retry(&market_id).await {
-                                        Ok(account) => {
-                                            if let Some((bids, asks, eq, _bv, _qv)) =
-                                                ironcrab::solana::dex::raydium::Raydium::parse_serum_market_accounts(&account.data)
-                                            {
-                                                if let (Some(b), Some(a), Some(e)) = (bids, asks, eq) {
-                                                    cache.set_raydium_serum_accounts(&pool_pk, b, a, e);
-                                                    let readiness =
-                                                        match cache.get(&pool_pk).as_ref() {
-                                                            Some(CachedPoolState::RaydiumAmm(st)) => {
-                                                                raydium_amm_readiness_for_pool_cache_update(st)
-                                                            }
-                                                            _ => DexPoolReadiness::Observed,
-                                                        };
-                                                    cache.merge_raydium_amm_pool_readiness(pool_pk, readiness);
-                                                    if let Some(ref nats) = nats_spawn {
-                                                        // `geyser_slot` must match the cache entry's last update slot (vault /
-                                                        // pool upserts), not the original discovery event — RPC may finish much
-                                                        // later while reserves already advanced on newer Geyser updates.
-                                                        if let Some((
-                                                            CachedPoolState::RaydiumAmm(st),
-                                                            pool_slot,
-                                                            _age_ms,
-                                                        )) = cache.get_with_metadata(&pool_pk)
-                                                        {
-                                                            let mut pool_update =
-                                                                PoolCacheUpdate::new_balance_updated(
-                                                                    "market-data",
-                                                                    BUILD_VERSION,
-                                                                    &run_id_spawn,
-                                                                    pool_pk.to_string(),
-                                                                    "raydium".to_string(),
-                                                                    st.base_mint.to_string(),
-                                                                    st.quote_mint.to_string(),
-                                                                    st.coin_reserve.unwrap_or(0),
-                                                                    st.pc_reserve.unwrap_or(0),
-                                                                    pool_slot,
-                                                                );
-                                                            let mut meta = std::collections::HashMap::new();
-                                                            if st.market_id != Pubkey::default() {
-                                                                meta.insert(
-                                                                    "market_id".to_string(),
-                                                                    st.market_id.to_string(),
-                                                                );
-                                                            }
-                                                            if let (Some(bids), Some(asks), Some(eq)) = (
-                                                                st.serum_bids,
-                                                                st.serum_asks,
-                                                                st.serum_event_queue,
-                                                            ) {
-                                                                meta.insert(
-                                                                    "serum_bids".to_string(),
-                                                                    bids.to_string(),
-                                                                );
-                                                                meta.insert(
-                                                                    "serum_asks".to_string(),
-                                                                    asks.to_string(),
-                                                                );
-                                                                meta.insert(
-                                                                    "serum_event_queue".to_string(),
-                                                                    eq.to_string(),
-                                                                );
-                                                            }
-                                                            if !meta.is_empty() {
-                                                                pool_update.metadata = Some(meta);
-                                                            }
-                                                            pool_update.set_dex_readiness_in_metadata(readiness);
-                                                            let subject =
-                                                                pool_subject(&pool_pk.to_string());
-                                                            if let Err(e) = nats
-                                                                .jetstream_publish(&subject, &pool_update)
-                                                                .await
-                                                            {
-                                                                warn!(
-                                                                    error = %e,
-                                                                    "Failed to publish Raydium AMM PoolCacheUpdate after serum fetch"
-                                                                );
-                                                                NATS_ERRORS_TOTAL
-                                                                    .fetch_add(1, Ordering::Relaxed);
-                                                            } else {
-                                                                NATS_MESSAGES_PUBLISHED_TOTAL
-                                                                    .fetch_add(1, Ordering::Relaxed);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::debug!(
-                                                pool = %pool_pk,
-                                                market_id = %market_id,
-                                                error = %e,
-                                                "FIX-29: Failed to fetch serum market account (will retry on next trade)"
-                                            );
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                    }
-
-                    // Extract mint and reserve info from cached_state for PoolCacheUpdate
-                    let (base_mint, quote_mint, base_reserve, quote_reserve) = match &cached_state {
-                        CachedPoolState::Orca(s) => {
-                            (s.token_mint_a, s.token_mint_b, s.vault_a_balance.unwrap_or(0), s.vault_b_balance.unwrap_or(0))
-                        }
-                        CachedPoolState::RaydiumAmm(s) => {
-                            (s.base_mint, s.quote_mint, s.coin_reserve.unwrap_or(0), s.pc_reserve.unwrap_or(0))
-                        }
-                        CachedPoolState::RaydiumCpmm(s) => {
-                            let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
-                            if s.token_1_mint == sol {
-                                (
-                                    s.token_0_mint,
-                                    s.token_1_mint,
-                                    s.reserve_0.unwrap_or(0),
-                                    s.reserve_1.unwrap_or(0),
-                                )
-                            } else if s.token_0_mint == sol {
-                                (
-                                    s.token_1_mint,
-                                    s.token_0_mint,
-                                    s.reserve_1.unwrap_or(0),
-                                    s.reserve_0.unwrap_or(0),
-                                )
-                            } else {
-                                (
-                                    s.token_0_mint,
-                                    s.token_1_mint,
-                                    s.reserve_0.unwrap_or(0),
-                                    s.reserve_1.unwrap_or(0),
-                                )
-                            }
-                        }
-                        CachedPoolState::Meteora(s) => {
-                            (s.token_x_mint, s.token_y_mint, s.reserve_x_balance.unwrap_or(0), s.reserve_y_balance.unwrap_or(0))
-                        }
-                        CachedPoolState::PumpAmm(s) => {
-                            // Cache creator for migrated PumpFun tokens (from AMM pool account)
-                            if let Some(creator) = s.creator {
-                                let mint_str = s.base_mint.to_string();
-                                let pool_str = account_update.pubkey.to_string();
-                                let creator_str = creator.to_string();
-
-                                // Cache in pool_creator_cache (pool -> creator)
-                                {
-                                    let mut pool_creator = ctx.pool_creator_cache.write();
-                                    if !pool_creator.contains_key(&pool_str) {
-                                        pool_creator.insert(pool_str.clone(), creator_str.clone());
-                                        debug!(
-                                            pool = %pool_str,
-                                            creator = %creator_str,
-                                            "Cached creator from PumpAmm pool account (pool_creator_cache)"
-                                        );
-                                    }
-                                }
-
-                                // Also cache in creator_cache (mint -> creator)
-                                {
-                                    let mut creator_cache = ctx.creator_cache.write();
-                                    if !creator_cache.contains_key(&mint_str) {
-                                        creator_cache.insert(mint_str.clone(), creator_str.clone());
-                                        info!(
-                                            mint = %mint_str,
-                                            pool = %pool_str,
-                                            creator = %creator_str,
-                                            "Cached creator from PumpAmm pool account (migrated token)"
-                                        );
-                                    }
-                                }
-                            }
-                            // A.1 Phase 2.1: Register PumpAmm vaults for Geyser subscription (base/quote reserve updates)
-                            {
-                                let dex_str = "pump_amm".to_string();
-                                let mut vaults_changed = false;
-                                {
-                                    let mut vaults = ctx.tracked_vaults.write();
-                                    vaults
-                                        .entry(s.pool_base_token_account)
-                                        .or_insert_with(|| {
-                                            vaults_changed = true;
-                                            VaultInfo {
-                                                pool_address: account_update.pubkey,
-                                                dex: dex_str.clone(),
-                                                base_mint: s.base_mint,
-                                                quote_mint: s.quote_mint,
-                                                is_base_vault: true,
-                                                last_balance: std::sync::atomic::AtomicU64::new(0),
-                                                active_id: None,
-                                                bin_step: None,
-                                            }
-                                        });
-                                    vaults
-                                        .entry(s.pool_quote_token_account)
-                                        .or_insert_with(|| {
-                                            vaults_changed = true;
-                                            VaultInfo {
-                                                pool_address: account_update.pubkey,
-                                                dex: dex_str,
-                                                base_mint: s.base_mint,
-                                                quote_mint: s.quote_mint,
-                                                is_base_vault: false,
-                                                last_balance: std::sync::atomic::AtomicU64::new(0),
-                                                active_id: None,
-                                                bin_step: None,
-                                            }
-                                        });
-                                }
-                                if vaults_changed {
-                                    let vault_list: Vec<Pubkey> = ctx.tracked_vaults.read().keys().copied().collect();
-                                    let _ = ctx.tracked_vaults_tx.send(vault_list);
-                                    debug!(
-                                        pool = %account_update.pubkey,
-                                        base_vault = %s.pool_base_token_account,
-                                        quote_vault = %s.pool_quote_token_account,
-                                        "A.1: Registered PumpAmm vaults for Geyser reserve subscription"
-                                    );
-                                }
-                            }
-                            {
-                                let (base_r, quote_r) = if s.base_reserve.is_none() || s.quote_reserve.is_none() {
-                                    let base_vault = s.pool_base_token_account;
-                                    let quote_vault = s.pool_quote_token_account;
-                                    let base_bal = match rpc.get_account_opt_retry(&base_vault).await {
-                                        Ok(Some(acc)) => try_parse_token_account_balance(&acc.data).unwrap_or(0),
-                                        _ => 0,
-                                    };
-                                    let quote_bal = match rpc.get_account_opt_retry(&quote_vault).await {
-                                        Ok(Some(acc)) => try_parse_token_account_balance(&acc.data).unwrap_or(0),
-                                        _ => 0,
-                                    };
-                                    if base_bal > 0 || quote_bal > 0 {
-                                        info!(
-                                            pool = %account_update.pubkey,
-                                            base_vault = %base_vault,
-                                            quote_vault = %quote_vault,
-                                            base_bal,
-                                            quote_bal,
-                                            "pump_amm: pre-loaded vault balances via RPC (Cold Start Bootstrap)"
-                                        );
-                                    }
-                                    (base_bal, quote_bal)
-                                } else {
-                                    (s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0))
-                                };
-                                (s.base_mint, s.quote_mint, base_r, quote_r)
-                            }
-                        }
-                        CachedPoolState::PumpFun(s) => {
-                            (s.token_mint, Pubkey::default(), s.virtual_token_reserves, s.virtual_sol_reserves)
-                        }
-                        CachedPoolState::MeteoraCpmm(s) => {
-                            let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
-                            if s.token_1_mint == sol {
-                                (
-                                    s.token_0_mint,
-                                    s.token_1_mint,
-                                    s.reserve_0,
-                                    s.reserve_1,
-                                )
-                            } else if s.token_0_mint == sol {
-                                (
-                                    s.token_1_mint,
-                                    s.token_0_mint,
-                                    s.reserve_1,
-                                    s.reserve_0,
-                                )
-                            } else {
-                                (
-                                    s.token_0_mint,
-                                    s.token_1_mint,
-                                    s.reserve_0,
-                                    s.reserve_1,
-                                )
-                            }
-                        }
-                    };
-
-                    // Publish PoolCacheUpdate to JetStream (Single Source of Truth for pool state)
-                    if let Some(ref nats) = ctx.nats {
-                        let mut pool_update = PoolCacheUpdate::new_pool_discovered(
-                            "market-data",
-                            BUILD_VERSION,
-                            run_id,
-                            account_update.pubkey.to_string(),
-                            cached_state.dex_name().to_string(),
-                            base_mint.to_string(),
-                            quote_mint.to_string(),
-                            base_reserve,
-                            quote_reserve,
-                            Some(0), // liquidity_lamports not available from account data
-                            account_update.slot,
-                        );
-
-                        // Propagate DEX-specific metadata to SLAVE caches via PoolCacheUpdate.metadata.
-                        // This ensures execution-engine receives creator, pool accounts, etc. from Geyser
-                        // without needing RPC fallbacks.
-                        match &cached_state {
-                            CachedPoolState::PumpFun(s) => {
-                                // SLAVE minimal state uses quote_mint for SOL side; must not be default.
-                                pool_update.quote_mint = NATIVE_SOL_MINT.to_string();
-                                // Always propagate real_reserves + complete for SELL validation
-                                // in execution-engine's SLAVE cache.
-                                let mut meta = std::collections::HashMap::new();
-                                if s.creator != Pubkey::default() {
-                                    meta.insert("creator".to_string(), s.creator.to_string());
-                                }
-                                meta.insert("associated_bonding_curve".to_string(), s.associated_bonding_curve.to_string());
-                                meta.insert("complete".to_string(), s.complete.to_string());
-                                meta.insert("real_token_reserves".to_string(), s.real_token_reserves.to_string());
-                                meta.insert("real_sol_reserves".to_string(), s.real_sol_reserves.to_string());
-                                meta.insert("cashback_enabled".to_string(), s.cashback_enabled.to_string());
-                                pool_update.metadata = Some(meta);
-                                // Geyser-fed bonding curve: observation / partial only — not cold-path verified Ready.
-                                pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Partial);
-                                ctx.live_pool_cache.merge_pumpfun_bonding_readiness(
-                                    account_update.pubkey,
-                                    DexPoolReadiness::Partial,
-                                );
-
-                                // === BondingCurveProgress event for momentum-bot exit signal ===
-                                // PumpFun initial real_token_reserves = 793_100_000_000_000
-                                const INITIAL_REAL_TOKEN_RESERVES: u64 = 793_100_000_000_000;
-                                let tokens_sold = INITIAL_REAL_TOKEN_RESERVES.saturating_sub(s.real_token_reserves);
-                                let progress_bps = ((tokens_sold as u128 * 10_000) / INITIAL_REAL_TOKEN_RESERVES as u128) as u32;
-                                let progress_bps = progress_bps.min(10_000);
-
-                                // Throttle: only emit when progress changes by >= 50 bps or complete changes
-                                let should_emit = {
-                                    let cache = ctx.last_emitted_curve_progress.read();
-                                    match cache.get(&account_update.pubkey) {
-                                        Some(&(last_bps, last_complete)) => {
-                                            progress_bps.abs_diff(last_bps) >= 50 || s.complete != last_complete
-                                        }
-                                        None => true,
-                                    }
-                                };
-
-                                if should_emit {
-                                    ctx.last_emitted_curve_progress.write()
-                                        .insert(account_update.pubkey, (progress_bps, s.complete));
-
-                                    let curve_event = MarketEvent::new(
-                                        "market-data",
-                                        BUILD_VERSION,
-                                        run_id,
-                                        ctx.next_event_id(),
-                                        "geyser_bonding_curve",
-                                        Some(account_update.slot),
-                                        MarketEventKind::BondingCurveProgress {
-                                            mint: s.token_mint.to_string(),
-                                            bonding_curve: account_update.pubkey.to_string(),
-                                            progress_bps,
-                                            complete: s.complete,
-                                        },
-                                    );
-
-                                    if let Err(e) = ctx.jsonl_writer.write(&curve_event) {
-                                        error!(error = %e, "Failed to write BondingCurveProgress event to JSONL");
-                                    }
-
-                                    let _ = publish_market_event_core_and_momentum_ex(
-                                        nats,
-                                        &curve_event,
-                                        Some(MarketEventCorePublishTrace {
-                                            recv_at: account_geyser_recv_at,
-                                            cold_path: false,
-                                            segment: MarketDataLatencySegment::BondingCurve,
-                                        }),
-                                        Some(ctx.as_ref()),
-                                    )
-                                    .await;
-                                }
-                            }
-                            CachedPoolState::PumpAmm(s) => {
-                                let mut meta = std::collections::HashMap::new();
-                                if let Some(creator) = s.creator {
-                                    meta.insert("creator".to_string(), creator.to_string());
-                                }
-                                // FIX-26: pool_accounts from Geyser parse, or fallback to MASTER cache
-                                let effective_pool_accounts = if !s.pool_accounts.is_empty() {
-                                    s.pool_accounts.clone()
-                                } else {
-                                    ctx.live_pool_cache
-                                        .get_pump_amm_pool_accounts(&account_update.pubkey)
-                                        .unwrap_or_default()
-                                };
-                                if !effective_pool_accounts.is_empty() {
-                                    let accounts_str: Vec<String> = effective_pool_accounts.iter().map(|p| p.to_string()).collect();
-                                    meta.insert("pool_accounts".to_string(), accounts_str.join(","));
-                                }
-                                let (ext_flag, ext_third, ext_t0, ext_t1) = ctx
-                                    .live_pool_cache
-                                    .pump_amm_sell_extended_layout(&account_update.pubkey);
-                                if ext_flag {
-                                    meta.insert(
-                                        "pump_amm_sell_cashback_remaining".to_string(),
-                                        "true".to_string(),
-                                    );
-                                }
-                                if let Some(pk) =
-                                    ext_third.filter(|p| *p != Pubkey::default())
-                                {
-                                    meta.insert(
-                                        "pump_amm_sell_cashback_third_meta".to_string(),
-                                        pk.to_string(),
-                                    );
-                                }
-                                if let Some(pk) = ext_t0.filter(|p| *p != Pubkey::default()) {
-                                    meta.insert(
-                                        "pump_amm_sell_extended_tail_0".to_string(),
-                                        pk.to_string(),
-                                    );
-                                }
-                                if let Some(pk) = ext_t1.filter(|p| *p != Pubkey::default()) {
-                                    meta.insert(
-                                        "pump_amm_sell_extended_tail_1".to_string(),
-                                        pk.to_string(),
-                                    );
-                                }
-                                if !meta.is_empty() {
-                                    pool_update.metadata = Some(meta);
-                                }
-                                // Geyser-fed accounts + reserves: stronger than observation-only, not Ready until verified trade/discovery.
-                                pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Partial);
-                                ctx.live_pool_cache.merge_pump_amm_pool_accounts_readiness(
-                                    account_update.pubkey,
-                                    DexPoolReadiness::Partial,
-                                );
-                            }
-                            CachedPoolState::RaydiumAmm(s) => {
-                                // FIX-29: Always propagate market_id (from Geyser parse),
-                                // plus serum accounts when available (from async RPC fetch)
-                                let mut meta = std::collections::HashMap::new();
-                                if s.market_id != Pubkey::default() {
-                                    meta.insert("market_id".to_string(), s.market_id.to_string());
-                                }
-                                if let (Some(bids), Some(asks), Some(eq)) =
-                                    (s.serum_bids, s.serum_asks, s.serum_event_queue)
-                                {
-                                    meta.insert("serum_bids".to_string(), bids.to_string());
-                                    meta.insert("serum_asks".to_string(), asks.to_string());
-                                    meta.insert("serum_event_queue".to_string(), eq.to_string());
-                                }
-                                if !meta.is_empty() {
-                                    pool_update.metadata = Some(meta);
-                                }
-                                let readiness = raydium_amm_readiness_for_pool_cache_update(s);
-                                pool_update.set_dex_readiness_in_metadata(readiness);
-                                ctx.live_pool_cache.merge_raydium_amm_pool_readiness(
-                                    account_update.pubkey,
-                                    readiness,
-                                );
-                            }
-                            CachedPoolState::RaydiumCpmm(s) => {
-                                let mut meta = std::collections::HashMap::new();
-                                meta.insert(
-                                    POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY.to_string(),
-                                    raydium_cpmm_vaults_for_pool_cache_update(s),
-                                );
-                                pool_update.metadata = Some(meta);
-                                let readiness = raydium_cpmm_readiness_for_pool_cache_update(s);
-                                pool_update.set_dex_readiness_in_metadata(readiness);
-                                ctx.live_pool_cache.merge_raydium_cpmm_pool_readiness(
-                                    account_update.pubkey,
-                                    readiness,
-                                );
-                            }
-                            CachedPoolState::MeteoraCpmm(s) => {
-                                let mut meta = std::collections::HashMap::new();
-                                meta.insert(
-                                    POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY.to_string(),
-                                    meteora_cpmm_vaults_for_pool_cache_update(s),
-                                );
-                                meta.insert(
-                                    POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY.to_string(),
-                                    meteora_cpmm_onchain_mints_for_pool_cache_update(s),
-                                );
-                                pool_update.metadata = Some(meta);
-                                let readiness = meteora_cpmm_readiness_for_pool_cache_update(s);
-                                pool_update.set_dex_readiness_in_metadata(readiness);
-                                ctx.live_pool_cache.merge_meteora_cpmm_pool_readiness(
-                                    account_update.pubkey,
-                                    readiness,
-                                );
-                            }
-                            CachedPoolState::Orca(s) => {
-                                pool_update.metadata =
-                                    Some(orca_metadata_for_pool_cache_update(s));
-                                let readiness = orca_readiness_for_pool_cache_update(s);
-                                pool_update.set_dex_readiness_in_metadata(readiness);
-                                ctx.live_pool_cache.merge_orca_pool_readiness(
-                                    account_update.pubkey,
-                                    readiness,
-                                );
-                            }
-                            CachedPoolState::Meteora(s) => {
-                                pool_update.metadata =
-                                    Some(meteora_dlmm_metadata_for_pool_cache_update(s));
-                                let readiness = meteora_dlmm_readiness_for_pool_cache_update(s);
-                                pool_update.set_dex_readiness_in_metadata(readiness);
-                                ctx.live_pool_cache.merge_meteora_dlmm_pool_readiness(
-                                    account_update.pubkey,
-                                    readiness,
-                                );
-                            }
-                        }
-                        // P3 #13: Propagate base_decimals and quote_decimals to SLAVE caches (all DEX types)
-                        {
-                            let mut meta = pool_update.metadata.as_ref().cloned().unwrap_or_default();
-                            if let Some(d) = ctx.live_pool_cache.get_mint_decimals(&base_mint) {
-                                meta.insert("base_decimals".to_string(), d.to_string());
-                            }
-                            // For quote: use quote_mint, or when default (PumpFun) use SOL
-                            let quote_for_decimals = if quote_mint == Pubkey::default() {
-                                Pubkey::from_str(NATIVE_SOL_MINT).ok()
-                            } else {
-                                Some(quote_mint)
-                            };
-                            if let Some(q) = quote_for_decimals {
-                                if let Some(d) = ctx.live_pool_cache.get_mint_decimals(&q) {
-                                    meta.insert("quote_decimals".to_string(), d.to_string());
-                                } else if q == Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default() {
-                                    meta.insert("quote_decimals".to_string(), "9".to_string());
-                                }
-                            }
-                            if !meta.is_empty() {
-                                pool_update.metadata = Some(meta);
-                            }
-                        }
-                        let subject = pool_subject(&account_update.pubkey.to_string());
-                        if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
-                            warn!(error = %e, "Failed to publish PoolCacheUpdate to JetStream");
-                            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-
-                // Try to parse as DEX pool event (for MarketEvents - existing logic)
-                let parsed = parse_account_update(&account_update);
-
-                // Special handling for PumpFun BondingCurveUpdate: cache creator
-                if let Some(ParsedDexEvent::BondingCurveUpdate {
-                    pool_address,
-                    creator,
-                    virtual_token_reserves,
-                    virtual_sol_reserves,
-                    real_token_reserves,
-                    real_sol_reserves,
-                    complete,
-                    cashback_enabled,
-                    slot,
-                }) = &parsed {
-                    let pool_str = pool_address.to_string();
-                    let creator_str = creator.to_string();
-
-                    // Cache pool -> creator mapping (AUTHORITATIVE: bonding curve account data)
-                    // FIX-22: Always overwrite — on-chain account data is the source of truth.
-                    {
-                        let mut pool_creator = ctx.pool_creator_cache.write();
-                        pool_creator.insert(pool_str.clone(), creator_str.clone());
-                    }
-
-                    // If we know the mint for this pool, also update creator_cache (mint -> creator)
-                    // and emit DevWalletIdentified event.
-                    // FIX-22: Always overwrite cache with authoritative bonding curve data.
-                    // PoolCreated events may set a wrong creator (instruction_accounts[7] can differ
-                    // from on-chain creator for CPI/bundler creates). BondingCurveUpdate is authoritative.
-                    if let Some(mint) = ctx.pool_mint_map.read().get(&pool_str).cloned() {
-                        let mut creator_cache = ctx.creator_cache.write();
-                        let existing = creator_cache.get(&mint).cloned();
-                        creator_cache.insert(mint.clone(), creator_str.clone());
-                        drop(creator_cache); // Release lock before async operations
-
-                        // Emit DevWalletIdentified if creator is new or CHANGED (correction)
-                        let should_emit = match &existing {
-                            None => true,
-                            Some(old) if old != &creator_str => {
-                                warn!(
-                                    mint = %mint,
-                                    pool = %pool_str,
-                                    old_creator = %old,
-                                    new_creator = %creator_str,
-                                    "FIX-22: Creator mismatch detected — BondingCurve account data overwrites stale cache value"
-                                );
-                                true
-                            }
-                            _ => false,
-                        };
-
-                        if should_emit {
-                            info!(
-                                mint = %mint,
-                                pool = %pool_str,
-                                creator = %creator_str,
-                                corrected = existing.is_some(),
-                                "Creator cached from BondingCurve account update (authoritative)"
-                            );
-
-                            // Emit DevWalletIdentified event
-                            let dev_event = MarketEvent::new(
-                                "market-data",
-                                BUILD_VERSION,
-                                run_id,
-                                ctx.next_event_id(),
-                                "geyser",
-                                Some(*slot),
-                                MarketEventKind::DevWalletIdentified {
-                                    mint: mint.clone(),
-                                    dev_wallet: creator_str.clone(),
-                                    supply_percentage: 0.0, // Not computed from account data
-                                },
-                            );
-
-                            if let Err(e) = ctx.jsonl_writer.write(&dev_event) {
-                                error!(error = %e, "Failed to write DevWalletIdentified to JSONL");
-                            }
-
-                            if let Some(ref nats) = ctx.nats {
-                                let _ = publish_market_event_core_and_momentum_ex(
-                                    nats,
-                                    &dev_event,
-                                    Some(MarketEventCorePublishTrace {
-                                        recv_at: account_geyser_recv_at,
-                                        cold_path: false,
-                                        segment: MarketDataLatencySegment::Other,
-                                    }),
-                                    Some(ctx.as_ref()),
-                                )
-                                .await;
-                            }
-                        }
-                    }
-
-                    // P2#7: BondingCurveUpdate fallback when parse_pool_account failed.
-                    // Ensure LivePoolCache/SLAVE receives creator so Liquidation/PumpFunDex skip RPC.
-                    let needs_fallback = ctx
-                        .live_pool_cache
-                        .get(pool_address)
-                        .is_none_or(|s| !matches!(s, CachedPoolState::PumpFun(_)));
-                    if needs_fallback {
-                        let base_mint_pk = ctx
-                            .pool_mint_map
-                            .read()
-                            .get(&pool_str)
-                            .and_then(|m| Pubkey::from_str(m).ok())
-                            .unwrap_or_default();
-                        let base_mint = base_mint_pk.to_string();
-                        let minimal_state = CachedPoolState::PumpFun(PumpFunState {
-                            token_mint: base_mint_pk,
-                            bonding_curve: *pool_address,
-                            associated_bonding_curve: Pubkey::default(),
-                            virtual_token_reserves: *virtual_token_reserves,
-                            virtual_sol_reserves: *virtual_sol_reserves,
-                            real_token_reserves: *real_token_reserves,
-                            real_sol_reserves: *real_sol_reserves,
-                            complete: *complete,
-                            creator: *creator,
-                            cashback_enabled: *cashback_enabled,
-                        });
-                        ctx.live_pool_cache
-                            .upsert(*pool_address, minimal_state, *slot);
-
-                        let mut pool_update = PoolCacheUpdate::new_pool_discovered(
-                            "market-data",
-                            BUILD_VERSION,
-                            run_id,
-                            pool_str.clone(),
-                            "pumpfun".to_string(),
-                            base_mint.clone(),
-                            NATIVE_SOL_MINT.to_string(),
-                            *virtual_token_reserves,
-                            *virtual_sol_reserves,
-                            Some(0),
-                            *slot,
-                        );
-                        let mut meta = std::collections::HashMap::new();
-                        meta.insert("creator".to_string(), creator_str.clone());
-                        meta.insert("complete".to_string(), complete.to_string());
-                        meta.insert("real_token_reserves".to_string(), real_token_reserves.to_string());
-                        meta.insert("real_sol_reserves".to_string(), real_sol_reserves.to_string());
-                        meta.insert("cashback_enabled".to_string(), cashback_enabled.to_string());
-                        // P3 #13: base_decimals and quote_decimals (PumpFun quote = SOL)
-                        if let Some(d) = ctx.live_pool_cache.get_mint_decimals(&base_mint_pk) {
-                            meta.insert("base_decimals".to_string(), d.to_string());
-                        }
-                        if let Ok(sol_pk) = Pubkey::from_str(NATIVE_SOL_MINT) {
-                            if let Some(d) = ctx.live_pool_cache.get_mint_decimals(&sol_pk) {
-                                meta.insert("quote_decimals".to_string(), d.to_string());
-                            } else {
-                                meta.insert("quote_decimals".to_string(), "9".to_string());
-                            }
-                        }
-                        pool_update.metadata = Some(meta);
-                        // Fallback path: weaker than full Geyser parse — observed only.
-                        pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Observed);
-                        ctx.live_pool_cache.merge_pumpfun_bonding_readiness(
-                            *pool_address,
-                            DexPoolReadiness::Observed,
-                        );
-
-                        if let Some(ref nats) = ctx.nats {
-                            let subject = pool_subject(&pool_str);
-                            if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
-                                warn!(error = %e, pool = %pool_str, "P2#7: Failed to publish BondingCurveUpdate fallback PoolCacheUpdate");
-                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                debug!(
-                                    pool = %pool_str,
-                                    creator = %creator_str,
-                                    "P2#7: Published BondingCurveUpdate fallback PoolCacheUpdate"
-                                );
-                            }
-                        }
-                    }
-
-                    // Don't emit the BondingCurveUpdate as a MarketEvent - it's internal
-                    continue;
-                }
-
-                let event_kind = if let Some(parsed) = parsed {
-                    debug!(
-                        slot = account_update.slot,
-                        "Parsed DEX account update"
-                    );
-                    parsed.to_market_event_kind()
-                } else {
-                    // Fallback to raw event for unknown accounts
-                    MarketEventKind::AccountUpdate {
-                        pubkey: account_update.pubkey.to_string(),
-                        owner: account_update.owner.to_string(),
-                        data_len: account_update.data.len(),
-                    }
-                };
-
-                let event = MarketEvent::new(
-                    "market-data",
-                    BUILD_VERSION,
-                    run_id,
-                    ctx.next_event_id(),
-                    "geyser",
-                    Some(account_update.slot),
-                    event_kind,
-                );
-
-                // Write to JSONL
-                if let Err(e) = ctx.jsonl_writer.write(&event) {
-                    error!(error = %e, "Failed to write account event to JSONL");
-                }
-
-                // Publish to NATS
-                if let Some(ref nats) = ctx.nats {
-                    let seg = market_data_publish_segment(&event.kind);
-                    let _ = publish_market_event_core_and_momentum_ex(
-                        nats,
-                        &event,
-                        Some(MarketEventCorePublishTrace {
-                            recv_at: account_geyser_recv_at,
-                            cold_path: false,
-                            segment: seg,
-                        }),
-                        Some(ctx.as_ref()),
-                    )
-                    .await;
-                }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        record_market_data_account_broadcast_lagged(n);
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        warn!("Geyser account broadcast channel closed");
-                        break;
-                    }
-                }
-            }
 
             // Blockhash updates from Geyser blocks_meta
             Ok(bh_update) = blockhash_rx.recv() => {
@@ -9557,14 +9660,15 @@ async fn run_geyser_loop(
                     ironcrab::metrics::record_activity();
                     let (records, bytes) = ctx.jsonl_writer.stats();
                     let tx_n = tx_count.load(Ordering::Relaxed);
-                    let total_events = account_count + tx_n;
+                    let acc_n = account_count.load(Ordering::Relaxed);
+                    let total_events = acc_n + tx_n;
 
                     // Update Prometheus metrics
                     MARKET_EVENTS_RECEIVED_TOTAL.store(total_events, Ordering::Relaxed);
-                    POOLS_TRACKED_GAUGE.store(account_count, Ordering::Relaxed);
+                    POOLS_TRACKED_GAUGE.store(acc_n, Ordering::Relaxed);
 
                     info!(
-                        accounts = account_count,
+                        accounts = acc_n,
                         transactions = tx_n,
                         records_written = records,
                         bytes_written = bytes,
