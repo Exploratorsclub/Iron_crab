@@ -45,14 +45,18 @@ use ironcrab::ipc::{
     POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use ironcrab::metrics::{
-    market_data_bump_geyser_head_slot, record_market_data_geyser_to_publish_on_success,
-    record_market_data_trade_after_bonding_publish_ms, serve_metrics,
-    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
-    update_readiness_market_data_current, wall_clock_unix_ms_now, MarketDataLatencySegment,
-    MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
-    MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL,
-    MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
-    NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
+    market_data_bump_geyser_head_slot, record_market_data_account_broadcast_lagged,
+    record_market_data_account_channel_lag_ms,
+    record_market_data_bonding_to_trade_slot_delta_slots,
+    record_market_data_geyser_to_publish_on_success,
+    record_market_data_trade_after_bonding_publish_ms, record_market_data_tx_broadcast_lagged,
+    record_market_data_tx_channel_lag_ms, serve_metrics, set_readiness_control_sub_active,
+    set_readiness_mode, set_readiness_nats_connected, update_readiness_market_data_current,
+    wall_clock_unix_ms_now, MarketDataLatencySegment, MetricsComponent,
+    MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS,
+    MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
+    MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
+    POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -208,16 +212,20 @@ pub(crate) async fn publish_market_event_core_and_momentum_ex(
                     } if dex == "pumpfun" => {
                         MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS.store(now_ms, Ordering::Relaxed);
                         if let Ok(pk) = Pubkey::from_str(pool_address) {
-                            if let Some(last) = ctx
-                                .bonding_curve_publish_times
-                                .lock()
-                                .last_bonding_wall_ms(&pk)
-                            {
+                            let bonding_times = ctx.bonding_curve_publish_times.lock();
+                            if let Some(last) = bonding_times.last_bonding_wall_ms(&pk) {
                                 if now_ms >= last {
                                     record_market_data_trade_after_bonding_publish_ms(
                                         now_ms.saturating_sub(last),
                                     );
                                 }
+                            }
+                            if let (Some(bond_slot), Some(trade_slot)) = (
+                                bonding_times.last_bonding_slot(&pk),
+                                event.slot.filter(|&s| s > 0),
+                            ) {
+                                let delta = trade_slot.saturating_sub(bond_slot);
+                                record_market_data_bonding_to_trade_slot_delta_slots(delta);
                             }
                         }
                     }
@@ -227,7 +235,7 @@ pub(crate) async fn publish_market_event_core_and_momentum_ex(
                         if let Ok(pk) = Pubkey::from_str(bonding_curve) {
                             ctx.bonding_curve_publish_times
                                 .lock()
-                                .record_bonding_publish(pk, now_ms);
+                                .record_bonding_publish(pk, now_ms, event.slot);
                         }
                     }
                     _ => {}
@@ -608,6 +616,8 @@ const BONDING_CURVE_PUBLISH_MAP_CAP: usize = 10_000;
 struct BondingCurvePublishTimes {
     insert_order: VecDeque<Pubkey>,
     last_wall_ms: HashMap<Pubkey, u64>,
+    /// Geyser slot from the last successfully published `BondingCurveProgress` for this curve (I-16).
+    last_bonding_slot: HashMap<Pubkey, u64>,
 }
 
 impl BondingCurvePublishTimes {
@@ -615,14 +625,18 @@ impl BondingCurvePublishTimes {
         Self {
             insert_order: VecDeque::new(),
             last_wall_ms: HashMap::new(),
+            last_bonding_slot: HashMap::new(),
         }
     }
 
-    fn record_bonding_publish(&mut self, curve: Pubkey, wall_ms: u64) {
+    fn record_bonding_publish(&mut self, curve: Pubkey, wall_ms: u64, bonding_slot: Option<u64>) {
         use std::collections::hash_map::Entry;
         match self.last_wall_ms.entry(curve) {
             Entry::Occupied(mut e) => {
                 e.insert(wall_ms);
+                if let Some(s) = bonding_slot.filter(|&s| s > 0) {
+                    self.last_bonding_slot.insert(curve, s);
+                }
                 // Refresh eviction order: otherwise a still-active curve stays at an old deque
                 // position and can be popped while newer keys retain slots.
                 self.insert_order.retain(|k| *k != curve);
@@ -632,16 +646,24 @@ impl BondingCurvePublishTimes {
                 while self.insert_order.len() >= BONDING_CURVE_PUBLISH_MAP_CAP {
                     if let Some(evicted) = self.insert_order.pop_front() {
                         self.last_wall_ms.remove(&evicted);
+                        self.last_bonding_slot.remove(&evicted);
                     }
                 }
                 self.insert_order.push_back(curve);
                 self.last_wall_ms.insert(curve, wall_ms);
+                if let Some(s) = bonding_slot.filter(|&s| s > 0) {
+                    self.last_bonding_slot.insert(curve, s);
+                }
             }
         }
     }
 
     fn last_bonding_wall_ms(&self, curve: &Pubkey) -> Option<u64> {
         self.last_wall_ms.get(curve).copied()
+    }
+
+    fn last_bonding_slot(&self, curve: &Pubkey) -> Option<u64> {
+        self.last_bonding_slot.get(curve).copied()
     }
 }
 
@@ -6933,8 +6955,15 @@ async fn run_geyser_loop(
             } => {}
 
             // Account updates (pool state changes)
-            Ok(account_update) = account_rx.recv() => {
-                let account_geyser_recv_at = Instant::now();
+            account_rx_res = account_rx.recv() => {
+                match account_rx_res {
+                    Ok(account_update) => {
+                let recv_at = Instant::now();
+                record_market_data_account_channel_lag_ms(
+                    account_update.grpc_recv_at,
+                    recv_at,
+                );
+                let account_geyser_recv_at = recv_at;
                 market_data_bump_geyser_head_slot(account_update.slot);
                 account_count += 1;
                 ironcrab::metrics::record_activity();
@@ -8431,6 +8460,15 @@ async fn run_geyser_loop(
                     )
                     .await;
                 }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        record_market_data_account_broadcast_lagged(n);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        warn!("Geyser account broadcast channel closed");
+                        break;
+                    }
+                }
             }
 
             // Blockhash updates from Geyser blocks_meta
@@ -8457,8 +8495,12 @@ async fn run_geyser_loop(
             }
 
             // Transaction updates (pool creations, swaps)
-            Ok(tx_update) = transaction_rx.recv() => {
-                let tx_geyser_recv_at = Instant::now();
+            transaction_rx_res = transaction_rx.recv() => {
+                match transaction_rx_res {
+                    Ok(tx_update) => {
+                let recv_at = Instant::now();
+                record_market_data_tx_channel_lag_ms(tx_update.grpc_recv_at, recv_at);
+                let tx_geyser_recv_at = recv_at;
                 market_data_bump_geyser_head_slot(tx_update.slot);
                 tx_count += 1;
                 ironcrab::metrics::record_activity();
@@ -9097,6 +9139,15 @@ async fn run_geyser_loop(
                         Some(ctx.as_ref()),
                     )
                     .await;
+                }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        record_market_data_tx_broadcast_lagged(n);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        warn!("Geyser transaction broadcast channel closed");
+                        break;
+                    }
                 }
             }
 

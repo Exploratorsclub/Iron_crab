@@ -151,6 +151,21 @@ journalctl -u execution-engine -n 100 --no-pager
 Segmentierte End-to-End-Latenzen über die drei Prozesse **market-data → momentum-bot → execution-engine**.
 Alle Werte nutzen konsistent `RecordHeader.ts_unix_ms` bzw. Geyser-`Instant::now()`-Startpunkte am Publish-Pfad; Details in `docs/BUGS_FIXES.md` (Eintrag **PIPELINE-LATENCY-METRICS**).
 
+**Ingest-Lag (Geyser vs. market-data Broadcast)** — siehe `docs/BUGS_FIXES.md` (**INGEST-LAG-METRICS**):
+
+| Signal | Metrik | Kurzinterpretation |
+|--------|--------|-------------------|
+| Channel-Queue | `market_data_tx_channel_lag_ms`, `market_data_account_channel_lag_ms` | Zeit zwischen Listener-`send` und market-data-`recv` (Broadcast + Tokio-Scheduling), **kein** Netzwerk danach |
+| Drops | `market_data_tx_broadcast_lagged_total`, `market_data_account_broadcast_lagged_total` | Summe der übersprungenen Nachrichten bei `RecvError::Lagged` |
+| Ketten vs. Wall | `market_data_bonding_to_trade_slot_delta_slots` | Slot-Delta letztes `BondingCurveProgress` → nächstes Pump.fun-`Trade` (I-16: Geyser-Slots) |
+
+**Entscheidungsbaum (nach Metrik-Deploy):**
+
+- `market_data_tx_channel_lag_ms` / `market_data_account_channel_lag_ms` **p99 hoch** → Backlog/Fairness eher in market-data (Broadcast/Loop), nicht „langsamer Publish“ allein.
+- Channel-Lag **niedrig**, aber `market_data_trade_after_bonding_publish_ms` (**B★**) weiter hoch → eher Geyser/Subscription/Vor market-data.
+- `market_data_bonding_to_trade_slot_delta_slots` **hoch** → kettenbedingte Lücke zwischen Bonding- und Trade-Sicht.
+- Slot-Delta **klein**, B★ **groß** → Wall-Lag ohne Slot-Erklärung (MATRIX-Muster: Scheduling/Stream).
+
 | Segment | Metrik (Präfix je nach Export) | Kurzinterpretation |
 |--------|--------------------------------|---------------------|
 | A | `market_data_geyser_to_publish_ms_*` (Suffix `_trade`, `_bonding_curve`, …) | Geyser-Eingang bis erfolgreicher Core-NATS-Publish |

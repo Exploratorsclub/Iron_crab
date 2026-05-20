@@ -1766,6 +1766,7 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
 mod tests {
     use super::*;
     use crate::solana::geyser_listener::{GeyserTransactionUpdate, TokenAmount, TokenBalance};
+    use std::time::Instant;
 
     #[test]
     fn test_dex_type_display() {
@@ -1807,6 +1808,7 @@ mod tests {
             post_balances: vec![],
             fee_lamports: 5000,
             compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
         };
 
         let parsed = parse_transaction_update(&update);
@@ -1932,6 +1934,7 @@ mod tests {
             post_balances,
             fee_lamports: 5000,
             compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
         };
 
         let parsed = parse_transaction_update(&update);
@@ -2057,6 +2060,7 @@ mod tests {
             post_balances,
             fee_lamports: 5000,
             compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
         };
 
         let event = parse_transaction_update(&update).expect("extended sell parse");

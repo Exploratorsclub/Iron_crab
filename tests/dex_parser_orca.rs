@@ -4,6 +4,7 @@ use ironcrab::solana::dex_parser::{
 use ironcrab::solana::geyser_listener::{GeyserTransactionUpdate, TokenAmount, TokenBalance};
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
+use std::time::Instant;
 
 const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 const ORCA_SWAP: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
@@ -55,6 +56,7 @@ fn parse_orca_buy_from_sol_uses_pool_mints_and_offsets() {
         post_balances: vec![5_000],
         fee_lamports: 0,
         compute_units_consumed: None,
+        grpc_recv_at: Instant::now(),
     };
 
     let lookup = |pool_key: &Pubkey| {
@@ -119,6 +121,7 @@ fn parse_orca_sell_to_sol_uses_pool_mints_and_offsets() {
         post_balances: vec![12_000],
         fee_lamports: 0,
         compute_units_consumed: None,
+        grpc_recv_at: Instant::now(),
     };
 
     let lookup = |pool_key: &Pubkey| {
