@@ -85,7 +85,10 @@ pub fn migrate_momentum_trade_velocity_keys_in_table(
     let Some(raw) = table.remove("min_trades_per_sec") else {
         return;
     };
-    let legacy = raw.as_float().unwrap_or(0.0);
+    let legacy = raw
+        .as_float()
+        .or_else(|| raw.as_integer().map(|i| i as f64))
+        .unwrap_or(0.0);
     let converted = legacy * 60.0;
     warn!(
         legacy_min_trades_per_sec = legacy,
