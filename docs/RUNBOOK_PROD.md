@@ -283,7 +283,7 @@ tail -n 400 "$f" | grep '"source":"arb-strategy"' | \
 | Validator nicht erreichbar | `curl http://127.0.0.1:8899/health` | Validator prüfen |
 | Geyser Verbindung fehlgeschlagen | market-data Logs prüfen | Geyser Plugin Config |
 | Keypair Permissions | `ls -la ~/.config/solana/id.json` | `chmod 600` |
-| Keine Intents ankommen | momentum-bot Logs | Filter zu strikt? |
+| Keine Intents ankommen | momentum-bot Logs, `filter_passed_total` | Filter zu strikt? Nach Deploy #138 u. a. häufig **`WAIT_BUYER_WINDOW`** (Käuferzahl) **und** Velocity. Velocity ist jetzt **`min_trades_per_min`** (nicht mehr `/s`); Prod-JetStream nicht mit altem `5/s` als `5/min` lesen — Start-Tuning z. B. **45–90/min**, beobachten. Deprecated `min_trades_per_sec` in Updates wird ×60 gewarnt. |
 | Simulation immer failed | execution-engine Logs | RPC/Balance Problem |
 
 ### Service-spezifische Checks

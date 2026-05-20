@@ -408,8 +408,8 @@ struct MomentumConfig {
     min_unique_buyers: u32,
     /// Early window for buyer count (seconds). Default: 20s
     buyer_window_secs: u64,
-    /// Min trades per second for momentum. Default: 0.5
-    min_trades_per_sec: f64,
+    /// Min trades per minute for momentum (chain-slot window). Default: 30 (~0.5/s).
+    min_trades_per_min: f64,
     /// Min buy dominance ratio (buys / total). Default: 0.6 (60%)
     min_buy_dominance: f64,
 
@@ -518,10 +518,10 @@ impl Default for MomentumConfig {
             lp_removal_window_secs: 60, // Track LP removals for 60s
 
             // Filter 2: Buyer Velocity
-            min_unique_buyers: 10,   // 10 unique buyers min
-            buyer_window_secs: 20,   // in first 20 seconds
-            min_trades_per_sec: 0.5, // 0.5 trades/sec momentum
-            min_buy_dominance: 0.6,  // 60% buys vs sells
+            min_unique_buyers: 10,    // 10 unique buyers min
+            buyer_window_secs: 20,    // in first 20 seconds
+            min_trades_per_min: 30.0, // ≈0.5 trades/s momentum (per-minute threshold)
+            min_buy_dominance: 0.6,   // 60% buys vs sells
 
             // Filter 3: SOL Inflow
             min_sol_inflow_lamports: 20_000_000_000, // 20 SOL net inflow
@@ -600,7 +600,7 @@ impl MomentumConfig {
             lp_removal_window_secs: cfg.lp_removal_window_secs,
             min_unique_buyers: cfg.min_unique_buyers,
             buyer_window_secs: cfg.buyer_window_secs,
-            min_trades_per_sec: cfg.min_trades_per_sec,
+            min_trades_per_min: cfg.min_trades_per_min,
             min_buy_dominance: cfg.min_buy_dominance,
             min_sol_inflow_lamports: cfg.min_sol_inflow_lamports,
             inflow_window_secs: cfg.inflow_window_secs,
@@ -2234,7 +2234,7 @@ impl TokenTracker {
             1u64
         };
         let chain_secs = (chain_span_slots as f64) * (MOMENTUM_APPROX_SLOT_MS as f64 / 1000.0);
-        let trades_per_sec = (trades_with_chain_slot as f64) / chain_secs.max(1e-9);
+        let trades_per_min = (trades_with_chain_slot as f64) / (chain_secs / 60.0).max(1e-9);
 
         let buy_dominance = if total_trades > 0 {
             self.buy_count as f64 / total_trades as f64
@@ -2244,7 +2244,7 @@ impl TokenTracker {
 
         TokenMetrics {
             unique_buyers_in_window: recent_buyers.len() as u32,
-            trades_per_sec,
+            trades_per_min,
             buy_dominance,
             net_sol_inflow: recent_buy_vol.saturating_sub(recent_sell_vol),
             dev_sold_early: self.dev_sold_early,
@@ -2374,10 +2374,10 @@ impl TokenTracker {
             );
         }
 
-        if metrics.trades_per_sec < config.min_trades_per_sec {
+        if metrics.trades_per_min < config.min_trades_per_min {
             let reason = format!(
-                "WAIT_BUYER_WINDOW: trades_per_sec {:.3} < {:.3}",
-                metrics.trades_per_sec, config.min_trades_per_sec
+                "WAIT_BUYER_WINDOW: trades_per_min {:.1} < {:.1}",
+                metrics.trades_per_min, config.min_trades_per_min
             );
             return self.record_wait_filter_rejection_and_return(
                 &FILTER_REJECTED_VELOCITY,
@@ -2500,10 +2500,10 @@ impl TokenTracker {
         self.last_wait_filter_obs_key = None;
         FILTER_PASSED_TOTAL.fetch_add(1, Ordering::Relaxed);
         let reason = format!(
-            "All filters passed: liq={:.1}SOL, buyers={}, vel={:.2}/s (chain-time), dom={:.0}%, inflow={:.1}SOL, bq(top1={:.0}%,top3={:.0}%,repeat={:.0}%,vol={:.2}SOL) | {}",
+            "All filters passed: liq={:.1}SOL, buyers={}, vel={:.0} trades/min (chain-time), dom={:.0}%, inflow={:.1}SOL, bq(top1={:.0}%,top3={:.0}%,repeat={:.0}%,vol={:.2}SOL) | {}",
             metrics.initial_liquidity_sol,
             metrics.unique_buyers_in_window,
-            metrics.trades_per_sec,
+            metrics.trades_per_min,
             metrics.buy_dominance * 100.0,
             metrics.net_sol_inflow as f64 / 1_000_000_000.0,
             bq.top1_share * 100.0,
@@ -2521,7 +2521,7 @@ impl TokenTracker {
 #[derive(Debug)]
 struct TokenMetrics {
     unique_buyers_in_window: u32,
-    trades_per_sec: f64,
+    trades_per_min: f64,
     buy_dominance: f64,
     net_sol_inflow: u64,
     dev_sold_early: bool,
@@ -7326,12 +7326,31 @@ impl MomentumContext {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
                 }
+                "min_trades_per_min" => {
+                    if let Some(v) = value.as_f64() {
+                        if v >= 0.0 {
+                            config.min_trades_per_min = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be >= 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
                 "min_trades_per_sec" => {
                     if let Some(v) = value.as_f64() {
                         if v >= 0.0 {
-                            config.min_trades_per_sec = v;
+                            let converted = v * 60.0;
+                            warn!(
+                                legacy_min_trades_per_sec = v,
+                                min_trades_per_min = converted,
+                                "JetStream config: deprecated key `min_trades_per_sec`; applied as `min_trades_per_min` (×60)"
+                            );
+                            config.min_trades_per_min = converted;
                             applied.push(key.clone());
-                            info!(key = %key, new_value = %v, "Config updated");
+                            info!(key = %key, new_value = %converted, "Config updated (from deprecated min_trades_per_sec)");
                         } else {
                             rejected.push((key.clone(), "Must be >= 0".to_string()));
                         }
@@ -8056,7 +8075,11 @@ async fn main() -> Result<()> {
                 // Parse just the [momentum] section
                 if let Ok(parsed) = toml::from_str::<toml::Value>(&toml_str) {
                     if let Some(momentum_table) = parsed.get("momentum") {
-                        match momentum_table.clone().try_into::<MomentumCfg>() {
+                        let mut mt = momentum_table.clone();
+                        if let Some(table) = mt.as_table_mut() {
+                            ironcrab::config::migrate_momentum_trade_velocity_keys_in_table(table);
+                        }
+                        match mt.try_into::<MomentumCfg>() {
                             Ok(cfg) => {
                                 // Apply config to MomentumConfig
                                 momentum_config = MomentumConfig::from_cfg(&cfg);
@@ -8064,7 +8087,7 @@ async fn main() -> Result<()> {
                                     config_path = %args.config.display(),
                                     min_sol_inflow = momentum_config.min_sol_inflow_lamports / 1_000_000_000,
                                     min_unique_buyers = momentum_config.min_unique_buyers,
-                                    min_trades_per_sec = momentum_config.min_trades_per_sec,
+                                    min_trades_per_min = momentum_config.min_trades_per_min,
                                     min_buy_dominance = momentum_config.min_buy_dominance,
                                     "Loaded momentum config from TOML"
                                 );
@@ -10463,7 +10486,7 @@ mod tests {
 
         cfg.early_min_liquidity_sol = 0.0;
         cfg.min_unique_buyers = 99;
-        cfg.min_trades_per_sec = 0.0;
+        cfg.min_trades_per_min = 0.0;
         cfg.min_buy_dominance = 0.0;
         cfg.min_sol_inflow_lamports = 0;
         cfg.require_mint_authority_renounced = false;
@@ -10484,6 +10507,63 @@ mod tests {
     }
 
     #[test]
+    fn velocity_trades_per_min_uses_chain_slot_span() {
+        let mut cfg = MomentumConfig::default();
+        cfg.early_min_liquidity_sol = 0.0;
+        cfg.min_unique_buyers = 3;
+        cfg.min_buy_dominance = 0.0;
+        cfg.min_sol_inflow_lamports = 0;
+        cfg.min_trades_per_min = 30.0;
+        cfg.require_mint_authority_renounced = false;
+        cfg.require_freeze_authority_none = false;
+        cfg.buyer_window_secs = 120;
+        cfg.top1_buyer_share_cap = 1.0;
+        cfg.top3_buyer_share_cap = 1.0;
+        cfg.repeat_buyer_min_ratio = 0.0;
+        cfg.min_trade_size_lamports = 0;
+        cfg.small_buy_ratio_cap = 1.0;
+        cfg.dump_recovery_window_secs = 0;
+
+        let mut tracker = TokenTracker::new(
+            "MintVelMinM1111111111111111111111111111",
+            "poolVelMinM111111111111111111111111111",
+            "pumpfun",
+            1,
+            30_000_000_000,
+        );
+        let base = 199_900u64;
+        for i in 0..9 {
+            tracker.record_trade(
+                &format!("buyer{i}"),
+                true,
+                100_000_000,
+                1_000_000,
+                &format!("sigv{i}"),
+                base,
+                &cfg,
+            );
+        }
+        tracker.record_trade(
+            "buyer_last",
+            true,
+            100_000_000,
+            1_000_000,
+            "sigv_last",
+            base + 30,
+            &cfg,
+        );
+
+        let (ok, reason) = tracker.should_generate_intent(&cfg, None, 200_000, Instant::now());
+        assert!(ok, "expected pass at 30/min threshold: {reason}");
+        assert!(reason.contains("trades/min"), "{reason}");
+
+        cfg.min_trades_per_min = 100.0;
+        let (ok2, reason2) = tracker.should_generate_intent(&cfg, None, 200_000, Instant::now());
+        assert!(!ok2, "expected fail at 100/min threshold");
+        assert!(reason2.contains("trades_per_min"), "{reason2}");
+    }
+
+    #[test]
     fn check_for_signals_emits_probe_for_tradeable_pumpfun_style_mint() {
         let cfg = {
             let mut c = MomentumConfig::default();
@@ -10491,7 +10571,7 @@ mod tests {
             c.probe_buy_pct = 0.25;
             c.early_min_liquidity_sol = 0.0;
             c.min_unique_buyers = 0;
-            c.min_trades_per_sec = 0.0;
+            c.min_trades_per_min = 0.0;
             c.min_buy_dominance = 0.0;
             c.min_sol_inflow_lamports = 0;
             c.require_mint_authority_renounced = false;
@@ -10626,7 +10706,7 @@ mod tests {
             c.probe_buy_pct = 0.25;
             c.early_min_liquidity_sol = 0.0;
             c.min_unique_buyers = 0;
-            c.min_trades_per_sec = 0.0;
+            c.min_trades_per_min = 0.0;
             c.min_buy_dominance = 0.0;
             c.min_sol_inflow_lamports = 0;
             c.require_mint_authority_renounced = false;
@@ -10712,7 +10792,7 @@ mod tests {
             c.probe_buy_pct = 0.25;
             c.early_min_liquidity_sol = 0.0;
             c.min_unique_buyers = 0;
-            c.min_trades_per_sec = 0.0;
+            c.min_trades_per_min = 0.0;
             c.min_buy_dominance = 0.0;
             c.min_sol_inflow_lamports = 0;
             c.require_mint_authority_renounced = false;
@@ -10780,7 +10860,7 @@ mod tests {
             c.probe_buy_pct = 0.25;
             c.early_min_liquidity_sol = 0.0;
             c.min_unique_buyers = 0;
-            c.min_trades_per_sec = 0.0;
+            c.min_trades_per_min = 0.0;
             c.min_buy_dominance = 0.0;
             c.min_sol_inflow_lamports = 0;
             c.require_mint_authority_renounced = false;
@@ -11401,7 +11481,7 @@ mod tests {
         cfg.buyer_window_secs = 10;
         cfg.early_min_liquidity_sol = 0.0;
         cfg.min_unique_buyers = 3;
-        cfg.min_trades_per_sec = 0.0;
+        cfg.min_trades_per_min = 0.0;
         cfg.min_buy_dominance = 0.0;
         cfg.min_sol_inflow_lamports = 0;
         cfg.require_mint_authority_renounced = false;
@@ -11448,7 +11528,7 @@ mod tests {
         // Disable other gates to isolate micro-buy behavior.
         cfg.early_min_liquidity_sol = 0.0;
         cfg.min_unique_buyers = 0;
-        cfg.min_trades_per_sec = 0.0;
+        cfg.min_trades_per_min = 0.0;
         cfg.min_buy_dominance = 0.0;
         cfg.min_sol_inflow_lamports = 0;
         cfg.require_mint_authority_renounced = false;
@@ -11793,7 +11873,7 @@ mod tests {
         cfg.scale_in_min_probe_executable_pnl_pct = 0.0;
         cfg.early_min_liquidity_sol = 0.0;
         cfg.min_unique_buyers = 0;
-        cfg.min_trades_per_sec = 0.0;
+        cfg.min_trades_per_min = 0.0;
         cfg.min_buy_dominance = 0.0;
         cfg.min_sol_inflow_lamports = 0;
         cfg.require_mint_authority_renounced = false;
@@ -11903,7 +11983,7 @@ mod tests {
         cfg.probe_buy_pct = 0.25;
         cfg.early_min_liquidity_sol = 0.0;
         cfg.min_unique_buyers = 0;
-        cfg.min_trades_per_sec = 0.0;
+        cfg.min_trades_per_min = 0.0;
         cfg.min_buy_dominance = 0.0;
         cfg.min_sol_inflow_lamports = 0;
         cfg.require_mint_authority_renounced = false;
@@ -12009,7 +12089,7 @@ mod tests {
         cfg.probe_buy_pct = 0.25;
         cfg.early_min_liquidity_sol = 0.0;
         cfg.min_unique_buyers = 0;
-        cfg.min_trades_per_sec = 0.0;
+        cfg.min_trades_per_min = 0.0;
         cfg.min_buy_dominance = 0.0;
         cfg.min_sol_inflow_lamports = 0;
         cfg.require_mint_authority_renounced = false;
@@ -12089,7 +12169,7 @@ mod tests {
         cfg.scale_in_min_probe_executable_pnl_pct = 1.0e12;
         cfg.early_min_liquidity_sol = 0.0;
         cfg.min_unique_buyers = 0;
-        cfg.min_trades_per_sec = 0.0;
+        cfg.min_trades_per_min = 0.0;
         cfg.min_buy_dominance = 0.0;
         cfg.min_sol_inflow_lamports = 0;
         cfg.require_mint_authority_renounced = false;
@@ -12181,7 +12261,7 @@ mod tests {
             c.probe_buy_pct = 0.25;
             c.early_min_liquidity_sol = 0.0;
             c.min_unique_buyers = 0;
-            c.min_trades_per_sec = 0.0;
+            c.min_trades_per_min = 0.0;
             c.min_buy_dominance = 0.0;
             c.min_sol_inflow_lamports = 0;
             c.require_mint_authority_renounced = false;
@@ -12251,7 +12331,7 @@ mod tests {
             c.probe_buy_pct = 0.25;
             c.early_min_liquidity_sol = 0.0;
             c.min_unique_buyers = 0;
-            c.min_trades_per_sec = 0.0;
+            c.min_trades_per_min = 0.0;
             c.min_buy_dominance = 0.0;
             c.min_sol_inflow_lamports = 0;
             c.require_mint_authority_renounced = false;
@@ -12515,7 +12595,7 @@ mod tests {
             c.probe_buy_pct = 0.25;
             c.early_min_liquidity_sol = 0.0;
             c.min_unique_buyers = 0;
-            c.min_trades_per_sec = 0.0;
+            c.min_trades_per_min = 0.0;
             c.min_buy_dominance = 0.0;
             c.min_sol_inflow_lamports = 0;
             c.require_mint_authority_renounced = false;
@@ -12577,7 +12657,7 @@ mod tests {
             c.probe_buy_pct = 0.25;
             c.early_min_liquidity_sol = 0.0;
             c.min_unique_buyers = 0;
-            c.min_trades_per_sec = 0.0;
+            c.min_trades_per_min = 0.0;
             c.min_buy_dominance = 0.0;
             c.min_sol_inflow_lamports = 0;
             c.require_mint_authority_renounced = false;
@@ -12638,7 +12718,7 @@ mod tests {
             c.probe_buy_pct = 0.25;
             c.early_min_liquidity_sol = 0.0;
             c.min_unique_buyers = 0;
-            c.min_trades_per_sec = 0.0;
+            c.min_trades_per_min = 0.0;
             c.min_buy_dominance = 0.0;
             c.min_sol_inflow_lamports = 0;
             c.require_mint_authority_renounced = false;
@@ -12704,7 +12784,7 @@ mod tests {
             c.probe_buy_pct = 0.25;
             c.early_min_liquidity_sol = 0.0;
             c.min_unique_buyers = 0;
-            c.min_trades_per_sec = 0.0;
+            c.min_trades_per_min = 0.0;
             c.min_buy_dominance = 0.0;
             c.min_sol_inflow_lamports = 0;
             c.require_mint_authority_renounced = true;
@@ -12923,7 +13003,7 @@ mod tests {
         cfg.probe_buy_pct = 0.25;
         cfg.early_min_liquidity_sol = 0.0;
         cfg.min_unique_buyers = 0;
-        cfg.min_trades_per_sec = 0.0;
+        cfg.min_trades_per_min = 0.0;
         cfg.min_buy_dominance = 0.0;
         cfg.min_sol_inflow_lamports = 0;
         cfg.require_mint_authority_renounced = true;
@@ -13009,7 +13089,7 @@ mod tests {
         // Disable other gates to isolate dump recovery.
         cfg.early_min_liquidity_sol = 0.0;
         cfg.min_unique_buyers = 0;
-        cfg.min_trades_per_sec = 0.0;
+        cfg.min_trades_per_min = 0.0;
         cfg.min_buy_dominance = 0.0;
         cfg.min_sol_inflow_lamports = 0;
         cfg.require_mint_authority_renounced = false;
@@ -13061,7 +13141,7 @@ mod tests {
         // Disable other gates to isolate CTO behavior.
         cfg.early_min_liquidity_sol = 0.0;
         cfg.min_unique_buyers = 0;
-        cfg.min_trades_per_sec = 0.0;
+        cfg.min_trades_per_min = 0.0;
         cfg.min_buy_dominance = 0.0;
         cfg.min_sol_inflow_lamports = 0;
         cfg.require_mint_authority_renounced = false;
@@ -13096,7 +13176,7 @@ mod tests {
         // Disable other gates to isolate CTO behavior.
         cfg.early_min_liquidity_sol = 0.0;
         cfg.min_unique_buyers = 0;
-        cfg.min_trades_per_sec = 0.0;
+        cfg.min_trades_per_min = 0.0;
         cfg.min_buy_dominance = 0.0;
         cfg.min_sol_inflow_lamports = 0;
         cfg.require_mint_authority_renounced = false;
@@ -13163,7 +13243,7 @@ mod tests {
         // Disable all entry gates so we can emit an intent deterministically.
         cfg.early_min_liquidity_sol = 0.0;
         cfg.min_unique_buyers = 0;
-        cfg.min_trades_per_sec = 0.0;
+        cfg.min_trades_per_min = 0.0;
         cfg.min_buy_dominance = 0.0;
         cfg.min_sol_inflow_lamports = 0;
         cfg.require_mint_authority_renounced = false;
@@ -15220,7 +15300,7 @@ mod tests {
             c.probe_buy_pct = 0.25;
             c.early_min_liquidity_sol = 0.0;
             c.min_unique_buyers = 0;
-            c.min_trades_per_sec = 0.0;
+            c.min_trades_per_min = 0.0;
             c.min_buy_dominance = 0.0;
             c.min_sol_inflow_lamports = 0;
             c.require_mint_authority_renounced = false;

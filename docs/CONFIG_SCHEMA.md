@@ -161,7 +161,7 @@ Component name: `momentum-bot`
 |-----|------|---------|-------|-------------|
 | `min_unique_buyers` | u64 | 3 | > 0 | Minimum unique buyers in window |
 | `buyer_window_secs` | u64 | 120 | > 0 | Time window for buyer tracking (seconds) |
-| `min_trades_per_sec` | f64 | 0.02 | >= 0 | Minimum trades per second for momentum |
+| `min_trades_per_min` | f64 | 30.0 | >= 0 | Minimum trades per minute for momentum (chain-slot window). Deprecated: `min_trades_per_sec` is accepted for one release cycle and converted (×60) with a warn log — do not treat the numeric value as trades/min without conversion |
 | `min_buy_dominance` | f64 | 0.45 | 0.0-1.0 | Minimum buy ratio (0.45 = 45%) |
 
 ### Filter 3: SOL Inflow
