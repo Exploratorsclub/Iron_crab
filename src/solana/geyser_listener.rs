@@ -3,6 +3,7 @@
 
 use anyhow::{anyhow, Result};
 use solana_sdk::pubkey::Pubkey;
+use std::time::Instant;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 
@@ -33,6 +34,8 @@ pub struct GeyserAccountUpdate {
     pub owner: Pubkey,
     pub data: Vec<u8>,
     pub lamports: u64,
+    /// Wall-clock instant when the gRPC stream delivered this update into the listener (immediately before broadcast send).
+    pub grpc_recv_at: Instant,
 }
 
 /// Inner instruction from transaction meta (for parsing token transfers)
@@ -82,6 +85,8 @@ pub struct GeyserTransactionUpdate {
     pub fee_lamports: u64,
     /// Compute units consumed (for priority fee calculation)
     pub compute_units_consumed: Option<u64>,
+    /// Wall-clock instant when the gRPC stream delivered this update into the listener (immediately before broadcast send).
+    pub grpc_recv_at: Instant,
 }
 
 /// Event emitted when a new confirmed block is produced (from blocks_meta)
@@ -347,12 +352,14 @@ impl GeyserListener {
                                         }
                                     };
 
+                                    let grpc_recv_at = Instant::now();
                                     let event = GeyserAccountUpdate {
                                         pubkey,
                                         slot: account_update.slot,
                                         owner,
                                         data: account_info.data,
                                         lamports: account_info.lamports,
+                                        grpc_recv_at,
                                     };
 
                                     // Broadcast to subscribers
@@ -588,6 +595,7 @@ impl GeyserListener {
                                         }
                                     }
 
+                                    let grpc_recv_at = Instant::now();
                                     let event = GeyserTransactionUpdate {
                                         signature,
                                         slot: tx_update.slot,
@@ -601,6 +609,7 @@ impl GeyserListener {
                                         post_balances,
                                         fee_lamports,
                                         compute_units_consumed,
+                                        grpc_recv_at,
                                     };
 
                                     // Broadcast to subscribers

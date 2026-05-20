@@ -76,6 +76,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Zweck** (Observability only): Kette A–I in `docs/RUNBOOK_PROD.md` — Geyser→Core-Publish (market-data), Momentum-Ingest und Intent-Publish, execution `process_intent` bis Confirm sowie Slot-Lag am Send. Kein Trading-Verhalten, kein Hot-Path-RPC.  
 **Dateien**: `src/metrics.rs`, `src/bin/market_data.rs`, `src/bin/momentum_bot.rs`, `src/bin/execution_engine.rs`, `docs/RUNBOOK_PROD.md`, `docs/BUGS_FIXES.md`
 
+### INGEST-LAG-METRICS: Geyser-Listener vs. market-data Broadcast (2026-05-20)
+**Datum**: 2026-05-20  
+**Zweck** (Observability only): Trennung von (a) Zeit in `tokio::sync::broadcast` + Event-Loop-Scheduling zwischen Geyser-Listener-`send` und market-data-`recv` und (b) Wall-Zeit `market_data_trade_after_bonding_publish_ms` (B★) sowie (c) reiner Ketten-Abstand `market_data_bonding_to_trade_slot_delta_slots` (Geyser-Slots, I-16). **Kein** `getSlot`/`getBlockTime`/`getTransaction` pro Event; nur `Instant` und bestehende `slot`-Felder.  
+**Metriken**: `market_data_tx_channel_lag_ms`, `market_data_account_channel_lag_ms`, `market_data_tx_broadcast_lagged_total`, `market_data_account_broadcast_lagged_total`, `market_data_bonding_to_trade_slot_delta_slots`.  
+**Dateien**: `src/solana/geyser_listener.rs`, `src/bin/market_data.rs`, `src/metrics.rs`, `docs/RUNBOOK_PROD.md`, `docs/BUGS_FIXES.md`  
+**Follow-up**: Fairness-Fix in market-data (`select!`/Priorität) nur wenn Channel-Lag p99 hoch bei kleinem Slot-Delta (separater Handoff).
+
 ### FIX-MOM-EXIT-QUOTE-GUARDS: Frische Reserve-Quotes + getrennte Ingest-Latenzen
 **Datum**: 2026-05-15  
 **Problem**: `momentum_event_to_ingest_ms` wirkte extrem hoch, ohne klare Trennung von JetStream-`PoolCacheUpdate`-Timestamps vs. Core-NATS; price-based Exits konnten theoretisch auf sehr alten Cache-Zeilen oder nicht verifizierten SOL-Paaren basieren.  

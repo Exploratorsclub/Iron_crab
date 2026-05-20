@@ -355,6 +355,43 @@ static MARKET_DATA_TRADE_AFTER_BONDING_PUBLISH_MS_SUM: Lazy<AtomicU64> =
 static MARKET_DATA_TRADE_AFTER_BONDING_PUBLISH_MS_COUNT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// Geyser listener `broadcast::send` → market-data `recv()` (queue + scheduling), milliseconds.
+static MARKET_DATA_TX_CHANNEL_LAG_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+static MARKET_DATA_TX_CHANNEL_LAG_MS_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_CHANNEL_LAG_MS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+static MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+static MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// Pump.fun: slot delta from last published `BondingCurveProgress` (Geyser slot) to successful `Trade` publish (same pool/bonding curve).
+static MARKET_DATA_BONDING_TO_TRADE_SLOT_DELTA_SLOTS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_BONDING_TO_TRADE_SLOT_DELTA_SLOTS_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_BONDING_TO_TRADE_SLOT_DELTA_SLOTS_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// `broadcast::RecvError::Lagged(n)` — skipped messages (cumulative `n` added per occurrence).
+pub static MARKET_DATA_TX_BROADCAST_LAGGED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// Update monotonic Geyser head slot (max). Safe from any market-data ingest arm.
 #[inline]
 pub fn market_data_bump_geyser_head_slot(slot: u64) {
@@ -375,6 +412,67 @@ pub fn record_market_data_trade_after_bonding_publish_ms(delta_ms: u64) {
         delta_ms,
         MARKET_DATA_LATENCY_MS_SUM_CAP,
     );
+}
+
+/// Wall ms from `grpc_recv_at` (set in Geyser listener before `broadcast::send`) to market-data `recv()` return.
+#[inline]
+pub fn record_market_data_tx_channel_lag_ms(grpc_recv_at: Instant, recv_at: Instant) {
+    let ms = recv_at
+        .saturating_duration_since(grpc_recv_at)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    record_histogram_u64_into(
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+        &MARKET_DATA_TX_CHANNEL_LAG_MS_BUCKET_COUNTS,
+        &MARKET_DATA_TX_CHANNEL_LAG_MS_SUM,
+        &MARKET_DATA_TX_CHANNEL_LAG_MS_COUNT,
+        ms,
+        MARKET_DATA_LATENCY_MS_SUM_CAP,
+    );
+}
+
+/// Same as [`record_market_data_tx_channel_lag_ms`] for account updates.
+#[inline]
+pub fn record_market_data_account_channel_lag_ms(grpc_recv_at: Instant, recv_at: Instant) {
+    let ms = recv_at
+        .saturating_duration_since(grpc_recv_at)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    record_histogram_u64_into(
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+        &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_SUM,
+        &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_COUNT,
+        ms,
+        MARKET_DATA_LATENCY_MS_SUM_CAP,
+    );
+}
+
+/// Pump.fun trade publish: chain slots since last bonding-curve progress publish for the same pool key.
+#[inline]
+pub fn record_market_data_bonding_to_trade_slot_delta_slots(delta_slots: u64) {
+    record_histogram_u64_into(
+        MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS,
+        &MARKET_DATA_BONDING_TO_TRADE_SLOT_DELTA_SLOTS_BUCKET_COUNTS,
+        &MARKET_DATA_BONDING_TO_TRADE_SLOT_DELTA_SLOTS_SUM,
+        &MARKET_DATA_BONDING_TO_TRADE_SLOT_DELTA_SLOTS_COUNT,
+        delta_slots,
+        u64::MAX,
+    );
+}
+
+#[inline]
+pub fn record_market_data_tx_broadcast_lagged(skipped_messages: u64) {
+    if skipped_messages > 0 {
+        MARKET_DATA_TX_BROADCAST_LAGGED_TOTAL.fetch_add(skipped_messages, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn record_market_data_account_broadcast_lagged(skipped_messages: u64) {
+    if skipped_messages > 0 {
+        MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL.fetch_add(skipped_messages, Ordering::Relaxed);
+    }
 }
 
 /// After successful core `TOPIC_MARKET_EVENTS` publish (`publish_market_event_core_and_momentum_ex` path).
@@ -1985,6 +2083,38 @@ async fn metrics_response() -> Response<Body> {
         &MARKET_DATA_TRADE_AFTER_BONDING_PUBLISH_MS_BUCKET_COUNTS,
         &MARKET_DATA_TRADE_AFTER_BONDING_PUBLISH_MS_SUM,
         &MARKET_DATA_TRADE_AFTER_BONDING_PUBLISH_MS_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_tx_channel_lag_ms",
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+        &MARKET_DATA_TX_CHANNEL_LAG_MS_BUCKET_COUNTS,
+        &MARKET_DATA_TX_CHANNEL_LAG_MS_SUM,
+        &MARKET_DATA_TX_CHANNEL_LAG_MS_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_account_channel_lag_ms",
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+        &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_SUM,
+        &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_bonding_to_trade_slot_delta_slots",
+        MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS,
+        &MARKET_DATA_BONDING_TO_TRADE_SLOT_DELTA_SLOTS_BUCKET_COUNTS,
+        &MARKET_DATA_BONDING_TO_TRADE_SLOT_DELTA_SLOTS_SUM,
+        &MARKET_DATA_BONDING_TO_TRADE_SLOT_DELTA_SLOTS_COUNT,
+    );
+    line!(
+        "market_data_tx_broadcast_lagged_total",
+        MARKET_DATA_TX_BROADCAST_LAGGED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_broadcast_lagged_total",
+        MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL.load(Ordering::Relaxed)
     );
 
     // --- momentum-bot service ---
