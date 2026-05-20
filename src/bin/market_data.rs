@@ -23,7 +23,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, watch};
@@ -50,13 +50,13 @@ use ironcrab::metrics::{
     record_market_data_bonding_to_trade_slot_delta_slots,
     record_market_data_geyser_to_publish_on_success,
     record_market_data_trade_after_bonding_publish_ms, record_market_data_tx_broadcast_lagged,
-    record_market_data_tx_channel_lag_ms, serve_metrics, set_readiness_control_sub_active,
-    set_readiness_mode, set_readiness_nats_connected, update_readiness_market_data_current,
-    wall_clock_unix_ms_now, MarketDataLatencySegment, MetricsComponent,
-    MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS,
-    MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
-    MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
-    POOLS_TRACKED_GAUGE,
+    record_market_data_tx_channel_lag_ms, serve_metrics, set_market_data_tx_broadcast_queue_depth,
+    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
+    update_readiness_market_data_current, wall_clock_unix_ms_now, MarketDataLatencySegment,
+    MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
+    MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL,
+    MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
+    NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -86,7 +86,7 @@ use spl_token_2022::extension::StateWithExtensions;
 
 /// NATS topic for config reload (P1: Runtime Configuration via UI)
 const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
-use ironcrab::solana::geyser_listener::GeyserListener;
+use ironcrab::solana::geyser_listener::{GeyserListener, GeyserTransactionUpdate};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
 /// ExecutionResult dedup: prevents replay storms from re-tracking the same ATA/mint over and over.
@@ -6217,6 +6217,679 @@ async fn publish_control_response(
     }
 }
 
+/// Geyser transaction ingest (dedizierte Task-Fairness, siehe MARKET-DATA-TX-INGEST-FAIRNESS).
+/// STOP-CHECK: keine neuen RPC-Calls; gleiche Logik wie zuvor im `select!`-Arm.
+async fn handle_geyser_transaction(
+    ctx: Arc<MarketDataContext>,
+    run_id: &str,
+    tx_update: GeyserTransactionUpdate,
+    tx_count: &AtomicU64,
+) {
+    let recv_at = Instant::now();
+    record_market_data_tx_channel_lag_ms(tx_update.grpc_recv_at, recv_at);
+    let tx_geyser_recv_at = recv_at;
+    market_data_bump_geyser_head_slot(tx_update.slot);
+    tx_count.fetch_add(1, Ordering::Relaxed);
+    ironcrab::metrics::record_activity();
+
+    // Phase 2 (Roadmap, Option C):
+    // Detect Associated Token Program create/close instructions for the tracked wallet
+    // and feed them into the same wallet-ATA tracking path (no RPC, no scanning).
+    // This is needed to catch manual wallet actions (Phantom/Jupiter) that do not
+    // produce ExecutionResults.
+
+    // P2: Track priority fees from Geyser transactions (NO RPC calls!)
+    if let Some(priority_fee) = ctx.priority_fee_tracker.add_sample(
+        tx_update.slot,
+        tx_update.fee_lamports,
+        tx_update.compute_units_consumed,
+    ) {
+        // Publish percentiles every 50 samples (rate limited)
+        let sample_count = ctx.priority_fee_tracker.sample_count();
+        if sample_count % 50 == 0 && sample_count >= 10 {
+            let percentiles = ctx.priority_fee_tracker.get_percentiles();
+            let fee_msg = PriorityFeePercentiles::new(
+                "market-data",
+                BUILD_VERSION,
+                &ctx.run_id,
+                percentiles.sample_count,
+                percentiles.last_slot,
+                percentiles.p25,
+                percentiles.p50,
+                percentiles.p75,
+                percentiles.p90,
+                ctx.priority_fee_tracker.get_fee_for_tier(IntentTier::Tier0),
+                ctx.priority_fee_tracker.get_fee_for_tier(IntentTier::Tier1),
+                ctx.priority_fee_tracker.get_fee_for_tier(IntentTier::Arb),
+            );
+            if let Some(ref nats) = ctx.nats {
+                // NOTE: nats.publish() already serializes - don't double-serialize!
+                if let Err(e) = nats.publish(TOPIC_PRIORITY_FEE_SAMPLES, &fee_msg).await {
+                    debug!(error = %e, "Failed to publish priority fee percentiles");
+                }
+            }
+            debug!(
+                samples = sample_count,
+                p50 = percentiles.p50,
+                p90 = percentiles.p90,
+                last_fee = priority_fee,
+                "priority_fee: published percentiles"
+            );
+        }
+    }
+
+    // Try to parse as DEX event (PoolCreated, Trade)
+    let pool_lookup = |pool: &Pubkey| -> Option<OrcaPoolInfo> {
+        match ctx.live_pool_cache.get(pool) {
+            Some(CachedPoolState::Orca(state)) => Some(OrcaPoolInfo {
+                token_mint_a: state.token_mint_a,
+                token_mint_b: state.token_mint_b,
+                token_vault_a: state.token_vault_a,
+                token_vault_b: state.token_vault_b,
+                tick_current_index: Some(state.tick_current_index),
+                tick_spacing: Some(state.tick_spacing),
+                token_a_program: state.token_a_program,
+                token_b_program: state.token_b_program,
+            }),
+            _ => None,
+        }
+    };
+    let parsed_event = parse_transaction_update_with_pool_lookup(&tx_update, Some(&pool_lookup));
+
+    // Track mint pubkeys for mint-authority/freeze metadata.
+    // GEYSER-FIRST: No RPC calls! For pump.fun we know decimals=6. For others, Geyser delivers.
+    if let Some(parsed) = parsed_event.as_ref() {
+        let mint_and_dex: Option<(Pubkey, Option<DexType>)> = match parsed {
+            ParsedDexEvent::PoolCreated { base_mint, dex, .. } => Some((*base_mint, Some(*dex))),
+            ParsedDexEvent::Trade { mint, dex, .. } => Some((*mint, Some(*dex))),
+            ParsedDexEvent::LiquidityRemoved { mint, .. } => Some((*mint, None)),
+            ParsedDexEvent::BondingCurveUpdate { .. } => None, // Handled separately in account update
+        };
+        if let Some((mint, dex_opt)) = mint_and_dex {
+            let mut tracked = ctx.tracked_mints.write();
+            if tracked.insert(mint) {
+                // Push updated list to geyser listener (resubscribe)
+                let updated: Vec<Pubkey> = tracked.iter().copied().collect();
+                let _ = ctx.tracked_mints_tx.send(updated);
+
+                // Geyser delivers mint accounts via AccountsDB snapshot when subscribed.
+                // tracked_mints_tx already sent above → GeyserListener will resubscribe.
+                debug!(
+                    mint = %mint,
+                    dex = ?dex_opt,
+                    "New mint tracked, waiting for Geyser mint account delivery"
+                );
+            }
+        }
+
+        // Build pool_mint_map for PumpFun (needed for BondingCurveUpdate -> creator lookup)
+        match parsed {
+            ParsedDexEvent::PoolCreated {
+                pool_address,
+                base_mint,
+                dex: DexType::PumpFun,
+                ..
+            } => {
+                ctx.pool_mint_map
+                    .write()
+                    .insert(pool_address.to_string(), base_mint.to_string());
+            }
+            ParsedDexEvent::Trade {
+                pool_address,
+                mint,
+                dex: DexType::PumpFun,
+                ..
+            } => {
+                ctx.pool_mint_map
+                    .write()
+                    .insert(pool_address.to_string(), mint.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    // Pump.fun: propagate creator/dev wallet so strategy can build deterministic intents.
+    // The PoolCreated MarketEventKind intentionally does not carry creator today, so emit
+    // a separate DevWalletIdentified event when available.
+    // Also cache the creator for later Trade events.
+    if let Some(ParsedDexEvent::PoolCreated {
+        base_mint,
+        dex: DexType::PumpFun,
+        creator: Some(creator),
+        ..
+    }) = parsed_event.as_ref()
+    {
+        // Cache creator for later Trade events (P0: avoid RPC in momentum-bot)
+        {
+            let mut cache = ctx.creator_cache.write();
+            cache.insert(base_mint.to_string(), creator.to_string());
+            debug!(
+                mint = %base_mint,
+                creator = %creator,
+                cache_size = cache.len(),
+                "Cached PumpFun creator for Trade enrichment"
+            );
+        }
+
+        let dev_event = MarketEvent::new(
+            "market-data",
+            BUILD_VERSION,
+            run_id,
+            ctx.next_event_id(),
+            "geyser",
+            Some(tx_update.slot),
+            MarketEventKind::DevWalletIdentified {
+                mint: base_mint.to_string(),
+                dev_wallet: creator.to_string(),
+                // Supply percentage is not computed here yet (would require extra on-chain reads).
+                // Momentum-bot treats this as an input for dev-risk filters; keep deterministic.
+                supply_percentage: 0.0,
+            },
+        );
+
+        if let Err(e) = ctx.jsonl_writer.write(&dev_event) {
+            error!(error = %e, "Failed to write dev wallet event to JSONL");
+        }
+
+        if let Some(ref nats) = ctx.nats {
+            let _ = publish_market_event_core_and_momentum_ex(
+                nats,
+                &dev_event,
+                Some(MarketEventCorePublishTrace {
+                    recv_at: tx_geyser_recv_at,
+                    cold_path: false,
+                    segment: MarketDataLatencySegment::Other,
+                }),
+                Some(ctx.as_ref()),
+            )
+            .await;
+        }
+    }
+
+    // P1: Process wallet tracking events
+    let wallet_events = if let Some(ref parsed) = parsed_event {
+        match parsed {
+            ParsedDexEvent::PoolCreated { base_mint, .. } => {
+                // Record pool creation for early buyer tracking
+                ctx.wallet_tracker
+                    .record_pool_created(&base_mint.to_string(), tx_update.slot);
+                Vec::new()
+            }
+            ParsedDexEvent::Trade {
+                mint,
+                trader,
+                is_buy,
+                sol_amount,
+                token_amount,
+                signature,
+                slot,
+                ..
+            } => {
+                // Check for smart money, early buyers, insider activity
+                ctx.wallet_tracker.process_trade(
+                    &mint.to_string(),
+                    &trader.to_string(),
+                    *is_buy,
+                    *sol_amount,
+                    *token_amount,
+                    *slot,
+                    signature,
+                    &ctx.run_id,
+                    "market-data",
+                )
+            }
+            ParsedDexEvent::LiquidityRemoved { .. } => Vec::new(),
+            // BondingCurveUpdate is handled separately (account updates, not TX)
+            ParsedDexEvent::BondingCurveUpdate { .. } => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Publish wallet tracking events
+    for wallet_event in wallet_events {
+        // Write to JSONL
+        if let Err(e) = ctx.jsonl_writer.write(&wallet_event) {
+            error!(error = %e, "Failed to write wallet event to JSONL");
+        }
+        // Publish to NATS
+        if let Some(ref nats) = ctx.nats {
+            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &wallet_event).await {
+                warn!(error = %e, "Failed to publish wallet event to NATS");
+            }
+        }
+    }
+
+    // PumpSwap create_pool: observation only. Do not emit DexPoolAccounts, cache, or
+    // JetStream pool_accounts — synthetic reconstruction is not swap-verified (Bug #36).
+    // First trade / EnsurePumpAmmPoolAccounts supply usable pool_accounts.
+    // Ignore `pool_accounts` in the match so a future parser change (Some vs None) does
+    // not silently skip PoolCreated / known_pump_amm_pools / pool_mint_map.
+    if let Some(ParsedDexEvent::PoolCreated {
+        pool_address,
+        base_mint: base_mint_pk,
+        quote_mint: quote_mint_pk,
+        dex: DexType::PumpFunAmm,
+        ..
+    }) = parsed_event.as_ref()
+    {
+        let is_new_pool = ctx.known_pump_amm_pools.write().insert(*pool_address);
+        if is_new_pool {
+            let base_mint = base_mint_pk.to_string();
+            let quote_mint = quote_mint_pk.to_string();
+            info!(
+                pool = %pool_address,
+                base_mint = %base_mint_pk,
+                "pump_amm pool observed via create_pool — PoolCreated only (DexPoolAccounts/cache deferred to verified path)"
+            );
+            let pool_created_event = MarketEvent::new(
+                "market-data",
+                BUILD_VERSION,
+                run_id,
+                ctx.next_event_id(),
+                "geyser_create_pool",
+                Some(tx_update.slot),
+                MarketEventKind::PoolCreated {
+                    pool_address: pool_address.to_string(),
+                    base_mint: base_mint.clone(),
+                    quote_mint: quote_mint.clone(),
+                    dex: DexType::PumpFunAmm.to_string(),
+                    initial_liquidity_sol: None,
+                },
+            );
+            if let Err(e) = ctx.jsonl_writer.write(&pool_created_event) {
+                error!(error = %e, "Failed to write pump_amm PoolCreated (create_pool) to JSONL");
+            }
+            if let Some(ref nats) = ctx.nats {
+                let _ = publish_market_event_core_and_momentum_ex(
+                    nats,
+                    &pool_created_event,
+                    Some(MarketEventCorePublishTrace {
+                        recv_at: tx_geyser_recv_at,
+                        cold_path: false,
+                        segment: MarketDataLatencySegment::PoolCreated,
+                    }),
+                    Some(ctx.as_ref()),
+                )
+                .await;
+            }
+            ctx.pool_mint_map
+                .write()
+                .insert(pool_address.to_string(), base_mint.clone());
+        }
+    }
+
+    // Pump.fun AMM: emit static pool account metadata for intent-driven execution.
+    // IMPORTANT: We emit PoolCreated + DexPoolAccounts TOGETHER on first trade.
+    // This ensures arb-strategy has all required accounts before seeing the pool.
+    if let Some(ParsedDexEvent::Trade {
+        pool_address,
+        mint: base_mint_pk,
+        dex: DexType::PumpFunAmm,
+        pool_accounts: Some(pool_accounts),
+        pump_amm_sell_requires_cashback_remaining,
+        pump_amm_sell_cashback_third_meta,
+        pump_amm_sell_extended_tail_0,
+        pump_amm_sell_extended_tail_1,
+        ..
+    }) = parsed_event.as_ref()
+    {
+        // Merge when this trade is extended OR cache already knows extended layout
+        // (e.g. prior Geyser observation / JetStream). Skipping when the trade is a
+        // standard 21-account sell would drop a true extended flag from the MASTER cache.
+        let (ext_flag_prior, ext_third_prior, ext_t0_prior, ext_t1_prior) = ctx
+            .live_pool_cache
+            .pump_amm_sell_extended_layout(pool_address);
+        let merge_requires = *pump_amm_sell_requires_cashback_remaining || ext_flag_prior;
+        let merge_third = (*pump_amm_sell_cashback_third_meta)
+            .filter(|p| *p != Pubkey::default())
+            .or(ext_third_prior);
+        let merge_t0 = (*pump_amm_sell_extended_tail_0)
+            .filter(|p| *p != Pubkey::default())
+            .or(ext_t0_prior);
+        let merge_t1 = (*pump_amm_sell_extended_tail_1)
+            .filter(|p| *p != Pubkey::default())
+            .or(ext_t1_prior);
+        if merge_requires || merge_third.is_some() || merge_t0.is_some() || merge_t1.is_some() {
+            ctx.live_pool_cache.merge_pump_amm_sell_extended_layout(
+                pool_address,
+                merge_requires,
+                merge_third,
+                merge_t0,
+                merge_t1,
+            );
+        }
+        // v1 order (see MarketEventKind::DexPoolAccounts docs): base_mint at [2], quote_mint at [3]
+        let base_mint = pool_accounts
+            .get(2)
+            .map(|p| p.to_string())
+            .unwrap_or_default();
+        let quote_mint = pool_accounts
+            .get(3)
+            .map(|p| p.to_string())
+            .unwrap_or_default();
+
+        // Check if this is the FIRST trade for this pool (new pool discovery)
+        let is_first_trade = ctx.known_pump_amm_pools.write().insert(*pool_address);
+
+        // If first trade, emit PoolCreated FIRST (before DexPoolAccounts)
+        // This ensures arb-strategy sees PoolCreated + DexPoolAccounts together
+        if is_first_trade {
+            info!(
+                pool = %pool_address,
+                base_mint = %base_mint_pk,
+                "pump_amm pool discovered via first trade - emitting PoolCreated + DexPoolAccounts"
+            );
+
+            let pool_created_event = MarketEvent::new(
+                "market-data",
+                BUILD_VERSION,
+                run_id,
+                ctx.next_event_id(),
+                "geyser_first_trade",
+                Some(tx_update.slot),
+                MarketEventKind::PoolCreated {
+                    pool_address: pool_address.to_string(),
+                    base_mint: base_mint.clone(),
+                    quote_mint: quote_mint.clone(),
+                    dex: DexType::PumpFunAmm.to_string(),
+                    initial_liquidity_sol: None, // Not available from trade
+                },
+            );
+
+            if let Err(e) = ctx.jsonl_writer.write(&pool_created_event) {
+                error!(error = %e, "Failed to write pump_amm PoolCreated event to JSONL");
+            }
+
+            if let Some(ref nats) = ctx.nats {
+                let _ = publish_market_event_core_and_momentum_ex(
+                    nats,
+                    &pool_created_event,
+                    Some(MarketEventCorePublishTrace {
+                        recv_at: tx_geyser_recv_at,
+                        cold_path: false,
+                        segment: MarketDataLatencySegment::PoolCreated,
+                    }),
+                    Some(ctx.as_ref()),
+                )
+                .await;
+            }
+        }
+        let accounts_event = MarketEvent::new(
+            "market-data",
+            BUILD_VERSION,
+            run_id,
+            ctx.next_event_id(),
+            "geyser",
+            Some(tx_update.slot),
+            MarketEventKind::DexPoolAccounts {
+                dex: DexType::PumpFunAmm.to_string(),
+                pool_address: pool_address.to_string(),
+                base_mint: base_mint.clone(),
+                quote_mint: quote_mint.clone(),
+                accounts: pool_accounts.iter().map(|p| p.to_string()).collect(),
+            },
+        );
+
+        if let Err(e) = ctx.jsonl_writer.write(&accounts_event) {
+            error!(error = %e, "Failed to write DexPoolAccounts event to JSONL");
+        }
+
+        if let Some(ref nats) = ctx.nats {
+            let _ = publish_market_event_core_and_momentum_ex(
+                nats,
+                &accounts_event,
+                Some(MarketEventCorePublishTrace {
+                    recv_at: tx_geyser_recv_at,
+                    cold_path: false,
+                    segment: MarketDataLatencySegment::Other,
+                }),
+                Some(ctx.as_ref()),
+            )
+            .await;
+        }
+        // Ensures the Geyser PoolCacheUpdate builder can use these as fallback
+        // when the parsed Geyser state has empty pool_accounts.
+        if pool_accounts.len() >= 14 {
+            ctx.live_pool_cache
+                .set_pump_amm_pool_accounts(pool_address, pool_accounts.clone());
+            let (ext_flag, ext_third, ext_t0, ext_t1) = ctx
+                .live_pool_cache
+                .pump_amm_sell_extended_layout(pool_address);
+            let merged_flag = ext_flag || *pump_amm_sell_requires_cashback_remaining;
+            let merged_third = ext_third
+                .or(*pump_amm_sell_cashback_third_meta)
+                .filter(|p| *p != Pubkey::default());
+            let merged_t0 = ext_t0
+                .or(*pump_amm_sell_extended_tail_0)
+                .filter(|p| *p != Pubkey::default());
+            let merged_t1 = ext_t1
+                .or(*pump_amm_sell_extended_tail_1)
+                .filter(|p| *p != Pubkey::default());
+            let (sell_layout_ready, dex_readiness) = pump_amm_sell_layout_publish_state(
+                merged_flag,
+                merged_third,
+                merged_t0,
+                merged_t1,
+                true,
+            );
+            ctx.live_pool_cache
+                .set_pump_amm_sell_layout_ready(pool_address, sell_layout_ready);
+            ctx.live_pool_cache
+                .set_pump_amm_pool_accounts_readiness_authoritative(*pool_address, dex_readiness);
+
+            // FIX-33: Persist pool_accounts to JetStream so bootstrap recovers them after restart.
+            if let Some(ref nats) = ctx.nats {
+                let mut pool_update = PoolCacheUpdate::new_pool_discovered(
+                    "market-data",
+                    BUILD_VERSION,
+                    run_id,
+                    pool_address.to_string(),
+                    "pump_amm".to_string(),
+                    base_mint.clone(),
+                    quote_mint.clone(),
+                    0,
+                    0,
+                    None,
+                    tx_update.slot,
+                );
+                let mut meta = std::collections::HashMap::new();
+                let accounts_str: Vec<String> =
+                    pool_accounts.iter().map(|p| p.to_string()).collect();
+                meta.insert("pool_accounts".to_string(), accounts_str.join(","));
+                meta.insert(
+                    "pump_amm_sell_cashback_remaining".to_string(),
+                    merged_flag.to_string(),
+                );
+                meta.insert(
+                    "pump_amm_sell_layout_ready".to_string(),
+                    sell_layout_ready.to_string(),
+                );
+                if let Some(pk) = merged_third {
+                    meta.insert(
+                        "pump_amm_sell_cashback_third_meta".to_string(),
+                        pk.to_string(),
+                    );
+                }
+                if let Some(pk) = merged_t0 {
+                    meta.insert("pump_amm_sell_extended_tail_0".to_string(), pk.to_string());
+                }
+                if let Some(pk) = merged_t1 {
+                    meta.insert("pump_amm_sell_extended_tail_1".to_string(), pk.to_string());
+                }
+                pool_update.metadata = Some(meta);
+                pool_update.set_dex_readiness_in_metadata(dex_readiness);
+                let subject = pool_subject(&pool_address.to_string());
+                if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
+                    warn!(error = %e, "FIX-33: Failed to publish pump_amm pool_accounts PoolCacheUpdate to JetStream (trade)");
+                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    // For non-pump_amm DEXes: emit DexPoolAccounts on first trade if pool_accounts present.
+    if let Some(ParsedDexEvent::Trade {
+        pool_address,
+        mint,
+        quote_mint,
+        dex,
+        pool_accounts: Some(pool_accounts),
+        ..
+    }) = parsed_event.as_ref()
+    {
+        if !matches!(dex, DexType::PumpFunAmm) {
+            let is_first_trade = ctx.known_trade_dex_pools.write().insert(*pool_address);
+            if is_first_trade {
+                let accounts_event = MarketEvent::new(
+                    "market-data",
+                    BUILD_VERSION,
+                    run_id,
+                    ctx.next_event_id(),
+                    "geyser_first_trade",
+                    Some(tx_update.slot),
+                    MarketEventKind::DexPoolAccounts {
+                        dex: dex.to_string(),
+                        pool_address: pool_address.to_string(),
+                        base_mint: mint.to_string(),
+                        quote_mint: quote_mint.to_string(),
+                        accounts: pool_accounts.iter().map(|p| p.to_string()).collect(),
+                    },
+                );
+
+                if let Err(e) = ctx.jsonl_writer.write(&accounts_event) {
+                    error!(error = %e, "Failed to write DexPoolAccounts event to JSONL");
+                }
+
+                if let Some(ref nats) = ctx.nats {
+                    if publish_market_event_core_and_momentum_ex(
+                        nats,
+                        &accounts_event,
+                        Some(MarketEventCorePublishTrace {
+                            recv_at: tx_geyser_recv_at,
+                            cold_path: false,
+                            segment: MarketDataLatencySegment::Other,
+                        }),
+                        None,
+                    )
+                    .await
+                    {
+                        debug!(
+                            dex = %dex,
+                            pool = %pool_address,
+                            "Emitted DexPoolAccounts from first trade"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let event_kind = if let Some(parsed) = parsed_event {
+        info!(
+            slot = tx_update.slot,
+            sig = %tx_update.signature,
+            "Parsed DEX transaction"
+        );
+        let mut kind = parsed.to_market_event_kind();
+
+        // Enrich Trade events with creator from cache (P0: PumpFun intent building)
+        if let MarketEventKind::Trade {
+            ref pool_address,
+            ref mint,
+            ref dex,
+            ref mut creator,
+            ..
+        } = kind
+        {
+            if dex == "pumpfun" || dex == "pump_amm" {
+                // Try creator_cache first (mint -> creator)
+                let mut found_creator = None;
+                {
+                    let cache = ctx.creator_cache.read();
+                    if let Some(cached_creator) = cache.get(mint) {
+                        found_creator = Some(cached_creator.clone());
+                    }
+                }
+
+                // Fallback to pool_creator_cache (pool -> creator) from BondingCurveUpdate
+                if found_creator.is_none() {
+                    let pool_cache = ctx.pool_creator_cache.read();
+                    if let Some(pool_creator) = pool_cache.get(pool_address) {
+                        found_creator = Some(pool_creator.clone());
+
+                        // Also populate creator_cache for future lookups
+                        drop(pool_cache);
+                        ctx.creator_cache
+                            .write()
+                            .insert(mint.clone(), found_creator.clone().unwrap());
+                        debug!(
+                            mint = %mint,
+                            pool = %pool_address,
+                            creator = %found_creator.as_ref().unwrap(),
+                            "Populated creator_cache from pool_creator_cache"
+                        );
+                    }
+                }
+
+                if let Some(cached_creator) = found_creator {
+                    *creator = Some(cached_creator.clone());
+                    debug!(
+                        mint = %mint,
+                        dex = %dex,
+                        creator = %cached_creator,
+                        "Enriched Trade event with cached creator"
+                    );
+                }
+            }
+        }
+        kind
+    } else {
+        // Fallback to raw event for unknown transactions
+        MarketEventKind::TransactionDetected {
+            signature: tx_update.signature.clone(),
+            program: tx_update
+                .account_keys
+                .first()
+                .map(|k| k.to_string())
+                .unwrap_or_default(),
+        }
+    };
+
+    let event = MarketEvent::new(
+        "market-data",
+        BUILD_VERSION,
+        run_id,
+        ctx.next_event_id(),
+        "geyser",
+        Some(tx_update.slot),
+        event_kind,
+    );
+
+    // Write to JSONL
+    if let Err(e) = ctx.jsonl_writer.write(&event) {
+        error!(error = %e, "Failed to write tx event to JSONL");
+    }
+
+    // Publish to NATS
+    if let Some(ref nats) = ctx.nats {
+        let seg = market_data_publish_segment(&event.kind);
+        let _ = publish_market_event_core_and_momentum_ex(
+            nats,
+            &event,
+            Some(MarketEventCorePublishTrace {
+                recv_at: tx_geyser_recv_at,
+                cold_path: false,
+                segment: seg,
+            }),
+            Some(ctx.as_ref()),
+        )
+        .await;
+    }
+}
+
 /// Run with real Geyser connection
 #[allow(clippy::too_many_arguments)]
 async fn run_geyser_loop(
@@ -6340,7 +7013,7 @@ async fn run_geyser_loop(
     }
 
     // Start legacy GeyserListener for transaction parsing (will be phased out in favor of pool discovery)
-    let (listener, mut account_rx, mut transaction_rx, mut blockhash_rx) =
+    let (listener, mut account_rx, transaction_rx, mut blockhash_rx) =
         GeyserListener::new_with_tracked_accounts(
             geyser_url.to_string(),
             program_ids,
@@ -6359,7 +7032,7 @@ async fn run_geyser_loop(
     tokio::pin!(shutdown);
 
     let mut account_count = 0u64;
-    let mut tx_count = 0u64;
+    let tx_count = Arc::new(AtomicU64::new(0));
     let mut last_heartbeat = std::time::Instant::now();
     let mut activity_interval = tokio::time::interval(std::time::Duration::from_secs(10));
 
@@ -6423,8 +7096,49 @@ async fn run_geyser_loop(
         None
     };
 
+    // Option A (MARKET-DATA-TX-INGEST-FAIRNESS): dedizierter Tokio-Task für Geyser-Txs.
+    // Verhindert, dass `transaction_rx.recv()` hinter langen Account-`select!`-Armen verhungert
+    // (p50 `market_data_tx_channel_lag_ms` war ~1s+ bei gleichzeitig niedrigem Publish-Tail).
+    let (geyser_tx_stream_stopped_tx, mut geyser_tx_stream_stopped_rx) = watch::channel(false);
+    let ctx_geyser_tx = Arc::clone(&ctx);
+    let run_id_geyser_tx = run_id.to_string();
+    let tx_count_geyser_tx = Arc::clone(&tx_count);
+    let mut transaction_rx_geyser = transaction_rx;
+    tokio::spawn(async move {
+        loop {
+            match transaction_rx_geyser.recv().await {
+                Ok(tx_update) => {
+                    set_market_data_tx_broadcast_queue_depth(transaction_rx_geyser.len());
+                    handle_geyser_transaction(
+                        Arc::clone(&ctx_geyser_tx),
+                        run_id_geyser_tx.as_str(),
+                        tx_update,
+                        tx_count_geyser_tx.as_ref(),
+                    )
+                    .await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    record_market_data_tx_broadcast_lagged(n);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    warn!("Geyser transaction broadcast channel closed");
+                    let _ = geyser_tx_stream_stopped_tx.send(true);
+                    break;
+                }
+            }
+        }
+    });
+
     loop {
         tokio::select! {
+            _ = geyser_tx_stream_stopped_rx.changed() => {
+                if *geyser_tx_stream_stopped_rx.borrow() {
+                    warn!("Geyser transaction stream ended; stopping market-data Geyser loop");
+                    listener_handle.abort();
+                    break;
+                }
+            }
+
             // I-24d: ControlRequests (EnsurePumpAmmPoolAccounts Discovery)
             msg = async {
                 if let Some(ref mut sub) = control_subscription {
@@ -8494,663 +9208,6 @@ async fn run_geyser_loop(
                 }
             }
 
-            // Transaction updates (pool creations, swaps)
-            transaction_rx_res = transaction_rx.recv() => {
-                match transaction_rx_res {
-                    Ok(tx_update) => {
-                let recv_at = Instant::now();
-                record_market_data_tx_channel_lag_ms(tx_update.grpc_recv_at, recv_at);
-                let tx_geyser_recv_at = recv_at;
-                market_data_bump_geyser_head_slot(tx_update.slot);
-                tx_count += 1;
-                ironcrab::metrics::record_activity();
-
-                // Phase 2 (Roadmap, Option C):
-                // Detect Associated Token Program create/close instructions for the tracked wallet
-                // and feed them into the same wallet-ATA tracking path (no RPC, no scanning).
-                // This is needed to catch manual wallet actions (Phantom/Jupiter) that do not
-                // produce ExecutionResults.
-
-                // P2: Track priority fees from Geyser transactions (NO RPC calls!)
-                if let Some(priority_fee) = ctx.priority_fee_tracker.add_sample(
-                    tx_update.slot,
-                    tx_update.fee_lamports,
-                    tx_update.compute_units_consumed,
-                ) {
-                    // Publish percentiles every 50 samples (rate limited)
-                    let sample_count = ctx.priority_fee_tracker.sample_count();
-                    if sample_count % 50 == 0 && sample_count >= 10 {
-                        let percentiles = ctx.priority_fee_tracker.get_percentiles();
-                        let fee_msg = PriorityFeePercentiles::new(
-                            "market-data",
-                            BUILD_VERSION,
-                            &ctx.run_id,
-                            percentiles.sample_count,
-                            percentiles.last_slot,
-                            percentiles.p25,
-                            percentiles.p50,
-                            percentiles.p75,
-                            percentiles.p90,
-                            ctx.priority_fee_tracker.get_fee_for_tier(IntentTier::Tier0),
-                            ctx.priority_fee_tracker.get_fee_for_tier(IntentTier::Tier1),
-                            ctx.priority_fee_tracker.get_fee_for_tier(IntentTier::Arb),
-                        );
-                        if let Some(ref nats) = ctx.nats {
-                            // NOTE: nats.publish() already serializes - don't double-serialize!
-                            if let Err(e) = nats.publish(
-                                TOPIC_PRIORITY_FEE_SAMPLES,
-                                &fee_msg,
-                            ).await {
-                                debug!(error = %e, "Failed to publish priority fee percentiles");
-                            }
-                        }
-                        debug!(
-                            samples = sample_count,
-                            p50 = percentiles.p50,
-                            p90 = percentiles.p90,
-                            last_fee = priority_fee,
-                            "priority_fee: published percentiles"
-                        );
-                    }
-                }
-
-                // Try to parse as DEX event (PoolCreated, Trade)
-                let pool_lookup = |pool: &Pubkey| -> Option<OrcaPoolInfo> {
-                    match ctx.live_pool_cache.get(pool) {
-                        Some(CachedPoolState::Orca(state)) => {
-                            Some(OrcaPoolInfo {
-                                token_mint_a: state.token_mint_a,
-                                token_mint_b: state.token_mint_b,
-                                token_vault_a: state.token_vault_a,
-                                token_vault_b: state.token_vault_b,
-                                tick_current_index: Some(state.tick_current_index),
-                                tick_spacing: Some(state.tick_spacing),
-                                token_a_program: state.token_a_program,
-                                token_b_program: state.token_b_program,
-                            })
-                        }
-                        _ => None,
-                    }
-                };
-                let parsed_event =
-                    parse_transaction_update_with_pool_lookup(&tx_update, Some(&pool_lookup));
-
-                // Track mint pubkeys for mint-authority/freeze metadata.
-                // GEYSER-FIRST: No RPC calls! For pump.fun we know decimals=6. For others, Geyser delivers.
-                if let Some(parsed) = parsed_event.as_ref() {
-                    let mint_and_dex: Option<(Pubkey, Option<DexType>)> = match parsed {
-                        ParsedDexEvent::PoolCreated { base_mint, dex, .. } => Some((*base_mint, Some(*dex))),
-                        ParsedDexEvent::Trade { mint, dex, .. } => Some((*mint, Some(*dex))),
-                        ParsedDexEvent::LiquidityRemoved { mint, .. } => Some((*mint, None)),
-                        ParsedDexEvent::BondingCurveUpdate { .. } => None, // Handled separately in account update
-                    };
-                    if let Some((mint, dex_opt)) = mint_and_dex {
-                        let mut tracked = ctx.tracked_mints.write();
-                        if tracked.insert(mint) {
-                            // Push updated list to geyser listener (resubscribe)
-                            let updated: Vec<Pubkey> = tracked.iter().copied().collect();
-                            let _ = ctx.tracked_mints_tx.send(updated);
-
-                            // Geyser delivers mint accounts via AccountsDB snapshot when subscribed.
-                            // tracked_mints_tx already sent above → GeyserListener will resubscribe.
-                            debug!(
-                                mint = %mint,
-                                dex = ?dex_opt,
-                                "New mint tracked, waiting for Geyser mint account delivery"
-                            );
-                        }
-                    }
-
-                    // Build pool_mint_map for PumpFun (needed for BondingCurveUpdate -> creator lookup)
-                    match parsed {
-                        ParsedDexEvent::PoolCreated {
-                            pool_address,
-                            base_mint,
-                            dex: DexType::PumpFun,
-                            ..
-                        } => {
-                            ctx.pool_mint_map.write().insert(
-                                pool_address.to_string(),
-                                base_mint.to_string()
-                            );
-                        }
-                        ParsedDexEvent::Trade {
-                            pool_address,
-                            mint,
-                            dex: DexType::PumpFun,
-                            ..
-                        } => {
-                            ctx.pool_mint_map.write().insert(
-                                pool_address.to_string(),
-                                mint.to_string()
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Pump.fun: propagate creator/dev wallet so strategy can build deterministic intents.
-                // The PoolCreated MarketEventKind intentionally does not carry creator today, so emit
-                // a separate DevWalletIdentified event when available.
-                // Also cache the creator for later Trade events.
-                if let Some(ParsedDexEvent::PoolCreated {
-                    base_mint,
-                    dex: DexType::PumpFun,
-                    creator: Some(creator),
-                    ..
-                }) = parsed_event.as_ref()
-                {
-                    // Cache creator for later Trade events (P0: avoid RPC in momentum-bot)
-                    {
-                        let mut cache = ctx.creator_cache.write();
-                        cache.insert(base_mint.to_string(), creator.to_string());
-                        debug!(
-                            mint = %base_mint,
-                            creator = %creator,
-                            cache_size = cache.len(),
-                            "Cached PumpFun creator for Trade enrichment"
-                        );
-                    }
-
-                    let dev_event = MarketEvent::new(
-                        "market-data",
-                        BUILD_VERSION,
-                        run_id,
-                        ctx.next_event_id(),
-                        "geyser",
-                        Some(tx_update.slot),
-                        MarketEventKind::DevWalletIdentified {
-                            mint: base_mint.to_string(),
-                            dev_wallet: creator.to_string(),
-                            // Supply percentage is not computed here yet (would require extra on-chain reads).
-                            // Momentum-bot treats this as an input for dev-risk filters; keep deterministic.
-                            supply_percentage: 0.0,
-                        },
-                    );
-
-                    if let Err(e) = ctx.jsonl_writer.write(&dev_event) {
-                        error!(error = %e, "Failed to write dev wallet event to JSONL");
-                    }
-
-                    if let Some(ref nats) = ctx.nats {
-                        let _ = publish_market_event_core_and_momentum_ex(
-                            nats,
-                            &dev_event,
-                            Some(MarketEventCorePublishTrace {
-                                recv_at: tx_geyser_recv_at,
-                                cold_path: false,
-                                segment: MarketDataLatencySegment::Other,
-                            }),
-                            Some(ctx.as_ref()),
-                        )
-                        .await;
-                    }
-                }
-
-                // P1: Process wallet tracking events
-                let wallet_events = if let Some(ref parsed) = parsed_event {
-                    match parsed {
-                        ParsedDexEvent::PoolCreated { base_mint, .. } => {
-                            // Record pool creation for early buyer tracking
-                            ctx.wallet_tracker.record_pool_created(&base_mint.to_string(), tx_update.slot);
-                            Vec::new()
-                        }
-                        ParsedDexEvent::Trade { mint, trader, is_buy, sol_amount, token_amount, signature, slot, .. } => {
-                            // Check for smart money, early buyers, insider activity
-                            ctx.wallet_tracker.process_trade(
-                                &mint.to_string(),
-                                &trader.to_string(),
-                                *is_buy,
-                                *sol_amount,
-                                *token_amount,
-                                *slot,
-                                signature,
-                                &ctx.run_id,
-                                "market-data",
-                            )
-                        }
-                        ParsedDexEvent::LiquidityRemoved { .. } => Vec::new(),
-                        // BondingCurveUpdate is handled separately (account updates, not TX)
-                        ParsedDexEvent::BondingCurveUpdate { .. } => Vec::new(),
-                    }
-                } else {
-                    Vec::new()
-                };
-
-                // Publish wallet tracking events
-                for wallet_event in wallet_events {
-                    // Write to JSONL
-                    if let Err(e) = ctx.jsonl_writer.write(&wallet_event) {
-                        error!(error = %e, "Failed to write wallet event to JSONL");
-                    }
-                    // Publish to NATS
-                    if let Some(ref nats) = ctx.nats {
-                        if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &wallet_event).await {
-                            warn!(error = %e, "Failed to publish wallet event to NATS");
-                        }
-                    }
-                }
-
-                // PumpSwap create_pool: observation only. Do not emit DexPoolAccounts, cache, or
-                // JetStream pool_accounts — synthetic reconstruction is not swap-verified (Bug #36).
-                // First trade / EnsurePumpAmmPoolAccounts supply usable pool_accounts.
-                // Ignore `pool_accounts` in the match so a future parser change (Some vs None) does
-                // not silently skip PoolCreated / known_pump_amm_pools / pool_mint_map.
-                if let Some(ParsedDexEvent::PoolCreated {
-                    pool_address,
-                    base_mint: base_mint_pk,
-                    quote_mint: quote_mint_pk,
-                    dex: DexType::PumpFunAmm,
-                    ..
-                }) = parsed_event.as_ref()
-                {
-                    let is_new_pool = ctx.known_pump_amm_pools.write().insert(*pool_address);
-                    if is_new_pool {
-                        let base_mint = base_mint_pk.to_string();
-                        let quote_mint = quote_mint_pk.to_string();
-                        info!(
-                            pool = %pool_address,
-                            base_mint = %base_mint_pk,
-                            "pump_amm pool observed via create_pool — PoolCreated only (DexPoolAccounts/cache deferred to verified path)"
-                        );
-                        let pool_created_event = MarketEvent::new(
-                            "market-data",
-                            BUILD_VERSION,
-                            run_id,
-                            ctx.next_event_id(),
-                            "geyser_create_pool",
-                            Some(tx_update.slot),
-                            MarketEventKind::PoolCreated {
-                                pool_address: pool_address.to_string(),
-                                base_mint: base_mint.clone(),
-                                quote_mint: quote_mint.clone(),
-                                dex: DexType::PumpFunAmm.to_string(),
-                                initial_liquidity_sol: None,
-                            },
-                        );
-                        if let Err(e) = ctx.jsonl_writer.write(&pool_created_event) {
-                            error!(error = %e, "Failed to write pump_amm PoolCreated (create_pool) to JSONL");
-                        }
-                        if let Some(ref nats) = ctx.nats {
-                            let _ = publish_market_event_core_and_momentum_ex(
-                                nats,
-                                &pool_created_event,
-                                Some(MarketEventCorePublishTrace {
-                                    recv_at: tx_geyser_recv_at,
-                                    cold_path: false,
-                                    segment: MarketDataLatencySegment::PoolCreated,
-                                }),
-                                Some(ctx.as_ref()),
-                            )
-                            .await;
-                        }
-                        ctx.pool_mint_map.write().insert(pool_address.to_string(), base_mint.clone());
-                    }
-                }
-
-                // Pump.fun AMM: emit static pool account metadata for intent-driven execution.
-                // IMPORTANT: We emit PoolCreated + DexPoolAccounts TOGETHER on first trade.
-                // This ensures arb-strategy has all required accounts before seeing the pool.
-                if let Some(ParsedDexEvent::Trade {
-                    pool_address,
-                    mint: base_mint_pk,
-                    dex: DexType::PumpFunAmm,
-                    pool_accounts: Some(pool_accounts),
-                    pump_amm_sell_requires_cashback_remaining,
-                    pump_amm_sell_cashback_third_meta,
-                    pump_amm_sell_extended_tail_0,
-                    pump_amm_sell_extended_tail_1,
-                    ..
-                }) = parsed_event.as_ref()
-                {
-                    // Merge when this trade is extended OR cache already knows extended layout
-                    // (e.g. prior Geyser observation / JetStream). Skipping when the trade is a
-                    // standard 21-account sell would drop a true extended flag from the MASTER cache.
-                    let (ext_flag_prior, ext_third_prior, ext_t0_prior, ext_t1_prior) = ctx
-                        .live_pool_cache
-                        .pump_amm_sell_extended_layout(pool_address);
-                    let merge_requires = *pump_amm_sell_requires_cashback_remaining
-                        || ext_flag_prior;
-                    let merge_third = (*pump_amm_sell_cashback_third_meta)
-                        .filter(|p| *p != Pubkey::default())
-                        .or(ext_third_prior);
-                    let merge_t0 = (*pump_amm_sell_extended_tail_0)
-                        .filter(|p| *p != Pubkey::default())
-                        .or(ext_t0_prior);
-                    let merge_t1 = (*pump_amm_sell_extended_tail_1)
-                        .filter(|p| *p != Pubkey::default())
-                        .or(ext_t1_prior);
-                    if merge_requires || merge_third.is_some() || merge_t0.is_some() || merge_t1.is_some()
-                    {
-                        ctx.live_pool_cache.merge_pump_amm_sell_extended_layout(
-                            pool_address,
-                            merge_requires,
-                            merge_third,
-                            merge_t0,
-                            merge_t1,
-                        );
-                    }
-                    // v1 order (see MarketEventKind::DexPoolAccounts docs): base_mint at [2], quote_mint at [3]
-                    let base_mint = pool_accounts.get(2).map(|p| p.to_string()).unwrap_or_default();
-                    let quote_mint = pool_accounts.get(3).map(|p| p.to_string()).unwrap_or_default();
-
-                    // Check if this is the FIRST trade for this pool (new pool discovery)
-                    let is_first_trade = ctx.known_pump_amm_pools.write().insert(*pool_address);
-
-                    // If first trade, emit PoolCreated FIRST (before DexPoolAccounts)
-                    // This ensures arb-strategy sees PoolCreated + DexPoolAccounts together
-                    if is_first_trade {
-                        info!(
-                            pool = %pool_address,
-                            base_mint = %base_mint_pk,
-                            "pump_amm pool discovered via first trade - emitting PoolCreated + DexPoolAccounts"
-                        );
-
-                        let pool_created_event = MarketEvent::new(
-                            "market-data",
-                            BUILD_VERSION,
-                            run_id,
-                            ctx.next_event_id(),
-                            "geyser_first_trade",
-                            Some(tx_update.slot),
-                            MarketEventKind::PoolCreated {
-                                pool_address: pool_address.to_string(),
-                                base_mint: base_mint.clone(),
-                                quote_mint: quote_mint.clone(),
-                                dex: DexType::PumpFunAmm.to_string(),
-                                initial_liquidity_sol: None, // Not available from trade
-                            },
-                        );
-
-                        if let Err(e) = ctx.jsonl_writer.write(&pool_created_event) {
-                            error!(error = %e, "Failed to write pump_amm PoolCreated event to JSONL");
-                        }
-
-                        if let Some(ref nats) = ctx.nats {
-                            let _ = publish_market_event_core_and_momentum_ex(
-                                nats,
-                                &pool_created_event,
-                                Some(MarketEventCorePublishTrace {
-                                    recv_at: tx_geyser_recv_at,
-                                    cold_path: false,
-                                    segment: MarketDataLatencySegment::PoolCreated,
-                                }),
-                                Some(ctx.as_ref()),
-                            )
-                            .await;
-                        }
-                    }
-                    let accounts_event = MarketEvent::new(
-                        "market-data",
-                        BUILD_VERSION,
-                        run_id,
-                        ctx.next_event_id(),
-                        "geyser",
-                        Some(tx_update.slot),
-                        MarketEventKind::DexPoolAccounts {
-                            dex: DexType::PumpFunAmm.to_string(),
-                            pool_address: pool_address.to_string(),
-                            base_mint: base_mint.clone(),
-                            quote_mint: quote_mint.clone(),
-                            accounts: pool_accounts.iter().map(|p| p.to_string()).collect(),
-                        },
-                    );
-
-                    if let Err(e) = ctx.jsonl_writer.write(&accounts_event) {
-                        error!(error = %e, "Failed to write DexPoolAccounts event to JSONL");
-                    }
-
-                    if let Some(ref nats) = ctx.nats {
-                        let _ = publish_market_event_core_and_momentum_ex(
-                            nats,
-                            &accounts_event,
-                            Some(MarketEventCorePublishTrace {
-                                recv_at: tx_geyser_recv_at,
-                                cold_path: false,
-                                segment: MarketDataLatencySegment::Other,
-                            }),
-                            Some(ctx.as_ref()),
-                        )
-                        .await;
-                    }
-                    // Ensures the Geyser PoolCacheUpdate builder can use these as fallback
-                    // when the parsed Geyser state has empty pool_accounts.
-                    if pool_accounts.len() >= 14 {
-                        ctx.live_pool_cache.set_pump_amm_pool_accounts(pool_address, pool_accounts.clone());
-                        let (ext_flag, ext_third, ext_t0, ext_t1) =
-                            ctx.live_pool_cache.pump_amm_sell_extended_layout(pool_address);
-                        let merged_flag = ext_flag || *pump_amm_sell_requires_cashback_remaining;
-                        let merged_third = ext_third
-                            .or(*pump_amm_sell_cashback_third_meta)
-                            .filter(|p| *p != Pubkey::default());
-                        let merged_t0 = ext_t0
-                            .or(*pump_amm_sell_extended_tail_0)
-                            .filter(|p| *p != Pubkey::default());
-                        let merged_t1 = ext_t1
-                            .or(*pump_amm_sell_extended_tail_1)
-                            .filter(|p| *p != Pubkey::default());
-                        let (sell_layout_ready, dex_readiness) = pump_amm_sell_layout_publish_state(
-                            merged_flag,
-                            merged_third,
-                            merged_t0,
-                            merged_t1,
-                            true,
-                        );
-                        ctx.live_pool_cache
-                            .set_pump_amm_sell_layout_ready(pool_address, sell_layout_ready);
-                        ctx.live_pool_cache
-                            .set_pump_amm_pool_accounts_readiness_authoritative(
-                                *pool_address,
-                                dex_readiness,
-                            );
-
-                        // FIX-33: Persist pool_accounts to JetStream so bootstrap recovers them after restart.
-                        if let Some(ref nats) = ctx.nats {
-                            let mut pool_update = PoolCacheUpdate::new_pool_discovered(
-                                "market-data",
-                                BUILD_VERSION,
-                                run_id,
-                                pool_address.to_string(),
-                                "pump_amm".to_string(),
-                                base_mint.clone(),
-                                quote_mint.clone(),
-                                0,
-                                0,
-                                None,
-                                tx_update.slot,
-                            );
-                            let mut meta = std::collections::HashMap::new();
-                            let accounts_str: Vec<String> = pool_accounts.iter().map(|p| p.to_string()).collect();
-                            meta.insert("pool_accounts".to_string(), accounts_str.join(","));
-                            meta.insert(
-                                "pump_amm_sell_cashback_remaining".to_string(),
-                                merged_flag.to_string(),
-                            );
-                            meta.insert(
-                                "pump_amm_sell_layout_ready".to_string(),
-                                sell_layout_ready.to_string(),
-                            );
-                            if let Some(pk) = merged_third {
-                                meta.insert(
-                                    "pump_amm_sell_cashback_third_meta".to_string(),
-                                    pk.to_string(),
-                                );
-                            }
-                            if let Some(pk) = merged_t0 {
-                                meta.insert("pump_amm_sell_extended_tail_0".to_string(), pk.to_string());
-                            }
-                            if let Some(pk) = merged_t1 {
-                                meta.insert("pump_amm_sell_extended_tail_1".to_string(), pk.to_string());
-                            }
-                            pool_update.metadata = Some(meta);
-                            pool_update.set_dex_readiness_in_metadata(dex_readiness);
-                            let subject = pool_subject(&pool_address.to_string());
-                            if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
-                                warn!(error = %e, "FIX-33: Failed to publish pump_amm pool_accounts PoolCacheUpdate to JetStream (trade)");
-                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-
-                // For non-pump_amm DEXes: emit DexPoolAccounts on first trade if pool_accounts present.
-                if let Some(ParsedDexEvent::Trade {
-                    pool_address,
-                    mint,
-                    quote_mint,
-                    dex,
-                    pool_accounts: Some(pool_accounts),
-                    ..
-                }) = parsed_event.as_ref()
-                {
-                    if !matches!(dex, DexType::PumpFunAmm) {
-                        let is_first_trade = ctx.known_trade_dex_pools.write().insert(*pool_address);
-                        if is_first_trade {
-                            let accounts_event = MarketEvent::new(
-                                "market-data",
-                                BUILD_VERSION,
-                                run_id,
-                                ctx.next_event_id(),
-                                "geyser_first_trade",
-                                Some(tx_update.slot),
-                                MarketEventKind::DexPoolAccounts {
-                                    dex: dex.to_string(),
-                                    pool_address: pool_address.to_string(),
-                                    base_mint: mint.to_string(),
-                                    quote_mint: quote_mint.to_string(),
-                                    accounts: pool_accounts.iter().map(|p| p.to_string()).collect(),
-                                },
-                            );
-
-                            if let Err(e) = ctx.jsonl_writer.write(&accounts_event) {
-                                error!(error = %e, "Failed to write DexPoolAccounts event to JSONL");
-                            }
-
-                            if let Some(ref nats) = ctx.nats {
-                                if publish_market_event_core_and_momentum_ex(
-                                    nats,
-                                    &accounts_event,
-                                    Some(MarketEventCorePublishTrace {
-                                        recv_at: tx_geyser_recv_at,
-                                        cold_path: false,
-                                        segment: MarketDataLatencySegment::Other,
-                                    }),
-                                    None,
-                                )
-                                .await
-                                {
-                                    debug!(
-                                        dex = %dex,
-                                        pool = %pool_address,
-                                        "Emitted DexPoolAccounts from first trade"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let event_kind = if let Some(parsed) = parsed_event {
-                    info!(
-                        slot = tx_update.slot,
-                        sig = %tx_update.signature,
-                        "Parsed DEX transaction"
-                    );
-                    let mut kind = parsed.to_market_event_kind();
-
-                    // Enrich Trade events with creator from cache (P0: PumpFun intent building)
-                    if let MarketEventKind::Trade { ref pool_address, ref mint, ref dex, ref mut creator, .. } = kind {
-                        if dex == "pumpfun" || dex == "pump_amm" {
-                            // Try creator_cache first (mint -> creator)
-                            let mut found_creator = None;
-                            {
-                                let cache = ctx.creator_cache.read();
-                                if let Some(cached_creator) = cache.get(mint) {
-                                    found_creator = Some(cached_creator.clone());
-                                }
-                            }
-
-                            // Fallback to pool_creator_cache (pool -> creator) from BondingCurveUpdate
-                            if found_creator.is_none() {
-                                let pool_cache = ctx.pool_creator_cache.read();
-                                if let Some(pool_creator) = pool_cache.get(pool_address) {
-                                    found_creator = Some(pool_creator.clone());
-
-                                    // Also populate creator_cache for future lookups
-                                    drop(pool_cache);
-                                    ctx.creator_cache.write().insert(mint.clone(), found_creator.clone().unwrap());
-                                    debug!(
-                                        mint = %mint,
-                                        pool = %pool_address,
-                                        creator = %found_creator.as_ref().unwrap(),
-                                        "Populated creator_cache from pool_creator_cache"
-                                    );
-                                }
-                            }
-
-                            if let Some(cached_creator) = found_creator {
-                                *creator = Some(cached_creator.clone());
-                                debug!(
-                                    mint = %mint,
-                                    dex = %dex,
-                                    creator = %cached_creator,
-                                    "Enriched Trade event with cached creator"
-                                );
-                            }
-                        }
-                    }
-                    kind
-                } else {
-                    // Fallback to raw event for unknown transactions
-                    MarketEventKind::TransactionDetected {
-                        signature: tx_update.signature.clone(),
-                        program: tx_update.account_keys.first().map(|k| k.to_string()).unwrap_or_default(),
-                    }
-                };
-
-                let event = MarketEvent::new(
-                    "market-data",
-                    BUILD_VERSION,
-                    run_id,
-                    ctx.next_event_id(),
-                    "geyser",
-                    Some(tx_update.slot),
-                    event_kind,
-                );
-
-                // Write to JSONL
-                if let Err(e) = ctx.jsonl_writer.write(&event) {
-                    error!(error = %e, "Failed to write tx event to JSONL");
-                }
-
-                // Publish to NATS
-                if let Some(ref nats) = ctx.nats {
-                    let seg = market_data_publish_segment(&event.kind);
-                    let _ = publish_market_event_core_and_momentum_ex(
-                        nats,
-                        &event,
-                        Some(MarketEventCorePublishTrace {
-                            recv_at: tx_geyser_recv_at,
-                            cold_path: false,
-                            segment: seg,
-                        }),
-                        Some(ctx.as_ref()),
-                    )
-                    .await;
-                }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        record_market_data_tx_broadcast_lagged(n);
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        warn!("Geyser transaction broadcast channel closed");
-                        break;
-                    }
-                }
-            }
-
             // Pool Discovery Events (Geyser-based pool creation events)
             Ok(pool_event) = pool_discovery_rx.recv() => {
                 let pool_discovery_recv_at = Instant::now();
@@ -9499,7 +9556,8 @@ async fn run_geyser_loop(
                 if last_heartbeat.elapsed().as_secs() >= 60 {
                     ironcrab::metrics::record_activity();
                     let (records, bytes) = ctx.jsonl_writer.stats();
-                    let total_events = account_count + tx_count;
+                    let tx_n = tx_count.load(Ordering::Relaxed);
+                    let total_events = account_count + tx_n;
 
                     // Update Prometheus metrics
                     MARKET_EVENTS_RECEIVED_TOTAL.store(total_events, Ordering::Relaxed);
@@ -9507,7 +9565,7 @@ async fn run_geyser_loop(
 
                     info!(
                         accounts = account_count,
-                        transactions = tx_count,
+                        transactions = tx_n,
                         records_written = records,
                         bytes_written = bytes,
                         "market-data heartbeat (Geyser)"

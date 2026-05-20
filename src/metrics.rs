@@ -389,6 +389,10 @@ static MARKET_DATA_BONDING_TO_TRADE_SLOT_DELTA_SLOTS_COUNT: Lazy<AtomicU64> =
 
 /// `broadcast::RecvError::Lagged(n)` — skipped messages (cumulative `n` added per occurrence).
 pub static MARKET_DATA_TX_BROADCAST_LAGGED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// Remaining messages in the Geyser→market-data `broadcast` buffer after each successful `recv`
+/// (ingest task only). Under healthy fairness this should stay near 0.
+pub static MARKET_DATA_TX_BROADCAST_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
@@ -466,6 +470,12 @@ pub fn record_market_data_tx_broadcast_lagged(skipped_messages: u64) {
     if skipped_messages > 0 {
         MARKET_DATA_TX_BROADCAST_LAGGED_TOTAL.fetch_add(skipped_messages, Ordering::Relaxed);
     }
+}
+
+/// Update gauge: pending tx updates in the `broadcast` receiver (see `GeyserListener` tx channel).
+#[inline]
+pub fn set_market_data_tx_broadcast_queue_depth(depth: usize) {
+    MARKET_DATA_TX_BROADCAST_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
 }
 
 #[inline]
@@ -2111,6 +2121,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_tx_broadcast_lagged_total",
         MARKET_DATA_TX_BROADCAST_LAGGED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_broadcast_queue_depth",
+        MARKET_DATA_TX_BROADCAST_QUEUE_DEPTH.load(Ordering::Relaxed)
     );
     line!(
         "market_data_account_broadcast_lagged_total",
