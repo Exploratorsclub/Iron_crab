@@ -41,6 +41,29 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
   return (await response.json()) as T
 }
 
+function isFiniteConfigNumber(v: ConfigValue): v is number {
+  return typeof v === 'number' && Number.isFinite(v)
+}
+
+/** Merge-Ergebnis: kein deprecated `min_trades_per_sec` im Draft; Legacy vom Server → ×60. */
+function applyMomentumVelocityUiMigration(
+  merged: ComponentConfig,
+  serverConfig: ComponentConfig,
+): ComponentConfig {
+  const out = { ...merged }
+  delete out['min_trades_per_sec']
+  const serverHasPerMin =
+    'min_trades_per_min' in serverConfig &&
+    isFiniteConfigNumber(serverConfig['min_trades_per_min'])
+  const serverHasPerSec =
+    'min_trades_per_sec' in serverConfig &&
+    isFiniteConfigNumber(serverConfig['min_trades_per_sec'])
+  if (!serverHasPerMin && serverHasPerSec) {
+    out['min_trades_per_min'] = serverConfig['min_trades_per_sec'] as number * 60
+  }
+  return out
+}
+
 function parsePrometheusMetrics(text: string): MetricsData {
   const lines = text.split('\n')
   const result: MetricsData = {}
@@ -139,7 +162,8 @@ const CONFIG_DESCRIPTIONS: Record<string, Record<string, string>> = {
     // Filter 2: Buyer Velocity
     min_unique_buyers: 'FILTER 2: Min unique buyers in window',
     buyer_window_secs: 'FILTER 2: Time window for buyer tracking (seconds)',
-    min_trades_per_sec: 'FILTER 2: Min trades per second for momentum',
+    min_trades_per_min:
+      'FILTER 2: Min trades per minute for momentum (chain-slot window)',
     min_buy_dominance: 'FILTER 2: Min buy ratio (0.0-1.0, 0.45=45%)',
     
     // Filter 3: SOL Inflow
@@ -284,7 +308,7 @@ const CONFIG_GROUPS: Record<string, Record<string, string[]>> = {
     'Filter 2: Buyer Velocity': [
       'min_unique_buyers',
       'buyer_window_secs',
-      'min_trades_per_sec',
+      'min_trades_per_min',
       'min_buy_dominance',
     ],
     'Filter 3: SOL Inflow': [
@@ -425,7 +449,7 @@ const DEFAULT_CONFIGS: Record<string, ComponentConfig> = {
     // Filter 2: Buyer Velocity
     min_unique_buyers: 3,
     buyer_window_secs: 120,
-    min_trades_per_sec: 0.02,
+    min_trades_per_min: 1.2,
     min_buy_dominance: 0.45,
     
     // Filter 3: SOL Inflow
@@ -602,8 +626,11 @@ export function ComponentDetail() {
       // Server values take precedence, defaults fill in missing fields
       const defaults = DEFAULT_CONFIGS[component] || {}
       const serverConfig = data.config || {}
-      const mergedConfig = { ...defaults, ...serverConfig }
-      
+      let mergedConfig: ComponentConfig = { ...defaults, ...serverConfig }
+      if (component === 'momentum-bot') {
+        mergedConfig = applyMomentumVelocityUiMigration(mergedConfig, serverConfig)
+      }
+
       setConfig(mergedConfig)
       setConfigDraft(mergedConfig)
       setLamportsDisplayDraft({})
@@ -632,6 +659,10 @@ export function ComponentDetail() {
       for (const [key, raw] of Object.entries(lamportsDisplayDraft)) {
         if (!isLamportsField(key)) continue
         resolved[key] = solToLamports(raw)
+      }
+
+      if (component === 'momentum-bot') {
+        delete resolved['min_trades_per_sec']
       }
 
       await postJson(`${CONTROL_PLANE}/config`, {
@@ -707,6 +738,12 @@ export function ComponentDetail() {
   // Check if a key represents lamports (for automatic conversion)
   function isLamportsField(key: string): boolean {
     return key.endsWith('_lamports')
+  }
+
+  function getConfigFieldUnit(key: string): string {
+    if (isLamportsField(key)) return ' SOL'
+    if (key === 'min_trades_per_min') return ' trades/min'
+    return ''
   }
 
   // Get display value (converts lamports to SOL if applicable)
@@ -807,7 +844,7 @@ export function ComponentDetail() {
                   if (val === undefined) return null
                   const description = CONFIG_DESCRIPTIONS[component || '']?.[key]
                   const displayValue = getDisplayValue(key, val)
-                  const unit = isLamportsField(key) ? ' SOL' : ''
+                  const unit = getConfigFieldUnit(key)
                   
                   return (
                     <div key={key} className="kvRow" style={{ alignItems: 'center' }}>
