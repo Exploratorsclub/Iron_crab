@@ -10,7 +10,8 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Datum**: 2026-05-20  
 **Problem**: Schwelle als **Trades pro Sekunde** war in Prod (z. B. JetStream `min_trades_per_sec` ≈ 5) extrem streng; viele Pools mit 3–4 Trades/s fielen dauerhaft durch (`filter_passed_total` blieb 0).  
 **Fix**: Kanonische Einheit **`min_trades_per_min`** / Metrik **`trades_per_min`** (gleiche Ketten-Slot-Zeitbasis wie zuvor, nur ×60 für Anzeige/Schwelle). TOML/JetStream-Key **`min_trades_per_sec`** wird weiterhin akzeptiert: Wert ×60 + **warn** (kein stilles 1:1 als „pro Minute“). Default im Code: **30/min** (≈0.5/s).  
-**Dateien**: `src/config.rs`, `src/bin/momentum_bot.rs`, `my_config.server.toml`, `docs/CONFIG_SCHEMA.md`, `docs/BUGS_FIXES.md`, `docs/RUNBOOK_PROD.md`
+**UI-Follow-up** (Control-Plane): `ui/src/pages/ComponentDetail.tsx` zeigt und speichert **`min_trades_per_min`** (Default UI **1.2** wie `my_config.server.toml`); beim Laden wird **`min_trades_per_sec`** aus dem Draft entfernt bzw. einmalig ×60 migriert; Speichern strippt den deprecated Key.  
+**Dateien**: `src/config.rs`, `src/bin/momentum_bot.rs`, `my_config.server.toml`, `docs/CONFIG_SCHEMA.md`, `docs/BUGS_FIXES.md`, `docs/RUNBOOK_PROD.md`, `ui/src/pages/ComponentDetail.tsx`
 
 ### FIX-MOM-LP-OBSERVED-AT-MINT-MERGE-MAX-2026-05-18: LP-Removal Wallclock — Mint-Aggregat `max` statt `min` (PR #134 Follow-up)
 **Datum**: 2026-05-18  
