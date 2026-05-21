@@ -309,7 +309,9 @@ lp_removal_window_secs = 60         # Track LP removals for 60s
 # FILTER 2: Buyer Velocity (RELAXED for realistic meme token activity)
 min_unique_buyers = 3               # 3 unique buyers in window (WAS 10!)
 buyer_window_secs = 120             # 120 second window (was 60s) - longer window for sparse activity
-min_trades_per_sec = 0.02           # 0.02 trades/sec = 1 trade per 50s (WAS 0.1 = unrealistic!)
+# Trade velocity (burst-safe chain-slot window): trades per MINUTE (canonical).
+# Was `min_trades_per_sec = 0.02` (≈1.2/min after ×60 migration).
+min_trades_per_min = 1.2
 min_buy_dominance = 0.45            # 45% buys vs sells (WAS 60%)
 
 # FILTER 3: SOL Inflow (RELAXED - major blocker)

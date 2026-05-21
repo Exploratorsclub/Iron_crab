@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### MOMENTUM-VELOCITY-TRADES-PER-MIN-2026-05-20: Entry-Velocity-Filter — `trades/min` statt `trades/s`
+**Datum**: 2026-05-20  
+**Problem**: Schwelle als **Trades pro Sekunde** war in Prod (z. B. JetStream `min_trades_per_sec` ≈ 5) extrem streng; viele Pools mit 3–4 Trades/s fielen dauerhaft durch (`filter_passed_total` blieb 0).  
+**Fix**: Kanonische Einheit **`min_trades_per_min`** / Metrik **`trades_per_min`** (gleiche Ketten-Slot-Zeitbasis wie zuvor, nur ×60 für Anzeige/Schwelle). TOML/JetStream-Key **`min_trades_per_sec`** wird weiterhin akzeptiert: Wert ×60 + **warn** (kein stilles 1:1 als „pro Minute“). Default im Code: **30/min** (≈0.5/s).  
+**Dateien**: `src/config.rs`, `src/bin/momentum_bot.rs`, `my_config.server.toml`, `docs/CONFIG_SCHEMA.md`, `docs/BUGS_FIXES.md`, `docs/RUNBOOK_PROD.md`
+
 ### FIX-MOM-LP-OBSERVED-AT-MINT-MERGE-MAX-2026-05-18: LP-Removal Wallclock — Mint-Aggregat `max` statt `min` (PR #134 Follow-up)
 **Datum**: 2026-05-18  
 **Problem**: Beim Merge von `TrackerExitSignals` pro Mint über mehrere Pool-Tracker war `lp_removal_observed_at` mit `min` zusammengeführt — das verschärfte das Wallclock-Fenster künstlich und konnte LP-Hard-Exits still unterdrücken (Bugbot Low auf PR #134).  

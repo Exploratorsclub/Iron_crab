@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +66,65 @@ fn default_toml_value() -> toml::Value {
     toml::Value::Table(Default::default())
 }
 
+/// Migrates deprecated `[momentum]` key `min_trades_per_sec` to `min_trades_per_min` (multiply by 60).
+/// If both keys exist, `min_trades_per_min` wins and the legacy key is dropped.
+pub fn migrate_momentum_trade_velocity_keys_in_table(
+    table: &mut toml::map::Map<String, toml::Value>,
+) {
+    use tracing::warn;
+    if !table.contains_key("min_trades_per_sec") {
+        return;
+    }
+    if table.contains_key("min_trades_per_min") {
+        warn!(
+            "`[momentum]` contains deprecated `min_trades_per_sec`; ignored in favour of `min_trades_per_min`"
+        );
+        table.remove("min_trades_per_sec");
+        return;
+    }
+    let Some(raw) = table.remove("min_trades_per_sec") else {
+        return;
+    };
+    let legacy = raw
+        .as_float()
+        .or_else(|| raw.as_integer().map(|i| i as f64))
+        .unwrap_or(0.0);
+    let converted = legacy * 60.0;
+    warn!(
+        legacy_min_trades_per_sec = legacy,
+        min_trades_per_min = converted,
+        "`min_trades_per_sec` is deprecated; converted to `min_trades_per_min` (×60; value was trades/s, not trades/min)"
+    );
+    table.insert(
+        "min_trades_per_min".to_string(),
+        toml::Value::Float(converted),
+    );
+}
+
+fn momentum_cfg_from_toml_value(val: toml::Value) -> Result<MomentumCfg, String> {
+    toml::to_string(&val)
+        .map_err(|e| e.to_string())
+        .and_then(|s| toml::from_str(&s).map_err(|e| e.to_string()))
+}
+
+pub(crate) fn deserialize_optional_momentum<'de, D>(
+    deserializer: D,
+) -> Result<Option<MomentumCfg>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<toml::Value>::deserialize(deserializer)?;
+    let Some(mut v) = opt else {
+        return Ok(None);
+    };
+    if let Some(t) = v.as_table_mut() {
+        migrate_momentum_trade_velocity_keys_in_table(t);
+    }
+    momentum_cfg_from_toml_value(v)
+        .map_err(serde::de::Error::custom)
+        .map(Some)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyDef {
     pub kind: String, // "rust" | "python"
@@ -92,7 +151,7 @@ pub struct Config {
     pub orca: OrcaCfg,
     #[serde(default)]
     pub wallet_tracker: Option<WalletTrackerCfg>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_momentum")]
     pub momentum: Option<MomentumCfg>,
     #[serde(default)]
     pub execution_engine: Option<ExecutionEngineCfg>,
@@ -597,9 +656,11 @@ pub struct MomentumCfg {
     /// Early window for buyer count (seconds). Default: 30s
     #[serde(default = "default_buyer_window")]
     pub buyer_window_secs: u64,
-    /// Min trades per second for momentum. Default: 0.2 (was 0.5, too strict)
-    #[serde(default = "default_min_trades_per_sec")]
-    pub min_trades_per_sec: f64,
+    /// Min trades per minute for momentum (burst-safe chain-slot window; see momentum-bot).
+    /// Default: 12.0 (= 0.2 trades/s × 60; same serde fallback as legacy `min_trades_per_sec` default).
+    /// Deprecated TOML key `min_trades_per_sec` is converted ×60.
+    #[serde(default = "default_min_trades_per_min")]
+    pub min_trades_per_min: f64,
     /// Min buy dominance ratio (buys / total). Default: 0.5 (was 0.6, too strict)
     #[serde(default = "default_min_buy_dominance")]
     pub min_buy_dominance: f64,
@@ -786,9 +847,9 @@ fn default_min_unique_buyers() -> u32 {
 fn default_buyer_window() -> u64 {
     30
 } // Extended from 20
-fn default_min_trades_per_sec() -> f64 {
-    0.2
-} // Relaxed from 0.5
+fn default_min_trades_per_min() -> f64 {
+    12.0
+} // 0.2 trades/s × 60; matches legacy default_min_trades_per_sec (relaxed from 0.5/s)
 fn default_min_buy_dominance() -> f64 {
     0.5
 } // Relaxed from 0.6
@@ -913,7 +974,7 @@ impl Default for MomentumCfg {
             lp_removal_window_secs: default_lp_removal_window(),
             min_unique_buyers: default_min_unique_buyers(),
             buyer_window_secs: default_buyer_window(),
-            min_trades_per_sec: default_min_trades_per_sec(),
+            min_trades_per_min: default_min_trades_per_min(),
             min_buy_dominance: default_min_buy_dominance(),
             min_sol_inflow_lamports: default_min_sol_inflow(),
             inflow_window_secs: default_inflow_window(),
