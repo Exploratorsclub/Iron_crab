@@ -399,6 +399,35 @@ pub static MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH: Lazy<AtomicU64> =
 pub static MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// Account ingest: messages accepted into per-worker `tokio::mpsc` queues (after recv, before worker `recv`).
+pub static MARKET_DATA_ACCOUNT_WORKER_QUEUE_DEPTH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Account ingest: jobs waiting in the dedicated NATS publish `mpsc` (JetStream + core publish).
+pub static MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Account ingest: cheap relevance filter discarded the update before `handle_geyser_account` body.
+pub static MARKET_DATA_ACCOUNT_EARLY_DROP_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// Wall microseconds for `handle_geyser_account` body per worker (excludes queue wait).
+const MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_BUCKETS: &[u64] = &[
+    50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+    1_000_000, 2_000_000,
+];
+
+static MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// Update monotonic Geyser head slot (max). Safe from any market-data ingest arm.
 #[inline]
 pub fn market_data_bump_geyser_head_slot(slot: u64) {
@@ -492,6 +521,44 @@ pub fn record_market_data_account_broadcast_lagged(skipped_messages: u64) {
     if skipped_messages > 0 {
         MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL.fetch_add(skipped_messages, Ordering::Relaxed);
     }
+}
+
+#[inline]
+pub fn inc_market_data_account_worker_queue_depth() {
+    MARKET_DATA_ACCOUNT_WORKER_QUEUE_DEPTH.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn dec_market_data_account_worker_queue_depth() {
+    MARKET_DATA_ACCOUNT_WORKER_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_publish_queue_depth() {
+    MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn dec_market_data_account_publish_queue_depth() {
+    MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_market_data_account_early_drop_total() {
+    MARKET_DATA_ACCOUNT_EARLY_DROP_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Per-account-update handler wall time (worker), microseconds.
+#[inline]
+pub fn record_market_data_account_handler_duration_us(us: u64) {
+    record_histogram_u64_into(
+        MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_BUCKETS,
+        &MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_SUM,
+        &MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_COUNT,
+        us,
+        u64::MAX,
+    );
 }
 
 /// After successful core `TOPIC_MARKET_EVENTS` publish (`publish_market_event_core_and_momentum_ex` path).
@@ -2142,6 +2209,26 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_account_broadcast_queue_depth",
         MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_worker_queue_depth",
+        MARKET_DATA_ACCOUNT_WORKER_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_publish_queue_depth",
+        MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_early_drop_total",
+        MARKET_DATA_ACCOUNT_EARLY_DROP_TOTAL.load(Ordering::Relaxed)
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_account_handler_duration_us",
+        MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_BUCKETS,
+        &MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_SUM,
+        &MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_COUNT,
     );
 
     // --- momentum-bot service ---

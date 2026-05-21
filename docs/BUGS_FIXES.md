@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### MARKET-DATA-ACCOUNT-THROUGHPUT-P0: Account-Pfad Durchsatz + async NATS-Publish
+**Datum**: 2026-05-21  
+**Problem**: Dedizierter Account-`recv`-Task (#140) beseitigte `select!`-Starvation, aber `handle_geyser_account` blieb **seriell**: hohe Geyser-Account-Rate ⇒ `market_data_account_broadcast_queue_depth` im **Tausender-Bereich**, `market_data_account_channel_lag_ms` p50 **~2,4 s** (Tx-Pfad blieb ~ms).  
+**Fix**: (1) **8 Worker** mit `tokio::mpsc` pro Shard (`hash(pubkey) % 8`, je **1250** Kapazität ≈ **10k** Backpressure-Budget), Recv-Task misst weiter `account_channel_lag_ms` und `account_broadcast_queue_depth`. (2) **Dedizierter Publish-Worker** (`clone_for_spawned_publish`) mit `mpsc` (**16384**): Worker **awaiten nicht** `jetstream_publish` / `publish_market_event_core_and_momentum_ex` — Jobs als `serde_json::Value` (JetStream) bzw. `Box<MarketEvent>` (Core). (3) **Early-Filter** im Recv-Task: unbekannte Owner ohne Wallet-/tracked_mints/vaults/bin_arrays und ohne DEX-Program-IDs → `market_data_account_early_drop_total`. **Kein** neuer Hot-Path-RPC (I-7); Cold-Path `tokio::spawn`+RPC unverändert.  
+**Ordering / I-24b**: Global **eine** Publish-FIFO-Queue (keine per-Pool-Shards); Account-Updates **pro Pubkey** bleiben durch Worker-Sharding seriell — Cross-Pubkey-Reihenfolge kann sich ändern (Trade-Pfad unverändert).  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`, `docs/RUNBOOK_PROD.md`
+
 ### MOMENTUM-VELOCITY-TRADES-PER-MIN-2026-05-20: Entry-Velocity-Filter — `trades/min` statt `trades/s`
 **Datum**: 2026-05-20  
 **Problem**: Schwelle als **Trades pro Sekunde** war in Prod (z. B. JetStream `min_trades_per_sec` ≈ 5) extrem streng; viele Pools mit 3–4 Trades/s fielen dauerhaft durch (`filter_passed_total` blieb 0).  
