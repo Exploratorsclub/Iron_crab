@@ -128,6 +128,22 @@ const PUMPFUN_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const METEORA_DLMM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const METEORA_CPMM: &str = "cpmmpPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D";
 
+/// Pre-decoded DEX program owners for [`account_geyser_update_might_be_relevant`] (no base58 / heap per update).
+const RAYDIUM_AMM_V4_OWNER: Pubkey =
+    solana_sdk::pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
+const RAYDIUM_CPMM_OWNER: Pubkey =
+    solana_sdk::pubkey!("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C");
+const ORCA_WHIRLPOOL_OWNER: Pubkey =
+    solana_sdk::pubkey!("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
+const PUMPFUN_PROGRAM_OWNER: Pubkey =
+    solana_sdk::pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+const PUMPFUN_AMM_PROGRAM_OWNER: Pubkey =
+    solana_sdk::pubkey!("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
+const METEORA_DLMM_OWNER: Pubkey =
+    solana_sdk::pubkey!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
+const METEORA_CPMM_OWNER: Pubkey =
+    solana_sdk::pubkey!("cpmmpPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D");
+
 /// Parallel account workers (shard = `hash(pubkey) % N` for per-pubkey ordering + cache locality).
 const MARKET_DATA_ACCOUNT_WORKER_COUNT: usize = 8;
 /// Per-shard `tokio::mpsc` capacity; total backpressure budget ≈ `N * cap` (~10k).
@@ -6284,17 +6300,14 @@ fn account_geyser_update_might_be_relevant(
         return true;
     }
 
-    let owner_str = u.owner.to_string();
-    matches!(
-        owner_str.as_str(),
-        RAYDIUM_AMM_V4
-            | RAYDIUM_CPMM
-            | ORCA_WHIRLPOOL
-            | METEORA_CPMM
-            | METEORA_DLMM
-            | PUMPFUN_PROGRAM
-            | PUMPFUN_AMM_PROGRAM
-    )
+    let o = u.owner;
+    o == RAYDIUM_AMM_V4_OWNER
+        || o == RAYDIUM_CPMM_OWNER
+        || o == ORCA_WHIRLPOOL_OWNER
+        || o == METEORA_CPMM_OWNER
+        || o == METEORA_DLMM_OWNER
+        || o == PUMPFUN_PROGRAM_OWNER
+        || o == PUMPFUN_AMM_PROGRAM_OWNER
 }
 
 async fn account_path_publish_worker(
