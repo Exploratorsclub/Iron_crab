@@ -8987,24 +8987,22 @@ async fn run_geyser_loop(
                     }
 
                     let shard = market_data_account_worker_shard(&account_update.pubkey);
-                    match worker_dispatch_recv[shard]
+                    inc_market_data_account_worker_queue_depth();
+                    if worker_dispatch_recv[shard]
                         .send(AccountWorkItem {
                             update: account_update,
                             recv_at,
                         })
                         .await
+                        .is_err()
                     {
-                        Ok(()) => {
-                            inc_market_data_account_worker_queue_depth();
-                        }
-                        Err(_e) => {
-                            error!(
-                                shard = shard,
-                                "account worker queue closed; stopping Geyser account stream"
-                            );
-                            let _ = geyser_account_stream_stopped_tx.send(true);
-                            break;
-                        }
+                        dec_market_data_account_worker_queue_depth();
+                        error!(
+                            shard = shard,
+                            "account worker queue closed; stopping Geyser account stream"
+                        );
+                        let _ = geyser_account_stream_stopped_tx.send(true);
+                        break;
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
