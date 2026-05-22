@@ -792,6 +792,11 @@ struct MarketDataContext {
     /// Pools for which we've already emitted DexPoolAccounts from trade parsing.
     known_trade_dex_pools: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
 
+    /// Pump.fun pool discovery: emit `TokenMintInfo` at most once per base mint (Geyser reconnect
+    /// or duplicate discovery must not spam `mint_info_tx`).
+    pumpfun_pool_discovery_mint_info_emitted:
+        parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
+
     /// Vault account tracking for PoolStateUpdate events (Geyser-based reserve balances).
     /// Maps vault_address → VaultInfo (pool context).
     tracked_vaults: parking_lot::RwLock<std::collections::HashMap<Pubkey, VaultInfo>>,
@@ -1165,8 +1170,9 @@ impl MarketDataContext {
     }
 
     /// Push current explicit tracked keys to all merge-task channels after eviction.
-    /// Cross-type LRU can evict vaults/bin-arrays/mints from any map; a single `send_tracked_*`
-    /// caller must refresh every channel so the combined Geyser subscription list stays in sync.
+    /// Cross-type LRU can evict vaults/bin-arrays/mints from any map; callers must run
+    /// [`Self::sync_geyser_tracked_accounts`] so every channel refreshes and the combined Geyser
+    /// subscription list stays in sync.
     fn broadcast_tracked_geyser_explicit_to_merge(&self) {
         let mints: Vec<Pubkey> = self.tracked_mints.read().keys().copied().collect();
         let vaults: Vec<Pubkey> = self.tracked_vaults.read().keys().copied().collect();
@@ -1177,17 +1183,7 @@ impl MarketDataContext {
         self.refresh_geyser_pins_gauge();
     }
 
-    fn send_tracked_mints_geyser(&self) {
-        self.evict_geyser_unpinned_lru_to_cap();
-        self.broadcast_tracked_geyser_explicit_to_merge();
-    }
-
-    fn send_tracked_vaults_geyser(&self) {
-        self.evict_geyser_unpinned_lru_to_cap();
-        self.broadcast_tracked_geyser_explicit_to_merge();
-    }
-
-    fn send_tracked_bin_arrays_geyser(&self) {
+    fn sync_geyser_tracked_accounts(&self) {
         self.evict_geyser_unpinned_lru_to_cap();
         self.broadcast_tracked_geyser_explicit_to_merge();
     }
@@ -1568,11 +1564,8 @@ impl MarketDataContext {
             _ => {}
         }
 
-        if vaults_changed {
-            self.send_tracked_vaults_geyser();
-        }
-        if bins_changed {
-            self.send_tracked_bin_arrays_geyser();
+        if vaults_changed || bins_changed {
+            self.sync_geyser_tracked_accounts();
         }
     }
 
@@ -5386,7 +5379,7 @@ async fn publish_wallet_snapshot(
 
         // Ensure mint is tracked so Geyser can publish TokenMintInfo later (no RPC here).
         if ctx.track_mint_for_geyser_metadata(*mint, Some(GeyserPinReason::Wallet)) {
-            ctx.send_tracked_mints_geyser();
+            ctx.sync_geyser_tracked_accounts();
         }
 
         let mint_str = mint.to_string();
@@ -5994,6 +5987,9 @@ async fn main() -> Result<()> {
         active_pool_set: Arc::new(ActivePoolSet::new()),
         known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
         known_trade_dex_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
+        pumpfun_pool_discovery_mint_info_emitted: parking_lot::RwLock::new(
+            std::collections::HashSet::new(),
+        ),
         tracked_vaults: parking_lot::RwLock::new(std::collections::HashMap::new()),
         tracked_vaults_tx,
         tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -7800,7 +7796,7 @@ async fn handle_geyser_account(
                 }
             }
             if vaults_changed {
-                ctx.send_tracked_vaults_geyser();
+                ctx.sync_geyser_tracked_accounts();
                 debug!(
                     pool = %account_update.pubkey,
                     coin_vault = %coin_vault,
@@ -7881,7 +7877,7 @@ async fn handle_geyser_account(
                     }
                 }
                 if vaults_changed {
-                    ctx.send_tracked_vaults_geyser();
+                    ctx.sync_geyser_tracked_accounts();
                     debug!(
                         pool = %account_update.pubkey,
                         vault_base = %vault_base,
@@ -7939,7 +7935,7 @@ async fn handle_geyser_account(
                     }
                 }
                 if vaults_changed {
-                    ctx.send_tracked_vaults_geyser();
+                    ctx.sync_geyser_tracked_accounts();
                     debug!(
                         pool = %account_update.pubkey,
                         reserve_x = %s.reserve_x,
@@ -8191,7 +8187,7 @@ async fn handle_geyser_account(
                         }
                     }
                     if vaults_changed {
-                        ctx.send_tracked_vaults_geyser();
+                        ctx.sync_geyser_tracked_accounts();
                         debug!(
                             pool = %account_update.pubkey,
                             base_vault = %s.pool_base_token_account,
@@ -8847,7 +8843,7 @@ async fn handle_geyser_transaction(
         if let Some((mint, dex_opt)) = mint_and_dex {
             let is_new = ctx.track_mint_for_geyser_metadata(mint, None);
             if is_new {
-                ctx.send_tracked_mints_geyser();
+                ctx.sync_geyser_tracked_accounts();
                 debug!(
                     mint = %mint,
                     dex = ?dex_opt,
@@ -10218,7 +10214,7 @@ async fn run_geyser_loop(
                                         let added_mint =
                                             ctx.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet));
                                         if added_mint {
-                                            ctx.send_tracked_mints_geyser();
+                                            ctx.sync_geyser_tracked_accounts();
                                         }
 
                                         // 4) Recompute tracked wallet accounts and notify listener
@@ -10362,27 +10358,33 @@ async fn run_geyser_loop(
                 // PR-B: discovery-only must not grow explicit Geyser mint/vault/bin subscriptions.
                 // Pump.fun still emits TokenMintInfo with known decimals=6 (no extra mint account filter).
                 if matches!(pool_event.dex_type, PoolDexType::PumpFun) {
-                    let mint_event = MarketEvent::new(
-                        "market-data",
-                        BUILD_VERSION,
-                        run_id,
-                        ctx.next_event_id(),
-                        "geyser_known", // Not RPC - we know pump.fun uses decimals=6
-                        Some(pool_event.slot),
-                        MarketEventKind::TokenMintInfo {
-                            mint: pool_event.base_mint.to_string(),
-                            token_program: spl_token::ID.to_string(), // pump.fun always uses SPL Token
-                            decimals: 6, // pump.fun tokens ALWAYS have 6 decimals
-                            supply: 0,   // Unknown, but not critical for trading
-                            mint_authority: None,
-                            freeze_authority: None,
-                        },
-                    );
-                    let _ = mint_info_tx.send(mint_event);
-                    debug!(
-                        mint = %pool_event.base_mint,
-                        "Emitted TokenMintInfo for pump.fun token (decimals=6, no RPC)"
-                    );
+                    let emit_mint_info = ctx
+                        .pumpfun_pool_discovery_mint_info_emitted
+                        .write()
+                        .insert(pool_event.base_mint);
+                    if emit_mint_info {
+                        let mint_event = MarketEvent::new(
+                            "market-data",
+                            BUILD_VERSION,
+                            run_id,
+                            ctx.next_event_id(),
+                            "geyser_known", // Not RPC - we know pump.fun uses decimals=6
+                            Some(pool_event.slot),
+                            MarketEventKind::TokenMintInfo {
+                                mint: pool_event.base_mint.to_string(),
+                                token_program: spl_token::ID.to_string(), // pump.fun always uses SPL Token
+                                decimals: 6, // pump.fun tokens ALWAYS have 6 decimals
+                                supply: 0,   // Unknown, but not critical for trading
+                                mint_authority: None,
+                                freeze_authority: None,
+                            },
+                        );
+                        let _ = mint_info_tx.send(mint_event);
+                        debug!(
+                            mint = %pool_event.base_mint,
+                            "Emitted TokenMintInfo for pump.fun token (decimals=6, no RPC)"
+                        );
+                    }
                 }
 
                 // Convert to MarketEvent::PoolCreated
