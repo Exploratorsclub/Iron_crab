@@ -362,7 +362,6 @@ impl GeyserListener {
                     "geyser_listener: subscribed"
                 );
 
-                reconnect_backoff_ms = rand::thread_rng().gen_range(100..=250);
                 let mut got_payload_since_subscribe = false;
 
                 let session_exit = 'read: loop {
