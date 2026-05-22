@@ -1094,6 +1094,118 @@
     },
     {
       "orgId": 1,
+      "name": "IronCrab Market Data",
+      "folder": "IronCrab Alerts",
+      "interval": "30s",
+      "rules": [
+        {
+          "uid": "ironcrab-marketdata-geyser-disconnected",
+          "title": "MarketDataGeyserDisconnected",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": { "from": 300, "to": 0 },
+              "datasourceUid": "bf5zln2g4x5vka",
+              "model": {
+                "expr": "geyser_connected{job=\"market-data\"}",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "datasourceUid": "__expr__",
+              "model": {
+                "expression": "A",
+                "reducer": "last",
+                "refId": "B",
+                "type": "reduce"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": { "params": [1], "type": "lt" }
+                  }
+                ],
+                "expression": "B",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "Alerting",
+          "execErrState": "Alerting",
+          "for": "2m",
+          "annotations": {
+            "summary": "market-data meldet keinen Geyser-Stream (geyser_connected=0)",
+            "description": "Mind. 2 Minuten lang geyser_connected{job=\"market-data\"} < 1. Hot-Path ohne frische Geyser-Daten. journalctl -u market-data pruefen; Validator-Geyser-Plugin und gRPC-Netzwerk verifizieren."
+          },
+          "labels": {
+            "severity": "critical",
+            "component": "market-data",
+            "type": "geyser"
+          }
+        },
+        {
+          "uid": "ironcrab-marketdata-geyser-reconnect-storm",
+          "title": "MarketDataGeyserReconnectStorm",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": { "from": 300, "to": 0 },
+              "datasourceUid": "bf5zln2g4x5vka",
+              "model": {
+                "expr": "sum(rate(geyser_reconnect_total{job=\"market-data\"}[1m]))",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "datasourceUid": "__expr__",
+              "model": {
+                "expression": "A",
+                "reducer": "last",
+                "refId": "B",
+                "type": "reduce"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": { "params": [0.5], "type": "gt" }
+                  }
+                ],
+                "expression": "B",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "OK",
+          "for": "3m",
+          "annotations": {
+            "summary": "Geyser-Reconnect-Rate bei market-data erhoeht",
+            "description": "sum(rate(geyser_reconnect_total{job=\"market-data\"}[1m])) > 0.5 fuer 3m. Auf Reconnect-Sturm pruefen (Grafana: Panel Geyser Reconnects 5m rate; PR #143 Metriken)."
+          },
+          "labels": {
+            "severity": "warning",
+            "component": "market-data",
+            "type": "geyser"
+          }
+        }
+      ]
+    },
+    {
+      "orgId": 1,
       "name": "Validator Health",
       "folder": "IronCrab Alerts",
       "interval": "30s",

@@ -2,7 +2,7 @@
   "title": "IronCrab Multi-Process Architecture",
   "description": "Dashboard for the Debuggable-First Multi-Process Architecture",
   "schemaVersion": 39,
-  "version": 7,
+  "version": 8,
   "time": {
     "from": "now-1h",
     "to": "now"
@@ -1050,13 +1050,148 @@
       }
     },
     {
+      "type": "stat",
+      "title": "Geyser Connected",
+      "description": "1 = gRPC-Stream verbunden, 0 = disconnected / Reconnect. Metriken aus PR #143.",
+      "targets": [
+        {
+          "expr": "geyser_connected{job=\"market-data\"}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 30
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "CONNECTED",
+                  "color": "green"
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "DISCONNECTED",
+                  "color": "red"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Geyser Reconnects (1h)",
+      "description": "Summe der Reconnect-Zuw\u00e4chse \u00fcber alle reason-Labels (1h-Fenster).",
+      "targets": [
+        {
+          "expr": "sum(increase(geyser_reconnect_total{job=\"market-data\"}[1h]))",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 30
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 10
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Geyser Reconnects (5m rate)",
+      "description": "rate() nach reason \u2014 Reconnect-Sturm (Incident: ~50/s gesamt). Summe >1/s in Explore pr\u00fcfen.",
+      "targets": [
+        {
+          "expr": "sum(rate(geyser_reconnect_total{job=\"market-data\"}[5m])) by (reason)",
+          "refId": "A",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "gridPos": {
+        "h": 7,
+        "w": 16,
+        "x": 8,
+        "y": 30
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Geyser Stream Errors (5m rate)",
+      "description": "gRPC-Stream-Fehler (z. B. BrokenPipe, h2).",
+      "targets": [
+        {
+          "expr": "rate(geyser_stream_errors_total{job=\"market-data\"}[5m])",
+          "refId": "A",
+          "legendFormat": "errors/s"
+        }
+      ],
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 37
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
       "type": "row",
       "title": "Momentum Bot (Port 9802) - 4-Filter Policy",
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 30
+        "y": 44
       },
       "collapsed": false
     },
@@ -1074,7 +1209,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 31
+        "y": 45
       },
       "fieldConfig": {
         "defaults": {
@@ -1099,7 +1234,7 @@
         "h": 4,
         "w": 4,
         "x": 4,
-        "y": 31
+        "y": 45
       },
       "fieldConfig": {
         "defaults": {
@@ -1123,7 +1258,7 @@
         "h": 4,
         "w": 2,
         "x": 8,
-        "y": 31
+        "y": 45
       },
       "fieldConfig": {
         "defaults": {
@@ -1147,7 +1282,7 @@
         "h": 4,
         "w": 2,
         "x": 10,
-        "y": 31
+        "y": 45
       },
       "fieldConfig": {
         "defaults": {
@@ -1171,7 +1306,7 @@
         "h": 4,
         "w": 2,
         "x": 12,
-        "y": 31
+        "y": 45
       },
       "fieldConfig": {
         "defaults": {
@@ -1195,7 +1330,7 @@
         "h": 4,
         "w": 2,
         "x": 14,
-        "y": 31
+        "y": 45
       },
       "fieldConfig": {
         "defaults": {
@@ -1219,7 +1354,7 @@
         "h": 4,
         "w": 2,
         "x": 16,
-        "y": 31
+        "y": 45
       },
       "fieldConfig": {
         "defaults": {
@@ -1244,7 +1379,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 31
+        "y": 45
       },
       "options": {
         "legend": {
@@ -1272,7 +1407,7 @@
         "h": 4,
         "w": 18,
         "x": 0,
-        "y": 35
+        "y": 49
       },
       "fieldConfig": {
         "defaults": {
@@ -1290,7 +1425,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 39
+        "y": 53
       },
       "collapsed": false
     },
@@ -1307,7 +1442,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 40
+        "y": 54
       },
       "fieldConfig": {
         "defaults": {
@@ -1331,7 +1466,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 40
+        "y": 54
       },
       "fieldConfig": {
         "defaults": {
@@ -1367,7 +1502,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 40
+        "y": 54
       },
       "fieldConfig": {
         "defaults": {
@@ -1412,7 +1547,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 44
+        "y": 58
       },
       "collapsed": false
     },
@@ -1429,7 +1564,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 45
+        "y": 59
       },
       "fieldConfig": {
         "defaults": {
@@ -1453,7 +1588,7 @@
         "h": 4,
         "w": 4,
         "x": 4,
-        "y": 45
+        "y": 59
       },
       "fieldConfig": {
         "defaults": {
@@ -1477,7 +1612,7 @@
         "h": 4,
         "w": 4,
         "x": 8,
-        "y": 45
+        "y": 59
       },
       "fieldConfig": {
         "defaults": {
@@ -1501,7 +1636,7 @@
         "h": 4,
         "w": 4,
         "x": 12,
-        "y": 45
+        "y": 59
       },
       "fieldConfig": {
         "defaults": {
@@ -1525,7 +1660,7 @@
         "h": 4,
         "w": 4,
         "x": 16,
-        "y": 45
+        "y": 59
       },
       "fieldConfig": {
         "defaults": {
@@ -1547,7 +1682,7 @@
         "h": 4,
         "w": 4,
         "x": 20,
-        "y": 45
+        "y": 59
       }
     },
     {
@@ -1563,7 +1698,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 49
+        "y": 63
       },
       "fieldConfig": {
         "defaults": {
@@ -1604,7 +1739,7 @@
         "h": 4,
         "w": 4,
         "x": 4,
-        "y": 49
+        "y": 63
       },
       "fieldConfig": {
         "defaults": {
@@ -1627,7 +1762,7 @@
         "h": 4,
         "w": 4,
         "x": 8,
-        "y": 49
+        "y": 63
       },
       "fieldConfig": {
         "defaults": {
@@ -1683,7 +1818,7 @@
         "h": 4,
         "w": 4,
         "x": 12,
-        "y": 49
+        "y": 63
       },
       "fieldConfig": {
         "defaults": {
@@ -1756,7 +1891,7 @@
         "h": 4,
         "w": 4,
         "x": 16,
-        "y": 49
+        "y": 63
       },
       "fieldConfig": {
         "defaults": {
@@ -1778,7 +1913,7 @@
         "h": 6,
         "w": 8,
         "x": 0,
-        "y": 53
+        "y": 67
       },
       "options": {
         "legend": {
@@ -1806,7 +1941,7 @@
         "h": 6,
         "w": 8,
         "x": 8,
-        "y": 53
+        "y": 67
       },
       "fieldConfig": {
         "defaults": {
@@ -1838,7 +1973,7 @@
         "h": 6,
         "w": 8,
         "x": 16,
-        "y": 53
+        "y": 67
       },
       "fieldConfig": {
         "defaults": {
@@ -1907,7 +2042,7 @@
         "h": 6,
         "w": 8,
         "x": 0,
-        "y": 59
+        "y": 73
       },
       "fieldConfig": {
         "defaults": {
@@ -1922,7 +2057,7 @@
         "h": 2,
         "w": 24,
         "x": 0,
-        "y": 65
+        "y": 79
       },
       "options": {
         "content": "**Time mode:** Grafana shows dashboard variables in the **top bar**; this JSON model cannot place the `time_mode` control between panels. Use the **Trades: Zeit (Recent Trades)** dropdown at the top to switch Relativ/UTC. The table column arrows **only** control sort order.",
@@ -1937,7 +2072,7 @@
         "h": 12,
         "w": 24,
         "x": 0,
-        "y": 67
+        "y": 81
       },
       "datasource": {
         "type": "yesoreyeram-infinity-datasource",
@@ -2383,7 +2518,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 79
+        "y": 93
       },
       "collapsed": false
     },
@@ -2416,7 +2551,7 @@
         "h": 6,
         "w": 12,
         "x": 0,
-        "y": 80
+        "y": 94
       },
       "fieldConfig": {
         "defaults": {
@@ -2437,7 +2572,7 @@
         "h": 3,
         "w": 4,
         "x": 12,
-        "y": 80
+        "y": 94
       },
       "fieldConfig": {
         "defaults": {
@@ -2477,7 +2612,7 @@
         "h": 3,
         "w": 4,
         "x": 16,
-        "y": 80
+        "y": 94
       },
       "fieldConfig": {
         "defaults": {
@@ -2513,7 +2648,7 @@
         "h": 3,
         "w": 4,
         "x": 20,
-        "y": 80
+        "y": 94
       }
     }
   ]
