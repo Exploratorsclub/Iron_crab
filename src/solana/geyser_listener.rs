@@ -345,7 +345,6 @@ impl GeyserListener {
                                 error = %e,
                                 "geyser_listener: subscribe failed; reconnecting with new client"
                             );
-                            geyser_metrics_inc_stream_error();
                             geyser_metrics_inc_reconnect(GeyserReconnectReason::StreamError);
                             geyser_metrics_set_connected(false);
                             let sleep_ms = Self::geyser_reconnect_sleep_ms(reconnect_backoff_ms);
