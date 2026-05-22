@@ -3,6 +3,8 @@
 
 use anyhow::{anyhow, Result};
 use solana_sdk::pubkey::Pubkey;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
@@ -119,8 +121,8 @@ pub struct GeyserListener {
     tracked_accounts_rx: Option<watch::Receiver<Vec<Pubkey>>>,
     /// When `tracked_accounts.len()` exceeds this value, account-list updates use a full outer
     /// gRPC reconnect instead of in-place `subscribe_tx.send` (PR-B Yellowstone churn control).
-    /// Use `usize::MAX` to always prefer in-place updates.
-    full_reconnect_tracked_threshold: usize,
+    /// Use `usize::MAX` to always prefer in-place updates. Shared so market-data can hot-reload.
+    full_reconnect_tracked_threshold: Arc<AtomicUsize>,
     #[cfg_attr(windows, allow(dead_code))]
     account_tx: broadcast::Sender<GeyserAccountUpdate>,
     #[cfg_attr(windows, allow(dead_code))]
@@ -153,7 +155,7 @@ impl GeyserListener {
                 endpoint,
                 program_ids,
                 tracked_accounts_rx: None,
-                full_reconnect_tracked_threshold: usize::MAX,
+                full_reconnect_tracked_threshold: Arc::new(AtomicUsize::new(usize::MAX)),
                 account_tx,
                 transaction_tx,
                 blockhash_tx,
@@ -172,7 +174,7 @@ impl GeyserListener {
         endpoint: String,
         program_ids: Vec<Pubkey>,
         tracked_accounts_rx: watch::Receiver<Vec<Pubkey>>,
-        full_reconnect_tracked_threshold: usize,
+        full_reconnect_tracked_threshold: Arc<AtomicUsize>,
     ) -> (
         Self,
         broadcast::Receiver<GeyserAccountUpdate>,
@@ -758,12 +760,13 @@ impl GeyserListener {
                             if let Some(new_list) = maybe_new {
                                 if new_list != tracked_accounts_current {
                                     tracked_accounts_current = new_list;
-                                    if tracked_accounts_current.len()
-                                        > self.full_reconnect_tracked_threshold
-                                    {
+                                    let threshold = self
+                                        .full_reconnect_tracked_threshold
+                                        .load(Ordering::Relaxed);
+                                    if tracked_accounts_current.len() > threshold {
                                         info!(
                                             tracked_accounts = tracked_accounts_current.len(),
-                                            threshold = self.full_reconnect_tracked_threshold,
+                                            threshold,
                                             "geyser_listener: large tracked set — forcing full reconnect (skip in-place subscribe update)"
                                         );
                                         break 'read SessionExit::SubscriptionRebuild;

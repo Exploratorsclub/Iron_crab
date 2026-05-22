@@ -26,7 +26,7 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, watch};
@@ -766,6 +766,8 @@ struct MarketDataContext {
     run_id: String,
     /// P1: Config in RwLock for runtime hot-reload
     config: parking_lot::RwLock<MarketDataConfig>,
+    /// Same value as `config.geyser_full_reconnect_threshold`, mirrored for `GeyserListener` hot-reload.
+    geyser_full_reconnect_threshold_live: Arc<AtomicUsize>,
     nats: Option<NatsClient>,
     jsonl_writer: JsonlWriter,
     event_counter: std::sync::atomic::AtomicU64,
@@ -1162,25 +1164,32 @@ impl MarketDataContext {
         }
     }
 
+    /// Push current explicit tracked keys to all merge-task channels after eviction.
+    /// Cross-type LRU can evict vaults/bin-arrays/mints from any map; a single `send_tracked_*`
+    /// caller must refresh every channel so the combined Geyser subscription list stays in sync.
+    fn broadcast_tracked_geyser_explicit_to_merge(&self) {
+        let mints: Vec<Pubkey> = self.tracked_mints.read().keys().copied().collect();
+        let vaults: Vec<Pubkey> = self.tracked_vaults.read().keys().copied().collect();
+        let bins: Vec<Pubkey> = self.tracked_bin_arrays.read().keys().copied().collect();
+        let _ = self.tracked_mints_tx.send(mints);
+        let _ = self.tracked_vaults_tx.send(vaults);
+        let _ = self.tracked_bin_arrays_tx.send(bins);
+        self.refresh_geyser_pins_gauge();
+    }
+
     fn send_tracked_mints_geyser(&self) {
         self.evict_geyser_unpinned_lru_to_cap();
-        let keys: Vec<Pubkey> = self.tracked_mints.read().keys().copied().collect();
-        let _ = self.tracked_mints_tx.send(keys);
-        self.refresh_geyser_pins_gauge();
+        self.broadcast_tracked_geyser_explicit_to_merge();
     }
 
     fn send_tracked_vaults_geyser(&self) {
         self.evict_geyser_unpinned_lru_to_cap();
-        let keys: Vec<Pubkey> = self.tracked_vaults.read().keys().copied().collect();
-        let _ = self.tracked_vaults_tx.send(keys);
-        self.refresh_geyser_pins_gauge();
+        self.broadcast_tracked_geyser_explicit_to_merge();
     }
 
     fn send_tracked_bin_arrays_geyser(&self) {
         self.evict_geyser_unpinned_lru_to_cap();
-        let keys: Vec<Pubkey> = self.tracked_bin_arrays.read().keys().copied().collect();
-        let _ = self.tracked_bin_arrays_tx.send(keys);
-        self.refresh_geyser_pins_gauge();
+        self.broadcast_tracked_geyser_explicit_to_merge();
     }
 
     /// Track mint pubkey for Geyser `TokenMintInfo` / metadata. Returns `true` if pubkey set changed.
@@ -1667,7 +1676,10 @@ impl MarketDataContext {
                 "geyser_full_reconnect_threshold" => {
                     if let Some(v) = value.as_u64() {
                         if (1000..=500_000).contains(&v) {
-                            config.geyser_full_reconnect_threshold = v as usize;
+                            let n = v as usize;
+                            config.geyser_full_reconnect_threshold = n;
+                            self.geyser_full_reconnect_threshold_live
+                                .store(n, Ordering::Relaxed);
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
                         } else {
@@ -5964,9 +5976,14 @@ async fn main() -> Result<()> {
         None
     };
 
+    let geyser_full_reconnect_threshold_live = Arc::new(AtomicUsize::new(
+        market_data_config.geyser_full_reconnect_threshold,
+    ));
+
     let ctx = Arc::new(MarketDataContext {
         run_id: run_id.clone(),
         config: parking_lot::RwLock::new(market_data_config),
+        geyser_full_reconnect_threshold_live,
         nats,
         jsonl_writer,
         event_counter: std::sync::atomic::AtomicU64::new(0),
@@ -9539,14 +9556,13 @@ async fn run_geyser_loop(
         });
     }
 
-    let full_reconnect_thr = ctx.config.read().geyser_full_reconnect_threshold;
     // Start legacy GeyserListener for transaction parsing (will be phased out in favor of pool discovery)
     let (listener, account_rx, transaction_rx, mut blockhash_rx) =
         GeyserListener::new_with_tracked_accounts(
             geyser_url.to_string(),
             program_ids,
             combined_tracked_rx,
-            full_reconnect_thr,
+            Arc::clone(&ctx.geyser_full_reconnect_threshold_live),
         );
 
     // Spawn Geyser listener task
