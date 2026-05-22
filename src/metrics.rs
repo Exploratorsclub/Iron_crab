@@ -219,8 +219,46 @@ pub static MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL: Lazy<AtomicU64> =
 pub static POOLS_DISCOVERED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static POOLS_TRACKED_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TOKENS_TRACKED_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
-pub static GEYSER_RECONNECTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
-pub static GEYSER_ERRORS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Reconnect attempts after `stream ended` (same gRPC client, resubscribe).
+pub static GEYSER_RECONNECT_TOTAL_STREAM_ENDED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Reconnect after transport/stream error (new `connect()`).
+pub static GEYSER_RECONNECT_TOTAL_STREAM_ERROR: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Reconnect after subscription sink closed / send failure (new `connect()`).
+pub static GEYSER_RECONNECT_TOTAL_SINK_GONE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// gRPC stream `Err` deliveries (excludes graceful `None` / stream ended).
+pub static GEYSER_STREAM_ERRORS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// 1 while a Geyser gRPC connection is established; 0 while reconnecting.
+pub static GEYSER_CONNECTED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// Geyser listener reconnect reason (PR-A stream resiliency).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeyserReconnectReason {
+    StreamEnded,
+    StreamError,
+    SinkGone,
+}
+
+pub fn geyser_metrics_inc_reconnect(reason: GeyserReconnectReason) {
+    match reason {
+        GeyserReconnectReason::StreamEnded => {
+            GEYSER_RECONNECT_TOTAL_STREAM_ENDED.fetch_add(1, Ordering::Relaxed);
+        }
+        GeyserReconnectReason::StreamError => {
+            GEYSER_RECONNECT_TOTAL_STREAM_ERROR.fetch_add(1, Ordering::Relaxed);
+        }
+        GeyserReconnectReason::SinkGone => {
+            GEYSER_RECONNECT_TOTAL_SINK_GONE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn geyser_metrics_inc_stream_error() {
+    GEYSER_STREAM_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn geyser_metrics_set_connected(connected: bool) {
+    GEYSER_CONNECTED.store(if connected { 1 } else { 0 }, Ordering::Relaxed);
+}
 
 // --- market-data: Geyser recv → Core NATS publish (hot path observability, no RPC) ---
 /// Monotonic Geyser chain head (max slot seen on market-data ingest paths). I-16: not RPC `getSlot`.
@@ -2078,14 +2116,32 @@ async fn metrics_response() -> Response<Body> {
         "tokens_tracked_total",
         TOKENS_TRACKED_GAUGE.load(Ordering::Relaxed)
     );
-    line!(
-        "geyser_reconnects_total",
-        GEYSER_RECONNECTS_TOTAL.load(Ordering::Relaxed)
+    out.push_str("geyser_reconnect_total{reason=\"stream_ended\"} ");
+    out.push_str(
+        &GEYSER_RECONNECT_TOTAL_STREAM_ENDED
+            .load(Ordering::Relaxed)
+            .to_string(),
     );
-    line!(
-        "geyser_errors_total",
-        GEYSER_ERRORS_TOTAL.load(Ordering::Relaxed)
+    out.push('\n');
+    out.push_str("geyser_reconnect_total{reason=\"stream_error\"} ");
+    out.push_str(
+        &GEYSER_RECONNECT_TOTAL_STREAM_ERROR
+            .load(Ordering::Relaxed)
+            .to_string(),
     );
+    out.push('\n');
+    out.push_str("geyser_reconnect_total{reason=\"sink_gone\"} ");
+    out.push_str(
+        &GEYSER_RECONNECT_TOTAL_SINK_GONE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "geyser_stream_errors_total",
+        GEYSER_STREAM_ERRORS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!("geyser_connected", GEYSER_CONNECTED.load(Ordering::Relaxed));
     line!(
         "market_data_geyser_head_slot",
         MARKET_DATA_GEYSER_HEAD_SLOT.load(Ordering::Relaxed)
