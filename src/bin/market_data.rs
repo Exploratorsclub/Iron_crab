@@ -1065,6 +1065,33 @@ impl MarketDataContext {
         geyser_metrics_set_tracked_pinned_accounts(pinned);
     }
 
+    /// Partner vault (opposite base/quote leg) eligible for paired LRU eviction.
+    /// Never returns a pinned sibling — pinned vaults must stay subscribed.
+    pub(crate) fn geyser_unpinned_sibling_vault_pubkey(
+        vaults: &std::collections::HashMap<Pubkey, VaultInfo>,
+        pool: Pubkey,
+        primary_is_base_vault: bool,
+    ) -> Option<Pubkey> {
+        vaults
+            .iter()
+            .find(|(_, vi)| {
+                vi.pool_address == pool && vi.is_base_vault != primary_is_base_vault && !vi.pinned
+            })
+            .map(|(pk, _)| *pk)
+    }
+
+    /// Whether a **pinned** partner vault exists for the same pool (opposite leg).
+    /// Used after evicting an unpinned vault to detect half-pair subscription (documented `warn!`).
+    pub(crate) fn geyser_pinned_sibling_vault_present(
+        vaults: &std::collections::HashMap<Pubkey, VaultInfo>,
+        pool: Pubkey,
+        primary_is_base_vault: bool,
+    ) -> bool {
+        vaults.values().any(|vi| {
+            vi.pool_address == pool && vi.is_base_vault != primary_is_base_vault && vi.pinned
+        })
+    }
+
     /// PR-B: LRU eviction when explicit combined accounts exceed `max_tracked_accounts`.
     /// Never evicts pinned rows; never evicts wallet subscription keys (they are not in these maps).
     fn evict_geyser_unpinned_lru_to_cap(&self) {
@@ -1141,16 +1168,12 @@ impl MarketDataContext {
                             oldest_age_ms = ?oldest_at.elapsed().as_millis(),
                             "geyser_evicted"
                         );
-                        // Evict the paired vault for the same pool so LRU cannot leave half a pair
-                        // tracked (misleading partial reserves when the sibling update path runs).
+                        // Evict the paired vault for the same pool when **both** legs are unpinned, so
+                        // LRU does not leave a misleading half-pair. Never remove a pinned sibling.
                         let pool = v.pool_address;
                         let this_is_base = v.is_base_vault;
-                        let sibling_pk = vaults
-                            .iter()
-                            .find(|(_, vi)| {
-                                vi.pool_address == pool && vi.is_base_vault != this_is_base
-                            })
-                            .map(|(pk, _)| *pk);
+                        let sibling_pk =
+                            Self::geyser_unpinned_sibling_vault_pubkey(&vaults, pool, this_is_base);
                         if let Some(spk) = sibling_pk {
                             if let Some(sv) = vaults.remove(&spk) {
                                 geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Vault);
@@ -1164,6 +1187,20 @@ impl MarketDataContext {
                                     "geyser_evicted"
                                 );
                             }
+                        } else if Self::geyser_pinned_sibling_vault_present(
+                            &vaults,
+                            pool,
+                            this_is_base,
+                        ) {
+                            // Single warn per eviction step: unpinned leg removed, pinned partner retained
+                            // (intentional — never evict pinned explicit accounts).
+                            warn!(
+                                run_id = %run_id,
+                                pool = %pool,
+                                evicted_vault = %pubkey,
+                                evicted_was_base_vault = this_is_base,
+                                "geyser_evict: removed unpinned vault but pinned sibling vault remains tracked (half-pair subscription)"
+                            );
                         }
                     }
                 }
@@ -12115,5 +12152,102 @@ mod pr_b_geyser_tracking_tests {
         assert!(s.is_pinned(mint, pool));
         s.unpin_pool(mint, pool);
         assert!(!s.is_pinned(mint, pool));
+    }
+
+    /// Bugbot PR-146: paired vault eviction must never pick a pinned sibling for `lru_cap_pair`.
+    #[test]
+    fn geyser_sibling_evict_helper_skips_pinned_leg() {
+        let pool = Pubkey::new_unique();
+        let base_pk = Pubkey::new_unique();
+        let quote_pk = Pubkey::new_unique();
+        let now = Instant::now();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            base_pk,
+            VaultInfo {
+                pool_address: pool,
+                dex: "x".into(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                is_base_vault: true,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: now,
+                pinned: false,
+                pin: None,
+                active_id: None,
+                bin_step: None,
+            },
+        );
+        map.insert(
+            quote_pk,
+            VaultInfo {
+                pool_address: pool,
+                dex: "x".into(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                is_base_vault: false,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: now,
+                pinned: true,
+                pin: Some(GeyserPinReason::Wallet),
+                active_id: None,
+                bin_step: None,
+            },
+        );
+        assert_eq!(
+            MarketDataContext::geyser_unpinned_sibling_vault_pubkey(&map, pool, true),
+            None
+        );
+        assert!(MarketDataContext::geyser_pinned_sibling_vault_present(
+            &map, pool, true
+        ));
+    }
+
+    #[test]
+    fn geyser_sibling_evict_helper_co_evicts_unpinned_partner() {
+        let pool = Pubkey::new_unique();
+        let base_pk = Pubkey::new_unique();
+        let quote_pk = Pubkey::new_unique();
+        let now = Instant::now();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            base_pk,
+            VaultInfo {
+                pool_address: pool,
+                dex: "x".into(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                is_base_vault: true,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: now,
+                pinned: false,
+                pin: None,
+                active_id: None,
+                bin_step: None,
+            },
+        );
+        map.insert(
+            quote_pk,
+            VaultInfo {
+                pool_address: pool,
+                dex: "x".into(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                is_base_vault: false,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: now,
+                pinned: false,
+                pin: None,
+                active_id: None,
+                bin_step: None,
+            },
+        );
+        assert_eq!(
+            MarketDataContext::geyser_unpinned_sibling_vault_pubkey(&map, pool, true),
+            Some(quote_pk)
+        );
+        assert!(!MarketDataContext::geyser_pinned_sibling_vault_present(
+            &map, pool, true
+        ));
     }
 }
