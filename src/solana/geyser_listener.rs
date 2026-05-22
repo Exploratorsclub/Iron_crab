@@ -323,6 +323,11 @@ impl GeyserListener {
         const RECONNECT_BACKOFF_CAP_MS: u64 = 60_000;
         let mut last_stream_ended_log =
             std::time::Instant::now() - std::time::Duration::from_secs(10);
+        // When over `full_reconnect_tracked_threshold`, subscription list deltas used to trigger a
+        // full reconnect on every change — thrashing the stream. Coalesce to at most one such
+        // rebuild per interval; other updates use in-place subscribe (same as small sets).
+        const LARGE_TRACKED_SUBSCRIBE_REBUILD_MIN_INTERVAL: Duration = Duration::from_secs(5);
+        let mut last_large_set_subscription_rebuild: Option<Instant> = None;
 
         geyser_metrics_set_connected(false);
 
@@ -763,7 +768,18 @@ impl GeyserListener {
                                     let threshold = self
                                         .full_reconnect_tracked_threshold
                                         .load(Ordering::Relaxed);
-                                    if tracked_accounts_current.len() > threshold {
+                                    let now = Instant::now();
+                                    let over_threshold =
+                                        tracked_accounts_current.len() > threshold;
+                                    let allow_full_rebuild = over_threshold
+                                        && last_large_set_subscription_rebuild
+                                            .map(|t| {
+                                                now.saturating_duration_since(t)
+                                                    >= LARGE_TRACKED_SUBSCRIBE_REBUILD_MIN_INTERVAL
+                                            })
+                                            .unwrap_or(true);
+                                    if allow_full_rebuild {
+                                        last_large_set_subscription_rebuild = Some(now);
                                         info!(
                                             tracked_accounts = tracked_accounts_current.len(),
                                             threshold,

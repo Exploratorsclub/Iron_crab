@@ -1157,6 +1157,12 @@ impl MarketDataContext {
             match kind {
                 EvKind::Vault => {
                     let mut vaults = self.tracked_vaults.write();
+                    // Re-check under write lock: LRU candidate may have been pinned after the read-only scan (TOCTOU).
+                    match vaults.get(&pubkey) {
+                        None => continue,
+                        Some(v) if v.pinned => continue,
+                        Some(_) => {}
+                    }
                     if let Some(v) = vaults.remove(&pubkey) {
                         geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Vault);
                         info!(
@@ -1175,17 +1181,23 @@ impl MarketDataContext {
                         let sibling_pk =
                             Self::geyser_unpinned_sibling_vault_pubkey(&vaults, pool, this_is_base);
                         if let Some(spk) = sibling_pk {
-                            if let Some(sv) = vaults.remove(&spk) {
-                                geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Vault);
-                                info!(
-                                    run_id = %run_id,
-                                    pool = %sv.pool_address,
-                                    mint = %sv.base_mint,
-                                    vault = %spk,
-                                    reason = "lru_cap_pair",
-                                    oldest_age_ms = ?oldest_at.elapsed().as_millis(),
-                                    "geyser_evicted"
-                                );
+                            let remove_sibling =
+                                vaults.get(&spk).map(|sv| !sv.pinned).unwrap_or(false);
+                            if remove_sibling {
+                                if let Some(sv) = vaults.remove(&spk) {
+                                    geyser_metrics_inc_tracked_evicted(
+                                        GeyserTrackedEvictKind::Vault,
+                                    );
+                                    info!(
+                                        run_id = %run_id,
+                                        pool = %sv.pool_address,
+                                        mint = %sv.base_mint,
+                                        vault = %spk,
+                                        reason = "lru_cap_pair",
+                                        oldest_age_ms = ?oldest_at.elapsed().as_millis(),
+                                        "geyser_evicted"
+                                    );
+                                }
                             }
                         } else if Self::geyser_pinned_sibling_vault_present(
                             &vaults,
@@ -1205,7 +1217,13 @@ impl MarketDataContext {
                     }
                 }
                 EvKind::Bin => {
-                    if let Some(b) = self.tracked_bin_arrays.write().remove(&pubkey) {
+                    let mut bins = self.tracked_bin_arrays.write();
+                    match bins.get(&pubkey) {
+                        None => continue,
+                        Some(b) if b.pinned => continue,
+                        Some(_) => {}
+                    }
+                    if let Some(b) = bins.remove(&pubkey) {
                         geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::BinArray);
                         info!(
                             run_id = %run_id,
@@ -1217,7 +1235,13 @@ impl MarketDataContext {
                     }
                 }
                 EvKind::Mint => {
-                    if self.tracked_mints.write().remove(&pubkey).is_some() {
+                    let mut mints = self.tracked_mints.write();
+                    match mints.get(&pubkey) {
+                        None => continue,
+                        Some(m) if m.pinned => continue,
+                        Some(_) => {}
+                    }
+                    if mints.remove(&pubkey).is_some() {
                         geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Mint);
                         info!(
                             run_id = %run_id,
