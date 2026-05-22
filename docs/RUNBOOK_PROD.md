@@ -146,6 +146,32 @@ journalctl -u execution-engine -n 100 --no-pager
 | Control Plane API | `http://localhost:8080` | REST API |
 | Trades API | `http://localhost:9899/trades` | Grafana Infinity |
 
+### Geyser / market-data Metriken (PR #143)
+
+Nach dem Geyser-Stream-Resilienz-Deploy ersetzen **neue** Prometheus-Namen die bisherigen Legacy-Zähler. Manuelle Grafana-Panels oder Alerts, die noch die alten Namen nutzen, zeigen dann keine Daten mehr.
+
+| Alt (entfernt) | Neu | Typ | Kurzbedeutung |
+|----------------|-----|-----|----------------|
+| `geyser_reconnects_total` | `geyser_reconnect_total{reason="stream_ended"}` | counter (Text-Export) | Resubscribe nach Stream-Ende |
+| — | `geyser_reconnect_total{reason="stream_error"}` | counter | harter Fehler → neuer Connect |
+| — | `geyser_reconnect_total{reason="sink_gone"}` | counter | Subscription-Sink weg |
+| `geyser_errors_total` | `geyser_stream_errors_total` | counter | gRPC-`Err` auf dem Stream |
+| — | `geyser_connected` | gauge 0/1 | 1 = verbunden |
+
+**Job-Label:** Prometheus scraped `market-data` typischerweise als `job="market-data"` (siehe `prometheus_multiprocess.yml`). In PromQL und Dashboards immer `{job="market-data"}` verwenden.
+
+**Schnellcheck auf dem Server:**
+
+```bash
+curl -s http://localhost:9801/metrics | grep '^geyser_'
+```
+
+**Incident-Debug:** `journalctl -u market-data` (Stream, Reconnects) und im importierten Multi-Process-Dashboard die Zeile **Market Data Service** → Panels **Geyser Connected** / **Geyser Reconnects (5m rate)**.
+
+**Betrieb:** `docs/systemd/market-data.service` setzt `Restart=always` (transiente Stream-Abbrüche sollen die Unit nicht dauerhaft inaktiv lassen). Nach Deploy in Grafana Dashboard JSON neu importieren bzw. Refresh; Explore: `geyser_connected{job="market-data"}`.
+
+**Prometheus / `rate()`:** Der Text-Export der Metriken kann je nach Prometheus-Konfiguration abweichen — nach Deploy in Explore verifizieren, z. B. `rate(geyser_reconnect_total{job="market-data"}[5m])` und `rate(geyser_stream_errors_total{job="market-data"}[5m])` liefern sinnvolle Zeitreihen.
+
 ### Pipeline-Latenz (Prometheus-Histogramme, A–I)
 
 Segmentierte End-to-End-Latenzen über die drei Prozesse **market-data → momentum-bot → execution-engine**.
