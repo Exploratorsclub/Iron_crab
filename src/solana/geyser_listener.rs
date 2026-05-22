@@ -807,7 +807,10 @@ impl GeyserListener {
                     SessionExit::SubscriptionRebuild => {
                         geyser_metrics_inc_reconnect(GeyserReconnectReason::SubscriptionRebuild);
                         geyser_metrics_set_connected(false);
-                        // Intentional full reconnect for large subscription churn — no error backoff.
+                        // Intentional full reconnect for large subscription churn — no error backoff sleep
+                        // in this arm. Still reset reconnect jitter so a *prior* HardReconnect cannot leave a
+                        // stale 60s-class backoff applied to the next outer connect attempt.
+                        reconnect_backoff_ms = rand::thread_rng().gen_range(100..=250);
                         continue 'outer;
                     }
                 }
