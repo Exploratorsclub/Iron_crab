@@ -117,6 +117,10 @@ pub struct GeyserListener {
     /// This is implemented via explicit `account` filters (not owner-wide token program
     /// subscriptions), so it scales with tracked tokens rather than chain-wide token activity.
     tracked_accounts_rx: Option<watch::Receiver<Vec<Pubkey>>>,
+    /// When `tracked_accounts.len()` exceeds this value, account-list updates use a full outer
+    /// gRPC reconnect instead of in-place `subscribe_tx.send` (PR-B Yellowstone churn control).
+    /// Use `usize::MAX` to always prefer in-place updates.
+    full_reconnect_tracked_threshold: usize,
     #[cfg_attr(windows, allow(dead_code))]
     account_tx: broadcast::Sender<GeyserAccountUpdate>,
     #[cfg_attr(windows, allow(dead_code))]
@@ -149,6 +153,7 @@ impl GeyserListener {
                 endpoint,
                 program_ids,
                 tracked_accounts_rx: None,
+                full_reconnect_tracked_threshold: usize::MAX,
                 account_tx,
                 transaction_tx,
                 blockhash_tx,
@@ -167,6 +172,7 @@ impl GeyserListener {
         endpoint: String,
         program_ids: Vec<Pubkey>,
         tracked_accounts_rx: watch::Receiver<Vec<Pubkey>>,
+        full_reconnect_tracked_threshold: usize,
     ) -> (
         Self,
         broadcast::Receiver<GeyserAccountUpdate>,
@@ -176,6 +182,7 @@ impl GeyserListener {
         let (mut listener, account_rx, transaction_rx, blockhash_rx) =
             Self::new(endpoint, program_ids);
         listener.tracked_accounts_rx = Some(tracked_accounts_rx);
+        listener.full_reconnect_tracked_threshold = full_reconnect_tracked_threshold;
         (listener, account_rx, transaction_rx, blockhash_rx)
     }
 
@@ -183,7 +190,12 @@ impl GeyserListener {
     pub async fn start(self) -> Result<()> {
         #[cfg(windows)]
         {
-            let _ = (self.endpoint, self.program_ids, self.tracked_accounts_rx);
+            let _ = (
+                self.endpoint,
+                self.program_ids,
+                self.tracked_accounts_rx,
+                self.full_reconnect_tracked_threshold,
+            );
             Err(anyhow!(
                 "Geyser gRPC is not supported on Windows in this repo build. \
                  Build on Linux/macOS for Geyser support."
@@ -285,6 +297,8 @@ impl GeyserListener {
         enum SessionExit {
             StreamEnded,
             HardReconnect,
+            /// PR-B: large explicit subscription set — reconnect with a fresh client.
+            SubscriptionRebuild,
         }
 
         info!(
@@ -744,6 +758,16 @@ impl GeyserListener {
                             if let Some(new_list) = maybe_new {
                                 if new_list != tracked_accounts_current {
                                     tracked_accounts_current = new_list;
+                                    if tracked_accounts_current.len()
+                                        > self.full_reconnect_tracked_threshold
+                                    {
+                                        info!(
+                                            tracked_accounts = tracked_accounts_current.len(),
+                                            threshold = self.full_reconnect_tracked_threshold,
+                                            "geyser_listener: large tracked set — forcing full reconnect (skip in-place subscribe update)"
+                                        );
+                                        break 'read SessionExit::SubscriptionRebuild;
+                                    }
                                     let updated_request = Self::build_subscribe_request(
                                         &self.program_ids,
                                         &tracked_accounts_current,
@@ -775,6 +799,12 @@ impl GeyserListener {
                         sleep(Duration::from_millis(sleep_ms)).await;
                         reconnect_backoff_ms =
                             (reconnect_backoff_ms.saturating_mul(2)).min(RECONNECT_BACKOFF_CAP_MS);
+                        continue 'outer;
+                    }
+                    SessionExit::SubscriptionRebuild => {
+                        geyser_metrics_inc_reconnect(GeyserReconnectReason::SubscriptionRebuild);
+                        geyser_metrics_set_connected(false);
+                        // Intentional full reconnect for large subscription churn — no error backoff.
                         continue 'outer;
                     }
                 }
