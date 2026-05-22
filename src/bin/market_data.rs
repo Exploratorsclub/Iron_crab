@@ -1129,7 +1129,8 @@ impl MarketDataContext {
 
             match kind {
                 EvKind::Vault => {
-                    if let Some(v) = self.tracked_vaults.write().remove(&pubkey) {
+                    let mut vaults = self.tracked_vaults.write();
+                    if let Some(v) = vaults.remove(&pubkey) {
                         geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Vault);
                         info!(
                             run_id = %run_id,
@@ -1140,6 +1141,30 @@ impl MarketDataContext {
                             oldest_age_ms = ?oldest_at.elapsed().as_millis(),
                             "geyser_evicted"
                         );
+                        // Evict the paired vault for the same pool so LRU cannot leave half a pair
+                        // tracked (misleading partial reserves when the sibling update path runs).
+                        let pool = v.pool_address;
+                        let this_is_base = v.is_base_vault;
+                        let sibling_pk = vaults
+                            .iter()
+                            .find(|(_, vi)| {
+                                vi.pool_address == pool && vi.is_base_vault != this_is_base
+                            })
+                            .map(|(pk, _)| *pk);
+                        if let Some(spk) = sibling_pk {
+                            if let Some(sv) = vaults.remove(&spk) {
+                                geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Vault);
+                                info!(
+                                    run_id = %run_id,
+                                    pool = %sv.pool_address,
+                                    mint = %sv.base_mint,
+                                    vault = %spk,
+                                    reason = "lru_cap_pair",
+                                    oldest_age_ms = ?oldest_at.elapsed().as_millis(),
+                                    "geyser_evicted"
+                                );
+                            }
+                        }
                     }
                 }
                 EvKind::Bin => {
@@ -1217,8 +1242,14 @@ impl MarketDataContext {
 
     fn touch_tracked_vault_pubkey(&self, vault: &Pubkey) {
         let now = Instant::now();
-        if let Some(v) = self.tracked_vaults.write().get_mut(vault) {
-            v.last_used_at = now;
+        let mut vs = self.tracked_vaults.write();
+        let pool = vs.get(vault).map(|v| v.pool_address);
+        if let Some(pool) = pool {
+            for v in vs.values_mut() {
+                if v.pool_address == pool {
+                    v.last_used_at = now;
+                }
+            }
         }
     }
 
