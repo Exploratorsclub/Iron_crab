@@ -176,7 +176,7 @@ Conditional exits:
 - Trailing stop after activation threshold.
 - Momentum fade (buy ratio below threshold in recent window).
 
-**Quote-first price exits (STOP_LOSS / TAKE_PROFIT / TRAILING_STOP):** these fire only when a usable **executable reserve quote** breaches the configured threshold. **Current-price-only** triggers for those exits are disabled; the trade-ratio mark may diverge for logging but is not the trigger source. **TRAILING_STOP** additionally requires that the executable quote **marks the position pool** (`quote_pool == position.pool`): an alternate-pool quote may still inform STOP/TAKE per routing policy, but must not be compared to the position-pool ATH for trailing drawdown (I-13).
+**Quote-first price exits (STOP_LOSS / TAKE_PROFIT / TRAILING_STOP):** these fire only when a usable **executable reserve quote** breaches the configured threshold. **Current-price-only** triggers for those exits are disabled; the trade-ratio / reserve mark may diverge for logging but is not the trigger source. **TRAILING_STOP** uses two layers: **activation** follows peak PnL implied by the **trade-session high** on the position pool (entry fill + post-entry trade-derived `tokens_per_sol` on that pool, slot-gated), not PoolCache reserve marks and not the executable quote; **trigger** drawdown is still quote-first (guarded executable vs that session high). The executable must **mark the position pool** for the trailing drawdown comparison: an alternate-pool quote may still inform STOP/TAKE per routing policy, but must not drive trailing drawdown vs the position session high (I-13).
 
 
 ## 5) Required Signals & Data Sources

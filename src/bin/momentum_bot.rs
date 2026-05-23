@@ -726,7 +726,8 @@ struct PositionTracker {
     token_amount: u64,
     /// SOL invested (lamports)
     sol_invested: u64,
-    /// Best price seen since entry (lowest tokens_per_sol = ATH for holder)
+    /// Trade-session high since BUY: best holder price = lowest `tokens_per_sol` on this
+    /// position pool from entry fill + trade-derived marks only (not PoolCache reserve marks).
     highest_price: f64,
     /// Current estimated price
     current_price: f64,
@@ -765,7 +766,12 @@ struct PositionTracker {
 /// Price exits (`STOP_LOSS` / `TAKE_PROFIT` / `TRAILING_STOP`) are **quote-first**: they trigger only
 /// from a usable executable reserve quote when present. **Current-price-only** triggers for these
 /// exits are disabled — `current_price` may diverge from the executable for logging and reporting,
-/// but it is not a trigger source (see `should_exit`).
+/// but it is not a trigger source (see `should_exit`). `TRAILING_STOP` **activation** uses the
+/// trade-session high on the position (`highest_price`), not the executable quote; **trigger**
+/// drawdown still uses the guarded executable vs that session high. For `TRAILING_STOP` triggers,
+/// the executable must **mark the position pool** when comparing drawdown (I-13); alternate-pool
+/// quotes may still inform `STOP_LOSS` / `TAKE_PROFIT` per routing policy but must not drive trailing
+/// drawdown vs the position session high.
 #[derive(Debug, Clone)]
 struct ExitExecutableQuote {
     /// tokens_per_sol (UI): token_ui / sol_ui, matching `entry_price` / `current_price` (I-14).
@@ -1037,7 +1043,7 @@ struct PersistedPosition {
     /// Geyser/RPC slot of confirmed BUY (0 = unknown)
     #[serde(default)]
     entry_confirmed_slot: u64,
-    /// Last slot applied to `current_price` / `highest_price`
+    /// Last slot applied to a position-pool price update (mark or trade-derived).
     #[serde(default)]
     last_price_slot: u64,
     /// Schema version for forward compatibility
@@ -1196,16 +1202,21 @@ impl PositionTracker {
         self.entry_time = Instant::now().checked_sub(ago).unwrap_or_else(Instant::now);
     }
 
-    /// Update price and track ATH (best price for holder).
-    /// Prices are in tokens_per_sol: LOWER tps = each token worth MORE SOL = better price.
-    /// So ATH (highest_price) tracks the LOWEST tps seen (best SOL value per token).
-    fn update_price(&mut self, new_price: f64) {
+    /// PoolCache / reserve **mark** only: updates `current_price` for reporting; does **not**
+    /// advance trade-session high (`highest_price`). I-13: session high stays on position-pool
+    /// fills + trade ratios, not reserve marks.
+    fn update_mark_price(&mut self, new_price: f64) {
         self.current_price = new_price;
-        self.highest_price = tokens_per_sol::updated_highest_price(self.highest_price, new_price);
+    }
+
+    /// Position-pool **trade** print: updates mark and session high (lowest tps = best for holder).
+    fn update_from_trade_price(&mut self, trade_tps: f64) {
+        self.current_price = trade_tps;
+        self.highest_price = tokens_per_sol::updated_highest_price(self.highest_price, trade_tps);
     }
 
     /// Scale-in: blend `entry_price` (tokens_per_sol) by SOL weight using the **fill** tps for
-    /// the new tranche — not `current_price` (mark can diverge and blew up TP/ATH decision text).
+    /// the new tranche — not `current_price` (mark can diverge). Session high uses the same fill tps.
     fn add_investment(&mut self, additional_sol: u64, fill_entry_tps: f64) {
         if additional_sol == 0 {
             return;
@@ -1226,9 +1237,8 @@ impl PositionTracker {
 
         self.sol_invested = self.sol_invested.saturating_add(additional_sol);
         self.entry_price = new_entry;
-        // ATH = lowest tps (best price for holder)
-        self.highest_price =
-            tokens_per_sol::updated_highest_price(self.highest_price, self.current_price);
+        // Session high: incorporate scale-in **fill** tps only (not reserve mark).
+        self.highest_price = tokens_per_sol::updated_highest_price(self.highest_price, leg_tps);
     }
 
     /// Record a trade for momentum tracking
@@ -1250,10 +1260,8 @@ impl PositionTracker {
         tokens_per_sol::pnl_pct(self.entry_price, self.current_price)
     }
 
-    /// Calculate drawdown from ATH (best price) percentage.
-    /// highest_price tracks the LOWEST tps seen (= best SOL value per token).
-    /// Drawdown = how much worse current price is vs ATH.
-    /// Positive = loss from ATH, zero = at ATH.
+    /// Drawdown of the mark vs trade-session high (same formula as `tokens_per_sol::drawdown_from_ath_pct`;
+    /// `highest_price` is the session-best lowest tps).
     fn drawdown_from_ath_pct(&self) -> f64 {
         tokens_per_sol::drawdown_from_ath_pct(self.highest_price, self.current_price)
     }
@@ -1266,7 +1274,7 @@ impl PositionTracker {
     /// position, pseudopool rejection, optional SOL-leg DexPoolAccounts proof). `current_price` alone
     /// never trips these exits. `TRAILING_STOP` drawdown uses the guarded quote only when
     /// `marks_position_pool` (I-13). Alternate-pool quotes may still trip `STOP_LOSS` / `TAKE_PROFIT`
-    /// when executable loss/gain is real, but never refresh `highest_price` / mark.
+    /// when executable loss/gain is real, but never refresh session high / mark.
     fn should_exit(
         &mut self,
         config: &MomentumConfig,
@@ -1423,19 +1431,24 @@ impl PositionTracker {
             }
         }
 
-        // 3. Trailing — refresh ATH only from **guarded** quotes that mark the position pool (I-13).
-        if let Some(q) = price_exit_q {
-            if q.marks_position_pool {
-                self.highest_price =
-                    tokens_per_sol::updated_highest_price(self.highest_price, q.tokens_per_sol);
-            }
-        }
+        // 3. Trailing — session high (`highest_price`) only from entry + position-pool trades
+        // (see `update_from_trade_price`). PoolCache marks and executable quotes must not advance it.
+        // Activation = peak PnL implied by session high vs entry; trigger = quote-first drawdown vs session high.
+        let session_peak_pnl_pct = tokens_per_sol::pnl_pct(self.entry_price, self.highest_price);
+        let drawdown_vs_session_high_exec = price_exit_q
+            .map(|q| tokens_per_sol::drawdown_from_ath_pct(self.highest_price, q.tokens_per_sol));
+        trace!(
+            mint = %self.mint,
+            session_high_tps = self.highest_price,
+            session_peak_pnl_pct,
+            executable_quote_tps = ?price_exit_q.map(|q| q.tokens_per_sol),
+            drawdown_from_session_high_pct = ?drawdown_vs_session_high_exec,
+            trailing_active = self.trailing_active,
+            trailing_would_activate = session_peak_pnl_pct >= config.trailing_activation_pct,
+            "trailing_session_high_eval"
+        );
 
-        let activation_pnl = price_exit_q
-            .filter(|q| q.marks_position_pool)
-            .map(|q| tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol))
-            .unwrap_or(pnl);
-        if activation_pnl >= config.trailing_activation_pct {
+        if session_peak_pnl_pct >= config.trailing_activation_pct {
             self.trailing_active = true;
         }
 
@@ -1474,7 +1487,7 @@ impl PositionTracker {
                         return Some((
                             "TRAILING_STOP".to_string(),
                             format!(
-                                "Trailing stop hit: -{:.1}% executable drawdown from ATH (limit: -{:.1}%), executable P&L: {:.1}%",
+                                "Trailing stop hit: -{:.1}% executable drawdown from session high (limit: -{:.1}%), executable P&L: {:.1}%",
                                 exec_dd, config.trailing_stop_pct, exec_pnl
                             ),
                         ));
@@ -5251,12 +5264,14 @@ impl MomentumContext {
                 }
             }
 
-            pos.update_price(new_price);
+            if let Some(t) = trade {
+                pos.update_from_trade_price(new_price);
+                pos.record_trade(t);
+            } else {
+                pos.update_mark_price(new_price);
+            }
             if let Some(s) = source_slot {
                 pos.last_price_slot = s;
-            }
-            if let Some(t) = trade {
-                pos.record_trade(t);
             }
             return true;
         }
@@ -6339,7 +6354,7 @@ impl MomentumContext {
         if hint.tokens_per_sol <= 0.0 || !hint.tokens_per_sol.is_finite() {
             return false;
         }
-        pos.update_price(hint.tokens_per_sol);
+        pos.update_mark_price(hint.tokens_per_sol);
         if hint.slot > 0 {
             pos.last_price_slot = pos.last_price_slot.max(hint.slot);
         }
@@ -11787,12 +11802,18 @@ mod tests {
         ctx.update_position_price("m1", 8.0, None, Some("poolA"), Some(501));
         assert_eq!(ctx.positions.read().get("m1").unwrap().current_price, 8.0);
         assert_eq!(ctx.positions.read().get("m1").unwrap().last_price_slot, 501);
+        assert_eq!(
+            ctx.positions.read().get("m1").unwrap().highest_price,
+            10.0,
+            "pool-cache mark must not advance trade-session high"
+        );
 
         ctx.update_position_price("m1", 7.0, None, Some("poolA"), Some(501));
         assert_eq!(ctx.positions.read().get("m1").unwrap().current_price, 8.0);
 
         ctx.update_position_price("m1", 6.5, None, Some("poolA"), Some(502));
         assert_eq!(ctx.positions.read().get("m1").unwrap().current_price, 6.5);
+        assert_eq!(ctx.positions.read().get("m1").unwrap().highest_price, 10.0);
     }
 
     /// Scale-in must blend fill `tokens_per_sol` for the new leg, not `current_price` (mark).
@@ -11805,6 +11826,10 @@ mod tests {
             (pos.entry_price - 200.0).abs() < 1e-6,
             "expected weighted entry ~200 tps, got {}",
             pos.entry_price
+        );
+        assert_eq!(
+            pos.highest_price, 100.0,
+            "worse fill leg tps must not improve session high vs entry"
         );
     }
 
@@ -14668,6 +14693,136 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn pool_cache_reserve_mark_does_not_advance_trailing_session_high() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let mint = "TrailSessMint1111111111111111111111111111";
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "poolA",
+            dex: "raydium",
+            entry_price: 100.0,
+            token_decimals: 6,
+            token_amount: 1_000_000,
+            sol_invested: 1_000_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 500,
+            initial_bonding: None,
+        });
+        ctx.update_position_price(mint, 89.0, None, Some("poolA"), Some(501));
+        let live = ctx.positions.read().get(mint).unwrap().clone();
+        assert_eq!(live.highest_price, 100.0);
+        assert_eq!(live.current_price, 89.0);
+
+        let c = make_exit_config();
+        let mut ex = sample_exit_quote(89.0);
+        ex.quote_pool = "poolA".to_string();
+        let mut pos = live;
+        pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64);
+        assert!(
+            !pos.trailing_active,
+            "reserve mark must not fabricate session high for trailing activation"
+        );
+    }
+
+    #[tokio::test]
+    async fn trade_derived_price_advances_session_high_and_can_activate_trailing() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let mint = "TrailSessMint2222222222222222222222222222";
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "poolA",
+            dex: "raydium",
+            entry_price: 100.0,
+            token_decimals: 6,
+            token_amount: 1_000_000,
+            sol_invested: 1_000_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 500,
+            initial_bonding: None,
+        });
+        let te = TradeEvent {
+            timestamp: Instant::now(),
+            slot: 501,
+            trader: "a".to_string(),
+            is_buy: true,
+            sol_amount: 1,
+            token_amount: 1,
+            signature: "sig".to_string(),
+        };
+        ctx.update_position_price(mint, 95.0, Some(te), Some("poolA"), Some(501));
+        let live = ctx.positions.read().get(mint).unwrap().clone();
+        assert!((live.highest_price - 95.0).abs() < 1e-6);
+
+        let mut c = make_exit_config();
+        c.trailing_activation_pct = 5.0;
+        c.hard_stop_loss_pct = 99.0;
+        c.take_profit_pct = 1_000.0;
+        let mut pos = live;
+        pos.should_exit(&c, None, "test", 9_000_000_000u64);
+        assert!(
+            pos.trailing_active,
+            "session peak PnL from trade session high should activate trailing"
+        );
+    }
+
+    #[tokio::test]
+    async fn modest_trade_then_reserve_spike_does_not_activate_trailing() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let mint = "TrailSessMint3333333333333333333333333333";
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "poolA",
+            dex: "raydium",
+            entry_price: 100.0,
+            token_decimals: 6,
+            token_amount: 1_000_000,
+            sol_invested: 1_000_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 500,
+            initial_bonding: None,
+        });
+        let te = TradeEvent {
+            timestamp: Instant::now(),
+            slot: 501,
+            trader: "b".to_string(),
+            is_buy: true,
+            sol_amount: 1,
+            token_amount: 1,
+            signature: "sig2".to_string(),
+        };
+        ctx.update_position_price(mint, 99.5, Some(te), Some("poolA"), Some(501));
+        ctx.update_position_price(mint, 89.0, None, Some("poolA"), Some(502));
+        let live = ctx.positions.read().get(mint).unwrap().clone();
+        assert!((live.highest_price - 99.5).abs() < 1e-6);
+        assert!((live.current_price - 89.0).abs() < 1e-6);
+
+        let mut c = make_exit_config();
+        c.trailing_activation_pct = 5.0;
+        c.hard_stop_loss_pct = 99.0;
+        c.take_profit_pct = 1_000.0;
+        let mut ex = sample_exit_quote(89.0);
+        ex.quote_pool = "poolA".to_string();
+        let mut pos = live;
+        pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64);
+        assert!(
+            !pos.trailing_active,
+            "reserve spike must not activate trailing when session high only modestly improved"
+        );
+    }
+
     /// Production-like: bad mark would look stopped out; executable shows gain — no STOP (quote-first).
     #[test]
     fn hard_stop_not_fired_when_executable_profitable_despite_bad_mark() {
@@ -14781,7 +14936,7 @@ mod tests {
         );
     }
 
-    /// I-13: alternate-pool executable must not drive TRAILING_STOP vs position-pool ATH.
+    /// I-13: alternate-pool executable must not drive TRAILING_STOP vs position-pool session high.
     #[test]
     fn trailing_stop_skipped_when_executable_quote_not_position_pool() {
         let mut c = make_exit_config();
@@ -14800,7 +14955,7 @@ mod tests {
         assert!(
             pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
                 .is_none(),
-            "wrong-pool executable must not trip TRAILING vs position ATH"
+            "wrong-pool executable must not trip TRAILING vs position session high"
         );
     }
 
@@ -14819,10 +14974,20 @@ mod tests {
         let mut ex = sample_exit_quote(250.0);
         ex.marks_position_pool = true;
         ex.quote_pool = "pos_pool".to_string();
-        let (ty, _) = pos
+        let (ty, reason) = pos
             .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
             .expect("TRAILING_STOP from position-pool quote");
         assert_eq!(ty, "TRAILING_STOP");
+        assert!(
+            reason.contains("session high"),
+            "reason should say session high: {}",
+            reason
+        );
+        assert!(
+            !reason.contains("ATH"),
+            "reason must not say ATH: {}",
+            reason
+        );
     }
 
     /// TP: `current` shows gain but no pool quote to confirm (or would disagree) → no TP
