@@ -629,6 +629,11 @@ impl ActivePoolSet {
     fn mint_has_any_pinned_pool(&self, mint: Pubkey) -> bool {
         self.pairs.read().iter().any(|(m, _)| *m == mint)
     }
+
+    /// True if any momentum active pin still references this pool (another `(mint, pool)` row).
+    fn pool_has_any_pin(&self, pool: Pubkey) -> bool {
+        self.pairs.read().iter().any(|(_, p)| *p == pool)
+    }
 }
 
 /// Market data configuration (hot-reloadable via NATS)
@@ -1823,23 +1828,27 @@ impl MarketDataContext {
     fn clear_momentum_geyser_reserves_for_active_entry(&self, mint: Pubkey, pool: Pubkey) -> bool {
         self.active_pool_set.unpin_pool(mint, pool);
         let mut changed = false;
-        {
-            let mut vaults = self.tracked_vaults.write();
-            for v in vaults.values_mut() {
-                if v.pool_address == pool && v.pin == Some(GeyserPinReason::MomentumActive) {
-                    v.pin = None;
-                    v.pinned = false;
-                    changed = true;
+        // Pool-level reserve pins are shared: only demote vaults/bin arrays when no `(m, pool)`
+        // row remains after this unpin (PR #147 follow-up).
+        if !self.active_pool_set.pool_has_any_pin(pool) {
+            {
+                let mut vaults = self.tracked_vaults.write();
+                for v in vaults.values_mut() {
+                    if v.pool_address == pool && v.pin == Some(GeyserPinReason::MomentumActive) {
+                        v.pin = None;
+                        v.pinned = false;
+                        changed = true;
+                    }
                 }
             }
-        }
-        {
-            let mut bins = self.tracked_bin_arrays.write();
-            for b in bins.values_mut() {
-                if b.pool_address == pool && b.pin == Some(GeyserPinReason::MomentumActive) {
-                    b.pin = None;
-                    b.pinned = false;
-                    changed = true;
+            {
+                let mut bins = self.tracked_bin_arrays.write();
+                for b in bins.values_mut() {
+                    if b.pool_address == pool && b.pin == Some(GeyserPinReason::MomentumActive) {
+                        b.pin = None;
+                        b.pinned = false;
+                        changed = true;
+                    }
                 }
             }
         }
@@ -12468,6 +12477,23 @@ mod pr_b_geyser_tracking_tests {
         assert!(!s.is_pinned(mint, pool));
     }
 
+    #[test]
+    fn active_pool_set_pool_has_any_pin() {
+        let s = ActivePoolSet::new();
+        let m1 = Pubkey::new_unique();
+        let m2 = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        assert!(!s.pool_has_any_pin(pool));
+        s.pin_pool(m1, pool);
+        assert!(s.pool_has_any_pin(pool));
+        s.pin_pool(m2, pool);
+        assert!(s.pool_has_any_pin(pool));
+        s.unpin_pool(m1, pool);
+        assert!(s.pool_has_any_pin(pool));
+        s.unpin_pool(m2, pool);
+        assert!(!s.pool_has_any_pin(pool));
+    }
+
     /// Bugbot PR-146: paired vault eviction must never pick a pinned sibling for `lru_cap_pair`.
     #[test]
     fn geyser_sibling_evict_helper_skips_pinned_leg() {
@@ -12728,5 +12754,79 @@ mod pr_b_geyser_tracking_tests {
             Some(GeyserPinReason::Wallet)
         );
         assert!(vs.get(&pc_vault).is_some_and(|v| v.pinned));
+    }
+
+    #[test]
+    fn momentum_active_pools_removed_one_mint_keeps_vault_momentum_when_other_mint_pins_pool() {
+        use ironcrab::nats::{
+            MomentumActivePinReason, MomentumActivePoolEntry, MomentumRemovedPoolEntry,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let other_tracker_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_mint,
+                token_1_mint: quote,
+                token_0_vault: coin_vault,
+                token_1_vault: pc_vault,
+                reserve_0: None,
+                reserve_1: None,
+            }),
+            1,
+        );
+
+        ctx.apply_momentum_active_pools_update(&MomentumActivePoolsUpdate {
+            version: 1,
+            ts_unix_ms: 1,
+            active: vec![
+                MomentumActivePoolEntry {
+                    mint: base_mint.to_string(),
+                    pool: pool.to_string(),
+                    pin_reason: MomentumActivePinReason::Tracker,
+                },
+                MomentumActivePoolEntry {
+                    mint: other_tracker_mint.to_string(),
+                    pool: pool.to_string(),
+                    pin_reason: MomentumActivePinReason::Tracker,
+                },
+            ],
+            removed: vec![],
+        });
+
+        ctx.apply_momentum_active_pools_update(&MomentumActivePoolsUpdate {
+            version: 1,
+            ts_unix_ms: 2,
+            active: vec![],
+            removed: vec![MomentumRemovedPoolEntry {
+                mint: base_mint.to_string(),
+                pool: pool.to_string(),
+                reason: "stale_discovery".to_string(),
+            }],
+        });
+
+        assert!(
+            ctx.active_pool_set.is_pinned(other_tracker_mint, pool),
+            "second pin row must survive"
+        );
+        let vs = ctx.tracked_vaults.read();
+        assert_eq!(
+            vs.get(&coin_vault).and_then(|v| v.pin),
+            Some(GeyserPinReason::MomentumActive)
+        );
+        assert_eq!(
+            vs.get(&pc_vault).and_then(|v| v.pin),
+            Some(GeyserPinReason::MomentumActive)
+        );
     }
 }
