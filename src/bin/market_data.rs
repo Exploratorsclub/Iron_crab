@@ -1663,121 +1663,129 @@ impl MarketDataContext {
 
     /// P1: Apply config update from control-plane (Runtime Configuration via UI)
     fn apply_config_update(&self, update: &ConfigUpdate) -> ConfigUpdateResponse {
-        let mut config = self.config.write();
         let mut applied = Vec::new();
         let mut rejected = Vec::new();
+        let mut sync_geyser_tracked_after_max_accounts = false;
 
-        for (key, value) in &update.config {
-            match key.as_str() {
-                "enable_raydium" => {
-                    if let Some(v) = value.as_bool() {
-                        config.enable_raydium = v;
-                        applied.push(key.clone());
-                        info!(key = %key, new_value = %v, "Config updated");
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
-                    }
-                }
-                "enable_raydium_cpmm" => {
-                    if let Some(v) = value.as_bool() {
-                        config.enable_raydium_cpmm = v;
-                        applied.push(key.clone());
-                        info!(key = %key, new_value = %v, "Config updated");
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
-                    }
-                }
-                "enable_orca" => {
-                    if let Some(v) = value.as_bool() {
-                        config.enable_orca = v;
-                        applied.push(key.clone());
-                        info!(key = %key, new_value = %v, "Config updated");
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
-                    }
-                }
-                "enable_pumpfun" => {
-                    if let Some(v) = value.as_bool() {
-                        config.enable_pumpfun = v;
-                        applied.push(key.clone());
-                        info!(key = %key, new_value = %v, "Config updated");
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
-                    }
-                }
-                "enable_pumpswap" => {
-                    if let Some(v) = value.as_bool() {
-                        config.enable_pumpswap = v;
-                        applied.push(key.clone());
-                        info!(key = %key, new_value = %v, "Config updated");
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
-                    }
-                }
-                "enable_meteora_dlmm" => {
-                    if let Some(v) = value.as_bool() {
-                        config.enable_meteora_dlmm = v;
-                        applied.push(key.clone());
-                        info!(key = %key, new_value = %v, "Config updated");
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
-                    }
-                }
-                "enable_meteora_cpmm" => {
-                    if let Some(v) = value.as_bool() {
-                        config.enable_meteora_cpmm = v;
-                        applied.push(key.clone());
-                        info!(key = %key, new_value = %v, "Config updated");
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
-                    }
-                }
-                "max_events_per_sec" => {
-                    if let Some(v) = value.as_u64() {
-                        if v > 0 && v <= 1_000_000 {
-                            config.max_events_per_sec = v as u32;
+        {
+            let mut config = self.config.write();
+            for (key, value) in &update.config {
+                match key.as_str() {
+                    "enable_raydium" => {
+                        if let Some(v) = value.as_bool() {
+                            config.enable_raydium = v;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
                         } else {
-                            rejected.push((key.clone(), "Must be 1-1000000".to_string()));
+                            rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
                         }
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
-                }
-                "max_tracked_accounts" => {
-                    if let Some(v) = value.as_u64() {
-                        if (1000..=500_000).contains(&v) {
-                            config.max_tracked_accounts = v as usize;
+                    "enable_raydium_cpmm" => {
+                        if let Some(v) = value.as_bool() {
+                            config.enable_raydium_cpmm = v;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
                         } else {
-                            rejected.push((key.clone(), "Must be 1000-500000".to_string()));
+                            rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
                         }
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
-                }
-                "geyser_full_reconnect_threshold" => {
-                    if let Some(v) = value.as_u64() {
-                        if (1000..=500_000).contains(&v) {
-                            let n = v as usize;
-                            config.geyser_full_reconnect_threshold = n;
-                            self.geyser_full_reconnect_threshold_live
-                                .store(n, Ordering::Relaxed);
+                    "enable_orca" => {
+                        if let Some(v) = value.as_bool() {
+                            config.enable_orca = v;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
                         } else {
-                            rejected.push((key.clone(), "Must be 1000-500000".to_string()));
+                            rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
                         }
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
-                }
-                _ => {
-                    rejected.push((key.clone(), format!("Unknown config key: {}", key)));
+                    "enable_pumpfun" => {
+                        if let Some(v) = value.as_bool() {
+                            config.enable_pumpfun = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                        }
+                    }
+                    "enable_pumpswap" => {
+                        if let Some(v) = value.as_bool() {
+                            config.enable_pumpswap = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                        }
+                    }
+                    "enable_meteora_dlmm" => {
+                        if let Some(v) = value.as_bool() {
+                            config.enable_meteora_dlmm = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                        }
+                    }
+                    "enable_meteora_cpmm" => {
+                        if let Some(v) = value.as_bool() {
+                            config.enable_meteora_cpmm = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                        }
+                    }
+                    "max_events_per_sec" => {
+                        if let Some(v) = value.as_u64() {
+                            if v > 0 && v <= 1_000_000 {
+                                config.max_events_per_sec = v as u32;
+                                applied.push(key.clone());
+                                info!(key = %key, new_value = %v, "Config updated");
+                            } else {
+                                rejected.push((key.clone(), "Must be 1-1000000".to_string()));
+                            }
+                        } else {
+                            rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                        }
+                    }
+                    "max_tracked_accounts" => {
+                        if let Some(v) = value.as_u64() {
+                            if (1000..=500_000).contains(&v) {
+                                config.max_tracked_accounts = v as usize;
+                                applied.push(key.clone());
+                                sync_geyser_tracked_after_max_accounts = true;
+                                info!(key = %key, new_value = %v, "Config updated");
+                            } else {
+                                rejected.push((key.clone(), "Must be 1000-500000".to_string()));
+                            }
+                        } else {
+                            rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                        }
+                    }
+                    "geyser_full_reconnect_threshold" => {
+                        if let Some(v) = value.as_u64() {
+                            if (1000..=500_000).contains(&v) {
+                                let n = v as usize;
+                                config.geyser_full_reconnect_threshold = n;
+                                self.geyser_full_reconnect_threshold_live
+                                    .store(n, Ordering::Relaxed);
+                                applied.push(key.clone());
+                                info!(key = %key, new_value = %v, "Config updated");
+                            } else {
+                                rejected.push((key.clone(), "Must be 1000-500000".to_string()));
+                            }
+                        } else {
+                            rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                        }
+                    }
+                    _ => {
+                        rejected.push((key.clone(), format!("Unknown config key: {}", key)));
+                    }
                 }
             }
+        }
+
+        if sync_geyser_tracked_after_max_accounts {
+            self.sync_geyser_tracked_accounts();
         }
 
         let status = if rejected.is_empty() {
