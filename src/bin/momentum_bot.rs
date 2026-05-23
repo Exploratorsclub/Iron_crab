@@ -2874,6 +2874,16 @@ impl MomentumContext {
     }
 
     fn queue_momentum_active_pool_removed(&self, mint: &str, pool: &str, reason: &str) {
+        // Open position on this pool still needs Geyser reserve pins; a Rejected tracker row
+        // (e.g. LP removal, scale-in gate) must not publish `removed` until the position is gone.
+        if self
+            .positions
+            .read()
+            .get(mint)
+            .is_some_and(|p| p.pool.as_str() == pool)
+        {
+            return;
+        }
         let mut g = self.momentum_active_pool_publish_queue.lock();
         g.removed.push(MomentumRemovedPoolEntry {
             mint: mint.to_string(),
@@ -2954,7 +2964,11 @@ impl MomentumContext {
         }
         for (mint, pos) in positions.iter() {
             let key = Self::tracker_storage_key(mint, pos.pool.as_str());
-            if !trackers.contains_key(&key) {
+            let position_fallback = match trackers.get(&key) {
+                None => true,
+                Some(t) => matches!(t.state, TrackerState::Rejected),
+            };
+            if position_fallback {
                 out.push(MomentumActivePoolEntry {
                     mint: mint.clone(),
                     pool: pos.pool.clone(),
