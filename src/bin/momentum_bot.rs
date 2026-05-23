@@ -4508,6 +4508,8 @@ impl MomentumContext {
                     tracker.set_dev_info(&dev_wallet, supply_pct, &config);
                     if was_not_rejected && tracker.is_rejected() {
                         self.record_token_blacklisted_once(mint);
+                        let reason = tracker.blacklist_reason.as_deref().unwrap_or("rejected");
+                        self.queue_momentum_active_pool_removed(mint, pool, reason);
                     }
                 }
 
@@ -12967,6 +12969,46 @@ mod tests {
             .is_rejected());
     }
 
+    /// PR #147: pending dev applied on vacant insert rejects immediately — queue `removed`, never `active`.
+    #[test]
+    fn get_or_create_tracker_pending_dev_immediate_reject_queues_removed_not_active_for_pin() {
+        let mut cfg = MomentumConfig::default();
+        cfg.max_dev_supply_pct = 50.0;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg;
+
+        let mint = "MintPendingRejectPin999999999999999999999999";
+        let pool = "poolPendingRejectPin999999999999999999999999";
+
+        ctx.pending_dev_info.write().insert(
+            mint.to_string(),
+            (
+                "DevWallet9999999999999999999999999999999999".to_string(),
+                99.0,
+            ),
+        );
+
+        assert!(ctx.get_or_create_tracker(mint, pool, "raydium", 1, 0));
+
+        let q = ctx.momentum_active_pool_publish_queue.lock();
+        assert!(
+            !q.active
+                .iter()
+                .any(|e| e.mint.as_str() == mint && e.pool.as_str() == pool),
+            "rejected-on-create must not queue active pin"
+        );
+        assert!(
+            q.removed
+                .iter()
+                .any(|r| r.mint.as_str() == mint && r.pool.as_str() == pool),
+            "rejected-on-create must queue removed for market-data"
+        );
+    }
+
     /// `tokens_blacklisted` is mint-level: one LP-removal event rejects two pool rows → +1 not +2.
     #[test]
     fn tokens_blacklisted_once_per_mint_for_record_lp_removal_two_pool_trackers() {
@@ -16573,18 +16615,26 @@ async fn process_market_event(
                     ctx.get_or_create_tracker(base_mint, pool_address, &dex, slot, liq_lamports);
 
                 if created {
-                    info!(
-                        mint = %base_mint,
-                        pool = %pool_address,
-                        dex = %dex,
-                        liquidity = liq_sol,
-                        "📊 Token tracker initialized"
-                    );
-                    ctx.queue_momentum_active_pool_active(
-                        base_mint,
-                        pool_address,
-                        MomentumActivePinReason::Tracker,
-                    );
+                    let tk = MomentumContext::tracker_storage_key(base_mint, pool_address);
+                    let should_pin = ctx
+                        .token_trackers
+                        .read()
+                        .get(&tk)
+                        .is_some_and(|t| !t.is_rejected());
+                    if should_pin {
+                        info!(
+                            mint = %base_mint,
+                            pool = %pool_address,
+                            dex = %dex,
+                            liquidity = liq_sol,
+                            "📊 Token tracker initialized"
+                        );
+                        ctx.queue_momentum_active_pool_active(
+                            base_mint,
+                            pool_address,
+                            MomentumActivePinReason::Tracker,
+                        );
+                    }
                     ctx.flush_momentum_active_pool_publish_queue();
                 }
             } else {
@@ -16686,18 +16736,26 @@ async fn process_market_event(
                 if created {
                     // A.2 Phase 5: Explicitly register pool when discovered via trade
                     ctx.register_pool(mint, pool_address, &dex, slot);
-                    info!(
-                        mint = %mint,
-                        pool = %pool_address,
-                        dex = %dex,
-                        discovery = "trade",
-                        "📊 Token tracker initialized (trade-based discovery)"
-                    );
-                    ctx.queue_momentum_active_pool_active(
-                        mint,
-                        pool_address,
-                        MomentumActivePinReason::Tracker,
-                    );
+                    let tk = MomentumContext::tracker_storage_key(mint, pool_address);
+                    let should_pin = ctx
+                        .token_trackers
+                        .read()
+                        .get(&tk)
+                        .is_some_and(|t| !t.is_rejected());
+                    if should_pin {
+                        info!(
+                            mint = %mint,
+                            pool = %pool_address,
+                            dex = %dex,
+                            discovery = "trade",
+                            "📊 Token tracker initialized (trade-based discovery)"
+                        );
+                        ctx.queue_momentum_active_pool_active(
+                            mint,
+                            pool_address,
+                            MomentumActivePinReason::Tracker,
+                        );
+                    }
                     ctx.flush_momentum_active_pool_publish_queue();
                 }
             }
