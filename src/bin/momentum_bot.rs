@@ -3042,8 +3042,13 @@ impl MomentumContext {
             return;
         }
         let tk = Self::tracker_storage_key(mint, pool);
-        if self.token_trackers.read().contains_key(&tk) {
-            return;
+        if let Some(t) = self.token_trackers.read().get(&tk) {
+            // `collect_momentum_active_pool_snapshot` skips Rejected rows; a leftover Rejected
+            // line must not block incremental `removed` after the position is gone (pins until
+            // full snapshot otherwise).
+            if !matches!(t.state, TrackerState::Rejected) {
+                return;
+            }
         }
         self.queue_momentum_active_pool_removed(mint, pool, "closed");
     }
@@ -5032,8 +5037,23 @@ impl MomentumContext {
     fn cleanup_old_trackers(&self) {
         let open_mints: std::collections::HashSet<_> =
             self.positions.read().keys().cloned().collect();
-        let mut trackers = self.token_trackers.write();
         let cutoff = Duration::from_secs(300); // 5 minutes
+        let pruned: Vec<(String, String)> = {
+            let trackers = self.token_trackers.read();
+            trackers
+                .values()
+                .filter(|tracker| {
+                    !open_mints.contains(&tracker.mint)
+                        && tracker.first_seen.elapsed() >= cutoff
+                        && tracker.state.is_terminal()
+                })
+                .map(|t| (t.mint.clone(), t.pool.clone()))
+                .collect()
+        };
+        for (mint, pool) in &pruned {
+            self.queue_momentum_active_pool_removed(mint, pool.as_str(), "tracker_cleanup");
+        }
+        let mut trackers = self.token_trackers.write();
         trackers.retain(|_, tracker| {
             open_mints.contains(&tracker.mint)
                 || tracker.first_seen.elapsed() < cutoff
