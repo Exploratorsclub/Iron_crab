@@ -46,7 +46,8 @@ use ironcrab::ipc::{
     TradingRegime, NATIVE_SOL_MINT,
 };
 use ironcrab::metrics::{
-    momentum_event_ts_latency_delta_ms, record_momentum_core_market_events_ingest_drain_batch,
+    momentum_event_ts_latency_delta_ms, record_momentum_active_pools_messages_total,
+    record_momentum_core_market_events_ingest_drain_batch,
     record_momentum_core_market_events_processed_kind,
     record_momentum_core_market_events_received_kind, record_momentum_ingest_to_process_us,
     record_momentum_market_events_last_applied_slot,
@@ -68,10 +69,11 @@ use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
     ensure_trade_intents_stream, execution_results_consumer_config,
     pool_cache_live_consumer_config, wallet_snapshot_consumer_config,
-    wallet_snapshot_live_consumer_config, NatsClient, NatsConfig, NatsMessage, CONFIG_STREAM_NAME,
-    EXECUTION_RESULTS_STREAM_NAME, STREAM_NAME, TOPIC_CONTROL_REQUESTS, TOPIC_EXECUTION_RESULTS,
-    TOPIC_MARKET_EVENTS, TOPIC_MOMENTUM_MARKET_EVENTS, TOPIC_TRADE_INTENTS,
-    WALLET_SNAPSHOT_STREAM_NAME,
+    wallet_snapshot_live_consumer_config, MomentumActivePinReason, MomentumActivePoolEntry,
+    MomentumActivePoolsUpdate, MomentumRemovedPoolEntry, NatsClient, NatsConfig, NatsMessage,
+    CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME, STREAM_NAME, TOPIC_CONTROL_REQUESTS,
+    TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_MOMENTUM_ACTIVE_POOLS,
+    TOPIC_MOMENTUM_MARKET_EVENTS, TOPIC_TRADE_INTENTS, WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::solana::dex_parser::SOL_MINT_PUBKEY;
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
@@ -107,6 +109,17 @@ fn is_non_tradeable_momentum_mint(mint: &str) -> bool {
 
 /// JetStream replay dedup for orphaned BUY path — bounded so memory does not grow forever.
 const ORPHANED_RECOVERED_INTENT_IDS_CAP: usize = 50_000;
+
+/// Wire version for [`TOPIC_MOMENTUM_ACTIVE_POOLS`] JSON payloads (PR-D).
+const MOMENTUM_ACTIVE_POOLS_WIRE_VERSION: u32 = 1;
+/// Discovery/Validation trackers without a trade for this long are dropped (PR-D plan #4).
+const MOMENTUM_STALE_DISCOVERY_SECS: u64 = 30 * 60;
+
+#[derive(Debug, Default)]
+struct MomentumActivePoolPublishQueue {
+    active: Vec<MomentumActivePoolEntry>,
+    removed: Vec<MomentumRemovedPoolEntry>,
+}
 
 /// Cooldown between repeated `Ensure*` ControlRequests for the same open-position pool recovery key.
 const OPEN_POSITION_POOL_RECOVERY_COOLDOWN: Duration = Duration::from_secs(60);
@@ -1678,6 +1691,9 @@ struct TokenTracker {
     /// Reason for rejection (only set when state == Rejected)
     blacklist_reason: Option<String>,
 
+    /// PR-D: last time this pool-scoped row observed any market trade (`record_trade`), for stale Discovery cleanup.
+    last_trade_at: Option<Instant>,
+
     /// Last WAIT_* filter class used for metrics/log dedupe (hot path CPU / NATS backpressure).
     last_wait_filter_obs_key: Option<String>,
 }
@@ -1723,6 +1739,7 @@ impl TokenTracker {
             cto_recovery_confirmed: false,
             state: TrackerState::Discovery,
             blacklist_reason: None,
+            last_trade_at: None,
             last_wait_filter_obs_key: None,
         }
     }
@@ -1730,6 +1747,22 @@ impl TokenTracker {
     #[cfg(test)]
     fn last_wait_filter_obs_key_for_test(&self) -> Option<&str> {
         self.last_wait_filter_obs_key.as_deref()
+    }
+
+    /// PR-D tests: Discovery/Validation-Zeile mit simuliertem Alter (`first_seen` / `last_trade_at`).
+    #[cfg(test)]
+    pub(crate) fn test_fixture_stale_discovery(
+        mint: &str,
+        pool: &str,
+        state: TrackerState,
+        first_seen_age: std::time::Duration,
+        last_trade_age: Option<std::time::Duration>,
+    ) -> Self {
+        let mut t = Self::new(mint, pool, "raydium", 1, 10_000_000_000);
+        t.first_seen = Instant::now() - first_seen_age;
+        t.state = state;
+        t.last_trade_at = last_trade_age.map(|d| Instant::now() - d);
+        t
     }
 
     // =========================================================================
@@ -2086,6 +2119,7 @@ impl TokenTracker {
         }
 
         self.trades.push(trade);
+        self.last_trade_at = Some(Instant::now());
     }
 
     fn last_trade_ratio(&self) -> Option<(u64, u64)> {
@@ -2785,6 +2819,8 @@ struct MomentumContext {
     /// K Phase 1: Last event slot/ts for Slot-to-Send Latency propagation
     last_event_slot: std::sync::atomic::AtomicU64,
     last_event_ts_ms: std::sync::atomic::AtomicU64,
+    /// PR-D: coalesced momentum active-pool NATS publishes (flushed on heartbeat / explicit tick).
+    momentum_active_pool_publish_queue: parking_lot::Mutex<MomentumActivePoolPublishQueue>,
 }
 
 /// Merge `lp_removal_observed_at` across sibling pool trackers for the same mint (wallclock LP_REMOVAL path).
@@ -2821,6 +2857,179 @@ impl MomentumContext {
             .intent_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         format!("int-{}-{:06}", &self.run_id[..8], n)
+    }
+
+    fn queue_momentum_active_pool_active(
+        &self,
+        mint: &str,
+        pool: &str,
+        pin_reason: MomentumActivePinReason,
+    ) {
+        let mut g = self.momentum_active_pool_publish_queue.lock();
+        g.active.push(MomentumActivePoolEntry {
+            mint: mint.to_string(),
+            pool: pool.to_string(),
+            pin_reason,
+        });
+    }
+
+    fn queue_momentum_active_pool_removed(&self, mint: &str, pool: &str, reason: &str) {
+        let mut g = self.momentum_active_pool_publish_queue.lock();
+        g.removed.push(MomentumRemovedPoolEntry {
+            mint: mint.to_string(),
+            pool: pool.to_string(),
+            reason: reason.to_string(),
+        });
+    }
+
+    fn flush_momentum_active_pool_publish_queue(self: &Arc<Self>) {
+        if self.nats.is_none() {
+            return;
+        }
+        let (active, removed) = {
+            let mut g = self.momentum_active_pool_publish_queue.lock();
+            if g.active.is_empty() && g.removed.is_empty() {
+                return;
+            }
+            let a = std::mem::take(&mut g.active);
+            let r = std::mem::take(&mut g.removed);
+            (a, r)
+        };
+        self.spawn_publish_momentum_active_pools(active, removed);
+    }
+
+    fn spawn_publish_momentum_active_pools(
+        self: &Arc<Self>,
+        active: Vec<MomentumActivePoolEntry>,
+        removed: Vec<MomentumRemovedPoolEntry>,
+    ) {
+        if active.is_empty() && removed.is_empty() {
+            return;
+        }
+        let Some(nats_src) = self.nats.as_ref() else {
+            return;
+        };
+        let nats = nats_src.clone_for_spawned_publish();
+        let update = MomentumActivePoolsUpdate {
+            version: MOMENTUM_ACTIVE_POOLS_WIRE_VERSION,
+            ts_unix_ms: wall_clock_unix_ms_now(),
+            active,
+            removed,
+        };
+        record_momentum_active_pools_messages_total();
+        tokio::spawn(async move {
+            if let Err(e) = nats.publish(TOPIC_MOMENTUM_ACTIVE_POOLS, &update).await {
+                warn!(
+                    error = %e,
+                    topic = TOPIC_MOMENTUM_ACTIVE_POOLS,
+                    "MomentumActivePools NATS publish failed"
+                );
+            }
+        });
+    }
+
+    fn collect_momentum_active_pool_snapshot(&self) -> Vec<MomentumActivePoolEntry> {
+        let positions = self.positions.read();
+        let trackers = self.token_trackers.read();
+        let mut out = Vec::new();
+        for t in trackers.values() {
+            if matches!(t.state, TrackerState::Rejected) {
+                continue;
+            }
+            let pos_same_pool = positions
+                .get(&t.mint)
+                .is_some_and(|p| p.pool.as_str() == t.pool.as_str());
+            let pin_reason = if pos_same_pool {
+                MomentumActivePinReason::Position
+            } else {
+                MomentumActivePinReason::Tracker
+            };
+            out.push(MomentumActivePoolEntry {
+                mint: t.mint.clone(),
+                pool: t.pool.clone(),
+                pin_reason,
+            });
+        }
+        for (mint, pos) in positions.iter() {
+            let key = Self::tracker_storage_key(mint, pos.pool.as_str());
+            if !trackers.contains_key(&key) {
+                out.push(MomentumActivePoolEntry {
+                    mint: mint.clone(),
+                    pool: pos.pool.clone(),
+                    pin_reason: MomentumActivePinReason::Position,
+                });
+            }
+        }
+        out
+    }
+
+    fn reconcile_momentum_active_pools_snapshot_publish(self: &Arc<Self>) {
+        if self.nats.is_none() {
+            return;
+        }
+        let active = self.collect_momentum_active_pool_snapshot();
+        self.spawn_publish_momentum_active_pools(active, Vec::new());
+    }
+
+    fn prune_stale_discovery_trackers(&self) -> Vec<MomentumRemovedPoolEntry> {
+        let stale = Duration::from_secs(MOMENTUM_STALE_DISCOVERY_SECS);
+        let positions = self.positions.read();
+        let mut trackers = self.token_trackers.write();
+        let keys: Vec<String> = trackers.keys().cloned().collect();
+        let mut removed = Vec::new();
+        for key in keys {
+            let Some(t) = trackers.get(&key) else {
+                continue;
+            };
+            if !matches!(t.state, TrackerState::Discovery | TrackerState::Validation) {
+                continue;
+            }
+            // "Ohne Trade seit 30 min": entweder nie `record_trade` (None) — dann nur prunen wenn
+            // der Tracker schon mindestens `stale` in Discovery/Validation sitzt (`first_seen`);
+            // oder letzter Markt-Trade älter als `stale`.
+            let idle_too_long = match t.last_trade_at {
+                None => t.first_seen.elapsed() > stale,
+                Some(ts) => ts.elapsed() > stale,
+            };
+            if !idle_too_long {
+                continue;
+            }
+            if positions
+                .get(&t.mint)
+                .is_some_and(|p| p.pool.as_str() == t.pool.as_str())
+            {
+                continue;
+            }
+            let mint = t.mint.clone();
+            let pool = t.pool.clone();
+            trackers.remove(&key);
+            removed.push(MomentumRemovedPoolEntry {
+                mint,
+                pool,
+                reason: "stale_discovery".to_string(),
+            });
+        }
+        drop(trackers);
+        drop(positions);
+        let snap = self.token_trackers.read();
+        self.refresh_tracker_keys_by_mint_index_from_map(&snap);
+        let keys_live: std::collections::HashSet<String> = snap.keys().cloned().collect();
+        drop(snap);
+        self.dirty_entry_tracker_keys
+            .write()
+            .retain(|k| keys_live.contains(k));
+        removed
+    }
+
+    fn maybe_queue_removed_after_position_closed(&self, mint: &str, pool: &str) {
+        if self.positions.read().contains_key(mint) {
+            return;
+        }
+        let tk = Self::tracker_storage_key(mint, pool);
+        if self.token_trackers.read().contains_key(&tk) {
+            return;
+        }
+        self.queue_momentum_active_pool_removed(mint, pool, "closed");
     }
 
     /// Same pool filtering as `find_best_sell_pool` (Scope 57 / I-13), shared for exit quotes.
@@ -4332,6 +4541,8 @@ impl MomentumContext {
             );
             if was_not_rejected && tracker.is_rejected() {
                 self.record_token_blacklisted_once(mint);
+                let reason = tracker.blacklist_reason.as_deref().unwrap_or("rejected");
+                self.queue_momentum_active_pool_removed(mint, pool, reason);
             }
             sync_sibling_dev_sell_early =
                 tracker.blacklist_reason.as_deref() == Some("REJECT_DEV_SELL_EARLY");
@@ -4361,6 +4572,11 @@ impl MomentumContext {
                 t.dev_sold = true;
                 t.dev_sold_early = true;
                 t.reject("REJECT_DEV_SELL_EARLY");
+                self.queue_momentum_active_pool_removed(
+                    t.mint.as_str(),
+                    t.pool.as_str(),
+                    "rejected",
+                );
                 self.mark_entry_eval_dirty_key(&sk);
             }
         }
@@ -4605,6 +4821,11 @@ impl MomentumContext {
                             "REJECT_PUMPFUN_BONDING_COMPLETE: skip entry — migrated bonding curve / complete evidence (pump_amm unaffected)"
                         );
                         self.record_token_blacklisted_once(&mint);
+                        self.queue_momentum_active_pool_removed(
+                            &mint,
+                            tracker.pool.as_str(),
+                            "rejected",
+                        );
                     }
                 }
                 continue;
@@ -4638,6 +4859,12 @@ impl MomentumContext {
                     );
                     if was_not_rejected && tracker.is_rejected() {
                         self.record_token_blacklisted_once(&mint);
+                        let rej_reason = tracker.blacklist_reason.as_deref().unwrap_or("rejected");
+                        self.queue_momentum_active_pool_removed(
+                            &mint,
+                            tracker.pool.as_str(),
+                            rej_reason,
+                        );
                     }
 
                     if should_trade {
@@ -4739,6 +4966,12 @@ impl MomentumContext {
                     );
                     if was_not_rejected && tracker.is_rejected() {
                         self.record_token_blacklisted_once(&mint);
+                        let rej_reason = tracker.blacklist_reason.as_deref().unwrap_or("rejected");
+                        self.queue_momentum_active_pool_removed(
+                            &mint,
+                            tracker.pool.as_str(),
+                            rej_reason,
+                        );
                     }
 
                     if should_trade {
@@ -4907,6 +5140,9 @@ impl MomentumContext {
         tokio::spawn(async move {
             ctx.save_position_to_kv(&mint_owned, &tracker).await;
         });
+
+        self.queue_momentum_active_pool_active(p.mint, p.pool, MomentumActivePinReason::Position);
+        self.flush_momentum_active_pool_publish_queue();
     }
 
     /// Update position price from market trade or pool reserves.
@@ -4981,9 +5217,11 @@ impl MomentumContext {
     /// Also removes the position from JetStream KV
     fn close_position(self: &Arc<Self>, mint: &str) {
         let mint_owned = mint.to_string();
-        let removed = {
+        let (removed, closed_pool) = {
             let mut positions = self.positions.write();
-            positions.remove(mint)
+            let pool = positions.get(mint).map(|p| p.pool.clone());
+            let removed = positions.remove(mint);
+            (removed, pool)
         };
 
         if let Some(pos) = removed {
@@ -5003,6 +5241,11 @@ impl MomentumContext {
         if !self.pending_buy_mint_index.read().contains_key(mint) {
             self.latest_bonding_by_mint.write().remove(mint);
             self.clear_scope_b_sticky_state_for_mint(mint);
+        }
+
+        if let Some(ref pool) = closed_pool {
+            self.maybe_queue_removed_after_position_closed(mint, pool.as_str());
+            self.flush_momentum_active_pool_publish_queue();
         }
 
         // Delete from KV asynchronously (fire-and-forget)
@@ -8293,6 +8536,9 @@ async fn main() -> Result<()> {
         exits_generated: std::sync::atomic::AtomicU64::new(0),
         last_event_slot: std::sync::atomic::AtomicU64::new(0),
         last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+        momentum_active_pool_publish_queue: parking_lot::Mutex::new(
+            MomentumActivePoolPublishQueue::default(),
+        ),
     });
 
     // === P0: Wallet snapshot recovery from JetStream ===
@@ -8667,6 +8913,8 @@ async fn main() -> Result<()> {
     strategy_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut activity_interval = tokio::time::interval(std::time::Duration::from_secs(10));
     let mut reconcile_interval = tokio::time::interval(std::time::Duration::from_secs(15));
+    let mut active_pools_snapshot_interval =
+        tokio::time::interval(std::time::Duration::from_secs(30));
     let mut execution_result_scheduled_interval =
         tokio::time::interval(EXECUTION_RESULT_SCHEDULED_POLL_INTERVAL);
     execution_result_scheduled_interval
@@ -8836,6 +9084,7 @@ async fn main() -> Result<()> {
                                         .as_micros()
                                         .min(u128::from(u64::MAX)) as u64,
                                 );
+                                ctx.flush_momentum_active_pool_publish_queue();
                                 let is_trade = matches!(
                                     event.kind,
                                     MarketEventKind::Trade { .. }
@@ -9116,6 +9365,7 @@ async fn main() -> Result<()> {
                                                                     .min(u128::from(u64::MAX))
                                                                     as u64,
                                                             );
+                                                            ctx.flush_momentum_active_pool_publish_queue();
                                                             if need_exit && ctx.position_count() > 0 {
                                                                 ctx.process_exit_signals(None).await;
                                                             }
@@ -9295,6 +9545,12 @@ async fn main() -> Result<()> {
                 ctx.tick_open_position_pool_recovery_retries().await;
             }
 
+            // PR-D: periodic full active-pool snapshot for market-data idempotency.
+            _ = active_pools_snapshot_interval.tick() => {
+                ironcrab::metrics::record_activity();
+                ctx.reconcile_momentum_active_pools_snapshot_publish();
+            }
+
             // Periodic heartbeat
             _ = heartbeat_interval.tick() => {
                 ironcrab::metrics::record_activity();
@@ -9332,6 +9588,16 @@ async fn main() -> Result<()> {
                 // Cleanup old trackers and stale pending intents
                 ctx.cleanup_old_trackers();
                 ctx.cleanup_stale_pending();
+                let stale_removed = ctx.prune_stale_discovery_trackers();
+                if !stale_removed.is_empty() {
+                    if ctx.nats.is_some() {
+                        ctx.spawn_publish_momentum_active_pools(Vec::new(), stale_removed);
+                    } else {
+                        let mut g = ctx.momentum_active_pool_publish_queue.lock();
+                        g.removed.extend(stale_removed);
+                    }
+                }
+                ctx.flush_momentum_active_pool_publish_queue();
             }
         }
     }
@@ -10310,6 +10576,9 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            momentum_active_pool_publish_queue: parking_lot::Mutex::new(
+                MomentumActivePoolPublishQueue::default(),
+            ),
         }
     }
 
@@ -10456,6 +10725,103 @@ mod tests {
             ctx.token_trackers.read().is_empty(),
             "no pool-scoped rows for quote/native/stable mints"
         );
+    }
+
+    #[test]
+    fn prune_stale_discovery_retains_new_tracker_without_market_trades() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        let mint = "MintPruneNew1111111111111111111111111111";
+        let pool = "poolPruneNew1";
+        let key = MomentumContext::tracker_storage_key(mint, pool);
+        ctx.token_trackers.write().insert(
+            key.clone(),
+            TokenTracker::test_fixture_stale_discovery(
+                mint,
+                pool,
+                TrackerState::Discovery,
+                std::time::Duration::from_secs(120),
+                None,
+            ),
+        );
+        let removed = ctx.prune_stale_discovery_trackers();
+        assert!(
+            removed.is_empty(),
+            "Discovery ohne Markt-Trade darf nicht sofort entfernt werden (first_seen jung)"
+        );
+        assert!(ctx.token_trackers.read().contains_key(&key));
+    }
+
+    #[test]
+    fn prune_stale_discovery_removes_tracker_idle_over_30m_no_position() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        let mint = "MintPruneOld1111111111111111111111111111";
+        let pool = "poolPruneOld1";
+        let key = MomentumContext::tracker_storage_key(mint, pool);
+        ctx.token_trackers.write().insert(
+            key.clone(),
+            TokenTracker::test_fixture_stale_discovery(
+                mint,
+                pool,
+                TrackerState::Validation,
+                std::time::Duration::from_secs(31 * 60),
+                None,
+            ),
+        );
+        let removed = ctx.prune_stale_discovery_trackers();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].reason, "stale_discovery");
+        assert!(!ctx.token_trackers.read().contains_key(&key));
+    }
+
+    #[test]
+    fn prune_stale_discovery_skips_when_open_position_same_pool() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        let mint = "MintPrunePos1111111111111111111111111111";
+        let pool = "poolPrunePos1";
+        let key = MomentumContext::tracker_storage_key(mint, pool);
+        ctx.token_trackers.write().insert(
+            key.clone(),
+            TokenTracker::test_fixture_stale_discovery(
+                mint,
+                pool,
+                TrackerState::Discovery,
+                std::time::Duration::from_secs(31 * 60),
+                None,
+            ),
+        );
+        ctx.positions.write().insert(
+            mint.to_string(),
+            PositionTracker::new(mint, pool, "raydium", 1.0, 6, 1_000, 1_000_000),
+        );
+        let removed = ctx.prune_stale_discovery_trackers();
+        assert!(removed.is_empty());
+        assert!(ctx.token_trackers.read().contains_key(&key));
+    }
+
+    #[test]
+    fn momentum_active_pool_flush_skipped_without_nats_keeps_queue() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        ctx.queue_momentum_active_pool_active(
+            "MintAct11111111111111111111111111111111",
+            "poolAct11111111111111111111111111111111",
+            MomentumActivePinReason::Tracker,
+        );
+        ctx.flush_momentum_active_pool_publish_queue();
+        let q = ctx.momentum_active_pool_publish_queue.lock();
+        assert_eq!(q.active.len(), 1);
+        assert!(q.removed.is_empty());
     }
 
     #[test]
@@ -11618,6 +11984,9 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            momentum_active_pool_publish_queue: parking_lot::Mutex::new(
+                MomentumActivePoolPublishQueue::default(),
+            ),
         };
 
         let mint = "So11111111111111111111111111111111111111112";
@@ -11683,6 +12052,9 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            momentum_active_pool_publish_queue: parking_lot::Mutex::new(
+                MomentumActivePoolPublishQueue::default(),
+            ),
         };
 
         let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -13296,6 +13668,9 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            momentum_active_pool_publish_queue: parking_lot::Mutex::new(
+                MomentumActivePoolPublishQueue::default(),
+            ),
         };
 
         // Seed tracker with a last_trade_ratio so intent generation can compute min_out.
@@ -13414,6 +13789,9 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            momentum_active_pool_publish_queue: parking_lot::Mutex::new(
+                MomentumActivePoolPublishQueue::default(),
+            ),
         };
 
         // Open a position.
@@ -13501,6 +13879,9 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            momentum_active_pool_publish_queue: parking_lot::Mutex::new(
+                MomentumActivePoolPublishQueue::default(),
+            ),
         };
 
         // Open a position.
@@ -13582,6 +13963,9 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            momentum_active_pool_publish_queue: parking_lot::Mutex::new(
+                MomentumActivePoolPublishQueue::default(),
+            ),
         };
 
         let now = Instant::now();
@@ -13668,6 +14052,9 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            momentum_active_pool_publish_queue: parking_lot::Mutex::new(
+                MomentumActivePoolPublishQueue::default(),
+            ),
         });
 
         ctx.register_pool("mintX", "poolX", "raydium", 1);
@@ -13785,6 +14172,9 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            momentum_active_pool_publish_queue: parking_lot::Mutex::new(
+                MomentumActivePoolPublishQueue::default(),
+            ),
         });
 
         ctx.open_position(OpenPositionParams {
@@ -13895,6 +14285,9 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            momentum_active_pool_publish_queue: parking_lot::Mutex::new(
+                MomentumActivePoolPublishQueue::default(),
+            ),
         });
 
         ctx.open_position(OpenPositionParams {
@@ -13990,6 +14383,9 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            momentum_active_pool_publish_queue: parking_lot::Mutex::new(
+                MomentumActivePoolPublishQueue::default(),
+            ),
         };
 
         // Seed pool registry so reconciliation can pick a pool.
@@ -14063,6 +14459,9 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            momentum_active_pool_publish_queue: parking_lot::Mutex::new(
+                MomentumActivePoolPublishQueue::default(),
+            ),
         };
 
         let mint = "TokenMint1111111111111111111111111111111111";
@@ -14128,6 +14527,9 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            momentum_active_pool_publish_queue: parking_lot::Mutex::new(
+                MomentumActivePoolPublishQueue::default(),
+            ),
         };
 
         let mint = "TokenMint2222222222222222222222222222222222";
@@ -14679,6 +15081,9 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            momentum_active_pool_publish_queue: parking_lot::Mutex::new(
+                MomentumActivePoolPublishQueue::default(),
+            ),
         });
 
         let mint = "9mR7mmX55n1F56rKBBcfMrRzMoJjaZnSRs6fV1GRpump";
@@ -14814,6 +15219,9 @@ mod tests {
             exits_generated: std::sync::atomic::AtomicU64::new(0),
             last_event_slot: std::sync::atomic::AtomicU64::new(0),
             last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+            momentum_active_pool_publish_queue: parking_lot::Mutex::new(
+                MomentumActivePoolPublishQueue::default(),
+            ),
         });
 
         let mint = "NoTrkMintttttttttttttttttttttttttttttttttttt";
@@ -16124,6 +16532,12 @@ async fn process_market_event(
                         liquidity = liq_sol,
                         "📊 Token tracker initialized"
                     );
+                    ctx.queue_momentum_active_pool_active(
+                        base_mint,
+                        pool_address,
+                        MomentumActivePinReason::Tracker,
+                    );
+                    ctx.flush_momentum_active_pool_publish_queue();
                 }
             } else {
                 debug!(
@@ -16231,6 +16645,12 @@ async fn process_market_event(
                         discovery = "trade",
                         "📊 Token tracker initialized (trade-based discovery)"
                     );
+                    ctx.queue_momentum_active_pool_active(
+                        mint,
+                        pool_address,
+                        MomentumActivePinReason::Tracker,
+                    );
+                    ctx.flush_momentum_active_pool_publish_queue();
                 }
             }
 

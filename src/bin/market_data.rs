@@ -56,22 +56,25 @@ use ironcrab::metrics::{
     record_market_data_account_early_drop_total, record_market_data_account_handler_duration_us,
     record_market_data_bonding_to_trade_slot_delta_slots,
     record_market_data_geyser_to_publish_on_success,
+    record_market_data_momentum_active_pool_messages_total,
     record_market_data_trade_after_bonding_publish_ms, record_market_data_tx_broadcast_lagged,
     record_market_data_tx_channel_lag_ms, serve_metrics,
-    set_market_data_account_broadcast_queue_depth, set_market_data_tx_broadcast_queue_depth,
-    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
-    update_readiness_market_data_current, wall_clock_unix_ms_now, GeyserTrackedEvictKind,
-    MarketDataLatencySegment, MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
-    MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL,
-    MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
-    NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
+    set_market_data_account_broadcast_queue_depth, set_market_data_momentum_active_pool_pins_gauge,
+    set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
+    set_readiness_nats_connected, update_readiness_market_data_current, wall_clock_unix_ms_now,
+    GeyserTrackedEvictKind, MarketDataLatencySegment, MetricsComponent,
+    MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS,
+    MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
+    MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
+    POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
     ensure_pool_cache_stream, ensure_wallet_snapshot_stream, execution_results_consumer_config,
-    pool_subject, wallet_snapshot_consumer_config, wallet_snapshot_subject, NatsClient, NatsConfig,
-    CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME, TOPIC_CONTROL_REQUESTS,
-    TOPIC_CONTROL_RESPONSES, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
+    pool_subject, wallet_snapshot_consumer_config, wallet_snapshot_subject,
+    MomentumActivePoolsUpdate, NatsClient, NatsConfig, CONFIG_STREAM_NAME,
+    EXECUTION_RESULTS_STREAM_NAME, TOPIC_CONTROL_REQUESTS, TOPIC_CONTROL_RESPONSES,
+    TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_MOMENTUM_ACTIVE_POOLS,
     TOPIC_MOMENTUM_MARKET_EVENTS, TOPIC_PRIORITY_FEE_SAMPLES, WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
@@ -570,7 +573,6 @@ fn pump_amm_control_response_for_ensure_publish(
 
 /// PR-B: explicit Geyser account subscription / LRU (also loaded from `[market_data_geyser]` in config.toml).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // MomentumActive wired in PR-D
 enum GeyserPinReason {
     /// Wallet bootstrap / execution-result mint tracking — never LRU-evicted.
     Wallet,
@@ -595,13 +597,12 @@ impl Default for MintTrackInfo {
     }
 }
 
-/// PR-B stub: future NATS-driven active pool pins (PR-D). API is live for unit tests.
+/// PR-B: optional momentum active pool pins (PR-D NATS-driven).
 #[derive(Debug)]
 struct ActivePoolSet {
     pairs: parking_lot::RwLock<std::collections::HashSet<(Pubkey, Pubkey)>>,
 }
 
-#[allow(dead_code)] // pin/unpin used by PR-D and `pr_b_geyser_tracking_tests` (clippy sees bin without tests)
 impl ActivePoolSet {
     fn new() -> Self {
         Self {
@@ -619,6 +620,14 @@ impl ActivePoolSet {
 
     fn is_pinned(&self, mint: Pubkey, pool: Pubkey) -> bool {
         self.pairs.read().contains(&(mint, pool))
+    }
+
+    fn pair_count(&self) -> usize {
+        self.pairs.read().len()
+    }
+
+    fn mint_has_any_pinned_pool(&self, mint: Pubkey) -> bool {
+        self.pairs.read().iter().any(|(m, _)| *m == mint)
     }
 }
 
@@ -996,8 +1005,28 @@ struct BinArrayInfo {
     bin_step: u16,
     last_used_at: Instant,
     pinned: bool,
-    #[allow(dead_code)]
     pin: Option<GeyserPinReason>,
+}
+
+#[derive(Clone, Copy)]
+enum GeyserReserveRegisterFollowUp {
+    None,
+    /// PR-D: promote vault/bin rows for this pool to `MomentumActive` and track pool mints.
+    MomentumUpgrade,
+}
+
+/// Base + quote mint pubkeys for explicit mint-account Geyser tracking (metadata).
+fn pool_mints_for_geyser_explicit_tracking(state: &CachedPoolState) -> Option<(Pubkey, Pubkey)> {
+    let wsol = Pubkey::from_str(NATIVE_SOL_MINT).ok()?;
+    match state {
+        CachedPoolState::RaydiumCpmm(s) => Some((s.token_0_mint, s.token_1_mint)),
+        CachedPoolState::MeteoraCpmm(s) => Some((s.token_0_mint, s.token_1_mint)),
+        CachedPoolState::Meteora(s) => Some((s.token_x_mint, s.token_y_mint)),
+        CachedPoolState::PumpAmm(s) => Some((s.base_mint, s.quote_mint)),
+        CachedPoolState::Orca(s) => Some((s.token_mint_a, s.token_mint_b)),
+        CachedPoolState::RaydiumAmm(s) => Some((s.base_mint, s.quote_mint)),
+        CachedPoolState::PumpFun(s) => Some((s.token_mint, wsol)),
+    }
 }
 
 impl MarketDataContext {
@@ -1274,14 +1303,14 @@ impl MarketDataContext {
         self.broadcast_tracked_geyser_explicit_to_merge();
     }
 
-    /// Track mint pubkey for Geyser `TokenMintInfo` / metadata. Returns `true` if pubkey set changed.
+    /// Track mint pubkey for Geyser `TokenMintInfo` / metadata. Returns `true` if explicit pubkey set changed.
     fn track_mint_for_geyser_metadata(&self, mint: Pubkey, pin: Option<GeyserPinReason>) -> bool {
         let now = Instant::now();
-        let pinned = pin.is_some();
         let mut map = self.tracked_mints.write();
         use std::collections::hash_map::Entry;
         match map.entry(mint) {
             Entry::Vacant(e) => {
+                let pinned = pin.is_some();
                 e.insert(MintTrackInfo {
                     last_used_at: now,
                     pinned,
@@ -1292,11 +1321,24 @@ impl MarketDataContext {
             Entry::Occupied(mut e) => {
                 let v = e.get_mut();
                 v.last_used_at = now;
-                if pinned {
-                    v.pinned = true;
-                    v.pin = pin;
+                match pin {
+                    None => false,
+                    Some(GeyserPinReason::Wallet) => {
+                        let changed = !v.pinned || v.pin != Some(GeyserPinReason::Wallet);
+                        v.pinned = true;
+                        v.pin = Some(GeyserPinReason::Wallet);
+                        changed
+                    }
+                    Some(GeyserPinReason::MomentumActive) => {
+                        if v.pin == Some(GeyserPinReason::Wallet) {
+                            return false;
+                        }
+                        let changed = !v.pinned || v.pin != Some(GeyserPinReason::MomentumActive);
+                        v.pinned = true;
+                        v.pin = Some(GeyserPinReason::MomentumActive);
+                        changed
+                    }
                 }
-                false
             }
         }
     }
@@ -1343,11 +1385,43 @@ impl MarketDataContext {
 
     /// PR-B: after a parsed swap trade, subscribe reserve vaults / DLMM bin arrays from MASTER cache.
     fn register_geyser_reserves_after_trade(&self, pool: Pubkey) {
+        let _ =
+            self.register_geyser_reserves_impl(pool, GeyserReserveRegisterFollowUp::None, false);
+    }
+
+    /// PR-D: explicit vault/bin subscriptions for momentum active `(mint, pool)` when cache has layout.
+    /// Returns whether any tracked set changed. If `suppress_end_sync`, caller must [`Self::sync_geyser_tracked_accounts`].
+    fn register_geyser_reserves_for_momentum_active_pool(
+        &self,
+        pool: Pubkey,
+        suppress_end_sync: bool,
+    ) -> bool {
+        if self.live_pool_cache.get(&pool).is_none() {
+            debug!(
+                run_id = %self.run_id,
+                pool = %pool,
+                "Momentum active pool: LivePoolCache miss — pin may still be recorded; reserve registration deferred"
+            );
+            return false;
+        }
+        self.register_geyser_reserves_impl(
+            pool,
+            GeyserReserveRegisterFollowUp::MomentumUpgrade,
+            suppress_end_sync,
+        )
+    }
+
+    fn register_geyser_reserves_impl(
+        &self,
+        pool: Pubkey,
+        follow_up: GeyserReserveRegisterFollowUp,
+        suppress_end_sync: bool,
+    ) -> bool {
         let now = Instant::now();
         let enable_dlmm = self.config.read().enable_meteora_dlmm;
         let enable_meteora_cpmm = self.config.read().enable_meteora_cpmm;
         let Some(state) = self.live_pool_cache.get(&pool) else {
-            return;
+            return false;
         };
 
         let mut vaults_changed = false;
@@ -1656,9 +1730,132 @@ impl MarketDataContext {
             _ => {}
         }
 
-        if vaults_changed || bins_changed {
+        let mut mints_changed = false;
+        if matches!(follow_up, GeyserReserveRegisterFollowUp::MomentumUpgrade) {
+            {
+                let mut vaults = self.tracked_vaults.write();
+                for v in vaults.values_mut() {
+                    if v.pool_address == pool
+                        && v.pin != Some(GeyserPinReason::Wallet)
+                        && (!v.pinned || v.pin != Some(GeyserPinReason::MomentumActive))
+                    {
+                        v.pinned = true;
+                        v.pin = Some(GeyserPinReason::MomentumActive);
+                        vaults_changed = true;
+                    }
+                }
+            }
+            {
+                let mut bins = self.tracked_bin_arrays.write();
+                for b in bins.values_mut() {
+                    if b.pool_address == pool
+                        && b.pin != Some(GeyserPinReason::Wallet)
+                        && (!b.pinned || b.pin != Some(GeyserPinReason::MomentumActive))
+                    {
+                        b.pinned = true;
+                        b.pin = Some(GeyserPinReason::MomentumActive);
+                        bins_changed = true;
+                    }
+                }
+            }
+            if let Some((a, b)) = pool_mints_for_geyser_explicit_tracking(&state) {
+                if self.track_mint_for_geyser_metadata(a, Some(GeyserPinReason::MomentumActive)) {
+                    mints_changed = true;
+                }
+                if self.track_mint_for_geyser_metadata(b, Some(GeyserPinReason::MomentumActive)) {
+                    mints_changed = true;
+                }
+            }
+        }
+
+        let changed = vaults_changed || bins_changed || mints_changed;
+        if changed && !suppress_end_sync {
             self.sync_geyser_tracked_accounts();
         }
+        changed
+    }
+
+    /// PR-D: apply momentum-bot active pool pin updates (core NATS; immediate `sync_geyser_tracked_accounts`).
+    fn apply_momentum_active_pools_update(&self, update: &MomentumActivePoolsUpdate) {
+        record_market_data_momentum_active_pool_messages_total();
+
+        let mut batch_dirty = false;
+
+        for r in &update.removed {
+            let Ok(mint_pk) = Pubkey::from_str(r.mint.trim()) else {
+                warn!(mint = %r.mint, "MomentumActivePoolsUpdate.removed: invalid mint");
+                continue;
+            };
+            let Ok(pool_pk) = Pubkey::from_str(r.pool.trim()) else {
+                warn!(pool = %r.pool, "MomentumActivePoolsUpdate.removed: invalid pool");
+                continue;
+            };
+            if self.clear_momentum_geyser_reserves_for_active_entry(mint_pk, pool_pk) {
+                batch_dirty = true;
+            }
+        }
+
+        for a in &update.active {
+            let Ok(mint_pk) = Pubkey::from_str(a.mint.trim()) else {
+                warn!(mint = %a.mint, "MomentumActivePoolsUpdate.active: invalid mint");
+                continue;
+            };
+            let Ok(pool_pk) = Pubkey::from_str(a.pool.trim()) else {
+                warn!(pool = %a.pool, "MomentumActivePoolsUpdate.active: invalid pool");
+                continue;
+            };
+            self.active_pool_set.pin_pool(mint_pk, pool_pk);
+            if self.register_geyser_reserves_for_momentum_active_pool(pool_pk, true) {
+                batch_dirty = true;
+            }
+            let _ = &a.pin_reason;
+        }
+
+        if batch_dirty {
+            self.sync_geyser_tracked_accounts();
+        } else {
+            self.refresh_geyser_pins_gauge();
+        }
+        set_market_data_momentum_active_pool_pins_gauge(self.active_pool_set.pair_count());
+    }
+
+    /// Clear `MomentumActive` pins for one `(mint, pool)` side; never demotes [`GeyserPinReason::Wallet`].
+    fn clear_momentum_geyser_reserves_for_active_entry(&self, mint: Pubkey, pool: Pubkey) -> bool {
+        self.active_pool_set.unpin_pool(mint, pool);
+        let mut changed = false;
+        {
+            let mut vaults = self.tracked_vaults.write();
+            for v in vaults.values_mut() {
+                if v.pool_address == pool && v.pin == Some(GeyserPinReason::MomentumActive) {
+                    v.pin = None;
+                    v.pinned = false;
+                    changed = true;
+                }
+            }
+        }
+        {
+            let mut bins = self.tracked_bin_arrays.write();
+            for b in bins.values_mut() {
+                if b.pool_address == pool && b.pin == Some(GeyserPinReason::MomentumActive) {
+                    b.pin = None;
+                    b.pinned = false;
+                    changed = true;
+                }
+            }
+        }
+        if !self.wallet_tracks_mint_for_geyser(&mint)
+            && !self.active_pool_set.mint_has_any_pinned_pool(mint)
+        {
+            let mut m = self.tracked_mints.write();
+            if let Some(info) = m.get_mut(&mint) {
+                if info.pin == Some(GeyserPinReason::MomentumActive) {
+                    info.pinned = false;
+                    info.pin = None;
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// P1: Apply config update from control-plane (Runtime Configuration via UI)
@@ -9737,6 +9934,29 @@ async fn run_geyser_loop(
         None
     };
 
+    // PR-D: momentum-bot active pool pin stream (core NATS; fire-and-forget).
+    let mut momentum_active_pools_sub = if let Some(ref nats) = ctx.nats {
+        match nats.subscribe(TOPIC_MOMENTUM_ACTIVE_POOLS).await {
+            Ok(sub) => {
+                info!(
+                    topic = TOPIC_MOMENTUM_ACTIVE_POOLS,
+                    "Subscribed to MomentumActivePools (Geyser pin stream)"
+                );
+                Some(sub)
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    topic = TOPIC_MOMENTUM_ACTIVE_POOLS,
+                    "Failed to subscribe to MomentumActivePools (momentum reserve pins disabled)"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Option A (MARKET-DATA-TX-INGEST-FAIRNESS): dedizierter Tokio-Task für Geyser-Txs.
     // Verhindert, dass `transaction_rx.recv()` hinter langen Account-`select!`-Armen verhungert
     // (p50 `market_data_tx_channel_lag_ms` war ~1s+ bei gleichzeitig niedrigem Publish-Tail).
@@ -10654,6 +10874,26 @@ async fn run_geyser_loop(
                 }
             }
 
+            // PR-D: Momentum active pool pin stream (core NATS).
+            msg = async {
+                if let Some(ref mut sub) = momentum_active_pools_sub {
+                    sub.next().await
+                } else {
+                    std::future::pending::<Option<ironcrab::nats::NatsMessage>>().await
+                }
+            } => {
+                if let Some(nats_msg) = msg {
+                    match serde_json::from_slice::<MomentumActivePoolsUpdate>(&nats_msg.payload) {
+                        Ok(update) => {
+                            ctx.apply_momentum_active_pools_update(&update);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to deserialize MomentumActivePoolsUpdate");
+                        }
+                    }
+                }
+            }
+
             // P1: Handle Config Updates (Runtime Configuration via UI)
             msg = async {
                 if let Some(ref mut sub) = config_subscription {
@@ -10749,6 +10989,28 @@ async fn run_simulation_loop(
             }
             Err(e) => {
                 warn!(error = %e, "Simulation mode: Failed to subscribe to ControlRequests");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut momentum_active_pools_sub = if let Some(ref nats) = ctx.nats {
+        match nats.subscribe(TOPIC_MOMENTUM_ACTIVE_POOLS).await {
+            Ok(sub) => {
+                info!(
+                    topic = TOPIC_MOMENTUM_ACTIVE_POOLS,
+                    "Simulation mode: Subscribed to MomentumActivePools"
+                );
+                Some(sub)
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    topic = TOPIC_MOMENTUM_ACTIVE_POOLS,
+                    "Simulation mode: Failed to subscribe to MomentumActivePools"
+                );
                 None
             }
         }
@@ -11050,6 +11312,26 @@ async fn run_simulation_loop(
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to deserialize ControlRequest");
+                        }
+                    }
+                }
+            }
+
+            // PR-D: Momentum active pool pin stream (simulation / tests).
+            msg = async {
+                if let Some(ref mut sub) = momentum_active_pools_sub {
+                    sub.next().await
+                } else {
+                    std::future::pending::<Option<ironcrab::nats::NatsMessage>>().await
+                }
+            } => {
+                if let Some(nats_msg) = msg {
+                    match serde_json::from_slice::<MomentumActivePoolsUpdate>(&nats_msg.payload) {
+                        Ok(update) => {
+                            ctx.apply_momentum_active_pools_update(&update);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to deserialize MomentumActivePoolsUpdate (simulation)");
                         }
                     }
                 }
@@ -12281,5 +12563,170 @@ mod pr_b_geyser_tracking_tests {
         assert!(!MarketDataContext::geyser_pinned_sibling_vault_present(
             &map, pool, true
         ));
+    }
+
+    /// Minimal [`MarketDataContext`] for PR-D active-pool pin tests (no NATS / no Geyser).
+    fn minimal_market_data_context_for_pr_d_tests(jsonl_writer: JsonlWriter) -> MarketDataContext {
+        let (tracked_mints_tx, _tracked_mints_rx) = watch::channel(Vec::<Pubkey>::new());
+        let (tracked_vaults_tx, _tracked_vaults_rx) = watch::channel(Vec::<Pubkey>::new());
+        let (tracked_bin_arrays_tx, _tracked_bin_arrays_rx) = watch::channel(Vec::<Pubkey>::new());
+        let (tracked_wallet_tx, _tracked_wallet_rx) = watch::channel(Vec::<Pubkey>::new());
+        MarketDataContext {
+            run_id: "run-prd-test".to_string(),
+            config: parking_lot::RwLock::new(MarketDataConfig::default()),
+            geyser_full_reconnect_threshold_live: Arc::new(AtomicUsize::new(0)),
+            nats: None,
+            jsonl_writer,
+            event_counter: std::sync::atomic::AtomicU64::new(0),
+            wallet_tracker: WalletTracker::new(WalletTrackerCfg::default()),
+            priority_fee_tracker: Arc::new(PriorityFeeTracker::new()),
+            tracked_mints: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tracked_mints_tx,
+            active_pool_set: Arc::new(ActivePoolSet::new()),
+            known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            known_trade_dex_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            pumpfun_pool_discovery_mint_info_emitted: parking_lot::RwLock::new(
+                std::collections::HashSet::new(),
+            ),
+            tracked_vaults: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tracked_vaults_tx,
+            tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tracked_bin_arrays_tx,
+            live_pool_cache: Arc::new(LivePoolCache::new()),
+            creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            raydium_serum_fetched: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            tracked_wallet: None,
+            tracked_wallet_tx,
+            tracked_wallet_token_accounts: parking_lot::RwLock::new(
+                std::collections::HashSet::new(),
+            ),
+            tracked_wallet_mint_decimals: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            execution_results_deduper: parking_lot::Mutex::new(ExecutionResultDeduper::default()),
+            last_emitted_curve_progress: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            bonding_curve_publish_times: parking_lot::Mutex::new(BondingCurvePublishTimes::new()),
+            pump_amm_dex: parking_lot::RwLock::new(None),
+            helius_rpc: None,
+        }
+    }
+
+    #[test]
+    fn momentum_active_pools_apply_active_sets_momentum_pin_on_vaults() {
+        use ironcrab::nats::{MomentumActivePinReason, MomentumActivePoolEntry};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_mint,
+                token_1_mint: quote,
+                token_0_vault: coin_vault,
+                token_1_vault: pc_vault,
+                reserve_0: None,
+                reserve_1: None,
+            }),
+            1,
+        );
+
+        let update = MomentumActivePoolsUpdate {
+            version: 1,
+            ts_unix_ms: 1,
+            active: vec![MomentumActivePoolEntry {
+                mint: base_mint.to_string(),
+                pool: pool.to_string(),
+                pin_reason: MomentumActivePinReason::Tracker,
+            }],
+            removed: vec![],
+        };
+        ctx.apply_momentum_active_pools_update(&update);
+
+        let vs = ctx.tracked_vaults.read();
+        assert_eq!(
+            vs.get(&coin_vault).and_then(|v| v.pin),
+            Some(GeyserPinReason::MomentumActive)
+        );
+        assert_eq!(
+            vs.get(&pc_vault).and_then(|v| v.pin),
+            Some(GeyserPinReason::MomentumActive)
+        );
+    }
+
+    #[test]
+    fn momentum_active_pools_removed_clears_momentum_but_keeps_wallet_pin() {
+        use ironcrab::nats::{
+            MomentumActivePinReason, MomentumActivePoolEntry, MomentumRemovedPoolEntry,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_mint,
+                token_1_mint: quote,
+                token_0_vault: coin_vault,
+                token_1_vault: pc_vault,
+                reserve_0: None,
+                reserve_1: None,
+            }),
+            1,
+        );
+
+        ctx.apply_momentum_active_pools_update(&MomentumActivePoolsUpdate {
+            version: 1,
+            ts_unix_ms: 1,
+            active: vec![MomentumActivePoolEntry {
+                mint: base_mint.to_string(),
+                pool: pool.to_string(),
+                pin_reason: MomentumActivePinReason::Tracker,
+            }],
+            removed: vec![],
+        });
+
+        {
+            let mut vs = ctx.tracked_vaults.write();
+            if let Some(v) = vs.get_mut(&pc_vault) {
+                v.pin = Some(GeyserPinReason::Wallet);
+                v.pinned = true;
+            }
+        }
+
+        ctx.apply_momentum_active_pools_update(&MomentumActivePoolsUpdate {
+            version: 1,
+            ts_unix_ms: 2,
+            active: vec![],
+            removed: vec![MomentumRemovedPoolEntry {
+                mint: base_mint.to_string(),
+                pool: pool.to_string(),
+                reason: "closed".to_string(),
+            }],
+        });
+
+        let vs = ctx.tracked_vaults.read();
+        assert_eq!(vs.get(&coin_vault).and_then(|v| v.pin), None);
+        assert!(!vs.get(&coin_vault).is_some_and(|v| v.pinned));
+        assert_eq!(
+            vs.get(&pc_vault).and_then(|v| v.pin),
+            Some(GeyserPinReason::Wallet)
+        );
+        assert!(vs.get(&pc_vault).is_some_and(|v| v.pinned));
     }
 }
