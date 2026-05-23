@@ -4627,6 +4627,12 @@ impl MomentumContext {
             tracker.set_dev_info(dev_wallet, supply_pct, &config);
             if was_not_rejected && tracker.is_rejected() {
                 self.record_token_blacklisted_once(mint);
+                let reason = tracker.blacklist_reason.as_deref().unwrap_or("rejected");
+                self.queue_momentum_active_pool_removed(
+                    tracker.mint.as_str(),
+                    tracker.pool.as_str(),
+                    reason,
+                );
             }
         }
         self.pumpfun_buy_missing_creator_suppress_clear_for_mint(mint);
@@ -4661,6 +4667,12 @@ impl MomentumContext {
             tracker.record_lp_removal(slot);
             if was_not_rejected && tracker.is_rejected() {
                 self.record_token_blacklisted_once(mint);
+                let reason = tracker.blacklist_reason.as_deref().unwrap_or("rejected");
+                self.queue_momentum_active_pool_removed(
+                    tracker.mint.as_str(),
+                    tracker.pool.as_str(),
+                    reason,
+                );
             }
         }
         self.mark_entry_eval_dirty_for_mint(mint);

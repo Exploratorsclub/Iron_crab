@@ -1856,11 +1856,18 @@ impl MarketDataContext {
     /// PR-D: whether `mint` is still a base/quote leg for any pool that has a momentum active pin row.
     fn momentum_pool_leg_mint_still_required_by_other_pool(&self, mint: Pubkey) -> bool {
         for (_, pool_pk) in self.active_pool_set.snapshot_pairs() {
-            if let Some(state) = self.live_pool_cache.get(&pool_pk) {
-                if let Some((a, b)) = pool_mints_for_geyser_explicit_tracking(&state) {
-                    if a == mint || b == mint {
-                        return true;
+            match self.live_pool_cache.get(&pool_pk) {
+                Some(state) => {
+                    if let Some((a, b)) = pool_mints_for_geyser_explicit_tracking(&state) {
+                        if a == mint || b == mint {
+                            return true;
+                        }
                     }
+                }
+                None => {
+                    // Pinned `(mint, pool)` without cache layout: cannot know pool legs (e.g. WSOL
+                    // quote). Assume this leg may still be required — avoids demoting companion mints.
+                    return true;
                 }
             }
         }
@@ -12895,6 +12902,92 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(
             vs.get(&pc_vault).and_then(|v| v.pin),
             Some(GeyserPinReason::MomentumActive)
+        );
+    }
+
+    /// PR #147 follow-up: leg mint (WSOL) must stay `MomentumActive` while another pinned pool has
+    /// no `LivePoolCache` row — `momentum_pool_leg_mint_still_required_by_other_pool` is conservative on miss.
+    #[test]
+    fn momentum_leg_mint_pin_kept_when_other_active_pool_has_cache_miss() {
+        use ironcrab::nats::{
+            MomentumActivePinReason, MomentumActivePoolEntry, MomentumRemovedPoolEntry,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let other_tracker_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool_a,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_mint,
+                token_1_mint: quote,
+                token_0_vault: coin_vault,
+                token_1_vault: pc_vault,
+                reserve_0: None,
+                reserve_1: None,
+            }),
+            1,
+        );
+
+        ctx.apply_momentum_active_pools_update(&MomentumActivePoolsUpdate {
+            version: 1,
+            ts_unix_ms: 1,
+            active: vec![
+                MomentumActivePoolEntry {
+                    mint: base_mint.to_string(),
+                    pool: pool_a.to_string(),
+                    pin_reason: MomentumActivePinReason::Tracker,
+                },
+                MomentumActivePoolEntry {
+                    mint: other_tracker_mint.to_string(),
+                    pool: pool_b.to_string(),
+                    pin_reason: MomentumActivePinReason::Tracker,
+                },
+            ],
+            removed: vec![],
+            full_active_snapshot: false,
+        });
+
+        assert!(
+            ctx.tracked_mints
+                .read()
+                .get(&quote)
+                .is_some_and(|m| m.pin == Some(GeyserPinReason::MomentumActive)),
+            "setup: WSOL leg tracked for pool_a"
+        );
+
+        ctx.apply_momentum_active_pools_update(&MomentumActivePoolsUpdate {
+            version: 1,
+            ts_unix_ms: 2,
+            active: vec![],
+            removed: vec![MomentumRemovedPoolEntry {
+                mint: base_mint.to_string(),
+                pool: pool_a.to_string(),
+                reason: "closed".to_string(),
+            }],
+            full_active_snapshot: false,
+        });
+
+        assert!(
+            ctx.active_pool_set.is_pinned(other_tracker_mint, pool_b),
+            "pool_b pin survives pool_a removal"
+        );
+        assert!(
+            ctx.tracked_mints
+                .read()
+                .get(&quote)
+                .is_some_and(|m| m.pin == Some(GeyserPinReason::MomentumActive)),
+            "WSOL must stay pinned while pool_b is active without cache layout"
         );
     }
 }
