@@ -11,8 +11,10 @@
 
 pub mod client;
 pub mod jetstream;
+pub mod momentum_active_pools;
 pub mod topics;
 
 pub use client::*;
 pub use jetstream::*;
+pub use momentum_active_pools::*;
 pub use topics::*;

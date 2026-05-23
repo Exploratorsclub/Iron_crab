@@ -15,6 +15,9 @@ pub const TOPIC_MARKET_EVENTS: &str = "ironcrab.v1.market_events";
 /// Other consumers keep using the core topic; momentum-bot prefers this subject to reduce fan-in.
 pub const TOPIC_MOMENTUM_MARKET_EVENTS: &str = "ironcrab.v1.market_events.momentum";
 
+/// Momentum active pool lifecycle (mint+pool pins for Geyser reserve subscription; PR-D).
+pub const TOPIC_MOMENTUM_ACTIVE_POOLS: &str = "ironcrab.v1.momentum.active_pools";
+
 /// Trade intents from strategy bots
 pub const TOPIC_TRADE_INTENTS: &str = "ironcrab.v1.trade_intents";
 
@@ -119,6 +122,14 @@ mod tests {
         assert!(TOPIC_MOMENTUM_MARKET_EVENTS.contains(TOPIC_VERSION));
         assert!(TOPIC_MOMENTUM_MARKET_EVENTS.starts_with(TOPIC_MARKET_EVENTS));
         assert!(TOPIC_MOMENTUM_MARKET_EVENTS.len() > TOPIC_MARKET_EVENTS.len());
+    }
+
+    #[test]
+    fn test_momentum_active_pools_topic_versioned() {
+        assert!(TOPIC_MOMENTUM_ACTIVE_POOLS.starts_with(TOPIC_PREFIX));
+        assert!(TOPIC_MOMENTUM_ACTIVE_POOLS.contains(TOPIC_VERSION));
+        assert!(TOPIC_MOMENTUM_ACTIVE_POOLS.contains("momentum"));
+        assert!(TOPIC_MOMENTUM_ACTIVE_POOLS.contains("active_pools"));
     }
 
     #[test]

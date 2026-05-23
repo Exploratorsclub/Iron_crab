@@ -241,6 +241,15 @@ pub static GEYSER_TRACKED_ACCOUNTS_EVICTED_BIN_ARRAY: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static GEYSER_TRACKED_ACCOUNTS_EVICTED_MINT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+/// momentum-bot published `MomentumActivePoolsUpdate` payloads (PR-D).
+pub static MOMENTUM_ACTIVE_POOLS_MESSAGES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// market-data applied `MomentumActivePoolsUpdate` from core NATS (PR-D).
+pub static MARKET_DATA_MOMENTUM_ACTIVE_POOL_MESSAGES_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Count of `(mint, pool)` entries in market-data `ActivePoolSet` (PR-D gauge).
+pub static MARKET_DATA_MOMENTUM_ACTIVE_POOL_PINS_GAUGE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// Reconnect after large explicit subscription set (PR-B: full client reconnect vs in-place churn).
 pub static GEYSER_RECONNECT_TOTAL_SUBSCRIPTION_REBUILD: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -280,6 +289,13 @@ pub fn geyser_metrics_set_tracked_pinned_accounts(n: usize) {
     GEYSER_TRACKED_PINNED_ACCOUNTS.store(n as u64, Ordering::Relaxed);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeyserTrackedEvictKind {
+    Vault,
+    BinArray,
+    Mint,
+}
+
 pub fn geyser_metrics_inc_tracked_evicted(kind: GeyserTrackedEvictKind) {
     match kind {
         GeyserTrackedEvictKind::Vault => {
@@ -294,11 +310,19 @@ pub fn geyser_metrics_inc_tracked_evicted(kind: GeyserTrackedEvictKind) {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GeyserTrackedEvictKind {
-    Vault,
-    BinArray,
-    Mint,
+#[inline]
+pub fn record_momentum_active_pools_messages_total() {
+    MOMENTUM_ACTIVE_POOLS_MESSAGES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_market_data_momentum_active_pool_messages_total() {
+    MARKET_DATA_MOMENTUM_ACTIVE_POOL_MESSAGES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_momentum_active_pool_pins_gauge(n: usize) {
+    MARKET_DATA_MOMENTUM_ACTIVE_POOL_PINS_GAUGE.store(n as u64, Ordering::Relaxed);
 }
 
 pub fn geyser_metrics_inc_stream_error() {
@@ -2205,6 +2229,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "geyser_tracked_pinned_accounts",
         GEYSER_TRACKED_PINNED_ACCOUNTS.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_active_pools_messages_total",
+        MOMENTUM_ACTIVE_POOLS_MESSAGES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_momentum_active_pool_messages_total",
+        MARKET_DATA_MOMENTUM_ACTIVE_POOL_MESSAGES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_momentum_active_pool_pins",
+        MARKET_DATA_MOMENTUM_ACTIVE_POOL_PINS_GAUGE.load(Ordering::Relaxed)
     );
     out.push_str("geyser_tracked_accounts_evicted_total{kind=\"vault\"} ");
     out.push_str(
