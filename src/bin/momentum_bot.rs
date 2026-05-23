@@ -513,6 +513,9 @@ struct MomentumConfig {
     bonding_curve_exit_enabled: bool,
     /// Bonding curve exit: threshold in BPS (0–10000). Default: 9800 (98%).
     bonding_curve_exit_threshold_bps: u32,
+    /// Minimum BUY notional (lamports) to improve **session high** on positions; smaller BUYs
+    /// refresh **mark** only (`current_price`). Loaded from `min_session_high_trade_sol` in TOML.
+    min_session_high_trade_lamports: u64,
 }
 
 impl Default for MomentumConfig {
@@ -590,7 +593,8 @@ impl Default for MomentumConfig {
             exit_max_slippage_bps: 9500,   // 95% - sell at any price rather than hold
             bonding_curve_exit_pct: 98.0,  // Exit when bonding curve is 98% complete
             bonding_curve_exit_enabled: false,
-            bonding_curve_exit_threshold_bps: 9800, // 98%
+            bonding_curve_exit_threshold_bps: 9800,      // 98%
+            min_session_high_trade_lamports: 50_000_000, // 0.05 SOL — dust cannot improve session high
         }
     }
 }
@@ -650,6 +654,14 @@ impl MomentumConfig {
             bonding_curve_exit_pct: cfg.bonding_curve_exit_pct.unwrap_or(98.0),
             bonding_curve_exit_enabled: cfg.bonding_curve_exit_enabled,
             bonding_curve_exit_threshold_bps: cfg.bonding_curve_exit_threshold_bps,
+            min_session_high_trade_lamports: {
+                let s = cfg.min_session_high_trade_sol;
+                if s.is_finite() && s > 0.0 {
+                    (s * 1_000_000_000.0).clamp(0.0, u64::MAX as f64) as u64
+                } else {
+                    0
+                }
+            },
         }
     }
 }
@@ -755,8 +767,18 @@ struct PositionTracker {
     creator: Option<String>,
     /// Geyser/RPC confirmed slot of the entry BUY (0 = unknown / legacy).
     entry_confirmed_slot: u64,
-    /// Last slot at which we applied a position price update (monotonic).
+    /// Legacy mirror: `max(last_trade_slot, last_reserve_hint_slot)` — used for quote staleness and
+    /// persistence; **trade** ordering uses `last_trade_slot` (same-slot merges allowed).
     last_price_slot: u64,
+    /// Max slot of applied **trade** prints (BUY/SELL). Same-slot merges allowed (`>=` gate).
+    last_trade_slot: u64,
+    /// Max slot of PoolCache / reserve **mark** hints. Does not block trade updates at the same slot.
+    last_reserve_hint_slot: u64,
+    /// Producer timestamp of the last applied reserve hint (for same-slot monotonicity).
+    last_reserve_hint_ts_unix_ms: u64,
+    /// True once session high improved from a BUY meeting `min_session_high_trade_lamports` or from
+    /// a probe/scale-in **fill** (entry path). Used with executable PnL for trailing activation.
+    session_high_has_min_notional_buy: bool,
 }
 
 /// Executable (reserve-based) `tokens_per_sol` for selling `position.token_amount`, when available.
@@ -843,7 +865,8 @@ fn exit_quote_price_exit_guard_violation(
         if pos.entry_confirmed_slot > 0 && slot <= pos.entry_confirmed_slot {
             return Some("QUOTE_SLOT_NOT_AFTER_ENTRY_CONFIRM");
         }
-        if pos.last_price_slot > 0 && slot < pos.last_price_slot {
+        let anchor = pos.last_trade_slot.max(pos.last_reserve_hint_slot);
+        if anchor > 0 && slot < anchor {
             return Some("QUOTE_SLOT_BEFORE_LAST_POSITION_MARK_SLOT");
         }
     }
@@ -855,6 +878,30 @@ fn exit_quote_price_exit_guard_violation(
         }
     }
     None
+}
+
+/// Human-readable PnL clause for exit **reason strings**: quote-first wording when a structural
+/// executable exists; never labels mark-only as plain "P&L" without context.
+fn momentum_exit_reason_pnl_phrase(
+    pos: &PositionTracker,
+    exit_quote: Option<&ExitExecutableQuote>,
+) -> String {
+    let structural = exit_quote.filter(|q| exit_executable_quote_is_usable(q));
+    let guarded =
+        exit_quote.filter(|q| exit_quote_price_exit_guard_violation(pos, q, None).is_none());
+    let mark = pos.pnl_pct();
+    if let Some(q) = guarded {
+        let qp = tokens_per_sol::pnl_pct(pos.entry_price, q.tokens_per_sol);
+        format!("executable P&L {:.1}% (mark {:.1}%)", qp, mark)
+    } else if let Some(q) = structural {
+        let qp = tokens_per_sol::pnl_pct(pos.entry_price, q.tokens_per_sol);
+        format!(
+            "executable P&L {:.1}% before freshness/guard (mark {:.1}%)",
+            qp, mark
+        )
+    } else {
+        format!("mark P&L {:.1}% (no pool executable quote)", mark)
+    }
 }
 
 /// `exit_quote` = optional reserve quote; `price_exit_quote` = same row after freshness / SOL-leg
@@ -1043,15 +1090,24 @@ struct PersistedPosition {
     /// Geyser/RPC slot of confirmed BUY (0 = unknown)
     #[serde(default)]
     entry_confirmed_slot: u64,
-    /// Last slot applied to a position-pool price update (mark or trade-derived).
+    /// Last slot applied to a position-pool price update (mark or trade-derived); legacy mirror of
+    /// `max(last_trade_slot, last_reserve_hint_slot)`.
     #[serde(default)]
     last_price_slot: u64,
+    #[serde(default)]
+    last_trade_slot: u64,
+    #[serde(default)]
+    last_reserve_hint_slot: u64,
+    #[serde(default)]
+    last_reserve_hint_ts_unix_ms: u64,
+    #[serde(default)]
+    session_high_has_min_notional_buy: bool,
     /// Schema version for forward compatibility
     schema_version: u8,
 }
 
 impl PersistedPosition {
-    const CURRENT_SCHEMA_VERSION: u8 = 3;
+    const CURRENT_SCHEMA_VERSION: u8 = 4;
 
     /// Convert from PositionTracker to PersistedPosition
     fn from_tracker(tracker: &PositionTracker) -> Self {
@@ -1086,7 +1142,11 @@ impl PersistedPosition {
             bonding_curve_progress_bps: tracker.bonding_curve_progress_bps,
             creator: tracker.creator.clone(),
             entry_confirmed_slot: tracker.entry_confirmed_slot,
-            last_price_slot: tracker.last_price_slot,
+            last_price_slot: tracker.last_trade_slot.max(tracker.last_reserve_hint_slot),
+            last_trade_slot: tracker.last_trade_slot,
+            last_reserve_hint_slot: tracker.last_reserve_hint_slot,
+            last_reserve_hint_ts_unix_ms: tracker.last_reserve_hint_ts_unix_ms,
+            session_high_has_min_notional_buy: tracker.session_high_has_min_notional_buy,
             schema_version: Self::CURRENT_SCHEMA_VERSION,
         }
     }
@@ -1111,6 +1171,14 @@ impl PersistedPosition {
         let exit_generated_at =
             exit_elapsed_ms.and_then(|ms| Instant::now().checked_sub(Duration::from_millis(ms)));
 
+        let last_trade_slot = if self.last_trade_slot > 0 {
+            self.last_trade_slot
+        } else {
+            self.last_price_slot
+        };
+        let last_reserve_hint_slot = self.last_reserve_hint_slot;
+        let last_reserve_hint_ts_unix_ms = self.last_reserve_hint_ts_unix_ms;
+
         PositionTracker {
             mint: self.mint.clone(),
             token_decimals: self.token_decimals,
@@ -1134,7 +1202,11 @@ impl PersistedPosition {
             bonding_curve_progress_bps: self.bonding_curve_progress_bps,
             creator: self.creator.clone(),
             entry_confirmed_slot: self.entry_confirmed_slot,
-            last_price_slot: self.last_price_slot,
+            last_price_slot: last_trade_slot.max(last_reserve_hint_slot),
+            last_trade_slot,
+            last_reserve_hint_slot,
+            last_reserve_hint_ts_unix_ms,
+            session_high_has_min_notional_buy: self.session_high_has_min_notional_buy,
         }
     }
 }
@@ -1189,6 +1261,10 @@ impl PositionTracker {
             creator: None,
             entry_confirmed_slot: 0,
             last_price_slot: 0,
+            last_trade_slot: 0,
+            last_reserve_hint_slot: 0,
+            last_reserve_hint_ts_unix_ms: 0,
+            session_high_has_min_notional_buy: false,
         }
     }
 
@@ -1209,10 +1285,24 @@ impl PositionTracker {
         self.current_price = new_price;
     }
 
-    /// Position-pool **trade** print: updates mark and session high (lowest tps = best for holder).
-    fn update_from_trade_price(&mut self, trade_tps: f64) {
+    /// Position-pool **trade** print: updates mark; session high only on qualifying **BUY** size
+    /// (SELL never improves session high — I-14 / chart alignment).
+    fn apply_pool_trade_price(
+        &mut self,
+        trade_tps: f64,
+        is_buy: bool,
+        sol_lamports: u64,
+        min_session_high_lamports: u64,
+    ) {
         self.current_price = trade_tps;
-        self.highest_price = tokens_per_sol::updated_highest_price(self.highest_price, trade_tps);
+        if is_buy && sol_lamports >= min_session_high_lamports {
+            let prev_high = self.highest_price;
+            self.highest_price =
+                tokens_per_sol::updated_highest_price(self.highest_price, trade_tps);
+            if self.highest_price < prev_high {
+                self.session_high_has_min_notional_buy = true;
+            }
+        }
     }
 
     /// Scale-in: blend `entry_price` (tokens_per_sol) by SOL weight using the **fill** tps for
@@ -1239,10 +1329,19 @@ impl PositionTracker {
         self.entry_price = new_entry;
         // Session high: incorporate scale-in **fill** tps only (not reserve mark).
         self.highest_price = tokens_per_sol::updated_highest_price(self.highest_price, leg_tps);
+        self.session_high_has_min_notional_buy = true;
     }
 
     /// Record a trade for momentum tracking
     fn record_trade(&mut self, trade: TradeEvent) {
+        if !trade.signature.is_empty()
+            && self
+                .recent_trades
+                .iter()
+                .any(|t| t.signature == trade.signature)
+        {
+            return;
+        }
         self.recent_trades.push(trade);
         // Keep only last 100 trades
         if self.recent_trades.len() > 100 {
@@ -1282,19 +1381,10 @@ impl PositionTracker {
         event_or_check_source: &str,
         chain_head_slot: u64,
     ) -> Option<(String, String)> {
-        let structural_q = exit_quote.filter(|q| exit_executable_quote_is_usable(q));
         let price_exit_q =
             exit_quote.filter(|q| exit_quote_price_exit_guard_violation(self, q, None).is_none());
         let pnl = self.pnl_pct();
         let hold_secs = self.entry_time.elapsed().as_secs();
-
-        let pnl_for_reporting = price_exit_q
-            .map(|q| tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol))
-            .unwrap_or_else(|| {
-                structural_q
-                    .map(|q| tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol))
-                    .unwrap_or(pnl)
-            });
 
         // 1. Hard stop — quote-first on **guarded** executable PnL (I-14, I-16).
         if let Some(q) = price_exit_q {
@@ -1418,13 +1508,14 @@ impl PositionTracker {
                     (config.bonding_curve_exit_pct * 100.0) as u32
                 };
                 if progress_bps >= threshold_bps {
+                    let pnl_phrase = momentum_exit_reason_pnl_phrase(self, exit_quote);
                     return Some((
                         "BONDING_CURVE_EXIT".to_string(),
                         format!(
-                            "Bonding curve {:.1}% complete (threshold: {:.1}%), P&L: {:.1}%",
+                            "Bonding curve {:.1}% complete (threshold: {:.1}%), {}",
                             progress_bps as f64 / 100.0,
                             threshold_bps as f64 / 100.0,
-                            pnl
+                            pnl_phrase
                         ),
                     ));
                 }
@@ -1432,23 +1523,46 @@ impl PositionTracker {
         }
 
         // 3. Trailing — session high (`highest_price`) only from entry + position-pool trades
-        // (see `update_from_trade_price`). PoolCache marks and executable quotes must not advance it.
+        // (see `apply_pool_trade_price`). PoolCache marks and executable quotes must not advance it.
         // Activation = peak PnL implied by session high vs entry; trigger = quote-first drawdown vs session high.
         let session_peak_pnl_pct = tokens_per_sol::pnl_pct(self.entry_price, self.highest_price);
         let drawdown_vs_session_high_exec = price_exit_q
             .map(|q| tokens_per_sol::drawdown_from_ath_pct(self.highest_price, q.tokens_per_sol));
+        let trailing_would_activate_session = session_peak_pnl_pct
+            >= config.trailing_activation_pct
+            && self.session_high_has_min_notional_buy;
+        let trailing_would_activate_exec = price_exit_q
+            .map(|q| {
+                tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol)
+                    >= config.trailing_activation_pct
+            })
+            .unwrap_or(false);
         trace!(
             mint = %self.mint,
+            entry_tps = self.entry_price,
             session_high_tps = self.highest_price,
+            mark_tps = self.current_price,
             session_peak_pnl_pct,
             executable_quote_tps = ?price_exit_q.map(|q| q.tokens_per_sol),
             drawdown_from_session_high_pct = ?drawdown_vs_session_high_exec,
             trailing_active = self.trailing_active,
-            trailing_would_activate = session_peak_pnl_pct >= config.trailing_activation_pct,
+            trailing_would_activate_session,
+            trailing_would_activate_exec,
+            last_trade_slot = self.last_trade_slot,
+            last_reserve_hint_slot = self.last_reserve_hint_slot,
+            session_high_has_min_notional_buy = self.session_high_has_min_notional_buy,
             "trailing_session_high_eval"
         );
 
-        if session_peak_pnl_pct >= config.trailing_activation_pct {
+        let session_activation = session_peak_pnl_pct >= config.trailing_activation_pct
+            && self.session_high_has_min_notional_buy;
+        let exec_activation = price_exit_q
+            .map(|q| {
+                tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol)
+                    >= config.trailing_activation_pct
+            })
+            .unwrap_or(false);
+        if session_activation || exec_activation {
             self.trailing_active = true;
         }
 
@@ -1473,6 +1587,19 @@ impl PositionTracker {
                     let exec_dd =
                         tokens_per_sol::drawdown_from_ath_pct(self.highest_price, q.tokens_per_sol);
                     if exec_dd >= config.trailing_stop_pct {
+                        if exec_dd > 100.0 {
+                            warn!(
+                                mint = %self.mint,
+                                exec_dd,
+                                session_high_tps = self.highest_price,
+                                mark_tps = self.current_price,
+                                quote_tps = q.tokens_per_sol,
+                                session_high_has_min_notional_buy = self.session_high_has_min_notional_buy,
+                                last_trade_slot = self.last_trade_slot,
+                                last_reserve_hint_slot = self.last_reserve_hint_slot,
+                                "TRAILING_STOP drawdown >100% — check dust/off-pool session high vs executable quote"
+                            );
+                        }
                         let exec_pnl = tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol);
                         log_momentum_exit_price_decision(
                             self,
@@ -1518,11 +1645,12 @@ impl PositionTracker {
 
         // 4. Time Exit — not gated on reserve freshness; reporting PnL prefers guarded quote when present.
         if hold_secs >= config.max_hold_time_secs {
+            let pnl_phrase = momentum_exit_reason_pnl_phrase(self, exit_quote);
             return Some((
                 "TIME_EXIT".to_string(),
                 format!(
-                    "Max hold time exceeded: {}s (limit: {}s), P&L: {:.1}% (TIME_EXIT does not assert a fresh reserve quote; uses guarded pool quote for reporting when available)",
-                    hold_secs, config.max_hold_time_secs, pnl_for_reporting
+                    "Max hold time exceeded: {}s (limit: {}s), {} (TIME_EXIT does not assert a fresh reserve quote)",
+                    hold_secs, config.max_hold_time_secs, pnl_phrase
                 ),
             ));
         }
@@ -1555,15 +1683,16 @@ impl PositionTracker {
             };
 
             if buy_ratio < config.momentum_exit_buy_ratio {
+                let pnl_phrase = momentum_exit_reason_pnl_phrase(self, exit_quote);
                 return Some((
                     "MOMENTUM_EXIT".to_string(),
                     format!(
-                        "Momentum fading: buy vol ratio {:.0}% < {:.0}% ({}b/{}t, buy_vol={:.4}SOL/total={:.4}SOL), P&L: {:.1}%",
+                        "Momentum fading: buy vol ratio {:.0}% < {:.0}% ({}b/{}t, buy_vol={:.4}SOL/total={:.4}SOL), {}",
                         buy_ratio * 100.0,
                         config.momentum_exit_buy_ratio * 100.0,
                         buy_count, total,
                         buy_vol as f64 / 1e9, total_vol as f64 / 1e9,
-                        pnl
+                        pnl_phrase
                     ),
                 ));
             }
@@ -5118,7 +5247,9 @@ impl MomentumContext {
     /// Also persists the position to JetStream KV for crash recovery
     fn open_position(self: &Arc<Self>, p: OpenPositionParams<'_>) {
         let mint_owned = p.mint.to_string();
-        let tracker = {
+        let pool_owned = p.pool.to_string();
+        let entry_confirmed_slot = p.entry_confirmed_slot;
+        {
             let mut positions = self.positions.write();
             if let Some(pos) = positions.get_mut(p.mint) {
                 pos.token_amount = pos.token_amount.saturating_add(p.token_amount);
@@ -5173,6 +5304,7 @@ impl MomentumContext {
                     }
                 }
                 new_tracker.entry_confirmed_slot = p.entry_confirmed_slot;
+                new_tracker.session_high_has_min_notional_buy = true;
                 if let Some(ref snap) = p.initial_bonding {
                     new_tracker.bonding_curve_progress_bps = Some(snap.progress_bps);
                 }
@@ -5195,8 +5327,11 @@ impl MomentumContext {
                 p.mint,
                 positions.get_mut(p.mint).expect("position"),
             );
-            positions.get(p.mint).expect("position").clone()
-        };
+        }
+        if entry_confirmed_slot > 0 {
+            self.backfill_open_position_trades(p.mint, pool_owned.as_str());
+        }
+        let tracker = self.positions.read().get(p.mint).expect("position").clone();
 
         // Persist to KV asynchronously (fire-and-forget)
         let ctx = Arc::clone(self);
@@ -5206,6 +5341,60 @@ impl MomentumContext {
 
         self.queue_momentum_active_pool_active(p.mint, p.pool, MomentumActivePinReason::Position);
         self.flush_momentum_active_pool_publish_queue();
+    }
+
+    /// After BUY confirm, apply pool trades already in the token tracker with slots in
+    /// `(entry_confirmed_slot, chain_head]` (I-7: no RPC). Fills gaps when events arrived before
+    /// the position row existed (RHIZOME-class race).
+    fn backfill_open_position_trades(&self, mint: &str, pos_pool: &str) {
+        let chain_head = self.last_event_slot.load(Ordering::Relaxed);
+        let entry_slot = self
+            .positions
+            .read()
+            .get(mint)
+            .map(|p| p.entry_confirmed_slot)
+            .unwrap_or(0);
+        if entry_slot == 0 || chain_head == 0 {
+            return;
+        }
+        let key = Self::tracker_storage_key(mint, pos_pool);
+        let decimals = self
+            .mint_infos
+            .read()
+            .get(mint)
+            .map(|m| m.decimals)
+            .unwrap_or(6);
+        let replay: Vec<(u64, String, TradeEvent, f64)> = {
+            let trackers = self.token_trackers.read();
+            let Some(tr) = trackers.get(&key) else {
+                return;
+            };
+            let mut v = Vec::new();
+            for t in &tr.trades {
+                if t.slot == 0 || t.slot <= entry_slot || t.slot > chain_head {
+                    continue;
+                }
+                if t.sol_amount == 0 || t.token_amount == 0 {
+                    continue;
+                }
+                let tok_ui = t.token_amount as f64 / 10f64.powi(decimals as i32);
+                let sol_ui = t.sol_amount as f64 / 1_000_000_000.0;
+                if !(tok_ui > 0.0 && sol_ui > 0.0) {
+                    continue;
+                }
+                let tps = tok_ui / sol_ui;
+                if !(tps > 0.0 && tps.is_finite()) {
+                    continue;
+                }
+                v.push((t.slot, t.signature.clone(), t.clone(), tps));
+            }
+            v.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            v
+        };
+        for (_slot, _sig, ev, tps) in replay {
+            let slot_o = if ev.slot > 0 { Some(ev.slot) } else { None };
+            let _ = self.update_position_price(mint, tps, Some(ev), Some(pos_pool), slot_o);
+        }
     }
 
     /// Update position price from market trade or pool reserves.
@@ -5220,6 +5409,7 @@ impl MomentumContext {
         source_pool: Option<&str>,
         source_slot: Option<u64>,
     ) -> bool {
+        let min_session_high_lamports = self.config.read().min_session_high_trade_lamports;
         let mut positions = self.positions.write();
         if let Some(pos) = positions.get_mut(mint) {
             if !ironcrab::execution::position_utils::should_apply_position_price_update(
@@ -5253,25 +5443,60 @@ impl MomentumContext {
                     );
                     return false;
                 }
-                if slot <= pos.last_price_slot {
-                    trace!(
-                        mint = %mint,
-                        last_price_slot = pos.last_price_slot,
-                        source_slot = slot,
-                        "Skipping price update: non-monotonic slot sequence"
-                    );
-                    return false;
+                if trade.is_some() {
+                    if slot < pos.last_trade_slot {
+                        trace!(
+                            mint = %mint,
+                            last_trade_slot = pos.last_trade_slot,
+                            source_slot = slot,
+                            "Skipping price update: trade slot before last applied trade slot"
+                        );
+                        return false;
+                    }
+                } else {
+                    if slot < pos.last_trade_slot {
+                        trace!(
+                            mint = %mint,
+                            last_trade_slot = pos.last_trade_slot,
+                            source_slot = slot,
+                            "Skipping price update: pool mark older than last applied trade slot"
+                        );
+                        return false;
+                    }
+                    if slot <= pos.last_reserve_hint_slot {
+                        trace!(
+                            mint = %mint,
+                            last_reserve_hint_slot = pos.last_reserve_hint_slot,
+                            source_slot = slot,
+                            "Skipping price update: non-increasing reserve mark slot"
+                        );
+                        return false;
+                    }
                 }
             }
 
             if let Some(t) = trade {
-                pos.update_from_trade_price(new_price);
+                pos.apply_pool_trade_price(
+                    new_price,
+                    t.is_buy,
+                    t.sol_amount,
+                    min_session_high_lamports,
+                );
                 pos.record_trade(t);
+                if let Some(s) = source_slot {
+                    if s > 0 {
+                        pos.last_trade_slot = pos.last_trade_slot.max(s);
+                        pos.last_price_slot = pos.last_trade_slot.max(pos.last_reserve_hint_slot);
+                    }
+                }
             } else {
                 pos.update_mark_price(new_price);
-            }
-            if let Some(s) = source_slot {
-                pos.last_price_slot = s;
+                if let Some(s) = source_slot {
+                    if s > 0 {
+                        pos.last_reserve_hint_slot = pos.last_reserve_hint_slot.max(s);
+                        pos.last_price_slot = pos.last_trade_slot.max(pos.last_reserve_hint_slot);
+                    }
+                }
             }
             return true;
         }
@@ -6347,7 +6572,17 @@ impl MomentumContext {
             if hint.slot <= pos.entry_confirmed_slot {
                 return false;
             }
-            if hint.slot <= pos.last_price_slot {
+            if hint.slot < pos.last_trade_slot {
+                return false;
+            }
+            if (pos.last_reserve_hint_slot > 0 || pos.last_reserve_hint_ts_unix_ms > 0)
+                && !bonding_geyser_observation_is_newer(
+                    hint.slot,
+                    hint.ts_unix_ms,
+                    pos.last_reserve_hint_slot,
+                    pos.last_reserve_hint_ts_unix_ms,
+                )
+            {
                 return false;
             }
         }
@@ -6356,7 +6591,9 @@ impl MomentumContext {
         }
         pos.update_mark_price(hint.tokens_per_sol);
         if hint.slot > 0 {
-            pos.last_price_slot = pos.last_price_slot.max(hint.slot);
+            pos.last_reserve_hint_slot = hint.slot;
+            pos.last_reserve_hint_ts_unix_ms = hint.ts_unix_ms;
+            pos.last_price_slot = pos.last_trade_slot.max(pos.last_reserve_hint_slot);
         }
         true
     }
@@ -7877,6 +8114,20 @@ impl MomentumContext {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
                 }
+                "min_session_high_trade_sol" => {
+                    if let Some(v) = value.as_f64() {
+                        if v >= 0.0 && v.is_finite() {
+                            config.min_session_high_trade_lamports =
+                                (v * 1_000_000_000.0).clamp(0.0, u64::MAX as f64) as u64;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be finite and >= 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
                 "exit_max_slippage_bps" => {
                     if let Some(v) = value.as_u64() {
                         if v <= 10_000 {
@@ -8171,7 +8422,11 @@ async fn recover_positions_from_jsonl(
                 .max()
                 .unwrap_or(0);
             tracker.entry_confirmed_slot = max_buy_slot;
+            tracker.last_trade_slot = max_buy_slot;
+            tracker.last_reserve_hint_slot = 0;
+            tracker.last_reserve_hint_ts_unix_ms = 0;
             tracker.last_price_slot = max_buy_slot;
+            tracker.session_high_has_min_notional_buy = true;
 
             // Override entry_time to match actual trade time
             tracker.entry_time = entry_time_estimate;
@@ -13915,6 +14170,9 @@ mod tests {
             let mut pos = PositionTracker::new("mint", "pool", "dex", 1.0, 6, 123, 1_000);
             pos.entry_time = Instant::now() - Duration::from_secs(10);
             pos.entry_confirmed_slot = 100;
+            pos.last_trade_slot = 150;
+            pos.last_reserve_hint_slot = 0;
+            pos.last_reserve_hint_ts_unix_ms = 0;
             pos.last_price_slot = 150;
             positions.insert("mint".to_string(), pos);
         }
@@ -14005,6 +14263,9 @@ mod tests {
             let mut pos = PositionTracker::new("mint", "pool", "dex", 1.0, 6, 123, 1_000);
             pos.entry_time = Instant::now() - Duration::from_secs(10);
             pos.entry_confirmed_slot = 10;
+            pos.last_reserve_hint_slot = 20;
+            pos.last_reserve_hint_ts_unix_ms = 0;
+            pos.last_trade_slot = 0;
             pos.last_price_slot = 20;
             positions.insert("mint".to_string(), pos);
         }
@@ -14719,7 +14980,7 @@ mod tests {
         assert_eq!(live.current_price, 89.0);
 
         let c = make_exit_config();
-        let mut ex = sample_exit_quote(89.0);
+        let mut ex = sample_exit_quote(100.0);
         ex.quote_pool = "poolA".to_string();
         let mut pos = live;
         pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64);
@@ -14754,8 +15015,8 @@ mod tests {
             slot: 501,
             trader: "a".to_string(),
             is_buy: true,
-            sol_amount: 1,
-            token_amount: 1,
+            sol_amount: 60_000_000,
+            token_amount: 5_700_000,
             signature: "sig".to_string(),
         };
         ctx.update_position_price(mint, 95.0, Some(te), Some("poolA"), Some(501));
@@ -14799,8 +15060,8 @@ mod tests {
             slot: 501,
             trader: "b".to_string(),
             is_buy: true,
-            sol_amount: 1,
-            token_amount: 1,
+            sol_amount: 50_000_000,
+            token_amount: 4_975_000,
             signature: "sig2".to_string(),
         };
         ctx.update_position_price(mint, 99.5, Some(te), Some("poolA"), Some(501));
@@ -14813,7 +15074,7 @@ mod tests {
         c.trailing_activation_pct = 5.0;
         c.hard_stop_loss_pct = 99.0;
         c.take_profit_pct = 1_000.0;
-        let mut ex = sample_exit_quote(89.0);
+        let mut ex = sample_exit_quote(99.0);
         ex.quote_pool = "poolA".to_string();
         let mut pos = live;
         pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64);

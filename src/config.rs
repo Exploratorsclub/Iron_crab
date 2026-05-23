@@ -758,6 +758,11 @@ pub struct MomentumCfg {
     /// High value ensures sells succeed even at loss - prevents stuck positions.
     #[serde(default = "default_exit_max_slippage_bps")]
     pub exit_max_slippage_bps: u32,
+    /// Minimum BUY **SOL notional** (trade `value`) to improve **session high** (`highest_price`) on
+    /// open positions. Smaller BUY prints still update **mark** (`current_price`) only — avoids
+    /// invisible dust improving session high / trailing activation (chart-aligned, I-14).
+    #[serde(default = "default_min_session_high_trade_sol")]
+    pub min_session_high_trade_sol: f64,
     /// Bonding curve exit: threshold in percent (e.g. 98.0 = exit when 98% complete).
     /// Set to 0.0 to disable. Default: 98.0
     pub bonding_curve_exit_pct: Option<f64>,
@@ -990,6 +995,10 @@ fn default_cto_min_net_inflow_lamports() -> u64 {
     1_000_000_000
 } // 1 SOL
 
+fn default_min_session_high_trade_sol() -> f64 {
+    0.05
+}
+
 impl Default for MomentumCfg {
     fn default() -> Self {
         Self {
@@ -1025,6 +1034,7 @@ impl Default for MomentumCfg {
             momentum_exit_window_secs: default_momentum_exit_window(),
             momentum_exit_min_trades: default_momentum_exit_min_trades(),
             exit_max_slippage_bps: default_exit_max_slippage_bps(),
+            min_session_high_trade_sol: default_min_session_high_trade_sol(),
             bonding_curve_exit_pct: Some(98.0),
             bonding_curve_exit_enabled: false,
             bonding_curve_exit_threshold_bps: default_bonding_curve_exit_threshold_bps(),
