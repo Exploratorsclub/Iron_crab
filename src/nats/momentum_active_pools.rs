@@ -11,6 +11,10 @@ pub struct MomentumActivePoolsUpdate {
     pub ts_unix_ms: u64,
     pub active: Vec<MomentumActivePoolEntry>,
     pub removed: Vec<MomentumRemovedPoolEntry>,
+    /// When true, `active` is the authoritative full set: market-data unpins any `(mint, pool)`
+    /// it still holds that is not listed in `active` (reconcile / lost-incremental recovery).
+    #[serde(default)]
+    pub full_active_snapshot: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,11 +57,20 @@ mod tests {
                 pool: "Pool333333333333333333333333333333333333333".to_string(),
                 reason: "stale_discovery".to_string(),
             }],
+            full_active_snapshot: false,
         };
         let json = serde_json::to_string(&u).expect("serialize");
         let back: MomentumActivePoolsUpdate = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(u, back);
+        assert!(!back.full_active_snapshot);
         assert!(json.contains("\"pin_reason\":\"tracker\""));
         assert!(json.contains("\"reason\":\"stale_discovery\""));
+    }
+
+    #[test]
+    fn momentum_active_pools_update_deserializes_without_full_snapshot_field() {
+        let json = r#"{"version":1,"ts_unix_ms":1,"active":[],"removed":[]}"#;
+        let u: MomentumActivePoolsUpdate = serde_json::from_str(json).expect("deserialize");
+        assert!(!u.full_active_snapshot);
     }
 }

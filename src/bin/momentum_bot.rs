@@ -2895,15 +2895,16 @@ impl MomentumContext {
             let r = std::mem::take(&mut g.removed);
             (a, r)
         };
-        self.spawn_publish_momentum_active_pools(active, removed);
+        self.spawn_publish_momentum_active_pools(active, removed, false);
     }
 
     fn spawn_publish_momentum_active_pools(
         self: &Arc<Self>,
         active: Vec<MomentumActivePoolEntry>,
         removed: Vec<MomentumRemovedPoolEntry>,
+        full_active_snapshot: bool,
     ) {
-        if active.is_empty() && removed.is_empty() {
+        if active.is_empty() && removed.is_empty() && !full_active_snapshot {
             return;
         }
         let Some(nats_src) = self.nats.as_ref() else {
@@ -2915,6 +2916,7 @@ impl MomentumContext {
             ts_unix_ms: wall_clock_unix_ms_now(),
             active,
             removed,
+            full_active_snapshot,
         };
         record_momentum_active_pools_messages_total();
         tokio::spawn(async move {
@@ -2968,7 +2970,7 @@ impl MomentumContext {
             return;
         }
         let active = self.collect_momentum_active_pool_snapshot();
-        self.spawn_publish_momentum_active_pools(active, Vec::new());
+        self.spawn_publish_momentum_active_pools(active, Vec::new(), true);
     }
 
     fn prune_stale_discovery_trackers(&self) -> Vec<MomentumRemovedPoolEntry> {
@@ -9591,7 +9593,7 @@ async fn main() -> Result<()> {
                 let stale_removed = ctx.prune_stale_discovery_trackers();
                 if !stale_removed.is_empty() {
                     if ctx.nats.is_some() {
-                        ctx.spawn_publish_momentum_active_pools(Vec::new(), stale_removed);
+                        ctx.spawn_publish_momentum_active_pools(Vec::new(), stale_removed, false);
                     } else {
                         let mut g = ctx.momentum_active_pool_publish_queue.lock();
                         g.removed.extend(stale_removed);

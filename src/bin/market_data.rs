@@ -22,7 +22,7 @@ use clap::Parser;
 use serde::Serialize;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -633,6 +633,10 @@ impl ActivePoolSet {
     /// True if any momentum active pin still references this pool (another `(mint, pool)` row).
     fn pool_has_any_pin(&self, pool: Pubkey) -> bool {
         self.pairs.read().iter().any(|(_, p)| *p == pool)
+    }
+
+    fn snapshot_pairs(&self) -> HashSet<(Pubkey, Pubkey)> {
+        self.pairs.read().clone()
     }
 }
 
@@ -1390,8 +1394,12 @@ impl MarketDataContext {
 
     /// PR-B: after a parsed swap trade, subscribe reserve vaults / DLMM bin arrays from MASTER cache.
     fn register_geyser_reserves_after_trade(&self, pool: Pubkey) {
-        let _ =
-            self.register_geyser_reserves_impl(pool, GeyserReserveRegisterFollowUp::None, false);
+        let follow_up = if self.active_pool_set.pool_has_any_pin(pool) {
+            GeyserReserveRegisterFollowUp::MomentumUpgrade
+        } else {
+            GeyserReserveRegisterFollowUp::None
+        };
+        let _ = self.register_geyser_reserves_impl(pool, follow_up, false);
     }
 
     /// PR-D: explicit vault/bin subscriptions for momentum active `(mint, pool)` when cache has layout.
@@ -1786,6 +1794,27 @@ impl MarketDataContext {
 
         let mut batch_dirty = false;
 
+        if update.full_active_snapshot {
+            let mut target: HashSet<(Pubkey, Pubkey)> = HashSet::new();
+            for a in &update.active {
+                let Ok(mint_pk) = Pubkey::from_str(a.mint.trim()) else {
+                    warn!(mint = %a.mint, "MomentumActivePoolsUpdate.active (snapshot): invalid mint");
+                    continue;
+                };
+                let Ok(pool_pk) = Pubkey::from_str(a.pool.trim()) else {
+                    warn!(pool = %a.pool, "MomentumActivePoolsUpdate.active (snapshot): invalid pool");
+                    continue;
+                };
+                target.insert((mint_pk, pool_pk));
+            }
+            let before = self.active_pool_set.snapshot_pairs();
+            for (m, p) in before.difference(&target) {
+                if self.clear_momentum_geyser_reserves_for_active_entry(*m, *p) {
+                    batch_dirty = true;
+                }
+            }
+        }
+
         for r in &update.removed {
             let Ok(mint_pk) = Pubkey::from_str(r.mint.trim()) else {
                 warn!(mint = %r.mint, "MomentumActivePoolsUpdate.removed: invalid mint");
@@ -1824,6 +1853,20 @@ impl MarketDataContext {
         set_market_data_momentum_active_pool_pins_gauge(self.active_pool_set.pair_count());
     }
 
+    /// PR-D: whether `mint` is still a base/quote leg for any pool that has a momentum active pin row.
+    fn momentum_pool_leg_mint_still_required_by_other_pool(&self, mint: Pubkey) -> bool {
+        for (_, pool_pk) in self.active_pool_set.snapshot_pairs() {
+            if let Some(state) = self.live_pool_cache.get(&pool_pk) {
+                if let Some((a, b)) = pool_mints_for_geyser_explicit_tracking(&state) {
+                    if a == mint || b == mint {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Clear `MomentumActive` pins for one `(mint, pool)` side; never demotes [`GeyserPinReason::Wallet`].
     fn clear_momentum_geyser_reserves_for_active_entry(&self, mint: Pubkey, pool: Pubkey) -> bool {
         self.active_pool_set.unpin_pool(mint, pool);
@@ -1848,6 +1891,26 @@ impl MarketDataContext {
                         b.pin = None;
                         b.pinned = false;
                         changed = true;
+                    }
+                }
+            }
+            if let Some(state) = self.live_pool_cache.get(&pool) {
+                if let Some((leg_a, leg_b)) = pool_mints_for_geyser_explicit_tracking(&state) {
+                    for leg in [leg_a, leg_b] {
+                        if self.wallet_tracks_mint_for_geyser(&leg) {
+                            continue;
+                        }
+                        if self.momentum_pool_leg_mint_still_required_by_other_pool(leg) {
+                            continue;
+                        }
+                        let mut m = self.tracked_mints.write();
+                        if let Some(info) = m.get_mut(&leg) {
+                            if info.pin == Some(GeyserPinReason::MomentumActive) {
+                                info.pinned = false;
+                                info.pin = None;
+                                changed = true;
+                            }
+                        }
                     }
                 }
             }
@@ -12673,6 +12736,7 @@ mod pr_b_geyser_tracking_tests {
                 pin_reason: MomentumActivePinReason::Tracker,
             }],
             removed: vec![],
+            full_active_snapshot: false,
         };
         ctx.apply_momentum_active_pools_update(&update);
 
@@ -12725,6 +12789,7 @@ mod pr_b_geyser_tracking_tests {
                 pin_reason: MomentumActivePinReason::Tracker,
             }],
             removed: vec![],
+            full_active_snapshot: false,
         });
 
         {
@@ -12744,6 +12809,7 @@ mod pr_b_geyser_tracking_tests {
                 pool: pool.to_string(),
                 reason: "closed".to_string(),
             }],
+            full_active_snapshot: false,
         });
 
         let vs = ctx.tracked_vaults.read();
@@ -12802,6 +12868,7 @@ mod pr_b_geyser_tracking_tests {
                 },
             ],
             removed: vec![],
+            full_active_snapshot: false,
         });
 
         ctx.apply_momentum_active_pools_update(&MomentumActivePoolsUpdate {
@@ -12813,6 +12880,7 @@ mod pr_b_geyser_tracking_tests {
                 pool: pool.to_string(),
                 reason: "stale_discovery".to_string(),
             }],
+            full_active_snapshot: false,
         });
 
         assert!(
