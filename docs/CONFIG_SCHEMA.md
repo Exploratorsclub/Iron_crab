@@ -248,9 +248,19 @@ Component name: `market-data`
 |-----|------|---------|-------|-------------|
 | `max_events_per_sec` | u32 | 10_000 | 1-1_000_000 | Maximum MarketEvents emitted per second |
 
+### Geyser explicit accounts (PR-B)
+
+Loaded from root TOML section `[market_data_geyser]` in `config.toml` (not the JetStream `market-data` DEX toggles).
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `max_tracked_accounts` | usize | 25000 | 1000-500000 | Max combined explicit Yellowstone accounts (mints + vaults + bin arrays + wallet list). LRU evicts unpinned rows when exceeded. |
+| `geyser_full_reconnect_threshold` | usize | 10000 | 1000-500000 | When combined explicit accounts exceed this, `market-data` forces a full Geyser gRPC reconnect on subscription changes instead of many in-place subscribe updates. |
+
 ### Validation Rules
 - Boolean values must be `true` or `false`
 - `max_events_per_sec` must be between 1 and 1,000,000
+- `max_tracked_accounts` and `geyser_full_reconnect_threshold` must be between 1000 and 500000 (when set via control-plane JSON; TOML should use same bounds)
 
 ---
 

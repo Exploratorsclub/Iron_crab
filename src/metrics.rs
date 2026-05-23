@@ -230,12 +230,29 @@ pub static GEYSER_STREAM_ERRORS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64:
 /// 1 while a Geyser gRPC connection is established; 0 while reconnecting.
 pub static GEYSER_CONNECTED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+/// Combined explicit Geyser account subscription size (mints + vaults + bin arrays + wallet).
+pub static GEYSER_SUBSCRIPTION_ACCOUNTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// Pinned explicit accounts (never LRU-evicted).
+pub static GEYSER_TRACKED_PINNED_ACCOUNTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub static GEYSER_TRACKED_ACCOUNTS_EVICTED_VAULT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static GEYSER_TRACKED_ACCOUNTS_EVICTED_BIN_ARRAY: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static GEYSER_TRACKED_ACCOUNTS_EVICTED_MINT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// Reconnect after large explicit subscription set (PR-B: full client reconnect vs in-place churn).
+pub static GEYSER_RECONNECT_TOTAL_SUBSCRIPTION_REBUILD: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// Geyser listener reconnect reason (PR-A stream resiliency).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GeyserReconnectReason {
     StreamEnded,
     StreamError,
     SinkGone,
+    /// PR-B: intentional full reconnect for large `combined_tracked` updates.
+    SubscriptionRebuild,
 }
 
 pub fn geyser_metrics_inc_reconnect(reason: GeyserReconnectReason) {
@@ -249,7 +266,39 @@ pub fn geyser_metrics_inc_reconnect(reason: GeyserReconnectReason) {
         GeyserReconnectReason::SinkGone => {
             GEYSER_RECONNECT_TOTAL_SINK_GONE.fetch_add(1, Ordering::Relaxed);
         }
+        GeyserReconnectReason::SubscriptionRebuild => {
+            GEYSER_RECONNECT_TOTAL_SUBSCRIPTION_REBUILD.fetch_add(1, Ordering::Relaxed);
+        }
     }
+}
+
+pub fn geyser_metrics_set_subscription_accounts(n: usize) {
+    GEYSER_SUBSCRIPTION_ACCOUNTS.store(n as u64, Ordering::Relaxed);
+}
+
+pub fn geyser_metrics_set_tracked_pinned_accounts(n: usize) {
+    GEYSER_TRACKED_PINNED_ACCOUNTS.store(n as u64, Ordering::Relaxed);
+}
+
+pub fn geyser_metrics_inc_tracked_evicted(kind: GeyserTrackedEvictKind) {
+    match kind {
+        GeyserTrackedEvictKind::Vault => {
+            GEYSER_TRACKED_ACCOUNTS_EVICTED_VAULT.fetch_add(1, Ordering::Relaxed);
+        }
+        GeyserTrackedEvictKind::BinArray => {
+            GEYSER_TRACKED_ACCOUNTS_EVICTED_BIN_ARRAY.fetch_add(1, Ordering::Relaxed);
+        }
+        GeyserTrackedEvictKind::Mint => {
+            GEYSER_TRACKED_ACCOUNTS_EVICTED_MINT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeyserTrackedEvictKind {
+    Vault,
+    BinArray,
+    Mint,
 }
 
 pub fn geyser_metrics_inc_stream_error() {
@@ -2137,11 +2186,47 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
+    out.push_str("geyser_reconnect_total{reason=\"subscription_rebuild\"} ");
+    out.push_str(
+        &GEYSER_RECONNECT_TOTAL_SUBSCRIPTION_REBUILD
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     line!(
         "geyser_stream_errors_total",
         GEYSER_STREAM_ERRORS_TOTAL.load(Ordering::Relaxed)
     );
     line!("geyser_connected", GEYSER_CONNECTED.load(Ordering::Relaxed));
+    line!(
+        "geyser_subscription_accounts",
+        GEYSER_SUBSCRIPTION_ACCOUNTS.load(Ordering::Relaxed)
+    );
+    line!(
+        "geyser_tracked_pinned_accounts",
+        GEYSER_TRACKED_PINNED_ACCOUNTS.load(Ordering::Relaxed)
+    );
+    out.push_str("geyser_tracked_accounts_evicted_total{kind=\"vault\"} ");
+    out.push_str(
+        &GEYSER_TRACKED_ACCOUNTS_EVICTED_VAULT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("geyser_tracked_accounts_evicted_total{kind=\"bin_array\"} ");
+    out.push_str(
+        &GEYSER_TRACKED_ACCOUNTS_EVICTED_BIN_ARRAY
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("geyser_tracked_accounts_evicted_total{kind=\"mint\"} ");
+    out.push_str(
+        &GEYSER_TRACKED_ACCOUNTS_EVICTED_MINT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     line!(
         "market_data_geyser_head_slot",
         MARKET_DATA_GEYSER_HEAD_SLOT.load(Ordering::Relaxed)

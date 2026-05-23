@@ -39,6 +39,11 @@ rpc_timeout_ms = 15000          # 15s timeout (local validator is fast)
 ## Some RPC/Proxies require WS subprotocol header "jsonrpc" for PubSub
 ws_headers = { "Sec-WebSocket-Protocol" = "jsonrpc" }
 
+# market-data: Yellowstone explicit account subscription caps (PR-B)
+[market_data_geyser]
+max_tracked_accounts = 25000
+geyser_full_reconnect_threshold = 10000
+
 # --- Markets (sum must be 100) ---
 [[markets]]
 name = "solana-arb"

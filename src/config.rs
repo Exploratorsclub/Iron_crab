@@ -136,6 +136,36 @@ pub struct StrategyDef {
     pub params: toml::Value,
 }
 
+/// market-data Geyser explicit account subscription limits (PR-B).
+/// TOML section: `[market_data_geyser]`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketDataGeyserCfg {
+    /// Max combined explicit Geyser accounts (mints + vaults + bin arrays + wallet list).
+    #[serde(default = "default_max_tracked_accounts")]
+    pub max_tracked_accounts: usize,
+    /// When `combined_tracked.len()` exceeds this, force a full Geyser gRPC reconnect instead of
+    /// many in-place `subscribe_tx` updates (reduces Yellowstone subscription churn).
+    #[serde(default = "default_geyser_full_reconnect_threshold")]
+    pub geyser_full_reconnect_threshold: usize,
+}
+
+fn default_max_tracked_accounts() -> usize {
+    25_000
+}
+
+fn default_geyser_full_reconnect_threshold() -> usize {
+    10_000
+}
+
+impl Default for MarketDataGeyserCfg {
+    fn default() -> Self {
+        Self {
+            max_tracked_accounts: default_max_tracked_accounts(),
+            geyser_full_reconnect_threshold: default_geyser_full_reconnect_threshold(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub app: AppCfg,
@@ -155,6 +185,8 @@ pub struct Config {
     pub momentum: Option<MomentumCfg>,
     #[serde(default)]
     pub execution_engine: Option<ExecutionEngineCfg>,
+    #[serde(default)]
+    pub market_data_geyser: MarketDataGeyserCfg,
 }
 
 /// Execution Engine Configuration (for execution-engine binary)

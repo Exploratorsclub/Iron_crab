@@ -26,14 +26,14 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use ironcrab::config::{Config, WalletTrackerCfg};
+use ironcrab::config::{Config, MarketDataGeyserCfg, WalletTrackerCfg};
 use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ControlRequest,
     ControlRequestKind, ControlResponse, ControlResponseStatus, DexPoolReadiness, ExecutionResult,
@@ -49,18 +49,19 @@ use ironcrab::ipc::{
 };
 use ironcrab::metrics::{
     dec_market_data_account_publish_queue_depth, dec_market_data_account_worker_queue_depth,
-    inc_market_data_account_publish_queue_depth, inc_market_data_account_worker_queue_depth,
-    market_data_bump_geyser_head_slot, record_market_data_account_broadcast_lagged,
-    record_market_data_account_channel_lag_ms, record_market_data_account_early_drop_total,
-    record_market_data_account_handler_duration_us,
+    geyser_metrics_inc_tracked_evicted, geyser_metrics_set_subscription_accounts,
+    geyser_metrics_set_tracked_pinned_accounts, inc_market_data_account_publish_queue_depth,
+    inc_market_data_account_worker_queue_depth, market_data_bump_geyser_head_slot,
+    record_market_data_account_broadcast_lagged, record_market_data_account_channel_lag_ms,
+    record_market_data_account_early_drop_total, record_market_data_account_handler_duration_us,
     record_market_data_bonding_to_trade_slot_delta_slots,
     record_market_data_geyser_to_publish_on_success,
     record_market_data_trade_after_bonding_publish_ms, record_market_data_tx_broadcast_lagged,
     record_market_data_tx_channel_lag_ms, serve_metrics,
     set_market_data_account_broadcast_queue_depth, set_market_data_tx_broadcast_queue_depth,
     set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
-    update_readiness_market_data_current, wall_clock_unix_ms_now, MarketDataLatencySegment,
-    MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
+    update_readiness_market_data_current, wall_clock_unix_ms_now, GeyserTrackedEvictKind,
+    MarketDataLatencySegment, MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
     MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL,
     MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
     NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
@@ -567,6 +568,60 @@ fn pump_amm_control_response_for_ensure_publish(
     (ControlResponseStatus::Ok, None)
 }
 
+/// PR-B: explicit Geyser account subscription / LRU (also loaded from `[market_data_geyser]` in config.toml).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // MomentumActive wired in PR-D
+enum GeyserPinReason {
+    /// Wallet bootstrap / execution-result mint tracking — never LRU-evicted.
+    Wallet,
+    /// Momentum active pool (PR-D will populate); never LRU-evicted.
+    MomentumActive,
+}
+
+#[derive(Debug, Clone)]
+struct MintTrackInfo {
+    last_used_at: Instant,
+    pinned: bool,
+    pin: Option<GeyserPinReason>,
+}
+
+impl Default for MintTrackInfo {
+    fn default() -> Self {
+        Self {
+            last_used_at: Instant::now(),
+            pinned: false,
+            pin: None,
+        }
+    }
+}
+
+/// PR-B stub: future NATS-driven active pool pins (PR-D). API is live for unit tests.
+#[derive(Debug)]
+struct ActivePoolSet {
+    pairs: parking_lot::RwLock<std::collections::HashSet<(Pubkey, Pubkey)>>,
+}
+
+#[allow(dead_code)] // pin/unpin used by PR-D and `pr_b_geyser_tracking_tests` (clippy sees bin without tests)
+impl ActivePoolSet {
+    fn new() -> Self {
+        Self {
+            pairs: parking_lot::RwLock::new(std::collections::HashSet::new()),
+        }
+    }
+
+    fn pin_pool(&self, mint: Pubkey, pool: Pubkey) {
+        self.pairs.write().insert((mint, pool));
+    }
+
+    fn unpin_pool(&self, mint: Pubkey, pool: Pubkey) {
+        self.pairs.write().remove(&(mint, pool));
+    }
+
+    fn is_pinned(&self, mint: Pubkey, pool: Pubkey) -> bool {
+        self.pairs.read().contains(&(mint, pool))
+    }
+}
+
 /// Market data configuration (hot-reloadable via NATS)
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -587,10 +642,15 @@ struct MarketDataConfig {
     enable_meteora_cpmm: bool,
     /// Max events per second rate limit. Default: 10000
     max_events_per_sec: u32,
+    /// PR-B: max combined explicit Geyser accounts (mints + vaults + bin arrays + wallet).
+    max_tracked_accounts: usize,
+    /// PR-B: full Geyser reconnect when combined explicit accounts exceed this threshold.
+    geyser_full_reconnect_threshold: usize,
 }
 
 impl Default for MarketDataConfig {
     fn default() -> Self {
+        let g = MarketDataGeyserCfg::default();
         Self {
             enable_raydium: true,
             enable_raydium_cpmm: true,
@@ -600,6 +660,8 @@ impl Default for MarketDataConfig {
             enable_meteora_dlmm: true,
             enable_meteora_cpmm: true,
             max_events_per_sec: 10_000,
+            max_tracked_accounts: g.max_tracked_accounts,
+            geyser_full_reconnect_threshold: g.geyser_full_reconnect_threshold,
         }
     }
 }
@@ -704,6 +766,8 @@ struct MarketDataContext {
     run_id: String,
     /// P1: Config in RwLock for runtime hot-reload
     config: parking_lot::RwLock<MarketDataConfig>,
+    /// Same value as `config.geyser_full_reconnect_threshold`, mirrored for `GeyserListener` hot-reload.
+    geyser_full_reconnect_threshold_live: Arc<AtomicUsize>,
     nats: Option<NatsClient>,
     jsonl_writer: JsonlWriter,
     event_counter: std::sync::atomic::AtomicU64,
@@ -714,8 +778,11 @@ struct MarketDataContext {
     priority_fee_tracker: Arc<PriorityFeeTracker>,
 
     /// Tracked token mints for mint-authority/freeze-authority metadata.
-    tracked_mints: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
+    tracked_mints: parking_lot::RwLock<std::collections::HashMap<Pubkey, MintTrackInfo>>,
     tracked_mints_tx: watch::Sender<Vec<Pubkey>>,
+
+    /// PR-B: optional momentum active pool pins (empty until PR-D NATS wiring).
+    active_pool_set: Arc<ActivePoolSet>,
 
     /// Known pump_amm pools (already seen first trade).
     /// We emit PoolCreated + DexPoolAccounts on FIRST trade, then just DexPoolAccounts on subsequent trades.
@@ -724,6 +791,11 @@ struct MarketDataContext {
 
     /// Pools for which we've already emitted DexPoolAccounts from trade parsing.
     known_trade_dex_pools: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
+
+    /// Pump.fun pool discovery: emit `TokenMintInfo` at most once per base mint (Geyser reconnect
+    /// or duplicate discovery must not spam `mint_info_tx`).
+    pumpfun_pool_discovery_mint_info_emitted:
+        parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
 
     /// Vault account tracking for PoolStateUpdate events (Geyser-based reserve balances).
     /// Maps vault_address → VaultInfo (pool context).
@@ -880,6 +952,11 @@ struct VaultInfo {
     is_base_vault: bool,
     /// Last known balance (for delta detection)
     last_balance: std::sync::atomic::AtomicU64,
+    /// PR-B: LRU ordering for explicit Geyser subscription caps.
+    last_used_at: Instant,
+    /// PR-B: pinned vaults are never evicted from explicit Geyser filters.
+    pinned: bool,
+    pin: Option<GeyserPinReason>,
     // =========================================================================
     // DLMM-specific fields (Option D: Bin Array Traversierung)
     // =========================================================================
@@ -900,6 +977,9 @@ impl Clone for VaultInfo {
             last_balance: std::sync::atomic::AtomicU64::new(
                 self.last_balance.load(std::sync::atomic::Ordering::Relaxed),
             ),
+            last_used_at: self.last_used_at,
+            pinned: self.pinned,
+            pin: self.pin,
             active_id: self.active_id,
             bin_step: self.bin_step,
         }
@@ -914,6 +994,10 @@ struct BinArrayInfo {
     bin_array_index: i64,
     /// Bin step from pool (needed for price calculation)
     bin_step: u16,
+    last_used_at: Instant,
+    pinned: bool,
+    #[allow(dead_code)]
+    pin: Option<GeyserPinReason>,
 }
 
 impl MarketDataContext {
@@ -924,94 +1008,784 @@ impl MarketDataContext {
         format!("evt-{}-{:06}", &self.run_id[..8], n)
     }
 
+    fn wallet_tracks_mint_for_geyser(&self, mint: &Pubkey) -> bool {
+        self.tracked_wallet_mint_decimals.read().contains_key(mint)
+    }
+
+    /// PR-B: explicit vault/bin-array/mint Geyser filters — not on cold-path pool-state alone.
+    fn admit_geyser_explicit_pool_assets(
+        &self,
+        pool: Pubkey,
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+    ) -> bool {
+        self.active_pool_set.is_pinned(base_mint, pool)
+            || self.active_pool_set.is_pinned(quote_mint, pool)
+            || self.wallet_tracks_mint_for_geyser(&base_mint)
+            || self.wallet_tracks_mint_for_geyser(&quote_mint)
+    }
+
+    fn count_geyser_wallet_explicit_accounts(&self) -> usize {
+        if self.tracked_wallet.is_some() {
+            2 + self.tracked_wallet_token_accounts.read().len()
+        } else {
+            0
+        }
+    }
+
+    fn combined_geyser_explicit_accounts(&self) -> usize {
+        self.tracked_vaults.read().len()
+            + self.tracked_bin_arrays.read().len()
+            + self.tracked_mints.read().len()
+            + self.count_geyser_wallet_explicit_accounts()
+    }
+
+    fn refresh_geyser_pins_gauge(&self) {
+        let mut pinned: usize = 0;
+        pinned += self
+            .tracked_mints
+            .read()
+            .values()
+            .filter(|m| m.pinned)
+            .count();
+        pinned += self
+            .tracked_vaults
+            .read()
+            .values()
+            .filter(|v| v.pinned)
+            .count();
+        pinned += self
+            .tracked_bin_arrays
+            .read()
+            .values()
+            .filter(|b| b.pinned)
+            .count();
+        // Wallet ATAs are always subscribed and treated as pinned for ops visibility.
+        pinned += self.count_geyser_wallet_explicit_accounts();
+        geyser_metrics_set_tracked_pinned_accounts(pinned);
+    }
+
+    /// Partner vault (opposite base/quote leg) eligible for paired LRU eviction.
+    /// Never returns a pinned sibling — pinned vaults must stay subscribed.
+    pub(crate) fn geyser_unpinned_sibling_vault_pubkey(
+        vaults: &std::collections::HashMap<Pubkey, VaultInfo>,
+        pool: Pubkey,
+        primary_is_base_vault: bool,
+    ) -> Option<Pubkey> {
+        vaults
+            .iter()
+            .find(|(_, vi)| {
+                vi.pool_address == pool && vi.is_base_vault != primary_is_base_vault && !vi.pinned
+            })
+            .map(|(pk, _)| *pk)
+    }
+
+    /// Whether a **pinned** partner vault exists for the same pool (opposite leg).
+    /// Used after evicting an unpinned vault to detect half-pair subscription (documented `warn!`).
+    pub(crate) fn geyser_pinned_sibling_vault_present(
+        vaults: &std::collections::HashMap<Pubkey, VaultInfo>,
+        pool: Pubkey,
+        primary_is_base_vault: bool,
+    ) -> bool {
+        vaults.values().any(|vi| {
+            vi.pool_address == pool && vi.is_base_vault != primary_is_base_vault && vi.pinned
+        })
+    }
+
+    /// PR-B: LRU eviction when explicit combined accounts exceed `max_tracked_accounts`.
+    /// Never evicts pinned rows; never evicts wallet subscription keys (they are not in these maps).
+    fn evict_geyser_unpinned_lru_to_cap(&self) {
+        let cap = self.config.read().max_tracked_accounts;
+        let run_id = self.run_id.clone();
+        loop {
+            if self.combined_geyser_explicit_accounts() <= cap {
+                break;
+            }
+
+            #[derive(Clone, Copy)]
+            enum EvKind {
+                Vault,
+                Bin,
+                Mint,
+            }
+            let mut best: Option<(Instant, EvKind, Pubkey)> = None;
+
+            for (pk, v) in self.tracked_vaults.read().iter() {
+                if v.pinned {
+                    continue;
+                }
+                let cand = (v.last_used_at, EvKind::Vault, *pk);
+                best = Some(match best {
+                    None => cand,
+                    Some(b) if cand.0 < b.0 => cand,
+                    Some(b) => b,
+                });
+            }
+            for (pk, b) in self.tracked_bin_arrays.read().iter() {
+                if b.pinned {
+                    continue;
+                }
+                let cand = (b.last_used_at, EvKind::Bin, *pk);
+                best = Some(match best {
+                    None => cand,
+                    Some(x) if cand.0 < x.0 => cand,
+                    Some(x) => x,
+                });
+            }
+            for (pk, m) in self.tracked_mints.read().iter() {
+                if m.pinned {
+                    continue;
+                }
+                let cand = (m.last_used_at, EvKind::Mint, *pk);
+                best = Some(match best {
+                    None => cand,
+                    Some(x) if cand.0 < x.0 => cand,
+                    Some(x) => x,
+                });
+            }
+
+            let Some((oldest_at, kind, pubkey)) = best else {
+                error!(
+                    run_id = %run_id,
+                    cap,
+                    combined = self.combined_geyser_explicit_accounts(),
+                    "geyser_evict: cannot reach cap — only pinned explicit accounts remain (no LRU candidates)"
+                );
+                break;
+            };
+
+            match kind {
+                EvKind::Vault => {
+                    let mut vaults = self.tracked_vaults.write();
+                    // Re-check under write lock: LRU candidate may have been pinned after the read-only scan (TOCTOU).
+                    match vaults.get(&pubkey) {
+                        None => continue,
+                        Some(v) if v.pinned => continue,
+                        Some(_) => {}
+                    }
+                    if let Some(v) = vaults.remove(&pubkey) {
+                        geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Vault);
+                        info!(
+                            run_id = %run_id,
+                            pool = %v.pool_address,
+                            mint = %v.base_mint,
+                            vault = %pubkey,
+                            reason = "lru_cap",
+                            oldest_age_ms = ?oldest_at.elapsed().as_millis(),
+                            "geyser_evicted"
+                        );
+                        // Evict the paired vault for the same pool when **both** legs are unpinned, so
+                        // LRU does not leave a misleading half-pair. Never remove a pinned sibling.
+                        let pool = v.pool_address;
+                        let this_is_base = v.is_base_vault;
+                        let sibling_pk =
+                            Self::geyser_unpinned_sibling_vault_pubkey(&vaults, pool, this_is_base);
+                        if let Some(spk) = sibling_pk {
+                            let remove_sibling =
+                                vaults.get(&spk).map(|sv| !sv.pinned).unwrap_or(false);
+                            if remove_sibling {
+                                if let Some(sv) = vaults.remove(&spk) {
+                                    geyser_metrics_inc_tracked_evicted(
+                                        GeyserTrackedEvictKind::Vault,
+                                    );
+                                    info!(
+                                        run_id = %run_id,
+                                        pool = %sv.pool_address,
+                                        mint = %sv.base_mint,
+                                        vault = %spk,
+                                        reason = "lru_cap_pair",
+                                        oldest_age_ms = ?oldest_at.elapsed().as_millis(),
+                                        "geyser_evicted"
+                                    );
+                                }
+                            }
+                        } else if Self::geyser_pinned_sibling_vault_present(
+                            &vaults,
+                            pool,
+                            this_is_base,
+                        ) {
+                            // Single warn per eviction step: unpinned leg removed, pinned partner retained
+                            // (intentional — never evict pinned explicit accounts).
+                            warn!(
+                                run_id = %run_id,
+                                pool = %pool,
+                                evicted_vault = %pubkey,
+                                evicted_was_base_vault = this_is_base,
+                                "geyser_evict: removed unpinned vault but pinned sibling vault remains tracked (half-pair subscription)"
+                            );
+                        }
+                    }
+                }
+                EvKind::Bin => {
+                    let mut bins = self.tracked_bin_arrays.write();
+                    match bins.get(&pubkey) {
+                        None => continue,
+                        Some(b) if b.pinned => continue,
+                        Some(_) => {}
+                    }
+                    if let Some(b) = bins.remove(&pubkey) {
+                        geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::BinArray);
+                        info!(
+                            run_id = %run_id,
+                            pool = %b.pool_address,
+                            bin_array = %pubkey,
+                            reason = "lru_cap",
+                            "geyser_evicted"
+                        );
+                    }
+                }
+                EvKind::Mint => {
+                    let mut mints = self.tracked_mints.write();
+                    match mints.get(&pubkey) {
+                        None => continue,
+                        Some(m) if m.pinned => continue,
+                        Some(_) => {}
+                    }
+                    if mints.remove(&pubkey).is_some() {
+                        geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Mint);
+                        info!(
+                            run_id = %run_id,
+                            mint = %pubkey,
+                            reason = "lru_cap",
+                            "geyser_evicted"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Push current explicit tracked keys to all merge-task channels after eviction.
+    /// Cross-type LRU can evict vaults/bin-arrays/mints from any map; callers must run
+    /// [`Self::sync_geyser_tracked_accounts`] so every channel refreshes and the combined Geyser
+    /// subscription list stays in sync.
+    fn broadcast_tracked_geyser_explicit_to_merge(&self) {
+        let mints: Vec<Pubkey> = self.tracked_mints.read().keys().copied().collect();
+        let vaults: Vec<Pubkey> = self.tracked_vaults.read().keys().copied().collect();
+        let bins: Vec<Pubkey> = self.tracked_bin_arrays.read().keys().copied().collect();
+        let _ = self.tracked_mints_tx.send(mints);
+        let _ = self.tracked_vaults_tx.send(vaults);
+        let _ = self.tracked_bin_arrays_tx.send(bins);
+        self.refresh_geyser_pins_gauge();
+    }
+
+    fn sync_geyser_tracked_accounts(&self) {
+        self.evict_geyser_unpinned_lru_to_cap();
+        self.broadcast_tracked_geyser_explicit_to_merge();
+    }
+
+    /// Track mint pubkey for Geyser `TokenMintInfo` / metadata. Returns `true` if pubkey set changed.
+    fn track_mint_for_geyser_metadata(&self, mint: Pubkey, pin: Option<GeyserPinReason>) -> bool {
+        let now = Instant::now();
+        let pinned = pin.is_some();
+        let mut map = self.tracked_mints.write();
+        use std::collections::hash_map::Entry;
+        match map.entry(mint) {
+            Entry::Vacant(e) => {
+                e.insert(MintTrackInfo {
+                    last_used_at: now,
+                    pinned,
+                    pin,
+                });
+                true
+            }
+            Entry::Occupied(mut e) => {
+                let v = e.get_mut();
+                v.last_used_at = now;
+                if pinned {
+                    v.pinned = true;
+                    v.pin = pin;
+                }
+                false
+            }
+        }
+    }
+
+    fn touch_tracked_vault_pubkey(&self, vault: &Pubkey) {
+        let now = Instant::now();
+        let mut vs = self.tracked_vaults.write();
+        let pool = vs.get(vault).map(|v| v.pool_address);
+        if let Some(pool) = pool {
+            for v in vs.values_mut() {
+                if v.pool_address == pool {
+                    v.last_used_at = now;
+                }
+            }
+        }
+    }
+
+    fn touch_tracked_bin_array_pubkey(&self, pda: &Pubkey) {
+        let now = Instant::now();
+        if let Some(b) = self.tracked_bin_arrays.write().get_mut(pda) {
+            b.last_used_at = now;
+        }
+    }
+
+    fn touch_tracked_pool_vaults_and_bins(&self, pool: Pubkey) {
+        let now = Instant::now();
+        {
+            let mut vs = self.tracked_vaults.write();
+            for v in vs.values_mut() {
+                if v.pool_address == pool {
+                    v.last_used_at = now;
+                }
+            }
+        }
+        {
+            let mut bs = self.tracked_bin_arrays.write();
+            for b in bs.values_mut() {
+                if b.pool_address == pool {
+                    b.last_used_at = now;
+                }
+            }
+        }
+    }
+
+    /// PR-B: after a parsed swap trade, subscribe reserve vaults / DLMM bin arrays from MASTER cache.
+    fn register_geyser_reserves_after_trade(&self, pool: Pubkey) {
+        let now = Instant::now();
+        let enable_dlmm = self.config.read().enable_meteora_dlmm;
+        let enable_meteora_cpmm = self.config.read().enable_meteora_cpmm;
+        let Some(state) = self.live_pool_cache.get(&pool) else {
+            return;
+        };
+
+        let mut vaults_changed = false;
+        let mut bins_changed = false;
+
+        match &state {
+            CachedPoolState::RaydiumCpmm(s) => {
+                let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+                let (base_mint_v, quote_mint_v, coin_vault, pc_vault) = if s.token_1_mint == sol {
+                    (
+                        s.token_0_mint,
+                        s.token_1_mint,
+                        s.token_0_vault,
+                        s.token_1_vault,
+                    )
+                } else if s.token_0_mint == sol {
+                    (
+                        s.token_1_mint,
+                        s.token_0_mint,
+                        s.token_1_vault,
+                        s.token_0_vault,
+                    )
+                } else {
+                    (
+                        s.token_0_mint,
+                        s.token_1_mint,
+                        s.token_0_vault,
+                        s.token_1_vault,
+                    )
+                };
+                let dex_str = "raydium_cpmm".to_string();
+                {
+                    let mut vaults = self.tracked_vaults.write();
+                    vaults.entry(coin_vault).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: pool,
+                            dex: dex_str.clone(),
+                            base_mint: base_mint_v,
+                            quote_mint: quote_mint_v,
+                            is_base_vault: true,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: now,
+                            pinned: false,
+                            pin: None,
+                            active_id: None,
+                            bin_step: None,
+                        }
+                    });
+                    vaults.entry(pc_vault).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: pool,
+                            dex: dex_str,
+                            base_mint: base_mint_v,
+                            quote_mint: quote_mint_v,
+                            is_base_vault: false,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: now,
+                            pinned: false,
+                            pin: None,
+                            active_id: None,
+                            bin_step: None,
+                        }
+                    });
+                }
+            }
+            CachedPoolState::MeteoraCpmm(s) if enable_meteora_cpmm => {
+                let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+                let (base_mint_v, quote_mint_v, vault_base, vault_quote) = if s.token_1_mint == sol
+                {
+                    (
+                        s.token_0_mint,
+                        s.token_1_mint,
+                        s.token_0_vault,
+                        s.token_1_vault,
+                    )
+                } else if s.token_0_mint == sol {
+                    (
+                        s.token_1_mint,
+                        s.token_0_mint,
+                        s.token_1_vault,
+                        s.token_0_vault,
+                    )
+                } else {
+                    (
+                        s.token_0_mint,
+                        s.token_1_mint,
+                        s.token_0_vault,
+                        s.token_1_vault,
+                    )
+                };
+                let dex_str = "meteora_cpmm".to_string();
+                {
+                    let mut vaults = self.tracked_vaults.write();
+                    vaults.entry(vault_base).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: pool,
+                            dex: dex_str.clone(),
+                            base_mint: base_mint_v,
+                            quote_mint: quote_mint_v,
+                            is_base_vault: true,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: now,
+                            pinned: false,
+                            pin: None,
+                            active_id: None,
+                            bin_step: None,
+                        }
+                    });
+                    vaults.entry(vault_quote).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: pool,
+                            dex: dex_str,
+                            base_mint: base_mint_v,
+                            quote_mint: quote_mint_v,
+                            is_base_vault: false,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: now,
+                            pinned: false,
+                            pin: None,
+                            active_id: None,
+                            bin_step: None,
+                        }
+                    });
+                }
+            }
+            CachedPoolState::Meteora(s) if enable_dlmm => {
+                let dex_str = "meteora_dlmm".to_string();
+                {
+                    let mut vaults = self.tracked_vaults.write();
+                    vaults.entry(s.reserve_x).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: pool,
+                            dex: dex_str.clone(),
+                            base_mint: s.token_x_mint,
+                            quote_mint: s.token_y_mint,
+                            is_base_vault: true,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: now,
+                            pinned: false,
+                            pin: None,
+                            active_id: Some(s.active_id),
+                            bin_step: Some(s.bin_step),
+                        }
+                    });
+                    vaults.entry(s.reserve_y).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: pool,
+                            dex: dex_str,
+                            base_mint: s.token_x_mint,
+                            quote_mint: s.token_y_mint,
+                            is_base_vault: false,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: now,
+                            pinned: false,
+                            pin: None,
+                            active_id: Some(s.active_id),
+                            bin_step: Some(s.bin_step),
+                        }
+                    });
+                }
+                let active_id = s.active_id;
+                let active_array_index =
+                    MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(active_id);
+                let bin_step = s.bin_step;
+                {
+                    let mut bin_arrays = self.tracked_bin_arrays.write();
+                    for offset in -3i64..=3i64 {
+                        let index = active_array_index + offset;
+                        if let Ok(pda) = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&pool, index)
+                        {
+                            bin_arrays.entry(pda).or_insert_with(|| {
+                                bins_changed = true;
+                                BinArrayInfo {
+                                    pool_address: pool,
+                                    bin_array_index: index,
+                                    bin_step,
+                                    last_used_at: now,
+                                    pinned: false,
+                                    pin: None,
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+            CachedPoolState::PumpAmm(s) => {
+                let dex_str = "pump_amm".to_string();
+                {
+                    let mut vaults = self.tracked_vaults.write();
+                    vaults.entry(s.pool_base_token_account).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: pool,
+                            dex: dex_str.clone(),
+                            base_mint: s.base_mint,
+                            quote_mint: s.quote_mint,
+                            is_base_vault: true,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: now,
+                            pinned: false,
+                            pin: None,
+                            active_id: None,
+                            bin_step: None,
+                        }
+                    });
+                    vaults.entry(s.pool_quote_token_account).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: pool,
+                            dex: dex_str,
+                            base_mint: s.base_mint,
+                            quote_mint: s.quote_mint,
+                            is_base_vault: false,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: now,
+                            pinned: false,
+                            pin: None,
+                            active_id: None,
+                            bin_step: None,
+                        }
+                    });
+                }
+            }
+            CachedPoolState::Orca(s) => {
+                let dex_str = "orca".to_string();
+                {
+                    let mut vaults = self.tracked_vaults.write();
+                    vaults.entry(s.token_vault_a).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: pool,
+                            dex: dex_str.clone(),
+                            base_mint: s.token_mint_a,
+                            quote_mint: s.token_mint_b,
+                            is_base_vault: true,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: now,
+                            pinned: false,
+                            pin: None,
+                            active_id: None,
+                            bin_step: None,
+                        }
+                    });
+                    vaults.entry(s.token_vault_b).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: pool,
+                            dex: dex_str,
+                            base_mint: s.token_mint_a,
+                            quote_mint: s.token_mint_b,
+                            is_base_vault: false,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: now,
+                            pinned: false,
+                            pin: None,
+                            active_id: None,
+                            bin_step: None,
+                        }
+                    });
+                }
+            }
+            CachedPoolState::RaydiumAmm(s) => {
+                let dex_str = "raydium".to_string();
+                {
+                    let mut vaults = self.tracked_vaults.write();
+                    vaults.entry(s.coin_vault).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: pool,
+                            dex: dex_str.clone(),
+                            base_mint: s.base_mint,
+                            quote_mint: s.quote_mint,
+                            is_base_vault: true,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: now,
+                            pinned: false,
+                            pin: None,
+                            active_id: None,
+                            bin_step: None,
+                        }
+                    });
+                    vaults.entry(s.pc_vault).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: pool,
+                            dex: dex_str,
+                            base_mint: s.base_mint,
+                            quote_mint: s.quote_mint,
+                            is_base_vault: false,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: now,
+                            pinned: false,
+                            pin: None,
+                            active_id: None,
+                            bin_step: None,
+                        }
+                    });
+                }
+            }
+            _ => {}
+        }
+
+        if vaults_changed || bins_changed {
+            self.sync_geyser_tracked_accounts();
+        }
+    }
+
     /// P1: Apply config update from control-plane (Runtime Configuration via UI)
     fn apply_config_update(&self, update: &ConfigUpdate) -> ConfigUpdateResponse {
-        let mut config = self.config.write();
         let mut applied = Vec::new();
         let mut rejected = Vec::new();
+        let mut sync_geyser_tracked_after_max_accounts = false;
 
-        for (key, value) in &update.config {
-            match key.as_str() {
-                "enable_raydium" => {
-                    if let Some(v) = value.as_bool() {
-                        config.enable_raydium = v;
-                        applied.push(key.clone());
-                        info!(key = %key, new_value = %v, "Config updated");
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
-                    }
-                }
-                "enable_raydium_cpmm" => {
-                    if let Some(v) = value.as_bool() {
-                        config.enable_raydium_cpmm = v;
-                        applied.push(key.clone());
-                        info!(key = %key, new_value = %v, "Config updated");
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
-                    }
-                }
-                "enable_orca" => {
-                    if let Some(v) = value.as_bool() {
-                        config.enable_orca = v;
-                        applied.push(key.clone());
-                        info!(key = %key, new_value = %v, "Config updated");
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
-                    }
-                }
-                "enable_pumpfun" => {
-                    if let Some(v) = value.as_bool() {
-                        config.enable_pumpfun = v;
-                        applied.push(key.clone());
-                        info!(key = %key, new_value = %v, "Config updated");
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
-                    }
-                }
-                "enable_pumpswap" => {
-                    if let Some(v) = value.as_bool() {
-                        config.enable_pumpswap = v;
-                        applied.push(key.clone());
-                        info!(key = %key, new_value = %v, "Config updated");
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
-                    }
-                }
-                "enable_meteora_dlmm" => {
-                    if let Some(v) = value.as_bool() {
-                        config.enable_meteora_dlmm = v;
-                        applied.push(key.clone());
-                        info!(key = %key, new_value = %v, "Config updated");
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
-                    }
-                }
-                "enable_meteora_cpmm" => {
-                    if let Some(v) = value.as_bool() {
-                        config.enable_meteora_cpmm = v;
-                        applied.push(key.clone());
-                        info!(key = %key, new_value = %v, "Config updated");
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
-                    }
-                }
-                "max_events_per_sec" => {
-                    if let Some(v) = value.as_u64() {
-                        if v > 0 && v <= 1_000_000 {
-                            config.max_events_per_sec = v as u32;
+        {
+            let mut config = self.config.write();
+            for (key, value) in &update.config {
+                match key.as_str() {
+                    "enable_raydium" => {
+                        if let Some(v) = value.as_bool() {
+                            config.enable_raydium = v;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
                         } else {
-                            rejected.push((key.clone(), "Must be 1-1000000".to_string()));
+                            rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
                         }
-                    } else {
-                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                    "enable_raydium_cpmm" => {
+                        if let Some(v) = value.as_bool() {
+                            config.enable_raydium_cpmm = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                        }
+                    }
+                    "enable_orca" => {
+                        if let Some(v) = value.as_bool() {
+                            config.enable_orca = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                        }
+                    }
+                    "enable_pumpfun" => {
+                        if let Some(v) = value.as_bool() {
+                            config.enable_pumpfun = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                        }
+                    }
+                    "enable_pumpswap" => {
+                        if let Some(v) = value.as_bool() {
+                            config.enable_pumpswap = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                        }
+                    }
+                    "enable_meteora_dlmm" => {
+                        if let Some(v) = value.as_bool() {
+                            config.enable_meteora_dlmm = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                        }
+                    }
+                    "enable_meteora_cpmm" => {
+                        if let Some(v) = value.as_bool() {
+                            config.enable_meteora_cpmm = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                        }
+                    }
+                    "max_events_per_sec" => {
+                        if let Some(v) = value.as_u64() {
+                            if v > 0 && v <= 1_000_000 {
+                                config.max_events_per_sec = v as u32;
+                                applied.push(key.clone());
+                                info!(key = %key, new_value = %v, "Config updated");
+                            } else {
+                                rejected.push((key.clone(), "Must be 1-1000000".to_string()));
+                            }
+                        } else {
+                            rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                        }
+                    }
+                    "max_tracked_accounts" => {
+                        if let Some(v) = value.as_u64() {
+                            if (1000..=500_000).contains(&v) {
+                                config.max_tracked_accounts = v as usize;
+                                applied.push(key.clone());
+                                sync_geyser_tracked_after_max_accounts = true;
+                                info!(key = %key, new_value = %v, "Config updated");
+                            } else {
+                                rejected.push((key.clone(), "Must be 1000-500000".to_string()));
+                            }
+                        } else {
+                            rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                        }
+                    }
+                    "geyser_full_reconnect_threshold" => {
+                        if let Some(v) = value.as_u64() {
+                            if (1000..=500_000).contains(&v) {
+                                let n = v as usize;
+                                config.geyser_full_reconnect_threshold = n;
+                                self.geyser_full_reconnect_threshold_live
+                                    .store(n, Ordering::Relaxed);
+                                applied.push(key.clone());
+                                info!(key = %key, new_value = %v, "Config updated");
+                            } else {
+                                rejected.push((key.clone(), "Must be 1000-500000".to_string()));
+                            }
+                        } else {
+                            rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                        }
+                    }
+                    _ => {
+                        rejected.push((key.clone(), format!("Unknown config key: {}", key)));
                     }
                 }
-                _ => {
-                    rejected.push((key.clone(), format!("Unknown config key: {}", key)));
-                }
             }
+        }
+
+        if sync_geyser_tracked_after_max_accounts {
+            self.sync_geyser_tracked_accounts();
         }
 
         let status = if rejected.is_empty() {
@@ -4704,12 +5478,8 @@ async fn publish_wallet_snapshot(
         }
 
         // Ensure mint is tracked so Geyser can publish TokenMintInfo later (no RPC here).
-        {
-            let mut tracked = ctx.tracked_mints.write();
-            if tracked.insert(*mint) {
-                let updated: Vec<Pubkey> = tracked.iter().copied().collect();
-                let _ = ctx.tracked_mints_tx.send(updated);
-            }
+        if ctx.track_mint_for_geyser_metadata(*mint, Some(GeyserPinReason::Wallet)) {
+            ctx.sync_geyser_tracked_accounts();
         }
 
         let mint_str = mint.to_string();
@@ -5128,29 +5898,41 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let run_id = Uuid::new_v4().to_string();
 
-    let helius_rpc: Option<Arc<SolanaRpc>> = match Config::load(&args.config) {
-        Ok(cfg) => cfg
-            .solana
-            .helius_rpc_url
-            .as_ref()
-            .map(|u| u.trim())
-            .filter(|u| !u.is_empty())
-            .map(|url| {
-                info!(
-                    helius_rpc_host = %url.split('/').nth(2).unwrap_or("?"),
-                    "Loaded solana.helius_rpc_url for bounded PumpSwap TX-history fallback (Cold Path only)"
-                );
-                Arc::new(SolanaRpc::new(url))
-            }),
+    let file_config: Option<Config> = match Config::load(&args.config) {
+        Ok(c) => Some(c),
         Err(e) => {
             warn!(
                 error = %e,
                 config_path = %args.config.display(),
-                "Could not load config.toml; Helius PumpSwap fallback disabled (optional)"
+                "Could not load config.toml; Helius PumpSwap fallback + market_data_geyser defaults (optional)"
             );
             None
         }
     };
+
+    let helius_rpc: Option<Arc<SolanaRpc>> = file_config
+        .as_ref()
+        .and_then(|cfg| {
+            cfg.solana
+                .helius_rpc_url
+                .as_ref()
+                .map(|u| u.trim())
+                .filter(|u| !u.is_empty())
+                .map(|url| {
+                    info!(
+                        helius_rpc_host = %url.split('/').nth(2).unwrap_or("?"),
+                        "Loaded solana.helius_rpc_url for bounded PumpSwap TX-history fallback (Cold Path only)"
+                    );
+                    Arc::new(SolanaRpc::new(url))
+                })
+        });
+
+    let mut market_data_config = MarketDataConfig::default();
+    if let Some(ref c) = file_config {
+        market_data_config.max_tracked_accounts = c.market_data_geyser.max_tracked_accounts;
+        market_data_config.geyser_full_reconnect_threshold =
+            c.market_data_geyser.geyser_full_reconnect_threshold;
+    }
 
     let wallet_env = std::env::var("IRONCRAB_WALLET_PUBKEY").ok();
     info!(
@@ -5287,18 +6069,27 @@ async fn main() -> Result<()> {
         None
     };
 
+    let geyser_full_reconnect_threshold_live = Arc::new(AtomicUsize::new(
+        market_data_config.geyser_full_reconnect_threshold,
+    ));
+
     let ctx = Arc::new(MarketDataContext {
         run_id: run_id.clone(),
-        config: parking_lot::RwLock::new(MarketDataConfig::default()),
+        config: parking_lot::RwLock::new(market_data_config),
+        geyser_full_reconnect_threshold_live,
         nats,
         jsonl_writer,
         event_counter: std::sync::atomic::AtomicU64::new(0),
         wallet_tracker,
         priority_fee_tracker: Arc::new(PriorityFeeTracker::new()),
-        tracked_mints: parking_lot::RwLock::new(std::collections::HashSet::new()),
+        tracked_mints: parking_lot::RwLock::new(std::collections::HashMap::new()),
         tracked_mints_tx,
+        active_pool_set: Arc::new(ActivePoolSet::new()),
         known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
         known_trade_dex_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
+        pumpfun_pool_discovery_mint_info_emitted: parking_lot::RwLock::new(
+            std::collections::HashSet::new(),
+        ),
         tracked_vaults: parking_lot::RwLock::new(std::collections::HashMap::new()),
         tracked_vaults_tx,
         tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -6290,7 +7081,7 @@ fn account_geyser_update_might_be_relevant(
             return true;
         }
     }
-    if ctx.tracked_mints.read().contains(&u.pubkey) {
+    if ctx.tracked_mints.read().contains_key(&u.pubkey) {
         return true;
     }
     if ctx.tracked_vaults.read().contains_key(&u.pubkey) {
@@ -6631,7 +7422,10 @@ async fn handle_geyser_account(
     // Tracked mint updates (Token mint authority/freeze info)
     if (account_update.owner.to_bytes() == spl_token::ID.to_bytes()
         || account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes())
-        && ctx.tracked_mints.read().contains(&account_update.pubkey)
+        && ctx
+            .tracked_mints
+            .read()
+            .contains_key(&account_update.pubkey)
     {
         if let Some((decimals, supply, mint_authority, freeze_authority)) =
             try_parse_mint_account(&account_update.owner, &account_update.data)
@@ -6724,6 +7518,7 @@ async fn handle_geyser_account(
                     .last_balance
                     .swap(balance, std::sync::atomic::Ordering::Relaxed);
                 if balance != prev_balance {
+                    ctx.touch_tracked_vault_pubkey(&account_update.pubkey);
                     // We need both vault balances to emit a complete PoolStateUpdate.
                     // For now, emit partial updates - consumers should merge base+quote.
                     // Future: Track both vaults and emit only when both are known.
@@ -6940,6 +7735,7 @@ async fn handle_geyser_account(
             .get(&account_update.pubkey)
             .cloned();
         if let Some(bin_array_info) = bin_array_info_opt {
+            ctx.touch_tracked_bin_array_pubkey(&account_update.pubkey);
             // Parse bin array to extract liquidity distribution
             match BinArray::parse(&account_update.data, bin_array_info.bin_step) {
                 Ok(parsed_array) => {
@@ -7058,38 +7854,49 @@ async fn handle_geyser_account(
             };
             let dex_str = "raydium_cpmm".to_string();
             let mut vaults_changed = false;
-            {
-                let mut vaults = ctx.tracked_vaults.write();
-                vaults.entry(coin_vault).or_insert_with(|| {
-                    vaults_changed = true;
-                    VaultInfo {
-                        pool_address: account_update.pubkey,
-                        dex: dex_str.clone(),
-                        base_mint: base_mint_v,
-                        quote_mint: quote_mint_v,
-                        is_base_vault: true,
-                        last_balance: std::sync::atomic::AtomicU64::new(0),
-                        active_id: None,
-                        bin_step: None,
-                    }
-                });
-                vaults.entry(pc_vault).or_insert_with(|| {
-                    vaults_changed = true;
-                    VaultInfo {
-                        pool_address: account_update.pubkey,
-                        dex: dex_str,
-                        base_mint: base_mint_v,
-                        quote_mint: quote_mint_v,
-                        is_base_vault: false,
-                        last_balance: std::sync::atomic::AtomicU64::new(0),
-                        active_id: None,
-                        bin_step: None,
-                    }
-                });
+            if ctx.admit_geyser_explicit_pool_assets(
+                account_update.pubkey,
+                base_mint_v,
+                quote_mint_v,
+            ) {
+                {
+                    let mut vaults = ctx.tracked_vaults.write();
+                    vaults.entry(coin_vault).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: account_update.pubkey,
+                            dex: dex_str.clone(),
+                            base_mint: base_mint_v,
+                            quote_mint: quote_mint_v,
+                            is_base_vault: true,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: Instant::now(),
+                            pinned: false,
+                            pin: None,
+                            active_id: None,
+                            bin_step: None,
+                        }
+                    });
+                    vaults.entry(pc_vault).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: account_update.pubkey,
+                            dex: dex_str,
+                            base_mint: base_mint_v,
+                            quote_mint: quote_mint_v,
+                            is_base_vault: false,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: Instant::now(),
+                            pinned: false,
+                            pin: None,
+                            active_id: None,
+                            bin_step: None,
+                        }
+                    });
+                }
             }
             if vaults_changed {
-                let vault_list: Vec<Pubkey> = ctx.tracked_vaults.read().keys().copied().collect();
-                let _ = ctx.tracked_vaults_tx.send(vault_list);
+                ctx.sync_geyser_tracked_accounts();
                 debug!(
                     pool = %account_update.pubkey,
                     coin_vault = %coin_vault,
@@ -7128,39 +7935,49 @@ async fn handle_geyser_account(
                 };
                 let dex_str = "meteora_cpmm".to_string();
                 let mut vaults_changed = false;
-                {
-                    let mut vaults = ctx.tracked_vaults.write();
-                    vaults.entry(vault_base).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: account_update.pubkey,
-                            dex: dex_str.clone(),
-                            base_mint: base_mint_v,
-                            quote_mint: quote_mint_v,
-                            is_base_vault: true,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            active_id: None,
-                            bin_step: None,
-                        }
-                    });
-                    vaults.entry(vault_quote).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: account_update.pubkey,
-                            dex: dex_str,
-                            base_mint: base_mint_v,
-                            quote_mint: quote_mint_v,
-                            is_base_vault: false,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            active_id: None,
-                            bin_step: None,
-                        }
-                    });
+                if ctx.admit_geyser_explicit_pool_assets(
+                    account_update.pubkey,
+                    base_mint_v,
+                    quote_mint_v,
+                ) {
+                    {
+                        let mut vaults = ctx.tracked_vaults.write();
+                        vaults.entry(vault_base).or_insert_with(|| {
+                            vaults_changed = true;
+                            VaultInfo {
+                                pool_address: account_update.pubkey,
+                                dex: dex_str.clone(),
+                                base_mint: base_mint_v,
+                                quote_mint: quote_mint_v,
+                                is_base_vault: true,
+                                last_balance: std::sync::atomic::AtomicU64::new(0),
+                                last_used_at: Instant::now(),
+                                pinned: false,
+                                pin: None,
+                                active_id: None,
+                                bin_step: None,
+                            }
+                        });
+                        vaults.entry(vault_quote).or_insert_with(|| {
+                            vaults_changed = true;
+                            VaultInfo {
+                                pool_address: account_update.pubkey,
+                                dex: dex_str,
+                                base_mint: base_mint_v,
+                                quote_mint: quote_mint_v,
+                                is_base_vault: false,
+                                last_balance: std::sync::atomic::AtomicU64::new(0),
+                                last_used_at: Instant::now(),
+                                pinned: false,
+                                pin: None,
+                                active_id: None,
+                                bin_step: None,
+                            }
+                        });
+                    }
                 }
                 if vaults_changed {
-                    let vault_list: Vec<Pubkey> =
-                        ctx.tracked_vaults.read().keys().copied().collect();
-                    let _ = ctx.tracked_vaults_tx.send(vault_list);
+                    ctx.sync_geyser_tracked_accounts();
                     debug!(
                         pool = %account_update.pubkey,
                         vault_base = %vault_base,
@@ -7176,39 +7993,49 @@ async fn handle_geyser_account(
             if let CachedPoolState::Meteora(s) = &cached_state {
                 let dex_str = "meteora_dlmm".to_string();
                 let mut vaults_changed = false;
-                {
-                    let mut vaults = ctx.tracked_vaults.write();
-                    vaults.entry(s.reserve_x).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: account_update.pubkey,
-                            dex: dex_str.clone(),
-                            base_mint: s.token_x_mint,
-                            quote_mint: s.token_y_mint,
-                            is_base_vault: true,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            active_id: Some(s.active_id),
-                            bin_step: Some(s.bin_step),
-                        }
-                    });
-                    vaults.entry(s.reserve_y).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: account_update.pubkey,
-                            dex: dex_str,
-                            base_mint: s.token_x_mint,
-                            quote_mint: s.token_y_mint,
-                            is_base_vault: false,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            active_id: Some(s.active_id),
-                            bin_step: Some(s.bin_step),
-                        }
-                    });
+                if ctx.admit_geyser_explicit_pool_assets(
+                    account_update.pubkey,
+                    s.token_x_mint,
+                    s.token_y_mint,
+                ) {
+                    {
+                        let mut vaults = ctx.tracked_vaults.write();
+                        vaults.entry(s.reserve_x).or_insert_with(|| {
+                            vaults_changed = true;
+                            VaultInfo {
+                                pool_address: account_update.pubkey,
+                                dex: dex_str.clone(),
+                                base_mint: s.token_x_mint,
+                                quote_mint: s.token_y_mint,
+                                is_base_vault: true,
+                                last_balance: std::sync::atomic::AtomicU64::new(0),
+                                last_used_at: Instant::now(),
+                                pinned: false,
+                                pin: None,
+                                active_id: Some(s.active_id),
+                                bin_step: Some(s.bin_step),
+                            }
+                        });
+                        vaults.entry(s.reserve_y).or_insert_with(|| {
+                            vaults_changed = true;
+                            VaultInfo {
+                                pool_address: account_update.pubkey,
+                                dex: dex_str,
+                                base_mint: s.token_x_mint,
+                                quote_mint: s.token_y_mint,
+                                is_base_vault: false,
+                                last_balance: std::sync::atomic::AtomicU64::new(0),
+                                last_used_at: Instant::now(),
+                                pinned: false,
+                                pin: None,
+                                active_id: Some(s.active_id),
+                                bin_step: Some(s.bin_step),
+                            }
+                        });
+                    }
                 }
                 if vaults_changed {
-                    let vault_list: Vec<Pubkey> =
-                        ctx.tracked_vaults.read().keys().copied().collect();
-                    let _ = ctx.tracked_vaults_tx.send(vault_list);
+                    ctx.sync_geyser_tracked_accounts();
                     debug!(
                         pool = %account_update.pubkey,
                         reserve_x = %s.reserve_x,
@@ -7418,39 +8245,49 @@ async fn handle_geyser_account(
                 {
                     let dex_str = "pump_amm".to_string();
                     let mut vaults_changed = false;
-                    {
-                        let mut vaults = ctx.tracked_vaults.write();
-                        vaults.entry(s.pool_base_token_account).or_insert_with(|| {
-                            vaults_changed = true;
-                            VaultInfo {
-                                pool_address: account_update.pubkey,
-                                dex: dex_str.clone(),
-                                base_mint: s.base_mint,
-                                quote_mint: s.quote_mint,
-                                is_base_vault: true,
-                                last_balance: std::sync::atomic::AtomicU64::new(0),
-                                active_id: None,
-                                bin_step: None,
-                            }
-                        });
-                        vaults.entry(s.pool_quote_token_account).or_insert_with(|| {
-                            vaults_changed = true;
-                            VaultInfo {
-                                pool_address: account_update.pubkey,
-                                dex: dex_str,
-                                base_mint: s.base_mint,
-                                quote_mint: s.quote_mint,
-                                is_base_vault: false,
-                                last_balance: std::sync::atomic::AtomicU64::new(0),
-                                active_id: None,
-                                bin_step: None,
-                            }
-                        });
+                    if ctx.admit_geyser_explicit_pool_assets(
+                        account_update.pubkey,
+                        s.base_mint,
+                        s.quote_mint,
+                    ) {
+                        {
+                            let mut vaults = ctx.tracked_vaults.write();
+                            vaults.entry(s.pool_base_token_account).or_insert_with(|| {
+                                vaults_changed = true;
+                                VaultInfo {
+                                    pool_address: account_update.pubkey,
+                                    dex: dex_str.clone(),
+                                    base_mint: s.base_mint,
+                                    quote_mint: s.quote_mint,
+                                    is_base_vault: true,
+                                    last_balance: std::sync::atomic::AtomicU64::new(0),
+                                    last_used_at: Instant::now(),
+                                    pinned: false,
+                                    pin: None,
+                                    active_id: None,
+                                    bin_step: None,
+                                }
+                            });
+                            vaults.entry(s.pool_quote_token_account).or_insert_with(|| {
+                                vaults_changed = true;
+                                VaultInfo {
+                                    pool_address: account_update.pubkey,
+                                    dex: dex_str,
+                                    base_mint: s.base_mint,
+                                    quote_mint: s.quote_mint,
+                                    is_base_vault: false,
+                                    last_balance: std::sync::atomic::AtomicU64::new(0),
+                                    last_used_at: Instant::now(),
+                                    pinned: false,
+                                    pin: None,
+                                    active_id: None,
+                                    bin_step: None,
+                                }
+                            });
+                        }
                     }
                     if vaults_changed {
-                        let vault_list: Vec<Pubkey> =
-                            ctx.tracked_vaults.read().keys().copied().collect();
-                        let _ = ctx.tracked_vaults_tx.send(vault_list);
+                        ctx.sync_geyser_tracked_accounts();
                         debug!(
                             pool = %account_update.pubkey,
                             base_vault = %s.pool_base_token_account,
@@ -8104,18 +8941,13 @@ async fn handle_geyser_transaction(
             ParsedDexEvent::BondingCurveUpdate { .. } => None, // Handled separately in account update
         };
         if let Some((mint, dex_opt)) = mint_and_dex {
-            let mut tracked = ctx.tracked_mints.write();
-            if tracked.insert(mint) {
-                // Push updated list to geyser listener (resubscribe)
-                let updated: Vec<Pubkey> = tracked.iter().copied().collect();
-                let _ = ctx.tracked_mints_tx.send(updated);
-
-                // Geyser delivers mint accounts via AccountsDB snapshot when subscribed.
-                // tracked_mints_tx already sent above → GeyserListener will resubscribe.
+            let is_new = ctx.track_mint_for_geyser_metadata(mint, None);
+            if is_new {
+                ctx.sync_geyser_tracked_accounts();
                 debug!(
                     mint = %mint,
                     dex = ?dex_opt,
-                    "New mint tracked, waiting for Geyser mint account delivery"
+                    "New mint tracked for Geyser metadata, waiting for mint account delivery"
                 );
             }
         }
@@ -8144,6 +8976,12 @@ async fn handle_geyser_transaction(
             }
             _ => {}
         }
+    }
+
+    // PR-B: qualifying swap trade — refresh LRU timestamps and register reserve vaults / DLMM bins.
+    if let Some(ParsedDexEvent::Trade { pool_address, .. }) = parsed_event.as_ref() {
+        ctx.touch_tracked_pool_vaults_and_bins(*pool_address);
+        ctx.register_geyser_reserves_after_trade(*pool_address);
     }
 
     // Pump.fun: propagate creator/dev wallet so strategy can build deterministic intents.
@@ -8786,6 +9624,7 @@ async fn run_geyser_loop(
         let mut bin_arrays_rx = tracked_bin_arrays_rx;
         let mut wallet_rx = tracked_wallet_rx;
         let combined_tx = combined_tracked_tx;
+        let ctx_merge = Arc::clone(&ctx);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -8805,7 +9644,10 @@ async fn run_geyser_loop(
                 combined.extend(wallet_accounts);
                 combined.sort();
                 combined.dedup();
+                let n = combined.len();
                 let _ = combined_tx.send(combined);
+                geyser_metrics_set_subscription_accounts(n);
+                ctx_merge.refresh_geyser_pins_gauge();
             }
         });
     }
@@ -8816,6 +9658,7 @@ async fn run_geyser_loop(
             geyser_url.to_string(),
             program_ids,
             combined_tracked_rx,
+            Arc::clone(&ctx.geyser_full_reconnect_threshold_live),
         );
 
     // Spawn Geyser listener task
@@ -9467,15 +10310,11 @@ async fn run_geyser_loop(
                                             ctx.live_pool_cache.set_mint_decimals(mint, d);
                                         }
 
-                                        // 3) Track mint so Geyser will deliver the mint account
-                                        let mut added_mint = false;
-                                        {
-                                            let mut tracked = ctx.tracked_mints.write();
-                                            if tracked.insert(mint) {
-                                                added_mint = true;
-                                                let updated: Vec<Pubkey> = tracked.iter().copied().collect();
-                                                let _ = ctx.tracked_mints_tx.send(updated);
-                                            }
+                                        // 3) Track mint so Geyser will deliver the mint account (wallet-pinned).
+                                        let added_mint =
+                                            ctx.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet));
+                                        if added_mint {
+                                            ctx.sync_geyser_tracked_accounts();
                                         }
 
                                         // 4) Recompute tracked wallet accounts and notify listener
@@ -9616,17 +10455,14 @@ async fn run_geyser_loop(
                     "Pool discovered via Geyser"
                 );
 
-                // Track base mint for metadata fetching - GEYSER-FIRST: No RPC calls!
-                let mut tracked = ctx.tracked_mints.write();
-                if tracked.insert(pool_event.base_mint) {
-                    let updated: Vec<Pubkey> = tracked.iter().copied().collect();
-                    let _ = ctx.tracked_mints_tx.send(updated);
-
-                    // For Pump.fun/PumpAMM: emit TokenMintInfo immediately with known decimals=6.
-                    // For other DEXes: Geyser will deliver the mint account when subscribed.
-                    // Note: PoolDexType only has PumpFun (legacy bonding), PumpAMM is detected via transaction parsing
-                    let is_pump = matches!(pool_event.dex_type, PoolDexType::PumpFun);
-                    if is_pump {
+                // PR-B: discovery-only must not grow explicit Geyser mint/vault/bin subscriptions.
+                // Pump.fun still emits TokenMintInfo with known decimals=6 (no extra mint account filter).
+                if matches!(pool_event.dex_type, PoolDexType::PumpFun) {
+                    let emit_mint_info = ctx
+                        .pumpfun_pool_discovery_mint_info_emitted
+                        .write()
+                        .insert(pool_event.base_mint);
+                    if emit_mint_info {
                         let mint_event = MarketEvent::new(
                             "market-data",
                             BUILD_VERSION,
@@ -9644,9 +10480,11 @@ async fn run_geyser_loop(
                             },
                         );
                         let _ = mint_info_tx.send(mint_event);
-                        debug!(mint = %pool_event.base_mint, "Emitted TokenMintInfo for pump.fun token (decimals=6, no RPC)");
+                        debug!(
+                            mint = %pool_event.base_mint,
+                            "Emitted TokenMintInfo for pump.fun token (decimals=6, no RPC)"
+                        );
                     }
-                    // For other DEXes: Geyser subscription handles it - no RPC call needed.
                 }
 
                 // Convert to MarketEvent::PoolCreated
@@ -9811,101 +10649,8 @@ async fn run_geyser_loop(
                         }
                     }
 
-                    // Track vault accounts for PoolStateUpdate events (Geyser-based reserve balances)
-                    // This enables real-time reserve tracking without RPC calls.
-                    let dex_str = pool_event.dex_type.to_string();
-                    // DLMM-specific: pass active_id/bin_step for Option D (Bin Array Traversierung)
-                    let dlmm_active_id = pool_event.active_id;
-                    let dlmm_bin_step = pool_event.bin_step;
-                    let mut vaults_changed = false;
-                    {
-                        let mut vaults = ctx.tracked_vaults.write();
-                        if let Some(coin_vault) = pool_event.coin_vault {
-                            vaults.entry(coin_vault).or_insert_with(|| {
-                                vaults_changed = true;
-                                VaultInfo {
-                                    pool_address: pool_event.pool_address,
-                                    dex: dex_str.clone(),
-                                    base_mint: pool_event.base_mint,
-                                    quote_mint: pool_event.quote_mint,
-                                    is_base_vault: true,
-                                    last_balance: std::sync::atomic::AtomicU64::new(0),
-                                    active_id: dlmm_active_id,
-                                    bin_step: dlmm_bin_step,
-                                }
-                            });
-                        }
-                        if let Some(pc_vault) = pool_event.pc_vault {
-                            vaults.entry(pc_vault).or_insert_with(|| {
-                                vaults_changed = true;
-                                VaultInfo {
-                                    pool_address: pool_event.pool_address,
-                                    dex: dex_str.clone(),
-                                    base_mint: pool_event.base_mint,
-                                    quote_mint: pool_event.quote_mint,
-                                    is_base_vault: false,
-                                    last_balance: std::sync::atomic::AtomicU64::new(0),
-                                    active_id: dlmm_active_id,
-                                    bin_step: dlmm_bin_step,
-                                }
-                            });
-                        }
-                    }
-                    // Notify GeyserListener to resubscribe with new vault accounts
-                    if vaults_changed {
-                        let vault_list: Vec<Pubkey> = ctx.tracked_vaults.read().keys().copied().collect();
-                        let _ = ctx.tracked_vaults_tx.send(vault_list);
-                        debug!(
-                            pool = %pool_event.pool_address,
-                            coin_vault = ?pool_event.coin_vault,
-                            pc_vault = ?pool_event.pc_vault,
-                            "Registered vault accounts for PoolStateUpdate tracking"
-                        );
-                    }
-
-                    // Track Meteora DLMM Bin Array accounts for BinArrayUpdate events
-                    // This enables real-time liquidity tracking without RPC calls.
-                    if pool_event.dex_type == PoolDexType::MeteoraDlmm {
-                        // For Meteora DLMM, we need to subscribe to bin array accounts.
-                        // We derive PDAs for ±3 arrays around the active bin.
-                        // Use actual active_id/bin_step from pool_event (parsed in geyser_pool_discovery)
-                        let active_id = pool_event.active_id.unwrap_or(0);
-                        let active_array_index = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(active_id);
-                        let bin_step = pool_event.bin_step.unwrap_or(1);
-
-                        let mut bin_arrays_changed = false;
-                        {
-                            let mut bin_arrays = ctx.tracked_bin_arrays.write();
-                            // Register ±3 bin arrays around active bin
-                            for offset in -3i64..=3i64 {
-                                let index = active_array_index + offset;
-                                if let Ok(pda) = MeteoraDlmmSwapBuilder::derive_bin_array_pda(
-                                    &pool_event.pool_address,
-                                    index,
-                                ) {
-                                    bin_arrays.entry(pda).or_insert_with(|| {
-                                        bin_arrays_changed = true;
-                                        BinArrayInfo {
-                                            pool_address: pool_event.pool_address,
-                                            bin_array_index: index,
-                                            bin_step,
-                                        }
-                                    });
-                                }
-                            }
-                        }
-                        // Notify GeyserListener to resubscribe with new bin array accounts
-                        if bin_arrays_changed {
-                            let bin_array_list: Vec<Pubkey> = ctx.tracked_bin_arrays.read().keys().copied().collect();
-                            let num_arrays = bin_array_list.len();
-                            let _ = ctx.tracked_bin_arrays_tx.send(bin_array_list);
-                            debug!(
-                                pool = %pool_event.pool_address,
-                                arrays_tracked = num_arrays,
-                                "Registered Meteora DLMM bin array accounts for BinArrayUpdate tracking"
-                            );
-                        }
-                    }
+                    // PR-B: explicit Geyser vault/bin-array subscriptions are deferred until first trade,
+                    // active-pool pin (PR-D), or wallet-held mint admission — not pool_discovery alone.
                 }
             }
 
@@ -11325,5 +12070,216 @@ mod momentum_nats_subject_tests {
             bin_step: None,
         };
         assert!(!market_event_is_momentum_nats_relevant(&ps_pump_usdc));
+    }
+}
+
+#[cfg(test)]
+mod pr_b_geyser_tracking_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn lru_eviction_prefers_oldest_unpinned_vault() {
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let now = Instant::now();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            a,
+            VaultInfo {
+                pool_address: pool,
+                dex: "x".into(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                is_base_vault: true,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: now - Duration::from_secs(100),
+                pinned: false,
+                pin: None,
+                active_id: None,
+                bin_step: None,
+            },
+        );
+        map.insert(
+            b,
+            VaultInfo {
+                pool_address: pool,
+                dex: "x".into(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                is_base_vault: false,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: now - Duration::from_secs(10),
+                pinned: false,
+                pin: None,
+                active_id: None,
+                bin_step: None,
+            },
+        );
+        let oldest = map
+            .iter()
+            .filter(|(_, v)| !v.pinned)
+            .min_by_key(|(_, v)| v.last_used_at)
+            .map(|(k, _)| *k)
+            .expect("candidate");
+        assert_eq!(oldest, a);
+    }
+
+    #[test]
+    fn pinned_vault_not_selected_for_lru() {
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let now = Instant::now();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            a,
+            VaultInfo {
+                pool_address: pool,
+                dex: "x".into(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                is_base_vault: true,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: now - Duration::from_secs(1000),
+                pinned: true,
+                pin: Some(GeyserPinReason::Wallet),
+                active_id: None,
+                bin_step: None,
+            },
+        );
+        map.insert(
+            b,
+            VaultInfo {
+                pool_address: pool,
+                dex: "x".into(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                is_base_vault: false,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: now - Duration::from_secs(1),
+                pinned: false,
+                pin: None,
+                active_id: None,
+                bin_step: None,
+            },
+        );
+        let oldest = map
+            .iter()
+            .filter(|(_, v)| !v.pinned)
+            .min_by_key(|(_, v)| v.last_used_at)
+            .map(|(k, _)| *k)
+            .expect("candidate");
+        assert_eq!(oldest, b);
+    }
+
+    #[test]
+    fn active_pool_set_pin_api_roundtrip() {
+        let s = ActivePoolSet::new();
+        let mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        assert!(!s.is_pinned(mint, pool));
+        s.pin_pool(mint, pool);
+        assert!(s.is_pinned(mint, pool));
+        s.unpin_pool(mint, pool);
+        assert!(!s.is_pinned(mint, pool));
+    }
+
+    /// Bugbot PR-146: paired vault eviction must never pick a pinned sibling for `lru_cap_pair`.
+    #[test]
+    fn geyser_sibling_evict_helper_skips_pinned_leg() {
+        let pool = Pubkey::new_unique();
+        let base_pk = Pubkey::new_unique();
+        let quote_pk = Pubkey::new_unique();
+        let now = Instant::now();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            base_pk,
+            VaultInfo {
+                pool_address: pool,
+                dex: "x".into(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                is_base_vault: true,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: now,
+                pinned: false,
+                pin: None,
+                active_id: None,
+                bin_step: None,
+            },
+        );
+        map.insert(
+            quote_pk,
+            VaultInfo {
+                pool_address: pool,
+                dex: "x".into(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                is_base_vault: false,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: now,
+                pinned: true,
+                pin: Some(GeyserPinReason::Wallet),
+                active_id: None,
+                bin_step: None,
+            },
+        );
+        assert_eq!(
+            MarketDataContext::geyser_unpinned_sibling_vault_pubkey(&map, pool, true),
+            None
+        );
+        assert!(MarketDataContext::geyser_pinned_sibling_vault_present(
+            &map, pool, true
+        ));
+    }
+
+    #[test]
+    fn geyser_sibling_evict_helper_co_evicts_unpinned_partner() {
+        let pool = Pubkey::new_unique();
+        let base_pk = Pubkey::new_unique();
+        let quote_pk = Pubkey::new_unique();
+        let now = Instant::now();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            base_pk,
+            VaultInfo {
+                pool_address: pool,
+                dex: "x".into(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                is_base_vault: true,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: now,
+                pinned: false,
+                pin: None,
+                active_id: None,
+                bin_step: None,
+            },
+        );
+        map.insert(
+            quote_pk,
+            VaultInfo {
+                pool_address: pool,
+                dex: "x".into(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                is_base_vault: false,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: now,
+                pinned: false,
+                pin: None,
+                active_id: None,
+                bin_step: None,
+            },
+        );
+        assert_eq!(
+            MarketDataContext::geyser_unpinned_sibling_vault_pubkey(&map, pool, true),
+            Some(quote_pk)
+        );
+        assert!(!MarketDataContext::geyser_pinned_sibling_vault_present(
+            &map, pool, true
+        ));
     }
 }
