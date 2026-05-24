@@ -1118,10 +1118,14 @@ impl PersistedPosition {
         let exit_generated_at =
             exit_elapsed_ms.and_then(|ms| Instant::now().checked_sub(Duration::from_millis(ms)));
 
+        // Never fall back to `current_price`: it may reflect PoolCache reserve marks only
+        // (I-13 / trade-based trailing). Prefer trade-session fields from the snapshot.
         let trade_mark_tps = if self.trade_mark_tps > 0.0 && self.trade_mark_tps.is_finite() {
             self.trade_mark_tps
+        } else if self.highest_price > 0.0 && self.highest_price.is_finite() {
+            self.highest_price
         } else {
-            self.current_price
+            self.entry_price
         };
         PositionTracker {
             mint: self.mint.clone(),
@@ -1268,7 +1272,7 @@ impl PositionTracker {
         self.trailing_active = false;
         self.recent_trades.clear();
         if scale_in_confirmed_slot > 0 {
-            self.entry_confirmed_slot = scale_in_confirmed_slot;
+            self.entry_confirmed_slot = self.entry_confirmed_slot.max(scale_in_confirmed_slot);
         }
 
         info!(
@@ -7928,6 +7932,28 @@ impl MomentumContext {
     }
 }
 
+/// `tokens_per_sol` for one confirmed BUY execution (same fill ratio as live `open_position`).
+fn buy_fill_tokens_per_sol_from_execution(exec: &ExecutionResult) -> Option<f64> {
+    let fill_out = exec.fill_out.as_ref()?;
+    let exec_sol = exec
+        .wallet_sol_delta_lamports
+        .map(|d| d.unsigned_abs() as u64)
+        .or_else(|| exec.fill_in.as_ref().map(|f| f.raw))
+        .unwrap_or(0);
+    let sol_ui_for_price = exec
+        .fill_in
+        .as_ref()
+        .map(|a| a.ui_f64())
+        .unwrap_or(exec_sol as f64 / 1_000_000_000.0)
+        .max(0.0);
+    let tok_ui = fill_out.ui_f64().max(0.0);
+    if sol_ui_for_price > 0.0 {
+        Some(tok_ui / sol_ui_for_price)
+    } else {
+        None
+    }
+}
+
 /// Recover open positions from execution_results JSONL after restart
 ///
 /// P0: Critical for preventing "forgotten" tokens that never get sold.
@@ -8187,9 +8213,28 @@ async fn recover_positions_from_jsonl(
             tracker.entry_confirmed_slot = max_buy_slot;
             tracker.last_price_slot = max_buy_slot;
 
+            // Probe + scale-in: match live `add_investment` trailing baseline (last BUY fill tps).
+            if valid_fills > 1 {
+                if let Some(last_exec) = execs
+                    .iter()
+                    .max_by_key(|e| (e.confirmed_slot.unwrap_or(0), e.header.ts_unix_ms))
+                {
+                    if let Some(leg_tps) = buy_fill_tokens_per_sol_from_execution(last_exec) {
+                        if leg_tps > 0.0 && leg_tps.is_finite() {
+                            tracker.highest_price = leg_tps;
+                            tracker.trade_mark_tps = leg_tps;
+                            tracker.current_price = leg_tps;
+                            tracker.trailing_active = false;
+                        }
+                    }
+                }
+            }
+
             // Override entry_time to match actual trade time
             tracker.entry_time = entry_time_estimate;
-            tracker.current_price = entry_price; // Will update from market events
+            if valid_fills <= 1 {
+                tracker.current_price = entry_price; // Will update from market events
+            }
 
             // Resolve token_program from execution metadata (best source for recovery)
             tracker.token_program = execs.iter().find_map(|exec| {
