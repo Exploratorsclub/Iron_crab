@@ -1274,6 +1274,10 @@ impl PositionTracker {
         if scale_in_confirmed_slot > 0 {
             self.entry_confirmed_slot = self.entry_confirmed_slot.max(scale_in_confirmed_slot);
         }
+        // Fresh slot gate for marks + trade prints: `update_position_price` / reserve hints reject
+        // `source_slot` <= `last_price_slot`. Without this reset, a pre-scale-in `last_price_slot`
+        // above the new `entry_confirmed_slot` can drop valid post-scale-in pool trades.
+        self.last_price_slot = 0;
 
         info!(
             mint = %self.mint,
@@ -8572,7 +8576,8 @@ async fn main() -> Result<()> {
         let mut positions = HashMap::new();
         let mut merged_count = 0u32;
         for (mint, jsonl_tracker) in &jsonl_positions {
-            let tracker = if let Some(kv_tracker) = kv_positions.get(mint) {
+            let mut tracker = jsonl_tracker.clone();
+            if let Some(kv_tracker) = kv_positions.get(mint) {
                 // Both sources: prefer JSONL — it sums ALL BUY fills (probe+scale).
                 // KV can be stale (saved after probe, before scale was processed).
                 if jsonl_tracker.token_amount > kv_tracker.token_amount {
@@ -8583,11 +8588,16 @@ async fn main() -> Result<()> {
                         jsonl_tokens = jsonl_tracker.token_amount,
                         "Probe+Scale merge: JSONL has full amount (KV was probe-only)"
                     );
+                } else if jsonl_tracker.token_amount == kv_tracker.token_amount {
+                    // JSONL reproduces scale-in fill baseline only; KV may hold post-scale trade path +
+                    // trailing latch from live updates — do not rewind TRAILING_STOP inputs.
+                    tracker.trade_mark_tps = kv_tracker.trade_mark_tps;
+                    tracker.highest_price = kv_tracker.highest_price;
+                    tracker.trailing_active = kv_tracker.trailing_active;
+                    tracker.last_price_slot = kv_tracker.last_price_slot;
+                    tracker.current_price = kv_tracker.current_price;
                 }
-                jsonl_tracker.clone()
-            } else {
-                jsonl_tracker.clone()
-            };
+            }
             positions.insert(mint.clone(), tracker);
         }
         for (mint, kv_tracker) in kv_positions {
@@ -11911,10 +11921,15 @@ mod tests {
             token_amount: 1,
             signature: "s".to_string(),
         });
+        pos.last_price_slot = 50_000;
         pos.add_investment(500_000_000, 90.0, 9_000);
         assert!((pos.highest_price - 90.0).abs() < 1e-9);
         assert!(!pos.trailing_active);
         assert_eq!(pos.entry_confirmed_slot, 9_000);
+        assert_eq!(
+            pos.last_price_slot, 0,
+            "scale-in resets slot gate for trade-mark updates"
+        );
         assert!((pos.trade_mark_tps - 90.0).abs() < 1e-9);
         assert!((pos.current_price - 90.0).abs() < 1e-9);
         assert!(pos.recent_trades.is_empty());
