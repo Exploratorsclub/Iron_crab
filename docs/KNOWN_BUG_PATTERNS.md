@@ -377,6 +377,16 @@
 
 ---
 
+## 37. Pump.fun Trade-Parser: Wallet-Brutto-Delta statt Swap-SOL (I-14)
+
+| Symptom | Session High / TRAILING zeigt z. B. starken Schein-Gewinn waehrend Chart/MC stabil bleiben. `tokens_per_sol` aus Geyser-Trades divergiert von Fill-/Chart-Preisen; besonders bei kleinen Swaps (Fees dominieren). |
+|---------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | `dex_parser` setzte `sol_amount` fuer Pump.fun **BUY** auf `calculate_native_balance_change` des Fee-Payers (Wallet-Brutto inkl. Base Fee, Priority, Jito-Tip, ATA-Rent), nicht auf die in die Bonding Curve fliessende Swap-SOL. |
+| **Fix** | Bonding-curve **native inflow** (pre/post) fuer Legacy-`buy`; `buy_exact_sol_in`: `spendable_sol_in` aus Instruction-Bytes `[8..16]`; PumpSwap `buy_exact_quote_in`: `amount_in` wie Raydium. Kein Trade-Preis aus Wallet-Gross fuer BUY. |
+| **Pruefen bei** | `parse_pumpfun_swap`, `parse_pumpfun_buy_exact_sol_in`, `parse_pumpfun_amm_transaction`, neue Pump.fun IX-Varianten |
+
+---
+
 ## Quick-Check: Bei neuem Bug
 
 1. Sieht das wie eines der Muster oben?
