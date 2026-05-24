@@ -6,7 +6,7 @@
 //! Source of Truth: docs/TARGET_ARCHITECTURE.md §2.1
 //! Supports: Raydium AMM V4, Orca Whirlpool, PumpFun
 
-use crate::solana::dex::pumpfun::BondingCurveState;
+use crate::solana::dex::pumpfun::{BondingCurveState, PUMPFUN_BUY_EXACT_SOL_IN_DISCRIMINATOR};
 use crate::solana::dex::pumpfun_amm::{
     pump_amm_sell_ix_discriminator, PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS,
 };
@@ -807,6 +807,9 @@ fn parse_pumpfun_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
     if disc == PUMPFUN_CREATE {
         return parse_pumpfun_create(update);
     }
+    if disc == PUMPFUN_BUY_EXACT_SOL_IN_DISCRIMINATOR {
+        return parse_pumpfun_buy_exact_sol_in(update);
+    }
     if disc == PUMPFUN_BUY {
         return parse_pumpfun_swap(update, true);
     }
@@ -870,6 +873,149 @@ fn parse_pumpfun_create(update: &GeyserTransactionUpdate) -> Option<ParsedDexEve
     })
 }
 
+fn build_pumpfun_trade_event(
+    update: &GeyserTransactionUpdate,
+    bonding_curve: Pubkey,
+    mint: Pubkey,
+    trader: Pubkey,
+    is_buy: bool,
+    sol_amount: u64,
+    token_amount: u64,
+) -> ParsedDexEvent {
+    let token_decimals = get_token_decimals(&update.post_token_balances, &mint);
+    let creator: Option<Pubkey> = None;
+
+    let spl_token_str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    let token_2022_str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+    let token_program = update
+        .post_token_balances
+        .iter()
+        .find(|b| Pubkey::from_str(&b.mint).ok() == Some(mint))
+        .and_then(|b| b.program_id.as_ref())
+        .and_then(|p| Pubkey::from_str(p).ok())
+        .filter(|tp| {
+            let tp_str = tp.to_string();
+            tp_str == spl_token_str || tp_str == token_2022_str
+        });
+
+    if let Some(ref tp) = token_program {
+        debug!(
+            mint = %mint,
+            token_program = %tp,
+            sig = %update.signature,
+            "PumpFun swap: extracted token_program from post_token_balances"
+        );
+    } else {
+        debug!(
+            mint = %mint,
+            sig = %update.signature,
+            "PumpFun swap: no token_program in post_token_balances (fallback to None)"
+        );
+    }
+
+    debug!(
+        pool = %bonding_curve,
+        mint = %mint,
+        trader = %trader,
+        is_buy = is_buy,
+        sol_amount = sol_amount,
+        token_amount = token_amount,
+        sig = %update.signature,
+        "PumpFun swap detected"
+    );
+
+    ParsedDexEvent::Trade {
+        pool_address: bonding_curve,
+        mint,
+        quote_mint: *SOL_MINT_PUBKEY,
+        trader,
+        dex: DexType::PumpFun,
+        is_buy,
+        sol_amount,
+        token_amount,
+        token_decimals,
+        signature: update.signature.clone(),
+        slot: update.slot,
+        pool_accounts: None,
+        creator,
+        token_program,
+        pump_amm_sell_requires_cashback_remaining: false,
+        pump_amm_sell_cashback_third_meta: None,
+        pump_amm_sell_extended_tail_0: None,
+        pump_amm_sell_extended_tail_1: None,
+    }
+}
+
+fn parse_pumpfun_buy_exact_sol_in(update: &GeyserTransactionUpdate) -> Option<ParsedDexEvent> {
+    if update.instruction_accounts.len() < 7 {
+        return None;
+    }
+    if update.instruction_data.len() < 24 {
+        return None;
+    }
+
+    let mint = update.instruction_accounts[2];
+    let bonding_curve = update.instruction_accounts[3];
+    let trader = update
+        .account_keys
+        .first()
+        .copied()
+        .unwrap_or(update.instruction_accounts[6]);
+
+    let swap_sol_used = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
+    let wallet_gross_delta = calculate_native_balance_change(
+        &update.account_keys,
+        &update.pre_balances,
+        &update.post_balances,
+        &trader,
+    )
+    .unwrap_or(0);
+
+    let tokens_received = calculate_token_balance_change(
+        &update.pre_token_balances,
+        &update.post_token_balances,
+        &mint,
+    )
+    .unwrap_or(0);
+
+    if tokens_received == 0 {
+        trace!(
+            sig = %update.signature,
+            "PumpFun buy_exact_sol_in: zero token delta; skip"
+        );
+        return None;
+    }
+
+    let token_decimals = get_token_decimals(&update.post_token_balances, &mint);
+    let token_ui = tokens_received as f64 / 10f64.powi(i32::from(token_decimals));
+    let sol_ui = swap_sol_used as f64 / 1e9;
+    let approx_tps = if sol_ui > f64::EPSILON {
+        token_ui / sol_ui
+    } else {
+        0.0
+    };
+
+    trace!(
+        sig = %update.signature,
+        wallet_gross_delta,
+        swap_sol_used,
+        tokens = tokens_received,
+        approx_tps,
+        "PumpFun buy_exact_sol_in parsed (swap SOL from ix)"
+    );
+
+    Some(build_pumpfun_trade_event(
+        update,
+        bonding_curve,
+        mint,
+        trader,
+        true,
+        swap_sol_used,
+        tokens_received,
+    ))
+}
+
 fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<ParsedDexEvent> {
     // PumpFun BUY/SELL instruction accounts:
     // [0]: Global
@@ -911,17 +1057,36 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
     let _quote_mint =
         Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap_or_default();
 
-    // Calculate actual amounts from native and token balance changes
-    // SOL is native balance, tokens from token_balances
     let (sol_amount, token_amount) = if is_buy {
-        // BUY: Calculate SOL spent from native balance
-        let sol_spent = calculate_native_balance_change(
+        let wallet_gross_delta = calculate_native_balance_change(
             &update.account_keys,
             &update.pre_balances,
             &update.post_balances,
             &trader,
         )
         .unwrap_or(0);
+
+        let curve_delta = native_lamports_signed_delta(
+            &update.account_keys,
+            &update.pre_balances,
+            &update.post_balances,
+            &bonding_curve,
+        );
+
+        let swap_sol_used = curve_delta
+            .filter(|&d| d > 0)
+            .and_then(|d| u64::try_from(d).ok());
+
+        let Some(swap_sol_used) = swap_sol_used else {
+            trace!(
+                sig = %update.signature,
+                ?curve_delta,
+                wallet_gross_delta,
+                bonding_curve = %bonding_curve,
+                "PumpFun legacy BUY: bonding curve native inflow missing or non-positive; skip trade (max_sol_cost not used for price)"
+            );
+            return None;
+        };
 
         let tokens_received = calculate_token_balance_change(
             &update.pre_token_balances,
@@ -930,10 +1095,46 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
         )
         .unwrap_or(0);
 
-        (sol_spent, tokens_received)
+        if tokens_received == 0 {
+            trace!(
+                sig = %update.signature,
+                "PumpFun legacy BUY: zero token delta; skip"
+            );
+            return None;
+        }
+
+        let token_decimals = get_token_decimals(&update.post_token_balances, &mint);
+        let token_ui = tokens_received as f64 / 10f64.powi(i32::from(token_decimals));
+        let sol_ui = swap_sol_used as f64 / 1e9;
+        let approx_tps = if sol_ui > f64::EPSILON {
+            token_ui / sol_ui
+        } else {
+            0.0
+        };
+
+        trace!(
+            sig = %update.signature,
+            wallet_gross_delta,
+            swap_sol_used,
+            tokens = tokens_received,
+            approx_tps,
+            "PumpFun legacy BUY parsed (swap SOL = bonding curve inflow)"
+        );
+
+        (swap_sol_used, tokens_received)
     } else {
-        // SELL: Calculate SOL received from native balance
-        let sol_received = calculate_native_balance_change(
+        let curve_delta = native_lamports_signed_delta(
+            &update.account_keys,
+            &update.pre_balances,
+            &update.post_balances,
+            &bonding_curve,
+        );
+
+        let swap_sol_out = curve_delta
+            .filter(|&d| d < 0)
+            .and_then(|d| u64::try_from(-d).ok());
+
+        let wallet_sol_delta = calculate_native_balance_change(
             &update.account_keys,
             &update.pre_balances,
             &update.post_balances,
@@ -941,83 +1142,28 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
         )
         .unwrap_or(0);
 
-        (sol_received, token_amount_param)
-    };
-
-    debug!(
-        pool = %bonding_curve,
-        mint = %mint,
-        trader = %trader,
-        is_buy = is_buy,
-        sol_amount = sol_amount,
-        token_amount = token_amount,
-        sig = %update.signature,
-        "PumpFun swap detected"
-    );
-
-    let token_decimals = get_token_decimals(&update.post_token_balances, &mint);
-
-    // NOTE: Do NOT extract creator from swap instruction accounts!
-    // account[1] is Fee Recipient, not the token creator.
-    // Creator must come from:
-    // 1. PoolCreated event (instruction_accounts[7] in CREATE)
-    // 2. market-data creator_cache (populated from PoolCreated)
-    // 3. On-chain bonding curve state (if cache miss)
-    let creator: Option<Pubkey> = None;
-
-    // Extract Token Program from post_token_balances (authoritative source).
-    // This is more reliable than instruction_accounts position which can vary
-    // depending on CPI calls, routing changes, or program updates.
-    // PumpFun now supports both SPL Token AND Token-2022 mints.
-    let spl_token_str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-    let token_2022_str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-
-    let token_program = update
-        .post_token_balances
-        .iter()
-        .find(|b| Pubkey::from_str(&b.mint).ok() == Some(mint))
-        .and_then(|b| b.program_id.as_ref())
-        .and_then(|p| Pubkey::from_str(p).ok())
-        .filter(|tp| {
-            let tp_str = tp.to_string();
-            tp_str == spl_token_str || tp_str == token_2022_str
+        let sol_to_trader = swap_sol_out.unwrap_or_else(|| {
+            trace!(
+                sig = %update.signature,
+                ?curve_delta,
+                wallet_sol_delta,
+                "PumpFun SELL: curve outflow unavailable; using trader wallet native delta"
+            );
+            wallet_sol_delta
         });
 
-    if let Some(ref tp) = token_program {
-        debug!(
-            mint = %mint,
-            token_program = %tp,
-            sig = %update.signature,
-            "PumpFun swap: extracted token_program from post_token_balances"
-        );
-    } else {
-        debug!(
-            mint = %mint,
-            sig = %update.signature,
-            "PumpFun swap: no token_program in post_token_balances (fallback to None)"
-        );
-    }
+        (sol_to_trader, token_amount_param)
+    };
 
-    Some(ParsedDexEvent::Trade {
-        pool_address: bonding_curve,
+    Some(build_pumpfun_trade_event(
+        update,
+        bonding_curve,
         mint,
-        quote_mint: *SOL_MINT_PUBKEY,
         trader,
-        dex: DexType::PumpFun,
         is_buy,
         sol_amount,
         token_amount,
-        token_decimals,
-        signature: update.signature.clone(),
-        slot: update.slot,
-        pool_accounts: None,
-        creator,
-        token_program,
-        pump_amm_sell_requires_cashback_remaining: false,
-        pump_amm_sell_cashback_third_meta: None,
-        pump_amm_sell_extended_tail_0: None,
-        pump_amm_sell_extended_tail_1: None,
-    })
+    ))
 }
 
 // ============================================================================
@@ -1209,7 +1355,6 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     // For BUY: user receives base tokens (token_amount), SOL from native balance
     // For SELL: user receives WSOL as native balance, tokens from token balance
     let (sol_amount, token_amount) = if is_buy {
-        // BUY: amount_in is SOL (from native balance), need to calculate tokens received
         let tokens_received = calculate_token_balance_change(
             &update.pre_token_balances,
             &update.post_token_balances,
@@ -1217,16 +1362,26 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         )
         .unwrap_or(0);
 
-        // Extract SOL spent from native balance (user account decreased)
-        let sol_spent = calculate_native_balance_change(
+        let wallet_gross_delta = calculate_native_balance_change(
             &update.account_keys,
             &update.pre_balances,
             &update.post_balances,
             &trader,
         )
-        .unwrap_or(amount_in); // Fallback to instruction amount
+        .unwrap_or(0);
 
-        (sol_spent, tokens_received)
+        const PUMP_AMM_BUY_WALLET_SOL_WARN_LAMPORTS: u64 = 50_000;
+        if wallet_gross_delta.abs_diff(amount_in) > PUMP_AMM_BUY_WALLET_SOL_WARN_LAMPORTS {
+            trace!(
+                sig = %update.signature,
+                wallet_gross_delta,
+                swap_sol_used = amount_in,
+                tokens = tokens_received,
+                "Pump.fun AMM BUY: wallet native delta differs from ix amount_in (fees/tips); using amount_in for price"
+            );
+        }
+
+        (amount_in, tokens_received)
     } else {
         // SELL: amount_in is tokens, need to calculate WSOL received from native balance
         let sol_received = calculate_native_balance_change(
@@ -1388,6 +1543,18 @@ fn calculate_native_balance_change(
     // For SELL: post > pre (user receives SOL)
     // For BUY: pre > post (user spends SOL)
     Some(post.abs_diff(pre))
+}
+
+fn native_lamports_signed_delta(
+    account_keys: &[Pubkey],
+    pre_balances: &[u64],
+    post_balances: &[u64],
+    account: &Pubkey,
+) -> Option<i128> {
+    let account_index = account_keys.iter().position(|k| k == account)?;
+    let pre = *pre_balances.get(account_index)? as i128;
+    let post = *post_balances.get(account_index)? as i128;
+    Some(post - pre)
 }
 
 /// Extract token decimals from token_balances
@@ -1765,6 +1932,7 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::solana::dex::pumpfun::PUMPFUN_BUY_EXACT_SOL_IN_DISCRIMINATOR;
     use crate::solana::geyser_listener::{GeyserTransactionUpdate, TokenAmount, TokenBalance};
     use std::time::Instant;
 
@@ -2076,6 +2244,340 @@ mod tests {
                 assert_eq!(pump_amm_sell_cashback_third_meta, Some(third_trailing));
                 assert_eq!(pump_amm_sell_extended_tail_0, Some(tail0));
                 assert_eq!(pump_amm_sell_extended_tail_1, Some(tail1));
+            }
+            _ => panic!("expected Trade"),
+        }
+    }
+
+    #[test]
+    fn mogemoji_eg_hj_buy_slot_594_tokens_per_sol_chart_compatible() {
+        const SPENDABLE_SOL_IN: u64 = 1_062_000;
+        const TOKEN_RAW: u64 = 4_096_007_510u64;
+
+        let trader = Pubkey::new_unique();
+        let g0 = Pubkey::new_unique();
+        let fee_r = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        let assoc_bc = Pubkey::new_unique();
+        let user_ata = Pubkey::new_unique();
+        let pumpfun = Pubkey::from_str(PUMPFUN_PROGRAM).unwrap();
+
+        let instruction_accounts = vec![g0, fee_r, mint, bonding_curve, assoc_bc, user_ata, trader];
+
+        let mut account_keys = vec![trader];
+        account_keys.extend_from_slice(&instruction_accounts);
+        account_keys.push(pumpfun);
+
+        let mut instruction_data = PUMPFUN_BUY_EXACT_SOL_IN_DISCRIMINATOR.to_vec();
+        instruction_data.extend_from_slice(&SPENDABLE_SOL_IN.to_le_bytes());
+        instruction_data.extend_from_slice(&1u64.to_le_bytes());
+        instruction_data.push(0u8);
+
+        let mint_str = mint.to_string();
+        let spl_token = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let user_ata_idx = account_keys.iter().position(|k| *k == user_ata).unwrap() as u8;
+
+        let pre_token = vec![TokenBalance {
+            account_index: user_ata_idx,
+            mint: mint_str.clone(),
+            ui_token_amount: TokenAmount {
+                ui_amount: None,
+                decimals: 6,
+                amount: "0".to_string(),
+            },
+            program_id: Some(spl_token.to_string()),
+        }];
+        let post_token = vec![TokenBalance {
+            account_index: user_ata_idx,
+            mint: mint_str,
+            ui_token_amount: TokenAmount {
+                ui_amount: None,
+                decimals: 6,
+                amount: TOKEN_RAW.to_string(),
+            },
+            program_id: Some(spl_token.to_string()),
+        }];
+
+        let pre_balances = vec![2_005_000u64; account_keys.len()];
+        let mut post_balances = pre_balances.clone();
+        post_balances[0] = 0;
+
+        let update = GeyserTransactionUpdate {
+            signature: "3PxnUrBbPWHqGKeQ1Gii8kYcGsVgE64v8YRjJR7utGqEMr1u2k9gGG3w6Mwb6LHJNpxVMbwae2dnrfwdc1YbJfcK"
+                .to_string(),
+            slot: 421_716_594,
+            account_keys,
+            instruction_accounts,
+            instruction_data,
+            inner_instructions: vec![],
+            pre_token_balances: pre_token,
+            post_token_balances: post_token,
+            pre_balances,
+            post_balances,
+            fee_lamports: 5000,
+            compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
+        };
+
+        let event = parse_transaction_update(&update).expect("parse buy_exact_sol_in");
+        match event {
+            ParsedDexEvent::Trade {
+                sol_amount,
+                token_amount,
+                token_decimals,
+                is_buy,
+                dex,
+                ..
+            } => {
+                assert_eq!(dex, DexType::PumpFun);
+                assert!(is_buy);
+                assert_eq!(sol_amount, SPENDABLE_SOL_IN);
+                assert_eq!(token_amount, TOKEN_RAW);
+                assert_eq!(token_decimals, 6);
+                let token_ui = token_amount as f64 / 10f64.powi(i32::from(token_decimals));
+                let sol_ui = sol_amount as f64 / 1e9;
+                let tps = token_ui / sol_ui;
+                let expected_mid = 3_856_425f64;
+                let lo = expected_mid * 0.98;
+                let hi = expected_mid * 1.02;
+                assert!(
+                    tps >= lo && tps <= hi,
+                    "tps {tps} not near chart-compatible ~3.86M (lo={lo}, hi={hi})"
+                );
+            }
+            _ => panic!("expected Trade"),
+        }
+    }
+
+    #[test]
+    fn buy_exact_sol_in_discriminator_routed() {
+        let trader = Pubkey::new_unique();
+        let g0 = Pubkey::new_unique();
+        let fee_r = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        let assoc_bc = Pubkey::new_unique();
+        let user_ata = Pubkey::new_unique();
+        let pumpfun = Pubkey::from_str(PUMPFUN_PROGRAM).unwrap();
+
+        let instruction_accounts = vec![g0, fee_r, mint, bonding_curve, assoc_bc, user_ata, trader];
+        let mut account_keys = vec![trader];
+        account_keys.extend_from_slice(&instruction_accounts);
+        account_keys.push(pumpfun);
+
+        let spendable: u64 = 500_000;
+        let mut instruction_data = PUMPFUN_BUY_EXACT_SOL_IN_DISCRIMINATOR.to_vec();
+        instruction_data.extend_from_slice(&spendable.to_le_bytes());
+        instruction_data.extend_from_slice(&1u64.to_le_bytes());
+        instruction_data.push(0u8);
+
+        let spl_token = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let mint_str = mint.to_string();
+        let user_ata_idx = account_keys.iter().position(|k| *k == user_ata).unwrap() as u8;
+        let pre_token = vec![TokenBalance {
+            account_index: user_ata_idx,
+            mint: mint_str.clone(),
+            ui_token_amount: TokenAmount {
+                ui_amount: None,
+                decimals: 6,
+                amount: "0".to_string(),
+            },
+            program_id: Some(spl_token.to_string()),
+        }];
+        let post_token = vec![TokenBalance {
+            account_index: user_ata_idx,
+            mint: mint_str,
+            ui_token_amount: TokenAmount {
+                ui_amount: None,
+                decimals: 6,
+                amount: "1000000".to_string(),
+            },
+            program_id: Some(spl_token.to_string()),
+        }];
+
+        let update = GeyserTransactionUpdate {
+            signature: "synth_buy_exact_sol".to_string(),
+            slot: 1,
+            account_keys,
+            instruction_accounts,
+            instruction_data,
+            inner_instructions: vec![],
+            pre_token_balances: pre_token,
+            post_token_balances: post_token,
+            pre_balances: vec![10_000_000; 9],
+            post_balances: vec![10_000_000; 9],
+            fee_lamports: 5000,
+            compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
+        };
+
+        let e = parse_transaction_update(&update).expect("routed");
+        match e {
+            ParsedDexEvent::Trade {
+                sol_amount, is_buy, ..
+            } => {
+                assert!(is_buy);
+                assert_eq!(sol_amount, spendable);
+            }
+            _ => panic!("expected Trade"),
+        }
+    }
+
+    #[test]
+    fn legacy_buy_curve_native_inflow_not_wallet_gross() {
+        const PUMPFUN_BUY_DISC: [u8; 8] = [0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea];
+        let trader = Pubkey::new_unique();
+        let g0 = Pubkey::new_unique();
+        let fee_r = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        let assoc_bc = Pubkey::new_unique();
+        let user_ata = Pubkey::new_unique();
+        let pumpfun = Pubkey::from_str(PUMPFUN_PROGRAM).unwrap();
+
+        let instruction_accounts = vec![g0, fee_r, mint, bonding_curve, assoc_bc, user_ata, trader];
+        let mut account_keys = vec![trader];
+        account_keys.extend_from_slice(&instruction_accounts);
+        account_keys.push(pumpfun);
+
+        let curve_idx = account_keys
+            .iter()
+            .position(|k| *k == bonding_curve)
+            .unwrap();
+
+        let pre_balances = vec![10_000_000_000u64; account_keys.len()];
+        let mut post_balances = pre_balances.clone();
+        post_balances[0] = pre_balances[0] - 6_000_000;
+        post_balances[curve_idx] = pre_balances[curve_idx] + 1_000_000;
+
+        let mut instruction_data = PUMPFUN_BUY_DISC.to_vec();
+        instruction_data.extend_from_slice(&500_000u64.to_le_bytes());
+        instruction_data.extend_from_slice(&10_000_000u64.to_le_bytes());
+
+        let spl_token = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let mint_str = mint.to_string();
+        let user_ata_idx = account_keys.iter().position(|k| *k == user_ata).unwrap() as u8;
+        let pre_token = vec![TokenBalance {
+            account_index: user_ata_idx,
+            mint: mint_str.clone(),
+            ui_token_amount: TokenAmount {
+                ui_amount: None,
+                decimals: 6,
+                amount: "0".to_string(),
+            },
+            program_id: Some(spl_token.to_string()),
+        }];
+        let post_token = vec![TokenBalance {
+            account_index: user_ata_idx,
+            mint: mint_str,
+            ui_token_amount: TokenAmount {
+                ui_amount: None,
+                decimals: 6,
+                amount: "1000000".to_string(),
+            },
+            program_id: Some(spl_token.to_string()),
+        }];
+
+        let update = GeyserTransactionUpdate {
+            signature: "legacy_buy_curve".to_string(),
+            slot: 2,
+            account_keys,
+            instruction_accounts,
+            instruction_data,
+            inner_instructions: vec![],
+            pre_token_balances: pre_token,
+            post_token_balances: post_token,
+            pre_balances,
+            post_balances,
+            fee_lamports: 5000,
+            compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
+        };
+
+        let e = parse_transaction_update(&update).expect("legacy buy");
+        match e {
+            ParsedDexEvent::Trade { sol_amount, .. } => {
+                assert_eq!(
+                    sol_amount, 1_000_000,
+                    "must use bonding curve inflow, not wallet gross 6M"
+                );
+            }
+            _ => panic!("expected Trade"),
+        }
+    }
+
+    #[test]
+    fn regression_raydium_buy_unchanged_uses_amount_in() {
+        const LEGACY_BUY_DISC: u8 = 11;
+        let trader = Pubkey::new_unique();
+        let spl_token = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let raydium = Pubkey::from_str(RAYDIUM_AMM_V4).unwrap();
+        let base_mint = Pubkey::new_unique();
+
+        let mut instruction_accounts = vec![spl_token, Pubkey::new_unique()];
+        while instruction_accounts.len() < 16 {
+            instruction_accounts.push(Pubkey::new_unique());
+        }
+        instruction_accounts.push(trader);
+
+        let mut account_keys = instruction_accounts.clone();
+        account_keys.push(raydium);
+
+        let amount_in: u64 = 12_345_678;
+        let mut instruction_data = vec![LEGACY_BUY_DISC];
+        instruction_data.extend_from_slice(&amount_in.to_le_bytes());
+        instruction_data.extend_from_slice(&1u64.to_le_bytes());
+
+        let mint_str = base_mint.to_string();
+        let pre_token = vec![TokenBalance {
+            account_index: 15,
+            mint: mint_str.clone(),
+            ui_token_amount: TokenAmount {
+                ui_amount: None,
+                decimals: 6,
+                amount: "0".to_string(),
+            },
+            program_id: Some(spl_token.to_string()),
+        }];
+        let post_token = vec![TokenBalance {
+            account_index: 15,
+            mint: mint_str,
+            ui_token_amount: TokenAmount {
+                ui_amount: None,
+                decimals: 6,
+                amount: "999000".to_string(),
+            },
+            program_id: Some(spl_token.to_string()),
+        }];
+
+        let update = GeyserTransactionUpdate {
+            signature: "raydium_buy_regression".to_string(),
+            slot: 3,
+            account_keys,
+            instruction_accounts,
+            instruction_data,
+            inner_instructions: vec![],
+            pre_token_balances: pre_token,
+            post_token_balances: post_token,
+            pre_balances: vec![5_000_000_000; 18],
+            post_balances: vec![5_000_000_000; 18],
+            fee_lamports: 5000,
+            compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
+        };
+
+        let e = parse_transaction_update(&update).expect("raydium parse");
+        match e {
+            ParsedDexEvent::Trade {
+                sol_amount,
+                is_buy,
+                dex,
+                ..
+            } => {
+                assert_eq!(dex, DexType::RaydiumAmmV4);
+                assert!(is_buy);
+                assert_eq!(sol_amount, amount_in);
             }
             _ => panic!("expected Trade"),
         }

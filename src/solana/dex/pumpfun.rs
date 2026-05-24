@@ -64,6 +64,9 @@ pub const PUMPFUN_FEE_PROGRAM: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6Voj
 /// See: pump-public-docs `BREAKING_FEE_RECIPIENT.md`.
 pub const PUMPFUN_BUYBACK_FEE_RECIPIENT: &str = "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD";
 
+/// Anchor instruction discriminator for buy_exact_sol_in (market order: exact SOL in).
+pub const PUMPFUN_BUY_EXACT_SOL_IN_DISCRIMINATOR: [u8; 8] = [56, 252, 116, 8, 158, 223, 205, 95];
+
 /// Borsh serialization of IDL `OptionBool` with inner `false` (one bool field → 1 byte).
 /// Pump.fun `buy` / `buy_exact_sol_in` require this as the third instruction-data argument.
 const TRACK_VOLUME_OPTION_BOOL_FALSE: u8 = 0;
@@ -501,7 +504,7 @@ impl PumpFunDex {
 
         // Data: discriminator(8) + spendable_sol_in(8) + min_tokens_out(8) + track_volume OptionBool(1)
         let mut data = Vec::with_capacity(25);
-        data.extend_from_slice(&[56, 252, 116, 8, 158, 223, 205, 95]);
+        data.extend_from_slice(&PUMPFUN_BUY_EXACT_SOL_IN_DISCRIMINATOR);
         data.extend_from_slice(&sol_amount.to_le_bytes());
         data.extend_from_slice(&min_tokens_out.to_le_bytes());
         data.push(TRACK_VOLUME_OPTION_BOOL_FALSE);
@@ -1558,8 +1561,8 @@ mod tests {
 
         assert_eq!(ix.data.len(), 25);
         assert_eq!(
-            ix.data[0..8],
-            [56, 252, 116, 8, 158, 223, 205, 95],
+            &ix.data[0..8],
+            &PUMPFUN_BUY_EXACT_SOL_IN_DISCRIMINATOR[..],
             "buy_exact_sol_in discriminator"
         );
         assert_eq!(
