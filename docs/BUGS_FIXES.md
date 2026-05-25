@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### ACCOUNT-PATH-TX-PARITY-CREATOR: DevWallet/Creator-Latenz — TX-Fast-Path + strategische Account-Queues
+**Datum**: 2026-05-25  
+**Problem** (Prod-Referenz „WONDERBRA“, 2026-05-24): Trade-Discovery ohne `PoolCreated`; `BondingCurveUpdate` füllte `pool_creator_cache`, aber `DevWalletIdentified` wurde nur bei **bekanntem** `pool_mint_map` emittiert — Updates **vor** dem ersten Trade gingen verloren (kein Re-Emit). Zugleich verarbeiteten **8** Account-Worker-FIFO-Shards massenweise PumpFun-Bonding-Curves; strategisch relevante Pools lagen **Minuten** in der Wall-Clock-Warteschlange hinter irrelevanten Updates (`ENTRY_BUY_DEFERRED_MISSING_CREATOR` / BUY-Gate).  
+**Fix**: (1) **TX-Fast-Path** `maybe_emit_dev_wallet_after_pool_mint_map`: nach `pool_mint_map.insert` (PumpFun-Trade / `PoolCreated`) synchron im TX-Task prüfen, ob `pool_creator_cache` bereits den autoritativen Creator hat — dann `DevWalletIdentified` wie Account-Pfad (FIX-22-Mismatch-WARN unverändert); Metrik `market_data_pool_mint_map_to_devwallet_ms` (Geyser-TX-`grpc_recv_at` → Publish). (2) **Zwei Queues pro Shard** (HIGH/LOW) mit strikt HIGH-vor-LOW-Drain; Admission HIGH u. a. bei `pool_mint_map`, `high_priority_bonding_curves` (First-Trade-Hook), `active_pool_set`-Pins, `wallet_tracks_mint`; Gauges `market_data_account_high_priority_queue_depth` / `market_data_account_low_priority_queue_depth`. (3) **Account-Pfad** nach erfolgreichem `DevWalletIdentified`-Publish: `market_data_bonding_curve_grpc_to_devwallet_ms` (Bonding-Curve-`grpc_recv_at` → Publish). **Verboten** unverändert: kein Creator aus Swap-Accounts (I-4 / BUG-D), kein RPC im Hot Path (I-7), keine NATS-Schema-Änderungen (I-23).  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`, `docs/RUNBOOK_PROD.md`
+
 ### MARKET-DATA-ACCOUNT-THROUGHPUT-P0: Account-Pfad Durchsatz + async NATS-Publish
 **Datum**: 2026-05-21  
 **Problem**: Dedizierter Account-`recv`-Task (#140) beseitigte `select!`-Starvation, aber `handle_geyser_account` blieb **seriell**: hohe Geyser-Account-Rate ⇒ `market_data_account_broadcast_queue_depth` im **Tausender-Bereich**, `market_data_account_channel_lag_ms` p50 **~2,4 s** (Tx-Pfad blieb ~ms).  
