@@ -8279,11 +8279,15 @@ async fn handle_geyser_account(
         }
 
         // Update MASTER LivePoolCache (Single Source of Truth)
-        ctx.live_pool_cache.upsert(
+        if !ctx.live_pool_cache.upsert(
             account_update.pubkey,
             cached_state.clone(),
             account_update.slot,
-        );
+        ) {
+            // Stale Geyser snapshot (e.g. HIGH/LOW queue reorder for same pubkey): skip downstream
+            // JetStream / MarketEvent side effects so trading state cannot regress.
+            return;
+        }
 
         // Raydium CPMM: register vault ATAs for Geyser reserve updates (enables non-RPC reserve path).
         if let CachedPoolState::RaydiumCpmm(s) = &cached_state {

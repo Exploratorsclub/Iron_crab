@@ -31,6 +31,7 @@
 //! - PumpFun Bonding: virtual reserves
 //! - PumpFun AMM (PumpSwap): reserves, pool accounts
 
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use solana_sdk::pubkey::Pubkey;
@@ -551,13 +552,35 @@ impl LivePoolCache {
     // Write API (called from Geyser subscription task)
     // ========================================================================
 
-    /// Update or insert pool state
-    pub fn upsert(&self, pool: Pubkey, state: CachedPoolState, slot: u64) {
-        // Register vault mappings for reserve updates
-        self.register_vaults(&pool, &state);
-
-        self.pools.insert(pool, CacheEntry::new(state, slot));
-        self.updates_total.fetch_add(1, Ordering::Relaxed);
+    /// Update or insert pool state.
+    ///
+    /// Returns `false` when `slot > 0` and the cache already holds a **strictly newer** slot for
+    /// this pool (reordered Geyser work items must not regress SSOT).
+    ///
+    /// `slot == 0` means "no Geyser slot" (e.g. cold-path RPC hydration): the state is applied,
+    /// but an existing non-zero slot watermark is preserved so later stale Geyser snapshots are
+    /// still rejected.
+    pub fn upsert(&self, pool: Pubkey, state: CachedPoolState, slot: u64) -> bool {
+        match self.pools.entry(pool) {
+            Entry::Vacant(v) => {
+                let stored_slot = if slot == 0 { 0 } else { slot };
+                self.register_vaults(&pool, &state);
+                v.insert(CacheEntry::new(state, stored_slot));
+                self.updates_total.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Entry::Occupied(mut o) => {
+                let prev_slot = o.get().slot;
+                if slot > 0 && prev_slot > slot {
+                    return false;
+                }
+                let stored_slot = if slot == 0 { prev_slot } else { slot };
+                self.register_vaults(&pool, &state);
+                *o.get_mut() = CacheEntry::new(state, stored_slot);
+                self.updates_total.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+        }
     }
 
     /// Update vault balance for a pool
