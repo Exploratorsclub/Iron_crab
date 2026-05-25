@@ -48,15 +48,20 @@ use ironcrab::ipc::{
     POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use ironcrab::metrics::{
-    dec_market_data_account_publish_queue_depth, dec_market_data_account_worker_queue_depth,
-    geyser_metrics_inc_tracked_evicted, geyser_metrics_set_subscription_accounts,
-    geyser_metrics_set_tracked_pinned_accounts, inc_market_data_account_publish_queue_depth,
+    dec_market_data_account_high_priority_queue_depth,
+    dec_market_data_account_low_priority_queue_depth, dec_market_data_account_publish_queue_depth,
+    dec_market_data_account_worker_queue_depth, geyser_metrics_inc_tracked_evicted,
+    geyser_metrics_set_subscription_accounts, geyser_metrics_set_tracked_pinned_accounts,
+    inc_market_data_account_high_priority_queue_depth,
+    inc_market_data_account_low_priority_queue_depth, inc_market_data_account_publish_queue_depth,
     inc_market_data_account_worker_queue_depth, market_data_bump_geyser_head_slot,
     record_market_data_account_broadcast_lagged, record_market_data_account_channel_lag_ms,
     record_market_data_account_early_drop_total, record_market_data_account_handler_duration_us,
+    record_market_data_bonding_curve_grpc_to_devwallet_ms,
     record_market_data_bonding_to_trade_slot_delta_slots,
     record_market_data_geyser_to_publish_on_success,
     record_market_data_momentum_active_pool_messages_total,
+    record_market_data_pool_mint_map_to_devwallet_ms,
     record_market_data_trade_after_bonding_publish_ms, record_market_data_tx_broadcast_lagged,
     record_market_data_tx_channel_lag_ms, serve_metrics,
     set_market_data_account_broadcast_queue_depth, set_market_data_momentum_active_pool_pins_gauge,
@@ -845,6 +850,9 @@ struct MarketDataContext {
     /// Maps pool_address -> creator. Populated from BondingCurveUpdate account events.
     /// Used as secondary lookup when creator_cache (mint -> creator) misses.
     pool_creator_cache: parking_lot::RwLock<std::collections::HashMap<String, String>>,
+
+    /// Bonding-curve pubkeys promoted after first PumpFun trade on the TX path (HIGH account-queue admission).
+    high_priority_bonding_curves: parking_lot::RwLock<HashSet<Pubkey>>,
 
     /// FIX-29: Raydium pools for which Serum accounts have already been fetched.
     /// Serum accounts are static — one RPC call per pool lifetime is sufficient.
@@ -6374,6 +6382,7 @@ async fn main() -> Result<()> {
         creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
         pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
         pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        high_priority_bonding_curves: parking_lot::RwLock::new(HashSet::new()),
         raydium_serum_fetched: parking_lot::RwLock::new(std::collections::HashSet::new()),
         tracked_wallet,
         tracked_wallet_tx,
@@ -7375,6 +7384,179 @@ fn account_geyser_update_might_be_relevant(
         || o == METEORA_DLMM_OWNER
         || o == PUMPFUN_PROGRAM_OWNER
         || o == PUMPFUN_AMM_PROGRAM_OWNER
+}
+
+/// Strategic HIGH admission for account worker sharding (ACCOUNT-PATH-TX-PARITY-CREATOR).
+fn account_geyser_dispatch_priority_high(ctx: &MarketDataContext, u: &GeyserAccountUpdate) -> bool {
+    let pool_pk = u.pubkey;
+    let pool_str = pool_pk.to_string();
+    if ctx.high_priority_bonding_curves.read().contains(&pool_pk) {
+        return true;
+    }
+    if ctx.pool_mint_map.read().contains_key(&pool_str) {
+        return true;
+    }
+    if ctx.active_pool_set.pool_has_any_pin(pool_pk) {
+        return true;
+    }
+    if ctx.wallet_tracks_mint_for_geyser(&pool_pk) {
+        return true;
+    }
+    false
+}
+
+/// Strict HIGH-then-LOW dequeue for one account worker (two `mpsc` channels per shard).
+async fn account_worker_recv_next(
+    high: &mut mpsc::Receiver<AccountWorkItem>,
+    low: &mut mpsc::Receiver<AccountWorkItem>,
+) -> Option<AccountWorkItem> {
+    let mut pending_low: Option<AccountWorkItem> = None;
+    loop {
+        if let Ok(w) = high.try_recv() {
+            dec_market_data_account_high_priority_queue_depth();
+            dec_market_data_account_worker_queue_depth();
+            return Some(w);
+        }
+        if let Some(w) = pending_low.take() {
+            dec_market_data_account_low_priority_queue_depth();
+            dec_market_data_account_worker_queue_depth();
+            return Some(w);
+        }
+        tokio::select! {
+            biased;
+            h = high.recv() => match h {
+                Some(w) => {
+                    dec_market_data_account_high_priority_queue_depth();
+                    dec_market_data_account_worker_queue_depth();
+                    return Some(w);
+                }
+                None => {
+                    if let Ok(w) = high.try_recv() {
+                        dec_market_data_account_high_priority_queue_depth();
+                        dec_market_data_account_worker_queue_depth();
+                        return Some(w);
+                    }
+                    if let Some(w) = pending_low.take() {
+                        dec_market_data_account_low_priority_queue_depth();
+                        dec_market_data_account_worker_queue_depth();
+                        return Some(w);
+                    }
+                    if let Some(w) = low.recv().await {
+                        dec_market_data_account_low_priority_queue_depth();
+                        dec_market_data_account_worker_queue_depth();
+                        return Some(w);
+                    }
+                    return None;
+                }
+            },
+            l = low.recv() => match l {
+                Some(w) => {
+                    pending_low = Some(w);
+                    continue;
+                }
+                None => {
+                    if let Ok(w) = high.try_recv() {
+                        dec_market_data_account_high_priority_queue_depth();
+                        dec_market_data_account_worker_queue_depth();
+                        return Some(w);
+                    }
+                    if let Some(w) = pending_low.take() {
+                        dec_market_data_account_low_priority_queue_depth();
+                        dec_market_data_account_worker_queue_depth();
+                        return Some(w);
+                    }
+                    return match high.recv().await {
+                        Some(w) => {
+                            dec_market_data_account_high_priority_queue_depth();
+                            dec_market_data_account_worker_queue_depth();
+                            Some(w)
+                        }
+                        None => None,
+                    };
+                }
+            },
+        }
+    }
+}
+
+/// After `pool_mint_map` insert on the TX path: emit `DevWalletIdentified` if bonding-curve cache
+/// already holds authoritative creator (no Swap parsing; I-4 / BUG-D).
+async fn maybe_emit_dev_wallet_after_pool_mint_map(
+    ctx: &MarketDataContext,
+    run_id: &str,
+    pool: &Pubkey,
+    mint: &str,
+    slot: Option<u64>,
+    tx_grpc_recv_at: Instant,
+    nats: Option<&NatsClient>,
+) -> bool {
+    let pool_str = pool.to_string();
+    let creator_str = match ctx.pool_creator_cache.read().get(&pool_str).cloned() {
+        Some(s) if !s.is_empty() => s,
+        _ => return false,
+    };
+    let existing = {
+        let mut creator_cache = ctx.creator_cache.write();
+        let existing = creator_cache.get(mint).cloned();
+        creator_cache.insert(mint.to_string(), creator_str.clone());
+        existing
+    };
+    let should_emit = match &existing {
+        None => true,
+        Some(old) if old != &creator_str => {
+            warn!(
+                mint = %mint,
+                pool = %pool_str,
+                old_creator = %old,
+                new_creator = %creator_str,
+                "FIX-22: Creator mismatch on TX fast-path — pool_creator_cache overwrites stale value"
+            );
+            true
+        }
+        _ => false,
+    };
+    if !should_emit {
+        return false;
+    }
+    let publish_at = Instant::now();
+    record_market_data_pool_mint_map_to_devwallet_ms(tx_grpc_recv_at, publish_at);
+    info!(
+        mint = %mint,
+        pool = %pool_str,
+        creator = %creator_str,
+        corrected = existing.is_some(),
+        "DevWalletIdentified from TX path after pool_mint_map (creator from pool_creator_cache)"
+    );
+    let dev_event = MarketEvent::new(
+        "market-data",
+        BUILD_VERSION,
+        run_id,
+        ctx.next_event_id(),
+        "geyser",
+        slot,
+        MarketEventKind::DevWalletIdentified {
+            mint: mint.to_string(),
+            dev_wallet: creator_str.clone(),
+            supply_percentage: 0.0,
+        },
+    );
+    if let Err(e) = ctx.jsonl_writer.write(&dev_event) {
+        error!(error = %e, "Failed to write DevWalletIdentified (TX fast-path) to JSONL");
+    }
+    if let Some(nats_client) = nats {
+        let _ = publish_market_event_core_and_momentum_ex(
+            nats_client,
+            &dev_event,
+            Some(MarketEventCorePublishTrace {
+                recv_at: tx_grpc_recv_at,
+                cold_path: false,
+                segment: MarketDataLatencySegment::Other,
+            }),
+            Some(ctx),
+        )
+        .await;
+    }
+    true
 }
 
 async fn account_path_publish_worker(
@@ -8987,6 +9169,10 @@ async fn handle_geyser_account(
                     )
                     .await;
                 }
+                record_market_data_bonding_curve_grpc_to_devwallet_ms(
+                    account_update.grpc_recv_at,
+                    Instant::now(),
+                );
             }
         }
 
@@ -9239,6 +9425,19 @@ async fn handle_geyser_transaction(
                 ctx.pool_mint_map
                     .write()
                     .insert(pool_address.to_string(), base_mint.to_string());
+                ctx.high_priority_bonding_curves
+                    .write()
+                    .insert(*pool_address);
+                maybe_emit_dev_wallet_after_pool_mint_map(
+                    ctx.as_ref(),
+                    run_id,
+                    pool_address,
+                    &base_mint.to_string(),
+                    Some(tx_update.slot),
+                    tx_update.grpc_recv_at,
+                    ctx.nats.as_ref(),
+                )
+                .await;
             }
             ParsedDexEvent::Trade {
                 pool_address,
@@ -9249,6 +9448,19 @@ async fn handle_geyser_transaction(
                 ctx.pool_mint_map
                     .write()
                     .insert(pool_address.to_string(), mint.to_string());
+                ctx.high_priority_bonding_curves
+                    .write()
+                    .insert(*pool_address);
+                maybe_emit_dev_wallet_after_pool_mint_map(
+                    ctx.as_ref(),
+                    run_id,
+                    pool_address,
+                    &mint.to_string(),
+                    Some(tx_update.slot),
+                    tx_update.grpc_recv_at,
+                    ctx.nats.as_ref(),
+                )
+                .await;
             }
             _ => {}
         }
@@ -10090,19 +10302,22 @@ async fn run_geyser_loop(
             tx
         });
 
-    let mut worker_tx_list: Vec<mpsc::Sender<AccountWorkItem>> =
+    let mut worker_high_tx_list: Vec<mpsc::Sender<AccountWorkItem>> =
+        Vec::with_capacity(MARKET_DATA_ACCOUNT_WORKER_COUNT);
+    let mut worker_low_tx_list: Vec<mpsc::Sender<AccountWorkItem>> =
         Vec::with_capacity(MARKET_DATA_ACCOUNT_WORKER_COUNT);
     for wid in 0..MARKET_DATA_ACCOUNT_WORKER_COUNT {
-        let (tx, mut rx) = mpsc::channel(MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP);
-        worker_tx_list.push(tx);
+        let (high_tx, mut high_rx) = mpsc::channel(MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP);
+        let (low_tx, mut low_rx) = mpsc::channel(MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP);
+        worker_high_tx_list.push(high_tx);
+        worker_low_tx_list.push(low_tx);
         let ctx_w = Arc::clone(&ctx_geyser_acc);
         let run_id_w = run_id_geyser_acc.clone();
         let account_count_w = Arc::clone(&account_count_geyser_acc);
         let rpc_w = Arc::clone(&rpc_geyser_acc);
         let publish_tx_w = account_publish_tx.clone();
         tokio::spawn(async move {
-            while let Some(work) = rx.recv().await {
-                dec_market_data_account_worker_queue_depth();
+            while let Some(work) = account_worker_recv_next(&mut high_rx, &mut low_rx).await {
                 let handler_start = Instant::now();
                 handle_geyser_account(
                     Arc::clone(&ctx_w),
@@ -10124,9 +10339,11 @@ async fn run_geyser_loop(
             warn!(worker = wid, "account ingest worker: input channel closed");
         });
     }
-    let worker_dispatch = Arc::new(worker_tx_list);
+    let worker_high_dispatch = Arc::new(worker_high_tx_list);
+    let worker_low_dispatch = Arc::new(worker_low_tx_list);
 
-    let worker_dispatch_recv = Arc::clone(&worker_dispatch);
+    let worker_high_recv = Arc::clone(&worker_high_dispatch);
+    let worker_low_recv = Arc::clone(&worker_low_dispatch);
     tokio::spawn(async move {
         loop {
             match account_rx_geyser.recv().await {
@@ -10142,16 +10359,36 @@ async fn run_geyser_loop(
                     }
 
                     let shard = market_data_account_worker_shard(&account_update.pubkey);
+                    let high =
+                        account_geyser_dispatch_priority_high(&ctx_geyser_acc, &account_update);
                     inc_market_data_account_worker_queue_depth();
-                    if worker_dispatch_recv[shard]
-                        .send(AccountWorkItem {
-                            update: account_update,
-                            recv_at,
-                        })
-                        .await
-                        .is_err()
-                    {
+                    if high {
+                        inc_market_data_account_high_priority_queue_depth();
+                    } else {
+                        inc_market_data_account_low_priority_queue_depth();
+                    }
+                    let send_res = if high {
+                        worker_high_recv[shard]
+                            .send(AccountWorkItem {
+                                update: account_update,
+                                recv_at,
+                            })
+                            .await
+                    } else {
+                        worker_low_recv[shard]
+                            .send(AccountWorkItem {
+                                update: account_update,
+                                recv_at,
+                            })
+                            .await
+                    };
+                    if send_res.is_err() {
                         dec_market_data_account_worker_queue_depth();
+                        if high {
+                            dec_market_data_account_high_priority_queue_depth();
+                        } else {
+                            dec_market_data_account_low_priority_queue_depth();
+                        }
                         error!(
                             shard = shard,
                             "account worker queue closed; stopping Geyser account stream"
@@ -12692,6 +12929,7 @@ mod pr_b_geyser_tracking_tests {
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            high_priority_bonding_curves: parking_lot::RwLock::new(HashSet::new()),
             raydium_serum_fetched: parking_lot::RwLock::new(std::collections::HashSet::new()),
             tracked_wallet: None,
             tracked_wallet_tx,
@@ -12989,5 +13227,118 @@ mod pr_b_geyser_tracking_tests {
                 .is_some_and(|m| m.pin == Some(GeyserPinReason::MomentumActive)),
             "WSOL must stay pinned while pool_b is active without cache layout"
         );
+    }
+
+    #[tokio::test]
+    async fn tx_fast_path_dev_wallet_after_pool_mint_map_emits_once() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        ctx.pool_creator_cache
+            .write()
+            .insert(pool.to_string(), creator.to_string());
+        let grpc_at = Instant::now() - std::time::Duration::from_millis(10);
+        assert!(
+            maybe_emit_dev_wallet_after_pool_mint_map(
+                &ctx,
+                "run-test",
+                &pool,
+                &mint.to_string(),
+                Some(1),
+                grpc_at,
+                None,
+            )
+            .await
+        );
+        assert!(
+            !maybe_emit_dev_wallet_after_pool_mint_map(
+                &ctx,
+                "run-test",
+                &pool,
+                &mint.to_string(),
+                Some(2),
+                grpc_at,
+                None,
+            )
+            .await,
+            "second call with same creator must not re-emit"
+        );
+        let date = chrono::Utc::now().format("%Y%m%d");
+        let log = tmp.path().join(format!("market_events-{date}.jsonl"));
+        let text = std::fs::read_to_string(&log).expect("jsonl read");
+        let dev_lines = text
+            .lines()
+            .filter(|l| l.contains("DevWalletIdentified"))
+            .count();
+        assert_eq!(
+            dev_lines, 1,
+            "expected exactly one DevWalletIdentified JSONL line"
+        );
+    }
+
+    #[test]
+    fn account_geyser_dispatch_high_when_pool_mint_map_contains_pubkey() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        ctx.pool_mint_map
+            .write()
+            .insert(pool.to_string(), Pubkey::new_unique().to_string());
+        let u = GeyserAccountUpdate {
+            pubkey: pool,
+            slot: 1,
+            owner: Pubkey::new_unique(),
+            data: vec![],
+            lamports: 0,
+            grpc_recv_at: Instant::now(),
+        };
+        assert!(account_geyser_dispatch_priority_high(&ctx, &u));
+    }
+
+    #[tokio::test]
+    async fn account_worker_recv_next_prefers_high_queue() {
+        use ironcrab::metrics::{
+            inc_market_data_account_high_priority_queue_depth,
+            inc_market_data_account_low_priority_queue_depth,
+            inc_market_data_account_worker_queue_depth,
+        };
+        let (htx, mut hrx) = mpsc::channel(8);
+        let (ltx, mut lrx) = mpsc::channel(8);
+        let pool_h = Pubkey::new_unique();
+        let pool_l = Pubkey::new_unique();
+        let mk = |p: Pubkey| AccountWorkItem {
+            update: GeyserAccountUpdate {
+                pubkey: p,
+                slot: 1,
+                owner: PUMPFUN_PROGRAM_OWNER,
+                data: vec![],
+                lamports: 0,
+                grpc_recv_at: Instant::now(),
+            },
+            recv_at: Instant::now(),
+        };
+        inc_market_data_account_low_priority_queue_depth();
+        inc_market_data_account_worker_queue_depth();
+        ltx.send(mk(pool_l)).await.unwrap();
+        inc_market_data_account_high_priority_queue_depth();
+        inc_market_data_account_worker_queue_depth();
+        htx.send(mk(pool_h)).await.unwrap();
+        drop(htx);
+        drop(ltx);
+        let w1 = account_worker_recv_next(&mut hrx, &mut lrx)
+            .await
+            .expect("high item");
+        assert_eq!(w1.update.pubkey, pool_h);
+        let w2 = account_worker_recv_next(&mut hrx, &mut lrx)
+            .await
+            .expect("low item");
+        assert_eq!(w2.update.pubkey, pool_l);
+        assert!(account_worker_recv_next(&mut hrx, &mut lrx).await.is_none());
     }
 }

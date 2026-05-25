@@ -215,8 +215,12 @@ histogram_quantile(0.95, sum(rate(market_data_account_channel_lag_ms_bucket[5m])
 histogram_quantile(0.99, sum(rate(market_data_account_channel_lag_ms_bucket[5m])) by (le))
 market_data_account_broadcast_queue_depth
 market_data_account_worker_queue_depth
+market_data_account_high_priority_queue_depth
+market_data_account_low_priority_queue_depth
 market_data_account_publish_queue_depth
 market_data_account_early_drop_total
+histogram_quantile(0.99, sum(rate(market_data_pool_mint_map_to_devwallet_ms_bucket[5m])) by (le))
+histogram_quantile(0.99, sum(rate(market_data_bonding_curve_grpc_to_devwallet_ms_bucket[5m])) by (le))
 histogram_quantile(0.50, sum(rate(market_data_account_handler_duration_us_bucket[5m])) by (le))
 market_data_account_broadcast_lagged_total
 histogram_quantile(0.50, sum(rate(market_data_tx_channel_lag_ms_bucket[5m])) by (le))

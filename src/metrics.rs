@@ -485,6 +485,32 @@ static MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = 
 static MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 static MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+/// Pump.fun: wall ms from Geyser `grpc_recv_at` on the TX update to `DevWalletIdentified` publish (TX fast-path after `pool_mint_map` insert).
+static MARKET_DATA_POOL_MINT_MAP_TO_DEVWALLET_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_POOL_MINT_MAP_TO_DEVWALLET_MS_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_POOL_MINT_MAP_TO_DEVWALLET_MS_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Pump.fun: wall ms from bonding-curve account `grpc_recv_at` to `DevWalletIdentified` publish (account path).
+static MARKET_DATA_BONDING_CURVE_GRPC_TO_DEVWALLET_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_BONDING_CURVE_GRPC_TO_DEVWALLET_MS_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_BONDING_CURVE_GRPC_TO_DEVWALLET_MS_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// Pump.fun: slot delta from last published `BondingCurveProgress` (Geyser slot) to successful `Trade` publish (same pool/bonding curve).
 static MARKET_DATA_BONDING_TO_TRADE_SLOT_DELTA_SLOTS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
     Lazy::new(|| {
@@ -512,6 +538,14 @@ pub static MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL: Lazy<AtomicU64> =
 
 /// Account ingest: messages accepted into per-worker `tokio::mpsc` queues (after recv, before worker `recv`).
 pub static MARKET_DATA_ACCOUNT_WORKER_QUEUE_DEPTH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Account ingest: per-shard HIGH-priority `mpsc` depth (discovered pools, pinned, wallet-tracked curves).
+pub static MARKET_DATA_ACCOUNT_HIGH_PRIORITY_QUEUE_DEPTH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Account ingest: per-shard LOW-priority `mpsc` depth (remaining relevant account updates).
+pub static MARKET_DATA_ACCOUNT_LOW_PRIORITY_QUEUE_DEPTH: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
 /// Account ingest: jobs waiting in the dedicated NATS publish `mpsc` (JetStream + core publish).
@@ -642,6 +676,66 @@ pub fn inc_market_data_account_worker_queue_depth() {
 #[inline]
 pub fn dec_market_data_account_worker_queue_depth() {
     MARKET_DATA_ACCOUNT_WORKER_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_high_priority_queue_depth() {
+    MARKET_DATA_ACCOUNT_HIGH_PRIORITY_QUEUE_DEPTH.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn dec_market_data_account_high_priority_queue_depth() {
+    MARKET_DATA_ACCOUNT_HIGH_PRIORITY_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_low_priority_queue_depth() {
+    MARKET_DATA_ACCOUNT_LOW_PRIORITY_QUEUE_DEPTH.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn dec_market_data_account_low_priority_queue_depth() {
+    MARKET_DATA_ACCOUNT_LOW_PRIORITY_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Wall ms from Geyser `grpc_recv_at` on the TX update to `DevWalletIdentified` publish (TX fast-path).
+#[inline]
+pub fn record_market_data_pool_mint_map_to_devwallet_ms(
+    grpc_recv_at: Instant,
+    publish_at: Instant,
+) {
+    let ms = publish_at
+        .saturating_duration_since(grpc_recv_at)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    record_histogram_u64_into(
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+        &MARKET_DATA_POOL_MINT_MAP_TO_DEVWALLET_MS_BUCKET_COUNTS,
+        &MARKET_DATA_POOL_MINT_MAP_TO_DEVWALLET_MS_SUM,
+        &MARKET_DATA_POOL_MINT_MAP_TO_DEVWALLET_MS_COUNT,
+        ms,
+        MARKET_DATA_LATENCY_MS_SUM_CAP,
+    );
+}
+
+/// Wall ms from bonding-curve account `grpc_recv_at` to `DevWalletIdentified` publish (account path).
+#[inline]
+pub fn record_market_data_bonding_curve_grpc_to_devwallet_ms(
+    grpc_recv_at: Instant,
+    publish_at: Instant,
+) {
+    let ms = publish_at
+        .saturating_duration_since(grpc_recv_at)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    record_histogram_u64_into(
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+        &MARKET_DATA_BONDING_CURVE_GRPC_TO_DEVWALLET_MS_BUCKET_COUNTS,
+        &MARKET_DATA_BONDING_CURVE_GRPC_TO_DEVWALLET_MS_SUM,
+        &MARKET_DATA_BONDING_CURVE_GRPC_TO_DEVWALLET_MS_COUNT,
+        ms,
+        MARKET_DATA_LATENCY_MS_SUM_CAP,
+    );
 }
 
 #[inline]
@@ -2365,6 +2459,22 @@ async fn metrics_response() -> Response<Body> {
     );
     append_momentum_latency_histogram_prometheus(
         &mut out,
+        "market_data_pool_mint_map_to_devwallet_ms",
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+        &MARKET_DATA_POOL_MINT_MAP_TO_DEVWALLET_MS_BUCKET_COUNTS,
+        &MARKET_DATA_POOL_MINT_MAP_TO_DEVWALLET_MS_SUM,
+        &MARKET_DATA_POOL_MINT_MAP_TO_DEVWALLET_MS_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_bonding_curve_grpc_to_devwallet_ms",
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+        &MARKET_DATA_BONDING_CURVE_GRPC_TO_DEVWALLET_MS_BUCKET_COUNTS,
+        &MARKET_DATA_BONDING_CURVE_GRPC_TO_DEVWALLET_MS_SUM,
+        &MARKET_DATA_BONDING_CURVE_GRPC_TO_DEVWALLET_MS_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
         "market_data_bonding_to_trade_slot_delta_slots",
         MARKET_DATA_SLOT_LAG_AT_PUBLISH_BUCKETS,
         &MARKET_DATA_BONDING_TO_TRADE_SLOT_DELTA_SLOTS_BUCKET_COUNTS,
@@ -2390,6 +2500,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_account_worker_queue_depth",
         MARKET_DATA_ACCOUNT_WORKER_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_high_priority_queue_depth",
+        MARKET_DATA_ACCOUNT_HIGH_PRIORITY_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_low_priority_queue_depth",
+        MARKET_DATA_ACCOUNT_LOW_PRIORITY_QUEUE_DEPTH.load(Ordering::Relaxed)
     );
     line!(
         "market_data_account_publish_queue_depth",
