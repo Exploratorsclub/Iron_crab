@@ -7402,6 +7402,15 @@ fn account_geyser_dispatch_priority_high(ctx: &MarketDataContext, u: &GeyserAcco
     if ctx.wallet_tracks_mint_for_geyser(&pool_pk) {
         return true;
     }
+    // `tracked_wallet_mint_decimals` is keyed by token mint; Pump.fun bonding-curve updates use the
+    // curve PDA as `u.pubkey`, so resolve the mint from the pool cache before wallet matching.
+    if u.owner == PUMPFUN_PROGRAM_OWNER {
+        if let Some(CachedPoolState::PumpFun(s)) = ctx.live_pool_cache.get(&pool_pk) {
+            if ctx.wallet_tracks_mint_for_geyser(&s.token_mint) {
+                return true;
+            }
+        }
+    }
     false
 }
 
