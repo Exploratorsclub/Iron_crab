@@ -28,8 +28,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -55,6 +56,8 @@ use ironcrab::metrics::{
     inc_market_data_account_high_priority_queue_depth,
     inc_market_data_account_low_priority_queue_depth, inc_market_data_account_publish_queue_depth,
     inc_market_data_account_publish_queue_dropped_total,
+    inc_market_data_account_publish_worker_liveness_reconnects_total,
+    inc_market_data_account_publish_worker_reconnects_total,
     inc_market_data_account_publish_worker_stalls_total,
     inc_market_data_account_worker_queue_depth, market_data_bump_geyser_head_slot,
     record_market_data_account_broadcast_lagged, record_market_data_account_channel_lag_ms,
@@ -74,6 +77,7 @@ use ironcrab::metrics::{
     set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
     update_readiness_market_data_current, wall_clock_unix_ms_now, GeyserTrackedEvictKind,
     MarketDataLatencySegment, MetricsComponent, MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH,
+    MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LAST_SUCCESS_UNIX_MS,
     MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS,
     MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
     MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
@@ -7715,21 +7719,36 @@ async fn process_account_path_nats_job(nats: &NatsClient, job: AccountPathNatsJo
     }
 }
 
+async fn account_path_publish_worker_reconnect_after_stall(nats_cell: &Arc<Mutex<NatsClient>>) {
+    let mut g = nats_cell.lock().await;
+    match g.reconnect().await {
+        Ok(()) => {
+            inc_market_data_account_publish_worker_reconnects_total();
+            info!("account_path: NATS reconnect after publish stall");
+        }
+        Err(e) => warn!(
+            error = %e,
+            "account_path: NATS reconnect after publish stall failed"
+        ),
+    }
+}
+
+/// One publish worker: **no** `Mutex` around `recv` — owns its `mpsc::Receiver` (PR155).
+/// `nats_cell` is only locked briefly for `clone_for_spawned_publish` / reconnect.
 async fn account_path_publish_worker(
-    rx_shared: Arc<Mutex<mpsc::Receiver<AccountPathNatsJob>>>,
-    nats: NatsClient,
+    mut rx: mpsc::Receiver<AccountPathNatsJob>,
+    nats_cell: Arc<Mutex<NatsClient>>,
 ) {
     loop {
-        let job = {
-            let mut g = rx_shared.lock().await;
-            g.recv().await
-        };
-        let Some(job) = job else {
+        let Some(job) = rx.recv().await else {
             break;
         };
         dec_market_data_account_publish_queue_depth();
         let job_start = Instant::now();
-        let nats_spawn = nats.clone_for_spawned_publish();
+        let nats_spawn = {
+            let g = nats_cell.lock().await;
+            g.clone_for_spawned_publish()
+        };
         let join_handle = tokio::spawn(async move {
             process_account_path_nats_job(&nats_spawn, job).await;
         });
@@ -7746,6 +7765,7 @@ async fn account_path_publish_worker(
                     "account_path: publish worker job task join error — counting stall"
                 );
                 inc_market_data_account_publish_worker_stalls_total();
+                account_path_publish_worker_reconnect_after_stall(&nats_cell).await;
             }
             Err(_elapsed) => {
                 abort_handle.abort();
@@ -7754,12 +7774,147 @@ async fn account_path_publish_worker(
                     "account_path: publish worker job timeout — aborted task to unblock queue"
                 );
                 inc_market_data_account_publish_worker_stalls_total();
+                account_path_publish_worker_reconnect_after_stall(&nats_cell).await;
             }
         }
         record_market_data_account_publish_worker_job_duration_us(
             job_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
         );
     }
+}
+
+async fn market_data_publish_dispatcher(
+    mut inbound_rx: mpsc::Receiver<AccountPathNatsJob>,
+    worker_txs: Vec<mpsc::Sender<AccountPathNatsJob>>,
+) {
+    let n = worker_txs.len();
+    if n == 0 {
+        return;
+    }
+    let mut rr = 0usize;
+    while let Some(mut job) = inbound_rx.recv().await {
+        let mut attempts = 0usize;
+        loop {
+            let i = rr % n;
+            rr = rr.wrapping_add(1);
+            match worker_txs[i].send(job).await {
+                Ok(()) => break,
+                Err(returned) => {
+                    job = returned.0;
+                    attempts += 1;
+                    if attempts >= n {
+                        warn!(
+                            "account_path: publish dispatcher — all worker channels closed; dropping job"
+                        );
+                        dec_market_data_account_publish_queue_depth();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn market_data_publish_liveness_watchdog(nats_handles: Vec<Arc<Mutex<NatsClient>>>) {
+    const TICK_SECS: u64 = 10;
+    const STALE_MS: u64 = 30_000;
+    let mut tick = tokio::time::interval(Duration::from_secs(TICK_SECS));
+    loop {
+        tick.tick().await;
+        let now = wall_clock_unix_ms_now();
+        let last = MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LAST_SUCCESS_UNIX_MS.load(Ordering::Relaxed);
+        let depth = MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH.load(Ordering::Relaxed);
+        if depth > 0 && now.saturating_sub(last) > STALE_MS {
+            warn!(
+                depth,
+                last_success_unix_ms = last,
+                stale_ms = now.saturating_sub(last),
+                "account_path: publish liveness watchdog — reconnecting all publish NATS clients"
+            );
+            inc_market_data_account_publish_worker_liveness_reconnects_total();
+            for h in &nats_handles {
+                let mut g = h.lock().await;
+                if let Err(e) = g.reconnect().await {
+                    warn!(
+                        error = %e,
+                        "account_path: liveness watchdog NATS reconnect failed for one worker"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Runs inside a **dedicated** `md-publish` `std::thread` + isolated Tokio multi-thread runtime (PR155).
+async fn market_data_account_publish_runtime_entry(
+    url: String,
+    requested_workers: usize,
+    inbound_rx: mpsc::Receiver<AccountPathNatsJob>,
+    ready_tx: oneshot::Sender<Result<(), String>>,
+) {
+    let per_worker_cap =
+        (MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_CAP / requested_workers.max(1)).max(512);
+    let mut nats_handles: Vec<Arc<Mutex<NatsClient>>> = Vec::new();
+    let mut worker_txs: Vec<mpsc::Sender<AccountPathNatsJob>> = Vec::new();
+    let mut worker_rxs: Vec<mpsc::Receiver<AccountPathNatsJob>> = Vec::new();
+
+    for wid in 0..requested_workers {
+        let mut nats =
+            NatsClient::new(NatsConfig::new(&url, &format!("market-data-publish-{wid}")));
+        match nats.connect().await {
+            Ok(()) => {
+                info!(
+                    url = %url,
+                    worker_id = wid,
+                    "Dedicated NATS connection for publish worker (isolated publish-runtime thread)"
+                );
+                let (wtx, wrx) = mpsc::channel(per_worker_cap);
+                nats_handles.push(Arc::new(Mutex::new(nats)));
+                worker_txs.push(wtx);
+                worker_rxs.push(wrx);
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    url = %url,
+                    worker_id = wid,
+                    "market-data-publish: worker NATS connect failed; skipping this worker"
+                );
+            }
+        }
+    }
+
+    if nats_handles.is_empty() {
+        let _ = ready_tx.send(Err(
+            "market-data-publish: no workers connected; async publish queue disabled".into(),
+        ));
+        return;
+    }
+
+    if nats_handles.len() < requested_workers {
+        warn!(
+            requested = requested_workers,
+            connected = nats_handles.len(),
+            "market-data-publish: fewer workers than requested (some connects failed)"
+        );
+    }
+
+    set_market_data_account_publish_workers_active(nats_handles.len() as u64);
+
+    tokio::spawn(market_data_publish_dispatcher(inbound_rx, worker_txs));
+
+    for (wrx, nats_cell) in worker_rxs
+        .into_iter()
+        .zip(nats_handles.iter().map(Arc::clone))
+    {
+        tokio::spawn(account_path_publish_worker(wrx, nats_cell));
+    }
+
+    let watch_handles: Vec<Arc<Mutex<NatsClient>>> = nats_handles.iter().map(Arc::clone).collect();
+    tokio::spawn(market_data_publish_liveness_watchdog(watch_handles));
+
+    let _ = ready_tx.send(Ok(()));
+    futures::future::pending::<()>().await
 }
 
 async fn account_path_enqueue_jetstream<T: Serialize>(
@@ -10506,58 +10661,65 @@ async fn run_geyser_loop(
         None
     };
 
-    // Async NATS publish queue (shared by account workers and TX fast-path).
-    // Must exist before the Geyser-Tx task starts. Each worker uses a **separate** NATS TCP connection
-    // (`market-data-publish-{i}`) so a stuck publish cannot block other workers (PR153/PR154).
+    // Async NATS publish queue: **isolated** Tokio runtime in `md-publish` std thread (PR155).
+    // Geyser/main runtime never runs publish workers — avoids timer starvation when the default
+    // runtime thread pool is saturated. Single dispatcher `recv` + fan-out (no Mutex on recv).
     let account_publish_tx: Option<mpsc::Sender<AccountPathNatsJob>> = if let (Some(_), Some(url)) =
         (ctx.nats.as_ref(), ctx.nats_server_url.as_deref())
     {
         let worker_count = market_data_publish_worker_count();
         let (tx, rx) = mpsc::channel(MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_CAP);
-        let rx_shared = Arc::new(Mutex::new(rx));
-        let mut spawned: u64 = 0;
-        for wid in 0..worker_count {
-            let mut nats_pub =
-                NatsClient::new(NatsConfig::new(url, &format!("market-data-publish-{wid}")));
-            match nats_pub.connect().await {
-                Ok(()) => {
-                    info!(
-                        url = %url,
-                        worker_id = wid,
-                        "Dedicated NATS connection for publish worker (isolated from main market-data client)"
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+        let url_owned = url.to_string();
+        let spawn_res = thread::Builder::new()
+            .name("md-publish".to_string())
+            .spawn(move || {
+                let thr_workers = worker_count.max(1);
+                let rt = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(thr_workers)
+                    .thread_name("md-publish")
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!("publish-runtime build failed: {e}")));
+                        return;
+                    }
+                };
+                rt.block_on(market_data_account_publish_runtime_entry(
+                    url_owned,
+                    worker_count,
+                    rx,
+                    ready_tx,
+                ));
+            });
+        match spawn_res {
+            Ok(_join) => match tokio::time::timeout(Duration::from_secs(60), ready_rx).await {
+                Ok(Ok(Ok(()))) => Some(tx),
+                Ok(Ok(Err(msg))) => {
+                    error!(
+                        msg = %msg,
+                        "market-data-publish: isolated publish-runtime failed to start"
                     );
-                    let rx_w = Arc::clone(&rx_shared);
-                    tokio::spawn(async move {
-                        account_path_publish_worker(rx_w, nats_pub).await;
-                    });
-                    spawned += 1;
+                    None
                 }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        url = %url,
-                        worker_id = wid,
-                        "market-data-publish: worker NATS connect failed; skipping this worker"
-                    );
+                Ok(Err(_)) => {
+                    error!("market-data-publish: publish-runtime ready channel dropped");
+                    None
                 }
-            }
-        }
-        if spawned == 0 {
-            error!(
-                url = %url,
-                "market-data-publish: no workers connected; async publish queue disabled"
-            );
-            None
-        } else {
-            if spawned < worker_count as u64 {
-                warn!(
-                    requested = worker_count,
-                    connected = spawned,
-                    "market-data-publish: fewer workers than requested (some connects failed)"
+                Err(_) => {
+                    error!("market-data-publish: timeout waiting for publish-runtime startup");
+                    None
+                }
+            },
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "market-data-publish: failed to spawn md-publish thread"
                 );
+                None
             }
-            set_market_data_account_publish_workers_active(spawned);
-            Some(tx)
         }
     } else {
         None
@@ -13696,12 +13858,16 @@ mod pr_b_geyser_tracking_tests {
         use ironcrab::metrics::MARKET_DATA_ACCOUNT_PUBLISH_WORKER_STALLS_TOTAL;
         use std::sync::atomic::AtomicU64;
         let (tx, rx) = mpsc::channel::<AccountPathNatsJob>(8);
-        let nats = NatsClient::new(NatsConfig::new("nats://127.0.0.1:1", "test-publish-worker"));
+        let nats = Arc::new(Mutex::new(NatsClient::new(NatsConfig::new(
+            "nats://127.0.0.1:1",
+            "test-publish-worker",
+        ))));
         let counter = Arc::new(AtomicU64::new(0));
         let counter_in = Arc::clone(&counter);
         let stalls_before = MARKET_DATA_ACCOUNT_PUBLISH_WORKER_STALLS_TOTAL.load(Ordering::Relaxed);
+        let nats_w = Arc::clone(&nats);
         let jh = tokio::spawn(async move {
-            account_path_publish_worker(Arc::new(tokio::sync::Mutex::new(rx)), nats).await;
+            account_path_publish_worker(rx, nats_w).await;
         });
         tx.send(AccountPathNatsJob::TestSleepMs(5_000))
             .await
@@ -13728,13 +13894,14 @@ mod pr_b_geyser_tracking_tests {
     async fn account_publish_worker_sync_block_increments_stalls_total() {
         use ironcrab::metrics::MARKET_DATA_ACCOUNT_PUBLISH_WORKER_STALLS_TOTAL;
         let (tx, rx) = mpsc::channel::<AccountPathNatsJob>(8);
-        let nats = NatsClient::new(NatsConfig::new(
+        let nats = Arc::new(Mutex::new(NatsClient::new(NatsConfig::new(
             "nats://127.0.0.1:1",
             "test-publish-worker-sync-block",
-        ));
+        ))));
         let stalls_before = MARKET_DATA_ACCOUNT_PUBLISH_WORKER_STALLS_TOTAL.load(Ordering::Relaxed);
+        let nats_w = Arc::clone(&nats);
         let jh = tokio::spawn(async move {
-            account_path_publish_worker(Arc::new(tokio::sync::Mutex::new(rx)), nats).await;
+            account_path_publish_worker(rx, nats_w).await;
         });
         tx.send(AccountPathNatsJob::TestBlockMs(3_000))
             .await
@@ -13747,6 +13914,44 @@ mod pr_b_geyser_tracking_tests {
         );
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(2), jh).await;
+    }
+
+    /// PR155: same stall/timeout behavior on a **dedicated** multi-thread runtime (mirrors md-publish thread).
+    #[test]
+    fn account_publish_worker_stall_unblocks_next_on_isolated_multi_thread_runtime() {
+        use ironcrab::metrics::MARKET_DATA_ACCOUNT_PUBLISH_WORKER_STALLS_TOTAL;
+        use std::sync::atomic::AtomicU64;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("md-publish-test")
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (tx, rx) = mpsc::channel::<AccountPathNatsJob>(8);
+        let nats = Arc::new(Mutex::new(NatsClient::new(NatsConfig::new(
+            "nats://127.0.0.1:1",
+            "test-isolated-publish-runtime",
+        ))));
+        let counter = Arc::new(AtomicU64::new(0));
+        let counter_in = Arc::clone(&counter);
+        let stalls_before = MARKET_DATA_ACCOUNT_PUBLISH_WORKER_STALLS_TOTAL.load(Ordering::Relaxed);
+        rt.block_on(async {
+            let nats_w = Arc::clone(&nats);
+            let w = tokio::spawn(account_path_publish_worker(rx, nats_w));
+            tx.send(AccountPathNatsJob::TestSleepMs(5_000))
+                .await
+                .unwrap();
+            tx.send(AccountPathNatsJob::TestInc(counter_in))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let stalls_after =
+                MARKET_DATA_ACCOUNT_PUBLISH_WORKER_STALLS_TOTAL.load(Ordering::Relaxed);
+            assert!(stalls_after > stalls_before);
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+            drop(tx);
+            let _ = tokio::time::timeout(Duration::from_secs(2), w).await;
+        });
     }
 
     #[test]

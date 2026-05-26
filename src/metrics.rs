@@ -569,6 +569,14 @@ pub static MARKET_DATA_ACCOUNT_PUBLISH_WORKERS_ACTIVE: Lazy<AtomicU64> =
 pub static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LAST_SUCCESS_UNIX_MS: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// Publish worker: forced NATS reconnect after a per-job timeout/stall (PR155).
+pub static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_RECONNECTS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Publish runtime: bulk NATS reconnect from the 10s liveness watchdog (stale `last_success` + queue depth).
+pub static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LIVENESS_RECONNECTS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// Account ingest: cheap relevance filter discarded the update before `handle_geyser_account` body.
 pub static MARKET_DATA_ACCOUNT_EARLY_DROP_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
@@ -802,6 +810,16 @@ pub fn set_market_data_account_publish_workers_active(n: u64) {
 #[inline]
 pub fn set_market_data_account_publish_worker_last_success_unix_ms(ts_ms: u64) {
     MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LAST_SUCCESS_UNIX_MS.store(ts_ms, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_publish_worker_reconnects_total() {
+    MARKET_DATA_ACCOUNT_PUBLISH_WORKER_RECONNECTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_publish_worker_liveness_reconnects_total() {
+    MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LIVENESS_RECONNECTS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Per publish-worker job wall time (microseconds), including timeout drops.
@@ -2597,6 +2615,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_account_publish_worker_last_success_unix_ms",
         MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LAST_SUCCESS_UNIX_MS.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_publish_worker_reconnects_total",
+        MARKET_DATA_ACCOUNT_PUBLISH_WORKER_RECONNECTS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_publish_worker_liveness_reconnects_total",
+        MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LIVENESS_RECONNECTS_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_account_early_drop_total",

@@ -101,6 +101,21 @@ impl NatsClient {
         Ok(())
     }
 
+    /// Drop the current TCP session and open a fresh one (same URL / connection name).
+    ///
+    /// Used when a publish worker hits a job timeout or a liveness watchdog detects a stale
+    /// pipeline — a hung `async_nats` client may never recover without an explicit reconnect (PR155).
+    pub async fn reconnect(&mut self) -> anyhow::Result<()> {
+        if self.client.take().is_some() {
+            info!(
+                url = %self.config.url,
+                name = %self.config.name,
+                "NATS client disconnected before reconnect"
+            );
+        }
+        self.connect().await
+    }
+
     pub fn is_connected(&self) -> bool {
         self.client.is_some()
     }
