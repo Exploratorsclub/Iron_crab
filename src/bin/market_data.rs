@@ -59,19 +59,20 @@ use ironcrab::metrics::{
     record_market_data_account_early_drop_total, record_market_data_account_handler_duration_us,
     record_market_data_bonding_curve_grpc_to_devwallet_ms,
     record_market_data_bonding_to_trade_slot_delta_slots,
+    record_market_data_geyser_sync_batch_total, record_market_data_geyser_sync_immediate_total,
     record_market_data_geyser_to_publish_on_success,
     record_market_data_momentum_active_pool_messages_total,
     record_market_data_pool_mint_map_to_devwallet_ms,
     record_market_data_trade_after_bonding_publish_ms, record_market_data_tx_broadcast_lagged,
     record_market_data_tx_channel_lag_ms, serve_metrics,
-    set_market_data_account_broadcast_queue_depth, set_market_data_momentum_active_pool_pins_gauge,
-    set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
-    set_readiness_nats_connected, update_readiness_market_data_current, wall_clock_unix_ms_now,
-    GeyserTrackedEvictKind, MarketDataLatencySegment, MetricsComponent,
-    MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS,
-    MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
-    MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
-    POOLS_TRACKED_GAUGE,
+    set_market_data_account_broadcast_queue_depth, set_market_data_geyser_sync_pending,
+    set_market_data_momentum_active_pool_pins_gauge, set_market_data_tx_broadcast_queue_depth,
+    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
+    update_readiness_market_data_current, wall_clock_unix_ms_now, GeyserTrackedEvictKind,
+    MarketDataLatencySegment, MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
+    MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL,
+    MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
+    NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -669,6 +670,8 @@ struct MarketDataConfig {
     max_tracked_accounts: usize,
     /// PR-B: full Geyser reconnect when combined explicit accounts exceed this threshold.
     geyser_full_reconnect_threshold: usize,
+    /// Coalesce TX-path Geyser subscription sync (ms); clamped 10–100 at use sites.
+    geyser_sync_batch_ms: u64,
 }
 
 impl Default for MarketDataConfig {
@@ -685,6 +688,7 @@ impl Default for MarketDataConfig {
             max_events_per_sec: 10_000,
             max_tracked_accounts: g.max_tracked_accounts,
             geyser_full_reconnect_threshold: g.geyser_full_reconnect_threshold,
+            geyser_sync_batch_ms: g.geyser_sync_batch_ms.clamp(10, 100),
         }
     }
 }
@@ -890,6 +894,9 @@ struct MarketDataContext {
     /// Optional Helius (or other full-history) RPC — **only** for bounded PumpSwap TX-history
     /// fallback in `EnsurePumpAmmPoolAccounts` when the local validator lacks tx index (Cold Path).
     helius_rpc: Option<Arc<SolanaRpc>>,
+
+    /// Debounced flush of explicit Geyser subscription maps after TX-path reserve registration.
+    geyser_sync_batch_timer: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Default)]
@@ -1030,6 +1037,16 @@ enum GeyserReserveRegisterFollowUp {
     None,
     /// PR-D: promote vault/bin rows for this pool to `MomentumActive` and track pool mints.
     MomentumUpgrade,
+}
+
+/// How to push explicit tracked keys to Geyser merge channels after reserve registration.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GeyserReserveEndSync {
+    /// Caller runs [`MarketDataContext::sync_geyser_tracked_accounts`] once after a batch.
+    Suppress,
+    Immediate,
+    /// TX-path: coalesce many updates into one debounced sync.
+    Batched,
 }
 
 /// Base + quote mint pubkeys for explicit mint-account Geyser tracking (metadata).
@@ -1315,9 +1332,37 @@ impl MarketDataContext {
         self.refresh_geyser_pins_gauge();
     }
 
-    fn sync_geyser_tracked_accounts(&self) {
+    fn sync_geyser_tracked_accounts_core(&self) {
         self.evict_geyser_unpinned_lru_to_cap();
         self.broadcast_tracked_geyser_explicit_to_merge();
+    }
+
+    /// Immediate subscription-list sync (momentum pins, wallet tracks, config, account-path admission, …).
+    fn sync_geyser_tracked_accounts(&self) {
+        record_market_data_geyser_sync_immediate_total();
+        self.sync_geyser_tracked_accounts_core();
+    }
+
+    /// Debounced TX-path flush: one coalesced sync after the batch window.
+    fn sync_geyser_tracked_accounts_batched_flush(&self) {
+        set_market_data_geyser_sync_pending(0);
+        record_market_data_geyser_sync_batch_total();
+        self.sync_geyser_tracked_accounts_core();
+    }
+
+    fn schedule_geyser_sync_batch_debounced(self: &Arc<Self>) {
+        let ms = self.config.read().geyser_sync_batch_ms.clamp(10, 100);
+        set_market_data_geyser_sync_pending(1);
+        let mut guard = self.geyser_sync_batch_timer.lock();
+        if let Some(h) = guard.take() {
+            h.abort();
+        }
+        let ctx = self.clone();
+        let h = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
+            ctx.sync_geyser_tracked_accounts_batched_flush();
+        });
+        *guard = Some(h);
     }
 
     /// Track mint pubkey for Geyser `TokenMintInfo` / metadata. Returns `true` if explicit pubkey set changed.
@@ -1400,14 +1445,45 @@ impl MarketDataContext {
         }
     }
 
-    /// PR-B: after a parsed swap trade, subscribe reserve vaults / DLMM bin arrays from MASTER cache.
-    fn register_geyser_reserves_after_trade(&self, pool: Pubkey) {
+    fn touch_tracked_pool_vaults_and_bins_if_tracked(&self, pool: Pubkey) {
+        let has_vault = self
+            .tracked_vaults
+            .read()
+            .values()
+            .any(|v| v.pool_address == pool);
+        let has_bin = self
+            .tracked_bin_arrays
+            .read()
+            .values()
+            .any(|b| b.pool_address == pool);
+        if has_vault || has_bin {
+            self.touch_tracked_pool_vaults_and_bins(pool);
+        }
+    }
+
+    /// PR-B: after a parsed swap trade, subscribe reserve vaults / DLMM bin arrays from MASTER cache
+    /// only when explicit pool assets are admitted (same rule as account-path).
+    fn register_geyser_reserves_after_trade(self: &Arc<Self>, pool: Pubkey) {
+        let Some(state) = self.live_pool_cache.get(&pool) else {
+            return;
+        };
+        let Some((base_mint, quote_mint)) = pool_mints_for_geyser_explicit_tracking(&state) else {
+            return;
+        };
+        if !self.admit_geyser_explicit_pool_assets(pool, base_mint, quote_mint) {
+            return;
+        }
         let follow_up = if self.active_pool_set.pool_has_any_pin(pool) {
             GeyserReserveRegisterFollowUp::MomentumUpgrade
         } else {
             GeyserReserveRegisterFollowUp::None
         };
-        let _ = self.register_geyser_reserves_impl(pool, follow_up, false);
+        let _ = self.register_geyser_reserves_impl(
+            pool,
+            follow_up,
+            GeyserReserveEndSync::Batched,
+            Some(self),
+        );
     }
 
     /// PR-D: explicit vault/bin subscriptions for momentum active `(mint, pool)` when cache has layout.
@@ -1425,10 +1501,16 @@ impl MarketDataContext {
             );
             return false;
         }
+        let end = if suppress_end_sync {
+            GeyserReserveEndSync::Suppress
+        } else {
+            GeyserReserveEndSync::Immediate
+        };
         self.register_geyser_reserves_impl(
             pool,
             GeyserReserveRegisterFollowUp::MomentumUpgrade,
-            suppress_end_sync,
+            end,
+            None,
         )
     }
 
@@ -1436,7 +1518,8 @@ impl MarketDataContext {
         &self,
         pool: Pubkey,
         follow_up: GeyserReserveRegisterFollowUp,
-        suppress_end_sync: bool,
+        end_sync: GeyserReserveEndSync,
+        ctx_for_batch: Option<&Arc<Self>>,
     ) -> bool {
         let now = Instant::now();
         let enable_dlmm = self.config.read().enable_meteora_dlmm;
@@ -1790,8 +1873,20 @@ impl MarketDataContext {
         }
 
         let changed = vaults_changed || bins_changed || mints_changed;
-        if changed && !suppress_end_sync {
-            self.sync_geyser_tracked_accounts();
+        if changed {
+            match end_sync {
+                GeyserReserveEndSync::Suppress => {}
+                GeyserReserveEndSync::Immediate => {
+                    self.sync_geyser_tracked_accounts();
+                }
+                GeyserReserveEndSync::Batched => {
+                    if let Some(ctx) = ctx_for_batch {
+                        ctx.schedule_geyser_sync_batch_debounced();
+                    } else {
+                        self.sync_geyser_tracked_accounts();
+                    }
+                }
+            }
         }
         changed
     }
@@ -2056,6 +2151,19 @@ impl MarketDataContext {
                                 info!(key = %key, new_value = %v, "Config updated");
                             } else {
                                 rejected.push((key.clone(), "Must be 1000-500000".to_string()));
+                            }
+                        } else {
+                            rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                        }
+                    }
+                    "geyser_sync_batch_ms" => {
+                        if let Some(v) = value.as_u64() {
+                            if (10..=100).contains(&v) {
+                                config.geyser_sync_batch_ms = v;
+                                applied.push(key.clone());
+                                info!(key = %key, new_value = %v, "Config updated");
+                            } else {
+                                rejected.push((key.clone(), "Must be 10-100".to_string()));
                             }
                         } else {
                             rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
@@ -6216,6 +6324,8 @@ async fn main() -> Result<()> {
         market_data_config.max_tracked_accounts = c.market_data_geyser.max_tracked_accounts;
         market_data_config.geyser_full_reconnect_threshold =
             c.market_data_geyser.geyser_full_reconnect_threshold;
+        market_data_config.geyser_sync_batch_ms =
+            c.market_data_geyser.geyser_sync_batch_ms.clamp(10, 100);
     }
 
     let wallet_env = std::env::var("IRONCRAB_WALLET_PUBKEY").ok();
@@ -6393,6 +6503,7 @@ async fn main() -> Result<()> {
         bonding_curve_publish_times: parking_lot::Mutex::new(BondingCurvePublishTimes::new()),
         pump_amm_dex: parking_lot::RwLock::new(None),
         helius_rpc,
+        geyser_sync_batch_timer: parking_lot::Mutex::new(None),
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -9490,7 +9601,7 @@ async fn handle_geyser_transaction(
 
     // PR-B: qualifying swap trade — refresh LRU timestamps and register reserve vaults / DLMM bins.
     if let Some(ParsedDexEvent::Trade { pool_address, .. }) = parsed_event.as_ref() {
-        ctx.touch_tracked_pool_vaults_and_bins(*pool_address);
+        ctx.touch_tracked_pool_vaults_and_bins_if_tracked(*pool_address);
         ctx.register_geyser_reserves_after_trade(*pool_address);
     }
 
@@ -12713,6 +12824,7 @@ mod momentum_nats_subject_tests {
 #[cfg(test)]
 mod pr_b_geyser_tracking_tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     #[test]
@@ -12938,12 +13050,14 @@ mod pr_b_geyser_tracking_tests {
     }
 
     /// Minimal [`MarketDataContext`] for PR-D active-pool pin tests (no NATS / no Geyser).
-    fn minimal_market_data_context_for_pr_d_tests(jsonl_writer: JsonlWriter) -> MarketDataContext {
+    fn minimal_market_data_context_for_pr_d_tests(
+        jsonl_writer: JsonlWriter,
+    ) -> Arc<MarketDataContext> {
         let (tracked_mints_tx, _tracked_mints_rx) = watch::channel(Vec::<Pubkey>::new());
         let (tracked_vaults_tx, _tracked_vaults_rx) = watch::channel(Vec::<Pubkey>::new());
         let (tracked_bin_arrays_tx, _tracked_bin_arrays_rx) = watch::channel(Vec::<Pubkey>::new());
         let (tracked_wallet_tx, _tracked_wallet_rx) = watch::channel(Vec::<Pubkey>::new());
-        MarketDataContext {
+        Arc::new(MarketDataContext {
             run_id: "run-prd-test".to_string(),
             config: parking_lot::RwLock::new(MarketDataConfig::default()),
             geyser_full_reconnect_threshold_live: Arc::new(AtomicUsize::new(0)),
@@ -12981,7 +13095,8 @@ mod pr_b_geyser_tracking_tests {
             bonding_curve_publish_times: parking_lot::Mutex::new(BondingCurvePublishTimes::new()),
             pump_amm_dex: parking_lot::RwLock::new(None),
             helius_rpc: None,
-        }
+            geyser_sync_batch_timer: parking_lot::Mutex::new(None),
+        })
     }
 
     #[test]
@@ -13273,7 +13388,7 @@ mod pr_b_geyser_tracking_tests {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
-        let ctx = Arc::new(minimal_market_data_context_for_pr_d_tests(jsonl));
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
         let (publish_tx, mut publish_rx) = mpsc::channel::<AccountPathNatsJob>(8);
         let pool = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
@@ -13399,5 +13514,145 @@ mod pr_b_geyser_tracking_tests {
             .expect("low item");
         assert_eq!(w2.update.pubkey, pool_l);
         assert!(account_worker_recv_next(&mut hrx, &mut lrx).await.is_none());
+    }
+
+    #[test]
+    fn tx_trade_path_skips_explicit_geyser_reserves_without_admission() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_mint,
+                token_1_mint: quote,
+                token_0_vault: coin_vault,
+                token_1_vault: pc_vault,
+                reserve_0: None,
+                reserve_1: None,
+            }),
+            1,
+        );
+
+        MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool);
+
+        let vs = ctx.tracked_vaults.read();
+        assert!(!vs.contains_key(&coin_vault));
+        assert!(!vs.contains_key(&pc_vault));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tx_trade_path_registers_vaults_when_active_pool_pin_admits() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_mint,
+                token_1_mint: quote,
+                token_0_vault: coin_vault,
+                token_1_vault: pc_vault,
+                reserve_0: None,
+                reserve_1: None,
+            }),
+            1,
+        );
+        ctx.active_pool_set.pin_pool(base_mint, pool);
+
+        MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool);
+
+        let vs = ctx.tracked_vaults.read();
+        assert!(vs.contains_key(&coin_vault));
+        assert!(vs.contains_key(&pc_vault));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tx_trade_path_geyser_sync_batches_two_pool_registers() {
+        use ironcrab::metrics::{
+            MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL, MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let base_a = Pubkey::new_unique();
+        let base_b = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+
+        let coin_a = Pubkey::new_unique();
+        let pc_a = Pubkey::new_unique();
+        let coin_b = Pubkey::new_unique();
+        let pc_b = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool_a,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_a,
+                token_1_mint: quote,
+                token_0_vault: coin_a,
+                token_1_vault: pc_a,
+                reserve_0: None,
+                reserve_1: None,
+            }),
+            1,
+        );
+        ctx.live_pool_cache.upsert(
+            pool_b,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_b,
+                token_1_mint: quote,
+                token_0_vault: coin_b,
+                token_1_vault: pc_b,
+                reserve_0: None,
+                reserve_1: None,
+            }),
+            1,
+        );
+        ctx.active_pool_set.pin_pool(base_a, pool_a);
+        ctx.active_pool_set.pin_pool(base_b, pool_b);
+
+        let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
+        let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
+
+        MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool_a);
+        MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool_b);
+
+        assert_eq!(
+            MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed),
+            imm0,
+            "trade-path reserve registration must not immediate-sync before debounce flush"
+        );
+
+        // Debounce window default 35 ms; wall-clock sleep so the spawned flush reliably runs.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        assert_eq!(
+            MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed),
+            batch0 + 1,
+            "expected a single batched Geyser subscription sync after coalesced trade-path updates"
+        );
+        assert_eq!(
+            MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed),
+            imm0
+        );
     }
 }
