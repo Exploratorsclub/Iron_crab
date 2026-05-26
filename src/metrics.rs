@@ -557,14 +557,6 @@ pub static MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH: Lazy<AtomicU64> =
 pub static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_STALLS_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
-/// JetStream (and similar) publish jobs dropped at enqueue when publish queue depth exceeds threshold (PR154).
-pub static MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
-    Lazy::new(|| AtomicU64::new(0));
-
-/// Number of dedicated `market-data-publish-*` NATS TCP connections / publish-worker tasks (PR154).
-pub static MARKET_DATA_ACCOUNT_PUBLISH_WORKERS_ACTIVE: Lazy<AtomicU64> =
-    Lazy::new(|| AtomicU64::new(0));
-
 /// Wall-clock unix ms of last successful publish-worker job (any variant). Stale in Grafana = worker stuck.
 pub static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LAST_SUCCESS_UNIX_MS: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -787,16 +779,6 @@ pub fn dec_market_data_account_publish_queue_depth() {
 #[inline]
 pub fn inc_market_data_account_publish_worker_stalls_total() {
     MARKET_DATA_ACCOUNT_PUBLISH_WORKER_STALLS_TOTAL.fetch_add(1, Ordering::Relaxed);
-}
-
-#[inline]
-pub fn inc_market_data_account_publish_queue_dropped_total() {
-    MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
-}
-
-#[inline]
-pub fn set_market_data_account_publish_workers_active(n: u64) {
-    MARKET_DATA_ACCOUNT_PUBLISH_WORKERS_ACTIVE.store(n, Ordering::Relaxed);
 }
 
 #[inline]
@@ -2581,14 +2563,6 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_account_publish_queue_depth",
         MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH.load(Ordering::Relaxed)
-    );
-    line!(
-        "market_data_account_publish_queue_dropped_total",
-        MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
-    );
-    line!(
-        "market_data_account_publish_workers_active",
-        MARKET_DATA_ACCOUNT_PUBLISH_WORKERS_ACTIVE.load(Ordering::Relaxed)
     );
     line!(
         "market_data_account_publish_worker_stalls_total",
