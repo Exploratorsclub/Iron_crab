@@ -250,6 +250,14 @@ pub static MARKET_DATA_MOMENTUM_ACTIVE_POOL_MESSAGES_TOTAL: Lazy<AtomicU64> =
 pub static MARKET_DATA_MOMENTUM_ACTIVE_POOL_PINS_GAUGE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// Geyser explicit-tracked subscription list syncs coalesced from the TX trade path (debounced flush).
+pub static MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Immediate `sync_geyser_tracked_accounts` (momentum pins, wallet tracks, config, mint metadata, etc.).
+pub static MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// 1 while a debounced TX-path Geyser sync is scheduled and not yet flushed; 0 otherwise.
+pub static MARKET_DATA_GEYSER_SYNC_PENDING: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
 /// Reconnect after large explicit subscription set (PR-B: full client reconnect vs in-place churn).
 pub static GEYSER_RECONNECT_TOTAL_SUBSCRIPTION_REBUILD: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -323,6 +331,21 @@ pub fn record_market_data_momentum_active_pool_messages_total() {
 #[inline]
 pub fn set_market_data_momentum_active_pool_pins_gauge(n: usize) {
     MARKET_DATA_MOMENTUM_ACTIVE_POOL_PINS_GAUGE.store(n as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_market_data_geyser_sync_batch_total() {
+    MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_market_data_geyser_sync_immediate_total() {
+    MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_geyser_sync_pending(pending: u64) {
+    MARKET_DATA_GEYSER_SYNC_PENDING.store(pending, Ordering::Relaxed);
 }
 
 pub fn geyser_metrics_inc_stream_error() {
@@ -2335,6 +2358,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_momentum_active_pool_pins",
         MARKET_DATA_MOMENTUM_ACTIVE_POOL_PINS_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_sync_batch_total",
+        MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_sync_immediate_total",
+        MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_sync_pending",
+        MARKET_DATA_GEYSER_SYNC_PENDING.load(Ordering::Relaxed)
     );
     out.push_str("geyser_tracked_accounts_evicted_total{kind=\"vault\"} ");
     out.push_str(

@@ -147,6 +147,9 @@ pub struct MarketDataGeyserCfg {
     /// many in-place `subscribe_tx` updates (reduces Yellowstone subscription churn).
     #[serde(default = "default_geyser_full_reconnect_threshold")]
     pub geyser_full_reconnect_threshold: usize,
+    /// Coalesce `sync_geyser_tracked_accounts` after TX-path vault registration (ms). Clamped 10–100 at runtime.
+    #[serde(default = "default_geyser_sync_batch_ms")]
+    pub geyser_sync_batch_ms: u64,
 }
 
 fn default_max_tracked_accounts() -> usize {
@@ -157,11 +160,16 @@ fn default_geyser_full_reconnect_threshold() -> usize {
     10_000
 }
 
+fn default_geyser_sync_batch_ms() -> u64 {
+    35
+}
+
 impl Default for MarketDataGeyserCfg {
     fn default() -> Self {
         Self {
             max_tracked_accounts: default_max_tracked_accounts(),
             geyser_full_reconnect_threshold: default_geyser_full_reconnect_threshold(),
+            geyser_sync_batch_ms: default_geyser_sync_batch_ms(),
         }
     }
 }

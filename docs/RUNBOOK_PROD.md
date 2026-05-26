@@ -207,6 +207,15 @@ market_data_tx_broadcast_queue_depth
 histogram_quantile(0.50, sum(rate(market_data_geyser_to_publish_ms_trade_bucket[5m])) by (le))
 ```
 
+**Prod-Smoke (Geyser explicit sync, nach Deploy):** TX-Pfad coalesced Sync — erwarte steigende `rate(market_data_geyser_sync_batch_total)` bei Trade-Last, **ohne** proportionales Wachstum von `geyser_tracked_accounts` durch unpinned Fremdpools; `market_data_geyser_sync_pending` sollte meist 0 sein.
+
+```promql
+market_data_geyser_sync_batch_total
+market_data_geyser_sync_immediate_total
+market_data_geyser_sync_pending
+geyser_tracked_accounts
+```
+
 **Prod-Gate (Account-Ingest-Fairness + Throughput P0, nach Deploy):** Ziel: `market_data_account_channel_lag_ms` **p50 < 20 ms**, **p95 < 100 ms**; `market_data_account_broadcast_queue_depth` **p50 ≈ 0**, **p99 < 10**; `market_data_account_worker_queue_depth` und `market_data_account_publish_queue_depth` dauerhaft niedrig (kein anhaltendes NATS-Await im Account-Handler). `market_data_account_broadcast_lagged_total == 0`. Tx-Metriken (`market_data_tx_channel_lag_ms`, `market_data_tx_broadcast_queue_depth`, `market_data_geyser_to_publish_ms_trade`) ohne Regression. Optional B★ (`market_data_trade_after_bonding_publish_ms`) und `market_data_bonding_to_trade_slot_delta_slots` beobachten.
 
 ```promql

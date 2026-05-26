@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### TX-PATH-GEYSER-ADMISSION-BATCH: Explizite Vault/Bin-Subscribe nur bei Admission + debounced Sync
+**Datum**: 2026-05-26  
+**Problem**: Nach PR #146 registrierte der TX-Trade-Pfad Reserve-Vaults/Bins via `register_geyser_reserves_after_trade` **ohne** `admit_geyser_explicit_pool_assets`; bei hohem Trade-Durchsatz (PR #151) folgte ein Sturm synchroner `sync_geyser_tracked_accounts()`-Aufrufe → Geyser-Subscription-Churn / NATS-Last (Prod-Ausfälle; Workarounds #153–#156 in #157 revertiert).  
+**Fix**: (1) **TX-Pfad**: `LivePoolCache`-Hit, `pool_mints_for_geyser_explicit_tracking`, dann `admit_geyser_explicit_pool_assets` — erst danach `register_geyser_reserves_impl` mit `GeyserReserveEndSync::Batched`. (2) **Batch-Sync**: Debounce per `tokio::spawn` + `sleep(geyser_sync_batch_ms)` (Default **35 ms**, TOML `[market_data_geyser] geyser_sync_batch_ms`, Clamp **10–100**); erneuter Trade resettet den Timer (ein Flush). **Momentum** / `max_tracked_accounts` / Wallet-Tracks: weiterhin **Immediate** via bestehendem `sync_geyser_tracked_accounts()`. (3) `touch_tracked_pool_vaults_and_bins` nur noch, wenn der Pool **bereits** in den expliziten Track-Maps liegt (`touch_tracked_pool_vaults_and_bins_if_tracked`). Metriken: `market_data_geyser_sync_batch_total`, `market_data_geyser_sync_immediate_total`, `market_data_geyser_sync_pending`. **Invarianten**: kein RPC im Hot Path (I-7), PR-B Admission konsistent mit Account-Pfad, kein Re-Intro #153–#156.  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `src/config.rs`, `docs/BUGS_FIXES.md`, `docs/RUNBOOK_PROD.md`
+
 ### PR151-NATS-WATCHDOG-FOLLOWUP: TX DevWallet async NATS + systemd-Watchdog unter Backpressure
 **Datum**: 2026-05-26  
 **Problem** (Prod `ironcrab-prod`): Nach PR #151 (Creator-Latenz korrekt) blieb der TX-Fast-Path `maybe_emit_dev_wallet_after_pool_mint_map` bei **synchronem** `publish_market_event_core_and_momentum_ex().await` im dedizierten Geyser-Tx-Task. Unter NATS-Client-Backpressure (100 ms Publish-Timeout) blockierten viele aufeinanderfolgende Versuche den Tokio-Scheduler; der Main-`select!` kam nicht rechtzeitig zum 10 s-`activity_interval` → **kein** `sd_notify(WATCHDOG)` → systemd `WatchdogSec=30` killte `market-data` in einer Schleife. Symptome: `nats_messages_published_total` friert, Logs `NATS publish timeout (backpressure)` / `Market event publish to NATS (core) dropped or failed`.  
