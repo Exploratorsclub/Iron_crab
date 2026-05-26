@@ -552,6 +552,15 @@ pub static MARKET_DATA_ACCOUNT_LOW_PRIORITY_QUEUE_DEPTH: Lazy<AtomicU64> =
 pub static MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// Dedicated publish worker: jobs dropped after a fixed worker-side job timeout
+/// (unblocks the queue under stuck NATS I/O).
+pub static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_STALLS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Wall-clock unix ms of last successful publish-worker job (any variant). Stale in Grafana = worker stuck.
+pub static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LAST_SUCCESS_UNIX_MS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// Account ingest: cheap relevance filter discarded the update before `handle_geyser_account` body.
 pub static MARKET_DATA_ACCOUNT_EARLY_DROP_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
@@ -571,6 +580,25 @@ static MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64
 static MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_SUM: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 static MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Dedicated NATS publish worker: per-job wall time (microseconds), including successful publishes
+/// and dropped jobs after worker timeout.
+const MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_BUCKETS: &[u64] = &[
+    100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 1_500_000, 2_000_000,
+    2_500_000, 5_000_000,
+];
+
+static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_COUNT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
 /// Update monotonic Geyser head slot (max). Safe from any market-data ingest arm.
@@ -746,6 +774,29 @@ pub fn inc_market_data_account_publish_queue_depth() {
 #[inline]
 pub fn dec_market_data_account_publish_queue_depth() {
     MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_publish_worker_stalls_total() {
+    MARKET_DATA_ACCOUNT_PUBLISH_WORKER_STALLS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_account_publish_worker_last_success_unix_ms(ts_ms: u64) {
+    MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LAST_SUCCESS_UNIX_MS.store(ts_ms, Ordering::Relaxed);
+}
+
+/// Per publish-worker job wall time (microseconds), including timeout drops.
+#[inline]
+pub fn record_market_data_account_publish_worker_job_duration_us(us: u64) {
+    record_histogram_u64_into(
+        MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_BUCKETS,
+        &MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_SUM,
+        &MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_COUNT,
+        us,
+        u64::MAX,
+    );
 }
 
 #[inline]
@@ -2514,6 +2565,14 @@ async fn metrics_response() -> Response<Body> {
         MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH.load(Ordering::Relaxed)
     );
     line!(
+        "market_data_account_publish_worker_stalls_total",
+        MARKET_DATA_ACCOUNT_PUBLISH_WORKER_STALLS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_publish_worker_last_success_unix_ms",
+        MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LAST_SUCCESS_UNIX_MS.load(Ordering::Relaxed)
+    );
+    line!(
         "market_data_account_early_drop_total",
         MARKET_DATA_ACCOUNT_EARLY_DROP_TOTAL.load(Ordering::Relaxed)
     );
@@ -2524,6 +2583,14 @@ async fn metrics_response() -> Response<Body> {
         &MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_BUCKET_COUNTS,
         &MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_SUM,
         &MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_account_publish_worker_job_duration_us",
+        MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_BUCKETS,
+        &MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_SUM,
+        &MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_COUNT,
     );
 
     // --- momentum-bot service ---
