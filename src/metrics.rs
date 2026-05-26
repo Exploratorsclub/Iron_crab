@@ -227,8 +227,7 @@ pub static GEYSER_RECONNECT_TOTAL_STREAM_ERROR: Lazy<AtomicU64> = Lazy::new(|| A
 pub static GEYSER_RECONNECT_TOTAL_SINK_GONE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// gRPC stream `Err` deliveries (excludes graceful `None` / stream ended).
 pub static GEYSER_STREAM_ERRORS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
-/// 1 while a Geyser gRPC TCP subscribe handshake succeeded; 0 while reconnecting.
-/// Not ingest health — see `geyser_ingest_alive` / `geyser_last_stream_payload_unix_ms` (PR-156).
+/// 1 while a Geyser gRPC connection is established; 0 while reconnecting.
 pub static GEYSER_CONNECTED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 /// Combined explicit Geyser account subscription size (mints + vaults + bin arrays + wallet).
@@ -255,20 +254,6 @@ pub static MARKET_DATA_MOMENTUM_ACTIVE_POOL_PINS_GAUGE: Lazy<AtomicU64> =
 pub static GEYSER_RECONNECT_TOTAL_SUBSCRIPTION_REBUILD: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
-/// Reconnect after main Geyser stream silent stall (no Account/Tx/BlockMeta payloads; PR-156).
-pub static GEYSER_RECONNECT_TOTAL_INGEST_STALE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
-
-/// Successful in-place `subscribe_tx.send` updates for tracked-account churn (PR-156).
-pub static GEYSER_SUBSCRIPTION_INPLACE_UPDATES_TOTAL: Lazy<AtomicU64> =
-    Lazy::new(|| AtomicU64::new(0));
-
-/// Wall-clock ms of last Account/Transaction/BlockMeta payload on main Geyser listener (PR-156).
-pub static GEYSER_LAST_STREAM_PAYLOAD_UNIX_MS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
-
-/// Wall-clock ms of last [`market_data_bump_geyser_head_slot`] call (PR-156 NATS liveness proxy).
-pub static MARKET_DATA_GEYSER_HEAD_SLOT_LAST_BUMP_UNIX_MS: Lazy<AtomicU64> =
-    Lazy::new(|| AtomicU64::new(0));
-
 /// Geyser listener reconnect reason (PR-A stream resiliency).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GeyserReconnectReason {
@@ -277,8 +262,6 @@ pub enum GeyserReconnectReason {
     SinkGone,
     /// PR-B: intentional full reconnect for large `combined_tracked` updates.
     SubscriptionRebuild,
-    /// PR-156: no stream payloads for extended period while TCP subscription appears healthy.
-    IngestStale,
 }
 
 pub fn geyser_metrics_inc_reconnect(reason: GeyserReconnectReason) {
@@ -295,32 +278,6 @@ pub fn geyser_metrics_inc_reconnect(reason: GeyserReconnectReason) {
         GeyserReconnectReason::SubscriptionRebuild => {
             GEYSER_RECONNECT_TOTAL_SUBSCRIPTION_REBUILD.fetch_add(1, Ordering::Relaxed);
         }
-        GeyserReconnectReason::IngestStale => {
-            GEYSER_RECONNECT_TOTAL_INGEST_STALE.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
-/// Main listener: any Account / Transaction / BlockMeta wire payload (PR-156 ingest liveness).
-#[inline]
-pub fn geyser_metrics_touch_stream_payload_unix_ms() {
-    GEYSER_LAST_STREAM_PAYLOAD_UNIX_MS.store(wall_clock_unix_ms_now(), Ordering::Relaxed);
-}
-
-#[inline]
-pub fn geyser_metrics_inc_subscription_inplace_updates_total() {
-    GEYSER_SUBSCRIPTION_INPLACE_UPDATES_TOTAL.fetch_add(1, Ordering::Relaxed);
-}
-
-/// PR-156: `1` if last stream payload is within `max_age_ms` of `now_ms`, else `0`. (Gauge semantics.)
-#[inline]
-pub fn geyser_ingest_alive_gauge(now_ms: u64, last_payload_unix_ms: u64, max_age_ms: u64) -> u64 {
-    if last_payload_unix_ms == 0 {
-        0
-    } else if now_ms.saturating_sub(last_payload_unix_ms) < max_age_ms {
-        1
-    } else {
-        0
     }
 }
 
@@ -620,10 +577,6 @@ pub static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_RECONNECTS_TOTAL: Lazy<AtomicU64> 
 pub static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LIVENESS_RECONNECTS_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
-/// Publish enqueue: `mpsc::send` exceeded timeout (PR-156; avoids blocking account ingest on full queue).
-pub static MARKET_DATA_ACCOUNT_PUBLISH_ENQUEUE_TIMEOUTS_TOTAL: Lazy<AtomicU64> =
-    Lazy::new(|| AtomicU64::new(0));
-
 /// Account ingest: cheap relevance filter discarded the update before `handle_geyser_account` body.
 pub static MARKET_DATA_ACCOUNT_EARLY_DROP_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
@@ -671,8 +624,6 @@ pub fn market_data_bump_geyser_head_slot(slot: u64) {
         return;
     }
     let _ = MARKET_DATA_GEYSER_HEAD_SLOT.fetch_max(slot, Ordering::Relaxed);
-    MARKET_DATA_GEYSER_HEAD_SLOT_LAST_BUMP_UNIX_MS
-        .store(wall_clock_unix_ms_now(), Ordering::Relaxed);
 }
 
 /// Record wall ms delta for pump.fun trade after last bonding publish (bounded map hit only).
@@ -849,11 +800,6 @@ pub fn inc_market_data_account_publish_worker_stalls_total() {
 #[inline]
 pub fn inc_market_data_account_publish_queue_dropped_total() {
     MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
-}
-
-#[inline]
-pub fn inc_market_data_account_publish_enqueue_timeouts_total() {
-    MARKET_DATA_ACCOUNT_PUBLISH_ENQUEUE_TIMEOUTS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -2452,29 +2398,11 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
-    out.push_str("geyser_reconnect_total{reason=\"ingest_stale\"} ");
-    out.push_str(
-        &GEYSER_RECONNECT_TOTAL_INGEST_STALE
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
     line!(
         "geyser_stream_errors_total",
         GEYSER_STREAM_ERRORS_TOTAL.load(Ordering::Relaxed)
     );
     line!("geyser_connected", GEYSER_CONNECTED.load(Ordering::Relaxed));
-    let now_ms = wall_clock_unix_ms_now();
-    let last_payload_ms = GEYSER_LAST_STREAM_PAYLOAD_UNIX_MS.load(Ordering::Relaxed);
-    line!("geyser_last_stream_payload_unix_ms", last_payload_ms);
-    line!(
-        "geyser_ingest_alive",
-        geyser_ingest_alive_gauge(now_ms, last_payload_ms, 30_000)
-    );
-    line!(
-        "geyser_subscription_inplace_updates_total",
-        GEYSER_SUBSCRIPTION_INPLACE_UPDATES_TOTAL.load(Ordering::Relaxed)
-    );
     line!(
         "geyser_subscription_accounts",
         GEYSER_SUBSCRIPTION_ACCOUNTS.load(Ordering::Relaxed)
@@ -2519,10 +2447,6 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_geyser_head_slot",
         MARKET_DATA_GEYSER_HEAD_SLOT.load(Ordering::Relaxed)
-    );
-    line!(
-        "market_data_geyser_head_slot_last_bump_unix_ms",
-        MARKET_DATA_GEYSER_HEAD_SLOT_LAST_BUMP_UNIX_MS.load(Ordering::Relaxed)
     );
     line!(
         "market_data_last_trade_publish_ts_unix_ms",
@@ -2679,10 +2603,6 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_account_publish_queue_dropped_total",
         MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
-    );
-    line!(
-        "market_data_account_publish_enqueue_timeouts_total",
-        MARKET_DATA_ACCOUNT_PUBLISH_ENQUEUE_TIMEOUTS_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_account_publish_workers_active",
@@ -4070,18 +3990,5 @@ mod momentum_latency_metrics_tests {
             MOMENTUM_CORE_MARKET_EVENTS_INGEST_CONSECUTIVE_CAP_HIT_STREAK.load(Ordering::Relaxed),
             0
         );
-    }
-}
-
-#[cfg(test)]
-mod geyser_ingest_liveness_metrics_tests {
-    use super::geyser_ingest_alive_gauge;
-
-    #[test]
-    fn geyser_ingest_alive_gauge_respects_window() {
-        assert_eq!(geyser_ingest_alive_gauge(100_000, 0, 30_000), 0);
-        assert_eq!(geyser_ingest_alive_gauge(100_000, 99_900, 30_000), 1);
-        assert_eq!(geyser_ingest_alive_gauge(130_000, 99_000, 30_000), 0);
-        assert_eq!(geyser_ingest_alive_gauge(129_999, 100_000, 30_000), 1);
     }
 }
