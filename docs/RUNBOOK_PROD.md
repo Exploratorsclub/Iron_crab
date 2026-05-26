@@ -168,7 +168,7 @@ curl -s http://localhost:9801/metrics | grep '^geyser_'
 
 **Incident-Debug:** `journalctl -u market-data` (Stream, Reconnects) und im importierten Multi-Process-Dashboard die Zeile **Market Data Service** → Panels **Geyser Connected** / **Geyser Reconnects (5m rate)**.
 
-**Betrieb:** `docs/systemd/market-data.service` setzt `Restart=always` (transiente Stream-Abbrüche sollen die Unit nicht dauerhaft inaktiv lassen). Nach Deploy in Grafana Dashboard JSON neu importieren bzw. Refresh; Explore: `geyser_connected{job="market-data"}`.
+**Betrieb:** `docs/systemd/market-data.service` setzt `Restart=always` (transiente Stream-Abbrüche sollen die Unit nicht dauerhaft inaktiv lassen). Nach Deploy in Grafana Dashboard JSON neu importieren bzw. Refresh; Explore: `geyser_connected{job="market-data"}`. **systemd-Watchdog:** Zusätzlich zum bestehenden Ping im Haupt-`select!` pingt ein **dedizierter Task alle 5 s** (`sd_notify(WATCHDOG)`), damit `WatchdogSec=30` nicht verfehlt wird, wenn NATS-Backpressure oder Geyser-Arbeit den Main-Loop verzögert (**PR151-NATS-WATCHDOG-FOLLOWUP** in `docs/BUGS_FIXES.md`).
 
 **Prometheus / `rate()`:** Der Text-Export der Metriken kann je nach Prometheus-Konfiguration abweichen — nach Deploy in Explore verifizieren, z. B. `rate(geyser_reconnect_total{job="market-data"}[5m])` und `rate(geyser_stream_errors_total{job="market-data"}[5m])` liefern sinnvolle Zeitreihen.
 

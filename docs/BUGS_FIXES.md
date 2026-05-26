@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PR151-NATS-WATCHDOG-FOLLOWUP: TX DevWallet async NATS + systemd-Watchdog unter Backpressure
+**Datum**: 2026-05-26  
+**Problem** (Prod `ironcrab-prod`): Nach PR #151 (Creator-Latenz korrekt) blieb der TX-Fast-Path `maybe_emit_dev_wallet_after_pool_mint_map` bei **synchronem** `publish_market_event_core_and_momentum_ex().await` im dedizierten Geyser-Tx-Task. Unter NATS-Client-Backpressure (100 ms Publish-Timeout) blockierten viele aufeinanderfolgende Versuche den Tokio-Scheduler; der Main-`select!` kam nicht rechtzeitig zum 10 s-`activity_interval` → **kein** `sd_notify(WATCHDOG)` → systemd `WatchdogSec=30` killte `market-data` in einer Schleife. Symptome: `nats_messages_published_total` friert, Logs `NATS publish timeout (backpressure)` / `Market event publish to NATS (core) dropped or failed`.  
+**Fix**: (1) **TX-Fast-Path** nutzt dieselbe **async**-Queue wie der Account-Pfad: `account_path_enqueue_core_market_event` mit `publish_tx` (kein direktes Await auf Core-Publish im Tx-Ingest-Task wenn Queue existiert). `account_publish_tx`-Worker wird **vor** dem Tx-`tokio::spawn` gestartet und an `handle_geyser_transaction` durchgereicht. (2) **Dedizierter Watchdog-Task** `tokio::time::interval(5 s)` + `sd_notify(WATCHDOG)` (nur unix), unabhängig von Geyser-`select!` und NATS-Last — Reserve zu `WatchdogSec=30`. Idempotenz / `pool_creator_cache` / Metrik `market_data_pool_mint_map_to_devwallet_ms` (Enqueue-/Vorbereitungszeitpunkt) unverändert. **Invarianten**: kein neuer RPC (I-7), keine NATS-Schema-Änderung (I-23), kein Creator aus Swap-Accounts (I-4).  
+**Dateien**: `src/bin/market_data.rs`, `docs/BUGS_FIXES.md`, `docs/RUNBOOK_PROD.md`
+
 ### ACCOUNT-PATH-TX-PARITY-CREATOR: DevWallet/Creator-Latenz — TX-Fast-Path + strategische Account-Queues
 **Datum**: 2026-05-25  
 **Problem** (Prod-Referenz „WONDERBRA“, 2026-05-24): Trade-Discovery ohne `PoolCreated`; `BondingCurveUpdate` füllte `pool_creator_cache`, aber `DevWalletIdentified` wurde nur bei **bekanntem** `pool_mint_map` emittiert — Updates **vor** dem ersten Trade gingen verloren (kein Re-Emit). Zugleich verarbeiteten **8** Account-Worker-FIFO-Shards massenweise PumpFun-Bonding-Curves; strategisch relevante Pools lagen **Minuten** in der Wall-Clock-Warteschlange hinter irrelevanten Updates (`ENTRY_BUY_DEFERRED_MISSING_CREATOR` / BUY-Gate).  
