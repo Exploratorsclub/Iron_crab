@@ -7490,13 +7490,18 @@ async fn account_worker_recv_next(
 
 /// After `pool_mint_map` insert on the TX path: emit `DevWalletIdentified` if bonding-curve cache
 /// already holds authoritative creator (no Swap parsing; I-4 / BUG-D).
+///
+/// NATS: when `publish_tx` is set (same channel as `account_path_publish_worker`), enqueue only —
+/// avoids blocking the TX ingest task on Core NATS backpressure (PR151 follow-up).
+#[allow(clippy::too_many_arguments)]
 async fn maybe_emit_dev_wallet_after_pool_mint_map(
-    ctx: &MarketDataContext,
+    ctx: &Arc<MarketDataContext>,
     run_id: &str,
     pool: &Pubkey,
     mint: &str,
     slot: Option<u64>,
     tx_grpc_recv_at: Instant,
+    publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
     nats: Option<&NatsClient>,
 ) -> bool {
     let pool_str = pool.to_string();
@@ -7552,16 +7557,17 @@ async fn maybe_emit_dev_wallet_after_pool_mint_map(
     if let Err(e) = ctx.jsonl_writer.write(&dev_event) {
         error!(error = %e, "Failed to write DevWalletIdentified (TX fast-path) to JSONL");
     }
-    if let Some(nats_client) = nats {
-        let _ = publish_market_event_core_and_momentum_ex(
-            nats_client,
-            &dev_event,
+    if publish_tx.is_some() || ctx.nats.is_some() {
+        account_path_enqueue_core_market_event(
+            publish_tx,
+            nats,
+            ctx,
+            dev_event,
             Some(MarketEventCorePublishTrace {
                 recv_at: tx_grpc_recv_at,
                 cold_path: false,
                 segment: MarketDataLatencySegment::Other,
             }),
-            Some(ctx),
         )
         .await;
     }
@@ -9334,6 +9340,7 @@ async fn handle_geyser_transaction(
     run_id: &str,
     tx_update: GeyserTransactionUpdate,
     tx_count: &AtomicU64,
+    account_publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
 ) {
     let recv_at = Instant::now();
     record_market_data_tx_channel_lag_ms(tx_update.grpc_recv_at, recv_at);
@@ -9442,12 +9449,13 @@ async fn handle_geyser_transaction(
                     .write()
                     .insert(*pool_address);
                 maybe_emit_dev_wallet_after_pool_mint_map(
-                    ctx.as_ref(),
+                    &ctx,
                     run_id,
                     pool_address,
                     &base_mint.to_string(),
                     Some(tx_update.slot),
                     tx_update.grpc_recv_at,
+                    account_publish_tx,
                     ctx.nats.as_ref(),
                 )
                 .await;
@@ -9465,12 +9473,13 @@ async fn handle_geyser_transaction(
                     .write()
                     .insert(*pool_address);
                 maybe_emit_dev_wallet_after_pool_mint_map(
-                    ctx.as_ref(),
+                    &ctx,
                     run_id,
                     pool_address,
                     &mint.to_string(),
                     Some(tx_update.slot),
                     tx_update.grpc_recv_at,
+                    account_publish_tx,
                     ctx.nats.as_ref(),
                 )
                 .await;
@@ -10087,6 +10096,19 @@ async fn run_geyser_loop(
         return Ok(());
     }
 
+    // PR151-NATS-WATCHDOG-FOLLOWUP: systemd WatchdogSec=30 — ping unabhängig vom Geyser-`select!`
+    // und NATS-Backpressure (siehe docs/BUGS_FIXES.md), analog execution_engine `maybe_ping_watchdog`.
+    #[cfg(unix)]
+    {
+        tokio::spawn(async {
+            let mut iv = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                iv.tick().await;
+                let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
+            }
+        });
+    }
+
     // Mint metadata fetch pipeline:
     // - We add mints to `tracked_mints` when we see them via tx/pool discovery.
     // - Mint accounts often *never change*, so relying on a future Geyser account update
@@ -10261,6 +10283,19 @@ async fn run_geyser_loop(
         None
     };
 
+    // Async NATS publish queue (shared by account workers and TX fast-path DevWallet enqueue).
+    // Must exist before the Geyser-Tx task starts so `handle_geyser_transaction` can enqueue.
+    let account_publish_tx: Option<mpsc::Sender<AccountPathNatsJob>> =
+        ctx.nats.as_ref().map(|nats| {
+            let (tx, rx) = mpsc::channel(MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_CAP);
+            let ctx_pub = Arc::clone(&ctx);
+            let nats_pub = nats.clone_for_spawned_publish();
+            tokio::spawn(async move {
+                account_path_publish_worker(rx, ctx_pub, nats_pub).await;
+            });
+            tx
+        });
+
     // Option A (MARKET-DATA-TX-INGEST-FAIRNESS): dedizierter Tokio-Task für Geyser-Txs.
     // Verhindert, dass `transaction_rx.recv()` hinter langen Account-`select!`-Armen verhungert
     // (p50 `market_data_tx_channel_lag_ms` war ~1s+ bei gleichzeitig niedrigem Publish-Tail).
@@ -10268,6 +10303,7 @@ async fn run_geyser_loop(
     let ctx_geyser_tx = Arc::clone(&ctx);
     let run_id_geyser_tx = run_id.to_string();
     let tx_count_geyser_tx = Arc::clone(&tx_count);
+    let account_publish_tx_geyser_tx = account_publish_tx.clone();
     let mut transaction_rx_geyser = transaction_rx;
     tokio::spawn(async move {
         loop {
@@ -10279,6 +10315,7 @@ async fn run_geyser_loop(
                         run_id_geyser_tx.as_str(),
                         tx_update,
                         tx_count_geyser_tx.as_ref(),
+                        account_publish_tx_geyser_tx.as_ref(),
                     )
                     .await;
                 }
@@ -10303,17 +10340,6 @@ async fn run_geyser_loop(
     let account_count_geyser_acc = Arc::clone(&account_count);
     let rpc_geyser_acc = Arc::clone(&rpc);
     let mut account_rx_geyser = account_rx;
-
-    let account_publish_tx: Option<mpsc::Sender<AccountPathNatsJob>> =
-        ctx_geyser_acc.nats.as_ref().map(|nats| {
-            let (tx, rx) = mpsc::channel(MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_CAP);
-            let ctx_pub = Arc::clone(&ctx_geyser_acc);
-            let nats_pub = nats.clone_for_spawned_publish();
-            tokio::spawn(async move {
-                account_path_publish_worker(rx, ctx_pub, nats_pub).await;
-            });
-            tx
-        });
 
     let mut worker_high_tx_list: Vec<mpsc::Sender<AccountWorkItem>> =
         Vec::with_capacity(MARKET_DATA_ACCOUNT_WORKER_COUNT);
@@ -13247,7 +13273,8 @@ mod pr_b_geyser_tracking_tests {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
-        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let ctx = Arc::new(minimal_market_data_context_for_pr_d_tests(jsonl));
+        let (publish_tx, mut publish_rx) = mpsc::channel::<AccountPathNatsJob>(8);
         let pool = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         let creator = Pubkey::new_unique();
@@ -13263,10 +13290,24 @@ mod pr_b_geyser_tracking_tests {
                 &mint.to_string(),
                 Some(1),
                 grpc_at,
+                Some(&publish_tx),
                 None,
             )
             .await
         );
+        let job = tokio::time::timeout(std::time::Duration::from_secs(2), publish_rx.recv())
+            .await
+            .expect("timeout waiting for publish job")
+            .expect("enqueue expected");
+        match job {
+            AccountPathNatsJob::CoreMarketEvent { event, .. } => {
+                assert!(matches!(
+                    event.kind,
+                    MarketEventKind::DevWalletIdentified { .. }
+                ));
+            }
+            _ => panic!("expected CoreMarketEvent job"),
+        }
         assert!(
             !maybe_emit_dev_wallet_after_pool_mint_map(
                 &ctx,
@@ -13275,10 +13316,15 @@ mod pr_b_geyser_tracking_tests {
                 &mint.to_string(),
                 Some(2),
                 grpc_at,
+                Some(&publish_tx),
                 None,
             )
             .await,
             "second call with same creator must not re-emit"
+        );
+        assert!(
+            publish_rx.try_recv().is_err(),
+            "idempotent second call must not enqueue another NATS job"
         );
         let date = chrono::Utc::now().format("%Y%m%d");
         let log = tmp.path().join(format!("market_events-{date}.jsonl"));
