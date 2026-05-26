@@ -51,10 +51,12 @@ use ironcrab::ipc::{
 use ironcrab::metrics::{
     dec_market_data_account_high_priority_queue_depth,
     dec_market_data_account_low_priority_queue_depth, dec_market_data_account_publish_queue_depth,
-    dec_market_data_account_worker_queue_depth, geyser_metrics_inc_tracked_evicted,
-    geyser_metrics_set_subscription_accounts, geyser_metrics_set_tracked_pinned_accounts,
-    inc_market_data_account_high_priority_queue_depth,
-    inc_market_data_account_low_priority_queue_depth, inc_market_data_account_publish_queue_depth,
+    dec_market_data_account_worker_queue_depth, geyser_ingest_alive_gauge,
+    geyser_metrics_inc_tracked_evicted, geyser_metrics_set_subscription_accounts,
+    geyser_metrics_set_tracked_pinned_accounts, inc_market_data_account_high_priority_queue_depth,
+    inc_market_data_account_low_priority_queue_depth,
+    inc_market_data_account_publish_enqueue_timeouts_total,
+    inc_market_data_account_publish_queue_depth,
     inc_market_data_account_publish_queue_dropped_total,
     inc_market_data_account_publish_worker_liveness_reconnects_total,
     inc_market_data_account_publish_worker_reconnects_total,
@@ -76,8 +78,10 @@ use ironcrab::metrics::{
     set_market_data_momentum_active_pool_pins_gauge, set_market_data_tx_broadcast_queue_depth,
     set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
     update_readiness_market_data_current, wall_clock_unix_ms_now, GeyserTrackedEvictKind,
-    MarketDataLatencySegment, MetricsComponent, MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH,
+    MarketDataLatencySegment, MetricsComponent, GEYSER_LAST_STREAM_PAYLOAD_UNIX_MS,
+    MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH,
     MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LAST_SUCCESS_UNIX_MS,
+    MARKET_DATA_GEYSER_HEAD_SLOT_LAST_BUMP_UNIX_MS,
     MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS,
     MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
     MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
@@ -233,8 +237,8 @@ pub(crate) struct MarketEventCorePublishTrace {
     pub recv_at: Instant,
     pub cold_path: bool,
     pub segment: MarketDataLatencySegment,
-    /// When true, [`record_market_data_geyser_to_publish_on_success`] was already called at `mpsc` enqueue
-    /// (PR153); the worker must not double-count end-to-end latency on successful publish.
+    /// When true, [`record_market_data_geyser_to_publish_on_success`] was already recorded after a
+    /// successful `mpsc` enqueue (PR-156); the worker must not double-count end-to-end latency on successful publish.
     pub skip_geyser_to_publish_histogram: bool,
 }
 
@@ -278,9 +282,8 @@ fn market_data_publish_segment(kind: &MarketEventKind) -> MarketDataLatencySegme
 
 /// Bonding / last-trade side effects after a logical core publish success.
 ///
-/// PR154: called from the inline NATS path after `Ok(true)`, and **optimistically** from
-/// `account_path_enqueue_core_market_event` when using `publish_tx`, so publish workers never take
-/// `bonding_curve_publish_times` (avoids cross-task `parking_lot::Mutex` deadlocks with account handlers).
+/// PR154/PR156: called from the inline NATS path after `Ok(true)`, and after a **successful**
+/// `publish_tx` enqueue (post-`mpsc::send`) so optimistic bonding/trade timestamps match delivered jobs.
 #[inline]
 fn apply_market_event_publish_success_side_effects(ctx: &MarketDataContext, event: &MarketEvent) {
     let now_ms = wall_clock_unix_ms_now();
@@ -7824,9 +7827,14 @@ async fn market_data_publish_liveness_watchdog(nats_handles: Vec<Arc<Mutex<NatsC
         let now = wall_clock_unix_ms_now();
         let last = MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LAST_SUCCESS_UNIX_MS.load(Ordering::Relaxed);
         let depth = MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH.load(Ordering::Relaxed);
-        if depth > 0 && now.saturating_sub(last) > STALE_MS {
+        let last_payload = GEYSER_LAST_STREAM_PAYLOAD_UNIX_MS.load(Ordering::Relaxed);
+        let head_bump = MARKET_DATA_GEYSER_HEAD_SLOT_LAST_BUMP_UNIX_MS.load(Ordering::Relaxed);
+        let geyser_alive = geyser_ingest_alive_gauge(now, last_payload, 30_000) == 1
+            || geyser_ingest_alive_gauge(now, head_bump, 30_000) == 1;
+        if now.saturating_sub(last) > STALE_MS && (depth > 0 || geyser_alive) {
             warn!(
                 depth,
+                geyser_alive,
                 last_success_unix_ms = last,
                 stale_ms = now.saturating_sub(last),
                 "account_path: publish liveness watchdog — reconnecting all publish NATS clients"
@@ -7949,20 +7957,32 @@ async fn account_path_enqueue_jetstream<T: Serialize>(
             }
         };
         inc_market_data_account_publish_queue_depth();
-        if tx
-            .send(AccountPathNatsJob::JetStream {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            tx.send(AccountPathNatsJob::JetStream {
                 subject,
                 payload,
                 bump_market_events_published_total,
-            })
-            .await
-            .is_err()
+            }),
+        )
+        .await
         {
-            dec_market_data_account_publish_queue_depth();
-            warn!(
-                msg = log_fail,
-                "account_path: publish queue closed (JetStream)"
-            );
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                dec_market_data_account_publish_queue_depth();
+                warn!(
+                    msg = log_fail,
+                    "account_path: publish queue closed (JetStream)"
+                );
+            }
+            Err(_) => {
+                dec_market_data_account_publish_queue_depth();
+                inc_market_data_account_publish_enqueue_timeouts_total();
+                warn!(
+                    msg = log_fail,
+                    "account_path: publish queue send timed out (JetStream)"
+                );
+            }
         }
     } else if let Some(nats) = nats {
         if let Err(e) = nats.jetstream_publish(&subject, payload).await {
@@ -7987,20 +8007,32 @@ async fn account_path_enqueue_topic_json(
 ) {
     if let Some(tx) = publish_tx {
         inc_market_data_account_publish_queue_depth();
-        if tx
-            .send(AccountPathNatsJob::TopicPublish {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            tx.send(AccountPathNatsJob::TopicPublish {
                 topic: topic.to_string(),
                 payload,
                 bump_nats_counter,
-            })
-            .await
-            .is_err()
+            }),
+        )
+        .await
         {
-            dec_market_data_account_publish_queue_depth();
-            warn!(
-                msg = log_fail,
-                "account_path: publish queue closed (topic JSON)"
-            );
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                dec_market_data_account_publish_queue_depth();
+                warn!(
+                    msg = log_fail,
+                    "account_path: publish queue closed (topic JSON)"
+                );
+            }
+            Err(_) => {
+                dec_market_data_account_publish_queue_depth();
+                inc_market_data_account_publish_enqueue_timeouts_total();
+                warn!(
+                    msg = log_fail,
+                    "account_path: publish queue send timed out (topic JSON)"
+                );
+            }
         }
     } else if let Some(nats) = nats {
         match nats.publish(topic, &payload).await {
@@ -8029,31 +8061,48 @@ async fn account_path_enqueue_core_market_event(
     if let Some(tx) = publish_tx {
         let event_id = event.event_id.clone();
         let event_slot = event.slot;
-        if let Some(t) = trace {
-            record_market_data_geyser_to_publish_on_success(
-                t.recv_at,
-                t.segment,
-                t.cold_path,
-                event_slot,
-            );
-        }
-        apply_market_event_publish_success_side_effects(ctx.as_ref(), &event);
+        let event_for_success_effects = event.clone();
         let trace_for_job =
             trace.map(MarketEventCorePublishTrace::with_skip_geyser_to_publish_histogram);
         inc_market_data_account_publish_queue_depth();
-        if tx
-            .send(AccountPathNatsJob::CoreMarketEvent {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            tx.send(AccountPathNatsJob::CoreMarketEvent {
                 event: Box::new(event),
                 trace: trace_for_job,
-            })
-            .await
-            .is_err()
+            }),
+        )
+        .await
         {
-            dec_market_data_account_publish_queue_depth();
-            warn!(
-                event_id = %event_id,
-                "account_path: publish queue closed (core MarketEvent)"
-            );
+            Ok(Ok(())) => {
+                if let Some(t) = trace {
+                    record_market_data_geyser_to_publish_on_success(
+                        t.recv_at,
+                        t.segment,
+                        t.cold_path,
+                        event_slot,
+                    );
+                }
+                apply_market_event_publish_success_side_effects(
+                    ctx.as_ref(),
+                    &event_for_success_effects,
+                );
+            }
+            Ok(Err(_)) => {
+                dec_market_data_account_publish_queue_depth();
+                warn!(
+                    event_id = %event_id,
+                    "account_path: publish queue closed (core MarketEvent)"
+                );
+            }
+            Err(_) => {
+                dec_market_data_account_publish_queue_depth();
+                inc_market_data_account_publish_enqueue_timeouts_total();
+                warn!(
+                    event_id = %event_id,
+                    "account_path: publish queue send timed out (core MarketEvent)"
+                );
+            }
         }
     } else if let Some(nats) = nats {
         let _ = publish_market_event_core_and_momentum_ex(nats, &event, trace, Some(ctx.as_ref()))

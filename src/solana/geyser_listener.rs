@@ -14,7 +14,9 @@ use futures::{SinkExt, StreamExt};
 #[cfg(not(windows))]
 use solana_sdk::bs58;
 #[cfg(not(windows))]
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+#[cfg(not(windows))]
+use std::pin::Pin;
 #[cfg(not(windows))]
 use tracing::debug;
 #[cfg(not(windows))]
@@ -30,8 +32,9 @@ use yellowstone_grpc_proto::prelude::{
 
 #[cfg(not(windows))]
 use crate::metrics::{
-    geyser_metrics_inc_reconnect, geyser_metrics_inc_stream_error, geyser_metrics_set_connected,
-    GeyserReconnectReason,
+    geyser_metrics_inc_reconnect, geyser_metrics_inc_stream_error,
+    geyser_metrics_inc_subscription_inplace_updates_total, geyser_metrics_set_connected,
+    geyser_metrics_touch_stream_payload_unix_ms, GeyserReconnectReason,
 };
 #[cfg(not(windows))]
 use rand::Rng;
@@ -39,6 +42,8 @@ use rand::Rng;
 use std::time::Duration;
 #[cfg(not(windows))]
 use tokio::time::sleep;
+#[cfg(not(windows))]
+use tokio::time::MissedTickBehavior;
 
 /// Event emitted when an account changes via Geyser
 #[derive(Debug, Clone)]
@@ -384,6 +389,21 @@ impl GeyserListener {
 
                 let mut got_payload_since_subscribe = false;
 
+                const MIN_TRACKED_INPLACE_SUBSCRIBE_INTERVAL: Duration = Duration::from_millis(300);
+                const TRACKED_INPLACE_CHURN_WINDOW: Duration = Duration::from_secs(2);
+                const INGEST_STALE_AFTER: Duration = Duration::from_secs(30);
+                const INGEST_LIVENESS_TICK: Duration = Duration::from_secs(10);
+                const POST_INPLACE_NO_PAYLOAD_WAIT: Duration = Duration::from_secs(10);
+
+                let mut last_stream_payload_at = Instant::now();
+                let mut ingest_liveness_tick = tokio::time::interval(INGEST_LIVENESS_TICK);
+                ingest_liveness_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+                let mut last_tracked_inplace_send_at: Option<Instant> = None;
+                let mut tracked_inplace_churn_times: VecDeque<Instant> = VecDeque::new();
+                let mut pending_tracked_inplace_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
+                let mut post_inplace_payload_deadline: Option<Instant> = None;
+
                 let session_exit = 'read: loop {
                     if last_log.elapsed().as_secs() >= 60 {
                         info!(
@@ -432,6 +452,9 @@ impl GeyserListener {
                                     if let Some(update) = msg.update_oneof {
                                         match update {
                                 UpdateOneof::Account(account_update) => {
+                                    last_stream_payload_at = Instant::now();
+                                    post_inplace_payload_deadline = None;
+                                    geyser_metrics_touch_stream_payload_unix_ms();
                                     account_update_count += 1;
 
                                     if let Some(account_info) = account_update.account {
@@ -481,6 +504,9 @@ impl GeyserListener {
                                     }
                                 }
                                 UpdateOneof::Transaction(tx_update) => {
+                                    last_stream_payload_at = Instant::now();
+                                    post_inplace_payload_deadline = None;
+                                    geyser_metrics_touch_stream_payload_unix_ms();
                                     transaction_count += 1;
 
                                     if let Some(tx) = tx_update.transaction {
@@ -736,6 +762,9 @@ impl GeyserListener {
                                     }
                                 }
                                 UpdateOneof::BlockMeta(block_meta) => {
+                                    last_stream_payload_at = Instant::now();
+                                    post_inplace_payload_deadline = None;
+                                    geyser_metrics_touch_stream_payload_unix_ms();
                                     let event = GeyserBlockhashUpdate {
                                         blockhash: block_meta.blockhash,
                                         slot: block_meta.slot,
@@ -756,53 +785,163 @@ impl GeyserListener {
                                 _ => {
                                     // Slots, etc. - ignore
                                 }
+                                        }
+                                    }
+                                }
                             }
-                        }
-                    }
+                        },
+                        _ = ingest_liveness_tick.tick() => {
+                            let now_i = Instant::now();
+                            if let Some(dl) = post_inplace_payload_deadline {
+                                if now_i >= dl {
+                                    warn!(
+                                        tracked_accounts = tracked_accounts_current.len(),
+                                        "geyser_listener: no stream payload within deadline after in-place subscription update — subscription rebuild"
+                                    );
+                                    break 'read SessionExit::SubscriptionRebuild;
+                                }
                             }
+                            if last_stream_payload_at.elapsed() >= INGEST_STALE_AFTER {
+                                let since_ms = last_stream_payload_at
+                                    .elapsed()
+                                    .as_millis()
+                                    .min(u128::from(u64::MAX))
+                                    as u64;
+                                warn!(
+                                    tracked_accounts = tracked_accounts_current.len(),
+                                    since_last_payload_ms = since_ms,
+                                    "geyser_listener: ingest stale (no Account/Tx/BlockMeta payloads) — hard reconnect"
+                                );
+                                geyser_metrics_set_connected(false);
+                                geyser_metrics_inc_reconnect(GeyserReconnectReason::IngestStale);
+                                break 'read SessionExit::HardReconnect;
+                            }
+                        },
+                        _ = async {
+                            match pending_tracked_inplace_sleep.as_mut() {
+                                Some(s) => s.as_mut().await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        }, if pending_tracked_inplace_sleep.is_some() => {
+                            pending_tracked_inplace_sleep = None;
+                            let now = Instant::now();
+                            while let Some(t) = tracked_inplace_churn_times.front().copied() {
+                                if now.saturating_duration_since(t) > TRACKED_INPLACE_CHURN_WINDOW {
+                                    tracked_inplace_churn_times.pop_front();
+                                } else {
+                                    break;
+                                }
+                            }
+                            if tracked_inplace_churn_times.len() >= 3 {
+                                warn!(
+                                    tracked_accounts = tracked_accounts_current.len(),
+                                    "geyser_listener: forcing full reconnect due to subscription churn"
+                                );
+                                break 'read SessionExit::SubscriptionRebuild;
+                            }
+                            let updated_request = Self::build_subscribe_request(
+                                &self.program_ids,
+                                &tracked_accounts_current,
+                            );
+                            if let Err(e) = subscribe_tx.send(updated_request).await {
+                                warn!(
+                                    "geyser_listener: failed to send subscription update: {e}; reconnecting with new client"
+                                );
+                                geyser_metrics_inc_reconnect(GeyserReconnectReason::SinkGone);
+                                break 'read SessionExit::HardReconnect;
+                            }
+                            geyser_metrics_inc_subscription_inplace_updates_total();
+                            last_tracked_inplace_send_at = Some(Instant::now());
+                            tracked_inplace_churn_times.push_back(Instant::now());
+                            post_inplace_payload_deadline =
+                                Some(Instant::now() + POST_INPLACE_NO_PAYLOAD_WAIT);
+                            warn!(
+                                tracked_accounts = tracked_accounts_current.len(),
+                                "geyser_listener: subscription updated (NO reconnect, coalesced)"
+                            );
                         },
                         maybe_new = tracked_changed_fut => {
                             if let Some(new_list) = maybe_new {
-                                if new_list != tracked_accounts_current {
-                                    tracked_accounts_current = new_list;
-                                    let threshold = self
-                                        .full_reconnect_tracked_threshold
-                                        .load(Ordering::Relaxed);
-                                    let now = Instant::now();
-                                    let over_threshold =
-                                        tracked_accounts_current.len() > threshold;
-                                    let allow_full_rebuild = over_threshold
-                                        && last_large_set_subscription_rebuild
-                                            .map(|t| {
-                                                now.saturating_duration_since(t)
-                                                    >= LARGE_TRACKED_SUBSCRIBE_REBUILD_MIN_INTERVAL
-                                            })
-                                            .unwrap_or(true);
-                                    if allow_full_rebuild {
-                                        last_large_set_subscription_rebuild = Some(now);
-                                        info!(
-                                            tracked_accounts = tracked_accounts_current.len(),
-                                            threshold,
-                                            "geyser_listener: large tracked set — forcing full reconnect (skip in-place subscribe update)"
-                                        );
-                                        break 'read SessionExit::SubscriptionRebuild;
-                                    }
-                                    let updated_request = Self::build_subscribe_request(
-                                        &self.program_ids,
-                                        &tracked_accounts_current,
+                                if new_list == tracked_accounts_current {
+                                    continue;
+                                }
+                                tracked_accounts_current = new_list;
+                                let threshold = self
+                                    .full_reconnect_tracked_threshold
+                                    .load(Ordering::Relaxed);
+                                let now = Instant::now();
+                                let over_threshold = tracked_accounts_current.len() > threshold;
+                                let allow_full_rebuild = over_threshold
+                                    && last_large_set_subscription_rebuild
+                                        .map(|t| {
+                                            now.saturating_duration_since(t)
+                                                >= LARGE_TRACKED_SUBSCRIBE_REBUILD_MIN_INTERVAL
+                                        })
+                                        .unwrap_or(true);
+                                if allow_full_rebuild {
+                                    last_large_set_subscription_rebuild = Some(now);
+                                    info!(
+                                        tracked_accounts = tracked_accounts_current.len(),
+                                        threshold,
+                                        "geyser_listener: large tracked set — forcing full reconnect (skip in-place subscribe update)"
                                     );
-                                    if let Err(e) = subscribe_tx.send(updated_request).await {
-                                        warn!(
-                                            "geyser_listener: failed to send subscription update: {e}; reconnecting with new client"
-                                        );
-                                        geyser_metrics_inc_reconnect(GeyserReconnectReason::SinkGone);
-                                        break 'read SessionExit::HardReconnect;
+                                    break 'read SessionExit::SubscriptionRebuild;
+                                }
+
+                                while let Some(t) = tracked_inplace_churn_times.front().copied() {
+                                    if now.saturating_duration_since(t) > TRACKED_INPLACE_CHURN_WINDOW
+                                    {
+                                        tracked_inplace_churn_times.pop_front();
+                                    } else {
+                                        break;
                                     }
+                                }
+                                if tracked_inplace_churn_times.len() >= 3 {
                                     warn!(
                                         tracked_accounts = tracked_accounts_current.len(),
-                                        "geyser_listener: subscription updated (NO reconnect)"
+                                        "geyser_listener: forcing full reconnect due to subscription churn"
                                     );
+                                    break 'read SessionExit::SubscriptionRebuild;
                                 }
+
+                                let can_inplace_send = last_tracked_inplace_send_at
+                                    .map(|t| {
+                                        t.elapsed() >= MIN_TRACKED_INPLACE_SUBSCRIBE_INTERVAL
+                                    })
+                                    .unwrap_or(true);
+                                if !can_inplace_send {
+                                    if pending_tracked_inplace_sleep.is_none() {
+                                        let deadline = last_tracked_inplace_send_at.unwrap()
+                                            + MIN_TRACKED_INPLACE_SUBSCRIBE_INTERVAL;
+                                        pending_tracked_inplace_sleep = Some(Box::pin(
+                                            tokio::time::sleep_until(deadline.into()),
+                                        ));
+                                    }
+                                    continue;
+                                }
+
+                                pending_tracked_inplace_sleep = None;
+
+                                let updated_request = Self::build_subscribe_request(
+                                    &self.program_ids,
+                                    &tracked_accounts_current,
+                                );
+                                if let Err(e) = subscribe_tx.send(updated_request).await {
+                                    warn!(
+                                        "geyser_listener: failed to send subscription update: {e}; reconnecting with new client"
+                                    );
+                                    geyser_metrics_inc_reconnect(GeyserReconnectReason::SinkGone);
+                                    break 'read SessionExit::HardReconnect;
+                                }
+                                geyser_metrics_inc_subscription_inplace_updates_total();
+                                last_tracked_inplace_send_at = Some(Instant::now());
+                                tracked_inplace_churn_times.push_back(Instant::now());
+                                post_inplace_payload_deadline =
+                                    Some(Instant::now() + POST_INPLACE_NO_PAYLOAD_WAIT);
+                                warn!(
+                                    tracked_accounts = tracked_accounts_current.len(),
+                                    "geyser_listener: subscription updated (NO reconnect)"
+                                );
                             }
                         }
                     }
@@ -838,6 +977,42 @@ impl GeyserListener {
 #[cfg(all(test, not(windows)))]
 mod geyser_resilience_tests {
     use super::GeyserListener;
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn churn_window_prunes_entries_older_than_two_seconds() {
+        let mut q = VecDeque::new();
+        let now = Instant::now();
+        let old = now - Duration::from_secs(5);
+        q.push_back(old);
+        q.push_back(now);
+        const WINDOW: Duration = Duration::from_secs(2);
+        while let Some(t) = q.front().copied() {
+            if now.saturating_duration_since(t) > WINDOW {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+        assert_eq!(q.len(), 1);
+        assert!(now.duration_since(*q.front().unwrap()) <= WINDOW);
+    }
+
+    #[test]
+    fn fourth_inplace_within_window_requires_escalation_check() {
+        let mut q = VecDeque::new();
+        let t = Instant::now();
+        q.push_back(t);
+        q.push_back(t);
+        assert!(q.len() < 3);
+        q.push_back(t);
+        assert_eq!(q.len(), 3);
+        assert!(
+            q.len() >= 3,
+            "with 3 prior in-window sends, the next must use SubscriptionRebuild"
+        );
+    }
 
     #[test]
     fn reconnect_sleep_ms_adds_bounded_jitter() {
