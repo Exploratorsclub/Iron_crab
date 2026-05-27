@@ -10,7 +10,10 @@ use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 
 /// Configuration for JSONL writer
@@ -99,24 +102,28 @@ impl JsonlWriter {
 
     /// Write a serializable record as JSONL
     pub fn write<T: Serialize>(&self, record: &T) -> std::io::Result<()> {
+        let json = serde_json::to_string(record)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        self.write_json_line(&json)
+    }
+
+    /// Write a pre-serialized JSON object as one JSONL line (no extra allocation on hot path).
+    pub fn write_json_line(&self, json: &str) -> std::io::Result<()> {
         let mut state = self.state.lock().unwrap();
 
-        // Check if we need to rotate
         let today = Utc::now().format("%Y%m%d").to_string();
         if state.current_date.as_ref() != Some(&today) {
             self.rotate_locked(&mut state, &today)?;
         }
 
-        // Serialize and write
-        let json = serde_json::to_string(record)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-
         if let Some(writer) = state.writer.as_mut() {
-            writeln!(writer, "{}", json)?;
-            writer.flush().ok(); // Flush within the same borrow if configured
+            writeln!(writer, "{json}")?;
+            if self.config.flush_each_write {
+                writer.flush()?;
+            }
         }
         state.records_written += 1;
-        state.bytes_written += json.len() as u64 + 1; // +1 for newline
+        state.bytes_written += json.len() as u64 + 1;
 
         Ok(())
     }
@@ -152,12 +159,10 @@ impl JsonlWriter {
     }
 
     fn rotate_locked(&self, state: &mut WriterState, date: &str) -> std::io::Result<()> {
-        // Flush and close existing writer
         if let Some(mut writer) = state.writer.take() {
             writer.flush()?;
         }
 
-        // Build new filename
         let filename = format!("{}-{}.jsonl", self.config.prefix, date);
         let path = self.config.log_dir.join(&filename);
 
@@ -167,7 +172,6 @@ impl JsonlWriter {
             "Rotating JSONL writer to new file"
         );
 
-        // Open for append
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         state.writer = Some(BufWriter::with_capacity(self.config.buffer_size, file));
@@ -187,7 +191,120 @@ impl Drop for JsonlWriter {
 }
 
 // ============================================================================
-// Async wrapper for non-blocking writes
+// Off-hot-path queued writer (dedicated OS thread)
+// ============================================================================
+
+enum QueuedJsonlMsg {
+    Line(String),
+    Flush,
+    Shutdown,
+}
+
+/// Non-blocking JSONL enqueue from Geyser paths; actual I/O on `jsonl-writer` thread.
+pub struct QueuedJsonlWriter {
+    sender: std::sync::mpsc::SyncSender<QueuedJsonlMsg>,
+    records_written: Arc<AtomicU64>,
+    bytes_written: Arc<AtomicU64>,
+    join: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl QueuedJsonlWriter {
+    /// Spawn background writer with bounded queue (`try_enqueue` drops when full).
+    pub fn spawn(config: JsonlWriterConfig, queue_capacity: usize) -> std::io::Result<Self> {
+        let queue_capacity = queue_capacity.max(64);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<QueuedJsonlMsg>(queue_capacity);
+        let records_written = Arc::new(AtomicU64::new(0));
+        let bytes_written = Arc::new(AtomicU64::new(0));
+        let records_for_thread = Arc::clone(&records_written);
+        let bytes_for_thread = Arc::clone(&bytes_written);
+        let flush_each_write = config.flush_each_write;
+        let join = std::thread::Builder::new()
+            .name("jsonl-writer".into())
+            .spawn(move || {
+                let writer = match JsonlWriter::new(config) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        error!(error = %e, "QueuedJsonlWriter: failed to open log file");
+                        return;
+                    }
+                };
+                let periodic_flush = Duration::from_secs(1);
+                let mut last_periodic_flush = Instant::now();
+                let write_line = |json: String| {
+                    let len = json.len() as u64 + 1;
+                    if let Err(e) = writer.write_json_line(&json) {
+                        warn!(error = %e, "QueuedJsonlWriter: write failed");
+                    } else {
+                        records_for_thread.fetch_add(1, Ordering::Relaxed);
+                        bytes_for_thread.fetch_add(len, Ordering::Relaxed);
+                    }
+                };
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(QueuedJsonlMsg::Line(json)) => write_line(json),
+                        Ok(QueuedJsonlMsg::Flush) => {
+                            let _ = writer.flush();
+                        }
+                        Ok(QueuedJsonlMsg::Shutdown) => {
+                            let _ = writer.flush();
+                            break;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if !flush_each_write && last_periodic_flush.elapsed() >= periodic_flush
+                            {
+                                let _ = writer.flush();
+                                last_periodic_flush = Instant::now();
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                let _ = writer.flush();
+            })?;
+
+        Ok(Self {
+            sender: tx,
+            records_written,
+            bytes_written,
+            join: Mutex::new(Some(join)),
+        })
+    }
+
+    /// Queue serialized JSON (non-blocking). Returns `false` when queue is full.
+    pub fn try_enqueue_json(&self, json: String) -> bool {
+        self.sender.try_send(QueuedJsonlMsg::Line(json)).is_ok()
+    }
+
+    /// Queue a serializable record (serializes on caller thread — prefer `try_enqueue_json` from hot path).
+    pub fn try_write<T: Serialize>(&self, record: &T) -> bool {
+        let json = serde_json::to_string(record).unwrap_or_else(|_| "{}".to_string());
+        self.try_enqueue_json(json)
+    }
+
+    pub fn flush(&self) -> std::io::Result<()> {
+        let _ = self.sender.send(QueuedJsonlMsg::Flush);
+        Ok(())
+    }
+
+    pub fn stats(&self) -> (u64, u64) {
+        (
+            self.records_written.load(Ordering::Relaxed),
+            self.bytes_written.load(Ordering::Relaxed),
+        )
+    }
+}
+
+impl Drop for QueuedJsonlWriter {
+    fn drop(&mut self) {
+        let _ = self.sender.send(QueuedJsonlMsg::Shutdown);
+        if let Some(handle) = self.join.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+// ============================================================================
+// Async wrapper for non-blocking writes (legacy; prefer QueuedJsonlWriter)
 // ============================================================================
 
 use tokio::sync::mpsc;
@@ -206,14 +323,10 @@ impl AsyncJsonlWriter {
 
         tokio::spawn(async move {
             while let Some(json) = receiver.recv().await {
-                // Write raw JSON string directly - parse to Value to satisfy Serialize trait
-                let value: serde_json::Value =
-                    serde_json::from_str(&json).unwrap_or(serde_json::json!({}));
-                if let Err(e) = writer.write(&value) {
+                if let Err(e) = writer.write_json_line(&json) {
                     warn!(error = %e, "Failed to write record to JSONL");
                 }
             }
-            // Final flush on shutdown
             let _ = writer.flush();
         });
 
@@ -302,9 +415,34 @@ mod tests {
     }
 
     #[test]
+    fn test_jsonl_writer_no_flush_per_write_when_disabled() {
+        let dir = tempdir().unwrap();
+        let config = JsonlWriterConfig::new("noflush")
+            .with_log_dir(dir.path())
+            .with_flush_each_write(false);
+
+        let writer = JsonlWriter::new(config).unwrap();
+        writer
+            .write(&TestRecord {
+                id: "x".to_string(),
+                value: 1,
+            })
+            .unwrap();
+
+        let path = writer.current_path().unwrap();
+        // Buffered write: file may exist but stay empty until flush/rotation/drop.
+        let size_before_flush = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        writer.flush().unwrap();
+        let size_after_flush = fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            size_before_flush, 0,
+            "write() must not flush when flush_each_write is false"
+        );
+        assert!(size_after_flush > 0);
+    }
+
+    #[test]
     fn test_jsonl_writer_rotation() {
-        // This test verifies the rotation logic works
-        // In practice, rotation happens on date change
         let dir = tempdir().unwrap();
         let config = JsonlWriterConfig::new("rotate_test").with_log_dir(dir.path());
 
@@ -319,10 +457,28 @@ mod tests {
         let path = writer.current_path().unwrap();
         let filename = path.file_name().unwrap().to_str().unwrap();
 
-        // Should contain today's date
         let today = Utc::now().format("%Y%m%d").to_string();
         assert!(filename.contains(&today));
         assert!(filename.starts_with("rotate_test-"));
         assert!(filename.ends_with(".jsonl"));
+    }
+
+    #[test]
+    fn test_queued_jsonl_writer_delivers_lines() {
+        let dir = tempdir().unwrap();
+        let config = JsonlWriterConfig::new("queued")
+            .with_log_dir(dir.path())
+            .with_flush_each_write(true);
+        let q = QueuedJsonlWriter::spawn(config, 64).unwrap();
+        assert!(q.try_write(&TestRecord {
+            id: "q1".to_string(),
+            value: 7,
+        }));
+        q.flush().unwrap();
+        drop(q);
+        let today = Utc::now().format("%Y%m%d").to_string();
+        let path = dir.path().join(format!("queued-{today}.jsonl"));
+        let content = fs::read_to_string(path).unwrap();
+        assert!(content.contains("q1"));
     }
 }

@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PR165-MARKET-DATA-RUNTIME-LIVENESS: Tokio-Liveness, JSONL off Hot-Path, PumpAmm-RPC aus Geyser-Handler entfernt
+**Datum**: 2026-05-27  
+**Problem** (Prod `bdfbcda`): `market-data` friert ~14 s nach Restart ein — Prozess lebt, JSONL `market_events` wächst auf Multi-GB (sync Flush + Mutex), `/metrics` und `/live` timeouten (selbe Tokio-Runtime), systemd restartet nicht (PR163 OS-Watchdog pingt weiter), hunderte `pump_amm: pre-loaded vault balances via RPC (Cold Start Bootstrap)` aus `handle_geyser_account` (nicht Wallet-Bootstrap).  
+**Fix**: (1) **Tokio-Liveness-Task** (10 s): kein Fortschritt >45 s nach 120 s Startup-Grace → `market_data_tokio_liveness_stalls_total`, Watchdog-Pings stoppen, `sd_notify(Stop)` + `exit(1)` für `Restart=always`. (2) **`/metrics`/`/live`** auf dediziertem `md-metrics` Thread + `current_thread` Tokio (wie PR160 Publish-Isolation). (3) **JSONL**: `QueuedJsonlWriter` (`jsonl-writer` OS-Thread, bounded `try_enqueue`); `flush_each_write` respektiert; periodischer Flush 1 s; **kein** JSONL für `AccountUpdate` / `TransactionDetected`. (4) **Geyser-Handler**: alle RPC aus `handle_geyser_account` entfernt (PumpAmm Cold-Start-RPC + Raydium-Serum-`tokio::spawn`); Reserves nur aus Geyser/Vault-Ticks; Wallet/Ensure*-Cold-Path unverändert. (5) **P1**: `execution_results_deduper` Lock nicht über `await`; PumpAmm-Vault-Registrierung in ersten 60 s debounced `sync`. **Invarianten**: I-7 (kein RPC im Geyser-Ingest), I-4 Geyser-first, PR160/161/164 unangetastet.  
+**Dateien**: `src/bin/market_data.rs`, `src/storage/jsonl_writer.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### PR164-GEYSER-SPLIT-TX-SACRED: zwei gRPC-Sessions (TX heilig + Account/Cuckoo); TX-Liveness-Reconnect
 **Datum**: 2026-05-27  
 **Problem** (Prod nach PR #162): Nach Startup-Burst in-place `SubscribeRequest`-Updates liefert Yellowstone weiter **Account**-Updates, aber **keine** DEX-`Transaction`-Updates mehr (`Parsed DEX transaction` stoppt; `market_data_geyser_to_publish_ms_trade_count` friert) — **ohne** Stream-Error/Reconnect-Metrik. Ursache: eine Session teilte sich TX-Filter und Cuckoo-Pin-Updates über denselben `subscribe_tx`-Sink; der letzte Full-Replace tötet den TX-Teil still.  
