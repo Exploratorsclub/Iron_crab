@@ -64,7 +64,8 @@ use ironcrab::metrics::{
     record_market_data_account_publish_worker_stall,
     record_market_data_bonding_curve_grpc_to_devwallet_ms,
     record_market_data_bonding_to_trade_slot_delta_slots,
-    record_market_data_geyser_sync_batch_total, record_market_data_geyser_sync_immediate_total,
+    record_market_data_geyser_merge_coalesced_total, record_market_data_geyser_sync_batch_total,
+    record_market_data_geyser_sync_immediate_total,
     record_market_data_geyser_to_publish_on_success,
     record_market_data_momentum_active_pool_messages_total,
     record_market_data_pool_mint_map_to_devwallet_ms,
@@ -72,14 +73,14 @@ use ironcrab::metrics::{
     record_market_data_tx_channel_lag_ms, serve_metrics,
     set_market_data_account_broadcast_queue_depth,
     set_market_data_account_publish_worker_last_success_unix_ms,
-    set_market_data_geyser_sync_pending, set_market_data_momentum_active_pool_pins_gauge,
-    set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
-    set_readiness_nats_connected, update_readiness_market_data_current, wall_clock_unix_ms_now,
-    GeyserTrackedEvictKind, MarketDataLatencySegment, MetricsComponent,
-    MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS,
-    MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
-    MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
-    POOLS_TRACKED_GAUGE,
+    set_market_data_geyser_merge_pending, set_market_data_geyser_sync_pending,
+    set_market_data_momentum_active_pool_pins_gauge, set_market_data_tx_broadcast_queue_depth,
+    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
+    update_readiness_market_data_current, wall_clock_unix_ms_now, GeyserTrackedEvictKind,
+    MarketDataLatencySegment, MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
+    MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL,
+    MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
+    NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -691,7 +692,8 @@ struct MarketDataConfig {
     max_tracked_accounts: usize,
     /// PR-B: full Geyser reconnect when combined explicit accounts exceed this threshold.
     geyser_full_reconnect_threshold: usize,
-    /// Coalesce TX-path Geyser subscription sync (ms); clamped 10–100 at use sites.
+    /// Coalesce TX-path Geyser subscription sync **and** merge-task `combined_tracked`→GeyserListener
+    /// updates (PR161); same debounce window for both (ms). Clamped 10–100 at use sites.
     geyser_sync_batch_ms: u64,
 }
 
@@ -1384,6 +1386,94 @@ impl MarketDataContext {
             ctx.sync_geyser_tracked_accounts_batched_flush();
         });
         *guard = Some(h);
+    }
+
+    /// PR161: merge four explicit-track `watch` streams into `combined_tracked_tx` with the same
+    /// debounce window as [`Self::schedule_geyser_sync_batch_debounced`] (`geyser_sync_batch_ms`,
+    /// clamped 10–100 ms). Reduces subscription-update churn when `broadcast_tracked_geyser_explicit_to_merge`
+    /// fans out to multiple watch updates.
+    fn schedule_geyser_tracked_merge_flush_debounced(
+        debounce_timer: &Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+        combined_tx: &watch::Sender<Vec<Pubkey>>,
+        ctx_merge: &Arc<MarketDataContext>,
+        mints_rx: &watch::Receiver<Vec<Pubkey>>,
+        vaults_rx: &watch::Receiver<Vec<Pubkey>>,
+        bin_arrays_rx: &watch::Receiver<Vec<Pubkey>>,
+        wallet_rx: &watch::Receiver<Vec<Pubkey>>,
+    ) {
+        let ms = ctx_merge.config.read().geyser_sync_batch_ms.clamp(10, 100);
+        set_market_data_geyser_merge_pending(1);
+        let mut guard = debounce_timer.lock();
+        if let Some(h) = guard.take() {
+            h.abort();
+        }
+        let combined_tx = combined_tx.clone();
+        let ctx_fl = Arc::clone(ctx_merge);
+        let mints_c = mints_rx.clone();
+        let vaults_c = vaults_rx.clone();
+        let bins_c = bin_arrays_rx.clone();
+        let wallet_c = wallet_rx.clone();
+        let h = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            set_market_data_geyser_merge_pending(0);
+            record_market_data_geyser_merge_coalesced_total();
+            let mut combined: Vec<Pubkey> = mints_c.borrow().clone();
+            combined.extend(vaults_c.borrow().clone());
+            combined.extend(bins_c.borrow().clone());
+            combined.extend(wallet_c.borrow().clone());
+            combined.sort();
+            combined.dedup();
+            let n = combined.len();
+            let _ = combined_tx.send(combined);
+            geyser_metrics_set_subscription_accounts(n);
+            ctx_fl.refresh_geyser_pins_gauge();
+        });
+        *guard = Some(h);
+    }
+
+    /// PR161: background loop merging explicit-track `watch` streams into `combined_tracked_tx` with debouncing.
+    async fn run_geyser_tracked_accounts_merge_coalesce_loop(
+        mut mints_rx: watch::Receiver<Vec<Pubkey>>,
+        mut vaults_rx: watch::Receiver<Vec<Pubkey>>,
+        mut bin_arrays_rx: watch::Receiver<Vec<Pubkey>>,
+        mut wallet_rx: watch::Receiver<Vec<Pubkey>>,
+        combined_tx: watch::Sender<Vec<Pubkey>>,
+        ctx_merge: Arc<MarketDataContext>,
+    ) {
+        let debounce_timer = Arc::new(parking_lot::Mutex::new(None::<tokio::task::JoinHandle<()>>));
+        loop {
+            tokio::select! {
+                r = mints_rx.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                }
+                r = vaults_rx.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                }
+                r = bin_arrays_rx.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                }
+                r = wallet_rx.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                }
+            }
+            Self::schedule_geyser_tracked_merge_flush_debounced(
+                &debounce_timer,
+                &combined_tx,
+                &ctx_merge,
+                &mints_rx,
+                &vaults_rx,
+                &bin_arrays_rx,
+                &wallet_rx,
+            );
+        }
     }
 
     /// Track mint pubkey for Geyser `TokenMintInfo` / metadata. Returns `true` if explicit pubkey set changed.
@@ -10479,36 +10569,22 @@ async fn run_geyser_loop(
     // GeyserListener will subscribe to all accounts in the combined list.
     let (combined_tracked_tx, combined_tracked_rx) = watch::channel(Vec::<Pubkey>::new());
     {
-        let mut mints_rx = tracked_mints_rx;
-        let mut vaults_rx = tracked_vaults_rx;
-        let mut bin_arrays_rx = tracked_bin_arrays_rx;
-        let mut wallet_rx = tracked_wallet_rx;
+        let mints_rx = tracked_mints_rx;
+        let vaults_rx = tracked_vaults_rx;
+        let bin_arrays_rx = tracked_bin_arrays_rx;
+        let wallet_rx = tracked_wallet_rx;
         let combined_tx = combined_tracked_tx;
         let ctx_merge = Arc::clone(&ctx);
         tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = mints_rx.changed() => {}
-                    _ = vaults_rx.changed() => {}
-                    _ = bin_arrays_rx.changed() => {}
-                    _ = wallet_rx.changed() => {}
-                }
-                // Merge all lists
-                let mints: Vec<Pubkey> = mints_rx.borrow().clone();
-                let vaults: Vec<Pubkey> = vaults_rx.borrow().clone();
-                let bin_arrays: Vec<Pubkey> = bin_arrays_rx.borrow().clone();
-                let wallet_accounts: Vec<Pubkey> = wallet_rx.borrow().clone();
-                let mut combined: Vec<Pubkey> = mints;
-                combined.extend(vaults);
-                combined.extend(bin_arrays);
-                combined.extend(wallet_accounts);
-                combined.sort();
-                combined.dedup();
-                let n = combined.len();
-                let _ = combined_tx.send(combined);
-                geyser_metrics_set_subscription_accounts(n);
-                ctx_merge.refresh_geyser_pins_gauge();
-            }
+            MarketDataContext::run_geyser_tracked_accounts_merge_coalesce_loop(
+                mints_rx,
+                vaults_rx,
+                bin_arrays_rx,
+                wallet_rx,
+                combined_tx,
+                ctx_merge,
+            )
+            .await;
         });
     }
 
@@ -13073,7 +13149,7 @@ mod momentum_nats_subject_tests {
 #[cfg(test)]
 mod pr_b_geyser_tracking_tests {
     use super::*;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     #[test]
@@ -13346,6 +13422,70 @@ mod pr_b_geyser_tracking_tests {
             helius_rpc: None,
             geyser_sync_batch_timer: parking_lot::Mutex::new(None),
         })
+    }
+
+    /// PR161: same as [`minimal_market_data_context_for_pr_d_tests`], but returns merge `watch` receivers.
+    #[allow(clippy::type_complexity)]
+    fn minimal_market_data_context_and_merge_receivers_for_pr161(
+        jsonl_writer: JsonlWriter,
+    ) -> (
+        Arc<MarketDataContext>,
+        watch::Receiver<Vec<Pubkey>>,
+        watch::Receiver<Vec<Pubkey>>,
+        watch::Receiver<Vec<Pubkey>>,
+        watch::Receiver<Vec<Pubkey>>,
+    ) {
+        let (tracked_mints_tx, tracked_mints_rx) = watch::channel(Vec::<Pubkey>::new());
+        let (tracked_vaults_tx, tracked_vaults_rx) = watch::channel(Vec::<Pubkey>::new());
+        let (tracked_bin_arrays_tx, tracked_bin_arrays_rx) = watch::channel(Vec::<Pubkey>::new());
+        let (tracked_wallet_tx, tracked_wallet_rx) = watch::channel(Vec::<Pubkey>::new());
+        let ctx = Arc::new(MarketDataContext {
+            run_id: "run-pr161-merge-test".to_string(),
+            config: parking_lot::RwLock::new(MarketDataConfig::default()),
+            geyser_full_reconnect_threshold_live: Arc::new(AtomicUsize::new(0)),
+            nats: None,
+            jsonl_writer,
+            event_counter: std::sync::atomic::AtomicU64::new(0),
+            wallet_tracker: WalletTracker::new(WalletTrackerCfg::default()),
+            priority_fee_tracker: Arc::new(PriorityFeeTracker::new()),
+            tracked_mints: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tracked_mints_tx,
+            active_pool_set: Arc::new(ActivePoolSet::new()),
+            known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            known_trade_dex_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            pumpfun_pool_discovery_mint_info_emitted: parking_lot::RwLock::new(
+                std::collections::HashSet::new(),
+            ),
+            tracked_vaults: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tracked_vaults_tx,
+            tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tracked_bin_arrays_tx,
+            live_pool_cache: Arc::new(LivePoolCache::new()),
+            creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            high_priority_bonding_curves: parking_lot::RwLock::new(HashSet::new()),
+            raydium_serum_fetched: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            tracked_wallet: None,
+            tracked_wallet_tx,
+            tracked_wallet_token_accounts: parking_lot::RwLock::new(
+                std::collections::HashSet::new(),
+            ),
+            tracked_wallet_mint_decimals: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            execution_results_deduper: parking_lot::Mutex::new(ExecutionResultDeduper::default()),
+            last_emitted_curve_progress: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            bonding_curve_publish_times: parking_lot::Mutex::new(BondingCurvePublishTimes::new()),
+            pump_amm_dex: parking_lot::RwLock::new(None),
+            helius_rpc: None,
+            geyser_sync_batch_timer: parking_lot::Mutex::new(None),
+        });
+        (
+            ctx,
+            tracked_mints_rx,
+            tracked_vaults_rx,
+            tracked_bin_arrays_rx,
+            tracked_wallet_rx,
+        )
     }
 
     #[test]
@@ -13930,6 +14070,94 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(
             MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed),
             imm0
+        );
+    }
+
+    /// PR161: many `tracked_mints_tx.send` within one debounce window → at most two `combined_tracked` updates
+    /// within ~120 ms (default 35 ms batch; coalesced merge flush).
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr161_merge_coalesces_burst_tracked_mint_updates() {
+        use ironcrab::metrics::MARKET_DATA_GEYSER_MERGE_COALESCED_TOTAL;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let (ctx, mints_rx, vaults_rx, bins_rx, wallet_rx) =
+            minimal_market_data_context_and_merge_receivers_for_pr161(jsonl);
+
+        let (combined_tx, mut combined_rx) = watch::channel(Vec::<Pubkey>::new());
+        let combined_change_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&combined_change_count);
+        let watch_task = tokio::spawn(async move {
+            loop {
+                if combined_rx.changed().await.is_err() {
+                    break;
+                }
+                cc.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let coalesced0 = MARKET_DATA_GEYSER_MERGE_COALESCED_TOTAL.load(Ordering::Relaxed);
+        let ctx_m = Arc::clone(&ctx);
+        let merge_task = tokio::spawn(async move {
+            MarketDataContext::run_geyser_tracked_accounts_merge_coalesce_loop(
+                mints_rx,
+                vaults_rx,
+                bins_rx,
+                wallet_rx,
+                combined_tx,
+                ctx_m,
+            )
+            .await;
+        });
+
+        for i in 0u8..10 {
+            let mut a = [0u8; 32];
+            a[0] = i;
+            let pk = Pubkey::new_from_array(a);
+            let _ = ctx.tracked_mints_tx.send(vec![pk]);
+        }
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let n = combined_change_count.load(Ordering::Relaxed);
+        assert!(
+            n <= 2,
+            "expected coalesced merge: at most 2 combined_tracked updates, got {n}"
+        );
+        assert!(
+            MARKET_DATA_GEYSER_MERGE_COALESCED_TOTAL.load(Ordering::Relaxed) > coalesced0,
+            "expected at least one coalesced merge flush"
+        );
+
+        merge_task.abort();
+        watch_task.abort();
+        let _ = merge_task.await;
+        let _ = watch_task.await;
+    }
+
+    /// PR161 / #158: `sync_geyser_tracked_accounts` counts as immediate sync, not batch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr161_sync_geyser_tracked_accounts_increments_immediate_only() {
+        use ironcrab::metrics::{
+            MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL, MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
+        let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
+        ctx.sync_geyser_tracked_accounts();
+        assert_eq!(
+            MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed),
+            imm0 + 1
+        );
+        assert_eq!(
+            MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed),
+            batch0
         );
     }
 }
