@@ -6627,6 +6627,19 @@ async fn main() -> Result<()> {
         // NOTE: Do NOT unset NOTIFY_SOCKET here; we need it for Watchdog pings.
         let _ = sd_notify::notify(false, &[NotifyState::Ready]);
         debug!("Sent sd_notify READY to systemd");
+
+        // PR163: Watchdog pings on a dedicated OS thread — `tokio::interval` on the main runtime
+        // can starve under Geyser/NATS load (same class as PR155 publish-runtime isolation).
+        #[cfg(not(test))]
+        {
+            std::thread::Builder::new()
+                .name("md-watchdog".to_string())
+                .spawn(|| loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
+                })
+                .expect("spawn md-watchdog thread");
+        }
     }
 
     // Keep readiness fresh even when idle.
@@ -10735,19 +10748,6 @@ async fn run_geyser_loop(
         return Ok(());
     }
 
-    // PR151-NATS-WATCHDOG-FOLLOWUP: systemd WatchdogSec=30 — ping unabhängig vom Geyser-`select!`
-    // und NATS-Backpressure (siehe docs/BUGS_FIXES.md), analog execution_engine `maybe_ping_watchdog`.
-    #[cfg(unix)]
-    {
-        tokio::spawn(async {
-            let mut iv = tokio::time::interval(std::time::Duration::from_secs(5));
-            loop {
-                iv.tick().await;
-                let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
-            }
-        });
-    }
-
     // Mint metadata fetch pipeline:
     // - We add mints to `tracked_mints` when we see them via tx/pool discovery.
     // - Mint accounts often *never change*, so relying on a future Geyser account update
@@ -11375,10 +11375,6 @@ async fn run_geyser_loop(
                     false
                 };
                 update_readiness_market_data_current(nats_connected, control_sub_active, jetstream_ready);
-
-                // P1 Crash Isolation: Ping systemd watchdog frequently enough.
-                #[cfg(unix)]
-                let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
             }
 
             // Track wallet ATAs/mints from execution-engine results via JetStream (no RPC).
@@ -11895,12 +11891,6 @@ async fn run_simulation_loop(
                         bytes_written = bytes,
                         "market-data heartbeat (simulation)"
                     );
-                }
-
-                // P1 Crash Isolation: Ping systemd watchdog frequently enough.
-                if slot % 10 == 0 {
-                    #[cfg(unix)]
-                    let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
                 }
             }
 

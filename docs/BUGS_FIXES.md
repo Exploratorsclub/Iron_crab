@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PR163-WATCHDOG-OS-THREAD: systemd-Watchdog-Ping auf dediziertem OS-Thread (Timer-Starvation)
+**Datum**: 2026-05-27  
+**Problem** (Prod post #160/#161): `market-data.service: Watchdog timeout (limit 30s)` → ABRT / Crash-Loop ohne Panic oder Geyser-Fehler. Der Reserve-Ping aus **PR151** lief als `tokio::spawn` + `interval(5s)` auf dem **Haupt-Runtime**; unter Last (Geyser-Ingest, Account-Worker, Publish-Pipeline) **Timer-Starvation** → kein `sd_notify(WATCHDOG)` innerhalb `WatchdogSec=30`. Gleiche Fehlerklasse wie **PR155** (NATS-Publish auf isolierter Runtime).  
+**Fix**: (1) **Dedizierter Thread** `md-watchdog`: `std::thread::sleep(5s)` + `sd_notify(WATCHDOG)` in einer Endlosschleife — unabhängig vom Tokio-Scheduler. (2) **Start** unmittelbar nach `sd_notify(Ready)` (vor langem Geyser-/JetStream-Setup), damit der Watchdog nach Ready nie verhungert. (3) **Entfernt**: Tokio-Watchdog-Task in `run_geyser_loop` sowie redundante `Watchdog`-Pings im `activity_interval`-Arm und im Simulations-`select!` (ein kanonischer Ping-Pfad). **`cfg(test)`**: kein Watchdog-Thread (keine Hintergrund-Threads in Unit-Tests). **Invarianten**: kein RPC (I-7), Geyser/NATS-Pipeline unverändert (Scope nur `market_data` binary).  
+**Dateien**: `src/bin/market_data.rs`, `docs/BUGS_FIXES.md`
+
 ### PR162-GEYSER-INGEST-LIVENESS: eine Geyser-Session + Subscription-Sink aus Read-Loop; Pool-Discovery off Main-`select!`
 **Datum**: 2026-05-27  
 **Problem** (Prod post #160): `head_slot` / `nats_messages_published_total` frieren ~60 s nach Restart; `geyser_listener: heartbeat` fehlt; letztes `subscription updated` beim Startup-Burst; paralleles `GeyserPoolDiscovery` (zweite gRPC-Connection) liefert weiter Meteora-Logs — Haupt-Read-Loop liefert keine Nutzlast mehr (Ingest-Starvation). Publish-Pipeline (#160) war nicht der Blocker.  
