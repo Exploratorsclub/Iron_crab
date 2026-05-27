@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PR160-MAIN-LOOP-NONBLOCKING-NATS-PUBLISH-PIPELINE: Geyser-`select!` und TX-Pfad enqueue-only; Publish-Runtime isoliert
+**Datum**: 2026-05-27  
+**Problem** (Prod nach #159): `nats_messages_published_total` friert; massiv `NATS publish timeout (backpressure)`; `account_publish_queue_depth` entleert nicht. Ursache: **ein** serialer Publish-Worker auf geteiltem Client + **synchrones** NATS in `run_geyser_loop`-`select!` (MintInfo, Blockhash, PoolDiscovery, ExecutionResults-JetStream) und im TX-Task — Main-Loop blockiert → Fairness bricht → Pipeline verhungert (I-7-äquivalent: Hot-Path darf nicht auf NATS-I/O warten).  
+**Fix**: (1) **Alle** genannten Pfade nur noch `account_path_enqueue_*` (`try_send` auf Hauptqueue, Drop-Metrik `market_data_account_publish_enqueue_dropped_total` bei vollem Channel). (2) **TX-Task** (`handle_geyser_transaction`): Core/JetStream/Priority-Fee wie Account-Pfad über Queue; neues Job-Variant `CoreTopicJson` für `TOPIC_PRIORITY_FEE_SAMPLES`. (3) **Publish-Runtime**: eigener `std::thread` `md-publish` + `tokio` multi-thread; **Dispatcher** round-robin auf **N** Worker-Queues (`MARKET_DATA_PUBLISH_WORKER_COUNT`, Default **4**); jeder Worker eigene `NatsClient`-Verbindung `market-data-publish-{id}` aus `connection_config_template()` (nicht `clone_for_spawned_publish`); **2 s** `timeout` pro Job → `market_data_account_publish_worker_stalls_total`, nach Stall frische TCP-Verbindung + `market_data_account_publish_worker_reconnects_total`; Histogram `market_data_account_publish_worker_job_duration_us`; Gauges `market_data_account_publish_worker_last_success_unix_ms{worker}`. **Nicht** reintroduziert: #156 Watchdog-/Churn-Heuristiken. **Invarianten**: kein RPC im Hot Path (I-7), keine NATS-Schema-Änderung (I-23), Geyser-Subscription-Logik unverändert (Scope B).  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `src/nats/client.rs`, `docs/BUGS_FIXES.md`
+
 ### TX-PATH-GEYSER-ADMISSION-BATCH: Explizite Vault/Bin-Subscribe nur bei Admission + debounced Sync
 **Datum**: 2026-05-26  
 **Problem**: Nach PR #146 registrierte der TX-Trade-Pfad Reserve-Vaults/Bins via `register_geyser_reserves_after_trade` **ohne** `admit_geyser_explicit_pool_assets`; bei hohem Trade-Durchsatz (PR #151) folgte ein Sturm synchroner `sync_geyser_tracked_accounts()`-Aufrufe → Geyser-Subscription-Churn / NATS-Last (Prod-Ausfälle; Workarounds #153–#156 in #157 revertiert).  

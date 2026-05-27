@@ -101,6 +101,17 @@ impl NatsClient {
         Ok(())
     }
 
+    /// Clone of [`NatsConfig`] for opening additional connections (e.g. dedicated publish workers).
+    pub fn connection_config_template(&self) -> NatsConfig {
+        self.config.clone()
+    }
+
+    /// Drop the client handle and establish a fresh TCP connection (same URL/options).
+    pub async fn reconnect(&mut self) -> anyhow::Result<()> {
+        self.client = None;
+        self.connect().await
+    }
+
     pub fn is_connected(&self) -> bool {
         self.client.is_some()
     }

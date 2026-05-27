@@ -583,6 +583,44 @@ pub static MARKET_DATA_ACCOUNT_LOW_PRIORITY_QUEUE_DEPTH: Lazy<AtomicU64> =
 pub static MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// Publish pipeline: `try_send` to main publish queue failed (channel full).
+pub static MARKET_DATA_ACCOUNT_PUBLISH_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Dedicated publish worker: job exceeded per-job wall timeout (aborted + reconnect).
+pub static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_STALLS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Dedicated publish worker: reconnect after stall/timeout recovery.
+pub static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_RECONNECTS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+const MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LAST_SUCCESS_MAX: usize = 32;
+static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LAST_SUCCESS_UNIX_MS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        (0..MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LAST_SUCCESS_MAX)
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+
+/// Per publish-worker job wall time (single NATS publish unit), microseconds.
+const MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_BUCKETS: &[u64] = &[
+    50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+    1_000_000, 2_000_000,
+];
+
+static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// Account ingest: cheap relevance filter discarded the update before `handle_geyser_account` body.
 pub static MARKET_DATA_ACCOUNT_EARLY_DROP_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
@@ -777,6 +815,40 @@ pub fn inc_market_data_account_publish_queue_depth() {
 #[inline]
 pub fn dec_market_data_account_publish_queue_depth() {
     MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_publish_enqueue_dropped_total() {
+    MARKET_DATA_ACCOUNT_PUBLISH_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_market_data_account_publish_worker_stall() {
+    MARKET_DATA_ACCOUNT_PUBLISH_WORKER_STALLS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_market_data_account_publish_worker_reconnect() {
+    MARKET_DATA_ACCOUNT_PUBLISH_WORKER_RECONNECTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_market_data_account_publish_worker_job_duration_us(us: u64) {
+    record_histogram_u64_into(
+        MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_BUCKETS,
+        &MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_SUM,
+        &MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_COUNT,
+        us,
+        u64::MAX,
+    );
+}
+
+#[inline]
+pub fn set_market_data_account_publish_worker_last_success_unix_ms(worker_id: usize, ms: u64) {
+    if let Some(cell) = MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LAST_SUCCESS_UNIX_MS.get(worker_id) {
+        cell.store(ms, Ordering::Relaxed);
+    }
 }
 
 #[inline]
@@ -2559,6 +2631,36 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_account_publish_queue_depth",
         MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_publish_enqueue_dropped_total",
+        MARKET_DATA_ACCOUNT_PUBLISH_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_publish_worker_stalls_total",
+        MARKET_DATA_ACCOUNT_PUBLISH_WORKER_STALLS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_publish_worker_reconnects_total",
+        MARKET_DATA_ACCOUNT_PUBLISH_WORKER_RECONNECTS_TOTAL.load(Ordering::Relaxed)
+    );
+    for (i, cell) in MARKET_DATA_ACCOUNT_PUBLISH_WORKER_LAST_SUCCESS_UNIX_MS
+        .iter()
+        .enumerate()
+    {
+        out.push_str("market_data_account_publish_worker_last_success_unix_ms{worker=\"");
+        out.push_str(&i.to_string());
+        out.push_str("\"} ");
+        out.push_str(&cell.load(Ordering::Relaxed).to_string());
+        out.push('\n');
+    }
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_account_publish_worker_job_duration_us",
+        MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_BUCKETS,
+        &MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_SUM,
+        &MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_COUNT,
     );
     line!(
         "market_data_account_early_drop_total",
