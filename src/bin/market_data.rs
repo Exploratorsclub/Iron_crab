@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -53,10 +53,15 @@ use ironcrab::metrics::{
     dec_market_data_account_worker_queue_depth, geyser_metrics_inc_tracked_evicted,
     geyser_metrics_set_subscription_accounts, geyser_metrics_set_tracked_pinned_accounts,
     inc_market_data_account_high_priority_queue_depth,
-    inc_market_data_account_low_priority_queue_depth, inc_market_data_account_publish_queue_depth,
-    inc_market_data_account_worker_queue_depth, market_data_bump_geyser_head_slot,
-    record_market_data_account_broadcast_lagged, record_market_data_account_channel_lag_ms,
-    record_market_data_account_early_drop_total, record_market_data_account_handler_duration_us,
+    inc_market_data_account_low_priority_queue_depth,
+    inc_market_data_account_publish_enqueue_dropped_total,
+    inc_market_data_account_publish_queue_depth, inc_market_data_account_worker_queue_depth,
+    market_data_bump_geyser_head_slot, record_market_data_account_broadcast_lagged,
+    record_market_data_account_channel_lag_ms, record_market_data_account_early_drop_total,
+    record_market_data_account_handler_duration_us,
+    record_market_data_account_publish_worker_job_duration_us,
+    record_market_data_account_publish_worker_reconnect,
+    record_market_data_account_publish_worker_stall,
     record_market_data_bonding_curve_grpc_to_devwallet_ms,
     record_market_data_bonding_to_trade_slot_delta_slots,
     record_market_data_geyser_sync_batch_total, record_market_data_geyser_sync_immediate_total,
@@ -65,14 +70,16 @@ use ironcrab::metrics::{
     record_market_data_pool_mint_map_to_devwallet_ms,
     record_market_data_trade_after_bonding_publish_ms, record_market_data_tx_broadcast_lagged,
     record_market_data_tx_channel_lag_ms, serve_metrics,
-    set_market_data_account_broadcast_queue_depth, set_market_data_geyser_sync_pending,
-    set_market_data_momentum_active_pool_pins_gauge, set_market_data_tx_broadcast_queue_depth,
-    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
-    update_readiness_market_data_current, wall_clock_unix_ms_now, GeyserTrackedEvictKind,
-    MarketDataLatencySegment, MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
-    MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL,
-    MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
-    NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
+    set_market_data_account_broadcast_queue_depth,
+    set_market_data_account_publish_worker_last_success_unix_ms,
+    set_market_data_geyser_sync_pending, set_market_data_momentum_active_pool_pins_gauge,
+    set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
+    set_readiness_nats_connected, update_readiness_market_data_current, wall_clock_unix_ms_now,
+    GeyserTrackedEvictKind, MarketDataLatencySegment, MetricsComponent,
+    MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS,
+    MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
+    MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
+    POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -160,6 +167,20 @@ const MARKET_DATA_ACCOUNT_WORKER_COUNT: usize = 8;
 const MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP: usize = 1250;
 /// Dedicated NATS publish queue (JetStream + core MarketEvent); isolates slow `jetstream_publish().await`.
 const MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_CAP: usize = 16_384;
+/// Dispatcher → per-worker queue capacity (PR160).
+const MARKET_DATA_ACCOUNT_PUBLISH_WORKER_DISPATCH_QUEUE_CAP: usize = 4096;
+/// Per publish job (single JetStream or core fan-out unit): wall timeout before abort + worker reconnect.
+const MARKET_DATA_PUBLISH_WORKER_JOB_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn market_data_publish_worker_count() -> usize {
+    const DEF: usize = 4;
+    const MAX: usize = 32;
+    std::env::var("MARKET_DATA_PUBLISH_WORKER_COUNT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0 && n <= MAX)
+        .unwrap_or(DEF)
+}
 
 /// Subset of [`MarketEventKind`] mirrored to [`TOPIC_MOMENTUM_MARKET_EVENTS`] in addition to core.
 ///
@@ -7449,6 +7470,217 @@ enum AccountPathNatsJob {
         event: Box<MarketEvent>,
         trace: Option<MarketEventCorePublishTrace>,
     },
+    /// Serialized JSON to a core NATS topic (not a [`MarketEvent`], e.g. priority fee samples).
+    CoreTopicJson {
+        topic: String,
+        payload: serde_json::Value,
+    },
+}
+
+#[inline]
+fn account_path_try_enqueue_job(
+    tx: &mpsc::Sender<AccountPathNatsJob>,
+    job: AccountPathNatsJob,
+    log_ctx: &'static str,
+) -> bool {
+    inc_market_data_account_publish_queue_depth();
+    match tx.try_send(job) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            dec_market_data_account_publish_queue_depth();
+            inc_market_data_account_publish_enqueue_dropped_total();
+            warn!(
+                msg = log_ctx,
+                "account_path: publish queue full (PR160 try_send drop)"
+            );
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            dec_market_data_account_publish_queue_depth();
+            warn!(msg = log_ctx, "account_path: publish queue closed");
+            false
+        }
+    }
+}
+
+async fn md_account_publish_execute_one_job(
+    nats: &NatsClient,
+    ctx: &Arc<MarketDataContext>,
+    job: AccountPathNatsJob,
+) {
+    match job {
+        AccountPathNatsJob::JetStream {
+            subject,
+            payload,
+            bump_market_events_published_total,
+        } => {
+            if let Err(e) = nats.jetstream_publish(&subject, &payload).await {
+                warn!(
+                    error = %e,
+                    subject = %subject,
+                    "account_path: JetStream publish failed"
+                );
+                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            } else {
+                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                if bump_market_events_published_total {
+                    MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        AccountPathNatsJob::CoreMarketEvent { event, trace } => {
+            let _ = publish_market_event_core_and_momentum_ex(
+                nats,
+                event.as_ref(),
+                trace,
+                Some(ctx.as_ref()),
+            )
+            .await;
+        }
+        AccountPathNatsJob::CoreTopicJson { topic, payload } => {
+            match nats.publish(&topic, &payload).await {
+                Ok(true) => {
+                    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(false) => {
+                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    warn!(error = %e, topic = %topic, "account_path: core topic publish failed");
+                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+async fn md_account_publish_worker_loop(
+    worker_id: usize,
+    mut rx: mpsc::Receiver<AccountPathNatsJob>,
+    ctx: Arc<MarketDataContext>,
+    cfg: NatsConfig,
+) {
+    let mut had_stall = false;
+    'reconnect: loop {
+        let mut nats = NatsClient::new(cfg.clone());
+        if let Err(e) = nats.connect().await {
+            warn!(
+                worker_id,
+                error = %e,
+                "md-publish worker: NATS connect failed; retrying in 1s"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue 'reconnect;
+        }
+        if std::mem::take(&mut had_stall) {
+            record_market_data_account_publish_worker_reconnect();
+        }
+        set_market_data_account_publish_worker_last_success_unix_ms(
+            worker_id,
+            wall_clock_unix_ms_now(),
+        );
+        loop {
+            let Some(job) = rx.recv().await else {
+                return;
+            };
+            let job_start = Instant::now();
+            match tokio::time::timeout(
+                MARKET_DATA_PUBLISH_WORKER_JOB_TIMEOUT,
+                md_account_publish_execute_one_job(&nats, &ctx, job),
+            )
+            .await
+            {
+                Ok(()) => {
+                    let us = job_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                    record_market_data_account_publish_worker_job_duration_us(us);
+                    set_market_data_account_publish_worker_last_success_unix_ms(
+                        worker_id,
+                        wall_clock_unix_ms_now(),
+                    );
+                    dec_market_data_account_publish_queue_depth();
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        worker_id,
+                        timeout_secs = MARKET_DATA_PUBLISH_WORKER_JOB_TIMEOUT.as_secs(),
+                        "md-publish worker: job wall timeout; rotating dedicated NATS client"
+                    );
+                    record_market_data_account_publish_worker_stall();
+                    dec_market_data_account_publish_queue_depth();
+                    had_stall = true;
+                    continue 'reconnect;
+                }
+            }
+        }
+    }
+}
+
+async fn md_account_publish_dispatcher(
+    mut main_rx: mpsc::Receiver<AccountPathNatsJob>,
+    worker_txs: Vec<mpsc::Sender<AccountPathNatsJob>>,
+) {
+    if worker_txs.is_empty() {
+        return;
+    }
+    let n = worker_txs.len();
+    let mut rr = 0usize;
+    while let Some(job) = main_rx.recv().await {
+        let i = rr % n;
+        rr = rr.wrapping_add(1);
+        if worker_txs[i].send(job).await.is_err() {
+            warn!(worker = i, "md-publish: worker dispatch queue closed");
+            break;
+        }
+    }
+}
+
+async fn md_publish_runtime_main(
+    main_rx: mpsc::Receiver<AccountPathNatsJob>,
+    ctx: Arc<MarketDataContext>,
+    template: NatsConfig,
+    worker_count: usize,
+) {
+    let mut worker_txs = Vec::with_capacity(worker_count);
+    let mut handles = Vec::with_capacity(worker_count);
+    for wid in 0..worker_count {
+        let (wtx, wrx) = mpsc::channel(MARKET_DATA_ACCOUNT_PUBLISH_WORKER_DISPATCH_QUEUE_CAP);
+        worker_txs.push(wtx);
+        let mut cfg = template.clone();
+        cfg.name = format!("market-data-publish-{wid}");
+        let ctx_w = Arc::clone(&ctx);
+        handles.push(tokio::spawn(md_account_publish_worker_loop(
+            wid, wrx, ctx_w, cfg,
+        )));
+    }
+    md_account_publish_dispatcher(main_rx, worker_txs).await;
+    for h in handles {
+        let _ = h.await;
+    }
+}
+
+/// PR160: isolated publish thread + multi-worker Tokio (no NATS await on main Geyser runtime).
+fn spawn_market_data_account_publish_runtime(
+    ctx: Arc<MarketDataContext>,
+    template: NatsConfig,
+    worker_count: usize,
+) -> mpsc::Sender<AccountPathNatsJob> {
+    let worker_count = worker_count.clamp(1, 32);
+    let (tx, rx) = mpsc::channel(MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_CAP);
+    let ctx_th = Arc::clone(&ctx);
+    std::thread::Builder::new()
+        .name("md-publish".to_string())
+        .spawn(move || {
+            let runtime_threads = (worker_count + 2).clamp(2, 32);
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(runtime_threads)
+                .thread_name("md-publish")
+                .enable_all()
+                .build()
+                .expect("md-publish tokio runtime");
+            rt.block_on(md_publish_runtime_main(rx, ctx_th, template, worker_count));
+        })
+        .expect("spawn md-publish thread");
+    tx
 }
 
 struct AccountWorkItem {
@@ -7602,7 +7834,7 @@ async fn account_worker_recv_next(
 /// After `pool_mint_map` insert on the TX path: emit `DevWalletIdentified` if bonding-curve cache
 /// already holds authoritative creator (no Swap parsing; I-4 / BUG-D).
 ///
-/// NATS: when `publish_tx` is set (same channel as `account_path_publish_worker`), enqueue only —
+/// NATS: when `publish_tx` is set (same channel as dedicated publish runtime), enqueue only —
 /// avoids blocking the TX ingest task on Core NATS backpressure (PR151 follow-up).
 #[allow(clippy::too_many_arguments)]
 async fn maybe_emit_dev_wallet_after_pool_mint_map(
@@ -7685,42 +7917,30 @@ async fn maybe_emit_dev_wallet_after_pool_mint_map(
     true
 }
 
-async fn account_path_publish_worker(
-    mut rx: mpsc::Receiver<AccountPathNatsJob>,
-    ctx: Arc<MarketDataContext>,
-    nats: NatsClient,
+async fn account_path_enqueue_priority_fee_sample(
+    publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
+    nats: Option<&NatsClient>,
+    fee_msg: &PriorityFeePercentiles,
 ) {
-    while let Some(job) = rx.recv().await {
-        dec_market_data_account_publish_queue_depth();
-        match job {
-            AccountPathNatsJob::JetStream {
-                subject,
-                payload,
-                bump_market_events_published_total,
-            } => {
-                if let Err(e) = nats.jetstream_publish(&subject, &payload).await {
-                    warn!(
-                        error = %e,
-                        subject = %subject,
-                        "account_path: JetStream publish failed"
-                    );
-                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    if bump_market_events_published_total {
-                        MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-            AccountPathNatsJob::CoreMarketEvent { event, trace } => {
-                let _ = publish_market_event_core_and_momentum_ex(
-                    &nats,
-                    event.as_ref(),
-                    trace,
-                    Some(ctx.as_ref()),
-                )
-                .await;
-            }
+    let payload = match serde_json::to_value(fee_msg) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "account_path: failed to serialize PriorityFeePercentiles for NATS"
+            );
+            return;
+        }
+    };
+    if let Some(tx) = publish_tx {
+        let job = AccountPathNatsJob::CoreTopicJson {
+            topic: TOPIC_PRIORITY_FEE_SAMPLES.to_string(),
+            payload,
+        };
+        let _ = account_path_try_enqueue_job(tx, job, "PriorityFeePercentiles");
+    } else if let Some(nats) = nats {
+        if let Err(e) = nats.publish(TOPIC_PRIORITY_FEE_SAMPLES, fee_msg).await {
+            debug!(error = %e, "Failed to publish priority fee percentiles");
         }
     }
 }
@@ -7745,22 +7965,12 @@ async fn account_path_enqueue_jetstream<T: Serialize>(
                 return;
             }
         };
-        inc_market_data_account_publish_queue_depth();
-        if tx
-            .send(AccountPathNatsJob::JetStream {
-                subject,
-                payload,
-                bump_market_events_published_total,
-            })
-            .await
-            .is_err()
-        {
-            dec_market_data_account_publish_queue_depth();
-            warn!(
-                msg = log_fail,
-                "account_path: publish queue closed (JetStream)"
-            );
-        }
+        let job = AccountPathNatsJob::JetStream {
+            subject,
+            payload,
+            bump_market_events_published_total,
+        };
+        let _ = account_path_try_enqueue_job(tx, job, log_fail);
     } else if let Some(nats) = nats {
         if let Err(e) = nats.jetstream_publish(&subject, payload).await {
             warn!(error = %e, msg = log_fail, "JetStream publish failed");
@@ -7780,27 +7990,24 @@ async fn account_path_enqueue_core_market_event(
     ctx: &Arc<MarketDataContext>,
     event: MarketEvent,
     trace: Option<MarketEventCorePublishTrace>,
-) {
+) -> bool {
     if let Some(tx) = publish_tx {
         let event_id = event.event_id.clone();
-        inc_market_data_account_publish_queue_depth();
-        if tx
-            .send(AccountPathNatsJob::CoreMarketEvent {
-                event: Box::new(event),
-                trace,
-            })
-            .await
-            .is_err()
-        {
-            dec_market_data_account_publish_queue_depth();
-            warn!(
-                event_id = %event_id,
-                "account_path: publish queue closed (core MarketEvent)"
-            );
+        let job = AccountPathNatsJob::CoreMarketEvent {
+            event: Box::new(event),
+            trace,
+        };
+        let ok = account_path_try_enqueue_job(tx, job, "core MarketEvent");
+        if !ok {
+            warn!(event_id = %event_id, "account_path: core MarketEvent enqueue failed");
         }
+        ok
     } else if let Some(nats) = nats {
         let _ = publish_market_event_core_and_momentum_ex(nats, &event, trace, Some(ctx.as_ref()))
             .await;
+        true
+    } else {
+        false
     }
 }
 
@@ -9490,7 +9697,14 @@ async fn handle_geyser_transaction(
                 ctx.priority_fee_tracker.get_fee_for_tier(IntentTier::Tier1),
                 ctx.priority_fee_tracker.get_fee_for_tier(IntentTier::Arb),
             );
-            if let Some(ref nats) = ctx.nats {
+            if let Some(publish_tx) = account_publish_tx {
+                account_path_enqueue_priority_fee_sample(
+                    Some(publish_tx),
+                    ctx.nats.as_ref(),
+                    &fee_msg,
+                )
+                .await;
+            } else if let Some(ref nats) = ctx.nats {
                 // NOTE: nats.publish() already serializes - don't double-serialize!
                 if let Err(e) = nats.publish(TOPIC_PRIORITY_FEE_SAMPLES, &fee_msg).await {
                     debug!(error = %e, "Failed to publish priority fee percentiles");
@@ -9648,16 +9862,17 @@ async fn handle_geyser_transaction(
             error!(error = %e, "Failed to write dev wallet event to JSONL");
         }
 
-        if let Some(ref nats) = ctx.nats {
-            let _ = publish_market_event_core_and_momentum_ex(
-                nats,
-                &dev_event,
+        if ctx.nats.is_some() {
+            account_path_enqueue_core_market_event(
+                account_publish_tx,
+                ctx.nats.as_ref(),
+                &ctx,
+                dev_event,
                 Some(MarketEventCorePublishTrace {
                     recv_at: tx_geyser_recv_at,
                     cold_path: false,
                     segment: MarketDataLatencySegment::Other,
                 }),
-                Some(ctx.as_ref()),
             )
             .await;
         }
@@ -9710,10 +9925,20 @@ async fn handle_geyser_transaction(
             error!(error = %e, "Failed to write wallet event to JSONL");
         }
         // Publish to NATS
-        if let Some(ref nats) = ctx.nats {
-            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &wallet_event).await {
-                warn!(error = %e, "Failed to publish wallet event to NATS");
-            }
+        if ctx.nats.is_some() {
+            let seg = market_data_publish_segment(&wallet_event.kind);
+            account_path_enqueue_core_market_event(
+                account_publish_tx,
+                ctx.nats.as_ref(),
+                &ctx,
+                wallet_event,
+                Some(MarketEventCorePublishTrace {
+                    recv_at: tx_geyser_recv_at,
+                    cold_path: false,
+                    segment: seg,
+                }),
+            )
+            .await;
         }
     }
 
@@ -9757,16 +9982,17 @@ async fn handle_geyser_transaction(
             if let Err(e) = ctx.jsonl_writer.write(&pool_created_event) {
                 error!(error = %e, "Failed to write pump_amm PoolCreated (create_pool) to JSONL");
             }
-            if let Some(ref nats) = ctx.nats {
-                let _ = publish_market_event_core_and_momentum_ex(
-                    nats,
-                    &pool_created_event,
+            if ctx.nats.is_some() {
+                let _ = account_path_enqueue_core_market_event(
+                    account_publish_tx,
+                    ctx.nats.as_ref(),
+                    &ctx,
+                    pool_created_event,
                     Some(MarketEventCorePublishTrace {
                         recv_at: tx_geyser_recv_at,
                         cold_path: false,
                         segment: MarketDataLatencySegment::PoolCreated,
                     }),
-                    Some(ctx.as_ref()),
                 )
                 .await;
             }
@@ -9858,16 +10084,17 @@ async fn handle_geyser_transaction(
                 error!(error = %e, "Failed to write pump_amm PoolCreated event to JSONL");
             }
 
-            if let Some(ref nats) = ctx.nats {
-                let _ = publish_market_event_core_and_momentum_ex(
-                    nats,
-                    &pool_created_event,
+            if ctx.nats.is_some() {
+                let _ = account_path_enqueue_core_market_event(
+                    account_publish_tx,
+                    ctx.nats.as_ref(),
+                    &ctx,
+                    pool_created_event,
                     Some(MarketEventCorePublishTrace {
                         recv_at: tx_geyser_recv_at,
                         cold_path: false,
                         segment: MarketDataLatencySegment::PoolCreated,
                     }),
-                    Some(ctx.as_ref()),
                 )
                 .await;
             }
@@ -9892,16 +10119,17 @@ async fn handle_geyser_transaction(
             error!(error = %e, "Failed to write DexPoolAccounts event to JSONL");
         }
 
-        if let Some(ref nats) = ctx.nats {
-            let _ = publish_market_event_core_and_momentum_ex(
-                nats,
-                &accounts_event,
+        if ctx.nats.is_some() {
+            let _ = account_path_enqueue_core_market_event(
+                account_publish_tx,
+                ctx.nats.as_ref(),
+                &ctx,
+                accounts_event,
                 Some(MarketEventCorePublishTrace {
                     recv_at: tx_geyser_recv_at,
                     cold_path: false,
                     segment: MarketDataLatencySegment::Other,
                 }),
-                Some(ctx.as_ref()),
             )
             .await;
         }
@@ -9936,7 +10164,7 @@ async fn handle_geyser_transaction(
                 .set_pump_amm_pool_accounts_readiness_authoritative(*pool_address, dex_readiness);
 
             // FIX-33: Persist pool_accounts to JetStream so bootstrap recovers them after restart.
-            if let Some(ref nats) = ctx.nats {
+            if ctx.nats.is_some() {
                 let mut pool_update = PoolCacheUpdate::new_pool_discovered(
                     "market-data",
                     BUILD_VERSION,
@@ -9977,12 +10205,15 @@ async fn handle_geyser_transaction(
                 pool_update.metadata = Some(meta);
                 pool_update.set_dex_readiness_in_metadata(dex_readiness);
                 let subject = pool_subject(&pool_address.to_string());
-                if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
-                    warn!(error = %e, "FIX-33: Failed to publish pump_amm pool_accounts PoolCacheUpdate to JetStream (trade)");
-                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                }
+                account_path_enqueue_jetstream(
+                    account_publish_tx,
+                    ctx.nats.as_ref(),
+                    subject,
+                    &pool_update,
+                    "FIX-33 pump_amm pool_accounts PoolCacheUpdate (trade)",
+                    false,
+                )
+                .await;
             }
         }
     }
@@ -10020,25 +10251,19 @@ async fn handle_geyser_transaction(
                     error!(error = %e, "Failed to write DexPoolAccounts event to JSONL");
                 }
 
-                if let Some(ref nats) = ctx.nats {
-                    if publish_market_event_core_and_momentum_ex(
-                        nats,
-                        &accounts_event,
+                if ctx.nats.is_some() {
+                    let _ = account_path_enqueue_core_market_event(
+                        account_publish_tx,
+                        ctx.nats.as_ref(),
+                        &ctx,
+                        accounts_event,
                         Some(MarketEventCorePublishTrace {
                             recv_at: tx_geyser_recv_at,
                             cold_path: false,
                             segment: MarketDataLatencySegment::Other,
                         }),
-                        None,
                     )
-                    .await
-                    {
-                        debug!(
-                            dex = %dex,
-                            pool = %pool_address,
-                            "Emitted DexPoolAccounts from first trade"
-                        );
-                    }
+                    .await;
                 }
             }
         }
@@ -10130,18 +10355,19 @@ async fn handle_geyser_transaction(
         error!(error = %e, "Failed to write tx event to JSONL");
     }
 
-    // Publish to NATS
-    if let Some(ref nats) = ctx.nats {
+    // Publish to NATS (enqueue when publish pipeline is active; PR160)
+    if ctx.nats.is_some() {
         let seg = market_data_publish_segment(&event.kind);
-        let _ = publish_market_event_core_and_momentum_ex(
-            nats,
-            &event,
+        let _ = account_path_enqueue_core_market_event(
+            account_publish_tx,
+            ctx.nats.as_ref(),
+            &ctx,
+            event,
             Some(MarketEventCorePublishTrace {
                 recv_at: tx_geyser_recv_at,
                 cold_path: false,
                 segment: seg,
             }),
-            Some(ctx.as_ref()),
         )
         .await;
     }
@@ -10395,17 +10621,19 @@ async fn run_geyser_loop(
         None
     };
 
-    // Async NATS publish queue (shared by account workers and TX fast-path DevWallet enqueue).
+    // PR160: dedicated `std::thread` + isolated Tokio runtime; multi-worker NATS clients + dispatcher.
     // Must exist before the Geyser-Tx task starts so `handle_geyser_transaction` can enqueue.
     let account_publish_tx: Option<mpsc::Sender<AccountPathNatsJob>> =
         ctx.nats.as_ref().map(|nats| {
-            let (tx, rx) = mpsc::channel(MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_CAP);
-            let ctx_pub = Arc::clone(&ctx);
-            let nats_pub = nats.clone_for_spawned_publish();
-            tokio::spawn(async move {
-                account_path_publish_worker(rx, ctx_pub, nats_pub).await;
-            });
-            tx
+            let template = nats.connection_config_template();
+            let n_workers = market_data_publish_worker_count();
+            info!(
+                workers = n_workers,
+                main_queue_cap = MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_CAP,
+                per_worker_dispatch_cap = MARKET_DATA_ACCOUNT_PUBLISH_WORKER_DISPATCH_QUEUE_CAP,
+                "PR160: starting md-publish runtime (non-blocking enqueue from Geyser paths)"
+            );
+            spawn_market_data_account_publish_runtime(Arc::clone(&ctx), template, n_workers)
         });
 
     // Option A (MARKET-DATA-TX-INGEST-FAIRNESS): dedizierter Tokio-Task für Geyser-Txs.
@@ -10800,18 +11028,18 @@ async fn run_geyser_loop(
                     error!(error = %e, "Failed to write TokenMintInfo event to JSONL");
                 }
 
-                // Publish to NATS
-                if let Some(ref nats) = ctx.nats {
+                if ctx.nats.is_some() {
                     let seg = market_data_publish_segment(&mint_event.kind);
-                    let _ = publish_market_event_core_and_momentum_ex(
-                        nats,
-                        &mint_event,
+                    account_path_enqueue_core_market_event(
+                        account_publish_tx.as_ref(),
+                        ctx.nats.as_ref(),
+                        &ctx,
+                        mint_event,
                         Some(MarketEventCorePublishTrace {
                             recv_at: mint_geyser_recv_at,
                             cold_path: true,
                             segment: seg,
                         }),
-                        Some(ctx.as_ref()),
                     )
                     .await;
                 }
@@ -11048,12 +11276,16 @@ async fn run_geyser_loop(
                                                     token_program: token_program_str.clone(),
                                                 },
                                             );
-                                            if let Some(ref nats) = ctx.nats {
-                                                let subject = wallet_snapshot_subject(&wallet_str, mint_str);
-                                                if let Err(e) = nats.jetstream_publish(&subject, &snapshot).await {
-                                                    warn!(error = %e, mint = %mint_str, "Failed to publish zero-balance snapshot to JetStream after SELL");
-                                                }
-                                            }
+                                            let subject = wallet_snapshot_subject(&wallet_str, mint_str);
+                                            account_path_enqueue_jetstream(
+                                                account_publish_tx.as_ref(),
+                                                ctx.nats.as_ref(),
+                                                subject,
+                                                &snapshot,
+                                                "zero-balance WalletBalanceSnapshot after SELL",
+                                                false,
+                                            )
+                                            .await;
 
                                             if mint_str == WSOL_MINT {
                                                 tracked_wallet.last_wsol_balance.store(0, Ordering::Relaxed);
@@ -11120,10 +11352,20 @@ async fn run_geyser_loop(
                         block_height: bh_update.block_height,
                     },
                 );
-                if let Some(ref nats) = ctx.nats {
-                    if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &event).await {
-                        warn!(error = %e, "Failed to publish LatestBlockhash to NATS");
-                    }
+                let recv_at = Instant::now();
+                if ctx.nats.is_some() {
+                    account_path_enqueue_core_market_event(
+                        account_publish_tx.as_ref(),
+                        ctx.nats.as_ref(),
+                        &ctx,
+                        event,
+                        Some(MarketEventCorePublishTrace {
+                            recv_at,
+                            cold_path: false,
+                            segment: MarketDataLatencySegment::Other,
+                        }),
+                    )
+                    .await;
                 }
             }
 
@@ -11199,17 +11441,19 @@ async fn run_geyser_loop(
                     error!(error = %e, "Failed to write pool discovery event to JSONL");
                 }
 
-                // Publish to NATS
-                if let Some(ref nats) = ctx.nats {
-                    let _ = publish_market_event_core_and_momentum_ex(
-                        nats,
-                        &event,
+                // Publish to NATS (enqueue-only; PR160)
+                if ctx.nats.is_some() {
+                    let seg = market_data_publish_segment(&event.kind);
+                    account_path_enqueue_core_market_event(
+                        account_publish_tx.as_ref(),
+                        ctx.nats.as_ref(),
+                        &ctx,
+                        event,
                         Some(MarketEventCorePublishTrace {
                             recv_at: pool_discovery_recv_at,
                             cold_path: false,
-                            segment: market_data_publish_segment(&event.kind),
+                            segment: seg,
                         }),
-                        Some(ctx.as_ref()),
                     )
                     .await;
                 }
@@ -11237,23 +11481,25 @@ async fn run_geyser_loop(
                             error!(error = %e, "Failed to write dev wallet event to JSONL");
                         }
 
-                        if let Some(ref nats) = ctx.nats {
-                            if publish_market_event_core_and_momentum_ex(
-                                nats,
-                                &dev_event,
+                        if ctx.nats.is_some() {
+                            let seg = market_data_publish_segment(&dev_event.kind);
+                            if account_path_enqueue_core_market_event(
+                                account_publish_tx.as_ref(),
+                                ctx.nats.as_ref(),
+                                &ctx,
+                                dev_event,
                                 Some(MarketEventCorePublishTrace {
                                     recv_at: pool_discovery_recv_at,
                                     cold_path: false,
-                                    segment: market_data_publish_segment(&dev_event.kind),
+                                    segment: seg,
                                 }),
-                                None,
                             )
                             .await
                             {
                                 info!(
                                     mint = %pool_event.base_mint,
                                     creator = %creator,
-                                    "✅ DevWalletIdentified emitted for pump.fun pool"
+                                    "✅ DevWalletIdentified enqueued for pump.fun pool"
                                 );
                             }
                         }
@@ -11315,23 +11561,25 @@ async fn run_geyser_loop(
                         error!(error = %e, "Failed to write DexPoolAccounts event to JSONL");
                     }
 
-                    if let Some(ref nats) = ctx.nats {
-                        if publish_market_event_core_and_momentum_ex(
-                            nats,
-                            &accounts_event,
+                    if ctx.nats.is_some() {
+                        let seg = market_data_publish_segment(&accounts_event.kind);
+                        if account_path_enqueue_core_market_event(
+                            account_publish_tx.as_ref(),
+                            ctx.nats.as_ref(),
+                            &ctx,
+                            accounts_event,
                             Some(MarketEventCorePublishTrace {
                                 recv_at: pool_discovery_recv_at,
                                 cold_path: false,
-                                segment: market_data_publish_segment(&accounts_event.kind),
+                                segment: seg,
                             }),
-                            None,
                         )
                         .await
                         {
                             debug!(
                                 dex = %pool_event.dex_type,
                                 pool = %pool_event.pool_address,
-                                "Emitted DexPoolAccounts for pool discovery"
+                                "Enqueued DexPoolAccounts for pool discovery"
                             );
                         }
                     }
@@ -13452,6 +13700,34 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(
             dev_lines, 1,
             "expected exactly one DevWalletIdentified JSONL line"
+        );
+    }
+
+    /// PR160: main publish `mpsc` uses `try_send` — second enqueue fails when channel capacity is 1 and unconsumed.
+    #[tokio::test]
+    async fn account_path_core_enqueue_drops_when_publish_queue_full() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (tx, _rx) = mpsc::channel::<AccountPathNatsJob>(1);
+        let mk_event = |slot: u64| {
+            MarketEvent::new(
+                "market-data",
+                BUILD_VERSION,
+                "run-test",
+                ctx.next_event_id(),
+                "test",
+                Some(slot),
+                MarketEventKind::SlotUpdate { current_slot: slot },
+            )
+        };
+        assert!(
+            account_path_enqueue_core_market_event(Some(&tx), None, &ctx, mk_event(1), None,).await
+        );
+        assert!(
+            !account_path_enqueue_core_market_event(Some(&tx), None, &ctx, mk_event(2), None,)
+                .await
         );
     }
 
