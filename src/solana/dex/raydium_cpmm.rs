@@ -349,7 +349,7 @@ impl Dex for RaydiumCpmm {
     /// - Testing and development
     /// - Fallback when Geyser stream is interrupted
     ///
-    /// In production, pool discovery should happen via `GeyserPoolDiscovery`
+    /// In production, pool discovery should happen via `PoolDiscoveryIngest`
     /// which provides real-time pool updates without expensive RPC scans.
     ///
     /// See: docs/TARGET_ARCHITECTURE.md - "Geyser preferred, RPC only as fallback"

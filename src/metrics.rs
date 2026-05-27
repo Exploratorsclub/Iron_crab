@@ -225,6 +225,8 @@ pub static GEYSER_RECONNECT_TOTAL_STREAM_ENDED: Lazy<AtomicU64> = Lazy::new(|| A
 pub static GEYSER_RECONNECT_TOTAL_STREAM_ERROR: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// Reconnect after subscription sink closed / send failure (new `connect()`).
 pub static GEYSER_RECONNECT_TOTAL_SINK_GONE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// gRPC stream payloads delivered into the listener (account / transaction / block_meta updates).
+pub static GEYSER_LISTENER_STREAM_MESSAGES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// gRPC stream `Err` deliveries (excludes graceful `None` / stream ended).
 pub static GEYSER_STREAM_ERRORS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// `CompressedAccountFilterSet::insert` failed: capacity below configured explicit-track ceiling.
@@ -379,6 +381,11 @@ pub fn set_market_data_geyser_merge_pending(pending: u64) {
 
 pub fn geyser_metrics_inc_stream_error() {
     GEYSER_STREAM_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn geyser_metrics_inc_listener_stream_payload() {
+    GEYSER_LISTENER_STREAM_MESSAGES_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -2443,6 +2450,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "geyser_stream_errors_total",
         GEYSER_STREAM_ERRORS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "geyser_listener_stream_messages_total",
+        GEYSER_LISTENER_STREAM_MESSAGES_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "geyser_tracked_cuckoo_table_full_total",

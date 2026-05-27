@@ -101,7 +101,9 @@ use ironcrab::solana::dex_parser::{
     parse_account_update, parse_transaction_update_with_pool_lookup, DexType, OrcaPoolInfo,
     ParsedDexEvent,
 };
-use ironcrab::solana::geyser_pool_discovery::{DexType as PoolDexType, GeyserPoolDiscovery};
+use ironcrab::solana::geyser_pool_discovery::{
+    DexType as PoolDexType, PoolDiscoveryEvent, PoolDiscoveryIngest,
+};
 use ironcrab::solana::priority_fee_tracker::PriorityFeeTracker;
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::solana::wallet_tracker::WalletTracker;
@@ -8101,6 +8103,216 @@ async fn account_path_enqueue_core_market_event(
     }
 }
 
+/// PR162: pool discovery handler (dedicated task; not in main `select!`).
+/// STOP-CHECK: keine neuen RPC-Calls; Pump.fun TokenMintInfo nutzt bekannte Decimals.
+async fn handle_pool_discovery_market_event(
+    ctx: &Arc<MarketDataContext>,
+    run_id: &str,
+    mint_info_tx: &mpsc::UnboundedSender<MarketEvent>,
+    account_publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
+    pool_event: PoolDiscoveryEvent,
+) {
+    let pool_discovery_recv_at = Instant::now();
+    market_data_bump_geyser_head_slot(pool_event.slot);
+    ironcrab::metrics::record_activity();
+
+    info!(
+        dex = %pool_event.dex_type,
+        pool = %pool_event.pool_address,
+        base = %pool_event.base_mint,
+        quote = %pool_event.quote_mint,
+        liquidity_lamports = pool_event.liquidity_estimate_lamports,
+        "Pool discovered via Geyser"
+    );
+
+    if matches!(pool_event.dex_type, PoolDexType::PumpFun) {
+        let emit_mint_info = ctx
+            .pumpfun_pool_discovery_mint_info_emitted
+            .write()
+            .insert(pool_event.base_mint);
+        if emit_mint_info {
+            let mint_event = MarketEvent::new(
+                "market-data",
+                BUILD_VERSION,
+                run_id,
+                ctx.next_event_id(),
+                "geyser_known",
+                Some(pool_event.slot),
+                MarketEventKind::TokenMintInfo {
+                    mint: pool_event.base_mint.to_string(),
+                    token_program: spl_token::ID.to_string(),
+                    decimals: 6,
+                    supply: 0,
+                    mint_authority: None,
+                    freeze_authority: None,
+                },
+            );
+            let _ = mint_info_tx.send(mint_event);
+            debug!(
+                mint = %pool_event.base_mint,
+                "Emitted TokenMintInfo for pump.fun token (decimals=6, no RPC)"
+            );
+        }
+    }
+
+    let event = MarketEvent::new(
+        "market-data",
+        BUILD_VERSION,
+        run_id,
+        ctx.next_event_id(),
+        "geyser_pool_discovery",
+        Some(pool_event.slot),
+        MarketEventKind::PoolCreated {
+            pool_address: pool_event.pool_address.to_string(),
+            base_mint: pool_event.base_mint.to_string(),
+            quote_mint: pool_event.quote_mint.to_string(),
+            dex: pool_event.dex_type.to_string(),
+            initial_liquidity_sol: Some(
+                rust_decimal::Decimal::from(pool_event.liquidity_estimate_lamports)
+                    / rust_decimal::Decimal::from(1_000_000_000u64),
+            ),
+        },
+    );
+
+    if let Err(e) = ctx.jsonl_writer.write(&event) {
+        error!(error = %e, "Failed to write pool discovery event to JSONL");
+    }
+
+    if ctx.nats.is_some() {
+        let seg = market_data_publish_segment(&event.kind);
+        account_path_enqueue_core_market_event(
+            account_publish_tx,
+            ctx.nats.as_ref(),
+            ctx,
+            event,
+            Some(MarketEventCorePublishTrace {
+                recv_at: pool_discovery_recv_at,
+                cold_path: false,
+                segment: seg,
+            }),
+        )
+        .await;
+    }
+
+    if pool_event.dex_type == PoolDexType::PumpFun {
+        if let Some(creator) = pool_event.creator {
+            let dev_event = MarketEvent::new(
+                "market-data",
+                BUILD_VERSION,
+                run_id,
+                ctx.next_event_id(),
+                "geyser_pool_discovery",
+                Some(pool_event.slot),
+                MarketEventKind::DevWalletIdentified {
+                    mint: pool_event.base_mint.to_string(),
+                    dev_wallet: creator.to_string(),
+                    supply_percentage: 0.0,
+                },
+            );
+
+            if let Err(e) = ctx.jsonl_writer.write(&dev_event) {
+                error!(error = %e, "Failed to write dev wallet event to JSONL");
+            }
+
+            if ctx.nats.is_some() {
+                let seg = market_data_publish_segment(&dev_event.kind);
+                if account_path_enqueue_core_market_event(
+                    account_publish_tx,
+                    ctx.nats.as_ref(),
+                    ctx,
+                    dev_event,
+                    Some(MarketEventCorePublishTrace {
+                        recv_at: pool_discovery_recv_at,
+                        cold_path: false,
+                        segment: seg,
+                    }),
+                )
+                .await
+                {
+                    info!(
+                        mint = %pool_event.base_mint,
+                        creator = %creator,
+                        "✅ DevWalletIdentified enqueued for pump.fun pool"
+                    );
+                }
+            }
+        }
+    }
+
+    if pool_event.coin_vault.is_some() || pool_event.pc_vault.is_some() {
+        let mut accounts = vec![
+            pool_event.pool_address.to_string(),
+            pool_event.base_mint.to_string(),
+            pool_event.quote_mint.to_string(),
+        ];
+
+        if let Some(coin_vault) = pool_event.coin_vault {
+            accounts.push(coin_vault.to_string());
+        }
+        if let Some(pc_vault) = pool_event.pc_vault {
+            accounts.push(pc_vault.to_string());
+        }
+        if let Some(creator) = pool_event.creator {
+            accounts.push(creator.to_string());
+        }
+        if let Some(active_id) = pool_event.active_id {
+            accounts.push(format!("active_id:{}", active_id));
+        }
+        if let Some(bin_step) = pool_event.bin_step {
+            accounts.push(format!("bin_step:{}", bin_step));
+        }
+        if let Some(tick) = pool_event.tick_current_index {
+            accounts.push(format!("tick_current_index:{}", tick));
+        }
+        if let Some(spacing) = pool_event.tick_spacing {
+            accounts.push(format!("tick_spacing:{}", spacing));
+        }
+
+        let accounts_event = MarketEvent::new(
+            "market-data",
+            BUILD_VERSION,
+            run_id,
+            ctx.next_event_id(),
+            "geyser_pool_discovery",
+            Some(pool_event.slot),
+            MarketEventKind::DexPoolAccounts {
+                dex: pool_event.dex_type.to_string(),
+                pool_address: pool_event.pool_address.to_string(),
+                base_mint: pool_event.base_mint.to_string(),
+                quote_mint: pool_event.quote_mint.to_string(),
+                accounts,
+            },
+        );
+
+        if let Err(e) = ctx.jsonl_writer.write(&accounts_event) {
+            error!(error = %e, "Failed to write DexPoolAccounts event to JSONL");
+        }
+
+        if ctx.nats.is_some() {
+            let seg = market_data_publish_segment(&accounts_event.kind);
+            if account_path_enqueue_core_market_event(
+                account_publish_tx,
+                ctx.nats.as_ref(),
+                ctx,
+                accounts_event,
+                Some(MarketEventCorePublishTrace {
+                    recv_at: pool_discovery_recv_at,
+                    cold_path: false,
+                    segment: seg,
+                }),
+            )
+            .await
+            {
+                debug!(
+                    dex = %pool_event.dex_type,
+                    pool = %pool_event.pool_address,
+                    "Enqueued DexPoolAccounts for pool discovery"
+                );
+            }
+        }
+    }
+}
+
 /// Geyser account ingest (dedizierter Task-Fairness, siehe MARKET-DATA-ACCOUNT-INGEST-FAIRNESS).
 /// STOP-CHECK: keine neuen RPC-Calls im Hot-Path; Cold-Path-RPC nur in bestehenden `tokio::spawn`-Pfaden.
 async fn handle_geyser_account(
@@ -10554,17 +10766,6 @@ async fn run_geyser_loop(
         Pubkey::from_str(METEORA_CPMM).expect("valid meteora cpmm pubkey"),
     ];
 
-    // Initialize Geyser-based pool discovery (PRIMARY method for pool discovery)
-    let (pool_discovery, mut pool_discovery_rx) =
-        GeyserPoolDiscovery::new(geyser_url.to_string(), program_ids.clone(), rpc.clone());
-
-    // Spawn pool discovery task
-    let _pool_discovery_handle = tokio::spawn(async move {
-        if let Err(e) = pool_discovery.start().await {
-            error!(error = %e, "GeyserPoolDiscovery crashed");
-        }
-    });
-
     // Merge tracked_mints, tracked_vaults, tracked_bin_arrays, and tracked_wallet into a single combined channel.
     // GeyserListener will subscribe to all accounts in the combined list.
     let (combined_tracked_tx, combined_tracked_rx) = watch::channel(Vec::<Pubkey>::new());
@@ -10588,7 +10789,7 @@ async fn run_geyser_loop(
         });
     }
 
-    // Start legacy GeyserListener for transaction parsing (will be phased out in favor of pool discovery)
+    // Geyser listener + unified pool discovery (single gRPC session; PR162)
     let (listener, account_rx, transaction_rx, mut blockhash_rx) =
         GeyserListener::new_with_tracked_accounts(
             geyser_url.to_string(),
@@ -10598,7 +10799,15 @@ async fn run_geyser_loop(
             ctx.config.read().max_tracked_accounts.max(1),
         );
 
-    // Spawn Geyser listener task
+    let pool_discovery_account_rx = listener.subscribe_account_updates();
+    let pool_discovery_transaction_rx = listener.subscribe_transaction_updates();
+    let pool_discovery_event_rx = PoolDiscoveryIngest::spawn_unified(
+        pool_discovery_account_rx,
+        pool_discovery_transaction_rx,
+        rpc.clone(),
+    );
+
+    // Spawn Geyser listener task (single gRPC session; PR162)
     let listener_handle = tokio::spawn(async move {
         if let Err(e) = listener.start().await {
             error!(error = %e, "Geyser listener crashed");
@@ -10745,6 +10954,26 @@ async fn run_geyser_loop(
                 }
             }
         }
+    });
+
+    // PR162: pool discovery off main `select!` — dedicated consumer (JSONL + enqueue; no sync NATS).
+    let ctx_pool_disc = Arc::clone(&ctx);
+    let run_id_pool_disc = run_id.to_string();
+    let mint_info_tx_pool_disc = mint_info_tx.clone();
+    let account_publish_tx_pool_disc = account_publish_tx.clone();
+    tokio::spawn(async move {
+        let mut pool_discovery_event_rx = pool_discovery_event_rx;
+        while let Some(pool_event) = pool_discovery_event_rx.recv().await {
+            handle_pool_discovery_market_event(
+                &ctx_pool_disc,
+                run_id_pool_disc.as_str(),
+                &mint_info_tx_pool_disc,
+                account_publish_tx_pool_disc.as_ref(),
+                pool_event,
+            )
+            .await;
+        }
+        warn!("pool discovery ingest: event channel closed");
     });
 
     // Option A + MARKET-DATA-ACCOUNT-THROUGHPUT-P0: dedicated recv + worker pool (sharded by pubkey)
@@ -11445,225 +11674,6 @@ async fn run_geyser_loop(
                 }
             }
 
-            // Pool Discovery Events (Geyser-based pool creation events)
-            Ok(pool_event) = pool_discovery_rx.recv() => {
-                let pool_discovery_recv_at = Instant::now();
-                market_data_bump_geyser_head_slot(pool_event.slot);
-                ironcrab::metrics::record_activity();
-
-                info!(
-                    dex = %pool_event.dex_type,
-                    pool = %pool_event.pool_address,
-                    base = %pool_event.base_mint,
-                    quote = %pool_event.quote_mint,
-                    liquidity_lamports = pool_event.liquidity_estimate_lamports,
-                    "Pool discovered via Geyser"
-                );
-
-                // PR-B: discovery-only must not grow explicit Geyser mint/vault/bin subscriptions.
-                // Pump.fun still emits TokenMintInfo with known decimals=6 (no extra mint account filter).
-                if matches!(pool_event.dex_type, PoolDexType::PumpFun) {
-                    let emit_mint_info = ctx
-                        .pumpfun_pool_discovery_mint_info_emitted
-                        .write()
-                        .insert(pool_event.base_mint);
-                    if emit_mint_info {
-                        let mint_event = MarketEvent::new(
-                            "market-data",
-                            BUILD_VERSION,
-                            run_id,
-                            ctx.next_event_id(),
-                            "geyser_known", // Not RPC - we know pump.fun uses decimals=6
-                            Some(pool_event.slot),
-                            MarketEventKind::TokenMintInfo {
-                                mint: pool_event.base_mint.to_string(),
-                                token_program: spl_token::ID.to_string(), // pump.fun always uses SPL Token
-                                decimals: 6, // pump.fun tokens ALWAYS have 6 decimals
-                                supply: 0,   // Unknown, but not critical for trading
-                                mint_authority: None,
-                                freeze_authority: None,
-                            },
-                        );
-                        let _ = mint_info_tx.send(mint_event);
-                        debug!(
-                            mint = %pool_event.base_mint,
-                            "Emitted TokenMintInfo for pump.fun token (decimals=6, no RPC)"
-                        );
-                    }
-                }
-
-                // Convert to MarketEvent::PoolCreated
-                let event = MarketEvent::new(
-                    "market-data",
-                    BUILD_VERSION,
-                    run_id,
-                    ctx.next_event_id(),
-                    "geyser_pool_discovery",
-                    Some(pool_event.slot),
-                    MarketEventKind::PoolCreated {
-                        pool_address: pool_event.pool_address.to_string(),
-                        base_mint: pool_event.base_mint.to_string(),
-                        quote_mint: pool_event.quote_mint.to_string(),
-                        dex: pool_event.dex_type.to_string(),
-                        initial_liquidity_sol: Some(
-                            rust_decimal::Decimal::from(pool_event.liquidity_estimate_lamports)
-                                / rust_decimal::Decimal::from(1_000_000_000u64)
-                        ),
-                    },
-                );
-
-                // Write to JSONL
-                if let Err(e) = ctx.jsonl_writer.write(&event) {
-                    error!(error = %e, "Failed to write pool discovery event to JSONL");
-                }
-
-                // Publish to NATS (enqueue-only; PR160)
-                if ctx.nats.is_some() {
-                    let seg = market_data_publish_segment(&event.kind);
-                    account_path_enqueue_core_market_event(
-                        account_publish_tx.as_ref(),
-                        ctx.nats.as_ref(),
-                        &ctx,
-                        event,
-                        Some(MarketEventCorePublishTrace {
-                            recv_at: pool_discovery_recv_at,
-                            cold_path: false,
-                            segment: seg,
-                        }),
-                    )
-                    .await;
-                }
-
-                // Emit DevWalletIdentified for Pump.fun pools where we know the creator
-                // This enables momentum-bot to populate metadata.creator for intent building
-                if pool_event.dex_type == PoolDexType::PumpFun {
-                    if let Some(creator) = pool_event.creator {
-                        let dev_event = MarketEvent::new(
-                            "market-data",
-                            BUILD_VERSION,
-                            run_id,
-                            ctx.next_event_id(),
-                            "geyser_pool_discovery",
-                            Some(pool_event.slot),
-                            MarketEventKind::DevWalletIdentified {
-                                mint: pool_event.base_mint.to_string(),
-                                dev_wallet: creator.to_string(),
-                                // Supply percentage not computed (would need extra on-chain reads)
-                                supply_percentage: 0.0,
-                            },
-                        );
-
-                        if let Err(e) = ctx.jsonl_writer.write(&dev_event) {
-                            error!(error = %e, "Failed to write dev wallet event to JSONL");
-                        }
-
-                        if ctx.nats.is_some() {
-                            let seg = market_data_publish_segment(&dev_event.kind);
-                            if account_path_enqueue_core_market_event(
-                                account_publish_tx.as_ref(),
-                                ctx.nats.as_ref(),
-                                &ctx,
-                                dev_event,
-                                Some(MarketEventCorePublishTrace {
-                                    recv_at: pool_discovery_recv_at,
-                                    cold_path: false,
-                                    segment: seg,
-                                }),
-                            )
-                            .await
-                            {
-                                info!(
-                                    mint = %pool_event.base_mint,
-                                    creator = %creator,
-                                    "✅ DevWalletIdentified enqueued for pump.fun pool"
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Emit DexPoolAccounts for all DEXes that have vault information
-                // This enables arb-strategy to have pool accounts BEFORE first trade
-                if pool_event.coin_vault.is_some() || pool_event.pc_vault.is_some() {
-                    let mut accounts = vec![
-                        pool_event.pool_address.to_string(),
-                        pool_event.base_mint.to_string(),
-                        pool_event.quote_mint.to_string(),
-                    ];
-
-                    if let Some(coin_vault) = pool_event.coin_vault {
-                        accounts.push(coin_vault.to_string());
-                    }
-                    if let Some(pc_vault) = pool_event.pc_vault {
-                        accounts.push(pc_vault.to_string());
-                    }
-                    if let Some(creator) = pool_event.creator {
-                        accounts.push(creator.to_string());
-                    }
-                    // Meteora DLMM: add active_id and bin_step as tagged values
-                    // Format: "active_id:<value>" and "bin_step:<value>"
-                    if let Some(active_id) = pool_event.active_id {
-                        accounts.push(format!("active_id:{}", active_id));
-                    }
-                    if let Some(bin_step) = pool_event.bin_step {
-                        accounts.push(format!("bin_step:{}", bin_step));
-                    }
-                    // Orca Whirlpool: add tick_current_index and tick_spacing as tagged values
-                    // Format: "tick_current_index:<value>" and "tick_spacing:<value>"
-                    if let Some(tick) = pool_event.tick_current_index {
-                        accounts.push(format!("tick_current_index:{}", tick));
-                    }
-                    if let Some(spacing) = pool_event.tick_spacing {
-                        accounts.push(format!("tick_spacing:{}", spacing));
-                    }
-
-                    let accounts_event = MarketEvent::new(
-                        "market-data",
-                        BUILD_VERSION,
-                        run_id,
-                        ctx.next_event_id(),
-                        "geyser_pool_discovery",
-                        Some(pool_event.slot),
-                        MarketEventKind::DexPoolAccounts {
-                            dex: pool_event.dex_type.to_string(),
-                            pool_address: pool_event.pool_address.to_string(),
-                            base_mint: pool_event.base_mint.to_string(),
-                            quote_mint: pool_event.quote_mint.to_string(),
-                            accounts,
-                        },
-                    );
-
-                    if let Err(e) = ctx.jsonl_writer.write(&accounts_event) {
-                        error!(error = %e, "Failed to write DexPoolAccounts event to JSONL");
-                    }
-
-                    if ctx.nats.is_some() {
-                        let seg = market_data_publish_segment(&accounts_event.kind);
-                        if account_path_enqueue_core_market_event(
-                            account_publish_tx.as_ref(),
-                            ctx.nats.as_ref(),
-                            &ctx,
-                            accounts_event,
-                            Some(MarketEventCorePublishTrace {
-                                recv_at: pool_discovery_recv_at,
-                                cold_path: false,
-                                segment: seg,
-                            }),
-                        )
-                        .await
-                        {
-                            debug!(
-                                dex = %pool_event.dex_type,
-                                pool = %pool_event.pool_address,
-                                "Enqueued DexPoolAccounts for pool discovery"
-                            );
-                        }
-                    }
-
-                    // PR-B: explicit Geyser vault/bin-array subscriptions are deferred until first trade,
-                    // active-pool pin (PR-D), or wallet-held mint admission — not pool_discovery alone.
-                }
-            }
 
             // PR-D: Momentum active pool pin stream (core NATS).
             msg = async {

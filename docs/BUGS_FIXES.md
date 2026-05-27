@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PR162-GEYSER-INGEST-LIVENESS: eine Geyser-Session + Subscription-Sink aus Read-Loop; Pool-Discovery off Main-`select!`
+**Datum**: 2026-05-27  
+**Problem** (Prod post #160): `head_slot` / `nats_messages_published_total` frieren ~60 s nach Restart; `geyser_listener: heartbeat` fehlt; letztes `subscription updated` beim Startup-Burst; paralleles `GeyserPoolDiscovery` (zweite gRPC-Connection) liefert weiter Meteora-Logs — Haupt-Read-Loop liefert keine Nutzlast mehr (Ingest-Starvation). Publish-Pipeline (#160) war nicht der Blocker.  
+**Fix**: (1) **`GeyserPoolDiscovery` entfernt** — `PoolDiscoveryIngest::spawn_unified` hängt an denselben `GeyserListener`-Broadcasts wie TX/Account (`subscribe_account_updates` / `subscribe_transaction_updates`); genau **eine** `subscribe_with_request`-Session. (2) **`subscribe_tx.send` nicht mehr im Stream-`select!`**: Pending `SubscribeRequest` in `Mutex<Option<_>>` + `Notify`; dedizierter Task awaited nur den Yellowstone-Sink; Read-Loop bleibt auf `stream.next()` fair (Heartbeats, Blockhash, Metrik `geyser_listener_stream_messages_total`). (3) **Pool-Discovery-MarketEvents**: dedizierter Tokio-Task `recv` auf `mpsc` (bounded **10000**) + `handle_pool_discovery_market_event` — kein Arm mehr im Main-`select!` (Fairness wie #151 TX-Ingest). **Invarianten**: kein neuer Hot-Path-RPC (I-7), PR160 Publish-Runtime unangetastet, I-16 kein stilles Droppen zulässig (Enqueue-Drop-Metriken PR160 bleiben).  
+**Dateien**: `src/bin/market_data.rs`, `src/solana/geyser_listener.rs`, `src/solana/geyser_pool_discovery.rs`, `src/metrics.rs`, `src/solana/dex/meteora_dlmm.rs`, `src/solana/dex/raydium_cpmm.rs`, `docs/BUGS_FIXES.md`
+
 ### PR161-GEYSER-MERGE-COALESCING: Merge-Task `combined_tracked` debounced wie TX-Path-Sync
 **Datum**: 2026-05-27  
 **Problem** (Prod post #159): Startup hunderte `subscription updated (NO reconnect)` in wenigen Sekunden — Cuckoo (#159) macht Updates billiger, aber **jeder** Merge feuerte sofort `combined_tracked_tx.send` (bis zu 4× pro `broadcast_tracked_geyser_explicit_to_merge` wegen vier `watch`-Channels) → Read-Loop-Last und NATS-Backpressure-Risiko.  
