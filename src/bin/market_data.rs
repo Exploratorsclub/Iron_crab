@@ -114,7 +114,7 @@ use spl_token_2022::extension::StateWithExtensions;
 /// NATS topic for config reload (P1: Runtime Configuration via UI)
 const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
 use ironcrab::solana::geyser_listener::{
-    GeyserAccountUpdate, GeyserListener, GeyserTransactionUpdate,
+    GeyserAccountListener, GeyserAccountUpdate, GeyserTransactionUpdate, GeyserTxListener,
 };
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
@@ -694,7 +694,7 @@ struct MarketDataConfig {
     max_tracked_accounts: usize,
     /// PR-B: full Geyser reconnect when combined explicit accounts exceed this threshold.
     geyser_full_reconnect_threshold: usize,
-    /// Coalesce TX-path Geyser subscription sync **and** merge-task `combined_tracked`→GeyserListener
+    /// Coalesce TX-path Geyser subscription sync **and** merge-task `combined_tracked`→GeyserAccountListener
     /// updates (PR161); same debounce window for both (ms). Clamped 10–100 at use sites.
     geyser_sync_batch_ms: u64,
 }
@@ -818,7 +818,7 @@ struct MarketDataContext {
     run_id: String,
     /// P1: Config in RwLock for runtime hot-reload
     config: parking_lot::RwLock<MarketDataConfig>,
-    /// Same value as `config.geyser_full_reconnect_threshold`, mirrored for `GeyserListener` hot-reload.
+    /// Same value as `config.geyser_full_reconnect_threshold`, mirrored for `GeyserAccountListener` hot-reload.
     geyser_full_reconnect_threshold_live: Arc<AtomicUsize>,
     nats: Option<NatsClient>,
     jsonl_writer: JsonlWriter,
@@ -852,13 +852,13 @@ struct MarketDataContext {
     /// Vault account tracking for PoolStateUpdate events (Geyser-based reserve balances).
     /// Maps vault_address → VaultInfo (pool context).
     tracked_vaults: parking_lot::RwLock<std::collections::HashMap<Pubkey, VaultInfo>>,
-    /// Channel to notify GeyserListener when tracked vaults change (triggers resubscribe).
+    /// Channel to notify GeyserAccountListener when tracked vaults change (triggers resubscribe).
     tracked_vaults_tx: watch::Sender<Vec<Pubkey>>,
 
     /// Meteora DLMM Bin Array tracking for BinArrayUpdate events (Geyser-based liquidity).
     /// Maps bin_array_pda → BinArrayInfo (pool context).
     tracked_bin_arrays: parking_lot::RwLock<std::collections::HashMap<Pubkey, BinArrayInfo>>,
-    /// Channel to notify GeyserListener when tracked bin arrays change (triggers resubscribe).
+    /// Channel to notify GeyserAccountListener when tracked bin arrays change (triggers resubscribe).
     tracked_bin_arrays_tx: watch::Sender<Vec<Pubkey>>,
 
     /// MASTER LivePoolCache - Single Source of Truth for all pool state.
@@ -891,7 +891,7 @@ struct MarketDataContext {
     /// Wallet pubkey to track for balance updates (for WsolManager in execution-engine).
     /// Set via IRONCRAB_WALLET_PUBKEY env var.
     tracked_wallet: Option<TrackedWallet>,
-    /// Channel to notify GeyserListener when tracked wallet accounts change.
+    /// Channel to notify GeyserAccountListener when tracked wallet accounts change.
     /// NOTE: We keep the Sender alive even though we don't use it after initial send,
     /// because dropping it would close the Receiver used by the merge task.
     #[allow(dead_code)]
@@ -922,6 +922,9 @@ struct MarketDataContext {
 
     /// Debounced flush of explicit Geyser subscription maps after TX-path reserve registration.
     geyser_sync_batch_timer: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+
+    /// PR164: dedupe `PoolCreated` NATS/JSONL for the same pool (account-path vault spam).
+    pool_discovery_poolcreated_emitted: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
 }
 
 #[derive(Debug, Default)]
@@ -6617,6 +6620,9 @@ async fn main() -> Result<()> {
         pump_amm_dex: parking_lot::RwLock::new(None),
         helius_rpc,
         geyser_sync_batch_timer: parking_lot::Mutex::new(None),
+        pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
+            std::collections::HashSet::new(),
+        ),
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -8128,6 +8134,14 @@ async fn handle_pool_discovery_market_event(
     let pool_discovery_recv_at = Instant::now();
     market_data_bump_geyser_head_slot(pool_event.slot);
     ironcrab::metrics::record_activity();
+
+    if !ctx
+        .pool_discovery_poolcreated_emitted
+        .write()
+        .insert(pool_event.pool_address)
+    {
+        return;
+    }
 
     info!(
         dex = %pool_event.dex_type,
@@ -10767,7 +10781,7 @@ async fn run_geyser_loop(
     ];
 
     // Merge tracked_mints, tracked_vaults, tracked_bin_arrays, and tracked_wallet into a single combined channel.
-    // GeyserListener will subscribe to all accounts in the combined list.
+    // GeyserAccountListener subscribes to all accounts in the combined list (TX path: GeyserTxListener).
     let (combined_tracked_tx, combined_tracked_rx) = watch::channel(Vec::<Pubkey>::new());
     {
         let mints_rx = tracked_mints_rx;
@@ -10789,28 +10803,35 @@ async fn run_geyser_loop(
         });
     }
 
-    // Geyser listener + unified pool discovery (single gRPC session; PR162)
-    let (listener, account_rx, transaction_rx, mut blockhash_rx) =
-        GeyserListener::new_with_tracked_accounts(
-            geyser_url.to_string(),
-            program_ids,
-            combined_tracked_rx,
-            Arc::clone(&ctx.geyser_full_reconnect_threshold_live),
-            ctx.config.read().max_tracked_accounts.max(1),
-        );
+    // PR164: two Geyser gRPC sessions — TX+blockhash (sacred, no pin subscribe updates) and
+    // accounts+cuckoo (in-place subscribe updates). Merge → account session only.
+    let (tx_listener, transaction_rx, mut blockhash_rx) =
+        GeyserTxListener::new(geyser_url.to_string(), program_ids.clone());
+    let (account_listener, account_rx) = GeyserAccountListener::new_with_tracked_accounts(
+        geyser_url.to_string(),
+        program_ids,
+        combined_tracked_rx,
+        Arc::clone(&ctx.geyser_full_reconnect_threshold_live),
+        ctx.config.read().max_tracked_accounts.max(1),
+    );
 
-    let pool_discovery_account_rx = listener.subscribe_account_updates();
-    let pool_discovery_transaction_rx = listener.subscribe_transaction_updates();
+    let pool_discovery_account_rx = account_listener.subscribe_account_updates();
+    let pool_discovery_transaction_rx = tx_listener.subscribe_transaction_updates();
     let pool_discovery_event_rx = PoolDiscoveryIngest::spawn_unified(
         pool_discovery_account_rx,
         pool_discovery_transaction_rx,
         rpc.clone(),
     );
 
-    // Spawn Geyser listener task (single gRPC session; PR162)
-    let listener_handle = tokio::spawn(async move {
-        if let Err(e) = listener.start().await {
-            error!(error = %e, "Geyser listener crashed");
+    let tx_listener_handle = tokio::spawn(async move {
+        if let Err(e) = tx_listener.start().await {
+            error!(error = %e, "Geyser TX listener crashed");
+        }
+    });
+
+    let account_listener_handle = tokio::spawn(async move {
+        if let Err(e) = account_listener.start().await {
+            error!(error = %e, "Geyser account listener crashed");
         }
     });
 
@@ -11098,7 +11119,8 @@ async fn run_geyser_loop(
             _ = geyser_tx_stream_stopped_rx.changed() => {
                 if *geyser_tx_stream_stopped_rx.borrow() {
                     warn!("Geyser transaction stream ended; stopping market-data Geyser loop");
-                    listener_handle.abort();
+                    tx_listener_handle.abort();
+                    account_listener_handle.abort();
                     break;
                 }
             }
@@ -11106,7 +11128,8 @@ async fn run_geyser_loop(
             _ = geyser_account_stream_stopped_rx.changed() => {
                 if *geyser_account_stream_stopped_rx.borrow() {
                     warn!("Geyser account stream ended; stopping market-data Geyser loop");
-                    listener_handle.abort();
+                    tx_listener_handle.abort();
+                    account_listener_handle.abort();
                     break;
                 }
             }
@@ -11752,7 +11775,8 @@ async fn run_geyser_loop(
 
             _ = &mut shutdown => {
                 info!("Shutdown signal received");
-                listener_handle.abort();
+                tx_listener_handle.abort();
+                account_listener_handle.abort();
                 break;
             }
         }
@@ -13421,6 +13445,9 @@ mod pr_b_geyser_tracking_tests {
             pump_amm_dex: parking_lot::RwLock::new(None),
             helius_rpc: None,
             geyser_sync_batch_timer: parking_lot::Mutex::new(None),
+            pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
+                std::collections::HashSet::new(),
+            ),
         })
     }
 
@@ -13478,6 +13505,9 @@ mod pr_b_geyser_tracking_tests {
             pump_amm_dex: parking_lot::RwLock::new(None),
             helius_rpc: None,
             geyser_sync_batch_timer: parking_lot::Mutex::new(None),
+            pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
+                std::collections::HashSet::new(),
+            ),
         });
         (
             ctx,

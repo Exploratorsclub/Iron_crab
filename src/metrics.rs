@@ -233,7 +233,27 @@ pub static GEYSER_STREAM_ERRORS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64:
 pub static GEYSER_TRACKED_CUCKOO_TABLE_FULL_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// 1 while a Geyser gRPC connection is established; 0 while reconnecting.
+/// PR164: `1` only when **both** TX and account Geyser sessions are connected.
 pub static GEYSER_CONNECTED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// PR164: TX-only Geyser gRPC session (transactions + blocks_meta).
+pub static GEYSER_TX_SESSION_CONNECTED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// PR164: Account-only Geyser gRPC session (owner filters + cuckoo pins; no transaction filters).
+pub static GEYSER_ACCOUNT_SESSION_CONNECTED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// PR164: `UpdateOneof::Transaction` received on the TX-only session.
+pub static GEYSER_TX_LISTENER_TRANSACTIONS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// PR164: Account updates received on the account-only session.
+pub static GEYSER_ACCOUNT_LISTENER_ACCOUNT_UPDATES_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR164: In-place subscribe updates after initial connect (must stay **0** on TX session).
+pub static GEYSER_TX_LISTENER_SUBSCRIBE_UPDATES_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR164: In-place subscribe updates (cuckoo / pin rebuild) on account session.
+pub static GEYSER_ACCOUNT_LISTENER_SUBSCRIBE_UPDATES_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR164: Forced outer reconnect of TX session because transaction ingest stalled while chain advanced.
+pub static GEYSER_TX_LISTENER_LIVENESS_RECONNECTS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 /// Combined explicit Geyser account subscription size (mints + vaults + bin arrays + wallet).
 pub static GEYSER_SUBSCRIPTION_ACCOUNTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -393,8 +413,49 @@ pub fn geyser_metrics_inc_tracked_cuckoo_table_full() {
     GEYSER_TRACKED_CUCKOO_TABLE_FULL_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
-pub fn geyser_metrics_set_connected(connected: bool) {
-    GEYSER_CONNECTED.store(if connected { 1 } else { 0 }, Ordering::Relaxed);
+#[inline]
+fn geyser_metrics_refresh_aggregate_connected() {
+    let both = GEYSER_TX_SESSION_CONNECTED.load(Ordering::Relaxed) == 1
+        && GEYSER_ACCOUNT_SESSION_CONNECTED.load(Ordering::Relaxed) == 1;
+    GEYSER_CONNECTED.store(if both { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// PR164: TX Geyser session connected state (also refreshes aggregate `geyser_connected`).
+pub fn geyser_metrics_set_tx_session_connected(connected: bool) {
+    GEYSER_TX_SESSION_CONNECTED.store(if connected { 1 } else { 0 }, Ordering::Relaxed);
+    geyser_metrics_refresh_aggregate_connected();
+}
+
+/// PR164: Account Geyser session connected state (also refreshes aggregate `geyser_connected`).
+pub fn geyser_metrics_set_account_session_connected(connected: bool) {
+    GEYSER_ACCOUNT_SESSION_CONNECTED.store(if connected { 1 } else { 0 }, Ordering::Relaxed);
+    geyser_metrics_refresh_aggregate_connected();
+}
+
+#[inline]
+pub fn geyser_metrics_inc_tx_listener_transactions_total() {
+    GEYSER_TX_LISTENER_TRANSACTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn geyser_metrics_inc_account_listener_account_updates_total() {
+    GEYSER_ACCOUNT_LISTENER_ACCOUNT_UPDATES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn geyser_metrics_inc_account_listener_subscribe_updates_total() {
+    GEYSER_ACCOUNT_LISTENER_SUBSCRIBE_UPDATES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn geyser_metrics_inc_tx_listener_liveness_reconnect_total() {
+    GEYSER_TX_LISTENER_LIVENESS_RECONNECTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Monotonic Geyser head slot (read-only). Used by TX liveness gate (PR164).
+#[inline]
+pub fn market_data_geyser_head_slot_value() -> u64 {
+    MARKET_DATA_GEYSER_HEAD_SLOT.load(Ordering::Relaxed)
 }
 
 // --- market-data: Geyser recv → Core NATS publish (hot path observability, no RPC) ---
@@ -751,13 +812,13 @@ pub fn record_market_data_tx_broadcast_lagged(skipped_messages: u64) {
     }
 }
 
-/// Update gauge: pending tx updates in the `broadcast` receiver (see `GeyserListener` tx channel).
+/// Update gauge: pending tx updates in the `broadcast` receiver (see `GeyserTxListener` tx channel).
 #[inline]
 pub fn set_market_data_tx_broadcast_queue_depth(depth: usize) {
     MARKET_DATA_TX_BROADCAST_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
 }
 
-/// Update gauge: pending account updates in the `broadcast` receiver (see `GeyserListener` account channel).
+/// Update gauge: pending account updates in the `broadcast` receiver (see `GeyserAccountListener` account channel).
 #[inline]
 pub fn set_market_data_account_broadcast_queue_depth(depth: usize) {
     MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
@@ -2460,6 +2521,34 @@ async fn metrics_response() -> Response<Body> {
         GEYSER_TRACKED_CUCKOO_TABLE_FULL_TOTAL.load(Ordering::Relaxed)
     );
     line!("geyser_connected", GEYSER_CONNECTED.load(Ordering::Relaxed));
+    line!(
+        "geyser_tx_session_connected",
+        GEYSER_TX_SESSION_CONNECTED.load(Ordering::Relaxed)
+    );
+    line!(
+        "geyser_account_session_connected",
+        GEYSER_ACCOUNT_SESSION_CONNECTED.load(Ordering::Relaxed)
+    );
+    line!(
+        "geyser_tx_listener_transactions_total",
+        GEYSER_TX_LISTENER_TRANSACTIONS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "geyser_account_listener_account_updates_total",
+        GEYSER_ACCOUNT_LISTENER_ACCOUNT_UPDATES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "geyser_tx_listener_subscribe_updates_total",
+        GEYSER_TX_LISTENER_SUBSCRIBE_UPDATES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "geyser_account_listener_subscribe_updates_total",
+        GEYSER_ACCOUNT_LISTENER_SUBSCRIBE_UPDATES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "geyser_tx_listener_liveness_reconnects_total",
+        GEYSER_TX_LISTENER_LIVENESS_RECONNECTS_TOTAL.load(Ordering::Relaxed)
+    );
     line!(
         "geyser_subscription_accounts",
         GEYSER_SUBSCRIPTION_ACCOUNTS.load(Ordering::Relaxed)
