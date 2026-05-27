@@ -12,6 +12,8 @@ use tokio::sync::watch;
 #[cfg(not(windows))]
 use futures::{SinkExt, StreamExt};
 #[cfg(not(windows))]
+use solana_pubkey::Pubkey as CuckooPubkey;
+#[cfg(not(windows))]
 use solana_sdk::bs58;
 #[cfg(not(windows))]
 use std::collections::HashMap;
@@ -22,6 +24,8 @@ use tracing::{error, info, warn};
 #[cfg(not(windows))]
 use yellowstone_grpc_client::GeyserGrpcClient;
 #[cfg(not(windows))]
+use yellowstone_grpc_proto::cuckoo::CompressedAccountFilterSet;
+#[cfg(not(windows))]
 use yellowstone_grpc_proto::prelude::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
     SubscribeRequestFilterAccounts, SubscribeRequestFilterBlocksMeta,
@@ -30,7 +34,8 @@ use yellowstone_grpc_proto::prelude::{
 
 #[cfg(not(windows))]
 use crate::metrics::{
-    geyser_metrics_inc_reconnect, geyser_metrics_inc_stream_error, geyser_metrics_set_connected,
+    geyser_metrics_inc_reconnect, geyser_metrics_inc_stream_error,
+    geyser_metrics_inc_tracked_cuckoo_table_full, geyser_metrics_set_connected,
     GeyserReconnectReason,
 };
 #[cfg(not(windows))]
@@ -123,6 +128,10 @@ pub struct GeyserListener {
     /// gRPC reconnect instead of in-place `subscribe_tx.send` (PR-B Yellowstone churn control).
     /// Use `usize::MAX` to always prefer in-place updates. Shared so market-data can hot-reload.
     full_reconnect_tracked_threshold: Arc<AtomicUsize>,
+    /// Max capacity for [`CompressedAccountFilterSet`] (Yellowstone cuckoo wire filter). Must be
+    /// at least the configured `max_tracked_accounts` peak. `0` disables cuckoo (legacy explicit
+    /// chunks — not used when `new_with_tracked_accounts` passes a positive cap from market-data).
+    tracked_cuckoo_max_capacity: usize,
     #[cfg_attr(windows, allow(dead_code))]
     account_tx: broadcast::Sender<GeyserAccountUpdate>,
     #[cfg_attr(windows, allow(dead_code))]
@@ -156,6 +165,7 @@ impl GeyserListener {
                 program_ids,
                 tracked_accounts_rx: None,
                 full_reconnect_tracked_threshold: Arc::new(AtomicUsize::new(usize::MAX)),
+                tracked_cuckoo_max_capacity: 0,
                 account_tx,
                 transaction_tx,
                 blockhash_tx,
@@ -175,6 +185,7 @@ impl GeyserListener {
         program_ids: Vec<Pubkey>,
         tracked_accounts_rx: watch::Receiver<Vec<Pubkey>>,
         full_reconnect_tracked_threshold: Arc<AtomicUsize>,
+        tracked_cuckoo_max_capacity: usize,
     ) -> (
         Self,
         broadcast::Receiver<GeyserAccountUpdate>,
@@ -185,6 +196,7 @@ impl GeyserListener {
             Self::new(endpoint, program_ids);
         listener.tracked_accounts_rx = Some(tracked_accounts_rx);
         listener.full_reconnect_tracked_threshold = full_reconnect_tracked_threshold;
+        listener.tracked_cuckoo_max_capacity = tracked_cuckoo_max_capacity;
         (listener, account_rx, transaction_rx, blockhash_rx)
     }
 
@@ -197,6 +209,7 @@ impl GeyserListener {
                 self.program_ids,
                 self.tracked_accounts_rx,
                 self.full_reconnect_tracked_threshold,
+                self.tracked_cuckoo_max_capacity,
             );
             Err(anyhow!(
                 "Geyser gRPC is not supported on Windows in this repo build. \
@@ -210,15 +223,54 @@ impl GeyserListener {
         }
     }
 
-    /// Build a SubscribeRequest for the given programs and tracked accounts.
+    /// Name of the single Yellowstone `cuckoo_accounts_filter` entry for explicit tracked accounts.
+    #[cfg(not(windows))]
+    const TRACKED_CUCKOO_SUBSCRIBE_NAME: &'static str = "tracked_accounts_cuckoo";
+
+    #[cfg(not(windows))]
+    #[inline]
+    fn cuckoo_pubkey(pk: Pubkey) -> CuckooPubkey {
+        CuckooPubkey::new_from_array(pk.to_bytes())
+    }
+
+    /// Rebuild the persistent cuckoo filter from the full explicit tracked list.
+    ///
+    /// Server-side updates stay compact (single cuckoo blob); rebuilding here is O(n) on the
+    /// client but avoids partial-failure corruption from incremental cuckoo mutations.
+    #[cfg(not(windows))]
+    fn sync_tracked_cuckoo_filter(
+        filter: &mut CompressedAccountFilterSet,
+        max_capacity: usize,
+        new_list: &[Pubkey],
+    ) -> Result<()> {
+        *filter = Self::tracked_cuckoo_from_full_list(max_capacity, new_list)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn tracked_cuckoo_from_full_list(
+        max_capacity: usize,
+        list: &[Pubkey],
+    ) -> Result<CompressedAccountFilterSet> {
+        let mut f = CompressedAccountFilterSet::with_capacity(max_capacity).map_err(|e| {
+            anyhow!("geyser_listener: CompressedAccountFilterSet with_capacity failed: {e}")
+        })?;
+        for pk in list {
+            f.insert(Self::cuckoo_pubkey(*pk)).map_err(|e| {
+                geyser_metrics_inc_tracked_cuckoo_table_full();
+                anyhow!("geyser_listener: CompressedAccountFilterSet insert / TableFull: {e}")
+            })?;
+        }
+        Ok(f)
+    }
+
+    /// Build a SubscribeRequest for the given programs and optional tracked-account cuckoo filter.
     /// Extracted so it can be reused for initial subscription and incremental updates.
     #[cfg(not(windows))]
-    fn build_subscribe_request(
+    pub(crate) fn build_subscribe_request(
         program_ids: &[Pubkey],
-        tracked_accounts: &[Pubkey],
+        tracked_cuckoo: Option<&mut CompressedAccountFilterSet>,
     ) -> SubscribeRequest {
-        const TRACKED_ACCOUNTS_CHUNK: usize = 1000;
-
         let mut accounts_filter = HashMap::new();
         let mut transactions_filter = HashMap::new();
 
@@ -231,6 +283,7 @@ impl GeyserListener {
                     owner: vec![program_id.to_string()],
                     filters: vec![],
                     nonempty_txn_signature: None,
+                    cuckoo_accounts_filter: None,
                 },
             );
 
@@ -248,26 +301,11 @@ impl GeyserListener {
             );
         }
 
-        // Additional explicit account subscriptions, chunked.
-        if !tracked_accounts.is_empty() {
-            for (chunk_idx, chunk) in tracked_accounts.chunks(TRACKED_ACCOUNTS_CHUNK).enumerate() {
-                accounts_filter.insert(
-                    format!("tracked_accounts_{}", chunk_idx),
-                    SubscribeRequestFilterAccounts {
-                        account: chunk.iter().map(|p| p.to_string()).collect(),
-                        owner: vec![],
-                        filters: vec![],
-                        nonempty_txn_signature: None,
-                    },
-                );
-            }
-        }
-
         // Subscribe to blocks_meta for confirmed blockhash streaming
         let blocks_meta_filter =
             HashMap::from([("blockhash".to_string(), SubscribeRequestFilterBlocksMeta {})]);
 
-        SubscribeRequest {
+        let mut req = SubscribeRequest {
             accounts: accounts_filter,
             slots: HashMap::new(),
             transactions: transactions_filter,
@@ -279,7 +317,13 @@ impl GeyserListener {
             accounts_data_slice: vec![],
             ping: None,
             from_slot: None,
+        };
+
+        if let Some(cuck) = tracked_cuckoo {
+            cuck.insert_into_subscribe_request(&mut req, Self::TRACKED_CUCKOO_SUBSCRIBE_NAME);
         }
+
+        req
     }
 
     /// PR-A: exponential reconnect sleep with small jitter (cold path only).
@@ -314,6 +358,28 @@ impl GeyserListener {
             .as_ref()
             .map(|rx| rx.borrow().clone())
             .unwrap_or_default();
+
+        let mut tracked_cuckoo_filter: Option<CompressedAccountFilterSet> = if tracked_accounts_rx
+            .is_some()
+        {
+            let cap = self.tracked_cuckoo_max_capacity.max(1);
+            match Self::tracked_cuckoo_from_full_list(cap, &tracked_accounts_current) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        capacity = cap,
+                        n = tracked_accounts_current.len(),
+                        "geyser_listener: initial CompressedAccountFilterSet build failed"
+                    );
+                    return Err(anyhow!(
+                            "geyser_listener: cannot build CompressedAccountFilterSet: {e}; increase max_tracked_accounts"
+                        ));
+                }
+            }
+        } else {
+            None
+        };
 
         let mut account_update_count = 0u64;
         let mut transaction_count = 0u64;
@@ -355,8 +421,10 @@ impl GeyserListener {
             };
 
             'same_client: loop {
-                let request =
-                    Self::build_subscribe_request(&self.program_ids, &tracked_accounts_current);
+                let request = Self::build_subscribe_request(
+                    &self.program_ids,
+                    tracked_cuckoo_filter.as_mut(),
+                );
 
                 let (mut subscribe_tx, mut stream) =
                     match client.subscribe_with_request(Some(request)).await {
@@ -452,6 +520,15 @@ impl GeyserListener {
                                                 continue;
                                             }
                                         };
+
+                                        if let Some(ref cf) = tracked_cuckoo_filter {
+                                            let passes_owner = self.program_ids.contains(&owner);
+                                            let passes_tracked =
+                                                cf.contains(Self::cuckoo_pubkey(pubkey));
+                                            if !(passes_owner || passes_tracked) {
+                                                continue;
+                                            }
+                                        }
 
                                         let grpc_recv_at = Instant::now();
                                         let event = GeyserAccountUpdate {
@@ -764,7 +841,21 @@ impl GeyserListener {
                         maybe_new = tracked_changed_fut => {
                             if let Some(new_list) = maybe_new {
                                 if new_list != tracked_accounts_current {
-                                    tracked_accounts_current = new_list;
+                                    let _old_list =
+                                        std::mem::replace(&mut tracked_accounts_current, new_list);
+                                    if let Some(ref mut cf) = tracked_cuckoo_filter {
+                                        if let Err(e) = Self::sync_tracked_cuckoo_filter(
+                                            cf,
+                                            self.tracked_cuckoo_max_capacity.max(1),
+                                            &tracked_accounts_current,
+                                        ) {
+                                            error!(
+                                                error = %e,
+                                                "geyser_listener: failed to rebuild CompressedAccountFilterSet"
+                                            );
+                                            return Err(e);
+                                        }
+                                    }
                                     let threshold = self
                                         .full_reconnect_tracked_threshold
                                         .load(Ordering::Relaxed);
@@ -789,7 +880,7 @@ impl GeyserListener {
                                     }
                                     let updated_request = Self::build_subscribe_request(
                                         &self.program_ids,
-                                        &tracked_accounts_current,
+                                        tracked_cuckoo_filter.as_mut(),
                                     );
                                     if let Err(e) = subscribe_tx.send(updated_request).await {
                                         warn!(
@@ -838,6 +929,7 @@ impl GeyserListener {
 #[cfg(all(test, not(windows)))]
 mod geyser_resilience_tests {
     use super::GeyserListener;
+    use yellowstone_grpc_proto::cuckoo::CompressedAccountFilterSet;
 
     #[test]
     fn reconnect_sleep_ms_adds_bounded_jitter() {
@@ -845,5 +937,20 @@ mod geyser_resilience_tests {
             let s = GeyserListener::geyser_reconnect_sleep_ms(500);
             assert!((500..=650).contains(&s), "s={s}");
         }
+    }
+
+    #[test]
+    fn subscribe_request_includes_single_tracked_cuckoo_filter() {
+        let mut cuckoo = CompressedAccountFilterSet::with_capacity(16).unwrap();
+        let pk = solana_pubkey::Pubkey::new_from_array([9u8; 32]);
+        cuckoo.insert(pk).unwrap();
+        let req = GeyserListener::build_subscribe_request(&[], Some(&mut cuckoo));
+        let f = req
+            .accounts
+            .get("tracked_accounts_cuckoo")
+            .expect("tracked cuckoo filter");
+        assert!(f.cuckoo_accounts_filter.is_some());
+        assert!(f.account.is_empty());
+        assert!(f.owner.is_empty());
     }
 }

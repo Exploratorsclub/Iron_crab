@@ -376,7 +376,7 @@ dependencies = [
  "pin-project-lite",
  "serde_core",
  "sync_wrapper",
- "tower",
+ "tower 0.5.3",
  "tower-layer",
  "tower-service",
 ]
@@ -2337,6 +2337,7 @@ dependencies = [
  "solana-connection-cache",
  "solana-message 3.0.1",
  "solana-program 3.0.0",
+ "solana-pubkey 4.1.0",
  "solana-quic-client",
  "solana-rpc-client",
  "solana-rpc-client-api",
@@ -3810,7 +3811,7 @@ dependencies = [
  "tokio",
  "tokio-native-tls",
  "tokio-rustls",
- "tower",
+ "tower 0.5.3",
  "tower-http",
  "tower-service",
  "url",
@@ -8435,7 +8436,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
- "tower",
+ "tower 0.5.3",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -8496,6 +8497,21 @@ dependencies = [
 
 [[package]]
 name = "tower"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8fa9be0de6cf49e536ce1851f987bd21a43b771b09473c3549a6c853db37c1c"
+dependencies = [
+ "futures-core",
+ "futures-util",
+ "pin-project",
+ "pin-project-lite",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebe5ef63511595f1344e2d5cfa636d973292adc0eec1f0ad45fae9f0851ab1d4"
@@ -8531,7 +8547,7 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tokio-util",
- "tower",
+ "tower 0.5.3",
  "tower-layer",
  "tower-service",
 ]
@@ -9524,26 +9540,35 @@ dependencies = [
 
 [[package]]
 name = "yellowstone-grpc-client"
-version = "12.0.0"
-source = "git+https://github.com/rpcpool/yellowstone-grpc.git?branch=master#9d6e1d5234de23e2fada59cdb57b8f8f175e4ee5"
+version = "13.1.0"
+source = "git+https://github.com/rpcpool/yellowstone-grpc.git?rev=486c2102bdf4f2e950dd04d5908388c58d5cc873#486c2102bdf4f2e950dd04d5908388c58d5cc873"
 dependencies = [
+ "arc-swap",
  "bytes",
  "futures",
+ "hyper-util",
+ "log",
+ "pin-project",
  "thiserror 2.0.18",
+ "tokio",
  "tonic",
  "tonic-health",
+ "tower 0.4.13",
  "yellowstone-grpc-proto",
 ]
 
 [[package]]
 name = "yellowstone-grpc-proto"
-version = "12.0.0"
-source = "git+https://github.com/rpcpool/yellowstone-grpc.git?branch=master#9d6e1d5234de23e2fada59cdb57b8f8f175e4ee5"
+version = "12.4.0"
+source = "git+https://github.com/rpcpool/yellowstone-grpc.git?rev=486c2102bdf4f2e950dd04d5908388c58d5cc873#486c2102bdf4f2e950dd04d5908388c58d5cc873"
 dependencies = [
  "anyhow",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
+ "siphasher 1.0.2",
+ "solana-pubkey 4.1.0",
+ "thiserror 2.0.18",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

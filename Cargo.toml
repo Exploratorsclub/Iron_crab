@@ -88,8 +88,12 @@ sd-notify = "0.4"
 # TPU Direct Client deps are also non-Windows (same cfg gate).
 # NOTE: These crates are currently unused in Rust code — kept for future TPU sender integration.
 [target.'cfg(not(windows))'.dependencies]
-yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc.git", branch = "master" }
-yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc.git", branch = "master" }
+# Pinned after PR #732 (CompressedAccountFilterSet / cuckoo account filters). `master` head may
+# require Agave 4-only workspace deps; this merge commit carries cuckoo + compatible client/proto API.
+yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc.git", rev = "486c2102bdf4f2e950dd04d5908388c58d5cc873" }
+yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc.git", rev = "486c2102bdf4f2e950dd04d5908388c58d5cc873" }
+# Align with yellowstone-grpc-proto cuckoo helpers (`CompressedAccountFilterSet::insert` takes `solana_pubkey::Pubkey`).
+solana-pubkey = "4.1.0"
 # TPU Direct Client (for low-latency TX submission)
 solana-tpu-client = "=3.0.0"
 solana-connection-cache = "=3.0.0"
