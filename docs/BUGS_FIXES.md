@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PR164-GEYSER-SPLIT-TX-SACRED: zwei gRPC-Sessions (TX heilig + Account/Cuckoo); TX-Liveness-Reconnect
+**Datum**: 2026-05-27  
+**Problem** (Prod nach PR #162): Nach Startup-Burst in-place `SubscribeRequest`-Updates liefert Yellowstone weiter **Account**-Updates, aber **keine** DEX-`Transaction`-Updates mehr (`Parsed DEX transaction` stoppt; `market_data_geyser_to_publish_ms_trade_count` friert) — **ohne** Stream-Error/Reconnect-Metrik. Ursache: eine Session teilte sich TX-Filter und Cuckoo-Pin-Updates über denselben `subscribe_tx`-Sink; der letzte Full-Replace tötet den TX-Teil still.  
+**Fix**: (1) **`GeyserTxListener`**: nur `build_tx_subscribe_request` (DEX-`transactions` + `blocks_meta`), **kein** `subscribe_tx.send` nach Init, **keine** tracked-Pins. (2) **`GeyserAccountListener`**: nur `build_account_subscribe_request` (Owner-`accounts` + Cuckoo; **leere** `transactions`); Merge→`combined_tracked` + async Sink (#162) nur hier. (3) **Metriken**: `geyser_tx_listener_transactions_total`, `geyser_account_listener_account_updates_total`, `geyser_tx_listener_subscribe_updates_total` (0 nach Init), `geyser_account_listener_subscribe_updates_total`, `geyser_tx_listener_liveness_reconnects_total`; `geyser_connected` nur wenn **beide** Sessions up. (4) **TX-Liveness**: wenn 60 s keine TX-Updates **und** `market_data_geyser_head_slot` steigt → nur TX-Session outer reconnect + Log. (5) **Optional**: `PoolCreated`-Dedup pro `pool_address` vor Publish. **Invarianten**: kein RPC (I-7), Geyser-first (I-4/I-16), PR160/#161 unangetastet.  
+**Dateien**: `src/solana/geyser_listener.rs`, `src/bin/market_data.rs`, `src/metrics.rs`, `src/solana/geyser_pool_discovery.rs`, `docs/BUGS_FIXES.md`
+
 ### PR163-WATCHDOG-OS-THREAD: systemd-Watchdog-Ping auf dediziertem OS-Thread (Timer-Starvation)
 **Datum**: 2026-05-27  
 **Problem** (Prod post #160/#161): `market-data.service: Watchdog timeout (limit 30s)` → ABRT / Crash-Loop ohne Panic oder Geyser-Fehler. Der Reserve-Ping aus **PR151** lief als `tokio::spawn` + `interval(5s)` auf dem **Haupt-Runtime**; unter Last (Geyser-Ingest, Account-Worker, Publish-Pipeline) **Timer-Starvation** → kein `sd_notify(WATCHDOG)` innerhalb `WatchdogSec=30`. Gleiche Fehlerklasse wie **PR155** (NATS-Publish auf isolierter Runtime).  

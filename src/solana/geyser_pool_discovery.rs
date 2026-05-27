@@ -1,8 +1,8 @@
 //! Professional Geyser-based Pool Discovery
 //! Simplified approach: TX-based for Pump.fun, Account-based for Raydium/Orca
 //!
-//! PR162: consumes the **unified** [`crate::solana::geyser_listener::GeyserListener`] broadcast feeds
-//! (no second Geyser gRPC connection).
+//! PR164: consumes **split** Geyser sessions — [`crate::solana::geyser_listener::GeyserTxListener`] (TX)
+//! and [`crate::solana::geyser_listener::GeyserAccountListener`] (accounts) — no second TX subscription.
 
 use crate::solana::geyser_listener::{GeyserAccountUpdate, GeyserTransactionUpdate};
 use crate::solana::rpc::SolanaRpc;
@@ -20,8 +20,8 @@ pub struct PoolDiscoveryIngest;
 impl PoolDiscoveryIngest {
     /// Spawn account + transaction processors that emit [`PoolDiscoveryEvent`] on `mpsc`.
     ///
-    /// Callers must pass [`GeyserListener::subscribe_account_updates`] /
-    /// [`GeyserListener::subscribe_transaction_updates`] **before** starting the listener so no
+    /// Callers must pass [`GeyserAccountListener::subscribe_account_updates`] /
+    /// [`GeyserTxListener::subscribe_transaction_updates`] **before** starting the listeners so no
     /// updates are missed.
     pub fn spawn_unified(
         mut account_rx: broadcast::Receiver<GeyserAccountUpdate>,
