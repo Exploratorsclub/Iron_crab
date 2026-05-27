@@ -766,13 +766,15 @@ struct PositionTracker {
 /// I-7: from LivePoolCache in-process only — no RPC.
 /// I-13: If `marks_position_pool` is false (e.g. PumpSwap quote while position.pool is still PumpFun BC),
 /// this quote is only for exit decisions — never apply `tokens_per_sol` as `current_price` on the position.
-/// Price exits `STOP_LOSS` / `TAKE_PROFIT` / `TRAILING_STOP` are **quote-first**: they trigger only
-/// from a usable executable reserve quote when present. **Current-price-only** triggers for these
-/// exits are disabled — `current_price` may diverge from the executable for logging and reporting,
-/// but it is not a trigger source (see `should_exit`). `TRAILING_STOP` **activation** uses peak PnL
-/// implied by trade-session high (`highest_price`) vs `entry_price`; **trigger** uses quote-first
-/// drawdown vs session high when `marks_position_pool` (I-13). Alternate-pool quotes may still trip
-/// `STOP_LOSS` / `TAKE_PROFIT` when executable loss/gain is real, but must not refresh session high.
+/// Price exits `STOP_LOSS` / `TAKE_PROFIT` are **quote-first**: they trigger only from a usable
+/// executable reserve quote when present. **Current-price-only** triggers for those exits are
+/// disabled — `current_price` may diverge from the executable for logging and reporting, but it is
+/// not their trigger source (see `should_exit`). `TRAILING_STOP` **activation** uses peak PnL
+/// implied by trade-session high (`highest_price`) vs `entry_price`; **trigger** uses drawdown from
+/// session high to the position trade-mark (`trade_mark_tps`: trade prints + fills only), not the
+/// executable quote. Optional guarded executable PnL may appear in logs for forensics. Alternate-pool
+/// quotes may still inform `STOP_LOSS` / `TAKE_PROFIT` per routing policy but must not drive trailing
+/// vs the position session high (I-13).
 #[derive(Debug, Clone)]
 struct ExitExecutableQuote {
     /// tokens_per_sol (UI): token_ui / sol_ui, matching `entry_price` / `current_price` (I-14).
@@ -1270,10 +1272,12 @@ impl PositionTracker {
         self.trailing_active = false;
         self.recent_trades.clear();
         if scale_in_confirmed_slot > 0 {
-            // Scale-in confirm slot replaces probe gate (not max — new tranche baseline).
-            self.entry_confirmed_slot = scale_in_confirmed_slot;
-            self.last_price_slot = scale_in_confirmed_slot;
+            self.entry_confirmed_slot = self.entry_confirmed_slot.max(scale_in_confirmed_slot);
         }
+        // Fresh slot gate for marks + trade prints: `update_position_price` / reserve hints reject
+        // `source_slot` <= `last_price_slot`. Without this reset, a pre-scale-in `last_price_slot`
+        // above the new `entry_confirmed_slot` can drop valid post-scale-in pool trades.
+        self.last_price_slot = 0;
 
         info!(
             mint = %self.mint,
@@ -1316,12 +1320,11 @@ impl PositionTracker {
     /// Check if we should exit this position. `exit_quote` is a reserve-based quote for selling
     /// `token_amount` from `LivePoolCache` (I-7: no RPC).
     ///
-    /// Quote-first (price exits): `STOP_LOSS`, `TAKE_PROFIT`, and `TRAILING_STOP` require a quote
-    /// that passes [`exit_quote_price_exit_guard_violation`] (freshness, slot monotonicity vs the
-    /// position, pseudopool rejection, optional SOL-leg DexPoolAccounts proof). `current_price` alone
-    /// never trips these exits. `TRAILING_STOP` drawdown uses the guarded quote only when
-    /// `marks_position_pool` (I-13). Alternate-pool quotes may still trip `STOP_LOSS` / `TAKE_PROFIT`
-    /// when executable loss/gain is real, but never refresh session high / mark.
+    /// Quote-first (price exits): `STOP_LOSS` and `TAKE_PROFIT` require a quote that passes
+    /// [`exit_quote_price_exit_guard_violation`]. `current_price` alone never trips those exits.
+    /// `TRAILING_STOP` **activation** follows peak PnL from trade-session high vs `entry_price`;
+    /// **trigger** is drawdown from session high to `trade_mark_tps` (trade path + fills only), not
+    /// the executable quote. Optional executable data is logged when present for forensics.
     fn should_exit(
         &mut self,
         config: &MomentumConfig,
@@ -1479,17 +1482,22 @@ impl PositionTracker {
         }
 
         // 3. Trailing — session high (`highest_price`) only from entry + position-pool trades
-        // (see `update_from_trade_price`). PoolCache marks and executable quotes must not advance it.
-        // Activation = peak PnL implied by session high vs entry; trigger = quote-first drawdown vs session high.
+        // (see `update_from_trade_price` / fills). PoolCache marks must not advance session high.
+        // Activation = peak PnL implied by session high vs entry; trigger = trade mark vs session high.
         let session_peak_pnl_pct = tokens_per_sol::pnl_pct(self.entry_price, self.highest_price);
+        let trade_mark_tps = self.trade_mark_tps;
+        let drawdown_vs_session_high_trade =
+            tokens_per_sol::drawdown_from_ath_pct(self.highest_price, trade_mark_tps);
         let drawdown_vs_session_high_exec = price_exit_q
             .map(|q| tokens_per_sol::drawdown_from_ath_pct(self.highest_price, q.tokens_per_sol));
         trace!(
             mint = %self.mint,
             session_high_tps = self.highest_price,
+            trade_mark_tps,
             session_peak_pnl_pct,
             executable_quote_tps = ?price_exit_q.map(|q| q.tokens_per_sol),
-            drawdown_from_session_high_pct = ?drawdown_vs_session_high_exec,
+            drawdown_from_session_high_pct = drawdown_vs_session_high_trade,
+            drawdown_from_session_high_executable_pct = ?drawdown_vs_session_high_exec,
             trailing_active = self.trailing_active,
             trailing_would_activate = session_peak_pnl_pct >= config.trailing_activation_pct,
             "trailing_session_high_eval"
@@ -1499,68 +1507,36 @@ impl PositionTracker {
             self.trailing_active = true;
         }
 
-        if self.trailing_active {
-            if let Some(q) = price_exit_q {
-                if !q.marks_position_pool {
-                    let exec_dd =
-                        tokens_per_sol::drawdown_from_ath_pct(self.highest_price, q.tokens_per_sol);
-                    if exec_dd >= config.trailing_stop_pct {
-                        log_momentum_exit_price_decision(
-                            self,
-                            exit_quote,
-                            None,
-                            "TRAILING_STOP",
-                            "skip",
-                            Some("TRAILING_STOP_SKIPPED_QUOTE_NOT_POSITION_POOL"),
-                            event_or_check_source,
-                            MomentumExitPriceLogLevel::Debug,
-                        );
-                    }
-                } else {
-                    let exec_dd =
-                        tokens_per_sol::drawdown_from_ath_pct(self.highest_price, q.tokens_per_sol);
-                    if exec_dd >= config.trailing_stop_pct {
-                        let exec_pnl = tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol);
-                        log_momentum_exit_price_decision(
-                            self,
-                            exit_quote,
-                            Some(q),
-                            "TRAILING_STOP",
-                            "allow",
-                            None,
-                            event_or_check_source,
-                            MomentumExitPriceLogLevel::Info,
-                        );
-                        return Some((
-                            "TRAILING_STOP".to_string(),
-                            format!(
-                                "Trailing stop hit: -{:.1}% executable drawdown from session high (limit: -{:.1}%), executable P&L: {:.1}%",
-                                exec_dd, config.trailing_stop_pct, exec_pnl
-                            ),
-                        ));
-                    }
+        if self.trailing_active && drawdown_vs_session_high_trade >= config.trailing_stop_pct {
+            let exec_note = match price_exit_q {
+                Some(q) => {
+                    let exec_pnl = tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol);
+                    format!(
+                        " Optional executable P&L vs entry: {:.1}% (quote marks position pool: {}).",
+                        exec_pnl, q.marks_position_pool
+                    )
                 }
-            } else {
-                let drawdown = self.drawdown_from_ath_pct();
-                if drawdown >= config.trailing_stop_pct {
-                    let code = if exit_quote.is_some() {
-                        exit_quote
-                            .and_then(|q| exit_quote_price_exit_guard_violation(self, q, None))
-                    } else {
-                        None
-                    };
-                    log_momentum_exit_price_decision(
-                        self,
-                        exit_quote,
-                        None,
-                        "TRAILING_STOP",
-                        "skip",
-                        code.or(Some("NO_GUARDED_EXECUTABLE_QUOTE")),
-                        event_or_check_source,
-                        MomentumExitPriceLogLevel::Debug,
-                    );
-                }
-            }
+                None => String::new(),
+            };
+            log_momentum_exit_price_decision(
+                self,
+                exit_quote,
+                price_exit_q,
+                "TRAILING_STOP",
+                "allow",
+                None,
+                event_or_check_source,
+                MomentumExitPriceLogLevel::Info,
+            );
+            return Some((
+                "TRAILING_STOP".to_string(),
+                format!(
+                    "Trailing stop: {:.1}% drawdown from session high via trade mark (limit: {:.1}%).{}",
+                    drawdown_vs_session_high_trade,
+                    config.trailing_stop_pct,
+                    exec_note
+                ),
+            ));
         }
 
         // 4. Time Exit — not gated on reserve freshness; reporting PnL prefers guarded quote when present.
@@ -11951,22 +11927,12 @@ mod tests {
         assert!(!pos.trailing_active);
         assert_eq!(pos.entry_confirmed_slot, 9_000);
         assert_eq!(
-            pos.last_price_slot, 9_000,
-            "scale-in sets slot gate to confirm slot (not probe-era last_price_slot)"
+            pos.last_price_slot, 0,
+            "scale-in resets slot gate for trade-mark updates"
         );
         assert!((pos.trade_mark_tps - 90.0).abs() < 1e-9);
         assert!((pos.current_price - 90.0).abs() < 1e-9);
         assert!(pos.recent_trades.is_empty());
-    }
-
-    #[test]
-    fn scale_in_confirm_slot_replaces_probe_slot_not_max() {
-        let mut pos = PositionTracker::new("mint", "pool", "dex", 100.0, 6, 1_000_000, 500_000_000);
-        pos.entry_confirmed_slot = 50_000;
-        pos.last_price_slot = 49_000;
-        pos.add_investment(500_000_000, 90.0, 9_000);
-        assert_eq!(pos.entry_confirmed_slot, 9_000);
-        assert_eq!(pos.last_price_slot, 9_000);
     }
 
     #[test]
@@ -15107,6 +15073,7 @@ mod tests {
         pos.trailing_active = true;
         pos.highest_price = entry;
         pos.current_price = 102.0;
+        pos.trade_mark_tps = 250.0;
         let mut ex = sample_exit_quote(250.0);
         ex.marks_position_pool = true;
         ex.quote_pool = "pos_pool".to_string();
@@ -15235,6 +15202,75 @@ mod tests {
             .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
             .expect("TAKE_PROFIT");
         assert_eq!(ty, "TAKE_PROFIT");
+    }
+
+    /// Trade-based trailing: TRAILING_STOP from session high vs trade mark without executable quote.
+    #[test]
+    fn trailing_stop_fires_from_trade_mark_drawdown_without_executable_quote() {
+        let mut c = make_exit_config();
+        c.trailing_stop_pct = 20.0;
+        c.trailing_activation_pct = 5.0;
+        c.hard_stop_loss_pct = 200.0;
+        c.take_profit_pct = 1_000.0;
+        let entry = 100.0;
+        let ath = 70.0_f64;
+        let trade_tps = 90.0;
+        let mut pos = PositionTracker::new("m", "p", "dex", entry, 6, 1_000_000, 0);
+        pos.highest_price = ath;
+        pos.trade_mark_tps = trade_tps;
+        pos.current_price = trade_tps;
+        pos.trailing_active = true;
+        let trade_dd = tokens_per_sol::drawdown_from_ath_pct(ath, trade_tps);
+        assert!(
+            trade_dd >= c.trailing_stop_pct - 1e-6,
+            "trade drawdown should breach threshold: {}",
+            trade_dd
+        );
+        let (ty, reason) = pos
+            .should_exit(&c, None, "test", 9_000_000_000u64)
+            .expect("TRAILING_STOP");
+        assert_eq!(ty, "TRAILING_STOP");
+        assert!(
+            reason.contains("trade mark"),
+            "reason should reference trade mark: {}",
+            reason
+        );
+    }
+
+    /// Executable drawdown vs session high is extreme, but trade mark is mild → no TRAILING_STOP.
+    #[test]
+    fn trailing_stop_not_fired_when_only_executable_drawdown_is_high() {
+        let mut c = make_exit_config();
+        c.trailing_stop_pct = 20.0;
+        c.trailing_activation_pct = 5.0;
+        c.hard_stop_loss_pct = 200.0;
+        c.take_profit_pct = 1_000.0;
+        let ath = 70.0_f64;
+        let trade_tps = 82.0;
+        let exec_tps = 95.0;
+        let mut pos = PositionTracker::new("m", "p", "dex", 100.0, 6, 1_000_000, 0);
+        pos.highest_price = ath;
+        pos.trade_mark_tps = trade_tps;
+        pos.current_price = trade_tps;
+        pos.trailing_active = true;
+        let trade_dd = tokens_per_sol::drawdown_from_ath_pct(ath, trade_tps);
+        let exec_dd = tokens_per_sol::drawdown_from_ath_pct(ath, exec_tps);
+        assert!(
+            trade_dd < c.trailing_stop_pct - 1e-6,
+            "trade drawdown below threshold: {}",
+            trade_dd
+        );
+        assert!(
+            exec_dd >= c.trailing_stop_pct,
+            "executable drawdown should be past threshold: {}",
+            exec_dd
+        );
+        let ex = sample_exit_quote(exec_tps);
+        assert!(
+            pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+                .is_none(),
+            "executable DD must not trip trailing when trade mark DD is below limit"
+        );
     }
 
     #[test]
