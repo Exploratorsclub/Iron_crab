@@ -227,6 +227,9 @@ pub static GEYSER_RECONNECT_TOTAL_STREAM_ERROR: Lazy<AtomicU64> = Lazy::new(|| A
 pub static GEYSER_RECONNECT_TOTAL_SINK_GONE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// gRPC stream `Err` deliveries (excludes graceful `None` / stream ended).
 pub static GEYSER_STREAM_ERRORS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// `CompressedAccountFilterSet::insert` failed: capacity below configured explicit-track ceiling.
+pub static GEYSER_TRACKED_CUCKOO_TABLE_FULL_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// 1 while a Geyser gRPC connection is established; 0 while reconnecting.
 pub static GEYSER_CONNECTED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
@@ -350,6 +353,11 @@ pub fn set_market_data_geyser_sync_pending(pending: u64) {
 
 pub fn geyser_metrics_inc_stream_error() {
     GEYSER_STREAM_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn geyser_metrics_inc_tracked_cuckoo_table_full() {
+    GEYSER_TRACKED_CUCKOO_TABLE_FULL_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn geyser_metrics_set_connected(connected: bool) {
@@ -2337,6 +2345,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "geyser_stream_errors_total",
         GEYSER_STREAM_ERRORS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "geyser_tracked_cuckoo_table_full_total",
+        GEYSER_TRACKED_CUCKOO_TABLE_FULL_TOTAL.load(Ordering::Relaxed)
     );
     line!("geyser_connected", GEYSER_CONNECTED.load(Ordering::Relaxed));
     line!(

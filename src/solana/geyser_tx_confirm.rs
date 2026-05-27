@@ -473,6 +473,7 @@ impl GeyserTxConfirm {
                 owner: vec![], // Don't filter by owner - we want specific accounts
                 filters: vec![],
                 nonempty_txn_signature: None,
+                cuckoo_accounts_filter: None,
             },
         );
 

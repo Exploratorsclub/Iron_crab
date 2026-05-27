@@ -379,6 +379,7 @@ fn build_cache_subscribe_request(
                 owner: vec![program_id.to_string()],
                 filters: vec![],
                 nonempty_txn_signature: None,
+                cuckoo_accounts_filter: None,
             },
         );
     }
@@ -393,6 +394,7 @@ fn build_cache_subscribe_request(
                     owner: vec![],
                     filters: vec![],
                     nonempty_txn_signature: None,
+                    cuckoo_accounts_filter: None,
                 },
             );
         }
@@ -408,6 +410,7 @@ fn build_cache_subscribe_request(
                     owner: vec![],
                     filters: vec![],
                     nonempty_txn_signature: None,
+                    cuckoo_accounts_filter: None,
                 },
             );
         }

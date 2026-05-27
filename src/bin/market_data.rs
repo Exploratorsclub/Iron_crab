@@ -10293,6 +10293,7 @@ async fn run_geyser_loop(
             program_ids,
             combined_tracked_rx,
             Arc::clone(&ctx.geyser_full_reconnect_threshold_live),
+            ctx.config.read().max_tracked_accounts.max(1),
         );
 
     // Spawn Geyser listener task
