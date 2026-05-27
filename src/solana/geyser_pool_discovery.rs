@@ -1,102 +1,81 @@
 //! Professional Geyser-based Pool Discovery
 //! Simplified approach: TX-based for Pump.fun, Account-based for Raydium/Orca
+//!
+//! PR162: consumes the **unified** [`crate::solana::geyser_listener::GeyserListener`] broadcast feeds
+//! (no second Geyser gRPC connection).
 
-use crate::solana::geyser_listener::{
-    GeyserAccountUpdate, GeyserListener, GeyserTransactionUpdate,
-};
+use crate::solana::geyser_listener::{GeyserAccountUpdate, GeyserTransactionUpdate};
 use crate::solana::rpc::SolanaRpc;
-use anyhow::Result;
 use solana_sdk::pubkey;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tracing::debug;
 
-/// Pool discovery via Geyser account updates
-pub struct GeyserPoolDiscovery {
-    listener: GeyserListener,
-}
+/// Pool discovery processors attached to the primary Geyser listener (PR162).
+pub struct PoolDiscoveryIngest;
 
-impl GeyserPoolDiscovery {
-    /// Create new Geyser-based pool discovery
+impl PoolDiscoveryIngest {
+    /// Spawn account + transaction processors that emit [`PoolDiscoveryEvent`] on `mpsc`.
     ///
-    /// # Arguments
-    /// * `geyser_endpoint` - Geyser gRPC endpoint (e.g., "http://127.0.0.1:10000")
-    /// * `program_ids` - DEX program IDs to monitor (Raydium, Orca, Pump.fun)
-    /// * `rpc` - RPC client for additional data fetching
-    pub fn new(
-        geyser_endpoint: String,
-        program_ids: Vec<Pubkey>,
+    /// Callers must pass [`GeyserListener::subscribe_account_updates`] /
+    /// [`GeyserListener::subscribe_transaction_updates`] **before** starting the listener so no
+    /// updates are missed.
+    pub fn spawn_unified(
+        mut account_rx: broadcast::Receiver<GeyserAccountUpdate>,
+        mut transaction_rx: broadcast::Receiver<GeyserTransactionUpdate>,
         rpc: Arc<SolanaRpc>,
-    ) -> (Self, broadcast::Receiver<PoolDiscoveryEvent>) {
-        let (listener, account_rx, transaction_rx, _blockhash_rx) =
-            GeyserListener::new(geyser_endpoint, program_ids);
+    ) -> mpsc::Receiver<PoolDiscoveryEvent> {
+        let (event_tx, event_rx) = mpsc::channel(10_000);
 
-        // Create event channel for pool discoveries
-        let (event_tx, event_rx) = broadcast::channel(10000);
-
-        let discovery = Self { listener };
-
-        // Spawn account processor (for Raydium/Orca)
-        let rpc_clone = rpc.clone();
-        let event_tx_clone = event_tx.clone();
+        let rpc_a = rpc.clone();
+        let event_tx_a = event_tx.clone();
         tokio::spawn(async move {
-            let mut rx = account_rx;
             loop {
-                match rx.recv().await {
+                match account_rx.recv().await {
                     Ok(update) => {
-                        if let Some(event) = Self::process_account_update(update, &rpc_clone).await
-                        {
+                        if let Some(event) = Self::process_account_update(update, &rpc_a).await {
                             tracing::debug!(
                                 dex = ?event.dex_type,
                                 pool = %event.pool_address,
                                 "geyser_pool_discovery: sending account-based event"
                             );
-                            let _ = event_tx_clone.send(event);
+                            if event_tx_a.send(event).await.is_err() {
+                                tracing::warn!("geyser_pool_discovery: pool event consumer dropped (account path)");
+                                break;
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "geyser_pool_discovery: account processor lagged");
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        tracing::warn!("geyser_pool_discovery: account stream closed");
+                        tracing::warn!("geyser_pool_discovery: account broadcast closed");
                         break;
                     }
                 }
             }
         });
 
-        // Spawn transaction processor (for Pump.fun - simplified approach)
-        let rpc_clone2 = rpc;
         tokio::spawn(async move {
-            let mut rx = transaction_rx;
             loop {
-                match rx.recv().await {
+                match transaction_rx.recv().await {
                     Ok(tx_update) => {
-                        if let Some(event) =
-                            Self::process_transaction_update(tx_update, &rpc_clone2).await
+                        if let Some(event) = Self::process_transaction_update(tx_update, &rpc).await
                         {
-                            // Log before sending to verify event is created
                             tracing::info!(
                                 dex = ?event.dex_type,
                                 pool = %event.pool_address,
                                 base_mint = %event.base_mint,
                                 "geyser_pool_discovery: SENDING transaction-based event to sniper"
                             );
-                            match event_tx.send(event) {
-                                Ok(receiver_count) => {
-                                    tracing::info!(
-                                        receiver_count,
-                                        "geyser_pool_discovery: event sent successfully"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        ?e,
-                                        "geyser_pool_discovery: FAILED to send event - no receivers!"
-                                    );
-                                }
+                            if event_tx.send(event).await.is_err() {
+                                tracing::warn!(
+                                    "geyser_pool_discovery: pool event consumer dropped (tx path)"
+                                );
+                                break;
                             }
                         }
                     }
@@ -107,19 +86,14 @@ impl GeyserPoolDiscovery {
                         );
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        tracing::warn!("geyser_pool_discovery: transaction stream closed");
+                        tracing::warn!("geyser_pool_discovery: transaction broadcast closed");
                         break;
                     }
                 }
             }
         });
 
-        (discovery, event_rx)
-    }
-
-    /// Start listening to Geyser updates
-    pub async fn start(self) -> Result<()> {
-        self.listener.start().await
+        event_rx
     }
 
     /// Process account update and determine if it's a new pool
@@ -771,4 +745,62 @@ struct PoolData {
     tick_current_index: Option<i32>,
     /// Orca Whirlpool: tick_spacing
     tick_spacing: Option<u16>,
+}
+
+#[cfg(test)]
+mod pool_discovery_ingest_tests {
+    use super::*;
+    use solana_sdk::pubkey::Pubkey;
+    use std::str::FromStr;
+    use std::time::Instant;
+
+    fn pumpfun_create_tx_update() -> GeyserTransactionUpdate {
+        let pump = Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap();
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let mut ixs = vec![Pubkey::default(); 8];
+        ixs[0] = mint;
+        ixs[7] = creator;
+        GeyserTransactionUpdate {
+            signature: "testsig".to_string(),
+            slot: 42,
+            account_keys: vec![pump],
+            instruction_accounts: ixs,
+            instruction_data: vec![0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77, 0, 0, 0, 0],
+            inner_instructions: vec![],
+            pre_token_balances: vec![],
+            post_token_balances: vec![],
+            pre_balances: vec![],
+            post_balances: vec![],
+            fee_lamports: 0,
+            compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_unified_tx_path_emits_pumpfun_pool_event() {
+        let (acc_tx, acc_rx) = broadcast::channel(8);
+        let pool_acc = acc_tx.subscribe();
+        drop(acc_rx);
+
+        let (tx_tx, tx_rx) = broadcast::channel(8);
+        let pool_tx = tx_tx.subscribe();
+        drop(tx_rx);
+
+        let rpc = Arc::new(crate::solana::rpc::SolanaRpc::new("http://127.0.0.1:8899"));
+        let mut out = PoolDiscoveryIngest::spawn_unified(pool_acc, pool_tx, Arc::clone(&rpc));
+
+        let upd = pumpfun_create_tx_update();
+        let expected_mint = upd.instruction_accounts[0];
+        assert!(tx_tx.send(upd).is_ok());
+
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), out.recv())
+            .await
+            .expect("timed out waiting for pool discovery event")
+            .expect("pool discovery channel closed");
+
+        assert_eq!(ev.dex_type, DexType::PumpFun);
+        assert_eq!(ev.base_mint, expected_mint);
+    }
 }

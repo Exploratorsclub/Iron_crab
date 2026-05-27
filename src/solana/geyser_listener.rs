@@ -34,14 +34,18 @@ use yellowstone_grpc_proto::prelude::{
 
 #[cfg(not(windows))]
 use crate::metrics::{
-    geyser_metrics_inc_reconnect, geyser_metrics_inc_stream_error,
-    geyser_metrics_inc_tracked_cuckoo_table_full, geyser_metrics_set_connected,
-    GeyserReconnectReason,
+    geyser_metrics_inc_listener_stream_payload, geyser_metrics_inc_reconnect,
+    geyser_metrics_inc_stream_error, geyser_metrics_inc_tracked_cuckoo_table_full,
+    geyser_metrics_set_connected, GeyserReconnectReason,
 };
 #[cfg(not(windows))]
 use rand::Rng;
 #[cfg(not(windows))]
+use std::sync::Mutex;
+#[cfg(not(windows))]
 use std::time::Duration;
+#[cfg(not(windows))]
+use tokio::sync::Notify;
 #[cfg(not(windows))]
 use tokio::time::sleep;
 
@@ -198,6 +202,18 @@ impl GeyserListener {
         listener.full_reconnect_tracked_threshold = full_reconnect_tracked_threshold;
         listener.tracked_cuckoo_max_capacity = tracked_cuckoo_max_capacity;
         (listener, account_rx, transaction_rx, blockhash_rx)
+    }
+
+    /// Subscribe to account updates (same stream as the primary `account_rx` from [`Self::new`]).
+    ///
+    /// PR162: pool discovery and other auxiliary consumers must not open a second Geyser gRPC session.
+    pub fn subscribe_account_updates(&self) -> broadcast::Receiver<GeyserAccountUpdate> {
+        self.account_tx.subscribe()
+    }
+
+    /// Subscribe to DEX transaction updates (same stream as the primary `transaction_rx`).
+    pub fn subscribe_transaction_updates(&self) -> broadcast::Receiver<GeyserTransactionUpdate> {
+        self.transaction_tx.subscribe()
     }
 
     /// Start listening to Geyser stream
@@ -444,6 +460,33 @@ impl GeyserListener {
                         }
                     };
 
+                // PR162: never `await` Yellowstone `subscribe_tx.send` in the stream read task — a slow
+                // sink starves `stream.next()`, heartbeats, and head_slot. Coalesce bursts into one pending
+                // request; a dedicated task performs the sink send.
+                let pending_subscription_request: Arc<Mutex<Option<SubscribeRequest>>> =
+                    Arc::new(Mutex::new(None));
+                let subscription_notify = Arc::new(Notify::new());
+                let pending_for_updater = Arc::clone(&pending_subscription_request);
+                let notify_for_updater = Arc::clone(&subscription_notify);
+                let subscription_updater_jh = tokio::spawn(async move {
+                    loop {
+                        notify_for_updater.notified().await;
+                        let req = match pending_for_updater.lock() {
+                            Ok(mut g) => g.take(),
+                            Err(_) => continue,
+                        };
+                        let Some(req) = req else { continue };
+                        if let Err(e) = subscribe_tx.send(req).await {
+                            warn!(
+                                error = %e,
+                                "geyser_listener: subscription updater failed to push subscribe request (sink gone)"
+                            );
+                            geyser_metrics_inc_reconnect(GeyserReconnectReason::SinkGone);
+                            break;
+                        }
+                    }
+                });
+
                 info!(
                     programs = ?self.program_ids,
                     tracked_accounts = tracked_accounts_current.len(),
@@ -497,6 +540,7 @@ impl GeyserListener {
                                     break 'read SessionExit::HardReconnect;
                                 }
                                 Some(Ok(msg)) => {
+                                    geyser_metrics_inc_listener_stream_payload();
                                     if let Some(update) = msg.update_oneof {
                                         match update {
                                 UpdateOneof::Account(account_update) => {
@@ -882,22 +926,21 @@ impl GeyserListener {
                                         &self.program_ids,
                                         tracked_cuckoo_filter.as_mut(),
                                     );
-                                    if let Err(e) = subscribe_tx.send(updated_request).await {
-                                        warn!(
-                                            "geyser_listener: failed to send subscription update: {e}; reconnecting with new client"
-                                        );
-                                        geyser_metrics_inc_reconnect(GeyserReconnectReason::SinkGone);
-                                        break 'read SessionExit::HardReconnect;
+                                    if let Ok(mut g) = pending_subscription_request.lock() {
+                                        *g = Some(updated_request);
                                     }
+                                    subscription_notify.notify_one();
                                     warn!(
                                         tracked_accounts = tracked_accounts_current.len(),
-                                        "geyser_listener: subscription updated (NO reconnect)"
+                                        "geyser_listener: subscription updated (NO reconnect; async sink)"
                                     );
                                 }
                             }
                         }
                     }
                 };
+
+                subscription_updater_jh.abort();
 
                 match session_exit {
                     SessionExit::StreamEnded => {
