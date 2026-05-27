@@ -261,6 +261,15 @@ pub static MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL: Lazy<AtomicU64> =
 /// 1 while a debounced TX-path Geyser sync is scheduled and not yet flushed; 0 otherwise.
 pub static MARKET_DATA_GEYSER_SYNC_PENDING: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+/// PR161: merge-task coalesced flush to `combined_tracked` (timer fired after `geyser_sync_batch_ms` quiet window).
+pub static MARKET_DATA_GEYSER_MERGE_COALESCED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR161: optional urgent merge path (reserved; default coalesce-only).
+pub static MARKET_DATA_GEYSER_MERGE_IMMEDIATE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR161: 1 while a debounced merge flush is scheduled; 0 otherwise.
+pub static MARKET_DATA_GEYSER_MERGE_PENDING: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
 /// Reconnect after large explicit subscription set (PR-B: full client reconnect vs in-place churn).
 pub static GEYSER_RECONNECT_TOTAL_SUBSCRIPTION_REBUILD: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -349,6 +358,23 @@ pub fn record_market_data_geyser_sync_immediate_total() {
 #[inline]
 pub fn set_market_data_geyser_sync_pending(pending: u64) {
     MARKET_DATA_GEYSER_SYNC_PENDING.store(pending, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_market_data_geyser_merge_coalesced_total() {
+    MARKET_DATA_GEYSER_MERGE_COALESCED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Reserved for an optional urgent merge path (PR161); coalesce-only mode does not increment this.
+#[inline]
+#[allow(dead_code)]
+pub fn record_market_data_geyser_merge_immediate_total() {
+    MARKET_DATA_GEYSER_MERGE_IMMEDIATE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_geyser_merge_pending(pending: u64) {
+    MARKET_DATA_GEYSER_MERGE_PENDING.store(pending, Ordering::Relaxed);
 }
 
 pub fn geyser_metrics_inc_stream_error() {
@@ -2454,6 +2480,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_geyser_sync_pending",
         MARKET_DATA_GEYSER_SYNC_PENDING.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_merge_coalesced_total",
+        MARKET_DATA_GEYSER_MERGE_COALESCED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_merge_immediate_total",
+        MARKET_DATA_GEYSER_MERGE_IMMEDIATE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_merge_pending",
+        MARKET_DATA_GEYSER_MERGE_PENDING.load(Ordering::Relaxed)
     );
     out.push_str("geyser_tracked_accounts_evicted_total{kind=\"vault\"} ");
     out.push_str(

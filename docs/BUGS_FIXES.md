@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PR161-GEYSER-MERGE-COALESCING: Merge-Task `combined_tracked` debounced wie TX-Path-Sync
+**Datum**: 2026-05-27  
+**Problem** (Prod post #159): Startup hunderte `subscription updated (NO reconnect)` in wenigen Sekunden — Cuckoo (#159) macht Updates billiger, aber **jeder** Merge feuerte sofort `combined_tracked_tx.send` (bis zu 4× pro `broadcast_tracked_geyser_explicit_to_merge` wegen vier `watch`-Channels) → Read-Loop-Last und NATS-Backpressure-Risiko.  
+**Fix**: Gleiches Debounce-Pattern wie `schedule_geyser_sync_batch_debounced`: bei jedem `watch`-Trigger wird ein `tokio::spawn`+`sleep(geyser_sync_batch_ms)` (Default **35 ms**, Clamp **10–100**, TOML `[market_data_geyser] geyser_sync_batch_ms`) neu geplant; vorheriger Timer wird abgebrochen; nach Ablauf **ein** Merge+`send` + `geyser_metrics_set_subscription_accounts` + `refresh_geyser_pins_gauge`. Kein Sekunden-Debounce im Trading-Pfad; nur Sync-Grenze Merge→GeyserListener (I-16: Verzögerung maximal `geyser_sync_batch_ms`). Metriken: `market_data_geyser_merge_coalesced_total`, `market_data_geyser_merge_immediate_total` (reserved), `market_data_geyser_merge_pending`. `market_data_geyser_sync_*` unverändert.  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### PR160-MAIN-LOOP-NONBLOCKING-NATS-PUBLISH-PIPELINE: Geyser-`select!` und TX-Pfad enqueue-only; Publish-Runtime isoliert
 **Datum**: 2026-05-27  
 **Problem** (Prod nach #159): `nats_messages_published_total` friert; massiv `NATS publish timeout (backpressure)`; `account_publish_queue_depth` entleert nicht. Ursache: **ein** serialer Publish-Worker auf geteiltem Client + **synchrones** NATS in `run_geyser_loop`-`select!` (MintInfo, Blockhash, PoolDiscovery, ExecutionResults-JetStream) und im TX-Task — Main-Loop blockiert → Fairness bricht → Pipeline verhungert (I-7-äquivalent: Hot-Path darf nicht auf NATS-I/O warten).  
