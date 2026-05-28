@@ -477,6 +477,16 @@ pub static GEYSER_ACCOUNT_LISTENER_LIVENESS_RECONNECTS_TOTAL: Lazy<AtomicU64> =
 /// PR167: deferred TX side-effect queue full (`try_send` drop).
 pub static MARKET_DATA_TX_DEFERRED_DROPPED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+/// PR169a: single-writer Geyser tracking actor queue depth (gauge).
+pub static MARKET_DATA_GEYSER_TRACKING_QUEUE_DEPTH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR169a: Geyser tracking actor queue full (`try_send` drop).
+pub static MARKET_DATA_GEYSER_TRACKING_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR169a: jobs processed by the Geyser tracking actor.
+pub static MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 #[inline]
 pub fn record_market_data_tx_handler_processed() {
     MARKET_DATA_TX_HANDLER_PROCESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -562,6 +572,21 @@ pub fn geyser_metrics_inc_account_listener_liveness_reconnect_total() {
 #[inline]
 pub fn inc_market_data_tx_deferred_dropped_total() {
     MARKET_DATA_TX_DEFERRED_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_geyser_tracking_queue_depth(depth: usize) {
+    MARKET_DATA_GEYSER_TRACKING_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_geyser_tracking_enqueue_dropped_total() {
+    MARKET_DATA_GEYSER_TRACKING_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_geyser_tracking_jobs_processed_total() {
+    MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -2720,6 +2745,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_tx_deferred_dropped_total",
         MARKET_DATA_TX_DEFERRED_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_tracking_queue_depth",
+        MARKET_DATA_GEYSER_TRACKING_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_tracking_enqueue_dropped_total",
+        MARKET_DATA_GEYSER_TRACKING_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_tracking_jobs_processed_total",
+        MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_unparsed_tx_dropped_total",

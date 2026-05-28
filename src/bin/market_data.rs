@@ -56,13 +56,14 @@ use ironcrab::metrics::{
     inc_market_data_account_low_priority_queue_depth,
     inc_market_data_account_publish_enqueue_dropped_total,
     inc_market_data_account_publish_queue_depth, inc_market_data_account_worker_queue_depth,
-    inc_market_data_jsonl_enqueue_dropped_total, inc_market_data_tx_deferred_dropped_total,
-    inc_market_data_unparsed_account_dropped_total, inc_market_data_unparsed_tx_dropped_total,
-    market_data_bump_geyser_head_slot, market_data_geyser_head_slot_value,
-    market_data_request_account_session_reconnect, market_data_request_tx_session_reconnect,
-    market_data_tx_handler_processed_value, record_market_data_account_broadcast_lagged,
-    record_market_data_account_channel_lag_ms, record_market_data_account_early_drop_total,
-    record_market_data_account_handler_duration_us,
+    inc_market_data_geyser_tracking_enqueue_dropped_total,
+    inc_market_data_geyser_tracking_jobs_processed_total,
+    inc_market_data_jsonl_enqueue_dropped_total, inc_market_data_unparsed_account_dropped_total,
+    inc_market_data_unparsed_tx_dropped_total, market_data_bump_geyser_head_slot,
+    market_data_geyser_head_slot_value, market_data_request_account_session_reconnect,
+    market_data_request_tx_session_reconnect, market_data_tx_handler_processed_value,
+    record_market_data_account_broadcast_lagged, record_market_data_account_channel_lag_ms,
+    record_market_data_account_early_drop_total, record_market_data_account_handler_duration_us,
     record_market_data_account_publish_worker_job_duration_us,
     record_market_data_account_publish_worker_reconnect,
     record_market_data_account_publish_worker_stall,
@@ -78,14 +79,14 @@ use ironcrab::metrics::{
     set_market_data_account_broadcast_queue_depth,
     set_market_data_account_publish_worker_last_success_unix_ms,
     set_market_data_geyser_merge_pending, set_market_data_geyser_sync_pending,
-    set_market_data_momentum_active_pool_pins_gauge, set_market_data_tx_broadcast_queue_depth,
-    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
-    touch_market_data_global_ingest_progress, update_readiness_market_data_current,
-    wall_clock_unix_ms_now, GeyserTrackedEvictKind, MarketDataLatencySegment, MetricsComponent,
-    MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS,
-    MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
-    MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
-    POOLS_TRACKED_GAUGE,
+    set_market_data_geyser_tracking_queue_depth, set_market_data_momentum_active_pool_pins_gauge,
+    set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
+    set_readiness_nats_connected, touch_market_data_global_ingest_progress,
+    update_readiness_market_data_current, wall_clock_unix_ms_now, GeyserTrackedEvictKind,
+    MarketDataLatencySegment, MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
+    MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL,
+    MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
+    NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -129,8 +130,8 @@ static MD_SYSTEMD_WATCHDOG_NOTIFY: AtomicBool = AtomicBool::new(true);
 
 /// Default capacity for off-hot-path market-events JSONL queue.
 const MARKET_DATA_JSONL_QUEUE_CAP: usize = 16_384;
-/// PR167: bounded queue for deferred TX side-effects (reserve register, geyser sync schedule).
-const MARKET_DATA_TX_DEFERRED_QUEUE_CAP: usize = 4096;
+/// PR169a: bounded queue for single-writer Geyser tracking mutations (account + TX path).
+const MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP: usize = 8192;
 /// PR167: minimum debounce for explicit pin updates during startup burst (seconds).
 const MARKET_DATA_GEYSER_SYNC_STARTUP_WINDOW: Duration = Duration::from_secs(120);
 const MARKET_DATA_GEYSER_SYNC_STARTUP_MIN_MS: u64 = 250;
@@ -274,35 +275,67 @@ fn market_data_global_ingest_stalled(
     tx_now == tx_prev && account_now == account_prev && head_now == head_prev
 }
 
-/// PR167: deferred TX side-effects (single FIFO worker — avoids lock convoy with account workers).
-enum TxDeferredSideEffect {
-    ScheduleGeyserSyncBatch,
+/// PR169a: commands for the single-writer Geyser tracking actor (account + TX path).
+enum GeyserTrackingCommand {
     RegisterReservesAfterTrade(Pubkey),
+    RegisterPoolVaultsFromAccount {
+        pool: Pubkey,
+    },
+    TrackMint {
+        mint: Pubkey,
+        pin: Option<GeyserPinReason>,
+    },
 }
 
-fn tx_deferred_try_enqueue(tx: &mpsc::Sender<TxDeferredSideEffect>, job: TxDeferredSideEffect) {
-    if tx.try_send(job).is_err() {
-        inc_market_data_tx_deferred_dropped_total();
+fn geyser_tracking_try_enqueue(
+    tx: &mpsc::Sender<GeyserTrackingCommand>,
+    queue_depth: &AtomicUsize,
+    job: GeyserTrackingCommand,
+) {
+    match tx.try_send(job) {
+        Ok(()) => {
+            let depth = queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+            set_market_data_geyser_tracking_queue_depth(depth);
+        }
+        Err(_) => inc_market_data_geyser_tracking_enqueue_dropped_total(),
     }
 }
 
-fn spawn_market_data_tx_deferred_worker(
+fn spawn_geyser_tracking_actor(
     ctx: Arc<MarketDataContext>,
-) -> mpsc::Sender<TxDeferredSideEffect> {
-    let (tx, mut rx) = mpsc::channel(MARKET_DATA_TX_DEFERRED_QUEUE_CAP);
+) -> (mpsc::Sender<GeyserTrackingCommand>, Arc<AtomicUsize>) {
+    let queue_depth = Arc::new(AtomicUsize::new(0));
+    let (tx, mut rx) = mpsc::channel(MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP);
+    let depth_worker = Arc::clone(&queue_depth);
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
+            let remaining = depth_worker.fetch_sub(1, Ordering::Relaxed);
+            set_market_data_geyser_tracking_queue_depth(remaining.saturating_sub(1));
+            inc_market_data_geyser_tracking_jobs_processed_total();
+            let mut schedule_sync = false;
             match job {
-                TxDeferredSideEffect::ScheduleGeyserSyncBatch => {
-                    ctx.schedule_geyser_sync_batch_debounced();
+                GeyserTrackingCommand::RegisterReservesAfterTrade(pool) => {
+                    if ctx.register_geyser_reserves_after_trade(pool) {
+                        schedule_sync = true;
+                    }
                 }
-                TxDeferredSideEffect::RegisterReservesAfterTrade(pool) => {
-                    ctx.register_geyser_reserves_after_trade(pool);
+                GeyserTrackingCommand::RegisterPoolVaultsFromAccount { pool } => {
+                    if ctx.register_pool_vaults_from_account(pool) {
+                        schedule_sync = true;
+                    }
                 }
+                GeyserTrackingCommand::TrackMint { mint, pin } => {
+                    if ctx.track_mint_for_geyser_metadata(mint, pin) {
+                        schedule_sync = true;
+                    }
+                }
+            }
+            if schedule_sync {
+                ctx.schedule_geyser_sync_batch_debounced();
             }
         }
     });
-    tx
+    (tx, queue_depth)
 }
 
 /// Optional Geyser→core-publish latency trace (same `recv_at` for all publishes from one Geyser message).
@@ -1148,16 +1181,6 @@ enum GeyserReserveRegisterFollowUp {
     MomentumUpgrade,
 }
 
-/// How to push explicit tracked keys to Geyser merge channels after reserve registration.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GeyserReserveEndSync {
-    /// Caller runs [`MarketDataContext::sync_geyser_tracked_accounts`] once after a batch.
-    Suppress,
-    Immediate,
-    /// TX-path: coalesce many updates into one debounced sync.
-    Batched,
-}
-
 /// Base + quote mint pubkeys for explicit mint-account Geyser tracking (metadata).
 fn pool_mints_for_geyser_explicit_tracking(state: &CachedPoolState) -> Option<(Pubkey, Pubkey)> {
     let wsol = Pubkey::from_str(NATIVE_SOL_MINT).ok()?;
@@ -1685,36 +1708,246 @@ impl MarketDataContext {
 
     /// PR-B: after a parsed swap trade, subscribe reserve vaults / DLMM bin arrays from MASTER cache
     /// only when explicit pool assets are admitted (same rule as account-path).
-    fn register_geyser_reserves_after_trade(self: &Arc<Self>, pool: Pubkey) {
+    /// PR169a: returns whether tracked sets changed; caller schedules debounced Geyser sync.
+    fn register_geyser_reserves_after_trade(self: &Arc<Self>, pool: Pubkey) -> bool {
         let Some(state) = self.live_pool_cache.get(&pool) else {
-            return;
+            return false;
         };
         let Some((base_mint, quote_mint)) = pool_mints_for_geyser_explicit_tracking(&state) else {
-            return;
+            return false;
         };
         if !self.admit_geyser_explicit_pool_assets(pool, base_mint, quote_mint) {
-            return;
+            return false;
         }
         let follow_up = if self.active_pool_set.pool_has_any_pin(pool) {
             GeyserReserveRegisterFollowUp::MomentumUpgrade
         } else {
             GeyserReserveRegisterFollowUp::None
         };
-        let _ = self.register_geyser_reserves_impl(
-            pool,
-            follow_up,
-            GeyserReserveEndSync::Batched,
-            Some(self),
-        );
+        self.register_geyser_reserves_impl(pool, follow_up)
+    }
+
+    /// PR169a: register vault ATAs from MASTER cache after account-path pool upsert (no sync here).
+    fn register_pool_vaults_from_account(&self, pool: Pubkey) -> bool {
+        let Some(cached_state) = self.live_pool_cache.get(&pool) else {
+            return false;
+        };
+        let now = Instant::now();
+        let mut vaults_changed = false;
+
+        if let CachedPoolState::RaydiumCpmm(s) = &cached_state {
+            let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+            let (base_mint_v, quote_mint_v, coin_vault, pc_vault) = if s.token_1_mint == sol {
+                (
+                    s.token_0_mint,
+                    s.token_1_mint,
+                    s.token_0_vault,
+                    s.token_1_vault,
+                )
+            } else if s.token_0_mint == sol {
+                (
+                    s.token_1_mint,
+                    s.token_0_mint,
+                    s.token_1_vault,
+                    s.token_0_vault,
+                )
+            } else {
+                (
+                    s.token_0_mint,
+                    s.token_1_mint,
+                    s.token_0_vault,
+                    s.token_1_vault,
+                )
+            };
+            if self.admit_geyser_explicit_pool_assets(pool, base_mint_v, quote_mint_v) {
+                let dex_str = "raydium_cpmm".to_string();
+                let mut vaults = self.tracked_vaults.write();
+                vaults.entry(coin_vault).or_insert_with(|| {
+                    vaults_changed = true;
+                    VaultInfo {
+                        pool_address: pool,
+                        dex: dex_str.clone(),
+                        base_mint: base_mint_v,
+                        quote_mint: quote_mint_v,
+                        is_base_vault: true,
+                        last_balance: std::sync::atomic::AtomicU64::new(0),
+                        last_used_at: now,
+                        pinned: false,
+                        pin: None,
+                        active_id: None,
+                        bin_step: None,
+                    }
+                });
+                vaults.entry(pc_vault).or_insert_with(|| {
+                    vaults_changed = true;
+                    VaultInfo {
+                        pool_address: pool,
+                        dex: dex_str,
+                        base_mint: base_mint_v,
+                        quote_mint: quote_mint_v,
+                        is_base_vault: false,
+                        last_balance: std::sync::atomic::AtomicU64::new(0),
+                        last_used_at: now,
+                        pinned: false,
+                        pin: None,
+                        active_id: None,
+                        bin_step: None,
+                    }
+                });
+            }
+        }
+
+        if self.config.read().enable_meteora_cpmm {
+            if let CachedPoolState::MeteoraCpmm(s) = &cached_state {
+                let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+                let (base_mint_v, quote_mint_v, vault_base, vault_quote) = if s.token_1_mint == sol
+                {
+                    (
+                        s.token_0_mint,
+                        s.token_1_mint,
+                        s.token_0_vault,
+                        s.token_1_vault,
+                    )
+                } else if s.token_0_mint == sol {
+                    (
+                        s.token_1_mint,
+                        s.token_0_mint,
+                        s.token_1_vault,
+                        s.token_0_vault,
+                    )
+                } else {
+                    (
+                        s.token_0_mint,
+                        s.token_1_mint,
+                        s.token_0_vault,
+                        s.token_1_vault,
+                    )
+                };
+                if self.admit_geyser_explicit_pool_assets(pool, base_mint_v, quote_mint_v) {
+                    let dex_str = "meteora_cpmm".to_string();
+                    let mut vaults = self.tracked_vaults.write();
+                    vaults.entry(vault_base).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: pool,
+                            dex: dex_str.clone(),
+                            base_mint: base_mint_v,
+                            quote_mint: quote_mint_v,
+                            is_base_vault: true,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: now,
+                            pinned: false,
+                            pin: None,
+                            active_id: None,
+                            bin_step: None,
+                        }
+                    });
+                    vaults.entry(vault_quote).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: pool,
+                            dex: dex_str,
+                            base_mint: base_mint_v,
+                            quote_mint: quote_mint_v,
+                            is_base_vault: false,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: now,
+                            pinned: false,
+                            pin: None,
+                            active_id: None,
+                            bin_step: None,
+                        }
+                    });
+                }
+            }
+        }
+
+        if self.config.read().enable_meteora_dlmm {
+            if let CachedPoolState::Meteora(s) = &cached_state {
+                if self.admit_geyser_explicit_pool_assets(pool, s.token_x_mint, s.token_y_mint) {
+                    let dex_str = "meteora_dlmm".to_string();
+                    let mut vaults = self.tracked_vaults.write();
+                    vaults.entry(s.reserve_x).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: pool,
+                            dex: dex_str.clone(),
+                            base_mint: s.token_x_mint,
+                            quote_mint: s.token_y_mint,
+                            is_base_vault: true,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: now,
+                            pinned: false,
+                            pin: None,
+                            active_id: Some(s.active_id),
+                            bin_step: Some(s.bin_step),
+                        }
+                    });
+                    vaults.entry(s.reserve_y).or_insert_with(|| {
+                        vaults_changed = true;
+                        VaultInfo {
+                            pool_address: pool,
+                            dex: dex_str,
+                            base_mint: s.token_x_mint,
+                            quote_mint: s.token_y_mint,
+                            is_base_vault: false,
+                            last_balance: std::sync::atomic::AtomicU64::new(0),
+                            last_used_at: now,
+                            pinned: false,
+                            pin: None,
+                            active_id: Some(s.active_id),
+                            bin_step: Some(s.bin_step),
+                        }
+                    });
+                }
+            }
+        }
+
+        if let CachedPoolState::PumpAmm(s) = &cached_state {
+            if self.admit_geyser_explicit_pool_assets(pool, s.base_mint, s.quote_mint) {
+                let dex_str = "pump_amm".to_string();
+                let mut vaults = self.tracked_vaults.write();
+                vaults.entry(s.pool_base_token_account).or_insert_with(|| {
+                    vaults_changed = true;
+                    VaultInfo {
+                        pool_address: pool,
+                        dex: dex_str.clone(),
+                        base_mint: s.base_mint,
+                        quote_mint: s.quote_mint,
+                        is_base_vault: true,
+                        last_balance: std::sync::atomic::AtomicU64::new(0),
+                        last_used_at: now,
+                        pinned: false,
+                        pin: None,
+                        active_id: None,
+                        bin_step: None,
+                    }
+                });
+                vaults.entry(s.pool_quote_token_account).or_insert_with(|| {
+                    vaults_changed = true;
+                    VaultInfo {
+                        pool_address: pool,
+                        dex: dex_str,
+                        base_mint: s.base_mint,
+                        quote_mint: s.quote_mint,
+                        is_base_vault: false,
+                        last_balance: std::sync::atomic::AtomicU64::new(0),
+                        last_used_at: now,
+                        pinned: false,
+                        pin: None,
+                        active_id: None,
+                        bin_step: None,
+                    }
+                });
+            }
+        }
+
+        vaults_changed
     }
 
     /// PR-D: explicit vault/bin subscriptions for momentum active `(mint, pool)` when cache has layout.
-    /// Returns whether any tracked set changed. If `suppress_end_sync`, caller must [`Self::sync_geyser_tracked_accounts`].
-    fn register_geyser_reserves_for_momentum_active_pool(
-        &self,
-        pool: Pubkey,
-        suppress_end_sync: bool,
-    ) -> bool {
+    /// Returns whether any tracked set changed. Caller must [`Self::sync_geyser_tracked_accounts`].
+    fn register_geyser_reserves_for_momentum_active_pool(&self, pool: Pubkey) -> bool {
         if self.live_pool_cache.get(&pool).is_none() {
             debug!(
                 run_id = %self.run_id,
@@ -1723,25 +1956,13 @@ impl MarketDataContext {
             );
             return false;
         }
-        let end = if suppress_end_sync {
-            GeyserReserveEndSync::Suppress
-        } else {
-            GeyserReserveEndSync::Immediate
-        };
-        self.register_geyser_reserves_impl(
-            pool,
-            GeyserReserveRegisterFollowUp::MomentumUpgrade,
-            end,
-            None,
-        )
+        self.register_geyser_reserves_impl(pool, GeyserReserveRegisterFollowUp::MomentumUpgrade)
     }
 
     fn register_geyser_reserves_impl(
         &self,
         pool: Pubkey,
         follow_up: GeyserReserveRegisterFollowUp,
-        end_sync: GeyserReserveEndSync,
-        ctx_for_batch: Option<&Arc<Self>>,
     ) -> bool {
         let now = Instant::now();
         let enable_dlmm = self.config.read().enable_meteora_dlmm;
@@ -2094,23 +2315,7 @@ impl MarketDataContext {
             }
         }
 
-        let changed = vaults_changed || bins_changed || mints_changed;
-        if changed {
-            match end_sync {
-                GeyserReserveEndSync::Suppress => {}
-                GeyserReserveEndSync::Immediate => {
-                    self.sync_geyser_tracked_accounts();
-                }
-                GeyserReserveEndSync::Batched => {
-                    if let Some(ctx) = ctx_for_batch {
-                        ctx.schedule_geyser_sync_batch_debounced();
-                    } else {
-                        self.sync_geyser_tracked_accounts();
-                    }
-                }
-            }
-        }
-        changed
+        vaults_changed || bins_changed || mints_changed
     }
 
     /// PR-D: apply momentum-bot active pool pin updates (core NATS; immediate `sync_geyser_tracked_accounts`).
@@ -2164,7 +2369,7 @@ impl MarketDataContext {
                 continue;
             };
             self.active_pool_set.pin_pool(mint_pk, pool_pk);
-            if self.register_geyser_reserves_for_momentum_active_pool(pool_pk, true) {
+            if self.register_geyser_reserves_for_momentum_active_pool(pool_pk) {
                 batch_dirty = true;
             }
             let _ = &a.pin_reason;
@@ -8535,6 +8740,7 @@ async fn handle_pool_discovery_market_event(
 
 /// Geyser account ingest (dedizierter Task-Fairness, siehe MARKET-DATA-ACCOUNT-INGEST-FAIRNESS).
 /// STOP-CHECK (PR165): **keine** RPC-Calls — weder direkt noch via `tokio::spawn` aus diesem Handler.
+#[allow(clippy::too_many_arguments)]
 async fn handle_geyser_account(
     ctx: Arc<MarketDataContext>,
     run_id: &str,
@@ -8542,6 +8748,8 @@ async fn handle_geyser_account(
     account_count: &AtomicU64,
     recv_at: Instant,
     publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
+    geyser_tracking_tx: &mpsc::Sender<GeyserTrackingCommand>,
+    geyser_tracking_queue_depth: &AtomicUsize,
 ) {
     let account_geyser_recv_at = recv_at;
     account_count.fetch_add(1, Ordering::Relaxed);
@@ -9136,223 +9344,21 @@ async fn handle_geyser_account(
             return;
         }
 
-        // Raydium CPMM: register vault ATAs for Geyser reserve updates (enables non-RPC reserve path).
-        if let CachedPoolState::RaydiumCpmm(s) = &cached_state {
-            let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
-            let (base_mint_v, quote_mint_v, coin_vault, pc_vault) = if s.token_1_mint == sol {
-                (
-                    s.token_0_mint,
-                    s.token_1_mint,
-                    s.token_0_vault,
-                    s.token_1_vault,
-                )
-            } else if s.token_0_mint == sol {
-                (
-                    s.token_1_mint,
-                    s.token_0_mint,
-                    s.token_1_vault,
-                    s.token_0_vault,
-                )
-            } else {
-                (
-                    s.token_0_mint,
-                    s.token_1_mint,
-                    s.token_0_vault,
-                    s.token_1_vault,
-                )
-            };
-            let dex_str = "raydium_cpmm".to_string();
-            let mut vaults_changed = false;
-            if ctx.admit_geyser_explicit_pool_assets(
-                account_update.pubkey,
-                base_mint_v,
-                quote_mint_v,
-            ) {
-                {
-                    let mut vaults = ctx.tracked_vaults.write();
-                    vaults.entry(coin_vault).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: account_update.pubkey,
-                            dex: dex_str.clone(),
-                            base_mint: base_mint_v,
-                            quote_mint: quote_mint_v,
-                            is_base_vault: true,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: Instant::now(),
-                            pinned: false,
-                            pin: None,
-                            active_id: None,
-                            bin_step: None,
-                        }
-                    });
-                    vaults.entry(pc_vault).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: account_update.pubkey,
-                            dex: dex_str,
-                            base_mint: base_mint_v,
-                            quote_mint: quote_mint_v,
-                            is_base_vault: false,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: Instant::now(),
-                            pinned: false,
-                            pin: None,
-                            active_id: None,
-                            bin_step: None,
-                        }
-                    });
-                }
-            }
-            if vaults_changed {
-                ctx.sync_geyser_tracked_accounts();
-                debug!(
-                    pool = %account_update.pubkey,
-                    coin_vault = %coin_vault,
-                    pc_vault = %pc_vault,
-                    "Registered Raydium CPMM vaults for Geyser reserve subscription"
-                );
-            }
-        }
-
-        // Meteora CPMM: register vault ATAs for Geyser reserve updates (same pattern as Raydium CPMM).
-        if ctx.config.read().enable_meteora_cpmm {
-            if let CachedPoolState::MeteoraCpmm(s) = &cached_state {
-                let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
-                let (base_mint_v, quote_mint_v, vault_base, vault_quote) = if s.token_1_mint == sol
-                {
-                    (
-                        s.token_0_mint,
-                        s.token_1_mint,
-                        s.token_0_vault,
-                        s.token_1_vault,
-                    )
-                } else if s.token_0_mint == sol {
-                    (
-                        s.token_1_mint,
-                        s.token_0_mint,
-                        s.token_1_vault,
-                        s.token_0_vault,
-                    )
-                } else {
-                    (
-                        s.token_0_mint,
-                        s.token_1_mint,
-                        s.token_0_vault,
-                        s.token_1_vault,
-                    )
-                };
-                let dex_str = "meteora_cpmm".to_string();
-                let mut vaults_changed = false;
-                if ctx.admit_geyser_explicit_pool_assets(
-                    account_update.pubkey,
-                    base_mint_v,
-                    quote_mint_v,
-                ) {
-                    {
-                        let mut vaults = ctx.tracked_vaults.write();
-                        vaults.entry(vault_base).or_insert_with(|| {
-                            vaults_changed = true;
-                            VaultInfo {
-                                pool_address: account_update.pubkey,
-                                dex: dex_str.clone(),
-                                base_mint: base_mint_v,
-                                quote_mint: quote_mint_v,
-                                is_base_vault: true,
-                                last_balance: std::sync::atomic::AtomicU64::new(0),
-                                last_used_at: Instant::now(),
-                                pinned: false,
-                                pin: None,
-                                active_id: None,
-                                bin_step: None,
-                            }
-                        });
-                        vaults.entry(vault_quote).or_insert_with(|| {
-                            vaults_changed = true;
-                            VaultInfo {
-                                pool_address: account_update.pubkey,
-                                dex: dex_str,
-                                base_mint: base_mint_v,
-                                quote_mint: quote_mint_v,
-                                is_base_vault: false,
-                                last_balance: std::sync::atomic::AtomicU64::new(0),
-                                last_used_at: Instant::now(),
-                                pinned: false,
-                                pin: None,
-                                active_id: None,
-                                bin_step: None,
-                            }
-                        });
-                    }
-                }
-                if vaults_changed {
-                    ctx.sync_geyser_tracked_accounts();
-                    debug!(
-                        pool = %account_update.pubkey,
-                        vault_base = %vault_base,
-                        vault_quote = %vault_quote,
-                        "Registered Meteora CPMM vaults for Geyser reserve subscription"
-                    );
-                }
-            }
-        }
-
-        // Meteora DLMM: register reserve vault ATAs (on-chain token_x / token_y order).
-        if ctx.config.read().enable_meteora_dlmm {
-            if let CachedPoolState::Meteora(s) = &cached_state {
-                let dex_str = "meteora_dlmm".to_string();
-                let mut vaults_changed = false;
-                if ctx.admit_geyser_explicit_pool_assets(
-                    account_update.pubkey,
-                    s.token_x_mint,
-                    s.token_y_mint,
-                ) {
-                    {
-                        let mut vaults = ctx.tracked_vaults.write();
-                        vaults.entry(s.reserve_x).or_insert_with(|| {
-                            vaults_changed = true;
-                            VaultInfo {
-                                pool_address: account_update.pubkey,
-                                dex: dex_str.clone(),
-                                base_mint: s.token_x_mint,
-                                quote_mint: s.token_y_mint,
-                                is_base_vault: true,
-                                last_balance: std::sync::atomic::AtomicU64::new(0),
-                                last_used_at: Instant::now(),
-                                pinned: false,
-                                pin: None,
-                                active_id: Some(s.active_id),
-                                bin_step: Some(s.bin_step),
-                            }
-                        });
-                        vaults.entry(s.reserve_y).or_insert_with(|| {
-                            vaults_changed = true;
-                            VaultInfo {
-                                pool_address: account_update.pubkey,
-                                dex: dex_str,
-                                base_mint: s.token_x_mint,
-                                quote_mint: s.token_y_mint,
-                                is_base_vault: false,
-                                last_balance: std::sync::atomic::AtomicU64::new(0),
-                                last_used_at: Instant::now(),
-                                pinned: false,
-                                pin: None,
-                                active_id: Some(s.active_id),
-                                bin_step: Some(s.bin_step),
-                            }
-                        });
-                    }
-                }
-                if vaults_changed {
-                    ctx.sync_geyser_tracked_accounts();
-                    debug!(
-                        pool = %account_update.pubkey,
-                        reserve_x = %s.reserve_x,
-                        reserve_y = %s.reserve_y,
-                        "Registered Meteora DLMM vaults for Geyser reserve subscription"
-                    );
-                }
-            }
+        // PR169a: vault registration off hot path — single-writer tracking actor.
+        if matches!(
+            &cached_state,
+            CachedPoolState::RaydiumCpmm(_)
+                | CachedPoolState::MeteoraCpmm(_)
+                | CachedPoolState::Meteora(_)
+                | CachedPoolState::PumpAmm(_)
+        ) {
+            geyser_tracking_try_enqueue(
+                geyser_tracking_tx,
+                geyser_tracking_queue_depth,
+                GeyserTrackingCommand::RegisterPoolVaultsFromAccount {
+                    pool: account_update.pubkey,
+                },
+            );
         }
 
         // Extract mint and reserve info from cached_state for PoolCacheUpdate
@@ -9432,65 +9438,6 @@ async fn handle_geyser_account(
                                 "Cached creator from PumpAmm pool account (migrated token)"
                             );
                         }
-                    }
-                }
-                // A.1 Phase 2.1: Register PumpAmm vaults for Geyser subscription (base/quote reserve updates)
-                {
-                    let dex_str = "pump_amm".to_string();
-                    let mut vaults_changed = false;
-                    if ctx.admit_geyser_explicit_pool_assets(
-                        account_update.pubkey,
-                        s.base_mint,
-                        s.quote_mint,
-                    ) {
-                        {
-                            let mut vaults = ctx.tracked_vaults.write();
-                            vaults.entry(s.pool_base_token_account).or_insert_with(|| {
-                                vaults_changed = true;
-                                VaultInfo {
-                                    pool_address: account_update.pubkey,
-                                    dex: dex_str.clone(),
-                                    base_mint: s.base_mint,
-                                    quote_mint: s.quote_mint,
-                                    is_base_vault: true,
-                                    last_balance: std::sync::atomic::AtomicU64::new(0),
-                                    last_used_at: Instant::now(),
-                                    pinned: false,
-                                    pin: None,
-                                    active_id: None,
-                                    bin_step: None,
-                                }
-                            });
-                            vaults.entry(s.pool_quote_token_account).or_insert_with(|| {
-                                vaults_changed = true;
-                                VaultInfo {
-                                    pool_address: account_update.pubkey,
-                                    dex: dex_str,
-                                    base_mint: s.base_mint,
-                                    quote_mint: s.quote_mint,
-                                    is_base_vault: false,
-                                    last_balance: std::sync::atomic::AtomicU64::new(0),
-                                    last_used_at: Instant::now(),
-                                    pinned: false,
-                                    pin: None,
-                                    active_id: None,
-                                    bin_step: None,
-                                }
-                            });
-                        }
-                    }
-                    if vaults_changed {
-                        if ctx.started_at.elapsed() < Duration::from_secs(60) {
-                            ctx.schedule_geyser_sync_batch_debounced();
-                        } else {
-                            ctx.sync_geyser_tracked_accounts();
-                        }
-                        debug!(
-                            pool = %account_update.pubkey,
-                            base_vault = %s.pool_base_token_account,
-                            quote_vault = %s.pool_quote_token_account,
-                            "A.1: Registered PumpAmm vaults for Geyser reserve subscription"
-                        );
                     }
                 }
                 (
@@ -10024,7 +9971,8 @@ async fn handle_geyser_transaction(
     tx_update: GeyserTransactionUpdate,
     tx_count: &AtomicU64,
     account_publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
-    tx_deferred_tx: &mpsc::Sender<TxDeferredSideEffect>,
+    geyser_tracking_tx: &mpsc::Sender<GeyserTrackingCommand>,
+    geyser_tracking_queue_depth: &AtomicUsize,
 ) {
     record_market_data_tx_handler_processed();
     let recv_at = Instant::now();
@@ -10115,18 +10063,16 @@ async fn handle_geyser_transaction(
             ParsedDexEvent::BondingCurveUpdate { .. } => None, // Handled separately in account update
         };
         if let Some((mint, dex_opt)) = mint_and_dex {
-            let is_new = ctx.track_mint_for_geyser_metadata(mint, None);
-            if is_new {
-                tx_deferred_try_enqueue(
-                    tx_deferred_tx,
-                    TxDeferredSideEffect::ScheduleGeyserSyncBatch,
-                );
-                debug!(
-                    mint = %mint,
-                    dex = ?dex_opt,
-                    "New mint tracked for Geyser metadata (batched sync deferred), waiting for mint account delivery"
-                );
-            }
+            geyser_tracking_try_enqueue(
+                geyser_tracking_tx,
+                geyser_tracking_queue_depth,
+                GeyserTrackingCommand::TrackMint { mint, pin: None },
+            );
+            debug!(
+                mint = %mint,
+                dex = ?dex_opt,
+                "Mint track enqueued for Geyser metadata (actor + batched sync)"
+            );
         }
 
         // Build pool_mint_map for PumpFun (needed for BondingCurveUpdate -> creator lookup)
@@ -10194,9 +10140,10 @@ async fn handle_geyser_transaction(
     // PR-B: qualifying swap trade — refresh LRU timestamps and register reserve vaults / DLMM bins.
     if let Some(ParsedDexEvent::Trade { pool_address, .. }) = parsed_event.as_ref() {
         ctx.touch_tracked_pool_vaults_and_bins_if_tracked(*pool_address);
-        tx_deferred_try_enqueue(
-            tx_deferred_tx,
-            TxDeferredSideEffect::RegisterReservesAfterTrade(*pool_address),
+        geyser_tracking_try_enqueue(
+            geyser_tracking_tx,
+            geyser_tracking_queue_depth,
+            GeyserTrackingCommand::RegisterReservesAfterTrade(*pool_address),
         );
     }
 
@@ -10956,8 +10903,9 @@ async fn run_geyser_loop(
             spawn_market_data_account_publish_runtime(Arc::clone(&ctx), template, n_workers)
         });
 
-    // PR167: single-worker deferred side-effects (reserve register, geyser sync schedule).
-    let tx_deferred_tx = spawn_market_data_tx_deferred_worker(Arc::clone(&ctx));
+    // PR169a: single-writer Geyser tracking actor (must exist before TX + account workers).
+    let (geyser_tracking_tx, geyser_tracking_queue_depth) =
+        spawn_geyser_tracking_actor(Arc::clone(&ctx));
 
     // Option A (MARKET-DATA-TX-INGEST-FAIRNESS): dedizierter Tokio-Task für Geyser-Txs.
     // Verhindert, dass `transaction_rx.recv()` hinter langen Account-`select!`-Armen verhungert
@@ -10967,7 +10915,8 @@ async fn run_geyser_loop(
     let run_id_geyser_tx = run_id.to_string();
     let tx_count_geyser_tx = Arc::clone(&tx_count);
     let account_publish_tx_geyser_tx = account_publish_tx.clone();
-    let tx_deferred_tx_geyser = tx_deferred_tx.clone();
+    let geyser_tracking_tx_geyser = geyser_tracking_tx.clone();
+    let geyser_tracking_depth_geyser = Arc::clone(&geyser_tracking_queue_depth);
     let mut transaction_rx_geyser = transaction_rx;
     tokio::spawn(async move {
         loop {
@@ -10980,7 +10929,8 @@ async fn run_geyser_loop(
                         tx_update,
                         tx_count_geyser_tx.as_ref(),
                         account_publish_tx_geyser_tx.as_ref(),
-                        &tx_deferred_tx_geyser,
+                        &geyser_tracking_tx_geyser,
+                        geyser_tracking_depth_geyser.as_ref(),
                     )
                     .await;
                 }
@@ -11038,6 +10988,8 @@ async fn run_geyser_loop(
         let run_id_w = run_id_geyser_acc.clone();
         let account_count_w = Arc::clone(&account_count_geyser_acc);
         let publish_tx_w = account_publish_tx.clone();
+        let geyser_tracking_tx_w = geyser_tracking_tx.clone();
+        let geyser_tracking_depth_w = Arc::clone(&geyser_tracking_queue_depth);
         tokio::spawn(async move {
             while let Some(work) = account_worker_recv_next(&mut high_rx, &mut low_rx).await {
                 let handler_start = Instant::now();
@@ -11048,6 +11000,8 @@ async fn run_geyser_loop(
                     account_count_w.as_ref(),
                     work.recv_at,
                     publish_tx_w.as_ref(),
+                    &geyser_tracking_tx_w,
+                    geyser_tracking_depth_w.as_ref(),
                 )
                 .await;
                 record_market_data_account_handler_duration_us(
@@ -14095,10 +14049,21 @@ mod pr_b_geyser_tracking_tests {
         ctx.active_pool_set.pin_pool(base_b, pool_b);
 
         let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
-        let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
 
-        MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool_a);
-        MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool_b);
+        let (tracking_tx, tracking_depth) = spawn_geyser_tracking_actor(Arc::clone(&ctx));
+        geyser_tracking_try_enqueue(
+            &tracking_tx,
+            tracking_depth.as_ref(),
+            GeyserTrackingCommand::RegisterReservesAfterTrade(pool_a),
+        );
+        geyser_tracking_try_enqueue(
+            &tracking_tx,
+            tracking_depth.as_ref(),
+            GeyserTrackingCommand::RegisterReservesAfterTrade(pool_b),
+        );
+
+        // Let the actor drain both jobs before measuring debounced flush (isolates from parallel tests).
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         assert_eq!(
             MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed),
@@ -14106,12 +14071,14 @@ mod pr_b_geyser_tracking_tests {
             "trade-path reserve registration must not immediate-sync before debounce flush"
         );
 
+        let batch_after_jobs = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
+
         // PR167: startup debounce min 250 ms; wall-clock sleep so the spawned flush reliably runs.
         tokio::time::sleep(Duration::from_millis(350)).await;
 
         assert_eq!(
             MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed),
-            batch0 + 1,
+            batch_after_jobs + 1,
             "expected a single batched Geyser subscription sync after coalesced trade-path updates"
         );
         assert_eq!(
@@ -14314,7 +14281,8 @@ mod pr_b_geyser_tracking_tests {
             compute_units_consumed: None,
             grpc_recv_at: Instant::now(),
         };
-        let (tx_deferred_tx, _) = mpsc::channel(16);
+        let (geyser_tracking_tx, geyser_tracking_queue_depth) =
+            spawn_geyser_tracking_actor(Arc::clone(&ctx));
         let done = tokio::time::timeout(
             std::time::Duration::from_millis(150),
             handle_geyser_transaction(
@@ -14323,7 +14291,8 @@ mod pr_b_geyser_tracking_tests {
                 tx_update,
                 &tx_count,
                 None,
-                &tx_deferred_tx,
+                &geyser_tracking_tx,
+                geyser_tracking_queue_depth.as_ref(),
             ),
         )
         .await;
@@ -14406,6 +14375,8 @@ mod pr_b_geyser_tracking_tests {
         );
 
         let account_count = AtomicU64::new(0);
+        let (geyser_tracking_tx, geyser_tracking_queue_depth) =
+            spawn_geyser_tracking_actor(Arc::clone(&ctx));
         let update = GeyserAccountUpdate {
             pubkey: pool,
             owner: super::PUMPFUN_AMM_PROGRAM_OWNER,
@@ -14421,6 +14392,8 @@ mod pr_b_geyser_tracking_tests {
             &account_count,
             Instant::now(),
             None,
+            &geyser_tracking_tx,
+            geyser_tracking_queue_depth.as_ref(),
         )
         .await;
 
@@ -14432,5 +14405,95 @@ mod pr_b_geyser_tracking_tests {
             }
             other => panic!("expected PumpAmm cache row, got {other:?}"),
         }
+    }
+
+    /// PR169a: parallel tracking enqueues are processed by the single-writer actor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr169a_geyser_tracking_actor_processes_parallel_enqueues() {
+        use ironcrab::metrics::MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (tracking_tx, tracking_depth) = spawn_geyser_tracking_actor(Arc::clone(&ctx));
+
+        let jobs0 = MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
+        for _ in 0..128 {
+            let mint = Pubkey::new_unique();
+            geyser_tracking_try_enqueue(
+                &tracking_tx,
+                tracking_depth.as_ref(),
+                GeyserTrackingCommand::TrackMint { mint, pin: None },
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let jobs1 = MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
+        assert!(
+            jobs1 >= jobs0 + 128,
+            "expected actor to process enqueued jobs (before={jobs0}, after={jobs1})"
+        );
+    }
+
+    /// PR169a: account-path vault register via actor — no immediate sync; batched after debounce.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr169a_register_pool_vaults_from_account_batches_sync() {
+        use ironcrab::metrics::{
+            MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL, MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_mint,
+                token_1_mint: quote,
+                token_0_vault: coin_vault,
+                token_1_vault: pc_vault,
+                reserve_0: None,
+                reserve_1: None,
+            }),
+            1,
+        );
+        ctx.active_pool_set.pin_pool(base_mint, pool);
+
+        let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
+        let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
+
+        let (tracking_tx, tracking_depth) = spawn_geyser_tracking_actor(Arc::clone(&ctx));
+        geyser_tracking_try_enqueue(
+            &tracking_tx,
+            tracking_depth.as_ref(),
+            GeyserTrackingCommand::RegisterPoolVaultsFromAccount { pool },
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let vs = ctx.tracked_vaults.read();
+        assert!(vs.contains_key(&coin_vault));
+        assert!(vs.contains_key(&pc_vault));
+        drop(vs);
+
+        assert_eq!(
+            MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed),
+            imm0,
+            "account-path vault register must not immediate-sync"
+        );
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(
+            MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed),
+            batch0 + 1,
+            "expected debounced batch sync after actor vault registration"
+        );
     }
 }

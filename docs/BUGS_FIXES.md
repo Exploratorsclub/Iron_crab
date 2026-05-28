@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PR169a-GEYSER-TRACKING-SINGLE-WRITER-ACTOR: Account + TX Path (Lock-Convoy Fix)
+**Datum**: 2026-05-28  
+**Problem** (Prod nach PR167): Startup-Burst mit **8 Account-Workern + TX-Task** mutiert parallel `tracked_vaults` / `tracked_mints` und ruft `sync_geyser_tracked_accounts()` auf → Lock-Convoy auf `MarketDataContext` → Tokio-Runtime tot (Global-Freeze-Symptom).  
+**Fix** (P169a, Account+TX only): (1) **`GeyserTrackingActor`** — ein FIFO-Worker (`MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP=8192`), einziger Writer für Tracking-Mutationen; nach Änderung nur `schedule_geyser_sync_batch_debounced()` (kein immediate sync auf Hot Path). (2) **Commands**: `RegisterReservesAfterTrade`, `RegisterPoolVaultsFromAccount`, `TrackMint`. (3) **Account-Pfad**: Vault-Register-Blöcke (Raydium CPMM, Meteora CPMM/DLMM, PumpAmm) → enqueue statt `tracked_vaults.write()` + sync im Handler. (4) **TX-Pfad**: PR167 `TxDeferredSideEffect`-Worker entfernt, in Actor gemerged. (5) `register_geyser_reserves_impl` ohne `GeyserReserveEndSync` am Ende (nur `changed` return). Metriken: `market_data_geyser_tracking_queue_depth`, `market_data_geyser_tracking_enqueue_dropped_total`, `market_data_geyser_tracking_jobs_processed_total`. **P169b** (Momentum/Wallet/Config wiring) bewusst ausgelassen. **Invarianten**: kein RPC (I-7), Geyser-first (I-4).  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### PR167-MARKET-DATA-GLOBAL-INGEST-FREEZE: Global Ingest Stall, Subscription Backpressure, Lock Scope
 **Datum**: 2026-05-28  
 **Problem** (Prod `fa27eea` nach PR165/166): ~3 s nach Restart **kompletter** Ingest-Tod — `tx_handler_processed`, `geyser_account_listener_account_updates`, `market_data_geyser_head_slot` alle still 15+ s; NATS-Trades 0; Kernel Geyser Recv-Q ~1,76 MB (Daten kommen, `stream.next()` pollt nicht), Send-Q ~2,10 MB (Subscription-Sink staut); 14× `subscription updated` in 3 s; `geyser_sync_pending=1`; PR166 TX-Watchdog blind (Head auch still). Ursache: Tokio-Runtime-Kollaps unter Startup-Burst — Lock-Convoy auf `MarketDataContext` + blockierendes `subscribe_tx.send().await` im Subscription-Updater.  
