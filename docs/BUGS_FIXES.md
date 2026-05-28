@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PR167-MARKET-DATA-GLOBAL-INGEST-FREEZE: Global Ingest Stall, Subscription Backpressure, Lock Scope
+**Datum**: 2026-05-28  
+**Problem** (Prod `fa27eea` nach PR165/166): ~3 s nach Restart **kompletter** Ingest-Tod — `tx_handler_processed`, `geyser_account_listener_account_updates`, `market_data_geyser_head_slot` alle still 15+ s; NATS-Trades 0; Kernel Geyser Recv-Q ~1,76 MB (Daten kommen, `stream.next()` pollt nicht), Send-Q ~2,10 MB (Subscription-Sink staut); 14× `subscription updated` in 3 s; `geyser_sync_pending=1`; PR166 TX-Watchdog blind (Head auch still). Ursache: Tokio-Runtime-Kollaps unter Startup-Burst — Lock-Convoy auf `MarketDataContext` + blockierendes `subscribe_tx.send().await` im Subscription-Updater.  
+**Fix**: (1) **Global Ingest Stall Detector** (10 s Sample, 120 s Grace, 50 s Stall): alle drei Counter flat → `market_data_global_ingest_stalls_total`, Reconnect **TX + Account** Session, danach `exit(1)`; ersetzt PR165 Tokio- + PR166 TX-only-Watchdogs. (2) **Subscription Sink**: coalesce (latest wins), Rate-Limit 400 ms, 2 s send-timeout → `HardReconnect` statt ewig await; Startup tracked-set jump >50 in 1 s → `SubscriptionRebuild`. (3) **Pin/Sync**: Startup-Debounce min 250 ms (120 s); deferred TX worker (reserve register + geyser sync schedule); Lock-Scope in TX-Handler (pool_mint_map write → drop → await). **Invarianten**: kein RPC (I-7), PR165/166/164 unangetastet (Watchdogs konsolidiert, nicht revertiert). **Bricht PR141–166 Symptom-Kreis** — strukturell, nicht weiterer partieller Watchdog.  
+**Dateien**: `src/bin/market_data.rs`, `src/solana/geyser_listener.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### PR166-MARKET-DATA-TX-INGEST-STALL: TX-Handler-Blockade, Payload-Liveness-Metriken, NATS-Noise-Policy
 **Datum**: 2026-05-28  
 **Problem** (Prod `0c04bac` nach PR165): `market_data_tx_channel_lag_ms_count` friert (~1128); `handle_geyser_transaction` verarbeitet keine weiteren TXs (`futex_wait_queue`); `geyser_tx_listener_transactions_total` steigt weiter (Zähler vor Payload-Check) → TX-Liveness-Reconnect greift nicht; `Parsed DEX transaction` / NATS `Trade` stoppen; Pool-Discovery/Account-Pfad lebt.  

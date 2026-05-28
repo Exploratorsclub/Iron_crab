@@ -50,15 +50,16 @@ use ironcrab::ipc::{
 use ironcrab::metrics::{
     dec_market_data_account_high_priority_queue_depth,
     dec_market_data_account_low_priority_queue_depth, dec_market_data_account_publish_queue_depth,
-    dec_market_data_account_worker_queue_depth, geyser_metrics_inc_tracked_evicted,
-    geyser_metrics_set_subscription_accounts, geyser_metrics_set_tracked_pinned_accounts,
-    inc_market_data_account_high_priority_queue_depth,
+    dec_market_data_account_worker_queue_depth, geyser_account_listener_account_updates_value,
+    geyser_metrics_inc_tracked_evicted, geyser_metrics_set_subscription_accounts,
+    geyser_metrics_set_tracked_pinned_accounts, inc_market_data_account_high_priority_queue_depth,
     inc_market_data_account_low_priority_queue_depth,
     inc_market_data_account_publish_enqueue_dropped_total,
     inc_market_data_account_publish_queue_depth, inc_market_data_account_worker_queue_depth,
-    inc_market_data_jsonl_enqueue_dropped_total, inc_market_data_unparsed_account_dropped_total,
-    inc_market_data_unparsed_tx_dropped_total, market_data_bump_geyser_head_slot,
-    market_data_geyser_head_slot_value, market_data_request_tx_session_reconnect,
+    inc_market_data_jsonl_enqueue_dropped_total, inc_market_data_tx_deferred_dropped_total,
+    inc_market_data_unparsed_account_dropped_total, inc_market_data_unparsed_tx_dropped_total,
+    market_data_bump_geyser_head_slot, market_data_geyser_head_slot_value,
+    market_data_request_account_session_reconnect, market_data_request_tx_session_reconnect,
     market_data_tx_handler_processed_value, record_market_data_account_broadcast_lagged,
     record_market_data_account_channel_lag_ms, record_market_data_account_early_drop_total,
     record_market_data_account_handler_duration_us,
@@ -69,22 +70,22 @@ use ironcrab::metrics::{
     record_market_data_bonding_to_trade_slot_delta_slots,
     record_market_data_geyser_merge_coalesced_total, record_market_data_geyser_sync_batch_total,
     record_market_data_geyser_sync_immediate_total,
-    record_market_data_geyser_to_publish_on_success,
+    record_market_data_geyser_to_publish_on_success, record_market_data_global_ingest_stall,
     record_market_data_momentum_active_pool_messages_total,
-    record_market_data_pool_mint_map_to_devwallet_ms, record_market_data_tokio_liveness_stall,
-    record_market_data_tokio_progress, record_market_data_trade_after_bonding_publish_ms,
-    record_market_data_tx_broadcast_lagged, record_market_data_tx_channel_lag_ms,
-    record_market_data_tx_handler_processed, record_market_data_tx_handler_stall, serve_metrics,
+    record_market_data_pool_mint_map_to_devwallet_ms, record_market_data_tokio_progress,
+    record_market_data_trade_after_bonding_publish_ms, record_market_data_tx_broadcast_lagged,
+    record_market_data_tx_channel_lag_ms, record_market_data_tx_handler_processed, serve_metrics,
     set_market_data_account_broadcast_queue_depth,
     set_market_data_account_publish_worker_last_success_unix_ms,
     set_market_data_geyser_merge_pending, set_market_data_geyser_sync_pending,
     set_market_data_momentum_active_pool_pins_gauge, set_market_data_tx_broadcast_queue_depth,
     set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
-    update_readiness_market_data_current, wall_clock_unix_ms_now, GeyserTrackedEvictKind,
-    MarketDataLatencySegment, MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
-    MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL,
-    MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
-    NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
+    touch_market_data_global_ingest_progress, update_readiness_market_data_current,
+    wall_clock_unix_ms_now, GeyserTrackedEvictKind, MarketDataLatencySegment, MetricsComponent,
+    MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS,
+    MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
+    MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
+    POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -128,6 +129,11 @@ static MD_SYSTEMD_WATCHDOG_NOTIFY: AtomicBool = AtomicBool::new(true);
 
 /// Default capacity for off-hot-path market-events JSONL queue.
 const MARKET_DATA_JSONL_QUEUE_CAP: usize = 16_384;
+/// PR167: bounded queue for deferred TX side-effects (reserve register, geyser sync schedule).
+const MARKET_DATA_TX_DEFERRED_QUEUE_CAP: usize = 4096;
+/// PR167: minimum debounce for explicit pin updates during startup burst (seconds).
+const MARKET_DATA_GEYSER_SYNC_STARTUP_WINDOW: Duration = Duration::from_secs(120);
+const MARKET_DATA_GEYSER_SYNC_STARTUP_MIN_MS: u64 = 250;
 
 /// ExecutionResult dedup: prevents replay storms from re-tracking the same ATA/mint over and over.
 ///
@@ -256,14 +262,47 @@ fn market_event_should_nats_core(kind: &MarketEventKind) -> bool {
     )
 }
 
-/// PR166: TX-handler liveness — chain head advanced but handler counter flat.
-fn market_data_tx_handler_liveness_stalled(
+/// PR167: global ingest stall — TX handler, account listener, and head slot all flat.
+fn market_data_global_ingest_stalled(
+    tx_now: u64,
+    tx_prev: u64,
+    account_now: u64,
+    account_prev: u64,
     head_now: u64,
     head_prev: u64,
-    handler_now: u64,
-    handler_prev: u64,
 ) -> bool {
-    head_now > head_prev && handler_now == handler_prev
+    tx_now == tx_prev && account_now == account_prev && head_now == head_prev
+}
+
+/// PR167: deferred TX side-effects (single FIFO worker — avoids lock convoy with account workers).
+enum TxDeferredSideEffect {
+    ScheduleGeyserSyncBatch,
+    RegisterReservesAfterTrade(Pubkey),
+}
+
+fn tx_deferred_try_enqueue(tx: &mpsc::Sender<TxDeferredSideEffect>, job: TxDeferredSideEffect) {
+    if tx.try_send(job).is_err() {
+        inc_market_data_tx_deferred_dropped_total();
+    }
+}
+
+fn spawn_market_data_tx_deferred_worker(
+    ctx: Arc<MarketDataContext>,
+) -> mpsc::Sender<TxDeferredSideEffect> {
+    let (tx, mut rx) = mpsc::channel(MARKET_DATA_TX_DEFERRED_QUEUE_CAP);
+    tokio::spawn(async move {
+        while let Some(job) = rx.recv().await {
+            match job {
+                TxDeferredSideEffect::ScheduleGeyserSyncBatch => {
+                    ctx.schedule_geyser_sync_batch_debounced();
+                }
+                TxDeferredSideEffect::RegisterReservesAfterTrade(pool) => {
+                    ctx.register_geyser_reserves_after_trade(pool);
+                }
+            }
+        }
+    });
+    tx
 }
 
 /// Optional Geyser→core-publish latency trace (same `recv_at` for all publishes from one Geyser message).
@@ -1435,8 +1474,18 @@ impl MarketDataContext {
         self.sync_geyser_tracked_accounts_core();
     }
 
+    /// PR167: longer debounce during startup pin burst (min 250 ms for first 120 s).
+    fn geyser_sync_batch_debounce_ms(&self) -> u64 {
+        let base = self.config.read().geyser_sync_batch_ms.clamp(10, 100);
+        if self.started_at.elapsed() < MARKET_DATA_GEYSER_SYNC_STARTUP_WINDOW {
+            base.max(MARKET_DATA_GEYSER_SYNC_STARTUP_MIN_MS)
+        } else {
+            base
+        }
+    }
+
     fn schedule_geyser_sync_batch_debounced(self: &Arc<Self>) {
-        let ms = self.config.read().geyser_sync_batch_ms.clamp(10, 100);
+        let ms = self.geyser_sync_batch_debounce_ms();
         set_market_data_geyser_sync_pending(1);
         let mut guard = self.geyser_sync_batch_timer.lock();
         if let Some(h) = guard.take() {
@@ -1463,7 +1512,7 @@ impl MarketDataContext {
         bin_arrays_rx: &watch::Receiver<Vec<Pubkey>>,
         wallet_rx: &watch::Receiver<Vec<Pubkey>>,
     ) {
-        let ms = ctx_merge.config.read().geyser_sync_batch_ms.clamp(10, 100);
+        let ms = ctx_merge.geyser_sync_batch_debounce_ms();
         set_market_data_geyser_merge_pending(1);
         let mut guard = debounce_timer.lock();
         if let Some(h) = guard.take() {
@@ -6552,8 +6601,7 @@ async fn main() -> Result<()> {
 
     record_market_data_tokio_progress();
     let process_started = Instant::now();
-    spawn_market_data_tokio_liveness_task(process_started);
-    spawn_market_data_tx_handler_liveness_task(process_started);
+    spawn_market_data_global_ingest_liveness_task(process_started);
 
     // Setup NATS (optional in dry-run mode)
     let nats = if args.dry_run {
@@ -7848,86 +7896,59 @@ fn spawn_market_data_metrics_runtime(addr: std::net::SocketAddr) {
         .expect("spawn md-metrics thread");
 }
 
-/// PR165: detect Tokio scheduler stall (OS-thread watchdog alone is insufficient).
-fn spawn_market_data_tokio_liveness_task(process_started: Instant) {
+/// PR167: detect global ingest stall (TX + account + head slot all frozen).
+fn spawn_market_data_global_ingest_liveness_task(process_started: Instant) {
     tokio::spawn(async move {
         const CHECK_INTERVAL: Duration = Duration::from_secs(10);
-        const STALL_THRESHOLD: Duration = Duration::from_secs(45);
+        const STALL_WINDOW: Duration = Duration::from_secs(50);
+        const RECOVERY_WAIT: Duration = Duration::from_secs(60);
         const STARTUP_GRACE: Duration = Duration::from_secs(120);
-        let mut last_tick =
-            ironcrab::metrics::MARKET_DATA_INGEST_PROGRESS_TICK.load(Ordering::Relaxed);
-        let mut last_ms =
-            ironcrab::metrics::MARKET_DATA_TOKIO_LAST_PROGRESS_UNIX_MS.load(Ordering::Relaxed);
-        let mut interval = tokio::time::interval(CHECK_INTERVAL);
-        loop {
-            interval.tick().await;
-            let tick = ironcrab::metrics::MARKET_DATA_INGEST_PROGRESS_TICK.load(Ordering::Relaxed);
-            let ms =
-                ironcrab::metrics::MARKET_DATA_TOKIO_LAST_PROGRESS_UNIX_MS.load(Ordering::Relaxed);
-            if tick != last_tick || ms != last_ms {
-                last_tick = tick;
-                last_ms = ms;
-                continue;
-            }
-            if process_started.elapsed() < STARTUP_GRACE {
-                continue;
-            }
-            record_market_data_tokio_liveness_stall();
-            error!(
-                stall_secs = STALL_THRESHOLD.as_secs(),
-                "PR165: Tokio ingest stalled — disabling systemd watchdog pings and exiting for Restart=always"
-            );
-            #[cfg(unix)]
-            MD_SYSTEMD_WATCHDOG_NOTIFY.store(false, Ordering::Relaxed);
-            std::process::exit(1);
-        }
-    });
-}
-
-/// PR166: detect TX ingest stall (head slot advances, `handle_geyser_transaction` counter frozen).
-fn spawn_market_data_tx_handler_liveness_task(process_started: Instant) {
-    tokio::spawn(async move {
-        const CHECK_INTERVAL: Duration = Duration::from_secs(10);
-        const STALL_WINDOW: Duration = Duration::from_secs(60);
-        const STARTUP_GRACE: Duration = Duration::from_secs(120);
+        let mut last_tx = market_data_tx_handler_processed_value();
+        let mut last_account = geyser_account_listener_account_updates_value();
         let mut last_head = market_data_geyser_head_slot_value();
-        let mut last_handler = market_data_tx_handler_processed_value();
         let mut stalled_since: Option<Instant> = None;
-        let mut reconnect_requested_at: Option<Instant> = None;
+        let mut recovery_requested_at: Option<Instant> = None;
         let mut interval = tokio::time::interval(CHECK_INTERVAL);
         loop {
             interval.tick().await;
             if process_started.elapsed() < STARTUP_GRACE {
+                last_tx = market_data_tx_handler_processed_value();
+                last_account = geyser_account_listener_account_updates_value();
                 last_head = market_data_geyser_head_slot_value();
-                last_handler = market_data_tx_handler_processed_value();
                 stalled_since = None;
-                reconnect_requested_at = None;
+                recovery_requested_at = None;
                 continue;
             }
+            let tx = market_data_tx_handler_processed_value();
+            let account = geyser_account_listener_account_updates_value();
             let head = market_data_geyser_head_slot_value();
-            let handler = market_data_tx_handler_processed_value();
-            let stalled =
-                market_data_tx_handler_liveness_stalled(head, last_head, handler, last_handler);
-            last_head = head;
-            last_handler = handler;
-            if stalled {
+            if market_data_global_ingest_stalled(
+                tx,
+                last_tx,
+                account,
+                last_account,
+                head,
+                last_head,
+            ) {
                 let since = *stalled_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= STALL_WINDOW {
-                    record_market_data_tx_handler_stall();
-                    if reconnect_requested_at.is_none() {
+                    record_market_data_global_ingest_stall();
+                    if recovery_requested_at.is_none() {
                         error!(
                             stall_secs = STALL_WINDOW.as_secs(),
+                            tx_handler_processed = tx,
+                            account_updates = account,
                             head_slot = head,
-                            tx_handler_processed = handler,
-                            "PR166: TX handler stalled — requesting Geyser TX session reconnect"
+                            "PR167: global ingest stalled — requesting Geyser TX + account session reconnect"
                         );
                         market_data_request_tx_session_reconnect();
-                        reconnect_requested_at = Some(Instant::now());
+                        market_data_request_account_session_reconnect();
+                        recovery_requested_at = Some(Instant::now());
                         stalled_since = None;
-                    } else if reconnect_requested_at.is_some_and(|t| t.elapsed() >= STALL_WINDOW) {
+                    } else if recovery_requested_at.is_some_and(|t| t.elapsed() >= RECOVERY_WAIT) {
                         error!(
-                            stall_secs = STALL_WINDOW.as_secs(),
-                            "PR166: TX handler still stalled after reconnect request — exiting for systemd restart"
+                            stall_secs = RECOVERY_WAIT.as_secs(),
+                            "PR167: global ingest still stalled after reconnect — exiting for systemd restart"
                         );
                         #[cfg(unix)]
                         MD_SYSTEMD_WATCHDOG_NOTIFY.store(false, Ordering::Relaxed);
@@ -7935,8 +7956,12 @@ fn spawn_market_data_tx_handler_liveness_task(process_started: Instant) {
                     }
                 }
             } else {
+                touch_market_data_global_ingest_progress();
                 stalled_since = None;
-                reconnect_requested_at = None;
+                recovery_requested_at = None;
+                last_tx = tx;
+                last_account = account;
+                last_head = head;
             }
         }
     });
@@ -9999,6 +10024,7 @@ async fn handle_geyser_transaction(
     tx_update: GeyserTransactionUpdate,
     tx_count: &AtomicU64,
     account_publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
+    tx_deferred_tx: &mpsc::Sender<TxDeferredSideEffect>,
 ) {
     record_market_data_tx_handler_processed();
     let recv_at = Instant::now();
@@ -10091,11 +10117,14 @@ async fn handle_geyser_transaction(
         if let Some((mint, dex_opt)) = mint_and_dex {
             let is_new = ctx.track_mint_for_geyser_metadata(mint, None);
             if is_new {
-                ctx.schedule_geyser_sync_batch_debounced();
+                tx_deferred_try_enqueue(
+                    tx_deferred_tx,
+                    TxDeferredSideEffect::ScheduleGeyserSyncBatch,
+                );
                 debug!(
                     mint = %mint,
                     dex = ?dex_opt,
-                    "New mint tracked for Geyser metadata (batched sync), waiting for mint account delivery"
+                    "New mint tracked for Geyser metadata (batched sync deferred), waiting for mint account delivery"
                 );
             }
         }
@@ -10108,17 +10137,21 @@ async fn handle_geyser_transaction(
                 dex: DexType::PumpFun,
                 ..
             } => {
-                ctx.pool_mint_map
-                    .write()
-                    .insert(pool_address.to_string(), base_mint.to_string());
-                ctx.high_priority_bonding_curves
-                    .write()
-                    .insert(*pool_address);
+                let pool_str = pool_address.to_string();
+                let mint_str = base_mint.to_string();
+                {
+                    ctx.pool_mint_map
+                        .write()
+                        .insert(pool_str.clone(), mint_str.clone());
+                    ctx.high_priority_bonding_curves
+                        .write()
+                        .insert(*pool_address);
+                }
                 maybe_emit_dev_wallet_after_pool_mint_map(
                     &ctx,
                     run_id,
                     pool_address,
-                    &base_mint.to_string(),
+                    &mint_str,
                     Some(tx_update.slot),
                     tx_update.grpc_recv_at,
                     account_publish_tx,
@@ -10132,17 +10165,21 @@ async fn handle_geyser_transaction(
                 dex: DexType::PumpFun,
                 ..
             } => {
-                ctx.pool_mint_map
-                    .write()
-                    .insert(pool_address.to_string(), mint.to_string());
-                ctx.high_priority_bonding_curves
-                    .write()
-                    .insert(*pool_address);
+                let pool_str = pool_address.to_string();
+                let mint_str = mint.to_string();
+                {
+                    ctx.pool_mint_map
+                        .write()
+                        .insert(pool_str.clone(), mint_str.clone());
+                    ctx.high_priority_bonding_curves
+                        .write()
+                        .insert(*pool_address);
+                }
                 maybe_emit_dev_wallet_after_pool_mint_map(
                     &ctx,
                     run_id,
                     pool_address,
-                    &mint.to_string(),
+                    &mint_str,
                     Some(tx_update.slot),
                     tx_update.grpc_recv_at,
                     account_publish_tx,
@@ -10157,7 +10194,10 @@ async fn handle_geyser_transaction(
     // PR-B: qualifying swap trade — refresh LRU timestamps and register reserve vaults / DLMM bins.
     if let Some(ParsedDexEvent::Trade { pool_address, .. }) = parsed_event.as_ref() {
         ctx.touch_tracked_pool_vaults_and_bins_if_tracked(*pool_address);
-        ctx.register_geyser_reserves_after_trade(*pool_address);
+        tx_deferred_try_enqueue(
+            tx_deferred_tx,
+            TxDeferredSideEffect::RegisterReservesAfterTrade(*pool_address),
+        );
     }
 
     // Pump.fun: propagate creator/dev wallet so strategy can build deterministic intents.
@@ -10916,6 +10956,9 @@ async fn run_geyser_loop(
             spawn_market_data_account_publish_runtime(Arc::clone(&ctx), template, n_workers)
         });
 
+    // PR167: single-worker deferred side-effects (reserve register, geyser sync schedule).
+    let tx_deferred_tx = spawn_market_data_tx_deferred_worker(Arc::clone(&ctx));
+
     // Option A (MARKET-DATA-TX-INGEST-FAIRNESS): dedizierter Tokio-Task für Geyser-Txs.
     // Verhindert, dass `transaction_rx.recv()` hinter langen Account-`select!`-Armen verhungert
     // (p50 `market_data_tx_channel_lag_ms` war ~1s+ bei gleichzeitig niedrigem Publish-Tail).
@@ -10924,6 +10967,7 @@ async fn run_geyser_loop(
     let run_id_geyser_tx = run_id.to_string();
     let tx_count_geyser_tx = Arc::clone(&tx_count);
     let account_publish_tx_geyser_tx = account_publish_tx.clone();
+    let tx_deferred_tx_geyser = tx_deferred_tx.clone();
     let mut transaction_rx_geyser = transaction_rx;
     tokio::spawn(async move {
         loop {
@@ -10936,6 +10980,7 @@ async fn run_geyser_loop(
                         tx_update,
                         tx_count_geyser_tx.as_ref(),
                         account_publish_tx_geyser_tx.as_ref(),
+                        &tx_deferred_tx_geyser,
                     )
                     .await;
                 }
@@ -14061,8 +14106,8 @@ mod pr_b_geyser_tracking_tests {
             "trade-path reserve registration must not immediate-sync before debounce flush"
         );
 
-        // Debounce window default 35 ms; wall-clock sleep so the spawned flush reliably runs.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // PR167: startup debounce min 250 ms; wall-clock sleep so the spawned flush reliably runs.
+        tokio::time::sleep(Duration::from_millis(350)).await;
 
         assert_eq!(
             MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed),
@@ -14120,7 +14165,7 @@ mod pr_b_geyser_tracking_tests {
             let _ = ctx.tracked_mints_tx.send(vec![pk]);
         }
 
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
 
         let n = combined_change_count.load(Ordering::Relaxed);
         assert!(
@@ -14195,10 +14240,20 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
-    fn pr166_tx_handler_liveness_stall_detection() {
-        assert!(market_data_tx_handler_liveness_stalled(100, 90, 5, 5));
-        assert!(!market_data_tx_handler_liveness_stalled(100, 100, 5, 5));
-        assert!(!market_data_tx_handler_liveness_stalled(100, 90, 5, 6));
+    fn pr167_global_ingest_stall_detection() {
+        assert!(market_data_global_ingest_stalled(5, 5, 10, 10, 100, 100));
+        assert!(!market_data_global_ingest_stalled(5, 5, 10, 11, 100, 100));
+        assert!(!market_data_global_ingest_stalled(5, 6, 10, 10, 100, 100));
+        assert!(!market_data_global_ingest_stalled(5, 5, 10, 10, 100, 101));
+    }
+
+    #[test]
+    fn pr167_geyser_sync_startup_debounce_ms() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        assert!(ctx.geyser_sync_batch_debounce_ms() >= MARKET_DATA_GEYSER_SYNC_STARTUP_MIN_MS);
     }
 
     #[test]
@@ -14259,9 +14314,17 @@ mod pr_b_geyser_tracking_tests {
             compute_units_consumed: None,
             grpc_recv_at: Instant::now(),
         };
+        let (tx_deferred_tx, _) = mpsc::channel(16);
         let done = tokio::time::timeout(
             std::time::Duration::from_millis(150),
-            handle_geyser_transaction(ctx, "run-pr166", tx_update, &tx_count, None),
+            handle_geyser_transaction(
+                ctx,
+                "run-pr166",
+                tx_update,
+                &tx_count,
+                None,
+                &tx_deferred_tx,
+            ),
         )
         .await;
         assert!(
