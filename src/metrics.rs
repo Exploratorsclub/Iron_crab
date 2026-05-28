@@ -435,8 +435,12 @@ pub fn geyser_metrics_set_account_session_connected(connected: bool) {
 }
 
 #[inline]
-pub fn geyser_metrics_inc_tx_listener_payload_broadcast_total() {
+pub fn geyser_metrics_inc_tx_listener_transactions_total() {
     GEYSER_TX_LISTENER_TRANSACTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn geyser_metrics_inc_tx_listener_payload_broadcast_total() {
     GEYSER_TX_LISTENER_PAYLOAD_BROADCAST_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 

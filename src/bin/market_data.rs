@@ -14216,10 +14216,12 @@ mod pr_b_geyser_tracking_tests {
     fn pr166_geyser_tx_payload_broadcast_increments_listener_counters() {
         use ironcrab::metrics::{
             geyser_metrics_inc_tx_listener_payload_broadcast_total,
+            geyser_metrics_inc_tx_listener_transactions_total,
             GEYSER_TX_LISTENER_PAYLOAD_BROADCAST_TOTAL, GEYSER_TX_LISTENER_TRANSACTIONS_TOTAL,
         };
         let tx0 = GEYSER_TX_LISTENER_TRANSACTIONS_TOTAL.load(Ordering::Relaxed);
         let payload0 = GEYSER_TX_LISTENER_PAYLOAD_BROADCAST_TOTAL.load(Ordering::Relaxed);
+        geyser_metrics_inc_tx_listener_transactions_total();
         geyser_metrics_inc_tx_listener_payload_broadcast_total();
         assert_eq!(
             GEYSER_TX_LISTENER_TRANSACTIONS_TOTAL.load(Ordering::Relaxed),

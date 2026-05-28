@@ -40,6 +40,7 @@ use crate::metrics::{
     geyser_metrics_inc_stream_error, geyser_metrics_inc_tracked_cuckoo_table_full,
     geyser_metrics_inc_tx_listener_liveness_reconnect_total,
     geyser_metrics_inc_tx_listener_payload_broadcast_total,
+    geyser_metrics_inc_tx_listener_transactions_total,
     geyser_metrics_set_account_session_connected, geyser_metrics_set_tx_session_connected,
     market_data_geyser_head_slot_value, market_data_take_tx_session_reconnect_request,
     market_data_tx_handler_processed_value, GeyserReconnectReason,
@@ -440,6 +441,7 @@ impl GeyserTxListener {
                                     if let Some(update) = msg.update_oneof {
                                         match update {
                                             UpdateOneof::Transaction(tx_update) => {
+                                                geyser_metrics_inc_tx_listener_transactions_total();
                                                 transaction_count = transaction_count.saturating_add(1);
                                                 if let Some(tx) = tx_update.transaction {
                                                     seen_tx_since_connect = true;
