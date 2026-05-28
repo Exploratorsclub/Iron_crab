@@ -281,7 +281,6 @@ enum GeyserTrackingCommand {
     RegisterPoolVaultsFromAccount {
         pool: Pubkey,
     },
-    #[allow(dead_code)] // PR169a tests; non-TX paths use inline `track_mint_for_geyser_metadata`
     TrackMint {
         mint: Pubkey,
         pin: Option<GeyserPinReason>,
@@ -1925,13 +1924,16 @@ impl MarketDataContext {
         let Some(cached_state) = self.live_pool_cache.get(&pool) else {
             return false;
         };
-        let cfg = self.config.read();
+        let (enable_meteora_cpmm, enable_meteora_dlmm) = {
+            let cfg = self.config.read();
+            (cfg.enable_meteora_cpmm, cfg.enable_meteora_dlmm)
+        };
         self.register_four_dex_pool_vaults_from_cached_state(
             pool,
             &cached_state,
             Instant::now(),
-            cfg.enable_meteora_cpmm,
-            cfg.enable_meteora_dlmm,
+            enable_meteora_cpmm,
+            enable_meteora_dlmm,
             true,
         )
     }
@@ -9864,15 +9866,16 @@ async fn handle_geyser_transaction(
             ParsedDexEvent::BondingCurveUpdate { .. } => None, // Handled separately in account update
         };
         if let Some((mint, dex_opt)) = mint_and_dex {
-            let is_new = ctx.track_mint_for_geyser_metadata(mint, None);
-            if is_new {
-                ctx.schedule_geyser_sync_batch_debounced();
-                debug!(
-                    mint = %mint,
-                    dex = ?dex_opt,
-                    "New mint tracked for Geyser metadata (batched sync deferred), waiting for mint account delivery"
-                );
-            }
+            geyser_tracking_try_enqueue(
+                geyser_tracking_tx,
+                geyser_tracking_queue_depth,
+                GeyserTrackingCommand::TrackMint { mint, pin: None },
+            );
+            debug!(
+                mint = %mint,
+                dex = ?dex_opt,
+                "Mint track enqueued for Geyser metadata (batched sync via actor), waiting for mint account delivery"
+            );
         }
 
         // Build pool_mint_map for PumpFun (needed for BondingCurveUpdate -> creator lookup)
