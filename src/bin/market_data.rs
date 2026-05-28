@@ -56,9 +56,12 @@ use ironcrab::metrics::{
     inc_market_data_account_low_priority_queue_depth,
     inc_market_data_account_publish_enqueue_dropped_total,
     inc_market_data_account_publish_queue_depth, inc_market_data_account_worker_queue_depth,
-    inc_market_data_jsonl_enqueue_dropped_total, market_data_bump_geyser_head_slot,
-    record_market_data_account_broadcast_lagged, record_market_data_account_channel_lag_ms,
-    record_market_data_account_early_drop_total, record_market_data_account_handler_duration_us,
+    inc_market_data_jsonl_enqueue_dropped_total, inc_market_data_unparsed_account_dropped_total,
+    inc_market_data_unparsed_tx_dropped_total, market_data_bump_geyser_head_slot,
+    market_data_geyser_head_slot_value, market_data_request_tx_session_reconnect,
+    market_data_tx_handler_processed_value, record_market_data_account_broadcast_lagged,
+    record_market_data_account_channel_lag_ms, record_market_data_account_early_drop_total,
+    record_market_data_account_handler_duration_us,
     record_market_data_account_publish_worker_job_duration_us,
     record_market_data_account_publish_worker_reconnect,
     record_market_data_account_publish_worker_stall,
@@ -70,7 +73,8 @@ use ironcrab::metrics::{
     record_market_data_momentum_active_pool_messages_total,
     record_market_data_pool_mint_map_to_devwallet_ms, record_market_data_tokio_liveness_stall,
     record_market_data_tokio_progress, record_market_data_trade_after_bonding_publish_ms,
-    record_market_data_tx_broadcast_lagged, record_market_data_tx_channel_lag_ms, serve_metrics,
+    record_market_data_tx_broadcast_lagged, record_market_data_tx_channel_lag_ms,
+    record_market_data_tx_handler_processed, record_market_data_tx_handler_stall, serve_metrics,
     set_market_data_account_broadcast_queue_depth,
     set_market_data_account_publish_worker_last_success_unix_ms,
     set_market_data_geyser_merge_pending, set_market_data_geyser_sync_pending,
@@ -244,6 +248,24 @@ fn market_event_should_jsonl(kind: &MarketEventKind) -> bool {
     )
 }
 
+/// PR166: raw Geyser fallback kinds excluded from core NATS (strategies use derived events only).
+fn market_event_should_nats_core(kind: &MarketEventKind) -> bool {
+    !matches!(
+        kind,
+        MarketEventKind::AccountUpdate { .. } | MarketEventKind::TransactionDetected { .. }
+    )
+}
+
+/// PR166: TX-handler liveness — chain head advanced but handler counter flat.
+fn market_data_tx_handler_liveness_stalled(
+    head_now: u64,
+    head_prev: u64,
+    handler_now: u64,
+    handler_prev: u64,
+) -> bool {
+    head_now > head_prev && handler_now == handler_prev
+}
+
 /// Optional Geyser→core-publish latency trace (same `recv_at` for all publishes from one Geyser message).
 #[derive(Clone, Copy)]
 pub(crate) struct MarketEventCorePublishTrace {
@@ -273,6 +295,9 @@ pub(crate) async fn publish_market_event_core_and_momentum_ex(
     trace: Option<MarketEventCorePublishTrace>,
     ctx: Option<&MarketDataContext>,
 ) -> bool {
+    if !market_event_should_nats_core(&event.kind) {
+        return false;
+    }
     match nats.publish(TOPIC_MARKET_EVENTS, event).await {
         Ok(true) => {
             NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -6528,6 +6553,7 @@ async fn main() -> Result<()> {
     record_market_data_tokio_progress();
     let process_started = Instant::now();
     spawn_market_data_tokio_liveness_task(process_started);
+    spawn_market_data_tx_handler_liveness_task(process_started);
 
     // Setup NATS (optional in dry-run mode)
     let nats = if args.dry_run {
@@ -7858,6 +7884,64 @@ fn spawn_market_data_tokio_liveness_task(process_started: Instant) {
     });
 }
 
+/// PR166: detect TX ingest stall (head slot advances, `handle_geyser_transaction` counter frozen).
+fn spawn_market_data_tx_handler_liveness_task(process_started: Instant) {
+    tokio::spawn(async move {
+        const CHECK_INTERVAL: Duration = Duration::from_secs(10);
+        const STALL_WINDOW: Duration = Duration::from_secs(60);
+        const STARTUP_GRACE: Duration = Duration::from_secs(120);
+        let mut last_head = market_data_geyser_head_slot_value();
+        let mut last_handler = market_data_tx_handler_processed_value();
+        let mut stalled_since: Option<Instant> = None;
+        let mut reconnect_requested_at: Option<Instant> = None;
+        let mut interval = tokio::time::interval(CHECK_INTERVAL);
+        loop {
+            interval.tick().await;
+            if process_started.elapsed() < STARTUP_GRACE {
+                last_head = market_data_geyser_head_slot_value();
+                last_handler = market_data_tx_handler_processed_value();
+                stalled_since = None;
+                reconnect_requested_at = None;
+                continue;
+            }
+            let head = market_data_geyser_head_slot_value();
+            let handler = market_data_tx_handler_processed_value();
+            let stalled =
+                market_data_tx_handler_liveness_stalled(head, last_head, handler, last_handler);
+            last_head = head;
+            last_handler = handler;
+            if stalled {
+                let since = *stalled_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= STALL_WINDOW {
+                    record_market_data_tx_handler_stall();
+                    if reconnect_requested_at.is_none() {
+                        error!(
+                            stall_secs = STALL_WINDOW.as_secs(),
+                            head_slot = head,
+                            tx_handler_processed = handler,
+                            "PR166: TX handler stalled — requesting Geyser TX session reconnect"
+                        );
+                        market_data_request_tx_session_reconnect();
+                        reconnect_requested_at = Some(Instant::now());
+                        stalled_since = None;
+                    } else if reconnect_requested_at.is_some_and(|t| t.elapsed() >= STALL_WINDOW) {
+                        error!(
+                            stall_secs = STALL_WINDOW.as_secs(),
+                            "PR166: TX handler still stalled after reconnect request — exiting for systemd restart"
+                        );
+                        #[cfg(unix)]
+                        MD_SYSTEMD_WATCHDOG_NOTIFY.store(false, Ordering::Relaxed);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                stalled_since = None;
+                reconnect_requested_at = None;
+            }
+        }
+    });
+}
+
 /// PR160: isolated publish thread + multi-worker Tokio (no NATS await on main Geyser runtime).
 fn spawn_market_data_account_publish_runtime(
     ctx: Arc<MarketDataContext>,
@@ -8189,6 +8273,9 @@ async fn account_path_enqueue_core_market_event(
     event: MarketEvent,
     trace: Option<MarketEventCorePublishTrace>,
 ) -> bool {
+    if !market_event_should_nats_core(&event.kind) {
+        return false;
+    }
     if let Some(tx) = publish_tx {
         let event_id = event.event_id.clone();
         let job = AccountPathNatsJob::CoreMarketEvent {
@@ -9866,17 +9953,13 @@ async fn handle_geyser_account(
         return;
     }
 
-    let event_kind = if let Some(parsed) = parsed {
-        debug!(slot = account_update.slot, "Parsed DEX account update");
-        parsed.to_market_event_kind()
-    } else {
-        // Fallback to raw event for unknown accounts
-        MarketEventKind::AccountUpdate {
-            pubkey: account_update.pubkey.to_string(),
-            owner: account_update.owner.to_string(),
-            data_len: account_update.data.len(),
-        }
+    let Some(parsed) = parsed else {
+        inc_market_data_unparsed_account_dropped_total();
+        return;
     };
+
+    debug!(slot = account_update.slot, "Parsed DEX account update");
+    let event_kind = parsed.to_market_event_kind();
 
     let event = MarketEvent::new(
         "market-data",
@@ -9917,12 +10000,12 @@ async fn handle_geyser_transaction(
     tx_count: &AtomicU64,
     account_publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
 ) {
+    record_market_data_tx_handler_processed();
     let recv_at = Instant::now();
     record_market_data_tx_channel_lag_ms(tx_update.grpc_recv_at, recv_at);
     let tx_geyser_recv_at = recv_at;
     market_data_bump_geyser_head_slot(tx_update.slot);
     tx_count.fetch_add(1, Ordering::Relaxed);
-    record_market_data_tokio_progress();
     ironcrab::metrics::record_activity();
 
     // Phase 2 (Roadmap, Option C):
@@ -10008,11 +10091,11 @@ async fn handle_geyser_transaction(
         if let Some((mint, dex_opt)) = mint_and_dex {
             let is_new = ctx.track_mint_for_geyser_metadata(mint, None);
             if is_new {
-                ctx.sync_geyser_tracked_accounts();
+                ctx.schedule_geyser_sync_batch_debounced();
                 debug!(
                     mint = %mint,
                     dex = ?dex_opt,
-                    "New mint tracked for Geyser metadata, waiting for mint account delivery"
+                    "New mint tracked for Geyser metadata (batched sync), waiting for mint account delivery"
                 );
             }
         }
@@ -10515,76 +10598,52 @@ async fn handle_geyser_transaction(
         }
     }
 
-    let event_kind = if let Some(parsed) = parsed_event {
-        info!(
-            slot = tx_update.slot,
-            sig = %tx_update.signature,
-            "Parsed DEX transaction"
-        );
-        let mut kind = parsed.to_market_event_kind();
+    let Some(parsed) = parsed_event else {
+        inc_market_data_unparsed_tx_dropped_total();
+        return;
+    };
 
-        // Enrich Trade events with creator from cache (P0: PumpFun intent building)
-        if let MarketEventKind::Trade {
-            ref pool_address,
-            ref mint,
-            ref dex,
-            ref mut creator,
-            ..
-        } = kind
-        {
-            if dex == "pumpfun" || dex == "pump_amm" {
-                // Try creator_cache first (mint -> creator)
-                let mut found_creator = None;
-                {
-                    let cache = ctx.creator_cache.read();
-                    if let Some(cached_creator) = cache.get(mint) {
-                        found_creator = Some(cached_creator.clone());
-                    }
-                }
+    info!(
+        slot = tx_update.slot,
+        sig = %tx_update.signature,
+        "Parsed DEX transaction"
+    );
+    let mut kind = parsed.to_market_event_kind();
 
-                // Fallback to pool_creator_cache (pool -> creator) from BondingCurveUpdate
-                if found_creator.is_none() {
-                    let pool_cache = ctx.pool_creator_cache.read();
-                    if let Some(pool_creator) = pool_cache.get(pool_address) {
-                        found_creator = Some(pool_creator.clone());
-
-                        // Also populate creator_cache for future lookups
-                        drop(pool_cache);
-                        ctx.creator_cache
-                            .write()
-                            .insert(mint.clone(), found_creator.clone().unwrap());
-                        debug!(
-                            mint = %mint,
-                            pool = %pool_address,
-                            creator = %found_creator.as_ref().unwrap(),
-                            "Populated creator_cache from pool_creator_cache"
-                        );
-                    }
-                }
-
-                if let Some(cached_creator) = found_creator {
-                    *creator = Some(cached_creator.clone());
-                    debug!(
-                        mint = %mint,
-                        dex = %dex,
-                        creator = %cached_creator,
-                        "Enriched Trade event with cached creator"
-                    );
+    // Enrich Trade events with creator from cache (P0: PumpFun intent building)
+    if let MarketEventKind::Trade {
+        ref pool_address,
+        ref mint,
+        ref dex,
+        ref mut creator,
+        ..
+    } = kind
+    {
+        if dex == "pumpfun" || dex == "pump_amm" {
+            let mut found_creator = None;
+            {
+                let cache = ctx.creator_cache.read();
+                if let Some(cached_creator) = cache.get(mint) {
+                    found_creator = Some(cached_creator.clone());
                 }
             }
+            if found_creator.is_none() {
+                let pool_cache = ctx.pool_creator_cache.read();
+                if let Some(pool_creator) = pool_cache.get(pool_address) {
+                    found_creator = Some(pool_creator.clone());
+                    drop(pool_cache);
+                    ctx.creator_cache
+                        .write()
+                        .insert(mint.clone(), found_creator.clone().unwrap());
+                }
+            }
+            if let Some(cached_creator) = found_creator {
+                *creator = Some(cached_creator.clone());
+            }
         }
-        kind
-    } else {
-        // Fallback to raw event for unknown transactions
-        MarketEventKind::TransactionDetected {
-            signature: tx_update.signature.clone(),
-            program: tx_update
-                .account_keys
-                .first()
-                .map(|k| k.to_string())
-                .unwrap_or_default(),
-        }
-    };
+    }
+
+    let event_kind = kind;
 
     let event = MarketEvent::new(
         "market-data",
@@ -14102,6 +14161,114 @@ mod pr_b_geyser_tracking_tests {
             MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed),
             batch0
         );
+    }
+
+    #[test]
+    fn pr166_nats_core_skips_high_volume_noise_kinds() {
+        assert!(!market_event_should_nats_core(
+            &MarketEventKind::AccountUpdate {
+                pubkey: "x".into(),
+                owner: "y".into(),
+                data_len: 0,
+            }
+        ));
+        assert!(!market_event_should_nats_core(
+            &MarketEventKind::TransactionDetected {
+                signature: "sig".into(),
+                program: "prog".into(),
+            }
+        ));
+        assert!(market_event_should_nats_core(&MarketEventKind::Trade {
+            pool_address: "p".into(),
+            mint: "m".into(),
+            quote_mint: NATIVE_SOL_MINT.to_string(),
+            trader: "t".into(),
+            is_buy: true,
+            sol_amount: 1,
+            token_amount: 1,
+            token_decimals: 6,
+            signature: None,
+            dex: "pumpfun".into(),
+            creator: None,
+            token_program: None,
+        }));
+    }
+
+    #[test]
+    fn pr166_tx_handler_liveness_stall_detection() {
+        assert!(market_data_tx_handler_liveness_stalled(100, 90, 5, 5));
+        assert!(!market_data_tx_handler_liveness_stalled(100, 100, 5, 5));
+        assert!(!market_data_tx_handler_liveness_stalled(100, 90, 5, 6));
+    }
+
+    #[test]
+    fn pr166_tx_handler_processed_metric_advances() {
+        use ironcrab::metrics::{
+            record_market_data_tx_handler_processed, MARKET_DATA_TX_HANDLER_PROCESSED_TOTAL,
+        };
+        let before = MARKET_DATA_TX_HANDLER_PROCESSED_TOTAL.load(Ordering::Relaxed);
+        record_market_data_tx_handler_processed();
+        assert!(MARKET_DATA_TX_HANDLER_PROCESSED_TOTAL.load(Ordering::Relaxed) > before);
+    }
+
+    #[test]
+    fn pr166_geyser_tx_payload_broadcast_increments_listener_counters() {
+        use ironcrab::metrics::{
+            geyser_metrics_inc_tx_listener_payload_broadcast_total,
+            geyser_metrics_inc_tx_listener_transactions_total,
+            GEYSER_TX_LISTENER_PAYLOAD_BROADCAST_TOTAL, GEYSER_TX_LISTENER_TRANSACTIONS_TOTAL,
+        };
+        let tx0 = GEYSER_TX_LISTENER_TRANSACTIONS_TOTAL.load(Ordering::Relaxed);
+        let payload0 = GEYSER_TX_LISTENER_PAYLOAD_BROADCAST_TOTAL.load(Ordering::Relaxed);
+        geyser_metrics_inc_tx_listener_transactions_total();
+        geyser_metrics_inc_tx_listener_payload_broadcast_total();
+        assert_eq!(
+            GEYSER_TX_LISTENER_TRANSACTIONS_TOTAL.load(Ordering::Relaxed),
+            tx0 + 1
+        );
+        assert_eq!(
+            GEYSER_TX_LISTENER_PAYLOAD_BROADCAST_TOTAL.load(Ordering::Relaxed),
+            payload0 + 1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr166_tx_handler_not_blocked_by_pool_mint_map_write_lock() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let lock_ctx = Arc::clone(&ctx);
+        let hold = tokio::task::spawn_blocking(move || {
+            let _guard = lock_ctx.pool_mint_map.write();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        let tx_count = AtomicU64::new(0);
+        let tx_update = GeyserTransactionUpdate {
+            signature: "sig".into(),
+            slot: 1,
+            account_keys: vec![],
+            instruction_accounts: vec![],
+            instruction_data: vec![],
+            inner_instructions: vec![],
+            pre_token_balances: vec![],
+            post_token_balances: vec![],
+            pre_balances: vec![],
+            post_balances: vec![],
+            fee_lamports: 0,
+            compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
+        };
+        let done = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            handle_geyser_transaction(ctx, "run-pr166", tx_update, &tx_count, None),
+        )
+        .await;
+        assert!(
+            done.is_ok(),
+            "TX handler must not block on pool_mint_map write lock"
+        );
+        let _ = hold.await;
     }
 
     #[test]
