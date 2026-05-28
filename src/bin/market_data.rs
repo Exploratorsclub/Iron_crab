@@ -281,6 +281,7 @@ enum GeyserTrackingCommand {
     RegisterPoolVaultsFromAccount {
         pool: Pubkey,
     },
+    #[allow(dead_code)] // PR169a tests; non-TX paths use inline `track_mint_for_geyser_metadata`
     TrackMint {
         mint: Pubkey,
         pin: Option<GeyserPinReason>,
@@ -1195,6 +1196,75 @@ fn pool_mints_for_geyser_explicit_tracking(state: &CachedPoolState) -> Option<(P
     }
 }
 
+/// CPMM pool cache rows: normalize base/quote mints and vault ATAs (SOL as quote when present).
+fn cpmm_token_mints_and_vaults_sol_normalized(
+    token_0_mint: Pubkey,
+    token_1_mint: Pubkey,
+    token_0_vault: Pubkey,
+    token_1_vault: Pubkey,
+) -> (Pubkey, Pubkey, Pubkey, Pubkey) {
+    let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+    if token_1_mint == sol {
+        (token_0_mint, token_1_mint, token_0_vault, token_1_vault)
+    } else if token_0_mint == sol {
+        (token_1_mint, token_0_mint, token_1_vault, token_0_vault)
+    } else {
+        (token_0_mint, token_1_mint, token_0_vault, token_1_vault)
+    }
+}
+
+struct TrackedVaultPairInsert<'a> {
+    pool: Pubkey,
+    now: Instant,
+    dex: &'a str,
+    base_mint: Pubkey,
+    quote_mint: Pubkey,
+    base_vault: Pubkey,
+    quote_vault: Pubkey,
+    active_id: Option<i32>,
+    bin_step: Option<u16>,
+}
+
+fn insert_tracked_vault_pair(
+    vaults: &mut std::collections::HashMap<Pubkey, VaultInfo>,
+    vaults_changed: &mut bool,
+    spec: TrackedVaultPairInsert<'_>,
+) {
+    let dex_str = spec.dex.to_string();
+    vaults.entry(spec.base_vault).or_insert_with(|| {
+        *vaults_changed = true;
+        VaultInfo {
+            pool_address: spec.pool,
+            dex: dex_str.clone(),
+            base_mint: spec.base_mint,
+            quote_mint: spec.quote_mint,
+            is_base_vault: true,
+            last_balance: std::sync::atomic::AtomicU64::new(0),
+            last_used_at: spec.now,
+            pinned: false,
+            pin: None,
+            active_id: spec.active_id,
+            bin_step: spec.bin_step,
+        }
+    });
+    vaults.entry(spec.quote_vault).or_insert_with(|| {
+        *vaults_changed = true;
+        VaultInfo {
+            pool_address: spec.pool,
+            dex: dex_str,
+            base_mint: spec.base_mint,
+            quote_mint: spec.quote_mint,
+            is_base_vault: false,
+            last_balance: std::sync::atomic::AtomicU64::new(0),
+            last_used_at: spec.now,
+            pinned: false,
+            pin: None,
+            active_id: spec.active_id,
+            bin_step: spec.bin_step,
+        }
+    });
+}
+
 impl MarketDataContext {
     /// Non-blocking JSONL enqueue (dedicated `jsonl-writer` thread). Skips `AccountUpdate` / `TransactionDetected`.
     fn write_market_event_jsonl(&self, event: &MarketEvent) {
@@ -1727,222 +1797,142 @@ impl MarketDataContext {
         self.register_geyser_reserves_impl(pool, follow_up)
     }
 
+    /// RaydiumCpmm / MeteoraCpmm / Meteora DLMM / PumpAmm vault rows from a MASTER cache entry.
+    /// When `require_explicit_admit` is set, only pools passing [`Self::admit_geyser_explicit_pool_assets`].
+    fn register_four_dex_pool_vaults_from_cached_state(
+        &self,
+        pool: Pubkey,
+        cached_state: &CachedPoolState,
+        now: Instant,
+        enable_meteora_cpmm: bool,
+        enable_meteora_dlmm: bool,
+        require_explicit_admit: bool,
+    ) -> bool {
+        let mut vaults_changed = false;
+        let admit = |base_mint: Pubkey, quote_mint: Pubkey| -> bool {
+            !require_explicit_admit
+                || self.admit_geyser_explicit_pool_assets(pool, base_mint, quote_mint)
+        };
+
+        if let CachedPoolState::RaydiumCpmm(s) = cached_state {
+            let (base_mint_v, quote_mint_v, base_vault, quote_vault) =
+                cpmm_token_mints_and_vaults_sol_normalized(
+                    s.token_0_mint,
+                    s.token_1_mint,
+                    s.token_0_vault,
+                    s.token_1_vault,
+                );
+            if admit(base_mint_v, quote_mint_v) {
+                let mut vaults = self.tracked_vaults.write();
+                insert_tracked_vault_pair(
+                    &mut vaults,
+                    &mut vaults_changed,
+                    TrackedVaultPairInsert {
+                        pool,
+                        now,
+                        dex: "raydium_cpmm",
+                        base_mint: base_mint_v,
+                        quote_mint: quote_mint_v,
+                        base_vault,
+                        quote_vault,
+                        active_id: None,
+                        bin_step: None,
+                    },
+                );
+            }
+        }
+
+        if enable_meteora_cpmm {
+            if let CachedPoolState::MeteoraCpmm(s) = cached_state {
+                let (base_mint_v, quote_mint_v, base_vault, quote_vault) =
+                    cpmm_token_mints_and_vaults_sol_normalized(
+                        s.token_0_mint,
+                        s.token_1_mint,
+                        s.token_0_vault,
+                        s.token_1_vault,
+                    );
+                if admit(base_mint_v, quote_mint_v) {
+                    let mut vaults = self.tracked_vaults.write();
+                    insert_tracked_vault_pair(
+                        &mut vaults,
+                        &mut vaults_changed,
+                        TrackedVaultPairInsert {
+                            pool,
+                            now,
+                            dex: "meteora_cpmm",
+                            base_mint: base_mint_v,
+                            quote_mint: quote_mint_v,
+                            base_vault,
+                            quote_vault,
+                            active_id: None,
+                            bin_step: None,
+                        },
+                    );
+                }
+            }
+        }
+
+        if enable_meteora_dlmm {
+            if let CachedPoolState::Meteora(s) = cached_state {
+                if admit(s.token_x_mint, s.token_y_mint) {
+                    let mut vaults = self.tracked_vaults.write();
+                    insert_tracked_vault_pair(
+                        &mut vaults,
+                        &mut vaults_changed,
+                        TrackedVaultPairInsert {
+                            pool,
+                            now,
+                            dex: "meteora_dlmm",
+                            base_mint: s.token_x_mint,
+                            quote_mint: s.token_y_mint,
+                            base_vault: s.reserve_x,
+                            quote_vault: s.reserve_y,
+                            active_id: Some(s.active_id),
+                            bin_step: Some(s.bin_step),
+                        },
+                    );
+                }
+            }
+        }
+
+        if let CachedPoolState::PumpAmm(s) = cached_state {
+            if admit(s.base_mint, s.quote_mint) {
+                let mut vaults = self.tracked_vaults.write();
+                insert_tracked_vault_pair(
+                    &mut vaults,
+                    &mut vaults_changed,
+                    TrackedVaultPairInsert {
+                        pool,
+                        now,
+                        dex: "pump_amm",
+                        base_mint: s.base_mint,
+                        quote_mint: s.quote_mint,
+                        base_vault: s.pool_base_token_account,
+                        quote_vault: s.pool_quote_token_account,
+                        active_id: None,
+                        bin_step: None,
+                    },
+                );
+            }
+        }
+
+        vaults_changed
+    }
+
     /// PR169a: register vault ATAs from MASTER cache after account-path pool upsert (no sync here).
     fn register_pool_vaults_from_account(&self, pool: Pubkey) -> bool {
         let Some(cached_state) = self.live_pool_cache.get(&pool) else {
             return false;
         };
-        let now = Instant::now();
-        let mut vaults_changed = false;
-
-        if let CachedPoolState::RaydiumCpmm(s) = &cached_state {
-            let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
-            let (base_mint_v, quote_mint_v, coin_vault, pc_vault) = if s.token_1_mint == sol {
-                (
-                    s.token_0_mint,
-                    s.token_1_mint,
-                    s.token_0_vault,
-                    s.token_1_vault,
-                )
-            } else if s.token_0_mint == sol {
-                (
-                    s.token_1_mint,
-                    s.token_0_mint,
-                    s.token_1_vault,
-                    s.token_0_vault,
-                )
-            } else {
-                (
-                    s.token_0_mint,
-                    s.token_1_mint,
-                    s.token_0_vault,
-                    s.token_1_vault,
-                )
-            };
-            if self.admit_geyser_explicit_pool_assets(pool, base_mint_v, quote_mint_v) {
-                let dex_str = "raydium_cpmm".to_string();
-                let mut vaults = self.tracked_vaults.write();
-                vaults.entry(coin_vault).or_insert_with(|| {
-                    vaults_changed = true;
-                    VaultInfo {
-                        pool_address: pool,
-                        dex: dex_str.clone(),
-                        base_mint: base_mint_v,
-                        quote_mint: quote_mint_v,
-                        is_base_vault: true,
-                        last_balance: std::sync::atomic::AtomicU64::new(0),
-                        last_used_at: now,
-                        pinned: false,
-                        pin: None,
-                        active_id: None,
-                        bin_step: None,
-                    }
-                });
-                vaults.entry(pc_vault).or_insert_with(|| {
-                    vaults_changed = true;
-                    VaultInfo {
-                        pool_address: pool,
-                        dex: dex_str,
-                        base_mint: base_mint_v,
-                        quote_mint: quote_mint_v,
-                        is_base_vault: false,
-                        last_balance: std::sync::atomic::AtomicU64::new(0),
-                        last_used_at: now,
-                        pinned: false,
-                        pin: None,
-                        active_id: None,
-                        bin_step: None,
-                    }
-                });
-            }
-        }
-
-        if self.config.read().enable_meteora_cpmm {
-            if let CachedPoolState::MeteoraCpmm(s) = &cached_state {
-                let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
-                let (base_mint_v, quote_mint_v, vault_base, vault_quote) = if s.token_1_mint == sol
-                {
-                    (
-                        s.token_0_mint,
-                        s.token_1_mint,
-                        s.token_0_vault,
-                        s.token_1_vault,
-                    )
-                } else if s.token_0_mint == sol {
-                    (
-                        s.token_1_mint,
-                        s.token_0_mint,
-                        s.token_1_vault,
-                        s.token_0_vault,
-                    )
-                } else {
-                    (
-                        s.token_0_mint,
-                        s.token_1_mint,
-                        s.token_0_vault,
-                        s.token_1_vault,
-                    )
-                };
-                if self.admit_geyser_explicit_pool_assets(pool, base_mint_v, quote_mint_v) {
-                    let dex_str = "meteora_cpmm".to_string();
-                    let mut vaults = self.tracked_vaults.write();
-                    vaults.entry(vault_base).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: pool,
-                            dex: dex_str.clone(),
-                            base_mint: base_mint_v,
-                            quote_mint: quote_mint_v,
-                            is_base_vault: true,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: now,
-                            pinned: false,
-                            pin: None,
-                            active_id: None,
-                            bin_step: None,
-                        }
-                    });
-                    vaults.entry(vault_quote).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: pool,
-                            dex: dex_str,
-                            base_mint: base_mint_v,
-                            quote_mint: quote_mint_v,
-                            is_base_vault: false,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: now,
-                            pinned: false,
-                            pin: None,
-                            active_id: None,
-                            bin_step: None,
-                        }
-                    });
-                }
-            }
-        }
-
-        if self.config.read().enable_meteora_dlmm {
-            if let CachedPoolState::Meteora(s) = &cached_state {
-                if self.admit_geyser_explicit_pool_assets(pool, s.token_x_mint, s.token_y_mint) {
-                    let dex_str = "meteora_dlmm".to_string();
-                    let mut vaults = self.tracked_vaults.write();
-                    vaults.entry(s.reserve_x).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: pool,
-                            dex: dex_str.clone(),
-                            base_mint: s.token_x_mint,
-                            quote_mint: s.token_y_mint,
-                            is_base_vault: true,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: now,
-                            pinned: false,
-                            pin: None,
-                            active_id: Some(s.active_id),
-                            bin_step: Some(s.bin_step),
-                        }
-                    });
-                    vaults.entry(s.reserve_y).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: pool,
-                            dex: dex_str,
-                            base_mint: s.token_x_mint,
-                            quote_mint: s.token_y_mint,
-                            is_base_vault: false,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: now,
-                            pinned: false,
-                            pin: None,
-                            active_id: Some(s.active_id),
-                            bin_step: Some(s.bin_step),
-                        }
-                    });
-                }
-            }
-        }
-
-        if let CachedPoolState::PumpAmm(s) = &cached_state {
-            if self.admit_geyser_explicit_pool_assets(pool, s.base_mint, s.quote_mint) {
-                let dex_str = "pump_amm".to_string();
-                let mut vaults = self.tracked_vaults.write();
-                vaults.entry(s.pool_base_token_account).or_insert_with(|| {
-                    vaults_changed = true;
-                    VaultInfo {
-                        pool_address: pool,
-                        dex: dex_str.clone(),
-                        base_mint: s.base_mint,
-                        quote_mint: s.quote_mint,
-                        is_base_vault: true,
-                        last_balance: std::sync::atomic::AtomicU64::new(0),
-                        last_used_at: now,
-                        pinned: false,
-                        pin: None,
-                        active_id: None,
-                        bin_step: None,
-                    }
-                });
-                vaults.entry(s.pool_quote_token_account).or_insert_with(|| {
-                    vaults_changed = true;
-                    VaultInfo {
-                        pool_address: pool,
-                        dex: dex_str,
-                        base_mint: s.base_mint,
-                        quote_mint: s.quote_mint,
-                        is_base_vault: false,
-                        last_balance: std::sync::atomic::AtomicU64::new(0),
-                        last_used_at: now,
-                        pinned: false,
-                        pin: None,
-                        active_id: None,
-                        bin_step: None,
-                    }
-                });
-            }
-        }
-
-        vaults_changed
+        let cfg = self.config.read();
+        self.register_four_dex_pool_vaults_from_cached_state(
+            pool,
+            &cached_state,
+            Instant::now(),
+            cfg.enable_meteora_cpmm,
+            cfg.enable_meteora_dlmm,
+            true,
+        )
     }
 
     /// PR-D: explicit vault/bin subscriptions for momentum active `(mint, pool)` when cache has layout.
@@ -1971,170 +1961,18 @@ impl MarketDataContext {
             return false;
         };
 
-        let mut vaults_changed = false;
+        let mut vaults_changed = self.register_four_dex_pool_vaults_from_cached_state(
+            pool,
+            &state,
+            now,
+            enable_meteora_cpmm,
+            enable_dlmm,
+            false,
+        );
         let mut bins_changed = false;
 
         match &state {
-            CachedPoolState::RaydiumCpmm(s) => {
-                let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
-                let (base_mint_v, quote_mint_v, coin_vault, pc_vault) = if s.token_1_mint == sol {
-                    (
-                        s.token_0_mint,
-                        s.token_1_mint,
-                        s.token_0_vault,
-                        s.token_1_vault,
-                    )
-                } else if s.token_0_mint == sol {
-                    (
-                        s.token_1_mint,
-                        s.token_0_mint,
-                        s.token_1_vault,
-                        s.token_0_vault,
-                    )
-                } else {
-                    (
-                        s.token_0_mint,
-                        s.token_1_mint,
-                        s.token_0_vault,
-                        s.token_1_vault,
-                    )
-                };
-                let dex_str = "raydium_cpmm".to_string();
-                {
-                    let mut vaults = self.tracked_vaults.write();
-                    vaults.entry(coin_vault).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: pool,
-                            dex: dex_str.clone(),
-                            base_mint: base_mint_v,
-                            quote_mint: quote_mint_v,
-                            is_base_vault: true,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: now,
-                            pinned: false,
-                            pin: None,
-                            active_id: None,
-                            bin_step: None,
-                        }
-                    });
-                    vaults.entry(pc_vault).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: pool,
-                            dex: dex_str,
-                            base_mint: base_mint_v,
-                            quote_mint: quote_mint_v,
-                            is_base_vault: false,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: now,
-                            pinned: false,
-                            pin: None,
-                            active_id: None,
-                            bin_step: None,
-                        }
-                    });
-                }
-            }
-            CachedPoolState::MeteoraCpmm(s) if enable_meteora_cpmm => {
-                let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
-                let (base_mint_v, quote_mint_v, vault_base, vault_quote) = if s.token_1_mint == sol
-                {
-                    (
-                        s.token_0_mint,
-                        s.token_1_mint,
-                        s.token_0_vault,
-                        s.token_1_vault,
-                    )
-                } else if s.token_0_mint == sol {
-                    (
-                        s.token_1_mint,
-                        s.token_0_mint,
-                        s.token_1_vault,
-                        s.token_0_vault,
-                    )
-                } else {
-                    (
-                        s.token_0_mint,
-                        s.token_1_mint,
-                        s.token_0_vault,
-                        s.token_1_vault,
-                    )
-                };
-                let dex_str = "meteora_cpmm".to_string();
-                {
-                    let mut vaults = self.tracked_vaults.write();
-                    vaults.entry(vault_base).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: pool,
-                            dex: dex_str.clone(),
-                            base_mint: base_mint_v,
-                            quote_mint: quote_mint_v,
-                            is_base_vault: true,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: now,
-                            pinned: false,
-                            pin: None,
-                            active_id: None,
-                            bin_step: None,
-                        }
-                    });
-                    vaults.entry(vault_quote).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: pool,
-                            dex: dex_str,
-                            base_mint: base_mint_v,
-                            quote_mint: quote_mint_v,
-                            is_base_vault: false,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: now,
-                            pinned: false,
-                            pin: None,
-                            active_id: None,
-                            bin_step: None,
-                        }
-                    });
-                }
-            }
             CachedPoolState::Meteora(s) if enable_dlmm => {
-                let dex_str = "meteora_dlmm".to_string();
-                {
-                    let mut vaults = self.tracked_vaults.write();
-                    vaults.entry(s.reserve_x).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: pool,
-                            dex: dex_str.clone(),
-                            base_mint: s.token_x_mint,
-                            quote_mint: s.token_y_mint,
-                            is_base_vault: true,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: now,
-                            pinned: false,
-                            pin: None,
-                            active_id: Some(s.active_id),
-                            bin_step: Some(s.bin_step),
-                        }
-                    });
-                    vaults.entry(s.reserve_y).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: pool,
-                            dex: dex_str,
-                            base_mint: s.token_x_mint,
-                            quote_mint: s.token_y_mint,
-                            is_base_vault: false,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: now,
-                            pinned: false,
-                            pin: None,
-                            active_id: Some(s.active_id),
-                            bin_step: Some(s.bin_step),
-                        }
-                    });
-                }
                 let active_id = s.active_id;
                 let active_array_index =
                     MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(active_id);
@@ -2158,44 +1996,6 @@ impl MarketDataContext {
                             });
                         }
                     }
-                }
-            }
-            CachedPoolState::PumpAmm(s) => {
-                let dex_str = "pump_amm".to_string();
-                {
-                    let mut vaults = self.tracked_vaults.write();
-                    vaults.entry(s.pool_base_token_account).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: pool,
-                            dex: dex_str.clone(),
-                            base_mint: s.base_mint,
-                            quote_mint: s.quote_mint,
-                            is_base_vault: true,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: now,
-                            pinned: false,
-                            pin: None,
-                            active_id: None,
-                            bin_step: None,
-                        }
-                    });
-                    vaults.entry(s.pool_quote_token_account).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: pool,
-                            dex: dex_str,
-                            base_mint: s.base_mint,
-                            quote_mint: s.quote_mint,
-                            is_base_vault: false,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: now,
-                            pinned: false,
-                            pin: None,
-                            active_id: None,
-                            bin_step: None,
-                        }
-                    });
                 }
             }
             CachedPoolState::Orca(s) => {
@@ -10063,16 +9863,15 @@ async fn handle_geyser_transaction(
             ParsedDexEvent::BondingCurveUpdate { .. } => None, // Handled separately in account update
         };
         if let Some((mint, dex_opt)) = mint_and_dex {
-            geyser_tracking_try_enqueue(
-                geyser_tracking_tx,
-                geyser_tracking_queue_depth,
-                GeyserTrackingCommand::TrackMint { mint, pin: None },
-            );
-            debug!(
-                mint = %mint,
-                dex = ?dex_opt,
-                "Mint track enqueued for Geyser metadata (actor + batched sync)"
-            );
+            let is_new = ctx.track_mint_for_geyser_metadata(mint, None);
+            if is_new {
+                ctx.schedule_geyser_sync_batch_debounced();
+                debug!(
+                    mint = %mint,
+                    dex = ?dex_opt,
+                    "New mint tracked for Geyser metadata (batched sync deferred), waiting for mint account delivery"
+                );
+            }
         }
 
         // Build pool_mint_map for PumpFun (needed for BondingCurveUpdate -> creator lookup)
