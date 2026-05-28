@@ -293,12 +293,13 @@ fn geyser_tracking_try_enqueue(
     queue_depth: &AtomicUsize,
     job: GeyserTrackingCommand,
 ) {
+    let depth = queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
     match tx.try_send(job) {
-        Ok(()) => {
-            let depth = queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
-            set_market_data_geyser_tracking_queue_depth(depth);
+        Ok(()) => set_market_data_geyser_tracking_queue_depth(depth),
+        Err(_) => {
+            queue_depth.fetch_sub(1, Ordering::Relaxed);
+            inc_market_data_geyser_tracking_enqueue_dropped_total();
         }
-        Err(_) => inc_market_data_geyser_tracking_enqueue_dropped_total(),
     }
 }
 
