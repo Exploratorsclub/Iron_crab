@@ -10006,7 +10006,6 @@ async fn handle_geyser_transaction(
     let tx_geyser_recv_at = recv_at;
     market_data_bump_geyser_head_slot(tx_update.slot);
     tx_count.fetch_add(1, Ordering::Relaxed);
-    record_market_data_tokio_progress();
     ironcrab::metrics::record_activity();
 
     // Phase 2 (Roadmap, Option C):
