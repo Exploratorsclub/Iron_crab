@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 
 #[cfg(not(windows))]
 use futures::{SinkExt, StreamExt};
@@ -17,6 +17,10 @@ use solana_pubkey::Pubkey as CuckooPubkey;
 use solana_sdk::bs58;
 #[cfg(not(windows))]
 use std::collections::HashMap;
+#[cfg(not(windows))]
+use std::sync::Mutex;
+#[cfg(not(windows))]
+use std::time::Duration;
 #[cfg(not(windows))]
 use tracing::debug;
 #[cfg(not(windows))]
@@ -35,6 +39,9 @@ use yellowstone_grpc_proto::prelude::{
 #[cfg(not(windows))]
 use crate::metrics::{
     geyser_metrics_inc_account_listener_account_updates_total,
+    geyser_metrics_inc_account_listener_liveness_reconnect_total,
+    geyser_metrics_inc_account_listener_subscribe_sink_backpressure,
+    geyser_metrics_inc_account_listener_subscribe_sink_throttled,
     geyser_metrics_inc_account_listener_subscribe_updates_total,
     geyser_metrics_inc_listener_stream_payload, geyser_metrics_inc_reconnect,
     geyser_metrics_inc_stream_error, geyser_metrics_inc_tracked_cuckoo_table_full,
@@ -42,17 +49,12 @@ use crate::metrics::{
     geyser_metrics_inc_tx_listener_payload_broadcast_total,
     geyser_metrics_inc_tx_listener_transactions_total,
     geyser_metrics_set_account_session_connected, geyser_metrics_set_tx_session_connected,
-    market_data_geyser_head_slot_value, market_data_take_tx_session_reconnect_request,
-    market_data_tx_handler_processed_value, GeyserReconnectReason,
+    market_data_geyser_head_slot_value, market_data_take_account_session_reconnect_request,
+    market_data_take_tx_session_reconnect_request, market_data_tx_handler_processed_value,
+    GeyserReconnectReason,
 };
 #[cfg(not(windows))]
 use rand::Rng;
-#[cfg(not(windows))]
-use std::sync::Mutex;
-#[cfg(not(windows))]
-use std::time::Duration;
-#[cfg(not(windows))]
-use tokio::sync::Notify;
 #[cfg(not(windows))]
 use tokio::time::sleep;
 
@@ -763,6 +765,24 @@ impl GeyserAccountListener {
         Ok(f)
     }
 
+    /// PR167: latest subscribe request wins — coalesce startup bursts into one sink send.
+    #[cfg(not(windows))]
+    fn coalesce_pending_subscription(
+        pending: &Mutex<Option<SubscribeRequest>>,
+        req: SubscribeRequest,
+    ) {
+        if let Ok(mut g) = pending.lock() {
+            *g = Some(req);
+        }
+    }
+
+    #[cfg(not(windows))]
+    const SUBSCRIBE_SINK_MIN_INTERVAL: Duration = Duration::from_millis(400);
+    #[cfg(not(windows))]
+    const SUBSCRIBE_SINK_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+    #[cfg(not(windows))]
+    const TRACKED_SET_JUMP_REBUILD_THRESHOLD: usize = 50;
+
     #[cfg(not(windows))]
     async fn start_account_impl(self) -> Result<()> {
         enum SessionExit {
@@ -819,6 +839,7 @@ impl GeyserAccountListener {
         // rebuild per interval; other updates use in-place subscribe (same as small sets).
         const LARGE_TRACKED_SUBSCRIBE_REBUILD_MIN_INTERVAL: Duration = Duration::from_secs(5);
         let mut last_large_set_subscription_rebuild: Option<Instant> = None;
+        let mut last_tracked_subscription_change: Option<Instant> = None;
 
         geyser_metrics_set_account_session_connected(false);
 
@@ -875,21 +896,60 @@ impl GeyserAccountListener {
                 let subscription_notify = Arc::new(Notify::new());
                 let pending_for_updater = Arc::clone(&pending_subscription_request);
                 let notify_for_updater = Arc::clone(&subscription_notify);
+                let sink_fail_notify = Arc::new(Notify::new());
+                let sink_fail_reader = Arc::clone(&sink_fail_notify);
+                let sink_fail_updater = Arc::clone(&sink_fail_notify);
                 let subscription_updater_jh = tokio::spawn(async move {
+                    let mut last_send = Instant::now() - Self::SUBSCRIBE_SINK_MIN_INTERVAL;
                     loop {
                         notify_for_updater.notified().await;
-                        let req = match pending_for_updater.lock() {
-                            Ok(mut g) => g.take(),
-                            Err(_) => continue,
-                        };
-                        let Some(req) = req else { continue };
-                        if let Err(e) = subscribe_tx.send(req).await {
-                            warn!(
-                                error = %e,
-                                "geyser_listener: subscription updater failed to push subscribe request (sink gone)"
-                            );
-                            geyser_metrics_inc_reconnect(GeyserReconnectReason::SinkGone);
-                            break;
+                        loop {
+                            let elapsed = last_send.elapsed();
+                            if elapsed < Self::SUBSCRIBE_SINK_MIN_INTERVAL {
+                                geyser_metrics_inc_account_listener_subscribe_sink_throttled();
+                                sleep(Self::SUBSCRIBE_SINK_MIN_INTERVAL - elapsed).await;
+                            }
+                            let req = match pending_for_updater.lock() {
+                                Ok(mut g) => g.take(),
+                                Err(_) => continue,
+                            };
+                            let Some(req) = req else {
+                                break;
+                            };
+                            match tokio::time::timeout(
+                                Self::SUBSCRIBE_SINK_SEND_TIMEOUT,
+                                subscribe_tx.send(req),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {
+                                    last_send = Instant::now();
+                                }
+                                Ok(Err(e)) => {
+                                    warn!(
+                                        error = %e,
+                                        "geyser_listener: subscription updater failed to push subscribe request (sink gone)"
+                                    );
+                                    geyser_metrics_inc_reconnect(GeyserReconnectReason::SinkGone);
+                                    return;
+                                }
+                                Err(_) => {
+                                    geyser_metrics_inc_account_listener_subscribe_sink_backpressure(
+                                    );
+                                    warn!(
+                                        "geyser_listener: subscription sink backpressure (send timeout) — requesting full reconnect"
+                                    );
+                                    sink_fail_updater.notify_one();
+                                    return;
+                                }
+                            }
+                            let has_more = pending_for_updater
+                                .lock()
+                                .map(|g| g.is_some())
+                                .unwrap_or(false);
+                            if !has_more {
+                                break;
+                            }
                         }
                     }
                 });
@@ -901,6 +961,8 @@ impl GeyserAccountListener {
                 );
 
                 let mut got_payload_since_subscribe = false;
+                let mut account_liveness = tokio::time::interval(Duration::from_secs(5));
+                account_liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                 let session_exit = 'read: loop {
                     if last_log.elapsed().as_secs() >= 60 {
@@ -918,6 +980,23 @@ impl GeyserAccountListener {
                     };
 
                     tokio::select! {
+                        biased;
+                        _ = sink_fail_reader.notified() => {
+                            warn!(
+                                tracked_accounts = tracked_accounts_current.len(),
+                                "geyser_listener: subscription sink backpressure — forcing full reconnect"
+                            );
+                            break 'read SessionExit::HardReconnect;
+                        }
+                        _ = account_liveness.tick() => {
+                            if market_data_take_account_session_reconnect_request() {
+                                warn!(
+                                    "geyser_account_listener: global ingest stall watchdog requested reconnect"
+                                );
+                                geyser_metrics_inc_account_listener_liveness_reconnect_total();
+                                break 'read SessionExit::HardReconnect;
+                            }
+                        }
                         maybe_message = stream.next() => {
                             match maybe_message {
                                 None => {
@@ -1017,6 +1096,7 @@ impl GeyserAccountListener {
                         },
                         new_list = tracked_changed_fut => {
                             if new_list != tracked_accounts_current {
+                                    let prev_len = tracked_accounts_current.len();
                                     let _old_list =
                                         std::mem::replace(&mut tracked_accounts_current, new_list);
                                     if let Some(ref mut cf) = tracked_cuckoo_filter {
@@ -1035,6 +1115,25 @@ impl GeyserAccountListener {
                                     let threshold = full_reconnect_tracked_threshold
                                         .load(Ordering::Relaxed);
                                     let now = Instant::now();
+                                    let new_len = tracked_accounts_current.len();
+                                    let jump = new_len.saturating_sub(prev_len);
+                                    if jump > Self::TRACKED_SET_JUMP_REBUILD_THRESHOLD
+                                        && last_tracked_subscription_change
+                                            .map(|t| {
+                                                now.saturating_duration_since(t)
+                                                    < Duration::from_secs(1)
+                                            })
+                                            .unwrap_or(true)
+                                    {
+                                        last_tracked_subscription_change = Some(now);
+                                        info!(
+                                            tracked_accounts = new_len,
+                                            jump,
+                                            "geyser_listener: tracked set jump — forcing full reconnect (skip in-place subscribe)"
+                                        );
+                                        break 'read SessionExit::SubscriptionRebuild;
+                                    }
+                                    last_tracked_subscription_change = Some(now);
                                     let over_threshold =
                                         tracked_accounts_current.len() > threshold;
                                     let allow_full_rebuild = over_threshold
@@ -1057,9 +1156,10 @@ impl GeyserAccountListener {
                                         &program_ids,
                                         tracked_cuckoo_filter.as_mut(),
                                     );
-                                    if let Ok(mut g) = pending_subscription_request.lock() {
-                                        *g = Some(updated_request);
-                                    }
+                                    Self::coalesce_pending_subscription(
+                                        &pending_subscription_request,
+                                        updated_request,
+                                    );
                                     subscription_notify.notify_one();
                                     geyser_metrics_inc_account_listener_subscribe_updates_total();
                                     warn!(
@@ -1104,7 +1204,9 @@ impl GeyserAccountListener {
 mod geyser_resilience_tests {
     use super::{
         build_account_subscribe_request, build_tx_subscribe_request, geyser_reconnect_sleep_ms,
+        GeyserAccountListener,
     };
+    use std::sync::Mutex;
     use yellowstone_grpc_proto::cuckoo::CompressedAccountFilterSet;
 
     #[test]
@@ -1124,6 +1226,19 @@ mod geyser_resilience_tests {
         let req = build_account_subscribe_request(std::slice::from_ref(&pk), None);
         assert!(req.transactions.is_empty());
         assert!(!req.accounts.is_empty());
+    }
+
+    #[test]
+    fn subscribe_request_coalesce_latest_wins() {
+        use yellowstone_grpc_proto::prelude::SubscribeRequest;
+        let pending = Mutex::new(None::<SubscribeRequest>);
+        let pk = solana_sdk::pubkey::Pubkey::new_from_array([1u8; 32]);
+        let req_a = build_account_subscribe_request(std::slice::from_ref(&pk), None);
+        let req_b = build_account_subscribe_request(&[], None);
+        GeyserAccountListener::coalesce_pending_subscription(&pending, req_a);
+        GeyserAccountListener::coalesce_pending_subscription(&pending, req_b);
+        let taken = pending.lock().unwrap().take().expect("pending req");
+        assert!(taken.accounts.is_empty());
     }
 
     #[test]

@@ -455,6 +455,27 @@ pub static MARKET_DATA_UNPARSED_ACCOUNT_DROPPED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 static MARKET_DATA_TX_HANDLER_RECONNECT_REQUESTED: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_ACCOUNT_SESSION_RECONNECT_REQUESTED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// PR167: all three ingest progress signals flat (TX handler, account listener, head slot).
+pub static MARKET_DATA_GLOBAL_INGEST_STALLS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GLOBAL_INGEST_LAST_PROGRESS_UNIX_MS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// PR167: subscription sink rate-limit skips (coalesced bursts during startup).
+pub static GEYSER_ACCOUNT_LISTENER_SUBSCRIBE_SINK_THROTTLED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR167: subscription sink send timeout / backpressure → full reconnect.
+pub static GEYSER_ACCOUNT_LISTENER_SUBSCRIBE_SINK_BACKPRESSURE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR167: account session reconnect requested by global ingest stall recovery.
+pub static GEYSER_ACCOUNT_LISTENER_LIVENESS_RECONNECTS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// PR167: deferred TX side-effect queue full (`try_send` drop).
+pub static MARKET_DATA_TX_DEFERRED_DROPPED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 #[inline]
 pub fn record_market_data_tx_handler_processed() {
@@ -493,6 +514,54 @@ pub fn market_data_take_tx_session_reconnect_request() -> bool {
     MARKET_DATA_TX_HANDLER_RECONNECT_REQUESTED
         .compare_exchange(1, 0, Ordering::Relaxed, Ordering::Relaxed)
         .is_ok()
+}
+
+#[inline]
+pub fn market_data_request_account_session_reconnect() {
+    MARKET_DATA_ACCOUNT_SESSION_RECONNECT_REQUESTED.store(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn market_data_take_account_session_reconnect_request() -> bool {
+    MARKET_DATA_ACCOUNT_SESSION_RECONNECT_REQUESTED
+        .compare_exchange(1, 0, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+#[inline]
+pub fn geyser_account_listener_account_updates_value() -> u64 {
+    GEYSER_ACCOUNT_LISTENER_ACCOUNT_UPDATES_TOTAL.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn record_market_data_global_ingest_stall() {
+    MARKET_DATA_GLOBAL_INGEST_STALLS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn touch_market_data_global_ingest_progress() {
+    MARKET_DATA_GLOBAL_INGEST_LAST_PROGRESS_UNIX_MS
+        .store(wall_clock_unix_ms_now(), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn geyser_metrics_inc_account_listener_subscribe_sink_throttled() {
+    GEYSER_ACCOUNT_LISTENER_SUBSCRIBE_SINK_THROTTLED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn geyser_metrics_inc_account_listener_subscribe_sink_backpressure() {
+    GEYSER_ACCOUNT_LISTENER_SUBSCRIBE_SINK_BACKPRESSURE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn geyser_metrics_inc_account_listener_liveness_reconnect_total() {
+    GEYSER_ACCOUNT_LISTENER_LIVENESS_RECONNECTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tx_deferred_dropped_total() {
+    MARKET_DATA_TX_DEFERRED_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -2641,6 +2710,18 @@ async fn metrics_response() -> Response<Body> {
         MARKET_DATA_TX_HANDLER_STALLS_TOTAL.load(Ordering::Relaxed)
     );
     line!(
+        "market_data_global_ingest_stalls_total",
+        MARKET_DATA_GLOBAL_INGEST_STALLS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_global_ingest_last_progress_unix_ms",
+        MARKET_DATA_GLOBAL_INGEST_LAST_PROGRESS_UNIX_MS.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_deferred_dropped_total",
+        MARKET_DATA_TX_DEFERRED_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
         "market_data_unparsed_tx_dropped_total",
         MARKET_DATA_UNPARSED_TX_DROPPED_TOTAL.load(Ordering::Relaxed)
     );
@@ -2659,6 +2740,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "geyser_account_listener_subscribe_updates_total",
         GEYSER_ACCOUNT_LISTENER_SUBSCRIBE_UPDATES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "geyser_account_listener_subscribe_sink_throttled_total",
+        GEYSER_ACCOUNT_LISTENER_SUBSCRIBE_SINK_THROTTLED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "geyser_account_listener_subscribe_sink_backpressure_total",
+        GEYSER_ACCOUNT_LISTENER_SUBSCRIBE_SINK_BACKPRESSURE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "geyser_account_listener_liveness_reconnects_total",
+        GEYSER_ACCOUNT_LISTENER_LIVENESS_RECONNECTS_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "geyser_tx_listener_liveness_reconnects_total",
