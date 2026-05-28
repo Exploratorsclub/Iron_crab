@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
@@ -56,9 +56,9 @@ use ironcrab::metrics::{
     inc_market_data_account_low_priority_queue_depth,
     inc_market_data_account_publish_enqueue_dropped_total,
     inc_market_data_account_publish_queue_depth, inc_market_data_account_worker_queue_depth,
-    market_data_bump_geyser_head_slot, record_market_data_account_broadcast_lagged,
-    record_market_data_account_channel_lag_ms, record_market_data_account_early_drop_total,
-    record_market_data_account_handler_duration_us,
+    inc_market_data_jsonl_enqueue_dropped_total, market_data_bump_geyser_head_slot,
+    record_market_data_account_broadcast_lagged, record_market_data_account_channel_lag_ms,
+    record_market_data_account_early_drop_total, record_market_data_account_handler_duration_us,
     record_market_data_account_publish_worker_job_duration_us,
     record_market_data_account_publish_worker_reconnect,
     record_market_data_account_publish_worker_stall,
@@ -68,9 +68,9 @@ use ironcrab::metrics::{
     record_market_data_geyser_sync_immediate_total,
     record_market_data_geyser_to_publish_on_success,
     record_market_data_momentum_active_pool_messages_total,
-    record_market_data_pool_mint_map_to_devwallet_ms,
-    record_market_data_trade_after_bonding_publish_ms, record_market_data_tx_broadcast_lagged,
-    record_market_data_tx_channel_lag_ms, serve_metrics,
+    record_market_data_pool_mint_map_to_devwallet_ms, record_market_data_tokio_liveness_stall,
+    record_market_data_tokio_progress, record_market_data_trade_after_bonding_publish_ms,
+    record_market_data_tx_broadcast_lagged, record_market_data_tx_channel_lag_ms, serve_metrics,
     set_market_data_account_broadcast_queue_depth,
     set_market_data_account_publish_worker_last_success_unix_ms,
     set_market_data_geyser_merge_pending, set_market_data_geyser_sync_pending,
@@ -116,7 +116,14 @@ const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
 use ironcrab::solana::geyser_listener::{
     GeyserAccountListener, GeyserAccountUpdate, GeyserTransactionUpdate, GeyserTxListener,
 };
-use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
+use ironcrab::storage::{JsonlWriterConfig, QueuedJsonlWriter};
+
+/// PR165: when false, `md-watchdog` stops `sd_notify(WATCHDOG)` so systemd can restart on Tokio stall.
+#[cfg(unix)]
+static MD_SYSTEMD_WATCHDOG_NOTIFY: AtomicBool = AtomicBool::new(true);
+
+/// Default capacity for off-hot-path market-events JSONL queue.
+const MARKET_DATA_JSONL_QUEUE_CAP: usize = 16_384;
 
 /// ExecutionResult dedup: prevents replay storms from re-tracking the same ATA/mint over and over.
 ///
@@ -227,6 +234,14 @@ pub(crate) fn market_event_is_momentum_nats_relevant(kind: &MarketEventKind) -> 
         | MarketEventKind::EarlyBuyerDetected { .. }
         | MarketEventKind::InsiderAlert { .. } => false,
     }
+}
+
+/// PR165: high-volume noise kinds excluded from JSONL (NATS core may still receive them).
+fn market_event_should_jsonl(kind: &MarketEventKind) -> bool {
+    !matches!(
+        kind,
+        MarketEventKind::AccountUpdate { .. } | MarketEventKind::TransactionDetected { .. }
+    )
 }
 
 /// Optional Geyser→core-publish latency trace (same `recv_at` for all publishes from one Geyser message).
@@ -821,7 +836,9 @@ struct MarketDataContext {
     /// Same value as `config.geyser_full_reconnect_threshold`, mirrored for `GeyserAccountListener` hot-reload.
     geyser_full_reconnect_threshold_live: Arc<AtomicUsize>,
     nats: Option<NatsClient>,
-    jsonl_writer: JsonlWriter,
+    jsonl_writer: QueuedJsonlWriter,
+    /// Process start for startup-only Geyser sync debouncing (PR165 P1).
+    started_at: Instant,
     event_counter: std::sync::atomic::AtomicU64,
     /// P1: Wallet tracker for smart money / early buyer detection
     wallet_tracker: WalletTracker,
@@ -1092,6 +1109,21 @@ fn pool_mints_for_geyser_explicit_tracking(state: &CachedPoolState) -> Option<(P
 }
 
 impl MarketDataContext {
+    /// Non-blocking JSONL enqueue (dedicated `jsonl-writer` thread). Skips `AccountUpdate` / `TransactionDetected`.
+    fn write_market_event_jsonl(&self, event: &MarketEvent) {
+        if !market_event_should_jsonl(&event.kind) {
+            return;
+        }
+        if !self.jsonl_writer.try_write(event) {
+            inc_market_data_jsonl_enqueue_dropped_total();
+            warn!(
+                event_id = %event.event_id,
+                kind = ?event.kind,
+                "JSONL enqueue dropped (queue full)"
+            );
+        }
+    }
+
     fn next_event_id(&self) -> String {
         let n = self
             .event_counter
@@ -6014,9 +6046,7 @@ async fn publish_wallet_snapshot(
             }
         }
 
-        if let Err(e) = ctx.jsonl_writer.write(&event) {
-            warn!(error = %e, "Failed to write WalletBalanceSnapshot (bootstrap) to JSONL");
-        }
+        ctx.write_market_event_jsonl(&event);
     }
 
     // 2.5) Stale JetStream Cleanup: Override ghost entries not covered by bootstrap.
@@ -6202,9 +6232,7 @@ async fn publish_wallet_snapshot(
         )
         .await;
     }
-    if let Err(e) = ctx.jsonl_writer.write(&complete_event) {
-        warn!(error = %e, "Failed to write WalletSnapshotComplete (bootstrap) to JSONL");
-    }
+    ctx.write_market_event_jsonl(&complete_event);
 
     // 4a) Bounded cold-path verification for wallet non-zero mints without explicit Ready
     // (PumpSwap, PumpFun, Raydium CPMM, Meteora CPMM, Orca, Meteora DLMM — cache-scoped where applicable);
@@ -6464,16 +6492,12 @@ async fn main() -> Result<()> {
         0
     });
 
-    // Start metrics server
+    // PR165: metrics on isolated runtime (not main Geyser Tokio pool).
     let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
-    tokio::spawn(async move {
-        if let Err(e) = serve_metrics(metrics_addr, MetricsComponent::MarketData).await {
-            error!(error = %e, "Metrics server failed");
-        }
-    });
+    spawn_market_data_metrics_runtime(metrics_addr);
     info!(
         port = args.metrics_port,
-        "Metrics server started at /metrics"
+        "Metrics server started at /metrics (md-metrics thread)"
     );
 
     // === P0 Check: Ensure no wallet keys are loaded ===
@@ -6493,9 +6517,17 @@ async fn main() -> Result<()> {
         .log_dir
         .unwrap_or_else(|| PathBuf::from("trade_logs/market_events"));
     let jsonl_config = JsonlWriterConfig::new("market_events").with_log_dir(&log_dir);
-    let jsonl_writer = JsonlWriter::new(jsonl_config)?;
+    let jsonl_writer = QueuedJsonlWriter::spawn(jsonl_config, MARKET_DATA_JSONL_QUEUE_CAP)?;
 
-    info!(log_dir = %log_dir.display(), "JSONL writer initialized");
+    info!(
+        log_dir = %log_dir.display(),
+        queue_cap = MARKET_DATA_JSONL_QUEUE_CAP,
+        "JSONL writer initialized (off hot-path queue)"
+    );
+
+    record_market_data_tokio_progress();
+    let process_started = Instant::now();
+    spawn_market_data_tokio_liveness_task(process_started);
 
     // Setup NATS (optional in dry-run mode)
     let nats = if args.dry_run {
@@ -6589,6 +6621,7 @@ async fn main() -> Result<()> {
         geyser_full_reconnect_threshold_live,
         nats,
         jsonl_writer,
+        started_at: process_started,
         event_counter: std::sync::atomic::AtomicU64::new(0),
         wallet_tracker,
         priority_fee_tracker: Arc::new(PriorityFeeTracker::new()),
@@ -6642,7 +6675,9 @@ async fn main() -> Result<()> {
                 .name("md-watchdog".to_string())
                 .spawn(|| loop {
                     std::thread::sleep(std::time::Duration::from_secs(5));
-                    let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
+                    if MD_SYSTEMD_WATCHDOG_NOTIFY.load(Ordering::Relaxed) {
+                        let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
+                    }
                 })
                 .expect("spawn md-watchdog thread");
         }
@@ -7769,6 +7804,60 @@ async fn md_publish_runtime_main(
     }
 }
 
+/// PR165: metrics `/live` + `/metrics` on isolated Tokio runtime (survives main-runtime starvation).
+fn spawn_market_data_metrics_runtime(addr: std::net::SocketAddr) {
+    std::thread::Builder::new()
+        .name("md-metrics".to_string())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("md-metrics tokio runtime");
+            rt.block_on(async {
+                if let Err(e) = serve_metrics(addr, MetricsComponent::MarketData).await {
+                    error!(error = %e, "Metrics server failed");
+                }
+            });
+        })
+        .expect("spawn md-metrics thread");
+}
+
+/// PR165: detect Tokio scheduler stall (OS-thread watchdog alone is insufficient).
+fn spawn_market_data_tokio_liveness_task(process_started: Instant) {
+    tokio::spawn(async move {
+        const CHECK_INTERVAL: Duration = Duration::from_secs(10);
+        const STALL_THRESHOLD: Duration = Duration::from_secs(45);
+        const STARTUP_GRACE: Duration = Duration::from_secs(120);
+        let mut last_tick =
+            ironcrab::metrics::MARKET_DATA_INGEST_PROGRESS_TICK.load(Ordering::Relaxed);
+        let mut last_ms =
+            ironcrab::metrics::MARKET_DATA_TOKIO_LAST_PROGRESS_UNIX_MS.load(Ordering::Relaxed);
+        let mut interval = tokio::time::interval(CHECK_INTERVAL);
+        loop {
+            interval.tick().await;
+            let tick = ironcrab::metrics::MARKET_DATA_INGEST_PROGRESS_TICK.load(Ordering::Relaxed);
+            let ms =
+                ironcrab::metrics::MARKET_DATA_TOKIO_LAST_PROGRESS_UNIX_MS.load(Ordering::Relaxed);
+            if tick != last_tick || ms != last_ms {
+                last_tick = tick;
+                last_ms = ms;
+                continue;
+            }
+            if process_started.elapsed() < STARTUP_GRACE {
+                continue;
+            }
+            record_market_data_tokio_liveness_stall();
+            error!(
+                stall_secs = STALL_THRESHOLD.as_secs(),
+                "PR165: Tokio ingest stalled — disabling systemd watchdog pings and exiting for Restart=always"
+            );
+            #[cfg(unix)]
+            MD_SYSTEMD_WATCHDOG_NOTIFY.store(false, Ordering::Relaxed);
+            std::process::exit(1);
+        }
+    });
+}
+
 /// PR160: isolated publish thread + multi-worker Tokio (no NATS await on main Geyser runtime).
 fn spawn_market_data_account_publish_runtime(
     ctx: Arc<MarketDataContext>,
@@ -8008,9 +8097,7 @@ async fn maybe_emit_dev_wallet_after_pool_mint_map(
             supply_percentage: 0.0,
         },
     );
-    if let Err(e) = ctx.jsonl_writer.write(&dev_event) {
-        error!(error = %e, "Failed to write DevWalletIdentified (TX fast-path) to JSONL");
-    }
+    ctx.write_market_event_jsonl(&dev_event);
     if publish_tx.is_some() || ctx.nats.is_some() {
         account_path_enqueue_core_market_event(
             publish_tx,
@@ -8201,9 +8288,7 @@ async fn handle_pool_discovery_market_event(
         },
     );
 
-    if let Err(e) = ctx.jsonl_writer.write(&event) {
-        error!(error = %e, "Failed to write pool discovery event to JSONL");
-    }
+    ctx.write_market_event_jsonl(&event);
 
     if ctx.nats.is_some() {
         let seg = market_data_publish_segment(&event.kind);
@@ -8237,9 +8322,7 @@ async fn handle_pool_discovery_market_event(
                 },
             );
 
-            if let Err(e) = ctx.jsonl_writer.write(&dev_event) {
-                error!(error = %e, "Failed to write dev wallet event to JSONL");
-            }
+            ctx.write_market_event_jsonl(&dev_event);
 
             if ctx.nats.is_some() {
                 let seg = market_data_publish_segment(&dev_event.kind);
@@ -8311,9 +8394,7 @@ async fn handle_pool_discovery_market_event(
             },
         );
 
-        if let Err(e) = ctx.jsonl_writer.write(&accounts_event) {
-            error!(error = %e, "Failed to write DexPoolAccounts event to JSONL");
-        }
+        ctx.write_market_event_jsonl(&accounts_event);
 
         if ctx.nats.is_some() {
             let seg = market_data_publish_segment(&accounts_event.kind);
@@ -8341,18 +8422,18 @@ async fn handle_pool_discovery_market_event(
 }
 
 /// Geyser account ingest (dedizierter Task-Fairness, siehe MARKET-DATA-ACCOUNT-INGEST-FAIRNESS).
-/// STOP-CHECK: keine neuen RPC-Calls im Hot-Path; Cold-Path-RPC nur in bestehenden `tokio::spawn`-Pfaden.
+/// STOP-CHECK (PR165): **keine** RPC-Calls — weder direkt noch via `tokio::spawn` aus diesem Handler.
 async fn handle_geyser_account(
     ctx: Arc<MarketDataContext>,
     run_id: &str,
     account_update: GeyserAccountUpdate,
     account_count: &AtomicU64,
-    rpc: Arc<SolanaRpc>,
     recv_at: Instant,
     publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
 ) {
     let account_geyser_recv_at = recv_at;
     account_count.fetch_add(1, Ordering::Relaxed);
+    record_market_data_tokio_progress();
     ironcrab::metrics::record_activity();
 
     // === WsolManager Support: Wallet Balance Updates ===
@@ -8533,9 +8614,7 @@ async fn handle_geyser_account(
                 .await;
             }
 
-            if let Err(e) = ctx.jsonl_writer.write(&event) {
-                warn!(error = %e, "Failed to write WalletBalanceSnapshot to JSONL");
-            }
+            ctx.write_market_event_jsonl(&event);
         }
     }
 
@@ -8598,9 +8677,7 @@ async fn handle_geyser_account(
                 );
             }
 
-            if let Err(e) = ctx.jsonl_writer.write(&mint_event) {
-                error!(error = %e, "Failed to write TokenMintInfo event to JSONL");
-            }
+            ctx.write_market_event_jsonl(&mint_event);
 
             if ctx.nats.is_some() {
                 account_path_enqueue_core_market_event(
@@ -8820,9 +8897,7 @@ async fn handle_geyser_account(
                             },
                         );
 
-                        if let Err(e) = ctx.jsonl_writer.write(&state_event) {
-                            error!(error = %e, "Failed to write PoolStateUpdate event to JSONL");
-                        }
+                        ctx.write_market_event_jsonl(&state_event);
 
                         if ctx.nats.is_some() {
                             account_path_enqueue_core_market_event(
@@ -8889,9 +8964,7 @@ async fn handle_geyser_account(
                             },
                         );
 
-                        if let Err(e) = ctx.jsonl_writer.write(&bin_event) {
-                            error!(error = %e, "Failed to write BinArrayUpdate event to JSONL");
-                        }
+                        ctx.write_market_event_jsonl(&bin_event);
 
                         if ctx.nats.is_some() {
                             account_path_enqueue_core_market_event(
@@ -9170,122 +9243,6 @@ async fn handle_geyser_account(
             }
         }
 
-        // FIX-29: One-time Cold Path RPC to fetch Serum/OpenBook accounts for Raydium AMM.
-        // These are static (never change) — fetch once, cache forever.
-        if let CachedPoolState::RaydiumAmm(ref s) = cached_state {
-            if s.serum_bids.is_none() && s.market_id != Pubkey::default() {
-                let pool_pk = account_update.pubkey;
-                let already_fetched = ctx.raydium_serum_fetched.read().contains(&pool_pk);
-                if !already_fetched {
-                    ctx.raydium_serum_fetched.write().insert(pool_pk);
-                    let rpc = Arc::clone(&rpc);
-                    let cache = Arc::clone(&ctx.live_pool_cache);
-                    let market_id = s.market_id;
-                    let run_id_spawn = ctx.run_id.clone();
-                    let nats_spawn = ctx.nats.as_ref().map(|n| n.clone_for_spawned_publish());
-                    tokio::spawn(async move {
-                        match rpc.get_account_retry(&market_id).await {
-                            Ok(account) => {
-                                if let Some((bids, asks, eq, _bv, _qv)) =
-                                    ironcrab::solana::dex::raydium::Raydium::parse_serum_market_accounts(&account.data)
-                                {
-                                    if let (Some(b), Some(a), Some(e)) = (bids, asks, eq) {
-                                        cache.set_raydium_serum_accounts(&pool_pk, b, a, e);
-                                        let readiness =
-                                            match cache.get(&pool_pk).as_ref() {
-                                                Some(CachedPoolState::RaydiumAmm(st)) => {
-                                                    raydium_amm_readiness_for_pool_cache_update(st)
-                                                }
-                                                _ => DexPoolReadiness::Observed,
-                                            };
-                                        cache.merge_raydium_amm_pool_readiness(pool_pk, readiness);
-                                        if let Some(ref nats) = nats_spawn {
-                                            // `geyser_slot` must match the cache entry's last update slot (vault /
-                                            // pool upserts), not the original discovery event — RPC may finish much
-                                            // later while reserves already advanced on newer Geyser updates.
-                                            if let Some((
-                                                CachedPoolState::RaydiumAmm(st),
-                                                pool_slot,
-                                                _age_ms,
-                                            )) = cache.get_with_metadata(&pool_pk)
-                                            {
-                                                let mut pool_update =
-                                                    PoolCacheUpdate::new_balance_updated(
-                                                        "market-data",
-                                                        BUILD_VERSION,
-                                                        &run_id_spawn,
-                                                        pool_pk.to_string(),
-                                                        "raydium".to_string(),
-                                                        st.base_mint.to_string(),
-                                                        st.quote_mint.to_string(),
-                                                        st.coin_reserve.unwrap_or(0),
-                                                        st.pc_reserve.unwrap_or(0),
-                                                        pool_slot,
-                                                    );
-                                                let mut meta = std::collections::HashMap::new();
-                                                if st.market_id != Pubkey::default() {
-                                                    meta.insert(
-                                                        "market_id".to_string(),
-                                                        st.market_id.to_string(),
-                                                    );
-                                                }
-                                                if let (Some(bids), Some(asks), Some(eq)) = (
-                                                    st.serum_bids,
-                                                    st.serum_asks,
-                                                    st.serum_event_queue,
-                                                ) {
-                                                    meta.insert(
-                                                        "serum_bids".to_string(),
-                                                        bids.to_string(),
-                                                    );
-                                                    meta.insert(
-                                                        "serum_asks".to_string(),
-                                                        asks.to_string(),
-                                                    );
-                                                    meta.insert(
-                                                        "serum_event_queue".to_string(),
-                                                        eq.to_string(),
-                                                    );
-                                                }
-                                                if !meta.is_empty() {
-                                                    pool_update.metadata = Some(meta);
-                                                }
-                                                pool_update.set_dex_readiness_in_metadata(readiness);
-                                                let subject =
-                                                    pool_subject(&pool_pk.to_string());
-                                                if let Err(e) = nats
-                                                    .jetstream_publish(&subject, &pool_update)
-                                                    .await
-                                                {
-                                                    warn!(
-                                                        error = %e,
-                                                        "Failed to publish Raydium AMM PoolCacheUpdate after serum fetch"
-                                                    );
-                                                    NATS_ERRORS_TOTAL
-                                                        .fetch_add(1, Ordering::Relaxed);
-                                                } else {
-                                                    NATS_MESSAGES_PUBLISHED_TOTAL
-                                                        .fetch_add(1, Ordering::Relaxed);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    pool = %pool_pk,
-                                    market_id = %market_id,
-                                    error = %e,
-                                    "FIX-29: Failed to fetch serum market account (will retry on next trade)"
-                                );
-                            }
-                        }
-                    });
-                }
-            }
-        }
-
         // Extract mint and reserve info from cached_state for PoolCacheUpdate
         let (base_mint, quote_mint, base_reserve, quote_reserve) = match &cached_state {
             CachedPoolState::Orca(s) => (
@@ -9411,7 +9368,11 @@ async fn handle_geyser_account(
                         }
                     }
                     if vaults_changed {
-                        ctx.sync_geyser_tracked_accounts();
+                        if ctx.started_at.elapsed() < Duration::from_secs(60) {
+                            ctx.schedule_geyser_sync_batch_debounced();
+                        } else {
+                            ctx.sync_geyser_tracked_accounts();
+                        }
                         debug!(
                             pool = %account_update.pubkey,
                             base_vault = %s.pool_base_token_account,
@@ -9420,39 +9381,12 @@ async fn handle_geyser_account(
                         );
                     }
                 }
-                {
-                    let (base_r, quote_r) = if s.base_reserve.is_none() || s.quote_reserve.is_none()
-                    {
-                        let base_vault = s.pool_base_token_account;
-                        let quote_vault = s.pool_quote_token_account;
-                        let base_bal = match rpc.get_account_opt_retry(&base_vault).await {
-                            Ok(Some(acc)) => {
-                                try_parse_token_account_balance(&acc.data).unwrap_or(0)
-                            }
-                            _ => 0,
-                        };
-                        let quote_bal = match rpc.get_account_opt_retry(&quote_vault).await {
-                            Ok(Some(acc)) => {
-                                try_parse_token_account_balance(&acc.data).unwrap_or(0)
-                            }
-                            _ => 0,
-                        };
-                        if base_bal > 0 || quote_bal > 0 {
-                            info!(
-                                pool = %account_update.pubkey,
-                                base_vault = %base_vault,
-                                quote_vault = %quote_vault,
-                                base_bal,
-                                quote_bal,
-                                "pump_amm: pre-loaded vault balances via RPC (Cold Start Bootstrap)"
-                            );
-                        }
-                        (base_bal, quote_bal)
-                    } else {
-                        (s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0))
-                    };
-                    (s.base_mint, s.quote_mint, base_r, quote_r)
-                }
+                (
+                    s.base_mint,
+                    s.quote_mint,
+                    s.base_reserve.unwrap_or(0),
+                    s.quote_reserve.unwrap_or(0),
+                )
             }
             CachedPoolState::PumpFun(s) => (
                 s.token_mint,
@@ -9567,9 +9501,7 @@ async fn handle_geyser_account(
                             },
                         );
 
-                        if let Err(e) = ctx.jsonl_writer.write(&curve_event) {
-                            error!(error = %e, "Failed to write BondingCurveProgress event to JSONL");
-                        }
+                        ctx.write_market_event_jsonl(&curve_event);
 
                         account_path_enqueue_core_market_event(
                             publish_tx,
@@ -9817,9 +9749,7 @@ async fn handle_geyser_account(
                     },
                 );
 
-                if let Err(e) = ctx.jsonl_writer.write(&dev_event) {
-                    error!(error = %e, "Failed to write DevWalletIdentified to JSONL");
-                }
+                ctx.write_market_event_jsonl(&dev_event);
 
                 if ctx.nats.is_some() {
                     account_path_enqueue_core_market_event(
@@ -9959,9 +9889,7 @@ async fn handle_geyser_account(
     );
 
     // Write to JSONL
-    if let Err(e) = ctx.jsonl_writer.write(&event) {
-        error!(error = %e, "Failed to write account event to JSONL");
-    }
+    ctx.write_market_event_jsonl(&event);
 
     // Publish to NATS
     if ctx.nats.is_some() {
@@ -9994,6 +9922,7 @@ async fn handle_geyser_transaction(
     let tx_geyser_recv_at = recv_at;
     market_data_bump_geyser_head_slot(tx_update.slot);
     tx_count.fetch_add(1, Ordering::Relaxed);
+    record_market_data_tokio_progress();
     ironcrab::metrics::record_activity();
 
     // Phase 2 (Roadmap, Option C):
@@ -10187,9 +10116,7 @@ async fn handle_geyser_transaction(
             },
         );
 
-        if let Err(e) = ctx.jsonl_writer.write(&dev_event) {
-            error!(error = %e, "Failed to write dev wallet event to JSONL");
-        }
+        ctx.write_market_event_jsonl(&dev_event);
 
         if ctx.nats.is_some() {
             account_path_enqueue_core_market_event(
@@ -10250,9 +10177,7 @@ async fn handle_geyser_transaction(
     // Publish wallet tracking events
     for wallet_event in wallet_events {
         // Write to JSONL
-        if let Err(e) = ctx.jsonl_writer.write(&wallet_event) {
-            error!(error = %e, "Failed to write wallet event to JSONL");
-        }
+        ctx.write_market_event_jsonl(&wallet_event);
         // Publish to NATS
         if ctx.nats.is_some() {
             let seg = market_data_publish_segment(&wallet_event.kind);
@@ -10308,9 +10233,7 @@ async fn handle_geyser_transaction(
                     initial_liquidity_sol: None,
                 },
             );
-            if let Err(e) = ctx.jsonl_writer.write(&pool_created_event) {
-                error!(error = %e, "Failed to write pump_amm PoolCreated (create_pool) to JSONL");
-            }
+            ctx.write_market_event_jsonl(&pool_created_event);
             if ctx.nats.is_some() {
                 let _ = account_path_enqueue_core_market_event(
                     account_publish_tx,
@@ -10409,9 +10332,7 @@ async fn handle_geyser_transaction(
                 },
             );
 
-            if let Err(e) = ctx.jsonl_writer.write(&pool_created_event) {
-                error!(error = %e, "Failed to write pump_amm PoolCreated event to JSONL");
-            }
+            ctx.write_market_event_jsonl(&pool_created_event);
 
             if ctx.nats.is_some() {
                 let _ = account_path_enqueue_core_market_event(
@@ -10444,9 +10365,7 @@ async fn handle_geyser_transaction(
             },
         );
 
-        if let Err(e) = ctx.jsonl_writer.write(&accounts_event) {
-            error!(error = %e, "Failed to write DexPoolAccounts event to JSONL");
-        }
+        ctx.write_market_event_jsonl(&accounts_event);
 
         if ctx.nats.is_some() {
             let _ = account_path_enqueue_core_market_event(
@@ -10576,9 +10495,7 @@ async fn handle_geyser_transaction(
                     },
                 );
 
-                if let Err(e) = ctx.jsonl_writer.write(&accounts_event) {
-                    error!(error = %e, "Failed to write DexPoolAccounts event to JSONL");
-                }
+                ctx.write_market_event_jsonl(&accounts_event);
 
                 if ctx.nats.is_some() {
                     let _ = account_path_enqueue_core_market_event(
@@ -10680,9 +10597,7 @@ async fn handle_geyser_transaction(
     );
 
     // Write to JSONL
-    if let Err(e) = ctx.jsonl_writer.write(&event) {
-        error!(error = %e, "Failed to write tx event to JSONL");
-    }
+    ctx.write_market_event_jsonl(&event);
 
     // Publish to NATS (enqueue when publish pipeline is active; PR160)
     if ctx.nats.is_some() {
@@ -11004,7 +10919,6 @@ async fn run_geyser_loop(
     let ctx_geyser_acc = Arc::clone(&ctx);
     let run_id_geyser_acc = run_id.to_string();
     let account_count_geyser_acc = Arc::clone(&account_count);
-    let rpc_geyser_acc = Arc::clone(&rpc);
     let mut account_rx_geyser = account_rx;
 
     let mut worker_high_tx_list: Vec<mpsc::Sender<AccountWorkItem>> =
@@ -11019,7 +10933,6 @@ async fn run_geyser_loop(
         let ctx_w = Arc::clone(&ctx_geyser_acc);
         let run_id_w = run_id_geyser_acc.clone();
         let account_count_w = Arc::clone(&account_count_geyser_acc);
-        let rpc_w = Arc::clone(&rpc_geyser_acc);
         let publish_tx_w = account_publish_tx.clone();
         tokio::spawn(async move {
             while let Some(work) = account_worker_recv_next(&mut high_rx, &mut low_rx).await {
@@ -11029,7 +10942,6 @@ async fn run_geyser_loop(
                     run_id_w.as_str(),
                     work.update,
                     account_count_w.as_ref(),
-                    Arc::clone(&rpc_w),
                     work.recv_at,
                     publish_tx_w.as_ref(),
                 )
@@ -11352,9 +11264,7 @@ async fn run_geyser_loop(
             Some(mint_event) = mint_info_rx.recv() => {
                 let mint_geyser_recv_at = Instant::now();
                 // Write to JSONL
-                if let Err(e) = ctx.jsonl_writer.write(&mint_event) {
-                    error!(error = %e, "Failed to write TokenMintInfo event to JSONL");
-                }
+        ctx.write_market_event_jsonl(&mint_event);
 
                 if ctx.nats.is_some() {
                     let seg = market_data_publish_segment(&mint_event.kind);
@@ -11433,12 +11343,13 @@ async fn run_geyser_loop(
                     } else {
                         exec.signature.clone().unwrap_or_else(|| exec.decision_id.clone())
                     };
-                                        {
+                                        let accept = {
                                             let mut deduper = ctx.execution_results_deduper.lock();
-                                            if !deduper.should_process(&dedup_key) {
-                                                let _ = msg.ack().await;
-                                                continue;
-                                            }
+                                            deduper.should_process(&dedup_key)
+                                        };
+                                        if !accept {
+                                            let _ = msg.ack().await;
+                                            continue;
                                         }
 
                                         let Some(ref tracked_wallet) = ctx.tracked_wallet else {
@@ -11895,9 +11806,7 @@ async fn run_simulation_loop(
                 );
 
                 // Write to JSONL (P0 requirement)
-                if let Err(e) = ctx.jsonl_writer.write(&event) {
-                    error!(error = %e, "Failed to write event to JSONL");
-                }
+        ctx.write_market_event_jsonl(&event);
 
                 // Publish to NATS
                 if let Some(ref nats) = ctx.nats {
@@ -13400,7 +13309,7 @@ mod pr_b_geyser_tracking_tests {
 
     /// Minimal [`MarketDataContext`] for PR-D active-pool pin tests (no NATS / no Geyser).
     fn minimal_market_data_context_for_pr_d_tests(
-        jsonl_writer: JsonlWriter,
+        jsonl_writer: QueuedJsonlWriter,
     ) -> Arc<MarketDataContext> {
         let (tracked_mints_tx, _tracked_mints_rx) = watch::channel(Vec::<Pubkey>::new());
         let (tracked_vaults_tx, _tracked_vaults_rx) = watch::channel(Vec::<Pubkey>::new());
@@ -13412,6 +13321,7 @@ mod pr_b_geyser_tracking_tests {
             geyser_full_reconnect_threshold_live: Arc::new(AtomicUsize::new(0)),
             nats: None,
             jsonl_writer,
+            started_at: Instant::now(),
             event_counter: std::sync::atomic::AtomicU64::new(0),
             wallet_tracker: WalletTracker::new(WalletTrackerCfg::default()),
             priority_fee_tracker: Arc::new(PriorityFeeTracker::new()),
@@ -13454,7 +13364,7 @@ mod pr_b_geyser_tracking_tests {
     /// PR161: same as [`minimal_market_data_context_for_pr_d_tests`], but returns merge `watch` receivers.
     #[allow(clippy::type_complexity)]
     fn minimal_market_data_context_and_merge_receivers_for_pr161(
-        jsonl_writer: JsonlWriter,
+        jsonl_writer: QueuedJsonlWriter,
     ) -> (
         Arc<MarketDataContext>,
         watch::Receiver<Vec<Pubkey>>,
@@ -13472,6 +13382,7 @@ mod pr_b_geyser_tracking_tests {
             geyser_full_reconnect_threshold_live: Arc::new(AtomicUsize::new(0)),
             nats: None,
             jsonl_writer,
+            started_at: Instant::now(),
             event_counter: std::sync::atomic::AtomicU64::new(0),
             wallet_tracker: WalletTracker::new(WalletTrackerCfg::default()),
             priority_fee_tracker: Arc::new(PriorityFeeTracker::new()),
@@ -13524,7 +13435,7 @@ mod pr_b_geyser_tracking_tests {
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
-        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
 
         let pool = Pubkey::new_unique();
@@ -13577,7 +13488,7 @@ mod pr_b_geyser_tracking_tests {
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
-        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
 
         let pool = Pubkey::new_unique();
@@ -13648,7 +13559,7 @@ mod pr_b_geyser_tracking_tests {
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
-        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
 
         let pool = Pubkey::new_unique();
@@ -13726,7 +13637,7 @@ mod pr_b_geyser_tracking_tests {
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
-        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
 
         let pool_a = Pubkey::new_unique();
@@ -13806,7 +13717,7 @@ mod pr_b_geyser_tracking_tests {
     async fn tx_fast_path_dev_wallet_after_pool_mint_map_emits_once() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
-        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
         let (publish_tx, mut publish_rx) = mpsc::channel::<AccountPathNatsJob>(8);
         let pool = Pubkey::new_unique();
@@ -13860,6 +13771,8 @@ mod pr_b_geyser_tracking_tests {
             publish_rx.try_recv().is_err(),
             "idempotent second call must not enqueue another NATS job"
         );
+        ctx.jsonl_writer.flush().expect("jsonl flush");
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let date = chrono::Utc::now().format("%Y%m%d");
         let log = tmp.path().join(format!("market_events-{date}.jsonl"));
         let text = std::fs::read_to_string(&log).expect("jsonl read");
@@ -13878,7 +13791,7 @@ mod pr_b_geyser_tracking_tests {
     async fn account_path_core_enqueue_drops_when_publish_queue_full() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
-        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
         let (tx, _rx) = mpsc::channel::<AccountPathNatsJob>(1);
         let mk_event = |slot: u64| {
@@ -13905,7 +13818,7 @@ mod pr_b_geyser_tracking_tests {
     fn account_geyser_dispatch_high_when_pool_mint_map_contains_pubkey() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
-        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
         let pool = Pubkey::new_unique();
         ctx.pool_mint_map
@@ -13967,7 +13880,7 @@ mod pr_b_geyser_tracking_tests {
     fn tx_trade_path_skips_explicit_geyser_reserves_without_admission() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
-        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
 
         let pool = Pubkey::new_unique();
@@ -13999,7 +13912,7 @@ mod pr_b_geyser_tracking_tests {
     async fn tx_trade_path_registers_vaults_when_active_pool_pin_admits() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
-        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
 
         let pool = Pubkey::new_unique();
@@ -14036,7 +13949,7 @@ mod pr_b_geyser_tracking_tests {
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
-        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
 
         let pool_a = Pubkey::new_unique();
@@ -14111,7 +14024,7 @@ mod pr_b_geyser_tracking_tests {
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
-        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let (ctx, mints_rx, vaults_rx, bins_rx, wallet_rx) =
             minimal_market_data_context_and_merge_receivers_for_pr161(jsonl);
 
@@ -14175,7 +14088,7 @@ mod pr_b_geyser_tracking_tests {
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
-        let jsonl = JsonlWriter::new(jsonl_cfg).expect("jsonl");
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
 
         let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
@@ -14189,5 +14102,105 @@ mod pr_b_geyser_tracking_tests {
             MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed),
             batch0
         );
+    }
+
+    #[test]
+    fn pr165_jsonl_skips_high_volume_noise_kinds() {
+        assert!(!market_event_should_jsonl(
+            &MarketEventKind::AccountUpdate {
+                pubkey: "x".into(),
+                owner: "y".into(),
+                data_len: 0,
+            }
+        ));
+        assert!(!market_event_should_jsonl(
+            &MarketEventKind::TransactionDetected {
+                signature: "sig".into(),
+                program: "prog".into(),
+            }
+        ));
+        assert!(market_event_should_jsonl(&MarketEventKind::Trade {
+            pool_address: "p".into(),
+            mint: "m".into(),
+            quote_mint: NATIVE_SOL_MINT.to_string(),
+            trader: "t".into(),
+            is_buy: true,
+            sol_amount: 1,
+            token_amount: 1,
+            token_decimals: 6,
+            signature: None,
+            dex: "pumpfun".into(),
+            creator: None,
+            token_program: None,
+        }));
+    }
+
+    #[test]
+    fn pr165_tokio_progress_metric_advances() {
+        use ironcrab::metrics::{
+            record_market_data_tokio_progress, MARKET_DATA_INGEST_PROGRESS_TICK,
+            MARKET_DATA_TOKIO_LAST_PROGRESS_UNIX_MS,
+        };
+        let tick0 = MARKET_DATA_INGEST_PROGRESS_TICK.load(Ordering::Relaxed);
+        let ms0 = MARKET_DATA_TOKIO_LAST_PROGRESS_UNIX_MS.load(Ordering::Relaxed);
+        record_market_data_tokio_progress();
+        assert!(
+            MARKET_DATA_INGEST_PROGRESS_TICK.load(Ordering::Relaxed) > tick0
+                || MARKET_DATA_TOKIO_LAST_PROGRESS_UNIX_MS.load(Ordering::Relaxed) >= ms0
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr165_handle_geyser_account_runs_without_rpc_client() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                pool_base_token_account: base_vault,
+                pool_quote_token_account: quote_vault,
+                base_reserve: None,
+                quote_reserve: None,
+                pool_accounts: vec![],
+                creator: Some(Pubkey::new_unique()),
+            }),
+            42,
+        );
+
+        let account_count = AtomicU64::new(0);
+        let update = GeyserAccountUpdate {
+            pubkey: pool,
+            owner: super::PUMPFUN_AMM_PROGRAM_OWNER,
+            slot: 42,
+            lamports: 0,
+            data: vec![],
+            grpc_recv_at: Instant::now(),
+        };
+        handle_geyser_account(
+            Arc::clone(&ctx),
+            "run-pr165",
+            update,
+            &account_count,
+            Instant::now(),
+            None,
+        )
+        .await;
+
+        assert_eq!(account_count.load(Ordering::Relaxed), 1);
+        match ctx.live_pool_cache.get(&pool).expect("cache") {
+            CachedPoolState::PumpAmm(s) => {
+                assert_eq!(s.base_reserve, None);
+                assert_eq!(s.quote_reserve, None);
+            }
+            other => panic!("expected PumpAmm cache row, got {other:?}"),
+        }
     }
 }

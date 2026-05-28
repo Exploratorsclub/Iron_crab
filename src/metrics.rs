@@ -736,6 +736,38 @@ static MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_SUM: Lazy<AtomicU64> =
 static MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_COUNT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// Monotonic tick bumped on Geyser account/tx ingest (Tokio liveness vs OS-thread watchdog).
+pub static MARKET_DATA_INGEST_PROGRESS_TICK: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// Wall ms of last Geyser ingest progress (account, tx, or head slot).
+pub static MARKET_DATA_TOKIO_LAST_PROGRESS_UNIX_MS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Tokio runtime detected as stalled (no ingest progress); process exits for systemd restart.
+pub static MARKET_DATA_TOKIO_LIVENESS_STALLS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// JSONL off-hot-path queue full (`try_enqueue` drop).
+pub static MARKET_DATA_JSONL_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Record Geyser ingest progress for Tokio liveness (cheap atomics only).
+#[inline]
+pub fn record_market_data_tokio_progress() {
+    MARKET_DATA_TOKIO_LAST_PROGRESS_UNIX_MS.store(wall_clock_unix_ms_now(), Ordering::Relaxed);
+    MARKET_DATA_INGEST_PROGRESS_TICK.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_market_data_tokio_liveness_stall() {
+    MARKET_DATA_TOKIO_LIVENESS_STALLS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_jsonl_enqueue_dropped_total() {
+    MARKET_DATA_JSONL_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Update monotonic Geyser head slot (max). Safe from any market-data ingest arm.
 #[inline]
 pub fn market_data_bump_geyser_head_slot(slot: u64) {
@@ -743,6 +775,7 @@ pub fn market_data_bump_geyser_head_slot(slot: u64) {
         return;
     }
     let _ = MARKET_DATA_GEYSER_HEAD_SLOT.fetch_max(slot, Ordering::Relaxed);
+    record_market_data_tokio_progress();
 }
 
 /// Record wall ms delta for pump.fun trade after last bonding publish (bounded map hit only).
@@ -2617,6 +2650,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_geyser_head_slot",
         MARKET_DATA_GEYSER_HEAD_SLOT.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tokio_last_progress_unix_ms",
+        MARKET_DATA_TOKIO_LAST_PROGRESS_UNIX_MS.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tokio_liveness_stalls_total",
+        MARKET_DATA_TOKIO_LIVENESS_STALLS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_jsonl_enqueue_dropped_total",
+        MARKET_DATA_JSONL_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_last_trade_publish_ts_unix_ms",
