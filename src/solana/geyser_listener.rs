@@ -39,9 +39,10 @@ use crate::metrics::{
     geyser_metrics_inc_listener_stream_payload, geyser_metrics_inc_reconnect,
     geyser_metrics_inc_stream_error, geyser_metrics_inc_tracked_cuckoo_table_full,
     geyser_metrics_inc_tx_listener_liveness_reconnect_total,
-    geyser_metrics_inc_tx_listener_transactions_total,
+    geyser_metrics_inc_tx_listener_payload_broadcast_total,
     geyser_metrics_set_account_session_connected, geyser_metrics_set_tx_session_connected,
-    market_data_geyser_head_slot_value, GeyserReconnectReason,
+    market_data_geyser_head_slot_value, market_data_take_tx_session_reconnect_request,
+    market_data_tx_handler_processed_value, GeyserReconnectReason,
 };
 #[cfg(not(windows))]
 use rand::Rng;
@@ -286,9 +287,6 @@ impl GeyserTxListener {
 
     #[cfg(not(windows))]
     async fn start_tx_impl(self) -> Result<()> {
-        use crate::metrics::GEYSER_TX_LISTENER_TRANSACTIONS_TOTAL;
-        use std::sync::atomic::Ordering as AtomicOrdering;
-
         enum SessionExit {
             StreamEnded,
             HardReconnect,
@@ -315,7 +313,7 @@ impl GeyserTxListener {
         let mut last_log = std::time::Instant::now();
         let mut transaction_count: u64 = 0;
         let mut seen_tx_since_connect = false;
-        let mut last_liveness_tx_total: u64 = 0;
+        let mut last_liveness_tx_handler_total: u64 = 0;
         let mut last_liveness_head_slot: u64 = 0;
         let mut first_liveness_window = true;
 
@@ -383,29 +381,36 @@ impl GeyserTxListener {
                     tokio::select! {
                         biased;
                         _ = liveness.tick() => {
+                            if market_data_take_tx_session_reconnect_request() {
+                                warn!(
+                                    "geyser_tx_listener: TX handler stall watchdog requested reconnect"
+                                );
+                                geyser_metrics_inc_tx_listener_liveness_reconnect_total();
+                                break 'read SessionExit::TxLivenessStale;
+                            }
                             let head = market_data_geyser_head_slot_value();
-                            let tx_total = GEYSER_TX_LISTENER_TRANSACTIONS_TOTAL.load(AtomicOrdering::Relaxed);
+                            let tx_handler_total = market_data_tx_handler_processed_value();
                             if first_liveness_window {
                                 last_liveness_head_slot = head;
-                                last_liveness_tx_total = tx_total;
+                                last_liveness_tx_handler_total = tx_handler_total;
                                 first_liveness_window = false;
                                 continue;
                             }
                             if seen_tx_since_connect
-                                && tx_total == last_liveness_tx_total
+                                && tx_handler_total == last_liveness_tx_handler_total
                                 && head > last_liveness_head_slot
                             {
                                 warn!(
-                                    tx_total,
+                                    tx_handler_total,
                                     head_slot = head,
                                     prev_head_slot = last_liveness_head_slot,
-                                    "geyser_tx_listener: TX stream stale — forcing reconnect"
+                                    "geyser_tx_listener: TX handler stale while chain advanced — forcing reconnect"
                                 );
                                 geyser_metrics_inc_tx_listener_liveness_reconnect_total();
                                 break 'read SessionExit::TxLivenessStale;
                             }
                             last_liveness_head_slot = head;
-                            last_liveness_tx_total = tx_total;
+                            last_liveness_tx_handler_total = tx_handler_total;
                         }
                         maybe_message = stream.next() => {
                             match maybe_message {
@@ -435,7 +440,6 @@ impl GeyserTxListener {
                                     if let Some(update) = msg.update_oneof {
                                         match update {
                                             UpdateOneof::Transaction(tx_update) => {
-                                                geyser_metrics_inc_tx_listener_transactions_total();
                                                 transaction_count = transaction_count.saturating_add(1);
                                                 if let Some(tx) = tx_update.transaction {
                                                     seen_tx_since_connect = true;
@@ -614,7 +618,9 @@ impl GeyserTxListener {
                                                         compute_units_consumed,
                                                         grpc_recv_at,
                                                     };
-                                                    let _ = transaction_tx.send(event);
+                                                    if transaction_tx.send(event).is_ok() {
+                                                        geyser_metrics_inc_tx_listener_payload_broadcast_total();
+                                                    }
                                                     if !got_payload_since_subscribe {
                                                         got_payload_since_subscribe = true;
                                                         reconnect_backoff_ms =

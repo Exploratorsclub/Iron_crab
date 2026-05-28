@@ -242,6 +242,8 @@ pub static GEYSER_ACCOUNT_SESSION_CONNECTED: Lazy<AtomicU64> = Lazy::new(|| Atom
 
 /// PR164: `UpdateOneof::Transaction` received on the TX-only session.
 pub static GEYSER_TX_LISTENER_TRANSACTIONS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static GEYSER_TX_LISTENER_PAYLOAD_BROADCAST_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// PR164: Account updates received on the account-only session.
 pub static GEYSER_ACCOUNT_LISTENER_ACCOUNT_UPDATES_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -433,8 +435,60 @@ pub fn geyser_metrics_set_account_session_connected(connected: bool) {
 }
 
 #[inline]
-pub fn geyser_metrics_inc_tx_listener_transactions_total() {
+pub fn geyser_metrics_inc_tx_listener_payload_broadcast_total() {
     GEYSER_TX_LISTENER_TRANSACTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    GEYSER_TX_LISTENER_PAYLOAD_BROADCAST_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// PR166: `handle_geyser_transaction` entered (TX ingest progress; liveness / stall detection).
+pub static MARKET_DATA_TX_HANDLER_PROCESSED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_TX_HANDLER_LAST_PROGRESS_UNIX_MS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_TX_HANDLER_STALLS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_UNPARSED_TX_DROPPED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_UNPARSED_ACCOUNT_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_HANDLER_RECONNECT_REQUESTED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn record_market_data_tx_handler_processed() {
+    MARKET_DATA_TX_HANDLER_PROCESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    MARKET_DATA_TX_HANDLER_LAST_PROGRESS_UNIX_MS.store(wall_clock_unix_ms_now(), Ordering::Relaxed);
+    record_market_data_tokio_progress();
+}
+
+#[inline]
+pub fn market_data_tx_handler_processed_value() -> u64 {
+    MARKET_DATA_TX_HANDLER_PROCESSED_TOTAL.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn record_market_data_tx_handler_stall() {
+    MARKET_DATA_TX_HANDLER_STALLS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_unparsed_tx_dropped_total() {
+    MARKET_DATA_UNPARSED_TX_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_unparsed_account_dropped_total() {
+    MARKET_DATA_UNPARSED_ACCOUNT_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn market_data_request_tx_session_reconnect() {
+    MARKET_DATA_TX_HANDLER_RECONNECT_REQUESTED.store(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn market_data_take_tx_session_reconnect_request() -> bool {
+    MARKET_DATA_TX_HANDLER_RECONNECT_REQUESTED
+        .compare_exchange(1, 0, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }
 
 #[inline]
@@ -2565,6 +2619,30 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "geyser_tx_listener_transactions_total",
         GEYSER_TX_LISTENER_TRANSACTIONS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "geyser_tx_listener_payload_broadcast_total",
+        GEYSER_TX_LISTENER_PAYLOAD_BROADCAST_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_handler_processed_total",
+        MARKET_DATA_TX_HANDLER_PROCESSED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_handler_last_progress_unix_ms",
+        MARKET_DATA_TX_HANDLER_LAST_PROGRESS_UNIX_MS.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_handler_stalls_total",
+        MARKET_DATA_TX_HANDLER_STALLS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_unparsed_tx_dropped_total",
+        MARKET_DATA_UNPARSED_TX_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_unparsed_account_dropped_total",
+        MARKET_DATA_UNPARSED_ACCOUNT_DROPPED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "geyser_account_listener_account_updates_total",

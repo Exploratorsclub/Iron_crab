@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PR166-MARKET-DATA-TX-INGEST-STALL: TX-Handler-Blockade, Payload-Liveness-Metriken, NATS-Noise-Policy
+**Datum**: 2026-05-28  
+**Problem** (Prod `0c04bac` nach PR165): `market_data_tx_channel_lag_ms_count` friert (~1128); `handle_geyser_transaction` verarbeitet keine weiteren TXs (`futex_wait_queue`); `geyser_tx_listener_transactions_total` steigt weiter (Zähler vor Payload-Check) → TX-Liveness-Reconnect greift nicht; `Parsed DEX transaction` / NATS `Trade` stoppen; Pool-Discovery/Account-Pfad lebt.  
+**Fix**: (1) **TX-Hot-Path**: neuer Mint → `schedule_geyser_sync_batch_debounced` statt sofortigem `sync_geyser_tracked_accounts()` (kein Sync-Lock-Sturm mit Account-Workern). (2) **Metriken**: `market_data_tx_handler_processed_total` + `market_data_tx_handler_last_progress_unix_ms` am Handler-Start; `geyser_tx_listener_transactions_total` / `geyser_tx_listener_payload_broadcast_total` nur bei erfolgreichem Payload-Broadcast; TX-Liveness in `geyser_tx_listener` nutzt Handler-Counter. (3) **TX-Stall-Watchdog** (10 s, 120 s Grace, 60 s Fenster): `market_data_tx_handler_stalls_total`, Reconnect-Request an TX-Session, danach `exit(1)` wie PR165. (4) **NATS**: `market_event_should_nats_core` filtert `AccountUpdate` / `TransactionDetected`; unparsed Geyser-Fallbacks early-return + Drop-Metriken. **Invarianten**: kein RPC im Geyser-Ingest (I-7), PR165/164/160 unangetastet.  
+**Dateien**: `src/bin/market_data.rs`, `src/solana/geyser_listener.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### PR165-MARKET-DATA-RUNTIME-LIVENESS: Tokio-Liveness, JSONL off Hot-Path, PumpAmm-RPC aus Geyser-Handler entfernt
 **Datum**: 2026-05-27  
 **Problem** (Prod `bdfbcda`): `market-data` friert ~14 s nach Restart ein — Prozess lebt, JSONL `market_events` wächst auf Multi-GB (sync Flush + Mutex), `/metrics` und `/live` timeouten (selbe Tokio-Runtime), systemd restartet nicht (PR163 OS-Watchdog pingt weiter), hunderte `pump_amm: pre-loaded vault balances via RPC (Cold Start Bootstrap)` aus `handle_geyser_account` (nicht Wallet-Bootstrap).  
