@@ -335,15 +335,15 @@ fn merge_momentum_active_pools_updates(
                 }
             }
             active_map.clear();
-            for a in &update.active {
-                let key = (a.mint.clone(), a.pool.clone());
-                removed_map.remove(&key);
-                active_map.insert(key, a.clone());
-            }
             for r in &update.removed {
                 let key = (r.mint.clone(), r.pool.clone());
                 active_map.remove(&key);
                 removed_map.insert(key, r.clone());
+            }
+            for a in &update.active {
+                let key = (a.mint.clone(), a.pool.clone());
+                removed_map.remove(&key);
+                active_map.insert(key, a.clone());
             }
         } else {
             for r in &update.removed {
