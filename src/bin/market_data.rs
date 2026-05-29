@@ -1761,6 +1761,13 @@ impl MarketDataContext {
         }
     }
 
+    fn touch_tracked_mint_pubkey(&self, mint: &Pubkey) {
+        let now = Instant::now();
+        if let Some(m) = self.tracked_mints.write().get_mut(mint) {
+            m.last_used_at = now;
+        }
+    }
+
     fn touch_tracked_pool_vaults_and_bins(&self, pool: Pubkey) {
         let now = Instant::now();
         {
@@ -9904,7 +9911,9 @@ async fn handle_geyser_transaction(
             ParsedDexEvent::BondingCurveUpdate { .. } => None, // Handled separately in account update
         };
         if let Some((mint, dex_opt)) = mint_and_dex {
-            if !ctx.tracked_mints.read().contains_key(&mint) {
+            if ctx.tracked_mints.read().contains_key(&mint) {
+                ctx.touch_tracked_mint_pubkey(&mint);
+            } else {
                 geyser_tracking_try_enqueue(
                     geyser_tracking_tx,
                     geyser_tracking_queue_depth,
