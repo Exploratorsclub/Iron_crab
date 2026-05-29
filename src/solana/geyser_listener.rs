@@ -44,7 +44,8 @@ use crate::metrics::{
     geyser_metrics_inc_account_listener_subscribe_sink_throttled,
     geyser_metrics_inc_account_listener_subscribe_updates_total,
     geyser_metrics_inc_listener_stream_payload, geyser_metrics_inc_reconnect,
-    geyser_metrics_inc_stream_error, geyser_metrics_inc_tracked_cuckoo_table_full,
+    geyser_metrics_inc_stream_error, geyser_metrics_inc_subscription_send_timeout_total,
+    geyser_metrics_inc_tracked_cuckoo_table_full,
     geyser_metrics_inc_tx_listener_liveness_reconnect_total,
     geyser_metrics_inc_tx_listener_payload_broadcast_total,
     geyser_metrics_inc_tx_listener_transactions_total,
@@ -229,6 +230,22 @@ pub struct GeyserTxListener {
     #[cfg_attr(windows, allow(dead_code))]
     blockhash_tx: broadcast::Sender<GeyserBlockhashUpdate>,
 }
+
+/// Outcome of pushing a coalesced `SubscribeRequest` to the Yellowstone subscription sink (Phase-R-R3).
+#[cfg(not(windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubscriptionSinkPushOutcome {
+    Sent,
+    SinkClosed,
+    TimedOut,
+}
+
+/// Phase-R-R3 (plan I-4b): max one Yellowstone subscription push per 500 ms window.
+#[cfg(not(windows))]
+pub(crate) const SUBSCRIBE_SINK_MIN_INTERVAL: Duration = Duration::from_millis(500);
+/// Phase-R-R3: never block indefinitely on a full subscription sink.
+#[cfg(not(windows))]
+pub(crate) const SUBSCRIBE_SINK_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// PR164: Account + cuckoo Geyser session — owner filters + dynamic pins; **no** transaction filters.
 pub struct GeyserAccountListener {
@@ -765,7 +782,7 @@ impl GeyserAccountListener {
         Ok(f)
     }
 
-    /// PR167: latest subscribe request wins — coalesce startup bursts into one sink send.
+    /// Phase-R-R3 / PR167: latest full subscribe snapshot wins — coalesce bursts into one sink send.
     #[cfg(not(windows))]
     fn coalesce_pending_subscription(
         pending: &Mutex<Option<SubscribeRequest>>,
@@ -776,10 +793,23 @@ impl GeyserAccountListener {
         }
     }
 
+    /// Push one coalesced `SubscribeRequest` to the Yellowstone sink with a hard timeout (I-4b).
     #[cfg(not(windows))]
-    const SUBSCRIBE_SINK_MIN_INTERVAL: Duration = Duration::from_millis(400);
-    #[cfg(not(windows))]
-    const SUBSCRIBE_SINK_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+    pub(crate) async fn push_subscribe_request_to_sink<S>(
+        subscribe_tx: &mut S,
+        req: SubscribeRequest,
+        timeout: Duration,
+    ) -> SubscriptionSinkPushOutcome
+    where
+        S: futures::Sink<SubscribeRequest> + Unpin,
+        S::Error: std::fmt::Display,
+    {
+        match tokio::time::timeout(timeout, subscribe_tx.send(req)).await {
+            Ok(Ok(())) => SubscriptionSinkPushOutcome::Sent,
+            Ok(Err(_)) => SubscriptionSinkPushOutcome::SinkClosed,
+            Err(_) => SubscriptionSinkPushOutcome::TimedOut,
+        }
+    }
     #[cfg(not(windows))]
     const TRACKED_SET_JUMP_REBUILD_THRESHOLD: usize = 50;
 
@@ -900,14 +930,14 @@ impl GeyserAccountListener {
                 let sink_fail_reader = Arc::clone(&sink_fail_notify);
                 let sink_fail_updater = Arc::clone(&sink_fail_notify);
                 let subscription_updater_jh = tokio::spawn(async move {
-                    let mut last_send = Instant::now() - Self::SUBSCRIBE_SINK_MIN_INTERVAL;
+                    let mut last_send = Instant::now() - SUBSCRIBE_SINK_MIN_INTERVAL;
                     loop {
                         notify_for_updater.notified().await;
                         loop {
                             let elapsed = last_send.elapsed();
-                            if elapsed < Self::SUBSCRIBE_SINK_MIN_INTERVAL {
+                            if elapsed < SUBSCRIBE_SINK_MIN_INTERVAL {
                                 geyser_metrics_inc_account_listener_subscribe_sink_throttled();
-                                sleep(Self::SUBSCRIBE_SINK_MIN_INTERVAL - elapsed).await;
+                                sleep(SUBSCRIBE_SINK_MIN_INTERVAL - elapsed).await;
                             }
                             let req = match pending_for_updater.lock() {
                                 Ok(mut g) => g.take(),
@@ -916,24 +946,25 @@ impl GeyserAccountListener {
                             let Some(req) = req else {
                                 break;
                             };
-                            match tokio::time::timeout(
-                                Self::SUBSCRIBE_SINK_SEND_TIMEOUT,
-                                subscribe_tx.send(req),
+                            match Self::push_subscribe_request_to_sink(
+                                &mut subscribe_tx,
+                                req,
+                                SUBSCRIBE_SINK_SEND_TIMEOUT,
                             )
                             .await
                             {
-                                Ok(Ok(())) => {
+                                SubscriptionSinkPushOutcome::Sent => {
                                     last_send = Instant::now();
                                 }
-                                Ok(Err(e)) => {
+                                SubscriptionSinkPushOutcome::SinkClosed => {
                                     warn!(
-                                        error = %e,
                                         "geyser_listener: subscription updater failed to push subscribe request (sink gone)"
                                     );
                                     geyser_metrics_inc_reconnect(GeyserReconnectReason::SinkGone);
                                     return;
                                 }
-                                Err(_) => {
+                                SubscriptionSinkPushOutcome::TimedOut => {
+                                    geyser_metrics_inc_subscription_send_timeout_total();
                                     geyser_metrics_inc_account_listener_subscribe_sink_backpressure(
                                     );
                                     warn!(
@@ -1204,10 +1235,17 @@ impl GeyserAccountListener {
 mod geyser_resilience_tests {
     use super::{
         build_account_subscribe_request, build_tx_subscribe_request, geyser_reconnect_sleep_ms,
-        GeyserAccountListener,
+        GeyserAccountListener, SubscriptionSinkPushOutcome, SUBSCRIBE_SINK_MIN_INTERVAL,
+        SUBSCRIBE_SINK_SEND_TIMEOUT,
     };
-    use std::sync::Mutex;
+    use futures::SinkExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use tokio::sync::Notify;
+    use tokio::time::sleep;
     use yellowstone_grpc_proto::cuckoo::CompressedAccountFilterSet;
+    use yellowstone_grpc_proto::prelude::SubscribeRequest;
 
     #[test]
     fn build_tx_subscribe_has_dex_transactions_empty_accounts() {
@@ -1247,6 +1285,105 @@ mod geyser_resilience_tests {
             let s = geyser_reconnect_sleep_ms(500);
             assert!((500..=650).contains(&s), "s={s}");
         }
+    }
+
+    #[tokio::test]
+    async fn r3_ten_subscription_notifies_coalesce_to_one_send() {
+        let pending: Arc<Mutex<Option<SubscribeRequest>>> = Arc::new(Mutex::new(None));
+        let notify = Arc::new(Notify::new());
+        let send_count = Arc::new(AtomicUsize::new(0));
+        let (mut sink_tx, _sink_rx) = futures::channel::mpsc::channel::<SubscribeRequest>(64);
+
+        let pending_u = Arc::clone(&pending);
+        let notify_u = Arc::clone(&notify);
+        let send_count_u = Arc::clone(&send_count);
+        let updater = tokio::spawn(async move {
+            let mut last_send = Instant::now() - SUBSCRIBE_SINK_MIN_INTERVAL;
+            loop {
+                notify_u.notified().await;
+                loop {
+                    let elapsed = last_send.elapsed();
+                    let min_interval = SUBSCRIBE_SINK_MIN_INTERVAL;
+                    if elapsed < min_interval {
+                        sleep(min_interval - elapsed).await;
+                    }
+                    let req = match pending_u.lock() {
+                        Ok(mut g) => g.take(),
+                        Err(_) => continue,
+                    };
+                    let Some(req) = req else {
+                        break;
+                    };
+                    if sink_tx.send(req).await.is_ok() {
+                        send_count_u.fetch_add(1, Ordering::Relaxed);
+                        last_send = Instant::now();
+                    }
+                    let has_more = pending_u.lock().map(|g| g.is_some()).unwrap_or(false);
+                    if !has_more {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let pk = solana_sdk::pubkey::Pubkey::new_from_array([3u8; 32]);
+        for _ in 0..10 {
+            let req = build_account_subscribe_request(std::slice::from_ref(&pk), None);
+            GeyserAccountListener::coalesce_pending_subscription(&pending, req);
+            notify.notify_one();
+        }
+
+        sleep(Duration::from_millis(700)).await;
+        let sends = send_count.load(Ordering::Relaxed);
+        assert_eq!(
+            sends, 1,
+            "expected exactly one sink send for 10 coalesced notifies within 500ms window, got {sends}"
+        );
+        updater.abort();
+    }
+
+    #[tokio::test]
+    async fn r3_blocked_sink_send_times_out_after_two_seconds() {
+        let (mut sink_tx, _sink_rx) = futures::channel::mpsc::channel::<SubscribeRequest>(1);
+        let req = build_account_subscribe_request(&[], None);
+        sink_tx.send(req.clone()).await.expect("prime channel");
+        let started = Instant::now();
+        let outcome = GeyserAccountListener::push_subscribe_request_to_sink(
+            &mut sink_tx,
+            req,
+            SUBSCRIBE_SINK_SEND_TIMEOUT,
+        )
+        .await;
+        assert!(matches!(outcome, SubscriptionSinkPushOutcome::TimedOut));
+        assert!(
+            started.elapsed() >= SUBSCRIBE_SINK_SEND_TIMEOUT,
+            "timeout should not return early"
+        );
+    }
+
+    #[tokio::test]
+    async fn r3_blocked_sink_send_notifies_reconnect_path() {
+        let sink_fail = Arc::new(Notify::new());
+        let sink_fail_updater = Arc::clone(&sink_fail);
+        let (mut sink_tx, _sink_rx) = futures::channel::mpsc::channel::<SubscribeRequest>(1);
+        let req = build_account_subscribe_request(&[], None);
+        sink_tx.send(req.clone()).await.expect("prime channel");
+
+        let jh = tokio::spawn(async move {
+            let outcome = GeyserAccountListener::push_subscribe_request_to_sink(
+                &mut sink_tx,
+                req,
+                SUBSCRIBE_SINK_SEND_TIMEOUT,
+            )
+            .await;
+            if matches!(outcome, SubscriptionSinkPushOutcome::TimedOut) {
+                sink_fail_updater.notify_one();
+            }
+        });
+
+        let notified = tokio::time::timeout(Duration::from_secs(3), sink_fail.notified()).await;
+        assert!(notified.is_ok(), "TimedOut should notify reconnect");
+        jh.await.expect("updater task");
     }
 
     #[test]
