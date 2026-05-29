@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PR169b-GEYSER-TRACKING-ACTOR-MOMENTUM-WALLET-CONFIG: Momentum / Wallet / Config Single-Writer
+**Datum**: 2026-05-29  
+**Problem** (Prod `b75fcc8` nach P169a-Deploy): Actor lief (`geyser_tracking_jobs_processed_total` ≈ 1132), aber **Global-Freeze unverändert** — `tx_handler_processed`, `geyser_account_listener_account_updates`, `geyser_head_slot` alle Δ0 nach ~6 s; `market_data_momentum_active_pool_messages_total` = **85** (Restart-Flood); `geyser_sync_immediate_total` = **110** (immediate sync storm); `geyser_merge_pending` = **1** (debounce-Timer feuert nie); `account_worker_queue_depth` = **192** (stehend); Tokio-Threads sleeping, Geyser Recv-Q ~2 MB. P169a serialisierte Account+TX, aber **Momentum Active Pools**, **Wallet-Snapshot** und **Config `max_tracked_accounts`** mutierten weiterhin parallel `tracked_*` und riefen `sync_geyser_tracked_accounts()` immediate auf.  
+**Fix** (P169b): (1) **Actor-Commands** erweitert: `ApplyMomentumActivePools`, `TrackWalletMint`, `ScheduleGeyserSyncAfterConfigChange`. (2) **Momentum-NATS** / Simulation: nur `geyser_tracking_try_enqueue(ApplyMomentumActivePools)` — Logik im Actor, ein debounced `schedule_geyser_sync_batch_debounced()` pro Update (kein immediate sync). (3) **Wallet**: Actor vor `publish_wallet_snapshot` gespawnt; Bootstrap + ExecutionResults → `TrackWalletMint` enqueue. (4) **Config** `max_tracked_accounts`: debounced sync via Actor (Bootstrap ohne Actor: einmaliger cold-path immediate sync). (5) **TX `TrackMint`**: enqueue nur wenn Mint noch nicht in `tracked_mints`. **Invarianten**: kein RPC (I-7), Geyser-first (I-4).  
+**Dateien**: `src/bin/market_data.rs`, `docs/BUGS_FIXES.md`
+
 ### PR169a-GEYSER-TRACKING-SINGLE-WRITER-ACTOR: Account + TX Path (Lock-Convoy Fix)
 **Datum**: 2026-05-28  
 **Problem** (Prod nach PR167): Startup-Burst mit **8 Account-Workern + TX-Task** mutiert parallel `tracked_vaults` / `tracked_mints` und ruft `sync_geyser_tracked_accounts()` auf → Lock-Convoy auf `MarketDataContext` → Tokio-Runtime tot (Global-Freeze-Symptom).  

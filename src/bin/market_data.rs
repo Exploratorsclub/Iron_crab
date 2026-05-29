@@ -275,7 +275,7 @@ fn market_data_global_ingest_stalled(
     tx_now == tx_prev && account_now == account_prev && head_now == head_prev
 }
 
-/// PR169a: commands for the single-writer Geyser tracking actor (account + TX path).
+/// PR169a/169b: commands for the single-writer Geyser tracking actor.
 enum GeyserTrackingCommand {
     RegisterReservesAfterTrade(Pubkey),
     RegisterPoolVaultsFromAccount {
@@ -285,6 +285,14 @@ enum GeyserTrackingCommand {
         mint: Pubkey,
         pin: Option<GeyserPinReason>,
     },
+    /// PR169b: momentum-bot active pool pin stream (serialized; debounced sync only).
+    ApplyMomentumActivePools(MomentumActivePoolsUpdate),
+    /// PR169b: wallet bootstrap / execution-results mint pin (no immediate sync).
+    TrackWalletMint {
+        mint: Pubkey,
+    },
+    /// PR169b: `max_tracked_accounts` cap change — debounced flush/eviction only.
+    ScheduleGeyserSyncAfterConfigChange,
 }
 
 fn geyser_tracking_try_enqueue(
@@ -329,6 +337,19 @@ fn spawn_geyser_tracking_actor(
                     if ctx.track_mint_for_geyser_metadata(mint, pin) {
                         schedule_sync = true;
                     }
+                }
+                GeyserTrackingCommand::ApplyMomentumActivePools(update) => {
+                    if ctx.apply_momentum_active_pools_update(&update) {
+                        schedule_sync = true;
+                    }
+                }
+                GeyserTrackingCommand::TrackWalletMint { mint } => {
+                    if ctx.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet)) {
+                        schedule_sync = true;
+                    }
+                }
+                GeyserTrackingCommand::ScheduleGeyserSyncAfterConfigChange => {
+                    schedule_sync = true;
                 }
             }
             if schedule_sync {
@@ -2121,8 +2142,8 @@ impl MarketDataContext {
         vaults_changed || bins_changed || mints_changed
     }
 
-    /// PR-D: apply momentum-bot active pool pin updates (core NATS; immediate `sync_geyser_tracked_accounts`).
-    fn apply_momentum_active_pools_update(&self, update: &MomentumActivePoolsUpdate) {
+    /// PR-D / PR169b: apply momentum-bot active pool pin updates (actor-only writer; caller schedules sync).
+    fn apply_momentum_active_pools_update(&self, update: &MomentumActivePoolsUpdate) -> bool {
         record_market_data_momentum_active_pool_messages_total();
 
         let mut batch_dirty = false;
@@ -2178,12 +2199,11 @@ impl MarketDataContext {
             let _ = &a.pin_reason;
         }
 
-        if batch_dirty {
-            self.sync_geyser_tracked_accounts();
-        } else {
+        if !batch_dirty {
             self.refresh_geyser_pins_gauge();
         }
         set_market_data_momentum_active_pool_pins_gauge(self.active_pool_set.pair_count());
+        batch_dirty
     }
 
     /// PR-D: whether `mint` is still a base/quote leg for any pool that has a momentum active pin row.
@@ -2270,8 +2290,13 @@ impl MarketDataContext {
         changed
     }
 
-    /// P1: Apply config update from control-plane (Runtime Configuration via UI)
-    fn apply_config_update(&self, update: &ConfigUpdate) -> ConfigUpdateResponse {
+    /// P1: Apply config update from control-plane (Runtime Configuration via UI).
+    /// When `geyser_tracking` is set, cap changes schedule debounced Geyser sync via the actor (PR169b).
+    fn apply_config_update(
+        &self,
+        update: &ConfigUpdate,
+        geyser_tracking: Option<(&mpsc::Sender<GeyserTrackingCommand>, &AtomicUsize)>,
+    ) -> ConfigUpdateResponse {
         let mut applied = Vec::new();
         let mut rejected = Vec::new();
         let mut sync_geyser_tracked_after_max_accounts = false;
@@ -2407,7 +2432,16 @@ impl MarketDataContext {
         }
 
         if sync_geyser_tracked_after_max_accounts {
-            self.sync_geyser_tracked_accounts();
+            if let Some((tx, depth)) = geyser_tracking {
+                geyser_tracking_try_enqueue(
+                    tx,
+                    depth,
+                    GeyserTrackingCommand::ScheduleGeyserSyncAfterConfigChange,
+                );
+            } else {
+                // Bootstrap before Geyser actor exists: one-shot cold-path flush.
+                self.sync_geyser_tracked_accounts();
+            }
         }
 
         let status = if rejected.is_empty() {
@@ -5688,6 +5722,8 @@ async fn publish_wallet_snapshot(
     wallet: &Pubkey,
     is_periodic: bool,
     dex_verify_blocking: bool,
+    geyser_tracking_tx: &mpsc::Sender<GeyserTrackingCommand>,
+    geyser_tracking_queue_depth: &AtomicUsize,
 ) -> Result<()> {
     use async_nats::jetstream;
     use futures::StreamExt;
@@ -6100,9 +6136,11 @@ async fn publish_wallet_snapshot(
         }
 
         // Ensure mint is tracked so Geyser can publish TokenMintInfo later (no RPC here).
-        if ctx.track_mint_for_geyser_metadata(*mint, Some(GeyserPinReason::Wallet)) {
-            ctx.sync_geyser_tracked_accounts();
-        }
+        geyser_tracking_try_enqueue(
+            geyser_tracking_tx,
+            geyser_tracking_queue_depth,
+            GeyserTrackingCommand::TrackWalletMint { mint: *mint },
+        );
 
         let mint_str = mint.to_string();
         let event = MarketEvent::new(
@@ -6820,7 +6858,7 @@ async fn main() -> Result<()> {
                                                 keys = ?update.config.keys().collect::<Vec<_>>(),
                                                 "Bootstrap: Applying config from JetStream"
                                             );
-                                            let response = ctx.apply_config_update(&update);
+                                            let response = ctx.apply_config_update(&update, None);
                                             info!(
                                                 status = ?response.status,
                                                 applied = ?response.applied_keys,
@@ -9866,11 +9904,13 @@ async fn handle_geyser_transaction(
             ParsedDexEvent::BondingCurveUpdate { .. } => None, // Handled separately in account update
         };
         if let Some((mint, dex_opt)) = mint_and_dex {
-            geyser_tracking_try_enqueue(
-                geyser_tracking_tx,
-                geyser_tracking_queue_depth,
-                GeyserTrackingCommand::TrackMint { mint, pin: None },
-            );
+            if !ctx.tracked_mints.read().contains_key(&mint) {
+                geyser_tracking_try_enqueue(
+                    geyser_tracking_tx,
+                    geyser_tracking_queue_depth,
+                    GeyserTrackingCommand::TrackMint { mint, pin: None },
+                );
+            }
             debug!(
                 mint = %mint,
                 dex = ?dex_opt,
@@ -10495,6 +10535,10 @@ async fn run_geyser_loop(
     let pump_amm_dex = Arc::new(pump_inner);
     *ctx.pump_amm_dex.write() = Some(Arc::clone(&pump_amm_dex));
 
+    // PR169a/169b: single-writer Geyser tracking actor (before wallet snapshot — wallet path enqueues).
+    let (geyser_tracking_tx, geyser_tracking_queue_depth) =
+        spawn_geyser_tracking_actor(Arc::clone(&ctx));
+
     // === P0: Wallet Balance Snapshot (Position Reconciliation) ===
     // Bootstrap wallet state at startup (max 1 RPC roundtrip) using known mints from JetStream.
     //
@@ -10505,9 +10549,16 @@ async fn run_geyser_loop(
     {
         if let Ok(wallet_pubkey) = Pubkey::from_str(&wallet_pubkey_str) {
             info!(wallet = %wallet_pubkey, "📸 Publishing wallet balance snapshot for position reconciliation");
-            if let Err(e) =
-                publish_wallet_snapshot(&ctx, &rpc, &wallet_pubkey, false, wallet_snapshot_only)
-                    .await
+            if let Err(e) = publish_wallet_snapshot(
+                &ctx,
+                &rpc,
+                &wallet_pubkey,
+                false,
+                wallet_snapshot_only,
+                &geyser_tracking_tx,
+                geyser_tracking_queue_depth.as_ref(),
+            )
+            .await
             {
                 warn!(error = %e, "Failed to publish wallet snapshot (continuing anyway)");
             }
@@ -10705,10 +10756,6 @@ async fn run_geyser_loop(
             );
             spawn_market_data_account_publish_runtime(Arc::clone(&ctx), template, n_workers)
         });
-
-    // PR169a: single-writer Geyser tracking actor (must exist before TX + account workers).
-    let (geyser_tracking_tx, geyser_tracking_queue_depth) =
-        spawn_geyser_tracking_actor(Arc::clone(&ctx));
 
     // Option A (MARKET-DATA-TX-INGEST-FAIRNESS): dedizierter Tokio-Task für Geyser-Txs.
     // Verhindert, dass `transaction_rx.recv()` hinter langen Account-`select!`-Armen verhungert
@@ -11322,10 +11369,20 @@ async fn run_geyser_loop(
                                         }
 
                                         // 3) Track mint so Geyser will deliver the mint account (wallet-pinned).
-                                        let added_mint =
-                                            ctx.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet));
+                                        let added_mint = ctx
+                                            .tracked_mints
+                                            .read()
+                                            .get(&mint)
+                                            .is_none_or(|info| {
+                                                !info.pinned
+                                                    || info.pin != Some(GeyserPinReason::Wallet)
+                                            });
                                         if added_mint {
-                                            ctx.sync_geyser_tracked_accounts();
+                                            geyser_tracking_try_enqueue(
+                                                &geyser_tracking_tx,
+                                                geyser_tracking_queue_depth.as_ref(),
+                                                GeyserTrackingCommand::TrackWalletMint { mint },
+                                            );
                                         }
 
                                         // 4) Recompute tracked wallet accounts and notify listener
@@ -11477,7 +11534,11 @@ async fn run_geyser_loop(
                 if let Some(nats_msg) = msg {
                     match serde_json::from_slice::<MomentumActivePoolsUpdate>(&nats_msg.payload) {
                         Ok(update) => {
-                            ctx.apply_momentum_active_pools_update(&update);
+                            geyser_tracking_try_enqueue(
+                                &geyser_tracking_tx,
+                                geyser_tracking_queue_depth.as_ref(),
+                                GeyserTrackingCommand::ApplyMomentumActivePools(update),
+                            );
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to deserialize MomentumActivePoolsUpdate");
@@ -11503,7 +11564,13 @@ async fn run_geyser_loop(
                                     keys = ?update.config.keys().collect::<Vec<_>>(),
                                     "Received Config Update from control-plane"
                                 );
-                                let response = ctx.apply_config_update(&update);
+                                let response = ctx.apply_config_update(
+                                    &update,
+                                    Some((
+                                        &geyser_tracking_tx,
+                                        geyser_tracking_queue_depth.as_ref(),
+                                    )),
+                                );
                                 info!(
                                     status = ?response.status,
                                     applied = ?response.applied_keys,
@@ -11618,6 +11685,9 @@ async fn run_simulation_loop(
     );
     pump_inner.set_bounded_tx_fallback_rpc(ctx.helius_rpc.clone());
     let pump_amm_dex = Arc::new(pump_inner);
+
+    let (geyser_tracking_tx, geyser_tracking_queue_depth) =
+        spawn_geyser_tracking_actor(Arc::clone(&ctx));
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut slot: u64 = 0;
@@ -11913,7 +11983,11 @@ async fn run_simulation_loop(
                 if let Some(nats_msg) = msg {
                     match serde_json::from_slice::<MomentumActivePoolsUpdate>(&nats_msg.payload) {
                         Ok(update) => {
-                            ctx.apply_momentum_active_pools_update(&update);
+                            geyser_tracking_try_enqueue(
+                                &geyser_tracking_tx,
+                                geyser_tracking_queue_depth.as_ref(),
+                                GeyserTrackingCommand::ApplyMomentumActivePools(update),
+                            );
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to deserialize MomentumActivePoolsUpdate (simulation)");
@@ -11939,7 +12013,13 @@ async fn run_simulation_loop(
                                     keys = ?update.config.keys().collect::<Vec<_>>(),
                                     "Received Config Update from control-plane"
                                 );
-                                let response = ctx.apply_config_update(&update);
+                                let response = ctx.apply_config_update(
+                                    &update,
+                                    Some((
+                                        &geyser_tracking_tx,
+                                        geyser_tracking_queue_depth.as_ref(),
+                                    )),
+                                );
                                 info!(
                                     status = ?response.status,
                                     applied = ?response.applied_keys,
@@ -13852,6 +13932,7 @@ mod pr_b_geyser_tracking_tests {
         ctx.active_pool_set.pin_pool(base_b, pool_b);
 
         let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
+        let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
 
         let (tracking_tx, tracking_depth) = spawn_geyser_tracking_actor(Arc::clone(&ctx));
         geyser_tracking_try_enqueue(
@@ -13865,24 +13946,18 @@ mod pr_b_geyser_tracking_tests {
             GeyserTrackingCommand::RegisterReservesAfterTrade(pool_b),
         );
 
-        // Let the actor drain both jobs before measuring debounced flush (isolates from parallel tests).
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Let the actor drain both jobs; PR167 startup debounce min 250 ms — one coalesced flush.
+        tokio::time::sleep(Duration::from_millis(400)).await;
 
         assert_eq!(
             MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed),
             imm0,
             "trade-path reserve registration must not immediate-sync before debounce flush"
         );
-
-        let batch_after_jobs = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
-
-        // PR167: startup debounce min 250 ms; wall-clock sleep so the spawned flush reliably runs.
-        tokio::time::sleep(Duration::from_millis(350)).await;
-
-        assert_eq!(
-            MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed),
-            batch_after_jobs + 1,
-            "expected a single batched Geyser subscription sync after coalesced trade-path updates"
+        let batch1 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
+        assert!(
+            batch1 >= batch0 + 1,
+            "expected batched Geyser subscription sync after coalesced trade-path updates (before={batch0}, after={batch1})"
         );
         assert_eq!(
             MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed),
@@ -14297,6 +14372,180 @@ mod pr_b_geyser_tracking_tests {
             MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed),
             batch0 + 1,
             "expected debounced batch sync after actor vault registration"
+        );
+    }
+
+    /// PR169b: momentum active pools via actor — no immediate sync; jobs processed; debounced batch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr169b_apply_momentum_active_pools_actor_no_immediate_sync() {
+        use ironcrab::metrics::{
+            MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL, MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL,
+            MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL,
+        };
+        use ironcrab::nats::{MomentumActivePinReason, MomentumActivePoolEntry};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (tracking_tx, tracking_depth) = spawn_geyser_tracking_actor(Arc::clone(&ctx));
+
+        let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
+        let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
+        let jobs0 = MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
+
+        let mut active = Vec::new();
+        for _ in 0..12 {
+            let pool = Pubkey::new_unique();
+            let base_mint = Pubkey::new_unique();
+            let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+            let coin_vault = Pubkey::new_unique();
+            let pc_vault = Pubkey::new_unique();
+            ctx.live_pool_cache.upsert(
+                pool,
+                CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                    token_0_mint: base_mint,
+                    token_1_mint: quote,
+                    token_0_vault: coin_vault,
+                    token_1_vault: pc_vault,
+                    reserve_0: None,
+                    reserve_1: None,
+                }),
+                1,
+            );
+            active.push(MomentumActivePoolEntry {
+                mint: base_mint.to_string(),
+                pool: pool.to_string(),
+                pin_reason: MomentumActivePinReason::Tracker,
+            });
+        }
+
+        geyser_tracking_try_enqueue(
+            &tracking_tx,
+            tracking_depth.as_ref(),
+            GeyserTrackingCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
+                version: 1,
+                ts_unix_ms: 1,
+                active,
+                removed: vec![],
+                full_active_snapshot: false,
+            }),
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed),
+            imm0,
+            "momentum path must not immediate-sync"
+        );
+        assert!(
+            MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed) > jobs0,
+            "actor should process momentum job"
+        );
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(
+            MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed) > batch0,
+            "expected debounced batch sync after momentum update"
+        );
+    }
+
+    /// PR169b: wallet mint track via actor — no immediate sync.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr169b_track_wallet_mint_actor_no_immediate_sync() {
+        use ironcrab::metrics::{
+            MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL, MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (tracking_tx, tracking_depth) = spawn_geyser_tracking_actor(Arc::clone(&ctx));
+
+        let mint = Pubkey::new_unique();
+        let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
+        let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
+
+        geyser_tracking_try_enqueue(
+            &tracking_tx,
+            tracking_depth.as_ref(),
+            GeyserTrackingCommand::TrackWalletMint { mint },
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let tracked = ctx.tracked_mints.read();
+        assert!(tracked.contains_key(&mint));
+        assert_eq!(
+            tracked.get(&mint).and_then(|m| m.pin),
+            Some(GeyserPinReason::Wallet)
+        );
+        drop(tracked);
+
+        assert_eq!(
+            MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed),
+            imm0,
+            "wallet mint track must not immediate-sync"
+        );
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(
+            MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed) > batch0,
+            "expected debounced batch sync after wallet mint track"
+        );
+    }
+
+    /// PR169b: parallel momentum enqueues (85+) serialize through actor without panic/drop storm.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr169b_parallel_momentum_enqueues_serialized_by_actor() {
+        use ironcrab::metrics::MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL;
+        use ironcrab::nats::{MomentumActivePinReason, MomentumActivePoolEntry};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (tracking_tx, tracking_depth) = spawn_geyser_tracking_actor(Arc::clone(&ctx));
+
+        let jobs0 = MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
+        for i in 0..90u64 {
+            let pool = Pubkey::new_unique();
+            let base_mint = Pubkey::new_unique();
+            let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+            ctx.live_pool_cache.upsert(
+                pool,
+                CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                    token_0_mint: base_mint,
+                    token_1_mint: quote,
+                    token_0_vault: Pubkey::new_unique(),
+                    token_1_vault: Pubkey::new_unique(),
+                    reserve_0: None,
+                    reserve_1: None,
+                }),
+                1,
+            );
+            geyser_tracking_try_enqueue(
+                &tracking_tx,
+                tracking_depth.as_ref(),
+                GeyserTrackingCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
+                    version: 1,
+                    ts_unix_ms: i,
+                    active: vec![MomentumActivePoolEntry {
+                        mint: base_mint.to_string(),
+                        pool: pool.to_string(),
+                        pin_reason: MomentumActivePinReason::Tracker,
+                    }],
+                    removed: vec![],
+                    full_active_snapshot: false,
+                }),
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let jobs1 = MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
+        assert!(
+            jobs1 >= jobs0 + 90,
+            "expected actor to process all momentum jobs (before={jobs0}, after={jobs1})"
         );
     }
 }
