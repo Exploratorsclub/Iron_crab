@@ -13956,7 +13956,7 @@ mod pr_b_geyser_tracking_tests {
         );
         let batch1 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
         assert!(
-            batch1 >= batch0 + 1,
+            batch1 > batch0,
             "expected batched Geyser subscription sync after coalesced trade-path updates (before={batch0}, after={batch1})"
         );
         assert_eq!(
