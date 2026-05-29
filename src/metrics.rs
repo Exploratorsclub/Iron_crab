@@ -276,6 +276,12 @@ pub static MARKET_DATA_MOMENTUM_ACTIVE_POOL_MESSAGES_TOTAL: Lazy<AtomicU64> =
 /// Count of `(mint, pool)` entries in market-data `ActivePoolSet` (PR-D gauge).
 pub static MARKET_DATA_MOMENTUM_ACTIVE_POOL_PINS_GAUGE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// NATS momentum updates absorbed by the pre-actor coalescer (PR169c).
+pub static MARKET_DATA_MOMENTUM_COALESCED_MESSAGES_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Merged `ApplyMomentumActivePools` batches enqueued to the tracking actor (PR169c).
+pub static MARKET_DATA_MOMENTUM_COALESCED_BATCHES_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 /// Geyser explicit-tracked subscription list syncs coalesced from the TX trade path (debounced flush).
 pub static MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -367,6 +373,16 @@ pub fn record_market_data_momentum_active_pool_messages_total() {
 #[inline]
 pub fn set_market_data_momentum_active_pool_pins_gauge(n: usize) {
     MARKET_DATA_MOMENTUM_ACTIVE_POOL_PINS_GAUGE.store(n as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_momentum_coalesced_messages_total() {
+    MARKET_DATA_MOMENTUM_COALESCED_MESSAGES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_momentum_coalesced_batches_total() {
+    MARKET_DATA_MOMENTUM_COALESCED_BATCHES_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -2813,6 +2829,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_momentum_active_pool_pins",
         MARKET_DATA_MOMENTUM_ACTIVE_POOL_PINS_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_momentum_coalesced_messages_total",
+        MARKET_DATA_MOMENTUM_COALESCED_MESSAGES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_momentum_coalesced_batches_total",
+        MARKET_DATA_MOMENTUM_COALESCED_BATCHES_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_geyser_sync_batch_total",
