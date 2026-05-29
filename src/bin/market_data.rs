@@ -1832,6 +1832,7 @@ impl MarketDataContext {
             handle.spawn(fut)
         } else {
             warn!("schedule_geyser_sync_batch_debounced: no Tokio runtime handle");
+            set_market_data_geyser_sync_pending(0);
             return;
         };
         *guard = Some(h);

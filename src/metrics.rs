@@ -486,6 +486,9 @@ pub static GEYSER_ACCOUNT_LISTENER_SUBSCRIBE_SINK_THROTTLED_TOTAL: Lazy<AtomicU6
 /// PR167: subscription sink send timeout / backpressure → full reconnect.
 pub static GEYSER_ACCOUNT_LISTENER_SUBSCRIBE_SINK_BACKPRESSURE_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Phase-R-R3: Yellowstone subscription sink `send` exceeded timeout (I-4b).
+pub static MARKET_DATA_GEYSER_SUBSCRIPTION_SEND_TIMEOUT_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// PR167: account session reconnect requested by global ingest stall recovery.
 pub static GEYSER_ACCOUNT_LISTENER_LIVENESS_RECONNECTS_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -578,6 +581,11 @@ pub fn geyser_metrics_inc_account_listener_subscribe_sink_throttled() {
 #[inline]
 pub fn geyser_metrics_inc_account_listener_subscribe_sink_backpressure() {
     GEYSER_ACCOUNT_LISTENER_SUBSCRIBE_SINK_BACKPRESSURE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn geyser_metrics_inc_subscription_send_timeout_total() {
+    MARKET_DATA_GEYSER_SUBSCRIPTION_SEND_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -2828,6 +2836,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "geyser_account_listener_subscribe_sink_backpressure_total",
         GEYSER_ACCOUNT_LISTENER_SUBSCRIBE_SINK_BACKPRESSURE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_subscription_send_timeout_total",
+        MARKET_DATA_GEYSER_SUBSCRIPTION_SEND_TIMEOUT_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "geyser_account_listener_liveness_reconnects_total",

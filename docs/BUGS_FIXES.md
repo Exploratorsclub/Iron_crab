@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PHASE-R-R3-SUBSCRIPTION-COALESCE-TIMEOUT: Geyser Subscription Sink Coalesce + 2s Timeout
+**Datum**: 2026-05-29  
+**Problem** (Plan `plan_market_data_ingest_rebuild.md` Phase R3 / PR167 Nachzug): Startup-Burst lieferte **14+** in-place `subscription updated` in wenigen Sekunden; blockierendes `subscribe_tx.send().await` im Subscription-Updater konnte die Read-Loop verhungern lassen (`geyser_sync_pending=1`, Send-Q staut, Ingest tot). PR167 adressierte das teilweise (400 ms Rate-Limit, 2 s Timeout); Plan I-4b verlangt explizit **500 ms** latest-wins coalesce und harten Reconnect bei Sink-Backpressure.  
+**Fix** (R3): (1) **Dedicated `subscription_updater`**: `push_subscribe_request_to_sink` mit `timeout(2s)` — bei Timeout/Closed **nie** unbegrenzt warten → `sink_fail` → `SessionExit::HardReconnect`. (2) **Coalesce**: `coalesce_pending_subscription` (latest full snapshot) + **max 1 Send / 500 ms** (PR167 400 ms → 500 ms per Plan); weitere Updates während Send/Fenster mergen in ein Pending. (3) **`geyser_sync_pending`**: `sync_geyser_tracked_accounts_batched_flush` setzt pending **am Anfang** auf 0; `schedule_geyser_sync_batch_debounced` ohne Runtime-Handle cleared pending ebenfalls. (4) Metrik `market_data_geyser_subscription_send_timeout_total`. (5) Unit-Tests: 10× notify → 1 Send; blockierter Sink → Timeout + Reconnect-Notify. **Invarianten**: kein RPC (I-7), I-4b (kein ewiges await), I-16 Recovery. Kombiniert mit R2 `md-state` debounced sync.  
+**Dateien**: `src/solana/geyser_listener.rs`, `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### PHASE-R-R2-MD-STATE-THREAD: Tracked-State Single-Writer off Tokio Pool
 **Datum**: 2026-05-29  
 **Problem** (Phase-0-Diagnose / Plan `plan_market_data_ingest_rebuild.md` Phase R): Nach PR169a/b/c serialisierte ein **Tokio-Actor** Tracking-Mutationen, lief aber auf dem **selben Runtime-Pool** wie TX-Task und 8 Account-Worker. Prod-Freeze (`futex_wait_queue`, `tracking_queue_depth`≈1367 bei Cap 8192): parallele `tracked_*`-Locks + `schedule_geyser_sync` pro Job → Lock-Convoy; TX-Task blockiert.  
