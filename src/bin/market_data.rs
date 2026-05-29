@@ -27,7 +27,9 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
@@ -81,14 +83,15 @@ use ironcrab::metrics::{
     set_market_data_account_broadcast_queue_depth,
     set_market_data_account_publish_worker_last_success_unix_ms,
     set_market_data_geyser_merge_pending, set_market_data_geyser_sync_pending,
-    set_market_data_geyser_tracking_queue_depth, set_market_data_momentum_active_pool_pins_gauge,
-    set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
-    set_readiness_nats_connected, touch_market_data_global_ingest_progress,
-    update_readiness_market_data_current, wall_clock_unix_ms_now, GeyserTrackedEvictKind,
-    MarketDataLatencySegment, MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
-    MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL,
-    MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
-    NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
+    set_market_data_geyser_tracking_queue_depth, set_market_data_md_state_queue_depth,
+    set_market_data_momentum_active_pool_pins_gauge, set_market_data_tx_broadcast_queue_depth,
+    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
+    touch_market_data_global_ingest_progress, update_readiness_market_data_current,
+    wall_clock_unix_ms_now, GeyserTrackedEvictKind, MarketDataLatencySegment, MetricsComponent,
+    MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS,
+    MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
+    MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
+    POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -133,8 +136,10 @@ static MD_SYSTEMD_WATCHDOG_NOTIFY: AtomicBool = AtomicBool::new(true);
 
 /// Default capacity for off-hot-path market-events JSONL queue.
 const MARKET_DATA_JSONL_QUEUE_CAP: usize = 16_384;
-/// PR169a: bounded queue for single-writer Geyser tracking mutations (account + TX path).
+/// PR169a / Phase-R-R2: bounded queue for single-writer Geyser tracking mutations (account + TX path).
 const MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP: usize = 8192;
+/// Phase-R-R2: max jobs drained per `md-state` burst before one debounced Geyser sync.
+const MARKET_DATA_MD_STATE_BURST_MAX: usize = 256;
 /// PR167: minimum debounce for explicit pin updates during startup burst (seconds).
 const MARKET_DATA_GEYSER_SYNC_STARTUP_WINDOW: Duration = Duration::from_secs(120);
 const MARKET_DATA_GEYSER_SYNC_STARTUP_MIN_MS: u64 = 250;
@@ -283,8 +288,8 @@ fn market_data_global_ingest_stalled(
     tx_now == tx_prev && account_now == account_prev && head_now == head_prev
 }
 
-/// PR169a/169b: commands for the single-writer Geyser tracking actor.
-enum GeyserTrackingCommand {
+/// Phase-R-R2: commands for the single-writer `md-state` thread (was Tokio Geyser tracking actor).
+enum MdStateCommand {
     RegisterReservesAfterTrade(Pubkey),
     RegisterPoolVaultsFromAccount {
         pool: Pubkey,
@@ -301,6 +306,18 @@ enum GeyserTrackingCommand {
     },
     /// PR169b: `max_tracked_accounts` cap change — debounced flush/eviction only.
     ScheduleGeyserSyncAfterConfigChange,
+    /// Phase-R-R2: LRU touch only (no subscription change).
+    TouchVault(Pubkey),
+    TouchBinArray(Pubkey),
+    TouchPool(Pubkey),
+}
+
+/// Bounded enqueue handle for the `md-state` OS thread (non-Tokio).
+#[derive(Clone)]
+struct MdStateSender {
+    tx: std_mpsc::SyncSender<MdStateCommand>,
+    queue_depth: Arc<AtomicUsize>,
+    queue_capacity: usize,
 }
 
 type MomentumPoolKey = (String, String);
@@ -384,8 +401,7 @@ fn momentum_coalesce_try_send(
 
 fn spawn_momentum_tracking_coalescer(
     ctx: Arc<MarketDataContext>,
-    geyser_tracking_tx: mpsc::Sender<GeyserTrackingCommand>,
-    geyser_tracking_queue_depth: Arc<AtomicUsize>,
+    md_state: MdStateSender,
 ) -> mpsc::Sender<MomentumActivePoolsUpdate> {
     let (coalesce_tx, mut coalesce_rx) =
         mpsc::channel::<MomentumActivePoolsUpdate>(MARKET_DATA_MOMENTUM_COALESCE_CHANNEL_CAP);
@@ -402,11 +418,7 @@ fn spawn_momentum_tracking_coalescer(
             }
             if let Some(merged) = merge_momentum_active_pools_updates(&pending) {
                 inc_market_data_momentum_coalesced_batches_total();
-                geyser_tracking_try_enqueue(
-                    &geyser_tracking_tx,
-                    geyser_tracking_queue_depth.as_ref(),
-                    GeyserTrackingCommand::ApplyMomentumActivePools(merged),
-                );
+                md_state_try_enqueue(&md_state, MdStateCommand::ApplyMomentumActivePools(merged));
             }
             pending.clear();
         }
@@ -414,7 +426,8 @@ fn spawn_momentum_tracking_coalescer(
     coalesce_tx
 }
 
-async fn apply_momentum_active_pools_in_actor(
+/// Phase-R-R2: sync momentum apply on `md-state` thread (no Tokio yield).
+fn apply_momentum_active_pools_in_md_state(
     ctx: &Arc<MarketDataContext>,
     update: MomentumActivePoolsUpdate,
 ) -> bool {
@@ -426,18 +439,15 @@ async fn apply_momentum_active_pools_in_actor(
     let mut batch_dirty = false;
     if update.full_active_snapshot {
         batch_dirty |= ctx.apply_momentum_snapshot_reconcile(&update.active);
-        tokio::task::yield_now().await;
-        record_market_data_tokio_progress();
+        std::thread::yield_now();
     }
     for chunk in update.removed.chunks(MARKET_DATA_MOMENTUM_APPLY_CHUNK_SIZE) {
         batch_dirty |= ctx.apply_momentum_removed_entries(chunk);
-        tokio::task::yield_now().await;
-        record_market_data_tokio_progress();
+        std::thread::yield_now();
     }
     for chunk in update.active.chunks(MARKET_DATA_MOMENTUM_APPLY_CHUNK_SIZE) {
         batch_dirty |= ctx.apply_momentum_active_entries(chunk);
-        tokio::task::yield_now().await;
-        record_market_data_tokio_progress();
+        std::thread::yield_now();
     }
     if !batch_dirty {
         ctx.refresh_geyser_pins_gauge();
@@ -446,71 +456,122 @@ async fn apply_momentum_active_pools_in_actor(
     batch_dirty
 }
 
-fn geyser_tracking_try_enqueue(
-    tx: &mpsc::Sender<GeyserTrackingCommand>,
-    queue_depth: &AtomicUsize,
-    job: GeyserTrackingCommand,
-) {
-    let depth = queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
-    match tx.try_send(job) {
-        Ok(()) => set_market_data_geyser_tracking_queue_depth(depth),
-        Err(_) => {
-            queue_depth.fetch_sub(1, Ordering::Relaxed);
-            inc_market_data_geyser_tracking_enqueue_dropped_total();
+fn md_state_dec_queue_depth(queue_depth: &AtomicUsize) {
+    let mut cur = queue_depth.load(Ordering::Relaxed);
+    while cur > 0 {
+        match queue_depth.compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => {
+                set_market_data_geyser_tracking_queue_depth(cur - 1);
+                set_market_data_md_state_queue_depth(cur - 1);
+                return;
+            }
+            Err(actual) => cur = actual,
+        }
+    }
+    set_market_data_geyser_tracking_queue_depth(0);
+    set_market_data_md_state_queue_depth(0);
+}
+
+fn md_state_process_job(ctx: &Arc<MarketDataContext>, job: MdStateCommand) -> bool {
+    match job {
+        MdStateCommand::RegisterReservesAfterTrade(pool) => {
+            ctx.register_geyser_reserves_after_trade(pool)
+        }
+        MdStateCommand::RegisterPoolVaultsFromAccount { pool } => {
+            ctx.register_pool_vaults_from_account(pool)
+        }
+        MdStateCommand::TrackMint { mint, pin } => ctx.track_mint_for_geyser_metadata(mint, pin),
+        MdStateCommand::ApplyMomentumActivePools(update) => {
+            apply_momentum_active_pools_in_md_state(ctx, update)
+        }
+        MdStateCommand::TrackWalletMint { mint } => {
+            ctx.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet))
+        }
+        MdStateCommand::ScheduleGeyserSyncAfterConfigChange => true,
+        MdStateCommand::TouchVault(vault) => {
+            ctx.touch_tracked_vault_pubkey(&vault);
+            false
+        }
+        MdStateCommand::TouchBinArray(pda) => {
+            ctx.touch_tracked_bin_array_pubkey(&pda);
+            false
+        }
+        MdStateCommand::TouchPool(pool) => {
+            ctx.touch_tracked_pool_vaults_and_bins_if_tracked(pool);
+            false
         }
     }
 }
 
-fn spawn_geyser_tracking_actor(
+fn md_state_try_enqueue(sender: &MdStateSender, job: MdStateCommand) {
+    if sender.queue_depth.load(Ordering::Relaxed) >= sender.queue_capacity {
+        inc_market_data_geyser_tracking_enqueue_dropped_total();
+        return;
+    }
+    if sender.tx.try_send(job).is_ok() {
+        let depth = sender.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        set_market_data_geyser_tracking_queue_depth(depth);
+        set_market_data_md_state_queue_depth(depth);
+    } else {
+        inc_market_data_geyser_tracking_enqueue_dropped_total();
+    }
+}
+
+fn md_state_worker_loop(
     ctx: Arc<MarketDataContext>,
-) -> (mpsc::Sender<GeyserTrackingCommand>, Arc<AtomicUsize>) {
-    let queue_depth = Arc::new(AtomicUsize::new(0));
-    let (tx, mut rx) = mpsc::channel(MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP);
-    let depth_worker = Arc::clone(&queue_depth);
-    tokio::spawn(async move {
-        while let Some(job) = rx.recv().await {
-            let remaining = depth_worker.fetch_sub(1, Ordering::Relaxed);
-            set_market_data_geyser_tracking_queue_depth(remaining.saturating_sub(1));
-            inc_market_data_geyser_tracking_jobs_processed_total();
-            let mut schedule_sync = false;
-            match job {
-                GeyserTrackingCommand::RegisterReservesAfterTrade(pool) => {
-                    if ctx.register_geyser_reserves_after_trade(pool) {
-                        schedule_sync = true;
-                    }
+    rx: std_mpsc::Receiver<MdStateCommand>,
+    queue_depth: Arc<AtomicUsize>,
+) {
+    loop {
+        let Ok(first) = rx.recv() else {
+            break;
+        };
+        md_state_dec_queue_depth(&queue_depth);
+        inc_market_data_geyser_tracking_jobs_processed_total();
+        let mut jobs = vec![first];
+        while jobs.len() < MARKET_DATA_MD_STATE_BURST_MAX {
+            match rx.try_recv() {
+                Ok(job) => {
+                    md_state_dec_queue_depth(&queue_depth);
+                    inc_market_data_geyser_tracking_jobs_processed_total();
+                    jobs.push(job);
                 }
-                GeyserTrackingCommand::RegisterPoolVaultsFromAccount { pool } => {
-                    if ctx.register_pool_vaults_from_account(pool) {
-                        schedule_sync = true;
-                    }
-                }
-                GeyserTrackingCommand::TrackMint { mint, pin } => {
-                    if ctx.track_mint_for_geyser_metadata(mint, pin) {
-                        schedule_sync = true;
-                    }
-                }
-                GeyserTrackingCommand::ApplyMomentumActivePools(update) => {
-                    if apply_momentum_active_pools_in_actor(&ctx, update).await {
-                        schedule_sync = true;
-                    }
-                }
-                GeyserTrackingCommand::TrackWalletMint { mint } => {
-                    if ctx.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet)) {
-                        schedule_sync = true;
-                    }
-                }
-                GeyserTrackingCommand::ScheduleGeyserSyncAfterConfigChange => {
-                    schedule_sync = true;
-                }
+                Err(std_mpsc::TryRecvError::Empty) => break,
+                Err(std_mpsc::TryRecvError::Disconnected) => break,
             }
-            if schedule_sync {
-                ctx.schedule_geyser_sync_batch_debounced();
-            }
-            tokio::task::yield_now().await;
-            record_market_data_tokio_progress();
         }
-    });
-    (tx, queue_depth)
+        let mut schedule_sync = false;
+        for job in jobs {
+            if md_state_process_job(&ctx, job) {
+                schedule_sync = true;
+            }
+        }
+        if schedule_sync {
+            ctx.schedule_geyser_sync_batch_debounced();
+        }
+    }
+}
+
+fn spawn_md_state_worker(
+    ctx: Arc<MarketDataContext>,
+    tokio_handle: tokio::runtime::Handle,
+) -> MdStateSender {
+    *ctx.ingest_tokio_handle.write() = Some(tokio_handle);
+    let queue_capacity = MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP;
+    let (tx, rx) = std_mpsc::sync_channel::<MdStateCommand>(queue_capacity);
+    let queue_depth = Arc::new(AtomicUsize::new(0));
+    let depth_worker = Arc::clone(&queue_depth);
+    let ctx_worker = Arc::clone(&ctx);
+    let _join: JoinHandle<()> = std::thread::Builder::new()
+        .name("md-state".into())
+        .spawn(move || md_state_worker_loop(ctx_worker, rx, depth_worker))
+        .expect("spawn md-state thread");
+    MdStateSender {
+        tx,
+        queue_depth,
+        queue_capacity,
+    }
 }
 
 /// Optional Geyser→core-publish latency trace (same `recv_at` for all publishes from one Geyser message).
@@ -1211,6 +1272,8 @@ struct MarketDataContext {
 
     /// Debounced flush of explicit Geyser subscription maps after TX-path reserve registration.
     geyser_sync_batch_timer: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Tokio handle for debounced Geyser sync from the `md-state` OS thread (Phase-R-R2).
+    ingest_tokio_handle: parking_lot::RwLock<Option<tokio::runtime::Handle>>,
 
     /// PR164: dedupe `PoolCreated` NATS/JSONL for the same pool (account-path vault spam).
     pool_discovery_poolcreated_emitted: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
@@ -1759,10 +1822,18 @@ impl MarketDataContext {
             h.abort();
         }
         let ctx = self.clone();
-        let h = tokio::spawn(async move {
+        let fut = async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
             ctx.sync_geyser_tracked_accounts_batched_flush();
-        });
+        };
+        let h = if let Some(handle) = self.ingest_tokio_handle.read().clone() {
+            handle.spawn(fut)
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(fut)
+        } else {
+            warn!("schedule_geyser_sync_batch_debounced: no Tokio runtime handle");
+            return;
+        };
         *guard = Some(h);
     }
 
@@ -1914,6 +1985,7 @@ impl MarketDataContext {
         }
     }
 
+    #[allow(dead_code)] // Phase-R-R2: ingest uses TrackMint on md-state; kept for LRU helpers/tests.
     fn touch_tracked_mint_pubkey(&self, mint: &Pubkey) {
         let now = Instant::now();
         if let Some(m) = self.tracked_mints.write().get_mut(mint) {
@@ -2465,11 +2537,11 @@ impl MarketDataContext {
     }
 
     /// P1: Apply config update from control-plane (Runtime Configuration via UI).
-    /// When `geyser_tracking` is set, cap changes schedule debounced Geyser sync via the actor (PR169b).
+    /// When `md_state` is set, cap changes schedule debounced Geyser sync via `md-state` (PR169b/R2).
     fn apply_config_update(
         &self,
         update: &ConfigUpdate,
-        geyser_tracking: Option<(&mpsc::Sender<GeyserTrackingCommand>, &AtomicUsize)>,
+        md_state: Option<&MdStateSender>,
     ) -> ConfigUpdateResponse {
         let mut applied = Vec::new();
         let mut rejected = Vec::new();
@@ -2606,14 +2678,13 @@ impl MarketDataContext {
         }
 
         if sync_geyser_tracked_after_max_accounts {
-            if let Some((tx, depth)) = geyser_tracking {
-                geyser_tracking_try_enqueue(
-                    tx,
-                    depth,
-                    GeyserTrackingCommand::ScheduleGeyserSyncAfterConfigChange,
+            if let Some(md_state) = md_state {
+                md_state_try_enqueue(
+                    md_state,
+                    MdStateCommand::ScheduleGeyserSyncAfterConfigChange,
                 );
             } else {
-                // Bootstrap before Geyser actor exists: one-shot cold-path flush.
+                // Bootstrap before md-state worker exists: one-shot cold-path flush.
                 self.sync_geyser_tracked_accounts();
             }
         }
@@ -5896,8 +5967,7 @@ async fn publish_wallet_snapshot(
     wallet: &Pubkey,
     is_periodic: bool,
     dex_verify_blocking: bool,
-    geyser_tracking_tx: &mpsc::Sender<GeyserTrackingCommand>,
-    geyser_tracking_queue_depth: &AtomicUsize,
+    md_state: &MdStateSender,
 ) -> Result<()> {
     use async_nats::jetstream;
     use futures::StreamExt;
@@ -6310,11 +6380,7 @@ async fn publish_wallet_snapshot(
         }
 
         // Ensure mint is tracked so Geyser can publish TokenMintInfo later (no RPC here).
-        geyser_tracking_try_enqueue(
-            geyser_tracking_tx,
-            geyser_tracking_queue_depth,
-            GeyserTrackingCommand::TrackWalletMint { mint: *mint },
-        );
+        md_state_try_enqueue(md_state, MdStateCommand::TrackWalletMint { mint: *mint });
 
         let mint_str = mint.to_string();
         let event = MarketEvent::new(
@@ -6947,6 +7013,7 @@ async fn main() -> Result<()> {
         pump_amm_dex: parking_lot::RwLock::new(None),
         helius_rpc,
         geyser_sync_batch_timer: parking_lot::Mutex::new(None),
+        ingest_tokio_handle: parking_lot::RwLock::new(None),
         pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
             std::collections::HashSet::new(),
         ),
@@ -8763,8 +8830,7 @@ async fn handle_geyser_account(
     account_count: &AtomicU64,
     recv_at: Instant,
     publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
-    geyser_tracking_tx: &mpsc::Sender<GeyserTrackingCommand>,
-    geyser_tracking_queue_depth: &AtomicUsize,
+    md_state: &MdStateSender,
 ) {
     let account_geyser_recv_at = recv_at;
     account_count.fetch_add(1, Ordering::Relaxed);
@@ -9050,7 +9116,10 @@ async fn handle_geyser_account(
                     .last_balance
                     .swap(balance, std::sync::atomic::Ordering::Relaxed);
                 if balance != prev_balance {
-                    ctx.touch_tracked_vault_pubkey(&account_update.pubkey);
+                    md_state_try_enqueue(
+                        md_state,
+                        MdStateCommand::TouchVault(account_update.pubkey),
+                    );
                     // We need both vault balances to emit a complete PoolStateUpdate.
                     // For now, emit partial updates - consumers should merge base+quote.
                     // Future: Track both vaults and emit only when both are known.
@@ -9265,7 +9334,10 @@ async fn handle_geyser_account(
             .get(&account_update.pubkey)
             .cloned();
         if let Some(bin_array_info) = bin_array_info_opt {
-            ctx.touch_tracked_bin_array_pubkey(&account_update.pubkey);
+            md_state_try_enqueue(
+                md_state,
+                MdStateCommand::TouchBinArray(account_update.pubkey),
+            );
             // Parse bin array to extract liquidity distribution
             match BinArray::parse(&account_update.data, bin_array_info.bin_step) {
                 Ok(parsed_array) => {
@@ -9367,10 +9439,9 @@ async fn handle_geyser_account(
                 | CachedPoolState::Meteora(_)
                 | CachedPoolState::PumpAmm(_)
         ) {
-            geyser_tracking_try_enqueue(
-                geyser_tracking_tx,
-                geyser_tracking_queue_depth,
-                GeyserTrackingCommand::RegisterPoolVaultsFromAccount {
+            md_state_try_enqueue(
+                md_state,
+                MdStateCommand::RegisterPoolVaultsFromAccount {
                     pool: account_update.pubkey,
                 },
             );
@@ -9986,8 +10057,7 @@ async fn handle_geyser_transaction(
     tx_update: GeyserTransactionUpdate,
     tx_count: &AtomicU64,
     account_publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
-    geyser_tracking_tx: &mpsc::Sender<GeyserTrackingCommand>,
-    geyser_tracking_queue_depth: &AtomicUsize,
+    md_state: &MdStateSender,
 ) {
     record_market_data_tx_handler_processed();
     let recv_at = Instant::now();
@@ -10078,19 +10148,11 @@ async fn handle_geyser_transaction(
             ParsedDexEvent::BondingCurveUpdate { .. } => None, // Handled separately in account update
         };
         if let Some((mint, dex_opt)) = mint_and_dex {
-            if ctx.tracked_mints.read().contains_key(&mint) {
-                ctx.touch_tracked_mint_pubkey(&mint);
-            } else {
-                geyser_tracking_try_enqueue(
-                    geyser_tracking_tx,
-                    geyser_tracking_queue_depth,
-                    GeyserTrackingCommand::TrackMint { mint, pin: None },
-                );
-            }
+            md_state_try_enqueue(md_state, MdStateCommand::TrackMint { mint, pin: None });
             debug!(
                 mint = %mint,
                 dex = ?dex_opt,
-                "Mint track enqueued for Geyser metadata (batched sync via actor), waiting for mint account delivery"
+                "Mint track enqueued for Geyser metadata (batched sync via md-state), waiting for mint account delivery"
             );
         }
 
@@ -10158,11 +10220,10 @@ async fn handle_geyser_transaction(
 
     // PR-B: qualifying swap trade — refresh LRU timestamps and register reserve vaults / DLMM bins.
     if let Some(ParsedDexEvent::Trade { pool_address, .. }) = parsed_event.as_ref() {
-        ctx.touch_tracked_pool_vaults_and_bins_if_tracked(*pool_address);
-        geyser_tracking_try_enqueue(
-            geyser_tracking_tx,
-            geyser_tracking_queue_depth,
-            GeyserTrackingCommand::RegisterReservesAfterTrade(*pool_address),
+        md_state_try_enqueue(md_state, MdStateCommand::TouchPool(*pool_address));
+        md_state_try_enqueue(
+            md_state,
+            MdStateCommand::RegisterReservesAfterTrade(*pool_address),
         );
     }
 
@@ -10711,15 +10772,11 @@ async fn run_geyser_loop(
     let pump_amm_dex = Arc::new(pump_inner);
     *ctx.pump_amm_dex.write() = Some(Arc::clone(&pump_amm_dex));
 
-    // PR169a/169b: single-writer Geyser tracking actor (before wallet snapshot — wallet path enqueues).
-    let (geyser_tracking_tx, geyser_tracking_queue_depth) =
-        spawn_geyser_tracking_actor(Arc::clone(&ctx));
-    // PR169c: coalesce momentum NATS bursts before the tracking actor.
-    let momentum_coalesce_tx = spawn_momentum_tracking_coalescer(
-        Arc::clone(&ctx),
-        geyser_tracking_tx.clone(),
-        Arc::clone(&geyser_tracking_queue_depth),
-    );
+    // Phase-R-R2: single-writer `md-state` OS thread (before wallet snapshot — wallet path enqueues).
+    let md_state = spawn_md_state_worker(Arc::clone(&ctx), tokio::runtime::Handle::current());
+    // PR169c: coalesce momentum NATS bursts before md-state.
+    let momentum_coalesce_tx =
+        spawn_momentum_tracking_coalescer(Arc::clone(&ctx), md_state.clone());
 
     // === P0: Wallet Balance Snapshot (Position Reconciliation) ===
     // Bootstrap wallet state at startup (max 1 RPC roundtrip) using known mints from JetStream.
@@ -10737,8 +10794,7 @@ async fn run_geyser_loop(
                 &wallet_pubkey,
                 false,
                 wallet_snapshot_only,
-                &geyser_tracking_tx,
-                geyser_tracking_queue_depth.as_ref(),
+                &md_state,
             )
             .await
             {
@@ -10947,8 +11003,7 @@ async fn run_geyser_loop(
     let run_id_geyser_tx = run_id.to_string();
     let tx_count_geyser_tx = Arc::clone(&tx_count);
     let account_publish_tx_geyser_tx = account_publish_tx.clone();
-    let geyser_tracking_tx_geyser = geyser_tracking_tx.clone();
-    let geyser_tracking_depth_geyser = Arc::clone(&geyser_tracking_queue_depth);
+    let md_state_geyser_tx = md_state.clone();
     let mut transaction_rx_geyser = transaction_rx;
     tokio::spawn(async move {
         loop {
@@ -10961,8 +11016,7 @@ async fn run_geyser_loop(
                         tx_update,
                         tx_count_geyser_tx.as_ref(),
                         account_publish_tx_geyser_tx.as_ref(),
-                        &geyser_tracking_tx_geyser,
-                        geyser_tracking_depth_geyser.as_ref(),
+                        &md_state_geyser_tx,
                     )
                     .await;
                 }
@@ -11020,8 +11074,7 @@ async fn run_geyser_loop(
         let run_id_w = run_id_geyser_acc.clone();
         let account_count_w = Arc::clone(&account_count_geyser_acc);
         let publish_tx_w = account_publish_tx.clone();
-        let geyser_tracking_tx_w = geyser_tracking_tx.clone();
-        let geyser_tracking_depth_w = Arc::clone(&geyser_tracking_queue_depth);
+        let md_state_w = md_state.clone();
         tokio::spawn(async move {
             while let Some(work) = account_worker_recv_next(&mut high_rx, &mut low_rx).await {
                 let handler_start = Instant::now();
@@ -11032,8 +11085,7 @@ async fn run_geyser_loop(
                     account_count_w.as_ref(),
                     work.recv_at,
                     publish_tx_w.as_ref(),
-                    &geyser_tracking_tx_w,
-                    geyser_tracking_depth_w.as_ref(),
+                    &md_state_w,
                 )
                 .await;
                 record_market_data_account_handler_duration_us(
@@ -11560,10 +11612,9 @@ async fn run_geyser_loop(
                                                     || info.pin != Some(GeyserPinReason::Wallet)
                                             });
                                         if added_mint {
-                                            geyser_tracking_try_enqueue(
-                                                &geyser_tracking_tx,
-                                                geyser_tracking_queue_depth.as_ref(),
-                                                GeyserTrackingCommand::TrackWalletMint { mint },
+                                            md_state_try_enqueue(
+                                                &md_state,
+                                                MdStateCommand::TrackWalletMint { mint },
                                             );
                                         }
 
@@ -11742,13 +11793,8 @@ async fn run_geyser_loop(
                                     keys = ?update.config.keys().collect::<Vec<_>>(),
                                     "Received Config Update from control-plane"
                                 );
-                                let response = ctx.apply_config_update(
-                                    &update,
-                                    Some((
-                                        &geyser_tracking_tx,
-                                        geyser_tracking_queue_depth.as_ref(),
-                                    )),
-                                );
+                                let response =
+                                    ctx.apply_config_update(&update, Some(&md_state));
                                 info!(
                                     status = ?response.status,
                                     applied = ?response.applied_keys,
@@ -11864,13 +11910,9 @@ async fn run_simulation_loop(
     pump_inner.set_bounded_tx_fallback_rpc(ctx.helius_rpc.clone());
     let pump_amm_dex = Arc::new(pump_inner);
 
-    let (geyser_tracking_tx, geyser_tracking_queue_depth) =
-        spawn_geyser_tracking_actor(Arc::clone(&ctx));
-    let momentum_coalesce_tx = spawn_momentum_tracking_coalescer(
-        Arc::clone(&ctx),
-        geyser_tracking_tx.clone(),
-        Arc::clone(&geyser_tracking_queue_depth),
-    );
+    let md_state = spawn_md_state_worker(Arc::clone(&ctx), tokio::runtime::Handle::current());
+    let momentum_coalesce_tx =
+        spawn_momentum_tracking_coalescer(Arc::clone(&ctx), md_state.clone());
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut slot: u64 = 0;
@@ -12192,13 +12234,8 @@ async fn run_simulation_loop(
                                     keys = ?update.config.keys().collect::<Vec<_>>(),
                                     "Received Config Update from control-plane"
                                 );
-                                let response = ctx.apply_config_update(
-                                    &update,
-                                    Some((
-                                        &geyser_tracking_tx,
-                                        geyser_tracking_queue_depth.as_ref(),
-                                    )),
-                                );
+                                let response =
+                                    ctx.apply_config_update(&update, Some(&md_state));
                                 info!(
                                     status = ?response.status,
                                     applied = ?response.applied_keys,
@@ -13205,6 +13242,16 @@ mod pr_b_geyser_tracking_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    fn test_spawn_md_state(ctx: &Arc<MarketDataContext>) -> MdStateSender {
+        spawn_md_state_worker(Arc::clone(ctx), tokio::runtime::Handle::current())
+    }
+
+    fn fill_md_state_queue(md_state: &MdStateSender) {
+        for _ in 0..md_state.queue_capacity {
+            md_state_try_enqueue(md_state, MdStateCommand::TouchVault(Pubkey::new_unique()));
+        }
+    }
+
     #[test]
     fn lru_eviction_prefers_oldest_unpinned_vault() {
         let a = Pubkey::new_unique();
@@ -13475,6 +13522,7 @@ mod pr_b_geyser_tracking_tests {
             pump_amm_dex: parking_lot::RwLock::new(None),
             helius_rpc: None,
             geyser_sync_batch_timer: parking_lot::Mutex::new(None),
+            ingest_tokio_handle: parking_lot::RwLock::new(None),
             pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
                 std::collections::HashSet::new(),
             ),
@@ -13536,6 +13584,7 @@ mod pr_b_geyser_tracking_tests {
             pump_amm_dex: parking_lot::RwLock::new(None),
             helius_rpc: None,
             geyser_sync_batch_timer: parking_lot::Mutex::new(None),
+            ingest_tokio_handle: parking_lot::RwLock::new(None),
             pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
                 std::collections::HashSet::new(),
             ),
@@ -14113,16 +14162,14 @@ mod pr_b_geyser_tracking_tests {
         let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
         let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
 
-        let (tracking_tx, tracking_depth) = spawn_geyser_tracking_actor(Arc::clone(&ctx));
-        geyser_tracking_try_enqueue(
-            &tracking_tx,
-            tracking_depth.as_ref(),
-            GeyserTrackingCommand::RegisterReservesAfterTrade(pool_a),
+        let md_state = test_spawn_md_state(&ctx);
+        md_state_try_enqueue(
+            &md_state,
+            MdStateCommand::RegisterReservesAfterTrade(pool_a),
         );
-        geyser_tracking_try_enqueue(
-            &tracking_tx,
-            tracking_depth.as_ref(),
-            GeyserTrackingCommand::RegisterReservesAfterTrade(pool_b),
+        md_state_try_enqueue(
+            &md_state,
+            MdStateCommand::RegisterReservesAfterTrade(pool_b),
         );
 
         // Let the actor drain both jobs; PR167 startup debounce min 250 ms — one coalesced flush.
@@ -14338,19 +14385,10 @@ mod pr_b_geyser_tracking_tests {
             compute_units_consumed: None,
             grpc_recv_at: Instant::now(),
         };
-        let (geyser_tracking_tx, geyser_tracking_queue_depth) =
-            spawn_geyser_tracking_actor(Arc::clone(&ctx));
+        let md_state = test_spawn_md_state(&ctx);
         let done = tokio::time::timeout(
             std::time::Duration::from_millis(150),
-            handle_geyser_transaction(
-                ctx,
-                "run-pr166",
-                tx_update,
-                &tx_count,
-                None,
-                &geyser_tracking_tx,
-                geyser_tracking_queue_depth.as_ref(),
-            ),
+            handle_geyser_transaction(ctx, "run-pr166", tx_update, &tx_count, None, &md_state),
         )
         .await;
         assert!(
@@ -14432,8 +14470,7 @@ mod pr_b_geyser_tracking_tests {
         );
 
         let account_count = AtomicU64::new(0);
-        let (geyser_tracking_tx, geyser_tracking_queue_depth) =
-            spawn_geyser_tracking_actor(Arc::clone(&ctx));
+        let md_state = test_spawn_md_state(&ctx);
         let update = GeyserAccountUpdate {
             pubkey: pool,
             owner: super::PUMPFUN_AMM_PROGRAM_OWNER,
@@ -14449,8 +14486,7 @@ mod pr_b_geyser_tracking_tests {
             &account_count,
             Instant::now(),
             None,
-            &geyser_tracking_tx,
-            geyser_tracking_queue_depth.as_ref(),
+            &md_state,
         )
         .await;
 
@@ -14473,23 +14509,19 @@ mod pr_b_geyser_tracking_tests {
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
-        let (tracking_tx, tracking_depth) = spawn_geyser_tracking_actor(Arc::clone(&ctx));
+        let md_state = test_spawn_md_state(&ctx);
 
         let jobs0 = MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
         for _ in 0..128 {
             let mint = Pubkey::new_unique();
-            geyser_tracking_try_enqueue(
-                &tracking_tx,
-                tracking_depth.as_ref(),
-                GeyserTrackingCommand::TrackMint { mint, pin: None },
-            );
+            md_state_try_enqueue(&md_state, MdStateCommand::TrackMint { mint, pin: None });
         }
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         let jobs1 = MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
         assert!(
             jobs1 >= jobs0 + 128,
-            "expected actor to process enqueued jobs (before={jobs0}, after={jobs1})"
+            "expected md-state thread to process enqueued jobs (before={jobs0}, after={jobs1})"
         );
     }
 
@@ -14527,11 +14559,10 @@ mod pr_b_geyser_tracking_tests {
         let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
         let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
 
-        let (tracking_tx, tracking_depth) = spawn_geyser_tracking_actor(Arc::clone(&ctx));
-        geyser_tracking_try_enqueue(
-            &tracking_tx,
-            tracking_depth.as_ref(),
-            GeyserTrackingCommand::RegisterPoolVaultsFromAccount { pool },
+        let md_state = test_spawn_md_state(&ctx);
+        md_state_try_enqueue(
+            &md_state,
+            MdStateCommand::RegisterPoolVaultsFromAccount { pool },
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -14567,7 +14598,7 @@ mod pr_b_geyser_tracking_tests {
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
-        let (tracking_tx, tracking_depth) = spawn_geyser_tracking_actor(Arc::clone(&ctx));
+        let md_state = test_spawn_md_state(&ctx);
 
         let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
         let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
@@ -14599,10 +14630,9 @@ mod pr_b_geyser_tracking_tests {
             });
         }
 
-        geyser_tracking_try_enqueue(
-            &tracking_tx,
-            tracking_depth.as_ref(),
-            GeyserTrackingCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
+        md_state_try_enqueue(
+            &md_state,
+            MdStateCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
                 version: 1,
                 ts_unix_ms: 1,
                 active,
@@ -14619,7 +14649,7 @@ mod pr_b_geyser_tracking_tests {
         );
         assert!(
             MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed) > jobs0,
-            "actor should process momentum job"
+            "md-state should process momentum job"
         );
 
         tokio::time::sleep(Duration::from_millis(350)).await;
@@ -14640,17 +14670,13 @@ mod pr_b_geyser_tracking_tests {
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
-        let (tracking_tx, tracking_depth) = spawn_geyser_tracking_actor(Arc::clone(&ctx));
+        let md_state = test_spawn_md_state(&ctx);
 
         let mint = Pubkey::new_unique();
         let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
         let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
 
-        geyser_tracking_try_enqueue(
-            &tracking_tx,
-            tracking_depth.as_ref(),
-            GeyserTrackingCommand::TrackWalletMint { mint },
-        );
+        md_state_try_enqueue(&md_state, MdStateCommand::TrackWalletMint { mint });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         let tracked = ctx.tracked_mints.read();
@@ -14687,9 +14713,8 @@ mod pr_b_geyser_tracking_tests {
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
-        let (tracking_tx, tracking_depth) = spawn_geyser_tracking_actor(Arc::clone(&ctx));
-        let coalesce_tx =
-            spawn_momentum_tracking_coalescer(Arc::clone(&ctx), tracking_tx, tracking_depth);
+        let md_state = test_spawn_md_state(&ctx);
+        let coalesce_tx = spawn_momentum_tracking_coalescer(Arc::clone(&ctx), md_state);
 
         let msgs0 = MARKET_DATA_MOMENTUM_COALESCED_MESSAGES_TOTAL.load(Ordering::Relaxed);
         let batches0 = MARKET_DATA_MOMENTUM_COALESCED_BATCHES_TOTAL.load(Ordering::Relaxed);
@@ -14836,16 +14861,16 @@ mod pr_b_geyser_tracking_tests {
         );
     }
 
-    /// PR169c: chunked momentum apply yields so other runtime tasks make progress mid-job.
-    #[tokio::test]
-    async fn pr169c_chunked_momentum_apply_yields_to_runtime() {
+    /// Phase-R-R2: large momentum apply runs on `md-state` thread (chunked, no Tokio in worker).
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr_r2_chunked_momentum_apply_on_md_state_thread() {
         use ironcrab::nats::{MomentumActivePinReason, MomentumActivePoolEntry};
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
-        let (tracking_tx, tracking_depth) = spawn_geyser_tracking_actor(Arc::clone(&ctx));
+        let md_state = test_spawn_md_state(&ctx);
 
         let mut active = Vec::new();
         for _ in 0..48 {
@@ -14871,23 +14896,9 @@ mod pr_b_geyser_tracking_tests {
             });
         }
 
-        let runtime_progress = Arc::new(AtomicBool::new(false));
-        let progress_flag = Arc::clone(&runtime_progress);
-        let apply_finished = Arc::new(AtomicBool::new(false));
-        let finished_flag = Arc::clone(&apply_finished);
-
-        tokio::spawn(async move {
-            while !finished_flag.load(Ordering::Relaxed) {
-                tokio::task::yield_now().await;
-                progress_flag.store(true, Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_micros(100)).await;
-            }
-        });
-
-        geyser_tracking_try_enqueue(
-            &tracking_tx,
-            tracking_depth.as_ref(),
-            GeyserTrackingCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
+        md_state_try_enqueue(
+            &md_state,
+            MdStateCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
                 version: 1,
                 ts_unix_ms: 1,
                 active,
@@ -14902,12 +14913,83 @@ mod pr_b_geyser_tracking_tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        apply_finished.store(true, Ordering::Relaxed);
-
-        assert!(
-            runtime_progress.load(Ordering::Relaxed),
-            "chunked momentum apply should yield to other runtime tasks"
-        );
         assert_eq!(ctx.active_pool_set.pair_count(), 48);
+    }
+
+    /// Phase-R-R2: full md-state queue + held `tracked_vaults` write must not block TX handler.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr_r2_tx_handler_returns_when_md_state_queue_full_and_vaults_locked() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let md_state = test_spawn_md_state(&ctx);
+        fill_md_state_queue(&md_state);
+
+        let lock_ctx = Arc::clone(&ctx);
+        let hold = tokio::task::spawn_blocking(move || {
+            let _guard = lock_ctx.tracked_vaults.write();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+
+        let tx_count = AtomicU64::new(0);
+        let tx_update = GeyserTransactionUpdate {
+            signature: "sig".into(),
+            slot: 1,
+            account_keys: vec![],
+            instruction_accounts: vec![],
+            instruction_data: vec![],
+            inner_instructions: vec![],
+            pre_token_balances: vec![],
+            post_token_balances: vec![],
+            pre_balances: vec![],
+            post_balances: vec![],
+            fee_lamports: 0,
+            compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
+        };
+        let done = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            handle_geyser_transaction(
+                Arc::clone(&ctx),
+                "run-r2",
+                tx_update,
+                &tx_count,
+                None,
+                &md_state,
+            ),
+        )
+        .await;
+        assert!(
+            done.is_ok(),
+            "TX handler must return without blocking on tracked_vaults when md-state queue is full"
+        );
+        let _ = hold.await;
+    }
+
+    /// Phase-R-R2: burst job processing sets `schedule_sync` once per worker drain (not per job).
+    #[test]
+    fn pr_r2_burst_track_mint_coalesces_single_schedule_sync_flag() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let mut schedule_sync = false;
+        for _ in 0..32 {
+            let mint = Pubkey::new_unique();
+            if md_state_process_job(&ctx, MdStateCommand::TrackMint { mint, pin: None }) {
+                schedule_sync = true;
+            }
+        }
+        assert!(
+            schedule_sync,
+            "burst TrackMint should mark schedule_sync once for the whole drain"
+        );
+        assert_eq!(
+            ctx.tracked_mints.read().len(),
+            32,
+            "all burst mints should be tracked on md-state"
+        );
     }
 }

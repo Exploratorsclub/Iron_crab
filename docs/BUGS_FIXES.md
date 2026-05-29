@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PHASE-R-R2-MD-STATE-THREAD: Tracked-State Single-Writer off Tokio Pool
+**Datum**: 2026-05-29  
+**Problem** (Phase-0-Diagnose / Plan `plan_market_data_ingest_rebuild.md` Phase R): Nach PR169a/b/c serialisierte ein **Tokio-Actor** Tracking-Mutationen, lief aber auf dem **selben Runtime-Pool** wie TX-Task und 8 Account-Worker. Prod-Freeze (`futex_wait_queue`, `tracking_queue_depth`≈1367 bei Cap 8192): parallele `tracked_*`-Locks + `schedule_geyser_sync` pro Job → Lock-Convoy; TX-Task blockiert.  
+**Fix** (R2): (1) **`md-state` OS-Thread** (`std::thread`, bounded `sync_channel`, `try_enqueue`) — einziger Writer für `tracked_*`, Touch-LRU, Eviction, debounced Geyser-Sync. (2) **Touch off Ingest**: Account/TX-Handler enqueuen `TouchVault` / `TouchBinArray` / `TouchPool` statt `touch_tracked_*` direkt. (3) **Burst coalesce**: Worker drain bis `MARKET_DATA_MD_STATE_BURST_MAX` (256), **ein** `schedule_geyser_sync_batch_debounced()` pro Burst. (4) **Momentum** chunked apply sync auf `md-state` (`std::thread::yield_now`, kein Tokio im Worker). (5) Queue-Depth-Gauge = aktuelle Channel-Tiefe (wie JSONL-Writer). Metrik-Alias `market_data_md_state_queue_depth`. **Invarianten**: I-4b (kein blockierendes tracked work im Ingest), I-7 unverändert, PR167 Startup-Debounce beibehalten. **Nicht** in R2: `geyser_listener` Subscription-Timeout (R3), deferred side-effects Queue (R4).  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### PHASE-R-R1-JSONL-HOT-PATH: JSONL-Serialisierung off Geyser-Ingest-Thread
 **Datum**: 2026-05-29  
 **Problem** (Phase-0-Diagnose / Plan `plan_market_data_ingest_rebuild.md` Phase R): PR165 brachte `QueuedJsonlWriter` + dedizierten `jsonl-writer`-Thread, aber `try_write` rief weiterhin `serde_json::to_string` auf dem Geyser-Ingest-Thread auf (CPU + Allocation im Hot Path, I-4b-Verstoß).  

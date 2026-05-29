@@ -595,6 +595,12 @@ pub fn set_market_data_geyser_tracking_queue_depth(depth: usize) {
     MARKET_DATA_GEYSER_TRACKING_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
 }
 
+/// Phase-R-R2: alias of [`set_market_data_geyser_tracking_queue_depth`] (md-state channel depth).
+#[inline]
+pub fn set_market_data_md_state_queue_depth(depth: usize) {
+    set_market_data_geyser_tracking_queue_depth(depth);
+}
+
 #[inline]
 pub fn inc_market_data_geyser_tracking_enqueue_dropped_total() {
     MARKET_DATA_GEYSER_TRACKING_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -2781,6 +2787,10 @@ async fn metrics_response() -> Response<Body> {
     );
     line!(
         "market_data_geyser_tracking_queue_depth",
+        MARKET_DATA_GEYSER_TRACKING_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_md_state_queue_depth",
         MARKET_DATA_GEYSER_TRACKING_QUEUE_DEPTH.load(Ordering::Relaxed)
     );
     line!(
