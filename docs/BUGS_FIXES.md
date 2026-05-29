@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PHASE-R-R4-MD-SIDEFX-DEFERRED: Deferred Side-Effects off Geyser Ingest
+**Datum**: 2026-05-30  
+**Problem** (Plan Phase R / Prod post-R3 `e4ebd09`): Global-Freeze ~3 s nach Restart bleibt — `md-state` entlastet `tracked_*`, Tokio-Ingest blockiert weiter auf `pool_mint_map.write()`, Pump-AMM-Burst, DevWallet, BondingCurve-Pfad und `tracked_vaults.read()` in Account-Handlern (8 Worker + TX-Task Lock-Convoy).  
+**Fix** (R4): (1) **`md-sidefx` OS-Thread** (`std::thread`, bounded `sync_channel` Cap 4096, `try_enqueue` only). (2) **TX defer**: PumpFun `pool_mint_map`, PumpFun DevWallet, PumpAmm create/first-trade + DexPoolAccounts/JetStream, generic first-trade accounts. (3) **Account defer**: BondingCurve DevWallet + fallback cache; vault balance ticks (pairing read in sidefx). (4) **Publish**: sync enqueue via PR160 `account_path_try_enqueue_job` (kein NATS-await im Worker). (5) **Burst coalesce** identische Pool-Keys vor `pool_mint_map.write`. Metriken: `market_data_md_sidefx_queue_depth`, `_jobs_processed_total`, `_enqueue_dropped_total`. **Invarianten**: I-4b, I-7, I-16. **Nicht**: R1/R2/R3 revert, kein P169d Tokio-Coalescer. Prod-Evidenz: `Iron_crab-eval/docs/supervisor/phase0_post_r3_deploy_20260530.md`.  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### PHASE-R-R3-SUBSCRIPTION-COALESCE-TIMEOUT: Geyser Subscription Sink Coalesce + 2s Timeout
 **Datum**: 2026-05-29  
 **Problem** (Plan `plan_market_data_ingest_rebuild.md` Phase R3 / PR167 Nachzug): Startup-Burst lieferte **14+** in-place `subscription updated` in wenigen Sekunden; blockierendes `subscribe_tx.send().await` im Subscription-Updater konnte die Read-Loop verhungern lassen (`geyser_sync_pending=1`, Send-Q staut, Ingest tot). PR167 adressierte das teilweise (400 ms Rate-Limit, 2 s Timeout); Plan I-4b verlangt explizit **500 ms** latest-wins coalesce und harten Reconnect bei Sink-Backpressure.  
