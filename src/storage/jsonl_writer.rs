@@ -5,12 +5,16 @@
 //! - Rotation: daily (UTC)
 //! - Naming: {prefix}-YYYYMMDD.jsonl
 
+use crate::ipc::schema::MarketEvent;
+use crate::metrics::{
+    inc_market_data_jsonl_records_written_total, set_market_data_jsonl_queue_depth,
+};
 use chrono::Utc;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -198,7 +202,12 @@ impl Drop for JsonlWriter {
 // ============================================================================
 
 enum QueuedJsonlMsg {
+    /// Pre-serialized line (cold path / tests).
     Line(String),
+    /// Market ingest: serialize only on `jsonl-writer` thread (Phase R1).
+    MarketEvent(Box<MarketEvent>),
+    /// Generic record: closure runs on writer thread (tests / non–market-data).
+    Serialize(Box<dyn FnOnce() -> String + Send>),
     Flush,
     Shutdown,
 }
@@ -206,6 +215,9 @@ enum QueuedJsonlMsg {
 /// Non-blocking JSONL enqueue from Geyser paths; actual I/O on `jsonl-writer` thread.
 pub struct QueuedJsonlWriter {
     sender: std::sync::mpsc::SyncSender<QueuedJsonlMsg>,
+    /// Max in-flight + channel records (matches `sync_channel` capacity).
+    queue_capacity: usize,
+    queue_depth: Arc<AtomicUsize>,
     records_written: Arc<AtomicU64>,
     bytes_written: Arc<AtomicU64>,
     join: Mutex<Option<JoinHandle<()>>>,
@@ -214,12 +226,14 @@ pub struct QueuedJsonlWriter {
 impl QueuedJsonlWriter {
     /// Spawn background writer with bounded queue (`try_enqueue` drops when full).
     pub fn spawn(config: JsonlWriterConfig, queue_capacity: usize) -> std::io::Result<Self> {
-        let queue_capacity = queue_capacity.max(64);
+        let queue_capacity = queue_capacity.max(1);
         let (tx, rx) = std::sync::mpsc::sync_channel::<QueuedJsonlMsg>(queue_capacity);
         let records_written = Arc::new(AtomicU64::new(0));
         let bytes_written = Arc::new(AtomicU64::new(0));
+        let queue_depth = Arc::new(AtomicUsize::new(0));
         let records_for_thread = Arc::clone(&records_written);
         let bytes_for_thread = Arc::clone(&bytes_written);
+        let depth_for_thread = Arc::clone(&queue_depth);
         let flush_each_write = config.flush_each_write;
         let join = std::thread::Builder::new()
             .name("jsonl-writer".into())
@@ -233,6 +247,24 @@ impl QueuedJsonlWriter {
                 };
                 let periodic_flush = Duration::from_secs(1);
                 let mut last_periodic_flush = Instant::now();
+                let dec_queue_depth = || {
+                    let mut cur = depth_for_thread.load(Ordering::Relaxed);
+                    while cur > 0 {
+                        match depth_for_thread.compare_exchange_weak(
+                            cur,
+                            cur - 1,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => {
+                                set_market_data_jsonl_queue_depth(cur - 1);
+                                return;
+                            }
+                            Err(actual) => cur = actual,
+                        }
+                    }
+                    set_market_data_jsonl_queue_depth(0);
+                };
                 let write_line = |json: String| {
                     let len = json.len() as u64 + 1;
                     if let Err(e) = writer.write_json_line(&json) {
@@ -240,11 +272,25 @@ impl QueuedJsonlWriter {
                     } else {
                         records_for_thread.fetch_add(1, Ordering::Relaxed);
                         bytes_for_thread.fetch_add(len, Ordering::Relaxed);
+                        inc_market_data_jsonl_records_written_total();
                     }
                 };
                 loop {
                     match rx.recv_timeout(Duration::from_millis(200)) {
-                        Ok(QueuedJsonlMsg::Line(json)) => write_line(json),
+                        Ok(QueuedJsonlMsg::Line(json)) => {
+                            write_line(json);
+                            dec_queue_depth();
+                        }
+                        Ok(QueuedJsonlMsg::MarketEvent(event)) => {
+                            let json =
+                                serde_json::to_string(&*event).unwrap_or_else(|_| "{}".to_string());
+                            write_line(json);
+                            dec_queue_depth();
+                        }
+                        Ok(QueuedJsonlMsg::Serialize(serialize)) => {
+                            write_line(serialize());
+                            dec_queue_depth();
+                        }
                         Ok(QueuedJsonlMsg::Flush) => {
                             let _ = writer.flush();
                         }
@@ -267,26 +313,56 @@ impl QueuedJsonlWriter {
 
         Ok(Self {
             sender: tx,
+            queue_capacity,
+            queue_depth,
             records_written,
             bytes_written,
             join: Mutex::new(Some(join)),
         })
     }
 
-    /// Queue serialized JSON (non-blocking). Returns `false` when queue is full.
-    pub fn try_enqueue_json(&self, json: String) -> bool {
-        self.sender.try_send(QueuedJsonlMsg::Line(json)).is_ok()
+    fn try_enqueue_msg(&self, msg: QueuedJsonlMsg) -> bool {
+        if self.queue_depth.load(Ordering::Relaxed) >= self.queue_capacity {
+            return false;
+        }
+        if self.sender.try_send(msg).is_ok() {
+            let d = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+            set_market_data_jsonl_queue_depth(d);
+            true
+        } else {
+            false
+        }
     }
 
-    /// Queue a serializable record (serializes on caller thread — prefer `try_enqueue_json` from hot path).
-    pub fn try_write<T: Serialize>(&self, record: &T) -> bool {
-        let json = serde_json::to_string(record).unwrap_or_else(|_| "{}".to_string());
-        self.try_enqueue_json(json)
+    /// Queue pre-serialized JSON (non-blocking). Returns `false` when queue is full.
+    pub fn try_enqueue_json(&self, json: String) -> bool {
+        self.try_enqueue_msg(QueuedJsonlMsg::Line(json))
+    }
+
+    /// Queue a market event for JSONL (no serde on caller; clone + bounded `try_send` only).
+    pub fn try_enqueue_market_event(&self, event: &MarketEvent) -> bool {
+        self.try_enqueue_msg(QueuedJsonlMsg::MarketEvent(Box::new(event.clone())))
+    }
+
+    /// Queue a serializable record (serialization on `jsonl-writer` thread only).
+    pub fn try_write<T: Serialize + Send + 'static>(&self, record: T) -> bool {
+        let record = Box::new(record);
+        self.try_enqueue_msg(QueuedJsonlMsg::Serialize(Box::new(move || {
+            serde_json::to_string(&*record).unwrap_or_else(|_| "{}".to_string())
+        })))
     }
 
     pub fn flush(&self) -> std::io::Result<()> {
-        let _ = self.sender.send(QueuedJsonlMsg::Flush);
-        Ok(())
+        for _ in 0..256 {
+            if self.sender.try_send(QueuedJsonlMsg::Flush).is_ok() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "QueuedJsonlWriter flush: queue full",
+        ))
     }
 
     pub fn stats(&self) -> (u64, u64) {
@@ -299,7 +375,13 @@ impl QueuedJsonlWriter {
 
 impl Drop for QueuedJsonlWriter {
     fn drop(&mut self) {
-        let _ = self.sender.send(QueuedJsonlMsg::Shutdown);
+        // Non-blocking: avoid deadlock if the bounded channel still holds pending records.
+        for _ in 0..4 {
+            if self.sender.try_send(QueuedJsonlMsg::Shutdown).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         if let Some(handle) = self.join.lock().unwrap().take() {
             let _ = handle.join();
         }
@@ -471,7 +553,7 @@ mod tests {
             .with_log_dir(dir.path())
             .with_flush_each_write(true);
         let q = QueuedJsonlWriter::spawn(config, 64).unwrap();
-        assert!(q.try_write(&TestRecord {
+        assert!(q.try_write(TestRecord {
             id: "q1".to_string(),
             value: 7,
         }));
@@ -481,5 +563,116 @@ mod tests {
         let path = dir.path().join(format!("queued-{today}.jsonl"));
         let content = fs::read_to_string(path).unwrap();
         assert!(content.contains("q1"));
+    }
+
+    /// Phase R1: full queue returns immediately (no blocking on ingest).
+    #[test]
+    fn phase_r1_queued_jsonl_full_queue_returns_false_immediately() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrdering};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let dir = tempdir().unwrap();
+        let config = JsonlWriterConfig::new("fullq")
+            .with_log_dir(dir.path())
+            .with_flush_each_write(true);
+        let hold = Arc::new(AtomicBool::new(true));
+        let hold_w = Arc::clone(&hold);
+        let q = QueuedJsonlWriter::spawn(config, 1).unwrap();
+        assert!(
+            q.try_enqueue_msg(QueuedJsonlMsg::Serialize(Box::new(move || {
+                while hold_w.load(AOrdering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                "{}".to_string()
+            })))
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        let t0 = Instant::now();
+        assert!(!q.try_enqueue_json("second".to_string()));
+        assert!(
+            t0.elapsed() < Duration::from_millis(50),
+            "try_enqueue must not block when in-flight depth is at capacity"
+        );
+        hold.store(false, AOrdering::Relaxed);
+        std::thread::sleep(Duration::from_millis(100));
+        drop(q);
+    }
+
+    /// Phase R1: writer thread produces valid JSONL for `MarketEvent`.
+    #[test]
+    fn phase_r1_queued_jsonl_serializes_market_event_on_writer_thread() {
+        use crate::ipc::schema::{MarketEvent, MarketEventKind, RecordHeader};
+
+        let dir = tempdir().unwrap();
+        let config = JsonlWriterConfig::new("mkt")
+            .with_log_dir(dir.path())
+            .with_flush_each_write(true);
+        let q = QueuedJsonlWriter::spawn(config, 64).unwrap();
+        let event = MarketEvent {
+            header: RecordHeader::new("market_data", "test", "run-test"),
+            event_id: "evt-r1-001".to_string(),
+            source: "geyser".to_string(),
+            slot: Some(42),
+            kind: MarketEventKind::TransactionDetected {
+                signature: "sig".into(),
+                program: "prog".into(),
+            },
+        };
+        assert!(q.try_enqueue_market_event(&event));
+        q.flush().unwrap();
+        drop(q);
+        let today = Utc::now().format("%Y%m%d").to_string();
+        let path = dir.path().join(format!("mkt-{today}.jsonl"));
+        let content = fs::read_to_string(path).unwrap();
+        assert!(content.contains("evt-r1-001"));
+        assert!(content.contains("TransactionDetected"));
+        let _: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("one line")).unwrap();
+    }
+
+    /// Phase R1: parallel enqueues from many threads do not block (bounded try_send).
+    #[test]
+    fn phase_r1_parallel_try_enqueue_does_not_block_callers() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrdering};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let dir = tempdir().unwrap();
+        let config = JsonlWriterConfig::new("parallel")
+            .with_log_dir(dir.path())
+            .with_flush_each_write(true);
+        let hold = Arc::new(AtomicBool::new(true));
+        let hold_w = Arc::clone(&hold);
+        let q = Arc::new(QueuedJsonlWriter::spawn(config, 2).unwrap());
+        assert!(
+            q.try_enqueue_msg(QueuedJsonlMsg::Serialize(Box::new(move || {
+                while hold_w.load(AOrdering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                "{}".to_string()
+            })))
+        );
+        assert!(q.try_enqueue_json("fill-2".to_string()));
+        std::thread::sleep(Duration::from_millis(20));
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let q = Arc::clone(&q);
+                std::thread::spawn(move || {
+                    let t0 = Instant::now();
+                    let _ = q.try_enqueue_json(format!("line-{i}"));
+                    assert!(
+                        t0.elapsed() < Duration::from_millis(100),
+                        "caller thread must not block on JsonlWriter mutex"
+                    );
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        hold.store(false, AOrdering::Relaxed);
+        std::thread::sleep(Duration::from_millis(100));
+        drop(q);
     }
 }

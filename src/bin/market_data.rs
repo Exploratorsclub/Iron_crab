@@ -1445,7 +1445,7 @@ impl MarketDataContext {
         if !market_event_should_jsonl(&event.kind) {
             return;
         }
-        if !self.jsonl_writer.try_write(event) {
+        if !self.jsonl_writer.try_enqueue_market_event(event) {
             inc_market_data_jsonl_enqueue_dropped_total();
             warn!(
                 event_id = %event.event_id,

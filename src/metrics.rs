@@ -919,6 +919,13 @@ pub static MARKET_DATA_TOKIO_LIVENESS_STALLS_TOTAL: Lazy<AtomicU64> =
 pub static MARKET_DATA_JSONL_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// PR Phase-R1: bounded JSONL writer queue depth (enqueue − dequeue).
+pub static MARKET_DATA_JSONL_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// PR Phase-R1: records written by `jsonl-writer` OS thread.
+pub static MARKET_DATA_JSONL_RECORDS_WRITTEN_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// Record Geyser ingest progress for Tokio liveness (cheap atomics only).
 #[inline]
 pub fn record_market_data_tokio_progress() {
@@ -934,6 +941,16 @@ pub fn record_market_data_tokio_liveness_stall() {
 #[inline]
 pub fn inc_market_data_jsonl_enqueue_dropped_total() {
     MARKET_DATA_JSONL_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_jsonl_queue_depth(depth: usize) {
+    MARKET_DATA_JSONL_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_jsonl_records_written_total() {
+    MARKET_DATA_JSONL_RECORDS_WRITTEN_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Update monotonic Geyser head slot (max). Safe from any market-data ingest arm.
@@ -2898,6 +2915,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_jsonl_enqueue_dropped_total",
         MARKET_DATA_JSONL_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_jsonl_queue_depth",
+        MARKET_DATA_JSONL_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_jsonl_records_written_total",
+        MARKET_DATA_JSONL_RECORDS_WRITTEN_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_last_trade_publish_ts_unix_ms",
