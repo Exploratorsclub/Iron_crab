@@ -6,6 +6,20 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PR169c-MOMENTUM-COALESCE-ACTOR-BUDGET: Startup Global-Freeze nach Momentum-Flood
+**Datum**: 2026-05-29  
+**Problem** (Prod Restart-Smoke `38f355e` nach P169b): ~10 s nach `systemctl restart market-data` **Global-Freeze** — `tx_handler`, `account_updates`, `head_slot` alle Δ0; letztes `Parsed DEX transaction` ~10 s nach Restart; **99×** Momentum-NATS → 99× `ApplyMomentumActivePools` serial + **18×** `subscription updated` (2→719 accounts) in 9 s; `geyser_sync_immediate_total` = 0 (P169b hält), Session verbunden, Runtime tot. P169b serialisierte Writer, coalesced aber nicht den Momentum-Enqueue-Sturm.  
+**Restart-Smoke (+8 / +20 / +60 s nach Restart 17:12:36 CEST):**
+
+| Zeitpunkt | `tx_handler` | `account_updates` | `head_slot` | `tracking_jobs` | `tracking_queue` |
+|-----------|--------------|-------------------|-------------|-----------------|-------------------|
+| +8 s | 3636 | 8210 | 422963221 | 2474 | 46 |
+| +20 s | **3636** Δ0 | **8210** Δ0 | **422963221** Δ0 | **2474** Δ0 | **46** Δ0 |
+| +60 s | **3636** Δ0 | **8210** Δ0 | **422963221** Δ0 | **2474** Δ0 | **46** Δ0 |
+
+**Fix** (P169c): (1) **`momentum_tracking_coalesce` Task** — NATS `try_send` non-blocking; merge burst (`union active`, `removed`, `full_active_snapshot`-Semantik); debounce aligned mit `geyser_sync_batch_debounce_ms()` (Startup min 250 ms); **ein** `ApplyMomentumActivePools` pro Fenster an Actor. Metriken: `market_data_momentum_coalesced_messages_total`, `market_data_momentum_coalesced_batches_total`. (2) **Actor budget**: `yield_now` + `record_market_data_tokio_progress()` nach jedem Job; große Momentum-Updates (>32 Einträge) in Chunks à 16 mit Yield, **ein** debounced sync am Ende. (3) Kein neuer RPC, kein immediate sync (I-7, I-4).  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### PR169b-GEYSER-TRACKING-ACTOR-MOMENTUM-WALLET-CONFIG: Momentum / Wallet / Config Single-Writer
 **Datum**: 2026-05-29  
 **Problem** (Prod `b75fcc8` nach P169a-Deploy): Actor lief (`geyser_tracking_jobs_processed_total` ≈ 1132), aber **Global-Freeze unverändert** — `tx_handler_processed`, `geyser_account_listener_account_updates`, `geyser_head_slot` alle Δ0 nach ~6 s; `market_data_momentum_active_pool_messages_total` = **85** (Restart-Flood); `geyser_sync_immediate_total` = **110** (immediate sync storm); `geyser_merge_pending` = **1** (debounce-Timer feuert nie); `account_worker_queue_depth` = **192** (stehend); Tokio-Threads sleeping, Geyser Recv-Q ~2 MB. P169a serialisierte Account+TX, aber **Momentum Active Pools**, **Wallet-Snapshot** und **Config `max_tracked_accounts`** mutierten weiterhin parallel `tracked_*` und riefen `sync_geyser_tracked_accounts()` immediate auf.  

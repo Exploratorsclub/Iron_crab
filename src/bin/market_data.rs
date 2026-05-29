@@ -58,12 +58,14 @@ use ironcrab::metrics::{
     inc_market_data_account_publish_queue_depth, inc_market_data_account_worker_queue_depth,
     inc_market_data_geyser_tracking_enqueue_dropped_total,
     inc_market_data_geyser_tracking_jobs_processed_total,
-    inc_market_data_jsonl_enqueue_dropped_total, inc_market_data_unparsed_account_dropped_total,
-    inc_market_data_unparsed_tx_dropped_total, market_data_bump_geyser_head_slot,
-    market_data_geyser_head_slot_value, market_data_request_account_session_reconnect,
-    market_data_request_tx_session_reconnect, market_data_tx_handler_processed_value,
-    record_market_data_account_broadcast_lagged, record_market_data_account_channel_lag_ms,
-    record_market_data_account_early_drop_total, record_market_data_account_handler_duration_us,
+    inc_market_data_jsonl_enqueue_dropped_total, inc_market_data_momentum_coalesced_batches_total,
+    inc_market_data_momentum_coalesced_messages_total,
+    inc_market_data_unparsed_account_dropped_total, inc_market_data_unparsed_tx_dropped_total,
+    market_data_bump_geyser_head_slot, market_data_geyser_head_slot_value,
+    market_data_request_account_session_reconnect, market_data_request_tx_session_reconnect,
+    market_data_tx_handler_processed_value, record_market_data_account_broadcast_lagged,
+    record_market_data_account_channel_lag_ms, record_market_data_account_early_drop_total,
+    record_market_data_account_handler_duration_us,
     record_market_data_account_publish_worker_job_duration_us,
     record_market_data_account_publish_worker_reconnect,
     record_market_data_account_publish_worker_stall,
@@ -92,10 +94,11 @@ use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
     ensure_pool_cache_stream, ensure_wallet_snapshot_stream, execution_results_consumer_config,
     pool_subject, wallet_snapshot_consumer_config, wallet_snapshot_subject,
-    MomentumActivePoolsUpdate, NatsClient, NatsConfig, CONFIG_STREAM_NAME,
-    EXECUTION_RESULTS_STREAM_NAME, TOPIC_CONTROL_REQUESTS, TOPIC_CONTROL_RESPONSES,
-    TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_MOMENTUM_ACTIVE_POOLS,
-    TOPIC_MOMENTUM_MARKET_EVENTS, TOPIC_PRIORITY_FEE_SAMPLES, WALLET_SNAPSHOT_STREAM_NAME,
+    MomentumActivePoolEntry, MomentumActivePoolsUpdate, MomentumRemovedPoolEntry, NatsClient,
+    NatsConfig, CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME, TOPIC_CONTROL_REQUESTS,
+    TOPIC_CONTROL_RESPONSES, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
+    TOPIC_MOMENTUM_ACTIVE_POOLS, TOPIC_MOMENTUM_MARKET_EVENTS, TOPIC_PRIORITY_FEE_SAMPLES,
+    WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
@@ -135,6 +138,11 @@ const MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP: usize = 8192;
 /// PR167: minimum debounce for explicit pin updates during startup burst (seconds).
 const MARKET_DATA_GEYSER_SYNC_STARTUP_WINDOW: Duration = Duration::from_secs(120);
 const MARKET_DATA_GEYSER_SYNC_STARTUP_MIN_MS: u64 = 250;
+/// PR169c: bounded channel for momentum updates before actor coalesce.
+const MARKET_DATA_MOMENTUM_COALESCE_CHANNEL_CAP: usize = 512;
+/// PR169c: chunk large momentum applies so the tracking actor yields to ingest tasks.
+const MARKET_DATA_MOMENTUM_APPLY_CHUNK_THRESHOLD: usize = 32;
+const MARKET_DATA_MOMENTUM_APPLY_CHUNK_SIZE: usize = 16;
 
 /// ExecutionResult dedup: prevents replay storms from re-tracking the same ATA/mint over and over.
 ///
@@ -295,6 +303,149 @@ enum GeyserTrackingCommand {
     ScheduleGeyserSyncAfterConfigChange,
 }
 
+type MomentumPoolKey = (String, String);
+
+/// PR169c: merge a burst of momentum updates into one payload equivalent to sequential applies.
+fn merge_momentum_active_pools_updates(
+    updates: &[MomentumActivePoolsUpdate],
+) -> Option<MomentumActivePoolsUpdate> {
+    if updates.is_empty() {
+        return None;
+    }
+    let mut active_map: HashMap<MomentumPoolKey, MomentumActivePoolEntry> = HashMap::new();
+    let mut removed_map: HashMap<MomentumPoolKey, MomentumRemovedPoolEntry> = HashMap::new();
+    let mut saw_full_snapshot = false;
+    let mut max_version = 0u32;
+    let mut max_ts = 0u64;
+
+    for update in updates {
+        max_version = max_version.max(update.version);
+        max_ts = max_ts.max(update.ts_unix_ms);
+        if update.full_active_snapshot {
+            saw_full_snapshot = true;
+            let target: HashSet<MomentumPoolKey> = update
+                .active
+                .iter()
+                .map(|a| (a.mint.clone(), a.pool.clone()))
+                .collect();
+            for key in active_map.keys().cloned().collect::<Vec<_>>() {
+                if !target.contains(&key) {
+                    active_map.remove(&key);
+                    removed_map.remove(&key);
+                }
+            }
+            active_map.clear();
+            for r in &update.removed {
+                let key = (r.mint.clone(), r.pool.clone());
+                active_map.remove(&key);
+                removed_map.insert(key, r.clone());
+            }
+            for a in &update.active {
+                let key = (a.mint.clone(), a.pool.clone());
+                removed_map.remove(&key);
+                active_map.insert(key, a.clone());
+            }
+        } else {
+            for r in &update.removed {
+                let key = (r.mint.clone(), r.pool.clone());
+                active_map.remove(&key);
+                removed_map.insert(key, r.clone());
+            }
+            for a in &update.active {
+                let key = (a.mint.clone(), a.pool.clone());
+                removed_map.remove(&key);
+                active_map.insert(key, a.clone());
+            }
+        }
+    }
+
+    for key in active_map.keys().cloned().collect::<Vec<_>>() {
+        removed_map.remove(&key);
+    }
+
+    Some(MomentumActivePoolsUpdate {
+        version: max_version,
+        ts_unix_ms: max_ts,
+        active: active_map.into_values().collect(),
+        removed: removed_map.into_values().collect(),
+        full_active_snapshot: saw_full_snapshot,
+    })
+}
+
+fn momentum_coalesce_try_send(
+    tx: &mpsc::Sender<MomentumActivePoolsUpdate>,
+    update: MomentumActivePoolsUpdate,
+) {
+    inc_market_data_momentum_coalesced_messages_total();
+    if tx.try_send(update).is_err() {
+        warn!("momentum coalesce channel full; dropping MomentumActivePoolsUpdate");
+    }
+}
+
+fn spawn_momentum_tracking_coalescer(
+    ctx: Arc<MarketDataContext>,
+    geyser_tracking_tx: mpsc::Sender<GeyserTrackingCommand>,
+    geyser_tracking_queue_depth: Arc<AtomicUsize>,
+) -> mpsc::Sender<MomentumActivePoolsUpdate> {
+    let (coalesce_tx, mut coalesce_rx) =
+        mpsc::channel::<MomentumActivePoolsUpdate>(MARKET_DATA_MOMENTUM_COALESCE_CHANNEL_CAP);
+    tokio::spawn(async move {
+        while let Some(first) = coalesce_rx.recv().await {
+            let mut pending = vec![first];
+            while let Ok(more) = coalesce_rx.try_recv() {
+                pending.push(more);
+            }
+            let debounce_ms = ctx.geyser_sync_batch_debounce_ms();
+            tokio::time::sleep(Duration::from_millis(debounce_ms)).await;
+            while let Ok(more) = coalesce_rx.try_recv() {
+                pending.push(more);
+            }
+            if let Some(merged) = merge_momentum_active_pools_updates(&pending) {
+                inc_market_data_momentum_coalesced_batches_total();
+                geyser_tracking_try_enqueue(
+                    &geyser_tracking_tx,
+                    geyser_tracking_queue_depth.as_ref(),
+                    GeyserTrackingCommand::ApplyMomentumActivePools(merged),
+                );
+            }
+            pending.clear();
+        }
+    });
+    coalesce_tx
+}
+
+async fn apply_momentum_active_pools_in_actor(
+    ctx: &Arc<MarketDataContext>,
+    update: MomentumActivePoolsUpdate,
+) -> bool {
+    let item_count = update.active.len() + update.removed.len();
+    if item_count <= MARKET_DATA_MOMENTUM_APPLY_CHUNK_THRESHOLD {
+        return ctx.apply_momentum_active_pools_update(&update);
+    }
+    record_market_data_momentum_active_pool_messages_total();
+    let mut batch_dirty = false;
+    if update.full_active_snapshot {
+        batch_dirty |= ctx.apply_momentum_snapshot_reconcile(&update.active);
+        tokio::task::yield_now().await;
+        record_market_data_tokio_progress();
+    }
+    for chunk in update.removed.chunks(MARKET_DATA_MOMENTUM_APPLY_CHUNK_SIZE) {
+        batch_dirty |= ctx.apply_momentum_removed_entries(chunk);
+        tokio::task::yield_now().await;
+        record_market_data_tokio_progress();
+    }
+    for chunk in update.active.chunks(MARKET_DATA_MOMENTUM_APPLY_CHUNK_SIZE) {
+        batch_dirty |= ctx.apply_momentum_active_entries(chunk);
+        tokio::task::yield_now().await;
+        record_market_data_tokio_progress();
+    }
+    if !batch_dirty {
+        ctx.refresh_geyser_pins_gauge();
+    }
+    set_market_data_momentum_active_pool_pins_gauge(ctx.active_pool_set.pair_count());
+    batch_dirty
+}
+
 fn geyser_tracking_try_enqueue(
     tx: &mpsc::Sender<GeyserTrackingCommand>,
     queue_depth: &AtomicUsize,
@@ -339,7 +490,7 @@ fn spawn_geyser_tracking_actor(
                     }
                 }
                 GeyserTrackingCommand::ApplyMomentumActivePools(update) => {
-                    if ctx.apply_momentum_active_pools_update(&update) {
+                    if apply_momentum_active_pools_in_actor(&ctx, update).await {
                         schedule_sync = true;
                     }
                 }
@@ -355,6 +506,8 @@ fn spawn_geyser_tracking_actor(
             if schedule_sync {
                 ctx.schedule_geyser_sync_batch_debounced();
             }
+            tokio::task::yield_now().await;
+            record_market_data_tokio_progress();
         }
     });
     (tx, queue_depth)
@@ -2152,31 +2305,46 @@ impl MarketDataContext {
     /// PR-D / PR169b: apply momentum-bot active pool pin updates (actor-only writer; caller schedules sync).
     fn apply_momentum_active_pools_update(&self, update: &MomentumActivePoolsUpdate) -> bool {
         record_market_data_momentum_active_pool_messages_total();
-
         let mut batch_dirty = false;
-
         if update.full_active_snapshot {
-            let mut target: HashSet<(Pubkey, Pubkey)> = HashSet::new();
-            for a in &update.active {
-                let Ok(mint_pk) = Pubkey::from_str(a.mint.trim()) else {
-                    warn!(mint = %a.mint, "MomentumActivePoolsUpdate.active (snapshot): invalid mint");
-                    continue;
-                };
-                let Ok(pool_pk) = Pubkey::from_str(a.pool.trim()) else {
-                    warn!(pool = %a.pool, "MomentumActivePoolsUpdate.active (snapshot): invalid pool");
-                    continue;
-                };
-                target.insert((mint_pk, pool_pk));
-            }
-            let before = self.active_pool_set.snapshot_pairs();
-            for (m, p) in before.difference(&target) {
-                if self.clear_momentum_geyser_reserves_for_active_entry(*m, *p) {
-                    batch_dirty = true;
-                }
+            batch_dirty |= self.apply_momentum_snapshot_reconcile(&update.active);
+        }
+        batch_dirty |= self.apply_momentum_removed_entries(&update.removed);
+        batch_dirty |= self.apply_momentum_active_entries(&update.active);
+        if !batch_dirty {
+            self.refresh_geyser_pins_gauge();
+        }
+        set_market_data_momentum_active_pool_pins_gauge(self.active_pool_set.pair_count());
+        batch_dirty
+    }
+
+    /// PR169c: snapshot reconcile only (`full_active_snapshot` target set).
+    fn apply_momentum_snapshot_reconcile(&self, active: &[MomentumActivePoolEntry]) -> bool {
+        let mut target: HashSet<(Pubkey, Pubkey)> = HashSet::new();
+        for a in active {
+            let Ok(mint_pk) = Pubkey::from_str(a.mint.trim()) else {
+                warn!(mint = %a.mint, "MomentumActivePoolsUpdate.active (snapshot): invalid mint");
+                continue;
+            };
+            let Ok(pool_pk) = Pubkey::from_str(a.pool.trim()) else {
+                warn!(pool = %a.pool, "MomentumActivePoolsUpdate.active (snapshot): invalid pool");
+                continue;
+            };
+            target.insert((mint_pk, pool_pk));
+        }
+        let mut batch_dirty = false;
+        let before = self.active_pool_set.snapshot_pairs();
+        for (m, p) in before.difference(&target) {
+            if self.clear_momentum_geyser_reserves_for_active_entry(*m, *p) {
+                batch_dirty = true;
             }
         }
+        batch_dirty
+    }
 
-        for r in &update.removed {
+    fn apply_momentum_removed_entries(&self, removed: &[MomentumRemovedPoolEntry]) -> bool {
+        let mut batch_dirty = false;
+        for r in removed {
             let Ok(mint_pk) = Pubkey::from_str(r.mint.trim()) else {
                 warn!(mint = %r.mint, "MomentumActivePoolsUpdate.removed: invalid mint");
                 continue;
@@ -2189,8 +2357,12 @@ impl MarketDataContext {
                 batch_dirty = true;
             }
         }
+        batch_dirty
+    }
 
-        for a in &update.active {
+    fn apply_momentum_active_entries(&self, active: &[MomentumActivePoolEntry]) -> bool {
+        let mut batch_dirty = false;
+        for a in active {
             let Ok(mint_pk) = Pubkey::from_str(a.mint.trim()) else {
                 warn!(mint = %a.mint, "MomentumActivePoolsUpdate.active: invalid mint");
                 continue;
@@ -2205,11 +2377,6 @@ impl MarketDataContext {
             }
             let _ = &a.pin_reason;
         }
-
-        if !batch_dirty {
-            self.refresh_geyser_pins_gauge();
-        }
-        set_market_data_momentum_active_pool_pins_gauge(self.active_pool_set.pair_count());
         batch_dirty
     }
 
@@ -10547,6 +10714,12 @@ async fn run_geyser_loop(
     // PR169a/169b: single-writer Geyser tracking actor (before wallet snapshot — wallet path enqueues).
     let (geyser_tracking_tx, geyser_tracking_queue_depth) =
         spawn_geyser_tracking_actor(Arc::clone(&ctx));
+    // PR169c: coalesce momentum NATS bursts before the tracking actor.
+    let momentum_coalesce_tx = spawn_momentum_tracking_coalescer(
+        Arc::clone(&ctx),
+        geyser_tracking_tx.clone(),
+        Arc::clone(&geyser_tracking_queue_depth),
+    );
 
     // === P0: Wallet Balance Snapshot (Position Reconciliation) ===
     // Bootstrap wallet state at startup (max 1 RPC roundtrip) using known mints from JetStream.
@@ -11543,11 +11716,7 @@ async fn run_geyser_loop(
                 if let Some(nats_msg) = msg {
                     match serde_json::from_slice::<MomentumActivePoolsUpdate>(&nats_msg.payload) {
                         Ok(update) => {
-                            geyser_tracking_try_enqueue(
-                                &geyser_tracking_tx,
-                                geyser_tracking_queue_depth.as_ref(),
-                                GeyserTrackingCommand::ApplyMomentumActivePools(update),
-                            );
+                            momentum_coalesce_try_send(&momentum_coalesce_tx, update);
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to deserialize MomentumActivePoolsUpdate");
@@ -11697,6 +11866,11 @@ async fn run_simulation_loop(
 
     let (geyser_tracking_tx, geyser_tracking_queue_depth) =
         spawn_geyser_tracking_actor(Arc::clone(&ctx));
+    let momentum_coalesce_tx = spawn_momentum_tracking_coalescer(
+        Arc::clone(&ctx),
+        geyser_tracking_tx.clone(),
+        Arc::clone(&geyser_tracking_queue_depth),
+    );
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut slot: u64 = 0;
@@ -11992,11 +12166,7 @@ async fn run_simulation_loop(
                 if let Some(nats_msg) = msg {
                     match serde_json::from_slice::<MomentumActivePoolsUpdate>(&nats_msg.payload) {
                         Ok(update) => {
-                            geyser_tracking_try_enqueue(
-                                &geyser_tracking_tx,
-                                geyser_tracking_queue_depth.as_ref(),
-                                GeyserTrackingCommand::ApplyMomentumActivePools(update),
-                            );
+                            momentum_coalesce_try_send(&momentum_coalesce_tx, update);
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to deserialize MomentumActivePoolsUpdate (simulation)");
@@ -14504,10 +14674,13 @@ mod pr_b_geyser_tracking_tests {
         );
     }
 
-    /// PR169b: parallel momentum enqueues (85+) serialize through actor without panic/drop storm.
+    /// PR169c: 99 momentum NATS-equivalent updates coalesce to at most two actor applies.
     #[tokio::test(flavor = "current_thread")]
-    async fn pr169b_parallel_momentum_enqueues_serialized_by_actor() {
-        use ironcrab::metrics::MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL;
+    async fn pr169c_momentum_coalesce_99_messages_few_actor_jobs() {
+        use ironcrab::metrics::{
+            MARKET_DATA_MOMENTUM_COALESCED_BATCHES_TOTAL,
+            MARKET_DATA_MOMENTUM_COALESCED_MESSAGES_TOTAL,
+        };
         use ironcrab::nats::{MomentumActivePinReason, MomentumActivePoolEntry};
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -14515,9 +14688,13 @@ mod pr_b_geyser_tracking_tests {
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
         let (tracking_tx, tracking_depth) = spawn_geyser_tracking_actor(Arc::clone(&ctx));
+        let coalesce_tx =
+            spawn_momentum_tracking_coalescer(Arc::clone(&ctx), tracking_tx, tracking_depth);
 
-        let jobs0 = MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
-        for i in 0..90u64 {
+        let msgs0 = MARKET_DATA_MOMENTUM_COALESCED_MESSAGES_TOTAL.load(Ordering::Relaxed);
+        let batches0 = MARKET_DATA_MOMENTUM_COALESCED_BATCHES_TOTAL.load(Ordering::Relaxed);
+
+        for i in 0..99u64 {
             let pool = Pubkey::new_unique();
             let base_mint = Pubkey::new_unique();
             let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
@@ -14533,10 +14710,9 @@ mod pr_b_geyser_tracking_tests {
                 }),
                 1,
             );
-            geyser_tracking_try_enqueue(
-                &tracking_tx,
-                tracking_depth.as_ref(),
-                GeyserTrackingCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
+            momentum_coalesce_try_send(
+                &coalesce_tx,
+                MomentumActivePoolsUpdate {
                     version: 1,
                     ts_unix_ms: i,
                     active: vec![MomentumActivePoolEntry {
@@ -14546,15 +14722,192 @@ mod pr_b_geyser_tracking_tests {
                     }],
                     removed: vec![],
                     full_active_snapshot: false,
-                }),
+                },
             );
         }
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let jobs1 = MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let msgs1 = MARKET_DATA_MOMENTUM_COALESCED_MESSAGES_TOTAL.load(Ordering::Relaxed);
+        let batches1 = MARKET_DATA_MOMENTUM_COALESCED_BATCHES_TOTAL.load(Ordering::Relaxed);
+
+        let msgs_delta = msgs1 - msgs0;
+        let batches_delta = batches1 - batches0;
+        assert_eq!(msgs_delta, 99, "expected all NATS updates counted");
         assert!(
-            jobs1 >= jobs0 + 90,
-            "expected actor to process all momentum jobs (before={jobs0}, after={jobs1})"
+            (1..=2).contains(&batches_delta),
+            "expected 1–2 coalesced batches (delta={batches_delta})"
         );
+        assert_eq!(
+            ctx.active_pool_set.pair_count(),
+            99,
+            "merged actor apply should pin every pool from the burst"
+        );
+    }
+
+    #[test]
+    fn pr169c_merge_momentum_updates_matches_sequential_apply() {
+        use ironcrab::nats::{
+            MomentumActivePinReason, MomentumActivePoolEntry, MomentumRemovedPoolEntry,
+        };
+
+        fn pin_count(ctx: &Arc<MarketDataContext>) -> usize {
+            ctx.active_pool_set.pair_count()
+        }
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx_seq = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let jsonl2 = QueuedJsonlWriter::spawn(
+            JsonlWriterConfig::new("market_events").with_log_dir(tmp.path()),
+            256,
+        )
+        .expect("jsonl2");
+        let ctx_merged = minimal_market_data_context_for_pr_d_tests(jsonl2);
+
+        let pool_a = Pubkey::new_unique();
+        let mint_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        for (pool, mint) in [(pool_a, mint_a), (pool_b, mint_b)] {
+            for ctx in [&ctx_seq, &ctx_merged] {
+                ctx.live_pool_cache.upsert(
+                    pool,
+                    CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                        token_0_mint: mint,
+                        token_1_mint: quote,
+                        token_0_vault: Pubkey::new_unique(),
+                        token_1_vault: Pubkey::new_unique(),
+                        reserve_0: None,
+                        reserve_1: None,
+                    }),
+                    1,
+                );
+            }
+        }
+
+        let updates = vec![
+            MomentumActivePoolsUpdate {
+                version: 1,
+                ts_unix_ms: 1,
+                active: vec![MomentumActivePoolEntry {
+                    mint: mint_a.to_string(),
+                    pool: pool_a.to_string(),
+                    pin_reason: MomentumActivePinReason::Tracker,
+                }],
+                removed: vec![],
+                full_active_snapshot: false,
+            },
+            MomentumActivePoolsUpdate {
+                version: 1,
+                ts_unix_ms: 2,
+                active: vec![MomentumActivePoolEntry {
+                    mint: mint_b.to_string(),
+                    pool: pool_b.to_string(),
+                    pin_reason: MomentumActivePinReason::Tracker,
+                }],
+                removed: vec![],
+                full_active_snapshot: true,
+            },
+            MomentumActivePoolsUpdate {
+                version: 1,
+                ts_unix_ms: 3,
+                active: vec![],
+                removed: vec![MomentumRemovedPoolEntry {
+                    mint: mint_b.to_string(),
+                    pool: pool_b.to_string(),
+                    reason: "stale".to_string(),
+                }],
+                full_active_snapshot: false,
+            },
+        ];
+
+        for u in &updates {
+            ctx_seq.apply_momentum_active_pools_update(u);
+        }
+        let merged = merge_momentum_active_pools_updates(&updates).expect("merged");
+        ctx_merged.apply_momentum_active_pools_update(&merged);
+
+        assert_eq!(pin_count(&ctx_seq), pin_count(&ctx_merged));
+        assert_eq!(
+            ctx_seq.active_pool_set.snapshot_pairs(),
+            ctx_merged.active_pool_set.snapshot_pairs()
+        );
+    }
+
+    /// PR169c: chunked momentum apply yields so other runtime tasks make progress mid-job.
+    #[tokio::test]
+    async fn pr169c_chunked_momentum_apply_yields_to_runtime() {
+        use ironcrab::nats::{MomentumActivePinReason, MomentumActivePoolEntry};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (tracking_tx, tracking_depth) = spawn_geyser_tracking_actor(Arc::clone(&ctx));
+
+        let mut active = Vec::new();
+        for _ in 0..48 {
+            let pool = Pubkey::new_unique();
+            let base_mint = Pubkey::new_unique();
+            let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+            ctx.live_pool_cache.upsert(
+                pool,
+                CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                    token_0_mint: base_mint,
+                    token_1_mint: quote,
+                    token_0_vault: Pubkey::new_unique(),
+                    token_1_vault: Pubkey::new_unique(),
+                    reserve_0: None,
+                    reserve_1: None,
+                }),
+                1,
+            );
+            active.push(MomentumActivePoolEntry {
+                mint: base_mint.to_string(),
+                pool: pool.to_string(),
+                pin_reason: MomentumActivePinReason::Tracker,
+            });
+        }
+
+        let runtime_progress = Arc::new(AtomicBool::new(false));
+        let progress_flag = Arc::clone(&runtime_progress);
+        let apply_finished = Arc::new(AtomicBool::new(false));
+        let finished_flag = Arc::clone(&apply_finished);
+
+        tokio::spawn(async move {
+            while !finished_flag.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+                progress_flag.store(true, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            }
+        });
+
+        geyser_tracking_try_enqueue(
+            &tracking_tx,
+            tracking_depth.as_ref(),
+            GeyserTrackingCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
+                version: 1,
+                ts_unix_ms: 1,
+                active,
+                removed: vec![],
+                full_active_snapshot: false,
+            }),
+        );
+
+        for _ in 0..200 {
+            if ctx.active_pool_set.pair_count() >= 48 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        apply_finished.store(true, Ordering::Relaxed);
+
+        assert!(
+            runtime_progress.load(Ordering::Relaxed),
+            "chunked momentum apply should yield to other runtime tasks"
+        );
+        assert_eq!(ctx.active_pool_set.pair_count(), 48);
     }
 }
