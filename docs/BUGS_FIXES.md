@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PHASE-R-R1-JSONL-HOT-PATH: JSONL-Serialisierung off Geyser-Ingest-Thread
+**Datum**: 2026-05-29  
+**Problem** (Phase-0-Diagnose / Plan `plan_market_data_ingest_rebuild.md` Phase R): PR165 brachte `QueuedJsonlWriter` + dedizierten `jsonl-writer`-Thread, aber `try_write` rief weiterhin `serde_json::to_string` auf dem Geyser-Ingest-Thread auf (CPU + Allocation im Hot Path, I-4b-Verstoß).  
+**Fix** (R1): (1) `QueuedJsonlMsg::MarketEvent(Box<MarketEvent>)` — Ingest nur `clone` + bounded `try_send`; Serialisierung + Disk-I/O ausschließlich im `jsonl-writer`-Thread. (2) Generisches `try_write` serialisiert via `FnOnce` auf Writer-Thread (Tests/Cold Path). (3) Metriken: `market_data_jsonl_queue_depth`, `market_data_jsonl_records_written_total`. (4) Audit: kein sync `JsonlWriter::write` in Geyser-Handlern; alle Pfade über `write_market_event_jsonl`. **Invarianten**: I-4b (keine schwere Arbeit im Ingest), I-7 unverändert. **Hinweis**: R2 (`md-state`) folgt für Prod-Freeze-Fix; R1 allein reicht für Soak nicht.  
+**Dateien**: `src/storage/jsonl_writer.rs`, `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### PR169c-MOMENTUM-COALESCE-ACTOR-BUDGET: Startup Global-Freeze nach Momentum-Flood
 **Datum**: 2026-05-29  
 **Problem** (Prod Restart-Smoke `38f355e` nach P169b): ~10 s nach `systemctl restart market-data` **Global-Freeze** — `tx_handler`, `account_updates`, `head_slot` alle Δ0; letztes `Parsed DEX transaction` ~10 s nach Restart; **99×** Momentum-NATS → 99× `ApplyMomentumActivePools` serial + **18×** `subscription updated` (2→719 accounts) in 9 s; `geyser_sync_immediate_total` = 0 (P169b hält), Session verbunden, Runtime tot. P169b serialisierte Writer, coalesced aber nicht den Momentum-Enqueue-Sturm.  
