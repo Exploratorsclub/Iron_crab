@@ -243,10 +243,21 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             prev_run = sorted_runs[1] if len(sorted_runs) > 1 else None
             current_trades = [t for t in all_trades if t.get('run_id') == current_run]
             earliest_current = min(
-                (t.get('timestamp_ms', 0) for t in current_trades), default=0
+                (
+                    t.get('timestamp_ms', 0)
+                    for t in current_trades
+                    if t.get('timestamp_ms', 0) > 0
+                ),
+                default=None,
             )
             for t in all_trades:
-                if not t.get('run_id') and t.get('timestamp_ms', 0) >= earliest_current:
+                ts = t.get('timestamp_ms', 0)
+                if (
+                    not t.get('run_id')
+                    and ts > 0
+                    and earliest_current is not None
+                    and ts >= earliest_current
+                ):
                     current_trades.append(t)
             prev_trades = []
             if prev_run:
