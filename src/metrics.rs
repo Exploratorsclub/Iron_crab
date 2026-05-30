@@ -1560,6 +1560,65 @@ pub fn record_momentum_entry_buy_suppressed_missing_creator() {
     MOMENTUM_ENTRY_BUY_SUPPRESSED_MISSING_CREATOR_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+// PR170: tracker trade ingest forensics (static metric names — no dynamic labels).
+pub static MOMENTUM_TRACKER_TRADES_RECORDED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_TRADES_RECEIVED_NO_TRACKER_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_TRACKER_REJECTED_DEV_SELL_EARLY_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_TRACKER_REJECTED_MICRO_BUY_SPAM_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_TRACKER_REJECTED_BOT_CONCENTRATION_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_TRACKER_REJECTED_LP_REMOVED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_TRACKER_REJECTED_MINT_AUTHORITY_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_TRACKER_REJECTED_PUMPFUN_BONDING_COMPLETE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_TRACKER_REJECTED_DEV_SUPPLY_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_TRACKER_REJECTED_LARGE_DUMP_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_TRACKER_REJECTED_OTHER_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn record_momentum_tracker_trades_recorded() {
+    MOMENTUM_TRACKER_TRADES_RECORDED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_momentum_trades_received_no_tracker() {
+    MOMENTUM_TRADES_RECEIVED_NO_TRACKER_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Maps `TokenTracker::reject` reason strings to low-cardinality Prometheus counters.
+#[inline]
+pub fn record_momentum_tracker_rejected(reason: &str) {
+    if reason.starts_with("REJECT_DEV_SELL_EARLY") {
+        MOMENTUM_TRACKER_REJECTED_DEV_SELL_EARLY_TOTAL.fetch_add(1, Ordering::Relaxed);
+    } else if reason.starts_with("REJECT_MICRO_BUY_SPAM") {
+        MOMENTUM_TRACKER_REJECTED_MICRO_BUY_SPAM_TOTAL.fetch_add(1, Ordering::Relaxed);
+    } else if reason.starts_with("REJECT_BOT_CONCENTRATION") {
+        MOMENTUM_TRACKER_REJECTED_BOT_CONCENTRATION_TOTAL.fetch_add(1, Ordering::Relaxed);
+    } else if reason.starts_with("REJECT_LP_REMOVED") {
+        MOMENTUM_TRACKER_REJECTED_LP_REMOVED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    } else if reason.starts_with("REJECT_MINT_AUTHORITY")
+        || reason.starts_with("REJECT_FREEZE_AUTHORITY")
+    {
+        MOMENTUM_TRACKER_REJECTED_MINT_AUTHORITY_TOTAL.fetch_add(1, Ordering::Relaxed);
+    } else if reason.starts_with("REJECT_PUMPFUN_BONDING_COMPLETE") {
+        MOMENTUM_TRACKER_REJECTED_PUMPFUN_BONDING_COMPLETE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    } else if reason.starts_with("Dev holds too much") {
+        MOMENTUM_TRACKER_REJECTED_DEV_SUPPLY_TOTAL.fetch_add(1, Ordering::Relaxed);
+    } else if reason.starts_with("Large dump detected") {
+        MOMENTUM_TRACKER_REJECTED_LARGE_DUMP_TOTAL.fetch_add(1, Ordering::Relaxed);
+    } else {
+        MOMENTUM_TRACKER_REJECTED_OTHER_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 // Per-kind counters (static label keys via metric name — no dynamic labels).
 pub static MOMENTUM_CORE_MARKET_EVENTS_RECV_TRADE_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -3272,6 +3331,50 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "momentum_entry_buy_suppressed_missing_creator_total",
         MOMENTUM_ENTRY_BUY_SUPPRESSED_MISSING_CREATOR_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_tracker_trades_recorded_total",
+        MOMENTUM_TRACKER_TRADES_RECORDED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_trades_received_no_tracker_total",
+        MOMENTUM_TRADES_RECEIVED_NO_TRACKER_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_tracker_rejected_dev_sell_early_total",
+        MOMENTUM_TRACKER_REJECTED_DEV_SELL_EARLY_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_tracker_rejected_micro_buy_spam_total",
+        MOMENTUM_TRACKER_REJECTED_MICRO_BUY_SPAM_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_tracker_rejected_bot_concentration_total",
+        MOMENTUM_TRACKER_REJECTED_BOT_CONCENTRATION_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_tracker_rejected_lp_removed_total",
+        MOMENTUM_TRACKER_REJECTED_LP_REMOVED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_tracker_rejected_mint_authority_total",
+        MOMENTUM_TRACKER_REJECTED_MINT_AUTHORITY_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_tracker_rejected_pumpfun_bonding_complete_total",
+        MOMENTUM_TRACKER_REJECTED_PUMPFUN_BONDING_COMPLETE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_tracker_rejected_dev_supply_total",
+        MOMENTUM_TRACKER_REJECTED_DEV_SUPPLY_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_tracker_rejected_large_dump_total",
+        MOMENTUM_TRACKER_REJECTED_LARGE_DUMP_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_tracker_rejected_other_total",
+        MOMENTUM_TRACKER_REJECTED_OTHER_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "momentum_core_market_events_ingest_consecutive_cap_hit_streak",

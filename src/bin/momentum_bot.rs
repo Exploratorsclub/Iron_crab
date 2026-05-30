@@ -25,6 +25,7 @@
 
 use anyhow::Result;
 use clap::Parser;
+use once_cell::sync::Lazy;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -52,7 +53,9 @@ use ironcrab::metrics::{
     record_momentum_core_market_events_received_kind, record_momentum_ingest_to_process_us,
     record_momentum_market_events_last_applied_slot,
     record_momentum_market_events_subscription_max_dequeued_slot,
-    record_momentum_nats_batch_prepare_us, record_momentum_signal_eval_us, serve_metrics,
+    record_momentum_nats_batch_prepare_us, record_momentum_signal_eval_us,
+    record_momentum_tracker_rejected, record_momentum_tracker_trades_recorded,
+    record_momentum_trades_received_no_tracker, serve_metrics,
     set_momentum_bot_process_start_unix_sec,
     set_momentum_market_events_ingest_max_wall_lag_ms_last_batch, set_readiness_nats_connected,
     try_record_momentum_event_to_ingest_ms, try_record_momentum_event_to_intent_publish_ms,
@@ -114,6 +117,15 @@ const ORPHANED_RECOVERED_INTENT_IDS_CAP: usize = 50_000;
 const MOMENTUM_ACTIVE_POOLS_WIRE_VERSION: u32 = 1;
 /// Discovery/Validation trackers without a trade for this long are dropped (PR-D plan #4).
 const MOMENTUM_STALE_DISCOVERY_SECS: u64 = 30 * 60;
+
+/// Rate-limit `trade without tracker` warnings (per mint+pool).
+const MOMENTUM_NO_TRACKER_WARN_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Emit `debug!` ingest forensics every N trades on an active (non-rejected) tracker row.
+const MOMENTUM_TRACKER_TRADE_INGEST_DEBUG_EVERY: usize = 50;
+
+static MOMENTUM_NO_TRACKER_WARN_LAST: Lazy<parking_lot::Mutex<HashMap<String, Instant>>> =
+    Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 #[derive(Debug, Default)]
 struct MomentumActivePoolPublishQueue {
@@ -1820,9 +1832,19 @@ impl TokenTracker {
 
     /// Transition to Rejected state with reason
     fn reject(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
         self.last_wait_filter_obs_key = None;
         self.state = TrackerState::Rejected;
-        self.blacklist_reason = Some(reason.into());
+        self.blacklist_reason = Some(reason.clone());
+        record_momentum_tracker_rejected(reason.as_str());
+        warn!(
+            mint = %self.mint,
+            pool = %self.pool,
+            dex = %self.dex,
+            reason = %reason,
+            trade_count = self.trades.len(),
+            "Tracker rejected (terminal)"
+        );
     }
 
     /// Check if tracker was previously not rejected (for metrics)
@@ -2488,49 +2510,53 @@ impl TokenTracker {
             return (false, reason);
         }
 
-        // Filter 2b: Buyer Quality (anti-bot / concentration)
+        // Filter 2b: Buyer Quality (anti-bot / concentration) — same min_samples guard as micro-buy spam
+        // so early pumps with few buyers cannot false-reject and silence entry eval (PR170).
         let bq = self.buyer_quality_stats_at(config, chain_head_slot);
+        let buyer_quality_min_samples = config.min_unique_buyers.max(5);
 
-        if bq.top1_share > config.top1_buyer_share_cap {
-            FILTER_REJECTED_BUYER_QUALITY.fetch_add(1, Ordering::Relaxed);
-            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            let reason = format!(
-                "REJECT_BOT_CONCENTRATION: top1 share {:.0}% > {:.0}% (buyers={}, buy_vol={:.2} SOL)",
-                bq.top1_share * 100.0,
-                config.top1_buyer_share_cap * 100.0,
-                bq.unique_buyers,
-                bq.total_buy_volume_lamports as f64 / 1_000_000_000.0
-            );
-            self.reject(reason.clone());
-            return (false, reason);
-        }
+        if bq.unique_buyers >= buyer_quality_min_samples {
+            if bq.top1_share > config.top1_buyer_share_cap {
+                FILTER_REJECTED_BUYER_QUALITY.fetch_add(1, Ordering::Relaxed);
+                FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                let reason = format!(
+                    "REJECT_BOT_CONCENTRATION: top1 share {:.0}% > {:.0}% (buyers={}, buy_vol={:.2} SOL)",
+                    bq.top1_share * 100.0,
+                    config.top1_buyer_share_cap * 100.0,
+                    bq.unique_buyers,
+                    bq.total_buy_volume_lamports as f64 / 1_000_000_000.0
+                );
+                self.reject(reason.clone());
+                return (false, reason);
+            }
 
-        if bq.top3_share > config.top3_buyer_share_cap {
-            FILTER_REJECTED_BUYER_QUALITY.fetch_add(1, Ordering::Relaxed);
-            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            let reason = format!(
-                "REJECT_BOT_CONCENTRATION: top3 share {:.0}% > {:.0}% (buyers={}, buy_vol={:.2} SOL)",
-                bq.top3_share * 100.0,
-                config.top3_buyer_share_cap * 100.0,
-                bq.unique_buyers,
-                bq.total_buy_volume_lamports as f64 / 1_000_000_000.0
-            );
-            self.reject(reason.clone());
-            return (false, reason);
-        }
+            if bq.top3_share > config.top3_buyer_share_cap {
+                FILTER_REJECTED_BUYER_QUALITY.fetch_add(1, Ordering::Relaxed);
+                FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                let reason = format!(
+                    "REJECT_BOT_CONCENTRATION: top3 share {:.0}% > {:.0}% (buyers={}, buy_vol={:.2} SOL)",
+                    bq.top3_share * 100.0,
+                    config.top3_buyer_share_cap * 100.0,
+                    bq.unique_buyers,
+                    bq.total_buy_volume_lamports as f64 / 1_000_000_000.0
+                );
+                self.reject(reason.clone());
+                return (false, reason);
+            }
 
-        if bq.repeat_buyer_ratio < config.repeat_buyer_min_ratio {
-            FILTER_REJECTED_BUYER_QUALITY.fetch_add(1, Ordering::Relaxed);
-            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            let reason = format!(
-                "REJECT_BOT_CONCENTRATION: repeat buyer ratio {:.0}% < {:.0}% (buyers={}, buy_vol={:.2} SOL)",
-                bq.repeat_buyer_ratio * 100.0,
-                config.repeat_buyer_min_ratio * 100.0,
-                bq.unique_buyers,
-                bq.total_buy_volume_lamports as f64 / 1_000_000_000.0
-            );
-            self.reject(reason.clone());
-            return (false, reason);
+            if bq.repeat_buyer_ratio < config.repeat_buyer_min_ratio {
+                FILTER_REJECTED_BUYER_QUALITY.fetch_add(1, Ordering::Relaxed);
+                FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                let reason = format!(
+                    "REJECT_BOT_CONCENTRATION: repeat buyer ratio {:.0}% < {:.0}% (buyers={}, buy_vol={:.2} SOL)",
+                    bq.repeat_buyer_ratio * 100.0,
+                    config.repeat_buyer_min_ratio * 100.0,
+                    bq.unique_buyers,
+                    bq.total_buy_volume_lamports as f64 / 1_000_000_000.0
+                );
+                self.reject(reason.clone());
+                return (false, reason);
+            }
         }
 
         // Filter 3: SOL Inflow
@@ -4569,6 +4595,25 @@ impl MomentumContext {
         }
     }
 
+    fn maybe_warn_trade_without_tracker(mint: &str, pool: &str, is_buy: bool) {
+        let dedupe_key = format!("{mint}\x1f{pool}");
+        let now = Instant::now();
+        let mut last = MOMENTUM_NO_TRACKER_WARN_LAST.lock();
+        let should_warn = last
+            .get(&dedupe_key)
+            .map(|t| now.duration_since(*t) >= MOMENTUM_NO_TRACKER_WARN_COOLDOWN)
+            .unwrap_or(true);
+        if should_warn {
+            last.insert(dedupe_key, now);
+            warn!(
+                mint = %mint,
+                pool = %pool,
+                is_buy,
+                "Trade received but no pool-scoped tracker row (discovery guard or pool key mismatch)"
+            );
+        }
+    }
+
     /// Record a trade for a token **on a specific pool** (pool-scoped tracker row).
     #[allow(clippy::too_many_arguments)] // MarketEvent trade fields — keep explicit for hot path clarity
     fn record_trade(
@@ -4581,13 +4626,14 @@ impl MomentumContext {
         token_amount: u64,
         signature: &str,
         trade_slot: u64,
-    ) {
+    ) -> bool {
         let _rt = MomentumRecordTradeTimer(Instant::now());
         let config = self.config.read().clone();
+        let head_slot = self.last_event_slot.load(Ordering::Relaxed);
         let mut trackers = self.token_trackers.write();
         let key = Self::tracker_storage_key(mint, pool);
         let mut sync_sibling_dev_sell_early = false;
-        if let Some(tracker) = trackers.get_mut(&key) {
+        let recorded = if let Some(tracker) = trackers.get_mut(&key) {
             let was_not_rejected = tracker.was_not_rejected();
             tracker.record_trade(
                 trader,
@@ -4598,6 +4644,7 @@ impl MomentumContext {
                 trade_slot,
                 &config,
             );
+            record_momentum_tracker_trades_recorded();
             if was_not_rejected && tracker.is_rejected() {
                 self.record_token_blacklisted_once(mint);
                 let reason = tracker.blacklist_reason.as_deref().unwrap_or("rejected");
@@ -4605,13 +4652,33 @@ impl MomentumContext {
             }
             sync_sibling_dev_sell_early =
                 tracker.blacklist_reason.as_deref() == Some("REJECT_DEV_SELL_EARLY");
-        }
+            if !tracker.is_rejected()
+                && tracker
+                    .trades
+                    .len()
+                    .is_multiple_of(MOMENTUM_TRACKER_TRADE_INGEST_DEBUG_EVERY)
+            {
+                let metrics = tracker.calculate_metrics(&config, head_slot);
+                debug!(
+                    mint = %mint,
+                    pool = %pool,
+                    trades_len = tracker.trades.len(),
+                    unique_buyers_in_window = metrics.unique_buyers_in_window,
+                    head_slot,
+                    "Tracker trade ingest sample"
+                );
+            }
+            true
+        } else {
+            record_momentum_trades_received_no_tracker();
+            false
+        };
         self.mark_entry_eval_dirty_key(&key);
         // Same-mint sibling pools: one pool's dev-sell-early reject must apply to all pool rows
         // (Trade event is per-pool; mint-wide creator was applied before `record_trade`).
         if sync_sibling_dev_sell_early {
             let Some(source_dev) = trackers.get(&key).and_then(|t| t.dev_wallet.clone()) else {
-                return;
+                return recorded;
             };
             let sibling_keys =
                 self.sibling_tracker_storage_keys_same_mint_excluding_pool(mint, pool, &trackers);
@@ -4639,6 +4706,7 @@ impl MomentumContext {
                 self.mark_entry_eval_dirty_key(&sk);
             }
         }
+        recorded
     }
 
     /// Record dev info for a token
@@ -5088,7 +5156,7 @@ impl MomentumContext {
         let open_mints: std::collections::HashSet<_> =
             self.positions.read().keys().cloned().collect();
         let cutoff = Duration::from_secs(300); // 5 minutes
-        let pruned: Vec<(String, String)> = {
+        let pruned: Vec<(String, String, usize, String)> = {
             let trackers = self.token_trackers.read();
             trackers
                 .values()
@@ -5097,10 +5165,25 @@ impl MomentumContext {
                         && tracker.first_seen.elapsed() >= cutoff
                         && tracker.state.is_terminal()
                 })
-                .map(|t| (t.mint.clone(), t.pool.clone()))
+                .map(|t| {
+                    (
+                        t.mint.clone(),
+                        t.pool.clone(),
+                        t.trades.len(),
+                        format!("{:?}", t.state),
+                    )
+                })
                 .collect()
         };
-        for (mint, pool) in &pruned {
+        for (mint, pool, trade_count, state) in &pruned {
+            warn!(
+                mint = %mint,
+                pool = %pool,
+                reason = "tracker_cleanup",
+                trade_count,
+                state = %state,
+                "Removing terminal pool-scoped tracker (5m TTL)"
+            );
             self.queue_momentum_active_pool_removed(mint, pool.as_str(), "tracker_cleanup");
         }
         let mut trackers = self.token_trackers.write();
@@ -12063,6 +12146,265 @@ mod tests {
     }
 
     #[test]
+    fn pr170_tracker_records_five_distinct_buyers_in_window() {
+        let mut cfg = MomentumConfig::default();
+        cfg.buyer_window_secs = 120;
+        cfg.early_min_liquidity_sol = 0.0;
+        cfg.min_unique_buyers = 0;
+        cfg.min_trades_per_min = 0.0;
+        cfg.min_buy_dominance = 0.0;
+        cfg.min_sol_inflow_lamports = 0;
+        cfg.require_mint_authority_renounced = false;
+        cfg.require_freeze_authority_none = false;
+        cfg.top1_buyer_share_cap = 1.0;
+        cfg.top3_buyer_share_cap = 1.0;
+        cfg.repeat_buyer_min_ratio = 0.0;
+        cfg.min_trade_size_lamports = 0;
+        cfg.small_buy_ratio_cap = 1.0;
+        cfg.dump_recovery_window_secs = 0;
+        cfg.cto_enabled = false;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "MintPr170Buyers111111111111111111111111111";
+        let pool = "poolPr170Buyers11111111111111111111111111";
+        assert!(ctx.get_or_create_tracker(mint, pool, "pumpfun", 100, 30_000_000_000));
+
+        let head = 200u64;
+        ctx.last_event_slot.store(head, Ordering::Relaxed);
+        for i in 0..5 {
+            assert!(ctx.record_trade(
+                mint,
+                pool,
+                &format!("buyer{i}"),
+                true,
+                50_000_000,
+                1_000_000,
+                &format!("sig{i}"),
+                head.saturating_sub(i as u64),
+            ));
+        }
+
+        let metrics = ctx
+            .token_trackers
+            .read()
+            .get(&MomentumContext::tracker_storage_key(mint, pool))
+            .expect("tracker")
+            .calculate_metrics(&cfg, head);
+        assert_eq!(metrics.unique_buyers_in_window, 5);
+    }
+
+    #[test]
+    fn pr170_trade_based_discovery_records_first_buy() {
+        let mut cfg = MomentumConfig::default();
+        cfg.cto_enabled = false;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        *ctx.config.write() = cfg;
+
+        let mint = "MintPr170Disc1111111111111111111111111111";
+        let pool = "poolPr170Disc111111111111111111111111111";
+        let evt = MarketEvent {
+            header: RecordHeader::new("test", BUILD_VERSION, "run"),
+            event_id: "ev-pr170-disc".into(),
+            source: "geyser".into(),
+            slot: Some(50),
+            kind: MarketEventKind::Trade {
+                pool_address: pool.to_string(),
+                mint: mint.to_string(),
+                quote_mint: WSOL_MINT.to_string(),
+                trader: "buyer0".to_string(),
+                is_buy: true,
+                sol_amount: 10_000_000,
+                token_amount: 1,
+                token_decimals: 6,
+                signature: Some("sig0".into()),
+                dex: "pumpfun".into(),
+                creator: None,
+                token_program: None,
+            },
+        };
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            process_market_event(&ctx, &evt, true)
+                .await
+                .expect("trade discovery");
+        });
+
+        let tk = MomentumContext::tracker_storage_key(mint, pool);
+        let trackers = ctx.token_trackers.read();
+        let tr = trackers.get(&tk).expect("tracker row");
+        assert_eq!(tr.trades.len(), 1);
+    }
+
+    #[test]
+    fn pr170_reject_logs_terminal_state_and_reason() {
+        let mut cfg = MomentumConfig::default();
+        cfg.max_single_dump_lamports = 1;
+
+        let mut tracker = TokenTracker::new("m", "p", "pumpfun", 1, 30_000_000_000);
+        tracker.record_trade("dumper", false, 5_000_000_000, 1, "sig", 10, &cfg);
+        assert!(tracker.is_rejected());
+        assert!(tracker
+            .blacklist_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("Large dump"));
+    }
+
+    #[test]
+    fn pr170_bot_concentration_waits_with_few_buyers_not_terminal_reject() {
+        let mut cfg = MomentumConfig::default();
+        cfg.early_min_liquidity_sol = 0.0;
+        cfg.min_unique_buyers = 3;
+        cfg.min_trades_per_min = 0.0;
+        cfg.min_buy_dominance = 0.0;
+        cfg.min_sol_inflow_lamports = 0;
+        cfg.require_mint_authority_renounced = false;
+        cfg.require_freeze_authority_none = false;
+        cfg.top1_buyer_share_cap = 0.30;
+        cfg.top3_buyer_share_cap = 1.0;
+        cfg.repeat_buyer_min_ratio = 0.0;
+        cfg.min_trade_size_lamports = 0;
+        cfg.small_buy_ratio_cap = 1.0;
+        cfg.dump_recovery_window_secs = 0;
+        cfg.cto_enabled = false;
+
+        let mut tracker = TokenTracker::new("m", "p", "pumpfun", 100, 30_000_000_000);
+        tracker.record_trade("whale", true, 900_000_000, 1, "s0", 150, &cfg);
+        tracker.record_trade("retail", true, 50_000_000, 1, "s1", 151, &cfg);
+
+        let (ok, reason) = tracker.should_generate_intent(&cfg, None, 200, Instant::now());
+        assert!(!ok);
+        assert!(!tracker.is_rejected(), "must not false-reject: {reason}");
+        assert!(reason.contains("WAIT_BUYER_WINDOW"), "{reason}");
+    }
+
+    #[test]
+    fn pr170_xhat_style_cto_pump_accumulates_ten_buyers() {
+        let mut cfg = MomentumConfig::default();
+        cfg.early_min_liquidity_sol = 0.0;
+        cfg.min_unique_buyers = 3;
+        cfg.min_trades_per_min = 0.0;
+        cfg.min_buy_dominance = 0.0;
+        cfg.min_sol_inflow_lamports = 0;
+        cfg.require_mint_authority_renounced = false;
+        cfg.require_freeze_authority_none = false;
+        cfg.top1_buyer_share_cap = 0.95;
+        cfg.top3_buyer_share_cap = 1.0;
+        cfg.repeat_buyer_min_ratio = 0.0;
+        cfg.min_trade_size_lamports = 0;
+        cfg.small_buy_ratio_cap = 1.0;
+        cfg.dump_recovery_window_secs = 0;
+        cfg.cto_enabled = true;
+        cfg.cto_entry_delay_secs = 0;
+        cfg.cto_min_unique_buyers = 3;
+        cfg.dev_early_sell_window_secs = 3600;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "MintPr170Xhat1111111111111111111111111111";
+        let pool = "poolPr170Xhat111111111111111111111111111";
+        let dev = "DevWalletPr170Xhat1111111111111111111111";
+        let head = 140u64;
+        ctx.last_event_slot.store(head, Ordering::Relaxed);
+
+        assert!(ctx.get_or_create_tracker(mint, pool, "pumpfun", 100, 30_000_000_000));
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let tr = trackers
+                .get_mut(&MomentumContext::tracker_storage_key(mint, pool))
+                .expect("tracker");
+            tr.set_dev_info(dev, 1.0, &cfg);
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let dev_sell = MarketEvent {
+                header: RecordHeader::new("test", BUILD_VERSION, "run"),
+                event_id: "ev-dev-sell".into(),
+                source: "geyser".into(),
+                slot: Some(110),
+                kind: MarketEventKind::Trade {
+                    pool_address: pool.to_string(),
+                    mint: mint.to_string(),
+                    quote_mint: WSOL_MINT.to_string(),
+                    trader: dev.to_string(),
+                    is_buy: false,
+                    sol_amount: 100_000_000,
+                    token_amount: 1,
+                    token_decimals: 6,
+                    signature: Some("sig-dev".into()),
+                    dex: "pumpfun".into(),
+                    creator: Some(dev.to_string()),
+                    token_program: None,
+                },
+            };
+            process_market_event(&ctx, &dev_sell, true)
+                .await
+                .expect("dev sell");
+
+            for i in 0..10 {
+                let buy = MarketEvent {
+                    header: RecordHeader::new("test", BUILD_VERSION, "run"),
+                    event_id: format!("ev-buy-{i}"),
+                    source: "geyser".into(),
+                    slot: Some(120 + i),
+                    kind: MarketEventKind::Trade {
+                        pool_address: pool.to_string(),
+                        mint: mint.to_string(),
+                        quote_mint: WSOL_MINT.to_string(),
+                        trader: format!("pumpBuyer{i}"),
+                        is_buy: true,
+                        sol_amount: 20_000_000,
+                        token_amount: 1,
+                        token_decimals: 6,
+                        signature: Some(format!("sig-buy-{i}")),
+                        dex: "pumpfun".into(),
+                        creator: Some(dev.to_string()),
+                        token_program: None,
+                    },
+                };
+                process_market_event(&ctx, &buy, true)
+                    .await
+                    .expect("pump buy");
+            }
+        });
+
+        let trackers = ctx.token_trackers.read();
+        let tr = trackers
+            .get(&MomentumContext::tracker_storage_key(mint, pool))
+            .expect("tracker");
+        assert!(
+            !tr.is_rejected(),
+            "CTO pump must not false-reject on bot concentration: {:?}",
+            tr.blacklist_reason
+        );
+        let metrics = tr.calculate_metrics(&cfg, head);
+        let trades_len = tr.trades.len();
+        let buyers = metrics.unique_buyers_in_window;
+        drop(trackers);
+        assert!(
+            buyers >= 10,
+            "buyers in window {} trades_len {}",
+            buyers,
+            trades_len
+        );
+    }
+
+    #[test]
     fn micro_buy_spam_rejects_when_ratio_too_high() {
         let mut cfg = MomentumConfig::default();
         cfg.buyer_window_secs = 60;
@@ -16999,6 +17341,7 @@ async fn process_market_event(
                     })
                 };
 
+            let mut discovery_created = false;
             if !tracker_exists
                 && *sol_amount > 0
                 && (*is_buy || is_dev)
@@ -17032,10 +17375,10 @@ async fn process_market_event(
                     0
                 };
 
-                let created =
+                discovery_created =
                     ctx.get_or_create_tracker(mint, pool_address, &dex, slot, initial_liq_lamports);
 
-                if created {
+                if discovery_created {
                     // A.2 Phase 5: Explicitly register pool when discovered via trade
                     ctx.register_pool(mint, pool_address, &dex, slot);
                     let tk = MomentumContext::tracker_storage_key(mint, pool_address);
@@ -17108,7 +17451,7 @@ async fn process_market_event(
                 }
             }
 
-            ctx.record_trade(
+            let recorded = ctx.record_trade(
                 mint,
                 pool_address,
                 trader,
@@ -17118,6 +17461,9 @@ async fn process_market_event(
                 &sig,
                 event.slot.unwrap_or(0),
             );
+            if !recorded && !discovery_created {
+                MomentumContext::maybe_warn_trade_without_tracker(mint, pool_address, *is_buy);
+            }
 
             // P1: If Trade event carries token_program (from PumpFun Geyser parsing), cache it.
             // This enables deterministic ATA creation without waiting for TokenMintInfo event.
