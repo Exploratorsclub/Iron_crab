@@ -6650,12 +6650,16 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| PathBuf::from("trade_logs"));
 
-    let decision_config =
-        JsonlWriterConfig::new("decision_records").with_log_dir(log_base.join("decisions"));
+    // P166: flush each write so execution_results JSONL is visible on disk before process exit
+    // (BufWriter default 8KB; small records stay buffered in release when flush_each_write=false).
+    let decision_config = JsonlWriterConfig::new("decision_records")
+        .with_log_dir(log_base.join("decisions"))
+        .with_flush_each_write(true);
     let decision_writer = JsonlWriter::new(decision_config)?;
 
-    let execution_config =
-        JsonlWriterConfig::new("execution_results").with_log_dir(log_base.join("executions"));
+    let execution_config = JsonlWriterConfig::new("execution_results")
+        .with_log_dir(log_base.join("executions"))
+        .with_flush_each_write(true);
     let execution_writer = JsonlWriter::new(execution_config)?;
 
     let burn_config = JsonlWriterConfig::new("burn_ops").with_log_dir(log_base.join("burns"));
@@ -8367,8 +8371,9 @@ async fn build_replay_context(
         .with_flush_each_write(true);
     let decision_writer = JsonlWriter::new(decision_config)?;
 
-    let execution_config =
-        JsonlWriterConfig::new("replay_exec").with_log_dir(log_dir.join("executions"));
+    let execution_config = JsonlWriterConfig::new("replay_exec")
+        .with_log_dir(log_dir.join("executions"))
+        .with_flush_each_write(true);
     let execution_writer = JsonlWriter::new(execution_config)?;
 
     let burn_config = JsonlWriterConfig::new("replay_burn").with_log_dir(log_dir.join("burns"));
