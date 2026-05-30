@@ -475,19 +475,35 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
     def _merge_trades_by_tx_hash(self, primary: list, secondary: list) -> list:
         """Merge trade lists; primary (execution_results) wins on duplicate tx_hash."""
         by_hash = {}
-        no_hash = []
+        no_hash_candidates = []
+
+        def identity_key(t):
+            mint = t.get("mint_full") or t.get("mint") or ""
+            return (t.get("timestamp_ms"), mint, t.get("action"), t.get("run_id") or "")
+
         for t in secondary:
             h = t.get("tx_hash") or ""
             if h:
                 by_hash[h] = t
             else:
-                no_hash.append(t)
+                no_hash_candidates.append(t)
         for t in primary:
             h = t.get("tx_hash") or ""
             if h:
                 by_hash[h] = t
             else:
-                no_hash.append(t)
+                no_hash_candidates.append(t)
+
+        hashed_identities = {identity_key(t) for t in by_hash.values()}
+        no_hash = []
+        seen = set()
+        for t in reversed(no_hash_candidates):
+            key = identity_key(t)
+            if key in hashed_identities or key in seen:
+                continue
+            seen.add(key)
+            no_hash.append(t)
+        no_hash.reverse()
         return list(by_hash.values()) + no_hash
 
     def _load_trades_from_execution_jsonl(self, days_ago_list: list) -> list:
