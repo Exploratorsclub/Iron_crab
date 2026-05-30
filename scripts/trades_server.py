@@ -535,7 +535,9 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         """metrics::RecentTrade lines — used when execution_results file is empty (buffered)."""
         trades = []
         for days_ago in days_ago_list:
-            date = (datetime.now() - timedelta(days=days_ago)).strftime("%Y%m%d")
+            date = (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime(
+                "%Y%m%d"
+            )
             jsonl_path = RECENT_TRADES_DIR / f"recent_trades-{date}.jsonl"
             if not jsonl_path.exists():
                 continue
