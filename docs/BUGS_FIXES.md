@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PHASE-R-R4B-ACCOUNT-WORKERS-DISCOVERY-DEFER: Account Workers 2 + LivePoolCache off Ingest
+**Datum**: 2026-05-30  
+**Problem** (Prod post-R4 `1d963ae`, Soak FAIL): TX-Stopp ~20 s (besser als R3 ~3 s, reicht nicht); Teil-Freeze — Account + Head leben, aber `md-sidefx` jobs Δ0 bei Queue ~385 und `md-state` jobs Δ0 bei Queue ~703 (Lock-Deadlock/Convoy mit 8 Account-Workern + schwerem Account-Handler: `live_pool_cache` writes, Discovery-Publish, `.await` auf Publish-Pfad).  
+**Fix** (R4b): (1) **`MARKET_DATA_ACCOUNT_WORKER_COUNT` 8→2** (PR141-Fallback), per-shard Cap 5000 (Gesamt-Backpressure ~10k). (2) **`LivePoolCacheAccountUpdate` + `LivePoolCacheMintDecimals`** auf `md-sidefx` — Account-Ingest ohne `live_pool_cache` upsert/merge/set_mint_decimals. (3) **TX `wallet_events`**: nur `try_enqueue` Publish (kein blockierender NATS-Fallback ohne `publish_tx`). (4) Gauge `market_data_account_worker_count`. Unit grep-guards: kein `live_pool_cache` write im Account-Handler. **Invarianten**: I-4b, I-7, I-4 Geyser-first (defer execution only). **Nicht**: Deploy, kein R1–R4 Revert, kein P169d. Evidenz: `Iron_crab-eval/docs/supervisor/phase0_post_r4_deploy_20260530.md`.  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### PHASE-R-R4-MD-SIDEFX-DEFERRED: Deferred Side-Effects off Geyser Ingest
 **Datum**: 2026-05-30  
 **Problem** (Plan Phase R / Prod post-R3 `e4ebd09`): Global-Freeze ~3 s nach Restart bleibt — `md-state` entlastet `tracked_*`, Tokio-Ingest blockiert weiter auf `pool_mint_map.write()`, Pump-AMM-Burst, DevWallet, BondingCurve-Pfad und `tracked_vaults.read()` in Account-Handlern (8 Worker + TX-Task Lock-Convoy).  
