@@ -867,6 +867,9 @@ pub static MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH: Lazy<AtomicU64> =
 pub static MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// Configured account worker pool size (Phase-R-R4b; const export for ops).
+pub static MARKET_DATA_ACCOUNT_WORKER_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
 /// Account ingest: messages accepted into per-worker `tokio::mpsc` queues (after recv, before worker `recv`).
 pub static MARKET_DATA_ACCOUNT_WORKER_QUEUE_DEPTH: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -1085,6 +1088,11 @@ pub fn record_market_data_account_broadcast_lagged(skipped_messages: u64) {
     if skipped_messages > 0 {
         MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL.fetch_add(skipped_messages, Ordering::Relaxed);
     }
+}
+
+#[inline]
+pub fn set_market_data_account_worker_count(count: usize) {
+    MARKET_DATA_ACCOUNT_WORKER_COUNT.store(count as u64, Ordering::Relaxed);
 }
 
 #[inline]
@@ -3117,6 +3125,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_account_broadcast_queue_depth",
         MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_worker_count",
+        MARKET_DATA_ACCOUNT_WORKER_COUNT.load(Ordering::Relaxed)
     );
     line!(
         "market_data_account_worker_queue_depth",
