@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PR170-MOMENTUM-TRADE-INGEST-GAP: Active-Pool Tracker Forensics + False Bot-Concentration Reject
+**Datum**: 2026-05-30  
+**Problem** (Prod XHAT `Eyav991r…pump`, 2026-05-30 14:00–14:05 UTC): market-data JSONL zeigte 99+ Buys / 15+ distinct Buyers im Pump-Fenster; momentum blieb bei `buyers 2 < 3` ohne Logs während des Pumps. Tracker existierte (Dev-Sell/CTO sichtbar), Eval aber stumm.  
+**Root Cause**: `REJECT_BOT_CONCENTRATION` feuerte ohne `min_samples`-Guard (im Gegensatz zu `REJECT_MICRO_BUY_SPAM`) — bei 2–4 frühen Buys oft 100% top1 → terminal `Rejected` → `check_for_signals` skippt (`is_entry_complete`) → keine `WAIT_BUYER_WINDOW`-Logs trotz weiterer MD-Trades; nach 5-Min-Cleanup Re-Discovery mit leerem Tracker. Zusätzlich: `MomentumContext::record_trade` no-op ohne Tracker ohne Metrik/Log.  
+**Fix** (PR170): (1) Buyer-Quality-Reject nur wenn `unique_buyers >= min_unique_buyers.max(5)` (gleiches Pattern wie Micro-Buy-Spam). (2) Prometheus: `momentum_tracker_trades_recorded_total`, `momentum_trades_received_no_tracker_total`, `momentum_tracker_rejected_*_total`. (3) `warn!` bei jedem `TokenTracker::reject`, rate-limited warn bei Trade ohne Tracker, cleanup log mit `trade_count`/`state`, debug ingest sample alle 50 Trades. (4) Unit-Tests: 5-Buyer-Fenster, trade-discovery, CTO+10-Buyer-Regression. **Invarianten**: I-7 (kein RPC), I-12 (Reject/Removal sichtbar), keine Schwellen-Tuning-Änderung an `min_unique_buyers`/`buyer_window_secs`.  
+**Dateien**: `src/bin/momentum_bot.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### PHASE-R-R4B-ACCOUNT-WORKERS-DISCOVERY-DEFER: Account Workers 2 + LivePoolCache off Ingest
 **Datum**: 2026-05-30  
 **Problem** (Prod post-R4 `1d963ae`, Soak FAIL): TX-Stopp ~20 s (besser als R3 ~3 s, reicht nicht); Teil-Freeze — Account + Head leben, aber `md-sidefx` jobs Δ0 bei Queue ~385 und `md-state` jobs Δ0 bei Queue ~703 (Lock-Deadlock/Convoy mit 8 Account-Workern + schwerem Account-Handler: `live_pool_cache` writes, Discovery-Publish, `.await` auf Publish-Pfad).  
