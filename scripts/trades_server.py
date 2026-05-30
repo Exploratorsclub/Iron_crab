@@ -23,11 +23,13 @@ from typing import List, Optional
 from urllib.parse import urlparse, parse_qs
 import argparse
 
-TRADE_LOG_DIR = os.environ.get("IRONCRAB_LOG_DIR", "trade_logs")
-EXECUTIONS_DIR = Path(TRADE_LOG_DIR) / "executions"
-DECISIONS_DIR = Path(TRADE_LOG_DIR) / "decisions"
-# metrics::record_recent_trade — flushed per line; fallback when execution_results buffered (P166)
-RECENT_TRADES_DIR = Path(TRADE_LOG_DIR)
+EXEC_LOG_DIR = os.environ.get("IRONCRAB_LOG_DIR", "trade_logs")
+EXECUTIONS_DIR = Path(EXEC_LOG_DIR) / "executions"
+DECISIONS_DIR = Path(EXEC_LOG_DIR) / "decisions"
+# metrics::record_recent_trade uses IRONCRAB_TRADE_LOG_DIR (see append_trade_to_jsonl)
+RECENT_TRADES_DIR = Path(
+    os.environ.get("IRONCRAB_TRADE_LOG_DIR", "trade_logs")
+)
 
 class TradesHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -208,18 +210,50 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
 
         # Sort runs by last trade timestamp descending
         sorted_runs = sorted(run_last_ts.keys(), key=lambda r: run_last_ts[r], reverse=True)
-        current_run = sorted_runs[0] if sorted_runs else ''
-        prev_run = sorted_runs[1] if len(sorted_runs) > 1 else None
 
         # Step 3: Collect trades for current run + last 20 from previous run
-        current_trades = [t for t in all_trades if t.get('run_id') == current_run]
-        prev_trades = []
-        if prev_run:
-            prev_all = [t for t in all_trades if t.get('run_id') == prev_run]
-            prev_all.sort(key=lambda t: t.get('timestamp_ms', 0), reverse=True)
-            prev_trades = prev_all[:20]
-
-        trades = current_trades + prev_trades
+        if not sorted_runs:
+            # recent_trades JSONL has no run_id — scope by calendar day of newest trade
+            all_trades.sort(key=lambda t: t.get('timestamp_ms', 0), reverse=True)
+            newest_ts = all_trades[0].get('timestamp_ms', 0)
+            newest_day = datetime.fromtimestamp(
+                newest_ts / 1000, tz=timezone.utc
+            ).date()
+            current_trades = [
+                t
+                for t in all_trades
+                if datetime.fromtimestamp(
+                    (t.get('timestamp_ms') or 0) / 1000, tz=timezone.utc
+                ).date()
+                == newest_day
+            ]
+            prev_candidates = [
+                t
+                for t in all_trades
+                if datetime.fromtimestamp(
+                    (t.get('timestamp_ms') or 0) / 1000, tz=timezone.utc
+                ).date()
+                != newest_day
+            ]
+            prev_candidates.sort(key=lambda t: t.get('timestamp_ms', 0), reverse=True)
+            prev_trades = prev_candidates[:20]
+            trades = current_trades + prev_trades
+        else:
+            current_run = sorted_runs[0]
+            prev_run = sorted_runs[1] if len(sorted_runs) > 1 else None
+            current_trades = [t for t in all_trades if t.get('run_id') == current_run]
+            earliest_current = min(
+                (t.get('timestamp_ms', 0) for t in current_trades), default=0
+            )
+            for t in all_trades:
+                if not t.get('run_id') and t.get('timestamp_ms', 0) >= earliest_current:
+                    current_trades.append(t)
+            prev_trades = []
+            if prev_run:
+                prev_all = [t for t in all_trades if t.get('run_id') == prev_run]
+                prev_all.sort(key=lambda t: t.get('timestamp_ms', 0), reverse=True)
+                prev_trades = prev_all[:20]
+            trades = current_trades + prev_trades
 
         # Step 4: Running PnL calculation (same logic as read_recent_trades)
         trades.sort(key=lambda t: t.get('timestamp_ms', 0))
@@ -416,16 +450,45 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         """Load confirmed trades from execution_results; fallback to recent_trades JSONL (P166)."""
         if days_ago_list is None:
             days_ago_list = [0, 1, 2]
-        trades = self._load_trades_from_execution_jsonl(days_ago_list)
-        if trades:
-            return trades
-        fallback = self._load_trades_from_recent_jsonl(days_ago_list)
-        if fallback:
+        trades = []
+        used_fallback = False
+        for days_ago in days_ago_list:
+            day_trades = self._load_trades_from_execution_jsonl([days_ago])
+            day_recent = self._load_trades_from_recent_jsonl([days_ago])
+            if days_ago == 0 and day_recent:
+                if not day_trades:
+                    used_fallback = True
+                    day_trades = day_recent
+                else:
+                    day_trades = self._merge_trades_by_tx_hash(day_trades, day_recent)
+            elif not day_trades and day_recent:
+                used_fallback = True
+                day_trades = day_recent
+            trades.extend(day_trades)
+        if used_fallback:
             print(
                 "trades_server: using recent_trades JSONL fallback "
-                "(execution_results empty or unparseable)"
+                "(execution_results empty or unparseable for one or more days)"
             )
-        return fallback
+        return trades
+
+    def _merge_trades_by_tx_hash(self, primary: list, secondary: list) -> list:
+        """Merge trade lists; primary (execution_results) wins on duplicate tx_hash."""
+        by_hash = {}
+        no_hash = []
+        for t in secondary:
+            h = t.get("tx_hash") or ""
+            if h:
+                by_hash[h] = t
+            else:
+                no_hash.append(t)
+        for t in primary:
+            h = t.get("tx_hash") or ""
+            if h:
+                by_hash[h] = t
+            else:
+                no_hash.append(t)
+        return list(by_hash.values()) + no_hash
 
     def _load_trades_from_execution_jsonl(self, days_ago_list: list) -> list:
         trades = []
