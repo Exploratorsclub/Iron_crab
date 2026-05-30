@@ -1610,7 +1610,7 @@ pub fn record_momentum_tracker_rejected(reason: &str) {
         MOMENTUM_TRACKER_REJECTED_MINT_AUTHORITY_TOTAL.fetch_add(1, Ordering::Relaxed);
     } else if reason.starts_with("REJECT_PUMPFUN_BONDING_COMPLETE") {
         MOMENTUM_TRACKER_REJECTED_PUMPFUN_BONDING_COMPLETE_TOTAL.fetch_add(1, Ordering::Relaxed);
-    } else if reason.starts_with("Dev holds too much") {
+    } else if reason.starts_with("REJECT_DEV_SUPPLY_TOO_HIGH") {
         MOMENTUM_TRACKER_REJECTED_DEV_SUPPLY_TOTAL.fetch_add(1, Ordering::Relaxed);
     } else if reason.starts_with("Large dump detected") {
         MOMENTUM_TRACKER_REJECTED_LARGE_DUMP_TOTAL.fetch_add(1, Ordering::Relaxed);
