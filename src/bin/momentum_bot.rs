@@ -7193,6 +7193,10 @@ impl MomentumContext {
         let mut config = self.config.write();
         let mut applied = Vec::new();
         let mut rejected = Vec::new();
+        let dev_sell_delay_dual_key_update = update
+            .config
+            .contains_key("dev_sell_revalidation_delay_secs")
+            && update.config.contains_key("cto_entry_delay_secs");
 
         for (key, value) in &update.config {
             match key.as_str() {
@@ -7439,7 +7443,12 @@ impl MomentumContext {
                 "dev_sell_revalidation_delay_secs" => {
                     if let Some(v) = value.as_u64() {
                         if v > 0 {
-                            config.dev_sell_revalidation_delay_secs = v;
+                            config.dev_sell_revalidation_delay_secs =
+                                if dev_sell_delay_dual_key_update {
+                                    config.dev_sell_revalidation_delay_secs.max(v)
+                                } else {
+                                    v
+                                };
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
                         } else {
