@@ -56,7 +56,9 @@ def _effective_timestamp_ms_from_record(record: dict) -> int:
     """Block-UTC when producer wrote block_time_unix_ms; else legacy wall-clock."""
     block_ts = record.get("block_time_unix_ms")
     if block_ts is not None and block_ts != "":
-        return int(block_ts)
+        block_ms = int(block_ts)
+        if block_ms > 0:
+            return block_ms
     if record.get("ts_unix_ms") is not None:
         return int(record.get("ts_unix_ms") or 0)
     return int(record.get("timestamp_ms") or 0)

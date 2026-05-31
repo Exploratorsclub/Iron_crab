@@ -796,7 +796,7 @@ async fn compute_intent_fills_best_effort(
 
     let block_time_unix_ms = tx
         .block_time
-        .and_then(|bt| (bt >= 0).then(|| (bt as u64).saturating_mul(1000)));
+        .and_then(|bt| (bt > 0).then(|| (bt as u64).saturating_mul(1000)));
 
     if tx.transaction.meta.is_none() {
         return ComputedIntentFills {
