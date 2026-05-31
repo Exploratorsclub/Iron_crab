@@ -324,9 +324,7 @@ min_sol_inflow_lamports = 500_000_000    # 0.5 SOL net inflow (WAS 20 SOL!!!)
 inflow_window_secs = 60              # 60 second window (was 30s)
 max_single_dump_lamports = 20_000_000_000 # 20 SOL max single sell (was 5 SOL)
 
-# FILTER 4: Dev Behavior
-dev_early_sell_window_secs = 90     # Dev sells in first 90s = bad (was 60s)
-dev_rebuy_positive = true           # Dev rebuy = positive signal
+dev_sell_revalidation_delay_secs = 30   # Pause after pre-entry dev sell before re-checking soft gates
 
 # EXIT STRATEGY
 hard_stop_loss_pct = 15.0           # -15% hard stop

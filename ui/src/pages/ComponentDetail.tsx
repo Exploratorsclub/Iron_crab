@@ -171,9 +171,9 @@ const CONFIG_DESCRIPTIONS: Record<string, Record<string, string>> = {
     inflow_window_secs: 'FILTER 3: Time window for SOL inflow tracking (seconds)',
     max_single_dump_lamports: 'FILTER 3: Max allowed single sell (lamports)',
     
-    // Filter 4: Dev Behavior
-    dev_early_sell_window_secs: 'FILTER 4: Dev sells in first N secs = bad signal',
-    dev_rebuy_positive: 'FILTER 4: Dev rebuy is positive signal (true/false)',
+    // Dev-Sell Re-Validation (pre-entry)
+    dev_sell_revalidation_delay_secs:
+      'DEV SELL: Pause after pre-entry dev sell before re-checking soft gates (seconds)',
     
     // Buyer Quality (Anti-Bot)
     top1_buyer_share_cap: 'ANTI-BOT: Max share for top-1 buyer (0.35 = 35%)',
@@ -189,14 +189,6 @@ const CONFIG_DESCRIPTIONS: Record<string, Record<string, string>> = {
     dump_recovery_min_buy_dominance: 'DUMP: Min buy dominance for recovery (0.55 = 55%)',
     dump_recovery_min_net_inflow_lamports: 'DUMP: Min net inflow for recovery (lamports)',
     dump_recovery_min_recovery_secs: 'DUMP: Min seconds of recovery before entry',
-    
-    // CTO Mode (Community Takeover)
-    cto_enabled: 'CTO: Enable CTO mode (wait for recovery after dev sells)',
-    cto_entry_delay_secs: 'CTO: Delay before allowing entry after dev sell (seconds)',
-    cto_confirm_window_secs: 'CTO: Window to confirm recovery (seconds)',
-    cto_min_unique_buyers: 'CTO: Min unique buyers for recovery confirmation',
-    cto_min_buy_dominance: 'CTO: Min buy dominance for recovery (0.55 = 55%)',
-    cto_min_net_inflow_lamports: 'CTO: Min net inflow for recovery (lamports)',
     
     // Exit Strategy
     hard_stop_loss_pct: 'EXIT: Hard stop-loss from entry (%, 15=15%)',
@@ -316,9 +308,8 @@ const CONFIG_GROUPS: Record<string, Record<string, string[]>> = {
       'inflow_window_secs',
       'max_single_dump_lamports',
     ],
-    'Filter 4: Dev Behavior': [
-      'dev_early_sell_window_secs',
-      'dev_rebuy_positive',
+    'Dev-Sell Re-Validation': [
+      'dev_sell_revalidation_delay_secs',
     ],
     'Anti-Bot (Buyer Quality)': [
       'top1_buyer_share_cap',
@@ -334,14 +325,6 @@ const CONFIG_GROUPS: Record<string, Record<string, string[]>> = {
       'dump_recovery_min_buy_dominance',
       'dump_recovery_min_net_inflow_lamports',
       'dump_recovery_min_recovery_secs',
-    ],
-    'CTO Mode (Community Takeover)': [
-      'cto_enabled',
-      'cto_entry_delay_secs',
-      'cto_confirm_window_secs',
-      'cto_min_unique_buyers',
-      'cto_min_buy_dominance',
-      'cto_min_net_inflow_lamports',
     ],
     'Exit Strategy': [
       'hard_stop_loss_pct',
@@ -457,9 +440,8 @@ const DEFAULT_CONFIGS: Record<string, ComponentConfig> = {
     inflow_window_secs: 60,
     max_single_dump_lamports: 20000000000, // 20 SOL
     
-    // Filter 4: Dev Behavior
-    dev_early_sell_window_secs: 90,
-    dev_rebuy_positive: true,
+    // Dev-Sell Re-Validation
+    dev_sell_revalidation_delay_secs: 30,
     
     // Anti-Bot (Buyer Quality)
     top1_buyer_share_cap: 0.35,
@@ -475,14 +457,6 @@ const DEFAULT_CONFIGS: Record<string, ComponentConfig> = {
     dump_recovery_min_buy_dominance: 0.55,
     dump_recovery_min_net_inflow_lamports: 1000000000, // 1 SOL
     dump_recovery_min_recovery_secs: 10,
-    
-    // CTO Mode (Community Takeover)
-    cto_enabled: false,
-    cto_entry_delay_secs: 30,
-    cto_confirm_window_secs: 30,
-    cto_min_unique_buyers: 5,
-    cto_min_buy_dominance: 0.55,
-    cto_min_net_inflow_lamports: 1000000000, // 1 SOL
     
     // Exit Strategy
     hard_stop_loss_pct: 15.0,

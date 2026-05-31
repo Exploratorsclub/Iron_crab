@@ -8,14 +8,14 @@
 |---------|--------|-------|
 | Two-Phase Entry (Probe + Scale-In) | ✅ | `probe_buy_pct`, `scale_in_confirm_window_secs` |
 | Explicit State Machine | ✅ | `TrackerState` enum with 7 states |
-| Reason Codes | ✅ | `REJECT_*`, `WAIT_*`, `EXIT_*`, `CTO_*` |
+| Reason Codes | ✅ | `REJECT_*`, `WAIT_*`, `EXIT_*` |
 | fill_in/fill_out Position Accounting | ✅ | From `ExecutionResult` |
 | DexPoolAccounts (14 accounts) | ✅ | PumpSwap deterministic routing |
 | TokenMintInfo Gates | ✅ | `mint_authority`, `freeze_authority` |
-| CTO Mode | ✅ | `cto_enabled`, recovery confirmation |
+| Dev-Sell Re-Validation | ✅ | `dev_sell_revalidation_delay_secs`, `WAIT_DEV_SELL_REVALIDATION` |
 | Buyer Quality / Anti-Bot | ✅ | `top1_buyer_share_cap`, `small_buy_ratio_cap` |
 | Exit Policies | ✅ | `hard_stop`, `trailing_stop`, `take_profit`, `max_hold_time` |
-| Dev Sell Detection | ✅ | Pre-entry reject, post-entry exit |
+| Dev Sell Detection | ✅ | Pre-entry WAIT + revalidation, post-entry exit |
 | LP Removal Detection | ✅ | `REJECT_LP_REMOVED` |
 | PendingIntent Tracking | ✅ | Correlation via `intent_id` |
 
@@ -118,7 +118,7 @@ Discovery → Validation → ProbeBuyPending → PositionOpenProbe
 - ScaleInPending → PositionOpenFull (on buy success)
 - ScaleInPending → Rejected (on execution failure/timeout)
 
-**Note**: CTO mode and Dump-Recovery are handled as **sub-states within Validation** via additional fields (`cto_started_at`, `dump_observed_at`, `recovery_started_at`), not as separate `TrackerState` variants.
+**Note**: Dev-sell revalidation delay and Dump-Recovery are handled as **sub-states within Validation** via additional fields (`dev_sell_observed_at`, `dump_observed_at`, `recovery_started_slot`), not as separate `TrackerState` variants.
 
 ---
 
@@ -203,11 +203,11 @@ Reason codes are uppercase snake case. A decision must include exactly one **pri
 - `WAIT_MINT_INFO`
 - `WAIT_BUYER_WINDOW`
 - `WAIT_CONFIRMATION`
+- `WAIT_DEV_SELL_REVALIDATION`
 
 ### Reject (pre-entry)
 - `REJECT_LP_REMOVED`
 - `REJECT_DEV_SUPPLY_TOO_HIGH`
-- `REJECT_DEV_SELL_EARLY`
 - `REJECT_MINT_AUTHORITY_NOT_RENOUNCED`
 - `REJECT_FREEZE_AUTHORITY_SET`
 - `REJECT_INSUFFICIENT_BUYERS`
@@ -217,10 +217,6 @@ Reason codes are uppercase snake case. A decision must include exactly one **pri
 - `REJECT_BOT_CONCENTRATION` (top buyer share too high)
 - `REJECT_MICRO_BUY_SPAM` (small-buy ratio too high)
 - `REJECT_UNSUPPORTED_TOKEN_PROGRAM` (token program not supported by current execution path)
-
-### CTO Mode
-- `CTO_WAIT_RECOVERY`
-- `CTO_RECOVERY_CONFIRMED`
 
 ### Intents
 - `ENTER_PROBE_BUY`
@@ -466,13 +462,8 @@ Dump recovery:
 - `dump_recovery_min_net_inflow_lamports`
 - `dump_recovery_min_recovery_secs`
 
-CTO mode:
-- `cto_enabled`
-- `cto_entry_delay_secs`
-- `cto_confirm_window_secs`
-- `cto_min_unique_buyers`
-- `cto_min_buy_dominance`
-- `cto_min_net_inflow_lamports`
+Dev-sell revalidation (pre-entry):
+- `dev_sell_revalidation_delay_secs`
 
 Mint safety:
 - `require_mint_authority_renounced`
