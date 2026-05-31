@@ -1624,7 +1624,11 @@ impl PositionTracker {
         // 5. Momentum Exit - selling pressure detected (hold + PnL gated)
         let momentum_hold_ok = hold_secs >= config.momentum_exit_min_hold_secs
             && hold_secs >= config.hard_stop_min_hold_secs;
-        let momentum_pnl_ok = pnl_for_reporting <= config.momentum_exit_max_pnl_pct;
+        let momentum_pnl_ok = if config.momentum_exit_only_when_losing {
+            pnl_for_reporting <= 0.0
+        } else {
+            pnl_for_reporting <= config.momentum_exit_max_pnl_pct
+        };
 
         if momentum_hold_ok && momentum_pnl_ok {
             // FIX-30d: Volume-weighted momentum ratio instead of trade-count ratio.
