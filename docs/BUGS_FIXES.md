@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### P171-TRADES-SERVER-DUPES-UTC-BLOCKTIME: Grafana Duplicate Recent Trades + UTC Date Split
+**Datum**: 2026-05-31  
+**Problem** (Prod `142be782`, Grafana „Recent Trades (Current Run)“): doppelte Zeilen pro `tx_hash` — eine mit leerem `run_id`/null `reason`, eine vollständig; `:9899/trades?mode=run` zeigte 19 Dupes bei ~26 Trades.  
+**Root Cause**: PR #176 `load_all_trades` — `_load_trades_from_execution_jsonl` nutzte **lokales** `datetime.now()`, `_load_trades_from_recent_jsonl` **UTC** (wie Rust-Writer). Um Mitternacht CEST: Execution-Tag `20260531` (leer), Recent `20260530` (50 Zeilen); Tag `days_ago=1` lieferte Execution ohne Merge mit Recent → 102 Einträge / 47 doppelte `tx_hash`. Zusätzlich `read_trades_by_run` hing `run_id`-lose Recent-Zeilen an die aktuelle Run-Liste.  
+**Fix**: (1) `_utc_date_str` für beide Loader. (2) Merge pro `days_ago` wenn Execution + Recent; finale `_dedupe_trades_by_tx_hash` (Execution gewinnt). (3) Append-Loop in `read_trades_by_run` entfernt. (4) `block_time_unix_ms` in `ExecutionResult` / `RecentTrade` (Cold-Path `getTransaction`); `trades_server` setzt `timestamp_ms` aus Block-UTC mit Fallback `ts_unix_ms`.  
+**Dateien**: `scripts/trades_server.py`, `src/bin/execution_engine.rs`, `src/ipc/schema.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### PR170-MOMENTUM-TRADE-INGEST-GAP: Active-Pool Tracker Forensics + False Bot-Concentration Reject
 **Datum**: 2026-05-30  
 **Problem** (Prod XHAT `Eyav991r…pump`, 2026-05-30 14:00–14:05 UTC): market-data JSONL zeigte 99+ Buys / 15+ distinct Buyers im Pump-Fenster; momentum blieb bei `buyers 2 < 3` ohne Logs während des Pumps. Tracker existierte (Dev-Sell/CTO sichtbar), Eval aber stumm.  

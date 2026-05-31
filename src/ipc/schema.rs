@@ -1861,6 +1861,11 @@ pub struct ExecutionResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confirmed_slot: Option<u64>,
 
+    /// On-chain block time (UTC) from confirmed transaction meta, in milliseconds.
+    /// Used by trades_server/Grafana instead of confirm wall-clock when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_time_unix_ms: Option<u64>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fees: Option<ExecutionFees>,
 
@@ -1926,6 +1931,7 @@ impl ExecutionResult {
             fill_unavailable_reason: None,
             wallet_sol_delta_lamports: None,
             confirmed_slot: None,
+            block_time_unix_ms: None,
             fees: None,
             pnl: None,
             error_message: None,

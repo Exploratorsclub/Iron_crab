@@ -11,6 +11,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RecentTrade {
     pub timestamp_ms: u64,
+    /// On-chain block time (UTC) when known; falls back to `timestamp_ms` in consumers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_time_unix_ms: Option<u64>,
     pub mint: String,
     pub action: String, // "BUY" or "SELL"
     pub tx_hash: String,
@@ -195,6 +198,7 @@ fn parse_csv_line(line: &str) -> Option<RecentTrade> {
 
     Some(RecentTrade {
         timestamp_ms,
+        block_time_unix_ms: None,
         mint,
         action,
         tx_hash,
