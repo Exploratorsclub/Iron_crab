@@ -101,6 +101,77 @@ pub fn migrate_momentum_trade_velocity_keys_in_table(
     );
 }
 
+const DEPRECATED_MOMENTUM_DEV_SELL_KEYS: &[&str] = &[
+    "cto_enabled",
+    "cto_confirm_window_secs",
+    "cto_min_unique_buyers",
+    "cto_min_buy_dominance",
+    "cto_min_net_inflow_lamports",
+    "dev_early_sell_window_secs",
+    "dev_rebuy_positive",
+];
+
+fn momentum_toml_u64(v: &toml::Value) -> Option<u64> {
+    v.as_integer()
+        .map(|i| i.max(0) as u64)
+        .or_else(|| v.as_float().map(|f| f.max(0.0) as u64))
+}
+
+/// Migrates deprecated CTO / dev-behavior keys to `dev_sell_revalidation_delay_secs`.
+/// If both `cto_entry_delay_secs` and `dev_sell_revalidation_delay_secs` are set, uses the max.
+pub fn migrate_momentum_dev_sell_config_keys_in_table(
+    table: &mut toml::map::Map<String, toml::Value>,
+) {
+    use tracing::warn;
+
+    let cto_delay = table
+        .get("cto_entry_delay_secs")
+        .and_then(momentum_toml_u64);
+    let new_delay = table
+        .get("dev_sell_revalidation_delay_secs")
+        .and_then(momentum_toml_u64);
+
+    match (cto_delay, new_delay) {
+        (Some(c), None) => {
+            warn!(
+                cto_entry_delay_secs = c,
+                dev_sell_revalidation_delay_secs = c,
+                "`cto_entry_delay_secs` is deprecated; migrated to `dev_sell_revalidation_delay_secs`"
+            );
+            table.insert(
+                "dev_sell_revalidation_delay_secs".to_string(),
+                toml::Value::Integer(c as i64),
+            );
+        }
+        (Some(c), Some(n)) => {
+            let merged = c.max(n);
+            if c != n {
+                warn!(
+                    cto_entry_delay_secs = c,
+                    dev_sell_revalidation_delay_secs = n,
+                    merged,
+                    "Both `cto_entry_delay_secs` and `dev_sell_revalidation_delay_secs` set; using max"
+                );
+            }
+            table.insert(
+                "dev_sell_revalidation_delay_secs".to_string(),
+                toml::Value::Integer(merged as i64),
+            );
+        }
+        _ => {}
+    }
+    table.remove("cto_entry_delay_secs");
+
+    for key in DEPRECATED_MOMENTUM_DEV_SELL_KEYS {
+        if table.remove(*key).is_some() {
+            warn!(
+                key = *key,
+                "Deprecated `[momentum]` config key ignored (dev-sell revalidation delay replaces CTO / early-window gates)"
+            );
+        }
+    }
+}
+
 fn momentum_cfg_from_toml_value(val: toml::Value) -> Result<MomentumCfg, String> {
     toml::to_string(&val)
         .map_err(|e| e.to_string())
@@ -119,6 +190,7 @@ where
     };
     if let Some(t) = v.as_table_mut() {
         migrate_momentum_trade_velocity_keys_in_table(t);
+        migrate_momentum_dev_sell_config_keys_in_table(t);
     }
     momentum_cfg_from_toml_value(v)
         .map_err(serde::de::Error::custom)
@@ -716,13 +788,10 @@ pub struct MomentumCfg {
     #[serde(default = "default_max_single_dump")]
     pub max_single_dump_lamports: u64,
 
-    // === Filter 4: Dev Behavior ===
-    /// Dev early sell triggers exit (seconds after pool creation). Default: 60s
-    #[serde(default = "default_dev_early_sell_window")]
-    pub dev_early_sell_window_secs: u64,
-    /// Dev rebuy is positive signal. Default: true
-    #[serde(default = "default_dev_rebuy_positive")]
-    pub dev_rebuy_positive: bool,
+    // === Dev-Sell Re-Validation (pre-entry) ===
+    /// Pause after any pre-entry dev sell before re-evaluating standard soft gates. Default: 30s
+    #[serde(default = "default_dev_sell_revalidation_delay_secs")]
+    pub dev_sell_revalidation_delay_secs: u64,
 
     // === Token Safety: Mint/Freeze Authority (via TokenMintInfo MarketEvents) ===
     /// Require mint authority to be renounced (mint_authority == None) before entering.
@@ -818,33 +887,6 @@ pub struct MomentumCfg {
     /// Default: 10s.
     #[serde(default = "default_dump_recovery_min_recovery_secs")]
     pub dump_recovery_min_recovery_secs: u64,
-
-    // === CTO Mode (pre-entry dev sell handling) ===
-    /// If true, a pre-entry dev sell transitions into CTO candidate state (wait-for-recovery)
-    /// instead of hard reject.
-    /// Default: false.
-    #[serde(default = "default_cto_enabled")]
-    pub cto_enabled: bool,
-    /// Minimum delay (seconds) after pre-entry dev sell before CTO recovery evaluation.
-    /// Default: 30s.
-    #[serde(default = "default_cto_entry_delay_secs")]
-    pub cto_entry_delay_secs: u64,
-    /// Confirmation window (seconds) used to evaluate CTO recovery.
-    /// Default: 30s.
-    #[serde(default = "default_cto_confirm_window_secs")]
-    pub cto_confirm_window_secs: u64,
-    /// Minimum unique buyers required during CTO recovery.
-    /// Default: 5.
-    #[serde(default = "default_cto_min_unique_buyers")]
-    pub cto_min_unique_buyers: u32,
-    /// Minimum buy dominance required during CTO recovery.
-    /// Default: 0.55.
-    #[serde(default = "default_cto_min_buy_dominance")]
-    pub cto_min_buy_dominance: f64,
-    /// Minimum net SOL inflow (lamports) required during CTO recovery.
-    /// Default: 1 SOL.
-    #[serde(default = "default_cto_min_net_inflow_lamports")]
-    pub cto_min_net_inflow_lamports: u64,
 }
 
 // Momentum config defaults - tuned to be less strict than original hardcoded values
@@ -902,11 +944,8 @@ fn default_inflow_window() -> u64 {
 fn default_max_single_dump() -> u64 {
     10_000_000_000
 } // 10 SOL
-fn default_dev_early_sell_window() -> u64 {
-    60
-}
-fn default_dev_rebuy_positive() -> bool {
-    true
+fn default_dev_sell_revalidation_delay_secs() -> u64 {
+    30
 }
 fn default_require_mint_authority_renounced() -> bool {
     false
@@ -979,25 +1018,6 @@ fn default_dump_recovery_min_recovery_secs() -> u64 {
     10
 }
 
-fn default_cto_enabled() -> bool {
-    false
-}
-fn default_cto_entry_delay_secs() -> u64 {
-    30
-}
-fn default_cto_confirm_window_secs() -> u64 {
-    30
-}
-fn default_cto_min_unique_buyers() -> u32 {
-    5
-}
-fn default_cto_min_buy_dominance() -> f64 {
-    0.55
-}
-fn default_cto_min_net_inflow_lamports() -> u64 {
-    1_000_000_000
-} // 1 SOL
-
 impl Default for MomentumCfg {
     fn default() -> Self {
         Self {
@@ -1019,8 +1039,7 @@ impl Default for MomentumCfg {
             min_sol_inflow_lamports: default_min_sol_inflow(),
             inflow_window_secs: default_inflow_window(),
             max_single_dump_lamports: default_max_single_dump(),
-            dev_early_sell_window_secs: default_dev_early_sell_window(),
-            dev_rebuy_positive: default_dev_rebuy_positive(),
+            dev_sell_revalidation_delay_secs: default_dev_sell_revalidation_delay_secs(),
             require_mint_authority_renounced: default_require_mint_authority_renounced(),
             require_freeze_authority_none: default_require_freeze_authority_none(),
             hard_stop_loss_pct: default_hard_stop_loss(),
@@ -1045,12 +1064,6 @@ impl Default for MomentumCfg {
             dump_recovery_min_buy_dominance: default_dump_recovery_min_buy_dominance(),
             dump_recovery_min_net_inflow_lamports: default_dump_recovery_min_net_inflow_lamports(),
             dump_recovery_min_recovery_secs: default_dump_recovery_min_recovery_secs(),
-            cto_enabled: default_cto_enabled(),
-            cto_entry_delay_secs: default_cto_entry_delay_secs(),
-            cto_confirm_window_secs: default_cto_confirm_window_secs(),
-            cto_min_unique_buyers: default_cto_min_unique_buyers(),
-            cto_min_buy_dominance: default_cto_min_buy_dominance(),
-            cto_min_net_inflow_lamports: default_cto_min_net_inflow_lamports(),
         }
     }
 }

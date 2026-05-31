@@ -130,16 +130,13 @@ Component name: `momentum-bot`
 | `dump_recovery_min_net_inflow_lamports` | u64 | 1_000_000_000 | >= 0 | Minimum net SOL inflow for recovery |
 | `dump_recovery_min_recovery_secs` | u64 | 10 | > 0 | Minimum time after dump before allowing entry |
 
-### CTO Candidate Mode
+### Dev-Sell Re-Validation (pre-entry)
 
 | Key | Type | Default | Range | Description |
 |-----|------|---------|-------|-------------|
-| `cto_enabled` | bool | false | true/false | If true, pre-entry dev sell transitions to CTO_Candidate instead of reject |
-| `cto_entry_delay_secs` | u64 | 30 | > 0 | Delay after dev sell before evaluating recovery |
-| `cto_confirm_window_secs` | u64 | 30 | > 0 | Confirmation window for CTO recovery |
-| `cto_min_unique_buyers` | u64 | 5 | > 0 | Minimum unique buyers for CTO recovery |
-| `cto_min_buy_dominance` | f64 | 0.55 | 0.0-1.0 | Minimum buy dominance for CTO recovery |
-| `cto_min_net_inflow_lamports` | u64 | 1_000_000_000 | >= 0 | Minimum net inflow for CTO recovery |
+| `dev_sell_revalidation_delay_secs` | u64 | 30 | > 0 | Pause after any pre-entry dev sell; standard soft gates must pass on fresh window data after delay |
+
+Deprecated (ignored with warn log): `cto_*`, `dev_early_sell_window_secs`, `dev_rebuy_positive`. Legacy `cto_entry_delay_secs` migrates to `dev_sell_revalidation_delay_secs` (max if both set).
 
 ### Mint Safety Gates
 
@@ -172,14 +169,8 @@ Component name: `momentum-bot`
 | `inflow_window_secs` | u64 | 60 | > 0 | Time window for SOL inflow tracking |
 | `max_single_dump_lamports` | u64 | 20_000_000_000 | > 0 | Max allowed single sell (20 SOL) |
 
-### Filter 4: Dev Behavior
 
-| Key | Type | Default | Range | Description |
-|-----|------|---------|-------|-------------|
-| `dev_early_sell_window_secs` | u64 | 90 | > 0 | Dev sells in first N secs = bad signal |
-| `dev_rebuy_positive` | bool | true | true/false | Dev rebuy is considered positive signal |
-
-### Exit Strategy
+### Mint Safety Gates
 
 | Key | Type | Default | Range | Description |
 |-----|------|---------|-------|-------------|
