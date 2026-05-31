@@ -754,6 +754,8 @@ struct ComputedIntentFills {
     fill_status: FillStatus,
     fill_unavailable_reason: Option<FillUnavailableReason>,
     wallet_sol_delta: Option<i128>,
+    /// On-chain block time from RPC tx meta (seconds → ms), cold path only.
+    block_time_unix_ms: Option<u64>,
     /// True only from tx meta: wallet had this mint pre-tx and no post-tx token balance for it.
     wallet_token_balance_absent_after_tx: bool,
 }
@@ -786,10 +788,15 @@ async fn compute_intent_fills_best_effort(
                 fill_status: FillStatus::Unavailable,
                 fill_unavailable_reason: Some(FillUnavailableReason::RpcTxFetchFailed),
                 wallet_sol_delta: None,
+                block_time_unix_ms: None,
                 wallet_token_balance_absent_after_tx: false,
             };
         }
     };
+
+    let block_time_unix_ms = tx
+        .block_time
+        .and_then(|bt| (bt > 0).then(|| (bt as u64).saturating_mul(1000)));
 
     if tx.transaction.meta.is_none() {
         return ComputedIntentFills {
@@ -798,6 +805,7 @@ async fn compute_intent_fills_best_effort(
             fill_status: FillStatus::Unavailable,
             fill_unavailable_reason: Some(FillUnavailableReason::TxMetaMissing),
             wallet_sol_delta: None,
+            block_time_unix_ms,
             wallet_token_balance_absent_after_tx: false,
         };
     }
@@ -877,6 +885,7 @@ async fn compute_intent_fills_best_effort(
                 fill_status: FillStatus::Complete,
                 fill_unavailable_reason: None,
                 wallet_sol_delta: Some(total_sol_delta),
+                block_time_unix_ms,
                 wallet_token_balance_absent_after_tx: false,
             };
         }
@@ -897,6 +906,7 @@ async fn compute_intent_fills_best_effort(
                 fill_status: FillStatus::Partial,
                 fill_unavailable_reason: Some(FillUnavailableReason::TokenBalanceDeltaMissing),
                 wallet_sol_delta: Some(payer_delta_lamports),
+                block_time_unix_ms,
                 wallet_token_balance_absent_after_tx: false,
             };
         }
@@ -1084,6 +1094,7 @@ async fn compute_intent_fills_best_effort(
         fill_status,
         fill_unavailable_reason,
         wallet_sol_delta,
+        block_time_unix_ms,
         wallet_token_balance_absent_after_tx,
     }
 }
@@ -10710,6 +10721,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
     let mut confirmed_sell_fill_status: Option<FillStatus> = None;
     // From tx meta only: wallet had input mint pre-tx and zero post-tx token balance rows.
     let mut confirmed_sell_wallet_balance_absent_after_tx: bool = false;
+    let mut confirmed_block_time_unix_ms: Option<u64> = None;
 
     if config.send_enabled {
         let status = match decision.outcome {
@@ -10900,6 +10912,10 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                         if let Some(delta) = fills.wallet_sol_delta {
                             exec = exec.with_sol_delta(delta);
                         }
+                        if let Some(bt_ms) = fills.block_time_unix_ms {
+                            exec.block_time_unix_ms = Some(bt_ms);
+                            confirmed_block_time_unix_ms = Some(bt_ms);
+                        }
                     }
                 }
             }
@@ -11072,6 +11088,9 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         let (fill_in, fill_out, _fill_status, _fill_reason, _wallet_sol_delta) =
             if let (Some(wallet), Ok(sig)) = (ctx.wallet_pubkey, Signature::from_str(&tx_hash)) {
                 let f = compute_intent_fills_best_effort(ctx, wallet, &sig, &intent).await;
+                if confirmed_block_time_unix_ms.is_none() {
+                    confirmed_block_time_unix_ms = f.block_time_unix_ms;
+                }
                 (
                     f.fill_in,
                     f.fill_out,
@@ -11115,7 +11134,8 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         };
 
         record_recent_trade(RecentTrade {
-            timestamp_ms: now_ms,
+            timestamp_ms: confirmed_block_time_unix_ms.unwrap_or(now_ms),
+            block_time_unix_ms: confirmed_block_time_unix_ms,
             mint,
             action,
             tx_hash,

@@ -6,6 +6,9 @@ Run this separately from the bot to keep trade history available even when bot i
 Reads from: trade_logs/executions/execution_results-YYYYMMDD.jsonl
 Grafana Infinity data source connects to this for "Recent Trades" table panel.
 
+`timestamp_ms` on each trade is the on-chain block time (UTC) when `block_time_unix_ms`
+is present on the JSONL record; otherwise confirm wall-clock (`ts_unix_ms` / legacy).
+
 Usage: python3 trades_server.py [--port 9899]
 
 Query params (GET /trades):
@@ -30,6 +33,36 @@ DECISIONS_DIR = Path(EXEC_LOG_DIR) / "decisions"
 RECENT_TRADES_DIR = Path(
     os.environ.get("IRONCRAB_TRADE_LOG_DIR", "trade_logs")
 )
+
+
+def _utc_date_str(days_ago: int) -> str:
+    """UTC calendar date for JSONL filenames (matches Rust JsonlWriter / metrics)."""
+    return (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y%m%d")
+
+
+def _trade_record_score(trade: dict) -> int:
+    """Prefer execution_results rows over recent_trades duplicates."""
+    score = 0
+    if trade.get("reason"):
+        score += 4
+    if trade.get("run_id"):
+        score += 2
+    if trade.get("wallet_sol_delta") is not None:
+        score += 1
+    return score
+
+
+def _effective_timestamp_ms_from_record(record: dict) -> int:
+    """Block-UTC when producer wrote block_time_unix_ms; else legacy wall-clock."""
+    block_ts = record.get("block_time_unix_ms")
+    if block_ts is not None and block_ts != "":
+        block_ms = int(block_ts)
+        if block_ms > 0:
+            return block_ms
+    if record.get("ts_unix_ms") is not None:
+        return int(record.get("ts_unix_ms") or 0)
+    return int(record.get("timestamp_ms") or 0)
+
 
 class TradesHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -242,23 +275,6 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             current_run = sorted_runs[0]
             prev_run = sorted_runs[1] if len(sorted_runs) > 1 else None
             current_trades = [t for t in all_trades if t.get('run_id') == current_run]
-            earliest_current = min(
-                (
-                    t.get('timestamp_ms', 0)
-                    for t in current_trades
-                    if t.get('timestamp_ms', 0) > 0
-                ),
-                default=None,
-            )
-            for t in all_trades:
-                ts = t.get('timestamp_ms', 0)
-                if (
-                    not t.get('run_id')
-                    and ts > 0
-                    and earliest_current is not None
-                    and ts >= earliest_current
-                ):
-                    current_trades.append(t)
             prev_trades = []
             if prev_run:
                 prev_all = [t for t in all_trades if t.get('run_id') == prev_run]
@@ -331,7 +347,9 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         Returns summary with realized_pnl_sol, trade_count, wins, losses.
         Uses the same FIFO cost-basis logic as the trades endpoint.
         """
-        cutoff_ms = int((datetime.now() - timedelta(hours=24)).timestamp() * 1000)
+        cutoff_ms = int(
+            (datetime.now(timezone.utc) - timedelta(hours=24)).timestamp() * 1000
+        )
 
         all_trades = self.load_all_trades(days_ago_list=[0, 1, 2])
 
@@ -466,12 +484,8 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         for days_ago in days_ago_list:
             day_trades = self._load_trades_from_execution_jsonl([days_ago])
             day_recent = self._load_trades_from_recent_jsonl([days_ago])
-            if days_ago == 0 and day_recent:
-                if not day_trades:
-                    used_fallback = True
-                    day_trades = day_recent
-                else:
-                    day_trades = self._merge_trades_by_tx_hash(day_trades, day_recent)
+            if day_trades and day_recent:
+                day_trades = self._merge_trades_by_tx_hash(day_trades, day_recent)
             elif not day_trades and day_recent:
                 used_fallback = True
                 day_trades = day_recent
@@ -481,7 +495,21 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 "trades_server: using recent_trades JSONL fallback "
                 "(execution_results empty or unparseable for one or more days)"
             )
-        return trades
+        return self._dedupe_trades_by_tx_hash(trades)
+
+    def _dedupe_trades_by_tx_hash(self, trades: list) -> list:
+        """One row per tx_hash; keep the richer execution_results-style row."""
+        by_hash = {}
+        no_hash = []
+        for t in trades:
+            h = t.get("tx_hash") or ""
+            if not h:
+                no_hash.append(t)
+                continue
+            existing = by_hash.get(h)
+            if existing is None or _trade_record_score(t) > _trade_record_score(existing):
+                by_hash[h] = t
+        return list(by_hash.values()) + no_hash
 
     def _merge_trades_by_tx_hash(self, primary: list, secondary: list) -> list:
         """Merge trade lists; primary (execution_results) wins on duplicate tx_hash."""
@@ -520,7 +548,7 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
     def _load_trades_from_execution_jsonl(self, days_ago_list: list) -> list:
         trades = []
         for days_ago in days_ago_list:
-            date = (datetime.now() - timedelta(days=days_ago)).strftime("%Y%m%d")
+            date = _utc_date_str(days_ago)
             jsonl_path = EXECUTIONS_DIR / f"execution_results-{date}.jsonl"
             if not jsonl_path.exists():
                 continue
@@ -546,9 +574,7 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         """metrics::RecentTrade lines — used when execution_results file is empty (buffered)."""
         trades = []
         for days_ago in days_ago_list:
-            date = (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime(
-                "%Y%m%d"
-            )
+            date = _utc_date_str(days_ago)
             jsonl_path = RECENT_TRADES_DIR / f"recent_trades-{date}.jsonl"
             if not jsonl_path.exists():
                 continue
@@ -571,7 +597,7 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
     def parse_recent_trade(self, record: dict) -> Optional[dict]:
         """Parse metrics::RecentTrade JSONL into Grafana-compatible trade format."""
         try:
-            ts_ms = int(record.get("timestamp_ms") or 0)
+            ts_ms = _effective_timestamp_ms_from_record(record)
             mint = record.get("mint") or ""
             action = (record.get("action") or "").upper()
             if action not in ("BUY", "SELL", "ARBITRAGE"):
@@ -610,7 +636,7 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         """Parse execution_results JSONL record into Grafana-compatible trade format"""
         try:
             # Extract data from execution result
-            ts_ms = record.get('ts_unix_ms', 0)
+            ts_ms = _effective_timestamp_ms_from_record(record)
             run_id = record.get('run_id', '')
             signature = record.get('signature', '')
             fill_in = record.get('fill_in', {})
@@ -881,6 +907,67 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
 def _self_check():
     """Quick sanity check for time_mode fields and recent_trades parser (no server)."""
     h = TradesHandler.__new__(TradesHandler)
+
+    merged = h._merge_trades_by_tx_hash(
+        [
+            {
+                "tx_hash": "dup",
+                "timestamp_ms": 1,
+                "reason": "LIQUIDATION",
+                "run_id": "run-a",
+                "wallet_sol_delta": -0.1,
+            }
+        ],
+        [
+            {
+                "tx_hash": "dup",
+                "timestamp_ms": 2,
+                "reason": None,
+                "run_id": "",
+                "wallet_sol_delta": None,
+            }
+        ],
+    )
+    assert len(merged) == 1 and merged[0].get("reason") == "LIQUIDATION"
+
+    deduped = h._dedupe_trades_by_tx_hash(
+        [
+            {"tx_hash": "x", "reason": None, "run_id": ""},
+            {"tx_hash": "x", "reason": "BUY", "run_id": "r1"},
+        ]
+    )
+    assert len(deduped) == 1 and deduped[0].get("reason") == "BUY"
+
+    assert _utc_date_str(0) == datetime.now(timezone.utc).strftime("%Y%m%d")
+
+    block_ts = 1_700_000_123_000
+    parsed_block = h.parse_execution_result(
+        {
+            "status": "confirmed",
+            "ts_unix_ms": 999,
+            "block_time_unix_ms": block_ts,
+            "signature": "sig",
+            "fill_in": {"raw": 0, "decimals": 9},
+            "fill_out": {"raw": 0, "decimals": 6},
+            "source": "arb-strategy",
+            "intent_id": "arb-1",
+        }
+    )
+    assert parsed_block and parsed_block["timestamp_ms"] == block_ts
+
+    parsed_legacy = h.parse_execution_result(
+        {
+            "status": "confirmed",
+            "ts_unix_ms": 888,
+            "signature": "sig2",
+            "fill_in": {"raw": 0, "decimals": 9},
+            "fill_out": {"raw": 0, "decimals": 6},
+            "source": "arb-strategy",
+            "intent_id": "arb-2",
+        }
+    )
+    assert parsed_legacy and parsed_legacy["timestamp_ms"] == 888
+
     ts_ms = 1_700_000_000_000
     expected_utc = (
         datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime(
