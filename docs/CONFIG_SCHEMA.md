@@ -174,11 +174,18 @@ Deprecated (ignored with warn log): `cto_*`, `dev_early_sell_window_secs`, `dev_
 
 | Key | Type | Default | Range | Description |
 |-----|------|---------|-------|-------------|
-| `hard_stop_loss_pct` | f64 | 15.0 | > 0 | Hard stop-loss from entry (15 = 15%) |
+| `hard_stop_min_hold_secs` | u64 | 45 | >= 0 | Grace period: normal hard stop suppressed (catastrophic only) |
+| `catastrophic_stop_loss_pct` | f64 | 45.0 | > 0 | Hard stop threshold during grace (%) |
+| `hard_stop_loss_pct` | f64 | 15.0 | > 0 | Hard stop-loss from entry after grace (15 = 15%) |
 | `trailing_stop_pct` | f64 | 20.0 | > 0 | Trailing stop from ATH (20 = 20%) |
 | `trailing_activation_pct` | f64 | 10.0 | >= 0 | Min profit to activate trailing (10 = 10%) |
 | `take_profit_pct` | f64 | 100.0 | > 0 | Take profit target (100 = 2x) |
-| `max_hold_time_secs` | u64 | 300 | > 0 | Max hold time before forced exit (5 min) |
+| `max_hold_time_secs` | u64 | 300 | > 0 | Min hold before TIME_EXIT is evaluated (5 min) |
+| `max_hold_absolute_cap_secs` | u64 | 0 | >= 0 | Absolute max hold; TIME_EXIT regardless of velocity (0 = off) |
+| `time_exit_requires_low_velocity` | bool | true | true/false | TIME_EXIT only when `trades_per_min` < `min_trades_per_min` |
+| `momentum_exit_min_hold_secs` | u64 | 60 | >= 0 | Min hold before MOMENTUM_EXIT |
+| `momentum_exit_only_when_losing` | bool | true | true/false | Momentum exit only when PnL <= `momentum_exit_max_pnl_pct` |
+| `momentum_exit_max_pnl_pct` | f64 | 0.0 | — | PnL ceiling for momentum exit |
 | `momentum_exit_buy_ratio` | f64 | 0.4 | 0.0-1.0 | Min buy ratio to stay in position |
 | `momentum_exit_window_secs` | u64 | 30 | > 0 | Check last N seconds for momentum |
 | `momentum_exit_min_trades` | u64 | 5 | > 0 | Min trades needed to evaluate exit |

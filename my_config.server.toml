@@ -327,11 +327,17 @@ max_single_dump_lamports = 20_000_000_000 # 20 SOL max single sell (was 5 SOL)
 dev_sell_revalidation_delay_secs = 30   # Pause after pre-entry dev sell before re-checking soft gates
 
 # EXIT STRATEGY
-hard_stop_loss_pct = 15.0           # -15% hard stop
+# Tiered stop (anti-shakeout): grace uses catastrophic_stop only; see CONFIG_SCHEMA.md
+# hard_stop_min_hold_secs = 45
+# catastrophic_stop_loss_pct = 45.0
+hard_stop_loss_pct = 15.0           # -15% hard stop (after grace)
 trailing_stop_pct = 20.0            # -20% from ATH
 trailing_activation_pct = 10.0      # Activate trailing after +10%
 take_profit_pct = 100.0             # Take profit at +100% (2x)
-max_hold_time_secs = 300            # Max 5 minutes hold
+max_hold_time_secs = 300            # Min hold before TIME_EXIT is evaluated
+# time_exit_requires_low_velocity = true  # TIME_EXIT only when trades_per_min < min_trades_per_min
+# momentum_exit_min_hold_secs = 60
+# momentum_exit_only_when_losing = true
 momentum_exit_buy_ratio = 0.4       # Exit if buy ratio < 40%
 momentum_exit_window_secs = 30      # Check last 30s of trades
 momentum_exit_min_trades = 5        # Need 5+ trades to evaluate
