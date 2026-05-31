@@ -156,9 +156,7 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
     
     def read_recent_trades(self, limit: int) -> list:
         """Read last N trades from execution_results JSONL (fallback: recent_trades JSONL)."""
-        trades = self._dedupe_trades_by_tx_hash(
-            self.load_all_trades(days_ago_list=[0, 1, 2])
-        )
+        trades = self.load_all_trades(days_ago_list=[0, 1, 2])
 
         # Compute running PnL.
         #
@@ -228,9 +226,7 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         belonging to that run, plus up to 20 trades from the most recent
         previous run (for context). PnL calculation covers all returned trades.
         """
-        all_trades = self._dedupe_trades_by_tx_hash(
-            self.load_all_trades(days_ago_list=[0, 1, 2])
-        )
+        all_trades = self.load_all_trades(days_ago_list=[0, 1, 2])
 
         if not all_trades:
             return []
@@ -353,9 +349,7 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             (datetime.now(timezone.utc) - timedelta(hours=24)).timestamp() * 1000
         )
 
-        all_trades = self._dedupe_trades_by_tx_hash(
-            self.load_all_trades(days_ago_list=[0, 1, 2])
-        )
+        all_trades = self.load_all_trades(days_ago_list=[0, 1, 2])
 
         if not all_trades:
             return {"realized_pnl_sol": 0.0, "trade_count": 0, "wins": 0, "losses": 0}
