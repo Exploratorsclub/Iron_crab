@@ -45,7 +45,7 @@ Component name: `execution-engine`
 | Key | Type | Default | Range | Description |
 |-----|------|---------|-------|-------------|
 | `max_position_size_lamports` | u64 | 500_000_000 | > 0 | Maximum SOL per single position (0.5 SOL) |
-| `max_open_positions` | u32 | 5 | > 0 | Maximum open positions at once |
+| `max_open_positions` | u32 | 5 | > 0 | Maximum open positions at once (new token mints). Momentum scale-in BUYs (`metadata.entry_kind=scale_in`) with an existing LockManager balance on `output_mint` do not count against this limit. |
 | `daily_loss_limit_lamports` | u64 | 5_000_000_000 | > 0 | Daily loss limit before auto-kill (5 SOL) |
 | `max_slippage_bps` | u32 | 500 | 1-10000 | Maximum slippage in basis points (5%) |
 

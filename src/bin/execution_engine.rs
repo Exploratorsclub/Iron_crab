@@ -8634,6 +8634,28 @@ fn max_open_positions_buy_gate(
     (passed, details)
 }
 
+/// Scale-in BUY adds to an existing mint position; it must not consume a new `max_open_positions` slot.
+///
+/// Returns skip details when `entry_kind=scale_in` **and** LockManager already tracks a non-zero
+/// balance for `output_mint` (defense-in-depth vs metadata spoofing). Otherwise returns `None` and
+/// the normal [`max_open_positions_buy_gate`] applies.
+fn scale_in_max_open_positions_skip_details(
+    entry_kind: Option<&str>,
+    output_mint: &str,
+    lock_manager: &LockManager,
+) -> Option<String> {
+    if entry_kind != Some("scale_in") {
+        return None;
+    }
+    let existing_balance_raw = lock_manager.available_token_balance(output_mint);
+    if existing_balance_raw == 0 {
+        return None;
+    }
+    Some(format!(
+        "skipped_for_scale_in (does not open new position; existing_balance_raw={existing_balance_raw})"
+    ))
+}
+
 /// After a successful send: `cached_blockhash.slot` minus intent metadata `slot` (Geyser chain position).
 #[inline]
 fn record_execution_slot_lag_at_send_if_applicable(ctx: &ExecutionContext, intent: &TradeIntent) {
@@ -8848,35 +8870,55 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
     // Check 3c: Max open positions (applies to BUY only; SELL exits should remain possible)
     // Authoritative count: LockManager non-zero token balances (A.28). Strategy metadata is kept
     // for observability but must not be the sole enforcement source (Scope 49).
+    // Scale-in BUY (`entry_kind=scale_in`) skips this gate when LockManager already holds the mint
+    // (P179): adds to an existing probe position, does not open a new token mint slot.
     if intent.side == TradeSide::Buy {
-        let metadata_current = intent
-            .metadata
-            .get("current_open_positions")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        let authoritative_current = ctx.get_open_positions();
-        let (passed, details) = max_open_positions_buy_gate(
-            metadata_current,
-            authoritative_current,
-            config.max_open_positions,
-        );
-
-        if !passed {
-            let reason = RejectReason::RiskMaxOpenPositions;
+        let entry_kind = intent.metadata.get("entry_kind").map(|s| s.as_str());
+        if let Some(skip_details) = scale_in_max_open_positions_skip_details(
+            entry_kind,
+            &intent.resources.output_mint,
+            &ctx.lock_manager,
+        ) {
             checks.push(CheckResult {
                 check_name: "max_open_positions".to_string(),
-                passed: false,
-                reason_code: Some(reason.to_string()),
+                passed: true,
+                reason_code: None,
+                details: Some(skip_details),
+            });
+        } else {
+            let metadata_current = intent
+                .metadata
+                .get("current_open_positions")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+            let authoritative_current = ctx.get_open_positions();
+            let (passed, details) = max_open_positions_buy_gate(
+                metadata_current,
+                authoritative_current,
+                config.max_open_positions,
+            );
+
+            if !passed {
+                let reason = RejectReason::RiskMaxOpenPositions;
+                checks.push(CheckResult {
+                    check_name: "max_open_positions".to_string(),
+                    passed: false,
+                    reason_code: Some(reason.to_string()),
+                    details: Some(if entry_kind == Some("scale_in") {
+                        format!("{details}; scale_in_bypass_denied_no_existing_balance")
+                    } else {
+                        details
+                    }),
+                });
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+            }
+            checks.push(CheckResult {
+                check_name: "max_open_positions".to_string(),
+                passed: true,
+                reason_code: None,
                 details: Some(details),
             });
-            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
         }
-        checks.push(CheckResult {
-            check_name: "max_open_positions".to_string(),
-            passed: true,
-            reason_code: None,
-            details: Some(details),
-        });
     } else {
         checks.push(CheckResult {
             check_name: "max_open_positions".to_string(),
@@ -11986,9 +12028,9 @@ mod execution_engine_tests {
         pump_amm_hint_pool_cache_usable_for_tx_plan_builder,
         pump_amm_liquidation_quote_timeout_str, pump_amm_pool_market_hint_merge,
         pump_amm_slave_recovery_snapshot, record_pump_amm_hot_path_refresh_after_success,
-        scope48_confirmed_sell_close_decision, sort_route_candidates_by_amount_out,
-        take_next_multi_pool_buildable_fallback_route, try_pump_amm_hot_path_refresh_publish,
-        wait_for_meteora_dlmm_slave_after_recovery,
+        scale_in_max_open_positions_skip_details, scope48_confirmed_sell_close_decision,
+        sort_route_candidates_by_amount_out, take_next_multi_pool_buildable_fallback_route,
+        try_pump_amm_hot_path_refresh_publish, wait_for_meteora_dlmm_slave_after_recovery,
         wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder,
         wait_for_pump_amm_slave_after_recovery, wait_for_pumpfun_bonding_cache_refresh,
         DiscoveryRequestOutcome, PumpAmmHotPathRefreshDecision, RouteCandidate,
@@ -12040,6 +12082,45 @@ mod execution_engine_tests {
         assert!(details.contains("authoritative_current=3"));
         assert!(details.contains("effective_current=3"));
         assert!(details.contains("< max=5"));
+    }
+
+    #[test]
+    fn max_open_positions_gate_skipped_for_scale_in_metadata() {
+        const MINT: &str = "ScaleInMintP179";
+        let lm = LockManager::new(0);
+        lm.set_available_token_balance(MINT.to_string(), 1_000_000);
+        let skip = scale_in_max_open_positions_skip_details(Some("scale_in"), MINT, &lm);
+        assert!(skip.is_some());
+        let details = skip.unwrap();
+        assert!(details.contains("skipped_for_scale_in"));
+        assert!(details.contains("existing_balance_raw=1000000"));
+        let (passed, _) = max_open_positions_buy_gate(10, 10, 5);
+        assert!(
+            !passed,
+            "gate would reject at limit; skip must bypass in process_intent"
+        );
+    }
+
+    #[test]
+    fn max_open_positions_gate_still_rejects_probe_at_limit() {
+        let max_open = 5usize;
+        let (passed, details) = max_open_positions_buy_gate(10, 10, max_open);
+        assert!(!passed);
+        assert!(details.contains("effective_current=10"));
+        let lm = LockManager::new(0);
+        assert!(scale_in_max_open_positions_skip_details(Some("probe"), "AnyMint", &lm).is_none());
+    }
+
+    #[test]
+    fn max_open_positions_gate_scale_in_without_balance_applies_gate() {
+        let lm = LockManager::new(0);
+        assert!(
+            scale_in_max_open_positions_skip_details(Some("scale_in"), "NoBalanceMint", &lm)
+                .is_none()
+        );
+        let (passed, details) = max_open_positions_buy_gate(10, 10, 5);
+        assert!(!passed);
+        assert!(details.contains(">="));
     }
 
     /// Scope 51: timeout log text matches `PUMPSWAP_LIQUIDATION_QUOTE_TIMEOUT_SECS` (45s).
