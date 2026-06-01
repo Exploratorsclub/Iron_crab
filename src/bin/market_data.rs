@@ -612,6 +612,7 @@ enum MdSidefxCommand {
         pool_address: Pubkey,
         base_mint_pk: Pubkey,
         slot: u64,
+        is_buy: bool,
         pool_accounts: Vec<Pubkey>,
         pump_amm_sell_requires_cashback_remaining: bool,
         pump_amm_sell_cashback_third_meta: Option<Pubkey>,
@@ -966,6 +967,7 @@ fn md_sidefx_process_pump_amm_trade(w: &MdSidefxWorkerCtx, job: &MdSidefxCommand
         pool_address,
         base_mint_pk,
         slot,
+        is_buy,
         pool_accounts,
         pump_amm_sell_requires_cashback_remaining,
         pump_amm_sell_cashback_third_meta,
@@ -1104,6 +1106,27 @@ fn md_sidefx_process_pump_amm_trade(w: &MdSidefxWorkerCtx, job: &MdSidefxCommand
         w.ctx
             .live_pool_cache
             .set_pump_amm_sell_layout_ready(pool_address, sell_layout_ready);
+        if !*is_buy {
+            ironcrab::metrics::record_pump_amm_geyser_sell_parsed();
+            if sell_layout_ready {
+                w.ctx
+                    .live_pool_cache
+                    .set_pump_amm_sell_layout_authoritative(
+                        pool_address,
+                        merged_flag,
+                        merged_third,
+                        merged_t0,
+                        merged_t1,
+                    );
+                ironcrab::metrics::record_pump_amm_geyser_sell_layout_ready();
+                info!(
+                    pool = %pool_address,
+                    base_mint = %base_mint_pk,
+                    slot = *slot,
+                    "pump_amm: Geyser SELL set sell_layout_ready (authoritative extended layout)"
+                );
+            }
+        }
         w.ctx
             .live_pool_cache
             .set_pump_amm_pool_accounts_readiness_authoritative(*pool_address, dex_readiness);
@@ -11141,6 +11164,7 @@ async fn handle_geyser_transaction(
         pool_address,
         mint: base_mint_pk,
         dex: DexType::PumpFunAmm,
+        is_buy,
         pool_accounts: Some(pool_accounts),
         pump_amm_sell_requires_cashback_remaining,
         pump_amm_sell_cashback_third_meta,
@@ -11156,6 +11180,7 @@ async fn handle_geyser_transaction(
                 pool_address: *pool_address,
                 base_mint_pk: *base_mint_pk,
                 slot: tx_update.slot,
+                is_buy: *is_buy,
                 pool_accounts: pool_accounts.clone(),
                 pump_amm_sell_requires_cashback_remaining:
                     *pump_amm_sell_requires_cashback_remaining,

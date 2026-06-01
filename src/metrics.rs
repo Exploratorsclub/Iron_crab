@@ -304,6 +304,20 @@ pub static MARKET_DATA_GEYSER_MERGE_IMMEDIATE_TOTAL: Lazy<AtomicU64> =
 /// PR161: 1 while a debounced merge flush is scheduled; 0 otherwise.
 pub static MARKET_DATA_GEYSER_MERGE_PENDING: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+/// PumpSwap `sell` successfully parsed from Geyser (dex_parser → market-data sidefx).
+pub static PUMP_AMM_GEYSER_SELL_PARSED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// PumpSwap Geyser-observed SELL that set `sell_layout_ready=true` in LivePoolCache.
+pub static PUMP_AMM_GEYSER_SELL_LAYOUT_READY_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub fn record_pump_amm_geyser_sell_parsed() {
+    PUMP_AMM_GEYSER_SELL_PARSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_pump_amm_geyser_sell_layout_ready() {
+    PUMP_AMM_GEYSER_SELL_LAYOUT_READY_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Reconnect after large explicit subscription set (PR-B: full client reconnect vs in-place churn).
 pub static GEYSER_RECONNECT_TOTAL_SUBSCRIPTION_REBUILD: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));

@@ -139,6 +139,98 @@ pub fn pump_amm_sell_ix_discriminator() -> [u8; 8] {
 /// Verified on mainnet (e.g. sig `2CCmRDScAErjuBLnVJbGEyV3jsWbuNZpniZ5iTLSwZoE84nmyf285hqJXjRStMHJUaJ9Ex7EvL9fgwAVM83qGd3o`).
 pub const PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS: usize = 24;
 
+/// Cashback-enabled `sell` after Pump fee-recipient upgrade: 21 base + volume metas #21/#22 + `pool-v2` #23 + fee pair #24/#25.
+/// See Pump `@pump_tech_updates` (2026): non-cashback `sell` = 24 accounts (`pool-v2` at #21); cashback `sell` = 26.
+pub const PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS: usize = 26;
+
+/// Extended SELL tail indices (shared by legacy 24-account cashback and 26-account layouts).
+pub const PUMPFUN_AMM_SELL_EXT_TAIL_0_IX: usize = 21;
+pub const PUMPFUN_AMM_SELL_EXT_TAIL_1_IX: usize = 22;
+pub const PUMPFUN_AMM_SELL_EXT_THIRD_META_IX: usize = 23;
+
+/// `pool-v2` PDA appended on post-upgrade PumpSwap swaps (`["pool-v2", base_mint]`).
+#[must_use]
+pub fn pump_amm_pool_v2_pda(base_mint: &Pubkey, program_id: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"pool-v2", base_mint.as_ref()], program_id).0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PumpAmmSellExtendedFields {
+    pub requires_extended: bool,
+    pub tail_0: Option<Pubkey>,
+    pub tail_1: Option<Pubkey>,
+    pub third_meta: Option<Pubkey>,
+}
+
+#[must_use]
+pub fn pump_amm_sell_ix_account_len_supported(n: usize) -> bool {
+    matches!(
+        n,
+        21 | PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS | PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS
+    )
+}
+
+/// Map observed `sell` instruction accounts to extended-layout fields (Geyser + RPC history).
+pub fn pump_amm_sell_extended_fields_from_ix_accounts(
+    instruction_accounts: &[Pubkey],
+) -> Option<PumpAmmSellExtendedFields> {
+    let n = instruction_accounts.len();
+    if !pump_amm_sell_ix_account_len_supported(n) {
+        return None;
+    }
+    let base_mint = *instruction_accounts.get(3)?;
+    let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).ok()?;
+    let pool_v2 = pump_amm_pool_v2_pda(&base_mint, &program_id);
+
+    match n {
+        21 => Some(PumpAmmSellExtendedFields {
+            requires_extended: false,
+            tail_0: None,
+            tail_1: None,
+            third_meta: None,
+        }),
+        PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS => {
+            let at_21 = *instruction_accounts.get(PUMPFUN_AMM_SELL_EXT_TAIL_0_IX)?;
+            if at_21 == pool_v2 {
+                // Post-upgrade non-cashback: #21 pool-v2, #22/#23 protocol fee recipient pair.
+                Some(PumpAmmSellExtendedFields {
+                    requires_extended: false,
+                    tail_0: None,
+                    tail_1: None,
+                    third_meta: None,
+                })
+            } else {
+                // Legacy extended cashback: #21/#22 volume metas, #23 third (often pool-v2).
+                Some(PumpAmmSellExtendedFields {
+                    requires_extended: true,
+                    tail_0: instruction_accounts
+                        .get(PUMPFUN_AMM_SELL_EXT_TAIL_0_IX)
+                        .copied(),
+                    tail_1: instruction_accounts
+                        .get(PUMPFUN_AMM_SELL_EXT_TAIL_1_IX)
+                        .copied(),
+                    third_meta: instruction_accounts
+                        .get(PUMPFUN_AMM_SELL_EXT_THIRD_META_IX)
+                        .copied(),
+                })
+            }
+        }
+        PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS => Some(PumpAmmSellExtendedFields {
+            requires_extended: true,
+            tail_0: instruction_accounts
+                .get(PUMPFUN_AMM_SELL_EXT_TAIL_0_IX)
+                .copied(),
+            tail_1: instruction_accounts
+                .get(PUMPFUN_AMM_SELL_EXT_TAIL_1_IX)
+                .copied(),
+            third_meta: instruction_accounts
+                .get(PUMPFUN_AMM_SELL_EXT_THIRD_META_IX)
+                .copied(),
+        }),
+        _ => None,
+    }
+}
+
 /// Stable, structured reason when local (validator) market-account parsing cannot build `PumpAmmPoolStatic`.
 /// Used by `market-data` cold-path logging (Scope 42); not a global canonicalization of fee recipients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1733,8 +1825,7 @@ impl PumpFunAmmDex {
                     continue;
                 };
                 if disc8 == sell_layout_sell_disc
-                    && acc_strings.len() != 21
-                    && acc_strings.len() != 24
+                    && !pump_amm_sell_ix_account_len_supported(acc_strings.len())
                 {
                     summary.termination_reason =
                         PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalPumpAmmSellAccountShapeUnsupported;
@@ -1783,11 +1874,7 @@ impl PumpFunAmmDex {
                 ) {
                     summary.termination_reason = PumpAmmSellLayoutTerminationReason::LayoutFound;
                     summary.elapsed_total_ms = t0.elapsed().as_millis();
-                    let sell_ix_account_count = match best_obs.layout {
-                        PumpAmmAuthoritativeSellLayout::Extended { .. } => 24u8,
-                        PumpAmmAuthoritativeSellLayout::Base => 21,
-                        PumpAmmAuthoritativeSellLayout::Unknown => 0,
-                    };
+                    let sell_ix_account_count = acc_strings.len() as u8;
                     let (tail0_log, tail1_log, tail2_log) = match best_obs.layout {
                         PumpAmmAuthoritativeSellLayout::Extended {
                             tail_0,
@@ -1861,7 +1948,9 @@ impl PumpFunAmmDex {
                 _ => (None, None, None),
             };
             let sell_ix_account_count = match best_obs.layout {
-                PumpAmmAuthoritativeSellLayout::Extended { .. } => 24u8,
+                PumpAmmAuthoritativeSellLayout::Extended { .. } => {
+                    PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS as u8
+                }
                 PumpAmmAuthoritativeSellLayout::Base => 21,
                 PumpAmmAuthoritativeSellLayout::Unknown => 0,
             };
@@ -4429,21 +4518,27 @@ impl PumpFunAmmDex {
         ix: &'a Value,
         message_account_keys: &'a [String],
     ) -> Option<&'a str> {
+        let ix = Self::pump_amm_instruction_json_body(ix);
         if let Some(s) = ix.get("programId").and_then(|v| v.as_str()) {
             return Some(s);
-        }
-        if let Some(w) = ix
-            .get("Parsed")
-            .and_then(|p| p.get("programId"))
-            .and_then(|v| v.as_str())
-        {
-            return Some(w);
         }
         let idx = ix.get("programIdIndex").and_then(|v| v.as_u64())? as usize;
         message_account_keys.get(idx).map(|s| s.as_str())
     }
 
+    /// Unwrap validator `jsonParsed` instruction envelopes (`Compiled` / `Parsed`).
+    fn pump_amm_instruction_json_body(ix: &Value) -> &Value {
+        if let Some(inner) = ix.get("Compiled") {
+            return inner;
+        }
+        if let Some(inner) = ix.get("Parsed") {
+            return inner;
+        }
+        ix
+    }
+
     fn pump_amm_ix_data_from_json(ix: &Value) -> Option<Vec<u8>> {
+        let ix = Self::pump_amm_instruction_json_body(ix);
         let d = ix.get("data")?;
         if let Some(s) = d.as_str() {
             return bs58::decode(s).into_vec().ok();
@@ -4468,6 +4563,7 @@ impl PumpFunAmmDex {
         ix: &Value,
         message_account_keys: &[String],
     ) -> Option<Vec<String>> {
+        let ix = Self::pump_amm_instruction_json_body(ix);
         let arr = ix.get("accounts")?.as_array()?;
         if arr.is_empty() {
             return None;
@@ -4538,18 +4634,22 @@ impl PumpFunAmmDex {
         }
 
         if disc == sell_disc {
-            let extended = match acc_accounts.len() {
-                21 => false,
-                24 => true,
-                _ => return None,
-            };
+            if !pump_amm_sell_ix_account_len_supported(acc_accounts.len()) {
+                return None;
+            }
             let pool_market = parse_pk(0)?;
             let base_mint = parse_pk(3)?;
-            let (third, tail_0, tail_1) = if extended {
+            let ext = pump_amm_sell_extended_fields_from_ix_accounts(
+                &acc_accounts
+                    .iter()
+                    .filter_map(|s| Pubkey::from_str(s).ok())
+                    .collect::<Vec<_>>(),
+            )?;
+            let (third, tail_0, tail_1) = if ext.requires_extended {
                 (
-                    Some(parse_pk(23)?),
-                    Some(parse_pk(21)?),
-                    Some(parse_pk(22)?),
+                    ext.third_meta.filter(|p| *p != Pubkey::default()),
+                    ext.tail_0.filter(|p| *p != Pubkey::default()),
+                    ext.tail_1.filter(|p| *p != Pubkey::default()),
                 )
             } else {
                 (None, None, None)
@@ -4569,7 +4669,7 @@ impl PumpFunAmmDex {
                 global_volume_accumulator: singleton_gva,
                 fee_config: parse_pk(19)?,
                 fee_program: parse_pk(20)?,
-                sell_requires_cashback_remaining: extended,
+                sell_requires_cashback_remaining: ext.requires_extended,
                 sell_cashback_third_meta: third,
                 sell_extended_tail_0: tail_0,
                 sell_extended_tail_1: tail_1,
@@ -4594,9 +4694,10 @@ impl PumpFunAmmDex {
                 Pubkey::default(),
             )
         })?;
-        let layout = match acc_accounts.len() {
-            21 => PumpAmmAuthoritativeSellLayout::Base,
-            24 => PumpAmmAuthoritativeSellLayout::Extended {
+        let layout = if !pool.sell_requires_cashback_remaining {
+            PumpAmmAuthoritativeSellLayout::Base
+        } else {
+            PumpAmmAuthoritativeSellLayout::Extended {
                 tail_0: pool
                     .sell_extended_tail_0
                     .filter(|p| *p != Pubkey::default())?,
@@ -4606,8 +4707,7 @@ impl PumpFunAmmDex {
                 tail_2: pool
                     .sell_cashback_third_meta
                     .filter(|p| *p != Pubkey::default())?,
-            },
-            _ => return None,
+            }
         };
         let obs = PumpAmmSellReferenceObservation {
             layout,
@@ -5823,6 +5923,19 @@ mod tests {
             Some(PUMPFUN_AMM_PROGRAM_ID)
         );
 
+        let ix_compiled: Value = json!({
+            "Compiled": {
+                "programId": PUMPFUN_AMM_PROGRAM_ID,
+                "accounts": ["11111111111111111111111111111111"],
+                "data": "33e685a4017f83ad00000000000000000000000000000000000000000000000000"
+            }
+        });
+        assert_eq!(
+            PumpFunAmmDex::pump_amm_ix_account_strings_from_json(&ix_compiled, &keys)
+                .map(|v| v.len()),
+            Some(1)
+        );
+
         let ix_idx: Value = json!({
             "programIdIndex": 0u64,
             "accounts": [],
@@ -6414,6 +6527,41 @@ mod tests {
         assert_eq!(observed.0, pool_market);
         assert_eq!(observed.1, base_mint);
         assert_eq!(observed.2, PumpAmmAuthoritativeSellLayout::Base);
+    }
+
+    #[test]
+    fn test_pump_amm_sell_layout_observation_parses_26_account_cashback_sell() {
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let third_meta = Pubkey::new_unique();
+        let tail0 = Pubkey::new_unique();
+        let tail1 = Pubkey::new_unique();
+        let mut account_keys: Vec<Pubkey> = (0..26).map(|_| Pubkey::new_unique()).collect();
+        account_keys[0] = pool_market;
+        account_keys[2] = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap();
+        account_keys[3] = base_mint;
+        account_keys[4] = Pubkey::from_str(WSOL_MINT).unwrap();
+        account_keys[20] = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap();
+        account_keys[21] = tail0;
+        account_keys[22] = tail1;
+        account_keys[23] = third_meta;
+        let acc_strings: Vec<String> = account_keys.iter().map(ToString::to_string).collect();
+        let ix_data = pump_amm_sell_ix_discriminator().to_vec();
+
+        let observed = PumpFunAmmDex::pump_amm_sell_layout_observation_from_parsed_swap_ix(
+            &acc_strings,
+            &ix_data,
+        )
+        .expect("26-account sell observation");
+
+        assert_eq!(
+            observed.2,
+            PumpAmmAuthoritativeSellLayout::Extended {
+                tail_0: tail0,
+                tail_1: tail1,
+                tail_2: third_meta,
+            }
+        );
     }
 
     #[test]
