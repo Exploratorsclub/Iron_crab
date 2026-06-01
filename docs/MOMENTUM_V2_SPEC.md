@@ -159,7 +159,7 @@ Soft gates (WAIT until sufficient data):
 - Not enough unique buyers in the early window.
 - Trade velocity / buy dominance below thresholds.
 - Net SOL inflow below threshold.
-- **Filter 5 — Price trend / downtrend** (`WAIT_DOWNTREND`): trade-implied `tokens_per_sol` from Geyser `TradeEvent` prints (no RPC). Blocks clear lower-highs structure and drawdown-from-session-high with falling short slope; recovery exception when fresh buy flow + improving slope. Runs **before** dump-recovery (Filter 3b).
+- **Filter 5 — Price trend / downtrend** (`WAIT_DOWNTREND`): trade-implied `tokens_per_sol` from Geyser `TradeEvent` prints (no RPC). Multi-bucket lower-highs (default 5 sub-windows) blocks structural downtrend; drawdown-from-session-high with rising short slope blocks unless recovery is confirmed (≥2 late buckets with falling median_tps, flow thresholds, ≥15s chain-slot duration, and no strict lower-highs structure). Runs **before** dump-recovery (Filter 3b).
 
 CTO behavior (pre-entry only):
 - If dev sells early and we do **not** hold a position:
@@ -485,6 +485,11 @@ Price trend / downtrend (Filter 5):
 - `price_trend_max_drawdown_pct`
 - `price_trend_recovery_min_buy_dominance`
 - `price_trend_recovery_min_inflow_lamports`
+- `price_trend_bucket_count`
+- `price_trend_lower_highs_max_breaks`
+- `price_trend_recovery_min_positive_buckets`
+- `price_trend_recovery_min_secs`
+- `price_trend_recovery_requires_no_lower_highs`
 
 Token age (Filter 1c, pre-entry):
 - `min_token_age_secs`

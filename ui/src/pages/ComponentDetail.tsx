@@ -200,6 +200,11 @@ const CONFIG_DESCRIPTIONS: Record<string, Record<string, string>> = {
     price_trend_max_drawdown_pct: 'TREND: Drawdown from session trade-high (%)',
     price_trend_recovery_min_buy_dominance: 'TREND: Recovery exception min buy dominance',
     price_trend_recovery_min_inflow_lamports: 'TREND: Recovery exception min net inflow (lamports)',
+    price_trend_bucket_count: 'TREND: Sub-buckets for lower-highs + recovery slope (3–8)',
+    price_trend_lower_highs_max_breaks: 'TREND: Max monotonicity breaks in lower-highs chain',
+    price_trend_recovery_min_positive_buckets: 'TREND: Min consecutive late buckets with falling median_tps',
+    price_trend_recovery_min_secs: 'TREND: Min continuous recovery duration (seconds)',
+    price_trend_recovery_requires_no_lower_highs: 'TREND: Disable recovery when strict lower-highs matches',
     
     // Exit Strategy
     hard_stop_min_hold_secs: 'EXIT: Grace period before normal hard stop (seconds)',
@@ -353,6 +358,11 @@ const CONFIG_GROUPS: Record<string, Record<string, string[]>> = {
       'price_trend_max_drawdown_pct',
       'price_trend_recovery_min_buy_dominance',
       'price_trend_recovery_min_inflow_lamports',
+      'price_trend_bucket_count',
+      'price_trend_lower_highs_max_breaks',
+      'price_trend_recovery_min_positive_buckets',
+      'price_trend_recovery_min_secs',
+      'price_trend_recovery_requires_no_lower_highs',
     ],
     'Exit Strategy': [
       'hard_stop_min_hold_secs',
@@ -496,12 +506,17 @@ const DEFAULT_CONFIGS: Record<string, ComponentConfig> = {
     
     // Filter 5: Price Trend / Downtrend
     price_trend_filter_enabled: true,
-    price_trend_window_secs: 90,
-    price_trend_min_trades: 12,
+    price_trend_window_secs: 120,
+    price_trend_min_trades: 18,
     price_trend_min_tps_rise_pct: 8,
     price_trend_max_drawdown_pct: 25,
     price_trend_recovery_min_buy_dominance: 0.60,
     price_trend_recovery_min_inflow_lamports: 500000000,
+    price_trend_bucket_count: 5,
+    price_trend_lower_highs_max_breaks: 0,
+    price_trend_recovery_min_positive_buckets: 2,
+    price_trend_recovery_min_secs: 15,
+    price_trend_recovery_requires_no_lower_highs: true,
     
     // Exit Strategy
     hard_stop_min_hold_secs: 45,

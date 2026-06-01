@@ -918,10 +918,10 @@ pub struct MomentumCfg {
     /// Master switch for trade-implied price-trend gate. Default: true.
     #[serde(default = "default_price_trend_filter_enabled")]
     pub price_trend_filter_enabled: bool,
-    /// Chain-slot window (seconds) for trend evaluation. Default: 90s. `0` disables.
+    /// Chain-slot window (seconds) for trend evaluation. Default: 120s. `0` disables.
     #[serde(default = "default_price_trend_window_secs")]
     pub price_trend_window_secs: u64,
-    /// Minimum trades with `slot > 0` in the trend window. Default: 12.
+    /// Minimum trades with `slot > 0` in the trend window. Default: 18.
     #[serde(default = "default_price_trend_min_trades")]
     pub price_trend_min_trades: u32,
     /// Minimum `trade_tps` rise (%) for lower-highs / short-slope signals. Default: 8.0.
@@ -936,6 +936,21 @@ pub struct MomentumCfg {
     /// Recovery exception: min net SOL inflow (lamports) in trend window. Default: 0.5 SOL.
     #[serde(default = "default_price_trend_recovery_min_inflow_lamports")]
     pub price_trend_recovery_min_inflow_lamports: u64,
+    /// Sub-buckets for lower-highs and recovery-slope (3–8). Default: 5.
+    #[serde(default = "default_price_trend_bucket_count")]
+    pub price_trend_bucket_count: u32,
+    /// Max allowed monotonicity breaks in lower-highs chain (0 = strict). Default: 0.
+    #[serde(default = "default_price_trend_lower_highs_max_breaks")]
+    pub price_trend_lower_highs_max_breaks: u32,
+    /// Min consecutive late buckets with falling median_tps for recovery. Default: 2.
+    #[serde(default = "default_price_trend_recovery_min_positive_buckets")]
+    pub price_trend_recovery_min_positive_buckets: u32,
+    /// Min continuous recovery duration (seconds, chain slots). Default: 15.
+    #[serde(default = "default_price_trend_recovery_min_secs")]
+    pub price_trend_recovery_min_secs: u64,
+    /// Disable recovery when strict lower-highs structure matches. Default: true.
+    #[serde(default = "default_price_trend_recovery_requires_no_lower_highs")]
+    pub price_trend_recovery_requires_no_lower_highs: bool,
 }
 
 // Momentum config defaults - tuned to be less strict than original hardcoded values
@@ -1089,10 +1104,10 @@ fn default_price_trend_filter_enabled() -> bool {
     true
 }
 fn default_price_trend_window_secs() -> u64 {
-    90
+    120
 }
 fn default_price_trend_min_trades() -> u32 {
-    12
+    18
 }
 fn default_price_trend_min_tps_rise_pct() -> f64 {
     8.0
@@ -1105,6 +1120,21 @@ fn default_price_trend_recovery_min_buy_dominance() -> f64 {
 }
 fn default_price_trend_recovery_min_inflow_lamports() -> u64 {
     500_000_000
+}
+fn default_price_trend_bucket_count() -> u32 {
+    5
+}
+fn default_price_trend_lower_highs_max_breaks() -> u32 {
+    0
+}
+fn default_price_trend_recovery_min_positive_buckets() -> u32 {
+    2
+}
+fn default_price_trend_recovery_min_secs() -> u64 {
+    15
+}
+fn default_price_trend_recovery_requires_no_lower_highs() -> bool {
+    true
 }
 
 impl Default for MomentumCfg {
@@ -1170,6 +1200,13 @@ impl Default for MomentumCfg {
             ),
             price_trend_recovery_min_inflow_lamports:
                 default_price_trend_recovery_min_inflow_lamports(),
+            price_trend_bucket_count: default_price_trend_bucket_count(),
+            price_trend_lower_highs_max_breaks: default_price_trend_lower_highs_max_breaks(),
+            price_trend_recovery_min_positive_buckets:
+                default_price_trend_recovery_min_positive_buckets(),
+            price_trend_recovery_min_secs: default_price_trend_recovery_min_secs(),
+            price_trend_recovery_requires_no_lower_highs:
+                default_price_trend_recovery_requires_no_lower_highs(),
         }
     }
 }
