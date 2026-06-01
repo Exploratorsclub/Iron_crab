@@ -57,6 +57,7 @@ pub struct OrcaPoolInfo {
 // ============================================================================
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ParsedDexEvent {
     /// New pool created
     PoolCreated {
@@ -104,6 +105,10 @@ pub enum ParsedDexEvent {
         pump_amm_sell_extended_tail_0: Option<Pubkey>,
         /// PumpSwap only: observed extended SELL ix account #22 (Scope 61).
         pump_amm_sell_extended_tail_1: Option<Pubkey>,
+        /// PumpSwap only: observed cashback `sell` fee-recipient ix #24.
+        pump_amm_sell_extended_fee_tail_0: Option<Pubkey>,
+        /// PumpSwap only: observed cashback `sell` fee-recipient ix #25.
+        pump_amm_sell_extended_fee_tail_1: Option<Pubkey>,
     },
     /// Liquidity removed (potential rug)
     LiquidityRemoved {
@@ -531,6 +536,8 @@ fn parse_raydium_swap(
         pump_amm_sell_cashback_third_meta: None,
         pump_amm_sell_extended_tail_0: None,
         pump_amm_sell_extended_tail_1: None,
+        pump_amm_sell_extended_fee_tail_0: None,
+        pump_amm_sell_extended_fee_tail_1: None,
     })
 }
 
@@ -763,6 +770,8 @@ fn parse_orca_transaction(
         pump_amm_sell_cashback_third_meta: None,
         pump_amm_sell_extended_tail_0: None,
         pump_amm_sell_extended_tail_1: None,
+        pump_amm_sell_extended_fee_tail_0: None,
+        pump_amm_sell_extended_fee_tail_1: None,
     })
 }
 
@@ -961,6 +970,8 @@ fn build_pumpfun_trade_event(
         pump_amm_sell_cashback_third_meta: None,
         pump_amm_sell_extended_tail_0: None,
         pump_amm_sell_extended_tail_1: None,
+        pump_amm_sell_extended_fee_tail_0: None,
+        pump_amm_sell_extended_fee_tail_1: None,
     }
 }
 
@@ -1304,7 +1315,14 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     let sell_cashback_third_meta = sell_ext.and_then(|e| e.third_meta);
     let sell_extended_tail_0 = sell_ext.and_then(|e| e.tail_0);
     let sell_extended_tail_1 = sell_ext.and_then(|e| e.tail_1);
+    let sell_extended_fee_tail_0 = sell_ext.and_then(|e| e.fee_tail_0);
+    let sell_extended_fee_tail_1 = sell_ext.and_then(|e| e.fee_tail_1);
     if sell_requires_cashback_remaining && sell_cashback_third_meta.is_none() {
+        return None;
+    }
+    if sell_ext.is_some_and(|e| e.requires_fee_tail)
+        && (sell_extended_fee_tail_0.is_none() || sell_extended_fee_tail_1.is_none())
+    {
         return None;
     }
 
@@ -1474,6 +1492,8 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         pump_amm_sell_cashback_third_meta: sell_cashback_third_meta,
         pump_amm_sell_extended_tail_0: sell_extended_tail_0,
         pump_amm_sell_extended_tail_1: sell_extended_tail_1,
+        pump_amm_sell_extended_fee_tail_0: sell_extended_fee_tail_0,
+        pump_amm_sell_extended_fee_tail_1: sell_extended_fee_tail_1,
     })
 }
 
@@ -1808,6 +1828,8 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
         pump_amm_sell_cashback_third_meta: None,
         pump_amm_sell_extended_tail_0: None,
         pump_amm_sell_extended_tail_1: None,
+        pump_amm_sell_extended_fee_tail_0: None,
+        pump_amm_sell_extended_fee_tail_1: None,
     })
 }
 
@@ -1938,6 +1960,8 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
         pump_amm_sell_cashback_third_meta: None,
         pump_amm_sell_extended_tail_0: None,
         pump_amm_sell_extended_tail_1: None,
+        pump_amm_sell_extended_fee_tail_0: None,
+        pump_amm_sell_extended_fee_tail_1: None,
     })
 }
 

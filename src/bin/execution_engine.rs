@@ -12900,6 +12900,8 @@ mod execution_engine_tests {
                 Some(third),
                 Some(t0),
                 Some(t1),
+                None,
+                None,
             );
             cache_clone.set_pump_amm_sell_layout_ready(&pool, true);
         });
