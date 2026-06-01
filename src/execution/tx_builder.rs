@@ -2201,6 +2201,7 @@ mod tests {
             Some(tail1),
             None,
             None,
+            false,
         );
 
         let mut intent = base_intent();
@@ -2293,6 +2294,7 @@ mod tests {
             Some(t1_other),
             None,
             None,
+            false,
         );
 
         // Target pool: explicit JetStream Ready (force_refresh / PoolCacheUpdate path).
@@ -2319,6 +2321,7 @@ mod tests {
             Some(t1_target),
             None,
             None,
+            false,
         );
 
         let mut intent = base_intent();

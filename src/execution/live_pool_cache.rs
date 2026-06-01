@@ -446,6 +446,8 @@ pub struct LivePoolCache {
     /// Observed cashback `sell` fee-recipient pair (ix #24/#25).
     pump_amm_sell_extended_fee_tail_0_by_market: DashMap<Pubkey, Pubkey>,
     pump_amm_sell_extended_fee_tail_1_by_market: DashMap<Pubkey, Pubkey>,
+    /// Monotonic: observed `sell` used 26 accounts (fee-recipient pair required).
+    pump_amm_sell_requires_fee_tail_by_market: DashMap<Pubkey, bool>,
     /// PumpSwap pool-market -> whether the authoritative source has proven the current SELL layout
     /// is fully known. `false` means "do not treat this as sell-ready truth yet", even if
     /// pool_accounts/reserves are otherwise present.
@@ -492,6 +494,7 @@ impl LivePoolCache {
             pump_amm_sell_extended_tail_1_by_market: DashMap::new(),
             pump_amm_sell_extended_fee_tail_0_by_market: DashMap::new(),
             pump_amm_sell_extended_fee_tail_1_by_market: DashMap::new(),
+            pump_amm_sell_requires_fee_tail_by_market: DashMap::new(),
             pump_amm_sell_layout_ready_by_market: DashMap::new(),
         }
     }
@@ -955,6 +958,9 @@ impl LivePoolCache {
                 .get("pump_amm_sell_extended_fee_tail_1")
                 .and_then(|s| Pubkey::from_str(s).ok())
                 .filter(|pk| *pk != Pubkey::default());
+            let requires_fee_tail = m
+                .get("pump_amm_sell_requires_fee_tail")
+                .is_some_and(|v| v == "true");
             self.set_pump_amm_sell_layout_authoritative(
                 pool,
                 requires_extended,
@@ -963,6 +969,7 @@ impl LivePoolCache {
                 tail_1,
                 fee_tail_0,
                 fee_tail_1,
+                requires_fee_tail,
             );
         } else {
             if m.get("pump_amm_sell_cashback_remaining")
@@ -1011,6 +1018,12 @@ impl LivePoolCache {
                     }
                 }
             }
+            if m.get("pump_amm_sell_requires_fee_tail")
+                .is_some_and(|v| v == "true")
+            {
+                self.pump_amm_sell_requires_fee_tail_by_market
+                    .insert(*pool, true);
+            }
         }
     }
 
@@ -1025,9 +1038,14 @@ impl LivePoolCache {
         tail_1: Option<Pubkey>,
         fee_tail_0: Option<Pubkey>,
         fee_tail_1: Option<Pubkey>,
+        requires_fee_tail: bool,
     ) {
         self.pump_amm_sell_extended_flag_by_market
             .insert(*pool, requires_extended);
+        if requires_fee_tail {
+            self.pump_amm_sell_requires_fee_tail_by_market
+                .insert(*pool, true);
+        }
         if let Some(pk) = third_meta.filter(|p| *p != Pubkey::default()) {
             self.pump_amm_sell_extended_third_meta_by_market
                 .insert(*pool, pk);
@@ -1067,9 +1085,12 @@ impl LivePoolCache {
         tail_1: Option<Pubkey>,
         fee_tail_0: Option<Pubkey>,
         fee_tail_1: Option<Pubkey>,
+        requires_fee_tail: bool,
     ) {
         self.pump_amm_sell_extended_flag_by_market
             .insert(*pool, requires_extended);
+        self.pump_amm_sell_requires_fee_tail_by_market
+            .insert(*pool, requires_fee_tail);
         match third_meta.filter(|p| *p != Pubkey::default()) {
             Some(pk) => {
                 self.pump_amm_sell_extended_third_meta_by_market
@@ -1146,6 +1167,15 @@ impl LivePoolCache {
         (flag, third, t0, t1)
     }
 
+    /// Whether an observed `sell` used 26 accounts (fee-recipient pair required).
+    #[must_use]
+    pub fn pump_amm_sell_requires_fee_tail(&self, pool_market: &Pubkey) -> bool {
+        self.pump_amm_sell_requires_fee_tail_by_market
+            .get(pool_market)
+            .map(|e| *e.value())
+            .unwrap_or(false)
+    }
+
     /// Observed cashback `sell` fee-recipient pair (ix #24/#25), when layout uses 26 accounts.
     #[must_use]
     pub fn pump_amm_sell_fee_tail_layout(
@@ -1182,7 +1212,9 @@ impl LivePoolCache {
             let third_ok = third.filter(|p| *p != Pubkey::default()).is_some();
             let tail_ok = tail_0.filter(|p| *p != Pubkey::default()).is_some()
                 && tail_1.filter(|p| *p != Pubkey::default()).is_some();
-            let needs_fee_tail = fee_t0.is_some() || fee_t1.is_some();
+            let needs_fee_tail = self.pump_amm_sell_requires_fee_tail(pool_market)
+                || fee_t0.is_some()
+                || fee_t1.is_some();
             let fee_ok = if needs_fee_tail {
                 fee_t0.filter(|p| *p != Pubkey::default()).is_some()
                     && fee_t1.filter(|p| *p != Pubkey::default()).is_some()
@@ -2740,7 +2772,16 @@ mod tests {
             100,
         );
         cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
-        cache.merge_pump_amm_sell_extended_layout(&pool_market, true, None, None, None, None, None);
+        cache.merge_pump_amm_sell_extended_layout(
+            &pool_market,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
         cache.set_pump_amm_sell_layout_ready(&pool_market, false);
 
         assert!(
@@ -2768,7 +2809,16 @@ mod tests {
             ),
             100,
         );
-        cache.merge_pump_amm_sell_extended_layout(&pool_market, true, None, None, None, None, None);
+        cache.merge_pump_amm_sell_extended_layout(
+            &pool_market,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
         cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
 
         assert!(
@@ -2816,6 +2866,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         cache.set_pump_amm_sell_layout_ready(&pool_market, true);
 
@@ -2859,6 +2910,7 @@ mod tests {
             Some(t1),
             None,
             None,
+            false,
         );
         cache.set_pump_amm_sell_layout_ready(&pool_market, true);
 
@@ -2928,6 +2980,7 @@ mod tests {
             Some(stale_t1),
             None,
             None,
+            false,
         );
         cache.set_pump_amm_sell_layout_ready(&pool_market, false);
         cache.merge_pump_amm_sell_layout_from_metadata(&pool_market, Some(&meta));

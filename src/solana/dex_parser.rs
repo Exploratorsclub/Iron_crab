@@ -109,6 +109,8 @@ pub enum ParsedDexEvent {
         pump_amm_sell_extended_fee_tail_0: Option<Pubkey>,
         /// PumpSwap only: observed cashback `sell` fee-recipient ix #25.
         pump_amm_sell_extended_fee_tail_1: Option<Pubkey>,
+        /// PumpSwap only: observed `sell` used 26 accounts (fee-recipient pair required).
+        pump_amm_sell_requires_fee_tail: bool,
     },
     /// Liquidity removed (potential rug)
     LiquidityRemoved {
@@ -538,6 +540,7 @@ fn parse_raydium_swap(
         pump_amm_sell_extended_tail_1: None,
         pump_amm_sell_extended_fee_tail_0: None,
         pump_amm_sell_extended_fee_tail_1: None,
+        pump_amm_sell_requires_fee_tail: false,
     })
 }
 
@@ -772,6 +775,7 @@ fn parse_orca_transaction(
         pump_amm_sell_extended_tail_1: None,
         pump_amm_sell_extended_fee_tail_0: None,
         pump_amm_sell_extended_fee_tail_1: None,
+        pump_amm_sell_requires_fee_tail: false,
     })
 }
 
@@ -972,6 +976,7 @@ fn build_pumpfun_trade_event(
         pump_amm_sell_extended_tail_1: None,
         pump_amm_sell_extended_fee_tail_0: None,
         pump_amm_sell_extended_fee_tail_1: None,
+        pump_amm_sell_requires_fee_tail: false,
     }
 }
 
@@ -1312,6 +1317,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         pump_amm_sell_extended_fields_from_ix_accounts(&update.instruction_accounts)
     };
     let sell_requires_cashback_remaining = sell_ext.map(|e| e.requires_extended).unwrap_or(false);
+    let sell_requires_fee_tail = sell_ext.map(|e| e.requires_fee_tail).unwrap_or(false);
     let sell_cashback_third_meta = sell_ext.and_then(|e| e.third_meta);
     let sell_extended_tail_0 = sell_ext.and_then(|e| e.tail_0);
     let sell_extended_tail_1 = sell_ext.and_then(|e| e.tail_1);
@@ -1494,6 +1500,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         pump_amm_sell_extended_tail_1: sell_extended_tail_1,
         pump_amm_sell_extended_fee_tail_0: sell_extended_fee_tail_0,
         pump_amm_sell_extended_fee_tail_1: sell_extended_fee_tail_1,
+        pump_amm_sell_requires_fee_tail: sell_requires_fee_tail,
     })
 }
 
@@ -1830,6 +1837,7 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
         pump_amm_sell_extended_tail_1: None,
         pump_amm_sell_extended_fee_tail_0: None,
         pump_amm_sell_extended_fee_tail_1: None,
+        pump_amm_sell_requires_fee_tail: false,
     })
 }
 
@@ -1962,6 +1970,7 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
         pump_amm_sell_extended_tail_1: None,
         pump_amm_sell_extended_fee_tail_0: None,
         pump_amm_sell_extended_fee_tail_1: None,
+        pump_amm_sell_requires_fee_tail: false,
     })
 }
 
