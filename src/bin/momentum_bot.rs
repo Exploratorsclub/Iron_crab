@@ -2162,11 +2162,13 @@ impl TokenTracker {
         head_slot: u64,
     ) -> Option<String> {
         if !config.price_trend_filter_enabled || config.price_trend_window_secs == 0 {
+            self.price_trend_recovery_since_slot = None;
             return None;
         }
 
         let window_slots = momentum_secs_to_slot_span(config.price_trend_window_secs);
         if window_slots == 0 {
+            self.price_trend_recovery_since_slot = None;
             return None;
         }
 
@@ -2213,6 +2215,7 @@ impl TokenTracker {
         }
 
         if samples < config.price_trend_min_trades {
+            self.price_trend_recovery_since_slot = None;
             return None;
         }
 
@@ -2235,6 +2238,7 @@ impl TokenTracker {
                 })
                 .collect();
             let (_, total_pairs) = price_trend_lower_highs_stats(&local_best);
+            self.price_trend_recovery_since_slot = None;
             return Some(format!(
                 "WAIT_DOWNTREND: lower_highs buckets=[{}] breaks={breaks}/{total_pairs} (+{rise:.1}% tps rise, window={window_secs}s, trades={samples})",
                 bucket_vals.join(",")
@@ -2276,14 +2280,20 @@ impl TokenTracker {
             && buy_dominance >= config.price_trend_recovery_min_buy_dominance;
         let min_positive = config
             .price_trend_recovery_min_positive_buckets
-            .min(bucket_count as u32) as usize;
+            .min(bucket_count.saturating_sub(1) as u32) as usize;
         let slope_ok = price_trend_recovery_slope_ok(&bucket_medians, min_positive);
         let lower_highs_blocks_recovery = config.price_trend_recovery_requires_no_lower_highs
             && price_trend_lower_highs_raw_match(&local_best);
         let instant_recovery = flow_ok && slope_ok && !lower_highs_blocks_recovery;
 
-        if instant_recovery {
-            self.price_trend_recovery_since_slot.get_or_insert(hs);
+        let in_drawdown_wait = drawdown_pct >= config.price_trend_max_drawdown_pct
+            && short_slope_tps_rise >= config.price_trend_min_tps_rise_pct;
+        if in_drawdown_wait {
+            if instant_recovery {
+                self.price_trend_recovery_since_slot.get_or_insert(hs);
+            } else {
+                self.price_trend_recovery_since_slot = None;
+            }
         } else {
             self.price_trend_recovery_since_slot = None;
         }
@@ -2294,10 +2304,7 @@ impl TokenTracker {
             .is_some_and(|rs| hs.saturating_sub(rs) >= recovery_min_slots);
         let recovery_ok = instant_recovery && duration_ok;
 
-        if drawdown_pct >= config.price_trend_max_drawdown_pct
-            && short_slope_tps_rise >= config.price_trend_min_tps_rise_pct
-            && !recovery_ok
-        {
+        if in_drawdown_wait && !recovery_ok {
             let recovery_detail = if !flow_ok || !slope_ok {
                 "flow/slope not confirmed".to_string()
             } else if lower_highs_blocks_recovery {
@@ -8069,12 +8076,15 @@ impl MomentumContext {
                 }
                 "price_trend_recovery_min_positive_buckets" => {
                     if let Some(v) = value.as_u64() {
-                        if v > 0 {
+                        let max_allowed =
+                            clamp_price_trend_bucket_count(config.price_trend_bucket_count)
+                                .saturating_sub(1) as u64;
+                        if v > 0 && v <= max_allowed {
                             config.price_trend_recovery_min_positive_buckets = v as u32;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
                         } else {
-                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                            rejected.push((key.clone(), format!("Must be in [1, {max_allowed}]")));
                         }
                     } else {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
