@@ -486,6 +486,10 @@ struct MomentumConfig {
     dump_recovery_min_recovery_secs: u64,
 
     // === Exit Strategy ===
+    /// Grace period (secs): normal hard stop suppressed; catastrophic threshold only.
+    hard_stop_min_hold_secs: u64,
+    /// Hard stop (%) during grace (catastrophic / rug). Default: 45%
+    catastrophic_stop_loss_pct: f64,
     /// Hard stop-loss percentage from entry (e.g., 15 = -15%). Default: 15%
     hard_stop_loss_pct: f64,
     /// Trailing stop percentage from ATH (e.g., 20 = -20% from high). Default: 20%
@@ -499,6 +503,16 @@ struct MomentumConfig {
     take_profit_min_hold_secs: u64,
     /// Max hold time in seconds before forced exit. Default: 300s (5 min)
     max_hold_time_secs: u64,
+    /// Absolute max hold before TIME_EXIT regardless of velocity. 0 = disabled.
+    max_hold_absolute_cap_secs: u64,
+    /// TIME_EXIT gated on trades_per_min < min_trades_per_min. Default: true
+    time_exit_requires_low_velocity: bool,
+    /// Min hold before MOMENTUM_EXIT. Default: 60s
+    momentum_exit_min_hold_secs: u64,
+    /// Momentum exit only when PnL <= momentum_exit_max_pnl_pct. Default: true
+    momentum_exit_only_when_losing: bool,
+    /// PnL ceiling for momentum exit when only_when_losing is false.
+    momentum_exit_max_pnl_pct: f64,
     /// Momentum exit: min buy ratio to stay in (e.g., 0.4 = 40% buys). Default: 0.4
     momentum_exit_buy_ratio: f64,
     /// Momentum exit window (seconds). Default: 30s
@@ -571,12 +585,19 @@ impl Default for MomentumConfig {
             dump_recovery_min_recovery_secs: 10,
 
             // Exit Strategy
+            hard_stop_min_hold_secs: 45,
+            catastrophic_stop_loss_pct: 45.0,
             hard_stop_loss_pct: 15.0,      // -15% hard stop
             trailing_stop_pct: 20.0,       // -20% from ATH
             trailing_activation_pct: 10.0, // Activate trailing after +10%
             take_profit_pct: 100.0,        // Take profit at +100% (2x)
             take_profit_min_hold_secs: 5,  // No TP in first 5s (avoids wrong-pool price spike)
             max_hold_time_secs: 300,       // Max 5 minutes hold
+            max_hold_absolute_cap_secs: 0,
+            time_exit_requires_low_velocity: true,
+            momentum_exit_min_hold_secs: 60,
+            momentum_exit_only_when_losing: true,
+            momentum_exit_max_pnl_pct: 0.0,
             momentum_exit_buy_ratio: 0.4,  // Exit if buy ratio < 40%
             momentum_exit_window_secs: 30, // Check last 30s of trades
             momentum_exit_min_trades: 5,   // Need 5+ trades to evaluate
@@ -623,12 +644,19 @@ impl MomentumConfig {
             dump_recovery_min_buy_dominance: cfg.dump_recovery_min_buy_dominance,
             dump_recovery_min_net_inflow_lamports: cfg.dump_recovery_min_net_inflow_lamports,
             dump_recovery_min_recovery_secs: cfg.dump_recovery_min_recovery_secs,
+            hard_stop_min_hold_secs: cfg.hard_stop_min_hold_secs,
+            catastrophic_stop_loss_pct: cfg.catastrophic_stop_loss_pct,
             hard_stop_loss_pct: cfg.hard_stop_loss_pct,
             trailing_stop_pct: cfg.trailing_stop_pct,
             trailing_activation_pct: cfg.trailing_activation_pct,
             take_profit_pct: cfg.take_profit_pct,
             take_profit_min_hold_secs: cfg.take_profit_min_hold_secs,
             max_hold_time_secs: cfg.max_hold_time_secs,
+            max_hold_absolute_cap_secs: cfg.max_hold_absolute_cap_secs,
+            time_exit_requires_low_velocity: cfg.time_exit_requires_low_velocity,
+            momentum_exit_min_hold_secs: cfg.momentum_exit_min_hold_secs,
+            momentum_exit_only_when_losing: cfg.momentum_exit_only_when_losing,
+            momentum_exit_max_pnl_pct: cfg.momentum_exit_max_pnl_pct,
             momentum_exit_buy_ratio: cfg.momentum_exit_buy_ratio,
             momentum_exit_window_secs: cfg.momentum_exit_window_secs,
             momentum_exit_min_trades: cfg.momentum_exit_min_trades,
@@ -679,6 +707,27 @@ fn momentum_trade_in_chain_slot_window(trade_slot: u64, head_slot: u64, window_s
         return false;
     }
     head_slot.saturating_sub(trade_slot) <= window_slots
+}
+
+/// Chain-slot-window trades/min (same formula as [`TokenTracker::calculate_metrics`]).
+fn trades_per_min_in_buyer_window(
+    trades: &[TradeEvent],
+    buyer_window_secs: u64,
+    head_slot: u64,
+) -> f64 {
+    let window_slots = momentum_secs_to_slot_span(buyer_window_secs);
+    let hs = head_slot.max(1);
+    let trades_with_slot_in_window = trades
+        .iter()
+        .filter(|t| momentum_trade_in_chain_slot_window(t.slot, hs, window_slots))
+        .filter(|t| t.slot > 0)
+        .count() as u32;
+    let window_secs = buyer_window_secs as f64;
+    if window_secs > 0.0 {
+        trades_with_slot_in_window as f64 / (window_secs / 60.0)
+    } else {
+        0.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1317,6 +1366,7 @@ impl PositionTracker {
         exit_quote: Option<&ExitExecutableQuote>,
         event_or_check_source: &str,
         chain_head_slot: u64,
+        live_trades_per_min: Option<f64>,
     ) -> Option<(String, String)> {
         let structural_q = exit_quote.filter(|q| exit_executable_quote_is_usable(q));
         let price_exit_q =
@@ -1332,10 +1382,17 @@ impl PositionTracker {
                     .unwrap_or(pnl)
             });
 
+        let effective_hard_stop = if hold_secs < config.hard_stop_min_hold_secs {
+            config.catastrophic_stop_loss_pct
+        } else {
+            config.hard_stop_loss_pct
+        };
+        let hard_stop_in_grace = hold_secs < config.hard_stop_min_hold_secs;
+
         // 1. Hard stop — quote-first on **guarded** executable PnL (I-14, I-16).
         if let Some(q) = price_exit_q {
             let exec_pnl = tokens_per_sol::pnl_pct(self.entry_price, q.tokens_per_sol);
-            if exec_pnl <= -config.hard_stop_loss_pct {
+            if exec_pnl <= -effective_hard_stop {
                 log_momentum_exit_price_decision(
                     self,
                     exit_quote,
@@ -1346,15 +1403,16 @@ impl PositionTracker {
                     event_or_check_source,
                     MomentumExitPriceLogLevel::Info,
                 );
+                let grace_label = if hard_stop_in_grace { " (grace)" } else { "" };
                 return Some((
                     "STOP_LOSS".to_string(),
                     format!(
-                        "Hard stop hit: {:.1}% executable loss (limit: -{:.1}%)",
-                        exec_pnl, config.hard_stop_loss_pct
+                        "Hard stop{}: {:.1}% executable loss (limit: -{:.1}%)",
+                        grace_label, exec_pnl, effective_hard_stop
                     ),
                 ));
             }
-        } else if pnl <= -config.hard_stop_loss_pct {
+        } else if pnl <= -effective_hard_stop {
             let suppressed =
                 exit_quote.and_then(|q| exit_quote_price_exit_guard_violation(self, q, None));
             if let Some(code) = suppressed {
@@ -1525,56 +1583,96 @@ impl PositionTracker {
             ));
         }
 
-        // 4. Time Exit — not gated on reserve freshness; reporting PnL prefers guarded quote when present.
-        if hold_secs >= config.max_hold_time_secs {
-            return Some((
-                "TIME_EXIT".to_string(),
-                format!(
-                    "Max hold time exceeded: {}s (limit: {}s), P&L: {:.1}% (TIME_EXIT does not assert a fresh reserve quote; uses guarded pool quote for reporting when available)",
-                    hold_secs, config.max_hold_time_secs, pnl_for_reporting
-                ),
-            ));
-        }
+        // 4. Time Exit — velocity-gated (dead token after max hold); optional absolute cap.
+        if config.max_hold_time_secs > 0 && hold_secs >= config.max_hold_time_secs {
+            let vel = live_trades_per_min.unwrap_or_else(|| {
+                trades_per_min_in_buyer_window(
+                    &self.recent_trades,
+                    config.buyer_window_secs,
+                    chain_head_slot,
+                )
+            });
+            let absolute_cap = config.max_hold_absolute_cap_secs > 0
+                && hold_secs >= config.max_hold_absolute_cap_secs;
+            let velocity_dead = !config.time_exit_requires_low_velocity
+                || config.min_trades_per_min <= 0.0
+                || vel < config.min_trades_per_min;
 
-        // 5. Momentum Exit - selling pressure detected
-        // FIX-30d: Volume-weighted momentum ratio instead of trade-count ratio.
-        // Prevents small bot-sells from overwhelming real buy volume.
-        let momentum_window_slots = momentum_secs_to_slot_span(config.momentum_exit_window_secs);
-        let head = chain_head_slot.max(1);
-        let recent: Vec<_> = self
-            .recent_trades
-            .iter()
-            .filter(|t| momentum_trade_in_chain_slot_window(t.slot, head, momentum_window_slots))
-            .collect();
-
-        if recent.len() >= config.momentum_exit_min_trades as usize {
-            let buy_count = recent.iter().filter(|t| t.is_buy).count();
-            let total = recent.len();
-            let buy_vol: u64 = recent
-                .iter()
-                .filter(|t| t.is_buy)
-                .map(|t| t.sol_amount)
-                .sum();
-            let total_vol: u64 = recent.iter().map(|t| t.sol_amount).sum();
-
-            let buy_ratio = if total_vol > 0 {
-                buy_vol as f64 / total_vol as f64
-            } else {
-                buy_count as f64 / total as f64
-            };
-
-            if buy_ratio < config.momentum_exit_buy_ratio {
+            if absolute_cap || velocity_dead {
+                let cap_note = if absolute_cap { ", absolute_cap" } else { "" };
                 return Some((
-                    "MOMENTUM_EXIT".to_string(),
+                    "TIME_EXIT".to_string(),
                     format!(
-                        "Momentum fading: buy vol ratio {:.0}% < {:.0}% ({}b/{}t, buy_vol={:.4}SOL/total={:.4}SOL), P&L: {:.1}%",
-                        buy_ratio * 100.0,
-                        config.momentum_exit_buy_ratio * 100.0,
-                        buy_count, total,
-                        buy_vol as f64 / 1e9, total_vol as f64 / 1e9,
-                        pnl
+                        "Max hold: {}s (limit: {}s), trades_per_min={:.1} (min={:.1}), P&L: {:.1}%{}",
+                        hold_secs,
+                        config.max_hold_time_secs,
+                        vel,
+                        config.min_trades_per_min,
+                        pnl_for_reporting,
+                        cap_note
                     ),
                 ));
+            }
+            trace!(
+                mint = %self.mint,
+                hold_secs,
+                trades_per_min = vel,
+                min_trades_per_min = config.min_trades_per_min,
+                "TIME_EXIT suppressed: hold >= max_hold but velocity still active"
+            );
+        }
+
+        // 5. Momentum Exit - selling pressure detected (hold + PnL gated)
+        let momentum_hold_ok = hold_secs >= config.momentum_exit_min_hold_secs
+            && hold_secs >= config.hard_stop_min_hold_secs;
+        let momentum_pnl_ok = if config.momentum_exit_only_when_losing {
+            pnl_for_reporting <= 0.0
+        } else {
+            pnl_for_reporting <= config.momentum_exit_max_pnl_pct
+        };
+
+        if momentum_hold_ok && momentum_pnl_ok {
+            // FIX-30d: Volume-weighted momentum ratio instead of trade-count ratio.
+            let momentum_window_slots =
+                momentum_secs_to_slot_span(config.momentum_exit_window_secs);
+            let head = chain_head_slot.max(1);
+            let recent: Vec<_> = self
+                .recent_trades
+                .iter()
+                .filter(|t| {
+                    momentum_trade_in_chain_slot_window(t.slot, head, momentum_window_slots)
+                })
+                .collect();
+
+            if recent.len() >= config.momentum_exit_min_trades as usize {
+                let buy_count = recent.iter().filter(|t| t.is_buy).count();
+                let total = recent.len();
+                let buy_vol: u64 = recent
+                    .iter()
+                    .filter(|t| t.is_buy)
+                    .map(|t| t.sol_amount)
+                    .sum();
+                let total_vol: u64 = recent.iter().map(|t| t.sol_amount).sum();
+
+                let buy_ratio = if total_vol > 0 {
+                    buy_vol as f64 / total_vol as f64
+                } else {
+                    buy_count as f64 / total as f64
+                };
+
+                if buy_ratio < config.momentum_exit_buy_ratio {
+                    return Some((
+                        "MOMENTUM_EXIT".to_string(),
+                        format!(
+                            "Momentum fading: buy vol ratio {:.0}% < {:.0}% ({}b/{}t, buy_vol={:.4}SOL/total={:.4}SOL), P&L: {:.1}%",
+                            buy_ratio * 100.0,
+                            config.momentum_exit_buy_ratio * 100.0,
+                            buy_count, total,
+                            buy_vol as f64 / 1e9, total_vol as f64 / 1e9,
+                            pnl_for_reporting
+                        ),
+                    ));
+                }
             }
         }
 
@@ -2154,7 +2252,6 @@ impl TokenTracker {
 
         let mut buy_count_in_window = 0u32;
         let mut sell_count_in_window = 0u32;
-        let mut trades_with_slot_in_window = 0u32;
         for t in self
             .trades
             .iter()
@@ -2165,9 +2262,6 @@ impl TokenTracker {
             } else {
                 sell_count_in_window = sell_count_in_window.saturating_add(1);
             }
-            if t.slot > 0 {
-                trades_with_slot_in_window = trades_with_slot_in_window.saturating_add(1);
-            }
         }
 
         let total_in_window = buy_count_in_window.saturating_add(sell_count_in_window);
@@ -2177,12 +2271,8 @@ impl TokenTracker {
             0.0
         };
 
-        let window_secs = config.buyer_window_secs as f64;
-        let trades_per_min = if window_secs > 0.0 {
-            trades_with_slot_in_window as f64 / (window_secs / 60.0)
-        } else {
-            0.0
-        };
+        let trades_per_min =
+            trades_per_min_in_buyer_window(&self.trades, config.buyer_window_secs, hs);
 
         TokenMetrics {
             unique_buyers_in_window: recent_buyers.len() as u32,
@@ -5399,10 +5489,16 @@ impl MomentumContext {
             dev_sold_sol: Option<u64>,
         }
 
-        let tracker_signals: HashMap<String, TrackerExitSignals> = {
+        let (tracker_signals, trades_per_min_by_tracker_key): (
+            HashMap<String, TrackerExitSignals>,
+            HashMap<String, f64>,
+        ) = {
             let trackers = self.token_trackers.read();
             let mut by_mint: HashMap<String, TrackerExitSignals> = HashMap::new();
+            let mut tpm_by_tracker_key: HashMap<String, f64> = HashMap::new();
             for t in trackers.values() {
+                let tpm = t.calculate_metrics(&config, chain_head_slot).trades_per_min;
+                tpm_by_tracker_key.insert(Self::tracker_storage_key(&t.mint, &t.pool), tpm);
                 let mint_key = t.mint.clone();
                 let mut dev_sell_slot: Option<u64> = None;
                 let mut dev_sell_observed_at: Option<Instant> = None;
@@ -5477,7 +5573,7 @@ impl MomentumContext {
                     }
                 }
             }
-            by_mint
+            (by_mint, tpm_by_tracker_key)
         };
 
         // FIX-30b: No longer block exit checks on pending BUY intents.
@@ -5599,9 +5695,16 @@ impl MomentumContext {
             }
 
             let exit_q = self.executable_exit_quote(pos, None);
-            if let Some((exit_type, reason)) =
-                pos.should_exit(&config, exit_q.as_ref(), "exit_scan", chain_head_slot)
-            {
+            let live_trades_per_min = trades_per_min_by_tracker_key
+                .get(&Self::tracker_storage_key(mint, &pos.pool))
+                .copied();
+            if let Some((exit_type, reason)) = pos.should_exit(
+                &config,
+                exit_q.as_ref(),
+                "exit_scan",
+                chain_head_slot,
+                live_trades_per_min,
+            ) {
                 // Note: exit_generated is set by caller after successful publish
                 exits.push((
                     mint.clone(),
@@ -5768,7 +5871,14 @@ impl MomentumContext {
                 .last_event_slot
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .max(1);
-            let (exit_type, reason) = {
+            let live_tpm = {
+                let trackers = self.token_trackers.read();
+                trackers
+                    .get(&Self::tracker_storage_key(&candidate.mint, &candidate.pool))
+                    .map(|t| t.calculate_metrics(&config, chain_head_slot).trades_per_min)
+            };
+
+            let exit_signal = {
                 let mut positions = self.positions.write();
                 if let Some(pos) = positions.get_mut(&candidate.mint) {
                     pos.should_exit(
@@ -5776,25 +5886,20 @@ impl MomentumContext {
                         exit_q.as_ref(),
                         "timed_exit_reconcile",
                         chain_head_slot,
+                        live_tpm,
                     )
-                    .unwrap_or_else(|| {
-                        (
-                            "TIME_EXIT".to_string(),
-                            match candidate.last_exit_age_secs {
-                                Some(age) => format!(
-                                    "Timed exit reconcile: hold={}s, last_exit_age={}s",
-                                    candidate.hold_secs, age
-                                ),
-                                None => {
-                                    format!("Timed exit reconcile: hold={}s", candidate.hold_secs)
-                                }
-                            },
-                        )
-                    })
                 } else {
-                    // Position removed, skip
-                    continue;
+                    None
                 }
+            };
+
+            let Some((exit_type, reason)) = exit_signal else {
+                trace!(
+                    mint = %candidate.mint,
+                    hold_secs = candidate.hold_secs,
+                    "timed_exit_reconcile_skipped_active_velocity"
+                );
+                continue;
             };
 
             info!(
@@ -7644,6 +7749,28 @@ impl MomentumContext {
                 }
 
                 // === Exit Strategy ===
+                "hard_stop_min_hold_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        config.hard_stop_min_hold_secs = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "catastrophic_stop_loss_pct" => {
+                    if let Some(v) = value.as_f64() {
+                        if (0.0..=100.0).contains(&v) {
+                            config.catastrophic_stop_loss_pct = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be in [0.0, 100.0]".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
                 "hard_stop_loss_pct" => {
                     if let Some(v) = value.as_f64() {
                         if (0.0..=100.0).contains(&v) {
@@ -7707,6 +7834,51 @@ impl MomentumContext {
                         }
                     } else {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "max_hold_absolute_cap_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        config.max_hold_absolute_cap_secs = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "time_exit_requires_low_velocity" => {
+                    if let Some(v) = value.as_bool() {
+                        config.time_exit_requires_low_velocity = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "momentum_exit_min_hold_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        config.momentum_exit_min_hold_secs = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "momentum_exit_only_when_losing" => {
+                    if let Some(v) = value.as_bool() {
+                        config.momentum_exit_only_when_losing = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "momentum_exit_max_pnl_pct" => {
+                    if let Some(v) = value.as_f64() {
+                        config.momentum_exit_max_pnl_pct = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
                     }
                 }
                 "momentum_exit_buy_ratio" => {
@@ -15000,12 +15172,15 @@ mod tests {
 
     fn make_exit_config() -> MomentumConfig {
         let mut c = MomentumConfig::default();
+        c.hard_stop_min_hold_secs = 0;
+        c.catastrophic_stop_loss_pct = 1_000.0;
         c.hard_stop_loss_pct = 20.0;
         c.trailing_stop_pct = 20.0;
         c.trailing_activation_pct = 5.0;
         c.take_profit_pct = 100.0;
         c.take_profit_min_hold_secs = 0;
         c.max_hold_time_secs = 1_000_000;
+        c.momentum_exit_min_hold_secs = 0;
         c
     }
 
@@ -15050,7 +15225,7 @@ mod tests {
         let mut ex = sample_exit_quote(89.0);
         ex.quote_pool = "poolA".to_string();
         let mut pos = live;
-        pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64);
+        pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None);
         assert!(
             !pos.trailing_active,
             "reserve mark must not fabricate session high for trailing activation"
@@ -15095,7 +15270,7 @@ mod tests {
         c.hard_stop_loss_pct = 99.0;
         c.take_profit_pct = 1_000.0;
         let mut pos = live;
-        pos.should_exit(&c, None, "test", 9_000_000_000u64);
+        pos.should_exit(&c, None, "test", 9_000_000_000u64, None);
         assert!(
             pos.trailing_active,
             "session peak PnL from trade session high should activate trailing"
@@ -15144,7 +15319,7 @@ mod tests {
         let mut ex = sample_exit_quote(89.0);
         ex.quote_pool = "poolA".to_string();
         let mut pos = live;
-        pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64);
+        pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None);
         assert!(
             !pos.trailing_active,
             "reserve spike must not activate trailing when session high only modestly improved"
@@ -15164,7 +15339,7 @@ mod tests {
         pos.highest_price = stale.min(pos.highest_price);
         // Exec ~3,692,386 tps → pnl = (5.7M/3.7M-1)*100 = +~55% (I-14)
         let ex = sample_exit_quote(3_692_386.0);
-        let r = pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64);
+        let r = pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None);
         assert!(
             r.is_none(),
             "expected no STOP_LOSS when executable is not past threshold, got {:?}",
@@ -15186,7 +15361,7 @@ mod tests {
         // Executable also very high tps → also deep loss; allow STOP_LOSS
         let ex = sample_exit_quote(12_000_000.0);
         let (ty, _reason) = pos
-            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
             .expect("STOP_LOSS");
         assert_eq!(ty, "STOP_LOSS");
     }
@@ -15199,7 +15374,7 @@ mod tests {
         let entry = 100.0;
         let mut pos = PositionTracker::new("m", "p", "dex", entry, 6, 1_000_000, 0);
         pos.current_price = 300.0; // I-14: higher tps vs entry ⇒ loss
-        let r = pos.should_exit(&c, None, "test", 9_000_000_000u64);
+        let r = pos.should_exit(&c, None, "test", 9_000_000_000u64, None);
         assert!(
             r.is_none(),
             "STOP_LOSS must not fire without executable quote, got {:?}",
@@ -15219,7 +15394,7 @@ mod tests {
         pos.highest_price = entry;
         let ex = sample_exit_quote(250.0); // executable ~-150% loss
         let (ty, _) = pos
-            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
             .expect("STOP_LOSS");
         assert_eq!(ty, "STOP_LOSS");
     }
@@ -15236,7 +15411,7 @@ mod tests {
         pos.highest_price = entry;
         let ex = sample_exit_quote(105.0); // executable only mild loss vs -20% threshold
         assert!(pos
-            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
             .is_none());
     }
 
@@ -15255,7 +15430,7 @@ mod tests {
         ex.quote_pool = "other_pool".to_string();
         let before = pos.current_price;
         let (ty, _) = pos
-            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
             .expect("STOP_LOSS");
         assert_eq!(ty, "STOP_LOSS");
         assert_eq!(
@@ -15281,7 +15456,7 @@ mod tests {
         ex.marks_position_pool = false;
         ex.quote_pool = "other_pool".to_string();
         assert!(
-            pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
                 .is_none(),
             "wrong-pool executable must not trip TRAILING vs position session high"
         );
@@ -15304,7 +15479,7 @@ mod tests {
         ex.marks_position_pool = true;
         ex.quote_pool = "pos_pool".to_string();
         let (ty, reason) = pos
-            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
             .expect("TRAILING_STOP from position-pool quote");
         assert_eq!(ty, "TRAILING_STOP");
         assert!(
@@ -15331,7 +15506,7 @@ mod tests {
         pos.current_price = 50.0; // pnl = +100%
 
         // No pool quote: suppress TP
-        let r0 = pos.should_exit(&c, None, "test", 9_000_000_000u64);
+        let r0 = pos.should_exit(&c, None, "test", 9_000_000_000u64, None);
         assert!(
             r0.is_none(),
             "expected TP suppressed without quote, got {:?}",
@@ -15340,7 +15515,7 @@ mod tests {
 
         // Stale: exec says we are not at take-profit
         let ex = sample_exit_quote(95.0);
-        let r1 = pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64);
+        let r1 = pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None);
         assert!(r1.is_none(), "expected TP suppression, got {:?}", r1);
     }
 
@@ -15357,7 +15532,7 @@ mod tests {
         pos.highest_price = entry;
         let ex = sample_exit_quote(40.0); // executable large gain vs entry
         let (ty, reason) = pos
-            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
             .expect("TAKE_PROFIT");
         assert_eq!(ty, "TAKE_PROFIT");
         assert!(
@@ -15393,7 +15568,7 @@ mod tests {
             exe_pnl
         );
         let (ty, _) = pos
-            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
             .expect("STOP_LOSS");
         assert_eq!(ty, "STOP_LOSS");
     }
@@ -15425,7 +15600,7 @@ mod tests {
             exe_pnl
         );
         let (ty, _) = pos
-            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
             .expect("TAKE_PROFIT");
         assert_eq!(ty, "TAKE_PROFIT");
     }
@@ -15453,7 +15628,7 @@ mod tests {
             trade_dd
         );
         let (ty, reason) = pos
-            .should_exit(&c, None, "test", 9_000_000_000u64)
+            .should_exit(&c, None, "test", 9_000_000_000u64, None)
             .expect("TRAILING_STOP");
         assert_eq!(ty, "TRAILING_STOP");
         assert!(
@@ -15493,7 +15668,7 @@ mod tests {
         );
         let ex = sample_exit_quote(exec_tps);
         assert!(
-            pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
                 .is_none(),
             "executable DD must not trip trailing when trade mark DD is below limit"
         );
@@ -15509,13 +15684,14 @@ mod tests {
         pos.current_price = entry;
 
         let (ty, reason) = pos
-            .should_exit(&c, None, "test", 9_000_000_000u64)
+            .should_exit(&c, None, "test", 9_000_000_000u64, None)
             .expect("time exit");
         assert_eq!(ty, "TIME_EXIT");
         assert!(
-            reason.contains("Max hold time exceeded")
+            reason.contains("Max hold:")
+                && reason.contains("trades_per_min")
                 && !reason.to_lowercase().contains("hard stop"),
-            "TIME_EXIT should not be framed as hard stop: {}",
+            "TIME_EXIT should include velocity detail, not hard stop: {}",
             reason
         );
     }
@@ -15529,12 +15705,289 @@ mod tests {
         pos.current_price = entry;
         let ex = sample_exit_quote(80.0);
         let (_, reason) = pos
-            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
             .expect("time exit");
         assert!(
             reason.contains("25.0%") || reason.contains("25.0"),
             "expected executable-backed reporting PnL in reason: {}",
             reason
+        );
+    }
+
+    fn push_recent_trade_at_slot(
+        pos: &mut PositionTracker,
+        head_slot: u64,
+        slot_offset: u64,
+        is_buy: bool,
+        sol_lamports: u64,
+    ) {
+        pos.recent_trades.push(TradeEvent {
+            timestamp: Instant::now(),
+            slot: head_slot.saturating_sub(slot_offset),
+            trader: format!("tr{}", pos.recent_trades.len()),
+            is_buy,
+            sol_amount: sol_lamports,
+            token_amount: 1,
+            signature: format!("sig{}", pos.recent_trades.len()),
+        });
+    }
+
+    #[test]
+    fn hard_stop_grace_uses_catastrophic_threshold() {
+        let mut c = make_exit_config();
+        c.hard_stop_min_hold_secs = 45;
+        c.catastrophic_stop_loss_pct = 45.0;
+        c.hard_stop_loss_pct = 20.0;
+        c.max_hold_time_secs = 1_000_000;
+        let entry = 100.0;
+        let mut pos = PositionTracker::new("m", "p", "dex", entry, 6, 1_000_000, 0);
+        pos.set_entry_time_ago(Duration::from_secs(10));
+        let mild_loss = sample_exit_quote(entry / 0.75);
+        assert!(
+            pos.should_exit(&c, Some(&mild_loss), "test", 9_000_000_000u64, None)
+                .is_none(),
+            "grace: -25% should not trip catastrophic 45%"
+        );
+        let severe_loss = sample_exit_quote(entry / 0.5);
+        let (ty, reason) = pos
+            .should_exit(&c, Some(&severe_loss), "test", 9_000_000_000u64, None)
+            .expect("catastrophic stop");
+        assert_eq!(ty, "STOP_LOSS");
+        assert!(reason.contains("grace"), "expected grace label: {}", reason);
+    }
+
+    #[test]
+    fn hard_stop_after_grace_uses_normal_threshold() {
+        let mut c = make_exit_config();
+        c.hard_stop_min_hold_secs = 45;
+        c.catastrophic_stop_loss_pct = 45.0;
+        c.hard_stop_loss_pct = 20.0;
+        c.max_hold_time_secs = 1_000_000;
+        let entry = 100.0;
+        let mut pos = PositionTracker::new("m", "p", "dex", entry, 6, 1_000_000, 0);
+        pos.set_entry_time_ago(Duration::from_secs(60));
+        let loss = sample_exit_quote(entry / 0.75);
+        let (ty, _) = pos
+            .should_exit(&c, Some(&loss), "test", 9_000_000_000u64, None)
+            .expect("normal hard stop after grace");
+        assert_eq!(ty, "STOP_LOSS");
+    }
+
+    #[test]
+    fn momentum_exit_suppressed_during_min_hold() {
+        let mut c = make_exit_config();
+        c.momentum_exit_min_hold_secs = 60;
+        c.hard_stop_min_hold_secs = 45;
+        c.max_hold_time_secs = 1_000_000;
+        c.hard_stop_loss_pct = 99.0;
+        c.take_profit_pct = 1_000.0;
+        c.momentum_exit_buy_ratio = 0.5;
+        c.momentum_exit_min_trades = 3;
+        c.momentum_exit_window_secs = 30;
+        let head = 10_000u64;
+        let mut pos = PositionTracker::new("m", "p", "dex", 100.0, 6, 1_000_000, 0);
+        pos.set_entry_time_ago(Duration::from_secs(20));
+        for i in 0..6 {
+            push_recent_trade_at_slot(&mut pos, head, i, false, 1_000_000_000);
+        }
+        assert!(
+            pos.should_exit(&c, None, "test", head, None).is_none(),
+            "momentum exit suppressed during min hold"
+        );
+    }
+
+    #[test]
+    fn momentum_exit_suppressed_when_in_profit() {
+        let mut c = make_exit_config();
+        c.momentum_exit_min_hold_secs = 60;
+        c.hard_stop_min_hold_secs = 45;
+        c.max_hold_time_secs = 1_000_000;
+        c.hard_stop_loss_pct = 99.0;
+        c.take_profit_pct = 1_000.0;
+        c.momentum_exit_only_when_losing = true;
+        c.momentum_exit_buy_ratio = 0.5;
+        c.momentum_exit_min_trades = 3;
+        let head = 10_000u64;
+        let entry = 100.0;
+        let mut pos = PositionTracker::new("m", "p", "dex", entry, 6, 1_000_000, 0);
+        pos.set_entry_time_ago(Duration::from_secs(90));
+        pos.current_price = 80.0;
+        for i in 0..6 {
+            push_recent_trade_at_slot(&mut pos, head, i, false, 1_000_000_000);
+        }
+        let ex = sample_exit_quote(80.0);
+        assert!(
+            pos.should_exit(&c, Some(&ex), "test", head, None).is_none(),
+            "momentum exit suppressed when executable PnL is positive"
+        );
+    }
+
+    #[test]
+    fn momentum_exit_fires_when_losing_after_hold() {
+        let mut c = make_exit_config();
+        c.momentum_exit_min_hold_secs = 60;
+        c.hard_stop_min_hold_secs = 45;
+        c.max_hold_time_secs = 1_000_000;
+        c.hard_stop_loss_pct = 99.0;
+        c.take_profit_pct = 1_000.0;
+        c.momentum_exit_buy_ratio = 0.5;
+        c.momentum_exit_min_trades = 3;
+        let head = 10_000u64;
+        let entry = 100.0;
+        let mut pos = PositionTracker::new("m", "p", "dex", entry, 6, 1_000_000, 0);
+        pos.set_entry_time_ago(Duration::from_secs(90));
+        pos.current_price = 110.0;
+        for i in 0..6 {
+            push_recent_trade_at_slot(&mut pos, head, i, false, 1_000_000_000);
+        }
+        let ex = sample_exit_quote(110.0);
+        let (ty, _) = pos
+            .should_exit(&c, Some(&ex), "test", head, None)
+            .expect("momentum exit when losing");
+        assert_eq!(ty, "MOMENTUM_EXIT");
+    }
+
+    #[test]
+    fn time_exit_requires_low_velocity_after_max_hold() {
+        let mut c = make_exit_config();
+        c.max_hold_time_secs = 300;
+        c.min_trades_per_min = 10.0;
+        c.buyer_window_secs = 20;
+        c.time_exit_requires_low_velocity = true;
+        let head = 10_000u64;
+        let mut pos = PositionTracker::new("m", "p", "dex", 100.0, 6, 1_000_000, 0);
+        pos.set_entry_time_ago(Duration::from_secs(310));
+        push_recent_trade_at_slot(&mut pos, head, 1, true, 1_000_000);
+        push_recent_trade_at_slot(&mut pos, head, 2, true, 1_000_000);
+        let (ty, reason) = pos
+            .should_exit(&c, None, "test", head, Some(5.0))
+            .expect("TIME_EXIT on low velocity");
+        assert_eq!(ty, "TIME_EXIT");
+        assert!(reason.contains("trades_per_min"), "{}", reason);
+    }
+
+    #[test]
+    fn time_exit_suppressed_when_velocity_still_high() {
+        let mut c = make_exit_config();
+        c.max_hold_time_secs = 300;
+        c.min_trades_per_min = 10.0;
+        c.time_exit_requires_low_velocity = true;
+        let mut pos = PositionTracker::new("m", "p", "dex", 100.0, 6, 1_000_000, 0);
+        pos.set_entry_time_ago(Duration::from_secs(310));
+        assert!(
+            pos.should_exit(&c, None, "test", 9_000_000_000u64, Some(25.0))
+                .is_none(),
+            "high velocity must suppress TIME_EXIT"
+        );
+    }
+
+    #[test]
+    fn time_exit_absolute_cap_overrides_velocity() {
+        let mut c = make_exit_config();
+        c.max_hold_time_secs = 300;
+        c.max_hold_absolute_cap_secs = 600;
+        c.min_trades_per_min = 10.0;
+        c.time_exit_requires_low_velocity = true;
+        let mut pos = PositionTracker::new("m", "p", "dex", 100.0, 6, 1_000_000, 0);
+        pos.set_entry_time_ago(Duration::from_secs(610));
+        let (ty, reason) = pos
+            .should_exit(&c, None, "test", 9_000_000_000u64, Some(50.0))
+            .expect("absolute cap TIME_EXIT");
+        assert_eq!(ty, "TIME_EXIT");
+        assert!(reason.contains("absolute_cap"), "{}", reason);
+    }
+
+    #[test]
+    fn trades_per_min_helper_matches_calculate_metrics() {
+        let mut cfg = MomentumConfig::default();
+        cfg.buyer_window_secs = 20;
+        let head = 50_000u64;
+        let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 0);
+        for i in 0..5u64 {
+            tracker.record_trade(
+                &format!("b{i}"),
+                true,
+                1_000_000,
+                1,
+                &format!("sig{i}"),
+                head - i,
+                &cfg,
+            );
+        }
+        let metrics = tracker.calculate_metrics(&cfg, head);
+        let helper = trades_per_min_in_buyer_window(&tracker.trades, cfg.buyer_window_secs, head);
+        assert!(
+            (metrics.trades_per_min - helper).abs() < 1e-6,
+            "metrics={} helper={}",
+            metrics.trades_per_min,
+            helper
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_timed_exit_does_not_force_time_exit_when_should_exit_none() {
+        let mut cfg = MomentumConfig::default();
+        cfg.max_hold_time_secs = 300;
+        cfg.min_trades_per_min = 10.0;
+        cfg.time_exit_requires_low_velocity = true;
+        cfg.hard_stop_loss_pct = 1_000.0;
+        cfg.take_profit_pct = 1_000.0;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "TimedExitMint1111111111111111111111111111";
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "poolA",
+            dex: "raydium",
+            entry_price: 100.0,
+            token_decimals: 6,
+            token_amount: 1_000_000,
+            sol_invested: 1_000_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 500,
+            initial_bonding: None,
+        });
+        {
+            let mut w = ctx.positions.write();
+            w.get_mut(mint)
+                .expect("position")
+                .set_entry_time_ago(Duration::from_secs(400));
+        }
+        let head = 10_000u64;
+        ctx.last_event_slot
+            .store(head, std::sync::atomic::Ordering::Relaxed);
+        let mut tracker = TokenTracker::new(mint, "poolA", "raydium", 1, 0);
+        for i in 0..12u64 {
+            tracker.record_trade(
+                &format!("b{i}"),
+                true,
+                1_000_000,
+                1,
+                &format!("sig{i}"),
+                head - i,
+                &cfg,
+            );
+        }
+        ctx.token_trackers
+            .write()
+            .insert(MomentumContext::tracker_storage_key(mint, "poolA"), tracker);
+
+        let before = ctx
+            .exits_generated
+            .load(std::sync::atomic::Ordering::Relaxed);
+        ctx.reconcile_timed_exits().await;
+        let after = ctx
+            .exits_generated
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            after, before,
+            "reconcile must not publish TIME_EXIT when should_exit is None"
         );
     }
 
@@ -15550,7 +16003,7 @@ mod tests {
         let mut ex = sample_exit_quote(250.0);
         ex.source_slot = Some(400);
         assert!(
-            pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
                 .is_none(),
             "older on-chain slot than BUY confirm must not authorize price exit"
         );
@@ -15568,7 +16021,7 @@ mod tests {
         let mut ex = sample_exit_quote(250.0);
         ex.cache_age_ms = Some(EXIT_QUOTE_MAX_CACHE_AGE_MS + 1);
         assert!(
-            pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
                 .is_none(),
             "stale reserve snapshot must not drive STOP_LOSS"
         );
@@ -15586,7 +16039,7 @@ mod tests {
         let mut ex = sample_exit_quote(250.0);
         ex.quote_pool = SPL_TOKEN_PROGRAM.to_string();
         assert!(
-            pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64)
+            pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
                 .is_none(),
             "Token program address must not be treated as a pool id for exits"
         );
@@ -15646,7 +16099,7 @@ mod tests {
             source_slot: Some(900_000_000),
             cache_age_ms: Some(0),
         };
-        let r = pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64);
+        let r = pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None);
         let (ty, _reason) = r.expect("STOP_LOSS must fire when loss is real");
         assert_eq!(ty, "STOP_LOSS");
     }

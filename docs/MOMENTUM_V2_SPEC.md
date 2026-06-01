@@ -14,7 +14,7 @@
 | TokenMintInfo Gates | ✅ | `mint_authority`, `freeze_authority` |
 | Dev-Sell Re-Validation | ✅ | `dev_sell_revalidation_delay_secs`, `WAIT_DEV_SELL_REVALIDATION` |
 | Buyer Quality / Anti-Bot | ✅ | `top1_buyer_share_cap`, `small_buy_ratio_cap` |
-| Exit Policies | ✅ | `hard_stop`, `trailing_stop`, `take_profit`, `max_hold_time` |
+| Exit Policies | ✅ | Tiered hard stop, velocity-gated `TIME_EXIT`, gated `MOMENTUM_EXIT` |
 | Dev Sell Detection | ✅ | Pre-entry WAIT + revalidation, post-entry exit |
 | LP Removal Detection | ✅ | `REJECT_LP_REMOVED` |
 | PendingIntent Tracking | ✅ | Correlation via `intent_id` |
@@ -230,6 +230,17 @@ Reason codes are uppercase snake case. A decision must include exactly one **pri
 - `EXIT_TRAILING_STOP`
 - `EXIT_MOMENTUM_FADE`
 - `EXIT_MAX_HOLD_TIME`
+
+### Post-Entry Exit Evaluation Order (`should_exit`)
+
+1. **Hard stop (tiered)** — During `hard_stop_min_hold_secs` grace, only `catastrophic_stop_loss_pct` applies; afterward `hard_stop_loss_pct`. Quote-first executable PnL (I-14).
+2. **Take profit** — After `take_profit_min_hold_secs`.
+3. **Bonding curve exit** — Unchanged.
+4. **Trailing stop** — Trade-session high only (I-13); unchanged.
+5. **TIME_EXIT (velocity-gated)** — After `max_hold_time_secs`, only if `trades_per_min` (chain-slot `buyer_window_secs` window, same as entry Filter 2) is below `min_trades_per_min`, unless `max_hold_absolute_cap_secs` forces exit. Suppressed exits are trace-only.
+6. **MOMENTUM_EXIT** — After `momentum_exit_min_hold_secs` and grace; only when reporting PnL `<= momentum_exit_max_pnl_pct` (default losing-only via `momentum_exit_only_when_losing`).
+
+`trades_per_min` prefers live `TokenTracker` metrics; falls back to `PositionTracker.recent_trades` via shared `trades_per_min_in_buyer_window`.
 
 ---
 

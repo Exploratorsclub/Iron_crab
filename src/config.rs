@@ -804,6 +804,12 @@ pub struct MomentumCfg {
     pub require_freeze_authority_none: bool,
 
     // === Exit Strategy ===
+    /// Grace period (secs): normal hard stop suppressed; only catastrophic threshold applies.
+    #[serde(default = "default_hard_stop_min_hold_secs")]
+    pub hard_stop_min_hold_secs: u64,
+    /// Hard stop threshold (%) during grace (catastrophic / rug). Default: 45%
+    #[serde(default = "default_catastrophic_stop_loss_pct")]
+    pub catastrophic_stop_loss_pct: f64,
     /// Hard stop-loss percentage from entry (e.g., 15 = -15%). Default: 15%
     #[serde(default = "default_hard_stop_loss")]
     pub hard_stop_loss_pct: f64,
@@ -822,6 +828,21 @@ pub struct MomentumCfg {
     /// Max hold time in seconds before forced exit. Default: 300s (5 min)
     #[serde(default = "default_max_hold_time")]
     pub max_hold_time_secs: u64,
+    /// Absolute max hold (secs) before TIME_EXIT regardless of velocity. 0 = disabled.
+    #[serde(default)]
+    pub max_hold_absolute_cap_secs: u64,
+    /// TIME_EXIT only when trades_per_min < min_trades_per_min after max_hold. Default: true
+    #[serde(default = "default_time_exit_requires_low_velocity")]
+    pub time_exit_requires_low_velocity: bool,
+    /// Min hold (secs) before MOMENTUM_EXIT can fire. Default: 60
+    #[serde(default = "default_momentum_exit_min_hold_secs")]
+    pub momentum_exit_min_hold_secs: u64,
+    /// Momentum exit only when reporting PnL <= momentum_exit_max_pnl_pct. Default: true
+    #[serde(default = "default_momentum_exit_only_when_losing")]
+    pub momentum_exit_only_when_losing: bool,
+    /// PnL ceiling for momentum exit when only_when_losing is false (default 0.0).
+    #[serde(default)]
+    pub momentum_exit_max_pnl_pct: f64,
     /// Momentum exit: min buy ratio to stay in (e.g., 0.4 = 40% buys). Default: 0.4
     #[serde(default = "default_momentum_exit_ratio")]
     pub momentum_exit_buy_ratio: f64,
@@ -953,8 +974,23 @@ fn default_require_mint_authority_renounced() -> bool {
 fn default_require_freeze_authority_none() -> bool {
     false
 }
+fn default_hard_stop_min_hold_secs() -> u64 {
+    45
+}
+fn default_catastrophic_stop_loss_pct() -> f64 {
+    45.0
+}
 fn default_hard_stop_loss() -> f64 {
     15.0
+}
+fn default_time_exit_requires_low_velocity() -> bool {
+    true
+}
+fn default_momentum_exit_min_hold_secs() -> u64 {
+    60
+}
+fn default_momentum_exit_only_when_losing() -> bool {
+    true
 }
 fn default_trailing_stop() -> f64 {
     20.0
@@ -1042,12 +1078,19 @@ impl Default for MomentumCfg {
             dev_sell_revalidation_delay_secs: default_dev_sell_revalidation_delay_secs(),
             require_mint_authority_renounced: default_require_mint_authority_renounced(),
             require_freeze_authority_none: default_require_freeze_authority_none(),
+            hard_stop_min_hold_secs: default_hard_stop_min_hold_secs(),
+            catastrophic_stop_loss_pct: default_catastrophic_stop_loss_pct(),
             hard_stop_loss_pct: default_hard_stop_loss(),
             trailing_stop_pct: default_trailing_stop(),
             trailing_activation_pct: default_trailing_activation(),
             take_profit_pct: default_take_profit(),
             take_profit_min_hold_secs: default_take_profit_min_hold_secs(),
             max_hold_time_secs: default_max_hold_time(),
+            max_hold_absolute_cap_secs: 0,
+            time_exit_requires_low_velocity: default_time_exit_requires_low_velocity(),
+            momentum_exit_min_hold_secs: default_momentum_exit_min_hold_secs(),
+            momentum_exit_only_when_losing: default_momentum_exit_only_when_losing(),
+            momentum_exit_max_pnl_pct: 0.0,
             momentum_exit_buy_ratio: default_momentum_exit_ratio(),
             momentum_exit_window_secs: default_momentum_exit_window(),
             momentum_exit_min_trades: default_momentum_exit_min_trades(),
