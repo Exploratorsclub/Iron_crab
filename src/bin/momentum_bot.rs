@@ -14616,7 +14616,7 @@ mod tests {
         let mut cfg = relaxed_entry_gates_helper_cfg();
         cfg.min_token_age_secs = 60;
 
-        let first_slot = 4_235_001_00u64;
+        let first_slot = 423_500_100_u64;
         let head = first_slot + 85; // ~34s @ 400ms/slot
         let mut tracker = TokenTracker::new("mint", "pool", "dex", first_slot, 10_000_000_000);
 
