@@ -947,14 +947,22 @@ impl LivePoolCache {
                 .get("pump_amm_sell_extended_tail_1")
                 .and_then(|s| Pubkey::from_str(s).ok())
                 .filter(|pk| *pk != Pubkey::default());
+            let fee_tail_0 = m
+                .get("pump_amm_sell_extended_fee_tail_0")
+                .and_then(|s| Pubkey::from_str(s).ok())
+                .filter(|pk| *pk != Pubkey::default());
+            let fee_tail_1 = m
+                .get("pump_amm_sell_extended_fee_tail_1")
+                .and_then(|s| Pubkey::from_str(s).ok())
+                .filter(|pk| *pk != Pubkey::default());
             self.set_pump_amm_sell_layout_authoritative(
                 pool,
                 requires_extended,
                 third_meta,
                 tail_0,
                 tail_1,
-                None,
-                None,
+                fee_tail_0,
+                fee_tail_1,
             );
         } else {
             if m.get("pump_amm_sell_cashback_remaining")
@@ -983,6 +991,22 @@ impl LivePoolCache {
                 if let Ok(pk) = Pubkey::from_str(s) {
                     if pk != Pubkey::default() {
                         self.pump_amm_sell_extended_tail_1_by_market
+                            .insert(*pool, pk);
+                    }
+                }
+            }
+            if let Some(s) = m.get("pump_amm_sell_extended_fee_tail_0") {
+                if let Ok(pk) = Pubkey::from_str(s) {
+                    if pk != Pubkey::default() {
+                        self.pump_amm_sell_extended_fee_tail_0_by_market
+                            .insert(*pool, pk);
+                    }
+                }
+            }
+            if let Some(s) = m.get("pump_amm_sell_extended_fee_tail_1") {
+                if let Ok(pk) = Pubkey::from_str(s) {
+                    if pk != Pubkey::default() {
+                        self.pump_amm_sell_extended_fee_tail_1_by_market
                             .insert(*pool, pk);
                     }
                 }

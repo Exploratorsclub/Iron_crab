@@ -1251,6 +1251,18 @@ fn md_sidefx_process_pump_amm_trade(w: &MdSidefxWorkerCtx, job: &MdSidefxCommand
             if let Some(pk) = merged_t1 {
                 meta.insert("pump_amm_sell_extended_tail_1".to_string(), pk.to_string());
             }
+            if let Some(pk) = merged_fee_t0 {
+                meta.insert(
+                    "pump_amm_sell_extended_fee_tail_0".to_string(),
+                    pk.to_string(),
+                );
+            }
+            if let Some(pk) = merged_fee_t1 {
+                meta.insert(
+                    "pump_amm_sell_extended_fee_tail_1".to_string(),
+                    pk.to_string(),
+                );
+            }
             pool_update.metadata = Some(meta);
             pool_update.set_dex_readiness_in_metadata(dex_readiness);
             let subject = pool_subject(&pool_address.to_string());
@@ -9245,6 +9257,18 @@ async fn handle_ensure_pump_amm_pool_accounts(
                 }
                 if let Some(pk) = tail1_merged {
                     meta.insert("pump_amm_sell_extended_tail_1".to_string(), pk.to_string());
+                }
+                if let Some(pk) = fee_tail0_merged {
+                    meta.insert(
+                        "pump_amm_sell_extended_fee_tail_0".to_string(),
+                        pk.to_string(),
+                    );
+                }
+                if let Some(pk) = fee_tail1_merged {
+                    meta.insert(
+                        "pump_amm_sell_extended_fee_tail_1".to_string(),
+                        pk.to_string(),
+                    );
                 }
                 if let Some(creator) = creator_opt {
                     meta.insert("creator".to_string(), creator.to_string());
