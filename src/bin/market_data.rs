@@ -2542,7 +2542,7 @@ fn raydium_cpmm_readiness_for_pool_cache_update(s: &RaydiumCpmmState) -> DexPool
 /// PumpSwap SELL-layout contract for JetStream / SLAVE SSOT.
 ///
 /// - Base-only SELL stays ready as long as the underlying refresh/observation says the base layout is usable.
-/// - Extended SELL is ready when the full observed tail (#21/#22/#23) is known and base layout is ready.
+/// - Extended SELL is ready when pool `third_meta` (+ fee tails when required) is known; #21/#22 are derived at build.
 #[allow(clippy::too_many_arguments)]
 fn pump_amm_sell_layout_publish_state(
     sell_requires_extended: bool,
@@ -2558,12 +2558,7 @@ fn pump_amm_sell_layout_publish_state(
         let third_ok = sell_cashback_third_meta
             .filter(|p| *p != Pubkey::default())
             .is_some();
-        let tail_ok = sell_extended_tail_0
-            .filter(|p| *p != Pubkey::default())
-            .is_some()
-            && sell_extended_tail_1
-                .filter(|p| *p != Pubkey::default())
-                .is_some();
+        let _ = (sell_extended_tail_0, sell_extended_tail_1);
         let needs_fee_tail = sell_requires_fee_tail
             || sell_extended_fee_tail_0.is_some()
             || sell_extended_fee_tail_1.is_some();
@@ -2577,7 +2572,7 @@ fn pump_amm_sell_layout_publish_state(
         } else {
             true
         };
-        third_ok && tail_ok && fee_ok && base_layout_ready
+        third_ok && fee_ok && base_layout_ready
     } else {
         base_layout_ready
     };
@@ -13396,7 +13391,7 @@ mod discovery_tests {
     }
 
     #[test]
-    fn test_pump_amm_trade_publish_extended_with_third_only_missing_tail_is_partial() {
+    fn test_pump_amm_trade_publish_extended_with_third_only_without_volume_tails_is_ready() {
         let (sell_layout_ready, dex_readiness) = pump_amm_sell_layout_publish_state(
             true,
             Some(Pubkey::new_unique()),
@@ -13408,10 +13403,10 @@ mod discovery_tests {
             true,
         );
         assert!(
-            !sell_layout_ready,
-            "extended SELL with third but missing tail0/tail1 must not be marked ready"
+            sell_layout_ready,
+            "extended SELL with third_meta only must be ready — volume tails #21/#22 are build-derived"
         );
-        assert_eq!(dex_readiness, DexPoolReadiness::Partial);
+        assert_eq!(dex_readiness, DexPoolReadiness::Ready);
     }
 
     #[test]

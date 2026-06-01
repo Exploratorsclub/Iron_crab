@@ -922,16 +922,8 @@ pub async fn build_tx_plan(
             } else {
                 None
             },
-            if intent.side == TradeSide::Sell {
-                sell_extended_tail_0
-            } else {
-                None
-            },
-            if intent.side == TradeSide::Sell {
-                sell_extended_tail_1
-            } else {
-                None
-            },
+            None, // volume tails #21/#22: always derived for intent user in builder
+            None,
             if intent.side == TradeSide::Sell {
                 sell_extended_fee_tail_0
             } else {
@@ -979,11 +971,30 @@ pub async fn build_tx_plan(
                 .map(|m| m.pubkey.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
+            let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes());
+            let quote_mint = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+            let (derived_tail_21, derived_tail_22) =
+                if sell_requires_cashback_remaining && intent.side == TradeSide::Sell {
+                    PumpFunAmmDex::pump_amm_sell_cashback_first_two_metas(
+                        wallet_pubkey,
+                        quote_mint,
+                        quote_tp,
+                    )
+                } else {
+                    (Pubkey::default(), Pubkey::default())
+                };
+            let cached_tail_mismatch =
+                sell_extended_tail_0
+                    .zip(sell_extended_tail_1)
+                    .is_some_and(|(c0, c1)| {
+                        c0 != Pubkey::default()
+                            && c1 != Pubkey::default()
+                            && (Some(c0) != Some(derived_tail_21)
+                                || Some(c1) != Some(derived_tail_22))
+                    });
             let sell_ext_tail_src =
-                if sell_extended_tail_0.is_some() && sell_extended_tail_1.is_some() {
-                    "livepoolcache_observed_tail"
-                } else if sell_requires_cashback_remaining && intent.side == TradeSide::Sell {
-                    "derived_first_two_metas"
+                if sell_requires_cashback_remaining && intent.side == TradeSide::Sell {
+                    "derived_for_intent_user"
                 } else {
                     "n/a"
                 };
@@ -991,12 +1002,16 @@ pub async fn build_tx_plan(
                 intent_id = %intent.intent_id,
                 scope = "44",
                 dex = "pump_amm",
+                intent_user = %wallet_pubkey,
                 pool_accounts_source = pool_accounts_build_source,
                 sell_extended = sell_requires_cashback_remaining && intent.side == TradeSide::Sell,
                 sell_cashback_third_meta = ?sell_cashback_third_meta,
                 sell_extended_tail_source = sell_ext_tail_src,
-                sell_extended_tail_0 = ?sell_extended_tail_0,
-                sell_extended_tail_1 = ?sell_extended_tail_1,
+                derived_tail_21 = %derived_tail_21,
+                derived_tail_22 = %derived_tail_22,
+                cached_tail_21 = ?sell_extended_tail_0,
+                cached_tail_22 = ?sell_extended_tail_1,
+                cached_tail_mismatch,
                 sell_extended_tail_2 = ?sell_cashback_third_meta,
                 sell_ix_meta_21 = %ixs[0].accounts.get(21).map(|m| m.pubkey.to_string()).unwrap_or_default(),
                 sell_ix_meta_22 = %ixs[0].accounts.get(22).map(|m| m.pubkey.to_string()).unwrap_or_default(),
@@ -1669,7 +1684,7 @@ async fn build_hop_pump_amm(
     cache: Option<&SharedLivePoolCache>,
 ) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
     // PumpSwap AMM (graduated tokens) - get pool_accounts from cache
-    let (pool_accounts, sell_requires, sell_third, sell_t0, sell_t1, sell_fee_t0, sell_fee_t1) =
+    let (pool_accounts, sell_requires, sell_third, _sell_t0, _sell_t1, sell_fee_t0, sell_fee_t1) =
         if let Some(cache) = cache {
             match cache.get(pool_address) {
                 Some(CachedPoolState::PumpAmm(amm_state)) => {
@@ -1739,8 +1754,8 @@ async fn build_hop_pump_amm(
         None, // Token-2022 not yet supported in multi-hop arb
         sell_requires && is_sell_hop,
         if is_sell_hop { sell_third } else { None },
-        if is_sell_hop { sell_t0 } else { None },
-        if is_sell_hop { sell_t1 } else { None },
+        None, // volume tails: derived for wallet in builder
+        None,
         if is_sell_hop { sell_fee_t0 } else { None },
         if is_sell_hop { sell_fee_t1 } else { None },
     )
@@ -2234,10 +2249,15 @@ mod tests {
             sell_ix.accounts.len()
         );
         assert_eq!(sell_ix.accounts.last().unwrap().pubkey, third_meta);
-        assert_eq!(sell_ix.accounts[21].pubkey, tail0);
-        assert_eq!(sell_ix.accounts[22].pubkey, tail1);
-        assert!(!sell_ix.accounts[21].is_writable);
-        assert!(!sell_ix.accounts[22].is_writable);
+        let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let (derived_21, derived_22) =
+            PumpFunAmmDex::pump_amm_sell_cashback_first_two_metas(wallet, quote_mint, quote_tp);
+        assert_eq!(sell_ix.accounts[21].pubkey, derived_21);
+        assert_eq!(sell_ix.accounts[22].pubkey, derived_22);
+        assert_ne!(derived_21, tail0);
+        assert_ne!(derived_22, tail1);
+        assert!(sell_ix.accounts[21].is_writable);
+        assert!(sell_ix.accounts[22].is_writable);
         assert!(sell_ix.accounts[23].is_writable);
     }
 

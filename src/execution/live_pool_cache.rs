@@ -440,6 +440,7 @@ pub struct LivePoolCache {
     /// Third trailing meta for extended `sell` (ix account #23, writable in observed reference).
     pump_amm_sell_extended_third_meta_by_market: DashMap<Pubkey, Pubkey>,
     /// Observed extended SELL ix account #21 (readonly in reference); Scope 61.
+    /// Observed reference-trader volume meta #21 (diagnostics / JetStream; not used when building our SELL).
     pump_amm_sell_extended_tail_0_by_market: DashMap<Pubkey, Pubkey>,
     /// Observed extended SELL ix account #22 (readonly in reference); Scope 61.
     pump_amm_sell_extended_tail_1_by_market: DashMap<Pubkey, Pubkey>,
@@ -1205,13 +1206,12 @@ impl LivePoolCache {
         if !self.pump_amm_sell_layout_ready(pool_market) {
             return false;
         }
-        let (requires_extended, third, tail_0, tail_1) =
+        let (requires_extended, third, _volume_tail_0, _volume_tail_1) =
             self.pump_amm_sell_extended_layout(pool_market);
         let (fee_t0, fee_t1) = self.pump_amm_sell_fee_tail_layout(pool_market);
         if requires_extended {
             let third_ok = third.filter(|p| *p != Pubkey::default()).is_some();
-            let tail_ok = tail_0.filter(|p| *p != Pubkey::default()).is_some()
-                && tail_1.filter(|p| *p != Pubkey::default()).is_some();
+            // #21/#22 volume tails are intent-user derivable at build time — not required in cache.
             let needs_fee_tail = self.pump_amm_sell_requires_fee_tail(pool_market)
                 || fee_t0.is_some()
                 || fee_t1.is_some();
@@ -1221,7 +1221,7 @@ impl LivePoolCache {
             } else {
                 true
             };
-            third_ok && tail_ok && fee_ok
+            third_ok && fee_ok
         } else {
             true
         }
@@ -2838,7 +2838,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pump_amm_extended_flag_with_third_only_missing_tail_blocks_ready_gate() {
+    fn test_pump_amm_extended_flag_with_third_only_is_swap_ready_without_observed_volume_tails() {
         let cache = LivePoolCache::new();
         let pool_market = Pubkey::new_unique();
         let base_mint = Pubkey::new_unique();
@@ -2857,7 +2857,7 @@ mod tests {
             100,
         );
         cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
-        // Legacy partial: extended flag + third only (no observed #21/#22) — Scope 61 must not count ready.
+        // Extended flag + third only: volume tails #21/#22 are derived at build — swap-ready without cache tails.
         cache.merge_pump_amm_sell_extended_layout(
             &pool_market,
             true,
@@ -2871,8 +2871,8 @@ mod tests {
         cache.set_pump_amm_sell_layout_ready(&pool_market, true);
 
         assert!(
-            !cache.pump_amm_swap_accounts_ready_by_base_mint(&base_mint),
-            "extended SELL with third but missing tail0/tail1 must not count as swap-ready"
+            cache.pump_amm_swap_accounts_ready_by_base_mint(&base_mint),
+            "extended SELL with third_meta + layout_ready must be swap-ready without observed volume tails"
         );
     }
 
