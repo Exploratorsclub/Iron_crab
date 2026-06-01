@@ -1016,6 +1016,7 @@ pub async fn build_tx_plan(
                 sell_ix_meta_21 = %ixs[0].accounts.get(21).map(|m| m.pubkey.to_string()).unwrap_or_default(),
                 sell_ix_meta_22 = %ixs[0].accounts.get(22).map(|m| m.pubkey.to_string()).unwrap_or_default(),
                 sell_ix_meta_23 = %ixs[0].accounts.get(23).map(|m| m.pubkey.to_string()).unwrap_or_default(),
+                sell_ix_meta_23_writable = ixs[0].accounts.get(23).map(|m| m.is_writable).unwrap_or(false),
                 sell_ix_account_count = ixs[0].accounts.len(),
                 pool = %pool_id,
                 input_mint = %intent.resources.input_mint,
@@ -2258,7 +2259,10 @@ mod tests {
         assert_ne!(derived_22, tail1);
         assert!(sell_ix.accounts[21].is_writable);
         assert!(sell_ix.accounts[22].is_writable);
-        assert!(sell_ix.accounts[23].is_writable);
+        assert!(
+            !sell_ix.accounts[23].is_writable,
+            "derived-user extended SELL: #23 third_meta must be readonly"
+        );
     }
 
     /// Two PumpSwap pools for the same base mint: only the intent’s `pools[0]` row (explicit Ready)

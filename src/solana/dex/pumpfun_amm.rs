@@ -2118,8 +2118,10 @@ impl PumpFunAmmDex {
         (user_vol_wsol_ata, user_vol)
     }
 
-    /// Append extended/cashback SELL trailing metas: #21/#22 always from [`Self::pump_amm_sell_cashback_first_two_metas`],
-    /// #23 `third`, optional #24/#25 fee pair from observation. Cached reference-trader volume tails are ignored.
+    /// Append extended/cashback SELL trailing metas for the **derived intent-user path**:
+    /// #21/#22 always from [`Self::pump_amm_sell_cashback_first_two_metas`] (writable),
+    /// #23 pool `third_meta` readonly (derived-user layout; writable #23 → on-chain PrivilegeEscalation),
+    /// optional #24/#25 fee pair readonly from observation. Cached reference-trader volume tails are ignored.
     #[allow(clippy::too_many_arguments)]
     fn push_pump_amm_sell_extended_trailing_metas(
         metas: &mut Vec<AccountMeta>,
@@ -2153,7 +2155,7 @@ impl PumpFunAmmDex {
         }
         metas.push(AccountMeta::new(user_vol_wsol_ata, false));
         metas.push(AccountMeta::new(user_vol, false));
-        metas.push(AccountMeta::new(third, false));
+        metas.push(AccountMeta::new_readonly(third, false));
         if let (Some(f0), Some(f1)) = (
             sell_extended_fee_tail_0.filter(|p| *p != Pubkey::default()),
             sell_extended_fee_tail_1.filter(|p| *p != Pubkey::default()),
@@ -6898,7 +6900,10 @@ mod tests {
         assert_eq!(ixs[0].accounts[23].pubkey, third_meta);
         assert!(ixs[0].accounts[21].is_writable);
         assert!(ixs[0].accounts[22].is_writable);
-        assert!(ixs[0].accounts[23].is_writable);
+        assert!(
+            !ixs[0].accounts[23].is_writable,
+            "derived-user extended SELL: #23 third_meta must be readonly"
+        );
     }
 
     /// Scope 60: without a TX-backed observation, apply must not rewrite protocol fee recipients.
@@ -7162,6 +7167,10 @@ mod tests {
         assert_eq!(ixs[0].accounts[22].pubkey, expected_22);
         assert_ne!(expected_21, foreign_tail_0);
         assert_ne!(expected_22, foreign_tail_1);
+        assert!(
+            !ixs[0].accounts[23].is_writable,
+            "derived-user extended SELL: #23 third_meta must be readonly"
+        );
     }
 
     /// SELL path: Token-2022 base mint — ix[11] must be Token-2022 program; user base ATA (ix[5]) must match derivation.
