@@ -1594,8 +1594,9 @@ impl PositionTracker {
             });
             let absolute_cap = config.max_hold_absolute_cap_secs > 0
                 && hold_secs >= config.max_hold_absolute_cap_secs;
-            let velocity_dead =
-                !config.time_exit_requires_low_velocity || vel < config.min_trades_per_min;
+            let velocity_dead = !config.time_exit_requires_low_velocity
+                || config.min_trades_per_min <= 0.0
+                || vel < config.min_trades_per_min;
 
             if absolute_cap || velocity_dead {
                 let cap_note = if absolute_cap { ", absolute_cap" } else { "" };
@@ -5488,19 +5489,16 @@ impl MomentumContext {
             dev_sold_sol: Option<u64>,
         }
 
-        let (tracker_signals, trades_per_min_by_mint): (
+        let (tracker_signals, trades_per_min_by_tracker_key): (
             HashMap<String, TrackerExitSignals>,
             HashMap<String, f64>,
         ) = {
             let trackers = self.token_trackers.read();
             let mut by_mint: HashMap<String, TrackerExitSignals> = HashMap::new();
-            let mut tpm_by_mint: HashMap<String, f64> = HashMap::new();
+            let mut tpm_by_tracker_key: HashMap<String, f64> = HashMap::new();
             for t in trackers.values() {
                 let tpm = t.calculate_metrics(&config, chain_head_slot).trades_per_min;
-                tpm_by_mint
-                    .entry(t.mint.clone())
-                    .and_modify(|cur| *cur = cur.max(tpm))
-                    .or_insert(tpm);
+                tpm_by_tracker_key.insert(Self::tracker_storage_key(&t.mint, &t.pool), tpm);
                 let mint_key = t.mint.clone();
                 let mut dev_sell_slot: Option<u64> = None;
                 let mut dev_sell_observed_at: Option<Instant> = None;
@@ -5575,7 +5573,7 @@ impl MomentumContext {
                     }
                 }
             }
-            (by_mint, tpm_by_mint)
+            (by_mint, tpm_by_tracker_key)
         };
 
         // FIX-30b: No longer block exit checks on pending BUY intents.
@@ -5697,7 +5695,9 @@ impl MomentumContext {
             }
 
             let exit_q = self.executable_exit_quote(pos, None);
-            let live_trades_per_min = trades_per_min_by_mint.get(mint).copied();
+            let live_trades_per_min = trades_per_min_by_tracker_key
+                .get(&Self::tracker_storage_key(mint, &pos.pool))
+                .copied();
             if let Some((exit_type, reason)) = pos.should_exit(
                 &config,
                 exit_q.as_ref(),
@@ -5873,15 +5873,9 @@ impl MomentumContext {
                 .max(1);
             let live_tpm = {
                 let trackers = self.token_trackers.read();
-                let live_trades_per_min = trackers
-                    .values()
-                    .filter(|t| t.mint == candidate.mint)
-                    .map(|t| t.calculate_metrics(&config, chain_head_slot).trades_per_min)
-                    .fold(0.0f64, f64::max);
                 trackers
-                    .values()
-                    .any(|t| t.mint == candidate.mint)
-                    .then_some(live_trades_per_min)
+                    .get(&Self::tracker_storage_key(&candidate.mint, &candidate.pool))
+                    .map(|t| t.calculate_metrics(&config, chain_head_slot).trades_per_min)
             };
 
             let exit_signal = {
