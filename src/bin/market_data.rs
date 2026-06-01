@@ -612,11 +612,15 @@ enum MdSidefxCommand {
         pool_address: Pubkey,
         base_mint_pk: Pubkey,
         slot: u64,
+        is_buy: bool,
         pool_accounts: Vec<Pubkey>,
         pump_amm_sell_requires_cashback_remaining: bool,
         pump_amm_sell_cashback_third_meta: Option<Pubkey>,
         pump_amm_sell_extended_tail_0: Option<Pubkey>,
         pump_amm_sell_extended_tail_1: Option<Pubkey>,
+        pump_amm_sell_extended_fee_tail_0: Option<Pubkey>,
+        pump_amm_sell_extended_fee_tail_1: Option<Pubkey>,
+        pump_amm_sell_requires_fee_tail: bool,
         tx_geyser_recv_at: Instant,
     },
     GenericDexFirstTradeAccounts {
@@ -960,43 +964,98 @@ fn md_sidefx_process_pump_amm_create_pool(w: &MdSidefxWorkerCtx, job: &MdSidefxC
         .insert(pool_address.to_string(), base_mint.clone());
 }
 
+#[allow(clippy::type_complexity)]
 fn md_sidefx_process_pump_amm_trade(w: &MdSidefxWorkerCtx, job: &MdSidefxCommand) {
     let MdSidefxCommand::PumpAmmTradeWithAccounts {
         run_id,
         pool_address,
         base_mint_pk,
         slot,
+        is_buy,
         pool_accounts,
         pump_amm_sell_requires_cashback_remaining,
         pump_amm_sell_cashback_third_meta,
         pump_amm_sell_extended_tail_0,
         pump_amm_sell_extended_tail_1,
+        pump_amm_sell_extended_fee_tail_0,
+        pump_amm_sell_extended_fee_tail_1,
+        pump_amm_sell_requires_fee_tail,
         tx_geyser_recv_at,
     } = job
     else {
         return;
     };
+    let filter_opt_pk = |p: Option<Pubkey>| p.filter(|pk| *pk != Pubkey::default());
+    let this_tx_tail = filter_opt_pk(*pump_amm_sell_cashback_third_meta)
+        .or(filter_opt_pk(*pump_amm_sell_extended_tail_0))
+        .or(filter_opt_pk(*pump_amm_sell_extended_tail_1))
+        .or(filter_opt_pk(*pump_amm_sell_extended_fee_tail_0))
+        .or(filter_opt_pk(*pump_amm_sell_extended_fee_tail_1));
+    let this_tx_defines_sell_layout =
+        *pump_amm_sell_requires_cashback_remaining || this_tx_tail.is_some();
     let (ext_flag_prior, ext_third_prior, ext_t0_prior, ext_t1_prior) = w
         .ctx
         .live_pool_cache
         .pump_amm_sell_extended_layout(pool_address);
-    let merge_requires = *pump_amm_sell_requires_cashback_remaining || ext_flag_prior;
-    let merge_third = (*pump_amm_sell_cashback_third_meta)
-        .filter(|p| *p != Pubkey::default())
-        .or(ext_third_prior);
-    let merge_t0 = (*pump_amm_sell_extended_tail_0)
-        .filter(|p| *p != Pubkey::default())
-        .or(ext_t0_prior);
-    let merge_t1 = (*pump_amm_sell_extended_tail_1)
-        .filter(|p| *p != Pubkey::default())
-        .or(ext_t1_prior);
-    if merge_requires || merge_third.is_some() || merge_t0.is_some() || merge_t1.is_some() {
+    let (ext_fee_t0_prior, ext_fee_t1_prior) = w
+        .ctx
+        .live_pool_cache
+        .pump_amm_sell_fee_tail_layout(pool_address);
+    let ext_requires_fee_tail_prior = w
+        .ctx
+        .live_pool_cache
+        .pump_amm_sell_requires_fee_tail(pool_address);
+    let merge_requires_fee_tail = if this_tx_defines_sell_layout {
+        *pump_amm_sell_requires_fee_tail
+    } else {
+        ext_requires_fee_tail_prior || *pump_amm_sell_requires_fee_tail
+    };
+    let merge_requires = if this_tx_defines_sell_layout {
+        *pump_amm_sell_requires_cashback_remaining
+    } else {
+        *pump_amm_sell_requires_cashback_remaining || ext_flag_prior
+    };
+    let merge_third = if this_tx_defines_sell_layout {
+        filter_opt_pk(*pump_amm_sell_cashback_third_meta)
+    } else {
+        filter_opt_pk(*pump_amm_sell_cashback_third_meta).or(ext_third_prior)
+    };
+    let merge_t0 = if this_tx_defines_sell_layout {
+        filter_opt_pk(*pump_amm_sell_extended_tail_0)
+    } else {
+        filter_opt_pk(*pump_amm_sell_extended_tail_0).or(ext_t0_prior)
+    };
+    let merge_t1 = if this_tx_defines_sell_layout {
+        filter_opt_pk(*pump_amm_sell_extended_tail_1)
+    } else {
+        filter_opt_pk(*pump_amm_sell_extended_tail_1).or(ext_t1_prior)
+    };
+    let merge_fee_t0 = if this_tx_defines_sell_layout {
+        filter_opt_pk(*pump_amm_sell_extended_fee_tail_0)
+    } else {
+        filter_opt_pk(*pump_amm_sell_extended_fee_tail_0).or(ext_fee_t0_prior)
+    };
+    let merge_fee_t1 = if this_tx_defines_sell_layout {
+        filter_opt_pk(*pump_amm_sell_extended_fee_tail_1)
+    } else {
+        filter_opt_pk(*pump_amm_sell_extended_fee_tail_1).or(ext_fee_t1_prior)
+    };
+    if merge_requires
+        || merge_third.is_some()
+        || merge_t0.is_some()
+        || merge_t1.is_some()
+        || merge_fee_t0.is_some()
+        || merge_fee_t1.is_some()
+    {
         w.ctx.live_pool_cache.merge_pump_amm_sell_extended_layout(
             pool_address,
             merge_requires,
             merge_third,
             merge_t0,
             merge_t1,
+            merge_fee_t0,
+            merge_fee_t1,
+            merge_requires_fee_tail,
         );
     }
     let base_mint = pool_accounts
@@ -1084,26 +1143,96 @@ fn md_sidefx_process_pump_amm_trade(w: &MdSidefxWorkerCtx, job: &MdSidefxCommand
             .ctx
             .live_pool_cache
             .pump_amm_sell_extended_layout(pool_address);
-        let merged_flag = ext_flag || *pump_amm_sell_requires_cashback_remaining;
-        let merged_third = ext_third
-            .or(*pump_amm_sell_cashback_third_meta)
-            .filter(|p| *p != Pubkey::default());
-        let merged_t0 = ext_t0
-            .or(*pump_amm_sell_extended_tail_0)
-            .filter(|p| *p != Pubkey::default());
-        let merged_t1 = ext_t1
-            .or(*pump_amm_sell_extended_tail_1)
-            .filter(|p| *p != Pubkey::default());
+        let (ext_fee_t0, ext_fee_t1) = w
+            .ctx
+            .live_pool_cache
+            .pump_amm_sell_fee_tail_layout(pool_address);
+        let ext_requires_fee_tail = w
+            .ctx
+            .live_pool_cache
+            .pump_amm_sell_requires_fee_tail(pool_address);
+        let merged_requires_fee_tail = if this_tx_defines_sell_layout {
+            *pump_amm_sell_requires_fee_tail
+        } else {
+            ext_requires_fee_tail || *pump_amm_sell_requires_fee_tail
+        };
+        let merged_flag = if this_tx_defines_sell_layout {
+            *pump_amm_sell_requires_cashback_remaining
+        } else {
+            ext_flag || *pump_amm_sell_requires_cashback_remaining
+        };
+        let merged_third = if this_tx_defines_sell_layout {
+            filter_opt_pk(*pump_amm_sell_cashback_third_meta)
+        } else {
+            ext_third
+                .or(*pump_amm_sell_cashback_third_meta)
+                .and_then(|p| filter_opt_pk(Some(p)))
+        };
+        let merged_t0 = if this_tx_defines_sell_layout {
+            filter_opt_pk(*pump_amm_sell_extended_tail_0)
+        } else {
+            ext_t0
+                .or(*pump_amm_sell_extended_tail_0)
+                .and_then(|p| filter_opt_pk(Some(p)))
+        };
+        let merged_t1 = if this_tx_defines_sell_layout {
+            filter_opt_pk(*pump_amm_sell_extended_tail_1)
+        } else {
+            ext_t1
+                .or(*pump_amm_sell_extended_tail_1)
+                .and_then(|p| filter_opt_pk(Some(p)))
+        };
+        let merged_fee_t0 = if this_tx_defines_sell_layout {
+            filter_opt_pk(*pump_amm_sell_extended_fee_tail_0)
+        } else {
+            ext_fee_t0
+                .or(*pump_amm_sell_extended_fee_tail_0)
+                .and_then(|p| filter_opt_pk(Some(p)))
+        };
+        let merged_fee_t1 = if this_tx_defines_sell_layout {
+            filter_opt_pk(*pump_amm_sell_extended_fee_tail_1)
+        } else {
+            ext_fee_t1
+                .or(*pump_amm_sell_extended_fee_tail_1)
+                .and_then(|p| filter_opt_pk(Some(p)))
+        };
         let (sell_layout_ready, dex_readiness) = pump_amm_sell_layout_publish_state(
             merged_flag,
             merged_third,
             merged_t0,
             merged_t1,
+            merged_fee_t0,
+            merged_fee_t1,
+            merged_requires_fee_tail,
             true,
         );
         w.ctx
             .live_pool_cache
             .set_pump_amm_sell_layout_ready(pool_address, sell_layout_ready);
+        if !*is_buy {
+            ironcrab::metrics::record_pump_amm_geyser_sell_parsed();
+            if sell_layout_ready {
+                w.ctx
+                    .live_pool_cache
+                    .set_pump_amm_sell_layout_authoritative(
+                        pool_address,
+                        merged_flag,
+                        merged_third,
+                        merged_t0,
+                        merged_t1,
+                        merged_fee_t0,
+                        merged_fee_t1,
+                        merged_requires_fee_tail,
+                    );
+                ironcrab::metrics::record_pump_amm_geyser_sell_layout_ready();
+                info!(
+                    pool = %pool_address,
+                    base_mint = %base_mint_pk,
+                    slot = *slot,
+                    "pump_amm: Geyser SELL set sell_layout_ready (authoritative extended layout)"
+                );
+            }
+        }
         w.ctx
             .live_pool_cache
             .set_pump_amm_pool_accounts_readiness_authoritative(*pool_address, dex_readiness);
@@ -1133,6 +1262,18 @@ fn md_sidefx_process_pump_amm_trade(w: &MdSidefxWorkerCtx, job: &MdSidefxCommand
                 "pump_amm_sell_layout_ready".to_string(),
                 sell_layout_ready.to_string(),
             );
+            if !*is_buy && sell_layout_ready && this_tx_defines_sell_layout {
+                meta.insert(
+                    "pump_amm_sell_layout_authoritative".to_string(),
+                    "true".to_string(),
+                );
+            }
+            if merged_requires_fee_tail {
+                meta.insert(
+                    "pump_amm_sell_requires_fee_tail".to_string(),
+                    "true".to_string(),
+                );
+            }
             if let Some(pk) = merged_third {
                 meta.insert(
                     "pump_amm_sell_cashback_third_meta".to_string(),
@@ -1144,6 +1285,20 @@ fn md_sidefx_process_pump_amm_trade(w: &MdSidefxWorkerCtx, job: &MdSidefxCommand
             }
             if let Some(pk) = merged_t1 {
                 meta.insert("pump_amm_sell_extended_tail_1".to_string(), pk.to_string());
+            }
+            if !*is_buy {
+                if let Some(pk) = merged_fee_t0 {
+                    meta.insert(
+                        "pump_amm_sell_extended_fee_tail_0".to_string(),
+                        pk.to_string(),
+                    );
+                }
+                if let Some(pk) = merged_fee_t1 {
+                    meta.insert(
+                        "pump_amm_sell_extended_fee_tail_1".to_string(),
+                        pk.to_string(),
+                    );
+                }
             }
             pool_update.metadata = Some(meta);
             pool_update.set_dex_readiness_in_metadata(dex_readiness);
@@ -2388,11 +2543,15 @@ fn raydium_cpmm_readiness_for_pool_cache_update(s: &RaydiumCpmmState) -> DexPool
 ///
 /// - Base-only SELL stays ready as long as the underlying refresh/observation says the base layout is usable.
 /// - Extended SELL is ready when the full observed tail (#21/#22/#23) is known and base layout is ready.
+#[allow(clippy::too_many_arguments)]
 fn pump_amm_sell_layout_publish_state(
     sell_requires_extended: bool,
     sell_cashback_third_meta: Option<Pubkey>,
     sell_extended_tail_0: Option<Pubkey>,
     sell_extended_tail_1: Option<Pubkey>,
+    sell_extended_fee_tail_0: Option<Pubkey>,
+    sell_extended_fee_tail_1: Option<Pubkey>,
+    sell_requires_fee_tail: bool,
     base_layout_ready: bool,
 ) -> (bool, DexPoolReadiness) {
     let sell_layout_ready = if sell_requires_extended {
@@ -2405,7 +2564,20 @@ fn pump_amm_sell_layout_publish_state(
             && sell_extended_tail_1
                 .filter(|p| *p != Pubkey::default())
                 .is_some();
-        third_ok && tail_ok && base_layout_ready
+        let needs_fee_tail = sell_requires_fee_tail
+            || sell_extended_fee_tail_0.is_some()
+            || sell_extended_fee_tail_1.is_some();
+        let fee_ok = if needs_fee_tail {
+            sell_extended_fee_tail_0
+                .filter(|p| *p != Pubkey::default())
+                .is_some()
+                && sell_extended_fee_tail_1
+                    .filter(|p| *p != Pubkey::default())
+                    .is_some()
+        } else {
+            true
+        };
+        third_ok && tail_ok && fee_ok && base_layout_ready
     } else {
         base_layout_ready
     };
@@ -2420,23 +2592,32 @@ fn pump_amm_sell_layout_publish_state(
 /// Resolve PumpSwap SELL-layout state for the EnsurePumpAmmPoolAccounts publish path.
 ///
 /// `force_refresh=true` is authoritative and must be able to override stale monotonic cache hints.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn pump_amm_sell_layout_state_for_ensure_publish(
     force_refresh: bool,
     cached_requires_extended: bool,
     cached_third_meta: Option<Pubkey>,
     cached_tail_0: Option<Pubkey>,
     cached_tail_1: Option<Pubkey>,
+    cached_fee_tail_0: Option<Pubkey>,
+    cached_fee_tail_1: Option<Pubkey>,
+    cached_requires_fee_tail: bool,
     refresh_requires_extended: bool,
     refresh_third_meta: Option<Pubkey>,
     refresh_tail_0: Option<Pubkey>,
     refresh_tail_1: Option<Pubkey>,
+    refresh_fee_tail_0: Option<Pubkey>,
+    refresh_fee_tail_1: Option<Pubkey>,
+    refresh_requires_fee_tail: bool,
     refresh_layout_ready: bool,
 ) -> (
     bool,
     Option<Pubkey>,
     Option<Pubkey>,
     Option<Pubkey>,
+    Option<Pubkey>,
+    Option<Pubkey>,
+    bool,
     bool,
     DexPoolReadiness,
 ) {
@@ -2445,6 +2626,9 @@ fn pump_amm_sell_layout_state_for_ensure_publish(
         effective_third_meta,
         effective_tail_0,
         effective_tail_1,
+        effective_fee_tail_0,
+        effective_fee_tail_1,
+        effective_requires_fee_tail,
         base_layout_ready,
     ) = if force_refresh {
         (
@@ -2452,6 +2636,9 @@ fn pump_amm_sell_layout_state_for_ensure_publish(
             refresh_third_meta.filter(|p| *p != Pubkey::default()),
             refresh_tail_0.filter(|p| *p != Pubkey::default()),
             refresh_tail_1.filter(|p| *p != Pubkey::default()),
+            refresh_fee_tail_0.filter(|p| *p != Pubkey::default()),
+            refresh_fee_tail_1.filter(|p| *p != Pubkey::default()),
+            refresh_requires_fee_tail,
             refresh_layout_ready,
         )
     } else {
@@ -2466,6 +2653,13 @@ fn pump_amm_sell_layout_state_for_ensure_publish(
             refresh_tail_1
                 .or(cached_tail_1)
                 .filter(|p| *p != Pubkey::default()),
+            refresh_fee_tail_0
+                .or(cached_fee_tail_0)
+                .filter(|p| *p != Pubkey::default()),
+            refresh_fee_tail_1
+                .or(cached_fee_tail_1)
+                .filter(|p| *p != Pubkey::default()),
+            cached_requires_fee_tail || refresh_requires_fee_tail,
             refresh_layout_ready,
         )
     };
@@ -2474,6 +2668,9 @@ fn pump_amm_sell_layout_state_for_ensure_publish(
         effective_third_meta,
         effective_tail_0,
         effective_tail_1,
+        effective_fee_tail_0,
+        effective_fee_tail_1,
+        effective_requires_fee_tail,
         base_layout_ready,
     );
     (
@@ -2481,6 +2678,9 @@ fn pump_amm_sell_layout_state_for_ensure_publish(
         effective_third_meta,
         effective_tail_0,
         effective_tail_1,
+        effective_fee_tail_0,
+        effective_fee_tail_1,
+        effective_requires_fee_tail,
         sell_layout_ready,
         dex_readiness,
     )
@@ -8925,6 +9125,8 @@ async fn handle_ensure_pump_amm_pool_accounts(
             let sell_cashback_third = wrapped.sell_cashback_third_meta;
             let sell_tail_0 = wrapped.sell_extended_tail_0;
             let sell_tail_1 = wrapped.sell_extended_tail_1;
+            let sell_fee_tail_0 = wrapped.sell_extended_fee_tail_0;
+            let sell_fee_tail_1 = wrapped.sell_extended_fee_tail_1;
             let sell_layout_ready_from_refresh = wrapped.sell_layout_ready;
             let pump_amm_force_refresh_sell_diag = wrapped.force_refresh_sell_layout_diag;
             let accounts = wrapped.accounts;
@@ -8957,11 +9159,21 @@ async fn handle_ensure_pump_amm_pool_accounts(
             let (ext_flag_cache, ext_third_cache, ext_t0_cache, ext_t1_cache) = ctx
                 .live_pool_cache
                 .pump_amm_sell_extended_layout(&pool_address);
+            let (ext_fee_t0_cache, ext_fee_t1_cache) = ctx
+                .live_pool_cache
+                .pump_amm_sell_fee_tail_layout(&pool_address);
+            let ext_requires_fee_cache = ctx
+                .live_pool_cache
+                .pump_amm_sell_requires_fee_tail(&pool_address);
+            let refresh_requires_fee_tail = sell_fee_tail_0.is_some() && sell_fee_tail_1.is_some();
             let (
                 sell_flag_merged,
                 third_merged,
                 tail0_merged,
                 tail1_merged,
+                fee_tail0_merged,
+                fee_tail1_merged,
+                requires_fee_tail_merged,
                 sell_layout_ready,
                 dex_readiness,
             ) = pump_amm_sell_layout_state_for_ensure_publish(
@@ -8970,10 +9182,16 @@ async fn handle_ensure_pump_amm_pool_accounts(
                 ext_third_cache,
                 ext_t0_cache,
                 ext_t1_cache,
+                ext_fee_t0_cache,
+                ext_fee_t1_cache,
+                ext_requires_fee_cache,
                 sell_cashback_remaining,
                 sell_cashback_third,
                 sell_tail_0,
                 sell_tail_1,
+                sell_fee_tail_0,
+                sell_fee_tail_1,
+                refresh_requires_fee_tail,
                 sell_layout_ready_from_refresh,
             );
 
@@ -9031,6 +9249,9 @@ async fn handle_ensure_pump_amm_pool_accounts(
                     third_merged,
                     tail0_merged,
                     tail1_merged,
+                    fee_tail0_merged,
+                    fee_tail1_merged,
+                    requires_fee_tail_merged,
                 );
             } else {
                 ctx.live_pool_cache.merge_pump_amm_sell_extended_layout(
@@ -9039,6 +9260,9 @@ async fn handle_ensure_pump_amm_pool_accounts(
                     third_merged,
                     tail0_merged,
                     tail1_merged,
+                    fee_tail0_merged,
+                    fee_tail1_merged,
+                    requires_fee_tail_merged,
                 );
             }
             ctx.live_pool_cache
@@ -9079,6 +9303,12 @@ async fn handle_ensure_pump_amm_pool_accounts(
                         "true".to_string(),
                     );
                 }
+                if requires_fee_tail_merged {
+                    meta.insert(
+                        "pump_amm_sell_requires_fee_tail".to_string(),
+                        "true".to_string(),
+                    );
+                }
                 if let Some(pk) = third_merged {
                     meta.insert(
                         "pump_amm_sell_cashback_third_meta".to_string(),
@@ -9090,6 +9320,18 @@ async fn handle_ensure_pump_amm_pool_accounts(
                 }
                 if let Some(pk) = tail1_merged {
                     meta.insert("pump_amm_sell_extended_tail_1".to_string(), pk.to_string());
+                }
+                if let Some(pk) = fee_tail0_merged {
+                    meta.insert(
+                        "pump_amm_sell_extended_fee_tail_0".to_string(),
+                        pk.to_string(),
+                    );
+                }
+                if let Some(pk) = fee_tail1_merged {
+                    meta.insert(
+                        "pump_amm_sell_extended_fee_tail_1".to_string(),
+                        pk.to_string(),
+                    );
                 }
                 if let Some(creator) = creator_opt {
                     meta.insert("creator".to_string(), creator.to_string());
@@ -11141,11 +11383,15 @@ async fn handle_geyser_transaction(
         pool_address,
         mint: base_mint_pk,
         dex: DexType::PumpFunAmm,
+        is_buy,
         pool_accounts: Some(pool_accounts),
         pump_amm_sell_requires_cashback_remaining,
         pump_amm_sell_cashback_third_meta,
         pump_amm_sell_extended_tail_0,
         pump_amm_sell_extended_tail_1,
+        pump_amm_sell_extended_fee_tail_0,
+        pump_amm_sell_extended_fee_tail_1,
+        pump_amm_sell_requires_fee_tail,
         ..
     }) = parsed_event.as_ref()
     {
@@ -11156,12 +11402,16 @@ async fn handle_geyser_transaction(
                 pool_address: *pool_address,
                 base_mint_pk: *base_mint_pk,
                 slot: tx_update.slot,
+                is_buy: *is_buy,
                 pool_accounts: pool_accounts.clone(),
                 pump_amm_sell_requires_cashback_remaining:
                     *pump_amm_sell_requires_cashback_remaining,
                 pump_amm_sell_cashback_third_meta: *pump_amm_sell_cashback_third_meta,
                 pump_amm_sell_extended_tail_0: *pump_amm_sell_extended_tail_0,
                 pump_amm_sell_extended_tail_1: *pump_amm_sell_extended_tail_1,
+                pump_amm_sell_extended_fee_tail_0: *pump_amm_sell_extended_fee_tail_0,
+                pump_amm_sell_extended_fee_tail_1: *pump_amm_sell_extended_fee_tail_1,
+                pump_amm_sell_requires_fee_tail: *pump_amm_sell_requires_fee_tail,
                 tx_geyser_recv_at,
             },
         );
@@ -13137,7 +13387,7 @@ mod discovery_tests {
     #[test]
     fn test_pump_amm_trade_publish_extended_without_third_meta_is_partial() {
         let (sell_layout_ready, dex_readiness) =
-            pump_amm_sell_layout_publish_state(true, None, None, None, true);
+            pump_amm_sell_layout_publish_state(true, None, None, None, None, None, false, true);
         assert!(
             !sell_layout_ready,
             "extended SELL without authoritative third meta must not be marked ready"
@@ -13147,8 +13397,16 @@ mod discovery_tests {
 
     #[test]
     fn test_pump_amm_trade_publish_extended_with_third_only_missing_tail_is_partial() {
-        let (sell_layout_ready, dex_readiness) =
-            pump_amm_sell_layout_publish_state(true, Some(Pubkey::new_unique()), None, None, true);
+        let (sell_layout_ready, dex_readiness) = pump_amm_sell_layout_publish_state(
+            true,
+            Some(Pubkey::new_unique()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+        );
         assert!(
             !sell_layout_ready,
             "extended SELL with third but missing tail0/tail1 must not be marked ready"
@@ -13164,6 +13422,9 @@ mod discovery_tests {
             Some(Pubkey::new_unique()),
             Some(Pubkey::new_unique()),
             Some(Pubkey::new_unique()),
+            None,
+            None,
+            false,
             true,
         );
         assert!(
@@ -13183,6 +13444,9 @@ mod discovery_tests {
             effective_third_meta,
             effective_tail_0,
             effective_tail_1,
+            _effective_fee_tail_0,
+            _effective_fee_tail_1,
+            _effective_requires_fee_tail,
             sell_layout_ready,
             dex_readiness,
         ) = pump_amm_sell_layout_state_for_ensure_publish(
@@ -13191,10 +13455,16 @@ mod discovery_tests {
             Some(stale_third),
             Some(stale_t0),
             Some(stale_t1),
+            None,
+            None,
+            false,
             false,
             None,
             None,
             None,
+            None,
+            None,
+            false,
             true,
         );
         assert!(

@@ -769,6 +769,9 @@ pub async fn build_tx_plan(
         ) = cache
             .map(|c| c.pump_amm_sell_extended_layout(&pool_id))
             .unwrap_or((false, None, None, None));
+        let (sell_extended_fee_tail_0, sell_extended_fee_tail_1) = cache
+            .map(|c| c.pump_amm_sell_fee_tail_layout(&pool_id))
+            .unwrap_or((None, None));
 
         let mut pool_accounts_build_source = if accounts_len == 0 {
             "slave_livepoolcache"
@@ -926,6 +929,16 @@ pub async fn build_tx_plan(
             },
             if intent.side == TradeSide::Sell {
                 sell_extended_tail_1
+            } else {
+                None
+            },
+            if intent.side == TradeSide::Sell {
+                sell_extended_fee_tail_0
+            } else {
+                None
+            },
+            if intent.side == TradeSide::Sell {
+                sell_extended_fee_tail_1
             } else {
                 None
             },
@@ -1656,56 +1669,61 @@ async fn build_hop_pump_amm(
     cache: Option<&SharedLivePoolCache>,
 ) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
     // PumpSwap AMM (graduated tokens) - get pool_accounts from cache
-    let (pool_accounts, sell_requires, sell_third, sell_t0, sell_t1) = if let Some(cache) = cache {
-        match cache.get(pool_address) {
-            Some(CachedPoolState::PumpAmm(amm_state)) => {
-                let (sell_requires, sell_third, sell_t0, sell_t1) =
-                    cache.pump_amm_sell_extended_layout(pool_address);
-                if amm_state.pool_accounts.len() >= 14 {
-                    tracing::debug!(
-                        pool = %pool_address,
-                        accounts_len = amm_state.pool_accounts.len(),
-                        "multi-hop pump_amm: using cached pool_accounts"
-                    );
-                    (
-                        amm_state.pool_accounts.clone(),
-                        sell_requires,
-                        sell_third,
-                        sell_t0,
-                        sell_t1,
-                    )
-                } else {
+    let (pool_accounts, sell_requires, sell_third, sell_t0, sell_t1, sell_fee_t0, sell_fee_t1) =
+        if let Some(cache) = cache {
+            match cache.get(pool_address) {
+                Some(CachedPoolState::PumpAmm(amm_state)) => {
+                    let (sell_requires, sell_third, sell_t0, sell_t1) =
+                        cache.pump_amm_sell_extended_layout(pool_address);
+                    let (sell_fee_t0, sell_fee_t1) =
+                        cache.pump_amm_sell_fee_tail_layout(pool_address);
+                    if amm_state.pool_accounts.len() >= 14 {
+                        tracing::debug!(
+                            pool = %pool_address,
+                            accounts_len = amm_state.pool_accounts.len(),
+                            "multi-hop pump_amm: using cached pool_accounts"
+                        );
+                        (
+                            amm_state.pool_accounts.clone(),
+                            sell_requires,
+                            sell_third,
+                            sell_t0,
+                            sell_t1,
+                            sell_fee_t0,
+                            sell_fee_t1,
+                        )
+                    } else {
+                        return Err(UnsupportedTxPlan {
+                            reason: RejectReason::UnsupportedIntent,
+                            details: format!(
+                                "pump_amm: cached pool_accounts too short (got {}, need 14)",
+                                amm_state.pool_accounts.len()
+                            ),
+                        });
+                    }
+                }
+                Some(_) => {
                     return Err(UnsupportedTxPlan {
                         reason: RejectReason::UnsupportedIntent,
                         details: format!(
-                            "pump_amm: cached pool_accounts too short (got {}, need 14)",
-                            amm_state.pool_accounts.len()
+                            "pump_amm: cache hit but wrong DEX type for {}",
+                            pool_address
                         ),
                     });
                 }
+                None => {
+                    return Err(UnsupportedTxPlan {
+                        reason: RejectReason::UnsupportedIntent,
+                        details: format!("pump_amm: pool {} not in cache", pool_address),
+                    });
+                }
             }
-            Some(_) => {
-                return Err(UnsupportedTxPlan {
-                    reason: RejectReason::UnsupportedIntent,
-                    details: format!(
-                        "pump_amm: cache hit but wrong DEX type for {}",
-                        pool_address
-                    ),
-                });
-            }
-            None => {
-                return Err(UnsupportedTxPlan {
-                    reason: RejectReason::UnsupportedIntent,
-                    details: format!("pump_amm: pool {} not in cache", pool_address),
-                });
-            }
-        }
-    } else {
-        return Err(UnsupportedTxPlan {
-            reason: RejectReason::UnsupportedIntent,
-            details: "pump_amm: no cache available for multi-hop".to_string(),
-        });
-    };
+        } else {
+            return Err(UnsupportedTxPlan {
+                reason: RejectReason::UnsupportedIntent,
+                details: "pump_amm: no cache available for multi-hop".to_string(),
+            });
+        };
 
     // Use static method with pool_accounts from cache
     // Note: Multi-hop arb doesn't pass token_program yet; Token-2022 arb tokens are rare.
@@ -1723,6 +1741,8 @@ async fn build_hop_pump_amm(
         if is_sell_hop { sell_third } else { None },
         if is_sell_hop { sell_t0 } else { None },
         if is_sell_hop { sell_t1 } else { None },
+        if is_sell_hop { sell_fee_t0 } else { None },
+        if is_sell_hop { sell_fee_t1 } else { None },
     )
     .map_err(|e| UnsupportedTxPlan {
         reason: RejectReason::UnsupportedIntent,
@@ -2179,6 +2199,9 @@ mod tests {
             Some(third_meta),
             Some(tail0),
             Some(tail1),
+            None,
+            None,
+            false,
         );
 
         let mut intent = base_intent();
@@ -2269,6 +2292,9 @@ mod tests {
             Some(third_other),
             Some(t0_other),
             Some(t1_other),
+            None,
+            None,
+            false,
         );
 
         // Target pool: explicit JetStream Ready (force_refresh / PoolCacheUpdate path).
@@ -2293,6 +2319,9 @@ mod tests {
             Some(third_target),
             Some(t0_target),
             Some(t1_target),
+            None,
+            None,
+            false,
         );
 
         let mut intent = base_intent();
