@@ -5871,18 +5871,20 @@ impl MomentumContext {
                 .last_event_slot
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .max(1);
-            let exit_signal = {
+            let live_tpm = {
                 let trackers = self.token_trackers.read();
                 let live_trades_per_min = trackers
                     .values()
                     .filter(|t| t.mint == candidate.mint)
                     .map(|t| t.calculate_metrics(&config, chain_head_slot).trades_per_min)
                     .fold(0.0f64, f64::max);
-                let live_tpm = trackers
+                trackers
                     .values()
                     .any(|t| t.mint == candidate.mint)
-                    .then_some(live_trades_per_min);
+                    .then_some(live_trades_per_min)
+            };
 
+            let exit_signal = {
                 let mut positions = self.positions.write();
                 if let Some(pos) = positions.get_mut(&candidate.mint) {
                     pos.should_exit(
