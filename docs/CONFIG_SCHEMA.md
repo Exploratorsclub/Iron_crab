@@ -130,6 +130,20 @@ Component name: `momentum-bot`
 | `dump_recovery_min_net_inflow_lamports` | u64 | 1_000_000_000 | >= 0 | Minimum net SOL inflow for recovery |
 | `dump_recovery_min_recovery_secs` | u64 | 10 | > 0 | Minimum time after dump before allowing entry |
 
+### Filter 5: Price Trend / Downtrend Gate (pre-entry)
+
+Trade-implied `tokens_per_sol` from Geyser trades only (no RPC). Emits `WAIT_DOWNTREND` (soft wait).
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `price_trend_filter_enabled` | bool | true | true/false | Master switch |
+| `price_trend_window_secs` | u64 | 90 | >= 0 | Chain-slot trend window (`0` = off) |
+| `price_trend_min_trades` | u32 | 12 | >= 0 | Min trades with `slot > 0` in window |
+| `price_trend_min_tps_rise_pct` | f64 | 8.0 | >= 0 | Min tps rise (%) for lower-highs / slope |
+| `price_trend_max_drawdown_pct` | f64 | 25.0 | >= 0 | Drawdown from session trade-high (%) |
+| `price_trend_recovery_min_buy_dominance` | f64 | 0.60 | 0.0-1.0 | Recovery exception: min buy dominance |
+| `price_trend_recovery_min_inflow_lamports` | u64 | 500_000_000 | >= 0 | Recovery exception: min net inflow |
+
 ### Dev-Sell Re-Validation (pre-entry)
 
 | Key | Type | Default | Range | Description |
