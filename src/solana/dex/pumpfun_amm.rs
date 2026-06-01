@@ -2101,9 +2101,9 @@ impl PumpFunAmmDex {
         Pubkey::find_program_address(&[b"user_volume_accumulator", user.as_ref()], &program_id).0
     }
 
-    /// First two trailing `sell` metas when cashback/extended path is active (mainnet order).
-    /// The **third** meta is pool/context-specific and must be supplied from authoritative observation
-    /// (Geyser / TX-history); it is not user-derivable.
+    /// First two trailing `sell` metas (#21 user volume WSOL ATA, #22 user volume accumulator) when
+    /// cashback/extended path is active — **always** derived from `(user, quote_mint, quote_tp)`.
+    /// The **third** meta (#23 pool-v2 / context) is pool-specific and must come from Geyser / TX-history.
     pub fn pump_amm_sell_cashback_first_two_metas(
         user: Pubkey,
         quote_mint: Pubkey,
@@ -2116,6 +2116,51 @@ impl PumpFunAmmDex {
         let user_vol_wsol_ata =
             Self::derive_ata_with_program(user_vol, quote_mint, quote_token_program);
         (user_vol_wsol_ata, user_vol)
+    }
+
+    /// Append extended/cashback SELL trailing metas: #21/#22 always from [`Self::pump_amm_sell_cashback_first_two_metas`],
+    /// #23 `third`, optional #24/#25 fee pair from observation. Cached reference-trader volume tails are ignored.
+    #[allow(clippy::too_many_arguments)]
+    fn push_pump_amm_sell_extended_trailing_metas(
+        metas: &mut Vec<AccountMeta>,
+        user: Pubkey,
+        quote_mint: Pubkey,
+        quote_token_program: Pubkey,
+        third: Pubkey,
+        sell_extended_fee_tail_0: Option<Pubkey>,
+        sell_extended_fee_tail_1: Option<Pubkey>,
+        cached_observed_volume_tail_0: Option<Pubkey>,
+        cached_observed_volume_tail_1: Option<Pubkey>,
+    ) {
+        let (user_vol_wsol_ata, user_vol) =
+            Self::pump_amm_sell_cashback_first_two_metas(user, quote_mint, quote_token_program);
+        if let (Some(c0), Some(c1)) = (
+            cached_observed_volume_tail_0.filter(|p| *p != Pubkey::default()),
+            cached_observed_volume_tail_1.filter(|p| *p != Pubkey::default()),
+        ) {
+            if c0 != user_vol_wsol_ata || c1 != user_vol {
+                warn!(
+                    intent_user = %user,
+                    cached_tail_21 = %c0,
+                    cached_tail_22 = %c1,
+                    derived_tail_21 = %user_vol_wsol_ata,
+                    derived_tail_22 = %user_vol,
+                    sell_extended_tail_source = "derived_for_intent_user",
+                    cached_tail_mismatch = true,
+                    "pump_amm SELL: ignoring cached volume tail #21/#22 from reference trader; using intent-user derivation"
+                );
+            }
+        }
+        metas.push(AccountMeta::new(user_vol_wsol_ata, false));
+        metas.push(AccountMeta::new(user_vol, false));
+        metas.push(AccountMeta::new(third, false));
+        if let (Some(f0), Some(f1)) = (
+            sell_extended_fee_tail_0.filter(|p| *p != Pubkey::default()),
+            sell_extended_fee_tail_1.filter(|p| *p != Pubkey::default()),
+        ) {
+            metas.push(AccountMeta::new_readonly(f0, false));
+            metas.push(AccountMeta::new_readonly(f1, false));
+        }
     }
 
     async fn rpc_get_account_owner_and_executable(
@@ -5473,8 +5518,8 @@ impl Dex for PumpFunAmmDex {
                                                                             // `pools_by_base` can be stale vs monotonic LivePoolCache (Geyser); prefer DashMap for extended SELL.
             let mut sell_requires_cashback_remaining = pool.sell_requires_cashback_remaining;
             let mut sell_cashback_third_meta = pool.sell_cashback_third_meta;
-            let mut sell_extended_tail_0 = pool.sell_extended_tail_0;
-            let mut sell_extended_tail_1 = pool.sell_extended_tail_1;
+            let mut cached_observed_volume_tail_0 = pool.sell_extended_tail_0;
+            let mut cached_observed_volume_tail_1 = pool.sell_extended_tail_1;
             let mut sell_extended_fee_tail_0 = pool.sell_extended_fee_tail_0;
             let mut sell_extended_fee_tail_1 = pool.sell_extended_fee_tail_1;
             if let Some(ref cache) = self.live_pool_cache {
@@ -5485,8 +5530,8 @@ impl Dex for PumpFunAmmDex {
                 if dash_flag {
                     sell_requires_cashback_remaining = true;
                     sell_cashback_third_meta = dash_third.or(sell_cashback_third_meta);
-                    sell_extended_tail_0 = dash_t0.or(sell_extended_tail_0);
-                    sell_extended_tail_1 = dash_t1.or(sell_extended_tail_1);
+                    cached_observed_volume_tail_0 = dash_t0.or(cached_observed_volume_tail_0);
+                    cached_observed_volume_tail_1 = dash_t1.or(cached_observed_volume_tail_1);
                     sell_extended_fee_tail_0 = dash_fee_t0.or(sell_extended_fee_tail_0);
                     sell_extended_fee_tail_1 = dash_fee_t1.or(sell_extended_fee_tail_1);
                 }
@@ -5498,31 +5543,17 @@ impl Dex for PumpFunAmmDex {
                         "pump_amm SELL: extended layout required but sell_cashback_third_meta missing (authoritative observation required)"
                     ));
                 };
-                let use_observed_tail = sell_extended_tail_0
-                    .filter(|p| *p != Pubkey::default())
-                    .zip(sell_extended_tail_1.filter(|p| *p != Pubkey::default()));
-                if let Some((t0, t1)) = use_observed_tail {
-                    metas.push(AccountMeta::new_readonly(t0, false));
-                    metas.push(AccountMeta::new_readonly(t1, false));
-                    metas.push(AccountMeta::new(third, false));
-                } else {
-                    let (user_vol_wsol_ata, user_vol) =
-                        Self::pump_amm_sell_cashback_first_two_metas(
-                            user,
-                            pool.quote_mint,
-                            quote_token_program,
-                        );
-                    metas.push(AccountMeta::new(user_vol_wsol_ata, false));
-                    metas.push(AccountMeta::new(user_vol, false));
-                    metas.push(AccountMeta::new_readonly(third, false));
-                }
-                if let (Some(f0), Some(f1)) = (
-                    sell_extended_fee_tail_0.filter(|p| *p != Pubkey::default()),
-                    sell_extended_fee_tail_1.filter(|p| *p != Pubkey::default()),
-                ) {
-                    metas.push(AccountMeta::new_readonly(f0, false));
-                    metas.push(AccountMeta::new_readonly(f1, false));
-                }
+                Self::push_pump_amm_sell_extended_trailing_metas(
+                    &mut metas,
+                    user,
+                    pool.quote_mint,
+                    quote_token_program,
+                    third,
+                    sell_extended_fee_tail_0,
+                    sell_extended_fee_tail_1,
+                    cached_observed_volume_tail_0,
+                    cached_observed_volume_tail_1,
+                );
             }
         }
 
@@ -5602,8 +5633,8 @@ impl PumpFunAmmDex {
     }
 
     /// Same as [`Self::build_swap_ix_from_pool_accounts`] plus optional observed extended SELL
-    /// ix accounts #21/#22 (Scope 61). Cold-path / tx_builder only — not part of the stable
-    /// 9-arg public contract.
+    /// fee tail (#24/#25). `sell_extended_tail_0/1` are ignored for build (user volume metas
+    /// #21/#22 are always derived for `user`). Cold-path / tx_builder only.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_swap_ix_from_pool_accounts_with_extended_tail(
         input_mint: &str,
@@ -5807,27 +5838,17 @@ impl PumpFunAmmDex {
                         "pump_amm SELL: extended layout required but sell_cashback_third_meta missing (MASTER/Geyser observation required)"
                     ));
                 };
-                let use_observed_tail = sell_extended_tail_0
-                    .filter(|p| *p != Pubkey::default())
-                    .zip(sell_extended_tail_1.filter(|p| *p != Pubkey::default()));
-                if let Some((t0, t1)) = use_observed_tail {
-                    metas.push(AccountMeta::new_readonly(t0, false)); // 21
-                    metas.push(AccountMeta::new_readonly(t1, false)); // 22
-                    metas.push(AccountMeta::new(third, false)); // 23
-                } else {
-                    let (user_vol_wsol_ata, user_vol) =
-                        Self::pump_amm_sell_cashback_first_two_metas(user, quote_mint, quote_tp);
-                    metas.push(AccountMeta::new(user_vol_wsol_ata, false)); // 21
-                    metas.push(AccountMeta::new(user_vol, false)); // 22
-                    metas.push(AccountMeta::new_readonly(third, false)); // 23
-                }
-                if let (Some(f0), Some(f1)) = (
-                    sell_extended_fee_tail_0.filter(|p| *p != Pubkey::default()),
-                    sell_extended_fee_tail_1.filter(|p| *p != Pubkey::default()),
-                ) {
-                    metas.push(AccountMeta::new_readonly(f0, false)); // 24
-                    metas.push(AccountMeta::new_readonly(f1, false)); // 25
-                }
+                Self::push_pump_amm_sell_extended_trailing_metas(
+                    &mut metas,
+                    user,
+                    quote_mint,
+                    quote_tp,
+                    third,
+                    sell_extended_fee_tail_0,
+                    sell_extended_fee_tail_1,
+                    sell_extended_tail_0,
+                    sell_extended_tail_1,
+                );
             }
             metas
         };
@@ -6867,11 +6888,16 @@ mod tests {
             Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap()
         );
         assert_eq!(ixs[0].accounts[20].pubkey, fee_program);
-        assert_eq!(ixs[0].accounts[21].pubkey, ref_tail_0);
-        assert_eq!(ixs[0].accounts[22].pubkey, ref_tail_1);
+        let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let (derived_21, derived_22) =
+            PumpFunAmmDex::pump_amm_sell_cashback_first_two_metas(user, wsol, quote_tp);
+        assert_eq!(ixs[0].accounts[21].pubkey, derived_21);
+        assert_eq!(ixs[0].accounts[22].pubkey, derived_22);
+        assert_ne!(derived_21, ref_tail_0);
+        assert_ne!(derived_22, ref_tail_1);
         assert_eq!(ixs[0].accounts[23].pubkey, third_meta);
-        assert!(!ixs[0].accounts[21].is_writable);
-        assert!(!ixs[0].accounts[22].is_writable);
+        assert!(ixs[0].accounts[21].is_writable);
+        assert!(ixs[0].accounts[22].is_writable);
         assert!(ixs[0].accounts[23].is_writable);
     }
 
@@ -7086,6 +7112,56 @@ mod tests {
     #[test]
     fn pumpswap_sell_fee_config_scope58_custom3002_regression_guard() {
         pumpswap_extended_sell_uses_global_fee_config();
+    }
+
+    /// P184b: foreign reference volume tails in cache must not override intent-user #21/#22.
+    #[test]
+    fn pumpswap_extended_sell_ignores_foreign_cached_volume_tails_at_build() {
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let our_user = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let third_meta = Pubkey::new_unique();
+        let foreign_tail_0 = Pubkey::new_unique();
+        let foreign_tail_1 = Pubkey::new_unique();
+        let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let pool_accounts: Vec<Pubkey> = vec![
+            Pubkey::new_unique(),
+            Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap(),
+            base_mint,
+            wsol,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(),
+        ];
+        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
+            &base_mint.to_string(),
+            WSOL_MINT,
+            1,
+            1,
+            our_user,
+            &pool_accounts,
+            None,
+            true,
+            Some(third_meta),
+            Some(foreign_tail_0),
+            Some(foreign_tail_1),
+            None,
+            None,
+        )
+        .expect("extended SELL");
+        let (expected_21, expected_22) =
+            PumpFunAmmDex::pump_amm_sell_cashback_first_two_metas(our_user, wsol, quote_tp);
+        assert_eq!(ixs[0].accounts[21].pubkey, expected_21);
+        assert_eq!(ixs[0].accounts[22].pubkey, expected_22);
+        assert_ne!(expected_21, foreign_tail_0);
+        assert_ne!(expected_22, foreign_tail_1);
     }
 
     /// SELL path: Token-2022 base mint — ix[11] must be Token-2022 program; user base ATA (ix[5]) must match derivation.

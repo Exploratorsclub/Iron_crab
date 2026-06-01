@@ -101,9 +101,9 @@ pub enum ParsedDexEvent {
         pump_amm_sell_requires_cashback_remaining: bool,
         /// PumpSwap only: third trailing meta from the observed ix (ix #23; not user-derivable alone).
         pump_amm_sell_cashback_third_meta: Option<Pubkey>,
-        /// PumpSwap only: observed extended SELL ix account #21 (Scope 61).
+        /// PumpSwap only: observed reference-trader volume meta #21 (forensics only — not used at build).
         pump_amm_sell_extended_tail_0: Option<Pubkey>,
-        /// PumpSwap only: observed extended SELL ix account #22 (Scope 61).
+        /// PumpSwap only: observed reference-trader volume meta #22 (forensics only — not used at build).
         pump_amm_sell_extended_tail_1: Option<Pubkey>,
         /// PumpSwap only: observed cashback `sell` fee-recipient ix #24.
         pump_amm_sell_extended_fee_tail_0: Option<Pubkey>,
