@@ -137,12 +137,17 @@ Trade-implied `tokens_per_sol` from Geyser trades only (no RPC). Emits `WAIT_DOW
 | Key | Type | Default | Range | Description |
 |-----|------|---------|-------|-------------|
 | `price_trend_filter_enabled` | bool | true | true/false | Master switch |
-| `price_trend_window_secs` | u64 | 90 | >= 0 | Chain-slot trend window (`0` = off) |
-| `price_trend_min_trades` | u32 | 12 | >= 0 | Min trades with `slot > 0` in window |
+| `price_trend_window_secs` | u64 | 120 | >= 0 | Chain-slot trend window (`0` = off) |
+| `price_trend_min_trades` | u32 | 18 | >= 0 | Min trades with `slot > 0` in window |
 | `price_trend_min_tps_rise_pct` | f64 | 8.0 | >= 0 | Min tps rise (%) for lower-highs / slope |
 | `price_trend_max_drawdown_pct` | f64 | 25.0 | >= 0 | Drawdown from session trade-high (%) |
 | `price_trend_recovery_min_buy_dominance` | f64 | 0.60 | 0.0-1.0 | Recovery exception: min buy dominance |
 | `price_trend_recovery_min_inflow_lamports` | u64 | 500_000_000 | >= 0 | Recovery exception: min net inflow |
+| `price_trend_bucket_count` | u32 | 5 | 3–8 | Sub-buckets for lower-highs + recovery slope |
+| `price_trend_lower_highs_max_breaks` | u32 | 0 | >= 0 | Max monotonicity breaks in lower-highs chain |
+| `price_trend_recovery_min_positive_buckets` | u32 | 2 | >= 1 | Min consecutive late buckets with falling median_tps |
+| `price_trend_recovery_min_secs` | u64 | 15 | >= 0 | Min continuous recovery duration (chain slots) |
+| `price_trend_recovery_requires_no_lower_highs` | bool | true | true/false | Disable recovery when strict lower-highs matches |
 
 ### Dev-Sell Re-Validation (pre-entry)
 

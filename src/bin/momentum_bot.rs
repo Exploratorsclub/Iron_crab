@@ -496,6 +496,11 @@ struct MomentumConfig {
     price_trend_max_drawdown_pct: f64,
     price_trend_recovery_min_buy_dominance: f64,
     price_trend_recovery_min_inflow_lamports: u64,
+    price_trend_bucket_count: u32,
+    price_trend_lower_highs_max_breaks: u32,
+    price_trend_recovery_min_positive_buckets: u32,
+    price_trend_recovery_min_secs: u64,
+    price_trend_recovery_requires_no_lower_highs: bool,
 
     // === Exit Strategy ===
     /// Grace period (secs): normal hard stop suppressed; catastrophic threshold only.
@@ -599,12 +604,17 @@ impl Default for MomentumConfig {
 
             // Filter 5: Price Trend
             price_trend_filter_enabled: true,
-            price_trend_window_secs: 90,
-            price_trend_min_trades: 12,
+            price_trend_window_secs: 120,
+            price_trend_min_trades: 18,
             price_trend_min_tps_rise_pct: 8.0,
             price_trend_max_drawdown_pct: 25.0,
             price_trend_recovery_min_buy_dominance: 0.60,
             price_trend_recovery_min_inflow_lamports: 500_000_000,
+            price_trend_bucket_count: 5,
+            price_trend_lower_highs_max_breaks: 0,
+            price_trend_recovery_min_positive_buckets: 2,
+            price_trend_recovery_min_secs: 15,
+            price_trend_recovery_requires_no_lower_highs: true,
 
             // Exit Strategy
             hard_stop_min_hold_secs: 45,
@@ -674,6 +684,13 @@ impl MomentumConfig {
             price_trend_max_drawdown_pct: cfg.price_trend_max_drawdown_pct,
             price_trend_recovery_min_buy_dominance: cfg.price_trend_recovery_min_buy_dominance,
             price_trend_recovery_min_inflow_lamports: cfg.price_trend_recovery_min_inflow_lamports,
+            price_trend_bucket_count: cfg.price_trend_bucket_count,
+            price_trend_lower_highs_max_breaks: cfg.price_trend_lower_highs_max_breaks,
+            price_trend_recovery_min_positive_buckets: cfg
+                .price_trend_recovery_min_positive_buckets,
+            price_trend_recovery_min_secs: cfg.price_trend_recovery_min_secs,
+            price_trend_recovery_requires_no_lower_highs: cfg
+                .price_trend_recovery_requires_no_lower_highs,
             hard_stop_min_hold_secs: cfg.hard_stop_min_hold_secs,
             catastrophic_stop_loss_pct: cfg.catastrophic_stop_loss_pct,
             hard_stop_loss_pct: cfg.hard_stop_loss_pct,
@@ -778,6 +795,108 @@ fn tps_rise_pct(earlier: f64, later: f64) -> f64 {
         return 0.0;
     }
     (later / earlier - 1.0) * 100.0
+}
+
+fn clamp_price_trend_bucket_count(n: u32) -> usize {
+    n.clamp(3, 8) as usize
+}
+
+/// Bucket index: 0 = latest (late), `bucket_count - 1` = earliest (early).
+fn price_trend_bucket_index(age_slots: u64, window_slots: u64, bucket_count: usize) -> usize {
+    let bucket_span = (window_slots / bucket_count as u64).max(1);
+    usize::min(
+        (age_slots / bucket_span) as usize,
+        bucket_count.saturating_sub(1),
+    )
+}
+
+fn price_trend_local_best_per_bucket(bucket_tps: &[Vec<f64>]) -> Vec<Option<f64>> {
+    bucket_tps
+        .iter()
+        .map(|vals| vals.iter().copied().reduce(f64::min))
+        .collect()
+}
+
+fn price_trend_median_per_bucket(bucket_tps: &[Vec<f64>]) -> Vec<Option<f64>> {
+    bucket_tps
+        .iter()
+        .map(|vals| median_f64(vals.clone()))
+        .collect()
+}
+
+/// Lower-highs pair count from early (high index) toward late (index 0).
+fn price_trend_lower_highs_stats(local_best: &[Option<f64>]) -> (u32, u32) {
+    let n = local_best.len();
+    if n < 2 {
+        return (0, 0);
+    }
+    let total_pairs = (n - 1) as u32;
+    let mut satisfied = 0u32;
+    for i in (1..n).rev() {
+        if let (Some(older), Some(newer)) = (local_best[i], local_best[i - 1]) {
+            if older < newer {
+                satisfied = satisfied.saturating_add(1);
+            }
+        }
+    }
+    (satisfied, total_pairs)
+}
+
+fn price_trend_lower_highs_raw_match(local_best: &[Option<f64>]) -> bool {
+    let (satisfied, total) = price_trend_lower_highs_stats(local_best);
+    if total == 0 {
+        return false;
+    }
+    let n = local_best.len();
+    let (Some(early), Some(late)) = (local_best[n - 1], local_best[0]) else {
+        return false;
+    };
+    satisfied == total && early < late
+}
+
+fn price_trend_lower_highs_signal_match(
+    local_best: &[Option<f64>],
+    min_tps_rise_pct: f64,
+    max_breaks: u32,
+) -> Option<(f64, u32, u32)> {
+    let n = local_best.len();
+    if n < 2 {
+        return None;
+    }
+    let early = local_best[n - 1]?;
+    let late = local_best[0]?;
+    let rise = tps_rise_pct(early, late);
+    if rise < min_tps_rise_pct {
+        return None;
+    }
+    let (satisfied, total) = price_trend_lower_highs_stats(local_best);
+    let breaks = total.saturating_sub(satisfied);
+    if breaks > max_breaks {
+        return None;
+    }
+    Some((rise, satisfied, breaks))
+}
+
+/// Confirmed upward price move: falling median_tps across the latest `min_positive` bucket pairs.
+fn price_trend_recovery_slope_ok(medians: &[Option<f64>], min_positive: usize) -> bool {
+    if min_positive == 0 {
+        return true;
+    }
+    if min_positive >= medians.len() {
+        return false;
+    }
+    for k in 0..min_positive {
+        let Some(late) = medians[k] else {
+            return false;
+        };
+        let Some(older) = medians[k + 1] else {
+            return false;
+        };
+        if late >= older {
+            return false;
+        }
+    }
+    true
 }
 
 /// Chain-slot-window trades/min (same formula as [`TokenTracker::calculate_metrics`]).
@@ -1872,6 +1991,8 @@ struct TokenTracker {
     // Dump-recovery gating (pre-entry), chain-time aware (slot / head slot)
     dump_observed_slot: Option<u64>,
     recovery_started_slot: Option<u64>,
+    /// Chain slot when price-trend recovery (flow + slope) first satisfied (Filter 5).
+    price_trend_recovery_since_slot: Option<u64>,
 
     /// Explicit lifecycle state (replaces probe_sent_at, probe_filled_at, etc.)
     state: TrackerState,
@@ -1924,6 +2045,7 @@ impl TokenTracker {
             max_trade_slot: 0,
             dump_observed_slot: None,
             recovery_started_slot: None,
+            price_trend_recovery_since_slot: None,
             state: TrackerState::Discovery,
             blacklist_reason: None,
             last_trade_at: None,
@@ -2034,7 +2156,11 @@ impl TokenTracker {
     }
 
     /// Filter 5: trade-implied downtrend gate (Geyser trades only, I-7).
-    fn price_trend_wait_reason(&self, config: &MomentumConfig, head_slot: u64) -> Option<String> {
+    fn price_trend_wait_reason(
+        &mut self,
+        config: &MomentumConfig,
+        head_slot: u64,
+    ) -> Option<String> {
         if !config.price_trend_filter_enabled || config.price_trend_window_secs == 0 {
             return None;
         }
@@ -2045,13 +2171,11 @@ impl TokenTracker {
         }
 
         let hs = self.chain_head_for_filters(head_slot);
-        let third = (window_slots / 3).max(1);
+        let bucket_count = clamp_price_trend_bucket_count(config.price_trend_bucket_count);
         let half = (window_slots / 2).max(1);
 
         let mut samples: u32 = 0;
-        let mut early_tps: Vec<f64> = Vec::new();
-        let mut mid_tps: Vec<f64> = Vec::new();
-        let mut late_tps: Vec<f64> = Vec::new();
+        let mut bucket_tps: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
         let mut early_half_tps: Vec<f64> = Vec::new();
         let mut late_half_tps: Vec<f64> = Vec::new();
         let mut buy_count: u32 = 0;
@@ -2079,18 +2203,11 @@ impl TokenTracker {
                 sell_vol = sell_vol.saturating_add(t.sol_amount);
             }
 
-            if age <= third {
-                late_tps.push(tps);
+            let bucket_idx = price_trend_bucket_index(age, window_slots, bucket_count);
+            bucket_tps[bucket_idx].push(tps);
+            if age <= half {
                 late_half_tps.push(tps);
-            } else if age <= third.saturating_mul(2) {
-                mid_tps.push(tps);
-                if age <= half {
-                    late_half_tps.push(tps);
-                } else {
-                    early_half_tps.push(tps);
-                }
             } else {
-                early_tps.push(tps);
                 early_half_tps.push(tps);
             }
         }
@@ -2100,21 +2217,28 @@ impl TokenTracker {
         }
 
         let window_secs = config.price_trend_window_secs;
+        let local_best = price_trend_local_best_per_bucket(&bucket_tps);
+        let bucket_medians = price_trend_median_per_bucket(&bucket_tps);
 
-        // Signal A: lower highs (structural downtrend)
-        if let (Some(eb), Some(mb), Some(lb)) = (
-            early_tps.iter().copied().reduce(f64::min),
-            mid_tps.iter().copied().reduce(f64::min),
-            late_tps.iter().copied().reduce(f64::min),
+        // Signal A: multi-bucket lower highs (no recovery exception)
+        if let Some((rise, _satisfied, breaks)) = price_trend_lower_highs_signal_match(
+            &local_best,
+            config.price_trend_min_tps_rise_pct,
+            config.price_trend_lower_highs_max_breaks,
         ) {
-            if eb < mb && mb < lb {
-                let rise = tps_rise_pct(eb, lb);
-                if rise >= config.price_trend_min_tps_rise_pct {
-                    return Some(format!(
-                        "WAIT_DOWNTREND: lower_highs early={eb:.3e} mid={mb:.3e} late={lb:.3e} (+{rise:.1}% tps rise, window={window_secs}s, trades={samples})"
-                    ));
-                }
-            }
+            let bucket_vals: Vec<String> = local_best
+                .iter()
+                .rev()
+                .map(|v| match v {
+                    Some(x) => format!("{x:.3e}"),
+                    None => "-".to_string(),
+                })
+                .collect();
+            let (_, total_pairs) = price_trend_lower_highs_stats(&local_best);
+            return Some(format!(
+                "WAIT_DOWNTREND: lower_highs buckets=[{}] breaks={breaks}/{total_pairs} (+{rise:.1}% tps rise, window={window_secs}s, trades={samples})",
+                bucket_vals.join(",")
+            ));
         }
 
         // Signal B: drawdown from session trade-high + falling short slope
@@ -2148,16 +2272,48 @@ impl TokenTracker {
         };
         let net_inflow = buy_vol as i128 - sell_vol as i128;
 
-        let recovery_ok = net_inflow >= config.price_trend_recovery_min_inflow_lamports as i128
-            && buy_dominance >= config.price_trend_recovery_min_buy_dominance
-            && short_slope_tps_rise < 0.0;
+        let flow_ok = net_inflow >= config.price_trend_recovery_min_inflow_lamports as i128
+            && buy_dominance >= config.price_trend_recovery_min_buy_dominance;
+        let min_positive = config
+            .price_trend_recovery_min_positive_buckets
+            .min(bucket_count as u32) as usize;
+        let slope_ok = price_trend_recovery_slope_ok(&bucket_medians, min_positive);
+        let lower_highs_blocks_recovery = config.price_trend_recovery_requires_no_lower_highs
+            && price_trend_lower_highs_raw_match(&local_best);
+        let instant_recovery = flow_ok && slope_ok && !lower_highs_blocks_recovery;
+
+        if instant_recovery {
+            self.price_trend_recovery_since_slot.get_or_insert(hs);
+        } else {
+            self.price_trend_recovery_since_slot = None;
+        }
+
+        let recovery_min_slots = momentum_secs_to_slot_span(config.price_trend_recovery_min_secs);
+        let duration_ok = self
+            .price_trend_recovery_since_slot
+            .is_some_and(|rs| hs.saturating_sub(rs) >= recovery_min_slots);
+        let recovery_ok = instant_recovery && duration_ok;
 
         if drawdown_pct >= config.price_trend_max_drawdown_pct
             && short_slope_tps_rise >= config.price_trend_min_tps_rise_pct
             && !recovery_ok
         {
+            let recovery_detail = if !flow_ok || !slope_ok {
+                "flow/slope not confirmed".to_string()
+            } else if lower_highs_blocks_recovery {
+                "blocked by lower_highs structure".to_string()
+            } else if !duration_ok {
+                format!(
+                    "recovery stabilizing ({} / {} slots, ~{}s)",
+                    hs.saturating_sub(self.price_trend_recovery_since_slot.unwrap_or(hs)),
+                    recovery_min_slots,
+                    config.price_trend_recovery_min_secs
+                )
+            } else {
+                "recovery not confirmed".to_string()
+            };
             return Some(format!(
-                "WAIT_DOWNTREND: drawdown={drawdown_pct:.1}% from session_high, slope=+{short_slope_tps_rise:.1}% tps (recovery not confirmed, dom={:.0}%, inflow={:.2} SOL)",
+                "WAIT_DOWNTREND: drawdown={drawdown_pct:.1}% from session_high, slope=+{short_slope_tps_rise:.1}% tps ({recovery_detail}, dom={:.0}%, inflow={:.2} SOL)",
                 buy_dominance * 100.0,
                 net_inflow as f64 / 1_000_000_000.0
             ));
@@ -7810,6 +7966,136 @@ impl MomentumContext {
                         }
                     } else {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+
+                // === Filter 5: Price Trend / Downtrend ===
+                "price_trend_filter_enabled" => {
+                    if let Some(v) = value.as_bool() {
+                        config.price_trend_filter_enabled = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "price_trend_window_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        config.price_trend_window_secs = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "price_trend_min_trades" => {
+                    if let Some(v) = value.as_u64() {
+                        config.price_trend_min_trades = v as u32;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "price_trend_min_tps_rise_pct" => {
+                    if let Some(v) = value.as_f64() {
+                        if v >= 0.0 {
+                            config.price_trend_min_tps_rise_pct = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be >= 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "price_trend_max_drawdown_pct" => {
+                    if let Some(v) = value.as_f64() {
+                        if v >= 0.0 {
+                            config.price_trend_max_drawdown_pct = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be >= 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "price_trend_recovery_min_buy_dominance" => {
+                    if let Some(v) = value.as_f64() {
+                        if (0.0..=1.0).contains(&v) {
+                            config.price_trend_recovery_min_buy_dominance = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be in [0.0, 1.0]".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "price_trend_recovery_min_inflow_lamports" => {
+                    if let Some(v) = value.as_u64() {
+                        config.price_trend_recovery_min_inflow_lamports = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "price_trend_bucket_count" => {
+                    if let Some(v) = value.as_u64() {
+                        if (3..=8).contains(&v) {
+                            config.price_trend_bucket_count = v as u32;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be in [3, 8]".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "price_trend_lower_highs_max_breaks" => {
+                    if let Some(v) = value.as_u64() {
+                        config.price_trend_lower_highs_max_breaks = v as u32;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "price_trend_recovery_min_positive_buckets" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.price_trend_recovery_min_positive_buckets = v as u32;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "price_trend_recovery_min_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        config.price_trend_recovery_min_secs = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "price_trend_recovery_requires_no_lower_highs" => {
+                    if let Some(v) = value.as_bool() {
+                        config.price_trend_recovery_requires_no_lower_highs = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
                     }
                 }
 
@@ -14336,13 +14622,45 @@ mod tests {
     fn downtrend_filter_test_cfg() -> MomentumConfig {
         let mut cfg = relaxed_entry_gates_helper_cfg();
         cfg.price_trend_filter_enabled = true;
-        cfg.price_trend_window_secs = 90;
-        cfg.price_trend_min_trades = 12;
+        cfg.price_trend_window_secs = 120;
+        cfg.price_trend_min_trades = 18;
         cfg.price_trend_min_tps_rise_pct = 8.0;
         cfg.price_trend_max_drawdown_pct = 25.0;
         cfg.price_trend_recovery_min_buy_dominance = 0.60;
         cfg.price_trend_recovery_min_inflow_lamports = 500_000_000;
+        cfg.price_trend_bucket_count = 5;
+        cfg.price_trend_lower_highs_max_breaks = 0;
+        cfg.price_trend_recovery_min_positive_buckets = 2;
+        cfg.price_trend_recovery_min_secs = 15;
+        cfg.price_trend_recovery_requires_no_lower_highs = true;
         cfg
+    }
+
+    fn record_trades_in_price_trend_bucket(
+        tracker: &mut TokenTracker,
+        cfg: &MomentumConfig,
+        head: u64,
+        bucket_idx: usize,
+        tps: f64,
+        count: u32,
+        is_buy: bool,
+        label: &str,
+    ) {
+        let window_slots = momentum_secs_to_slot_span(cfg.price_trend_window_secs);
+        let bucket_count = clamp_price_trend_bucket_count(cfg.price_trend_bucket_count);
+        let bucket_span = (window_slots / bucket_count as u64).max(1);
+        let age = bucket_idx as u64 * bucket_span + bucket_span / 2;
+        let base_slot = head.saturating_sub(age);
+        for i in 0..count {
+            record_trade_implied_tps(
+                tracker,
+                cfg,
+                base_slot + u64::from(i),
+                tps,
+                is_buy,
+                &format!("{label}_{bucket_idx}_{i}"),
+            );
+        }
     }
 
     fn record_trade_implied_tps(
@@ -14367,24 +14685,23 @@ mod tests {
     }
 
     #[test]
-    fn downtrend_lower_highs_blocks_entry() {
+    fn downtrend_multi_bucket_lower_highs_blocks() {
         let cfg = downtrend_filter_test_cfg();
         let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 10_000_000_000);
         let head = 1_000u64;
-        let window_slots = momentum_secs_to_slot_span(cfg.price_trend_window_secs);
-        let third = (window_slots / 3).max(1);
-
-        for i in 0..4u64 {
-            let slot = head.saturating_sub(third.saturating_mul(2) + 10 + i);
-            record_trade_implied_tps(&mut tracker, &cfg, slot, 100.0, true, &format!("e{i}"));
-        }
-        for i in 0..4u64 {
-            let slot = head.saturating_sub(third + 10 + i);
-            record_trade_implied_tps(&mut tracker, &cfg, slot, 110.0, true, &format!("m{i}"));
-        }
-        for i in 0..4u64 {
-            let slot = head.saturating_sub(i);
-            record_trade_implied_tps(&mut tracker, &cfg, slot, 120.0, true, &format!("l{i}"));
+        // bucket 0 = late (higher tps); bucket 4 = early (lower tps) → lower highs in price
+        let rising_tps_late_to_early = [120.0, 115.0, 110.0, 105.0, 100.0];
+        for (bucket_idx, tps) in rising_tps_late_to_early.iter().enumerate() {
+            record_trades_in_price_trend_bucket(
+                &mut tracker,
+                &cfg,
+                head,
+                bucket_idx,
+                *tps,
+                4,
+                true,
+                "lh",
+            );
         }
 
         let (should_trade, reason) =
@@ -14392,6 +14709,12 @@ mod tests {
         assert!(!should_trade, "expected WAIT_DOWNTREND, got: {reason}");
         assert!(reason.contains("WAIT_DOWNTREND"));
         assert!(reason.contains("lower_highs"));
+        assert!(reason.contains("breaks=0/"));
+    }
+
+    #[test]
+    fn downtrend_lower_highs_blocks_entry() {
+        downtrend_multi_bucket_lower_highs_blocks();
     }
 
     #[test]
@@ -14402,13 +14725,17 @@ mod tests {
         let window_slots = momentum_secs_to_slot_span(cfg.price_trend_window_secs);
         let half = (window_slots / 2).max(1);
 
-        for i in 0..6u64 {
-            let slot = head.saturating_sub(half + 20 + i);
-            record_trade_implied_tps(&mut tracker, &cfg, slot, 80.0, true, &format!("old{i}"));
+        for i in 0..10u64 {
+            let slot = head.saturating_sub(window_slots - 10 + i);
+            record_trade_implied_tps(&mut tracker, &cfg, slot, 70.0, true, &format!("ath{i}"));
         }
-        for i in 0..6u64 {
+        for i in 0..10u64 {
+            let slot = head.saturating_sub(half + 20 + i);
+            record_trade_implied_tps(&mut tracker, &cfg, slot, 130.0, false, &format!("fall{i}"));
+        }
+        for i in 0..10u64 {
             let slot = head.saturating_sub(5 + i);
-            record_trade_implied_tps(&mut tracker, &cfg, slot, 130.0, false, &format!("new{i}"));
+            record_trade_implied_tps(&mut tracker, &cfg, slot, 125.0, false, &format!("late{i}"));
         }
 
         let (should_trade, reason) =
@@ -14420,32 +14747,61 @@ mod tests {
 
     #[test]
     fn downtrend_recovery_exception_allows() {
-        let cfg = downtrend_filter_test_cfg();
+        let mut cfg = downtrend_filter_test_cfg();
+        cfg.price_trend_min_trades = 5;
+        cfg.price_trend_recovery_min_secs = 10;
+        cfg.price_trend_max_drawdown_pct = 5.0;
+        cfg.price_trend_min_tps_rise_pct = 1.0;
+        cfg.price_trend_recovery_requires_no_lower_highs = false;
+        cfg.price_trend_recovery_min_inflow_lamports = 100;
         let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 10_000_000_000);
         let head = 3_000u64;
-        let window_slots = momentum_secs_to_slot_span(cfg.price_trend_window_secs);
-        let half = (window_slots / 2).max(1);
+        let half = (momentum_secs_to_slot_span(cfg.price_trend_window_secs) / 2).max(1);
 
-        for i in 0..4u64 {
-            let slot = head.saturating_sub(window_slots.saturating_sub(10) + i);
-            record_trade_implied_tps(&mut tracker, &cfg, slot, 80.0, true, &format!("best{i}"));
+        for i in 0..8u64 {
+            record_trade_implied_tps(
+                &mut tracker,
+                &cfg,
+                head.saturating_sub(half + 80 + i),
+                80.0,
+                true,
+                &format!("early{i}"),
+            );
         }
-        for i in 0..6u64 {
-            let slot = head.saturating_sub(half + 20 + i);
-            record_trade_implied_tps(&mut tracker, &cfg, slot, 130.0, false, &format!("fall{i}"));
+        for i in 0..10u64 {
+            record_trade_implied_tps(
+                &mut tracker,
+                &cfg,
+                head.saturating_sub(20 + i),
+                135.0,
+                false,
+                &format!("fall{i}"),
+            );
         }
-        for i in 0..6u64 {
-            let slot = head.saturating_sub(5 + i);
-            record_trade_implied_tps(&mut tracker, &cfg, slot, 95.0, true, &format!("rec{i}"));
-        }
-        record_trade_implied_tps(&mut tracker, &cfg, head, 110.0, true, "cur");
-
-        let (should_trade, reason) =
-            tracker.should_generate_intent(&cfg, None, head, Instant::now());
-        assert!(
-            should_trade,
-            "recovery should bypass drawdown+slope block: {reason}"
+        record_trades_in_price_trend_bucket(&mut tracker, &cfg, head, 2, 128.0, 6, false, "dump_b");
+        record_trades_in_price_trend_bucket(&mut tracker, &cfg, head, 1, 120.0, 6, true, "rec_mid");
+        record_trades_in_price_trend_bucket(
+            &mut tracker,
+            &cfg,
+            head,
+            0,
+            110.0,
+            6,
+            true,
+            "rec_late",
         );
+
+        let wait = tracker.price_trend_wait_reason(&cfg, head);
+        assert!(
+            wait.is_some(),
+            "recovery must not bypass before min_secs: {wait:?}"
+        );
+        assert!(
+            wait.as_deref().unwrap().contains("stabilizing")
+                || wait.as_deref().unwrap().contains("drawdown"),
+            "unexpected wait: {wait:?}"
+        );
+        // Confirmed recovery after min_secs: see `downtrend_recovery_requires_min_secs`.
     }
 
     #[test]
@@ -14453,20 +14809,19 @@ mod tests {
         let cfg = downtrend_filter_test_cfg();
         let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 10_000_000_000);
         let head = 4_000u64;
-        let window_slots = momentum_secs_to_slot_span(cfg.price_trend_window_secs);
-        let third = (window_slots / 3).max(1);
-
-        for i in 0..4u64 {
-            let slot = head.saturating_sub(third.saturating_mul(2) + 10 + i);
-            record_trade_implied_tps(&mut tracker, &cfg, slot, 120.0, true, &format!("e{i}"));
-        }
-        for i in 0..4u64 {
-            let slot = head.saturating_sub(third + 10 + i);
-            record_trade_implied_tps(&mut tracker, &cfg, slot, 110.0, true, &format!("m{i}"));
-        }
-        for i in 0..4u64 {
-            let slot = head.saturating_sub(i);
-            record_trade_implied_tps(&mut tracker, &cfg, slot, 100.0, true, &format!("l{i}"));
+        // bucket 0 = late (lower tps); bucket 4 = early (higher tps) → rising price, no lower highs
+        let falling_tps_late_to_early = [100.0, 105.0, 110.0, 115.0, 120.0];
+        for (bucket_idx, tps) in falling_tps_late_to_early.iter().enumerate() {
+            record_trades_in_price_trend_bucket(
+                &mut tracker,
+                &cfg,
+                head,
+                bucket_idx,
+                *tps,
+                4,
+                true,
+                "pump",
+            );
         }
 
         let (should_trade, reason) =
@@ -14475,6 +14830,192 @@ mod tests {
             should_trade,
             "rising price should pass downtrend gate: {reason}"
         );
+    }
+
+    #[test]
+    fn downtrend_bounce_breaks_strict_lower_highs_but_blocks_with_max_breaks_zero() {
+        let cfg = downtrend_filter_test_cfg();
+        let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 10_000_000_000);
+        let head = 4_500u64;
+        let window_slots = momentum_secs_to_slot_span(cfg.price_trend_window_secs);
+        let half = (window_slots / 2).max(1);
+
+        // 4/4 lower-high pairs monotonic; bucket-0 bounce breaks only the last pair (max_breaks=0).
+        let bucket_tps = [118.0, 124.0, 116.0, 108.0, 100.0];
+        for (bucket_idx, tps) in bucket_tps.iter().enumerate() {
+            record_trades_in_price_trend_bucket(
+                &mut tracker,
+                &cfg,
+                head,
+                bucket_idx,
+                *tps,
+                4,
+                true,
+                "lh",
+            );
+        }
+        record_trades_in_price_trend_bucket(&mut tracker, &cfg, head, 4, 50.0, 6, true, "ath");
+        // Late-window dump keeps short_slope positive (price still falling vs early half).
+        for i in 0..8u64 {
+            let slot = head.saturating_sub(half + 5 + i);
+            record_trade_implied_tps(&mut tracker, &cfg, slot, 135.0, false, &format!("dump{i}"));
+        }
+
+        let (should_trade, reason) =
+            tracker.should_generate_intent(&cfg, None, head, Instant::now());
+        assert!(!should_trade, "FODL-like bounce must not enter: {reason}");
+        assert!(reason.contains("WAIT_DOWNTREND"));
+    }
+
+    #[test]
+    fn downtrend_recovery_requires_two_positive_buckets() {
+        let medians_one_step = [Some(120.0), Some(130.0), None, None, None];
+        assert!(!price_trend_recovery_slope_ok(&medians_one_step, 2));
+        let medians_two_steps = [Some(115.0), Some(125.0), Some(135.0), None, None];
+        assert!(price_trend_recovery_slope_ok(&medians_two_steps, 2));
+    }
+
+    #[test]
+    fn downtrend_recovery_requires_min_secs() {
+        let mut cfg = downtrend_filter_test_cfg();
+        cfg.price_trend_min_trades = 5;
+        cfg.price_trend_recovery_min_secs = 15;
+        cfg.price_trend_max_drawdown_pct = 5.0;
+        cfg.price_trend_min_tps_rise_pct = 1.0;
+        cfg.price_trend_recovery_requires_no_lower_highs = false;
+        cfg.price_trend_recovery_min_inflow_lamports = 100;
+        let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 10_000_000_000);
+        let head = 6_000u64;
+        let half = (momentum_secs_to_slot_span(cfg.price_trend_window_secs) / 2).max(1);
+
+        for i in 0..8u64 {
+            record_trade_implied_tps(
+                &mut tracker,
+                &cfg,
+                head.saturating_sub(half + 80 + i),
+                70.0,
+                true,
+                &format!("early{i}"),
+            );
+        }
+        for i in 0..8u64 {
+            record_trade_implied_tps(
+                &mut tracker,
+                &cfg,
+                head.saturating_sub(half + 20 + i),
+                140.0,
+                false,
+                &format!("dump{i}"),
+            );
+        }
+        record_trades_in_price_trend_bucket(&mut tracker, &cfg, head, 0, 115.0, 6, true, "r0");
+        record_trades_in_price_trend_bucket(&mut tracker, &cfg, head, 1, 125.0, 6, true, "r1");
+
+        let wait = tracker.price_trend_wait_reason(&cfg, head);
+        assert!(wait.is_some(), "expected wait before min recovery secs");
+        assert!(
+            wait.as_deref().unwrap().contains("stabilizing")
+                || wait.as_deref().unwrap().contains("drawdown"),
+            "unexpected: {wait:?}"
+        );
+
+        let recovery_slots = momentum_secs_to_slot_span(cfg.price_trend_recovery_min_secs);
+        let head_after = head + recovery_slots + 5;
+        record_trades_in_price_trend_bucket(
+            &mut tracker,
+            &cfg,
+            head_after,
+            0,
+            115.0,
+            6,
+            true,
+            "r0b",
+        );
+        record_trades_in_price_trend_bucket(
+            &mut tracker,
+            &cfg,
+            head_after,
+            1,
+            125.0,
+            6,
+            true,
+            "r1b",
+        );
+        let wait_after = tracker.price_trend_wait_reason(&cfg, head_after);
+        assert!(
+            wait_after.is_none(),
+            "recovery should be confirmed after min_secs: {wait_after:?}"
+        );
+    }
+
+    #[test]
+    fn downtrend_recovery_blocked_when_lower_highs_raw_match() {
+        let mut cfg = downtrend_filter_test_cfg();
+        cfg.price_trend_recovery_min_secs = 0;
+        cfg.price_trend_recovery_requires_no_lower_highs = true;
+        let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 10_000_000_000);
+        let head = 6_500u64;
+        let rising_tps_late_to_early = [132.0, 124.0, 116.0, 108.0, 100.0];
+        for (bucket_idx, tps) in rising_tps_late_to_early.iter().enumerate() {
+            record_trades_in_price_trend_bucket(
+                &mut tracker,
+                &cfg,
+                head,
+                bucket_idx,
+                *tps,
+                4,
+                true,
+                "struct",
+            );
+        }
+        let (should_trade, reason) =
+            tracker.should_generate_intent(&cfg, None, head, Instant::now());
+        assert!(
+            !should_trade,
+            "recovery must be blocked by lower_highs: {reason}"
+        );
+        assert!(
+            reason.contains("lower_highs"),
+            "unexpected reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn downtrend_fodl_bounce_scenario_blocks_entry() {
+        let mut cfg = downtrend_filter_test_cfg();
+        cfg.price_trend_recovery_min_buy_dominance = 0.65;
+        cfg.price_trend_recovery_min_inflow_lamports = 1_500_000_000;
+        let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 10_000_000_000);
+        let head = 7_000u64;
+        let window_slots = momentum_secs_to_slot_span(cfg.price_trend_window_secs);
+        let half = (window_slots / 2).max(1);
+
+        // Structural lower highs across 5 buckets (pump → dump), late bounce cannot recover.
+        let rising_tps_late_to_early = [122.0, 118.0, 112.0, 105.0, 95.0];
+        for (bucket_idx, tps) in rising_tps_late_to_early.iter().enumerate() {
+            record_trades_in_price_trend_bucket(
+                &mut tracker,
+                &cfg,
+                head,
+                bucket_idx,
+                *tps,
+                4,
+                true,
+                "fodl",
+            );
+        }
+        for i in 0..8u64 {
+            let slot = head.saturating_sub(half + 5 + i);
+            record_trade_implied_tps(&mut tracker, &cfg, slot, 128.0, true, &format!("bounce{i}"));
+        }
+
+        let (should_trade, reason) =
+            tracker.should_generate_intent(&cfg, None, head, Instant::now());
+        assert!(
+            !should_trade,
+            "FODL 2nd-bounce profile must WAIT_DOWNTREND: {reason}"
+        );
+        assert!(reason.contains("WAIT_DOWNTREND"));
     }
 
     #[test]
