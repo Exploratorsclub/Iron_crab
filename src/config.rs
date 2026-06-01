@@ -761,6 +761,11 @@ pub struct MomentumCfg {
     #[serde(default = "default_lp_removal_window")]
     pub lp_removal_window_secs: u64,
 
+    // === Filter 1c: Token Age (pre-entry) ===
+    /// Minimum token age since discovery before probe/scale-in entry (seconds). Default: 60s. `0` = disabled.
+    #[serde(default = "default_min_token_age_secs")]
+    pub min_token_age_secs: u64,
+
     // === Filter 2: Buyer Velocity ===
     /// Min unique buyers in early window. Default: 3 (was 10, too strict)
     #[serde(default = "default_min_unique_buyers")]
@@ -967,6 +972,9 @@ fn default_max_dev_supply_pct() -> f64 {
 fn default_lp_removal_window() -> u64 {
     60
 }
+fn default_min_token_age_secs() -> u64 {
+    60
+}
 fn default_min_unique_buyers() -> u32 {
     3
 } // Relaxed from 10
@@ -1113,6 +1121,7 @@ impl Default for MomentumCfg {
             scale_in_min_probe_executable_pnl_pct: default_scale_in_min_probe_executable_pnl_pct(),
             max_dev_supply_pct: default_max_dev_supply_pct(),
             lp_removal_window_secs: default_lp_removal_window(),
+            min_token_age_secs: default_min_token_age_secs(),
             min_unique_buyers: default_min_unique_buyers(),
             buyer_window_secs: default_buyer_window(),
             min_trades_per_min: default_min_trades_per_min(),

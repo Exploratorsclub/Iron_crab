@@ -158,6 +158,8 @@ const CONFIG_DESCRIPTIONS: Record<string, Record<string, string>> = {
     // Filter 1: Liquidity
     max_dev_supply_pct: 'FILTER 1: Max dev supply percentage (0-100)',
     lp_removal_window_secs: 'FILTER 1: Track LP removals for N seconds',
+    min_token_age_secs:
+      'FILTER 1c: Min seconds since discovery before probe/scale-in (0=disabled, default 60)',
     
     // Filter 2: Buyer Velocity
     min_unique_buyers: 'FILTER 2: Min unique buyers in window',
@@ -312,6 +314,7 @@ const CONFIG_GROUPS: Record<string, Record<string, string[]>> = {
     'Filter 1: Liquidity': [
       'max_dev_supply_pct',
       'lp_removal_window_secs',
+      'min_token_age_secs',
     ],
     'Filter 2: Buyer Velocity': [
       'min_unique_buyers',
@@ -460,6 +463,7 @@ const DEFAULT_CONFIGS: Record<string, ComponentConfig> = {
     // Filter 1: Liquidity
     max_dev_supply_pct: 95.0,
     lp_removal_window_secs: 60,
+    min_token_age_secs: 60,
     
     // Filter 2: Buyer Velocity
     min_unique_buyers: 3,

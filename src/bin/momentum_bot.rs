@@ -64,10 +64,10 @@ use ironcrab::metrics::{
     try_record_momentum_publish_to_intent_ms, wall_clock_unix_ms_now, MetricsComponent,
     EXITS_GENERATED_TOTAL, FILTER_PASSED_TOTAL, FILTER_REJECTED_BUYER_QUALITY,
     FILTER_REJECTED_DEV_BEHAVIOR, FILTER_REJECTED_DOWNTREND, FILTER_REJECTED_INFLOW,
-    FILTER_REJECTED_LIQUIDITY, FILTER_REJECTED_TOTAL, FILTER_REJECTED_VELOCITY,
-    INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL, NATS_ERRORS_TOTAL,
-    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
-    TOKENS_TRACKED_GAUGE,
+    FILTER_REJECTED_LIQUIDITY, FILTER_REJECTED_TOKEN_AGE, FILTER_REJECTED_TOTAL,
+    FILTER_REJECTED_VELOCITY, INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL,
+    NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
+    POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -428,6 +428,8 @@ struct MomentumConfig {
     max_dev_supply_pct: f64,
     /// Window to detect LP removal (seconds). Default: 60s
     lp_removal_window_secs: u64,
+    /// Min token age since discovery before entry (seconds). Default: 60s. `0` = disabled.
+    min_token_age_secs: u64,
 
     // === Filter 2: Buyer Velocity ===
     /// Min unique buyers in early window. Default: 10
@@ -555,6 +557,7 @@ impl Default for MomentumConfig {
             // Filter 1: Liquidity Check
             max_dev_supply_pct: 90.0,   // Max 90% dev supply
             lp_removal_window_secs: 60, // Track LP removals for 60s
+            min_token_age_secs: 60,     // Ignore first minute after discovery
 
             // Filter 2: Buyer Velocity
             min_unique_buyers: 10,    // 10 unique buyers min
@@ -644,6 +647,7 @@ impl MomentumConfig {
             test_allowlist: HashSet::new(), // Not in TOML config
             max_dev_supply_pct: cfg.max_dev_supply_pct,
             lp_removal_window_secs: cfg.lp_removal_window_secs,
+            min_token_age_secs: cfg.min_token_age_secs,
             min_unique_buyers: cfg.min_unique_buyers,
             buyer_window_secs: cfg.buyer_window_secs,
             min_trades_per_min: cfg.min_trades_per_min,
@@ -1990,6 +1994,17 @@ impl TokenTracker {
 
     /// Monotonic chain head for slot-window filters: max(latest Geyser slot seen by bot, this row).
     #[inline]
+    /// Token age since discovery (I-16 chain-first; wallclock fallback when slots missing).
+    fn token_age_secs(&self, chain_head_slot: u64) -> (u64, bool) {
+        let hs = self.chain_head_for_filters(chain_head_slot);
+        if self.first_slot > 0 && hs > self.first_slot {
+            let age_secs = (hs - self.first_slot).saturating_mul(MOMENTUM_APPROX_SLOT_MS) / 1000;
+            (age_secs, true)
+        } else {
+            (self.first_seen.elapsed().as_secs(), false)
+        }
+    }
+
     fn chain_head_for_filters(&self, ctx_head_slot: u64) -> u64 {
         let local = self.max_trade_slot.max(self.first_slot);
         if ctx_head_slot > 0 {
@@ -2614,6 +2629,27 @@ impl TokenTracker {
             self.reject("REJECT_LP_REMOVED");
             warn!(mint = %self.mint, pool = %self.pool, dex = %self.dex, "🚫 Filter rejected: LP_REMOVED (blacklisted)");
             return (false, "REJECT_LP_REMOVED".to_string());
+        }
+
+        // Filter 1c: Token age (skip launch-minute rugs; chain-slot first)
+        if config.min_token_age_secs > 0 {
+            let (age_secs, chain_time) = self.token_age_secs(chain_head_slot);
+            if age_secs < config.min_token_age_secs {
+                let time_note = if chain_time {
+                    "~chain-time"
+                } else {
+                    "~wallclock"
+                };
+                let reason = format!(
+                    "WAIT_TOKEN_AGE: token age {}s < {}s (first_slot={}, head={}, {})",
+                    age_secs, config.min_token_age_secs, self.first_slot, hs, time_note
+                );
+                return self.record_wait_filter_rejection_and_return(
+                    &FILTER_REJECTED_TOKEN_AGE,
+                    reason,
+                    "WAIT_TOKEN_AGE",
+                );
+            }
         }
 
         // Dev-sell revalidation delay (pre-entry WAIT; after delay standard filters decide on fresh window data)
@@ -7874,6 +7910,15 @@ impl MomentumContext {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
                 }
+                "min_token_age_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        config.min_token_age_secs = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
 
                 // === Filter 2: Buyer Velocity ===
                 "min_unique_buyers" => {
@@ -11370,6 +11415,7 @@ mod tests {
             c.repeat_buyer_min_ratio = 0.0;
             c.min_trade_size_lamports = 0;
             c.small_buy_ratio_cap = 1.0;
+            c.min_token_age_secs = 0;
             c
         };
 
@@ -11505,6 +11551,7 @@ mod tests {
             c.repeat_buyer_min_ratio = 0.0;
             c.min_trade_size_lamports = 0;
             c.small_buy_ratio_cap = 1.0;
+            c.min_token_age_secs = 0;
             c
         };
 
@@ -11591,6 +11638,7 @@ mod tests {
             c.repeat_buyer_min_ratio = 0.0;
             c.min_trade_size_lamports = 0;
             c.small_buy_ratio_cap = 1.0;
+            c.min_token_age_secs = 0;
             c
         };
 
@@ -11659,6 +11707,7 @@ mod tests {
             c.repeat_buyer_min_ratio = 0.0;
             c.min_trade_size_lamports = 0;
             c.small_buy_ratio_cap = 1.0;
+            c.min_token_age_secs = 0;
             c
         };
 
@@ -12479,6 +12528,7 @@ mod tests {
         cfg.min_trade_size_lamports = 0;
         cfg.small_buy_ratio_cap = 1.0;
         cfg.dump_recovery_window_secs = 0;
+        cfg.min_token_age_secs = 0;
 
         let mut tracker = TokenTracker::new("m", "p", "pumpfun", 100, 30_000_000_000);
         tracker.record_trade("whale", true, 900_000_000, 1, "s0", 150, &cfg);
@@ -12507,6 +12557,7 @@ mod tests {
         cfg.small_buy_ratio_cap = 1.0;
         cfg.dump_recovery_window_secs = 0;
         cfg.dev_sell_revalidation_delay_secs = 0;
+        cfg.min_token_age_secs = 0;
 
         let tmp = TempDir::new().expect("tempdir");
         let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
@@ -12624,6 +12675,7 @@ mod tests {
         // Micro-buy gate params
         cfg.min_trade_size_lamports = 100;
         cfg.small_buy_ratio_cap = 0.60;
+        cfg.min_token_age_secs = 0;
 
         let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 0);
 
@@ -12973,6 +13025,7 @@ mod tests {
         cfg.repeat_buyer_min_ratio = 0.0;
         cfg.min_trade_size_lamports = 0;
         cfg.small_buy_ratio_cap = 1.0;
+        cfg.min_token_age_secs = 0;
 
         let tmp = TempDir::new().expect("tempdir");
         let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
@@ -13083,6 +13136,7 @@ mod tests {
         cfg.repeat_buyer_min_ratio = 0.0;
         cfg.min_trade_size_lamports = 0;
         cfg.small_buy_ratio_cap = 1.0;
+        cfg.min_token_age_secs = 0;
 
         let tmp = TempDir::new().expect("tempdir");
         let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
@@ -13189,6 +13243,7 @@ mod tests {
         cfg.repeat_buyer_min_ratio = 0.0;
         cfg.min_trade_size_lamports = 0;
         cfg.small_buy_ratio_cap = 1.0;
+        cfg.min_token_age_secs = 0;
 
         let tmp = TempDir::new().expect("tempdir");
         let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
@@ -13269,6 +13324,7 @@ mod tests {
         cfg.repeat_buyer_min_ratio = 0.0;
         cfg.min_trade_size_lamports = 0;
         cfg.small_buy_ratio_cap = 1.0;
+        cfg.min_token_age_secs = 0;
 
         let tmp = TempDir::new().expect("tempdir");
         let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
@@ -13361,6 +13417,7 @@ mod tests {
             c.repeat_buyer_min_ratio = 0.0;
             c.min_trade_size_lamports = 0;
             c.small_buy_ratio_cap = 1.0;
+            c.min_token_age_secs = 0;
             c
         };
 
@@ -13431,6 +13488,7 @@ mod tests {
             c.repeat_buyer_min_ratio = 0.0;
             c.min_trade_size_lamports = 0;
             c.small_buy_ratio_cap = 1.0;
+            c.min_token_age_secs = 0;
             c
         };
 
@@ -13735,6 +13793,7 @@ mod tests {
             c.repeat_buyer_min_ratio = 0.0;
             c.min_trade_size_lamports = 0;
             c.small_buy_ratio_cap = 1.0;
+            c.min_token_age_secs = 0;
             c
         };
 
@@ -13797,6 +13856,7 @@ mod tests {
             c.repeat_buyer_min_ratio = 0.0;
             c.min_trade_size_lamports = 0;
             c.small_buy_ratio_cap = 1.0;
+            c.min_token_age_secs = 0;
             c
         };
 
@@ -13858,6 +13918,7 @@ mod tests {
             c.repeat_buyer_min_ratio = 0.0;
             c.min_trade_size_lamports = 0;
             c.small_buy_ratio_cap = 1.0;
+            c.min_token_age_secs = 0;
             c
         };
 
@@ -13924,6 +13985,7 @@ mod tests {
             c.repeat_buyer_min_ratio = 0.0;
             c.min_trade_size_lamports = 0;
             c.small_buy_ratio_cap = 1.0;
+            c.min_token_age_secs = 0;
             c
         };
 
@@ -14147,6 +14209,7 @@ mod tests {
         cfg.repeat_buyer_min_ratio = 0.0;
         cfg.min_trade_size_lamports = 0;
         cfg.small_buy_ratio_cap = 1.0;
+        cfg.min_token_age_secs = 0;
 
         let tmp = TempDir::new().expect("tempdir");
         let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
@@ -14234,6 +14297,7 @@ mod tests {
         cfg.min_trade_size_lamports = 0;
         cfg.small_buy_ratio_cap = 1.0;
         cfg.price_trend_filter_enabled = false;
+        cfg.min_token_age_secs = 0;
 
         // Dump recovery params (window translated to ~slot span via MOMENTUM_APPROX_SLOT_MS)
         cfg.dump_recovery_window_secs = 30;
@@ -14460,6 +14524,7 @@ mod tests {
         cfg.small_buy_ratio_cap = 1.0;
         cfg.dump_recovery_window_secs = 0;
         cfg.price_trend_filter_enabled = false;
+        cfg.min_token_age_secs = 0;
         cfg
     }
 
@@ -14544,6 +14609,58 @@ mod tests {
             "expected ~{expected} trades/min, got {}",
             metrics.trades_per_min
         );
+    }
+
+    #[test]
+    fn token_age_blocks_when_young() {
+        let mut cfg = relaxed_entry_gates_helper_cfg();
+        cfg.min_token_age_secs = 60;
+
+        let first_slot = 423_500_100_u64;
+        let head = first_slot + 85; // ~34s @ 400ms/slot
+        let mut tracker = TokenTracker::new("mint", "pool", "dex", first_slot, 10_000_000_000);
+
+        let (ok, reason) = tracker.should_generate_intent(&cfg, None, head, Instant::now());
+        assert!(!ok);
+        assert!(reason.contains("WAIT_TOKEN_AGE"), "{reason}");
+        assert!(reason.contains("34s"), "{reason}");
+    }
+
+    #[test]
+    fn token_age_allows_when_old_enough() {
+        let mut cfg = relaxed_entry_gates_helper_cfg();
+        cfg.min_token_age_secs = 60;
+
+        let first_slot = 1_000u64;
+        let head = first_slot + momentum_secs_to_slot_span(60);
+        let mut tracker = TokenTracker::new("mint", "pool", "dex", first_slot, 10_000_000_000);
+
+        let (ok, reason) = tracker.should_generate_intent(&cfg, None, head, Instant::now());
+        assert!(ok, "expected pass when chain age >= min, got: {reason}");
+    }
+
+    #[test]
+    fn token_age_zero_disables_gate() {
+        let mut cfg = relaxed_entry_gates_helper_cfg();
+        cfg.min_token_age_secs = 0;
+
+        let mut tracker = TokenTracker::new("mint", "pool", "dex", 1_000, 10_000_000_000);
+        let (ok, reason) = tracker.should_generate_intent(&cfg, None, 1_001, Instant::now());
+        assert!(ok, "gate disabled: {reason}");
+    }
+
+    #[test]
+    fn token_age_fallback_first_seen() {
+        let mut cfg = relaxed_entry_gates_helper_cfg();
+        cfg.min_token_age_secs = 60;
+
+        let mut tracker = TokenTracker::new("mint", "pool", "dex", 0, 10_000_000_000);
+        tracker.first_seen = Instant::now() - Duration::from_secs(30);
+
+        let (ok, reason) = tracker.should_generate_intent(&cfg, None, 0, Instant::now());
+        assert!(!ok);
+        assert!(reason.contains("WAIT_TOKEN_AGE"), "{reason}");
+        assert!(reason.contains("~wallclock"), "{reason}");
     }
 
     #[test]
@@ -14648,6 +14765,7 @@ mod tests {
         cfg.repeat_buyer_min_ratio = 0.0;
         cfg.min_trade_size_lamports = 0;
         cfg.small_buy_ratio_cap = 1.0;
+        cfg.min_token_age_secs = 0;
 
         cfg.default_position_lamports = 1_000;
 
@@ -17201,6 +17319,7 @@ mod tests {
             c.repeat_buyer_min_ratio = 0.0;
             c.min_trade_size_lamports = 0;
             c.small_buy_ratio_cap = 1.0;
+            c.min_token_age_secs = 0;
             c
         };
 

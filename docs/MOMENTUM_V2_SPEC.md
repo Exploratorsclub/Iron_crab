@@ -155,6 +155,7 @@ Configurable safety gates (typical default: ON for real money):
   - `freeze_authority == None` if `require_freeze_authority_none=true`.
 
 Soft gates (WAIT until sufficient data):
+- **Filter 1c — Token age** (`WAIT_TOKEN_AGE`): `token_age_secs >= min_token_age_secs` (default 60s; `0` = disabled). Age prefers chain slots (`first_slot` vs Geyser head); falls back to `first_seen` wallclock when slots are missing. Runs after liquidity/LP gates, before dev-sell revalidation and Filter 2.
 - Not enough unique buyers in the early window.
 - Trade velocity / buy dominance below thresholds.
 - Net SOL inflow below threshold.
@@ -206,6 +207,7 @@ Reason codes are uppercase snake case. A decision must include exactly one **pri
 - `WAIT_CONFIRMATION`
 - `WAIT_DOWNTREND`
 - `WAIT_DEV_SELL_REVALIDATION`
+- `WAIT_TOKEN_AGE`
 
 ### Reject (pre-entry)
 - `REJECT_LP_REMOVED`
@@ -483,6 +485,9 @@ Price trend / downtrend (Filter 5):
 - `price_trend_max_drawdown_pct`
 - `price_trend_recovery_min_buy_dominance`
 - `price_trend_recovery_min_inflow_lamports`
+
+Token age (Filter 1c, pre-entry):
+- `min_token_age_secs`
 
 Dev-sell revalidation (pre-entry):
 - `dev_sell_revalidation_delay_secs`

@@ -1389,6 +1389,7 @@ pub static FILTER_REJECTED_BUYER_QUALITY: Lazy<AtomicU64> = Lazy::new(|| AtomicU
 pub static FILTER_REJECTED_INFLOW: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static FILTER_REJECTED_DEV_BEHAVIOR: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static FILTER_REJECTED_DOWNTREND: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static FILTER_REJECTED_TOKEN_AGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MARKET_EVENTS_CONSUMED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 // --- momentum-bot hot-path latency (Prometheus histograms; momentum-bot process only) ---
@@ -3301,6 +3302,13 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("filter_rejection_by_reason{reason=\"downtrend\"} ");
     out.push_str(
         &FILTER_REJECTED_DOWNTREND
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("filter_rejection_by_reason{reason=\"token_age\"} ");
+    out.push_str(
+        &FILTER_REJECTED_TOKEN_AGE
             .load(Ordering::Relaxed)
             .to_string(),
     );
