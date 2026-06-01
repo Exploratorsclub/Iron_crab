@@ -143,6 +143,10 @@ pub const PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS: usize = 24;
 /// See Pump `@pump_tech_updates` (2026): non-cashback `sell` = 24 accounts (`pool-v2` at #21); cashback `sell` = 26.
 pub const PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS: usize = 26;
 
+/// Extended cashback `sell` with two Pump-owned pre-fee metas before global FeeConfig/FeeProgram (mainnet ref
+/// `3XPKr7ynZzRSwvwiVvWpDr58pFCUVUqwySBiUwPMqwUTDGETFWaZXpYWm84DnAuSet4rQRmcwUwsfZ8Vg8gJqeae`, pool `GrgDaBg4…`).
+pub const PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS: usize = 27;
+
 /// Extended SELL tail indices (shared by legacy 24-account cashback and 26-account layouts).
 pub const PUMPFUN_AMM_SELL_EXT_TAIL_0_IX: usize = 21;
 pub const PUMPFUN_AMM_SELL_EXT_TAIL_1_IX: usize = 22;
@@ -150,6 +154,16 @@ pub const PUMPFUN_AMM_SELL_EXT_THIRD_META_IX: usize = 23;
 /// Cashback `sell` fee-recipient pair after post-upgrade `pool-v2` meta (#23).
 pub const PUMPFUN_AMM_SELL_FEE_TAIL_0_IX: usize = 24;
 pub const PUMPFUN_AMM_SELL_FEE_TAIL_1_IX: usize = 25;
+
+/// 27-account extended SELL: pre-fee metas before global fee pair; fee + trailing indices shifted by +2.
+pub const PUMPFUN_AMM_SELL_PRE_FEE_0_IX_V2: usize = 19;
+pub const PUMPFUN_AMM_SELL_PRE_FEE_1_IX_V2: usize = 20;
+pub const PUMPFUN_AMM_SELL_FEE_CONFIG_IX_V2: usize = 21;
+pub const PUMPFUN_AMM_SELL_FEE_PROGRAM_IX_V2: usize = 22;
+pub const PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2: usize = 23;
+pub const PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2: usize = 24;
+pub const PUMPFUN_AMM_SELL_EXT_THIRD_META_IX_V2: usize = 25;
+pub const PUMPFUN_AMM_SELL_FEE_TAIL_0_IX_V2: usize = 26;
 
 /// `pool-v2` PDA appended on post-upgrade PumpSwap swaps (`["pool-v2", base_mint]`).
 #[must_use]
@@ -160,8 +174,12 @@ pub fn pump_amm_pool_v2_pda(base_mint: &Pubkey, program_id: &Pubkey) -> Pubkey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PumpAmmSellExtendedFields {
     pub requires_extended: bool,
+    /// 27-account extended `sell`: two readonly pre-fee metas at #19/#20 before global FeeConfig/FeeProgram.
+    pub requires_pre_fee_metas: bool,
     /// Cashback `sell` (26 accounts): fee-recipient pair at ix #24/#25.
     pub requires_fee_tail: bool,
+    pub pre_fee_meta_0: Option<Pubkey>,
+    pub pre_fee_meta_1: Option<Pubkey>,
     pub tail_0: Option<Pubkey>,
     pub tail_1: Option<Pubkey>,
     pub third_meta: Option<Pubkey>,
@@ -173,8 +191,24 @@ pub struct PumpAmmSellExtendedFields {
 pub fn pump_amm_sell_ix_account_len_supported(n: usize) -> bool {
     matches!(
         n,
-        21 | PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS | PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS
+        21 | PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS
+            | PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS
+            | PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS
     )
+}
+
+#[must_use]
+pub fn pump_amm_sell_ix_uses_global_fee_at(n: usize) -> Option<(usize, usize)> {
+    match n {
+        PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS => Some((
+            PUMPFUN_AMM_SELL_FEE_CONFIG_IX_V2,
+            PUMPFUN_AMM_SELL_FEE_PROGRAM_IX_V2,
+        )),
+        21
+        | PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS
+        | PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS => Some((19, 20)),
+        _ => None,
+    }
 }
 
 /// Map observed `sell` instruction accounts to extended-layout fields (Geyser + RPC history).
@@ -189,23 +223,63 @@ pub fn pump_amm_sell_extended_fields_from_ix_accounts(
     let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).ok()?;
     let pool_v2 = pump_amm_pool_v2_pda(&base_mint, &program_id);
 
+    let global_fee_config = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).ok()?;
+    let global_fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).ok()?;
+
     match n {
         21 => Some(PumpAmmSellExtendedFields {
             requires_extended: false,
+            requires_pre_fee_metas: false,
             requires_fee_tail: false,
+            pre_fee_meta_0: None,
+            pre_fee_meta_1: None,
             tail_0: None,
             tail_1: None,
             third_meta: None,
             fee_tail_0: None,
             fee_tail_1: None,
         }),
+        PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS => {
+            let fee_at_21 = *instruction_accounts.get(PUMPFUN_AMM_SELL_FEE_CONFIG_IX_V2)?;
+            let fee_at_22 = *instruction_accounts.get(PUMPFUN_AMM_SELL_FEE_PROGRAM_IX_V2)?;
+            if fee_at_21 != global_fee_config || fee_at_22 != global_fee_program {
+                return None;
+            }
+            Some(PumpAmmSellExtendedFields {
+                requires_extended: true,
+                requires_pre_fee_metas: true,
+                requires_fee_tail: false,
+                pre_fee_meta_0: instruction_accounts
+                    .get(PUMPFUN_AMM_SELL_PRE_FEE_0_IX_V2)
+                    .copied(),
+                pre_fee_meta_1: instruction_accounts
+                    .get(PUMPFUN_AMM_SELL_PRE_FEE_1_IX_V2)
+                    .copied(),
+                tail_0: instruction_accounts
+                    .get(PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2)
+                    .copied(),
+                tail_1: instruction_accounts
+                    .get(PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2)
+                    .copied(),
+                third_meta: instruction_accounts
+                    .get(PUMPFUN_AMM_SELL_EXT_THIRD_META_IX_V2)
+                    .copied(),
+                fee_tail_0: instruction_accounts
+                    .get(PUMPFUN_AMM_SELL_FEE_TAIL_0_IX_V2)
+                    .copied(),
+                fee_tail_1: None,
+            })
+        }
         PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS => {
             let at_21 = *instruction_accounts.get(PUMPFUN_AMM_SELL_EXT_TAIL_0_IX)?;
             if at_21 == pool_v2 {
                 // Post-upgrade non-cashback: #21 pool-v2, #22/#23 protocol fee recipient pair.
                 Some(PumpAmmSellExtendedFields {
                     requires_extended: true,
+                    requires_pre_fee_metas: false,
                     requires_fee_tail: false,
+                    pre_fee_meta_0: None,
+                    pre_fee_meta_1: None,
                     tail_0: Some(at_21),
                     tail_1: instruction_accounts
                         .get(PUMPFUN_AMM_SELL_EXT_TAIL_1_IX)
@@ -220,7 +294,10 @@ pub fn pump_amm_sell_extended_fields_from_ix_accounts(
                 // Legacy extended cashback: #21/#22 volume metas, #23 third (often pool-v2).
                 Some(PumpAmmSellExtendedFields {
                     requires_extended: true,
+                    requires_pre_fee_metas: false,
                     requires_fee_tail: false,
+                    pre_fee_meta_0: None,
+                    pre_fee_meta_1: None,
                     tail_0: instruction_accounts
                         .get(PUMPFUN_AMM_SELL_EXT_TAIL_0_IX)
                         .copied(),
@@ -237,7 +314,10 @@ pub fn pump_amm_sell_extended_fields_from_ix_accounts(
         }
         PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS => Some(PumpAmmSellExtendedFields {
             requires_extended: true,
+            requires_pre_fee_metas: false,
             requires_fee_tail: true,
+            pre_fee_meta_0: None,
+            pre_fee_meta_1: None,
             tail_0: instruction_accounts
                 .get(PUMPFUN_AMM_SELL_EXT_TAIL_0_IX)
                 .copied(),
@@ -443,6 +523,10 @@ pub struct PumpAmmPoolStatic {
     /// Observed cashback `sell` fee-recipient pair (ix #24/#25) when layout has 26 accounts.
     pub sell_extended_fee_tail_0: Option<Pubkey>,
     pub sell_extended_fee_tail_1: Option<Pubkey>,
+    /// 27-account extended `sell`: readonly pre-fee metas at ix #19/#20 before global fee pair.
+    pub sell_requires_pre_fee_metas: bool,
+    /// Second pre-fee meta (ix #20 on 27-account layout); first is usually `global_volume_accumulator` / v14[11].
+    pub sell_pre_fee_meta_1: Option<Pubkey>,
     /// Set when this struct was built inside `pumpfun_amm` (parse / tx-history / cache reconstruct).
     pub last_parse_diagnostics: Option<PumpAmmPoolAccountsDiagnostic>,
 }
@@ -459,6 +543,8 @@ pub struct PoolAccountsV14WithDiagnostic {
     pub sell_extended_tail_1: Option<Pubkey>,
     pub sell_extended_fee_tail_0: Option<Pubkey>,
     pub sell_extended_fee_tail_1: Option<Pubkey>,
+    pub sell_requires_pre_fee_metas: bool,
+    pub sell_pre_fee_meta_1: Option<Pubkey>,
     /// `true` only when the cold-path result is authoritative enough for SELL planning.
     pub sell_layout_ready: bool,
     /// Scope 49: structured outcome when `force_refresh` could not resolve SELL layout (empty if ready).
@@ -646,11 +732,15 @@ struct SellLayoutObserveOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 enum PumpAmmAuthoritativeSellLayout {
     Unknown,
     Base,
-    /// Extended `sell`: trailing metas #21/#22/#23; optional #24/#25 fee pair for 26-account cashback.
+    /// Extended `sell`: trailing metas #21/#22/#23 (26-account) or shifted #23–#26 (27-account);
+    /// optional pre-fee pair at #19/#20 for 27-account layouts.
     Extended {
+        pre_fee_0: Option<Pubkey>,
+        pre_fee_1: Option<Pubkey>,
         tail_0: Pubkey,
         tail_1: Pubkey,
         tail_2: Pubkey,
@@ -1201,6 +1291,9 @@ impl PumpFunAmmDex {
                             sell_extended_tail_1: sell_t1,
                             sell_extended_fee_tail_0: sell_fee_t0,
                             sell_extended_fee_tail_1: sell_fee_t1,
+                            sell_requires_pre_fee_metas: cache
+                                .pump_amm_sell_requires_pre_fee_metas(&pool_market),
+                            sell_pre_fee_meta_1: cache.pump_amm_sell_pre_fee_meta_1(&pool_market),
                             sell_layout_ready: true,
                             force_refresh_sell_layout_diag: None,
                         }));
@@ -1376,9 +1469,13 @@ impl PumpFunAmmDex {
                     pool.sell_extended_tail_1 = None;
                     pool.sell_extended_fee_tail_0 = None;
                     pool.sell_extended_fee_tail_1 = None;
+                    pool.sell_requires_pre_fee_metas = false;
+                    pool.sell_pre_fee_meta_1 = None;
                     (true, None)
                 }
                 PumpAmmAuthoritativeSellLayout::Extended {
+                    pre_fee_0,
+                    pre_fee_1,
                     tail_0,
                     tail_1,
                     tail_2,
@@ -1386,6 +1483,13 @@ impl PumpFunAmmDex {
                     fee_tail_1,
                 } => {
                     pool.sell_requires_cashback_remaining = true;
+                    pool.sell_requires_pre_fee_metas =
+                        pre_fee_0.filter(|p| *p != Pubkey::default()).is_some()
+                            && pre_fee_1.filter(|p| *p != Pubkey::default()).is_some();
+                    if let Some(p0) = pre_fee_0.filter(|p| *p != Pubkey::default()) {
+                        pool.global_volume_accumulator = p0;
+                    }
+                    pool.sell_pre_fee_meta_1 = pre_fee_1.filter(|p| *p != Pubkey::default());
                     pool.sell_extended_tail_0 = Some(tail_0);
                     pool.sell_extended_tail_1 = Some(tail_1);
                     pool.sell_cashback_third_meta = Some(tail_2);
@@ -1407,6 +1511,8 @@ impl PumpFunAmmDex {
             sell_extended_tail_1: pool.sell_extended_tail_1,
             sell_extended_fee_tail_0: pool.sell_extended_fee_tail_0,
             sell_extended_fee_tail_1: pool.sell_extended_fee_tail_1,
+            sell_requires_pre_fee_metas: pool.sell_requires_pre_fee_metas,
+            sell_pre_fee_meta_1: pool.sell_pre_fee_meta_1,
             sell_layout_ready,
             force_refresh_sell_layout_diag,
         })
@@ -1923,16 +2029,25 @@ impl PumpFunAmmDex {
                     summary.termination_reason = PumpAmmSellLayoutTerminationReason::LayoutFound;
                     summary.elapsed_total_ms = t0.elapsed().as_millis();
                     let sell_ix_account_count = acc_strings.len() as u8;
-                    let (tail0_log, tail1_log, tail2_log) = match best_obs.layout {
-                        PumpAmmAuthoritativeSellLayout::Extended {
-                            tail_0,
-                            tail_1,
-                            tail_2,
-                            fee_tail_0: _,
-                            fee_tail_1: _,
-                        } => (Some(tail_0), Some(tail_1), Some(tail_2)),
-                        _ => (None, None, None),
-                    };
+                    let (tail0_log, tail1_log, tail2_log, pre0_log, pre1_log) =
+                        match best_obs.layout {
+                            PumpAmmAuthoritativeSellLayout::Extended {
+                                pre_fee_0,
+                                pre_fee_1,
+                                tail_0,
+                                tail_1,
+                                tail_2,
+                                fee_tail_0: _,
+                                fee_tail_1: _,
+                            } => (
+                                Some(tail_0),
+                                Some(tail_1),
+                                Some(tail_2),
+                                pre_fee_0,
+                                pre_fee_1,
+                            ),
+                            _ => (None, None, None, None, None),
+                        };
                     info!(
                         pool = %pool_market,
                         base_mint = %base_mint,
@@ -1952,6 +2067,8 @@ impl PumpFunAmmDex {
                         sell_extended_tail_0 = ?tail0_log,
                         sell_extended_tail_1 = ?tail1_log,
                         sell_extended_tail_2 = ?tail2_log,
+                        sell_ix_meta_19 = ?pre0_log,
+                        sell_ix_meta_20 = ?pre1_log,
                         sell_ix_meta_21 = ?tail0_log,
                         sell_ix_meta_22 = ?tail1_log,
                         sell_ix_meta_23 = ?tail2_log,
@@ -1989,17 +2106,34 @@ impl PumpFunAmmDex {
         if best_obs.layout != PumpAmmAuthoritativeSellLayout::Unknown {
             summary.termination_reason = PumpAmmSellLayoutTerminationReason::LayoutFound;
             summary.elapsed_total_ms = t0.elapsed().as_millis();
-            let (tail0_log, tail1_log, tail2_log) = match best_obs.layout {
+            let (tail0_log, tail1_log, tail2_log, pre0_log, pre1_log) = match best_obs.layout {
                 PumpAmmAuthoritativeSellLayout::Extended {
+                    pre_fee_0,
+                    pre_fee_1,
                     tail_0,
                     tail_1,
                     tail_2,
                     fee_tail_0: _,
                     fee_tail_1: _,
-                } => (Some(tail_0), Some(tail_1), Some(tail_2)),
-                _ => (None, None, None),
+                } => (
+                    Some(tail_0),
+                    Some(tail_1),
+                    Some(tail_2),
+                    pre_fee_0,
+                    pre_fee_1,
+                ),
+                _ => (None, None, None, None, None),
             };
             let sell_ix_account_count = match best_obs.layout {
+                PumpAmmAuthoritativeSellLayout::Extended {
+                    pre_fee_0,
+                    pre_fee_1,
+                    ..
+                } if pre_fee_0.filter(|p| *p != Pubkey::default()).is_some()
+                    && pre_fee_1.filter(|p| *p != Pubkey::default()).is_some() =>
+                {
+                    PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS as u8
+                }
                 PumpAmmAuthoritativeSellLayout::Extended {
                     fee_tail_0,
                     fee_tail_1,
@@ -2033,6 +2167,8 @@ impl PumpFunAmmDex {
                 sell_extended_tail_0 = ?tail0_log,
                 sell_extended_tail_1 = ?tail1_log,
                 sell_extended_tail_2 = ?tail2_log,
+                sell_ix_meta_19 = ?pre0_log,
+                sell_ix_meta_20 = ?pre1_log,
                 sell_ix_meta_21 = ?tail0_log,
                 sell_ix_meta_22 = ?tail1_log,
                 sell_ix_meta_23 = ?tail2_log,
@@ -2116,6 +2252,27 @@ impl PumpFunAmmDex {
         let user_vol_wsol_ata =
             Self::derive_ata_with_program(user_vol, quote_mint, quote_token_program);
         (user_vol_wsol_ata, user_vol)
+    }
+
+    /// Insert global FeeConfig + FeeProgram after coin-creator vault authority; optional 27-account pre-fee pair first.
+    fn push_pump_amm_sell_global_fee_metas(
+        metas: &mut Vec<AccountMeta>,
+        sell_requires_pre_fee_metas: bool,
+        pre_fee_meta_0: Pubkey,
+        sell_pre_fee_meta_1: Option<Pubkey>,
+        sell_fee_config: Pubkey,
+        sell_fee_program: Pubkey,
+    ) {
+        if sell_requires_pre_fee_metas {
+            if pre_fee_meta_0 != Pubkey::default() {
+                metas.push(AccountMeta::new_readonly(pre_fee_meta_0, false));
+            }
+            if let Some(p1) = sell_pre_fee_meta_1.filter(|p| *p != Pubkey::default()) {
+                metas.push(AccountMeta::new_readonly(p1, false));
+            }
+        }
+        metas.push(AccountMeta::new_readonly(sell_fee_config, false));
+        metas.push(AccountMeta::new_readonly(sell_fee_program, false));
     }
 
     /// Append extended/cashback SELL trailing metas for the **derived intent-user path**:
@@ -3602,6 +3759,8 @@ impl PumpFunAmmDex {
             sell_extended_tail_1: None,
             sell_extended_fee_tail_0: None,
             sell_extended_fee_tail_1: None,
+            sell_requires_pre_fee_metas: false,
+            sell_pre_fee_meta_1: None,
             last_parse_diagnostics: Some(diag),
         }))
     }
@@ -4005,6 +4164,9 @@ impl PumpFunAmmDex {
                             sell_extended_fee_tail_1: cache
                                 .pump_amm_sell_fee_tail_layout(&accounts[0])
                                 .1,
+                            sell_requires_pre_fee_metas: cache
+                                .pump_amm_sell_requires_pre_fee_metas(&accounts[0]),
+                            sell_pre_fee_meta_1: cache.pump_amm_sell_pre_fee_meta_1(&accounts[0]),
                             last_parse_diagnostics: Some(Self::pump_amm_livepoolcache_diagnostic(
                                 "discover_pool_static_livepoolcache_reconstruct",
                                 force_refresh,
@@ -4529,8 +4691,7 @@ impl PumpFunAmmDex {
                 else {
                     continue;
                 };
-                // PumpSwap AMM `sell` uses 21 base metas or 24 extended; legacy scans used 21-only.
-                if acc_strings.len() != 21 && acc_strings.len() != 24 {
+                if !pump_amm_sell_ix_account_len_supported(acc_strings.len()) {
                     continue;
                 }
 
@@ -4747,6 +4908,8 @@ impl PumpFunAmmDex {
                 sell_extended_tail_1: None,
                 sell_extended_fee_tail_0: None,
                 sell_extended_fee_tail_1: None,
+                sell_requires_pre_fee_metas: false,
+                sell_pre_fee_meta_1: None,
                 last_parse_diagnostics: Some(diag_factory(None)),
             });
         }
@@ -4775,6 +4938,13 @@ impl PumpFunAmmDex {
             } else {
                 (None, None, None, None, None)
             };
+            let (fee_config_ix, fee_program_ix) =
+                pump_amm_sell_ix_uses_global_fee_at(acc_accounts.len())?;
+            let gva = if ext.requires_pre_fee_metas {
+                filter_pk(ext.pre_fee_meta_0).unwrap_or(singleton_gva)
+            } else {
+                singleton_gva
+            };
             return Some(PumpAmmPoolStatic {
                 pool_market,
                 global_config: parse_pk(2)?,
@@ -4787,15 +4957,17 @@ impl PumpFunAmmDex {
                 event_authority: parse_pk(15)?,
                 coin_creator_vault_ata: parse_pk(17)?,
                 coin_creator_vault_authority: parse_pk(18)?,
-                global_volume_accumulator: singleton_gva,
-                fee_config: parse_pk(19)?,
-                fee_program: parse_pk(20)?,
+                global_volume_accumulator: gva,
+                fee_config: parse_pk(fee_config_ix)?,
+                fee_program: parse_pk(fee_program_ix)?,
                 sell_requires_cashback_remaining: ext.requires_extended,
                 sell_cashback_third_meta: third,
                 sell_extended_tail_0: tail_0,
                 sell_extended_tail_1: tail_1,
                 sell_extended_fee_tail_0: fee_t0,
                 sell_extended_fee_tail_1: fee_t1,
+                sell_requires_pre_fee_metas: ext.requires_pre_fee_metas,
+                sell_pre_fee_meta_1: filter_pk(ext.pre_fee_meta_1),
                 last_parse_diagnostics: Some(diag_factory(None)),
             });
         }
@@ -4821,6 +4993,12 @@ impl PumpFunAmmDex {
             PumpAmmAuthoritativeSellLayout::Base
         } else {
             PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: if pool.sell_requires_pre_fee_metas {
+                    Some(pool.global_volume_accumulator)
+                } else {
+                    None
+                },
+                pre_fee_1: pool.sell_pre_fee_meta_1,
                 tail_0: pool
                     .sell_extended_tail_0
                     .filter(|p| *p != Pubkey::default())?,
@@ -5236,6 +5414,8 @@ impl Dex for PumpFunAmmDex {
             sell_extended_tail_1: None,
             sell_extended_fee_tail_0: None,
             sell_extended_fee_tail_1: None,
+            sell_requires_pre_fee_metas: false,
+            sell_pre_fee_meta_1: None,
             last_parse_diagnostics: None,
         };
 
@@ -5515,15 +5695,15 @@ impl Dex for PumpFunAmmDex {
                 pool.coin_creator_vault_authority,
                 false,
             )); // 18
-            metas.push(AccountMeta::new_readonly(sell_fee_config, false)); // 19
-            metas.push(AccountMeta::new_readonly(sell_fee_program, false)); // 20
-                                                                            // `pools_by_base` can be stale vs monotonic LivePoolCache (Geyser); prefer DashMap for extended SELL.
+                // `pools_by_base` can be stale vs monotonic LivePoolCache (Geyser); prefer DashMap for extended SELL.
             let mut sell_requires_cashback_remaining = pool.sell_requires_cashback_remaining;
             let mut sell_cashback_third_meta = pool.sell_cashback_third_meta;
             let mut cached_observed_volume_tail_0 = pool.sell_extended_tail_0;
             let mut cached_observed_volume_tail_1 = pool.sell_extended_tail_1;
             let mut sell_extended_fee_tail_0 = pool.sell_extended_fee_tail_0;
             let mut sell_extended_fee_tail_1 = pool.sell_extended_fee_tail_1;
+            let mut sell_requires_pre_fee_metas = pool.sell_requires_pre_fee_metas;
+            let mut sell_pre_fee_meta_1 = pool.sell_pre_fee_meta_1;
             if let Some(ref cache) = self.live_pool_cache {
                 let (dash_flag, dash_third, dash_t0, dash_t1) =
                     cache.pump_amm_sell_extended_layout(&pool.pool_market);
@@ -5537,7 +5717,21 @@ impl Dex for PumpFunAmmDex {
                     sell_extended_fee_tail_0 = dash_fee_t0.or(sell_extended_fee_tail_0);
                     sell_extended_fee_tail_1 = dash_fee_t1.or(sell_extended_fee_tail_1);
                 }
+                if cache.pump_amm_sell_requires_pre_fee_metas(&pool.pool_market) {
+                    sell_requires_pre_fee_metas = true;
+                }
+                sell_pre_fee_meta_1 = cache
+                    .pump_amm_sell_pre_fee_meta_1(&pool.pool_market)
+                    .or(sell_pre_fee_meta_1);
             }
+            Self::push_pump_amm_sell_global_fee_metas(
+                &mut metas,
+                sell_requires_pre_fee_metas,
+                pool.global_volume_accumulator,
+                sell_pre_fee_meta_1,
+                sell_fee_config,
+                sell_fee_program,
+            );
             if sell_requires_cashback_remaining {
                 let Some(third) = sell_cashback_third_meta.filter(|p| *p != Pubkey::default())
                 else {
@@ -5627,6 +5821,8 @@ impl PumpFunAmmDex {
             base_token_program,
             sell_requires_cashback_remaining,
             sell_cashback_third_meta,
+            false,
+            None,
             None,
             None,
             None,
@@ -5648,6 +5844,8 @@ impl PumpFunAmmDex {
         base_token_program: Option<Pubkey>,
         sell_requires_cashback_remaining: bool,
         sell_cashback_third_meta: Option<Pubkey>,
+        sell_requires_pre_fee_metas: bool,
+        sell_pre_fee_meta_1: Option<Pubkey>,
         sell_extended_tail_0: Option<Pubkey>,
         sell_extended_tail_1: Option<Pubkey>,
         sell_extended_fee_tail_0: Option<Pubkey>,
@@ -5830,9 +6028,15 @@ impl PumpFunAmmDex {
                 AccountMeta::new_readonly(program_id, false), // 16
                 AccountMeta::new(coin_creator_vault_ata, false), // 17
                 AccountMeta::new_readonly(coin_creator_vault_authority, false), // 18
-                AccountMeta::new_readonly(sell_fee_config, false), // 19
-                AccountMeta::new_readonly(sell_fee_program, false), // 20
             ];
+            Self::push_pump_amm_sell_global_fee_metas(
+                &mut metas,
+                sell_requires_pre_fee_metas,
+                global_volume_accumulator,
+                sell_pre_fee_meta_1,
+                sell_fee_config,
+                sell_fee_program,
+            );
             if sell_requires_cashback_remaining {
                 let Some(third) = sell_cashback_third_meta.filter(|p| *p != Pubkey::default())
                 else {
@@ -6109,6 +6313,8 @@ mod tests {
         };
         let ext_obs = PumpAmmSellReferenceObservation {
             layout: PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: None,
+                pre_fee_1: None,
                 tail_0: t0,
                 tail_1: t1,
                 tail_2: t2,
@@ -6126,6 +6332,8 @@ mod tests {
             )
             .layout,
             PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: None,
+                pre_fee_1: None,
                 tail_0: t0,
                 tail_1: t1,
                 tail_2: t2,
@@ -6150,6 +6358,8 @@ mod tests {
         assert_eq!(
             merged2.layout,
             PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: None,
+                pre_fee_1: None,
                 tail_0: t0,
                 tail_1: t1,
                 tail_2: t2,
@@ -6207,6 +6417,8 @@ mod tests {
             },
             PumpAmmSellReferenceObservation {
                 layout: PumpAmmAuthoritativeSellLayout::Extended {
+                    pre_fee_0: None,
+                    pre_fee_1: None,
                     tail_0: t0,
                     tail_1: t1,
                     tail_2: t2,
@@ -6225,6 +6437,8 @@ mod tests {
         assert_eq!(
             out.layout,
             PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: None,
+                pre_fee_1: None,
                 tail_0: t0,
                 tail_1: t1,
                 tail_2: t2,
@@ -6698,6 +6912,8 @@ mod tests {
         assert_eq!(
             observed.2,
             PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: None,
+                pre_fee_1: None,
                 tail_0: tail0,
                 tail_1: tail1,
                 tail_2: third_meta,
@@ -6705,6 +6921,61 @@ mod tests {
                 fee_tail_1: Some(fee_tail1),
             }
         );
+    }
+
+    /// P184d: 27-account extended `sell` — pre-fee readonly metas at #19/#20, global fee pair at #21/#22.
+    #[test]
+    fn p184d_sell_layout_observation_parses_27_account_pre_fee_extended_sell() {
+        let pool_market = Pubkey::from_str("GrgDaBg4TGBQCDZk9HHw8JT24RnoDHtQnvgguKxGKStb").unwrap();
+        let base_mint = Pubkey::new_unique();
+        let pre_fee_0 = Pubkey::new_unique();
+        let pre_fee_1 = Pubkey::new_unique();
+        let third_meta = Pubkey::new_unique();
+        let tail0 = Pubkey::new_unique();
+        let tail1 = Pubkey::new_unique();
+        let fee_tail0 = Pubkey::new_unique();
+        let fee_config = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap();
+        let fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap();
+        let mut account_keys: Vec<Pubkey> = (0..27).map(|_| Pubkey::new_unique()).collect();
+        account_keys[0] = pool_market;
+        account_keys[2] = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap();
+        account_keys[3] = base_mint;
+        account_keys[4] = Pubkey::from_str(WSOL_MINT).unwrap();
+        account_keys[PUMPFUN_AMM_SELL_PRE_FEE_0_IX_V2] = pre_fee_0;
+        account_keys[PUMPFUN_AMM_SELL_PRE_FEE_1_IX_V2] = pre_fee_1;
+        account_keys[PUMPFUN_AMM_SELL_FEE_CONFIG_IX_V2] = fee_config;
+        account_keys[PUMPFUN_AMM_SELL_FEE_PROGRAM_IX_V2] = fee_program;
+        account_keys[PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2] = tail0;
+        account_keys[PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2] = tail1;
+        account_keys[PUMPFUN_AMM_SELL_EXT_THIRD_META_IX_V2] = third_meta;
+        account_keys[PUMPFUN_AMM_SELL_FEE_TAIL_0_IX_V2] = fee_tail0;
+        let acc_strings: Vec<String> = account_keys.iter().map(ToString::to_string).collect();
+        let ix_data = pump_amm_sell_ix_discriminator().to_vec();
+
+        let observed = PumpFunAmmDex::pump_amm_sell_layout_observation_from_parsed_swap_ix(
+            &acc_strings,
+            &ix_data,
+        )
+        .expect("27-account sell observation");
+
+        assert_eq!(observed.0, pool_market);
+        assert_eq!(observed.1, base_mint);
+        assert_eq!(
+            observed.2,
+            PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: Some(pre_fee_0),
+                pre_fee_1: Some(pre_fee_1),
+                tail_0: tail0,
+                tail_1: tail1,
+                tail_2: third_meta,
+                fee_tail_0: Some(fee_tail0),
+                fee_tail_1: None,
+            }
+        );
+        let ext = pump_amm_sell_extended_fields_from_ix_accounts(&account_keys).expect("fields");
+        assert!(ext.requires_pre_fee_metas);
+        assert_eq!(ext.pre_fee_meta_0, Some(pre_fee_0));
+        assert_eq!(ext.pre_fee_meta_1, Some(pre_fee_1));
     }
 
     #[test]
@@ -6737,6 +7008,8 @@ mod tests {
         assert_eq!(
             observed.2,
             PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: None,
+                pre_fee_1: None,
                 tail_0: tail0,
                 tail_1: tail1,
                 tail_2: third_meta,
@@ -6780,6 +7053,8 @@ mod tests {
             sell_extended_tail_1: None,
             sell_extended_fee_tail_0: None,
             sell_extended_fee_tail_1: None,
+            sell_requires_pre_fee_metas: false,
+            sell_pre_fee_meta_1: None,
             last_parse_diagnostics: None,
         };
 
@@ -6814,6 +7089,8 @@ mod tests {
         assert_eq!(
             sell_obs.layout,
             PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: None,
+                pre_fee_1: None,
                 tail_0: ref_t0,
                 tail_1: ref_t1,
                 tail_2: third_meta,
@@ -6875,6 +7152,8 @@ mod tests {
             None,
             true,
             Some(third_meta),
+            false,
+            None,
             Some(ref_tail_0),
             Some(ref_tail_1),
             None,
@@ -6932,6 +7211,8 @@ mod tests {
             sell_extended_tail_1: None,
             sell_extended_fee_tail_0: None,
             sell_extended_fee_tail_1: None,
+            sell_requires_pre_fee_metas: false,
+            sell_pre_fee_meta_1: None,
             last_parse_diagnostics: None,
         };
         PumpFunAmmDex::apply_sell_reference_protocol_fee_recipients_for_force_refresh(
@@ -7155,6 +7436,8 @@ mod tests {
             None,
             true,
             Some(third_meta),
+            false,
+            None,
             Some(foreign_tail_0),
             Some(foreign_tail_1),
             None,
@@ -7263,6 +7546,8 @@ mod tests {
             sell_extended_tail_1: None,
             sell_extended_fee_tail_0: None,
             sell_extended_fee_tail_1: None,
+            sell_requires_pre_fee_metas: false,
+            sell_pre_fee_meta_1: None,
             last_parse_diagnostics: None,
         };
         dex.pools_by_base.insert(base_mint, pool);

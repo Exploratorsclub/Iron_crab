@@ -772,6 +772,10 @@ pub async fn build_tx_plan(
         let (sell_extended_fee_tail_0, sell_extended_fee_tail_1) = cache
             .map(|c| c.pump_amm_sell_fee_tail_layout(&pool_id))
             .unwrap_or((None, None));
+        let sell_requires_pre_fee_metas = cache
+            .map(|c| c.pump_amm_sell_requires_pre_fee_metas(&pool_id))
+            .unwrap_or(false);
+        let sell_pre_fee_meta_1 = cache.and_then(|c| c.pump_amm_sell_pre_fee_meta_1(&pool_id));
 
         let mut pool_accounts_build_source = if accounts_len == 0 {
             "slave_livepoolcache"
@@ -919,6 +923,12 @@ pub async fn build_tx_plan(
             sell_requires_cashback_remaining && intent.side == TradeSide::Sell,
             if intent.side == TradeSide::Sell {
                 sell_cashback_third_meta
+            } else {
+                None
+            },
+            sell_requires_pre_fee_metas && intent.side == TradeSide::Sell,
+            if intent.side == TradeSide::Sell {
+                sell_pre_fee_meta_1
             } else {
                 None
             },
@@ -1685,61 +1695,71 @@ async fn build_hop_pump_amm(
     cache: Option<&SharedLivePoolCache>,
 ) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
     // PumpSwap AMM (graduated tokens) - get pool_accounts from cache
-    let (pool_accounts, sell_requires, sell_third, _sell_t0, _sell_t1, sell_fee_t0, sell_fee_t1) =
-        if let Some(cache) = cache {
-            match cache.get(pool_address) {
-                Some(CachedPoolState::PumpAmm(amm_state)) => {
-                    let (sell_requires, sell_third, sell_t0, sell_t1) =
-                        cache.pump_amm_sell_extended_layout(pool_address);
-                    let (sell_fee_t0, sell_fee_t1) =
-                        cache.pump_amm_sell_fee_tail_layout(pool_address);
-                    if amm_state.pool_accounts.len() >= 14 {
-                        tracing::debug!(
-                            pool = %pool_address,
-                            accounts_len = amm_state.pool_accounts.len(),
-                            "multi-hop pump_amm: using cached pool_accounts"
-                        );
-                        (
-                            amm_state.pool_accounts.clone(),
-                            sell_requires,
-                            sell_third,
-                            sell_t0,
-                            sell_t1,
-                            sell_fee_t0,
-                            sell_fee_t1,
-                        )
-                    } else {
-                        return Err(UnsupportedTxPlan {
-                            reason: RejectReason::UnsupportedIntent,
-                            details: format!(
-                                "pump_amm: cached pool_accounts too short (got {}, need 14)",
-                                amm_state.pool_accounts.len()
-                            ),
-                        });
-                    }
-                }
-                Some(_) => {
+    let (
+        pool_accounts,
+        sell_requires,
+        sell_third,
+        _sell_t0,
+        _sell_t1,
+        sell_fee_t0,
+        sell_fee_t1,
+        sell_requires_pre_fee,
+        sell_pre_fee_meta_1,
+    ) = if let Some(cache) = cache {
+        match cache.get(pool_address) {
+            Some(CachedPoolState::PumpAmm(amm_state)) => {
+                let (sell_requires, sell_third, sell_t0, sell_t1) =
+                    cache.pump_amm_sell_extended_layout(pool_address);
+                let (sell_fee_t0, sell_fee_t1) = cache.pump_amm_sell_fee_tail_layout(pool_address);
+                if amm_state.pool_accounts.len() >= 14 {
+                    tracing::debug!(
+                        pool = %pool_address,
+                        accounts_len = amm_state.pool_accounts.len(),
+                        "multi-hop pump_amm: using cached pool_accounts"
+                    );
+                    (
+                        amm_state.pool_accounts.clone(),
+                        sell_requires,
+                        sell_third,
+                        sell_t0,
+                        sell_t1,
+                        sell_fee_t0,
+                        sell_fee_t1,
+                        cache.pump_amm_sell_requires_pre_fee_metas(pool_address),
+                        cache.pump_amm_sell_pre_fee_meta_1(pool_address),
+                    )
+                } else {
                     return Err(UnsupportedTxPlan {
                         reason: RejectReason::UnsupportedIntent,
                         details: format!(
-                            "pump_amm: cache hit but wrong DEX type for {}",
-                            pool_address
+                            "pump_amm: cached pool_accounts too short (got {}, need 14)",
+                            amm_state.pool_accounts.len()
                         ),
                     });
                 }
-                None => {
-                    return Err(UnsupportedTxPlan {
-                        reason: RejectReason::UnsupportedIntent,
-                        details: format!("pump_amm: pool {} not in cache", pool_address),
-                    });
-                }
             }
-        } else {
-            return Err(UnsupportedTxPlan {
-                reason: RejectReason::UnsupportedIntent,
-                details: "pump_amm: no cache available for multi-hop".to_string(),
-            });
-        };
+            Some(_) => {
+                return Err(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: format!(
+                        "pump_amm: cache hit but wrong DEX type for {}",
+                        pool_address
+                    ),
+                });
+            }
+            None => {
+                return Err(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: format!("pump_amm: pool {} not in cache", pool_address),
+                });
+            }
+        }
+    } else {
+        return Err(UnsupportedTxPlan {
+            reason: RejectReason::UnsupportedIntent,
+            details: "pump_amm: no cache available for multi-hop".to_string(),
+        });
+    };
 
     // Use static method with pool_accounts from cache
     // Note: Multi-hop arb doesn't pass token_program yet; Token-2022 arb tokens are rare.
@@ -1755,6 +1775,12 @@ async fn build_hop_pump_amm(
         None, // Token-2022 not yet supported in multi-hop arb
         sell_requires && is_sell_hop,
         if is_sell_hop { sell_third } else { None },
+        sell_requires_pre_fee && is_sell_hop,
+        if is_sell_hop {
+            sell_pre_fee_meta_1
+        } else {
+            None
+        },
         None, // volume tails: derived for wallet in builder
         None,
         if is_sell_hop { sell_fee_t0 } else { None },
@@ -2218,6 +2244,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
         );
 
         let mut intent = base_intent();
@@ -2319,6 +2347,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
         );
 
         // Target pool: explicit JetStream Ready (force_refresh / PoolCacheUpdate path).
@@ -2346,6 +2376,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
         );
 
         let mut intent = base_intent();
