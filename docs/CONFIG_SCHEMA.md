@@ -165,6 +165,7 @@ Deprecated (ignored with warn log): `cto_*`, `dev_early_sell_window_secs`, `dev_
 |-----|------|---------|-------|-------------|
 | `max_dev_supply_pct` | f64 | 95.0 | 0-100 | Max dev supply percentage before rejecting |
 | `lp_removal_window_secs` | u64 | 60 | > 0 | Track LP removals for N seconds |
+| `min_token_age_secs` | u64 | 60 | >= 0 | Min seconds since discovery before probe/scale-in; `0` disables (Filter 1c) |
 
 ### Filter 2: Buyer Velocity
 
