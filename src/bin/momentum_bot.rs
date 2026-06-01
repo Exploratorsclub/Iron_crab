@@ -14636,30 +14636,34 @@ mod tests {
         cfg
     }
 
-    fn record_trades_in_price_trend_bucket(
-        tracker: &mut TokenTracker,
-        cfg: &MomentumConfig,
+    struct PriceTrendBucketTradeArgs<'a> {
+        tracker: &'a mut TokenTracker,
+        cfg: &'a MomentumConfig,
         head: u64,
         bucket_idx: usize,
         tps: f64,
         count: u32,
         is_buy: bool,
-        label: &str,
-    ) {
-        let window_slots = momentum_secs_to_slot_span(cfg.price_trend_window_secs);
-        let bucket_count = clamp_price_trend_bucket_count(cfg.price_trend_bucket_count);
-        let bucket_span = (window_slots / bucket_count as u64).max(1);
-        let age = bucket_idx as u64 * bucket_span + bucket_span / 2;
-        let base_slot = head.saturating_sub(age);
-        for i in 0..count {
-            record_trade_implied_tps(
-                tracker,
-                cfg,
-                base_slot + u64::from(i),
-                tps,
-                is_buy,
-                &format!("{label}_{bucket_idx}_{i}"),
-            );
+        label: &'a str,
+    }
+
+    impl PriceTrendBucketTradeArgs<'_> {
+        fn record(self) {
+            let window_slots = momentum_secs_to_slot_span(self.cfg.price_trend_window_secs);
+            let bucket_count = clamp_price_trend_bucket_count(self.cfg.price_trend_bucket_count);
+            let bucket_span = (window_slots / bucket_count as u64).max(1);
+            let age = self.bucket_idx as u64 * bucket_span + bucket_span / 2;
+            let base_slot = self.head.saturating_sub(age);
+            for i in 0..self.count {
+                record_trade_implied_tps(
+                    self.tracker,
+                    self.cfg,
+                    base_slot + u64::from(i),
+                    self.tps,
+                    self.is_buy,
+                    &format!("{}_{}_{i}", self.label, self.bucket_idx),
+                );
+            }
         }
     }
 
@@ -14692,16 +14696,17 @@ mod tests {
         // bucket 0 = late (higher tps); bucket 4 = early (lower tps) → lower highs in price
         let rising_tps_late_to_early = [120.0, 115.0, 110.0, 105.0, 100.0];
         for (bucket_idx, tps) in rising_tps_late_to_early.iter().enumerate() {
-            record_trades_in_price_trend_bucket(
-                &mut tracker,
-                &cfg,
+            PriceTrendBucketTradeArgs {
+                tracker: &mut tracker,
+                cfg: &cfg,
                 head,
                 bucket_idx,
-                *tps,
-                4,
-                true,
-                "lh",
-            );
+                tps: *tps,
+                count: 4,
+                is_buy: true,
+                label: "lh",
+            }
+            .record();
         }
 
         let (should_trade, reason) =
@@ -14778,18 +14783,39 @@ mod tests {
                 &format!("fall{i}"),
             );
         }
-        record_trades_in_price_trend_bucket(&mut tracker, &cfg, head, 2, 128.0, 6, false, "dump_b");
-        record_trades_in_price_trend_bucket(&mut tracker, &cfg, head, 1, 120.0, 6, true, "rec_mid");
-        record_trades_in_price_trend_bucket(
-            &mut tracker,
-            &cfg,
+        PriceTrendBucketTradeArgs {
+            tracker: &mut tracker,
+            cfg: &cfg,
             head,
-            0,
-            110.0,
-            6,
-            true,
-            "rec_late",
-        );
+            bucket_idx: 2,
+            tps: 128.0,
+            count: 6,
+            is_buy: false,
+            label: "dump_b",
+        }
+        .record();
+        PriceTrendBucketTradeArgs {
+            tracker: &mut tracker,
+            cfg: &cfg,
+            head,
+            bucket_idx: 1,
+            tps: 120.0,
+            count: 6,
+            is_buy: true,
+            label: "rec_mid",
+        }
+        .record();
+        PriceTrendBucketTradeArgs {
+            tracker: &mut tracker,
+            cfg: &cfg,
+            head,
+            bucket_idx: 0,
+            tps: 110.0,
+            count: 6,
+            is_buy: true,
+            label: "rec_late",
+        }
+        .record();
 
         let wait = tracker.price_trend_wait_reason(&cfg, head);
         assert!(
@@ -14812,16 +14838,17 @@ mod tests {
         // bucket 0 = late (lower tps); bucket 4 = early (higher tps) → rising price, no lower highs
         let falling_tps_late_to_early = [100.0, 105.0, 110.0, 115.0, 120.0];
         for (bucket_idx, tps) in falling_tps_late_to_early.iter().enumerate() {
-            record_trades_in_price_trend_bucket(
-                &mut tracker,
-                &cfg,
+            PriceTrendBucketTradeArgs {
+                tracker: &mut tracker,
+                cfg: &cfg,
                 head,
                 bucket_idx,
-                *tps,
-                4,
-                true,
-                "pump",
-            );
+                tps: *tps,
+                count: 4,
+                is_buy: true,
+                label: "pump",
+            }
+            .record();
         }
 
         let (should_trade, reason) =
@@ -14843,18 +14870,29 @@ mod tests {
         // 4/4 lower-high pairs monotonic; bucket-0 bounce breaks only the last pair (max_breaks=0).
         let bucket_tps = [118.0, 124.0, 116.0, 108.0, 100.0];
         for (bucket_idx, tps) in bucket_tps.iter().enumerate() {
-            record_trades_in_price_trend_bucket(
-                &mut tracker,
-                &cfg,
+            PriceTrendBucketTradeArgs {
+                tracker: &mut tracker,
+                cfg: &cfg,
                 head,
                 bucket_idx,
-                *tps,
-                4,
-                true,
-                "lh",
-            );
+                tps: *tps,
+                count: 4,
+                is_buy: true,
+                label: "lh",
+            }
+            .record();
         }
-        record_trades_in_price_trend_bucket(&mut tracker, &cfg, head, 4, 50.0, 6, true, "ath");
+        PriceTrendBucketTradeArgs {
+            tracker: &mut tracker,
+            cfg: &cfg,
+            head,
+            bucket_idx: 4,
+            tps: 50.0,
+            count: 6,
+            is_buy: true,
+            label: "ath",
+        }
+        .record();
         // Late-window dump keeps short_slope positive (price still falling vs early half).
         for i in 0..8u64 {
             let slot = head.saturating_sub(half + 5 + i);
@@ -14908,8 +14946,28 @@ mod tests {
                 &format!("dump{i}"),
             );
         }
-        record_trades_in_price_trend_bucket(&mut tracker, &cfg, head, 0, 115.0, 6, true, "r0");
-        record_trades_in_price_trend_bucket(&mut tracker, &cfg, head, 1, 125.0, 6, true, "r1");
+        PriceTrendBucketTradeArgs {
+            tracker: &mut tracker,
+            cfg: &cfg,
+            head,
+            bucket_idx: 0,
+            tps: 115.0,
+            count: 6,
+            is_buy: true,
+            label: "r0",
+        }
+        .record();
+        PriceTrendBucketTradeArgs {
+            tracker: &mut tracker,
+            cfg: &cfg,
+            head,
+            bucket_idx: 1,
+            tps: 125.0,
+            count: 6,
+            is_buy: true,
+            label: "r1",
+        }
+        .record();
 
         let wait = tracker.price_trend_wait_reason(&cfg, head);
         assert!(wait.is_some(), "expected wait before min recovery secs");
@@ -14921,26 +14979,28 @@ mod tests {
 
         let recovery_slots = momentum_secs_to_slot_span(cfg.price_trend_recovery_min_secs);
         let head_after = head + recovery_slots + 5;
-        record_trades_in_price_trend_bucket(
-            &mut tracker,
-            &cfg,
-            head_after,
-            0,
-            115.0,
-            6,
-            true,
-            "r0b",
-        );
-        record_trades_in_price_trend_bucket(
-            &mut tracker,
-            &cfg,
-            head_after,
-            1,
-            125.0,
-            6,
-            true,
-            "r1b",
-        );
+        PriceTrendBucketTradeArgs {
+            tracker: &mut tracker,
+            cfg: &cfg,
+            head: head_after,
+            bucket_idx: 0,
+            tps: 115.0,
+            count: 6,
+            is_buy: true,
+            label: "r0b",
+        }
+        .record();
+        PriceTrendBucketTradeArgs {
+            tracker: &mut tracker,
+            cfg: &cfg,
+            head: head_after,
+            bucket_idx: 1,
+            tps: 125.0,
+            count: 6,
+            is_buy: true,
+            label: "r1b",
+        }
+        .record();
         let wait_after = tracker.price_trend_wait_reason(&cfg, head_after);
         assert!(
             wait_after.is_none(),
@@ -14957,16 +15017,17 @@ mod tests {
         let head = 6_500u64;
         let rising_tps_late_to_early = [132.0, 124.0, 116.0, 108.0, 100.0];
         for (bucket_idx, tps) in rising_tps_late_to_early.iter().enumerate() {
-            record_trades_in_price_trend_bucket(
-                &mut tracker,
-                &cfg,
+            PriceTrendBucketTradeArgs {
+                tracker: &mut tracker,
+                cfg: &cfg,
                 head,
                 bucket_idx,
-                *tps,
-                4,
-                true,
-                "struct",
-            );
+                tps: *tps,
+                count: 4,
+                is_buy: true,
+                label: "struct",
+            }
+            .record();
         }
         let (should_trade, reason) =
             tracker.should_generate_intent(&cfg, None, head, Instant::now());
@@ -14993,16 +15054,17 @@ mod tests {
         // Structural lower highs across 5 buckets (pump → dump), late bounce cannot recover.
         let rising_tps_late_to_early = [122.0, 118.0, 112.0, 105.0, 95.0];
         for (bucket_idx, tps) in rising_tps_late_to_early.iter().enumerate() {
-            record_trades_in_price_trend_bucket(
-                &mut tracker,
-                &cfg,
+            PriceTrendBucketTradeArgs {
+                tracker: &mut tracker,
+                cfg: &cfg,
                 head,
                 bucket_idx,
-                *tps,
-                4,
-                true,
-                "fodl",
-            );
+                tps: *tps,
+                count: 4,
+                is_buy: true,
+                label: "fodl",
+            }
+            .record();
         }
         for i in 0..8u64 {
             let slot = head.saturating_sub(half + 5 + i);
