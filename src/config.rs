@@ -908,6 +908,29 @@ pub struct MomentumCfg {
     /// Default: 10s.
     #[serde(default = "default_dump_recovery_min_recovery_secs")]
     pub dump_recovery_min_recovery_secs: u64,
+
+    // === Filter 5: Price Trend / Downtrend Gate (pre-entry) ===
+    /// Master switch for trade-implied price-trend gate. Default: true.
+    #[serde(default = "default_price_trend_filter_enabled")]
+    pub price_trend_filter_enabled: bool,
+    /// Chain-slot window (seconds) for trend evaluation. Default: 90s. `0` disables.
+    #[serde(default = "default_price_trend_window_secs")]
+    pub price_trend_window_secs: u64,
+    /// Minimum trades with `slot > 0` in the trend window. Default: 12.
+    #[serde(default = "default_price_trend_min_trades")]
+    pub price_trend_min_trades: u32,
+    /// Minimum `trade_tps` rise (%) for lower-highs / short-slope signals. Default: 8.0.
+    #[serde(default = "default_price_trend_min_tps_rise_pct")]
+    pub price_trend_min_tps_rise_pct: f64,
+    /// Drawdown from session trade-high (%) to arm drawdown+slope signal. Default: 25.0.
+    #[serde(default = "default_price_trend_max_drawdown_pct")]
+    pub price_trend_max_drawdown_pct: f64,
+    /// Recovery exception: min buy dominance in trend window. Default: 0.60.
+    #[serde(default = "default_price_trend_recovery_min_buy_dominance")]
+    pub price_trend_recovery_min_buy_dominance: f64,
+    /// Recovery exception: min net SOL inflow (lamports) in trend window. Default: 0.5 SOL.
+    #[serde(default = "default_price_trend_recovery_min_inflow_lamports")]
+    pub price_trend_recovery_min_inflow_lamports: u64,
 }
 
 // Momentum config defaults - tuned to be less strict than original hardcoded values
@@ -1054,6 +1077,28 @@ fn default_dump_recovery_min_recovery_secs() -> u64 {
     10
 }
 
+fn default_price_trend_filter_enabled() -> bool {
+    true
+}
+fn default_price_trend_window_secs() -> u64 {
+    90
+}
+fn default_price_trend_min_trades() -> u32 {
+    12
+}
+fn default_price_trend_min_tps_rise_pct() -> f64 {
+    8.0
+}
+fn default_price_trend_max_drawdown_pct() -> f64 {
+    25.0
+}
+fn default_price_trend_recovery_min_buy_dominance() -> f64 {
+    0.60
+}
+fn default_price_trend_recovery_min_inflow_lamports() -> u64 {
+    500_000_000
+}
+
 impl Default for MomentumCfg {
     fn default() -> Self {
         Self {
@@ -1107,6 +1152,15 @@ impl Default for MomentumCfg {
             dump_recovery_min_buy_dominance: default_dump_recovery_min_buy_dominance(),
             dump_recovery_min_net_inflow_lamports: default_dump_recovery_min_net_inflow_lamports(),
             dump_recovery_min_recovery_secs: default_dump_recovery_min_recovery_secs(),
+            price_trend_filter_enabled: default_price_trend_filter_enabled(),
+            price_trend_window_secs: default_price_trend_window_secs(),
+            price_trend_min_trades: default_price_trend_min_trades(),
+            price_trend_min_tps_rise_pct: default_price_trend_min_tps_rise_pct(),
+            price_trend_max_drawdown_pct: default_price_trend_max_drawdown_pct(),
+            price_trend_recovery_min_buy_dominance: default_price_trend_recovery_min_buy_dominance(
+            ),
+            price_trend_recovery_min_inflow_lamports:
+                default_price_trend_recovery_min_inflow_lamports(),
         }
     }
 }

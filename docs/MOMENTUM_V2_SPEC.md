@@ -158,6 +158,7 @@ Soft gates (WAIT until sufficient data):
 - Not enough unique buyers in the early window.
 - Trade velocity / buy dominance below thresholds.
 - Net SOL inflow below threshold.
+- **Filter 5 — Price trend / downtrend** (`WAIT_DOWNTREND`): trade-implied `tokens_per_sol` from Geyser `TradeEvent` prints (no RPC). Blocks clear lower-highs structure and drawdown-from-session-high with falling short slope; recovery exception when fresh buy flow + improving slope. Runs **before** dump-recovery (Filter 3b).
 
 CTO behavior (pre-entry only):
 - If dev sells early and we do **not** hold a position:
@@ -203,6 +204,7 @@ Reason codes are uppercase snake case. A decision must include exactly one **pri
 - `WAIT_MINT_INFO`
 - `WAIT_BUYER_WINDOW`
 - `WAIT_CONFIRMATION`
+- `WAIT_DOWNTREND`
 - `WAIT_DEV_SELL_REVALIDATION`
 
 ### Reject (pre-entry)
@@ -472,6 +474,15 @@ Dump recovery:
 - `dump_recovery_min_buy_dominance`
 - `dump_recovery_min_net_inflow_lamports`
 - `dump_recovery_min_recovery_secs`
+
+Price trend / downtrend (Filter 5):
+- `price_trend_filter_enabled`
+- `price_trend_window_secs`
+- `price_trend_min_trades`
+- `price_trend_min_tps_rise_pct`
+- `price_trend_max_drawdown_pct`
+- `price_trend_recovery_min_buy_dominance`
+- `price_trend_recovery_min_inflow_lamports`
 
 Dev-sell revalidation (pre-entry):
 - `dev_sell_revalidation_delay_secs`

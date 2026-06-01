@@ -190,6 +190,15 @@ const CONFIG_DESCRIPTIONS: Record<string, Record<string, string>> = {
     dump_recovery_min_net_inflow_lamports: 'DUMP: Min net inflow for recovery (lamports)',
     dump_recovery_min_recovery_secs: 'DUMP: Min seconds of recovery before entry',
     
+    // Filter 5: Price Trend / Downtrend
+    price_trend_filter_enabled: 'TREND: Enable pre-entry downtrend gate (trade-implied tps)',
+    price_trend_window_secs: 'TREND: Chain-slot window for trend (seconds)',
+    price_trend_min_trades: 'TREND: Min trades with slot in window',
+    price_trend_min_tps_rise_pct: 'TREND: Min tps rise (%) for lower-highs / slope',
+    price_trend_max_drawdown_pct: 'TREND: Drawdown from session trade-high (%)',
+    price_trend_recovery_min_buy_dominance: 'TREND: Recovery exception min buy dominance',
+    price_trend_recovery_min_inflow_lamports: 'TREND: Recovery exception min net inflow (lamports)',
+    
     // Exit Strategy
     hard_stop_min_hold_secs: 'EXIT: Grace period before normal hard stop (seconds)',
     catastrophic_stop_loss_pct: 'EXIT: Hard stop threshold during grace (%, rug/catastrophic)',
@@ -333,6 +342,15 @@ const CONFIG_GROUPS: Record<string, Record<string, string[]>> = {
       'dump_recovery_min_net_inflow_lamports',
       'dump_recovery_min_recovery_secs',
     ],
+    'Filter 5: Price Trend / Downtrend': [
+      'price_trend_filter_enabled',
+      'price_trend_window_secs',
+      'price_trend_min_trades',
+      'price_trend_min_tps_rise_pct',
+      'price_trend_max_drawdown_pct',
+      'price_trend_recovery_min_buy_dominance',
+      'price_trend_recovery_min_inflow_lamports',
+    ],
     'Exit Strategy': [
       'hard_stop_min_hold_secs',
       'catastrophic_stop_loss_pct',
@@ -471,6 +489,15 @@ const DEFAULT_CONFIGS: Record<string, ComponentConfig> = {
     dump_recovery_min_buy_dominance: 0.55,
     dump_recovery_min_net_inflow_lamports: 1000000000, // 1 SOL
     dump_recovery_min_recovery_secs: 10,
+    
+    // Filter 5: Price Trend / Downtrend
+    price_trend_filter_enabled: true,
+    price_trend_window_secs: 90,
+    price_trend_min_trades: 12,
+    price_trend_min_tps_rise_pct: 8,
+    price_trend_max_drawdown_pct: 25,
+    price_trend_recovery_min_buy_dominance: 0.60,
+    price_trend_recovery_min_inflow_lamports: 500000000,
     
     // Exit Strategy
     hard_stop_min_hold_secs: 45,
