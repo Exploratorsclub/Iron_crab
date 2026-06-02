@@ -2262,17 +2262,26 @@ impl PumpFunAmmDex {
         sell_pre_fee_meta_1: Option<Pubkey>,
         sell_fee_config: Pubkey,
         sell_fee_program: Pubkey,
-    ) {
+    ) -> Result<()> {
         if sell_requires_pre_fee_metas {
-            if pre_fee_meta_0 != Pubkey::default() {
-                metas.push(AccountMeta::new_readonly(pre_fee_meta_0, false));
+            if pre_fee_meta_0 == Pubkey::default() {
+                return Err(anyhow!(
+                    "pump_amm SELL: 27-account layout requires global_volume_accumulator pre_fee_meta_0"
+                ));
             }
-            if let Some(p1) = sell_pre_fee_meta_1.filter(|p| *p != Pubkey::default()) {
-                metas.push(AccountMeta::new_readonly(p1, false));
-            }
+            let pre_fee_1 = sell_pre_fee_meta_1
+                .filter(|p| *p != Pubkey::default())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "pump_amm SELL: 27-account layout requires sell_pre_fee_meta_1 (authoritative observation required)"
+                    )
+                })?;
+            metas.push(AccountMeta::new_readonly(pre_fee_meta_0, false));
+            metas.push(AccountMeta::new_readonly(pre_fee_1, false));
         }
         metas.push(AccountMeta::new_readonly(sell_fee_config, false));
         metas.push(AccountMeta::new_readonly(sell_fee_program, false));
+        Ok(())
     }
 
     /// Append extended/cashback SELL trailing metas for the **derived intent-user path**:
@@ -2286,6 +2295,7 @@ impl PumpFunAmmDex {
         quote_mint: Pubkey,
         quote_token_program: Pubkey,
         third: Pubkey,
+        sell_requires_pre_fee_metas: bool,
         sell_extended_fee_tail_0: Option<Pubkey>,
         sell_extended_fee_tail_1: Option<Pubkey>,
         cached_observed_volume_tail_0: Option<Pubkey>,
@@ -2313,10 +2323,15 @@ impl PumpFunAmmDex {
         metas.push(AccountMeta::new(user_vol_wsol_ata, false));
         metas.push(AccountMeta::new(user_vol, false));
         metas.push(AccountMeta::new_readonly(third, false));
-        if let Some(f0) = sell_extended_fee_tail_0.filter(|p| *p != Pubkey::default()) {
+        if sell_requires_pre_fee_metas {
+            if let Some(f0) = sell_extended_fee_tail_0.filter(|p| *p != Pubkey::default()) {
+                metas.push(AccountMeta::new_readonly(f0, false));
+            }
+        } else if let (Some(f0), Some(f1)) = (
+            sell_extended_fee_tail_0.filter(|p| *p != Pubkey::default()),
+            sell_extended_fee_tail_1.filter(|p| *p != Pubkey::default()),
+        ) {
             metas.push(AccountMeta::new_readonly(f0, false));
-        }
-        if let Some(f1) = sell_extended_fee_tail_1.filter(|p| *p != Pubkey::default()) {
             metas.push(AccountMeta::new_readonly(f1, false));
         }
     }
@@ -5730,7 +5745,7 @@ impl Dex for PumpFunAmmDex {
                 sell_pre_fee_meta_1,
                 sell_fee_config,
                 sell_fee_program,
-            );
+            )?;
             if sell_requires_cashback_remaining {
                 let Some(third) = sell_cashback_third_meta.filter(|p| *p != Pubkey::default())
                 else {
@@ -5744,6 +5759,7 @@ impl Dex for PumpFunAmmDex {
                     pool.quote_mint,
                     quote_token_program,
                     third,
+                    sell_requires_pre_fee_metas,
                     sell_extended_fee_tail_0,
                     sell_extended_fee_tail_1,
                     cached_observed_volume_tail_0,
@@ -6035,7 +6051,7 @@ impl PumpFunAmmDex {
                 sell_pre_fee_meta_1,
                 sell_fee_config,
                 sell_fee_program,
-            );
+            )?;
             if sell_requires_cashback_remaining {
                 let Some(third) = sell_cashback_third_meta.filter(|p| *p != Pubkey::default())
                 else {
@@ -6049,6 +6065,7 @@ impl PumpFunAmmDex {
                     quote_mint,
                     quote_tp,
                     third,
+                    sell_requires_pre_fee_metas,
                     sell_extended_fee_tail_0,
                     sell_extended_fee_tail_1,
                     sell_extended_tail_0,
