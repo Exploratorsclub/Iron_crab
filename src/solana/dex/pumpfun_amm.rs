@@ -4718,10 +4718,16 @@ impl PumpFunAmmDex {
                     continue;
                 }
 
+                let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
                 let ua = PumpAmmUserAccounts {
                     user_base_ta: Pubkey::from_str(acc_strings[5].as_str())?,
                     user_quote_ta: Pubkey::from_str(acc_strings[6].as_str())?,
-                    user_volume_accumulator: Pubkey::from_str(acc_strings[20].as_str())?,
+                    // SELL layouts place fee/pre-fee metas at #19/#20, not user_volume (BUY #19).
+                    user_volume_accumulator: Self::derive_user_volume_accumulator(
+                        program_id,
+                        pool_market,
+                        user,
+                    ),
                 };
                 self.user_accounts.insert((pool_market, user), ua.clone());
                 return Ok(Some(ua));
