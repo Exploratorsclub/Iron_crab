@@ -1701,25 +1701,39 @@ impl PumpFunAmmDex {
         Self::extend_with_loaded_addresses(&mut account_keys, meta);
         let sell_layout_sell_disc = anchor_disc("sell");
         for ix in Self::collect_all_instructions(msg, meta) {
-            let program_id = Self::program_id_str_from_instruction_json(ix, &account_keys)?;
+            let Some(program_id) = Self::program_id_str_from_instruction_json(ix, &account_keys)
+            else {
+                continue;
+            };
             if program_id != PUMPFUN_AMM_PROGRAM_ID {
                 continue;
             }
-            let ix_data = Self::pump_amm_ix_data_from_json(ix)?;
-            let disc8: [u8; 8] = ix_data.get(..8).and_then(|s| s.try_into().ok())?;
+            let Some(ix_data) = Self::pump_amm_ix_data_from_json(ix) else {
+                continue;
+            };
+            let Some(disc8): Option<[u8; 8]> = ix_data.get(..8).and_then(|s| s.try_into().ok())
+            else {
+                continue;
+            };
             if disc8 != sell_layout_sell_disc {
                 continue;
             }
-            let acc_strings = Self::pump_amm_ix_account_strings_from_json(ix, &account_keys)?;
+            let Some(acc_strings) = Self::pump_amm_ix_account_strings_from_json(ix, &account_keys)
+            else {
+                continue;
+            };
             if !pump_amm_sell_ix_account_len_supported(acc_strings.len()) {
                 continue;
             }
-            let (observed_pool, observed_base, cand_obs) =
+            let Some((observed_pool, observed_base, cand_obs)) =
                 Self::pump_amm_sell_reference_observation_from_parsed_swap_ix(
                     &acc_strings,
                     &ix_data,
                     Some(signature.to_string()),
-                )?;
+                )
+            else {
+                continue;
+            };
             if observed_pool == pool_market && observed_base == base_mint {
                 return Some(cand_obs);
             }
