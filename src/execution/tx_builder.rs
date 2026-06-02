@@ -5,11 +5,12 @@ use crate::solana::dex::orca::Orca;
 use crate::solana::dex::orca_whirlpool_layout;
 use crate::solana::dex::pumpfun::PumpFunDex;
 use crate::solana::dex::pumpfun_amm::{
-    PumpAmmPoolAccountsDiagnostic, PumpFunAmmDex, PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR,
-    PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR, PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS,
-    PUMPFUN_AMM_SELL_EXT_TAIL_0_IX, PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2,
-    PUMPFUN_AMM_SELL_EXT_TAIL_1_IX, PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2,
-    PUMPFUN_AMM_SELL_EXT_THIRD_META_IX, PUMPFUN_AMM_SELL_EXT_THIRD_META_IX_V2,
+    pump_amm_sell_ix_uses_global_fee_at, PumpAmmPoolAccountsDiagnostic, PumpFunAmmDex,
+    PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR, PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR,
+    PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS, PUMPFUN_AMM_SELL_EXT_TAIL_0_IX,
+    PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2, PUMPFUN_AMM_SELL_EXT_TAIL_1_IX,
+    PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2, PUMPFUN_AMM_SELL_EXT_THIRD_META_IX,
+    PUMPFUN_AMM_SELL_EXT_THIRD_META_IX_V2,
 };
 use crate::solana::dex::raydium::Raydium;
 use crate::solana::dex::Dex;
@@ -962,16 +963,25 @@ pub async fn build_tx_plan(
             && intent.side == TradeSide::Sell
             && pool_accounts.len() >= 14
             && !ixs.is_empty()
-            && ixs[0].accounts.len() >= 21
         {
+            if let Some((fee_config_ix, fee_program_ix)) =
+                pump_amm_sell_ix_uses_global_fee_at(ixs[0].accounts.len())
+            {
+            let sell_ix_accounts = &ixs[0].accounts;
             let canonical_fee_cfg =
                 Pubkey::from_str(PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR).unwrap_or_default();
             let canonical_fee_prog =
                 Pubkey::from_str(PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR).unwrap_or_default();
             let v12_fc = pool_accounts[12];
             let v12_fp = pool_accounts[13];
-            let ix_fc = ixs[0].accounts[19].pubkey;
-            let ix_fp = ixs[0].accounts[20].pubkey;
+            let ix_fc = sell_ix_accounts
+                .get(fee_config_ix)
+                .map(|m| m.pubkey)
+                .unwrap_or_default();
+            let ix_fp = sell_ix_accounts
+                .get(fee_program_ix)
+                .map(|m| m.pubkey)
+                .unwrap_or_default();
             let fee_config_uses_global_constant = ix_fc == canonical_fee_cfg;
             let fee_program_uses_expected = ix_fp == canonical_fee_prog;
             let fee_config_differs_from_v14_row = v12_fc != ix_fc;
@@ -1011,7 +1021,6 @@ pub async fn build_tx_plan(
                 } else {
                     "n/a"
                 };
-            let sell_ix_accounts = &ixs[0].accounts;
             let sell_ix_account_count = sell_ix_accounts.len();
             let (tail0_ix, tail1_ix, tail2_ix) =
                 if sell_ix_account_count == PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS {
@@ -1081,7 +1090,9 @@ pub async fn build_tx_plan(
                     v14_fee_program_differs_from_expected = (v12_fp != canonical_fee_prog),
                     fee_config_differs_from_v14_row = fee_config_differs_from_v14_row,
                     fee_program_differs_from_v14_row = fee_program_differs_from_v14_row,
-                    "Scope44: pump_amm SELL plan — meta #19/#20 must be global FeeConfig + fee_program (v14[12] is informational; wrong type → Custom 3002)"
+                    sell_ix_fee_config_ix = fee_config_ix,
+                    sell_ix_fee_program_ix = fee_program_ix,
+                    "Scope44: pump_amm SELL plan (27-account) — meta #21/#22 must be global FeeConfig + fee_program (v14[12] is informational; wrong type → Custom 3002)"
                 );
             } else {
                 info!(
@@ -1121,8 +1132,11 @@ pub async fn build_tx_plan(
                     v14_fee_program_differs_from_expected = (v12_fp != canonical_fee_prog),
                     fee_config_differs_from_v14_row = fee_config_differs_from_v14_row,
                     fee_program_differs_from_v14_row = fee_program_differs_from_v14_row,
+                    sell_ix_fee_config_ix = fee_config_ix,
+                    sell_ix_fee_program_ix = fee_program_ix,
                     "Scope44: pump_amm SELL plan — meta #19/#20 must be global FeeConfig + fee_program (v14[12] is informational; wrong type → Custom 3002)"
                 );
+            }
             }
         }
 
