@@ -878,11 +878,47 @@ fn sell_layout_scan_termination_after_successful_tx_fetch(
     }
 }
 
+/// Rank authoritative SELL layouts for TX-history merge (higher = stronger evidence).
+///
+/// P184e: a newer **26-account** `sell` must not terminate discovery before an older **27-account**
+/// reference is considered; strength ordering prefers 27 > 26 > 24 > 21 (Base).
+#[must_use]
+fn authoritative_sell_layout_strength(layout: &PumpAmmAuthoritativeSellLayout) -> u8 {
+    match layout {
+        PumpAmmAuthoritativeSellLayout::Unknown => 0,
+        PumpAmmAuthoritativeSellLayout::Base => 1,
+        PumpAmmAuthoritativeSellLayout::Extended {
+            pre_fee_0,
+            pre_fee_1,
+            fee_tail_0,
+            fee_tail_1,
+            ..
+        } => {
+            let has_pre_fee = pre_fee_0.filter(|p| *p != Pubkey::default()).is_some()
+                && pre_fee_1.filter(|p| *p != Pubkey::default()).is_some();
+            if has_pre_fee {
+                4
+            } else if fee_tail_0.filter(|p| *p != Pubkey::default()).is_some()
+                && fee_tail_1.filter(|p| *p != Pubkey::default()).is_some()
+            {
+                3
+            } else {
+                2
+            }
+        }
+    }
+}
+
+/// True when the scan can stop early — 27-account extended `sell` with both pre-fee metas.
+#[must_use]
+fn authoritative_sell_layout_is_terminal_for_scan(layout: &PumpAmmAuthoritativeSellLayout) -> bool {
+    authoritative_sell_layout_strength(layout) >= 4
+}
+
 /// Merge SELL-layout observations while scanning **reverse-chronological** signatures (newest first).
 ///
-/// The **newest** matching `sell` wins. A newer **21-account** `sell` must not hide an older
-/// **24-account** extended `sell`, but a newer post-upgrade extended `sell` must not be replaced
-/// by an older legacy extended row. Fee recipient fields follow the winning layout (Scope 60).
+/// Prefer the **strongest** layout (27 > 26 > 24 > Base). On equal strength, keep `best` (newer
+/// evidence in newest-first scan). Fee recipient fields follow the winning layout (Scope 60).
 fn merge_pump_amm_authoritative_sell_reference_observation(
     best: PumpAmmSellReferenceObservation,
     candidate: PumpAmmSellReferenceObservation,
@@ -890,12 +926,15 @@ fn merge_pump_amm_authoritative_sell_reference_observation(
     if matches!(best.layout, PumpAmmAuthoritativeSellLayout::Unknown) {
         return candidate;
     }
-    match candidate.layout {
-        PumpAmmAuthoritativeSellLayout::Extended { .. } => match best.layout {
-            PumpAmmAuthoritativeSellLayout::Base => candidate,
-            _ => best,
-        },
-        PumpAmmAuthoritativeSellLayout::Base | PumpAmmAuthoritativeSellLayout::Unknown => best,
+    if matches!(candidate.layout, PumpAmmAuthoritativeSellLayout::Unknown) {
+        return best;
+    }
+    let best_strength = authoritative_sell_layout_strength(&best.layout);
+    let cand_strength = authoritative_sell_layout_strength(&candidate.layout);
+    if cand_strength > best_strength {
+        candidate
+    } else {
+        best
     }
 }
 
@@ -909,11 +948,20 @@ fn fold_force_refresh_sell_reference_observations_newest_first(
 ) -> PumpAmmSellReferenceObservation {
     for obs in observations_newest_first {
         best = merge_pump_amm_authoritative_sell_reference_observation(best, obs);
-        if matches!(best.layout, PumpAmmAuthoritativeSellLayout::Extended { .. }) {
-            return best;
-        }
     }
     best
+}
+
+/// Cold-path reference `sell` txs known to use the 27-account extended layout (P184e).
+fn pump_amm_known_v2_sell_reference_signatures(pool_market: &Pubkey) -> &'static [&'static str] {
+    const STUCK_POOL: &str = "GrgDaBg4TGBQCDZk9HHw8JT24RnoDHtQnvgguKxGKStb";
+    const STUCK_POOL_V2_REF: &str =
+        "3XPKr7ynZzRSwvwiVvWpDr58pFCUVUqwySBiUwPMqwUTDGETFWaZXpYWm84DnAuSet4rQRmcwUwsfZ8Vg8gJqeae";
+    if pool_market.to_string() == STUCK_POOL {
+        &[STUCK_POOL_V2_REF]
+    } else {
+        &[]
+    }
 }
 
 fn provider_status_from_anyhow_rpc(err: &anyhow::Error) -> PumpAmmSellLayoutProviderStatus {
@@ -1591,6 +1639,94 @@ impl PumpFunAmmDex {
         pool.protocol_fee_recipient_ta = obs.protocol_fee_recipient_ta;
     }
 
+    /// Cold-path only: when TX-history scan found a weaker extended layout, try curated 27-account refs.
+    async fn upgrade_sell_layout_observation_with_known_v2_reference(
+        &self,
+        tx_rpc: Arc<SolanaRpc>,
+        pool_market: Pubkey,
+        base_mint: Pubkey,
+        mut obs: PumpAmmSellReferenceObservation,
+    ) -> PumpAmmSellReferenceObservation {
+        if authoritative_sell_layout_is_terminal_for_scan(&obs.layout) {
+            return obs;
+        }
+        let baseline_strength = authoritative_sell_layout_strength(&obs.layout);
+        for sig in pump_amm_known_v2_sell_reference_signatures(&pool_market) {
+            if let Some(ref_obs) = self
+                .try_observe_sell_layout_from_reference_signature(
+                    tx_rpc.as_ref(),
+                    pool_market,
+                    base_mint,
+                    sig,
+                )
+                .await
+            {
+                obs = merge_pump_amm_authoritative_sell_reference_observation(obs, ref_obs);
+                if authoritative_sell_layout_strength(&obs.layout) > baseline_strength {
+                    info!(
+                        pool = %pool_market,
+                        base_mint = %base_mint,
+                        reference_swap_signature = %obs.reference_swap_signature.as_deref().unwrap_or(""),
+                        sell_ix_account_count = PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS,
+                        layout = ?obs.layout,
+                        "pump_amm: upgraded force_refresh SELL layout from known 27-account reference tx"
+                    );
+                    return obs;
+                }
+            }
+        }
+        obs
+    }
+
+    /// Fetch and decode a single known-good 27-account `sell` reference (cold path / discovery only).
+    async fn try_observe_sell_layout_from_reference_signature(
+        &self,
+        tx_rpc: &SolanaRpc,
+        pool_market: Pubkey,
+        base_mint: Pubkey,
+        signature: &str,
+    ) -> Option<PumpAmmSellReferenceObservation> {
+        let tx_v = Self::fetch_tx_as_value_with_rpc(tx_rpc, signature)
+            .await
+            .ok()?;
+        let msg = tx_v
+            .get("result")
+            .and_then(|r| r.get("transaction"))
+            .and_then(|t| t.get("message"))?;
+        let meta = tx_v
+            .get("result")
+            .and_then(|r| r.get("meta"))
+            .unwrap_or(&serde_json::Value::Null);
+        let mut account_keys = Self::parse_account_keys(msg).ok()?;
+        Self::extend_with_loaded_addresses(&mut account_keys, meta);
+        let sell_layout_sell_disc = anchor_disc("sell");
+        for ix in Self::collect_all_instructions(msg, meta) {
+            let program_id = Self::program_id_str_from_instruction_json(ix, &account_keys)?;
+            if program_id != PUMPFUN_AMM_PROGRAM_ID {
+                continue;
+            }
+            let ix_data = Self::pump_amm_ix_data_from_json(ix)?;
+            let disc8: [u8; 8] = ix_data.get(..8).and_then(|s| s.try_into().ok())?;
+            if disc8 != sell_layout_sell_disc {
+                continue;
+            }
+            let acc_strings = Self::pump_amm_ix_account_strings_from_json(ix, &account_keys)?;
+            if !pump_amm_sell_ix_account_len_supported(acc_strings.len()) {
+                continue;
+            }
+            let (observed_pool, observed_base, cand_obs) =
+                Self::pump_amm_sell_reference_observation_from_parsed_swap_ix(
+                    &acc_strings,
+                    &ix_data,
+                    Some(signature.to_string()),
+                )?;
+            if observed_pool == pool_market && observed_base == base_mint {
+                return Some(cand_obs);
+            }
+        }
+        None
+    }
+
     async fn resolve_authoritative_sell_layout_for_force_refresh(
         &self,
         pool: &PumpAmmPoolStatic,
@@ -1621,7 +1757,15 @@ impl PumpFunAmmDex {
 
         match local_outcome.result {
             Ok(obs) if obs.layout != PumpAmmAuthoritativeSellLayout::Unknown => {
-                return Ok((obs, None));
+                let merged = self
+                    .upgrade_sell_layout_observation_with_known_v2_reference(
+                        Arc::clone(&self.rpc),
+                        pool.pool_market,
+                        base_mint,
+                        obs,
+                    )
+                    .await;
+                return Ok((merged, None));
             }
             Ok(_) => {}
             Err(e) => {
@@ -1707,7 +1851,16 @@ impl PumpFunAmmDex {
         let (sell_obs, summary_opt, timed_out) = match timed {
             Ok(obs) => {
                 let out = match obs.result {
-                    Ok(v) => v,
+                    Ok(v) if v.layout != PumpAmmAuthoritativeSellLayout::Unknown => {
+                        self.upgrade_sell_layout_observation_with_known_v2_reference(
+                            Arc::clone(h_rpc),
+                            pool.pool_market,
+                            base_mint,
+                            v,
+                        )
+                        .await
+                    }
+                    Ok(_) => PumpAmmSellReferenceObservation::unknown(),
                     Err(_) => PumpAmmSellReferenceObservation::unknown(),
                 };
                 (out, Some(obs.summary), false)
@@ -2076,10 +2229,7 @@ impl PumpFunAmmDex {
                     best_obs,
                     std::iter::once(cand_obs),
                 );
-                if matches!(
-                    best_obs.layout,
-                    PumpAmmAuthoritativeSellLayout::Extended { .. }
-                ) {
+                if authoritative_sell_layout_is_terminal_for_scan(&best_obs.layout) {
                     summary.termination_reason = PumpAmmSellLayoutTerminationReason::LayoutFound;
                     summary.elapsed_total_ms = t0.elapsed().as_millis();
                     let sell_ix_account_count = acc_strings.len() as u8;

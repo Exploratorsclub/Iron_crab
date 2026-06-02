@@ -1928,6 +1928,8 @@ const DISCOVERY_REQUEST_TIMEOUT_SECS: u64 = 45;
 /// (JetStream `PoolCacheUpdate` delivery + merge into `LivePoolCache`). Call sites run only after
 /// `DiscoveryRequestOutcome::Ok`, so this must **not** re-budget [`DISCOVERY_REQUEST_TIMEOUT_SECS`].
 const DISCOVERY_CACHE_WAIT_TIMEOUT_MS: u64 = 10_000;
+/// PumpSwap liquidation cold-path: extra JetStream wait after force_refresh (P184e).
+const PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS: u64 = 20_000;
 
 /// I-24d: Poll interval when waiting for usable PumpAmm cache state in SLAVE cache.
 const DISCOVERY_CACHE_POLL_INTERVAL_MS: u64 = 100;
@@ -9924,7 +9926,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                             cache,
                             &pool_pk,
                             before_snap,
-                            DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                            PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS,
                             DISCOVERY_CACHE_POLL_INTERVAL_MS,
                         )
                         .await
@@ -9934,6 +9936,9 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                                 intent_id = %intent.intent_id,
                                 pool = %pool_pk,
                                 sim_error = ?sim_result.error_code,
+                                sell_requires_pre_fee_metas = cache.pump_amm_sell_requires_pre_fee_metas(&pool_pk),
+                                sell_pre_fee_meta_1 = ?cache.pump_amm_sell_pre_fee_meta_1(&pool_pk),
+                                sell_layout_ready = cache.pump_amm_sell_layout_ready(&pool_pk),
                                 "PumpSwap cold-path recovery: simulation failed — force-refresh pool_accounts (market-data RPC), rebuilding tx (one retry)"
                             );
                             continue;
@@ -9941,6 +9946,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                             warn!(
                                 intent_id = %intent.intent_id,
                                 pool = %pool_pk,
+                                timeout_ms = PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS,
                                 "PumpSwap cold-path recovery: force-refresh reply was Ok, but SLAVE did not expose fresh explicit-ready pool snapshot before timeout"
                             );
                         }
