@@ -2313,11 +2313,10 @@ impl PumpFunAmmDex {
         metas.push(AccountMeta::new(user_vol_wsol_ata, false));
         metas.push(AccountMeta::new(user_vol, false));
         metas.push(AccountMeta::new_readonly(third, false));
-        if let (Some(f0), Some(f1)) = (
-            sell_extended_fee_tail_0.filter(|p| *p != Pubkey::default()),
-            sell_extended_fee_tail_1.filter(|p| *p != Pubkey::default()),
-        ) {
+        if let Some(f0) = sell_extended_fee_tail_0.filter(|p| *p != Pubkey::default()) {
             metas.push(AccountMeta::new_readonly(f0, false));
+        }
+        if let Some(f1) = sell_extended_fee_tail_1.filter(|p| *p != Pubkey::default()) {
             metas.push(AccountMeta::new_readonly(f1, false));
         }
     }
