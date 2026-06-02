@@ -958,6 +958,21 @@ pub async fn build_tx_plan(
             }
         };
 
+        if intent.side == TradeSide::Sell
+            && sell_requires_pre_fee_metas
+            && !ixs.is_empty()
+            && ixs[0].accounts.len() != PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS
+        {
+            return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                reason: RejectReason::UnsupportedIntent,
+                details: format!(
+                    "pump_amm SELL: sell_requires_pre_fee_metas=true but built ix has {} accounts (expected {})",
+                    ixs[0].accounts.len(),
+                    PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS
+                ),
+            });
+        }
+
         // Scope 44: cold-path only — exact v14 from intent/cache vs final SELL ix metas (fee fields overwritten in builder).
         if allow_rpc_fallback
             && intent.side == TradeSide::Sell

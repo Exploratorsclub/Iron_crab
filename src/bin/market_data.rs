@@ -2690,15 +2690,21 @@ fn pump_amm_sell_layout_state_for_ensure_publish(
         base_layout_ready,
     ) = if force_refresh {
         (
-            refresh_requires_extended,
+            refresh_requires_extended || cached_requires_extended,
             refresh_third_meta.filter(|p| *p != Pubkey::default()),
             refresh_tail_0.filter(|p| *p != Pubkey::default()),
             refresh_tail_1.filter(|p| *p != Pubkey::default()),
-            refresh_fee_tail_0.filter(|p| *p != Pubkey::default()),
-            refresh_fee_tail_1.filter(|p| *p != Pubkey::default()),
-            refresh_requires_fee_tail,
-            refresh_requires_pre_fee_metas,
-            refresh_pre_fee_meta_1.filter(|p| *p != Pubkey::default()),
+            refresh_fee_tail_0
+                .or(cached_fee_tail_0)
+                .filter(|p| *p != Pubkey::default()),
+            refresh_fee_tail_1
+                .or(cached_fee_tail_1)
+                .filter(|p| *p != Pubkey::default()),
+            refresh_requires_fee_tail || cached_requires_fee_tail,
+            refresh_requires_pre_fee_metas || cached_requires_pre_fee_metas,
+            refresh_pre_fee_meta_1
+                .or(cached_pre_fee_meta_1)
+                .filter(|p| *p != Pubkey::default()),
             refresh_layout_ready,
         )
     } else {
@@ -13539,7 +13545,7 @@ mod discovery_tests {
     }
 
     #[test]
-    fn test_pump_amm_force_refresh_base_overrides_stale_extended_cache_flag() {
+    fn test_pump_amm_force_refresh_base_keeps_monotonic_extended_with_pre_fee() {
         let stale_third = Pubkey::new_unique();
         let stale_t0 = Pubkey::new_unique();
         let stale_t1 = Pubkey::new_unique();
@@ -13551,7 +13557,7 @@ mod discovery_tests {
             _effective_fee_tail_0,
             _effective_fee_tail_1,
             _effective_requires_fee_tail,
-            _effective_requires_pre_fee_metas,
+            effective_requires_pre_fee_metas,
             _effective_pre_fee_meta_1,
             sell_layout_ready,
             dex_readiness,
@@ -13564,7 +13570,7 @@ mod discovery_tests {
             None,
             None,
             false,
-            false,
+            true,
             None,
             false,
             None,
@@ -13578,19 +13584,23 @@ mod discovery_tests {
             true,
         );
         assert!(
-            !effective_requires_extended,
-            "authoritative force_refresh base result must override stale extended cache flag"
+            effective_requires_extended,
+            "cached extended hint must stay monotonic on force_refresh"
+        );
+        assert!(
+            effective_requires_pre_fee_metas,
+            "cached pre-fee hint must stay monotonic on force_refresh"
         );
         assert!(
             effective_third_meta.is_none(),
-            "authoritative base result must discard stale third meta"
+            "authoritative base refresh must discard stale third meta"
         );
         assert!(effective_tail_0.is_none() && effective_tail_1.is_none());
         assert!(
-            sell_layout_ready,
-            "base layout proven by force_refresh stays ready"
+            !sell_layout_ready,
+            "extended+pre-fee without refresh metas must not mark pool ready"
         );
-        assert_eq!(dex_readiness, DexPoolReadiness::Ready);
+        assert_eq!(dex_readiness, DexPoolReadiness::Partial);
     }
 
     #[test]
