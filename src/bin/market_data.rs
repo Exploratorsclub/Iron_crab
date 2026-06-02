@@ -110,7 +110,10 @@ use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
 use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
-use ironcrab::solana::dex::pumpfun_amm::{PumpAmmPoolAccountsDiagnostic, PumpFunAmmDex};
+use ironcrab::solana::dex::pumpfun_amm::{
+    pump_amm_sell_extended_layout_ready, PumpAmmPoolAccountsDiagnostic,
+    PumpAmmSellExtendedReadinessParams, PumpFunAmmDex,
+};
 use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex_parser::{
     parse_account_update, parse_transaction_update_with_pool_lookup, DexType, OrcaPoolInfo,
@@ -2615,35 +2618,16 @@ fn pump_amm_sell_layout_publish_state(
     base_layout_ready: bool,
 ) -> (bool, DexPoolReadiness) {
     let sell_layout_ready = if sell_requires_extended {
-        let third_ok = sell_cashback_third_meta
-            .filter(|p| *p != Pubkey::default())
-            .is_some();
         let _ = (sell_extended_tail_0, sell_extended_tail_1);
-        let pre_fee_ok = if sell_requires_pre_fee_metas {
-            sell_pre_fee_meta_1
-                .filter(|p| *p != Pubkey::default())
-                .is_some()
-        } else {
-            true
-        };
-        let needs_fee_tail = sell_requires_fee_tail
-            || sell_extended_fee_tail_0.is_some()
-            || sell_extended_fee_tail_1.is_some();
-        let fee_ok = if sell_requires_pre_fee_metas {
-            sell_extended_fee_tail_0
-                .filter(|p| *p != Pubkey::default())
-                .is_some()
-        } else if needs_fee_tail {
-            sell_extended_fee_tail_0
-                .filter(|p| *p != Pubkey::default())
-                .is_some()
-                && sell_extended_fee_tail_1
-                    .filter(|p| *p != Pubkey::default())
-                    .is_some()
-        } else {
-            true
-        };
-        third_ok && pre_fee_ok && fee_ok && base_layout_ready
+        pump_amm_sell_extended_layout_ready(PumpAmmSellExtendedReadinessParams {
+            sell_requires_extended: true,
+            third_meta: sell_cashback_third_meta,
+            fee_tail_0: sell_extended_fee_tail_0,
+            fee_tail_1: sell_extended_fee_tail_1,
+            sell_requires_fee_tail,
+            sell_requires_pre_fee_metas,
+            sell_pre_fee_meta_1,
+        }) && base_layout_ready
     } else {
         base_layout_ready
     };

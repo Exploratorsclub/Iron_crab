@@ -46,6 +46,9 @@ use crate::ipc::DexPoolReadiness;
 // Re-export parsers
 use crate::solana::dex::meteora_dlmm_layout::DlmmPool;
 use crate::solana::dex::orca_whirlpool_layout::{self, WhirlpoolParsed};
+use crate::solana::dex::pumpfun_amm::{
+    pump_amm_sell_extended_layout_ready, PumpAmmSellExtendedReadinessParams,
+};
 
 // ============================================================================
 // DEX-specific cached state structs
@@ -1277,32 +1280,15 @@ impl LivePoolCache {
         let (requires_extended, third, _volume_tail_0, _volume_tail_1) =
             self.pump_amm_sell_extended_layout(pool_market);
         let (fee_t0, fee_t1) = self.pump_amm_sell_fee_tail_layout(pool_market);
-        if requires_extended {
-            let third_ok = third.filter(|p| *p != Pubkey::default()).is_some();
-            // #21/#22 volume tails are intent-user derivable at build time — not required in cache.
-            let needs_pre_fee = self.pump_amm_sell_requires_pre_fee_metas(pool_market);
-            let pre_fee_ok = if needs_pre_fee {
-                self.pump_amm_sell_pre_fee_meta_1(pool_market)
-                    .filter(|p| *p != Pubkey::default())
-                    .is_some()
-            } else {
-                true
-            };
-            let needs_fee_tail = self.pump_amm_sell_requires_fee_tail(pool_market)
-                || fee_t0.is_some()
-                || fee_t1.is_some();
-            let fee_ok = if needs_pre_fee {
-                fee_t0.filter(|p| *p != Pubkey::default()).is_some()
-            } else if needs_fee_tail {
-                fee_t0.filter(|p| *p != Pubkey::default()).is_some()
-                    && fee_t1.filter(|p| *p != Pubkey::default()).is_some()
-            } else {
-                true
-            };
-            third_ok && pre_fee_ok && fee_ok
-        } else {
-            true
-        }
+        pump_amm_sell_extended_layout_ready(PumpAmmSellExtendedReadinessParams {
+            sell_requires_extended: requires_extended,
+            third_meta: third,
+            fee_tail_0: fee_t0,
+            fee_tail_1: fee_t1,
+            sell_requires_fee_tail: self.pump_amm_sell_requires_fee_tail(pool_market),
+            sell_requires_pre_fee_metas: self.pump_amm_sell_requires_pre_fee_metas(pool_market),
+            sell_pre_fee_meta_1: self.pump_amm_sell_pre_fee_meta_1(pool_market),
+        })
     }
 
     /// Set Raydium AMM Serum/OpenBook accounts (bids, asks, event_queue).

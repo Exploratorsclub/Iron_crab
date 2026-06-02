@@ -6,7 +6,10 @@ use crate::solana::dex::orca_whirlpool_layout;
 use crate::solana::dex::pumpfun::PumpFunDex;
 use crate::solana::dex::pumpfun_amm::{
     PumpAmmPoolAccountsDiagnostic, PumpFunAmmDex, PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR,
-    PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR,
+    PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR, PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS,
+    PUMPFUN_AMM_SELL_EXT_TAIL_0_IX, PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2,
+    PUMPFUN_AMM_SELL_EXT_TAIL_1_IX, PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2,
+    PUMPFUN_AMM_SELL_EXT_THIRD_META_IX, PUMPFUN_AMM_SELL_EXT_THIRD_META_IX_V2,
 };
 use crate::solana::dex::raydium::Raydium;
 use crate::solana::dex::Dex;
@@ -1008,45 +1011,119 @@ pub async fn build_tx_plan(
                 } else {
                     "n/a"
                 };
-            info!(
-                intent_id = %intent.intent_id,
-                scope = "44",
-                dex = "pump_amm",
-                intent_user = %wallet_pubkey,
-                pool_accounts_source = pool_accounts_build_source,
-                sell_extended = sell_requires_cashback_remaining && intent.side == TradeSide::Sell,
-                sell_cashback_third_meta = ?sell_cashback_third_meta,
-                sell_extended_tail_source = sell_ext_tail_src,
-                derived_tail_21 = %derived_tail_21,
-                derived_tail_22 = %derived_tail_22,
-                cached_tail_21 = ?sell_extended_tail_0,
-                cached_tail_22 = ?sell_extended_tail_1,
-                cached_tail_mismatch,
-                sell_extended_tail_2 = ?sell_cashback_third_meta,
-                sell_ix_meta_21 = %ixs[0].accounts.get(21).map(|m| m.pubkey.to_string()).unwrap_or_default(),
-                sell_ix_meta_22 = %ixs[0].accounts.get(22).map(|m| m.pubkey.to_string()).unwrap_or_default(),
-                sell_ix_meta_23 = %ixs[0].accounts.get(23).map(|m| m.pubkey.to_string()).unwrap_or_default(),
-                sell_ix_meta_23_writable = ixs[0].accounts.get(23).map(|m| m.is_writable).unwrap_or(false),
-                sell_ix_account_count = ixs[0].accounts.len(),
-                pool = %pool_id,
-                input_mint = %intent.resources.input_mint,
-                base_token_program_override = ?token_program_override,
-                v14_csv = %PumpAmmPoolAccountsDiagnostic::format_v14_csv(&pool_accounts[..14]),
-                sell_ix_accounts_csv = %sell_csv,
-                v14_fee_config_row = %v12_fc,
-                v14_fee_program_row = %v12_fp,
-                sell_ix_fee_config_meta = %ix_fc,
-                sell_ix_fee_program_meta = %ix_fp,
-                fee_config_uses_global_constant = fee_config_uses_global_constant,
-                fee_program_matches_expected_fee_program = fee_program_uses_expected,
-                protocol_fee_recipient_preserved_from_v14 = pfr_preserved,
-                protocol_fee_recipient_ta_preserved_from_v14 = pfr_ta_preserved,
-                v14_fee_config_differs_from_global_constant = (v12_fc != canonical_fee_cfg),
-                v14_fee_program_differs_from_expected = (v12_fp != canonical_fee_prog),
-                fee_config_differs_from_v14_row = fee_config_differs_from_v14_row,
-                fee_program_differs_from_v14_row = fee_program_differs_from_v14_row,
-                "Scope44: pump_amm SELL plan — meta #19/#20 must be global FeeConfig + fee_program (v14[12] is informational; wrong type → Custom 3002)"
-            );
+            let sell_ix_accounts = &ixs[0].accounts;
+            let sell_ix_account_count = sell_ix_accounts.len();
+            let (tail0_ix, tail1_ix, tail2_ix) =
+                if sell_ix_account_count == PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS {
+                    (
+                        PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2,
+                        PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2,
+                        PUMPFUN_AMM_SELL_EXT_THIRD_META_IX_V2,
+                    )
+                } else {
+                    (
+                        PUMPFUN_AMM_SELL_EXT_TAIL_0_IX,
+                        PUMPFUN_AMM_SELL_EXT_TAIL_1_IX,
+                        PUMPFUN_AMM_SELL_EXT_THIRD_META_IX,
+                    )
+                };
+            let sell_ix_tail0 = sell_ix_accounts
+                .get(tail0_ix)
+                .map(|m| m.pubkey.to_string())
+                .unwrap_or_default();
+            let sell_ix_tail1 = sell_ix_accounts
+                .get(tail1_ix)
+                .map(|m| m.pubkey.to_string())
+                .unwrap_or_default();
+            let sell_ix_tail2 = sell_ix_accounts
+                .get(tail2_ix)
+                .map(|m| m.pubkey.to_string())
+                .unwrap_or_default();
+            let sell_ix_tail2_writable = sell_ix_accounts
+                .get(tail2_ix)
+                .map(|m| m.is_writable)
+                .unwrap_or(false);
+            if sell_ix_account_count == PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS {
+                info!(
+                    intent_id = %intent.intent_id,
+                    scope = "44",
+                    dex = "pump_amm",
+                    intent_user = %wallet_pubkey,
+                    pool_accounts_source = pool_accounts_build_source,
+                    sell_extended = sell_requires_cashback_remaining && intent.side == TradeSide::Sell,
+                    sell_cashback_third_meta = ?sell_cashback_third_meta,
+                    sell_extended_tail_source = sell_ext_tail_src,
+                    derived_tail_21 = %derived_tail_21,
+                    derived_tail_22 = %derived_tail_22,
+                    cached_tail_21 = ?sell_extended_tail_0,
+                    cached_tail_22 = ?sell_extended_tail_1,
+                    cached_tail_mismatch,
+                    sell_extended_tail_2 = ?sell_cashback_third_meta,
+                    sell_ix_meta_23 = %sell_ix_tail0,
+                    sell_ix_meta_24 = %sell_ix_tail1,
+                    sell_ix_meta_25 = %sell_ix_tail2,
+                    sell_ix_meta_25_writable = sell_ix_tail2_writable,
+                    sell_ix_account_count,
+                    pool = %pool_id,
+                    input_mint = %intent.resources.input_mint,
+                    base_token_program_override = ?token_program_override,
+                    v14_csv = %PumpAmmPoolAccountsDiagnostic::format_v14_csv(&pool_accounts[..14]),
+                    sell_ix_accounts_csv = %sell_csv,
+                    v14_fee_config_row = %v12_fc,
+                    v14_fee_program_row = %v12_fp,
+                    sell_ix_fee_config_meta = %ix_fc,
+                    sell_ix_fee_program_meta = %ix_fp,
+                    fee_config_uses_global_constant = fee_config_uses_global_constant,
+                    fee_program_matches_expected_fee_program = fee_program_uses_expected,
+                    protocol_fee_recipient_preserved_from_v14 = pfr_preserved,
+                    protocol_fee_recipient_ta_preserved_from_v14 = pfr_ta_preserved,
+                    v14_fee_config_differs_from_global_constant = (v12_fc != canonical_fee_cfg),
+                    v14_fee_program_differs_from_expected = (v12_fp != canonical_fee_prog),
+                    fee_config_differs_from_v14_row = fee_config_differs_from_v14_row,
+                    fee_program_differs_from_v14_row = fee_program_differs_from_v14_row,
+                    "Scope44: pump_amm SELL plan — meta #19/#20 must be global FeeConfig + fee_program (v14[12] is informational; wrong type → Custom 3002)"
+                );
+            } else {
+                info!(
+                    intent_id = %intent.intent_id,
+                    scope = "44",
+                    dex = "pump_amm",
+                    intent_user = %wallet_pubkey,
+                    pool_accounts_source = pool_accounts_build_source,
+                    sell_extended = sell_requires_cashback_remaining && intent.side == TradeSide::Sell,
+                    sell_cashback_third_meta = ?sell_cashback_third_meta,
+                    sell_extended_tail_source = sell_ext_tail_src,
+                    derived_tail_21 = %derived_tail_21,
+                    derived_tail_22 = %derived_tail_22,
+                    cached_tail_21 = ?sell_extended_tail_0,
+                    cached_tail_22 = ?sell_extended_tail_1,
+                    cached_tail_mismatch,
+                    sell_extended_tail_2 = ?sell_cashback_third_meta,
+                    sell_ix_meta_21 = %sell_ix_tail0,
+                    sell_ix_meta_22 = %sell_ix_tail1,
+                    sell_ix_meta_23 = %sell_ix_tail2,
+                    sell_ix_meta_23_writable = sell_ix_tail2_writable,
+                    sell_ix_account_count,
+                    pool = %pool_id,
+                    input_mint = %intent.resources.input_mint,
+                    base_token_program_override = ?token_program_override,
+                    v14_csv = %PumpAmmPoolAccountsDiagnostic::format_v14_csv(&pool_accounts[..14]),
+                    sell_ix_accounts_csv = %sell_csv,
+                    v14_fee_config_row = %v12_fc,
+                    v14_fee_program_row = %v12_fp,
+                    sell_ix_fee_config_meta = %ix_fc,
+                    sell_ix_fee_program_meta = %ix_fp,
+                    fee_config_uses_global_constant = fee_config_uses_global_constant,
+                    fee_program_matches_expected_fee_program = fee_program_uses_expected,
+                    protocol_fee_recipient_preserved_from_v14 = pfr_preserved,
+                    protocol_fee_recipient_ta_preserved_from_v14 = pfr_ta_preserved,
+                    v14_fee_config_differs_from_global_constant = (v12_fc != canonical_fee_cfg),
+                    v14_fee_program_differs_from_expected = (v12_fp != canonical_fee_prog),
+                    fee_config_differs_from_v14_row = fee_config_differs_from_v14_row,
+                    fee_program_differs_from_v14_row = fee_program_differs_from_v14_row,
+                    "Scope44: pump_amm SELL plan — meta #19/#20 must be global FeeConfig + fee_program (v14[12] is informational; wrong type → Custom 3002)"
+                );
+            }
         }
 
         // NOTE: No in-TX wrap for BUYs!
