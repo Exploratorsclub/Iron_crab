@@ -46,6 +46,9 @@ use crate::ipc::DexPoolReadiness;
 // Re-export parsers
 use crate::solana::dex::meteora_dlmm_layout::DlmmPool;
 use crate::solana::dex::orca_whirlpool_layout::{self, WhirlpoolParsed};
+use crate::solana::dex::pumpfun_amm::{
+    pump_amm_sell_extended_layout_ready, PumpAmmSellExtendedReadinessParams,
+};
 
 // ============================================================================
 // DEX-specific cached state structs
@@ -447,8 +450,12 @@ pub struct LivePoolCache {
     /// Observed cashback `sell` fee-recipient pair (ix #24/#25).
     pump_amm_sell_extended_fee_tail_0_by_market: DashMap<Pubkey, Pubkey>,
     pump_amm_sell_extended_fee_tail_1_by_market: DashMap<Pubkey, Pubkey>,
+    /// 27-account extended `sell`: second pre-fee meta at ix #20.
+    pump_amm_sell_pre_fee_meta_1_by_market: DashMap<Pubkey, Pubkey>,
     /// Monotonic: observed `sell` used 26 accounts (fee-recipient pair required).
     pump_amm_sell_requires_fee_tail_by_market: DashMap<Pubkey, bool>,
+    /// Monotonic: observed `sell` used 27 accounts (pre-fee metas at ix #19/#20).
+    pump_amm_sell_requires_pre_fee_metas_by_market: DashMap<Pubkey, bool>,
     /// PumpSwap pool-market -> whether the authoritative source has proven the current SELL layout
     /// is fully known. `false` means "do not treat this as sell-ready truth yet", even if
     /// pool_accounts/reserves are otherwise present.
@@ -495,7 +502,9 @@ impl LivePoolCache {
             pump_amm_sell_extended_tail_1_by_market: DashMap::new(),
             pump_amm_sell_extended_fee_tail_0_by_market: DashMap::new(),
             pump_amm_sell_extended_fee_tail_1_by_market: DashMap::new(),
+            pump_amm_sell_pre_fee_meta_1_by_market: DashMap::new(),
             pump_amm_sell_requires_fee_tail_by_market: DashMap::new(),
+            pump_amm_sell_requires_pre_fee_metas_by_market: DashMap::new(),
             pump_amm_sell_layout_ready_by_market: DashMap::new(),
         }
     }
@@ -962,6 +971,13 @@ impl LivePoolCache {
             let requires_fee_tail = m
                 .get("pump_amm_sell_requires_fee_tail")
                 .is_some_and(|v| v == "true");
+            let requires_pre_fee_metas = m
+                .get("pump_amm_sell_requires_pre_fee_metas")
+                .is_some_and(|v| v == "true");
+            let pre_fee_meta_1 = m
+                .get("pump_amm_sell_pre_fee_meta_1")
+                .and_then(|s| Pubkey::from_str(s).ok())
+                .filter(|pk| *pk != Pubkey::default());
             self.set_pump_amm_sell_layout_authoritative(
                 pool,
                 requires_extended,
@@ -971,6 +987,8 @@ impl LivePoolCache {
                 fee_tail_0,
                 fee_tail_1,
                 requires_fee_tail,
+                requires_pre_fee_metas,
+                pre_fee_meta_1,
             );
         } else {
             if m.get("pump_amm_sell_cashback_remaining")
@@ -1025,6 +1043,20 @@ impl LivePoolCache {
                 self.pump_amm_sell_requires_fee_tail_by_market
                     .insert(*pool, true);
             }
+            if m.get("pump_amm_sell_requires_pre_fee_metas")
+                .is_some_and(|v| v == "true")
+            {
+                self.pump_amm_sell_requires_pre_fee_metas_by_market
+                    .insert(*pool, true);
+            }
+            if let Some(s) = m.get("pump_amm_sell_pre_fee_meta_1") {
+                if let Ok(pk) = Pubkey::from_str(s) {
+                    if pk != Pubkey::default() {
+                        self.pump_amm_sell_pre_fee_meta_1_by_market
+                            .insert(*pool, pk);
+                    }
+                }
+            }
         }
     }
 
@@ -1040,12 +1072,22 @@ impl LivePoolCache {
         fee_tail_0: Option<Pubkey>,
         fee_tail_1: Option<Pubkey>,
         requires_fee_tail: bool,
+        requires_pre_fee_metas: bool,
+        pre_fee_meta_1: Option<Pubkey>,
     ) {
         self.pump_amm_sell_extended_flag_by_market
             .insert(*pool, requires_extended);
         if requires_fee_tail {
             self.pump_amm_sell_requires_fee_tail_by_market
                 .insert(*pool, true);
+        }
+        if requires_pre_fee_metas {
+            self.pump_amm_sell_requires_pre_fee_metas_by_market
+                .insert(*pool, true);
+        }
+        if let Some(pk) = pre_fee_meta_1.filter(|p| *p != Pubkey::default()) {
+            self.pump_amm_sell_pre_fee_meta_1_by_market
+                .insert(*pool, pk);
         }
         if let Some(pk) = third_meta.filter(|p| *p != Pubkey::default()) {
             self.pump_amm_sell_extended_third_meta_by_market
@@ -1087,11 +1129,24 @@ impl LivePoolCache {
         fee_tail_0: Option<Pubkey>,
         fee_tail_1: Option<Pubkey>,
         requires_fee_tail: bool,
+        requires_pre_fee_metas: bool,
+        pre_fee_meta_1: Option<Pubkey>,
     ) {
         self.pump_amm_sell_extended_flag_by_market
             .insert(*pool, requires_extended);
         self.pump_amm_sell_requires_fee_tail_by_market
             .insert(*pool, requires_fee_tail);
+        self.pump_amm_sell_requires_pre_fee_metas_by_market
+            .insert(*pool, requires_pre_fee_metas);
+        match pre_fee_meta_1.filter(|p| *p != Pubkey::default()) {
+            Some(pk) => {
+                self.pump_amm_sell_pre_fee_meta_1_by_market
+                    .insert(*pool, pk);
+            }
+            None => {
+                self.pump_amm_sell_pre_fee_meta_1_by_market.remove(pool);
+            }
+        }
         match third_meta.filter(|p| *p != Pubkey::default()) {
             Some(pk) => {
                 self.pump_amm_sell_extended_third_meta_by_market
@@ -1177,6 +1232,22 @@ impl LivePoolCache {
             .unwrap_or(false)
     }
 
+    /// 27-account extended `sell`: second pre-fee meta (ix #20).
+    #[must_use]
+    pub fn pump_amm_sell_pre_fee_meta_1(&self, pool_market: &Pubkey) -> Option<Pubkey> {
+        self.pump_amm_sell_pre_fee_meta_1_by_market
+            .get(pool_market)
+            .map(|e| *e.value())
+    }
+
+    #[must_use]
+    pub fn pump_amm_sell_requires_pre_fee_metas(&self, pool_market: &Pubkey) -> bool {
+        self.pump_amm_sell_requires_pre_fee_metas_by_market
+            .get(pool_market)
+            .map(|e| *e.value())
+            .unwrap_or(false)
+    }
+
     /// Observed cashback `sell` fee-recipient pair (ix #24/#25), when layout uses 26 accounts.
     #[must_use]
     pub fn pump_amm_sell_fee_tail_layout(
@@ -1209,22 +1280,15 @@ impl LivePoolCache {
         let (requires_extended, third, _volume_tail_0, _volume_tail_1) =
             self.pump_amm_sell_extended_layout(pool_market);
         let (fee_t0, fee_t1) = self.pump_amm_sell_fee_tail_layout(pool_market);
-        if requires_extended {
-            let third_ok = third.filter(|p| *p != Pubkey::default()).is_some();
-            // #21/#22 volume tails are intent-user derivable at build time — not required in cache.
-            let needs_fee_tail = self.pump_amm_sell_requires_fee_tail(pool_market)
-                || fee_t0.is_some()
-                || fee_t1.is_some();
-            let fee_ok = if needs_fee_tail {
-                fee_t0.filter(|p| *p != Pubkey::default()).is_some()
-                    && fee_t1.filter(|p| *p != Pubkey::default()).is_some()
-            } else {
-                true
-            };
-            third_ok && fee_ok
-        } else {
-            true
-        }
+        pump_amm_sell_extended_layout_ready(PumpAmmSellExtendedReadinessParams {
+            sell_requires_extended: requires_extended,
+            third_meta: third,
+            fee_tail_0: fee_t0,
+            fee_tail_1: fee_t1,
+            sell_requires_fee_tail: self.pump_amm_sell_requires_fee_tail(pool_market),
+            sell_requires_pre_fee_metas: self.pump_amm_sell_requires_pre_fee_metas(pool_market),
+            sell_pre_fee_meta_1: self.pump_amm_sell_pre_fee_meta_1(pool_market),
+        })
     }
 
     /// Set Raydium AMM Serum/OpenBook accounts (bids, asks, event_queue).
@@ -2781,6 +2845,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
         );
         cache.set_pump_amm_sell_layout_ready(&pool_market, false);
 
@@ -2818,6 +2884,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
         );
         cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
 
@@ -2867,6 +2935,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
         );
         cache.set_pump_amm_sell_layout_ready(&pool_market, true);
 
@@ -2911,6 +2981,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
         );
         cache.set_pump_amm_sell_layout_ready(&pool_market, true);
 
@@ -2981,6 +3053,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
         );
         cache.set_pump_amm_sell_layout_ready(&pool_market, false);
         cache.merge_pump_amm_sell_layout_from_metadata(&pool_market, Some(&meta));
