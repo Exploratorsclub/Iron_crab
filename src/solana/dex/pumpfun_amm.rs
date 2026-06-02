@@ -772,6 +772,8 @@ const FORCE_REFRESH_EXTERNAL_SIG_LIMIT: usize = 40;
 const FORCE_REFRESH_EXTERNAL_MAX_TX_ATTEMPTS: usize = 40;
 const FORCE_REFRESH_EXTERNAL_MAX_GET_TRANSACTION_CALLS: u32 = 40;
 const BOUNDED_EXTERNAL_SELL_LAYOUT_TIMEOUT: Duration = Duration::from_secs(12);
+/// Per curated-reference `getTransaction` during force_refresh SELL-layout upgrade (cold path).
+const BOUNDED_SELL_LAYOUT_V2_REFERENCE_UPGRADE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy)]
 struct SellLayoutObserveLimits {
@@ -1652,22 +1654,63 @@ impl PumpFunAmmDex {
         }
         let baseline_strength = authoritative_sell_layout_strength(&obs.layout);
         for sig in pump_amm_known_v2_sell_reference_signatures(&pool_market) {
-            if let Some(ref_obs) = self
-                .try_observe_sell_layout_from_reference_signature(
-                    tx_rpc.as_ref(),
-                    pool_market,
-                    base_mint,
-                    sig,
-                )
-                .await
+            let observe_fut = self.try_observe_sell_layout_from_reference_signature(
+                tx_rpc.as_ref(),
+                pool_market,
+                base_mint,
+                sig,
+            );
+            let ref_obs = match tokio::time::timeout(
+                BOUNDED_SELL_LAYOUT_V2_REFERENCE_UPGRADE_TIMEOUT,
+                observe_fut,
+            )
+            .await
             {
+                Ok(v) => v,
+                Err(_) => {
+                    warn!(
+                        pool = %pool_market,
+                        base_mint = %base_mint,
+                        reference_swap_signature = %sig,
+                        timeout_secs = BOUNDED_SELL_LAYOUT_V2_REFERENCE_UPGRADE_TIMEOUT.as_secs(),
+                        "pump_amm: known v2 SELL-layout reference getTransaction timed out during force_refresh upgrade"
+                    );
+                    continue;
+                }
+            };
+            if let Some(ref_obs) = ref_obs {
                 obs = merge_pump_amm_authoritative_sell_reference_observation(obs, ref_obs);
                 if authoritative_sell_layout_strength(&obs.layout) > baseline_strength {
+                    let sell_ix_account_count = match obs.layout {
+                        PumpAmmAuthoritativeSellLayout::Extended {
+                            pre_fee_0,
+                            pre_fee_1,
+                            ..
+                        } if pre_fee_0.filter(|p| *p != Pubkey::default()).is_some()
+                            && pre_fee_1.filter(|p| *p != Pubkey::default()).is_some() =>
+                        {
+                            PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS as u8
+                        }
+                        PumpAmmAuthoritativeSellLayout::Extended {
+                            fee_tail_0,
+                            fee_tail_1,
+                            ..
+                        } if fee_tail_0.filter(|p| *p != Pubkey::default()).is_some()
+                            && fee_tail_1.filter(|p| *p != Pubkey::default()).is_some() =>
+                        {
+                            PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS as u8
+                        }
+                        PumpAmmAuthoritativeSellLayout::Extended { .. } => {
+                            PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS as u8
+                        }
+                        PumpAmmAuthoritativeSellLayout::Base => 21,
+                        PumpAmmAuthoritativeSellLayout::Unknown => 0,
+                    };
                     info!(
                         pool = %pool_market,
                         base_mint = %base_mint,
                         reference_swap_signature = %obs.reference_swap_signature.as_deref().unwrap_or(""),
-                        sell_ix_account_count = PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS,
+                        sell_ix_account_count,
                         layout = ?obs.layout,
                         "pump_amm: upgraded force_refresh SELL layout from known 27-account reference tx"
                     );
