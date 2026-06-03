@@ -2701,7 +2701,7 @@ fn pump_amm_sell_layout_state_for_ensure_publish(
                 .or(cached_fee_tail_1)
                 .filter(|p| *p != Pubkey::default()),
             refresh_requires_fee_tail || cached_requires_fee_tail,
-            refresh_requires_pre_fee_metas || cached_requires_pre_fee_metas,
+            refresh_requires_pre_fee_metas,
             refresh_pre_fee_meta_1
                 .or(cached_pre_fee_meta_1)
                 .filter(|p| *p != Pubkey::default()),
