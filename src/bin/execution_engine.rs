@@ -1970,7 +1970,7 @@ async fn wait_for_usable_pump_amm_cache_state(
     false
 }
 
-/// Evidence tuple for PumpSwap cold-path force-refresh wait (Bug #34 / #36).
+/// Evidence tuple for PumpSwap cold-path force-refresh wait (Bug #34 / #36, P184h).
 type PumpAmmSlaveRecoveryEvidence = (
     u64,            // cache entry slot
     Option<u64>,    // base_reserve
@@ -1983,6 +1983,8 @@ type PumpAmmSlaveRecoveryEvidence = (
     bool,           // sell_layout_ready
     bool,           // sell_requires_pre_fee_metas (27-account SSOT)
     u8,             // inferred sell_ix_account_count
+    Option<Pubkey>, // sell_pre_fee_meta_1 (ix #20 on 27-account layout)
+    u64,            // layout_generation (monotonic per pool)
 );
 
 /// Snapshot of the PumpSwap SLAVE row for the specific `pool`.
@@ -2018,7 +2020,28 @@ fn pump_amm_slave_recovery_snapshot(
         sell_layout_ready,
         sell_requires_pre_fee_metas,
         sell_ix_account_count,
+        cache.pump_amm_sell_pre_fee_meta_1(pool),
+        cache.pump_amm_layout_generation(pool),
     ))
+}
+
+fn pump_amm_slave_recovery_evidence_changed(
+    before: &PumpAmmSlaveRecoveryEvidence,
+    after: &PumpAmmSlaveRecoveryEvidence,
+) -> bool {
+    before.0 != after.0
+        || before.1 != after.1
+        || before.2 != after.2
+        || before.3 != after.3
+        || before.4 != after.4
+        || before.5 != after.5
+        || before.6 != after.6
+        || before.7 != after.7
+        || before.8 != after.8
+        || before.9 != after.9
+        || before.10 != after.10
+        || before.11 != after.11
+        || before.12 != after.12
 }
 
 /// After `EnsurePumpAmmPoolAccounts(force_refresh=true)` + JetStream merge: bounded wait until
@@ -2041,7 +2064,16 @@ async fn wait_for_pump_amm_slave_after_recovery(
             .is_some();
         if explicit_ready {
             let after = pump_amm_slave_recovery_snapshot(cache, pool);
-            if after.is_some() && (before.is_none() || after != before) {
+            let layout_gen_fresh = before
+                .as_ref()
+                .zip(after.as_ref())
+                .is_some_and(|(b, a)| a.12 > b.12);
+            let evidence_changed = match (&before, &after) {
+                (None, Some(_)) => true,
+                (Some(b), Some(a)) => pump_amm_slave_recovery_evidence_changed(b, a),
+                _ => false,
+            };
+            if after.is_some() && (before.is_none() || evidence_changed || layout_gen_fresh) {
                 return true;
             }
         }
@@ -13039,6 +13071,65 @@ mod execution_engine_tests {
         assert_eq!(
             snap.10,
             ironcrab::solana::dex::pumpfun_amm::PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS as u8
+        );
+        assert_eq!(snap.11, Some(pre1));
+    }
+
+    #[test]
+    fn pump_amm_force_refresh_wait_succeeds_on_layout_generation_bump_same_reserves() {
+        let cache = std::sync::Arc::new(LivePoolCache::new());
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(ironcrab::ipc::NATIVE_SOL_MINT).unwrap();
+        let accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        cache.upsert(
+            pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: base,
+                quote_mint: wsol,
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(1_000),
+                quote_reserve: Some(2_000),
+                pool_accounts: accounts,
+                creator: None,
+            }),
+            1,
+        );
+        cache.set_pump_amm_pool_accounts_readiness_authoritative(pool, DexPoolReadiness::Ready);
+        cache.set_pump_amm_sell_layout_ready(&pool, true);
+
+        let before = pump_amm_slave_recovery_snapshot(cache.as_ref(), &pool);
+        let cache_clone = std::sync::Arc::clone(&cache);
+        let new_pre1 = Pubkey::new_unique();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            cache_clone.bump_pump_amm_layout_generation(&pool);
+            cache_clone.merge_pump_amm_sell_extended_layout(
+                &pool,
+                true,
+                Some(Pubkey::new_unique()),
+                Some(Pubkey::new_unique()),
+                Some(Pubkey::new_unique()),
+                Some(Pubkey::new_unique()),
+                None,
+                false,
+                true,
+                Some(new_pre1),
+            );
+        });
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ok = rt.block_on(wait_for_pump_amm_slave_after_recovery(
+            cache.as_ref(),
+            &pool,
+            before,
+            500,
+            10,
+        ));
+        assert!(
+            ok,
+            "layout_generation bump with changed pre_fee must satisfy force-refresh wait even if reserves unchanged"
         );
     }
 

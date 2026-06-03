@@ -5,12 +5,12 @@ use crate::solana::dex::orca::Orca;
 use crate::solana::dex::orca_whirlpool_layout;
 use crate::solana::dex::pumpfun::PumpFunDex;
 use crate::solana::dex::pumpfun_amm::{
-    pump_amm_sell_ix_uses_global_fee_at, PumpAmmPoolAccountsDiagnostic, PumpFunAmmDex,
-    PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR, PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR,
-    PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS, PUMPFUN_AMM_SELL_EXT_TAIL_0_IX,
-    PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2, PUMPFUN_AMM_SELL_EXT_TAIL_1_IX,
-    PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2, PUMPFUN_AMM_SELL_EXT_THIRD_META_IX,
-    PUMPFUN_AMM_SELL_EXT_THIRD_META_IX_V2,
+    pump_amm_resolve_sell_pre_fee_meta_1_for_build, pump_amm_sell_ix_uses_global_fee_at,
+    PumpAmmPoolAccountsDiagnostic, PumpFunAmmDex, PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR,
+    PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR, PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS,
+    PUMPFUN_AMM_SELL_EXT_TAIL_0_IX, PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2,
+    PUMPFUN_AMM_SELL_EXT_TAIL_1_IX, PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2,
+    PUMPFUN_AMM_SELL_EXT_THIRD_META_IX, PUMPFUN_AMM_SELL_EXT_THIRD_META_IX_V2,
 };
 use crate::solana::dex::raydium::Raydium;
 use crate::solana::dex::Dex;
@@ -779,7 +779,8 @@ pub async fn build_tx_plan(
         let sell_requires_pre_fee_metas = cache
             .map(|c| c.pump_amm_sell_requires_pre_fee_metas(&pool_id))
             .unwrap_or(false);
-        let sell_pre_fee_meta_1 = cache.and_then(|c| c.pump_amm_sell_pre_fee_meta_1(&pool_id));
+        let cached_sell_pre_fee_meta_1 =
+            cache.and_then(|c| c.pump_amm_sell_pre_fee_meta_1(&pool_id));
 
         let mut pool_accounts_build_source = if accounts_len == 0 {
             "slave_livepoolcache"
@@ -891,6 +892,27 @@ pub async fn build_tx_plan(
             });
         }
 
+        let global_volume_accumulator = pool_accounts
+            .get(11)
+            .copied()
+            .filter(|p| *p != Pubkey::default());
+        let (sell_pre_fee_meta_1, pre_fee_source) = if allow_rpc_fallback
+            && intent.side == TradeSide::Sell
+            && sell_requires_pre_fee_metas
+        {
+            if let Some(gva) = global_volume_accumulator {
+                pump_amm_resolve_sell_pre_fee_meta_1_for_build(
+                    &pool_id,
+                    gva,
+                    cached_sell_pre_fee_meta_1,
+                )
+            } else {
+                (cached_sell_pre_fee_meta_1, "cache_unvalidated")
+            }
+        } else {
+            (cached_sell_pre_fee_meta_1, "cache")
+        };
+
         // Parse token_program from intent for Token-2022 support (same as pumpfun path).
         // TradeResources documents token_program as "output_mint" — on SELL, output is WSOL (SPL Token).
         // Producers may therefore set SPL Token program here even when the *input* (base) mint uses
@@ -956,6 +978,7 @@ pub async fn build_tx_plan(
             } else {
                 None
             },
+            allow_rpc_fallback,
         ) {
             Ok(ixs) => ixs,
             Err(e) => {
@@ -1045,13 +1068,22 @@ pub async fn build_tx_plan(
                             sell_extended_tail_0.filter(|p| *p != Pubkey::default()),
                             sell_extended_tail_1.filter(|p| *p != Pubkey::default()),
                         ) {
-                            (Some(_), Some(_)) if cached_tail_mismatch => "observed_cache_mismatch",
-                            (Some(_), Some(_)) => "observed_cache",
+                            (Some(_), Some(_)) if cached_tail_mismatch => {
+                                if allow_rpc_fallback {
+                                    "derived_wallet_pool"
+                                } else {
+                                    "observed_cache_mismatch"
+                                }
+                            }
+                            (Some(_), Some(_)) => "validated_cache",
                             _ => "derived_or_curated",
                         }
                     } else {
                         "derived_for_intent_user"
                     };
+                let layout_authoritative = sell_requires_pre_fee_metas
+                    && sell_pre_fee_meta_1.is_some()
+                    && sell_extended_fee_tail_0.is_some();
                 let sell_ix_account_count = sell_ix_accounts.len();
                 let (tail0_ix, tail1_ix, tail2_ix) =
                     if sell_ix_account_count == PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS {
@@ -1094,6 +1126,9 @@ pub async fn build_tx_plan(
                         sell_extended = sell_requires_cashback_remaining && intent.side == TradeSide::Sell,
                         sell_cashback_third_meta = ?sell_cashback_third_meta,
                         sell_extended_tail_source = sell_ext_tail_src,
+                        pre_fee_source,
+                        tail_source = sell_ext_tail_src,
+                        layout_authoritative,
                         cached_tail_mismatch,
                         derived_tail_21 = %derived_tail_21,
                         derived_tail_22 = %derived_tail_22,
@@ -1138,6 +1173,9 @@ pub async fn build_tx_plan(
                         sell_extended = sell_requires_cashback_remaining && intent.side == TradeSide::Sell,
                         sell_cashback_third_meta = ?sell_cashback_third_meta,
                         sell_extended_tail_source = sell_ext_tail_src,
+                        pre_fee_source,
+                        tail_source = sell_ext_tail_src,
+                        layout_authoritative,
                         cached_tail_mismatch,
                         derived_tail_21 = %derived_tail_21,
                         derived_tail_22 = %derived_tail_22,
@@ -1911,6 +1949,7 @@ async fn build_hop_pump_amm(
         None,
         if is_sell_hop { sell_fee_t0 } else { None },
         if is_sell_hop { sell_fee_t1 } else { None },
+        false,
     )
     .map_err(|e| UnsupportedTxPlan {
         reason: RejectReason::UnsupportedIntent,
