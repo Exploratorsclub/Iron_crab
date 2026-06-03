@@ -1981,6 +1981,8 @@ type PumpAmmSlaveRecoveryEvidence = (
     Option<Pubkey>, // sell_extended_tail_0 (ix #21)
     Option<Pubkey>, // sell_extended_tail_1 (ix #22)
     bool,           // sell_layout_ready
+    bool,           // sell_requires_pre_fee_metas (27-account SSOT)
+    u8,             // inferred sell_ix_account_count
 );
 
 /// Snapshot of the PumpSwap SLAVE row for the specific `pool`.
@@ -1996,6 +1998,14 @@ fn pump_amm_slave_recovery_snapshot(
     let (sell_extended, sell_third_meta, sell_tail_0, sell_tail_1) =
         cache.pump_amm_sell_extended_layout(pool);
     let sell_layout_ready = cache.pump_amm_sell_layout_ready(pool);
+    let sell_requires_pre_fee_metas = cache.pump_amm_sell_requires_pre_fee_metas(pool);
+    let sell_requires_fee_tail = cache.pump_amm_sell_requires_fee_tail(pool);
+    let sell_ix_account_count =
+        ironcrab::solana::dex::pumpfun_amm::pump_amm_inferred_sell_ix_account_count(
+            sell_requires_pre_fee_metas,
+            sell_requires_fee_tail,
+            sell_extended,
+        );
     Some((
         slot,
         s.base_reserve,
@@ -2006,6 +2016,8 @@ fn pump_amm_slave_recovery_snapshot(
         sell_tail_0,
         sell_tail_1,
         sell_layout_ready,
+        sell_requires_pre_fee_metas,
+        sell_ix_account_count,
     ))
 }
 
@@ -9931,24 +9943,70 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                         )
                         .await
                         {
-                            pump_amm_recovery_attempted = true;
                             let sell_requires_pre_fee_metas =
                                 cache.pump_amm_sell_requires_pre_fee_metas(&pool_pk);
                             let sell_requires_fee_tail =
                                 cache.pump_amm_sell_requires_fee_tail(&pool_pk);
                             let (sell_requires_extended, _, _, _) =
                                 cache.pump_amm_sell_extended_layout(&pool_pk);
+                            let sell_ix_account_count =
+                                ironcrab::solana::dex::pumpfun_amm::pump_amm_inferred_sell_ix_account_count(
+                                    sell_requires_pre_fee_metas,
+                                    sell_requires_fee_tail,
+                                    sell_requires_extended,
+                                );
+                            let before_pre_fee = before_snap.map(|s| s.9).unwrap_or(false);
+                            if before_pre_fee && !sell_requires_pre_fee_metas {
+                                warn!(
+                                    intent_id = %intent.intent_id,
+                                    pool = %pool_pk,
+                                    sim_error = ?sim_result.error_code,
+                                    sell_requires_pre_fee_metas,
+                                    sell_ix_account_count,
+                                    "PumpSwap cold-path recovery: refusing retry — sell_requires_pre_fee_metas degraded from true to false (no 26-account fallback)"
+                                );
+                                break (
+                                    tx_plan,
+                                    plan_hash_str,
+                                    sim_result,
+                                    requires_bundle,
+                                    bundle_tip_ix,
+                                    wallet_pubkey,
+                                    bundle_tip_lamports,
+                                );
+                            }
+                            if before_pre_fee
+                                && sell_ix_account_count
+                                    < ironcrab::solana::dex::pumpfun_amm::PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS
+                                        as u8
+                            {
+                                warn!(
+                                    intent_id = %intent.intent_id,
+                                    pool = %pool_pk,
+                                    sim_error = ?sim_result.error_code,
+                                    sell_requires_pre_fee_metas,
+                                    sell_ix_account_count,
+                                    expected = ironcrab::solana::dex::pumpfun_amm::PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS,
+                                    "PumpSwap cold-path recovery: refusing retry — inferred SELL layout below 27-account SSOT"
+                                );
+                                break (
+                                    tx_plan,
+                                    plan_hash_str,
+                                    sim_result,
+                                    requires_bundle,
+                                    bundle_tip_ix,
+                                    wallet_pubkey,
+                                    bundle_tip_lamports,
+                                );
+                            }
+                            pump_amm_recovery_attempted = true;
                             warn!(
                                 intent_id = %intent.intent_id,
                                 pool = %pool_pk,
                                 sim_error = ?sim_result.error_code,
                                 sell_requires_pre_fee_metas,
                                 sell_pre_fee_meta_1 = ?cache.pump_amm_sell_pre_fee_meta_1(&pool_pk),
-                                sell_ix_account_count = ironcrab::solana::dex::pumpfun_amm::pump_amm_inferred_sell_ix_account_count(
-                                    sell_requires_pre_fee_metas,
-                                    sell_requires_fee_tail,
-                                    sell_requires_extended,
-                                ),
+                                sell_ix_account_count,
                                 sell_layout_ready = cache.pump_amm_sell_layout_ready(&pool_pk),
                                 "PumpSwap cold-path recovery: simulation failed — force-refresh pool_accounts (market-data RPC), rebuilding tx (one retry)"
                             );
@@ -12937,6 +12995,50 @@ mod execution_engine_tests {
         assert!(
             ok,
             "fresh explicit-ready merge with extended sell metadata must satisfy force-refresh wait"
+        );
+    }
+
+    /// P184g: recovery snapshot must expose 27-account SSOT flags for degradation guard.
+    #[test]
+    fn pump_amm_recovery_snapshot_includes_pre_fee_and_inferred_ix_count() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(ironcrab::ipc::NATIVE_SOL_MINT).unwrap();
+        let accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        cache.upsert(
+            pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: base,
+                quote_mint: wsol,
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(1),
+                quote_reserve: Some(2),
+                pool_accounts: accounts,
+                creator: None,
+            }),
+            1,
+        );
+        let third = Pubkey::new_unique();
+        let pre1 = Pubkey::new_unique();
+        cache.merge_pump_amm_sell_extended_layout(
+            &pool,
+            true,
+            Some(third),
+            Some(Pubkey::new_unique()),
+            Some(Pubkey::new_unique()),
+            Some(Pubkey::new_unique()),
+            None,
+            false,
+            true,
+            Some(pre1),
+        );
+        let snap = pump_amm_slave_recovery_snapshot(&cache, &pool).expect("pump amm row");
+        assert!(snap.9, "sell_requires_pre_fee_metas");
+        assert_eq!(
+            snap.10,
+            ironcrab::solana::dex::pumpfun_amm::PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS as u8
         );
     }
 
