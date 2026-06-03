@@ -805,6 +805,13 @@ enum PumpAmmAuthoritativeSellLayout {
     },
 }
 
+/// Whether a layout reference came from an on-chain `sell` ix or a 27-account `buy_exact_quote_in` hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpAmmSellReferenceIxKind {
+    SellInstruction,
+    BuyLayoutHint,
+}
+
 /// Successful same-pool SELL reference from TX-history during `force_refresh` (Scope 60).
 /// Carries authoritative protocol fee metas from observed `sell` ix #9/#10 for v14 `[6]`/`[7]`.
 #[derive(Debug, Clone)]
@@ -813,6 +820,7 @@ struct PumpAmmSellReferenceObservation {
     protocol_fee_recipient: Pubkey,
     protocol_fee_recipient_ta: Pubkey,
     reference_swap_signature: Option<String>,
+    reference_ix_kind: PumpAmmSellReferenceIxKind,
 }
 
 impl PumpAmmSellReferenceObservation {
@@ -822,8 +830,43 @@ impl PumpAmmSellReferenceObservation {
             protocol_fee_recipient: Pubkey::default(),
             protocol_fee_recipient_ta: Pubkey::default(),
             reference_swap_signature: None,
+            reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
         }
     }
+}
+
+/// P184i: complete 26-account cashback `sell` from TX decode (volume + fee tails present).
+#[must_use]
+fn pump_amm_observation_is_26_account_cashback_sell(obs: &PumpAmmSellReferenceObservation) -> bool {
+    obs.reference_ix_kind == PumpAmmSellReferenceIxKind::SellInstruction
+        && matches!(
+            obs.layout,
+            PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: None,
+                pre_fee_1: None,
+                tail_0,
+                tail_1,
+                tail_2,
+                fee_tail_0: Some(f0),
+                fee_tail_1: Some(f1),
+                ..
+            } if f0 != Pubkey::default()
+                && f1 != Pubkey::default()
+                && tail_0 != Pubkey::default()
+                && tail_1 != Pubkey::default()
+                && tail_2 != Pubkey::default()
+        )
+}
+
+/// P184i: build tier prefers on-chain `sell` over 27-account `buy_exact_quote_in` layout hints.
+#[must_use]
+fn pump_amm_reference_observation_prefers_sell_over_buy_hint(
+    sell_obs: &PumpAmmSellReferenceObservation,
+    buy_hint_obs: &PumpAmmSellReferenceObservation,
+) -> bool {
+    sell_obs.reference_ix_kind == PumpAmmSellReferenceIxKind::SellInstruction
+        && buy_hint_obs.reference_ix_kind == PumpAmmSellReferenceIxKind::BuyLayoutHint
+        && pump_amm_observation_is_26_account_cashback_sell(sell_obs)
 }
 
 fn local_history_probe_from_sell_layout_summary(
@@ -882,8 +925,8 @@ fn sell_layout_scan_termination_after_successful_tx_fetch(
 
 /// Rank authoritative SELL layouts for TX-history merge (higher = stronger evidence).
 ///
-/// P184e: a newer **26-account** `sell` must not terminate discovery before an older **27-account**
-/// reference is considered; strength ordering prefers 27 > 26 > 24 > 21 (Base).
+/// Strength 27 > 26 > 24 > Base applies **within the same instruction kind** (`sell` vs `sell`).
+/// On-chain `sell` (e.g. 26-account cashback) beats 27-account `buy_exact_quote_in` hints (P184i).
 #[must_use]
 fn authoritative_sell_layout_strength(layout: &PumpAmmAuthoritativeSellLayout) -> u8 {
     match layout {
@@ -1063,6 +1106,12 @@ fn merge_pump_amm_authoritative_sell_reference_observation(
     if matches!(candidate.layout, PumpAmmAuthoritativeSellLayout::Unknown) {
         return best;
     }
+    if pump_amm_reference_observation_prefers_sell_over_buy_hint(&best, &candidate) {
+        return best;
+    }
+    if pump_amm_reference_observation_prefers_sell_over_buy_hint(&candidate, &best) {
+        return candidate;
+    }
     let best_strength = authoritative_sell_layout_strength(&best.layout);
     let cand_strength = authoritative_sell_layout_strength(&candidate.layout);
     if cand_strength > best_strength {
@@ -1102,7 +1151,7 @@ fn fold_force_refresh_sell_reference_observations_newest_first(
     best
 }
 
-/// Prod stuck pool (`GrgDaBg4…`): on-chain SELL requires 27 accounts (P184f).
+/// Prod stuck pool (`GrgDaBg4…`): on-chain successful SELL uses 26-account cashback (P184i); 27er BUY ref is layout hint only.
 static PUMP_AMM_STUCK_POOL_MARKET: LazyLock<Pubkey> = LazyLock::new(|| {
     Pubkey::from_str("GrgDaBg4TGBQCDZk9HHw8JT24RnoDHtQnvgguKxGKStb").expect("stuck pool pubkey")
 });
@@ -1202,6 +1251,9 @@ fn pump_amm_stuck_pool_v2_seed_observation(
     if !pump_amm_is_stuck_pool_market(&pool.pool_market) {
         return None;
     }
+    if pump_amm_observation_is_26_account_cashback_sell(obs) {
+        return None;
+    }
     if authoritative_sell_layout_strength(&obs.layout) >= 4
         && pump_amm_extended_layout_is_authoritative(&obs.layout)
     {
@@ -1248,6 +1300,7 @@ fn pump_amm_stuck_pool_v2_seed_observation(
         protocol_fee_recipient: obs.protocol_fee_recipient,
         protocol_fee_recipient_ta: obs.protocol_fee_recipient_ta,
         reference_swap_signature: Some(PUMP_AMM_STUCK_POOL_V2_SEED_REF_TAG.to_string()),
+        reference_ix_kind: PumpAmmSellReferenceIxKind::BuyLayoutHint,
     })
 }
 
@@ -1933,6 +1986,9 @@ impl PumpFunAmmDex {
         base_mint: Pubkey,
         mut obs: PumpAmmSellReferenceObservation,
     ) -> PumpAmmSellReferenceObservation {
+        if pump_amm_observation_is_26_account_cashback_sell(&obs) {
+            return obs;
+        }
         let pool_market = pool.pool_market;
         let scan_authoritative = pump_amm_extended_layout_is_authoritative(&obs.layout);
         let baseline_strength = authoritative_sell_layout_strength(&obs.layout);
@@ -2083,6 +2139,7 @@ impl PumpFunAmmDex {
             protocol_fee_recipient,
             protocol_fee_recipient_ta,
             reference_swap_signature,
+            reference_ix_kind: PumpAmmSellReferenceIxKind::BuyLayoutHint,
         };
         Some((pool_market, base_mint, obs))
     }
@@ -3042,50 +3099,23 @@ impl PumpFunAmmDex {
             if c0 != derived_vol_wsol_ata || c1 != derived_vol);
         let (user_vol_wsol_ata, user_vol, sell_extended_tail_source) =
             if sell_requires_pre_fee_metas {
-                if cold_path_prefer_derived_on_mismatch && cached_tail_mismatch {
-                    if let Some((c0, c1)) = curated_tails {
-                        warn!(
-                            intent_user = %user,
-                            sell_extended_tail_source = "reference",
-                            cached_tail_mismatch = true,
-                            sell_requires_pre_fee_metas = true,
-                            "pump_amm SELL: 27-account cold path — cached volume tails mismatch; using curated reference tails"
-                        );
-                        (c0, c1, "reference")
-                    } else {
-                        warn!(
-                            intent_user = %user,
-                            cached_tail_21 = ?observed_t0,
-                            cached_tail_22 = ?observed_t1,
-                            derived_tail_21 = %derived_vol_wsol_ata,
-                            derived_tail_22 = %derived_vol,
-                            sell_extended_tail_source = "derived_wallet_pool",
-                            cached_tail_mismatch = true,
-                            sell_requires_pre_fee_metas = true,
-                            "pump_amm SELL: 27-account cold path — ignoring mismatched cached volume tails; using intent-user derivation"
-                        );
-                        (derived_vol_wsol_ata, derived_vol, "derived_wallet_pool")
-                    }
+                if cached_tail_mismatch {
+                    warn!(
+                        intent_user = %user,
+                        cached_tail_21 = ?observed_t0,
+                        cached_tail_22 = ?observed_t1,
+                        derived_tail_21 = %derived_vol_wsol_ata,
+                        derived_tail_22 = %derived_vol,
+                        sell_extended_tail_source = "derived_wallet_pool",
+                        cached_tail_mismatch = true,
+                        sell_requires_pre_fee_metas = true,
+                        "pump_amm SELL: 27-account layout — ignoring mismatched cached volume tails; using intent-user derivation"
+                    );
+                    (derived_vol_wsol_ata, derived_vol, "derived_wallet_pool")
                 } else if let (Some(c0), Some(c1)) = (observed_t0, observed_t1) {
-                    let source = if cached_tail_mismatch {
-                        "observed_cache_mismatch"
-                    } else {
-                        "observed_cache"
-                    };
-                    if cached_tail_mismatch {
-                        warn!(
-                            intent_user = %user,
-                            cached_tail_21 = %c0,
-                            cached_tail_22 = %c1,
-                            derived_tail_21 = %derived_vol_wsol_ata,
-                            derived_tail_22 = %derived_vol,
-                            sell_extended_tail_source = source,
-                            cached_tail_mismatch = true,
-                            sell_requires_pre_fee_metas = true,
-                            "pump_amm SELL: 27-account layout — using observed volume tails (not intent-user derivation)"
-                        );
-                    }
-                    (c0, c1, source)
+                    (c0, c1, "validated_cache")
+                } else if cold_path_prefer_derived_on_mismatch {
+                    (derived_vol_wsol_ata, derived_vol, "derived_wallet_pool")
                 } else if let Some((c0, c1)) = curated_tails {
                     warn!(
                         intent_user = %user,
@@ -5838,6 +5868,7 @@ impl PumpFunAmmDex {
             protocol_fee_recipient: pool.protocol_fee_recipient,
             protocol_fee_recipient_ta: pool.protocol_fee_recipient_ta,
             reference_swap_signature,
+            reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
         };
         Some((pool.pool_market, pool.base_mint, obs))
     }
@@ -7139,6 +7170,7 @@ mod tests {
             protocol_fee_recipient: pfr_base,
             protocol_fee_recipient_ta: pfr_ta_base,
             reference_swap_signature: Some("sig_base".to_string()),
+            reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
         };
         let ext_obs = PumpAmmSellReferenceObservation {
             layout: PumpAmmAuthoritativeSellLayout::Extended {
@@ -7153,6 +7185,7 @@ mod tests {
             protocol_fee_recipient: pfr_ext,
             protocol_fee_recipient_ta: pfr_ta_ext,
             reference_swap_signature: Some("sig_ext".to_string()),
+            reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
         };
         assert_eq!(
             merge_pump_amm_authoritative_sell_reference_observation(
@@ -7181,6 +7214,7 @@ mod tests {
             protocol_fee_recipient: pfr_base,
             protocol_fee_recipient_ta: pfr_ta_base,
             reference_swap_signature: Some("sig_base".to_string()),
+            reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
         };
         let merged2 =
             merge_pump_amm_authoritative_sell_reference_observation(ext_obs.clone(), base_obs2);
@@ -7207,6 +7241,7 @@ mod tests {
             protocol_fee_recipient: pfr,
             protocol_fee_recipient_ta: Pubkey::new_unique(),
             reference_swap_signature: Some("sig_b".to_string()),
+            reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
         };
         assert_eq!(
             merge_pump_amm_authoritative_sell_reference_observation(
@@ -7243,6 +7278,7 @@ mod tests {
                 protocol_fee_recipient: Pubkey::new_unique(),
                 protocol_fee_recipient_ta: Pubkey::new_unique(),
                 reference_swap_signature: Some("sig_newer_base".to_string()),
+                reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
             },
             PumpAmmSellReferenceObservation {
                 layout: PumpAmmAuthoritativeSellLayout::Extended {
@@ -7257,6 +7293,7 @@ mod tests {
                 protocol_fee_recipient: pfr_ext,
                 protocol_fee_recipient_ta: pfr_ta_ext,
                 reference_swap_signature: Some("sig_older_ext".to_string()),
+                reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
             },
         ];
         let out = fold_force_refresh_sell_reference_observations_newest_first(
@@ -8513,7 +8550,7 @@ mod tests {
         );
     }
 
-    /// P184e: newest 26-account scan must not downgrade a stronger 27-account observation.
+    /// P184e (within `sell` only): older 27-account `sell` beats newer 26-account `sell` on strength.
     #[test]
     fn p184e_merge_27_account_pre_fee_wins_over_newer_26_account_cashback() {
         let t0 = Pubkey::new_unique();
@@ -8536,6 +8573,7 @@ mod tests {
             protocol_fee_recipient: Pubkey::new_unique(),
             protocol_fee_recipient_ta: Pubkey::new_unique(),
             reference_swap_signature: Some("sig_27".to_string()),
+            reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
         };
         let v26 = PumpAmmSellReferenceObservation {
             layout: PumpAmmAuthoritativeSellLayout::Extended {
@@ -8550,6 +8588,7 @@ mod tests {
             protocol_fee_recipient: Pubkey::new_unique(),
             protocol_fee_recipient_ta: Pubkey::new_unique(),
             reference_swap_signature: Some("sig_26_newer".to_string()),
+            reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
         };
         let merged = fold_force_refresh_sell_reference_observations_newest_first(v26, [v27]);
         assert_eq!(authoritative_sell_layout_strength(&merged.layout), 4);
@@ -8563,16 +8602,16 @@ mod tests {
         ));
     }
 
-    /// P184f: 26-account scan + stuck-pool seed → strength-4 SSOT and 27-account SELL build.
+    /// P184i: 26-account on-chain `sell` must not be upgraded to 27-account via stuck-pool seed.
     #[test]
-    fn p184f_stuck_pool_seed_upgrades_26_account_scan_observation() {
+    fn p184i_stuck_pool_seed_does_not_upgrade_26_account_sell_observation() {
         let pool_market = *PUMP_AMM_STUCK_POOL_MARKET;
         let base_mint = Pubkey::new_unique();
         let tail0 = Pubkey::new_unique();
-        let tail1 = Pubkey::new_unique();
+        let tail1 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_1).unwrap();
         let tail2 = Pubkey::new_unique();
-        let fee0 = Pubkey::new_unique();
-        let fee1 = Pubkey::new_unique();
+        let fee0 = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap();
+        let fee1 = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap();
         let scan_obs = PumpAmmSellReferenceObservation {
             layout: PumpAmmAuthoritativeSellLayout::Extended {
                 pre_fee_0: None,
@@ -8586,6 +8625,7 @@ mod tests {
             protocol_fee_recipient: Pubkey::new_unique(),
             protocol_fee_recipient_ta: Pubkey::new_unique(),
             reference_swap_signature: Some("sig_scan_26".to_string()),
+            reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
         };
         let pre_fee_0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_0).unwrap();
         let pool = PumpAmmPoolStatic {
@@ -8601,8 +8641,8 @@ mod tests {
             coin_creator_vault_ata: Pubkey::new_unique(),
             coin_creator_vault_authority: Pubkey::new_unique(),
             global_volume_accumulator: pre_fee_0,
-            fee_config: Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap(),
-            fee_program: Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(),
+            fee_config: fee0,
+            fee_program: fee1,
             sell_requires_cashback_remaining: true,
             sell_cashback_third_meta: Some(tail2),
             sell_extended_tail_0: Some(tail0),
@@ -8613,23 +8653,31 @@ mod tests {
             sell_pre_fee_meta_1: None,
             last_parse_diagnostics: None,
         };
-        let seeded = pump_amm_stuck_pool_v2_seed_observation(&pool, &scan_obs).expect("seed");
-        let merged = merge_pump_amm_authoritative_sell_reference_observation(scan_obs, seeded);
-        assert_eq!(authoritative_sell_layout_strength(&merged.layout), 4);
-        let PumpAmmAuthoritativeSellLayout::Extended {
-            pre_fee_0: Some(p0),
-            pre_fee_1: Some(p1),
-            ..
-        } = merged.layout
-        else {
-            panic!("expected extended v2 layout");
+        assert!(pump_amm_stuck_pool_v2_seed_observation(&pool, &scan_obs).is_none());
+        let buy_hint = PumpAmmSellReferenceObservation {
+            layout: PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: Some(pre_fee_0),
+                pre_fee_1: Some(Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_1).unwrap()),
+                tail_0: Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_0).unwrap(),
+                tail_1: tail1,
+                tail_2: tail2,
+                fee_tail_0: Some(fee0),
+                fee_tail_1: None,
+            },
+            protocol_fee_recipient: scan_obs.protocol_fee_recipient,
+            protocol_fee_recipient_ta: scan_obs.protocol_fee_recipient_ta,
+            reference_swap_signature: Some(PUMP_AMM_STUCK_POOL_V2_REF_SIG.to_string()),
+            reference_ix_kind: PumpAmmSellReferenceIxKind::BuyLayoutHint,
         };
-        assert_eq!(p0, pre_fee_0);
-        assert_eq!(
-            p1,
-            Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_1).unwrap()
+        let merged = fold_force_refresh_sell_reference_observations_newest_first(
+            scan_obs.clone(),
+            [buy_hint],
         );
-
+        assert!(pump_amm_observation_is_26_account_cashback_sell(&merged));
+        assert_eq!(
+            pump_amm_sell_ix_account_count_from_observation(&merged),
+            PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS as u8
+        );
         let v14 = pool.as_pool_accounts_v14();
         let user = Pubkey::new_unique();
         let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
@@ -8642,18 +8690,23 @@ mod tests {
             None,
             true,
             Some(tail2),
-            true,
-            Some(p1),
-            Some(tail0),
-            Some(tail1),
+            false,
+            None,
+            None,
+            None,
             Some(fee0),
             Some(fee1),
             false,
         )
-        .expect("27-account SELL");
+        .expect("26-account SELL");
         assert_eq!(
             ixs[0].accounts.len(),
-            PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS
+            PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS
+        );
+        let (fee_cfg_ix, _) = pump_amm_sell_ix_uses_global_fee_at(ixs[0].accounts.len()).unwrap();
+        assert_eq!(
+            ixs[0].accounts[fee_cfg_ix].pubkey,
+            Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap()
         );
     }
 
@@ -8698,7 +8751,7 @@ mod tests {
         assert_ne!(tail_2, Pubkey::default());
     }
 
-    /// P184g: 27-account SELL must use observed volume tails when they differ from intent-user derivation.
+    /// P184i: 27-account SELL uses validated cache tails only when they match intent-user derivation.
     #[test]
     fn p184g_push_extended_trailing_metas_prefers_observed_for_27_account() {
         let user = Pubkey::new_unique();
@@ -8729,8 +8782,8 @@ mod tests {
         )
         .expect("trailing metas");
         assert_eq!(metas.len(), 4);
-        assert_eq!(metas[0].pubkey, observed0);
-        assert_eq!(metas[1].pubkey, observed1);
+        assert_eq!(metas[0].pubkey, derived0);
+        assert_eq!(metas[1].pubkey, derived1);
         assert_eq!(metas[2].pubkey, third);
     }
 
@@ -8751,6 +8804,7 @@ mod tests {
             protocol_fee_recipient: Pubkey::new_unique(),
             protocol_fee_recipient_ta: Pubkey::new_unique(),
             reference_swap_signature: Some("sig_scan".to_string()),
+            reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
         };
         let pool = PumpAmmPoolStatic {
             pool_market,
@@ -8802,7 +8856,7 @@ mod tests {
         );
     }
 
-    /// P184g: builder uses observed tails in final 27-account SELL when cache provides them.
+    /// P184i: builder uses derived tails in final 27-account SELL when cached tails mismatch intent-user.
     #[test]
     fn p184g_build_swap_27_account_uses_observed_tails_not_derived() {
         let pool_market = *PUMP_AMM_STUCK_POOL_MARKET;
@@ -8811,6 +8865,11 @@ mod tests {
         let third = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_THIRD_META).unwrap();
         let tail0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_0).unwrap();
         let tail1 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_1).unwrap();
+        let quote_mint = Pubkey::from_str(WSOL_MINT).unwrap();
+        let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let (derived0, derived1) =
+            PumpFunAmmDex::pump_amm_sell_cashback_first_two_metas(user, quote_mint, quote_tp);
+        assert_ne!(tail0, derived0);
         let fee0 = Pubkey::new_unique();
         let pre1 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_1).unwrap();
         let pool = PumpAmmPoolStatic {
@@ -8865,11 +8924,11 @@ mod tests {
         );
         assert_eq!(
             ixs[0].accounts[PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2].pubkey,
-            tail0
+            derived0
         );
         assert_eq!(
             ixs[0].accounts[PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2].pubkey,
-            tail1
+            derived1
         );
     }
 
@@ -8893,6 +8952,7 @@ mod tests {
             protocol_fee_recipient: Pubkey::new_unique(),
             protocol_fee_recipient_ta: Pubkey::new_unique(),
             reference_swap_signature: Some("sig_ref_valid".to_string()),
+            reference_ix_kind: PumpAmmSellReferenceIxKind::BuyLayoutHint,
         }
     }
 
@@ -8914,6 +8974,7 @@ mod tests {
             protocol_fee_recipient: Pubkey::new_unique(),
             protocol_fee_recipient_ta: Pubkey::new_unique(),
             reference_swap_signature: Some("sig_scan_invalid".to_string()),
+            reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
         };
         let ref_obs = p184h_valid_v2_reference_observation();
         assert_eq!(authoritative_sell_layout_strength(&scan_obs.layout), 4);
@@ -8962,6 +9023,7 @@ mod tests {
             protocol_fee_recipient: Pubkey::new_unique(),
             protocol_fee_recipient_ta: Pubkey::new_unique(),
             reference_swap_signature: Some("sig_newer_invalid".to_string()),
+            reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
         };
         let older_valid = p184h_valid_v2_reference_observation();
         let folded = fold_force_refresh_sell_reference_observations_newest_first(
@@ -8975,22 +9037,19 @@ mod tests {
         );
     }
 
-    /// P184h: cold path must not write mismatched observed tails into 27-account SELL ix.
+    /// P184h/P184i: mismatched cache tails must not land in the final 27-account SELL ix (hot or cold).
     #[test]
     fn p184h_cold_path_trailing_metas_derived_on_cache_mismatch() {
         let user = Pubkey::new_unique();
         let quote_mint = Pubkey::from_str(WSOL_MINT).unwrap();
         let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes());
         let third = Pubkey::new_unique();
-        let observed0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_0).unwrap();
-        let observed1 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_1).unwrap();
         let fee_tail0 = Pubkey::new_unique();
         let (derived0, derived1) =
             PumpFunAmmDex::pump_amm_sell_cashback_first_two_metas(user, quote_mint, quote_tp);
-        assert_ne!(observed0, derived0);
-        let mut metas = Vec::new();
+        let mut metas_validated_cache = Vec::new();
         PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
-            &mut metas,
+            &mut metas_validated_cache,
             *PUMP_AMM_STUCK_POOL_MARKET,
             user,
             quote_mint,
@@ -8999,35 +9058,56 @@ mod tests {
             true,
             Some(fee_tail0),
             None,
-            Some(observed0),
-            Some(observed1),
-            true,
+            Some(derived0),
+            Some(derived1),
+            false,
         )
-        .expect("trailing metas");
-        assert_eq!(metas[0].pubkey, observed0);
-        assert_eq!(metas[1].pubkey, observed1);
-        let mut metas_cold = Vec::new();
-        PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
-            &mut metas_cold,
-            *PUMP_AMM_STUCK_POOL_MARKET,
-            user,
-            quote_mint,
-            quote_tp,
-            third,
-            true,
-            Some(fee_tail0),
-            None,
-            Some(observed0),
-            Some(observed1),
-            true,
-        )
-        .expect("cold trailing metas");
-        // Stuck pool has curated reference tails matching observed — cold path uses reference.
-        assert_eq!(metas_cold[0].pubkey, observed0);
-        assert_eq!(metas_cold[1].pubkey, observed1);
+        .expect("validated-cache trailing metas");
+        assert_eq!(metas_validated_cache[0].pubkey, derived0);
+        assert_eq!(metas_validated_cache[1].pubkey, derived1);
 
         let foreign0 = Pubkey::new_unique();
         let foreign1 = Pubkey::new_unique();
+        let mut metas_hot_stuck = Vec::new();
+        PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
+            &mut metas_hot_stuck,
+            *PUMP_AMM_STUCK_POOL_MARKET,
+            user,
+            quote_mint,
+            quote_tp,
+            third,
+            true,
+            Some(fee_tail0),
+            None,
+            Some(foreign0),
+            Some(foreign1),
+            false,
+        )
+        .expect("hot stuck trailing");
+        assert_eq!(metas_hot_stuck[0].pubkey, derived0);
+        assert_eq!(metas_hot_stuck[1].pubkey, derived1);
+
+        let (curated0, curated1) = pump_amm_stuck_pool_curated_volume_tails().expect("curated");
+        let mut metas_stripped_cache = Vec::new();
+        PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
+            &mut metas_stripped_cache,
+            *PUMP_AMM_STUCK_POOL_MARKET,
+            user,
+            quote_mint,
+            quote_tp,
+            third,
+            true,
+            Some(fee_tail0),
+            None,
+            None,
+            None,
+            true,
+        )
+        .expect("stripped-cache trailing");
+        assert_eq!(metas_stripped_cache[0].pubkey, derived0);
+        assert_ne!(metas_stripped_cache[0].pubkey, curated0);
+        assert_ne!(metas_stripped_cache[1].pubkey, curated1);
+
         let mut metas_foreign = Vec::new();
         PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
             &mut metas_foreign,
@@ -9043,7 +9123,7 @@ mod tests {
             Some(foreign1),
             true,
         )
-        .expect("foreign cold trailing");
+        .expect("foreign trailing");
         assert_eq!(metas_foreign[0].pubkey, derived0);
         assert_eq!(metas_foreign[1].pubkey, derived1);
     }

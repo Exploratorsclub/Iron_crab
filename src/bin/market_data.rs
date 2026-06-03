@@ -111,8 +111,8 @@ use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
 use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
 use ironcrab::solana::dex::pumpfun_amm::{
-    pump_amm_sell_extended_layout_ready, PumpAmmPoolAccountsDiagnostic,
-    PumpAmmSellExtendedReadinessParams, PumpFunAmmDex,
+    pump_amm_inferred_sell_ix_account_count, pump_amm_sell_extended_layout_ready,
+    PumpAmmPoolAccountsDiagnostic, PumpAmmSellExtendedReadinessParams, PumpFunAmmDex,
 };
 use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex_parser::{
@@ -9454,12 +9454,18 @@ async fn handle_ensure_pump_amm_pool_accounts(
                 let subject = pool_subject(&pool_address_str);
                 match nats.jetstream_publish(&subject, &pool_update).await {
                     Ok(true) => {
+                        let sell_ix_account_count = pump_amm_inferred_sell_ix_account_count(
+                            requires_pre_fee_metas_merged,
+                            requires_fee_tail_merged,
+                            sell_flag_merged,
+                        );
                         info!(
                             pool = %pool_address_str,
                             base_mint = %base_mint_str,
                             force_refresh,
                             sell_requires_pre_fee_metas = requires_pre_fee_metas_merged,
                             sell_pre_fee_meta_1 = ?pre_fee_meta_1_merged,
+                            sell_ix_account_count,
                             sell_layout_ready,
                             "EnsurePumpAmmPoolAccounts: Published PoolCacheUpdate to JetStream"
                         );
