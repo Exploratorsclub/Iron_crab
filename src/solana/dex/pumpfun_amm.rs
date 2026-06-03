@@ -962,10 +962,10 @@ const PUMP_AMM_STUCK_POOL_V2_REF_SIG: &str =
     "3XPKr7ynZzRSwvwiVvWpDr58pFCUVUqwySBiUwPMqwUTDGETFWaZXpYWm84DnAuSet4rQRmcwUwsfZ8Vg8gJqeae";
 const PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_0: &str = "C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw";
 const PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_1: &str = "61MucWEpFA5iiZCJCzzHCYYkk9hJXephDTLuJQGdQbwG";
-/// Scope44 / prod reference SELL tails when TX decode is unavailable (pool `GrgDaBg4…`).
-const PUMP_AMM_STUCK_POOL_CURATED_TAIL_0: &str = "HdeTxVpFmwZLeuhgk6K9xFCu81LG7mKRiLQdyYsegueY";
-const PUMP_AMM_STUCK_POOL_CURATED_TAIL_1: &str = "57hnepn3grPACamPur9oAW8pzt3YBcXM7L77xsqHEJQp";
-const PUMP_AMM_STUCK_POOL_CURATED_THIRD_META: &str = "68gqomxAG38Sj8deqxmrctBUp6hr3Lh2eoqGEyGgrsKo";
+/// Scope44 / prod reference v2 trailing metas when TX decode is unavailable (pool `GrgDaBg4…`, ref `3XPKr7…`).
+const PUMP_AMM_STUCK_POOL_CURATED_TAIL_0: &str = "2HEkAp3PvBNLanbowHLJYQNcHu58ekEEBMRT5xyWxzM1";
+const PUMP_AMM_STUCK_POOL_CURATED_TAIL_1: &str = "68gqomxAG38Sj8deqxmrctBUp6hr3Lh2eoqGEyGgrsKo";
+const PUMP_AMM_STUCK_POOL_CURATED_THIRD_META: &str = "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD";
 const PUMP_AMM_STUCK_POOL_V2_SEED_REF_TAG: &str = "p184f_stuck_pool_v2_seed";
 
 #[must_use]
@@ -2834,6 +2834,7 @@ impl PumpFunAmmDex {
     #[allow(clippy::too_many_arguments)]
     fn push_pump_amm_sell_extended_trailing_metas(
         metas: &mut Vec<AccountMeta>,
+        pool_market: Pubkey,
         user: Pubkey,
         quote_mint: Pubkey,
         quote_token_program: Pubkey,
@@ -2848,11 +2849,12 @@ impl PumpFunAmmDex {
             Self::pump_amm_sell_cashback_first_two_metas(user, quote_mint, quote_token_program);
         let observed_t0 = cached_observed_volume_tail_0.filter(|p| *p != Pubkey::default());
         let observed_t1 = cached_observed_volume_tail_1.filter(|p| *p != Pubkey::default());
-        let curated_tails = if sell_requires_pre_fee_metas {
-            pump_amm_stuck_pool_curated_volume_tails()
-        } else {
-            None
-        };
+        let curated_tails =
+            if sell_requires_pre_fee_metas && pump_amm_is_stuck_pool_market(&pool_market) {
+                pump_amm_stuck_pool_curated_volume_tails()
+            } else {
+                None
+            };
         let cached_tail_mismatch = matches!((observed_t0, observed_t1), (Some(c0), Some(c1))
             if c0 != derived_vol_wsol_ata || c1 != derived_vol);
         let (user_vol_wsol_ata, user_vol, sell_extended_tail_source) =
@@ -6353,6 +6355,7 @@ impl Dex for PumpFunAmmDex {
                 };
                 Self::push_pump_amm_sell_extended_trailing_metas(
                     &mut metas,
+                    pool.pool_market,
                     user,
                     pool.quote_mint,
                     quote_token_program,
@@ -6659,6 +6662,7 @@ impl PumpFunAmmDex {
                 };
                 Self::push_pump_amm_sell_extended_trailing_metas(
                     &mut metas,
+                    pool_market,
                     user,
                     quote_mint,
                     quote_tp,
@@ -7668,6 +7672,7 @@ mod tests {
         let mut metas = Vec::new();
         let err = PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
             &mut metas,
+            *PUMP_AMM_STUCK_POOL_MARKET,
             Pubkey::new_unique(),
             Pubkey::from_str(WSOL_MINT).unwrap(),
             Pubkey::new_from_array(spl_token::id().to_bytes()),
@@ -8495,6 +8500,7 @@ mod tests {
         let mut metas = Vec::new();
         PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
             &mut metas,
+            *PUMP_AMM_STUCK_POOL_MARKET,
             user,
             quote_mint,
             quote_tp,
