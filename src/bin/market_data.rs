@@ -9445,6 +9445,10 @@ async fn handle_ensure_pump_amm_pool_accounts(
                         info!(
                             pool = %pool_address_str,
                             base_mint = %base_mint_str,
+                            force_refresh,
+                            sell_requires_pre_fee_metas = requires_pre_fee_metas_merged,
+                            sell_pre_fee_meta_1 = ?pre_fee_meta_1_merged,
+                            sell_layout_ready,
                             "EnsurePumpAmmPoolAccounts: Published PoolCacheUpdate to JetStream"
                         );
                         true

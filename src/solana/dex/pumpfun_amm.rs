@@ -20,7 +20,7 @@ use solana_transaction_status::UiTransactionEncoding;
 use spl_token::solana_program::pubkey::Pubkey as SplProgramPubkey;
 use std::collections::HashSet;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -954,16 +954,120 @@ fn fold_force_refresh_sell_reference_observations_newest_first(
     best
 }
 
-/// Cold-path reference `sell` txs known to use the 27-account extended layout (P184e).
+/// Prod stuck pool (`GrgDaBg4…`): on-chain SELL requires 27 accounts (P184f).
+static PUMP_AMM_STUCK_POOL_MARKET: LazyLock<Pubkey> = LazyLock::new(|| {
+    Pubkey::from_str("GrgDaBg4TGBQCDZk9HHw8JT24RnoDHtQnvgguKxGKStb").expect("stuck pool pubkey")
+});
+const PUMP_AMM_STUCK_POOL_V2_REF_SIG: &str =
+    "3XPKr7ynZzRSwvwiVvWpDr58pFCUVUqwySBiUwPMqwUTDGETFWaZXpYWm84DnAuSet4rQRmcwUwsfZ8Vg8gJqeae";
+const PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_0: &str = "C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw";
+const PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_1: &str = "61MucWEpFA5iiZCJCzzHCYYkk9hJXephDTLuJQGdQbwG";
+const PUMP_AMM_STUCK_POOL_V2_SEED_REF_TAG: &str = "p184f_stuck_pool_v2_seed";
+
+#[must_use]
+fn pump_amm_is_stuck_pool_market(pool_market: &Pubkey) -> bool {
+    *pool_market == *PUMP_AMM_STUCK_POOL_MARKET
+}
+
+/// Cold-path reference `sell` txs known to use the 27-account extended layout (P184e/P184f).
 fn pump_amm_known_v2_sell_reference_signatures(pool_market: &Pubkey) -> &'static [&'static str] {
-    const STUCK_POOL: &str = "GrgDaBg4TGBQCDZk9HHw8JT24RnoDHtQnvgguKxGKStb";
-    const STUCK_POOL_V2_REF: &str =
-        "3XPKr7ynZzRSwvwiVvWpDr58pFCUVUqwySBiUwPMqwUTDGETFWaZXpYWm84DnAuSet4rQRmcwUwsfZ8Vg8gJqeae";
-    if pool_market.to_string() == STUCK_POOL {
-        &[STUCK_POOL_V2_REF]
+    if pump_amm_is_stuck_pool_market(pool_market) {
+        &[PUMP_AMM_STUCK_POOL_V2_REF_SIG]
     } else {
         &[]
     }
+}
+
+#[must_use]
+fn pump_amm_sell_ix_account_count_from_observation(obs: &PumpAmmSellReferenceObservation) -> u8 {
+    match obs.layout {
+        PumpAmmAuthoritativeSellLayout::Extended {
+            pre_fee_0,
+            pre_fee_1,
+            ..
+        } if pre_fee_0.filter(|p| *p != Pubkey::default()).is_some()
+            && pre_fee_1.filter(|p| *p != Pubkey::default()).is_some() =>
+        {
+            PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS as u8
+        }
+        PumpAmmAuthoritativeSellLayout::Extended {
+            fee_tail_0,
+            fee_tail_1,
+            ..
+        } if fee_tail_0.filter(|p| *p != Pubkey::default()).is_some()
+            && fee_tail_1.filter(|p| *p != Pubkey::default()).is_some() =>
+        {
+            PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS as u8
+        }
+        PumpAmmAuthoritativeSellLayout::Extended { .. } => {
+            PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS as u8
+        }
+        PumpAmmAuthoritativeSellLayout::Base => 21,
+        PumpAmmAuthoritativeSellLayout::Unknown => 0,
+    }
+}
+
+/// Infer SELL ix account count from SLAVE / cache flags (Scope 44 diagnostics).
+#[must_use]
+pub fn pump_amm_inferred_sell_ix_account_count(
+    sell_requires_pre_fee_metas: bool,
+    sell_requires_fee_tail: bool,
+    sell_requires_extended: bool,
+) -> u8 {
+    if sell_requires_pre_fee_metas {
+        PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS as u8
+    } else if sell_requires_fee_tail {
+        PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS as u8
+    } else if sell_requires_extended {
+        PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS as u8
+    } else {
+        21
+    }
+}
+
+/// P184f: when TX scan only finds 26-account `sell`, seed curated 27-account pre-fee metas for the stuck pool.
+fn pump_amm_stuck_pool_v2_seed_observation(
+    pool: &PumpAmmPoolStatic,
+    obs: &PumpAmmSellReferenceObservation,
+) -> Option<PumpAmmSellReferenceObservation> {
+    if !pump_amm_is_stuck_pool_market(&pool.pool_market) {
+        return None;
+    }
+    if authoritative_sell_layout_strength(&obs.layout) >= 4 {
+        return None;
+    }
+    let PumpAmmAuthoritativeSellLayout::Extended {
+        tail_0,
+        tail_1,
+        tail_2,
+        fee_tail_0,
+        fee_tail_1,
+        ..
+    } = obs.layout
+    else {
+        return None;
+    };
+    let curated_pre_fee_0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_0).ok()?;
+    let pre_fee_0 = if pool.global_volume_accumulator != Pubkey::default() {
+        pool.global_volume_accumulator
+    } else {
+        curated_pre_fee_0
+    };
+    let pre_fee_1 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_1).ok()?;
+    Some(PumpAmmSellReferenceObservation {
+        layout: PumpAmmAuthoritativeSellLayout::Extended {
+            pre_fee_0: Some(pre_fee_0),
+            pre_fee_1: Some(pre_fee_1),
+            tail_0,
+            tail_1,
+            tail_2,
+            fee_tail_0,
+            fee_tail_1,
+        },
+        protocol_fee_recipient: obs.protocol_fee_recipient,
+        protocol_fee_recipient_ta: obs.protocol_fee_recipient_ta,
+        reference_swap_signature: Some(PUMP_AMM_STUCK_POOL_V2_SEED_REF_TAG.to_string()),
+    })
 }
 
 fn provider_status_from_anyhow_rpc(err: &anyhow::Error) -> PumpAmmSellLayoutProviderStatus {
@@ -1644,22 +1748,28 @@ impl PumpFunAmmDex {
     /// Cold-path only: when TX-history scan found a weaker extended layout, try curated 27-account refs.
     async fn upgrade_sell_layout_observation_with_known_v2_reference(
         &self,
-        tx_rpc: Arc<SolanaRpc>,
-        pool_market: Pubkey,
+        pool: &PumpAmmPoolStatic,
         base_mint: Pubkey,
         mut obs: PumpAmmSellReferenceObservation,
     ) -> PumpAmmSellReferenceObservation {
+        let pool_market = pool.pool_market;
         if authoritative_sell_layout_is_terminal_for_scan(&obs.layout) {
             return obs;
         }
         let baseline_strength = authoritative_sell_layout_strength(&obs.layout);
-        for sig in pump_amm_known_v2_sell_reference_signatures(&pool_market) {
-            let observe_fut = self.try_observe_sell_layout_from_reference_signature(
-                tx_rpc.as_ref(),
-                pool_market,
-                base_mint,
-                sig,
+        let curated_sigs = pump_amm_known_v2_sell_reference_signatures(&pool_market);
+        if !curated_sigs.is_empty() {
+            info!(
+                pool = %pool_market,
+                base_mint = %base_mint,
+                baseline_strength,
+                reference_count = curated_sigs.len(),
+                "pump_amm: attempting force_refresh SELL layout upgrade from curated 27-account reference"
             );
+        }
+        for sig in curated_sigs {
+            let observe_fut =
+                self.try_observe_sell_layout_from_curated_reference(pool_market, base_mint, sig);
             let ref_obs = match tokio::time::timeout(
                 BOUNDED_SELL_LAYOUT_V2_REFERENCE_UPGRADE_TIMEOUT,
                 observe_fut,
@@ -1681,31 +1791,8 @@ impl PumpFunAmmDex {
             if let Some(ref_obs) = ref_obs {
                 obs = merge_pump_amm_authoritative_sell_reference_observation(obs, ref_obs);
                 if authoritative_sell_layout_strength(&obs.layout) > baseline_strength {
-                    let sell_ix_account_count = match obs.layout {
-                        PumpAmmAuthoritativeSellLayout::Extended {
-                            pre_fee_0,
-                            pre_fee_1,
-                            ..
-                        } if pre_fee_0.filter(|p| *p != Pubkey::default()).is_some()
-                            && pre_fee_1.filter(|p| *p != Pubkey::default()).is_some() =>
-                        {
-                            PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS as u8
-                        }
-                        PumpAmmAuthoritativeSellLayout::Extended {
-                            fee_tail_0,
-                            fee_tail_1,
-                            ..
-                        } if fee_tail_0.filter(|p| *p != Pubkey::default()).is_some()
-                            && fee_tail_1.filter(|p| *p != Pubkey::default()).is_some() =>
-                        {
-                            PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS as u8
-                        }
-                        PumpAmmAuthoritativeSellLayout::Extended { .. } => {
-                            PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS as u8
-                        }
-                        PumpAmmAuthoritativeSellLayout::Base => 21,
-                        PumpAmmAuthoritativeSellLayout::Unknown => 0,
-                    };
+                    let sell_ix_account_count =
+                        pump_amm_sell_ix_account_count_from_observation(&obs);
                     info!(
                         pool = %pool_market,
                         base_mint = %base_mint,
@@ -1718,20 +1805,41 @@ impl PumpFunAmmDex {
                 }
             }
         }
+        if authoritative_sell_layout_strength(&obs.layout) < 4 {
+            if let Some(seeded) = pump_amm_stuck_pool_v2_seed_observation(pool, &obs) {
+                obs = merge_pump_amm_authoritative_sell_reference_observation(obs, seeded);
+                if authoritative_sell_layout_strength(&obs.layout) >= 4 {
+                    info!(
+                        pool = %pool_market,
+                        base_mint = %base_mint,
+                        sell_ix_account_count = PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS,
+                        sell_pre_fee_meta_1 = %PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_1,
+                        reference_swap_signature = %obs.reference_swap_signature.as_deref().unwrap_or(""),
+                        "pump_amm: upgraded force_refresh SELL layout via stuck-pool v2 seed (scan had weaker layout)"
+                    );
+                    return obs;
+                }
+            }
+            if pump_amm_is_stuck_pool_market(&pool_market) {
+                warn!(
+                    pool = %pool_market,
+                    base_mint = %base_mint,
+                    baseline_strength,
+                    final_strength = authoritative_sell_layout_strength(&obs.layout),
+                    "pump_amm: stuck-pool force_refresh still missing 27-account SELL layout after curated reference and seed"
+                );
+            }
+        }
         obs
     }
 
-    /// Fetch and decode a single known-good 27-account `sell` reference (cold path / discovery only).
-    async fn try_observe_sell_layout_from_reference_signature(
-        &self,
-        tx_rpc: &SolanaRpc,
+    /// Decode a fetched transaction JSON value into a pool-matching `sell` reference observation.
+    fn observe_sell_layout_from_tx_value(
+        tx_v: &Value,
         pool_market: Pubkey,
         base_mint: Pubkey,
         signature: &str,
     ) -> Option<PumpAmmSellReferenceObservation> {
-        let tx_v = Self::fetch_tx_as_value_with_rpc(tx_rpc, signature)
-            .await
-            .ok()?;
         let msg = tx_v
             .get("result")
             .and_then(|r| r.get("transaction"))
@@ -1784,6 +1892,61 @@ impl PumpFunAmmDex {
         None
     }
 
+    /// Fetch curated 27-account `sell` reference via Helius fallback first, then local RPC (P184f).
+    async fn try_observe_sell_layout_from_curated_reference(
+        &self,
+        pool_market: Pubkey,
+        base_mint: Pubkey,
+        signature: &str,
+    ) -> Option<PumpAmmSellReferenceObservation> {
+        let mut rpc_chain: Vec<(&SolanaRpc, &'static str)> = Vec::with_capacity(2);
+        if let Some(ref h_rpc) = self.bounded_tx_fallback_rpc {
+            rpc_chain.push((h_rpc.as_ref(), "bounded_tx_fallback"));
+        }
+        rpc_chain.push((self.rpc.as_ref(), "local"));
+
+        let mut fetch_errors: Vec<String> = Vec::new();
+        let mut fetched_but_undecodable = false;
+        for (tx_rpc, rpc_label) in rpc_chain {
+            match Self::fetch_tx_as_value_with_rpc(tx_rpc, signature).await {
+                Ok(tx_v) => {
+                    if let Some(obs) = Self::observe_sell_layout_from_tx_value(
+                        &tx_v,
+                        pool_market,
+                        base_mint,
+                        signature,
+                    ) {
+                        info!(
+                            pool = %pool_market,
+                            base_mint = %base_mint,
+                            reference_swap_signature = %signature,
+                            rpc = rpc_label,
+                            sell_ix_account_count = pump_amm_sell_ix_account_count_from_observation(&obs),
+                            "pump_amm: decoded curated v2 SELL reference tx during force_refresh upgrade"
+                        );
+                        return Some(obs);
+                    }
+                    fetched_but_undecodable = true;
+                    fetch_errors.push(format!(
+                        "{rpc_label}: getTransaction ok but no matching pool/mint sell ix"
+                    ));
+                }
+                Err(e) => {
+                    fetch_errors.push(format!("{rpc_label}: {e:#}"));
+                }
+            }
+        }
+        warn!(
+            pool = %pool_market,
+            base_mint = %base_mint,
+            reference_swap_signature = %signature,
+            fetched_but_undecodable,
+            errors = %fetch_errors.join(" | "),
+            "pump_amm: curated v2 SELL reference getTransaction failed on all RPC providers or returned no decodable sell ix"
+        );
+        None
+    }
+
     async fn resolve_authoritative_sell_layout_for_force_refresh(
         &self,
         pool: &PumpAmmPoolStatic,
@@ -1815,12 +1978,7 @@ impl PumpFunAmmDex {
         match local_outcome.result {
             Ok(obs) if obs.layout != PumpAmmAuthoritativeSellLayout::Unknown => {
                 let merged = self
-                    .upgrade_sell_layout_observation_with_known_v2_reference(
-                        Arc::clone(&self.rpc),
-                        pool.pool_market,
-                        base_mint,
-                        obs,
-                    )
+                    .upgrade_sell_layout_observation_with_known_v2_reference(pool, base_mint, obs)
                     .await;
                 return Ok((merged, None));
             }
@@ -1910,10 +2068,7 @@ impl PumpFunAmmDex {
                 let out = match obs.result {
                     Ok(v) if v.layout != PumpAmmAuthoritativeSellLayout::Unknown => {
                         self.upgrade_sell_layout_observation_with_known_v2_reference(
-                            Arc::clone(h_rpc),
-                            pool.pool_market,
-                            base_mint,
-                            v,
+                            pool, base_mint, v,
                         )
                         .await
                     }
@@ -8002,6 +8157,149 @@ mod tests {
         assert_eq!(
             ixs[0].accounts[10].pubkey,
             PumpFunAmmDex::derive_ata_with_program(observed, wsol, quote_tp)
+        );
+    }
+
+    /// P184e: newest 26-account scan must not downgrade a stronger 27-account observation.
+    #[test]
+    fn p184e_merge_27_account_pre_fee_wins_over_newer_26_account_cashback() {
+        let t0 = Pubkey::new_unique();
+        let t1 = Pubkey::new_unique();
+        let t2 = Pubkey::new_unique();
+        let pre0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_0).unwrap();
+        let pre1 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_1).unwrap();
+        let fee0 = Pubkey::new_unique();
+        let fee1 = Pubkey::new_unique();
+        let v27 = PumpAmmSellReferenceObservation {
+            layout: PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: Some(pre0),
+                pre_fee_1: Some(pre1),
+                tail_0: t0,
+                tail_1: t1,
+                tail_2: t2,
+                fee_tail_0: Some(fee0),
+                fee_tail_1: None,
+            },
+            protocol_fee_recipient: Pubkey::new_unique(),
+            protocol_fee_recipient_ta: Pubkey::new_unique(),
+            reference_swap_signature: Some("sig_27".to_string()),
+        };
+        let v26 = PumpAmmSellReferenceObservation {
+            layout: PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: None,
+                pre_fee_1: None,
+                tail_0: Pubkey::new_unique(),
+                tail_1: Pubkey::new_unique(),
+                tail_2: Pubkey::new_unique(),
+                fee_tail_0: Some(fee0),
+                fee_tail_1: Some(fee1),
+            },
+            protocol_fee_recipient: Pubkey::new_unique(),
+            protocol_fee_recipient_ta: Pubkey::new_unique(),
+            reference_swap_signature: Some("sig_26_newer".to_string()),
+        };
+        let merged = fold_force_refresh_sell_reference_observations_newest_first(v26, [v27]);
+        assert_eq!(authoritative_sell_layout_strength(&merged.layout), 4);
+        assert!(matches!(
+            merged.layout,
+            PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: Some(p0),
+                pre_fee_1: Some(p1),
+                ..
+            } if p0 == pre0 && p1 == pre1
+        ));
+    }
+
+    /// P184f: 26-account scan + stuck-pool seed → strength-4 SSOT and 27-account SELL build.
+    #[test]
+    fn p184f_stuck_pool_seed_upgrades_26_account_scan_observation() {
+        let pool_market = *PUMP_AMM_STUCK_POOL_MARKET;
+        let base_mint = Pubkey::new_unique();
+        let tail0 = Pubkey::new_unique();
+        let tail1 = Pubkey::new_unique();
+        let tail2 = Pubkey::new_unique();
+        let fee0 = Pubkey::new_unique();
+        let fee1 = Pubkey::new_unique();
+        let scan_obs = PumpAmmSellReferenceObservation {
+            layout: PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: None,
+                pre_fee_1: None,
+                tail_0: tail0,
+                tail_1: tail1,
+                tail_2: tail2,
+                fee_tail_0: Some(fee0),
+                fee_tail_1: Some(fee1),
+            },
+            protocol_fee_recipient: Pubkey::new_unique(),
+            protocol_fee_recipient_ta: Pubkey::new_unique(),
+            reference_swap_signature: Some("sig_scan_26".to_string()),
+        };
+        let pre_fee_0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_0).unwrap();
+        let pool = PumpAmmPoolStatic {
+            pool_market,
+            global_config: Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap(),
+            base_mint,
+            quote_mint: Pubkey::from_str(WSOL_MINT).unwrap(),
+            pool_base_vault: Pubkey::new_unique(),
+            pool_quote_vault: Pubkey::new_unique(),
+            protocol_fee_recipient: scan_obs.protocol_fee_recipient,
+            protocol_fee_recipient_ta: scan_obs.protocol_fee_recipient_ta,
+            event_authority: Pubkey::new_unique(),
+            coin_creator_vault_ata: Pubkey::new_unique(),
+            coin_creator_vault_authority: Pubkey::new_unique(),
+            global_volume_accumulator: pre_fee_0,
+            fee_config: Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap(),
+            fee_program: Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(),
+            sell_requires_cashback_remaining: true,
+            sell_cashback_third_meta: Some(tail2),
+            sell_extended_tail_0: Some(tail0),
+            sell_extended_tail_1: Some(tail1),
+            sell_extended_fee_tail_0: Some(fee0),
+            sell_extended_fee_tail_1: Some(fee1),
+            sell_requires_pre_fee_metas: false,
+            sell_pre_fee_meta_1: None,
+            last_parse_diagnostics: None,
+        };
+        let seeded = pump_amm_stuck_pool_v2_seed_observation(&pool, &scan_obs).expect("seed");
+        let merged = merge_pump_amm_authoritative_sell_reference_observation(scan_obs, seeded);
+        assert_eq!(authoritative_sell_layout_strength(&merged.layout), 4);
+        let PumpAmmAuthoritativeSellLayout::Extended {
+            pre_fee_0: Some(p0),
+            pre_fee_1: Some(p1),
+            ..
+        } = merged.layout
+        else {
+            panic!("expected extended v2 layout");
+        };
+        assert_eq!(p0, pre_fee_0);
+        assert_eq!(
+            p1,
+            Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_1).unwrap()
+        );
+
+        let v14 = pool.as_pool_accounts_v14();
+        let user = Pubkey::new_unique();
+        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
+            &base_mint.to_string(),
+            WSOL_MINT,
+            1,
+            1,
+            user,
+            &v14,
+            None,
+            true,
+            Some(tail2),
+            true,
+            Some(p1),
+            Some(tail0),
+            Some(tail1),
+            Some(fee0),
+            Some(fee1),
+        )
+        .expect("27-account SELL");
+        assert_eq!(
+            ixs[0].accounts.len(),
+            PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS
         );
     }
 }

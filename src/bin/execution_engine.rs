@@ -9932,12 +9932,23 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                         .await
                         {
                             pump_amm_recovery_attempted = true;
+                            let sell_requires_pre_fee_metas =
+                                cache.pump_amm_sell_requires_pre_fee_metas(&pool_pk);
+                            let sell_requires_fee_tail =
+                                cache.pump_amm_sell_requires_fee_tail(&pool_pk);
+                            let (sell_requires_extended, _, _, _) =
+                                cache.pump_amm_sell_extended_layout(&pool_pk);
                             warn!(
                                 intent_id = %intent.intent_id,
                                 pool = %pool_pk,
                                 sim_error = ?sim_result.error_code,
-                                sell_requires_pre_fee_metas = cache.pump_amm_sell_requires_pre_fee_metas(&pool_pk),
+                                sell_requires_pre_fee_metas,
                                 sell_pre_fee_meta_1 = ?cache.pump_amm_sell_pre_fee_meta_1(&pool_pk),
+                                sell_ix_account_count = ironcrab::solana::dex::pumpfun_amm::pump_amm_inferred_sell_ix_account_count(
+                                    sell_requires_pre_fee_metas,
+                                    sell_requires_fee_tail,
+                                    sell_requires_extended,
+                                ),
                                 sell_layout_ready = cache.pump_amm_sell_layout_ready(&pool_pk),
                                 "PumpSwap cold-path recovery: simulation failed — force-refresh pool_accounts (market-data RPC), rebuilding tx (one retry)"
                             );
