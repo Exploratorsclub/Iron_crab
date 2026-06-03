@@ -962,11 +962,32 @@ const PUMP_AMM_STUCK_POOL_V2_REF_SIG: &str =
     "3XPKr7ynZzRSwvwiVvWpDr58pFCUVUqwySBiUwPMqwUTDGETFWaZXpYWm84DnAuSet4rQRmcwUwsfZ8Vg8gJqeae";
 const PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_0: &str = "C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw";
 const PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_1: &str = "61MucWEpFA5iiZCJCzzHCYYkk9hJXephDTLuJQGdQbwG";
+/// Scope44 / prod reference SELL tails when TX decode is unavailable (pool `GrgDaBg4…`).
+const PUMP_AMM_STUCK_POOL_CURATED_TAIL_0: &str = "HdeTxVpFmwZLeuhgk6K9xFCu81LG7mKRiLQdyYsegueY";
+const PUMP_AMM_STUCK_POOL_CURATED_TAIL_1: &str = "57hnepn3grPACamPur9oAW8pzt3YBcXM7L77xsqHEJQp";
+const PUMP_AMM_STUCK_POOL_CURATED_THIRD_META: &str = "68gqomxAG38Sj8deqxmrctBUp6hr3Lh2eoqGEyGgrsKo";
 const PUMP_AMM_STUCK_POOL_V2_SEED_REF_TAG: &str = "p184f_stuck_pool_v2_seed";
 
 #[must_use]
 fn pump_amm_is_stuck_pool_market(pool_market: &Pubkey) -> bool {
     *pool_market == *PUMP_AMM_STUCK_POOL_MARKET
+}
+
+#[must_use]
+fn pump_amm_stuck_pool_curated_volume_tails() -> Option<(Pubkey, Pubkey)> {
+    let t0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_0).ok()?;
+    let t1 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_1).ok()?;
+    if t0 == Pubkey::default() || t1 == Pubkey::default() {
+        return None;
+    }
+    Some((t0, t1))
+}
+
+#[must_use]
+fn pump_amm_stuck_pool_curated_third_meta() -> Option<Pubkey> {
+    Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_THIRD_META)
+        .ok()
+        .filter(|p| *p != Pubkey::default())
 }
 
 /// Cold-path reference `sell` txs known to use the 27-account extended layout (P184e/P184f).
@@ -1054,6 +1075,16 @@ fn pump_amm_stuck_pool_v2_seed_observation(
         curated_pre_fee_0
     };
     let pre_fee_1 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_1).ok()?;
+    let (tail_0, tail_1) = if tail_0 != Pubkey::default() && tail_1 != Pubkey::default() {
+        (tail_0, tail_1)
+    } else {
+        pump_amm_stuck_pool_curated_volume_tails().unwrap_or((Pubkey::default(), Pubkey::default()))
+    };
+    let tail_2 = if tail_2 != Pubkey::default() {
+        tail_2
+    } else {
+        pump_amm_stuck_pool_curated_third_meta().unwrap_or_default()
+    };
     Some(PumpAmmSellReferenceObservation {
         layout: PumpAmmAuthoritativeSellLayout::Extended {
             pre_fee_0: Some(pre_fee_0),
@@ -1833,7 +1864,51 @@ impl PumpFunAmmDex {
         obs
     }
 
-    /// Decode a fetched transaction JSON value into a pool-matching `sell` reference observation.
+    /// Build a reference observation from an extended v2 account list (`sell` or 27-account `buy`).
+    fn pump_amm_extended_layout_reference_observation_from_parsed_ix_accounts(
+        acc_accounts: &[String],
+        reference_swap_signature: Option<String>,
+    ) -> Option<(Pubkey, Pubkey, PumpAmmSellReferenceObservation)> {
+        let instruction_accounts: Vec<Pubkey> = acc_accounts
+            .iter()
+            .filter_map(|s| Pubkey::from_str(s).ok())
+            .collect();
+        if instruction_accounts.len() != acc_accounts.len() {
+            return None;
+        }
+        let ext = pump_amm_sell_extended_fields_from_ix_accounts(&instruction_accounts)?;
+        if !ext.requires_extended {
+            return None;
+        }
+        let pool_market = *instruction_accounts.first()?;
+        let base_mint = *instruction_accounts.get(3)?;
+        let protocol_fee_recipient = *instruction_accounts.get(9)?;
+        let protocol_fee_recipient_ta = *instruction_accounts.get(10)?;
+        let tail_0 = ext.tail_0.filter(|p| *p != Pubkey::default())?;
+        let tail_1 = ext.tail_1.filter(|p| *p != Pubkey::default())?;
+        let tail_2 = ext.third_meta.filter(|p| *p != Pubkey::default())?;
+        let layout = PumpAmmAuthoritativeSellLayout::Extended {
+            pre_fee_0: ext.pre_fee_meta_0.filter(|p| *p != Pubkey::default()),
+            pre_fee_1: ext.pre_fee_meta_1.filter(|p| *p != Pubkey::default()),
+            tail_0,
+            tail_1,
+            tail_2,
+            fee_tail_0: ext.fee_tail_0.filter(|p| *p != Pubkey::default()),
+            fee_tail_1: ext.fee_tail_1.filter(|p| *p != Pubkey::default()),
+        };
+        let obs = PumpAmmSellReferenceObservation {
+            layout,
+            protocol_fee_recipient,
+            protocol_fee_recipient_ta,
+            reference_swap_signature,
+        };
+        Some((pool_market, base_mint, obs))
+    }
+
+    /// Decode a fetched transaction JSON value into a pool-matching extended-layout reference.
+    ///
+    /// Accepts `sell` (21/24/26/27) and 27-account `buy_exact_quote_in` (mainnet ref `3XPKr7…` is a buy
+    /// with the same trailing meta layout as extended v2 `sell`).
     fn observe_sell_layout_from_tx_value(
         tx_v: &Value,
         pool_market: Pubkey,
@@ -1851,6 +1926,7 @@ impl PumpFunAmmDex {
         let mut account_keys = Self::parse_account_keys(msg).ok()?;
         Self::extend_with_loaded_addresses(&mut account_keys, meta);
         let sell_layout_sell_disc = anchor_disc("sell");
+        let buy_exact_quote_in_disc = anchor_disc("buy_exact_quote_in");
         for ix in Self::collect_all_instructions(msg, meta) {
             let Some(program_id) = Self::program_id_str_from_instruction_json(ix, &account_keys)
             else {
@@ -1866,23 +1942,30 @@ impl PumpFunAmmDex {
             else {
                 continue;
             };
-            if disc8 != sell_layout_sell_disc {
-                continue;
-            }
             let Some(acc_strings) = Self::pump_amm_ix_account_strings_from_json(ix, &account_keys)
             else {
                 continue;
             };
-            if !pump_amm_sell_ix_account_len_supported(acc_strings.len()) {
-                continue;
-            }
-            let Some((observed_pool, observed_base, cand_obs)) =
+            let cand = if disc8 == sell_layout_sell_disc {
+                if !pump_amm_sell_ix_account_len_supported(acc_strings.len()) {
+                    continue;
+                }
                 Self::pump_amm_sell_reference_observation_from_parsed_swap_ix(
                     &acc_strings,
                     &ix_data,
                     Some(signature.to_string()),
                 )
-            else {
+            } else if disc8 == buy_exact_quote_in_disc
+                && acc_strings.len() == PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS
+            {
+                Self::pump_amm_extended_layout_reference_observation_from_parsed_ix_accounts(
+                    &acc_strings,
+                    Some(signature.to_string()),
+                )
+            } else {
+                continue;
+            };
+            let Some((observed_pool, observed_base, cand_obs)) = cand else {
                 continue;
             };
             if observed_pool == pool_market && observed_base == base_mint {
@@ -2397,20 +2480,28 @@ impl PumpFunAmmDex {
                 else {
                     continue;
                 };
-                if disc8 == sell_layout_sell_disc
-                    && !pump_amm_sell_ix_account_len_supported(acc_strings.len())
-                {
-                    summary.termination_reason =
-                        PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalPumpAmmSellAccountShapeUnsupported;
-                    continue;
-                }
-                let Some((observed_pool, observed_base, cand_obs)) =
+                let cand = if disc8 == sell_layout_sell_disc {
+                    if !pump_amm_sell_ix_account_len_supported(acc_strings.len()) {
+                        summary.termination_reason =
+                            PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalPumpAmmSellAccountShapeUnsupported;
+                        continue;
+                    }
                     Self::pump_amm_sell_reference_observation_from_parsed_swap_ix(
                         &acc_strings,
                         &ix_data,
                         Some(sig.clone()),
                     )
-                else {
+                } else if disc8 == sell_layout_buy_disc
+                    && acc_strings.len() == PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS
+                {
+                    Self::pump_amm_extended_layout_reference_observation_from_parsed_ix_accounts(
+                        &acc_strings,
+                        Some(sig.clone()),
+                    )
+                } else {
+                    continue;
+                };
+                let Some((observed_pool, observed_base, cand_obs)) = cand else {
                     if disc8 == sell_layout_sell_disc {
                         summary.termination_reason =
                             PumpAmmSellLayoutTerminationReason::LocalHistoryEmptyExternalPumpAmmSellLayoutNotDerivable;
@@ -2753,25 +2844,68 @@ impl PumpFunAmmDex {
         cached_observed_volume_tail_0: Option<Pubkey>,
         cached_observed_volume_tail_1: Option<Pubkey>,
     ) -> Result<()> {
-        let (user_vol_wsol_ata, user_vol) =
+        let (derived_vol_wsol_ata, derived_vol) =
             Self::pump_amm_sell_cashback_first_two_metas(user, quote_mint, quote_token_program);
-        if let (Some(c0), Some(c1)) = (
-            cached_observed_volume_tail_0.filter(|p| *p != Pubkey::default()),
-            cached_observed_volume_tail_1.filter(|p| *p != Pubkey::default()),
-        ) {
-            if c0 != user_vol_wsol_ata || c1 != user_vol {
-                warn!(
-                    intent_user = %user,
-                    cached_tail_21 = %c0,
-                    cached_tail_22 = %c1,
-                    derived_tail_21 = %user_vol_wsol_ata,
-                    derived_tail_22 = %user_vol,
-                    sell_extended_tail_source = "derived_for_intent_user",
-                    cached_tail_mismatch = true,
-                    "pump_amm SELL: ignoring cached volume tail #21/#22 from reference trader; using intent-user derivation"
-                );
-            }
-        }
+        let observed_t0 = cached_observed_volume_tail_0.filter(|p| *p != Pubkey::default());
+        let observed_t1 = cached_observed_volume_tail_1.filter(|p| *p != Pubkey::default());
+        let curated_tails = if sell_requires_pre_fee_metas {
+            pump_amm_stuck_pool_curated_volume_tails()
+        } else {
+            None
+        };
+        let cached_tail_mismatch = matches!((observed_t0, observed_t1), (Some(c0), Some(c1))
+            if c0 != derived_vol_wsol_ata || c1 != derived_vol);
+        let (user_vol_wsol_ata, user_vol, sell_extended_tail_source) =
+            if sell_requires_pre_fee_metas {
+                if let (Some(c0), Some(c1)) = (observed_t0, observed_t1) {
+                    let source = if cached_tail_mismatch {
+                        "observed_cache_mismatch"
+                    } else {
+                        "observed_cache"
+                    };
+                    if cached_tail_mismatch {
+                        warn!(
+                            intent_user = %user,
+                            cached_tail_21 = %c0,
+                            cached_tail_22 = %c1,
+                            derived_tail_21 = %derived_vol_wsol_ata,
+                            derived_tail_22 = %derived_vol,
+                            sell_extended_tail_source = source,
+                            cached_tail_mismatch = true,
+                            sell_requires_pre_fee_metas = true,
+                            "pump_amm SELL: 27-account layout — using observed volume tails (not intent-user derivation)"
+                        );
+                    }
+                    (c0, c1, source)
+                } else if let Some((c0, c1)) = curated_tails {
+                    warn!(
+                        intent_user = %user,
+                        sell_extended_tail_source = "curated_stuck_pool_seed",
+                        sell_requires_pre_fee_metas = true,
+                        "pump_amm SELL: 27-account stuck pool — using curated reference volume tails"
+                    );
+                    (c0, c1, "curated_stuck_pool_seed")
+                } else {
+                    (derived_vol_wsol_ata, derived_vol, "derived_for_intent_user")
+                }
+            } else if let (Some(c0), Some(c1)) = (observed_t0, observed_t1) {
+                if cached_tail_mismatch {
+                    warn!(
+                        intent_user = %user,
+                        cached_tail_21 = %c0,
+                        cached_tail_22 = %c1,
+                        derived_tail_21 = %derived_vol_wsol_ata,
+                        derived_tail_22 = %derived_vol,
+                        sell_extended_tail_source = "derived_for_intent_user",
+                        cached_tail_mismatch = true,
+                        "pump_amm SELL: ignoring cached volume tail #21/#22 from reference trader; using intent-user derivation"
+                    );
+                }
+                (derived_vol_wsol_ata, derived_vol, "derived_for_intent_user")
+            } else {
+                (derived_vol_wsol_ata, derived_vol, "derived_for_intent_user")
+            };
+        let _ = sell_extended_tail_source;
         metas.push(AccountMeta::new(user_vol_wsol_ata, false));
         metas.push(AccountMeta::new(user_vol, false));
         metas.push(AccountMeta::new_readonly(third, false));
@@ -8300,6 +8434,219 @@ mod tests {
         assert_eq!(
             ixs[0].accounts.len(),
             PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS
+        );
+    }
+
+    /// P184g: mainnet ref `3XPKr7…` is a 27-account `buy_exact_quote_in` with the same trailing layout as extended v2 `sell`.
+    #[test]
+    fn p184g_ref_tx_fixture_decodes_stuck_pool_extended_v2_layout() {
+        let fixture = include_str!("fixtures/p184g_3XPKr7_ref_tx.json");
+        let tx_v: Value = serde_json::from_str(fixture).expect("fixture json");
+        let pool_market = *PUMP_AMM_STUCK_POOL_MARKET;
+        let base_mint =
+            Pubkey::from_str("E2sHHwpzeVjhV3DjAMP8kYBeG27qT66xS3V9EBYVpump").expect("mint");
+        let obs = PumpFunAmmDex::observe_sell_layout_from_tx_value(
+            &tx_v,
+            pool_market,
+            base_mint,
+            PUMP_AMM_STUCK_POOL_V2_REF_SIG,
+        )
+        .expect("decode ref tx");
+        assert_eq!(authoritative_sell_layout_strength(&obs.layout), 4);
+        let PumpAmmAuthoritativeSellLayout::Extended {
+            pre_fee_0: Some(p0),
+            pre_fee_1: Some(p1),
+            tail_0,
+            tail_1,
+            tail_2,
+            fee_tail_0: Some(_),
+            ..
+        } = obs.layout
+        else {
+            panic!("expected v2 extended layout");
+        };
+        assert_eq!(
+            p0,
+            Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_0).unwrap()
+        );
+        assert_eq!(
+            p1,
+            Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_1).unwrap()
+        );
+        assert_ne!(tail_0, Pubkey::default());
+        assert_ne!(tail_1, Pubkey::default());
+        assert_ne!(tail_2, Pubkey::default());
+    }
+
+    /// P184g: 27-account SELL must use observed volume tails when they differ from intent-user derivation.
+    #[test]
+    fn p184g_push_extended_trailing_metas_prefers_observed_for_27_account() {
+        let user = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(WSOL_MINT).unwrap();
+        let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let third = Pubkey::new_unique();
+        let observed0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_0).unwrap();
+        let observed1 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_1).unwrap();
+        let fee_tail0 = Pubkey::new_unique();
+        let (derived0, derived1) =
+            PumpFunAmmDex::pump_amm_sell_cashback_first_two_metas(user, quote_mint, quote_tp);
+        assert_ne!(observed0, derived0);
+        assert_ne!(observed1, derived1);
+        let mut metas = Vec::new();
+        PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
+            &mut metas,
+            user,
+            quote_mint,
+            quote_tp,
+            third,
+            true,
+            Some(fee_tail0),
+            None,
+            Some(observed0),
+            Some(observed1),
+        )
+        .expect("trailing metas");
+        assert_eq!(metas.len(), 4);
+        assert_eq!(metas[0].pubkey, observed0);
+        assert_eq!(metas[1].pubkey, observed1);
+        assert_eq!(metas[2].pubkey, third);
+    }
+
+    /// P184g: stuck-pool seed fills curated tails when scan observation used placeholder tails.
+    #[test]
+    fn p184g_stuck_pool_seed_applies_curated_volume_tails() {
+        let pool_market = *PUMP_AMM_STUCK_POOL_MARKET;
+        let scan_obs = PumpAmmSellReferenceObservation {
+            layout: PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: None,
+                pre_fee_1: None,
+                tail_0: Pubkey::default(),
+                tail_1: Pubkey::default(),
+                tail_2: Pubkey::default(),
+                fee_tail_0: Some(Pubkey::new_unique()),
+                fee_tail_1: Some(Pubkey::new_unique()),
+            },
+            protocol_fee_recipient: Pubkey::new_unique(),
+            protocol_fee_recipient_ta: Pubkey::new_unique(),
+            reference_swap_signature: Some("sig_scan".to_string()),
+        };
+        let pool = PumpAmmPoolStatic {
+            pool_market,
+            global_config: Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap(),
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::from_str(WSOL_MINT).unwrap(),
+            pool_base_vault: Pubkey::new_unique(),
+            pool_quote_vault: Pubkey::new_unique(),
+            protocol_fee_recipient: scan_obs.protocol_fee_recipient,
+            protocol_fee_recipient_ta: scan_obs.protocol_fee_recipient_ta,
+            event_authority: Pubkey::new_unique(),
+            coin_creator_vault_ata: Pubkey::new_unique(),
+            coin_creator_vault_authority: Pubkey::new_unique(),
+            global_volume_accumulator: Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_0)
+                .unwrap(),
+            fee_config: Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap(),
+            fee_program: Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(),
+            sell_requires_cashback_remaining: true,
+            sell_cashback_third_meta: None,
+            sell_extended_tail_0: None,
+            sell_extended_tail_1: None,
+            sell_extended_fee_tail_0: None,
+            sell_extended_fee_tail_1: None,
+            sell_requires_pre_fee_metas: false,
+            sell_pre_fee_meta_1: None,
+            last_parse_diagnostics: None,
+        };
+        let seeded = pump_amm_stuck_pool_v2_seed_observation(&pool, &scan_obs).expect("seed");
+        let PumpAmmAuthoritativeSellLayout::Extended {
+            tail_0,
+            tail_1,
+            tail_2,
+            ..
+        } = seeded.layout
+        else {
+            panic!("expected extended");
+        };
+        assert_eq!(
+            tail_0,
+            Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_0).unwrap()
+        );
+        assert_eq!(
+            tail_1,
+            Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_1).unwrap()
+        );
+        assert_eq!(
+            tail_2,
+            Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_THIRD_META).unwrap()
+        );
+    }
+
+    /// P184g: builder uses observed tails in final 27-account SELL when cache provides them.
+    #[test]
+    fn p184g_build_swap_27_account_uses_observed_tails_not_derived() {
+        let pool_market = *PUMP_AMM_STUCK_POOL_MARKET;
+        let base_mint = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let third = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_THIRD_META).unwrap();
+        let tail0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_0).unwrap();
+        let tail1 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_1).unwrap();
+        let fee0 = Pubkey::new_unique();
+        let pre1 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_1).unwrap();
+        let pool = PumpAmmPoolStatic {
+            pool_market,
+            global_config: Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap(),
+            base_mint,
+            quote_mint: Pubkey::from_str(WSOL_MINT).unwrap(),
+            pool_base_vault: Pubkey::new_unique(),
+            pool_quote_vault: Pubkey::new_unique(),
+            protocol_fee_recipient: Pubkey::new_unique(),
+            protocol_fee_recipient_ta: Pubkey::new_unique(),
+            event_authority: Pubkey::new_unique(),
+            coin_creator_vault_ata: Pubkey::new_unique(),
+            coin_creator_vault_authority: Pubkey::new_unique(),
+            global_volume_accumulator: Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_0)
+                .unwrap(),
+            fee_config: Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap(),
+            fee_program: Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(),
+            sell_requires_cashback_remaining: true,
+            sell_cashback_third_meta: Some(third),
+            sell_extended_tail_0: Some(tail0),
+            sell_extended_tail_1: Some(tail1),
+            sell_extended_fee_tail_0: Some(fee0),
+            sell_extended_fee_tail_1: None,
+            sell_requires_pre_fee_metas: true,
+            sell_pre_fee_meta_1: Some(pre1),
+            last_parse_diagnostics: None,
+        };
+        let v14 = pool.as_pool_accounts_v14();
+        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
+            &base_mint.to_string(),
+            WSOL_MINT,
+            1,
+            1,
+            user,
+            &v14,
+            None,
+            true,
+            Some(third),
+            true,
+            Some(pre1),
+            Some(tail0),
+            Some(tail1),
+            Some(fee0),
+            None,
+        )
+        .expect("build");
+        assert_eq!(
+            ixs[0].accounts.len(),
+            PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS
+        );
+        assert_eq!(
+            ixs[0].accounts[PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2].pubkey,
+            tail0
+        );
+        assert_eq!(
+            ixs[0].accounts[PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2].pubkey,
+            tail1
         );
     }
 }

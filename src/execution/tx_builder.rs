@@ -936,8 +936,16 @@ pub async fn build_tx_plan(
             } else {
                 None
             },
-            None, // volume tails #21/#22: always derived for intent user in builder
-            None,
+            if intent.side == TradeSide::Sell && sell_requires_pre_fee_metas {
+                sell_extended_tail_0
+            } else {
+                None
+            },
+            if intent.side == TradeSide::Sell && sell_requires_pre_fee_metas {
+                sell_extended_tail_1
+            } else {
+                None
+            },
             if intent.side == TradeSide::Sell {
                 sell_extended_fee_tail_0
             } else {
@@ -1030,10 +1038,19 @@ pub async fn build_tx_plan(
                                 || Some(c1) != Some(derived_tail_22))
                     });
                 let sell_ext_tail_src =
-                    if sell_requires_cashback_remaining && intent.side == TradeSide::Sell {
-                        "derived_for_intent_user"
-                    } else {
+                    if !sell_requires_cashback_remaining || intent.side != TradeSide::Sell {
                         "n/a"
+                    } else if sell_requires_pre_fee_metas {
+                        match (
+                            sell_extended_tail_0.filter(|p| *p != Pubkey::default()),
+                            sell_extended_tail_1.filter(|p| *p != Pubkey::default()),
+                        ) {
+                            (Some(_), Some(_)) if cached_tail_mismatch => "observed_cache_mismatch",
+                            (Some(_), Some(_)) => "observed_cache",
+                            _ => "derived_or_curated",
+                        }
+                    } else {
+                        "derived_for_intent_user"
                     };
                 let sell_ix_account_count = sell_ix_accounts.len();
                 let (tail0_ix, tail1_ix, tail2_ix) =
@@ -1073,9 +1090,11 @@ pub async fn build_tx_plan(
                         dex = "pump_amm",
                         intent_user = %wallet_pubkey,
                         pool_accounts_source = pool_accounts_build_source,
+                        sell_requires_pre_fee_metas,
                         sell_extended = sell_requires_cashback_remaining && intent.side == TradeSide::Sell,
                         sell_cashback_third_meta = ?sell_cashback_third_meta,
                         sell_extended_tail_source = sell_ext_tail_src,
+                        cached_tail_mismatch,
                         derived_tail_21 = %derived_tail_21,
                         derived_tail_22 = %derived_tail_22,
                         cached_tail_21 = ?sell_extended_tail_0,
@@ -1115,9 +1134,11 @@ pub async fn build_tx_plan(
                         dex = "pump_amm",
                         intent_user = %wallet_pubkey,
                         pool_accounts_source = pool_accounts_build_source,
+                        sell_requires_pre_fee_metas,
                         sell_extended = sell_requires_cashback_remaining && intent.side == TradeSide::Sell,
                         sell_cashback_third_meta = ?sell_cashback_third_meta,
                         sell_extended_tail_source = sell_ext_tail_src,
+                        cached_tail_mismatch,
                         derived_tail_21 = %derived_tail_21,
                         derived_tail_22 = %derived_tail_22,
                         cached_tail_21 = ?sell_extended_tail_0,
