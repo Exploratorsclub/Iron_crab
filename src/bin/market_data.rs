@@ -9362,6 +9362,14 @@ async fn handle_ensure_pump_amm_pool_accounts(
             ctx.live_pool_cache
                 .set_pump_amm_pool_accounts_readiness_authoritative(pool_address, dex_readiness);
 
+            let layout_generation = if force_refresh {
+                ctx.live_pool_cache
+                    .bump_pump_amm_layout_generation(&pool_address)
+            } else {
+                ctx.live_pool_cache
+                    .pump_amm_layout_generation(&pool_address)
+            };
+
             // Publish JetStream PoolCacheUpdate (authoritative SSOT).
             // Reply Ok ONLY when JetStream write succeeds (I-24a).
             let jetstream_ok = if let Some(ref nats) = ctx.nats {
@@ -9395,6 +9403,10 @@ async fn handle_ensure_pump_amm_pool_accounts(
                         "true".to_string(),
                     );
                 }
+                meta.insert(
+                    "pump_amm_layout_generation".to_string(),
+                    layout_generation.to_string(),
+                );
                 if requires_fee_tail_merged {
                     meta.insert(
                         "pump_amm_sell_requires_fee_tail".to_string(),

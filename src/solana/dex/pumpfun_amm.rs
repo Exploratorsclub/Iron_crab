@@ -911,16 +911,149 @@ fn authoritative_sell_layout_strength(layout: &PumpAmmAuthoritativeSellLayout) -
     }
 }
 
-/// True when the scan can stop early — 27-account extended `sell` with both pre-fee metas.
+/// True when the scan can stop early — strength ≥ 4 **and** layout passes structural validation.
 #[must_use]
 fn authoritative_sell_layout_is_terminal_for_scan(layout: &PumpAmmAuthoritativeSellLayout) -> bool {
     authoritative_sell_layout_strength(layout) >= 4
+        && pump_amm_extended_layout_is_authoritative(layout)
+}
+
+/// Structural validation for extended v2 (27-account) SELL SSOT — Cold Path / force_refresh only.
+///
+/// Does not RPC; checks pre-fee/fee/tail completeness and that pre-fee #0 is the singleton global
+/// volume accumulator. Newest-first scan alone is insufficient for v2 layout (P184h).
+#[must_use]
+fn pump_amm_extended_layout_is_authoritative(layout: &PumpAmmAuthoritativeSellLayout) -> bool {
+    let PumpAmmAuthoritativeSellLayout::Extended {
+        pre_fee_0,
+        pre_fee_1,
+        tail_0,
+        tail_1,
+        tail_2,
+        fee_tail_0,
+        fee_tail_1,
+    } = layout
+    else {
+        return false;
+    };
+    let pre0 = pre_fee_0.filter(|p| *p != Pubkey::default());
+    let pre1 = pre_fee_1.filter(|p| *p != Pubkey::default());
+    let has_pre_fee = pre0.is_some() && pre1.is_some();
+    if !has_pre_fee {
+        return false;
+    }
+    let program_id = match Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let global_vol = pump_amm_singleton_global_volume_accumulator(&program_id);
+    let fee_config = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap_or_default();
+    let fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap_or_default();
+    if pre0 != Some(global_vol) {
+        return false;
+    }
+    if pre1 == Some(fee_config) || pre1 == Some(fee_program) {
+        return false;
+    }
+    if *tail_0 == Pubkey::default() || *tail_1 == Pubkey::default() || *tail_2 == Pubkey::default()
+    {
+        return false;
+    }
+    // 27-account v2: single fee tail at ix #26; 26-account uses pair at #24/#25.
+    if fee_tail_0.filter(|p| *p != Pubkey::default()).is_none() {
+        return false;
+    }
+    if fee_tail_1.filter(|p| *p != Pubkey::default()).is_some() {
+        return fee_tail_0.is_some();
+    }
+    true
+}
+
+/// Merge tie-break quality (higher = prefer). Authoritative v2 layouts beat incomplete strength-4 scans.
+#[must_use]
+fn pump_amm_extended_layout_merge_quality(layout: &PumpAmmAuthoritativeSellLayout) -> u8 {
+    if !pump_amm_extended_layout_is_authoritative(layout) {
+        return 0;
+    }
+    let PumpAmmAuthoritativeSellLayout::Extended {
+        fee_tail_0,
+        fee_tail_1,
+        ..
+    } = layout
+    else {
+        return 0;
+    };
+    let mut q = 10u8;
+    if fee_tail_0.filter(|p| *p != Pubkey::default()).is_some() {
+        q += 1;
+    }
+    if fee_tail_1.filter(|p| *p != Pubkey::default()).is_some() {
+        q += 1;
+    }
+    q
+}
+
+/// Whether a cached `sell_pre_fee_meta_1` is structurally consistent with validated v2 layout rules.
+#[must_use]
+pub fn pump_amm_sell_pre_fee_meta_1_is_valid(
+    pre_fee_meta_1: Pubkey,
+    pre_fee_meta_0: Pubkey,
+) -> bool {
+    if pre_fee_meta_1 == Pubkey::default() {
+        return false;
+    }
+    let program_id = match Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let global_vol = pump_amm_singleton_global_volume_accumulator(&program_id);
+    let fee_config = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap_or_default();
+    let fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap_or_default();
+    if pre_fee_meta_0 != global_vol {
+        return false;
+    }
+    pre_fee_meta_1 != fee_config && pre_fee_meta_1 != fee_program
+}
+
+/// Pool-scoped volume accumulator for 27-account SELL pre-fee meta #20 (ix index).
+#[must_use]
+pub fn derive_pump_amm_pool_volume_accumulator(
+    program_id: &Pubkey,
+    pool_market: &Pubkey,
+) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"pool_volume_accumulator", pool_market.as_ref()],
+        program_id,
+    )
+    .0
+}
+
+/// Resolve `sell_pre_fee_meta_1` for cold-path build: validated cache value or pool PDA derivation.
+#[must_use]
+pub fn pump_amm_resolve_sell_pre_fee_meta_1_for_build(
+    pool_market: &Pubkey,
+    global_volume_accumulator: Pubkey,
+    cached_pre_fee_meta_1: Option<Pubkey>,
+) -> (Option<Pubkey>, &'static str) {
+    if let Some(pk) = cached_pre_fee_meta_1.filter(|p| *p != Pubkey::default()) {
+        if pump_amm_sell_pre_fee_meta_1_is_valid(pk, global_volume_accumulator) {
+            return (Some(pk), "validated_cache");
+        }
+    }
+    let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).expect("PUMPFUN_AMM_PROGRAM_ID");
+    let derived = derive_pump_amm_pool_volume_accumulator(&program_id, pool_market);
+    if pump_amm_sell_pre_fee_meta_1_is_valid(derived, global_volume_accumulator) {
+        (Some(derived), "derived_wallet_pool")
+    } else {
+        (None, "unresolved")
+    }
 }
 
 /// Merge SELL-layout observations while scanning **reverse-chronological** signatures (newest first).
 ///
-/// Prefer the **strongest** layout (27 > 26 > 24 > Base). On equal strength, keep `best` (newer
-/// evidence in newest-first scan). Fee recipient fields follow the winning layout (Scope 60).
+/// Prefer the **strongest** layout (27 > 26 > 24 > Base). On equal strength: **authoritative** v2
+/// layout beats incomplete scans; complete fee tails beat partial; then keep `best` (newer in
+/// newest-first scan). Newest-first alone is not enough for v2 layout (P184h).
 fn merge_pump_amm_authoritative_sell_reference_observation(
     best: PumpAmmSellReferenceObservation,
     candidate: PumpAmmSellReferenceObservation,
@@ -934,6 +1067,22 @@ fn merge_pump_amm_authoritative_sell_reference_observation(
     let best_strength = authoritative_sell_layout_strength(&best.layout);
     let cand_strength = authoritative_sell_layout_strength(&candidate.layout);
     if cand_strength > best_strength {
+        return candidate;
+    }
+    if cand_strength < best_strength {
+        return best;
+    }
+    let best_auth = pump_amm_extended_layout_is_authoritative(&best.layout);
+    let cand_auth = pump_amm_extended_layout_is_authoritative(&candidate.layout);
+    if cand_auth && !best_auth {
+        return candidate;
+    }
+    if best_auth && !cand_auth {
+        return best;
+    }
+    let best_q = pump_amm_extended_layout_merge_quality(&best.layout);
+    let cand_q = pump_amm_extended_layout_merge_quality(&candidate.layout);
+    if cand_q > best_q {
         candidate
     } else {
         best
@@ -990,8 +1139,8 @@ fn pump_amm_stuck_pool_curated_third_meta() -> Option<Pubkey> {
         .filter(|p| *p != Pubkey::default())
 }
 
-/// Cold-path reference `sell` txs known to use the 27-account extended layout (P184e/P184f).
-fn pump_amm_known_v2_sell_reference_signatures(pool_market: &Pubkey) -> &'static [&'static str] {
+/// Cold-path reference txs known to use the 27-account extended layout (P184e/P184f/P184h).
+fn pump_amm_known_v2_reference_signatures(pool_market: &Pubkey) -> &'static [&'static str] {
     if pump_amm_is_stuck_pool_market(pool_market) {
         &[PUMP_AMM_STUCK_POOL_V2_REF_SIG]
     } else {
@@ -1054,7 +1203,9 @@ fn pump_amm_stuck_pool_v2_seed_observation(
     if !pump_amm_is_stuck_pool_market(&pool.pool_market) {
         return None;
     }
-    if authoritative_sell_layout_strength(&obs.layout) >= 4 {
+    if authoritative_sell_layout_strength(&obs.layout) >= 4
+        && pump_amm_extended_layout_is_authoritative(&obs.layout)
+    {
         return None;
     }
     let PumpAmmAuthoritativeSellLayout::Extended {
@@ -1776,7 +1927,7 @@ impl PumpFunAmmDex {
         pool.protocol_fee_recipient_ta = obs.protocol_fee_recipient_ta;
     }
 
-    /// Cold-path only: when TX-history scan found a weaker extended layout, try curated 27-account refs.
+    /// Cold-path only: when TX-history scan found a weaker or invalid extended layout, try curated 27-account refs.
     async fn upgrade_sell_layout_observation_with_known_v2_reference(
         &self,
         pool: &PumpAmmPoolStatic,
@@ -1784,17 +1935,18 @@ impl PumpFunAmmDex {
         mut obs: PumpAmmSellReferenceObservation,
     ) -> PumpAmmSellReferenceObservation {
         let pool_market = pool.pool_market;
-        if authoritative_sell_layout_is_terminal_for_scan(&obs.layout) {
-            return obs;
-        }
+        let scan_authoritative = pump_amm_extended_layout_is_authoritative(&obs.layout);
         let baseline_strength = authoritative_sell_layout_strength(&obs.layout);
-        let curated_sigs = pump_amm_known_v2_sell_reference_signatures(&pool_market);
-        if !curated_sigs.is_empty() {
+        let baseline_quality = pump_amm_extended_layout_merge_quality(&obs.layout);
+        let curated_sigs = pump_amm_known_v2_reference_signatures(&pool_market);
+        if !curated_sigs.is_empty() && (!scan_authoritative || baseline_strength < 4) {
             info!(
                 pool = %pool_market,
                 base_mint = %base_mint,
                 baseline_strength,
+                scan_authoritative,
                 reference_count = curated_sigs.len(),
+                layout_authority_source = "reference",
                 "pump_amm: attempting force_refresh SELL layout upgrade from curated 27-account reference"
             );
         }
@@ -1820,32 +1972,53 @@ impl PumpFunAmmDex {
                 }
             };
             if let Some(ref_obs) = ref_obs {
-                obs = merge_pump_amm_authoritative_sell_reference_observation(obs, ref_obs);
-                if authoritative_sell_layout_strength(&obs.layout) > baseline_strength {
-                    let sell_ix_account_count =
-                        pump_amm_sell_ix_account_count_from_observation(&obs);
-                    info!(
+                let ref_auth = pump_amm_extended_layout_is_authoritative(&ref_obs.layout);
+                let ref_quality = pump_amm_extended_layout_merge_quality(&ref_obs.layout);
+                let ref_strength = authoritative_sell_layout_strength(&ref_obs.layout);
+                let should_apply = ref_auth
+                    && (!scan_authoritative
+                        || ref_quality > baseline_quality
+                        || ref_strength > baseline_strength);
+                if should_apply {
+                    obs = merge_pump_amm_authoritative_sell_reference_observation(obs, ref_obs);
+                    if pump_amm_extended_layout_is_authoritative(&obs.layout) {
+                        let sell_ix_account_count =
+                            pump_amm_sell_ix_account_count_from_observation(&obs);
+                        info!(
+                            pool = %pool_market,
+                            base_mint = %base_mint,
+                            reference_swap_signature = %obs.reference_swap_signature.as_deref().unwrap_or(""),
+                            sell_ix_account_count,
+                            layout = ?obs.layout,
+                            layout_authority_source = "reference",
+                            layout_authoritative = true,
+                            "pump_amm: upgraded force_refresh SELL layout from known 27-account reference tx"
+                        );
+                        return obs;
+                    }
+                } else {
+                    debug!(
                         pool = %pool_market,
-                        base_mint = %base_mint,
-                        reference_swap_signature = %obs.reference_swap_signature.as_deref().unwrap_or(""),
-                        sell_ix_account_count,
-                        layout = ?obs.layout,
-                        "pump_amm: upgraded force_refresh SELL layout from known 27-account reference tx"
+                        reference_swap_signature = %sig,
+                        ref_authoritative = ref_auth,
+                        scan_authoritative,
+                        "pump_amm: curated v2 reference did not beat scan observation quality"
                     );
-                    return obs;
                 }
             }
         }
-        if authoritative_sell_layout_strength(&obs.layout) < 4 {
+        if !pump_amm_extended_layout_is_authoritative(&obs.layout) {
             if let Some(seeded) = pump_amm_stuck_pool_v2_seed_observation(pool, &obs) {
                 obs = merge_pump_amm_authoritative_sell_reference_observation(obs, seeded);
-                if authoritative_sell_layout_strength(&obs.layout) >= 4 {
+                if pump_amm_extended_layout_is_authoritative(&obs.layout) {
                     info!(
                         pool = %pool_market,
                         base_mint = %base_mint,
                         sell_ix_account_count = PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS,
                         sell_pre_fee_meta_1 = %PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_1,
                         reference_swap_signature = %obs.reference_swap_signature.as_deref().unwrap_or(""),
+                        layout_authority_source = "seed",
+                        layout_authoritative = true,
                         "pump_amm: upgraded force_refresh SELL layout via stuck-pool v2 seed (scan had weaker layout)"
                     );
                     return obs;
@@ -1856,8 +2029,18 @@ impl PumpFunAmmDex {
                     pool = %pool_market,
                     base_mint = %base_mint,
                     baseline_strength,
+                    scan_authoritative,
                     final_strength = authoritative_sell_layout_strength(&obs.layout),
-                    "pump_amm: stuck-pool force_refresh still missing 27-account SELL layout after curated reference and seed"
+                    layout_authoritative = pump_amm_extended_layout_is_authoritative(&obs.layout),
+                    "pump_amm: stuck-pool force_refresh still missing authoritative 27-account SELL layout after curated reference and seed"
+                );
+            } else if !scan_authoritative && authoritative_sell_layout_strength(&obs.layout) >= 4 {
+                warn!(
+                    pool = %pool_market,
+                    base_mint = %base_mint,
+                    layout = ?obs.layout,
+                    layout_authoritative = false,
+                    "pump_amm: force_refresh scan has strength-4 extended layout but failed v2 authority validation"
                 );
             }
         }
@@ -2844,6 +3027,7 @@ impl PumpFunAmmDex {
         sell_extended_fee_tail_1: Option<Pubkey>,
         cached_observed_volume_tail_0: Option<Pubkey>,
         cached_observed_volume_tail_1: Option<Pubkey>,
+        cold_path_prefer_derived_on_mismatch: bool,
     ) -> Result<()> {
         let (derived_vol_wsol_ata, derived_vol) =
             Self::pump_amm_sell_cashback_first_two_metas(user, quote_mint, quote_token_program);
@@ -2859,7 +3043,31 @@ impl PumpFunAmmDex {
             if c0 != derived_vol_wsol_ata || c1 != derived_vol);
         let (user_vol_wsol_ata, user_vol, sell_extended_tail_source) =
             if sell_requires_pre_fee_metas {
-                if let (Some(c0), Some(c1)) = (observed_t0, observed_t1) {
+                if cold_path_prefer_derived_on_mismatch && cached_tail_mismatch {
+                    if let Some((c0, c1)) = curated_tails {
+                        warn!(
+                            intent_user = %user,
+                            sell_extended_tail_source = "reference",
+                            cached_tail_mismatch = true,
+                            sell_requires_pre_fee_metas = true,
+                            "pump_amm SELL: 27-account cold path — cached volume tails mismatch; using curated reference tails"
+                        );
+                        (c0, c1, "reference")
+                    } else {
+                        warn!(
+                            intent_user = %user,
+                            cached_tail_21 = ?observed_t0,
+                            cached_tail_22 = ?observed_t1,
+                            derived_tail_21 = %derived_vol_wsol_ata,
+                            derived_tail_22 = %derived_vol,
+                            sell_extended_tail_source = "derived_wallet_pool",
+                            cached_tail_mismatch = true,
+                            sell_requires_pre_fee_metas = true,
+                            "pump_amm SELL: 27-account cold path — ignoring mismatched cached volume tails; using intent-user derivation"
+                        );
+                        (derived_vol_wsol_ata, derived_vol, "derived_wallet_pool")
+                    }
+                } else if let (Some(c0), Some(c1)) = (observed_t0, observed_t1) {
                     let source = if cached_tail_mismatch {
                         "observed_cache_mismatch"
                     } else {
@@ -6365,6 +6573,7 @@ impl Dex for PumpFunAmmDex {
                     sell_extended_fee_tail_1,
                     cached_observed_volume_tail_0,
                     cached_observed_volume_tail_1,
+                    false,
                 )?;
             }
         }
@@ -6443,6 +6652,7 @@ impl PumpFunAmmDex {
             None,
             None,
             None,
+            false,
         )
     }
 
@@ -6466,6 +6676,7 @@ impl PumpFunAmmDex {
         sell_extended_tail_1: Option<Pubkey>,
         sell_extended_fee_tail_0: Option<Pubkey>,
         sell_extended_fee_tail_1: Option<Pubkey>,
+        cold_path_prefer_derived_on_mismatch: bool,
     ) -> Result<Vec<Instruction>> {
         // Require 14 accounts (v1 format with global_volume_accumulator)
         if pool_accounts.len() < 14 {
@@ -6672,6 +6883,7 @@ impl PumpFunAmmDex {
                     sell_extended_fee_tail_1,
                     sell_extended_tail_0,
                     sell_extended_tail_1,
+                    cold_path_prefer_derived_on_mismatch,
                 )?;
             }
             metas
@@ -7682,6 +7894,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(
             err.is_err(),
@@ -7828,6 +8041,7 @@ mod tests {
             Some(ref_tail_1),
             None,
             None,
+            false,
         )
         .expect("extended SELL");
 
@@ -8112,6 +8326,7 @@ mod tests {
             Some(foreign_tail_1),
             None,
             None,
+            false,
         )
         .expect("extended SELL");
         let (expected_21, expected_22) =
@@ -8434,6 +8649,7 @@ mod tests {
             Some(tail1),
             Some(fee0),
             Some(fee1),
+            false,
         )
         .expect("27-account SELL");
         assert_eq!(
@@ -8510,6 +8726,7 @@ mod tests {
             None,
             Some(observed0),
             Some(observed1),
+            false,
         )
         .expect("trailing metas");
         assert_eq!(metas.len(), 4);
@@ -8640,6 +8857,7 @@ mod tests {
             Some(tail1),
             Some(fee0),
             None,
+            false,
         )
         .expect("build");
         assert_eq!(
@@ -8654,5 +8872,180 @@ mod tests {
             ixs[0].accounts[PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2].pubkey,
             tail1
         );
+    }
+
+    fn p184h_valid_v2_reference_observation() -> PumpAmmSellReferenceObservation {
+        let pre0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_0).unwrap();
+        let pre1 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_1).unwrap();
+        let tail0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_0).unwrap();
+        let tail1 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_1).unwrap();
+        let tail2 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_THIRD_META).unwrap();
+        let fee0 = Pubkey::new_unique();
+        PumpAmmSellReferenceObservation {
+            layout: PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: Some(pre0),
+                pre_fee_1: Some(pre1),
+                tail_0: tail0,
+                tail_1: tail1,
+                tail_2: tail2,
+                fee_tail_0: Some(fee0),
+                fee_tail_1: None,
+            },
+            protocol_fee_recipient: Pubkey::new_unique(),
+            protocol_fee_recipient_ta: Pubkey::new_unique(),
+            reference_swap_signature: Some("sig_ref_valid".to_string()),
+        }
+    }
+
+    /// P184h: invalid strength-4 scan (missing fee tail) loses to valid reference at equal strength.
+    #[test]
+    fn p184h_merge_invalid_scan_loses_to_valid_reference_at_strength_4() {
+        let pre0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_0).unwrap();
+        let bad_pre1 = Pubkey::new_unique();
+        let scan_obs = PumpAmmSellReferenceObservation {
+            layout: PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: Some(pre0),
+                pre_fee_1: Some(bad_pre1),
+                tail_0: Pubkey::new_unique(),
+                tail_1: Pubkey::new_unique(),
+                tail_2: Pubkey::new_unique(),
+                fee_tail_0: None,
+                fee_tail_1: None,
+            },
+            protocol_fee_recipient: Pubkey::new_unique(),
+            protocol_fee_recipient_ta: Pubkey::new_unique(),
+            reference_swap_signature: Some("sig_scan_invalid".to_string()),
+        };
+        let ref_obs = p184h_valid_v2_reference_observation();
+        assert_eq!(authoritative_sell_layout_strength(&scan_obs.layout), 4);
+        assert!(!pump_amm_extended_layout_is_authoritative(&scan_obs.layout));
+        assert!(pump_amm_extended_layout_is_authoritative(&ref_obs.layout));
+        let merged =
+            merge_pump_amm_authoritative_sell_reference_observation(scan_obs, ref_obs.clone());
+        assert!(pump_amm_extended_layout_is_authoritative(&merged.layout));
+        assert_eq!(
+            merged.reference_swap_signature.as_deref(),
+            Some("sig_ref_valid")
+        );
+    }
+
+    /// P184h: strength-4 without fee_tail_0 is not terminal for scan.
+    #[test]
+    fn p184h_strength_4_without_fee_tail_not_terminal_for_scan() {
+        let pre0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_0).unwrap();
+        let layout = PumpAmmAuthoritativeSellLayout::Extended {
+            pre_fee_0: Some(pre0),
+            pre_fee_1: Some(Pubkey::new_unique()),
+            tail_0: Pubkey::new_unique(),
+            tail_1: Pubkey::new_unique(),
+            tail_2: Pubkey::new_unique(),
+            fee_tail_0: None,
+            fee_tail_1: None,
+        };
+        assert_eq!(authoritative_sell_layout_strength(&layout), 4);
+        assert!(!authoritative_sell_layout_is_terminal_for_scan(&layout));
+    }
+
+    /// P184h: newest-first fold prefers valid older over invalid newer at strength 4.
+    #[test]
+    fn p184h_fold_newest_invalid_scan_valid_older_reference_wins() {
+        let pre0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_0).unwrap();
+        let newer_invalid = PumpAmmSellReferenceObservation {
+            layout: PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: Some(pre0),
+                pre_fee_1: Some(Pubkey::new_unique()),
+                tail_0: Pubkey::new_unique(),
+                tail_1: Pubkey::new_unique(),
+                tail_2: Pubkey::new_unique(),
+                fee_tail_0: None,
+                fee_tail_1: None,
+            },
+            protocol_fee_recipient: Pubkey::new_unique(),
+            protocol_fee_recipient_ta: Pubkey::new_unique(),
+            reference_swap_signature: Some("sig_newer_invalid".to_string()),
+        };
+        let older_valid = p184h_valid_v2_reference_observation();
+        let folded = fold_force_refresh_sell_reference_observations_newest_first(
+            newer_invalid,
+            [older_valid],
+        );
+        assert!(pump_amm_extended_layout_is_authoritative(&folded.layout));
+        assert_eq!(
+            folded.reference_swap_signature.as_deref(),
+            Some("sig_ref_valid")
+        );
+    }
+
+    /// P184h: cold path must not write mismatched observed tails into 27-account SELL ix.
+    #[test]
+    fn p184h_cold_path_trailing_metas_derived_on_cache_mismatch() {
+        let user = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(WSOL_MINT).unwrap();
+        let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let third = Pubkey::new_unique();
+        let observed0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_0).unwrap();
+        let observed1 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_1).unwrap();
+        let fee_tail0 = Pubkey::new_unique();
+        let (derived0, derived1) =
+            PumpFunAmmDex::pump_amm_sell_cashback_first_two_metas(user, quote_mint, quote_tp);
+        assert_ne!(observed0, derived0);
+        let mut metas = Vec::new();
+        PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
+            &mut metas,
+            *PUMP_AMM_STUCK_POOL_MARKET,
+            user,
+            quote_mint,
+            quote_tp,
+            third,
+            true,
+            Some(fee_tail0),
+            None,
+            Some(observed0),
+            Some(observed1),
+            true,
+        )
+        .expect("trailing metas");
+        assert_eq!(metas[0].pubkey, observed0);
+        assert_eq!(metas[1].pubkey, observed1);
+        let mut metas_cold = Vec::new();
+        PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
+            &mut metas_cold,
+            *PUMP_AMM_STUCK_POOL_MARKET,
+            user,
+            quote_mint,
+            quote_tp,
+            third,
+            true,
+            Some(fee_tail0),
+            None,
+            Some(observed0),
+            Some(observed1),
+            true,
+        )
+        .expect("cold trailing metas");
+        // Stuck pool has curated reference tails matching observed — cold path uses reference.
+        assert_eq!(metas_cold[0].pubkey, observed0);
+        assert_eq!(metas_cold[1].pubkey, observed1);
+
+        let foreign0 = Pubkey::new_unique();
+        let foreign1 = Pubkey::new_unique();
+        let mut metas_foreign = Vec::new();
+        PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
+            &mut metas_foreign,
+            Pubkey::new_unique(),
+            user,
+            quote_mint,
+            quote_tp,
+            third,
+            true,
+            Some(fee_tail0),
+            None,
+            Some(foreign0),
+            Some(foreign1),
+            true,
+        )
+        .expect("foreign cold trailing");
+        assert_eq!(metas_foreign[0].pubkey, derived0);
+        assert_eq!(metas_foreign[1].pubkey, derived1);
     }
 }

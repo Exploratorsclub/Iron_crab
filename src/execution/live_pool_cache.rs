@@ -460,6 +460,8 @@ pub struct LivePoolCache {
     /// is fully known. `false` means "do not treat this as sell-ready truth yet", even if
     /// pool_accounts/reserves are otherwise present.
     pump_amm_sell_layout_ready_by_market: DashMap<Pubkey, bool>,
+    /// Monotonic layout generation per pool-market (P184h). Incremented on authoritative JetStream merge.
+    pump_amm_layout_generation_by_market: DashMap<Pubkey, u64>,
 }
 
 /// Which vault position (A/B or X/Y or 0/1) this vault represents
@@ -506,6 +508,7 @@ impl LivePoolCache {
             pump_amm_sell_requires_fee_tail_by_market: DashMap::new(),
             pump_amm_sell_requires_pre_fee_metas_by_market: DashMap::new(),
             pump_amm_sell_layout_ready_by_market: DashMap::new(),
+            pump_amm_layout_generation_by_market: DashMap::new(),
         }
     }
 
@@ -934,6 +937,7 @@ impl LivePoolCache {
         pool: &Pubkey,
         meta: Option<&std::collections::HashMap<String, String>>,
     ) {
+        self.merge_pump_amm_layout_generation_from_metadata(pool, meta);
         let Some(m) = meta else {
             return;
         };
@@ -1238,6 +1242,49 @@ impl LivePoolCache {
         self.pump_amm_sell_pre_fee_meta_1_by_market
             .get(pool_market)
             .map(|e| *e.value())
+    }
+
+    /// Monotonic layout generation for PumpSwap pool-market (P184h recovery freshness).
+    #[must_use]
+    pub fn pump_amm_layout_generation(&self, pool_market: &Pubkey) -> u64 {
+        self.pump_amm_layout_generation_by_market
+            .get(pool_market)
+            .map(|e| *e.value())
+            .unwrap_or(0)
+    }
+
+    /// Increment layout generation (authoritative force-refresh publish or JetStream merge).
+    pub fn bump_pump_amm_layout_generation(&self, pool: &Pubkey) -> u64 {
+        let mut entry = self
+            .pump_amm_layout_generation_by_market
+            .entry(*pool)
+            .or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    /// Set layout generation from JetStream metadata (monotonic max).
+    pub fn merge_pump_amm_layout_generation_from_metadata(
+        &self,
+        pool: &Pubkey,
+        meta: Option<&std::collections::HashMap<String, String>>,
+    ) {
+        let Some(m) = meta else {
+            return;
+        };
+        let Some(v) = m.get("pump_amm_layout_generation") else {
+            return;
+        };
+        let Ok(parsed) = v.parse::<u64>() else {
+            return;
+        };
+        let mut entry = self
+            .pump_amm_layout_generation_by_market
+            .entry(*pool)
+            .or_insert(0);
+        if parsed > *entry {
+            *entry = parsed;
+        }
     }
 
     #[must_use]
