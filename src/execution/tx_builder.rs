@@ -1009,7 +1009,7 @@ pub async fn build_tx_plan(
             } else {
                 None
             },
-            allow_rpc_fallback,
+            cached_tail_mismatch_plan,
         ) {
             Ok(ixs) => ixs,
             Err(e) => {

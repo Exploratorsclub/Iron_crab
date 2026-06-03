@@ -3083,7 +3083,7 @@ impl PumpFunAmmDex {
         sell_extended_fee_tail_1: Option<Pubkey>,
         cached_observed_volume_tail_0: Option<Pubkey>,
         cached_observed_volume_tail_1: Option<Pubkey>,
-        _cold_path_prefer_derived_on_mismatch: bool,
+        cold_path_prefer_derived_on_mismatch: bool,
     ) -> Result<()> {
         let (derived_vol_wsol_ata, derived_vol) =
             Self::pump_amm_sell_cashback_first_two_metas(user, quote_mint, quote_token_program);
@@ -3114,6 +3114,8 @@ impl PumpFunAmmDex {
                     (derived_vol_wsol_ata, derived_vol, "derived_wallet_pool")
                 } else if let (Some(c0), Some(c1)) = (observed_t0, observed_t1) {
                     (c0, c1, "validated_cache")
+                } else if cold_path_prefer_derived_on_mismatch {
+                    (derived_vol_wsol_ata, derived_vol, "derived_wallet_pool")
                 } else if let Some((c0, c1)) = curated_tails {
                     warn!(
                         intent_user = %user,
@@ -9084,6 +9086,27 @@ mod tests {
         .expect("hot stuck trailing");
         assert_eq!(metas_hot_stuck[0].pubkey, derived0);
         assert_eq!(metas_hot_stuck[1].pubkey, derived1);
+
+        let (curated0, curated1) = pump_amm_stuck_pool_curated_volume_tails().expect("curated");
+        let mut metas_stripped_cache = Vec::new();
+        PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
+            &mut metas_stripped_cache,
+            *PUMP_AMM_STUCK_POOL_MARKET,
+            user,
+            quote_mint,
+            quote_tp,
+            third,
+            true,
+            Some(fee_tail0),
+            None,
+            None,
+            None,
+            true,
+        )
+        .expect("stripped-cache trailing");
+        assert_eq!(metas_stripped_cache[0].pubkey, derived0);
+        assert_ne!(metas_stripped_cache[0].pubkey, curated0);
+        assert_ne!(metas_stripped_cache[1].pubkey, curated1);
 
         let mut metas_foreign = Vec::new();
         PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
