@@ -896,22 +896,53 @@ pub async fn build_tx_plan(
             .get(11)
             .copied()
             .filter(|p| *p != Pubkey::default());
-        let (sell_pre_fee_meta_1, pre_fee_source) = if allow_rpc_fallback
-            && intent.side == TradeSide::Sell
-            && sell_requires_pre_fee_metas
-        {
-            if let Some(gva) = global_volume_accumulator {
-                pump_amm_resolve_sell_pre_fee_meta_1_for_build(
-                    &pool_id,
-                    gva,
-                    cached_sell_pre_fee_meta_1,
+        let (sell_pre_fee_meta_1, pre_fee_source) =
+            if intent.side == TradeSide::Sell && sell_requires_pre_fee_metas {
+                if let Some(gva) = global_volume_accumulator {
+                    pump_amm_resolve_sell_pre_fee_meta_1_for_build(
+                        &pool_id,
+                        gva,
+                        cached_sell_pre_fee_meta_1,
+                    )
+                } else {
+                    (cached_sell_pre_fee_meta_1, "cache_unvalidated")
+                }
+            } else {
+                (cached_sell_pre_fee_meta_1, "cache")
+            };
+
+        let quote_tp_for_tail = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let quote_mint_for_tail = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+        let (derived_tail_21_plan, derived_tail_22_plan) =
+            if sell_requires_cashback_remaining && intent.side == TradeSide::Sell {
+                PumpFunAmmDex::pump_amm_sell_cashback_first_two_metas(
+                    wallet_pubkey,
+                    quote_mint_for_tail,
+                    quote_tp_for_tail,
                 )
             } else {
-                (cached_sell_pre_fee_meta_1, "cache_unvalidated")
-            }
-        } else {
-            (cached_sell_pre_fee_meta_1, "cache")
-        };
+                (Pubkey::default(), Pubkey::default())
+            };
+        let cached_tail_mismatch_plan =
+            sell_extended_tail_0
+                .zip(sell_extended_tail_1)
+                .is_some_and(|(c0, c1)| {
+                    c0 != Pubkey::default()
+                        && c1 != Pubkey::default()
+                        && (c0 != derived_tail_21_plan || c1 != derived_tail_22_plan)
+                });
+        let sell_extended_tail_0_for_build =
+            if intent.side == TradeSide::Sell && cached_tail_mismatch_plan {
+                None
+            } else {
+                sell_extended_tail_0
+            };
+        let sell_extended_tail_1_for_build =
+            if intent.side == TradeSide::Sell && cached_tail_mismatch_plan {
+                None
+            } else {
+                sell_extended_tail_1
+            };
 
         // Parse token_program from intent for Token-2022 support (same as pumpfun path).
         // TradeResources documents token_program as "output_mint" — on SELL, output is WSOL (SPL Token).
@@ -959,12 +990,12 @@ pub async fn build_tx_plan(
                 None
             },
             if intent.side == TradeSide::Sell && sell_requires_pre_fee_metas {
-                sell_extended_tail_0
+                sell_extended_tail_0_for_build
             } else {
                 None
             },
             if intent.side == TradeSide::Sell && sell_requires_pre_fee_metas {
-                sell_extended_tail_1
+                sell_extended_tail_1_for_build
             } else {
                 None
             },
@@ -1004,12 +1035,8 @@ pub async fn build_tx_plan(
             });
         }
 
-        // Scope 44: cold-path only — exact v14 from intent/cache vs final SELL ix metas (fee fields overwritten in builder).
-        if allow_rpc_fallback
-            && intent.side == TradeSide::Sell
-            && pool_accounts.len() >= 14
-            && !ixs.is_empty()
-        {
+        // Scope 44: exact v14 from intent/cache vs final SELL ix metas (fee fields overwritten in builder).
+        if intent.side == TradeSide::Sell && pool_accounts.len() >= 14 && !ixs.is_empty() {
             if let Some((fee_config_ix, fee_program_ix)) =
                 pump_amm_sell_ix_uses_global_fee_at(ixs[0].accounts.len())
             {
@@ -1052,14 +1079,7 @@ pub async fn build_tx_plan(
                     } else {
                         (Pubkey::default(), Pubkey::default())
                     };
-                let cached_tail_mismatch = sell_extended_tail_0
-                    .zip(sell_extended_tail_1)
-                    .is_some_and(|(c0, c1)| {
-                        c0 != Pubkey::default()
-                            && c1 != Pubkey::default()
-                            && (Some(c0) != Some(derived_tail_21)
-                                || Some(c1) != Some(derived_tail_22))
-                    });
+                let cached_tail_mismatch = cached_tail_mismatch_plan;
                 let sell_ext_tail_src =
                     if !sell_requires_cashback_remaining || intent.side != TradeSide::Sell {
                         "n/a"
@@ -1068,13 +1088,7 @@ pub async fn build_tx_plan(
                             sell_extended_tail_0.filter(|p| *p != Pubkey::default()),
                             sell_extended_tail_1.filter(|p| *p != Pubkey::default()),
                         ) {
-                            (Some(_), Some(_)) if cached_tail_mismatch => {
-                                if allow_rpc_fallback {
-                                    "derived_wallet_pool"
-                                } else {
-                                    "observed_cache_mismatch"
-                                }
-                            }
+                            (Some(_), Some(_)) if cached_tail_mismatch => "derived_wallet_pool",
                             (Some(_), Some(_)) => "validated_cache",
                             _ => "derived_or_curated",
                         }
