@@ -998,6 +998,7 @@ fn pump_amm_extended_layout_merge_quality(layout: &PumpAmmAuthoritativeSellLayou
 pub fn pump_amm_sell_pre_fee_meta_1_is_valid(
     pre_fee_meta_1: Pubkey,
     pre_fee_meta_0: Pubkey,
+    pool_market: &Pubkey,
 ) -> bool {
     if pre_fee_meta_1 == Pubkey::default() {
         return false;
@@ -1007,12 +1008,10 @@ pub fn pump_amm_sell_pre_fee_meta_1_is_valid(
         Err(_) => return false,
     };
     let global_vol = pump_amm_singleton_global_volume_accumulator(&program_id);
-    let fee_config = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap_or_default();
-    let fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap_or_default();
     if pre_fee_meta_0 != global_vol {
         return false;
     }
-    pre_fee_meta_1 != fee_config && pre_fee_meta_1 != fee_program
+    pre_fee_meta_1 == derive_pump_amm_pool_volume_accumulator(&program_id, pool_market)
 }
 
 /// Pool-scoped volume accumulator for 27-account SELL pre-fee meta #20 (ix index).
@@ -1035,14 +1034,14 @@ pub fn pump_amm_resolve_sell_pre_fee_meta_1_for_build(
     global_volume_accumulator: Pubkey,
     cached_pre_fee_meta_1: Option<Pubkey>,
 ) -> (Option<Pubkey>, &'static str) {
+    let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).expect("PUMPFUN_AMM_PROGRAM_ID");
+    let derived = derive_pump_amm_pool_volume_accumulator(&program_id, pool_market);
     if let Some(pk) = cached_pre_fee_meta_1.filter(|p| *p != Pubkey::default()) {
-        if pump_amm_sell_pre_fee_meta_1_is_valid(pk, global_volume_accumulator) {
+        if pump_amm_sell_pre_fee_meta_1_is_valid(pk, global_volume_accumulator, pool_market) {
             return (Some(pk), "validated_cache");
         }
     }
-    let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).expect("PUMPFUN_AMM_PROGRAM_ID");
-    let derived = derive_pump_amm_pool_volume_accumulator(&program_id, pool_market);
-    if pump_amm_sell_pre_fee_meta_1_is_valid(derived, global_volume_accumulator) {
+    if pump_amm_sell_pre_fee_meta_1_is_valid(derived, global_volume_accumulator, pool_market) {
         (Some(derived), "derived_wallet_pool")
     } else {
         (None, "unresolved")
