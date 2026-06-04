@@ -2702,9 +2702,13 @@ fn pump_amm_sell_layout_state_for_ensure_publish(
                 .filter(|p| *p != Pubkey::default()),
             refresh_requires_fee_tail || cached_requires_fee_tail,
             refresh_requires_pre_fee_metas,
-            refresh_pre_fee_meta_1
-                .or(cached_pre_fee_meta_1)
-                .filter(|p| *p != Pubkey::default()),
+            if refresh_requires_pre_fee_metas {
+                refresh_pre_fee_meta_1
+                    .or(cached_pre_fee_meta_1)
+                    .filter(|p| *p != Pubkey::default())
+            } else {
+                None
+            },
             refresh_layout_ready,
         )
     } else {
@@ -13566,11 +13570,13 @@ mod discovery_tests {
         assert_eq!(dex_readiness, DexPoolReadiness::Ready);
     }
 
+    /// P184j: authoritative force_refresh (e.g. tier-26 / base) must clear stale 27er pre_fee cache.
     #[test]
-    fn test_pump_amm_force_refresh_base_keeps_monotonic_extended_with_pre_fee() {
+    fn test_pump_amm_force_refresh_authoritative_pre_fee_overrides_stale_cache() {
         let stale_third = Pubkey::new_unique();
         let stale_t0 = Pubkey::new_unique();
         let stale_t1 = Pubkey::new_unique();
+        let stale_pre_fee_1 = Pubkey::new_unique();
         let (
             effective_requires_extended,
             effective_third_meta,
@@ -13580,7 +13586,7 @@ mod discovery_tests {
             _effective_fee_tail_1,
             _effective_requires_fee_tail,
             effective_requires_pre_fee_metas,
-            _effective_pre_fee_meta_1,
+            effective_pre_fee_meta_1,
             sell_layout_ready,
             dex_readiness,
         ) = pump_amm_sell_layout_state_for_ensure_publish(
@@ -13593,7 +13599,7 @@ mod discovery_tests {
             None,
             false,
             true,
-            None,
+            Some(stale_pre_fee_1),
             false,
             None,
             None,
@@ -13607,11 +13613,15 @@ mod discovery_tests {
         );
         assert!(
             effective_requires_extended,
-            "cached extended hint must stay monotonic on force_refresh"
+            "cached extended hint may stay monotonic on force_refresh when refresh is base-only"
         );
         assert!(
-            effective_requires_pre_fee_metas,
-            "cached pre-fee hint must stay monotonic on force_refresh"
+            !effective_requires_pre_fee_metas,
+            "P184j: stale cached pre-fee must not OR over authoritative tier-26/base refresh"
+        );
+        assert!(
+            effective_pre_fee_meta_1.is_none(),
+            "authoritative refresh without pre_fee must not keep stale pre_fee_meta_1 alone"
         );
         assert!(
             effective_third_meta.is_none(),
@@ -13620,9 +13630,53 @@ mod discovery_tests {
         assert!(effective_tail_0.is_none() && effective_tail_1.is_none());
         assert!(
             !sell_layout_ready,
-            "extended+pre-fee without refresh metas must not mark pool ready"
+            "extended without authoritative third meta must not mark pool ready"
         );
         assert_eq!(dex_readiness, DexPoolReadiness::Partial);
+    }
+
+    #[test]
+    fn test_pump_amm_force_refresh_authoritative_pre_fee_true_not_downgraded_by_cache() {
+        let refresh_pre_fee_1 = Pubkey::new_unique();
+        let (
+            _effective_requires_extended,
+            _effective_third_meta,
+            _effective_tail_0,
+            _effective_tail_1,
+            _effective_fee_tail_0,
+            _effective_fee_tail_1,
+            _effective_requires_fee_tail,
+            effective_requires_pre_fee_metas,
+            effective_pre_fee_meta_1,
+            _sell_layout_ready,
+            _dex_readiness,
+        ) = pump_amm_sell_layout_state_for_ensure_publish(
+            true,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+            Some(refresh_pre_fee_1),
+            false,
+        );
+        assert!(
+            effective_requires_pre_fee_metas,
+            "authoritative 27er refresh must publish pre_fee even when cache had none"
+        );
+        assert_eq!(effective_pre_fee_meta_1, Some(refresh_pre_fee_1));
     }
 
     #[test]
