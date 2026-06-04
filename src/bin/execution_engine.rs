@@ -298,6 +298,9 @@ fn pump_amm_liquidation_discovery_force_refresh() -> bool {
 }
 
 /// P184m / Bug #36: skip hot-path simulation when SLAVE quote is not ready (avoids Custom 6004 storm).
+///
+/// Gates on the routed pool ([`pump_amm_pool_market_hint_pk`] / `resources.pools[0]`), not any
+/// cache row for the base mint — mint-level scans can pass while the intent pool lacks reserves.
 fn pump_amm_hot_path_quote_not_ready_detail(
     intent: &TradeIntent,
     cache: Option<&LivePoolCache>,
@@ -309,14 +312,30 @@ fn pump_amm_hot_path_quote_not_ready_detail(
         return None;
     }
     let base_mint = Pubkey::from_str(&intent.resources.input_mint).ok()?;
+    let pool_market = intent
+        .resources
+        .pools
+        .first()
+        .and_then(|s| Pubkey::from_str(s).ok())
+        .or_else(|| cache.and_then(|c| c.get_pump_amm_pool_address_by_base_mint(&base_mint)))?;
     let ready = cache
-        .map(|c| c.pump_amm_quote_ready_by_base_mint(&base_mint))
+        .map(|c| match c.get(&pool_market) {
+            Some(CachedPoolState::PumpAmm(ref s)) => {
+                s.pool_accounts.len() >= 14
+                    && matches!(
+                        (s.base_reserve, s.quote_reserve),
+                        (Some(b), Some(q)) if b > 0 && q > 0
+                    )
+            }
+            _ => false,
+        })
         .unwrap_or(false);
     if ready {
         return None;
     }
     Some(format!(
-        "quote_not_ready: pump_amm SLAVE missing ready pool_accounts+nonzero reserves for mint {}",
+        "quote_not_ready: pump_amm SLAVE missing ready pool_accounts+nonzero reserves for pool {} mint {}",
+        pool_market,
         intent.resources.input_mint
     ))
 }
