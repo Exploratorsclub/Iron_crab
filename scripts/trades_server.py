@@ -4,7 +4,13 @@ Simple HTTP server that serves trade data from JSONL execution_results files.
 Run this separately from the bot to keep trade history available even when bot is stopped.
 
 Reads from: trade_logs/executions/execution_results-YYYYMMDD.jsonl
+(and optional same-day segments execution_results-YYYYMMDD.2.jsonl, .3.jsonl, …)
 Grafana Infinity data source connects to this for "Recent Trades" table panel.
+
+Tail-read (P172): only the last N lines per file are scanned (not full-file O(n) loads).
+Env:
+  IRONCRAB_TRADES_JSONL_TAIL_LINES — max non-empty lines per file (default 15000)
+  IRONCRAB_TRADES_DAYS_LOOKBACK — optional override; endpoints use [0], [0,1], or [0,1] for pnl
 
 `timestamp_ms` on each trade is the on-chain block time (UTC) when `block_time_unix_ms`
 is present on the JSONL record; otherwise confirm wall-clock (`ts_unix_ms` / legacy).
@@ -20,9 +26,12 @@ Query params (GET /trades):
 import http.server
 import json
 import os
+import re
+import tempfile
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterator, List, Optional
 from urllib.parse import urlparse, parse_qs
 import argparse
 
@@ -33,6 +42,33 @@ DECISIONS_DIR = Path(EXEC_LOG_DIR) / "decisions"
 RECENT_TRADES_DIR = Path(
     os.environ.get("IRONCRAB_TRADE_LOG_DIR", "trade_logs")
 )
+
+_SEGMENT_SUFFIX_RE = re.compile(r"\.(\d+)\.jsonl$")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return int(raw)
+
+
+# P172: cap lines read per JSONL file (execution_results can exceed 100k lines/day).
+JSONL_TAIL_LINES = max(1, _env_int("IRONCRAB_TRADES_JSONL_TAIL_LINES", 15000))
+# Optional global override; per-endpoint defaults apply when unset.
+DAYS_LOOKBACK_OVERRIDE: Optional[List[int]] = None
+_raw_lookback = os.environ.get("IRONCRAB_TRADES_DAYS_LOOKBACK", "").strip()
+if _raw_lookback:
+    DAYS_LOOKBACK_OVERRIDE = [int(x.strip()) for x in _raw_lookback.split(",") if x.strip() != ""]
+
+
+def _days_for_endpoint(endpoint: str) -> List[int]:
+    """Lookback UTC days: limit=[0], run/pnl=[0,1] unless env override."""
+    if DAYS_LOOKBACK_OVERRIDE is not None:
+        return DAYS_LOOKBACK_OVERRIDE
+    if endpoint == "limit":
+        return [0]
+    return [0, 1]
 
 
 def _utc_date_str(days_ago: int) -> str:
@@ -50,6 +86,66 @@ def _trade_record_score(trade: dict) -> int:
     if trade.get("wallet_sol_delta") is not None:
         score += 1
     return score
+
+
+def _iter_jsonl_tail(path: Path, max_lines: int) -> Iterator[str]:
+    """Yield up to max_lines non-empty lines from the end of path (oldest-first within tail).
+
+    Does not load the full file into RAM. Reads backwards in fixed-size chunks from EOF.
+    """
+    if max_lines <= 0 or not path.is_file():
+        return iter(())
+
+    chunk_size = 64 * 1024
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return iter(())
+    if size == 0:
+        return iter(())
+
+    collected: deque[bytes] = deque(maxlen=max_lines)
+    with open(path, "rb") as f:
+        pos = size
+        carry = b""
+        while pos > 0 and len(collected) < max_lines:
+            read_len = min(chunk_size, pos)
+            pos -= read_len
+            f.seek(pos)
+            chunk = f.read(read_len) + carry
+            parts = chunk.split(b"\n")
+            carry = parts[0]
+            for part in reversed(parts[1:]):
+                if not part.strip():
+                    continue
+                collected.appendleft(part)
+                if len(collected) >= max_lines:
+                    break
+        if len(collected) < max_lines and carry.strip():
+            collected.appendleft(carry)
+
+    def _decode_line(raw: bytes) -> str:
+        return raw.decode("utf-8", errors="replace")
+
+    return (_decode_line(b) for b in collected)
+
+
+def _jsonl_segment_paths(directory: Path, prefix: str, date: str) -> List[Path]:
+    """All JSONL segments for one UTC day, chronological (base, .2, .3, …)."""
+    base = directory / f"{prefix}-{date}.jsonl"
+    numbered: List[tuple[int, Path]] = []
+    for path in directory.glob(f"{prefix}-{date}.*.jsonl"):
+        if path == base:
+            continue
+        m = _SEGMENT_SUFFIX_RE.search(path.name)
+        if m:
+            numbered.append((int(m.group(1)), path))
+    numbered.sort(key=lambda item: item[0])
+    segments: List[Path] = []
+    if base.is_file():
+        segments.append(base)
+    segments.extend(p for _, p in numbered)
+    return segments
 
 
 def _effective_timestamp_ms_from_record(record: dict) -> int:
@@ -158,7 +254,7 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
     
     def read_recent_trades(self, limit: int) -> list:
         """Read last N trades from execution_results JSONL (fallback: recent_trades JSONL)."""
-        trades = self.load_all_trades(days_ago_list=[0, 1, 2])
+        trades = self.load_all_trades(days_ago_list=_days_for_endpoint("limit"))
 
         # Compute running PnL.
         #
@@ -228,7 +324,7 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         belonging to that run, plus up to 20 trades from the most recent
         previous run (for context). PnL calculation covers all returned trades.
         """
-        all_trades = self.load_all_trades(days_ago_list=[0, 1, 2])
+        all_trades = self.load_all_trades(days_ago_list=_days_for_endpoint("run"))
 
         if not all_trades:
             return []
@@ -351,7 +447,7 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             (datetime.now(timezone.utc) - timedelta(hours=24)).timestamp() * 1000
         )
 
-        all_trades = self.load_all_trades(days_ago_list=[0, 1, 2])
+        all_trades = self.load_all_trades(days_ago_list=_days_for_endpoint("pnl"))
 
         if not all_trades:
             return {"realized_pnl_sol": 0.0, "trade_count": 0, "wins": 0, "losses": 0}
@@ -478,7 +574,7 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
     def load_all_trades(self, days_ago_list: Optional[List[int]] = None) -> list:
         """Load confirmed trades from execution_results; fallback to recent_trades JSONL (P166)."""
         if days_ago_list is None:
-            days_ago_list = [0, 1, 2]
+            days_ago_list = _days_for_endpoint("limit")
         trades = []
         used_fallback = False
         for days_ago in days_ago_list:
@@ -549,14 +645,9 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         trades = []
         for days_ago in days_ago_list:
             date = _utc_date_str(days_ago)
-            jsonl_path = EXECUTIONS_DIR / f"execution_results-{date}.jsonl"
-            if not jsonl_path.exists():
-                continue
-            try:
-                with open(jsonl_path, "r") as f:
-                    for line in f:
-                        if not line.strip():
-                            continue
+            for jsonl_path in _jsonl_segment_paths(EXECUTIONS_DIR, "execution_results", date):
+                try:
+                    for line in _iter_jsonl_tail(jsonl_path, JSONL_TAIL_LINES):
                         try:
                             record = json.loads(line)
                             status = str(record.get("status") or "").lower()
@@ -566,8 +657,8 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                                     trades.append(trade)
                         except json.JSONDecodeError:
                             continue
-            except Exception as e:
-                print(f"Error reading {jsonl_path}: {e}")
+                except Exception as e:
+                    print(f"Error reading {jsonl_path}: {e}")
         return trades
 
     def _load_trades_from_recent_jsonl(self, days_ago_list: list) -> list:
@@ -576,20 +667,17 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         for days_ago in days_ago_list:
             date = _utc_date_str(days_ago)
             jsonl_path = RECENT_TRADES_DIR / f"recent_trades-{date}.jsonl"
-            if not jsonl_path.exists():
+            if not jsonl_path.is_file():
                 continue
             try:
-                with open(jsonl_path, "r") as f:
-                    for line in f:
-                        if not line.strip():
-                            continue
-                        try:
-                            record = json.loads(line)
-                            trade = self.parse_recent_trade(record)
-                            if trade:
-                                trades.append(trade)
-                        except json.JSONDecodeError:
-                            continue
+                for line in _iter_jsonl_tail(jsonl_path, JSONL_TAIL_LINES):
+                    try:
+                        record = json.loads(line)
+                        trade = self.parse_recent_trade(record)
+                        if trade:
+                            trades.append(trade)
+                    except json.JSONDecodeError:
+                        continue
             except Exception as e:
                 print(f"Error reading {jsonl_path}: {e}")
         return trades
@@ -992,6 +1080,34 @@ def _self_check():
         }
     )
     assert parsed and parsed["action"] == "BUY" and parsed["mint_full"]
+
+    # P172: tail-read returns the last line of a large synthetic file without full scan in RAM.
+    with tempfile.TemporaryDirectory() as tmp:
+        big = Path(tmp) / "execution_results-test.jsonl"
+        line_count = 100_000
+        with open(big, "w", encoding="utf-8") as f:
+            for i in range(line_count - 1):
+                f.write(json.dumps({"n": i}) + "\n")
+            f.write(json.dumps({"status": "confirmed", "marker": "tail"}) + "\n")
+        tail_lines = list(_iter_jsonl_tail(big, 5))
+        assert len(tail_lines) == 5
+        last = json.loads(tail_lines[-1])
+        assert last.get("marker") == "tail"
+
+        seg_dir = Path(tmp) / "executions"
+        seg_dir.mkdir()
+        base_seg = seg_dir / "execution_results-20990101.jsonl"
+        base_seg.write_text('{"status":"confirmed","intent_id":"old"}\n', encoding="utf-8")
+        seg2 = seg_dir / "execution_results-20990101.2.jsonl"
+        seg2.write_text(
+            '{"status":"confirmed","intent_id":"arb-3","signature":"s",'
+            '"fill_in":{"raw":0,"decimals":9},"fill_out":{"raw":0,"decimals":6},'
+            '"source":"arb-strategy"}\n',
+            encoding="utf-8",
+        )
+        paths = _jsonl_segment_paths(seg_dir, "execution_results", "20990101")
+        assert paths == [base_seg, seg2]
+
     print("trades_server: self-check OK")
 
 
