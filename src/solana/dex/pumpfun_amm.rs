@@ -821,6 +821,8 @@ struct PumpAmmSellReferenceObservation {
     protocol_fee_recipient_ta: Pubkey,
     reference_swap_signature: Option<String>,
     reference_ix_kind: PumpAmmSellReferenceIxKind,
+    /// PumpSwap program `sell` ix account count (not full message length). Set at TX decode.
+    sell_ix_account_len: u8,
 }
 
 impl PumpAmmSellReferenceObservation {
@@ -831,14 +833,91 @@ impl PumpAmmSellReferenceObservation {
             protocol_fee_recipient_ta: Pubkey::default(),
             reference_swap_signature: None,
             reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
+            sell_ix_account_len: 0,
         }
     }
 }
 
-/// P184i: complete 26-account cashback `sell` from TX decode (volume + fee tails present).
+/// P184j: on-chain `sell` with exactly 26 Pump-IX accounts (tier from instruction length).
+#[must_use]
+fn pump_amm_observation_is_26_account_tier_sell(obs: &PumpAmmSellReferenceObservation) -> bool {
+    obs.reference_ix_kind == PumpAmmSellReferenceIxKind::SellInstruction
+        && (obs.sell_ix_account_len == PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS as u8
+            || (obs.sell_ix_account_len == 0
+                && pump_amm_sell_ix_account_count_from_observation(obs)
+                    == PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS as u8))
+}
+
+/// Build authoritative layout from resolved `sell` instruction accounts (tier = `n` first).
+fn pump_amm_authoritative_sell_layout_from_sell_ix_accounts(
+    instruction_accounts: &[Pubkey],
+) -> Option<PumpAmmAuthoritativeSellLayout> {
+    let n = instruction_accounts.len();
+    if !pump_amm_sell_ix_account_len_supported(n) {
+        return None;
+    }
+    let ext = pump_amm_sell_extended_fields_from_ix_accounts(instruction_accounts)?;
+    let filter_pk = |p: Option<Pubkey>| p.filter(|pk| *pk != Pubkey::default());
+    match n {
+        21 => Some(PumpAmmAuthoritativeSellLayout::Base),
+        PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS => {
+            let tail_0 = filter_pk(ext.tail_0)?;
+            let tail_1 = filter_pk(ext.tail_1)?;
+            let tail_2 = filter_pk(ext.third_meta)?;
+            let fee_tail_0 = filter_pk(ext.fee_tail_0)?;
+            let fee_tail_1 = filter_pk(ext.fee_tail_1)?;
+            Some(PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: None,
+                pre_fee_1: None,
+                tail_0,
+                tail_1,
+                tail_2,
+                fee_tail_0: Some(fee_tail_0),
+                fee_tail_1: Some(fee_tail_1),
+            })
+        }
+        PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS => {
+            if !ext.requires_pre_fee_metas {
+                return None;
+            }
+            let pre_fee_0 = filter_pk(ext.pre_fee_meta_0)?;
+            let pre_fee_1 = filter_pk(ext.pre_fee_meta_1)?;
+            let tail_0 = filter_pk(ext.tail_0)?;
+            let tail_1 = filter_pk(ext.tail_1)?;
+            let tail_2 = filter_pk(ext.third_meta)?;
+            let fee_tail_0 = filter_pk(ext.fee_tail_0)?;
+            Some(PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: Some(pre_fee_0),
+                pre_fee_1: Some(pre_fee_1),
+                tail_0,
+                tail_1,
+                tail_2,
+                fee_tail_0: Some(fee_tail_0),
+                fee_tail_1: filter_pk(ext.fee_tail_1),
+            })
+        }
+        PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS => {
+            let tail_0 = filter_pk(ext.tail_0)?;
+            let tail_1 = filter_pk(ext.tail_1)?;
+            let tail_2 = filter_pk(ext.third_meta)?;
+            Some(PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: None,
+                pre_fee_1: None,
+                tail_0,
+                tail_1,
+                tail_2,
+                fee_tail_0: filter_pk(ext.fee_tail_0),
+                fee_tail_1: filter_pk(ext.fee_tail_1),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// P184i/P184j: complete 26-account cashback `sell` from TX decode (volume + fee tails present).
 #[must_use]
 fn pump_amm_observation_is_26_account_cashback_sell(obs: &PumpAmmSellReferenceObservation) -> bool {
-    obs.reference_ix_kind == PumpAmmSellReferenceIxKind::SellInstruction
+    pump_amm_observation_is_26_account_tier_sell(obs)
         && matches!(
             obs.layout,
             PumpAmmAuthoritativeSellLayout::Extended {
@@ -856,6 +935,23 @@ fn pump_amm_observation_is_26_account_cashback_sell(obs: &PumpAmmSellReferenceOb
                 && tail_1 != Pubkey::default()
                 && tail_2 != Pubkey::default()
         )
+}
+
+/// P184j: build tier prefers on-chain 26-account `sell` over 27-account v2 / buy hints.
+#[must_use]
+fn pump_amm_reference_observation_prefers_26_sell_tier_for_build(
+    left: &PumpAmmSellReferenceObservation,
+    right: &PumpAmmSellReferenceObservation,
+) -> Option<bool> {
+    let left26 = pump_amm_observation_is_26_account_tier_sell(left);
+    let right26 = pump_amm_observation_is_26_account_tier_sell(right);
+    if left26 && !right26 {
+        return Some(true);
+    }
+    if right26 && !left26 {
+        return Some(false);
+    }
+    None
 }
 
 /// P184i: build tier prefers on-chain `sell` over 27-account `buy_exact_quote_in` layout hints.
@@ -954,11 +1050,10 @@ fn authoritative_sell_layout_strength(layout: &PumpAmmAuthoritativeSellLayout) -
     }
 }
 
-/// True when the scan can stop early — strength ≥ 4 **and** layout passes structural validation.
+/// True when the scan can stop early — P184j: only terminal on complete 26-account `sell` (not 27er).
 #[must_use]
-fn authoritative_sell_layout_is_terminal_for_scan(layout: &PumpAmmAuthoritativeSellLayout) -> bool {
-    authoritative_sell_layout_strength(layout) >= 4
-        && pump_amm_extended_layout_is_authoritative(layout)
+fn authoritative_sell_layout_is_terminal_for_scan(obs: &PumpAmmSellReferenceObservation) -> bool {
+    pump_amm_observation_is_26_account_cashback_sell(obs)
 }
 
 /// Structural validation for extended v2 (27-account) SELL SSOT — Cold Path / force_refresh only.
@@ -1112,6 +1207,11 @@ fn merge_pump_amm_authoritative_sell_reference_observation(
     if pump_amm_reference_observation_prefers_sell_over_buy_hint(&candidate, &best) {
         return candidate;
     }
+    if let Some(prefer_left) =
+        pump_amm_reference_observation_prefers_26_sell_tier_for_build(&best, &candidate)
+    {
+        return if prefer_left { best } else { candidate };
+    }
     let best_strength = authoritative_sell_layout_strength(&best.layout);
     let cand_strength = authoritative_sell_layout_strength(&candidate.layout);
     if cand_strength > best_strength {
@@ -1198,6 +1298,9 @@ fn pump_amm_known_v2_reference_signatures(pool_market: &Pubkey) -> &'static [&'s
 
 #[must_use]
 fn pump_amm_sell_ix_account_count_from_observation(obs: &PumpAmmSellReferenceObservation) -> u8 {
+    if obs.sell_ix_account_len > 0 {
+        return obs.sell_ix_account_len;
+    }
     match obs.layout {
         PumpAmmAuthoritativeSellLayout::Extended {
             pre_fee_0,
@@ -1301,6 +1404,7 @@ fn pump_amm_stuck_pool_v2_seed_observation(
         protocol_fee_recipient_ta: obs.protocol_fee_recipient_ta,
         reference_swap_signature: Some(PUMP_AMM_STUCK_POOL_V2_SEED_REF_TAG.to_string()),
         reference_ix_kind: PumpAmmSellReferenceIxKind::BuyLayoutHint,
+        sell_ix_account_len: PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS as u8,
     })
 }
 
@@ -1926,7 +2030,8 @@ impl PumpFunAmmDex {
                 } => {
                     pool.sell_requires_cashback_remaining = true;
                     pool.sell_requires_pre_fee_metas =
-                        pre_fee_0.filter(|p| *p != Pubkey::default()).is_some()
+                        !pump_amm_observation_is_26_account_tier_sell(&sell_obs)
+                            && pre_fee_0.filter(|p| *p != Pubkey::default()).is_some()
                             && pre_fee_1.filter(|p| *p != Pubkey::default()).is_some();
                     if let Some(p0) = pre_fee_0.filter(|p| *p != Pubkey::default()) {
                         pool.global_volume_accumulator = p0;
@@ -1986,7 +2091,7 @@ impl PumpFunAmmDex {
         base_mint: Pubkey,
         mut obs: PumpAmmSellReferenceObservation,
     ) -> PumpAmmSellReferenceObservation {
-        if pump_amm_observation_is_26_account_cashback_sell(&obs) {
+        if pump_amm_observation_is_26_account_tier_sell(&obs) {
             return obs;
         }
         let pool_market = pool.pool_market;
@@ -2140,6 +2245,7 @@ impl PumpFunAmmDex {
             protocol_fee_recipient_ta,
             reference_swap_signature,
             reference_ix_kind: PumpAmmSellReferenceIxKind::BuyLayoutHint,
+            sell_ix_account_len: PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS as u8,
         };
         Some((pool_market, base_mint, obs))
     }
@@ -2771,10 +2877,11 @@ impl PumpFunAmmDex {
                     best_obs,
                     std::iter::once(cand_obs),
                 );
-                if authoritative_sell_layout_is_terminal_for_scan(&best_obs.layout) {
+                if authoritative_sell_layout_is_terminal_for_scan(&best_obs) {
                     summary.termination_reason = PumpAmmSellLayoutTerminationReason::LayoutFound;
                     summary.elapsed_total_ms = t0.elapsed().as_millis();
-                    let sell_ix_account_count = acc_strings.len() as u8;
+                    let sell_ix_account_count =
+                        pump_amm_sell_ix_account_count_from_observation(&best_obs);
                     let (tail0_log, tail1_log, tail2_log, pre0_log, pre1_log) =
                         match best_obs.layout {
                             PumpAmmAuthoritativeSellLayout::Extended {
@@ -5832,45 +5939,36 @@ impl PumpFunAmmDex {
         ix_data: &[u8],
         reference_swap_signature: Option<String>,
     ) -> Option<(Pubkey, Pubkey, PumpAmmSellReferenceObservation)> {
-        let pool = Self::pump_amm_pool_static_from_parsed_swap_ix(acc_accounts, ix_data, |_| {
-            Self::pump_amm_livepoolcache_diagnostic(
-                "sell_layout_observation",
-                true,
-                Pubkey::default(),
-                Pubkey::default(),
-            )
-        })?;
-        let layout = if !pool.sell_requires_cashback_remaining {
-            PumpAmmAuthoritativeSellLayout::Base
-        } else {
-            PumpAmmAuthoritativeSellLayout::Extended {
-                pre_fee_0: if pool.sell_requires_pre_fee_metas {
-                    Some(pool.global_volume_accumulator)
-                } else {
-                    None
-                },
-                pre_fee_1: pool.sell_pre_fee_meta_1,
-                tail_0: pool
-                    .sell_extended_tail_0
-                    .filter(|p| *p != Pubkey::default())?,
-                tail_1: pool
-                    .sell_extended_tail_1
-                    .filter(|p| *p != Pubkey::default())?,
-                tail_2: pool
-                    .sell_cashback_third_meta
-                    .filter(|p| *p != Pubkey::default())?,
-                fee_tail_0: pool.sell_extended_fee_tail_0,
-                fee_tail_1: pool.sell_extended_fee_tail_1,
-            }
-        };
+        if ix_data.len() < 8 {
+            return None;
+        }
+        let disc: [u8; 8] = ix_data[0..8].try_into().ok()?;
+        if disc != anchor_disc("sell") {
+            return None;
+        }
+        let instruction_accounts: Vec<Pubkey> = acc_accounts
+            .iter()
+            .filter_map(|s| Pubkey::from_str(s).ok())
+            .collect();
+        if instruction_accounts.len() != acc_accounts.len() {
+            return None;
+        }
+        let sell_ix_account_len = instruction_accounts.len();
+        let layout =
+            pump_amm_authoritative_sell_layout_from_sell_ix_accounts(&instruction_accounts)?;
+        let pool_market = *instruction_accounts.first()?;
+        let base_mint = *instruction_accounts.get(3)?;
+        let protocol_fee_recipient = *instruction_accounts.get(9)?;
+        let protocol_fee_recipient_ta = *instruction_accounts.get(10)?;
         let obs = PumpAmmSellReferenceObservation {
             layout,
-            protocol_fee_recipient: pool.protocol_fee_recipient,
-            protocol_fee_recipient_ta: pool.protocol_fee_recipient_ta,
+            protocol_fee_recipient,
+            protocol_fee_recipient_ta,
             reference_swap_signature,
             reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
+            sell_ix_account_len: sell_ix_account_len as u8,
         };
-        Some((pool.pool_market, pool.base_mint, obs))
+        Some((pool_market, base_mint, obs))
     }
 
     #[cfg(test)]
@@ -7171,6 +7269,7 @@ mod tests {
             protocol_fee_recipient_ta: pfr_ta_base,
             reference_swap_signature: Some("sig_base".to_string()),
             reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
+            sell_ix_account_len: 21,
         };
         let ext_obs = PumpAmmSellReferenceObservation {
             layout: PumpAmmAuthoritativeSellLayout::Extended {
@@ -7186,6 +7285,7 @@ mod tests {
             protocol_fee_recipient_ta: pfr_ta_ext,
             reference_swap_signature: Some("sig_ext".to_string()),
             reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
+            sell_ix_account_len: PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS as u8,
         };
         assert_eq!(
             merge_pump_amm_authoritative_sell_reference_observation(
@@ -7215,6 +7315,7 @@ mod tests {
             protocol_fee_recipient_ta: pfr_ta_base,
             reference_swap_signature: Some("sig_base".to_string()),
             reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
+            sell_ix_account_len: 21,
         };
         let merged2 =
             merge_pump_amm_authoritative_sell_reference_observation(ext_obs.clone(), base_obs2);
@@ -7242,6 +7343,7 @@ mod tests {
             protocol_fee_recipient_ta: Pubkey::new_unique(),
             reference_swap_signature: Some("sig_b".to_string()),
             reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
+            sell_ix_account_len: 21,
         };
         assert_eq!(
             merge_pump_amm_authoritative_sell_reference_observation(
@@ -7279,6 +7381,7 @@ mod tests {
                 protocol_fee_recipient_ta: Pubkey::new_unique(),
                 reference_swap_signature: Some("sig_newer_base".to_string()),
                 reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
+                sell_ix_account_len: 21,
             },
             PumpAmmSellReferenceObservation {
                 layout: PumpAmmAuthoritativeSellLayout::Extended {
@@ -7294,6 +7397,7 @@ mod tests {
                 protocol_fee_recipient_ta: pfr_ta_ext,
                 reference_swap_signature: Some("sig_older_ext".to_string()),
                 reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
+                sell_ix_account_len: PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS as u8,
             },
         ];
         let out = fold_force_refresh_sell_reference_observations_newest_first(
@@ -8550,9 +8654,104 @@ mod tests {
         );
     }
 
-    /// P184e (within `sell` only): older 27-account `sell` beats newer 26-account `sell` on strength.
+    /// P184j: 26-account `sell` with global fee_config/fee_program at #19/#20 is tier-26 (no pre_fee).
     #[test]
-    fn p184e_merge_27_account_pre_fee_wins_over_newer_26_account_cashback() {
+    fn p184j_26_account_sell_global_fee_at_19_20_not_pre_fee() {
+        let pool_market = Pubkey::from_str("GrgDaBg4TGBQCDZk9HHw8JT24RnoDHtQnvgguKxGKStb").unwrap();
+        let base_mint = Pubkey::new_unique();
+        let fee_config = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap();
+        let fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap();
+        let third_meta = Pubkey::new_unique();
+        let tail0 = Pubkey::new_unique();
+        let tail1 = Pubkey::new_unique();
+        let fee_tail0 = Pubkey::new_unique();
+        let fee_tail1 = Pubkey::new_unique();
+        let mut account_keys: Vec<Pubkey> = (0..26).map(|_| Pubkey::new_unique()).collect();
+        account_keys[0] = pool_market;
+        account_keys[2] = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap();
+        account_keys[3] = base_mint;
+        account_keys[4] = Pubkey::from_str(WSOL_MINT).unwrap();
+        account_keys[19] = fee_config;
+        account_keys[20] = fee_program;
+        account_keys[21] = tail0;
+        account_keys[22] = tail1;
+        account_keys[23] = third_meta;
+        account_keys[24] = fee_tail0;
+        account_keys[25] = fee_tail1;
+        let acc_strings: Vec<String> = account_keys.iter().map(ToString::to_string).collect();
+        let ix_data = pump_amm_sell_ix_discriminator().to_vec();
+        let (_, _, layout) = PumpFunAmmDex::pump_amm_sell_layout_observation_from_parsed_swap_ix(
+            &acc_strings,
+            &ix_data,
+        )
+        .expect("26-account sell");
+        assert_eq!(
+            layout,
+            PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: None,
+                pre_fee_1: None,
+                tail_0: tail0,
+                tail_1: tail1,
+                tail_2: third_meta,
+                fee_tail_0: Some(fee_tail0),
+                fee_tail_1: Some(fee_tail1),
+            }
+        );
+        let ext = pump_amm_sell_extended_fields_from_ix_accounts(&account_keys).expect("ext");
+        assert!(!ext.requires_pre_fee_metas);
+    }
+
+    /// P184j: force_refresh fold — newest 27er extended+pre_fee then older 26er sell → tier 26.
+    #[test]
+    fn p184j_force_refresh_fold_27_then_26_sell_prefers_26() {
+        let pre0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_0).unwrap();
+        let pre1 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_1).unwrap();
+        let fee0 = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap();
+        let fee1 = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap();
+        let v27_newer = PumpAmmSellReferenceObservation {
+            layout: PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: Some(pre0),
+                pre_fee_1: Some(pre1),
+                tail_0: Pubkey::new_unique(),
+                tail_1: Pubkey::new_unique(),
+                tail_2: Pubkey::new_unique(),
+                fee_tail_0: Some(Pubkey::new_unique()),
+                fee_tail_1: None,
+            },
+            protocol_fee_recipient: Pubkey::new_unique(),
+            protocol_fee_recipient_ta: Pubkey::new_unique(),
+            reference_swap_signature: Some("sig_27_newer".to_string()),
+            reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
+            sell_ix_account_len: PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS as u8,
+        };
+        let v26_older = PumpAmmSellReferenceObservation {
+            layout: PumpAmmAuthoritativeSellLayout::Extended {
+                pre_fee_0: None,
+                pre_fee_1: None,
+                tail_0: Pubkey::new_unique(),
+                tail_1: Pubkey::new_unique(),
+                tail_2: Pubkey::new_unique(),
+                fee_tail_0: Some(fee0),
+                fee_tail_1: Some(fee1),
+            },
+            protocol_fee_recipient: Pubkey::new_unique(),
+            protocol_fee_recipient_ta: Pubkey::new_unique(),
+            reference_swap_signature: Some("sig_26_older".to_string()),
+            reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
+            sell_ix_account_len: PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS as u8,
+        };
+        let merged =
+            fold_force_refresh_sell_reference_observations_newest_first(v27_newer, [v26_older]);
+        assert!(pump_amm_observation_is_26_account_cashback_sell(&merged));
+        assert_eq!(
+            pump_amm_sell_ix_account_count_from_observation(&merged),
+            PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS as u8
+        );
+    }
+
+    /// P184j: newest 26-account on-chain `sell` beats older 27-account v2 for build tier.
+    #[test]
+    fn p184j_merge_26_account_sell_wins_over_older_27_account_v2() {
         let t0 = Pubkey::new_unique();
         let t1 = Pubkey::new_unique();
         let t2 = Pubkey::new_unique();
@@ -8572,8 +8771,9 @@ mod tests {
             },
             protocol_fee_recipient: Pubkey::new_unique(),
             protocol_fee_recipient_ta: Pubkey::new_unique(),
-            reference_swap_signature: Some("sig_27".to_string()),
+            reference_swap_signature: Some("sig_27_older".to_string()),
             reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
+            sell_ix_account_len: PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS as u8,
         };
         let v26 = PumpAmmSellReferenceObservation {
             layout: PumpAmmAuthoritativeSellLayout::Extended {
@@ -8589,16 +8789,21 @@ mod tests {
             protocol_fee_recipient_ta: Pubkey::new_unique(),
             reference_swap_signature: Some("sig_26_newer".to_string()),
             reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
+            sell_ix_account_len: PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS as u8,
         };
         let merged = fold_force_refresh_sell_reference_observations_newest_first(v26, [v27]);
-        assert_eq!(authoritative_sell_layout_strength(&merged.layout), 4);
+        assert!(pump_amm_observation_is_26_account_cashback_sell(&merged));
+        assert_eq!(
+            pump_amm_sell_ix_account_count_from_observation(&merged),
+            PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS as u8
+        );
         assert!(matches!(
             merged.layout,
             PumpAmmAuthoritativeSellLayout::Extended {
-                pre_fee_0: Some(p0),
-                pre_fee_1: Some(p1),
+                pre_fee_0: None,
+                pre_fee_1: None,
                 ..
-            } if p0 == pre0 && p1 == pre1
+            }
         ));
     }
 
@@ -8626,6 +8831,7 @@ mod tests {
             protocol_fee_recipient_ta: Pubkey::new_unique(),
             reference_swap_signature: Some("sig_scan_26".to_string()),
             reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
+            sell_ix_account_len: PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS as u8,
         };
         let pre_fee_0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_0).unwrap();
         let pool = PumpAmmPoolStatic {
@@ -8668,6 +8874,7 @@ mod tests {
             protocol_fee_recipient_ta: scan_obs.protocol_fee_recipient_ta,
             reference_swap_signature: Some(PUMP_AMM_STUCK_POOL_V2_REF_SIG.to_string()),
             reference_ix_kind: PumpAmmSellReferenceIxKind::BuyLayoutHint,
+            sell_ix_account_len: PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS as u8,
         };
         let merged = fold_force_refresh_sell_reference_observations_newest_first(
             scan_obs.clone(),
@@ -8805,6 +9012,7 @@ mod tests {
             protocol_fee_recipient_ta: Pubkey::new_unique(),
             reference_swap_signature: Some("sig_scan".to_string()),
             reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
+            sell_ix_account_len: PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS as u8,
         };
         let pool = PumpAmmPoolStatic {
             pool_market,
@@ -8953,6 +9161,7 @@ mod tests {
             protocol_fee_recipient_ta: Pubkey::new_unique(),
             reference_swap_signature: Some("sig_ref_valid".to_string()),
             reference_ix_kind: PumpAmmSellReferenceIxKind::BuyLayoutHint,
+            sell_ix_account_len: PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS as u8,
         }
     }
 
@@ -8975,6 +9184,7 @@ mod tests {
             protocol_fee_recipient_ta: Pubkey::new_unique(),
             reference_swap_signature: Some("sig_scan_invalid".to_string()),
             reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
+            sell_ix_account_len: PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS as u8,
         };
         let ref_obs = p184h_valid_v2_reference_observation();
         assert_eq!(authoritative_sell_layout_strength(&scan_obs.layout), 4);
@@ -9003,7 +9213,15 @@ mod tests {
             fee_tail_1: None,
         };
         assert_eq!(authoritative_sell_layout_strength(&layout), 4);
-        assert!(!authoritative_sell_layout_is_terminal_for_scan(&layout));
+        let obs = PumpAmmSellReferenceObservation {
+            layout,
+            protocol_fee_recipient: Pubkey::new_unique(),
+            protocol_fee_recipient_ta: Pubkey::new_unique(),
+            reference_swap_signature: Some("sig_v2_incomplete".to_string()),
+            reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
+            sell_ix_account_len: PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS as u8,
+        };
+        assert!(!authoritative_sell_layout_is_terminal_for_scan(&obs));
     }
 
     /// P184h: newest-first fold prefers valid older over invalid newer at strength 4.
@@ -9024,6 +9242,7 @@ mod tests {
             protocol_fee_recipient_ta: Pubkey::new_unique(),
             reference_swap_signature: Some("sig_newer_invalid".to_string()),
             reference_ix_kind: PumpAmmSellReferenceIxKind::SellInstruction,
+            sell_ix_account_len: PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS as u8,
         };
         let older_valid = p184h_valid_v2_reference_observation();
         let folded = fold_force_refresh_sell_reference_observations_newest_first(
