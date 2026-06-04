@@ -34,10 +34,11 @@ use ironcrab::ipc::{
     TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
-    serve_metrics, set_readiness_nats_connected, MetricsComponent, ARB_REJECTED_MISSING_ACCOUNTS,
-    ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL,
-    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
-    TOKENS_TRACKED_GAUGE,
+    arb_two_hop_opportunity_inc, arb_two_hop_rejected_inc, serve_metrics,
+    set_readiness_nats_connected, ArbTwoHopRejectReason, MetricsComponent,
+    ARB_REJECTED_MISSING_ACCOUNTS, ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL,
+    MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
+    POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, slave_consumer_config, CONFIG_STREAM_NAME, STREAM_NAME,
@@ -152,6 +153,8 @@ const STABLECOIN_MAX_SPREAD_BPS: i64 = 200; // 2% for stablecoins
 /// If Geyser is connected but a pool has no updates, the data IS current (pool is inactive).
 const GEYSER_CONNECTION_TIMEOUT_SECS: u64 = 30;
 const MIN_TRADE_VOLUME_LAMPORTS: u64 = 100_000; // 0.0001 SOL minimum (filter dust)
+/// Max age for pool comparable prices used in 2-hop spread (aligns with Geyser health window).
+const MAX_PRICE_AGE_MS: u64 = 30_000;
 
 fn is_known_dex_label(dex: &str) -> bool {
     matches!(
@@ -189,16 +192,72 @@ struct Args {
 // Pool Tracking for Cross-DEX Arbitrage
 // ============================================================================
 
+/// Comparable price semantics for 2-hop: **SOL per 1 whole token** (not lamports, not tokens/SOL).
+/// Reserve-mid from Geyser vault balances is preferred; trade-implied prices use buy/sell mid.
+fn reserve_mid_sol_per_token(
+    reserve_base: u64,
+    reserve_quote: u64,
+    token_decimals: u8,
+) -> Option<Decimal> {
+    if reserve_base == 0 || reserve_quote == 0 {
+        return None;
+    }
+    let sol = Decimal::from(reserve_quote) / Decimal::from(1_000_000_000u64);
+    let token_divisor = 10u64.pow(token_decimals as u32);
+    let tokens = Decimal::from(reserve_base) / Decimal::from(token_divisor);
+    if tokens <= Decimal::ZERO {
+        return None;
+    }
+    Some(sol / tokens)
+}
+
+/// Trade-implied SOL per token from a single fill (same units as reserve mid).
+fn trade_implied_sol_per_token(sol_amount: u64, token_amount: u64, token_decimals: u8) -> Decimal {
+    let sol_dec = Decimal::from(sol_amount) / Decimal::from(1_000_000_000u64);
+    let token_divisor = 10u64.pow(token_decimals as u32);
+    let token_dec = Decimal::from(token_amount) / Decimal::from(token_divisor);
+    if token_dec <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    sol_dec / token_dec
+}
+
+/// Comparable SOL/token for spread: reserve mid (Geyser) > arithmetic mid of last buy/sell trades.
+fn comparable_price_sol_per_token(
+    pool: &PoolState,
+    vault_reserves: Option<(u64, u64)>,
+    token_decimals: u8,
+) -> Option<Decimal> {
+    if let Some((reserve_base, reserve_quote)) = vault_reserves {
+        if let Some(mid) = reserve_mid_sol_per_token(reserve_base, reserve_quote, token_decimals) {
+            return Some(mid);
+        }
+    }
+    match (pool.trade_price_buy, pool.trade_price_sell) {
+        (Some(buy), Some(sell)) if buy > Decimal::ZERO && sell > Decimal::ZERO => {
+            Some((buy + sell) / Decimal::from(2))
+        }
+        (Some(one), None) | (None, Some(one)) if one > Decimal::ZERO => Some(one),
+        _ => None,
+    }
+}
+
 /// Tracks a pool's price/liquidity state
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct PoolState {
     pool_address: String,
     dex: String,
-    /// Last known price (quote per base, e.g., SOL per token)
+    /// Last comparable SOL per token (from reserve mid or trade mid)
     last_price: Option<Decimal>,
-    /// Liquidity in SOL
+    /// Last buy-side trade implied price (SOL per token)
+    trade_price_buy: Option<Decimal>,
+    /// Last sell-side trade implied price (SOL per token)
+    trade_price_sell: Option<Decimal>,
+    /// Liquidity in SOL (from PoolCreated or Geyser reserves)
     liquidity_sol: Decimal,
+    /// True when `PoolStateUpdate` reserves were applied for this pool
+    has_reserve_data: bool,
     /// Last update time
     last_update: Instant,
     /// Trade count for activity tracking
@@ -212,13 +271,15 @@ struct PoolState {
 #[derive(Debug)]
 struct TokenArbTracker {
     base_mint: String,
-    /// Pool states by DEX name
-    pools_by_dex: HashMap<String, PoolState>,
+    /// Pool states keyed by pool_address (multiple pools per DEX allowed)
+    pools: HashMap<String, PoolState>,
     /// Pool accounts by pool_address (from DexPoolAccounts events)
     /// Key: pool_address, Value: accounts vec
     pool_accounts: HashMap<String, Vec<String>>,
     /// Token program for base_mint (SPL Token or Token-2022), from TokenMintInfo event
     token_program: Option<String>,
+    /// Token decimals from Trade events (for reserve mid normalization)
+    token_decimals: Option<u8>,
     /// Last intent generated time
     last_intent_time: Option<Instant>,
 }
@@ -227,9 +288,10 @@ impl TokenArbTracker {
     fn new(base_mint: &str) -> Self {
         Self {
             base_mint: base_mint.to_string(),
-            pools_by_dex: HashMap::new(),
+            pools: HashMap::new(),
             pool_accounts: HashMap::new(),
             token_program: None,
+            token_decimals: None,
             last_intent_time: None,
         }
     }
@@ -250,9 +312,17 @@ impl TokenArbTracker {
         self.token_program = Some(token_program.to_string());
     }
 
-    /// Add or update a pool for this token
+    /// Add or update a pool for this token (keyed by pool_address)
     fn upsert_pool(&mut self, pool: PoolState) {
-        self.pools_by_dex.insert(pool.dex.clone(), pool);
+        self.pools.insert(pool.pool_address.clone(), pool);
+    }
+
+    fn pool_count_on_distinct_dexes(&self) -> usize {
+        let mut dexes = HashSet::new();
+        for pool in self.pools.values() {
+            dexes.insert(pool.dex.as_str());
+        }
+        dexes.len()
     }
 
     /// Check for arbitrage opportunity between DEXes
@@ -261,6 +331,7 @@ impl TokenArbTracker {
         &self,
         config: &ArbConfig,
         known_pools: &HashSet<String>,
+        vault_balances: &HashMap<String, VaultBalanceCache>,
     ) -> Option<ArbOpportunity> {
         // Check if 2-hop arbitrage is enabled
         if !config.two_hop_enabled {
@@ -271,55 +342,76 @@ impl TokenArbTracker {
             return None;
         }
 
-        // Need at least 2 DEXes with prices
-        let pools_with_price: Vec<_> = self
-            .pools_by_dex
-            .values()
-            .filter(|p| {
-                let has_price = p.last_price.is_some();
-                let is_known_dex = is_known_dex_label(&p.dex);
-                let in_master_cache = known_pools.contains(&p.pool_address);
+        let token_decimals = self.token_decimals.unwrap_or(6);
 
-                // Log when pool is filtered out due to not being in MASTER cache
-                if has_price && is_known_dex && !in_master_cache {
+        // Build comparable prices per pool (reserve mid preferred over trade mid)
+        let mut priced_pools: Vec<(&PoolState, Decimal)> = Vec::new();
+        for pool in self.pools.values() {
+            let is_known_dex = is_known_dex_label(&pool.dex);
+            let in_master_cache = known_pools.contains(&pool.pool_address);
+            if !is_known_dex || !in_master_cache {
+                if is_known_dex && !in_master_cache {
                     debug!(
-                        pool = %p.pool_address,
-                        dex = %p.dex,
+                        pool = %pool.pool_address,
+                        dex = %pool.dex,
                         mint = %self.base_mint,
                         "Pool filtered: not in market-data MASTER cache (parse_pool_account failed)"
                     );
                 }
+                continue;
+            }
+            let vault_reserves = vault_balances
+                .get(&pool.pool_address)
+                .map(|c| (c.reserve_base, c.reserve_quote));
+            let Some(price) = comparable_price_sol_per_token(pool, vault_reserves, token_decimals)
+            else {
+                continue;
+            };
+            if price <= Decimal::ZERO {
+                continue;
+            }
+            priced_pools.push((pool, price));
+        }
 
-                has_price && is_known_dex && in_master_cache
-            })
-            .collect();
-
-        if pools_with_price.len() < 2 {
+        if priced_pools.len() < 2 {
             debug!(
                 mint = %self.base_mint,
-                pools = pools_with_price.len(),
-                "Arb check: insufficient pools with prices"
+                pools = priced_pools.len(),
+                "Arb check: insufficient pools with comparable prices"
             );
+            arb_two_hop_rejected_inc(ArbTwoHopRejectReason::InsufficientPools);
             return None;
         }
 
-        // Find best buy (lowest price) and best sell (highest price)
-        let mut best_buy: Option<&PoolState> = None;
-        let mut best_sell: Option<&PoolState> = None;
+        // Find cheapest pool to buy and most expensive pool to sell (may be same DEX — filtered below)
+        let mut best_buy: Option<(&PoolState, Decimal)> = None;
+        let mut best_sell: Option<(&PoolState, Decimal)> = None;
 
-        for pool in &pools_with_price {
-            let price = pool.last_price.unwrap();
-
-            if best_buy.is_none() || price < best_buy.unwrap().last_price.unwrap() {
-                best_buy = Some(pool);
+        for (pool, price) in &priced_pools {
+            if best_buy.is_none() || *price < best_buy.unwrap().1 {
+                best_buy = Some((pool, *price));
             }
-            if best_sell.is_none() || price > best_sell.unwrap().last_price.unwrap() {
-                best_sell = Some(pool);
+            if best_sell.is_none() || *price > best_sell.unwrap().1 {
+                best_sell = Some((pool, *price));
             }
         }
 
-        let buy_pool = best_buy?;
-        let sell_pool = best_sell?;
+        let (buy_pool, buy_price) = best_buy?;
+        let (sell_pool, sell_price) = best_sell?;
+
+        // Staleness: both pool prices must be fresh
+        let max_age = Duration::from_millis(MAX_PRICE_AGE_MS);
+        if buy_pool.last_update.elapsed() > max_age || sell_pool.last_update.elapsed() > max_age {
+            debug!(
+                mint = %self.base_mint,
+                buy_pool = %buy_pool.pool_address,
+                sell_pool = %sell_pool.pool_address,
+                max_age_ms = MAX_PRICE_AGE_MS,
+                "Arb check rejected: stale comparable price"
+            );
+            arb_two_hop_rejected_inc(ArbTwoHopRejectReason::StalePrice);
+            return None;
+        }
 
         // Don't arb same DEX
         if buy_pool.dex == sell_pool.dex {
@@ -328,13 +420,11 @@ impl TokenArbTracker {
                 dex = %buy_pool.dex,
                 "Arb check rejected: same DEX for buy/sell"
             );
+            arb_two_hop_rejected_inc(ArbTwoHopRejectReason::SameDex);
             return None;
         }
 
         // CRITICAL: Exclude pumpfun (bonding curve) from ALL arbitrage!
-        // While a token is on the bonding curve, there are NO other pools for it.
-        // Other DEXes (Meteora, Orca, Raydium) only list tokens AFTER migration.
-        // Therefore pumpfun arbitrage is NEVER valid - there's nothing to arb against.
         if buy_pool.dex == "pumpfun" || sell_pool.dex == "pumpfun" {
             debug!(
                 mint = %self.base_mint,
@@ -342,11 +432,9 @@ impl TokenArbTracker {
                 sell_dex = %sell_pool.dex,
                 "Arb check rejected: pumpfun (bonding curve) has no other pools to arb against"
             );
+            arb_two_hop_rejected_inc(ArbTwoHopRejectReason::Pumpfun);
             return None;
         }
-
-        let buy_price = buy_pool.last_price.unwrap();
-        let sell_price = sell_pool.last_price.unwrap();
 
         // Calculate spread in bps
         // spread = (sell_price - buy_price) / buy_price * 10000
@@ -366,6 +454,7 @@ impl TokenArbTracker {
                 mint = %self.base_mint,
                 "Arb check rejected: Native SOL trades are wrap/unwrap, not arbitrage"
             );
+            arb_two_hop_rejected_inc(ArbTwoHopRejectReason::NativeSol);
             return None;
         }
 
@@ -393,6 +482,7 @@ impl TokenArbTracker {
                 sell_dex = %sell_pool.dex,
                 "Arb check rejected: spread too large (likely data error)"
             );
+            arb_two_hop_rejected_inc(ArbTwoHopRejectReason::SpreadTooLarge);
             return None;
         }
 
@@ -407,6 +497,7 @@ impl TokenArbTracker {
                 min_spread = config.min_spread_bps,
                 "Arb check rejected: spread below minimum"
             );
+            arb_two_hop_rejected_inc(ArbTwoHopRejectReason::SpreadBelowMin);
             return None;
         }
 
@@ -433,25 +524,27 @@ impl TokenArbTracker {
         // Net profit after tx costs
         let net_profit = gross_profit_lamports.saturating_sub(config.est_tx_cost_lamports);
 
-        // LIQUIDITY VALIDATION: For trade-discovered pools (liquidity=0), require higher profit threshold
-        // This compensates for unknown actual liquidity and reduces risk
-        let effective_min_profit = if buy_pool.liquidity_sol <= Decimal::ZERO
-            || sell_pool.liquidity_sol <= Decimal::ZERO
-        {
-            // Require 5x normal profit for unknown liquidity pools
+        // 5× profit penalty only when BOTH sides lack Geyser reserve data and SOL liquidity
+        let buy_liquidity_unknown =
+            !buy_pool.has_reserve_data && buy_pool.liquidity_sol <= Decimal::ZERO;
+        let sell_liquidity_unknown =
+            !sell_pool.has_reserve_data && sell_pool.liquidity_sol <= Decimal::ZERO;
+        let effective_min_profit = if buy_liquidity_unknown && sell_liquidity_unknown {
             config.min_profit_lamports * 5
         } else {
             config.min_profit_lamports
         };
 
-        if buy_pool.liquidity_sol <= Decimal::ZERO || sell_pool.liquidity_sol <= Decimal::ZERO {
+        if buy_liquidity_unknown || sell_liquidity_unknown {
             debug!(
                 mint = %self.base_mint,
                 buy_liquidity = %buy_pool.liquidity_sol,
                 sell_liquidity = %sell_pool.liquidity_sol,
+                buy_reserve = buy_pool.has_reserve_data,
+                sell_reserve = sell_pool.has_reserve_data,
                 net_profit = net_profit,
                 required_profit = effective_min_profit,
-                "Using higher profit threshold for unknown liquidity pools"
+                "Profit threshold (5× only when both sides lack reserve/liquidity data)"
             );
         }
 
@@ -466,12 +559,15 @@ impl TokenArbTracker {
                 net_profit = net_profit,
                 min_profit = config.min_profit_lamports,
                 effective_min_profit = effective_min_profit,
-                buy_liquidity_known = buy_pool.liquidity_sol > Decimal::ZERO,
-                sell_liquidity_known = sell_pool.liquidity_sol > Decimal::ZERO,
+                buy_liquidity_known = !buy_liquidity_unknown,
+                sell_liquidity_known = !sell_liquidity_unknown,
                 "Arb check rejected: profit below minimum"
             );
+            arb_two_hop_rejected_inc(ArbTwoHopRejectReason::ProfitBelowMin);
             return None;
         }
+
+        arb_two_hop_opportunity_inc();
 
         let trade_amount_lamports = (max_trade_sol * Decimal::from(1_000_000_000u64))
             .to_string()
@@ -933,13 +1029,16 @@ impl ArbContext {
             pool_address: pool_address.to_string(),
             dex: dex.to_string(),
             last_price: None,
+            trade_price_buy: None,
+            trade_price_sell: None,
             liquidity_sol,
+            has_reserve_data: false,
             last_update: Instant::now(),
             trade_count: 0,
             dex_accounts: None, // Will be filled by DexPoolAccounts event
         };
 
-        let is_new = !tracker.pools_by_dex.contains_key(dex);
+        let is_new = !tracker.pools.contains_key(pool_address);
         tracker.upsert_pool(pool_state);
 
         if is_new {
@@ -949,7 +1048,7 @@ impl ArbContext {
                 dex = %dex,
                 pool = %pool_address,
                 liquidity = %liquidity_sol,
-                dexes = tracker.pools_by_dex.len(),
+                pools = tracker.pools.len(),
                 "Pool added to arb tracker"
             );
         }
@@ -1071,6 +1170,23 @@ impl ArbContext {
                 slot = update_slot,
                 "Vault balances updated"
             );
+        }
+
+        // Mirror SOL liquidity + reserve flag into per-mint pool trackers (Geyser-only, no RPC)
+        let liquidity_sol = Decimal::from(reserve_quote) / Decimal::from(1_000_000_000u64);
+        let mut trackers = self.trackers.write();
+        for tracker in trackers.values_mut() {
+            if let Some(pool) = tracker.pools.get_mut(pool_address) {
+                pool.liquidity_sol = liquidity_sol;
+                pool.has_reserve_data = reserve_base > 0 && reserve_quote > 0;
+                pool.last_update = Instant::now();
+                let token_decimals = tracker.token_decimals.unwrap_or(6);
+                if let Some(mid) =
+                    reserve_mid_sol_per_token(reserve_base, reserve_quote, token_decimals)
+                {
+                    pool.last_price = Some(mid);
+                }
+            }
         }
     }
 
@@ -1388,7 +1504,7 @@ impl ArbContext {
         sol_amount: u64,
         token_amount: u64,
         token_decimals: u8,
-        _is_buy: bool,
+        is_buy: bool,
         dex: &str,
     ) -> Option<ArbOpportunity> {
         // CRITICAL: Only track SOL-quoted pools for price comparison.
@@ -1428,11 +1544,7 @@ impl ArbContext {
             return None;
         }
 
-        // Calculate price: SOL per token
-        let sol_dec = Decimal::from(sol_amount) / Decimal::from(1_000_000_000u64);
-        let token_divisor = 10u64.pow(token_decimals as u32);
-        let token_dec = Decimal::from(token_amount) / Decimal::from(token_divisor);
-        let price = sol_dec / token_dec;
+        let price = trade_implied_sol_per_token(sol_amount, token_amount, token_decimals);
 
         info!(
             pool = %pool_address,
@@ -1440,8 +1552,9 @@ impl ArbContext {
             sol_amount = sol_amount,
             token_amount = token_amount,
             token_decimals = token_decimals,
+            is_buy = is_buy,
             price = %price,
-            "Price calculated from trade"
+            "Trade-implied SOL per token"
         );
 
         let config = self.config.read().clone();
@@ -1452,55 +1565,61 @@ impl ArbContext {
             info!(mint = %mint, "Creating tracker from Trade event (no PoolCreated)");
             TokenArbTracker {
                 base_mint: mint.to_string(),
-                pools_by_dex: HashMap::new(),
+                pools: HashMap::new(),
                 pool_accounts: HashMap::new(),
                 token_program: None,
+                token_decimals: None,
                 last_intent_time: None,
             }
         });
 
-        // Find or create pool for this pool_address
-        // Prefer updating a pool we already know (from PoolCreated) by matching pool_address.
-        let existing_dex_key = tracker
-            .pools_by_dex
-            .iter()
-            .find(|(_, p)| p.pool_address == pool_address)
-            .map(|(k, _)| k.clone());
+        tracker.token_decimals = Some(token_decimals);
 
-        let pool = if let Some(dex_key) = existing_dex_key {
-            tracker
-                .pools_by_dex
-                .get_mut(&dex_key)
-                .expect("dex_key must exist")
+        let effective_dex = if !dex.is_empty() && dex != "unknown" {
+            dex.to_string()
         } else {
-            // Use the DEX from the Trade event. If empty/unknown, use pool_address as key.
-            let effective_dex = if !dex.is_empty() && dex != "unknown" {
-                dex.to_string()
-            } else {
-                pool_address.to_string()
-            };
-            tracker
-                .pools_by_dex
-                .entry(effective_dex.clone())
-                .or_insert_with(|| {
-                    info!(pool = %pool_address, mint = %mint, dex = %effective_dex, "Creating pool from Trade event");
-                    PoolState {
-                        pool_address: pool_address.to_string(),
-                        dex: effective_dex,
-                        liquidity_sol: Decimal::ZERO, // Unknown liquidity
-                        last_price: None,
-                        trade_count: 0,
-                        last_update: Instant::now(),
-                        dex_accounts: None, // Will be filled by DexPoolAccounts event
-                    }
-                })
+            pool_address.to_string()
         };
 
-        // Update price
-        pool.last_price = Some(price);
+        let pool = tracker
+            .pools
+            .entry(pool_address.to_string())
+            .or_insert_with(|| {
+                info!(pool = %pool_address, mint = %mint, dex = %effective_dex, "Creating pool from Trade event");
+                PoolState {
+                    pool_address: pool_address.to_string(),
+                    dex: effective_dex.clone(),
+                    liquidity_sol: Decimal::ZERO,
+                    has_reserve_data: false,
+                    last_price: None,
+                    trade_price_buy: None,
+                    trade_price_sell: None,
+                    trade_count: 0,
+                    last_update: Instant::now(),
+                    dex_accounts: None,
+                }
+            });
+
+        if is_buy {
+            pool.trade_price_buy = Some(price);
+        } else {
+            pool.trade_price_sell = Some(price);
+        }
+        let vault_reserves = self
+            .vault_balances
+            .read()
+            .get(pool_address)
+            .map(|c| (c.reserve_base, c.reserve_quote));
+        pool.last_price = comparable_price_sol_per_token(pool, vault_reserves, token_decimals);
         pool.trade_count += 1;
         pool.last_update = Instant::now();
-        info!(pool = %pool_address, mint = %mint, dex = %pool.dex, price = %price, "Pool price updated");
+        info!(
+            pool = %pool_address,
+            mint = %mint,
+            dex = %pool.dex,
+            comparable_price = ?pool.last_price,
+            "Pool comparable price updated"
+        );
 
         // Global Geyser connection health check (replaces per-pool staleness)
         // If no MarketEvents received for 30s, connection is broken - don't trade
@@ -1515,7 +1634,8 @@ impl ArbContext {
 
         // Check for arbitrage opportunity (with known_pools filter)
         let known_pools = self.known_pools.read();
-        if let Some(opp) = tracker.check_arbitrage(&config, &known_pools) {
+        let vault_balances = self.vault_balances.read();
+        if let Some(opp) = tracker.check_arbitrage(&config, &known_pools, &vault_balances) {
             // Check cooldown
             let cooldown = Duration::from_millis(config.intent_cooldown_ms);
             if let Some(last_time) = tracker.last_intent_time {
@@ -2362,8 +2482,9 @@ async fn main() -> Result<()> {
             _ = heartbeat_interval.tick() => {
                 let (records, bytes) = ctx.jsonl_writer.stats();
                 let trackers = ctx.trackers.read();
-                let multi_dex_tokens = trackers.values()
-                    .filter(|t| t.pools_by_dex.len() >= 2)
+                let multi_dex_tokens = trackers
+                    .values()
+                    .filter(|t| t.pool_count_on_distinct_dexes() >= 2)
                     .count();
 
                 let known_pools_count = ctx.known_pools.read().len();
@@ -2611,6 +2732,97 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
         }
 
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod two_hop_price_tests {
+    use super::*;
+    use rust_decimal::Decimal;
+    use std::time::Instant;
+
+    fn sample_pool(
+        dex: &str,
+        addr: &str,
+        buy: Option<Decimal>,
+        sell: Option<Decimal>,
+    ) -> PoolState {
+        PoolState {
+            pool_address: addr.to_string(),
+            dex: dex.to_string(),
+            last_price: None,
+            trade_price_buy: buy,
+            trade_price_sell: sell,
+            liquidity_sol: Decimal::ZERO,
+            has_reserve_data: false,
+            last_update: Instant::now(),
+            trade_count: 1,
+            dex_accounts: None,
+        }
+    }
+
+    #[test]
+    fn same_reserve_mid_on_two_dexes_yields_near_zero_spread() {
+        // 1 SOL : 1M tokens @ 6 decimals → 1e-3 SOL per token
+        let reserves = (1_000_000_000_000u64, 1_000_000_000u64); // 1e6 tokens, 1 SOL
+        let mid = reserve_mid_sol_per_token(reserves.0, reserves.1, 6).unwrap();
+        let pool_a = sample_pool("meteora_dlmm", "poolA", None, None);
+        let pool_b = sample_pool("pump_amm", "poolB", None, None);
+        let p_a = comparable_price_sol_per_token(&pool_a, Some(reserves), 6).unwrap();
+        let p_b = comparable_price_sol_per_token(&pool_b, Some(reserves), 6).unwrap();
+        assert_eq!(p_a, mid);
+        assert_eq!(p_b, mid);
+        let spread_bps = ((p_b - p_a) / p_a * Decimal::from(10000))
+            .round()
+            .to_i64()
+            .unwrap();
+        assert_eq!(spread_bps, 0);
+    }
+
+    #[test]
+    fn buy_vs_sell_trade_mid_avoids_huge_artificial_spread() {
+        let buy_price = trade_implied_sol_per_token(2_000_000_000, 1_000_000_000_000, 6); // 2 SOL / 1M tok
+        let sell_price = trade_implied_sol_per_token(500_000_000, 1_000_000_000_000, 6); // 0.5 SOL / 1M tok
+        let pool = sample_pool("orca", "poolO", Some(buy_price), Some(sell_price));
+        let mid = comparable_price_sol_per_token(&pool, None, 6).unwrap();
+        let naive_buy_only = buy_price;
+        let naive_sell_only = sell_price;
+        let naive_spread_bps = ((naive_buy_only - naive_sell_only) / naive_sell_only
+            * Decimal::from(10000))
+        .round()
+        .to_i64()
+        .unwrap();
+        let mid_spread_bps = ((mid - mid) / mid * Decimal::from(10000))
+            .round()
+            .to_i64()
+            .unwrap();
+        assert!(
+            naive_spread_bps > 1000,
+            "unnormalized buy/sell should look like data error"
+        );
+        assert_eq!(mid_spread_bps, 0);
+    }
+
+    #[test]
+    fn liquidity_penalty_only_when_both_sides_lack_reserve_and_liquidity() {
+        let buy_pool = PoolState {
+            has_reserve_data: true,
+            liquidity_sol: Decimal::ONE,
+            ..sample_pool("meteora_dlmm", "poolBuy", None, None)
+        };
+        let sell_pool = PoolState {
+            has_reserve_data: false,
+            liquidity_sol: Decimal::ZERO,
+            ..sample_pool("pump_amm", "poolSell", None, None)
+        };
+        let buy_unknown = !buy_pool.has_reserve_data && buy_pool.liquidity_sol <= Decimal::ZERO;
+        let sell_unknown = !sell_pool.has_reserve_data && sell_pool.liquidity_sol <= Decimal::ZERO;
+        assert!(!buy_unknown);
+        assert!(sell_unknown);
+        assert!(
+            !(buy_unknown && sell_unknown),
+            "5× min-profit must not apply when at least one side has Geyser reserves"
+        );
     }
 }
 

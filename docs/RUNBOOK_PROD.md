@@ -419,6 +419,27 @@ Für lokale UI-Entwicklung mit SSH-Tunnel zum Server:
 
 Siehe `.github/copilot-instructions.md` für Details.
 
+## 2-Hop Cross-DEX (arb-strategy)
+
+Nach `two_hop_enabled=true` (Control Plane / UI) liefert **arb-strategy** (Port 9803) Prometheus-Metriken für Debug und Prod-Gate:
+
+```bash
+curl -s http://127.0.0.1:9803/metrics | grep arb_two_hop
+```
+
+| Metrik | Bedeutung |
+|--------|-----------|
+| `arb_two_hop_opportunities_total` | Spread + Profit-Filter bestanden (vor Intent-Build) |
+| `arb_two_hop_rejected_total{reason="spread_too_large"}` | Vergleichbare Preise wahrscheinlich inkonsistent (>10% bps, bzw. 2% Stable) |
+| `arb_two_hop_rejected_total{reason="spread_below_min"}` | Spread unter `min_spread_bps` |
+| `arb_two_hop_rejected_total{reason="profit_below_min"}` | Geschätzter Netto-Profit unter Schwellwert |
+| `arb_two_hop_rejected_total{reason="stale_price"}` | Pool-Preis älter als 30s |
+| `arb_two_hop_rejected_total{reason="insufficient_pools"}` | Weniger als 2 Pools mit vergleichbarem Preis (MASTER cache) |
+
+**Erwartung nach Preis-Fix:** `spread_too_large` sinkt stark; `opportunities_total` oder plausible `profit_below_min` (mit bekannter Liquidität auf mindestens einer Seite) steigen.
+
+Logs: `journalctl -u arb-strategy | grep "Arb check rejected"`
+
 ## Siehe auch
 
 - [Iron_crab-eval/docs/spec/](https://github.com/Exploratorsclub/Iron_crab-eval) — Spezifikation (TARGET_ARCHITECTURE, ROLE_SEPARATION, DEFINITION_OF_DONE, STORAGE_CONVENTIONS)
