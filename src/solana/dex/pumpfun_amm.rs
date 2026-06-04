@@ -9465,11 +9465,18 @@ mod tests {
         let num_unsigned = account_keys.len().saturating_sub(num_req);
         let num_writable_unsigned = num_unsigned.saturating_sub(num_ro_unsigned);
         let mut key_writable = vec![false; account_keys.len()];
-        for i in 0..num_req.saturating_sub(num_ro_signed) {
-            key_writable[i] = true;
+        for item in key_writable
+            .iter_mut()
+            .take(num_req.saturating_sub(num_ro_signed))
+        {
+            *item = true;
         }
-        for i in 0..num_writable_unsigned {
-            key_writable[num_req + i] = true;
+        for item in key_writable
+            .iter_mut()
+            .skip(num_req)
+            .take(num_writable_unsigned)
+        {
+            *item = true;
         }
 
         let sell_disc = pump_amm_sell_ix_discriminator();
