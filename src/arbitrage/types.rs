@@ -143,7 +143,7 @@ pub struct RankedPool {
 impl RankedPool {
     /// Combined score for ranking (profit × liquidity_factor)
     pub fn combined_score(&self) -> f64 {
-        self.edge_ratio * self.liquidity_score
+        clamp_edge_ratio(self.edge_ratio) * self.liquidity_score
     }
 }
 

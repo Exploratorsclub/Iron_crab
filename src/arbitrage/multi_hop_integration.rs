@@ -188,6 +188,23 @@ impl QuoteProvider for CachedQuoteProvider {
             .get(&(*pool_address, *input_mint, *output_mint))
             .is_some_and(|(_, ts)| ts.elapsed() < self.cache_ttl)
     }
+
+    fn get_cached_probe_quote(
+        &self,
+        pool_address: &Pubkey,
+        _dex: DexType,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+        amount_in: u64,
+    ) -> Option<u64> {
+        let cache = self.cache.read();
+        let (cached_output, ts) = cache.get(&(*pool_address, *input_mint, *output_mint))?;
+        if ts.elapsed() >= self.cache_ttl {
+            return None;
+        }
+        let probe = 10_000_000u64;
+        Some((*cached_output as u128 * amount_in as u128 / probe as u128) as u64)
+    }
 }
 
 /// Token search state for cooldown tracking
@@ -681,6 +698,17 @@ impl QuoteProvider for Arc<CachedQuoteProvider> {
         output_mint: &Pubkey,
     ) -> bool {
         (**self).has_cached_quote(pool_address, input_mint, output_mint)
+    }
+
+    fn get_cached_probe_quote(
+        &self,
+        pool_address: &Pubkey,
+        dex: DexType,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+        amount_in: u64,
+    ) -> Option<u64> {
+        (**self).get_cached_probe_quote(pool_address, dex, input_mint, output_mint, amount_in)
     }
 }
 

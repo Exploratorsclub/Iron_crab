@@ -76,6 +76,22 @@ pub trait QuoteProvider: Send + Sync {
     ) -> bool {
         true
     }
+
+    /// Fresh cached probe quote, or `None` if missing/stale.
+    /// Default uses separate cache checks (fine for mocks); TTL caches should override.
+    fn get_cached_probe_quote(
+        &self,
+        pool_address: &Pubkey,
+        dex: DexType,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+        amount_in: u64,
+    ) -> Option<u64> {
+        if !self.has_cached_quote(pool_address, input_mint, output_mint) {
+            return None;
+        }
+        self.get_quote(pool_address, dex, input_mint, output_mint, amount_in)
+    }
 }
 
 /// Pool ranker that pre-computes edge ratios using probe quotes
@@ -121,7 +137,7 @@ impl<Q: QuoteProvider> PoolRanker<Q> {
             for edge in pools {
                 if let Some(ranked) = self.rank_single_pool(&edge, input_mint, &output_mint) {
                     // Track max edge ratio for upper bound pruning
-                    max_edge_updates.push((*input_mint, ranked.edge_ratio));
+                    max_edge_updates.push((*input_mint, clamp_edge_ratio(ranked.edge_ratio)));
                     ranked_pools.push(ranked);
                 }
             }
@@ -160,26 +176,19 @@ impl<Q: QuoteProvider> PoolRanker<Q> {
         input_mint: &Pubkey,
         output_mint: &Pubkey,
     ) -> Option<RankedPool> {
-        if !self
-            .quote_provider
-            .has_cached_quote(&edge.pool_address, input_mint, output_mint)
-        {
-            crate::metrics::multi_hop_hop_missing_quote_inc();
-            return None;
-        }
-
-        // Get probe quote
-        let quote_out = self.quote_provider.get_quote(
+        let Some(quote_out) = self.quote_provider.get_cached_probe_quote(
             &edge.pool_address,
             edge.dex,
             input_mint,
             output_mint,
             self.config.probe_amount,
-        )?;
+        ) else {
+            crate::metrics::multi_hop_hop_missing_quote_inc();
+            return None;
+        };
 
-        // Edge ratio = output / input (accounts for fees & curve), then sanity clamp
-        let raw_ratio = quote_out as f64 / self.config.probe_amount as f64;
-        let edge_ratio = clamp_edge_ratio(raw_ratio);
+        // Edge ratio = output / input (accounts for fees & curve); clamp in beam expand
+        let edge_ratio = quote_out as f64 / self.config.probe_amount as f64;
 
         // Dampened liquidity score (clamped, NOT sqrt!)
         // From external review: clamp(liquidity/baseline, 0.3, 1.5)
