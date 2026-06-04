@@ -20,6 +20,42 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 
+/// Size/record caps for same-day JSONL segments (P172: execution_results only).
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentRotationLimits {
+    /// Rotate when current segment file size reaches this (bytes). 0 = disabled.
+    pub max_bytes: u64,
+    /// Rotate when this many records were written to the current segment. 0 = disabled.
+    pub max_records: u64,
+}
+
+impl SegmentRotationLimits {
+    /// Defaults: 32 MiB and 50_000 records (`IRONCRAB_EXEC_JSONL_SEGMENT_MAX_*` env).
+    pub fn execution_results_from_env() -> Self {
+        let max_mb: u64 = std::env::var("IRONCRAB_EXEC_JSONL_SEGMENT_MAX_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32);
+        let max_records: u64 = std::env::var("IRONCRAB_EXEC_JSONL_SEGMENT_MAX_RECORDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50_000);
+        Self {
+            max_bytes: max_mb.saturating_mul(1024 * 1024),
+            max_records,
+        }
+    }
+
+    fn should_rotate(&self, segment_bytes: u64, segment_records: u64) -> bool {
+        (self.max_bytes > 0 && segment_bytes >= self.max_bytes)
+            || (self.max_records > 0 && segment_records >= self.max_records)
+    }
+
+    fn file_exceeds_cap(&self, file_len: u64) -> bool {
+        self.max_bytes > 0 && file_len >= self.max_bytes
+    }
+}
+
 /// Configuration for JSONL writer
 ///
 /// All defaults documented (DoD K) P0: No hidden defaults).
@@ -33,6 +69,8 @@ pub struct JsonlWriterConfig {
     pub buffer_size: usize,
     /// Flush after each write (safer but slower). Default: false
     pub flush_each_write: bool,
+    /// Same-day segment rotation when file grows too large (optional; P172 execution_results).
+    pub segment_rotation: Option<SegmentRotationLimits>,
 }
 
 impl Default for JsonlWriterConfig {
@@ -44,6 +82,7 @@ impl Default for JsonlWriterConfig {
             prefix: "records".to_string(),
             buffer_size: 8192,       // 8KB buffer
             flush_each_write: false, // batch writes for performance
+            segment_rotation: None,
         }
     }
 }
@@ -65,6 +104,41 @@ impl JsonlWriterConfig {
         self.flush_each_write = flush;
         self
     }
+
+    /// Enable same-day segment files `{prefix}-YYYYMMDD.jsonl`, `.2.jsonl`, … when caps are hit.
+    pub fn with_segment_rotation(mut self, limits: SegmentRotationLimits) -> Self {
+        self.segment_rotation = Some(limits);
+        self
+    }
+}
+
+fn segment_filename(prefix: &str, date: &str, segment_index: u32) -> String {
+    if segment_index <= 1 {
+        format!("{prefix}-{date}.jsonl")
+    } else {
+        format!("{prefix}-{date}.{segment_index}.jsonl")
+    }
+}
+
+fn resolve_append_segment(
+    log_dir: &Path,
+    prefix: &str,
+    date: &str,
+    limits: &SegmentRotationLimits,
+) -> u32 {
+    let mut idx = 1u32;
+    loop {
+        let path = log_dir.join(segment_filename(prefix, date, idx));
+        if !path.exists() {
+            return idx;
+        }
+        let len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if limits.file_exceeds_cap(len) {
+            idx += 1;
+            continue;
+        }
+        return idx;
+    }
 }
 
 /// Thread-safe append-only JSONL writer with daily rotation
@@ -77,6 +151,9 @@ struct WriterState {
     writer: Option<BufWriter<File>>,
     current_date: Option<String>,
     current_path: Option<PathBuf>,
+    segment_index: u32,
+    segment_records: u64,
+    segment_bytes: u64,
     records_written: u64,
     bytes_written: u64,
 }
@@ -93,6 +170,9 @@ impl JsonlWriter {
                 writer: None,
                 current_date: None,
                 current_path: None,
+                segment_index: 1,
+                segment_records: 0,
+                segment_bytes: 0,
                 records_written: 0,
                 bytes_written: 0,
             }),
@@ -117,7 +197,7 @@ impl JsonlWriter {
 
         let today = Utc::now().format("%Y%m%d").to_string();
         if state.current_date.as_ref() != Some(&today) {
-            self.rotate_locked(&mut state, &today)?;
+            self.open_day_locked(&mut state, &today)?;
         }
 
         if let Some(writer) = state.writer.as_mut() {
@@ -129,8 +209,17 @@ impl JsonlWriter {
                 writer.flush()?;
             }
         }
+        let line_len = json.len() as u64 + 1;
         state.records_written += 1;
-        state.bytes_written += json.len() as u64 + 1;
+        state.bytes_written += line_len;
+        state.segment_records += 1;
+        state.segment_bytes += line_len;
+
+        if let Some(limits) = self.config.segment_rotation {
+            if limits.should_rotate(state.segment_bytes, state.segment_records) {
+                self.rotate_segment_locked(&mut state, &today)?;
+            }
+        }
 
         Ok(())
     }
@@ -165,25 +254,56 @@ impl JsonlWriter {
         (state.records_written, state.bytes_written)
     }
 
-    fn rotate_locked(&self, state: &mut WriterState, date: &str) -> std::io::Result<()> {
+    fn open_day_locked(&self, state: &mut WriterState, date: &str) -> std::io::Result<()> {
         if let Some(mut writer) = state.writer.take() {
             writer.flush()?;
         }
 
-        let filename = format!("{}-{}.jsonl", self.config.prefix, date);
+        state.segment_index = if let Some(limits) = self.config.segment_rotation {
+            resolve_append_segment(&self.config.log_dir, &self.config.prefix, date, &limits)
+        } else {
+            1
+        };
+        state.segment_records = 0;
+        state.segment_bytes = 0;
+        self.open_segment_locked(state, date, state.segment_index)
+    }
+
+    fn rotate_segment_locked(&self, state: &mut WriterState, date: &str) -> std::io::Result<()> {
+        if let Some(mut writer) = state.writer.take() {
+            writer.flush()?;
+        }
+        state.segment_index = state.segment_index.saturating_add(1);
+        state.segment_records = 0;
+        state.segment_bytes = 0;
+        self.open_segment_locked(state, date, state.segment_index)
+    }
+
+    fn open_segment_locked(
+        &self,
+        state: &mut WriterState,
+        date: &str,
+        segment_index: u32,
+    ) -> std::io::Result<()> {
+        let filename = segment_filename(&self.config.prefix, date, segment_index);
         let path = self.config.log_dir.join(&filename);
 
         debug!(
             prefix = %self.config.prefix,
             path = %path.display(),
-            "Rotating JSONL writer to new file"
+            segment_index,
+            "Opening JSONL segment"
         );
 
+        let existing_len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         state.writer = Some(BufWriter::with_capacity(self.config.buffer_size, file));
         state.current_date = Some(date.to_string());
         state.current_path = Some(path);
+        state.segment_index = segment_index;
+        state.segment_bytes = existing_len;
+        // segment_records stays 0 on reopen; byte cap still protects across restarts.
 
         Ok(())
     }
@@ -522,6 +642,44 @@ mod tests {
             size_after_write > 0,
             "dev/test build: write() must flush for test harness disk visibility"
         );
+    }
+
+    #[test]
+    fn test_execution_results_segment_rotation_by_record_cap() {
+        let dir = tempdir().unwrap();
+        let limits = SegmentRotationLimits {
+            max_bytes: 0,
+            max_records: 3,
+        };
+        let config = JsonlWriterConfig::new("execution_results")
+            .with_log_dir(dir.path())
+            .with_flush_each_write(true)
+            .with_segment_rotation(limits);
+
+        let writer = JsonlWriter::new(config).unwrap();
+        for i in 0..5 {
+            writer
+                .write(&TestRecord {
+                    id: format!("r{i}"),
+                    value: i,
+                })
+                .unwrap();
+        }
+        writer.flush().unwrap();
+
+        let today = Utc::now().format("%Y%m%d").to_string();
+        let seg1 = dir.path().join(format!("execution_results-{today}.jsonl"));
+        let seg2 = dir
+            .path()
+            .join(format!("execution_results-{today}.2.jsonl"));
+        assert!(seg1.exists());
+        assert!(seg2.exists());
+        let content1 = fs::read_to_string(&seg1).unwrap();
+        let content2 = fs::read_to_string(&seg2).unwrap();
+        let lines1: Vec<_> = content1.lines().collect();
+        let lines2: Vec<_> = content2.lines().collect();
+        assert_eq!(lines1.len(), 3);
+        assert_eq!(lines2.len(), 2);
     }
 
     #[test]

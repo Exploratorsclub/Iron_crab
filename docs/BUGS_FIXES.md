@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### P172-TRADES-SERVER-TAIL-JSONL-SEGMENTS: Grafana Timeout on Large execution_results JSONL
+**Datum**: 2026-06-04  
+**Problem** (Prod `ironcrab-prod`): `trades-server` active but `:9899` timed out — single-threaded HTTP blocked on `/pnl_24h` full-file scan. `execution_results-20260604.jsonl` ~103k lines / 109 MB; `load_all_trades([0,1,2])` read every line of three days (~540k lines). Dashboard empty while WORLDCUP-Sell was in logs.  
+**Root Cause**: Daily UTC filename rotation only; no size cap on active segment. `trades_server.py` used `for line in f` (O(n) per file). `metrics.rs` `read_trades_from_jsonl` loaded all lines into `Vec` before tail (unchanged in P172; Python path fixed).  
+**Fix**: (1) `trades_server`: `_iter_jsonl_tail` (reverse chunk read), `IRONCRAB_TRADES_JSONL_TAIL_LINES` default 15000; lookback `[0]` limit / `[0,1]` run+pnl. (2) `JsonlWriter` optional same-day segments for `execution_results` only (default 32 MiB / 50k records → `.2.jsonl`, …). (3) trades_server reads all segments per day with tail per segment.  
+**Dateien**: `scripts/trades_server.py`, `src/storage/jsonl_writer.rs`, `src/bin/execution_engine.rs`, `docs/BUGS_FIXES.md`, `docs/RUNBOOK_PROD.md`
+
 ### P171-TRADES-SERVER-DUPES-UTC-BLOCKTIME: Grafana Duplicate Recent Trades + UTC Date Split
 **Datum**: 2026-05-31  
 **Problem** (Prod `142be782`, Grafana „Recent Trades (Current Run)“): doppelte Zeilen pro `tx_hash` — eine mit leerem `run_id`/null `reason`, eine vollständig; `:9899/trades?mode=run` zeigte 19 Dupes bei ~26 Trades.  

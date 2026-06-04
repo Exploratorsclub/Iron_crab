@@ -117,7 +117,7 @@ use ironcrab::solana::token_utils::get_token_decimals_or_default;
 use ironcrab::solana::tx_sender::TxSender;
 use ironcrab::storage::{
     locks::{LockHolder, LockManager, LockResult, ResourceType},
-    JsonlWriter, JsonlWriterConfig,
+    JsonlWriter, JsonlWriterConfig, SegmentRotationLimits,
 };
 use ironcrab::wallet::Treasury;
 use parking_lot::Mutex as ParkingMutex;
@@ -6714,9 +6714,11 @@ async fn main() -> Result<()> {
         .with_flush_each_write(true);
     let decision_writer = JsonlWriter::new(decision_config)?;
 
+    // P172: same-day segment rotation so a single UTC file cannot grow unbounded (Grafana tail-read).
     let execution_config = JsonlWriterConfig::new("execution_results")
         .with_log_dir(log_base.join("executions"))
-        .with_flush_each_write(true);
+        .with_flush_each_write(true)
+        .with_segment_rotation(SegmentRotationLimits::execution_results_from_env());
     let execution_writer = JsonlWriter::new(execution_config)?;
 
     let burn_config = JsonlWriterConfig::new("burn_ops").with_log_dir(log_base.join("burns"));

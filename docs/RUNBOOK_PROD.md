@@ -145,6 +145,20 @@ journalctl -u execution-engine -n 100 --no-pager
 | execution-engine Metrics | `http://localhost:9804/metrics` | Prometheus |
 | Control Plane API | `http://localhost:8080` | REST API |
 | Trades API | `http://localhost:9899/trades` | Grafana Infinity |
+| Trades health | `http://localhost:9899/health` | Liveness (should stay fast under load; P172 tail-read) |
+
+### trades-server / execution_results JSONL (P172)
+
+`trades-server` tail-reads JSONL (default last **15000** non-empty lines per file). Env on the service unit:
+
+| Variable | Default | Zweck |
+|----------|---------|--------|
+| `IRONCRAB_TRADES_JSONL_TAIL_LINES` | `15000` | Max lines scanned per JSONL file |
+| `IRONCRAB_TRADES_DAYS_LOOKBACK` | (unset) | Override `0` / `0,1` — else limit=`[0]`, run+pnl=`[0,1]` |
+
+`execution-engine` segments same-day `execution_results` when a segment exceeds **32 MiB** or **50_000** records (env `IRONCRAB_EXEC_JSONL_SEGMENT_MAX_MB`, `IRONCRAB_EXEC_JSONL_SEGMENT_MAX_RECORDS`). Files: `execution_results-YYYYMMDD.jsonl`, `.2.jsonl`, … Forensic archives under `trade_logs/executions/` are not trimmed by rotation.
+
+Smoke after deploy: `time curl -s http://127.0.0.1:9899/trades?mode=run | jq length` and `curl -s http://127.0.0.1:9899/health`.
 
 ### Geyser / market-data Metriken (PR #143)
 
