@@ -2313,6 +2313,48 @@ pub fn arb_two_hop_rejected_inc(reason: ArbTwoHopRejectReason) {
 pub fn arb_two_hop_opportunity_inc() {
     ARB_TWO_HOP_OPPORTUNITIES.fetch_add(1, Ordering::Relaxed);
 }
+
+// --- Multi-hop shadow / cycle sanity (arb-strategy) ---
+pub static MULTI_HOP_RETURN_BPS_SATURATED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MULTI_HOP_SHADOW_LOGGED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MULTI_HOP_HOP_MISSING_QUOTE_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MULTI_HOP_CYCLE_REJECTED_SANITY_EDGE_RATIO: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MULTI_HOP_CYCLE_REJECTED_SANITY_PROFIT_CAP: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MULTI_HOP_CYCLE_REJECTED_SANITY_RETURN_BPS_CAP: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Sanity rejection reason for multi-hop cycles (Prometheus label `reason`).
+#[derive(Debug, Clone, Copy)]
+pub enum MultiHopSanityRejectReason {
+    EdgeRatio,
+    ProfitCap,
+    ReturnBpsCap,
+}
+
+pub fn multi_hop_return_bps_saturated_inc() {
+    MULTI_HOP_RETURN_BPS_SATURATED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn multi_hop_shadow_logged_inc() {
+    MULTI_HOP_SHADOW_LOGGED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn multi_hop_hop_missing_quote_inc() {
+    MULTI_HOP_HOP_MISSING_QUOTE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn multi_hop_cycle_rejected_sanity_inc(reason: MultiHopSanityRejectReason) {
+    let counter = match reason {
+        MultiHopSanityRejectReason::EdgeRatio => &*MULTI_HOP_CYCLE_REJECTED_SANITY_EDGE_RATIO,
+        MultiHopSanityRejectReason::ProfitCap => &*MULTI_HOP_CYCLE_REJECTED_SANITY_PROFIT_CAP,
+        MultiHopSanityRejectReason::ReturnBpsCap => {
+            &*MULTI_HOP_CYCLE_REJECTED_SANITY_RETURN_BPS_CAP
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
 pub static QUOTE_LATENCY_TOTAL_NS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Generic cycle search metrics
 pub static CYCLE_PARTIAL_EXAMINED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -3988,6 +4030,39 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("arb_two_hop_rejected_total{reason=\"native_sol\"} ");
     out.push_str(
         &ARB_TWO_HOP_REJECTED_NATIVE_SOL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "multi_hop_return_bps_saturated_total",
+        MULTI_HOP_RETURN_BPS_SATURATED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "multi_hop_shadow_logged_total",
+        MULTI_HOP_SHADOW_LOGGED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "multi_hop_hop_missing_quote_total",
+        MULTI_HOP_HOP_MISSING_QUOTE_TOTAL.load(Ordering::Relaxed)
+    );
+    out.push_str("multi_hop_cycle_rejected_sanity_total{reason=\"edge_ratio\"} ");
+    out.push_str(
+        &MULTI_HOP_CYCLE_REJECTED_SANITY_EDGE_RATIO
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("multi_hop_cycle_rejected_sanity_total{reason=\"profit_cap\"} ");
+    out.push_str(
+        &MULTI_HOP_CYCLE_REJECTED_SANITY_PROFIT_CAP
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("multi_hop_cycle_rejected_sanity_total{reason=\"return_bps_cap\"} ");
+    out.push_str(
+        &MULTI_HOP_CYCLE_REJECTED_SANITY_RETURN_BPS_CAP
             .load(Ordering::Relaxed)
             .to_string(),
     );

@@ -40,7 +40,11 @@ pub use multi_hop_integration::{
 };
 pub use pool_graph::{GraphStats, PoolGraph};
 pub use pool_ranker::{PoolRanker, QuoteProvider, RankerConfig};
-pub use types::{ArbCycle, DexType, ParseDexTypeError, PoolEdge, RankedPool, SearchNode};
+pub use types::{
+    clamp_edge_ratio, profit_to_return_bps, ArbCycle, DexType, ParseDexTypeError, PoolEdge,
+    RankedPool, SearchNode, MAX_CYCLE_PROFIT_MULTIPLIER, MAX_EDGE_RATIO, MAX_RETURN_BPS,
+    MIN_EDGE_RATIO, MIN_RETURN_BPS,
+};
 
 #[cfg(any(test, feature = "test_helpers"))]
 pub use pool_ranker::MockQuoteProvider;

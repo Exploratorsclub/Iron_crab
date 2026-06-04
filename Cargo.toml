@@ -179,3 +179,8 @@ path = "src/bin/burn_manual_keyless.rs"
 name = "manual-swap"
 path = "src/bin/manual_swap.rs"
 
+[[test]]
+name = "multi_hop_sanity"
+path = "tests/multi_hop_sanity.rs"
+required-features = ["test_helpers"]
+

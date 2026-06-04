@@ -143,8 +143,40 @@ pub struct RankedPool {
 impl RankedPool {
     /// Combined score for ranking (profit × liquidity_factor)
     pub fn combined_score(&self) -> f64 {
-        self.edge_ratio * self.liquidity_score
+        clamp_edge_ratio(self.edge_ratio) * self.liquidity_score
     }
+}
+
+/// Maximum profit multiplier during beam search (10× = +900% raw product).
+pub const MAX_CYCLE_PROFIT_MULTIPLIER: f64 = 10.0;
+
+/// Per-hop edge ratio bounds (probe quote output/input). Rejects pathological quotes.
+pub const MIN_EDGE_RATIO: f64 = 0.01;
+pub const MAX_EDGE_RATIO: f64 = 1.05;
+
+/// `estimated_return_bps` clamp: −100% .. +500% (interpretable shadow/live signal).
+pub const MIN_RETURN_BPS: i32 = -10_000;
+pub const MAX_RETURN_BPS: i32 = 50_000;
+
+/// Clamp per-hop edge ratio before multiplying into cumulative profit.
+#[inline]
+pub fn clamp_edge_ratio(edge_ratio: f64) -> f64 {
+    edge_ratio.clamp(MIN_EDGE_RATIO, MAX_EDGE_RATIO)
+}
+
+/// Convert profit multiplier to basis points with saturating clamp.
+/// Returns `(bps, saturated)` where `saturated` means the raw value was outside bounds.
+#[inline]
+pub fn profit_to_return_bps(profit: f64) -> (i32, bool) {
+    let raw = (profit - 1.0) * 10_000.0;
+    if !raw.is_finite() {
+        return (MAX_RETURN_BPS, true);
+    }
+    let saturated = raw < f64::from(MIN_RETURN_BPS) || raw > f64::from(MAX_RETURN_BPS);
+    let bps = raw
+        .round()
+        .clamp(f64::from(MIN_RETURN_BPS), f64::from(MAX_RETURN_BPS)) as i32;
+    (bps, saturated)
 }
 
 /// A found arbitrage cycle with pool alternatives for fallback routing
@@ -155,13 +187,24 @@ pub struct ArbCycle {
     /// Pools for each hop - WITH ALTERNATIVES for execution fallbacks!
     /// pools[hop_idx][0] = Best Pool, pools[hop_idx][1..] = Fallbacks
     pub pools: Vec<Vec<PoolEdge>>,
-    /// Estimated return in basis points (before slippage)
+    /// Estimated return in basis points (before slippage), clamped to [`MIN_RETURN_BPS`, `MAX_RETURN_BPS`]
     pub estimated_return_bps: i32,
     /// Minimum liquidity in the path (USD)
     pub min_liquidity_usd: f64,
+    /// True when cumulative profit hit [`MAX_CYCLE_PROFIT_MULTIPLIER`] during search.
+    pub profit_multiplier_capped: bool,
+    /// True when `estimated_return_bps` required clamping (or profit cap implies untrustworthy ROI).
+    pub return_bps_saturated: bool,
+    /// True when any hop used an edge ratio outside [`MIN_EDGE_RATIO`, `MAX_EDGE_RATIO`].
+    pub edge_ratio_clamped: bool,
 }
 
 impl ArbCycle {
+    /// Profit estimate is safe to compare against `min_profit_bps` / shadow logging.
+    pub fn is_trustworthy_profit_estimate(&self) -> bool {
+        !self.return_bps_saturated && !self.profit_multiplier_capped && !self.edge_ratio_clamped
+    }
+
     /// Number of hops in the cycle
     pub fn hop_count(&self) -> usize {
         self.pools.len()
@@ -199,6 +242,10 @@ pub struct SearchNode {
     pub min_liquidity: f64,
     /// Visited tokens for O(1) lookup (instead of O(n) path.contains)
     pub visited: HashSet<Pubkey>,
+    /// Cumulative profit hit [`MAX_CYCLE_PROFIT_MULTIPLIER`] on at least one expand step.
+    pub profit_multiplier_capped: bool,
+    /// At least one hop used an edge ratio outside sane bounds (after clamp).
+    pub edge_ratio_clamped: bool,
 }
 
 impl SearchNode {
@@ -216,6 +263,8 @@ impl SearchNode {
             depth: 0,
             min_liquidity: f64::MAX,
             visited,
+            profit_multiplier_capped: false,
+            edge_ratio_clamped: false,
         }
     }
 
@@ -234,7 +283,11 @@ impl SearchNode {
         let mut new_pools = self.pools.clone();
         new_pools.push(pool_alternatives);
 
-        let new_profit = self.profit * edge_ratio;
+        let clamped_ratio = clamp_edge_ratio(edge_ratio);
+        let edge_clamped = (clamped_ratio - edge_ratio).abs() > f64::EPSILON;
+        let uncapped_profit = self.profit * clamped_ratio;
+        let profit_hit_cap = uncapped_profit > MAX_CYCLE_PROFIT_MULTIPLIER;
+        let new_profit = uncapped_profit.min(MAX_CYCLE_PROFIT_MULTIPLIER);
         let new_liquidity = self.min_liquidity.min(liquidity_usd);
         let new_score = new_profit * liquidity_score;
 
@@ -250,6 +303,8 @@ impl SearchNode {
             depth: self.depth + 1,
             min_liquidity: new_liquidity,
             visited: new_visited,
+            profit_multiplier_capped: self.profit_multiplier_capped || profit_hit_cap,
+            edge_ratio_clamped: self.edge_ratio_clamped || edge_clamped,
         }
     }
 
@@ -264,13 +319,17 @@ impl SearchNode {
             return None;
         }
 
-        let return_bps = ((self.profit - 1.0) * 10000.0) as i32;
+        let (return_bps, return_saturated) = profit_to_return_bps(self.profit);
+        let return_bps_saturated = return_saturated || self.profit_multiplier_capped;
 
         Some(ArbCycle {
             path: self.path.clone(),
             pools: self.pools.clone(),
             estimated_return_bps: return_bps,
             min_liquidity_usd: self.min_liquidity,
+            profit_multiplier_capped: self.profit_multiplier_capped,
+            return_bps_saturated,
+            edge_ratio_clamped: self.edge_ratio_clamped,
         })
     }
 }
@@ -372,6 +431,60 @@ mod tests {
 
         // Higher score should be "greater" for max-heap
         assert!(node2 > node1);
+    }
+
+    #[test]
+    fn test_profit_overflow_never_returns_i32_max() {
+        let wsol = test_pubkey(0x01);
+        let mut node = SearchNode::start(wsol);
+        // Simulate pathological cumulative profit (would overflow naive cast)
+        node.profit = 1e12;
+        node.path = vec![wsol, test_pubkey(0x02), wsol];
+        node.pools = vec![vec![], vec![]];
+
+        let cycle = node.to_arb_cycle().expect("valid closed path");
+        assert_ne!(cycle.estimated_return_bps, i32::MAX);
+        assert_eq!(cycle.estimated_return_bps, MAX_RETURN_BPS);
+        assert!(cycle.return_bps_saturated);
+        assert!(!cycle.is_trustworthy_profit_estimate());
+    }
+
+    #[test]
+    fn test_extreme_edge_ratio_clamped() {
+        let wsol = test_pubkey(0x01);
+        let token_a = test_pubkey(0x0A);
+        let start = SearchNode::start(wsol);
+        let edge = PoolEdge::new(
+            test_pubkey(0x42),
+            DexType::RaydiumAmmV4,
+            wsol,
+            token_a,
+            5000.0,
+            30,
+        );
+        let expanded = start.expand(token_a, vec![edge], 999.0, 1.0, 5000.0);
+        assert!(expanded.edge_ratio_clamped);
+        assert!((expanded.profit - 1.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_profit_multiplier_cap_after_many_hops() {
+        let wsol = test_pubkey(0x01);
+        let token = test_pubkey(0x0A);
+        let edge = PoolEdge::new(
+            test_pubkey(0x42),
+            DexType::RaydiumAmmV4,
+            wsol,
+            token,
+            5000.0,
+            30,
+        );
+        let mut node = SearchNode::start(wsol);
+        for _ in 0..80 {
+            node = node.expand(token, vec![edge.clone()], 1.05, 1.0, 5000.0);
+        }
+        assert!(node.profit_multiplier_capped);
+        assert!((node.profit - MAX_CYCLE_PROFIT_MULTIPLIER).abs() < f64::EPSILON);
     }
 
     #[test]
