@@ -2262,6 +2262,57 @@ pub static ARB_TRIANGLE_PROFITABLE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::ne
 pub static ARB_TRIANGLE_OPPORTUNITIES: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// Count of arb opportunities rejected due to missing DexPoolAccounts for pump_amm
 pub static ARB_REJECTED_MISSING_ACCOUNTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// 2-hop cross-DEX opportunities that passed all filters in arb-strategy
+pub static ARB_TWO_HOP_OPPORTUNITIES: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// 2-hop reject breakdown (arb-strategy `check_arbitrage`)
+pub static ARB_TWO_HOP_REJECTED_SPREAD_TOO_LARGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECTED_SPREAD_BELOW_MIN: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECTED_PROFIT_BELOW_MIN: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECTED_SAME_DEX: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECTED_PUMPFUN: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECTED_INSUFFICIENT_POOLS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECTED_STALE_PRICE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECTED_NO_COMPARABLE_PRICE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECTED_NATIVE_SOL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// Rejection reason for 2-hop cross-DEX arb checks (Prometheus label `reason`).
+#[derive(Debug, Clone, Copy)]
+pub enum ArbTwoHopRejectReason {
+    SpreadTooLarge,
+    SpreadBelowMin,
+    ProfitBelowMin,
+    SameDex,
+    Pumpfun,
+    InsufficientPools,
+    StalePrice,
+    NoComparablePrice,
+    NativeSol,
+}
+
+/// Increment `arb_two_hop_rejected_total{reason=...}` for the given rejection.
+pub fn arb_two_hop_rejected_inc(reason: ArbTwoHopRejectReason) {
+    let counter = match reason {
+        ArbTwoHopRejectReason::SpreadTooLarge => &*ARB_TWO_HOP_REJECTED_SPREAD_TOO_LARGE,
+        ArbTwoHopRejectReason::SpreadBelowMin => &*ARB_TWO_HOP_REJECTED_SPREAD_BELOW_MIN,
+        ArbTwoHopRejectReason::ProfitBelowMin => &*ARB_TWO_HOP_REJECTED_PROFIT_BELOW_MIN,
+        ArbTwoHopRejectReason::SameDex => &*ARB_TWO_HOP_REJECTED_SAME_DEX,
+        ArbTwoHopRejectReason::Pumpfun => &*ARB_TWO_HOP_REJECTED_PUMPFUN,
+        ArbTwoHopRejectReason::InsufficientPools => &*ARB_TWO_HOP_REJECTED_INSUFFICIENT_POOLS,
+        ArbTwoHopRejectReason::StalePrice => &*ARB_TWO_HOP_REJECTED_STALE_PRICE,
+        ArbTwoHopRejectReason::NoComparablePrice => &*ARB_TWO_HOP_REJECTED_NO_COMPARABLE_PRICE,
+        ArbTwoHopRejectReason::NativeSol => &*ARB_TWO_HOP_REJECTED_NATIVE_SOL,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_two_hop_opportunities_total`.
+pub fn arb_two_hop_opportunity_inc() {
+    ARB_TWO_HOP_OPPORTUNITIES.fetch_add(1, Ordering::Relaxed);
+}
 pub static QUOTE_LATENCY_TOTAL_NS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Generic cycle search metrics
 pub static CYCLE_PARTIAL_EXAMINED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -3874,6 +3925,73 @@ async fn metrics_response() -> Response<Body> {
         "arb_rejected_missing_accounts_total",
         ARB_REJECTED_MISSING_ACCOUNTS.load(Ordering::Relaxed)
     );
+    line!(
+        "arb_two_hop_opportunities_total",
+        ARB_TWO_HOP_OPPORTUNITIES.load(Ordering::Relaxed)
+    );
+    out.push_str("arb_two_hop_rejected_total{reason=\"spread_too_large\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECTED_SPREAD_TOO_LARGE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_rejected_total{reason=\"spread_below_min\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECTED_SPREAD_BELOW_MIN
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_rejected_total{reason=\"profit_below_min\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECTED_PROFIT_BELOW_MIN
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_rejected_total{reason=\"same_dex\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECTED_SAME_DEX
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_rejected_total{reason=\"pumpfun\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECTED_PUMPFUN
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_rejected_total{reason=\"insufficient_pools\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECTED_INSUFFICIENT_POOLS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_rejected_total{reason=\"stale_price\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECTED_STALE_PRICE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_rejected_total{reason=\"no_comparable_price\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECTED_NO_COMPARABLE_PRICE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_rejected_total{reason=\"native_sol\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECTED_NATIVE_SOL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     line!(
         "cycle_partial_examined_total",
         CYCLE_PARTIAL_EXAMINED.load(Ordering::Relaxed)
