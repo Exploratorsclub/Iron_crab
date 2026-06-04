@@ -457,6 +457,20 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                             if new_pump.creator.is_none() && existing_pump.creator.is_some() {
                                 new_pump.creator = existing_pump.creator;
                             }
+                            // Bug #27 / #28: PoolDiscovered with 0/0 or partial reserves must not
+                            // wipe good SLAVE reserves (e.g. FIX-33 trade publish without vault scalars).
+                            let (eb, eq) = (
+                                existing_pump.base_reserve.unwrap_or(0),
+                                existing_pump.quote_reserve.unwrap_or(0),
+                            );
+                            let (nb, nq) = (
+                                new_pump.base_reserve.unwrap_or(0),
+                                new_pump.quote_reserve.unwrap_or(0),
+                            );
+                            let merged_base = if nb > 0 { nb } else { eb };
+                            let merged_quote = if nq > 0 { nq } else { eq };
+                            new_pump.base_reserve = Some(merged_base);
+                            new_pump.quote_reserve = Some(merged_quote);
                         }
                     }
                 }
@@ -1298,6 +1312,67 @@ mod tests {
         assert!(cache
             .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
             .is_some());
+    }
+
+    /// P184m / Bug #28+#27: PoolDiscovered with empty `pool_accounts` and 0/0 reserves must not wipe SLAVE row.
+    #[test]
+    fn test_pump_amm_pool_discovered_empty_accounts_preserves_existing_and_reserves() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        let mut first = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool_market.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            900,
+            2_000,
+            None,
+            1,
+        );
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            "pool_accounts".to_string(),
+            accounts
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        first.metadata = Some(meta);
+        first.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+        assert!(apply_pool_cache_update(&cache, &first));
+
+        let mut second = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool_market.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            0,
+            0,
+            None,
+            2,
+        );
+        second.metadata = Some(std::collections::HashMap::new());
+        assert!(apply_pool_cache_update(&cache, &second));
+
+        let state = cache.get(&pool_market).expect("pool row");
+        let CachedPoolState::PumpAmm(s) = state else {
+            panic!("expected PumpAmm");
+        };
+        assert_eq!(s.pool_accounts.len(), 14);
+        assert_eq!(s.base_reserve, Some(900));
+        assert_eq!(s.quote_reserve, Some(2_000));
+        assert!(cache.pump_amm_quote_ready_by_base_mint(&base_mint));
     }
 
     /// I-24d / legacy JetStream: struct literal with 14 pool_accounts + non-zero reserves, no readiness key.

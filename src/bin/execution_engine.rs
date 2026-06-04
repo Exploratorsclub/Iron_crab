@@ -291,6 +291,36 @@ fn is_regular_momentum_hot_path_sell(intent: &TradeIntent) -> bool {
     true
 }
 
+/// I-24e (P184m): Liquidation / stale-SLAVE PumpSwap discovery must not reuse cache-first MD path.
+#[inline]
+fn pump_amm_liquidation_discovery_force_refresh() -> bool {
+    true
+}
+
+/// P184m / Bug #36: skip hot-path simulation when SLAVE quote is not ready (avoids Custom 6004 storm).
+fn pump_amm_hot_path_quote_not_ready_detail(
+    intent: &TradeIntent,
+    cache: Option<&LivePoolCache>,
+) -> Option<String> {
+    if !is_regular_momentum_hot_path_sell(intent) {
+        return None;
+    }
+    if intent.metadata.get("dex").map(|s| s.as_str()) != Some("pump_amm") {
+        return None;
+    }
+    let base_mint = Pubkey::from_str(&intent.resources.input_mint).ok()?;
+    let ready = cache
+        .map(|c| c.pump_amm_quote_ready_by_base_mint(&base_mint))
+        .unwrap_or(false);
+    if ready {
+        return None;
+    }
+    Some(format!(
+        "quote_not_ready: pump_amm SLAVE missing ready pool_accounts+nonzero reserves for mint {}",
+        intent.resources.input_mint
+    ))
+}
+
 /// Scope-2: dedupe repeated async `EnsurePumpAmmPoolAccounts` publishes for the same base mint
 /// (regular momentum PumpSwap SELL hot path). Static window — no new runtime config in this scope.
 const PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
@@ -2025,6 +2055,63 @@ fn pump_amm_slave_recovery_snapshot(
     ))
 }
 
+/// Structured timeout log for PumpSwap liquidation / cold-path SLAVE wait (P184m).
+fn log_pump_amm_slave_wait_timeout_evidence(
+    mint: &Pubkey,
+    pool: &str,
+    cache: &LivePoolCache,
+    timeout_ms: u64,
+) {
+    let Some(pool_pk) = Pubkey::from_str(pool).ok() else {
+        warn!(
+            mint = %mint,
+            pool = %pool,
+            timeout_ms,
+            "pump_amm: usable cache state not visible after discovery timeout (invalid pool pubkey)"
+        );
+        return;
+    };
+    if let Some((
+        slot,
+        base_r,
+        quote_r,
+        acct_len,
+        sell_extended,
+        _sell_third,
+        _tail0,
+        _tail1,
+        sell_layout_ready,
+        sell_pre_fee,
+        sell_ix_count,
+        _pre_fee_meta_1,
+        layout_gen,
+    )) = pump_amm_slave_recovery_snapshot(cache, &pool_pk)
+    {
+        warn!(
+            mint = %mint,
+            pool = %pool,
+            timeout_ms,
+            cache_slot = slot,
+            base_reserve = ?base_r,
+            quote_reserve = ?quote_r,
+            pool_accounts_len = acct_len,
+            sell_extended,
+            sell_layout_ready,
+            sell_requires_pre_fee_metas = sell_pre_fee,
+            sell_ix_account_count = sell_ix_count,
+            layout_generation = layout_gen,
+            "pump_amm: usable cache state not visible after discovery timeout (pool_accounts+nonzero reserves)"
+        );
+    } else {
+        warn!(
+            mint = %mint,
+            pool = %pool,
+            timeout_ms,
+            "pump_amm: usable cache state not visible after discovery timeout (no PumpAmm SLAVE row)"
+        );
+    }
+}
+
 fn pump_amm_slave_recovery_evidence_changed(
     before: &PumpAmmSlaveRecoveryEvidence,
     after: &PumpAmmSlaveRecoveryEvidence,
@@ -2729,7 +2816,11 @@ impl ExecutionContext {
                             .map(|p| p.to_string());
                         info!(mint = %mint_str, pool_address = ?pool_hint, "6005-retry: pool_accounts cache miss, requesting discovery from market-data");
                         match self
-                            .request_discovery_and_wait(&mint_str, pool_hint.as_deref(), false)
+                            .request_discovery_and_wait(
+                                &mint_str,
+                                pool_hint.as_deref(),
+                                pump_amm_liquidation_discovery_force_refresh(),
+                            )
                             .await
                         {
                             DiscoveryRequestOutcome::Ok => {
@@ -2743,7 +2834,7 @@ impl ExecutionContext {
                                 if !wait_for_usable_pump_amm_cache_state(
                                     cache,
                                     &mint,
-                                    DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                    PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS,
                                     DISCOVERY_CACHE_POLL_INTERVAL_MS,
                                 )
                                 .await
@@ -2805,7 +2896,11 @@ impl ExecutionContext {
                     .and_then(|c| c.get_pump_amm_pool_address_by_base_mint(&mint))
                     .map(|p| p.to_string());
                 match self
-                    .request_discovery_and_wait(&mint_str, pool_hint.as_deref(), false)
+                    .request_discovery_and_wait(
+                        &mint_str,
+                        pool_hint.as_deref(),
+                        pump_amm_liquidation_discovery_force_refresh(),
+                    )
                     .await
                 {
                     DiscoveryRequestOutcome::Ok => {
@@ -2819,13 +2914,14 @@ impl ExecutionContext {
                         if !wait_for_usable_pump_amm_cache_state(
                             cache,
                             &mint,
-                            DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                            PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS,
                             DISCOVERY_CACHE_POLL_INTERVAL_MS,
                         )
                         .await
                         {
                             warn!(
                                 mint = %mint_str,
+                                timeout_ms = PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS,
                                 "6005-retry: usable PumpAmm cache state not visible after discovery timeout (pool_accounts+reserves)"
                             );
                             return None;
@@ -4069,12 +4165,12 @@ impl ExecutionContext {
                                         _ => {
                                             // I-24d: Request discovery, wait bounded on authoritative cache state.
                                             // pool_id from quote enables fast getAccount path in market-data.
-                                            info!(mint = %mint, pool = %pool_id, "pump_amm quote ok but ready pool_accounts missing; requesting discovery");
+                                            info!(mint = %mint, pool = %pool_id, "pump_amm quote ok but ready pool_accounts missing; requesting discovery (force_refresh)");
                                             match ctx
                                                 .request_discovery_and_wait(
                                                     &mint.to_string(),
                                                     Some(pool_id.as_str()),
-                                                    false,
+                                                    pump_amm_liquidation_discovery_force_refresh(),
                                                 )
                                                 .await
                                             {
@@ -4085,47 +4181,71 @@ impl ExecutionContext {
                                                         if wait_for_usable_pump_amm_cache_state(
                                                             cache,
                                                             &mint,
-                                                            DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                                            PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS,
                                                             DISCOVERY_CACHE_POLL_INTERVAL_MS,
                                                         )
                                                         .await
                                                         {
-                                                            let accounts = cache
+                                                            let retry_quote = pump_amm
+                                                                .quote_exact_in(
+                                                                    &mint.to_string(),
+                                                                    &sol_mint.to_string(),
+                                                                    amount_in,
+                                                                )
+                                                                .await;
+                                                            match retry_quote {
+                                                                Ok(Some(ref rq))
+                                                                    if rq.amount_out > 0 =>
+                                                                {
+                                                                    let accounts = cache
                                                             .get_ready_pump_amm_pool_accounts_by_base_mint(&mint);
-                                                            if let Some(accounts) = accounts {
-                                                                if accounts.len() >= 14 {
-                                                                    let acct_strings: Vec<String> =
-                                                                        accounts
-                                                                            .into_iter()
-                                                                            .map(|p| p.to_string())
-                                                                            .collect();
-                                                                    quote_attempts.push(format!(
+                                                                    if let Some(accounts) = accounts {
+                                                                        if accounts.len() >= 14 {
+                                                                            let acct_strings: Vec<String> =
+                                                                                accounts
+                                                                                    .into_iter()
+                                                                                    .map(|p| p.to_string())
+                                                                                    .collect();
+                                                                            quote_attempts.push(format!(
                                                                     "pump_amm=ok amount_out={} pool={} accounts_len={} (after discovery)",
-                                                                    q.amount_out,
+                                                                    rq.amount_out,
                                                                     pool_id,
                                                                     acct_strings.len()
                                                                 ));
-                                                                    record_candidate(
-                                                                        "pump_amm",
-                                                                        q.amount_out,
-                                                                        pool_id,
-                                                                        acct_strings,
-                                                                    );
-                                                                } else {
-                                                                    quote_attempts.push(format!(
+                                                                            record_candidate(
+                                                                                "pump_amm",
+                                                                                rq.amount_out,
+                                                                                pool_id,
+                                                                                acct_strings,
+                                                                            );
+                                                                        } else {
+                                                                            quote_attempts.push(format!(
                                                                     "pump_amm=skip no_pool_accounts amount_out={} pool={}",
-                                                                    q.amount_out, pool_id
+                                                                    rq.amount_out, pool_id
+                                                                ));
+                                                                        }
+                                                                    } else {
+                                                                        warn!(mint = %mint, "pump_amm pool_accounts still missing after discovery");
+                                                                        quote_attempts.push(format!(
+                                                                "pump_amm=skip no_pool_accounts amount_out={} pool={}",
+                                                                rq.amount_out, pool_id
+                                                            ));
+                                                                    }
+                                                                }
+                                                                _ => {
+                                                                    quote_attempts.push(format!(
+                                                                    "pump_amm=skip zero_quote_after_discovery pool={}",
+                                                                    pool_id
                                                                 ));
                                                                 }
-                                                            } else {
-                                                                warn!(mint = %mint, "pump_amm pool_accounts still missing after discovery");
-                                                                quote_attempts.push(format!(
-                                                                "pump_amm=skip no_pool_accounts amount_out={} pool={}",
-                                                                q.amount_out, pool_id
-                                                            ));
                                                             }
                                                         } else {
-                                                            warn!(mint = %mint, "pump_amm: usable cache state not visible after discovery timeout (pool_accounts+nonzero reserves)");
+                                                            log_pump_amm_slave_wait_timeout_evidence(
+                                                                &mint,
+                                                                &pool_id,
+                                                                cache,
+                                                                PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS,
+                                                            );
                                                             quote_attempts.push(format!(
                                                             "pump_amm=skip timeout amount_out={} pool={}",
                                                             q.amount_out, pool_id
@@ -4179,7 +4299,7 @@ impl ExecutionContext {
                                     .request_discovery_and_wait(
                                         &mint.to_string(),
                                         pool_hint.as_deref(),
-                                        false,
+                                        pump_amm_liquidation_discovery_force_refresh(),
                                     )
                                     .await
                                 {
@@ -4188,7 +4308,7 @@ impl ExecutionContext {
                                             if wait_for_usable_pump_amm_cache_state(
                                                 cache,
                                                 &mint,
-                                                DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                                PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS,
                                                 DISCOVERY_CACHE_POLL_INTERVAL_MS,
                                             )
                                             .await
@@ -4202,7 +4322,7 @@ impl ExecutionContext {
                                                     )
                                                     .await;
                                                 match retry_quote {
-                                                    Ok(Some(q)) => {
+                                                    Ok(Some(q)) if q.amount_out > 0 => {
                                                         if let Some(pool_id) =
                                                             q.route.first().cloned()
                                                         {
@@ -4248,12 +4368,26 @@ impl ExecutionContext {
                                                     }
                                                     _ => {
                                                         quote_attempts.push(
-                                                        "pump_amm=none (after discovery, reserves may be degenerate)"
+                                                        "pump_amm=none (after discovery, zero amount_out or degenerate reserves)"
                                                             .to_string(),
                                                     );
                                                     }
                                                 }
                                             } else {
+                                                if let Some(pool_id) = pool_hint.as_deref() {
+                                                    log_pump_amm_slave_wait_timeout_evidence(
+                                                        &mint,
+                                                        pool_id,
+                                                        cache,
+                                                        PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS,
+                                                    );
+                                                } else {
+                                                    warn!(
+                                                        mint = %mint,
+                                                        timeout_ms = PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS,
+                                                        "pump_amm: usable cache state not visible after discovery timeout (no pool hint)"
+                                                    );
+                                                }
                                                 quote_attempts.push(
                                                 "pump_amm=skip timeout (cache wait after discovery)"
                                                     .to_string(),
@@ -9637,7 +9771,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                                 .request_discovery_and_wait(
                                     &intent.resources.input_mint,
                                     Some(pool_hint_str),
-                                    false,
+                                    true,
                                 )
                                 .await
                             {
@@ -9646,7 +9780,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                                         if wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder(
                                             cache,
                                             &pool_pk,
-                                            DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                            PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS,
                                             DISCOVERY_CACHE_POLL_INTERVAL_MS,
                                         )
                                         .await
@@ -9831,6 +9965,47 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         } else {
             tx_plan.clone()
         };
+
+        // P184m: regular momentum PumpSwap SELL — skip simulation when SLAVE quote is not ready
+        // (avoids Custom 6004 storm on degenerate reserves; I-9: never send without successful sim).
+        if !ctx.replay_mode {
+            if let Some(detail) =
+                pump_amm_hot_path_quote_not_ready_detail(&intent, ctx.live_pool_cache.as_deref())
+            {
+                let pool_hint_str =
+                    pump_amm_pool_market_hint_pk(&intent, ctx).map(|p| p.to_string());
+                let base_mint_parse = Pubkey::from_str(&intent.resources.input_mint);
+                let refresh_decision = match base_mint_parse {
+                    Ok(pk) => try_pump_amm_hot_path_refresh_publish(
+                        &ctx.pump_amm_hot_path_refresh_last,
+                        pk,
+                        Instant::now(),
+                    ),
+                    Err(_) => PumpAmmHotPathRefreshDecision::Publish,
+                };
+                if matches!(refresh_decision, PumpAmmHotPathRefreshDecision::Publish) {
+                    if let Some(ref nats) = ctx.nats {
+                        ExecutionContext::fire_pump_amm_pool_accounts_refresh_async(
+                            nats,
+                            ctx.run_id.clone(),
+                            intent.resources.input_mint.clone(),
+                            pool_hint_str,
+                            Arc::clone(&ctx.pump_amm_hot_path_refresh_last),
+                            base_mint_parse.ok(),
+                        );
+                    }
+                }
+                let reason = RejectReason::QuoteUnavailable;
+                checks.push(CheckResult {
+                    check_name: "pump_amm_quote_ready".to_string(),
+                    passed: false,
+                    reason_code: Some(reason.to_string()),
+                    details: Some(detail),
+                });
+                ctx.lock_manager.release_locks(&intent.intent_id);
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+            }
+        }
 
         // === Simulate (P0: simulate-gated) ===
         info!(intent_id = %intent.intent_id, "Running simulation");
@@ -12135,6 +12310,7 @@ mod execution_engine_tests {
         is_regular_momentum_hot_path_sell, liquidation_pumpfun_sell_preference,
         liquidation_store_multi_pool_fallback_metadata, max_open_positions_buy_gate,
         pump_amm_hint_pool_cache_usable_for_tx_plan_builder,
+        pump_amm_hot_path_quote_not_ready_detail, pump_amm_liquidation_discovery_force_refresh,
         pump_amm_liquidation_quote_timeout_str, pump_amm_pool_market_hint_merge,
         pump_amm_slave_recovery_snapshot, record_pump_amm_hot_path_refresh_after_success,
         scale_in_max_open_positions_skip_details, scope48_confirmed_sell_close_decision,
@@ -12143,15 +12319,16 @@ mod execution_engine_tests {
         wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder,
         wait_for_pump_amm_slave_after_recovery, wait_for_pumpfun_bonding_cache_refresh,
         DiscoveryRequestOutcome, PumpAmmHotPathRefreshDecision, RouteCandidate,
-        PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN,
+        PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN, WSOL_MINT,
     };
     use ironcrab::execution::live_pool_cache::{
         CachedPoolState, LivePoolCache, MeteoraState, PumpAmmState, PumpFunState,
     };
+    use ironcrab::execution::pool_cache_sync::apply_pool_cache_update;
     use ironcrab::ipc::{
         ControlResponse, ControlResponseStatus, DexPoolReadiness, ExecutionResult, ExecutionStatus,
-        ExplicitAmount, IntentOrigin, IntentTier, TradeIntent, TradeResources, TradeSide,
-        TradingRegime,
+        ExplicitAmount, IntentOrigin, IntentTier, PoolCacheUpdate, TradeIntent, TradeResources,
+        TradeSide, TradingRegime,
     };
     use ironcrab::solana::dex::pumpfun::PumpFunDex;
     use ironcrab::storage::locks::{LockHolder, LockManager, LockResult};
@@ -12238,6 +12415,92 @@ mod execution_engine_tests {
         let s = pump_amm_liquidation_quote_timeout_str();
         assert!(s.contains("45s"), "expected 45s in timeout string, got {s}");
         assert!(!s.contains("10s"), "stale 10s label must not appear: {s}");
+    }
+
+    /// P184m / I-24e: liquidation discovery must force_refresh (no cache-first stale SLAVE reuse).
+    #[test]
+    fn pump_amm_liquidation_discovery_uses_force_refresh() {
+        assert!(pump_amm_liquidation_discovery_force_refresh());
+    }
+
+    /// P184m: hot-path PumpSwap SELL skips simulation when quote is not ready.
+    #[test]
+    fn pump_amm_hot_path_quote_not_ready_gates_simulation() {
+        let base_mint = Pubkey::new_unique();
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        cache.upsert(
+            pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint,
+                quote_mint: Pubkey::new_unique(),
+                pool_base_token_account: Pubkey::default(),
+                pool_quote_token_account: Pubkey::default(),
+                base_reserve: Some(0),
+                quote_reserve: Some(0),
+                pool_accounts: (0..14).map(|_| Pubkey::new_unique()).collect(),
+                creator: None,
+            }),
+            0,
+        );
+
+        let mut intent = TradeIntent::new_sell(
+            "momentum-bot",
+            "0.1.0",
+            "run",
+            "int-1".to_string(),
+            "momentum-bot",
+            IntentTier::Tier1,
+            IntentOrigin::StrategyA,
+            base_mint.to_string(),
+            6,
+            WSOL_MINT.to_string(),
+            1_000,
+            0,
+            500,
+            TradingRegime::Established,
+        );
+        intent
+            .metadata
+            .insert("dex".to_string(), "pump_amm".to_string());
+
+        let detail = pump_amm_hot_path_quote_not_ready_detail(&intent, Some(&cache));
+        assert!(
+            detail
+                .as_deref()
+                .is_some_and(|d| d.contains("quote_not_ready")),
+            "expected quote_not_ready gate, got {detail:?}"
+        );
+
+        let mut ready = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            intent.resources.output_mint.clone(),
+            1_000,
+            2_000,
+            None,
+            1,
+        );
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            "pool_accounts".to_string(),
+            (0..14)
+                .map(|_| Pubkey::new_unique().to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        ready.metadata = Some(meta);
+        ready.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+        apply_pool_cache_update(&cache, &ready);
+
+        assert!(
+            pump_amm_hot_path_quote_not_ready_detail(&intent, Some(&cache)).is_none(),
+            "ready quote must not gate simulation"
+        );
     }
 
     /// Known active curve (`complete=false`): prefer PumpFun before multi-pool.
