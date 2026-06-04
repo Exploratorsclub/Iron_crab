@@ -202,7 +202,7 @@ pub struct ArbCycle {
 impl ArbCycle {
     /// Profit estimate is safe to compare against `min_profit_bps` / shadow logging.
     pub fn is_trustworthy_profit_estimate(&self) -> bool {
-        !self.return_bps_saturated && !self.profit_multiplier_capped
+        !self.return_bps_saturated && !self.profit_multiplier_capped && !self.edge_ratio_clamped
     }
 
     /// Number of hops in the cycle
