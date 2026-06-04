@@ -185,6 +185,34 @@ pub const PUMPFUN_AMM_SELL_26_TIER_TRAILING_MUTABILITY: PumpAmmSell26TierTrailin
         fee_tail_1_writable: true,
     };
 
+/// Trailing-meta writability for post-upgrade non-cashback 24-account `sell` (#21 `pool-v2`, #22/#23 fee pair).
+/// Mainnet ref: sig `46dSBXmG…`, pool `CHit3VLJ…`, mint `F5RU4VNS…` (P184l).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PumpAmmSell24PostUpgradeTrailingMutability {
+    pub pool_v2_writable: bool,
+    pub tail_1_writable: bool,
+    pub third_writable: bool,
+}
+
+pub const PUMPFUN_AMM_SELL_24_POST_UPGRADE_TRAILING_MUTABILITY:
+    PumpAmmSell24PostUpgradeTrailingMutability = PumpAmmSell24PostUpgradeTrailingMutability {
+    pool_v2_writable: false,
+    tail_1_writable: false,
+    third_writable: true,
+};
+
+/// Post-upgrade migrated pools: extended 24-account `sell` with `pool-v2` PDA at ix #21 (not user volume metas).
+#[must_use]
+pub fn pump_amm_sell_trailing_is_post_upgrade_pool_v2(base_mint: &Pubkey, tail_0: Pubkey) -> bool {
+    if tail_0 == Pubkey::default() {
+        return false;
+    }
+    let Ok(program_id) = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID) else {
+        return false;
+    };
+    tail_0 == pump_amm_pool_v2_pda(base_mint, &program_id)
+}
+
 #[inline]
 fn pump_amm_push_sell_trailing_account_meta(
     metas: &mut Vec<AccountMeta>,
@@ -3211,16 +3239,19 @@ impl PumpFunAmmDex {
     /// Tier-26 (`!sell_requires_pre_fee_metas`): mutability matches mainnet ref `3wNpdTky…`
     /// ([`PUMPFUN_AMM_SELL_26_TIER_TRAILING_MUTABILITY`]); volume #21/#22 use intent-user derivation
     /// when cached reference tails mismatch (P184i), else validated cache when they match.
+    /// Post-upgrade 24-account (`pool-v2` at #21): validated cache tails only — never intent-user volume derivation (P184l).
     /// Tier-27: #21/#22 writable, #23 readonly, single readonly fee tail at #26.
     #[allow(clippy::too_many_arguments)]
     fn push_pump_amm_sell_extended_trailing_metas(
         metas: &mut Vec<AccountMeta>,
         pool_market: Pubkey,
+        base_mint: Pubkey,
         user: Pubkey,
         quote_mint: Pubkey,
         quote_token_program: Pubkey,
         third: Pubkey,
         sell_requires_pre_fee_metas: bool,
+        sell_requires_fee_tail: bool,
         sell_extended_fee_tail_0: Option<Pubkey>,
         sell_extended_fee_tail_1: Option<Pubkey>,
         cached_observed_volume_tail_0: Option<Pubkey>,
@@ -3231,6 +3262,18 @@ impl PumpFunAmmDex {
             Self::pump_amm_sell_cashback_first_two_metas(user, quote_mint, quote_token_program);
         let observed_t0 = cached_observed_volume_tail_0.filter(|p| *p != Pubkey::default());
         let observed_t1 = cached_observed_volume_tail_1.filter(|p| *p != Pubkey::default());
+
+        if !sell_requires_pre_fee_metas {
+            if let (Some(t0), Some(t1)) = (observed_t0, observed_t1) {
+                if pump_amm_sell_trailing_is_post_upgrade_pool_v2(&base_mint, t0) {
+                    let tier24 = PUMPFUN_AMM_SELL_24_POST_UPGRADE_TRAILING_MUTABILITY;
+                    pump_amm_push_sell_trailing_account_meta(metas, t0, tier24.pool_v2_writable);
+                    pump_amm_push_sell_trailing_account_meta(metas, t1, tier24.tail_1_writable);
+                    pump_amm_push_sell_trailing_account_meta(metas, third, tier24.third_writable);
+                    return Ok(());
+                }
+            }
+        }
         let curated_tails =
             if sell_requires_pre_fee_metas && pump_amm_is_stuck_pool_market(&pool_market) {
                 pump_amm_stuck_pool_curated_volume_tails()
@@ -3310,12 +3353,21 @@ impl PumpFunAmmDex {
             );
             pump_amm_push_sell_trailing_account_meta(metas, user_vol, tier.tail_1_writable);
             pump_amm_push_sell_trailing_account_meta(metas, third, tier.third_writable);
-            if let (Some(f0), Some(f1)) = (
+            let (f0, f1) = (
                 sell_extended_fee_tail_0.filter(|p| *p != Pubkey::default()),
                 sell_extended_fee_tail_1.filter(|p| *p != Pubkey::default()),
-            ) {
-                pump_amm_push_sell_trailing_account_meta(metas, f0, tier.fee_tail_0_writable);
-                pump_amm_push_sell_trailing_account_meta(metas, f1, tier.fee_tail_1_writable);
+            );
+            match (f0, f1) {
+                (Some(f0), Some(f1)) => {
+                    pump_amm_push_sell_trailing_account_meta(metas, f0, tier.fee_tail_0_writable);
+                    pump_amm_push_sell_trailing_account_meta(metas, f1, tier.fee_tail_1_writable);
+                }
+                (None, None) if !sell_requires_fee_tail => {}
+                _ => {
+                    return Err(anyhow!(
+                        "pump_amm SELL: tier-26 layout requires sell_extended_fee_tail_0 and sell_extended_fee_tail_1 (authoritative observation required)"
+                    ));
+                }
             }
         }
         Ok(())
@@ -6701,6 +6753,8 @@ impl Dex for PumpFunAmmDex {
             let mut sell_extended_fee_tail_1 = pool.sell_extended_fee_tail_1;
             let mut sell_requires_pre_fee_metas = pool.sell_requires_pre_fee_metas;
             let mut sell_pre_fee_meta_1 = pool.sell_pre_fee_meta_1;
+            let mut sell_requires_fee_tail =
+                pool.sell_extended_fee_tail_0.is_some() && pool.sell_extended_fee_tail_1.is_some();
             if let Some(ref cache) = self.live_pool_cache {
                 let (dash_flag, dash_third, dash_t0, dash_t1) =
                     cache.pump_amm_sell_extended_layout(&pool.pool_market);
@@ -6716,6 +6770,9 @@ impl Dex for PumpFunAmmDex {
                 }
                 if cache.pump_amm_sell_requires_pre_fee_metas(&pool.pool_market) {
                     sell_requires_pre_fee_metas = true;
+                }
+                if cache.pump_amm_sell_requires_fee_tail(&pool.pool_market) {
+                    sell_requires_fee_tail = true;
                 }
                 sell_pre_fee_meta_1 = cache
                     .pump_amm_sell_pre_fee_meta_1(&pool.pool_market)
@@ -6739,11 +6796,13 @@ impl Dex for PumpFunAmmDex {
                 Self::push_pump_amm_sell_extended_trailing_metas(
                     &mut metas,
                     pool.pool_market,
+                    pool.base_mint,
                     user,
                     pool.quote_mint,
                     quote_token_program,
                     third,
                     sell_requires_pre_fee_metas,
+                    sell_requires_fee_tail,
                     sell_extended_fee_tail_0,
                     sell_extended_fee_tail_1,
                     cached_observed_volume_tail_0,
@@ -6828,12 +6887,14 @@ impl PumpFunAmmDex {
             None,
             None,
             false,
+            false,
         )
     }
 
     /// Same as [`Self::build_swap_ix_from_pool_accounts`] plus optional observed extended SELL
     /// fee tail (#24/#25). `sell_extended_tail_0/1` are ignored for build (user volume metas
-    /// #21/#22 are always derived for `user`). Cold-path / tx_builder only.
+    /// #21/#22 are always derived for `user`) except post-upgrade `pool-v2` at #21 (P184l).
+    /// Cold-path / tx_builder only.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_swap_ix_from_pool_accounts_with_extended_tail(
         input_mint: &str,
@@ -6851,6 +6912,7 @@ impl PumpFunAmmDex {
         sell_extended_tail_1: Option<Pubkey>,
         sell_extended_fee_tail_0: Option<Pubkey>,
         sell_extended_fee_tail_1: Option<Pubkey>,
+        sell_requires_fee_tail: bool,
         cold_path_prefer_derived_on_mismatch: bool,
     ) -> Result<Vec<Instruction>> {
         // Require 14 accounts (v1 format with global_volume_accumulator)
@@ -7049,11 +7111,13 @@ impl PumpFunAmmDex {
                 Self::push_pump_amm_sell_extended_trailing_metas(
                     &mut metas,
                     pool_market,
+                    base_mint,
                     user,
                     quote_mint,
                     quote_tp,
                     third,
                     sell_requires_pre_fee_metas,
+                    sell_requires_fee_tail,
                     sell_extended_fee_tail_0,
                     sell_extended_fee_tail_1,
                     sell_extended_tail_0,
@@ -8073,10 +8137,12 @@ mod tests {
             &mut metas,
             *PUMP_AMM_STUCK_POOL_MARKET,
             Pubkey::new_unique(),
+            Pubkey::new_unique(),
             Pubkey::from_str(WSOL_MINT).unwrap(),
             Pubkey::new_from_array(spl_token::id().to_bytes()),
             Pubkey::new_unique(),
             true,
+            false,
             None,
             None,
             None,
@@ -8228,6 +8294,7 @@ mod tests {
             Some(ref_tail_1),
             None,
             None,
+            false,
             false,
         )
         .expect("extended SELL");
@@ -8513,6 +8580,7 @@ mod tests {
             Some(foreign_tail_1),
             None,
             None,
+            false,
             false,
         )
         .expect("extended SELL");
@@ -8950,6 +9018,7 @@ mod tests {
             None,
             Some(fee0),
             Some(fee1),
+            true,
             false,
         )
         .expect("26-account SELL");
@@ -9023,11 +9092,13 @@ mod tests {
         PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
             &mut metas,
             *PUMP_AMM_STUCK_POOL_MARKET,
+            Pubkey::new_unique(),
             user,
             quote_mint,
             quote_tp,
             third,
             true,
+            false,
             Some(fee_tail0),
             None,
             Some(observed0),
@@ -9170,6 +9241,7 @@ mod tests {
             Some(tail1),
             Some(fee0),
             None,
+            false,
             false,
         )
         .expect("build");
@@ -9317,11 +9389,13 @@ mod tests {
         PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
             &mut metas_validated_cache,
             *PUMP_AMM_STUCK_POOL_MARKET,
+            Pubkey::new_unique(),
             user,
             quote_mint,
             quote_tp,
             third,
             true,
+            false,
             Some(fee_tail0),
             None,
             Some(derived0),
@@ -9338,11 +9412,13 @@ mod tests {
         PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
             &mut metas_hot_stuck,
             *PUMP_AMM_STUCK_POOL_MARKET,
+            Pubkey::new_unique(),
             user,
             quote_mint,
             quote_tp,
             third,
             true,
+            false,
             Some(fee_tail0),
             None,
             Some(foreign0),
@@ -9358,11 +9434,13 @@ mod tests {
         PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
             &mut metas_stripped_cache,
             *PUMP_AMM_STUCK_POOL_MARKET,
+            Pubkey::new_unique(),
             user,
             quote_mint,
             quote_tp,
             third,
             true,
+            false,
             Some(fee_tail0),
             None,
             None,
@@ -9378,11 +9456,13 @@ mod tests {
         PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas(
             &mut metas_foreign,
             Pubkey::new_unique(),
+            Pubkey::new_unique(),
             user,
             quote_mint,
             quote_tp,
             third,
             true,
+            false,
             Some(fee_tail0),
             None,
             Some(foreign0),
@@ -9570,6 +9650,7 @@ mod tests {
             Some(tail_1),
             Some(fee_tail0),
             Some(fee_tail1),
+            true,
             false,
         )
         .expect("build 26-account sell");
@@ -9586,6 +9667,91 @@ mod tests {
         assert!(
             ixs[0].accounts[PUMPFUN_AMM_SELL_FEE_TAIL_1_IX].is_writable,
             "fee_tail_1 (#25) must be writable on tier-26 (PrivilegeEscalation if readonly)"
+        );
+    }
+
+    /// P184l: migrated pool `CHit3VLJ…` uses post-upgrade 24-account `sell` (`pool-v2` at #21), not intent-user volume derivation.
+    #[test]
+    fn p184l_post_upgrade_pool_v2_trailing_builds_24_account_sell_from_validated_cache() {
+        const P184L_POOL: &str = "CHit3VLJndHLRrAQbFkmJHfjFruGtfD7XbwjGYPQoqyq";
+        const P184L_MINT: &str = "F5RU4VNSRDj8sP9yVB518a7PhM9NyUWBQemCLqk4pump";
+        const P184L_TAIL_0: &str = "5CXzL4rxA677oGhKUDBxxapLk6wLpRPLmackZDHGmZCQ";
+        const P184L_TAIL_1: &str = "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD";
+        const P184L_THIRD: &str = "HjQjngTDqoHE6aaGhUqfz9aQ7WZcBRjy5xB8PScLSr8i";
+
+        let pool_market = Pubkey::from_str(P184L_POOL).unwrap();
+        let base_mint = Pubkey::from_str(P184L_MINT).unwrap();
+        let user = Pubkey::new_unique();
+        let tail_0 = Pubkey::from_str(P184L_TAIL_0).unwrap();
+        let tail_1 = Pubkey::from_str(P184L_TAIL_1).unwrap();
+        let third = Pubkey::from_str(P184L_THIRD).unwrap();
+        assert!(pump_amm_sell_trailing_is_post_upgrade_pool_v2(
+            &base_mint, tail_0
+        ));
+
+        let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let (derived_21, derived_22) =
+            PumpFunAmmDex::pump_amm_sell_cashback_first_two_metas(user, wsol, quote_tp);
+        assert_ne!(derived_21, tail_0);
+        assert_ne!(derived_22, tail_1);
+
+        let pool_accounts = vec![
+            pool_market,
+            Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap(),
+            base_mint,
+            wsol,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap(),
+            Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(),
+        ];
+
+        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
+            &base_mint.to_string(),
+            WSOL_MINT,
+            1,
+            1,
+            user,
+            &pool_accounts,
+            Some(Pubkey::new_from_array(spl_token_2022::id().to_bytes())),
+            true,
+            Some(third),
+            false,
+            None,
+            Some(tail_0),
+            Some(tail_1),
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("post-upgrade pool-v2 SELL");
+
+        assert_eq!(
+            ixs[0].accounts.len(),
+            PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS
+        );
+        assert_eq!(ixs[0].accounts[21].pubkey, tail_0);
+        assert_eq!(ixs[0].accounts[22].pubkey, tail_1);
+        assert_eq!(ixs[0].accounts[23].pubkey, third);
+        assert!(
+            !ixs[0].accounts[21].is_writable,
+            "pool-v2 (#21) must be readonly"
+        );
+        assert!(
+            !ixs[0].accounts[22].is_writable,
+            "post-upgrade fee meta #22 must be readonly"
+        );
+        assert!(
+            ixs[0].accounts[23].is_writable,
+            "post-upgrade fee meta #23 must be writable"
         );
     }
 }

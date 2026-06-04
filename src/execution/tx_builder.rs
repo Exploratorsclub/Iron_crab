@@ -6,13 +6,13 @@ use crate::solana::dex::orca_whirlpool_layout;
 use crate::solana::dex::pumpfun::PumpFunDex;
 use crate::solana::dex::pumpfun_amm::{
     pump_amm_resolve_sell_pre_fee_meta_1_for_build, pump_amm_sell_ix_uses_global_fee_at,
-    PumpAmmPoolAccountsDiagnostic, PumpFunAmmDex, PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR,
-    PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR, PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS,
-    PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS, PUMPFUN_AMM_SELL_EXT_TAIL_0_IX,
-    PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2, PUMPFUN_AMM_SELL_EXT_TAIL_1_IX,
-    PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2, PUMPFUN_AMM_SELL_EXT_THIRD_META_IX,
-    PUMPFUN_AMM_SELL_EXT_THIRD_META_IX_V2, PUMPFUN_AMM_SELL_FEE_TAIL_0_IX,
-    PUMPFUN_AMM_SELL_FEE_TAIL_1_IX,
+    pump_amm_sell_trailing_is_post_upgrade_pool_v2, PumpAmmPoolAccountsDiagnostic, PumpFunAmmDex,
+    PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR, PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR,
+    PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS, PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS,
+    PUMPFUN_AMM_SELL_EXT_TAIL_0_IX, PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2,
+    PUMPFUN_AMM_SELL_EXT_TAIL_1_IX, PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2,
+    PUMPFUN_AMM_SELL_EXT_THIRD_META_IX, PUMPFUN_AMM_SELL_EXT_THIRD_META_IX_V2,
+    PUMPFUN_AMM_SELL_FEE_TAIL_0_IX, PUMPFUN_AMM_SELL_FEE_TAIL_1_IX,
 };
 use crate::solana::dex::raydium::Raydium;
 use crate::solana::dex::Dex;
@@ -781,6 +781,9 @@ pub async fn build_tx_plan(
         let sell_requires_pre_fee_metas = cache
             .map(|c| c.pump_amm_sell_requires_pre_fee_metas(&pool_id))
             .unwrap_or(false);
+        let sell_requires_fee_tail = cache
+            .map(|c| c.pump_amm_sell_requires_fee_tail(&pool_id))
+            .unwrap_or(false);
         let sell_layout_ready = cache
             .map(|c| c.pump_amm_sell_layout_ready(&pool_id))
             .unwrap_or(false);
@@ -928,14 +931,25 @@ pub async fn build_tx_plan(
             } else {
                 (Pubkey::default(), Pubkey::default())
             };
-        let cached_tail_mismatch_plan =
+        let input_mint_pk = Pubkey::from_str(&intent.resources.input_mint).ok();
+        let sell_post_upgrade_pool_v2_trailing = intent.side == TradeSide::Sell
+            && sell_requires_cashback_remaining
+            && input_mint_pk.is_some_and(|m| {
+                sell_extended_tail_0
+                    .filter(|p| *p != Pubkey::default())
+                    .is_some_and(|t0| pump_amm_sell_trailing_is_post_upgrade_pool_v2(&m, t0))
+            });
+        let cached_tail_mismatch_plan = if sell_post_upgrade_pool_v2_trailing {
+            false
+        } else {
             sell_extended_tail_0
                 .zip(sell_extended_tail_1)
                 .is_some_and(|(c0, c1)| {
                     c0 != Pubkey::default()
                         && c1 != Pubkey::default()
                         && (c0 != derived_tail_21_plan || c1 != derived_tail_22_plan)
-                });
+                })
+        };
         let sell_extended_tail_0_for_build =
             if intent.side == TradeSide::Sell && cached_tail_mismatch_plan {
                 None
@@ -1014,6 +1028,7 @@ pub async fn build_tx_plan(
             } else {
                 None
             },
+            sell_requires_fee_tail && intent.side == TradeSide::Sell,
             cached_tail_mismatch_plan,
         ) {
             Ok(ixs) => ixs,
@@ -1088,6 +1103,8 @@ pub async fn build_tx_plan(
                 let sell_ext_tail_src =
                     if !sell_requires_cashback_remaining || intent.side != TradeSide::Sell {
                         "n/a"
+                    } else if sell_post_upgrade_pool_v2_trailing {
+                        "validated_cache"
                     } else if sell_requires_pre_fee_metas {
                         match (
                             sell_extended_tail_0.filter(|p| *p != Pubkey::default()),
@@ -1109,6 +1126,17 @@ pub async fn build_tx_plan(
                     };
                 let layout_authoritative = if sell_requires_pre_fee_metas {
                     sell_pre_fee_meta_1.is_some() && sell_extended_fee_tail_0.is_some()
+                } else if sell_post_upgrade_pool_v2_trailing {
+                    sell_layout_ready
+                        && sell_cashback_third_meta
+                            .filter(|p| *p != Pubkey::default())
+                            .is_some()
+                        && sell_extended_tail_0
+                            .filter(|p| *p != Pubkey::default())
+                            .is_some()
+                        && sell_extended_tail_1
+                            .filter(|p| *p != Pubkey::default())
+                            .is_some()
                 } else {
                     sell_layout_ready
                         && sell_requires_cashback_remaining
@@ -1936,6 +1964,7 @@ async fn build_hop_pump_amm(
         sell_fee_t1,
         sell_requires_pre_fee,
         sell_pre_fee_meta_1,
+        sell_requires_fee_tail,
     ) = if let Some(cache) = cache {
         match cache.get(pool_address) {
             Some(CachedPoolState::PumpAmm(amm_state)) => {
@@ -1958,6 +1987,7 @@ async fn build_hop_pump_amm(
                         sell_fee_t1,
                         cache.pump_amm_sell_requires_pre_fee_metas(pool_address),
                         cache.pump_amm_sell_pre_fee_meta_1(pool_address),
+                        cache.pump_amm_sell_requires_fee_tail(pool_address),
                     )
                 } else {
                     return Err(UnsupportedTxPlan {
@@ -2016,6 +2046,7 @@ async fn build_hop_pump_amm(
         None,
         if is_sell_hop { sell_fee_t0 } else { None },
         if is_sell_hop { sell_fee_t1 } else { None },
+        sell_requires_fee_tail && is_sell_hop,
         false,
     )
     .map_err(|e| UnsupportedTxPlan {
