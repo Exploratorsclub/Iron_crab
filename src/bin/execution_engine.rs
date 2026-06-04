@@ -4225,8 +4225,11 @@ impl ExecutionContext {
                                                                         .first()
                                                                         .cloned()
                                                                         .unwrap_or(pool_id);
-                                                                    let accounts = cache
-                                                            .get_ready_pump_amm_pool_accounts_by_base_mint(&mint);
+                                                                    let accounts = Pubkey::from_str(&pool_id)
+                                                                        .ok()
+                                                                        .and_then(|pk| {
+                                                                            cache.get_ready_pump_amm_pool_accounts_for_pool_market(&pk)
+                                                                        });
                                                                     if let Some(accounts) = accounts {
                                                                         if accounts.len() >= 14 {
                                                                             let acct_strings: Vec<String> =

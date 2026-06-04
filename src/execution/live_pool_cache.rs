@@ -1913,6 +1913,23 @@ impl LivePoolCache {
         None
     }
 
+    /// Same readiness contract as [`Self::get_ready_pump_amm_pool_accounts_by_base_mint`], keyed by pool market.
+    pub fn get_ready_pump_amm_pool_accounts_for_pool_market(
+        &self,
+        pool_market: &Pubkey,
+    ) -> Option<Vec<Pubkey>> {
+        let entry = self.pools.get(pool_market)?;
+        let CachedPoolState::PumpAmm(ref s) = entry.value().state else {
+            return None;
+        };
+        if s.pool_accounts.is_empty()
+            || !self.pump_amm_effective_ready_for_cache_first_accounts(pool_market, s)
+        {
+            return None;
+        }
+        Some(s.pool_accounts.clone())
+    }
+
     /// Same JetStream explicit-ready contract as
     /// [`Self::get_explicit_jetstream_ready_pump_amm_pool_accounts_v14_for_pool_market`], but allows
     /// SELL’s 12-account layout as well as 14 (BUY / extended). Cold-path recovery must not require 14
