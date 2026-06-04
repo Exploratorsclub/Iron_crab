@@ -288,6 +288,10 @@ fn is_regular_momentum_hot_path_sell(intent: &TradeIntent) -> bool {
     if intent.metadata.get("sell_all").map(|v| v.as_str()) == Some("true") {
         return false;
     }
+    // Liquidation / kill-switch sells share `source=momentum-bot` but are cold-path recovery.
+    if is_cold_path_recovery_sell(intent) {
+        return false;
+    }
     true
 }
 
@@ -321,7 +325,7 @@ fn pump_amm_hot_path_quote_not_ready_detail(
     let ready = cache
         .map(|c| match c.get(&pool_market) {
             Some(CachedPoolState::PumpAmm(ref s)) => {
-                s.pool_accounts.len() >= 14
+                s.pool_accounts.len() >= 12
                     && matches!(
                         (s.base_reserve, s.quote_reserve),
                         (Some(b), Some(q)) if b > 0 && q > 0
@@ -4216,6 +4220,11 @@ impl ExecutionContext {
                                                                 Ok(Some(ref rq))
                                                                     if rq.amount_out > 0 =>
                                                                 {
+                                                                    let pool_id = rq
+                                                                        .route
+                                                                        .first()
+                                                                        .cloned()
+                                                                        .unwrap_or(pool_id);
                                                                     let accounts = cache
                                                             .get_ready_pump_amm_pool_accounts_by_base_mint(&mint);
                                                                     if let Some(accounts) = accounts {
