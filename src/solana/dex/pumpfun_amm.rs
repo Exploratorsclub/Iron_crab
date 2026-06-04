@@ -9214,7 +9214,7 @@ mod tests {
         };
         assert_eq!(authoritative_sell_layout_strength(&layout), 4);
         let obs = PumpAmmSellReferenceObservation {
-            layout: layout.clone(),
+            layout,
             protocol_fee_recipient: Pubkey::new_unique(),
             protocol_fee_recipient_ta: Pubkey::new_unique(),
             reference_swap_signature: Some("sig_v2_incomplete".to_string()),
