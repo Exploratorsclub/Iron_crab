@@ -7,10 +7,12 @@ use crate::solana::dex::pumpfun::PumpFunDex;
 use crate::solana::dex::pumpfun_amm::{
     pump_amm_resolve_sell_pre_fee_meta_1_for_build, pump_amm_sell_ix_uses_global_fee_at,
     PumpAmmPoolAccountsDiagnostic, PumpFunAmmDex, PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR,
-    PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR, PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS,
-    PUMPFUN_AMM_SELL_EXT_TAIL_0_IX, PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2,
-    PUMPFUN_AMM_SELL_EXT_TAIL_1_IX, PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2,
-    PUMPFUN_AMM_SELL_EXT_THIRD_META_IX, PUMPFUN_AMM_SELL_EXT_THIRD_META_IX_V2,
+    PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR, PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS,
+    PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS, PUMPFUN_AMM_SELL_EXT_TAIL_0_IX,
+    PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2, PUMPFUN_AMM_SELL_EXT_TAIL_1_IX,
+    PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2, PUMPFUN_AMM_SELL_EXT_THIRD_META_IX,
+    PUMPFUN_AMM_SELL_EXT_THIRD_META_IX_V2, PUMPFUN_AMM_SELL_FEE_TAIL_0_IX,
+    PUMPFUN_AMM_SELL_FEE_TAIL_1_IX,
 };
 use crate::solana::dex::raydium::Raydium;
 use crate::solana::dex::Dex;
@@ -779,6 +781,9 @@ pub async fn build_tx_plan(
         let sell_requires_pre_fee_metas = cache
             .map(|c| c.pump_amm_sell_requires_pre_fee_metas(&pool_id))
             .unwrap_or(false);
+        let sell_layout_ready = cache
+            .map(|c| c.pump_amm_sell_layout_ready(&pool_id))
+            .unwrap_or(false);
         let cached_sell_pre_fee_meta_1 =
             cache.and_then(|c| c.pump_amm_sell_pre_fee_meta_1(&pool_id));
 
@@ -989,12 +994,12 @@ pub async fn build_tx_plan(
             } else {
                 None
             },
-            if intent.side == TradeSide::Sell && sell_requires_pre_fee_metas {
+            if intent.side == TradeSide::Sell {
                 sell_extended_tail_0_for_build
             } else {
                 None
             },
-            if intent.side == TradeSide::Sell && sell_requires_pre_fee_metas {
+            if intent.side == TradeSide::Sell {
                 sell_extended_tail_1_for_build
             } else {
                 None
@@ -1093,11 +1098,30 @@ pub async fn build_tx_plan(
                             _ => "derived_or_curated",
                         }
                     } else {
-                        "derived_for_intent_user"
+                        match (
+                            sell_extended_tail_0.filter(|p| *p != Pubkey::default()),
+                            sell_extended_tail_1.filter(|p| *p != Pubkey::default()),
+                        ) {
+                            (Some(_), Some(_)) if cached_tail_mismatch => "derived_for_intent_user",
+                            (Some(_), Some(_)) => "validated_cache",
+                            _ => "derived_for_intent_user",
+                        }
                     };
-                let layout_authoritative = sell_requires_pre_fee_metas
-                    && sell_pre_fee_meta_1.is_some()
-                    && sell_extended_fee_tail_0.is_some();
+                let layout_authoritative = if sell_requires_pre_fee_metas {
+                    sell_pre_fee_meta_1.is_some() && sell_extended_fee_tail_0.is_some()
+                } else {
+                    sell_layout_ready
+                        && sell_requires_cashback_remaining
+                        && sell_cashback_third_meta
+                            .filter(|p| *p != Pubkey::default())
+                            .is_some()
+                        && sell_extended_fee_tail_0
+                            .filter(|p| *p != Pubkey::default())
+                            .is_some()
+                        && sell_extended_fee_tail_1
+                            .filter(|p| *p != Pubkey::default())
+                            .is_some()
+                };
                 let sell_ix_account_count = sell_ix_accounts.len();
                 let (tail0_ix, tail1_ix, tail2_ix) =
                     if sell_ix_account_count == PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS {
@@ -1127,6 +1151,31 @@ pub async fn build_tx_plan(
                     .unwrap_or_default();
                 let sell_ix_tail2_writable = sell_ix_accounts
                     .get(tail2_ix)
+                    .map(|m| m.is_writable)
+                    .unwrap_or(false);
+                let (fee_tail0_ix, fee_tail1_ix) =
+                    if sell_ix_account_count == PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS {
+                        (
+                            PUMPFUN_AMM_SELL_FEE_TAIL_0_IX,
+                            PUMPFUN_AMM_SELL_FEE_TAIL_1_IX,
+                        )
+                    } else {
+                        (usize::MAX, usize::MAX)
+                    };
+                let sell_ix_meta_21_writable = sell_ix_accounts
+                    .get(tail0_ix)
+                    .map(|m| m.is_writable)
+                    .unwrap_or(false);
+                let sell_ix_meta_22_writable = sell_ix_accounts
+                    .get(tail1_ix)
+                    .map(|m| m.is_writable)
+                    .unwrap_or(false);
+                let sell_ix_meta_24_writable = sell_ix_accounts
+                    .get(fee_tail0_ix)
+                    .map(|m| m.is_writable)
+                    .unwrap_or(false);
+                let sell_ix_meta_25_writable = sell_ix_accounts
+                    .get(fee_tail1_ix)
                     .map(|m| m.is_writable)
                     .unwrap_or(false);
                 if sell_ix_account_count == PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS {
@@ -1200,7 +1249,11 @@ pub async fn build_tx_plan(
                         sell_ix_meta_21 = %sell_ix_tail0,
                         sell_ix_meta_22 = %sell_ix_tail1,
                         sell_ix_meta_23 = %sell_ix_tail2,
+                        sell_ix_meta_21_writable = sell_ix_meta_21_writable,
+                        sell_ix_meta_22_writable = sell_ix_meta_22_writable,
                         sell_ix_meta_23_writable = sell_ix_tail2_writable,
+                        sell_ix_meta_24_writable = sell_ix_meta_24_writable,
+                        sell_ix_meta_25_writable = sell_ix_meta_25_writable,
                         sell_ix_account_count,
                         pool = %pool_id,
                         input_mint = %intent.resources.input_mint,
