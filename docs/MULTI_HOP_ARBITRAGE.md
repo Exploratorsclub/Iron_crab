@@ -35,6 +35,19 @@ Das Design wurde von einem Senior-Reviewer analysiert. **Gesamturteil: Realistis
 - Early `best_profit` seeding aus 2-Hop Scan
 - `edge_count` Tracking korrigieren (Metrics)
 
+### Profit / `return_bps` Sanity (Shadow-Mode, 2026-06)
+
+Shadow-Mode loggt Zyklen zur Prod-Validierung. Ohne Caps explodieren kumulative `edge_ratio`-Produkte und `estimated_return_bps` kann `i32::MAX` werden (kein interpretierbares Signal).
+
+| Konstante | Wert | Semantik |
+|-----------|------|----------|
+| `MIN_EDGE_RATIO` / `MAX_EDGE_RATIO` | 0.01 / 1.05 | Per-Hop Clamp auf Probe-Quote |
+| `MAX_CYCLE_PROFIT_MULTIPLIER` | 10.0 | Cumulative profit cap während Beam-Search |
+| `MIN_RETURN_BPS` / `MAX_RETURN_BPS` | −10_000 / 50_000 | −100% .. +500% ROI-Schätzung |
+| `is_trustworthy_profit_estimate()` | — | `false` bei Cap/Saturierung → nicht „profitable“, kein Intent |
+
+Prometheus (arb-strategy :9803): `multi_hop_return_bps_saturated_total`, `multi_hop_cycle_rejected_sanity_total{reason=edge_ratio|profit_cap|return_bps_cap}`, `multi_hop_hop_missing_quote_total`, `multi_hop_shadow_logged_total`.
+
 ## Motivation
 
 Aktuell: 2-Hop Arbitrage (WSOL → Token → WSOL auf verschiedenen DEXes)

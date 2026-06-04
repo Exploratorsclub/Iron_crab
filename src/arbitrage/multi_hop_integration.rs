@@ -13,11 +13,15 @@
 
 use crate::arbitrage::{
     ArbCycle, BeamCycleFinder, CycleFinderConfig, DexType, PoolEdge, PoolGraph, PoolRanker,
-    QuoteProvider, RankerConfig,
+    QuoteProvider, RankerConfig, MAX_RETURN_BPS,
 };
 use crate::ipc::{
     ExplicitAmount, IntentOrigin, IntentTier, PoolAlternative, RecordHeader, SwapHop, TradeIntent,
     TradeResources, TradeSide, TradingRegime,
+};
+use crate::metrics::{
+    multi_hop_cycle_rejected_sanity_inc, multi_hop_return_bps_saturated_inc,
+    multi_hop_shadow_logged_inc, MultiHopSanityRejectReason,
 };
 use parking_lot::RwLock;
 use solana_sdk::pubkey::Pubkey;
@@ -169,8 +173,20 @@ impl QuoteProvider for CachedQuoteProvider {
             }
         }
 
-        // No cached quote - return conservative estimate
+        // No cached quote - return conservative estimate (ranker skips via has_cached_quote)
         Some((amount_in as f64 * self.default_edge_ratio) as u64)
+    }
+
+    fn has_cached_quote(
+        &self,
+        pool_address: &Pubkey,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+    ) -> bool {
+        let cache = self.cache.read();
+        cache
+            .get(&(*pool_address, *input_mint, *output_mint))
+            .is_some_and(|(_, ts)| ts.elapsed() < self.cache_ttl)
     }
 }
 
@@ -433,10 +449,27 @@ impl MultiHopArbitrage {
         self.cycles_found
             .fetch_add(cycles.len() as u64, Ordering::Relaxed);
 
-        // Filter profitable
+        // Filter: trustworthy profit estimate + min threshold
         let profitable: Vec<_> = cycles
             .into_iter()
-            .filter(|c| c.estimated_return_bps >= config.min_profit_bps)
+            .filter(|c| {
+                if !c.is_trustworthy_profit_estimate() {
+                    if c.return_bps_saturated {
+                        multi_hop_return_bps_saturated_inc();
+                        multi_hop_cycle_rejected_sanity_inc(
+                            MultiHopSanityRejectReason::ReturnBpsCap,
+                        );
+                    }
+                    if c.profit_multiplier_capped {
+                        multi_hop_cycle_rejected_sanity_inc(MultiHopSanityRejectReason::ProfitCap);
+                    }
+                    if c.edge_ratio_clamped {
+                        multi_hop_cycle_rejected_sanity_inc(MultiHopSanityRejectReason::EdgeRatio);
+                    }
+                    return false;
+                }
+                c.estimated_return_bps >= config.min_profit_bps
+            })
             .collect();
 
         self.cycles_profitable
@@ -459,9 +492,13 @@ impl MultiHopArbitrage {
         // Shadow mode: log but don't generate intents
         if config.shadow_mode {
             for (i, cycle) in profitable.iter().enumerate() {
+                multi_hop_shadow_logged_inc();
+                let near_cap = cycle.estimated_return_bps > MAX_RETURN_BPS.saturating_sub(500);
                 info!(
                     rank = i + 1,
                     return_bps = cycle.estimated_return_bps,
+                    return_bps_capped = false,
+                    sanity_flags = if near_cap { "near_return_cap" } else { "" },
                     hops = cycle.hop_count(),
                     min_liquidity = cycle.min_liquidity_usd,
                     path = ?cycle.path.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
@@ -635,6 +672,15 @@ impl QuoteProvider for Arc<CachedQuoteProvider> {
         amount_in: u64,
     ) -> Option<u64> {
         (**self).get_quote(pool_address, dex, input_mint, output_mint, amount_in)
+    }
+
+    fn has_cached_quote(
+        &self,
+        pool_address: &Pubkey,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+    ) -> bool {
+        (**self).has_cached_quote(pool_address, input_mint, output_mint)
     }
 }
 

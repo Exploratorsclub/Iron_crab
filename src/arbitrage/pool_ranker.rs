@@ -11,7 +11,7 @@
 //! > This is MORE ACCURATE than spot price because it includes fees & curve effects.
 
 use super::pool_graph::PoolGraph;
-use super::types::{DexType, PoolEdge, RankedPool};
+use super::types::{clamp_edge_ratio, DexType, PoolEdge, RankedPool};
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 
@@ -65,6 +65,17 @@ pub trait QuoteProvider: Send + Sync {
         output_mint: &Pubkey,
         amount_in: u64,
     ) -> Option<u64>;
+
+    /// Whether a fresh cached probe quote exists for this pool direction.
+    /// Default `true` (mocks / providers without cache distinction).
+    fn has_cached_quote(
+        &self,
+        _pool_address: &Pubkey,
+        _input_mint: &Pubkey,
+        _output_mint: &Pubkey,
+    ) -> bool {
+        true
+    }
 }
 
 /// Pool ranker that pre-computes edge ratios using probe quotes
@@ -149,6 +160,14 @@ impl<Q: QuoteProvider> PoolRanker<Q> {
         input_mint: &Pubkey,
         output_mint: &Pubkey,
     ) -> Option<RankedPool> {
+        if !self
+            .quote_provider
+            .has_cached_quote(&edge.pool_address, input_mint, output_mint)
+        {
+            crate::metrics::multi_hop_hop_missing_quote_inc();
+            return None;
+        }
+
         // Get probe quote
         let quote_out = self.quote_provider.get_quote(
             &edge.pool_address,
@@ -158,8 +177,9 @@ impl<Q: QuoteProvider> PoolRanker<Q> {
             self.config.probe_amount,
         )?;
 
-        // Edge ratio = output / input (accounts for fees & curve)
-        let edge_ratio = quote_out as f64 / self.config.probe_amount as f64;
+        // Edge ratio = output / input (accounts for fees & curve), then sanity clamp
+        let raw_ratio = quote_out as f64 / self.config.probe_amount as f64;
+        let edge_ratio = clamp_edge_ratio(raw_ratio);
 
         // Dampened liquidity score (clamped, NOT sqrt!)
         // From external review: clamp(liquidity/baseline, 0.3, 1.5)
