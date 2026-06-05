@@ -4649,6 +4649,202 @@ fn wallet_geyser_snapshots_to_publish(
     }
 }
 
+/// Wallet-owned WSOL `post_token_balances` row present — skip paired NATIVE_SOL publish (PR #201).
+fn wallet_tx_meta_has_wsol_post_balance(wallet: &Pubkey, tx: &GeyserTransactionUpdate) -> bool {
+    let wallet_str = wallet.to_string();
+    tx.post_token_balances
+        .iter()
+        .any(|b| b.mint == WSOL_MINT && b.owner.as_deref() == Some(wallet_str.as_str()))
+}
+
+fn wallet_tx_meta_native_sol_post_lamports(
+    wallet: &Pubkey,
+    tx: &GeyserTransactionUpdate,
+) -> Option<u64> {
+    let idx = tx.account_keys.iter().position(|k| k == wallet)?;
+    tx.post_balances.get(idx).copied()
+}
+
+/// Idempotent ATA pin + Geyser subscribe list refresh after a wallet TX meta balance row.
+fn wallet_tx_meta_pin_ata_from_balance(
+    ctx: &MarketDataContext,
+    tracked_wallet: &TrackedWallet,
+    tx: &GeyserTransactionUpdate,
+    balance: &ironcrab::solana::geyser_listener::TokenBalance,
+    md_state: &MdStateSender,
+) -> bool {
+    use ironcrab::solana::geyser_listener::geyser_token_balance_account_pubkey;
+
+    let Some(ata) = geyser_token_balance_account_pubkey(tx, balance) else {
+        return false;
+    };
+    let mut added_ata = false;
+    {
+        let mut set = ctx.tracked_wallet_token_accounts.write();
+        if set.insert(ata) {
+            added_ata = true;
+        }
+    }
+    if let Ok(mint) = Pubkey::from_str(&balance.mint) {
+        let needs_mint_track = ctx
+            .tracked_mints
+            .read()
+            .get(&mint)
+            .is_none_or(|info| !info.pinned || info.pin != Some(GeyserPinReason::Wallet));
+        if needs_mint_track {
+            md_state_try_enqueue(md_state, MdStateCommand::TrackWalletMint { mint });
+        }
+        ctx.tracked_wallet_mint_decimals
+            .write()
+            .insert(mint, balance.ui_token_amount.decimals);
+    }
+    if added_ata {
+        let mut accounts: Vec<Pubkey> = Vec::new();
+        accounts.push(tracked_wallet.wallet);
+        accounts.push(tracked_wallet.wsol_ata);
+        accounts.extend(ctx.tracked_wallet_token_accounts.read().iter().copied());
+        accounts.sort();
+        accounts.dedup();
+        let _ = ctx.tracked_wallet_tx.send(accounts);
+    }
+    added_ata
+}
+
+/// Phase 1 (PR1): publish `WalletBalanceSnapshot` from Geyser TX `post_token_balances` / native SOL meta.
+async fn process_wallet_balance_snapshots_from_tx_meta(
+    ctx: &Arc<MarketDataContext>,
+    run_id: &str,
+    tx: &GeyserTransactionUpdate,
+    account_publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
+    md_state: &MdStateSender,
+) {
+    use ironcrab::solana::geyser_listener::{
+        geyser_tx_involves_wallet, geyser_wallet_post_token_balances,
+    };
+
+    let Some(tracked_wallet) = ctx.tracked_wallet.as_ref() else {
+        return;
+    };
+    let wallet = tracked_wallet.wallet;
+    if !geyser_tx_involves_wallet(&wallet, tx) {
+        return;
+    }
+
+    let wallet_str = wallet.to_string();
+    let has_wsol_post = wallet_tx_meta_has_wsol_post_balance(&wallet, tx);
+    let can_publish = ctx.nats.is_some() || account_publish_tx.is_some();
+
+    if !has_wsol_post {
+        if let Some(lamports) = wallet_tx_meta_native_sol_post_lamports(&wallet, tx) {
+            let prev = tracked_wallet
+                .last_sol_balance
+                .swap(lamports, Ordering::Relaxed);
+            if lamports != prev && can_publish {
+                let sol_snapshot = MarketEvent::new(
+                    "market-data",
+                    BUILD_VERSION,
+                    run_id,
+                    format!("geyser_wallet_tx_sol_{}", tx.signature),
+                    "geyser_wallet_tx_meta",
+                    Some(tx.slot),
+                    MarketEventKind::WalletBalanceSnapshot {
+                        mint: "NATIVE_SOL".to_string(),
+                        balance_raw: lamports,
+                        decimals: 9,
+                        token_program: "system".to_string(),
+                    },
+                );
+                let sol_subject = wallet_snapshot_subject(&wallet_str, "NATIVE_SOL");
+                account_path_enqueue_jetstream(
+                    account_publish_tx,
+                    ctx.nats.as_ref(),
+                    sol_subject,
+                    &sol_snapshot,
+                    "native SOL WalletBalanceSnapshot (TX meta)",
+                    false,
+                )
+                .await;
+                info!(
+                    wallet = %wallet_str,
+                    sol_lamports = lamports,
+                    slot = tx.slot,
+                    sig = %tx.signature,
+                    "WalletBalanceSnapshot (NATIVE_SOL) enqueued from TX meta"
+                );
+            }
+        }
+    }
+
+    for balance in geyser_wallet_post_token_balances(&wallet, tx) {
+        let balance_raw = match balance.ui_token_amount.amount.parse::<u64>() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    wallet = %wallet_str,
+                    mint = %balance.mint,
+                    amount = %balance.ui_token_amount.amount,
+                    error = %e,
+                    sig = %tx.signature,
+                    "Skipping wallet TX meta balance: invalid raw amount"
+                );
+                continue;
+            }
+        };
+        let decimals = balance.ui_token_amount.decimals;
+        let token_program = balance
+            .program_id
+            .clone()
+            .unwrap_or_else(|| spl_token::ID.to_string());
+
+        let snapshot_mint = if balance.mint == WSOL_MINT {
+            tracked_wallet
+                .last_wsol_balance
+                .store(balance_raw, Ordering::Relaxed);
+            tracked_wallet.wsol_seen.store(true, Ordering::Relaxed);
+            WSOL_MINT.to_string()
+        } else {
+            balance.mint.clone()
+        };
+
+        if can_publish {
+            let event = MarketEvent::new(
+                "market-data",
+                BUILD_VERSION,
+                run_id,
+                format!("geyser_wallet_tx_{}_{}", tx.signature, snapshot_mint),
+                "geyser_wallet_tx_meta",
+                Some(tx.slot),
+                MarketEventKind::WalletBalanceSnapshot {
+                    mint: snapshot_mint.clone(),
+                    balance_raw,
+                    decimals,
+                    token_program: token_program.clone(),
+                },
+            );
+            let subject = wallet_snapshot_subject(&wallet_str, &snapshot_mint);
+            account_path_enqueue_jetstream(
+                account_publish_tx,
+                ctx.nats.as_ref(),
+                subject,
+                &event,
+                "WalletBalanceSnapshot JetStream (TX meta)",
+                true,
+            )
+            .await;
+            info!(
+                wallet = %wallet_str,
+                mint = %snapshot_mint,
+                balance_raw,
+                slot = tx.slot,
+                sig = %tx.signature,
+                "WalletBalanceSnapshot enqueued from TX meta"
+            );
+        }
+
+        wallet_tx_meta_pin_ata_from_balance(ctx, tracked_wallet, tx, balance, md_state);
+    }
+}
+
 /// Wallet `mints_in_wallet` are non-zero balances from bootstrap RPC; pick at most `max_mints`
 /// unique pubkeys that still lack explicit Ready for any modeled slice per
 /// [`LivePoolCache::base_mint_has_any_ready_pool`] (PumpSwap, PumpFun, Raydium CPMM, Meteora CPMM, Meteora DLMM,
@@ -11311,6 +11507,16 @@ async fn handle_geyser_transaction(
     // This is needed to catch manual wallet actions (Phantom/Jupiter) that do not
     // produce ExecutionResults.
 
+    // PR1 Phase 1: wallet balance snapshots from TX meta (post_token_balances + native SOL).
+    process_wallet_balance_snapshots_from_tx_meta(
+        &ctx,
+        run_id,
+        &tx_update,
+        account_publish_tx,
+        md_state,
+    )
+    .await;
+
     // P2: Track priority fees from Geyser transactions (NO RPC calls!)
     if let Some(priority_fee) = ctx.priority_fee_tracker.add_sample(
         tx_update.slot,
@@ -14199,6 +14405,221 @@ mod wallet_geyser_snapshot_decouple_tests {
             })
             .is_none()
         );
+    }
+}
+
+/// PR1: wallet balance snapshots from Geyser TX meta (`post_token_balances`).
+#[cfg(test)]
+mod wallet_tx_meta_balance_tests {
+    use super::*;
+    use ironcrab::solana::geyser_listener::{
+        geyser_tx_involves_wallet, GeyserTransactionUpdate, TokenAmount, TokenBalance,
+    };
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::mpsc;
+
+    fn spawn_test_md_state(ctx: &Arc<MarketDataContext>) -> MdStateSender {
+        spawn_md_state_worker(Arc::clone(ctx), tokio::runtime::Handle::current())
+    }
+
+    fn market_data_context_with_tracked_wallet(wallet: Pubkey) -> Arc<MarketDataContext> {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let (tracked_wallet_tx, _) = watch::channel(Vec::<Pubkey>::new());
+        let tracked = TrackedWallet::new(wallet);
+        let (tracked_mints_tx, _tracked_mints_rx) = watch::channel(Vec::<Pubkey>::new());
+        let (tracked_vaults_tx, _tracked_vaults_rx) = watch::channel(Vec::<Pubkey>::new());
+        let (tracked_bin_arrays_tx, _tracked_bin_arrays_rx) = watch::channel(Vec::<Pubkey>::new());
+        Arc::new(MarketDataContext {
+            run_id: "run-wallet-tx-meta".to_string(),
+            config: parking_lot::RwLock::new(MarketDataConfig::default()),
+            geyser_full_reconnect_threshold_live: Arc::new(AtomicUsize::new(0)),
+            nats: None,
+            jsonl_writer: jsonl,
+            started_at: Instant::now(),
+            event_counter: std::sync::atomic::AtomicU64::new(0),
+            wallet_tracker: WalletTracker::new(WalletTrackerCfg::default()),
+            priority_fee_tracker: Arc::new(PriorityFeeTracker::new()),
+            tracked_mints: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tracked_mints_tx,
+            active_pool_set: Arc::new(ActivePoolSet::new()),
+            known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            known_trade_dex_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            pumpfun_pool_discovery_mint_info_emitted: parking_lot::RwLock::new(
+                std::collections::HashSet::new(),
+            ),
+            tracked_vaults: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tracked_vaults_tx,
+            tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tracked_bin_arrays_tx,
+            live_pool_cache: Arc::new(LivePoolCache::new()),
+            creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            high_priority_bonding_curves: parking_lot::RwLock::new(HashSet::new()),
+            raydium_serum_fetched: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            tracked_wallet: Some(tracked),
+            tracked_wallet_tx,
+            tracked_wallet_token_accounts: parking_lot::RwLock::new(
+                std::collections::HashSet::new(),
+            ),
+            tracked_wallet_mint_decimals: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            execution_results_deduper: parking_lot::Mutex::new(ExecutionResultDeduper::default()),
+            last_emitted_curve_progress: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            bonding_curve_publish_times: parking_lot::Mutex::new(BondingCurvePublishTimes::new()),
+            pump_amm_dex: parking_lot::RwLock::new(None),
+            helius_rpc: None,
+            geyser_sync_batch_timer: parking_lot::Mutex::new(None),
+            ingest_tokio_handle: parking_lot::RwLock::new(None),
+            pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
+                std::collections::HashSet::new(),
+            ),
+        })
+    }
+
+    fn sample_wallet_tx_update(
+        wallet: Pubkey,
+        token_ata: Pubkey,
+        mint: &str,
+    ) -> GeyserTransactionUpdate {
+        let balance_raw = 1_500_000u64;
+        GeyserTransactionUpdate {
+            signature: "wallet_tx_meta_sig".into(),
+            slot: 99,
+            account_keys: vec![wallet, token_ata],
+            instruction_accounts: vec![],
+            instruction_data: vec![],
+            inner_instructions: vec![],
+            pre_token_balances: vec![],
+            post_token_balances: vec![TokenBalance {
+                account_index: 1,
+                mint: mint.to_string(),
+                ui_token_amount: TokenAmount {
+                    ui_amount: None,
+                    decimals: 6,
+                    amount: balance_raw.to_string(),
+                },
+                program_id: Some(spl_token::ID.to_string()),
+                owner: Some(wallet.to_string()),
+            }],
+            pre_balances: vec![5_000_000_000, 2_039_280],
+            post_balances: vec![4_900_000_000, 2_039_280],
+            fee_lamports: 5_000,
+            compute_units_consumed: Some(42_000),
+            grpc_recv_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn geyser_tx_involves_wallet_signer_or_token_owner() {
+        let wallet = Pubkey::new_unique();
+        let foreign = Pubkey::new_unique();
+        let ata = Pubkey::new_unique();
+        let signer_tx = GeyserTransactionUpdate {
+            signature: "s".into(),
+            slot: 1,
+            account_keys: vec![wallet],
+            instruction_accounts: vec![],
+            instruction_data: vec![],
+            inner_instructions: vec![],
+            pre_token_balances: vec![],
+            post_token_balances: vec![],
+            pre_balances: vec![1],
+            post_balances: vec![1],
+            fee_lamports: 0,
+            compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
+        };
+        assert!(geyser_tx_involves_wallet(&wallet, &signer_tx));
+        assert!(!geyser_tx_involves_wallet(&foreign, &signer_tx));
+
+        let owner_tx = sample_wallet_tx_update(wallet, ata, &Pubkey::new_unique().to_string());
+        assert!(geyser_tx_involves_wallet(&wallet, &owner_tx));
+        assert!(!geyser_tx_involves_wallet(&foreign, &owner_tx));
+    }
+
+    #[test]
+    fn wallet_tx_meta_skips_native_sol_when_wsol_post_balance_present() {
+        let wallet = Pubkey::new_unique();
+        let wsol_ata = Pubkey::new_unique();
+        let mut tx = sample_wallet_tx_update(wallet, wsol_ata, WSOL_MINT);
+        tx.post_token_balances[0].mint = WSOL_MINT.to_string();
+        assert!(wallet_tx_meta_has_wsol_post_balance(&wallet, &tx));
+        assert!(wallet_tx_meta_native_sol_post_lamports(&wallet, &tx).is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wallet_tx_meta_publishes_token_snapshot_and_pins_ata() {
+        let wallet = Pubkey::new_unique();
+        let token_ata = Pubkey::new_unique();
+        let mint = Pubkey::new_unique().to_string();
+        let ctx = market_data_context_with_tracked_wallet(wallet);
+        let md_state = spawn_test_md_state(&ctx);
+        let (publish_tx, mut publish_rx) = mpsc::channel(8);
+        let tx = sample_wallet_tx_update(wallet, token_ata, &mint);
+
+        process_wallet_balance_snapshots_from_tx_meta(
+            &ctx,
+            "run-wallet-tx-meta",
+            &tx,
+            Some(&publish_tx),
+            &md_state,
+        )
+        .await;
+
+        let mut snapshots: Vec<(String, u64)> = Vec::new();
+        while let Ok(job) = publish_rx.try_recv() {
+            if let AccountPathNatsJob::JetStream { payload, .. } = job {
+                if payload.get("kind").and_then(|v| v.as_str()) == Some("WalletBalanceSnapshot") {
+                    snapshots.push((
+                        payload
+                            .get("mint")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        payload
+                            .get("balance_raw")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            snapshots.iter().any(|(m, b)| m == &mint && *b == 1_500_000),
+            "expected token WalletBalanceSnapshot, got {snapshots:?}"
+        );
+        assert!(
+            ctx.tracked_wallet_token_accounts
+                .read()
+                .contains(&token_ata),
+            "ATA should be pinned from TX meta"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreign_wallet_tx_meta_publishes_nothing() {
+        let wallet = Pubkey::new_unique();
+        let foreign = Pubkey::new_unique();
+        let token_ata = Pubkey::new_unique();
+        let ctx = market_data_context_with_tracked_wallet(wallet);
+        let md_state = spawn_test_md_state(&ctx);
+        let (publish_tx, mut publish_rx) = mpsc::channel(8);
+        let tx = sample_wallet_tx_update(foreign, token_ata, &Pubkey::new_unique().to_string());
+
+        process_wallet_balance_snapshots_from_tx_meta(
+            &ctx,
+            "run-wallet-tx-meta",
+            &tx,
+            Some(&publish_tx),
+            &md_state,
+        )
+        .await;
+
+        assert!(publish_rx.try_recv().is_err());
+        assert!(ctx.tracked_wallet_token_accounts.read().is_empty());
     }
 }
 
