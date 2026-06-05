@@ -4608,6 +4608,47 @@ fn wsol_ata_balance_lamports_from_geyser_data(data: &[u8]) -> Option<u64> {
     try_parse_token_account_balance(data)
 }
 
+/// Which tracked-wallet Geyser account produced a balance update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalletGeyserUpdateSource {
+    NativeSol { lamports: u64, prev_lamports: u64 },
+    WsolAta { balance: u64, prev_balance: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalletGeyserSnapshotMint {
+    NativeSol,
+    Wsol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalletGeyserSnapshotToPublish {
+    mint: WalletGeyserSnapshotMint,
+    balance_raw: u64,
+}
+
+/// One Geyser account update → at most one wallet snapshot. Never cross-publish the other mint from cache.
+fn wallet_geyser_snapshots_to_publish(
+    source: WalletGeyserUpdateSource,
+) -> Option<WalletGeyserSnapshotToPublish> {
+    match source {
+        WalletGeyserUpdateSource::NativeSol {
+            lamports,
+            prev_lamports,
+        } => (lamports != prev_lamports).then_some(WalletGeyserSnapshotToPublish {
+            mint: WalletGeyserSnapshotMint::NativeSol,
+            balance_raw: lamports,
+        }),
+        WalletGeyserUpdateSource::WsolAta {
+            balance,
+            prev_balance,
+        } => (balance != prev_balance).then_some(WalletGeyserSnapshotToPublish {
+            mint: WalletGeyserSnapshotMint::Wsol,
+            balance_raw: balance,
+        }),
+    }
+}
+
 /// Wallet `mints_in_wallet` are non-zero balances from bootstrap RPC; pick at most `max_mints`
 /// unique pubkeys that still lack explicit Ready for any modeled slice per
 /// [`LivePoolCache::base_mint_has_any_ready_pool`] (PumpSwap, PumpFun, Raydium CPMM, Meteora CPMM, Meteora DLMM,
@@ -10800,42 +10841,20 @@ async fn handle_geyser_account(
             .read()
             .contains(&account_update.pubkey);
 
-        if is_wallet_account || is_wsol_ata {
-            // Parse balance based on account type
-            let (new_sol, new_wsol, balance_changed) = if is_wallet_account {
-                // Native SOL account - balance is in lamports field
-                let lamports = account_update.lamports;
-                let prev = tracked_wallet
-                    .last_sol_balance
-                    .swap(lamports, Ordering::Relaxed);
-                let wsol = tracked_wallet.last_wsol_balance.load(Ordering::Relaxed);
-                let has_wsol = tracked_wallet.wsol_seen.load(Ordering::Relaxed);
-                let wsol_value = if has_wsol { Some(wsol) } else { None };
-                (lamports, wsol_value, lamports != prev)
-            } else {
-                // WSOL ATA - parse token account balance.
-                // When the ATA is closed (unwrap), Geyser often delivers an update with
-                // `data` empty (account gone) — not parseable as SPL token state.
-                // That means WSOL=0. Previously we `continue`d and kept a stale balance
-                // with no zero WalletBalanceSnapshot to JetStream.
-                let Some(balance) =
-                    wsol_ata_balance_lamports_from_geyser_data(&account_update.data)
-                else {
-                    return;
-                };
-                let prev = tracked_wallet
-                    .last_wsol_balance
-                    .swap(balance, Ordering::Relaxed);
-                tracked_wallet.wsol_seen.store(true, Ordering::Relaxed);
-                let sol = tracked_wallet.last_sol_balance.load(Ordering::Relaxed);
-                (sol, Some(balance), balance != prev)
-            };
-
-            if balance_changed {
-                let wallet_str = tracked_wallet.wallet.to_string();
-
-                // Publish SOL + WSOL as WalletBalanceSnapshot to JetStream (SSOT)
+        if is_wallet_account {
+            // Native SOL account — balance is in lamports field. Publish NATIVE_SOL only.
+            let lamports = account_update.lamports;
+            let prev = tracked_wallet
+                .last_sol_balance
+                .swap(lamports, Ordering::Relaxed);
+            if let Some(snapshot) =
+                wallet_geyser_snapshots_to_publish(WalletGeyserUpdateSource::NativeSol {
+                    lamports,
+                    prev_lamports: prev,
+                })
+            {
                 if ctx.nats.is_some() {
+                    let wallet_str = tracked_wallet.wallet.to_string();
                     let sol_snapshot = MarketEvent::new(
                         "market-data",
                         BUILD_VERSION,
@@ -10845,7 +10864,7 @@ async fn handle_geyser_account(
                         Some(account_update.slot),
                         MarketEventKind::WalletBalanceSnapshot {
                             mint: "NATIVE_SOL".to_string(),
-                            balance_raw: new_sol,
+                            balance_raw: snapshot.balance_raw,
                             decimals: 9,
                             token_program: "system".to_string(),
                         },
@@ -10861,40 +10880,67 @@ async fn handle_geyser_account(
                     )
                     .await;
 
-                    if let Some(wsol) = new_wsol {
-                        let wsol_snapshot = MarketEvent::new(
-                            "market-data",
-                            BUILD_VERSION,
-                            run_id,
-                            format!("geyser_wallet_wsol_{}", account_update.slot),
-                            "geyser_wallet_update",
-                            Some(account_update.slot),
-                            MarketEventKind::WalletBalanceSnapshot {
-                                mint: WSOL_MINT.to_string(),
-                                balance_raw: wsol,
-                                decimals: 9,
-                                token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-                                    .to_string(),
-                            },
-                        );
-                        let wsol_subject = wallet_snapshot_subject(&wallet_str, WSOL_MINT);
-                        account_path_enqueue_jetstream(
-                            publish_tx,
-                            ctx.nats.as_ref(),
-                            wsol_subject,
-                            &wsol_snapshot,
-                            "WSOL WalletBalanceSnapshot",
-                            false,
-                        )
-                        .await;
-                    }
+                    info!(
+                        wallet = %wallet_str,
+                        sol_lamports = snapshot.balance_raw,
+                        slot = account_update.slot,
+                        "WalletBalanceSnapshot (NATIVE_SOL) enqueued for JetStream"
+                    );
+                }
+            }
+        } else if is_wsol_ata {
+            // WSOL ATA — parse token account balance. Publish WSOL only.
+            // When the ATA is closed (unwrap), Geyser often delivers an update with
+            // `data` empty (account gone) — not parseable as SPL token state.
+            // That means WSOL=0. Previously we `continue`d and kept a stale balance
+            // with no zero WalletBalanceSnapshot to JetStream.
+            let Some(balance) = wsol_ata_balance_lamports_from_geyser_data(&account_update.data)
+            else {
+                return;
+            };
+            let prev = tracked_wallet
+                .last_wsol_balance
+                .swap(balance, Ordering::Relaxed);
+            tracked_wallet.wsol_seen.store(true, Ordering::Relaxed);
+            if let Some(snapshot) =
+                wallet_geyser_snapshots_to_publish(WalletGeyserUpdateSource::WsolAta {
+                    balance,
+                    prev_balance: prev,
+                })
+            {
+                if ctx.nats.is_some() {
+                    let wallet_str = tracked_wallet.wallet.to_string();
+                    let wsol_snapshot = MarketEvent::new(
+                        "market-data",
+                        BUILD_VERSION,
+                        run_id,
+                        format!("geyser_wallet_wsol_{}", account_update.slot),
+                        "geyser_wallet_update",
+                        Some(account_update.slot),
+                        MarketEventKind::WalletBalanceSnapshot {
+                            mint: WSOL_MINT.to_string(),
+                            balance_raw: snapshot.balance_raw,
+                            decimals: 9,
+                            token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+                                .to_string(),
+                        },
+                    );
+                    let wsol_subject = wallet_snapshot_subject(&wallet_str, WSOL_MINT);
+                    account_path_enqueue_jetstream(
+                        publish_tx,
+                        ctx.nats.as_ref(),
+                        wsol_subject,
+                        &wsol_snapshot,
+                        "WSOL WalletBalanceSnapshot",
+                        false,
+                    )
+                    .await;
 
                     info!(
                         wallet = %wallet_str,
-                        sol_lamports = new_sol,
-                        wsol_lamports = ?new_wsol,
+                        wsol_lamports = snapshot.balance_raw,
                         slot = account_update.slot,
-                        "WalletBalanceSnapshot (SOL/WSOL) enqueued for JetStream"
+                        "WalletBalanceSnapshot (WSOL) enqueued for JetStream"
                     );
                 }
             }
@@ -14087,6 +14133,71 @@ mod wsol_ata_update_tests {
         assert_eq!(
             wsol_ata_balance_lamports_from_geyser_data(&data),
             Some(1_000_000_000)
+        );
+    }
+}
+
+/// Decoupled SOL/WSOL Geyser publish decisions (KNOWN_BUG_PATTERNS #23 fix).
+#[cfg(test)]
+mod wallet_geyser_snapshot_decouple_tests {
+    use super::{
+        wallet_geyser_snapshots_to_publish, WalletGeyserSnapshotMint, WalletGeyserUpdateSource,
+    };
+
+    #[test]
+    fn native_sol_geyser_change_publishes_only_native_even_with_stale_wsol_cache() {
+        // Simulates: last_wsol_balance=1B in cache, but only native SOL lamports changed on Geyser.
+        let snapshot = wallet_geyser_snapshots_to_publish(WalletGeyserUpdateSource::NativeSol {
+            lamports: 2_900_000_000,
+            prev_lamports: 3_000_000_000,
+        })
+        .expect("native balance changed");
+        assert_eq!(snapshot.mint, WalletGeyserSnapshotMint::NativeSol);
+        assert_eq!(snapshot.balance_raw, 2_900_000_000);
+    }
+
+    #[test]
+    fn native_sol_geyser_unchanged_publishes_nothing() {
+        assert!(
+            wallet_geyser_snapshots_to_publish(WalletGeyserUpdateSource::NativeSol {
+                lamports: 3_000_000_000,
+                prev_lamports: 3_000_000_000,
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn wsol_ata_geyser_change_publishes_only_wsol_even_with_stale_native_cache() {
+        // Simulates: last_sol_balance=3B in cache, but only WSOL token balance changed on Geyser.
+        let snapshot = wallet_geyser_snapshots_to_publish(WalletGeyserUpdateSource::WsolAta {
+            balance: 1_000_000_000,
+            prev_balance: 0,
+        })
+        .expect("wsol balance changed");
+        assert_eq!(snapshot.mint, WalletGeyserSnapshotMint::Wsol);
+        assert_eq!(snapshot.balance_raw, 1_000_000_000);
+    }
+
+    #[test]
+    fn wsol_ata_zero_after_unwrap_still_publishes_wsol_zero() {
+        let snapshot = wallet_geyser_snapshots_to_publish(WalletGeyserUpdateSource::WsolAta {
+            balance: 0,
+            prev_balance: 1_000_000_000,
+        })
+        .expect("unwrap must publish WSOL=0");
+        assert_eq!(snapshot.mint, WalletGeyserSnapshotMint::Wsol);
+        assert_eq!(snapshot.balance_raw, 0);
+    }
+
+    #[test]
+    fn wsol_ata_unchanged_publishes_nothing() {
+        assert!(
+            wallet_geyser_snapshots_to_publish(WalletGeyserUpdateSource::WsolAta {
+                balance: 1_000_000_000,
+                prev_balance: 1_000_000_000,
+            })
+            .is_none()
         );
     }
 }
