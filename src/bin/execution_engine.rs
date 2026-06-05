@@ -95,7 +95,8 @@ use ironcrab::metrics::{
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
-    ensure_trade_intents_stream, wallet_snapshot_consumer_config, NatsClient, NatsConfig,
+    ensure_trade_intents_stream, wallet_snapshot_consumer_config,
+    wallet_snapshot_live_consumer_config_execution_engine, NatsClient, NatsConfig,
     CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_CONTROL_REQUESTS, TOPIC_CONTROL_RESPONSES,
     TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
     TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS, TRADE_INTENTS_STREAM_NAME,
@@ -8088,14 +8089,14 @@ async fn main() -> Result<()> {
         match jetstream.get_stream(WALLET_SNAPSHOT_STREAM_NAME).await {
             Ok(stream) => {
                 let wallet_str = wallet.to_string();
-                let mut cfg = wallet_snapshot_consumer_config();
+                let mut cfg = wallet_snapshot_live_consumer_config_execution_engine();
                 cfg.filter_subject = format!("ironcrab.wallet_snapshot.{}.*", wallet_str);
                 match stream.create_consumer(cfg).await {
                     Ok(consumer) => {
                         info!(
                             stream = WALLET_SNAPSHOT_STREAM_NAME,
                             wallet = %wallet_str,
-                            "Subscribed to JetStream WalletBalanceSnapshot (token balance sync)"
+                            "Subscribed to JetStream WalletBalanceSnapshot (live, DeliverPolicy::New)"
                         );
                         Some(consumer)
                     }
