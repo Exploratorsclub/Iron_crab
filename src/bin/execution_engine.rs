@@ -10821,6 +10821,21 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         None
     };
 
+    // PR1 Phase 2: pre-confirm ATA track — publish Sent ExecutionResult before confirm wait.
+    if config.send_enabled && sent_anything {
+        if let Some(ref sr) = send_result {
+            if let Err(e) =
+                publish_pre_confirm_execution_result(ctx, &intent, &decision_id, sr).await
+            {
+                warn!(
+                    intent_id = %intent.intent_id,
+                    error = %e,
+                    "Failed to publish pre-confirm ExecutionResult (ATA pre-track)"
+                );
+            }
+        }
+    }
+
     // === Confirm (RS-4.2 / RS-7.4) ===
     // - RPC path (non-bundle): confirm signature via getSignatureStatuses.
     // - Bundle path: wait for bundle landing via Jito block engine.
@@ -11132,108 +11147,14 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                 },
             );
 
-            // Ensure market-data can track the new ATA via Geyser after a BUY.
-            // The intent already carries token_program (from TradeResources) and the
-            // output_mint + wallet_pubkey are known — so we derive the ATA deterministically
-            // (PDA, no RPC call). Without these metadata fields market-data silently skips
-            // ExecutionResult processing and never subscribes the new ATA to Geyser.
-            if intent.side == TradeSide::Buy {
-                if let Some(wallet) = ctx.wallet_pubkey {
-                    let output_mint_str = &intent.resources.output_mint;
-                    if let Ok(output_mint_pk) = Pubkey::from_str(output_mint_str) {
-                        // token_program: use intent-provided value, fall back to SPL Token
-                        use spl_token::solana_program::pubkey::Pubkey as SplPubkey;
-
-                        let token_program_spl = intent
-                            .resources
-                            .token_program
-                            .as_ref()
-                            .and_then(|tp| Pubkey::from_str(tp).ok())
-                            .map(|pk| SplPubkey::new_from_array(pk.to_bytes()))
-                            .unwrap_or_else(spl_token::id);
-
-                        // Derive ATA deterministically (PDA — no RPC)
-                        let wallet_spl = SplPubkey::new_from_array(wallet.to_bytes());
-                        let mint_spl = SplPubkey::new_from_array(output_mint_pk.to_bytes());
-                        let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
-                            &wallet_spl, &mint_spl, &token_program_spl,
-                        );
-                        let ata_pk = Pubkey::new_from_array(ata_spl.to_bytes());
-                        let token_program_pk = Pubkey::new_from_array(token_program_spl.to_bytes());
-
-                        exec.metadata
-                            .entry("token_account".to_string())
-                            .or_insert_with(|| ata_pk.to_string());
-                        exec.metadata
-                            .entry("token_program".to_string())
-                            .or_insert_with(|| token_program_pk.to_string());
-
-                        // Also propagate mint_decimals if available in LivePoolCache
-                        if !exec.metadata.contains_key("mint_decimals") {
-                            if let Some(ref cache) = ctx.live_pool_cache {
-                                if let Some(d) = cache.get_mint_decimals(&output_mint_pk) {
-                                    exec.metadata
-                                        .insert("mint_decimals".to_string(), d.to_string());
-                                }
-                            }
-                        }
-
-                        info!(
-                            intent_id = %intent.intent_id,
-                            token_account = %ata_pk,
-                            token_program = %token_program_pk,
-                            "ExecutionResult: enriched metadata for market-data ATA tracking"
-                        );
-                    }
-                }
-            } else if intent.side == TradeSide::Sell {
-                // For SELL: derive ATA from wallet + input_mint + token_program (PDA, no RPC).
-                // market-data needs token_account/token_program to untrack the ATA after a sell.
-                if let Some(wallet) = ctx.wallet_pubkey {
-                    let input_mint_str = &intent.resources.input_mint;
-                    if let Ok(input_mint_pk) = Pubkey::from_str(input_mint_str) {
-                        use spl_token::solana_program::pubkey::Pubkey as SplPubkey;
-
-                        let token_program_spl = intent
-                            .resources
-                            .token_program
-                            .as_ref()
-                            .and_then(|tp| Pubkey::from_str(tp).ok())
-                            .map(|pk| SplPubkey::new_from_array(pk.to_bytes()))
-                            .unwrap_or_else(spl_token::id);
-
-                        let wallet_spl = SplPubkey::new_from_array(wallet.to_bytes());
-                        let mint_spl = SplPubkey::new_from_array(input_mint_pk.to_bytes());
-                        let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
-                            &wallet_spl, &mint_spl, &token_program_spl,
-                        );
-                        let ata_pk = Pubkey::new_from_array(ata_spl.to_bytes());
-                        let token_program_pk = Pubkey::new_from_array(token_program_spl.to_bytes());
-
-                        exec.metadata
-                            .entry("token_account".to_string())
-                            .or_insert_with(|| ata_pk.to_string());
-                        exec.metadata
-                            .entry("token_program".to_string())
-                            .or_insert_with(|| token_program_pk.to_string());
-
-                        if !exec.metadata.contains_key("mint_decimals") {
-                            if let Some(ref cache) = ctx.live_pool_cache {
-                                if let Some(d) = cache.get_mint_decimals(&input_mint_pk) {
-                                    exec.metadata
-                                        .insert("mint_decimals".to_string(), d.to_string());
-                                }
-                            }
-                        }
-
-                        info!(
-                            intent_id = %intent.intent_id,
-                            token_account = %ata_pk,
-                            token_program = %token_program_pk,
-                            "ExecutionResult: enriched metadata for market-data ATA untracking (SELL)"
-                        );
-                    }
-                }
+            enrich_execution_result_ata_metadata(&mut exec, ctx, &intent);
+            if let Some(token_account) = exec.metadata.get("token_account") {
+                info!(
+                    intent_id = %intent.intent_id,
+                    token_account = %token_account,
+                    side = ?exec.metadata.get("side"),
+                    "ExecutionResult: enriched metadata for market-data ATA tracking"
+                );
             }
 
             // Best-effort fill accounting: attach fills only when we have a signature and wallet.
@@ -12070,6 +11991,155 @@ enum ConfirmOutcome {
     TimeoutSent {
         details: String,
     },
+}
+
+/// Derive ATA metadata (PDA, no RPC) so market-data can pre-track wallet token accounts.
+fn enrich_execution_result_ata_metadata(
+    exec: &mut ExecutionResult,
+    ctx: &ExecutionContext,
+    intent: &TradeIntent,
+) {
+    if intent.side == TradeSide::Buy {
+        if let Some(wallet) = ctx.wallet_pubkey {
+            let output_mint_str = &intent.resources.output_mint;
+            if let Ok(output_mint_pk) = Pubkey::from_str(output_mint_str) {
+                use spl_token::solana_program::pubkey::Pubkey as SplPubkey;
+
+                let token_program_spl = intent
+                    .resources
+                    .token_program
+                    .as_ref()
+                    .and_then(|tp| Pubkey::from_str(tp).ok())
+                    .map(|pk| SplPubkey::new_from_array(pk.to_bytes()))
+                    .unwrap_or_else(spl_token::id);
+
+                let wallet_spl = SplPubkey::new_from_array(wallet.to_bytes());
+                let mint_spl = SplPubkey::new_from_array(output_mint_pk.to_bytes());
+                let ata_spl =
+                    spl_associated_token_account::get_associated_token_address_with_program_id(
+                        &wallet_spl,
+                        &mint_spl,
+                        &token_program_spl,
+                    );
+                let ata_pk = Pubkey::new_from_array(ata_spl.to_bytes());
+                let token_program_pk = Pubkey::new_from_array(token_program_spl.to_bytes());
+
+                exec.metadata
+                    .entry("token_account".to_string())
+                    .or_insert_with(|| ata_pk.to_string());
+                exec.metadata
+                    .entry("token_program".to_string())
+                    .or_insert_with(|| token_program_pk.to_string());
+
+                if !exec.metadata.contains_key("mint_decimals") {
+                    if let Some(ref cache) = ctx.live_pool_cache {
+                        if let Some(d) = cache.get_mint_decimals(&output_mint_pk) {
+                            exec.metadata
+                                .insert("mint_decimals".to_string(), d.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    } else if intent.side == TradeSide::Sell {
+        if let Some(wallet) = ctx.wallet_pubkey {
+            let input_mint_str = &intent.resources.input_mint;
+            if let Ok(input_mint_pk) = Pubkey::from_str(input_mint_str) {
+                use spl_token::solana_program::pubkey::Pubkey as SplPubkey;
+
+                let token_program_spl = intent
+                    .resources
+                    .token_program
+                    .as_ref()
+                    .and_then(|tp| Pubkey::from_str(tp).ok())
+                    .map(|pk| SplPubkey::new_from_array(pk.to_bytes()))
+                    .unwrap_or_else(spl_token::id);
+
+                let wallet_spl = SplPubkey::new_from_array(wallet.to_bytes());
+                let mint_spl = SplPubkey::new_from_array(input_mint_pk.to_bytes());
+                let ata_spl =
+                    spl_associated_token_account::get_associated_token_address_with_program_id(
+                        &wallet_spl,
+                        &mint_spl,
+                        &token_program_spl,
+                    );
+                let ata_pk = Pubkey::new_from_array(ata_spl.to_bytes());
+                let token_program_pk = Pubkey::new_from_array(token_program_spl.to_bytes());
+
+                exec.metadata
+                    .entry("token_account".to_string())
+                    .or_insert_with(|| ata_pk.to_string());
+                exec.metadata
+                    .entry("token_program".to_string())
+                    .or_insert_with(|| token_program_pk.to_string());
+
+                if !exec.metadata.contains_key("mint_decimals") {
+                    if let Some(ref cache) = ctx.live_pool_cache {
+                        if let Some(d) = cache.get_mint_decimals(&input_mint_pk) {
+                            exec.metadata
+                                .insert("mint_decimals".to_string(), d.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// PR1 Phase 2: publish `ExecutionStatus::Sent` immediately after send so market-data can
+/// pin the ATA before confirm (~30s). Uses a **distinct** `execution_id` from the post-confirm
+/// result so `execution_results_deduper` in market-data processes both events (ATA track is idempotent).
+async fn publish_pre_confirm_execution_result(
+    ctx: &ExecutionContext,
+    intent: &TradeIntent,
+    decision_id: &str,
+    send_result: &ironcrab::ipc::SendResult,
+) -> Result<()> {
+    let token_mint = match intent.side {
+        TradeSide::Buy => Some(intent.resources.output_mint.clone()),
+        TradeSide::Sell => Some(intent.resources.input_mint.clone()),
+    };
+
+    let mut exec = ExecutionResult::new_sent(
+        "execution-engine",
+        BUILD_VERSION,
+        &ctx.run_id,
+        ctx.next_execution_id(),
+        decision_id.to_string(),
+        intent.intent_id.clone(),
+        intent.source.clone(),
+        token_mint,
+        send_result.signature.clone(),
+        send_result.bundle_id.clone(),
+    )
+    .with_metadata(intent.metadata.clone());
+
+    exec.metadata.insert(
+        "side".to_string(),
+        match intent.side {
+            TradeSide::Buy => "BUY".to_string(),
+            TradeSide::Sell => "SELL".to_string(),
+        },
+    );
+    exec.metadata
+        .insert("phase".to_string(), "pre_confirm_track".to_string());
+
+    enrich_execution_result_ata_metadata(&mut exec, ctx, intent);
+
+    let token_account = exec.metadata.get("token_account").cloned();
+    info!(
+        intent_id = %intent.intent_id,
+        token_account = ?token_account,
+        phase = "pre_confirm_track",
+        "Early ExecutionResult published for market-data ATA pre-track"
+    );
+
+    ctx.execution_writer.write(&exec)?;
+    if let Some(ref nats) = ctx.nats {
+        nats.jetstream_publish(TOPIC_EXECUTION_RESULTS, &exec)
+            .await?;
+    }
+    Ok(())
 }
 
 /// FIX-32: Geyser-first TX confirmation with RPC-polling fallback.

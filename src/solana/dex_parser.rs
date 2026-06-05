@@ -2139,6 +2139,7 @@ mod tests {
                 amount: "2000000".to_string(),
             },
             program_id: Some(spl_token.to_string()),
+            owner: None,
         }];
         let post_token = vec![TokenBalance {
             account_index: 5,
@@ -2149,6 +2150,7 @@ mod tests {
                 amount: "1000000".to_string(),
             },
             program_id: Some(spl_token.to_string()),
+            owner: None,
         }];
 
         let pre_balances = vec![1_000_000_000u64; account_keys.len()];
@@ -2265,6 +2267,7 @@ mod tests {
                 amount: "2000000".to_string(),
             },
             program_id: Some(spl_token.to_string()),
+            owner: None,
         }];
         let post_token = vec![TokenBalance {
             account_index: 5,
@@ -2275,6 +2278,7 @@ mod tests {
                 amount: "1000000".to_string(),
             },
             program_id: Some(spl_token.to_string()),
+            owner: None,
         }];
 
         let pre_balances = vec![1_000_000_000u64; account_keys.len()];
@@ -2391,6 +2395,7 @@ mod tests {
                 amount: "2000000".to_string(),
             },
             program_id: Some(spl_token.to_string()),
+            owner: None,
         }];
         let post_token = vec![TokenBalance {
             account_index: 5,
@@ -2401,6 +2406,7 @@ mod tests {
                 amount: "1000000".to_string(),
             },
             program_id: Some(spl_token.to_string()),
+            owner: None,
         }];
 
         let pre_balances = vec![1_000_000_000u64; account_keys.len()];
@@ -2518,6 +2524,7 @@ mod tests {
                 amount: "2000000".to_string(),
             },
             program_id: Some(spl_token.to_string()),
+            owner: None,
         }];
         let post_token = vec![TokenBalance {
             account_index: sell_account_indices[5],
@@ -2528,6 +2535,7 @@ mod tests {
                 amount: "1000000".to_string(),
             },
             program_id: Some(spl_token.to_string()),
+            owner: None,
         }];
 
         let update = GeyserTransactionUpdate {
@@ -2602,6 +2610,7 @@ mod tests {
                 amount: "0".to_string(),
             },
             program_id: Some(spl_token.to_string()),
+            owner: None,
         }];
         let post_token = vec![TokenBalance {
             account_index: user_ata_idx,
@@ -2612,6 +2621,7 @@ mod tests {
                 amount: TOKEN_RAW.to_string(),
             },
             program_id: Some(spl_token.to_string()),
+            owner: None,
         }];
 
         let pre_balances = vec![2_005_000u64; account_keys.len()];
@@ -2699,6 +2709,7 @@ mod tests {
                 amount: "0".to_string(),
             },
             program_id: Some(spl_token.to_string()),
+            owner: None,
         }];
         let post_token = vec![TokenBalance {
             account_index: user_ata_idx,
@@ -2709,6 +2720,7 @@ mod tests {
                 amount: "1000000".to_string(),
             },
             program_id: Some(spl_token.to_string()),
+            owner: None,
         }];
 
         let update = GeyserTransactionUpdate {
@@ -2782,6 +2794,7 @@ mod tests {
                 amount: "0".to_string(),
             },
             program_id: Some(spl_token.to_string()),
+            owner: None,
         }];
         let post_token = vec![TokenBalance {
             account_index: user_ata_idx,
@@ -2792,6 +2805,7 @@ mod tests {
                 amount: "1000000".to_string(),
             },
             program_id: Some(spl_token.to_string()),
+            owner: None,
         }];
 
         let update = GeyserTransactionUpdate {
@@ -2854,6 +2868,7 @@ mod tests {
                 amount: "0".to_string(),
             },
             program_id: Some(spl_token.to_string()),
+            owner: None,
         }];
         let post_token = vec![TokenBalance {
             account_index: 15,
@@ -2864,6 +2879,7 @@ mod tests {
                 amount: "999000".to_string(),
             },
             program_id: Some(spl_token.to_string()),
+            owner: None,
         }];
 
         let update = GeyserTransactionUpdate {

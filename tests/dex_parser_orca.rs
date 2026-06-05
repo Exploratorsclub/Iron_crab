@@ -30,6 +30,7 @@ fn token_balance(account_index: u8, mint: &Pubkey, amount: u64, decimals: u8) ->
             amount: amount.to_string(),
         },
         program_id: None,
+        owner: None,
     }
 }
 

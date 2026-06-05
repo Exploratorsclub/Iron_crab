@@ -87,6 +87,38 @@ pub struct TokenBalance {
     pub ui_token_amount: TokenAmount,
     /// Token program ID (SPL Token or Token-2022) - authoritative source for token type
     pub program_id: Option<String>,
+    /// Wallet owner of the token account (from TX meta `post_token_balances.owner`).
+    pub owner: Option<String>,
+}
+
+/// True when `wallet` is a signer/fee-payer in `account_keys` or owns a `post_token_balances` row.
+pub fn geyser_tx_involves_wallet(wallet: &Pubkey, tx: &GeyserTransactionUpdate) -> bool {
+    if tx.account_keys.iter().any(|k| k == wallet) {
+        return true;
+    }
+    let wallet_str = wallet.to_string();
+    tx.post_token_balances
+        .iter()
+        .any(|b| b.owner.as_deref() == Some(wallet_str.as_str()))
+}
+
+/// Token account pubkey for a TX meta balance row (`account_keys[account_index]`).
+pub fn geyser_token_balance_account_pubkey(
+    tx: &GeyserTransactionUpdate,
+    balance: &TokenBalance,
+) -> Option<Pubkey> {
+    tx.account_keys.get(balance.account_index as usize).copied()
+}
+
+/// `post_token_balances` rows owned by `wallet`.
+pub fn geyser_wallet_post_token_balances<'a>(
+    wallet: &Pubkey,
+    tx: &'a GeyserTransactionUpdate,
+) -> impl Iterator<Item = &'a TokenBalance> {
+    let wallet_str = wallet.to_string();
+    tx.post_token_balances
+        .iter()
+        .filter(move |b| b.owner.as_deref() == Some(wallet_str.as_str()))
 }
 
 #[derive(Debug, Clone)]
@@ -601,6 +633,11 @@ impl GeyserTxListener {
                                                                     } else {
                                                                         Some(balance.program_id.clone())
                                                                     },
+                                                                    owner: if balance.owner.is_empty() {
+                                                                        None
+                                                                    } else {
+                                                                        Some(balance.owner.clone())
+                                                                    },
                                                                 });
                                                             }
                                                         }
@@ -618,6 +655,11 @@ impl GeyserTxListener {
                                                                         None
                                                                     } else {
                                                                         Some(balance.program_id.clone())
+                                                                    },
+                                                                    owner: if balance.owner.is_empty() {
+                                                                        None
+                                                                    } else {
+                                                                        Some(balance.owner.clone())
                                                                     },
                                                                 });
                                                             }
