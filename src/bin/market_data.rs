@@ -1290,6 +1290,13 @@ fn md_sidefx_process_pump_amm_trade(w: &MdSidefxWorkerCtx, job: &MdSidefxCommand
             .set_pump_amm_pool_accounts_readiness_authoritative(*pool_address, dex_readiness);
 
         if w.ctx.nats.is_some() {
+            let (pub_base_reserve, pub_quote_reserve) =
+                match w.ctx.live_pool_cache.get(pool_address) {
+                    Some(CachedPoolState::PumpAmm(ref s)) => {
+                        (s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0))
+                    }
+                    _ => (0, 0),
+                };
             let mut pool_update = PoolCacheUpdate::new_pool_discovered(
                 "market-data",
                 BUILD_VERSION,
@@ -1298,8 +1305,8 @@ fn md_sidefx_process_pump_amm_trade(w: &MdSidefxWorkerCtx, job: &MdSidefxCommand
                 "pump_amm".to_string(),
                 base_mint.clone(),
                 quote_mint.clone(),
-                0,
-                0,
+                pub_base_reserve,
+                pub_quote_reserve,
                 None,
                 *slot,
             );
