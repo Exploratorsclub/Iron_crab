@@ -3233,6 +3233,8 @@ struct MomentumContext {
     /// Scope 56: in-memory idempotency for duplicate JetStream / replayed ExecutionResults
     /// on the orphaned-BUY path (no durable store in this scope).
     orphaned_recovered_intent_ids: parking_lot::RwLock<BoundedIntentIdCache>,
+    /// Scope 57: latest JetStream `WalletBalanceSnapshot` per mint (authority hint for exit sizing; I-7 no RPC).
+    latest_wallet_balance_raw_by_mint: parking_lot::RwLock<HashMap<String, u64>>,
     /// Stats — **unique mints** with at least one pool-scoped tracker row (not one increment per pool row).
     tokens_tracked: std::sync::atomic::AtomicU64,
     /// Prometheus / heartbeat: **unique tokens (mints)** that crossed into a rejected/blacklisted
@@ -5417,6 +5419,9 @@ impl MomentumContext {
                 let now = Instant::now();
                 if now.duration_since(filled_at).as_secs() > config.scale_in_confirm_window_secs {
                     // Confirmation window expired: keep probe position only.
+                    ironcrab::metrics::record_momentum_scale_in_gate_blocked_total(
+                        ironcrab::metrics::MomentumScaleInGateBlockedReason::WindowExpired,
+                    );
                     let tracker = trackers.get_mut(key).expect("tracker key from iteration");
                     tracker.state = TrackerState::PositionOpenFull { filled_at };
                     continue;
@@ -5425,6 +5430,9 @@ impl MomentumContext {
                 // Scale-in gate (I-14, I-7): same `executable_exit_quote` quality as exits — no RPC.
                 // Require strictly `exec_pnl > scale_in_min_probe_executable_pnl_pct` (default 0 ⇒ underwater probe never scales in).
                 let Some(pos) = positions.get(&mint) else {
+                    ironcrab::metrics::record_momentum_scale_in_gate_blocked_total(
+                        ironcrab::metrics::MomentumScaleInGateBlockedReason::MissingProbeState,
+                    );
                     trace!(
                         mint = %mint,
                         pool = %this_pool,
@@ -5434,6 +5442,9 @@ impl MomentumContext {
                     continue;
                 };
                 let Some(ex_q) = self.executable_exit_quote(pos, Some(trackers)) else {
+                    ironcrab::metrics::record_momentum_scale_in_gate_blocked_total(
+                        ironcrab::metrics::MomentumScaleInGateBlockedReason::NoQuote,
+                    );
                     trace!(
                         mint = %mint,
                         pool = %this_pool,
@@ -5446,6 +5457,9 @@ impl MomentumContext {
                 let gate_ok = exec_pnl.partial_cmp(&config.scale_in_min_probe_executable_pnl_pct)
                     == Some(std::cmp::Ordering::Greater);
                 if !gate_ok {
+                    ironcrab::metrics::record_momentum_scale_in_gate_blocked_total(
+                        ironcrab::metrics::MomentumScaleInGateBlockedReason::Pnl,
+                    );
                     trace!(
                         mint = %mint,
                         pool = %this_pool,
@@ -6816,6 +6830,80 @@ impl MomentumContext {
         exit_maybe
     }
 
+    /// Resolve `entry_kind` for orphaned BUY recovery (pending lifecycle or intent metadata).
+    fn resolve_orphan_entry_kind(
+        intent_id: &str,
+        metadata: &HashMap<String, String>,
+        pending_entries: &HashMap<String, PendingBuyEntry>,
+    ) -> EntryKind {
+        if let Some(entry) = pending_entries.get(intent_id) {
+            if let Some(kind) = entry.entry_kind {
+                return kind;
+            }
+        }
+        match metadata.get("entry_kind").map(|s| s.as_str()) {
+            Some("scale_in") => EntryKind::ScaleIn,
+            Some("probe") => EntryKind::Probe,
+            _ => EntryKind::Probe,
+        }
+    }
+
+    /// After orphan `open_position`, align `TokenTracker` with the normal BUY-confirm state machine.
+    fn apply_orphan_buy_tracker_state_after_recovery(
+        &self,
+        mint: &str,
+        pool: &str,
+        entry_kind: EntryKind,
+        applied_to_existing_position: bool,
+    ) {
+        let tk = Self::tracker_storage_key(mint, pool);
+        let mut trackers = self.token_trackers.write();
+        let Some(tr) = trackers.get_mut(&tk) else {
+            return;
+        };
+        let filled_at = Instant::now();
+        if applied_to_existing_position || entry_kind == EntryKind::ScaleIn {
+            tr.state = TrackerState::PositionOpenFull { filled_at };
+            ironcrab::metrics::record_momentum_orphan_scale_in_recovery_total();
+        } else {
+            tr.state = TrackerState::PositionOpenProbe { filled_at };
+            ironcrab::metrics::record_momentum_orphan_probe_recovery_total();
+        }
+        drop(trackers);
+        self.mark_entry_eval_dirty_key(&tk);
+    }
+
+    fn cache_wallet_balance_snapshot_raw(&self, mint: &str, balance_raw: u64) {
+        self.latest_wallet_balance_raw_by_mint
+            .write()
+            .insert(mint.to_string(), balance_raw);
+    }
+
+    /// Scope 57 interim exit sizing (PA-5 follow-up): prefer JetStream wallet snapshot when overlay drifts.
+    fn resolve_exit_token_amount_raw(&self, mint: &str, hint_amount: u64) -> u64 {
+        let overlay = self
+            .positions
+            .read()
+            .get(mint)
+            .map(|p| p.token_amount)
+            .filter(|t| *t > 0)
+            .unwrap_or(hint_amount);
+
+        match self
+            .latest_wallet_balance_raw_by_mint
+            .read()
+            .get(mint)
+            .copied()
+            .filter(|a| *a > 0)
+        {
+            Some(auth) => auth,
+            None => {
+                ironcrab::metrics::record_momentum_exit_amount_overlay_only_total();
+                overlay
+            }
+        }
+    }
+
     fn try_apply_reserve_hint_as_position_price(
         pos: &mut PositionTracker,
         hint: &CachedPoolReservePriceHint,
@@ -7022,6 +7110,14 @@ impl MomentumContext {
                                     });
                                 let used_position_routing = from_pos.is_some();
                                 if let Some((pool, dex, creator)) = from_pos.or(tracker_info) {
+                                    let entry_kind = {
+                                        let entries = self.pending_buy_entries.read();
+                                        Self::resolve_orphan_entry_kind(
+                                            &result.intent_id,
+                                            &result.metadata,
+                                            &entries,
+                                        )
+                                    };
                                     info!(
                                         intent_id = %result.intent_id,
                                         mint = %mint,
@@ -7030,6 +7126,7 @@ impl MomentumContext {
                                         sol_invested,
                                         token_amount_raw = fill_out.raw,
                                         used_position_routing = used_position_routing,
+                                        entry_kind = ?entry_kind,
                                         "⚠️ ORPHANED BUY APPLIED TO EXISTING POSITION — scale-in fill \
                                          recovered after pending intent was dropped"
                                     );
@@ -7050,6 +7147,9 @@ impl MomentumContext {
                                         ),
                                         initial_bonding,
                                     });
+                                    self.apply_orphan_buy_tracker_state_after_recovery(
+                                        mint, &pool, entry_kind, true,
+                                    );
                                     let ctx_exit = Arc::clone(self);
                                     tokio::spawn(async move {
                                         ctx_exit.process_exit_signals(None).await;
@@ -7067,6 +7167,14 @@ impl MomentumContext {
                                     );
                                 }
                             } else if let Some((pool, dex, creator)) = tracker_info {
+                                let entry_kind = {
+                                    let entries = self.pending_buy_entries.read();
+                                    Self::resolve_orphan_entry_kind(
+                                        &result.intent_id,
+                                        &result.metadata,
+                                        &entries,
+                                    )
+                                };
                                 warn!(
                                     intent_id = %result.intent_id,
                                     mint = %mint,
@@ -7074,6 +7182,7 @@ impl MomentumContext {
                                     dex = %dex,
                                     sol_invested,
                                     token_amount = fill_out.raw,
+                                    entry_kind = ?entry_kind,
                                     "⚠️ ORPHANED BUY RECOVERED — pending intent expired, \
                                      creating position from ExecutionResult"
                                 );
@@ -7095,6 +7204,9 @@ impl MomentumContext {
                                     ),
                                     initial_bonding,
                                 });
+                                self.apply_orphan_buy_tracker_state_after_recovery(
+                                    mint, &pool, entry_kind, false,
+                                );
                                 let ctx_exit = Arc::clone(self);
                                 tokio::spawn(async move {
                                     ctx_exit.process_exit_signals(None).await;
@@ -9293,6 +9405,7 @@ async fn main() -> Result<()> {
         orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
             ORPHANED_RECOVERED_INTENT_IDS_CAP,
         )),
+        latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
         tokens_tracked: std::sync::atomic::AtomicU64::new(0),
         tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
         blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
@@ -11333,6 +11446,7 @@ mod tests {
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
             )),
+            latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
@@ -13043,6 +13157,7 @@ mod tests {
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
             )),
+            latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
@@ -13111,6 +13226,7 @@ mod tests {
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
             )),
+            latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
@@ -15415,6 +15531,7 @@ mod tests {
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
             )),
+            latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
@@ -15536,6 +15653,7 @@ mod tests {
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
             )),
+            latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
@@ -15626,6 +15744,7 @@ mod tests {
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
             )),
+            latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
@@ -15710,6 +15829,7 @@ mod tests {
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
             )),
+            latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
@@ -15799,6 +15919,7 @@ mod tests {
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
             )),
+            latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
@@ -15919,6 +16040,7 @@ mod tests {
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
             )),
+            latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
@@ -16033,6 +16155,7 @@ mod tests {
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
             )),
+            latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
@@ -16132,6 +16255,7 @@ mod tests {
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
             )),
+            latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
@@ -16208,6 +16332,7 @@ mod tests {
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
             )),
+            latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
@@ -16276,6 +16401,7 @@ mod tests {
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
             )),
+            latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
@@ -17286,6 +17412,7 @@ mod tests {
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
             )),
+            latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
@@ -17352,6 +17479,15 @@ mod tests {
         Arc::clone(&ctx).handle_execution_result(&orphan);
 
         let expected = 12_345_672_542u64.saturating_add(scale_fill);
+        {
+            let sk = MomentumContext::tracker_storage_key(mint, pool);
+            let trackers = ctx.token_trackers.read();
+            let tr = trackers.get(&sk).expect("tracker after orphan scale-in");
+            assert!(
+                matches!(tr.state, TrackerState::PositionOpenFull { .. }),
+                "orphan scale-in on existing position must set PositionOpenFull"
+            );
+        }
         {
             let positions = ctx.positions.read();
             let pos = positions.get(mint).expect("position after orphan scale");
@@ -17425,6 +17561,7 @@ mod tests {
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
             )),
+            latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
@@ -17507,6 +17644,218 @@ mod tests {
         let exits = ctx.check_for_exits();
         assert_eq!(exits.len(), 1);
         assert_eq!(exits[0].5, expected);
+    }
+
+    /// Scope 57: orphan probe BUY must set `PositionOpenProbe` so scale-in gate can run.
+    #[tokio::test]
+    async fn scope57_orphan_probe_recovery_sets_position_open_probe() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+
+        let mint = "OrphProbeMintttttttttttttttttttttttttttttttt";
+        let pool = "OrphProbePoolttttttttttttttttttttttttttttttt";
+        ctx.register_pool(mint, pool, "raydium", 1);
+        let sk = MomentumContext::tracker_storage_key(mint, pool);
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let mut tr = TokenTracker::new(mint, pool, "raydium", 1, 0);
+            tr.state = TrackerState::ProbeBuyPending {
+                sent_at: Instant::now(),
+            };
+            trackers.insert(sk.clone(), tr);
+        }
+
+        let probe_fill = 7_159_492_133u64;
+        let sol_spent = 250_000_000u64;
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("side".to_string(), "BUY".to_string());
+        meta.insert("entry_kind".to_string(), "probe".to_string());
+        let orphan = ExecutionResult {
+            header: RecordHeader::new("test", BUILD_VERSION, "run-test"),
+            execution_id: "ex-orphan-probe".to_string(),
+            decision_id: "dec-orphan-probe".to_string(),
+            intent_id: "int-orphan-probe-001".to_string(),
+            source: "momentum-bot".to_string(),
+            token_mint: Some(mint.to_string()),
+            signature: Some("sig-orphan-probe".to_string()),
+            bundle_id: None,
+            status: ExecutionStatus::Confirmed,
+            fill_in: Some(ExplicitAmount::new(sol_spent, 9)),
+            fill_out: Some(ExplicitAmount::new(probe_fill, 6)),
+            fill_status: Some(FillStatus::Complete),
+            fill_unavailable_reason: None,
+            confirmed_slot: Some(100),
+            block_time_unix_ms: None,
+            fees: None,
+            pnl: None,
+            wallet_sol_delta_lamports: Some(-(sol_spent as i128)),
+            error_message: None,
+            error_code: None,
+            latency_ms: Some(1),
+            metadata: meta,
+        };
+
+        Arc::clone(&ctx).handle_execution_result(&orphan);
+
+        assert!(ctx.positions.read().contains_key(mint));
+        let trackers = ctx.token_trackers.read();
+        let tr = trackers.get(&sk).unwrap();
+        assert!(
+            matches!(tr.state, TrackerState::PositionOpenProbe { .. }),
+            "orphan probe recovery must advance tracker to PositionOpenProbe"
+        );
+    }
+
+    /// Scope 57: after orphan probe recovery, scale-in gate can emit ENTER_SCALE_IN within window.
+    #[tokio::test]
+    async fn scope57_scale_in_fires_after_orphan_probe_recovery() {
+        use solana_sdk::pubkey::Pubkey;
+
+        let mut cfg = MomentumConfig::default();
+        cfg.default_position_lamports = 1_000;
+        cfg.probe_buy_pct = 0.25;
+        cfg.early_min_liquidity_sol = 0.0;
+        cfg.min_unique_buyers = 0;
+        cfg.min_trades_per_min = 0.0;
+        cfg.min_buy_dominance = 0.0;
+        cfg.min_sol_inflow_lamports = 0;
+        cfg.require_mint_authority_renounced = false;
+        cfg.require_freeze_authority_none = false;
+        cfg.top1_buyer_share_cap = 1.0;
+        cfg.top3_buyer_share_cap = 1.0;
+        cfg.repeat_buyer_min_ratio = 0.0;
+        cfg.min_trade_size_lamports = 0;
+        cfg.small_buy_ratio_cap = 1.0;
+        cfg.min_token_age_secs = 0;
+        cfg.scale_in_confirm_window_secs = 120;
+        cfg.scale_in_min_probe_executable_pnl_pct = 0.0;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        *ctx.config.write() = cfg;
+
+        let mint = Pubkey::new_from_array([0xC3u8; 32]).to_string();
+        let pool = Pubkey::new_from_array([0xD4u8; 32]).to_string();
+        ctx.register_pool(&mint, &pool, "raydium", 1);
+        let sk = MomentumContext::tracker_storage_key(&mint, &pool);
+        {
+            let mut trackers = ctx.token_trackers.write();
+            trackers.insert(sk.clone(), TokenTracker::new(&mint, &pool, "raydium", 1, 0));
+        }
+        {
+            let mut pi = PoolInfo::new(pool.clone(), "raydium".to_string(), 100);
+            pi.dex_pool_accounts = Some(vec![]);
+            ctx.mint_pools.write().insert(mint.clone(), vec![pi]);
+        }
+
+        let probe_fill = 7_159_492_133u64;
+        let sol_spent = 250_000_000u64;
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("side".to_string(), "BUY".to_string());
+        meta.insert("entry_kind".to_string(), "probe".to_string());
+        let orphan = ExecutionResult {
+            header: RecordHeader::new("test", BUILD_VERSION, "run-test"),
+            execution_id: "ex-orphan-probe-scale".to_string(),
+            decision_id: "dec-orphan-probe-scale".to_string(),
+            intent_id: "int-orphan-probe-scale-001".to_string(),
+            source: "momentum-bot".to_string(),
+            token_mint: Some(mint.clone()),
+            signature: Some("sig-orphan-probe-scale".to_string()),
+            bundle_id: None,
+            status: ExecutionStatus::Confirmed,
+            fill_in: Some(ExplicitAmount::new(sol_spent, 9)),
+            fill_out: Some(ExplicitAmount::new(probe_fill, 6)),
+            fill_status: Some(FillStatus::Complete),
+            fill_unavailable_reason: None,
+            confirmed_slot: Some(100),
+            block_time_unix_ms: None,
+            fees: None,
+            pnl: None,
+            wallet_sol_delta_lamports: Some(-(sol_spent as i128)),
+            error_message: None,
+            error_code: None,
+            latency_ms: Some(1),
+            metadata: meta,
+        };
+        Arc::clone(&ctx).handle_execution_result(&orphan);
+
+        let upd = pool_cache_update_stub(
+            &mint,
+            &pool,
+            10_000_000_000_000u64,
+            1_000_000_000_000u64,
+            900_000_000u64,
+            1,
+        );
+        assert!(
+            pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, &upd),
+            "pool cache apply failed"
+        );
+
+        let signals = ctx.check_for_signals();
+        assert_eq!(
+            signals.len(),
+            1,
+            "scale-in expected after orphan probe state"
+        );
+        assert_eq!(signals[0].kind, EntryKind::ScaleIn);
+    }
+
+    /// Scope 57: exit sizing prefers JetStream wallet snapshot when overlay understates holdings.
+    #[tokio::test]
+    async fn scope57_exit_amount_uses_wallet_authority_when_overlay_smaller() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let ctx = Arc::new(empty_test_context(jsonl_writer));
+
+        let mint = "WalletAuthMintttttttttttttttttttttttttttttt";
+        let pool = "WalletAuthPoolttttttttttttttttttttttttttttt";
+        ctx.register_pool(mint, pool, "raydium", 1);
+        ctx.update_pool_accounts(mint, pool, vec!["a0".to_string(), "a1".to_string()]);
+
+        let probe_only = 14_099_749_285u64;
+        let wallet_total = probe_only.saturating_add(38_711_432_312);
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool,
+            dex: "raydium",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: probe_only,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 100,
+            initial_bonding: None,
+        });
+        ctx.cache_wallet_balance_snapshot_raw(mint, wallet_total);
+
+        generate_and_publish_exit_intent(
+            ctx.as_ref(),
+            mint,
+            pool,
+            "raydium",
+            "TIME_EXIT",
+            "test",
+            probe_only,
+            None,
+        )
+        .await
+        .expect("exit intent");
+
+        let path = ctx.jsonl_writer.current_path().expect("jsonl path");
+        let content = std::fs::read_to_string(path).expect("read jsonl");
+        let line = content.lines().last().expect("intent line");
+        let intent: TradeIntent = serde_json::from_str(line).expect("parse TradeIntent");
+        assert_eq!(
+            intent.required_capital.raw, wallet_total,
+            "exit must use wallet authority when overlay is probe-only"
+        );
     }
 
     /// Scope A: BondingCurveProgress at 100% before `open_position` is merged via `initial_bonding`.
@@ -18272,15 +18621,8 @@ async fn generate_and_publish_exit_intent(
     // bootstrap, and any `check_for_exits()`-driven scan where one event is not tied to each exit.
     source_event_ts_unix_ms: Option<u64>,
 ) -> Result<()> {
-    // Authoritative sell size: open position total at publish time (handles probe+scale-in
-    // and races where the caller still had a stale hint amount).
-    let token_amount = ctx
-        .positions
-        .read()
-        .get(mint)
-        .map(|p| p.token_amount)
-        .filter(|t| *t > 0)
-        .unwrap_or(token_amount);
+    // Authoritative sell size: overlay + optional JetStream wallet snapshot (Scope 57 / PA-5 interim).
+    let token_amount = ctx.resolve_exit_token_amount_raw(mint, token_amount);
 
     // Phase 3: Slippage escalation — when prior sells failed with 6002, increase tolerance
     let max_slippage = {
@@ -19182,7 +19524,10 @@ async fn process_market_event(
                 return Ok(false);
             }
 
+            ctx.cache_wallet_balance_snapshot_raw(mint, *balance_raw);
+
             if *balance_raw == 0 {
+                ctx.latest_wallet_balance_raw_by_mint.write().remove(mint);
                 // Remove ghost position if wallet balance is zero
                 let was_tracked = {
                     let mut positions = ctx.positions.write();

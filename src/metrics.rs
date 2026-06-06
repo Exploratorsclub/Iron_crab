@@ -1580,6 +1580,60 @@ pub fn record_momentum_entry_buy_suppressed_missing_creator() {
     MOMENTUM_ENTRY_BUY_SUPPRESSED_MISSING_CREATOR_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+// Scope 57: orphan BUY recovery tracker-state alignment + exit amount authority hint.
+pub static MOMENTUM_ORPHAN_PROBE_RECOVERY_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_ORPHAN_SCALE_IN_RECOVERY_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_EXIT_AMOUNT_OVERLAY_ONLY_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub static MOMENTUM_SCALE_IN_GATE_BLOCKED_MISSING_PROBE_STATE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_SCALE_IN_GATE_BLOCKED_PNL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_SCALE_IN_GATE_BLOCKED_WINDOW_EXPIRED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_SCALE_IN_GATE_BLOCKED_NO_QUOTE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn record_momentum_orphan_probe_recovery_total() {
+    MOMENTUM_ORPHAN_PROBE_RECOVERY_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_momentum_orphan_scale_in_recovery_total() {
+    MOMENTUM_ORPHAN_SCALE_IN_RECOVERY_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_momentum_exit_amount_overlay_only_total() {
+    MOMENTUM_EXIT_AMOUNT_OVERLAY_ONLY_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Scale-in gate blocked reason (Prometheus label `reason`).
+#[derive(Debug, Clone, Copy)]
+pub enum MomentumScaleInGateBlockedReason {
+    MissingProbeState,
+    Pnl,
+    WindowExpired,
+    NoQuote,
+}
+
+#[inline]
+pub fn record_momentum_scale_in_gate_blocked_total(reason: MomentumScaleInGateBlockedReason) {
+    let counter = match reason {
+        MomentumScaleInGateBlockedReason::MissingProbeState => {
+            &*MOMENTUM_SCALE_IN_GATE_BLOCKED_MISSING_PROBE_STATE
+        }
+        MomentumScaleInGateBlockedReason::Pnl => &*MOMENTUM_SCALE_IN_GATE_BLOCKED_PNL,
+        MomentumScaleInGateBlockedReason::WindowExpired => {
+            &*MOMENTUM_SCALE_IN_GATE_BLOCKED_WINDOW_EXPIRED
+        }
+        MomentumScaleInGateBlockedReason::NoQuote => &*MOMENTUM_SCALE_IN_GATE_BLOCKED_NO_QUOTE,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
 // PR170: tracker trade ingest forensics (static metric names — no dynamic labels).
 pub static MOMENTUM_TRACKER_TRADES_RECORDED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -3470,6 +3524,46 @@ async fn metrics_response() -> Response<Body> {
         "momentum_entry_buy_suppressed_missing_creator_total",
         MOMENTUM_ENTRY_BUY_SUPPRESSED_MISSING_CREATOR_TOTAL.load(Ordering::Relaxed)
     );
+    line!(
+        "momentum_orphan_probe_recovery_total",
+        MOMENTUM_ORPHAN_PROBE_RECOVERY_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_orphan_scale_in_recovery_total",
+        MOMENTUM_ORPHAN_SCALE_IN_RECOVERY_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_exit_amount_overlay_only_total",
+        MOMENTUM_EXIT_AMOUNT_OVERLAY_ONLY_TOTAL.load(Ordering::Relaxed)
+    );
+    out.push_str("momentum_scale_in_gate_blocked_total{reason=\"missing_probe_state\"} ");
+    out.push_str(
+        &MOMENTUM_SCALE_IN_GATE_BLOCKED_MISSING_PROBE_STATE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("momentum_scale_in_gate_blocked_total{reason=\"pnl\"} ");
+    out.push_str(
+        &MOMENTUM_SCALE_IN_GATE_BLOCKED_PNL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("momentum_scale_in_gate_blocked_total{reason=\"window_expired\"} ");
+    out.push_str(
+        &MOMENTUM_SCALE_IN_GATE_BLOCKED_WINDOW_EXPIRED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("momentum_scale_in_gate_blocked_total{reason=\"no_quote\"} ");
+    out.push_str(
+        &MOMENTUM_SCALE_IN_GATE_BLOCKED_NO_QUOTE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     line!(
         "momentum_tracker_trades_recorded_total",
         MOMENTUM_TRACKER_TRADES_RECORDED_TOTAL.load(Ordering::Relaxed)
