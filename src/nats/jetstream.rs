@@ -394,15 +394,16 @@ pub fn wallet_snapshot_live_consumer_config() -> jetstream::consumer::pull::Conf
 }
 
 /// Consumer config for live WalletBalanceSnapshot updates in execution-engine.
-/// Durable consumer with DeliverPolicy::New so reconnects receive fresh snapshots.
-pub fn wallet_snapshot_live_consumer_config_execution_engine() -> jetstream::consumer::pull::Config
-{
+/// Durable consumer scoped per wallet; DeliverPolicy may be overridden at create time.
+pub fn wallet_snapshot_live_consumer_config_execution_engine(
+    wallet: &str,
+) -> jetstream::consumer::pull::Config {
     jetstream::consumer::pull::Config {
         deliver_policy: jetstream::consumer::DeliverPolicy::New,
         ack_policy: jetstream::consumer::AckPolicy::Explicit,
-        durable_name: Some("execution-engine-wallet-snapshot".to_string()),
+        durable_name: Some(format!("execution-engine-wallet-snapshot-{}", wallet)),
         max_ack_pending: 1000,
-        filter_subject: "ironcrab.wallet_snapshot.>".to_string(),
+        filter_subject: format!("ironcrab.wallet_snapshot.{}.*", wallet),
         ..Default::default()
     }
 }
@@ -464,14 +465,16 @@ mod tests {
 
     #[test]
     fn wallet_snapshot_live_consumer_execution_engine_uses_new_deliver_policy() {
-        let live = wallet_snapshot_live_consumer_config_execution_engine();
+        let wallet = "WALLET123";
+        let live = wallet_snapshot_live_consumer_config_execution_engine(wallet);
         assert!(matches!(
             live.deliver_policy,
             jetstream::consumer::DeliverPolicy::New
         ));
         assert_eq!(
             live.durable_name.as_deref(),
-            Some("execution-engine-wallet-snapshot")
+            Some("execution-engine-wallet-snapshot-WALLET123")
         );
+        assert_eq!(live.filter_subject, "ironcrab.wallet_snapshot.WALLET123.*");
     }
 }

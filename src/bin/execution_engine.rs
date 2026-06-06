@@ -6573,6 +6573,62 @@ async fn bootstrap_token_balances_from_wallet_snapshot(
     Ok(observed)
 }
 
+/// Create the durable live wallet snapshot consumer for the main loop.
+///
+/// When `bootstrap_observed == 0` (stream missing at bootstrap or no snapshots), uses
+/// `LastPerSubject` so the consumer backfills latest per-mint snapshots when the stream
+/// appears later. Otherwise uses `New` to avoid replaying history already seeded by bootstrap.
+async fn create_wallet_snapshot_live_consumer(
+    nats_client: &NatsClient,
+    wallet: &Pubkey,
+    bootstrap_observed: usize,
+) -> Option<async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>>
+{
+    use async_nats::jetstream;
+
+    let jetstream = jetstream::new(nats_client.client().clone());
+    let stream = match jetstream.get_stream(WALLET_SNAPSHOT_STREAM_NAME).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                error = %e,
+                stream = WALLET_SNAPSHOT_STREAM_NAME,
+                "JetStream wallet snapshot stream not found (market-data may not be running)"
+            );
+            return None;
+        }
+    };
+
+    let wallet_str = wallet.to_string();
+    let mut cfg = wallet_snapshot_live_consumer_config_execution_engine(&wallet_str);
+    if bootstrap_observed == 0 {
+        cfg.deliver_policy = jetstream::consumer::DeliverPolicy::LastPerSubject;
+    }
+
+    match stream.create_consumer(cfg).await {
+        Ok(consumer) => {
+            info!(
+                stream = WALLET_SNAPSHOT_STREAM_NAME,
+                wallet = %wallet_str,
+                deliver_policy = if bootstrap_observed == 0 {
+                    "LastPerSubject"
+                } else {
+                    "New"
+                },
+                "Subscribed to JetStream WalletBalanceSnapshot (live)"
+            );
+            Some(consumer)
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "Failed to create JetStream consumer for WalletBalanceSnapshot"
+            );
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -7011,12 +7067,25 @@ async fn main() -> Result<()> {
     // This also replaces the hardcoded 1 SOL default with the actual on-chain balance
     // from JetStream (persistent), avoiding the race condition with core NATS
     // WalletBalanceUpdate (fire-and-forget, can be missed if not yet subscribed).
-    if let (Some(ref nats_client), Some(wallet)) = (&nats, wallet_pubkey) {
-        if let Err(e) =
-            bootstrap_token_balances_from_wallet_snapshot(nats_client, &wallet, &lock_manager).await
+    // The live consumer is created immediately after bootstrap (reused in the main loop)
+    // so snapshots published during the long startup phase are not missed (DeliverPolicy::New).
+    let mut wallet_snapshot_bootstrap_observed = 0usize;
+    let wallet_snapshot_bootstrap_consumer = if let (Some(ref nats_client), Some(wallet)) =
+        (&nats, wallet_pubkey)
+    {
+        wallet_snapshot_bootstrap_observed = match bootstrap_token_balances_from_wallet_snapshot(
+            nats_client,
+            &wallet,
+            &lock_manager,
+        )
+        .await
         {
-            warn!(error = %e, "Wallet snapshot bootstrap: failed to seed token balances");
-        }
+            Ok(observed) => observed,
+            Err(e) => {
+                warn!(error = %e, "Wallet snapshot bootstrap: failed to seed token balances");
+                0
+            }
+        };
         // "Available WSOL" metric: always actual WSOL (0 when no ATA), never native SOL fallback.
         let wsol = lock_manager.available_wsol();
         AVAILABLE_SOL_LAMPORTS.store(wsol, Ordering::Relaxed);
@@ -7028,7 +7097,15 @@ async fn main() -> Result<()> {
             total_sol_wsol = (total_native_sol.saturating_add(wsol)) as f64 / 1e9,
             "Prometheus metrics refreshed after wallet snapshot bootstrap"
         );
-    }
+        create_wallet_snapshot_live_consumer(
+            nats_client,
+            &wallet,
+            wallet_snapshot_bootstrap_observed,
+        )
+        .await
+    } else {
+        None
+    };
 
     // Kill-switch persistence: survives restarts and is independent of day.
     let initial_kill_switch_active = snapshot
@@ -8080,44 +8157,17 @@ async fn main() -> Result<()> {
     // Subscribe to WalletBalanceSnapshot from JetStream (subject-per-wallet+mint).
     //
     // This keeps LockManager token balances synced WITHOUT any RPC calls.
-    let wallet_snapshot_consumer = if let (Some(ref nats), Some(wallet)) =
-        (&ctx.nats, ctx.wallet_pubkey)
-    {
-        use async_nats::jetstream;
-
-        let jetstream = jetstream::new(nats.client().clone());
-        match jetstream.get_stream(WALLET_SNAPSHOT_STREAM_NAME).await {
-            Ok(stream) => {
-                let wallet_str = wallet.to_string();
-                let mut cfg = wallet_snapshot_live_consumer_config_execution_engine();
-                cfg.filter_subject = format!("ironcrab.wallet_snapshot.{}.*", wallet_str);
-                match stream.create_consumer(cfg).await {
-                    Ok(consumer) => {
-                        info!(
-                            stream = WALLET_SNAPSHOT_STREAM_NAME,
-                            wallet = %wallet_str,
-                            "Subscribed to JetStream WalletBalanceSnapshot (live, DeliverPolicy::New)"
-                        );
-                        Some(consumer)
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            "Failed to create JetStream consumer for WalletBalanceSnapshot"
-                        );
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    stream = WALLET_SNAPSHOT_STREAM_NAME,
-                    "JetStream wallet snapshot stream not found (market-data may not be running)"
-                );
-                None
-            }
-        }
+    // Reuse the consumer created right after bootstrap when available; otherwise create
+    // now (e.g. stream appeared after bootstrap) with LastPerSubject if bootstrap missed.
+    let wallet_snapshot_consumer = if let Some(consumer) = wallet_snapshot_bootstrap_consumer {
+        info!(
+            stream = WALLET_SNAPSHOT_STREAM_NAME,
+            "Reusing early wallet snapshot consumer for live sync (no startup gap)"
+        );
+        Some(consumer)
+    } else if let (Some(ref nats), Some(wallet)) = (&ctx.nats, ctx.wallet_pubkey) {
+        create_wallet_snapshot_live_consumer(nats, &wallet, wallet_snapshot_bootstrap_observed)
+            .await
     } else {
         None
     };
