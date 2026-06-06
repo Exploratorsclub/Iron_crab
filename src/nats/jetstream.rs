@@ -22,7 +22,10 @@ use anyhow::{Context, Result};
 use async_nats::jetstream;
 use tracing::{info, warn};
 
-use super::{TOPIC_EXECUTION_RESULTS, TOPIC_TRADE_INTENTS, TOPIC_WALLET_SNAPSHOT_PATTERN};
+use super::{
+    TOPIC_EXECUTION_RESULTS, TOPIC_TRADE_INTENTS, TOPIC_WALLET_SNAPSHOT_PATTERN,
+    TOPIC_WALLET_TX_CONFIRM_PATTERN,
+};
 
 /// JetStream stream name for pool cache updates
 pub const STREAM_NAME: &str = "POOL_CACHE";
@@ -32,6 +35,9 @@ pub const CONFIG_STREAM_NAME: &str = "CONFIG_UPDATES";
 
 /// JetStream stream name for wallet balance snapshots
 pub const WALLET_SNAPSHOT_STREAM_NAME: &str = "WALLET_SNAPSHOT";
+
+/// JetStream stream name for wallet TX confirmations (separate from WALLET_SNAPSHOT for clear lifecycle)
+pub const WALLET_TX_CONFIRM_STREAM_NAME: &str = "WALLET_TX_CONFIRM";
 
 /// JetStream stream name for trade intents (persistent, avoids startup race with Core NATS)
 pub const TRADE_INTENTS_STREAM_NAME: &str = "TRADE_INTENTS";
@@ -149,6 +155,48 @@ pub async fn ensure_wallet_snapshot_stream(client: &async_nats::Client) -> Resul
                 "Failed to create/update WALLET_SNAPSHOT stream"
             );
             Err(e).context("WALLET_SNAPSHOT stream creation/update failed")
+        }
+    }
+}
+
+/// Create or update the WALLET_TX_CONFIRM stream for execution-engine TX confirmation.
+///
+/// Separate from `WALLET_SNAPSHOT`: confirmations are append-only per signature (not compacted
+/// per-subject like balance snapshots).
+pub async fn ensure_wallet_tx_confirm_stream(client: &async_nats::Client) -> Result<()> {
+    let jetstream = jetstream::new(client.clone());
+
+    let stream_config = jetstream::stream::Config {
+        name: WALLET_TX_CONFIRM_STREAM_NAME.to_string(),
+        subjects: vec![TOPIC_WALLET_TX_CONFIRM_PATTERN.to_string()],
+        retention: jetstream::stream::RetentionPolicy::Limits,
+        max_age: std::time::Duration::from_secs(24 * 60 * 60), // 24h
+        storage: jetstream::stream::StorageType::File,
+        num_replicas: 1,
+        discard: jetstream::stream::DiscardPolicy::Old,
+        ..Default::default()
+    };
+
+    match jetstream.get_or_create_stream(stream_config).await {
+        Ok(mut stream) => {
+            let info = stream.info().await?;
+            info!(
+                stream_name = %WALLET_TX_CONFIRM_STREAM_NAME,
+                subjects = %TOPIC_WALLET_TX_CONFIRM_PATTERN,
+                retention_hours = 24,
+                num_messages = info.state.messages,
+                storage = ?info.config.storage,
+                "JetStream WALLET_TX_CONFIRM stream ready"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                stream_name = %WALLET_TX_CONFIRM_STREAM_NAME,
+                error = %e,
+                "Failed to create/update WALLET_TX_CONFIRM stream"
+            );
+            Err(e).context("WALLET_TX_CONFIRM stream creation/update failed")
         }
     }
 }
@@ -408,6 +456,21 @@ pub fn wallet_snapshot_live_consumer_config_execution_engine(
     }
 }
 
+/// Consumer config for live WalletTxConfirmed updates in execution-engine.
+/// Durable consumer scoped per wallet; `DeliverPolicy::New` avoids replaying historical confirms.
+pub fn wallet_tx_confirm_live_consumer_config_execution_engine(
+    wallet: &str,
+) -> jetstream::consumer::pull::Config {
+    jetstream::consumer::pull::Config {
+        deliver_policy: jetstream::consumer::DeliverPolicy::New,
+        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+        durable_name: Some(format!("execution-engine-wallet-tx-confirm-{}", wallet)),
+        max_ack_pending: 1000,
+        filter_subject: format!("ironcrab.wallet_tx_confirm.{}.*", wallet),
+        ..Default::default()
+    }
+}
+
 /// Consumer config for trade intents (All = includes intents published before we subscribed)
 pub fn trade_intents_consumer_config() -> jetstream::consumer::pull::Config {
     jetstream::consumer::pull::Config {
@@ -476,5 +539,23 @@ mod tests {
             Some("execution-engine-wallet-snapshot-WALLET123")
         );
         assert_eq!(live.filter_subject, "ironcrab.wallet_snapshot.WALLET123.*");
+    }
+
+    #[test]
+    fn wallet_tx_confirm_live_consumer_execution_engine_uses_new_deliver_policy() {
+        let wallet = "WALLET123";
+        let live = wallet_tx_confirm_live_consumer_config_execution_engine(wallet);
+        assert!(matches!(
+            live.deliver_policy,
+            jetstream::consumer::DeliverPolicy::New
+        ));
+        assert_eq!(
+            live.durable_name.as_deref(),
+            Some("execution-engine-wallet-tx-confirm-WALLET123")
+        );
+        assert_eq!(
+            live.filter_subject,
+            "ironcrab.wallet_tx_confirm.WALLET123.*"
+        );
     }
 }

@@ -392,6 +392,19 @@ pub enum MarketEventKind {
         is_periodic: bool,
     },
 
+    /// Wallet transaction confirmed on-chain (published by market-data via Geyser `transactions_status`).
+    ///
+    /// Consumed by execution-engine over JetStream for TX confirmation (I-4: no EE Geyser client).
+    WalletTxConfirmed {
+        /// Wallet pubkey (base58)
+        wallet: String,
+        /// Transaction signature (base58)
+        signature: String,
+        slot: u64,
+        /// `None` = success; `Some` = on-chain error string
+        err: Option<String>,
+    },
+
     // =========================================================================
     // Wallet Tracking Events (P1: Smart Money / Insider Detection)
     // =========================================================================

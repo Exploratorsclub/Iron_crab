@@ -55,7 +55,8 @@ Component name: `execution-engine`
 |-----|------|---------|-------|-------------|
 | `simulation_timeout_ms` | u64 | 2000 | 100-30000 | Simulation timeout (ms) |
 | `confirmation_timeout_ms` | u64 | 30000 | 500-300000 | Confirmation timeout after send (ms) |
-| `confirm_commitment` | string | "confirmed" | finalized, confirmed | Commitment level for TX confirmation. Default `"confirmed"`: lower confirmation latency with **reorg risk** (slot can still reorganize). `"finalized"`: typical ~12–15s extra latency, stronger fork resistance. Geyser subscription uses the value at engine startup (restart to apply a default change consistently); RPC polling uses the hot-reloaded config value. |
+| `confirm_commitment` | string | "confirmed" | finalized, confirmed | Commitment level for TX confirmation. Default `"confirmed"`: lower confirmation latency with **reorg risk** (slot can still reorganize). `"finalized"`: typical ~12–15s extra latency, stronger fork resistance. **market-data** Geyser `transactions_status` subscription uses this value at market-data startup (restart market-data to apply consistently). execution-engine waits on JetStream `WalletTxConfirmed` only (no RPC fallback). |
+| `jetstream_tx_confirm_enabled` | bool | true | true/false | Wait for `WalletTxConfirmed` on JetStream after send (PR3). **Deprecated alias:** `geyser_confirm_enabled` (hot-reload still accepted). No RPC fallback on timeout (I-7). |
 | `send_enabled` | bool | false | true/false | If true, engine signs and submits transactions |
 
 ### Validation Rules

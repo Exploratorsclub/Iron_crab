@@ -2029,8 +2029,9 @@ pub static TX_SEND_JITO_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0))
 pub static TX_SEND_RPC_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TX_CONFIRMED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TX_CONFIRM_TIMEOUT_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
-// FIX-32: Geyser-based TX confirmation breakdown
-pub static TX_CONFIRM_GEYSER_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// PR3: JetStream-based TX confirmation (market-data Geyser → JetStream → EE)
+pub static TX_CONFIRM_JETSTREAM_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+#[allow(dead_code)]
 pub static TX_CONFIRM_RPC_FALLBACK_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TX_CONFIRM_LATENCY_MS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // K Phase 1: Slot-to-Send Latency (Geyser event/slot → TX send)
@@ -2087,7 +2088,9 @@ pub static EXECUTION_SLOT_LAG_AT_SEND_SLOTS_COUNT: Lazy<AtomicU64> =
 
 pub static TPU_RECONNECT_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TPU_CACHE_STALE_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
-pub static GEYSER_TX_WATCHER_CONNECTED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+/// market-data wallet TX confirm Geyser listener connected (separate session from DEX ingest).
+pub static WALLET_TX_CONFIRM_LISTENER_CONNECTED: Lazy<AtomicBool> =
+    Lazy::new(|| AtomicBool::new(false));
 pub static AVAILABLE_SOL_LAMPORTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ACTIVE_CAPITAL_LOCKS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ACTIVE_RESOURCE_LOCKS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -3722,14 +3725,10 @@ async fn metrics_response() -> Response<Body> {
         "tx_confirm_timeout_total",
         TX_CONFIRM_TIMEOUT_TOTAL.load(Ordering::Relaxed)
     );
-    // FIX-32: Geyser-based TX confirmation breakdown
+    // PR3: JetStream-based TX confirmation breakdown
     line!(
-        "tx_confirm_geyser_total",
-        TX_CONFIRM_GEYSER_TOTAL.load(Ordering::Relaxed)
-    );
-    line!(
-        "tx_confirm_rpc_fallback_total",
-        TX_CONFIRM_RPC_FALLBACK_TOTAL.load(Ordering::Relaxed)
+        "tx_confirm_jetstream_total",
+        TX_CONFIRM_JETSTREAM_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "tx_confirm_latency_ms",
@@ -3792,8 +3791,8 @@ async fn metrics_response() -> Response<Body> {
         TPU_CACHE_STALE_TOTAL.load(Ordering::Relaxed)
     );
     line!(
-        "geyser_tx_watcher_connected",
-        GEYSER_TX_WATCHER_CONNECTED.load(Ordering::Relaxed) as u64
+        "wallet_tx_confirm_listener_connected",
+        WALLET_TX_CONFIRM_LISTENER_CONNECTED.load(Ordering::Relaxed) as u64
     );
     line!(
         "simulation_failures_total",
