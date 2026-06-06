@@ -12262,7 +12262,6 @@ async fn run_geyser_loop(
                     MarketEventKind::WalletTxConfirmed {
                         wallet: wallet_str.clone(),
                         signature: update.signature.clone(),
-                        slot: update.slot,
                         err: update.err.clone(),
                     },
                 );
