@@ -70,6 +70,8 @@ _trades_cache: dict = {}
 
 # Fields copied from execution_results when enriching recent_trades rows.
 _EXEC_ENRICH_KEYS = (
+    "timestamp_ms",
+    "time",
     "reason",
     "reason_detail",
     "exit_type",
