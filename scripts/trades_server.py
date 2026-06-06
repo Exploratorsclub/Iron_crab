@@ -8,8 +8,10 @@ Reads from: trade_logs/executions/execution_results-YYYYMMDD.jsonl
 Grafana Infinity data source connects to this for "Recent Trades" table panel.
 
 Tail-read (P172): only the last N lines per file are scanned (not full-file O(n) loads).
+Run mode (P173): recent_trades JSONL first, enrich from execution_results* (incl. rotated segments).
 Env:
   IRONCRAB_TRADES_JSONL_TAIL_LINES — max non-empty lines per file (default 15000)
+  IRONCRAB_TRADES_CACHE_TTL_SEC — in-memory cache TTL seconds (default 3)
   IRONCRAB_TRADES_DAYS_LOOKBACK — optional override; endpoints use [0], [0,1], or [0,1] for pnl
 
 `timestamp_ms` on each trade is the on-chain block time (UTC) when `block_time_unix_ms`
@@ -28,10 +30,11 @@ import json
 import os
 import re
 import tempfile
+import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator, List, Optional
+from typing import Callable, Iterator, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 import argparse
 
@@ -60,6 +63,84 @@ DAYS_LOOKBACK_OVERRIDE: Optional[List[int]] = None
 _raw_lookback = os.environ.get("IRONCRAB_TRADES_DAYS_LOOKBACK", "").strip()
 if _raw_lookback:
     DAYS_LOOKBACK_OVERRIDE = [int(x.strip()) for x in _raw_lookback.split(",") if x.strip() != ""]
+
+# In-memory cache for JSONL loads (Grafana polls every 5s).
+TRADES_CACHE_TTL_SEC = max(2, _env_int("IRONCRAB_TRADES_CACHE_TTL_SEC", 3))
+_trades_cache: dict = {}
+
+# Fields copied from execution_results when enriching recent_trades rows.
+_EXEC_ENRICH_KEYS = (
+    "reason",
+    "reason_detail",
+    "exit_type",
+    "exit_reason",
+    "run_id",
+    "wallet_sol_delta",
+    "value_sol",
+    "amount_tokens",
+)
+
+
+def _should_skip_execution_record(record: dict) -> bool:
+    """Skip pre_confirm_track noise and non-terminal execution statuses."""
+    metadata = record.get("metadata") or {}
+    if isinstance(metadata, dict) and metadata.get("phase") == "pre_confirm_track":
+        return True
+    status = str(record.get("status") or "").lower()
+    return status not in ("confirmed", "failed_confirmed")
+
+
+def _enrich_trade_with_execution(recent: dict, execution: dict) -> dict:
+    """Overlay execution_results fields onto a recent_trades row (same tx_hash)."""
+    out = dict(recent)
+    for key in _EXEC_ENRICH_KEYS:
+        val = execution.get(key)
+        if val is not None and val != "":
+            out[key] = val
+    return out
+
+
+def _watch_paths_for_days(days_ago_list: List[int]) -> List[Path]:
+    """Paths whose mtime/size invalidate the trades cache."""
+    paths: List[Path] = []
+    for days_ago in days_ago_list:
+        date = _utc_date_str(days_ago)
+        paths.extend(_jsonl_segment_paths(EXECUTIONS_DIR, "execution_results", date))
+        recent_path = RECENT_TRADES_DIR / f"recent_trades-{date}.jsonl"
+        if recent_path.is_file():
+            paths.append(recent_path)
+    return paths
+
+
+def _paths_fingerprint(paths: List[Path]) -> Tuple[tuple, ...]:
+    fp: List[tuple] = []
+    for path in paths:
+        try:
+            if path.is_file():
+                st = path.stat()
+                fp.append((str(path), st.st_mtime_ns, st.st_size))
+            else:
+                fp.append((str(path), 0, 0))
+        except OSError:
+            fp.append((str(path), 0, 0))
+    return tuple(fp)
+
+
+def _cached_trades_load(cache_key: str, paths: List[Path], loader: Callable[[], list]) -> list:
+    """Return cached trade list when TTL + file fingerprints are unchanged."""
+    now = time.monotonic()
+    fp = _paths_fingerprint(paths)
+    entry = _trades_cache.get(cache_key)
+    if entry and now - entry["ts"] < TRADES_CACHE_TTL_SEC and entry["fp"] == fp:
+        return entry["data"]
+    data = loader()
+    _trades_cache[cache_key] = {"ts": now, "fp": fp, "data": data}
+    return data
+
+
+def clear_trades_cache() -> None:
+    """Test helper: drop in-memory trade cache."""
+    _trades_cache.clear()
 
 
 def _days_for_endpoint(endpoint: str) -> List[int]:
@@ -320,16 +401,57 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
     def read_trades_by_run(self) -> list:
         """Read all trades from the current run + last 20 from the previous run.
 
-        Identifies the latest run_id as the 'current run'. Returns all trades
-        belonging to that run, plus up to 20 trades from the most recent
-        previous run (for context). PnL calculation covers all returned trades.
+        Fast path (P173): load small recent_trades JSONL first, enrich from
+        execution_results* (rotated segments), then filter by run_id / time window.
         """
-        all_trades = self.load_all_trades(days_ago_list=_days_for_endpoint("run"))
+        days = _days_for_endpoint("run")
+        all_trades = self._load_run_mode_trades(days)
 
         if not all_trades:
             return []
 
-        # Step 2: Identify run_ids by most recent trade timestamp
+        trades = self._select_trades_for_current_and_prev_run(all_trades)
+        self._compute_running_pnl(trades)
+        trades.sort(key=lambda t: t.get('timestamp_ms', 0), reverse=True)
+        return trades
+
+    def _load_run_mode_trades(self, days_ago_list: List[int]) -> list:
+        """Recent-trades-first load with execution_results enrichment (mode=run)."""
+        paths = _watch_paths_for_days(days_ago_list)
+        cache_key = f"run_mode:{tuple(days_ago_list)}"
+
+        def loader() -> list:
+            recent_all: list = []
+            exec_all: list = []
+            for days_ago in days_ago_list:
+                recent_all.extend(self._load_trades_from_recent_jsonl([days_ago]))
+                exec_all.extend(self._load_trades_from_execution_jsonl([days_ago]))
+
+            exec_by_hash = {t["tx_hash"]: t for t in exec_all if t.get("tx_hash")}
+            merged: list = []
+            seen_hashes: set = set()
+
+            for trade in recent_all:
+                tx_hash = trade.get("tx_hash") or ""
+                if tx_hash and tx_hash in exec_by_hash:
+                    merged.append(_enrich_trade_with_execution(trade, exec_by_hash[tx_hash]))
+                else:
+                    merged.append(trade)
+                if tx_hash:
+                    seen_hashes.add(tx_hash)
+
+            for trade in exec_all:
+                tx_hash = trade.get("tx_hash") or ""
+                if tx_hash and tx_hash not in seen_hashes:
+                    merged.append(trade)
+                    seen_hashes.add(tx_hash)
+
+            return self._dedupe_trades_by_tx_hash(merged)
+
+        return _cached_trades_load(cache_key, paths, loader)
+
+    def _select_trades_for_current_and_prev_run(self, all_trades: list) -> list:
+        """Current run (+ run_id-less rows in its time window) + up to 20 prev-run rows."""
         run_last_ts = {}
         for t in all_trades:
             rid = t.get('run_id', '')
@@ -337,12 +459,9 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             if rid and ts > run_last_ts.get(rid, 0):
                 run_last_ts[rid] = ts
 
-        # Sort runs by last trade timestamp descending
         sorted_runs = sorted(run_last_ts.keys(), key=lambda r: run_last_ts[r], reverse=True)
 
-        # Step 3: Collect trades for current run + last 20 from previous run
         if not sorted_runs:
-            # recent_trades JSONL has no run_id — scope by calendar day of newest trade
             all_trades.sort(key=lambda t: t.get('timestamp_ms', 0), reverse=True)
             newest_ts = all_trades[0].get('timestamp_ms', 0)
             newest_day = datetime.fromtimestamp(
@@ -365,20 +484,39 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 != newest_day
             ]
             prev_candidates.sort(key=lambda t: t.get('timestamp_ms', 0), reverse=True)
-            prev_trades = prev_candidates[:20]
-            trades = current_trades + prev_trades
-        else:
-            current_run = sorted_runs[0]
-            prev_run = sorted_runs[1] if len(sorted_runs) > 1 else None
-            current_trades = [t for t in all_trades if t.get('run_id') == current_run]
-            prev_trades = []
-            if prev_run:
-                prev_all = [t for t in all_trades if t.get('run_id') == prev_run]
-                prev_all.sort(key=lambda t: t.get('timestamp_ms', 0), reverse=True)
-                prev_trades = prev_all[:20]
-            trades = current_trades + prev_trades
+            return current_trades + prev_candidates[:20]
 
-        # Step 4: Running PnL calculation (same logic as read_recent_trades)
+        current_run = sorted_runs[0]
+        prev_run = sorted_runs[1] if len(sorted_runs) > 1 else None
+
+        current_run_rows = [t for t in all_trades if t.get('run_id') == current_run]
+        if current_run_rows:
+            ts_values = [t.get('timestamp_ms', 0) for t in current_run_rows]
+            run_min_ts = min(ts_values)
+            run_max_ts = max(ts_values)
+        else:
+            run_min_ts = run_max_ts = None
+
+        def in_current_run(trade: dict) -> bool:
+            if trade.get('run_id') == current_run:
+                return True
+            if trade.get('run_id'):
+                return False
+            if run_min_ts is None:
+                return False
+            ts = trade.get('timestamp_ms', 0)
+            return run_min_ts <= ts <= run_max_ts
+
+        current_trades = [t for t in all_trades if in_current_run(t)]
+        prev_trades: list = []
+        if prev_run:
+            prev_all = [t for t in all_trades if t.get('run_id') == prev_run]
+            prev_all.sort(key=lambda t: t.get('timestamp_ms', 0), reverse=True)
+            prev_trades = prev_all[:20]
+        return current_trades + prev_trades
+
+    def _compute_running_pnl(self, trades: list) -> None:
+        """Running PnL over trades sorted chronologically (mutates trade dicts)."""
         trades.sort(key=lambda t: t.get('timestamp_ms', 0))
         positions = {}
         for trade in trades:
@@ -392,7 +530,6 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 continue
 
             if action == "BUY":
-                # Cost: PREFER value_sol (fill_in) — actual swap amount
                 cost_sol = value_sol if (value_sol is not None and value_sol > 0) else None
                 if cost_sol is None and wallet_delta is not None:
                     cost_sol = abs(wallet_delta)
@@ -405,8 +542,6 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 trade["pnl_sol"] = 0.0
                 trade["pnl_pct"] = None
             elif action == "SELL":
-                # Proceeds: PREFER value_sol (fill_out) — wallet_delta doesn't include
-                # WSOL swap output for PumpSwap SELL.
                 proceeds_sol = value_sol if (value_sol is not None and value_sol > 0) else 0
                 if proceeds_sol == 0:
                     proceeds_sol = wallet_delta if (wallet_delta is not None and wallet_delta > 0) else 0
@@ -423,10 +558,6 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 else:
                     trade["pnl_sol"] = None
                     trade["pnl_pct"] = None
-
-        # Sort by timestamp descending for display
-        trades.sort(key=lambda t: t.get('timestamp_ms', 0), reverse=True)
-        return trades
 
     def serve_pnl_24h(self):
         """Serve 24h realized PnL summary as JSON."""
@@ -575,23 +706,29 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         """Load confirmed trades from execution_results; fallback to recent_trades JSONL (P166)."""
         if days_ago_list is None:
             days_ago_list = _days_for_endpoint("limit")
-        trades = []
-        used_fallback = False
-        for days_ago in days_ago_list:
-            day_trades = self._load_trades_from_execution_jsonl([days_ago])
-            day_recent = self._load_trades_from_recent_jsonl([days_ago])
-            if day_trades and day_recent:
-                day_trades = self._merge_trades_by_tx_hash(day_trades, day_recent)
-            elif not day_trades and day_recent:
-                used_fallback = True
-                day_trades = day_recent
-            trades.extend(day_trades)
-        if used_fallback:
-            print(
-                "trades_server: using recent_trades JSONL fallback "
-                "(execution_results empty or unparseable for one or more days)"
-            )
-        return self._dedupe_trades_by_tx_hash(trades)
+        paths = _watch_paths_for_days(days_ago_list)
+        cache_key = f"load_all:{tuple(days_ago_list)}"
+
+        def loader() -> list:
+            trades = []
+            used_fallback = False
+            for days_ago in days_ago_list:
+                day_trades = self._load_trades_from_execution_jsonl([days_ago])
+                day_recent = self._load_trades_from_recent_jsonl([days_ago])
+                if day_trades and day_recent:
+                    day_trades = self._merge_trades_by_tx_hash(day_trades, day_recent)
+                elif not day_trades and day_recent:
+                    used_fallback = True
+                    day_trades = day_recent
+                trades.extend(day_trades)
+            if used_fallback:
+                print(
+                    "trades_server: using recent_trades JSONL fallback "
+                    "(execution_results empty or unparseable for one or more days)"
+                )
+            return self._dedupe_trades_by_tx_hash(trades)
+
+        return _cached_trades_load(cache_key, paths, loader)
 
     def _dedupe_trades_by_tx_hash(self, trades: list) -> list:
         """One row per tx_hash; keep the richer execution_results-style row."""
@@ -650,11 +787,11 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                     for line in _iter_jsonl_tail(jsonl_path, JSONL_TAIL_LINES):
                         try:
                             record = json.loads(line)
-                            status = str(record.get("status") or "").lower()
-                            if status in ("confirmed", "failed_confirmed"):
-                                trade = self.parse_execution_result(record)
-                                if trade:
-                                    trades.append(trade)
+                            if _should_skip_execution_record(record):
+                                continue
+                            trade = self.parse_execution_result(record)
+                            if trade:
+                                trades.append(trade)
                         except json.JSONDecodeError:
                             continue
                 except Exception as e:
