@@ -12188,8 +12188,7 @@ async fn run_geyser_loop(
 
     // PR3: separate Geyser session for wallet TX status → JetStream WalletTxConfirmed (I-4).
     #[cfg(not(windows))]
-    if let (Some(ref tracked_wallet), Some(_)) = (&ctx.tracked_wallet, &ctx.nats)
-    {
+    if let (Some(ref tracked_wallet), Some(_)) = (&ctx.tracked_wallet, &ctx.nats) {
         let (wallet_tx_update_tx, mut wallet_tx_update_rx) =
             mpsc::channel::<WalletTxConfirmUpdate>(512);
         let _wallet_tx_confirm_listener = spawn_wallet_tx_confirm_listener(
