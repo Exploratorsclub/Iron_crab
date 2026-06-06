@@ -8214,6 +8214,18 @@ async fn main() -> Result<()> {
         };
     let mut wallet_tx_confirm_consumer_opt = wallet_tx_confirm_consumer_opt;
 
+    if ctx.config.read().jetstream_tx_confirm_enabled
+        && ctx.wallet_pubkey.is_some()
+        && wallet_tx_confirm_consumer_opt.is_none()
+    {
+        warn!(
+            stream = WALLET_TX_CONFIRM_STREAM_NAME,
+            "JetStream TX confirm enabled but WalletTxConfirmed consumer missing \
+             (market-data may not be running or WALLET_TX_CONFIRM stream unavailable); \
+             confirms will timeout"
+        );
+    }
+
     // E2E Readiness: consuming state paths (LockManager, LivePoolCache, JetStream consumers) initialized
     set_readiness_state_paths_initialized(true);
 
@@ -12391,7 +12403,9 @@ async fn confirm_signature_status(
         #[cfg(windows)]
         {
             let _ = pre_registered_rx;
-            confirm_via_rpc_polling(ctx, signature_base58, deadline, start).await
+            let outcome = confirm_via_rpc_polling(ctx, signature_base58, deadline, start).await;
+            ctx.pending_tx_confirms.write().remove(signature_base58);
+            outcome
         }
         #[cfg(not(windows))]
         {

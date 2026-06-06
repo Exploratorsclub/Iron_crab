@@ -9069,6 +9069,13 @@ async fn main() -> Result<()> {
         None
     };
 
+    if !args.dry_run && !args.simulate && tracked_wallet.is_none() {
+        warn!(
+            "IRONCRAB_WALLET_PUBKEY not set: WalletTxConfirmed will NOT be published; \
+             execution-engine JetStream TX confirm will timeout until wallet env is configured on market-data"
+        );
+    }
+
     let geyser_full_reconnect_threshold_live = Arc::new(AtomicUsize::new(
         market_data_config.geyser_full_reconnect_threshold,
     ));
@@ -10217,17 +10224,43 @@ async fn md_account_publish_execute_one_job(
             payload,
             bump_market_events_published_total,
         } => {
-            if let Err(e) = nats.jetstream_publish(&subject, &payload).await {
-                warn!(
-                    error = %e,
-                    subject = %subject,
-                    "account_path: JetStream publish failed"
-                );
-                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-            } else {
-                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                if bump_market_events_published_total {
-                    MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            let is_wallet_tx_confirm = subject.starts_with("ironcrab.wallet_tx_confirm.");
+            match nats.jetstream_publish(&subject, &payload).await {
+                Ok(true) => {
+                    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    if bump_market_events_published_total {
+                        MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Ok(false) => {
+                    if is_wallet_tx_confirm {
+                        error!(
+                            subject = %subject,
+                            "account_path: WalletTxConfirmed JetStream publish failed (timeout or drop)"
+                        );
+                    } else {
+                        warn!(
+                            subject = %subject,
+                            "account_path: JetStream publish failed (timeout or drop)"
+                        );
+                    }
+                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    if is_wallet_tx_confirm {
+                        error!(
+                            error = %e,
+                            subject = %subject,
+                            "account_path: WalletTxConfirmed JetStream publish failed"
+                        );
+                    } else {
+                        warn!(
+                            error = %e,
+                            subject = %subject,
+                            "account_path: JetStream publish failed"
+                        );
+                    }
+                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -10756,7 +10789,7 @@ async fn account_path_enqueue_jetstream<T: Serialize>(
     payload: &T,
     log_fail: &'static str,
     bump_market_events_published_total: bool,
-) {
+) -> bool {
     if let Some(tx) = publish_tx {
         let payload = match serde_json::to_value(payload) {
             Ok(v) => v,
@@ -10766,7 +10799,7 @@ async fn account_path_enqueue_jetstream<T: Serialize>(
                     msg = log_fail,
                     "account_path: failed to serialize JetStream payload"
                 );
-                return;
+                return false;
             }
         };
         let job = AccountPathNatsJob::JetStream {
@@ -10774,17 +10807,33 @@ async fn account_path_enqueue_jetstream<T: Serialize>(
             payload,
             bump_market_events_published_total,
         };
-        let _ = account_path_try_enqueue_job(tx, job, log_fail);
+        account_path_try_enqueue_job(tx, job, log_fail)
     } else if let Some(nats) = nats {
-        if let Err(e) = nats.jetstream_publish(&subject, payload).await {
-            warn!(error = %e, msg = log_fail, "JetStream publish failed");
-            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-        } else {
-            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            if bump_market_events_published_total {
-                MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        match nats.jetstream_publish(&subject, payload).await {
+            Ok(true) => {
+                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                if bump_market_events_published_total {
+                    MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                }
+                true
+            }
+            Ok(false) => {
+                warn!(
+                    subject = %subject,
+                    msg = log_fail,
+                    "JetStream publish failed (timeout or drop)"
+                );
+                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            Err(e) => {
+                warn!(error = %e, subject = %subject, msg = log_fail, "JetStream publish failed");
+                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                false
             }
         }
+    } else {
+        false
     }
 }
 
@@ -12219,7 +12268,7 @@ async fn run_geyser_loop(
                 );
                 let subject = wallet_tx_confirm_subject(&wallet_str, &update.signature);
                 // Critical confirm path: publish directly (bounded account queue may drop).
-                account_path_enqueue_jetstream(
+                let published = account_path_enqueue_jetstream(
                     None,
                     ctx_wallet_tx.nats.as_ref(),
                     subject,
@@ -12228,12 +12277,21 @@ async fn run_geyser_loop(
                     false,
                 )
                 .await;
-                info!(
-                    sig = %update.signature,
-                    slot = update.slot,
-                    err = ?update.err,
-                    "WalletTxConfirmed published to JetStream"
-                );
+                if published {
+                    info!(
+                        sig = %update.signature,
+                        slot = update.slot,
+                        err = ?update.err,
+                        "WalletTxConfirmed published to JetStream"
+                    );
+                } else {
+                    error!(
+                        sig = %update.signature,
+                        slot = update.slot,
+                        err = ?update.err,
+                        "WalletTxConfirmed JetStream publish failed (execution-engine confirm will timeout)"
+                    );
+                }
             }
             warn!("wallet_tx_confirm bridge: update channel closed");
         });
