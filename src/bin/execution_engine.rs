@@ -88,19 +88,20 @@ use ironcrab::metrics::{
     PUMPSWAP_HOT_PATH_HEALING_COOLDOWN_SUPPRESSED_TOTAL,
     PUMPSWAP_HOT_PATH_HEALING_SKIPPED_NO_NATS_TOTAL, PUMPSWAP_HOT_PATH_HEALING_TRIGGER_TOTAL,
     REJECT_CAPITAL_LOCK, REJECT_DUPLICATE, REJECT_RESOURCE_LOCK, REJECT_SEND_FAILED,
-    REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL, TX_CONFIRMED_TOTAL, TX_CONFIRM_GEYSER_TOTAL,
-    TX_CONFIRM_LATENCY_MS, TX_CONFIRM_RPC_FALLBACK_TOTAL, TX_CONFIRM_TIMEOUT_TOTAL,
+    REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL, TX_CONFIRMED_TOTAL,
+    TX_CONFIRM_JETSTREAM_TOTAL, TX_CONFIRM_LATENCY_MS, TX_CONFIRM_TIMEOUT_TOTAL,
     TX_SEND_ATTEMPTS_TOTAL, TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL, TX_SEND_SUCCESS_TOTAL,
     TX_SEND_TPU_TOTAL, WALLET_TOTAL_SOL_LAMPORTS,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
     ensure_trade_intents_stream, wallet_snapshot_consumer_config,
-    wallet_snapshot_live_consumer_config_execution_engine, NatsClient, NatsConfig,
+    wallet_snapshot_live_consumer_config_execution_engine,
+    wallet_tx_confirm_live_consumer_config_execution_engine, NatsClient, NatsConfig,
     CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_CONTROL_REQUESTS, TOPIC_CONTROL_RESPONSES,
     TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
     TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS, TRADE_INTENTS_STREAM_NAME,
-    WALLET_SNAPSHOT_STREAM_NAME,
+    WALLET_SNAPSHOT_STREAM_NAME, WALLET_TX_CONFIRM_STREAM_NAME,
 };
 use ironcrab::position_authority::{position_authority_drift_lockmanager, PositionAuthority};
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
@@ -1497,9 +1498,9 @@ struct ExecutionConfig {
     /// Maximum number of intents processed concurrently. Startup-only (restart required).
     max_concurrent_intents: u32,
 
-    // === FIX-32: Geyser TX Confirmation ===
-    /// Use Geyser for TX confirmation instead of RPC polling (requires geyser_grpc_url)
-    geyser_confirm_enabled: bool,
+    // === PR3: JetStream TX Confirmation (market-data Geyser → JetStream) ===
+    /// Wait for `WalletTxConfirmed` on JetStream (no EE Geyser, no RPC fallback).
+    jetstream_tx_confirm_enabled: bool,
     /// Commitment for TX confirmation: `"confirmed"` (default, lower latency, reorg risk) or `"finalized"` (slower, stricter finality).
     confirm_commitment: String,
     /// Rebroadcast interval during confirmation wait (ms)
@@ -1559,8 +1560,8 @@ impl Default for ExecutionConfig {
             wsol_dry_run: false,
             // FIX-31: Parallel intent processing
             max_concurrent_intents: 4,
-            // FIX-32: Geyser TX confirmation defaults (product default: confirmed — see CONFIG_SCHEMA)
-            geyser_confirm_enabled: true,
+            // PR3: JetStream TX confirmation (product default: enabled — see CONFIG_SCHEMA)
+            jetstream_tx_confirm_enabled: true,
             confirm_commitment: "confirmed".to_string(),
             rebroadcast_interval_ms: 2_000,
             max_rebroadcasts: 5,
@@ -2451,9 +2452,13 @@ struct ExecutionContext {
     /// When Some, WalletBalanceSnapshot for NATIVE_SOL/WSOL are forwarded here.
     wsol_balance_tx: Option<tokio::sync::mpsc::Sender<(u64, Option<u64>)>>,
 
-    // === FIX-32: Geyser TX Confirmation ===
-    /// Geyser-based TX confirmation tracker (Geyser-first, RPC-polling fallback)
-    tx_confirm: Arc<ironcrab::solana::geyser_tx_confirm::GeyserTxConfirm>,
+    // === PR3: JetStream TX Confirmation ===
+    /// Pending signature → oneshot notify (filled by main-loop JetStream WalletTxConfirmed consumer).
+    pending_tx_confirms: Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<WalletTxConfirmNotify>>,
+        >,
+    >,
 
     // Metrics
     intents_received: std::sync::atomic::AtomicU64,
@@ -5842,11 +5847,19 @@ impl ExecutionContext {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
                 }
-                "geyser_confirm_enabled" => {
+                "jetstream_tx_confirm_enabled" | "geyser_confirm_enabled" => {
                     if let Some(v) = value.as_bool() {
-                        config.geyser_confirm_enabled = v;
+                        config.jetstream_tx_confirm_enabled = v;
                         applied.push(key.clone());
-                        info!(key = %key, new_value = %v, "Config updated");
+                        if key == "geyser_confirm_enabled" {
+                            info!(
+                                key = %key,
+                                new_value = %v,
+                                "Config updated (deprecated key; use jetstream_tx_confirm_enabled)"
+                            );
+                        } else {
+                            info!(key = %key, new_value = %v, "Config updated");
+                        }
                     } else {
                         rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
                     }
@@ -5861,7 +5874,7 @@ impl ExecutionContext {
                                 info!(
                                     key = %key,
                                     new_value = %v,
-                                    "Config updated (RPC polling uses new value; Geyser uses startup value)"
+                                    "Config updated (EE confirm waits on JetStream; commitment is market-data Geyser subscription at startup)"
                                 );
                             }
                             _ => rejected.push((
@@ -6629,6 +6642,50 @@ async fn create_wallet_snapshot_live_consumer(
     }
 }
 
+/// Create the durable live WalletTxConfirmed consumer for the main loop (PR3).
+async fn create_wallet_tx_confirm_live_consumer(
+    nats_client: &NatsClient,
+    wallet: &Pubkey,
+) -> Option<async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>>
+{
+    use async_nats::jetstream;
+
+    let jetstream = jetstream::new(nats_client.client().clone());
+    let stream = match jetstream.get_stream(WALLET_TX_CONFIRM_STREAM_NAME).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                error = %e,
+                stream = WALLET_TX_CONFIRM_STREAM_NAME,
+                "JetStream wallet TX confirm stream not found (market-data may not be running)"
+            );
+            return None;
+        }
+    };
+
+    let wallet_str = wallet.to_string();
+    let cfg = wallet_tx_confirm_live_consumer_config_execution_engine(&wallet_str);
+
+    match stream.create_consumer(cfg).await {
+        Ok(consumer) => {
+            info!(
+                stream = WALLET_TX_CONFIRM_STREAM_NAME,
+                wallet = %wallet_str,
+                "Subscribed to JetStream WalletTxConfirmed (live)"
+            );
+            Some(consumer)
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                stream = WALLET_TX_CONFIRM_STREAM_NAME,
+                "Failed to create JetStream consumer for WalletTxConfirmed"
+            );
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -7149,38 +7206,11 @@ async fn main() -> Result<()> {
     // I-24d: No global Startup-Seeding/Discovery-Rebuild. market-data is Discovery authority.
     // Pool_accounts arrive via JetStream PoolCacheUpdate or Discovery Request/Reply on demand.
 
-    // FIX-32: Initialize Geyser-based TX confirmation tracker
-    let tx_confirm = {
-        let geyser_url = app_config
-            .as_ref()
-            .and_then(|c| c.solana.geyser_grpc_url.as_ref());
-        if exec_config.geyser_confirm_enabled {
-            if let (Some(url), Some(ref wpk)) = (geyser_url, &wallet_pubkey) {
-                info!(
-                    "FIX-32: Initializing Geyser-based TX confirmation (wallet={})",
-                    wpk
-                );
-                Arc::new(
-                    ironcrab::solana::geyser_tx_confirm::GeyserTxConfirm::with_geyser(
-                        exec_config.confirmation_timeout_ms / 1000,
-                        url.clone(),
-                        *wpk,
-                        &exec_config.confirm_commitment,
-                    ),
-                )
-            } else {
-                info!("FIX-32: Geyser TX confirm disabled (no geyser URL or wallet)");
-                Arc::new(ironcrab::solana::geyser_tx_confirm::GeyserTxConfirm::new(
-                    exec_config.confirmation_timeout_ms / 1000,
-                ))
-            }
-        } else {
-            info!("FIX-32: Geyser TX confirm disabled by config");
-            Arc::new(ironcrab::solana::geyser_tx_confirm::GeyserTxConfirm::new(
-                exec_config.confirmation_timeout_ms / 1000,
-            ))
-        }
-    };
+    let pending_tx_confirms: Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<WalletTxConfirmNotify>>,
+        >,
+    > = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
 
     let mut ctx = ExecutionContext {
         run_id: run_id.clone(),
@@ -7229,8 +7259,8 @@ async fn main() -> Result<()> {
         cached_blockhash: parking_lot::RwLock::new(None),
         // Option C: LivePoolCache - for zero-RPC quote calculation
         live_pool_cache: live_pool_cache.clone(),
-        // FIX-32: Geyser-based TX confirmation
-        tx_confirm,
+        // PR3: JetStream WalletTxConfirmed waiters (market-data Geyser → JetStream)
+        pending_tx_confirms,
         // WsolManager balance updates (from JetStream); set when WsolManager enabled
         wsol_balance_tx: None,
         // Metrics
@@ -7692,6 +7722,8 @@ async fn main() -> Result<()> {
     };
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut wallet_tx_confirm_interval =
+        tokio::time::interval(std::time::Duration::from_millis(100));
 
     // For MVP dry-run test
     let mut simulated_tick: u64 = 0;
@@ -8174,6 +8206,26 @@ async fn main() -> Result<()> {
 
     let mut wallet_snapshot_consumer_opt = wallet_snapshot_consumer;
 
+    let wallet_tx_confirm_consumer_opt =
+        if let (Some(ref nats), Some(wallet)) = (&ctx.nats, ctx.wallet_pubkey) {
+            create_wallet_tx_confirm_live_consumer(nats, &wallet).await
+        } else {
+            None
+        };
+    let mut wallet_tx_confirm_consumer_opt = wallet_tx_confirm_consumer_opt;
+
+    if ctx.config.read().jetstream_tx_confirm_enabled
+        && ctx.wallet_pubkey.is_some()
+        && wallet_tx_confirm_consumer_opt.is_none()
+    {
+        warn!(
+            stream = WALLET_TX_CONFIRM_STREAM_NAME,
+            "JetStream TX confirm enabled but WalletTxConfirmed consumer missing \
+             (market-data may not be running or WALLET_TX_CONFIRM stream unavailable); \
+             confirms will timeout"
+        );
+    }
+
     // E2E Readiness: consuming state paths (LockManager, LivePoolCache, JetStream consumers) initialized
     set_readiness_state_paths_initialized(true);
 
@@ -8312,6 +8364,75 @@ async fn main() -> Result<()> {
                         // #[non_exhaustive]: unknown variants (e.g. EnsurePumpAmmPoolAccounts for market-data)
                         _ => {
                             debug!(kind = ?req.kind, "Ignoring ControlRequest for other target");
+                        }
+                    }
+                }
+            }
+
+            // PR3: WalletTxConfirmed from JetStream → pending confirm waiters (no RPC).
+            // Polled at 100ms (not the 1s heartbeat tick) to minimize confirm latency.
+            _ = wallet_tx_confirm_interval.tick() => {
+                if wallet_tx_confirm_consumer_opt.is_none() {
+                    if let (Some(ref nats), Some(wallet)) = (&ctx.nats, ctx.wallet_pubkey) {
+                        wallet_tx_confirm_consumer_opt =
+                            create_wallet_tx_confirm_live_consumer(nats, &wallet).await;
+                    }
+                }
+                if let Some(ref mut consumer) = wallet_tx_confirm_consumer_opt {
+                    use futures::StreamExt;
+                    match consumer
+                        .fetch()
+                        .max_messages(100)
+                        .expires(std::time::Duration::from_millis(100))
+                        .messages()
+                        .await
+                    {
+                        Ok(mut messages) => {
+                            while let Some(msg_result) = messages.next().await {
+                                match msg_result {
+                                    Ok(msg) => {
+                                        match serde_json::from_slice::<MarketEvent>(&msg.payload) {
+                                            Ok(event) => {
+                                                if let MarketEventKind::WalletTxConfirmed {
+                                                    signature,
+                                                    slot,
+                                                    err,
+                                                    ..
+                                                } = event.kind
+                                                {
+                                                    dispatch_wallet_tx_confirmed(
+                                                        &ctx.pending_tx_confirms,
+                                                        &signature,
+                                                        slot,
+                                                        err,
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                debug!(
+                                                    error = %e,
+                                                    "Failed to deserialize WalletTxConfirmed MarketEvent"
+                                                );
+                                            }
+                                        }
+                                        if let Err(e) = msg.ack().await {
+                                            debug!(
+                                                error = %e,
+                                                "Failed to ack wallet TX confirm message"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!(
+                                            error = %e,
+                                            "JetStream wallet TX confirm fetch returned error"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "No new wallet TX confirm messages in JetStream");
                         }
                     }
                 }
@@ -8731,9 +8852,7 @@ async fn build_replay_context(
             std::collections::HashMap::new(),
         )),
         wsol_balance_tx: None,
-        tx_confirm: Arc::new(ironcrab::solana::geyser_tx_confirm::GeyserTxConfirm::new(
-            15,
-        )),
+        pending_tx_confirms: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
         intents_received: std::sync::atomic::AtomicU64::new(0),
         intents_rejected: std::sync::atomic::AtomicU64::new(0),
         sim_failures: std::sync::atomic::AtomicU64::new(0),
@@ -10872,6 +10991,16 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         None
     };
 
+    // Register JetStream confirm waiter before any async pre-confirm work so the main loop
+    // cannot ack WalletTxConfirmed while this intent task is still between send and confirm.
+    let mut wallet_tx_confirm_rx: Option<tokio::sync::oneshot::Receiver<WalletTxConfirmNotify>> =
+        None;
+    if config.send_enabled && sent_anything && !requires_bundle {
+        if let Some(ref sig) = send_signature {
+            wallet_tx_confirm_rx = Some(register_wallet_tx_confirm_waiter(ctx, sig));
+        }
+    }
+
     // PR1 Phase 2: pre-confirm ATA track — publish Sent ExecutionResult before confirm wait.
     if config.send_enabled && sent_anything {
         if let Some(ref sr) = send_result {
@@ -10971,6 +11100,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                     sig_str,
                     config.confirmation_timeout_ms,
                     sent_tx.as_ref(),
+                    wallet_tx_confirm_rx.take(),
                 )
                 .await
                 {
@@ -12029,10 +12159,49 @@ fn build_input_snapshots(intent: &TradeIntent) -> std::collections::HashMap<Stri
     snapshots
 }
 
+/// Payload delivered when a pending TX receives `WalletTxConfirmed` from JetStream.
+#[derive(Debug, Clone)]
+struct WalletTxConfirmNotify {
+    slot: u64,
+    err: Option<String>,
+}
+
+fn register_wallet_tx_confirm_waiter(
+    ctx: &ExecutionContext,
+    signature_base58: &str,
+) -> tokio::sync::oneshot::Receiver<WalletTxConfirmNotify> {
+    let (notify_tx, notify_rx) = tokio::sync::oneshot::channel();
+    ctx.pending_tx_confirms
+        .write()
+        .insert(signature_base58.to_string(), notify_tx);
+    notify_rx
+}
+
+fn dispatch_wallet_tx_confirmed(
+    pending: &Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<WalletTxConfirmNotify>>,
+        >,
+    >,
+    signature: &str,
+    slot: u64,
+    err: Option<String>,
+) {
+    if let Some(notify_tx) = pending.write().remove(signature) {
+        let _ = notify_tx.send(WalletTxConfirmNotify { slot, err });
+    } else {
+        debug!(
+            sig = %signature,
+            slot = slot,
+            "WalletTxConfirmed with no pending waiter (late confirm or duplicate)"
+        );
+    }
+}
+
 enum ConfirmOutcome {
     Confirmed {
         details: String,
-        /// Execution landing slot when known (Geyser, RPC status, or bundle watcher).
+        /// Execution landing slot when known (JetStream WalletTxConfirmed or bundle watcher).
         slot: Option<u64>,
     },
     FailedConfirmed {
@@ -12193,18 +12362,16 @@ async fn publish_pre_confirm_execution_result(
     Ok(())
 }
 
-/// FIX-32: Geyser-first TX confirmation with RPC-polling fallback.
+/// PR3: JetStream WalletTxConfirmed wait (market-data Geyser → JetStream → EE).
 ///
-/// If Geyser TX watcher is connected, registers the signature and waits for a
-/// Geyser `transactions_status` notification (sub-200ms typical). Falls back to
-/// RPC polling if Geyser is unavailable or the channel drops.
-///
-/// Rebroadcasts run in a parallel task regardless of confirmation strategy.
+/// No EE Geyser client and no RPC fallback on timeout (I-4 / I-7).
+/// Rebroadcasts run in a parallel task regardless of confirmation source.
 async fn confirm_signature_status(
     ctx: &ExecutionContext,
     signature_base58: &str,
     timeout_ms: u64,
     rebroadcast_tx: Option<&Transaction>,
+    pre_registered_rx: Option<tokio::sync::oneshot::Receiver<WalletTxConfirmNotify>>,
 ) -> std::result::Result<ConfirmOutcome, String> {
     let start = std::time::Instant::now();
     let deadline = Duration::from_millis(timeout_ms.max(1));
@@ -12232,10 +12399,26 @@ async fn confirm_signature_status(
         None
     };
 
-    let outcome = if ctx.tx_confirm.is_geyser_enabled() && config.geyser_confirm_enabled {
-        confirm_via_geyser(ctx, signature_base58, deadline, start).await
-    } else {
-        confirm_via_rpc_polling(ctx, signature_base58, deadline, start).await
+    let outcome = {
+        #[cfg(windows)]
+        {
+            let _ = pre_registered_rx;
+            let outcome = confirm_via_rpc_polling(ctx, signature_base58, deadline, start).await;
+            ctx.pending_tx_confirms.write().remove(signature_base58);
+            outcome
+        }
+        #[cfg(not(windows))]
+        {
+            confirm_via_jetstream(
+                ctx,
+                signature_base58,
+                deadline,
+                start,
+                &config,
+                pre_registered_rx,
+            )
+            .await
+        }
     };
 
     // Cancel rebroadcast task on completion
@@ -12246,62 +12429,69 @@ async fn confirm_signature_status(
     outcome
 }
 
-/// Geyser-based confirmation: register TX, wait for oneshot notification or timeout.
-async fn confirm_via_geyser(
+/// JetStream-based confirmation: register pending signature, wait for main-loop dispatch or timeout.
+async fn confirm_via_jetstream(
     ctx: &ExecutionContext,
     signature_base58: &str,
     deadline: Duration,
     start: std::time::Instant,
+    config: &ExecutionConfig,
+    pre_registered_rx: Option<tokio::sync::oneshot::Receiver<WalletTxConfirmNotify>>,
 ) -> std::result::Result<ConfirmOutcome, String> {
-    let rx = ctx
-        .tx_confirm
-        .register_tx(signature_base58.to_string(), None);
+    if !config.jetstream_tx_confirm_enabled {
+        ctx.pending_tx_confirms.write().remove(signature_base58);
+        TX_CONFIRM_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+        return Ok(ConfirmOutcome::TimeoutSent {
+            details: format!(
+                "method=jetstream_disabled elapsed_ms={} signature={signature_base58}",
+                start.elapsed().as_millis()
+            ),
+        });
+    }
+
+    let notify_rx = match pre_registered_rx {
+        Some(rx) => rx,
+        None => register_wallet_tx_confirm_waiter(ctx, signature_base58),
+    };
+
     let remaining = deadline.saturating_sub(start.elapsed());
 
-    tokio::select! {
-        result = rx => {
+    let outcome = tokio::select! {
+        result = notify_rx => {
             match result {
-                Ok(confirm) if confirm.confirmed => {
+                Ok(confirm) if confirm.err.is_none() => {
                     let elapsed_ms = start.elapsed().as_millis() as u64;
                     TX_CONFIRMED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    TX_CONFIRM_GEYSER_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    TX_CONFIRM_JETSTREAM_TOTAL.fetch_add(1, Ordering::Relaxed);
                     TX_CONFIRM_LATENCY_MS.store(elapsed_ms, Ordering::Relaxed);
                     Ok(ConfirmOutcome::Confirmed {
                         details: format!(
-                            "method=geyser slot={} elapsed_ms={elapsed_ms} signature={signature_base58}",
+                            "method=jetstream slot={} elapsed_ms={elapsed_ms} signature={signature_base58}",
                             confirm.slot,
                         ),
                         slot: Some(confirm.slot),
                     })
                 }
-                Ok(confirm) if confirm.error.is_some() => {
+                Ok(confirm) => {
                     let elapsed_ms = start.elapsed().as_millis() as u64;
                     TX_CONFIRM_LATENCY_MS.store(elapsed_ms, Ordering::Relaxed);
                     Ok(ConfirmOutcome::FailedConfirmed {
                         details: format!(
-                            "method=geyser err={} slot={} elapsed_ms={elapsed_ms} signature={signature_base58}",
-                            confirm.error.as_deref().unwrap_or("unknown"),
+                            "method=jetstream err={} slot={} elapsed_ms={elapsed_ms} signature={signature_base58}",
+                            confirm.err.as_deref().unwrap_or("unknown"),
                             confirm.slot,
                         ),
                         slot: Some(confirm.slot),
                     })
                 }
-                Ok(_confirm) => {
-                    // Timeout from cleanup_timeouts() in the TX watcher
+                Err(_) => {
                     TX_CONFIRM_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
                     Ok(ConfirmOutcome::TimeoutSent {
                         details: format!(
-                            "method=geyser_timeout elapsed_ms={} signature={signature_base58}",
+                            "method=jetstream_channel_dropped elapsed_ms={} signature={signature_base58}",
                             start.elapsed().as_millis()
                         ),
                     })
-                }
-                Err(_) => {
-                    // Channel dropped — Geyser watcher may have disconnected.
-                    // Fall back to RPC polling with remaining time.
-                    warn!(sig=%signature_base58, "Geyser confirm channel dropped, falling back to RPC polling");
-                    TX_CONFIRM_RPC_FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    confirm_via_rpc_polling(ctx, signature_base58, deadline, start).await
                 }
             }
         }
@@ -12309,17 +12499,21 @@ async fn confirm_via_geyser(
             TX_CONFIRM_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
             Ok(ConfirmOutcome::TimeoutSent {
                 details: format!(
-                    "method=geyser_deadline elapsed_ms={} signature={signature_base58}",
+                    "method=jetstream_deadline elapsed_ms={} signature={signature_base58}",
                     start.elapsed().as_millis()
                 ),
             })
         }
-    }
+    };
+
+    // Remove pending entry after deadline (late JetStream confirms are ignored — no double-count).
+    ctx.pending_tx_confirms.write().remove(signature_base58);
+
+    outcome
 }
 
-/// RPC-polling fallback: exponential backoff polling of `get_signature_statuses()`.
-/// When `confirm_commitment == "finalized"`, only `Finalized` RPC status counts as confirmed;
-/// with default `"confirmed"`, `Confirmed` or `Finalized` is accepted (reorg risk vs latency trade-off).
+/// RPC-polling fallback for environments without Geyser/JetStream confirm (e.g. Windows dev/CI).
+#[cfg(windows)]
 async fn confirm_via_rpc_polling(
     ctx: &ExecutionContext,
     signature_base58: &str,
@@ -12375,13 +12569,13 @@ async fn confirm_via_rpc_polling(
                     !require_finalized
                 }
                 Some(solana_transaction_status::TransactionConfirmationStatus::Processed) => false,
-                None => false, // No definitive status, keep polling
+                None => false,
             };
 
             if is_confirmed {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 TX_CONFIRMED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                TX_CONFIRM_RPC_FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+                ironcrab::metrics::TX_CONFIRM_RPC_FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
                 TX_CONFIRM_LATENCY_MS.store(elapsed_ms, Ordering::Relaxed);
                 return Ok(ConfirmOutcome::Confirmed {
                     details: format!(

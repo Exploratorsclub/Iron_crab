@@ -66,6 +66,21 @@ pub fn wallet_snapshot_subject(wallet: &str, mint: &str) -> String {
     format!("{}.{}.{}", TOPIC_WALLET_SNAPSHOT_PREFIX, wallet, mint)
 }
 
+/// Wallet TX confirmation (JetStream; market-data → execution-engine)
+/// Subject per wallet+signature: ironcrab.wallet_tx_confirm.{wallet}.{signature}
+pub const TOPIC_WALLET_TX_CONFIRM_PREFIX: &str = "ironcrab.wallet_tx_confirm";
+
+/// Subject pattern for wallet TX confirmations (for JetStream consumers)
+pub const TOPIC_WALLET_TX_CONFIRM_PATTERN: &str = "ironcrab.wallet_tx_confirm.*.*";
+
+/// Build JetStream subject for a wallet TX confirmation event.
+pub fn wallet_tx_confirm_subject(wallet: &str, signature: &str) -> String {
+    format!(
+        "{}.{}.{}",
+        TOPIC_WALLET_TX_CONFIRM_PREFIX, wallet, signature
+    )
+}
+
 /// JetStream subject pattern for pool cache (subject-per-pool for automatic compaction)
 /// Each pool gets its own subject: ironcrab.pool_cache.{pool_address}
 /// This allows JetStream to keep only the latest state per pool (max_messages_per_subject=1)

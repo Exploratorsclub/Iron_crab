@@ -8,11 +8,6 @@ pub mod dex;
 pub mod dex_parser;
 pub mod geyser_listener;
 pub mod geyser_pool_discovery;
-#[cfg(not(windows))]
-pub mod geyser_tx_confirm;
-#[cfg(windows)]
-#[path = "geyser_tx_confirm_windows.rs"]
-pub mod geyser_tx_confirm;
 pub mod jito;
 pub mod kill_switch;
 pub mod priority_fee_tracker;
@@ -21,3 +16,5 @@ pub mod token_utils;
 pub mod tpu_client;
 pub mod tx_sender;
 pub mod wallet_tracker;
+#[cfg(not(windows))]
+pub mod wallet_tx_confirm_listener;

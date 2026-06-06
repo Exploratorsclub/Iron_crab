@@ -1057,11 +1057,12 @@ TX Confirmation nutzt `get_signature_statuses()` Polling mit exponential Backoff
 ---
 
 ### FIX-32: Phase 3 — TX Latenz Optimierung / Geyser-basierte Confirmation (BUG-30f)
-**Datum**: 2026-02-19
+**Datum**: 2026-02-19  
+**Status (PR3)**: **superseded** — EE Geyser TX watcher removed; confirm via market-data JetStream (`WalletTxConfirmed`). Siehe PR3 `refactor(confirm): remove EE Geyser TX watcher`.
 
 **Problem**: TX Confirmation nutzte `get_signature_statuses()` RPC-Polling mit exponentiellem Backoff (50ms→1000ms). Beobachtete Latenzen: 7-100s. Zusätzlich: TPU WebSocket hatte kein proaktives Keepalive, Leader Cache wurde stale, TXs gingen an falsche Validatoren.
 
-**Änderungen in `src/solana/geyser_tx_confirm.rs`:**
+**Änderungen in `src/solana/geyser_tx_confirm.rs` (entfernt in PR3):**
 
 1. **Zweiter Geyser-Stream für TX Confirmation**: `run_tx_watcher()` startet einen dedizierten Geyser `transactions_status`-Stream gefiltert auf `account_include: [wallet_pubkey]`. Verarbeitet `UpdateOneof::TransactionStatus` und `UpdateOneof::Transaction`. O(1) HashMap-Lookup für Signature-Matching.
 
