@@ -12188,8 +12188,7 @@ async fn run_geyser_loop(
 
     // PR3: separate Geyser session for wallet TX status → JetStream WalletTxConfirmed (I-4).
     #[cfg(not(windows))]
-    if let (Some(ref tracked_wallet), Some(ref publish_tx)) =
-        (&ctx.tracked_wallet, &account_publish_tx)
+    if let (Some(ref tracked_wallet), Some(_)) = (&ctx.tracked_wallet, &ctx.nats)
     {
         let (wallet_tx_update_tx, mut wallet_tx_update_rx) =
             mpsc::channel::<WalletTxConfirmUpdate>(512);
@@ -12202,7 +12201,6 @@ async fn run_geyser_loop(
 
         let ctx_wallet_tx = Arc::clone(&ctx);
         let run_id_wallet_tx = run_id.to_string();
-        let publish_tx_wallet_tx = publish_tx.clone();
         tokio::spawn(async move {
             while let Some(update) = wallet_tx_update_rx.recv().await {
                 let wallet_str = update.wallet.to_string();
@@ -12221,8 +12219,9 @@ async fn run_geyser_loop(
                     },
                 );
                 let subject = wallet_tx_confirm_subject(&wallet_str, &update.signature);
+                // Critical confirm path: publish directly (bounded account queue may drop).
                 account_path_enqueue_jetstream(
-                    Some(&publish_tx_wallet_tx),
+                    None,
                     ctx_wallet_tx.nats.as_ref(),
                     subject,
                     &event,

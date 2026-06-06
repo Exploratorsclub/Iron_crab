@@ -12420,6 +12420,7 @@ async fn confirm_via_jetstream(
     pre_registered_rx: Option<tokio::sync::oneshot::Receiver<WalletTxConfirmNotify>>,
 ) -> std::result::Result<ConfirmOutcome, String> {
     if !config.jetstream_tx_confirm_enabled {
+        ctx.pending_tx_confirms.write().remove(signature_base58);
         TX_CONFIRM_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
         return Ok(ConfirmOutcome::TimeoutSent {
             details: format!(
