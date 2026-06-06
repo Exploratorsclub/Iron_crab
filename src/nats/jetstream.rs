@@ -457,12 +457,13 @@ pub fn wallet_snapshot_live_consumer_config_execution_engine(
 }
 
 /// Consumer config for live WalletTxConfirmed updates in execution-engine.
-/// Durable consumer scoped per wallet; `DeliverPolicy::New` avoids replaying historical confirms.
+/// Durable consumer scoped per wallet; `DeliverPolicy::All` includes confirms published
+/// before the consumer exists (e.g. stream/EE startup ordering gap).
 pub fn wallet_tx_confirm_live_consumer_config_execution_engine(
     wallet: &str,
 ) -> jetstream::consumer::pull::Config {
     jetstream::consumer::pull::Config {
-        deliver_policy: jetstream::consumer::DeliverPolicy::New,
+        deliver_policy: jetstream::consumer::DeliverPolicy::All,
         ack_policy: jetstream::consumer::AckPolicy::Explicit,
         durable_name: Some(format!("execution-engine-wallet-tx-confirm-{}", wallet)),
         max_ack_pending: 1000,
@@ -542,12 +543,12 @@ mod tests {
     }
 
     #[test]
-    fn wallet_tx_confirm_live_consumer_execution_engine_uses_new_deliver_policy() {
+    fn wallet_tx_confirm_live_consumer_execution_engine_uses_all_deliver_policy() {
         let wallet = "WALLET123";
         let live = wallet_tx_confirm_live_consumer_config_execution_engine(wallet);
         assert!(matches!(
             live.deliver_policy,
-            jetstream::consumer::DeliverPolicy::New
+            jetstream::consumer::DeliverPolicy::All
         ));
         assert_eq!(
             live.durable_name.as_deref(),

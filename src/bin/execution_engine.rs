@@ -7722,6 +7722,8 @@ async fn main() -> Result<()> {
     };
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut wallet_tx_confirm_interval =
+        tokio::time::interval(std::time::Duration::from_millis(100));
 
     // For MVP dry-run test
     let mut simulated_tick: u64 = 0;
@@ -8355,6 +8357,75 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // PR3: WalletTxConfirmed from JetStream → pending confirm waiters (no RPC).
+            // Polled at 100ms (not the 1s heartbeat tick) to minimize confirm latency.
+            _ = wallet_tx_confirm_interval.tick() => {
+                if wallet_tx_confirm_consumer_opt.is_none() {
+                    if let (Some(ref nats), Some(wallet)) = (&ctx.nats, ctx.wallet_pubkey) {
+                        wallet_tx_confirm_consumer_opt =
+                            create_wallet_tx_confirm_live_consumer(nats, &wallet).await;
+                    }
+                }
+                if let Some(ref mut consumer) = wallet_tx_confirm_consumer_opt {
+                    use futures::StreamExt;
+                    match consumer
+                        .fetch()
+                        .max_messages(100)
+                        .expires(std::time::Duration::from_millis(100))
+                        .messages()
+                        .await
+                    {
+                        Ok(mut messages) => {
+                            while let Some(msg_result) = messages.next().await {
+                                match msg_result {
+                                    Ok(msg) => {
+                                        match serde_json::from_slice::<MarketEvent>(&msg.payload) {
+                                            Ok(event) => {
+                                                if let MarketEventKind::WalletTxConfirmed {
+                                                    signature,
+                                                    slot,
+                                                    err,
+                                                    ..
+                                                } = event.kind
+                                                {
+                                                    dispatch_wallet_tx_confirmed(
+                                                        &ctx.pending_tx_confirms,
+                                                        &signature,
+                                                        slot,
+                                                        err,
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                debug!(
+                                                    error = %e,
+                                                    "Failed to deserialize WalletTxConfirmed MarketEvent"
+                                                );
+                                            }
+                                        }
+                                        if let Err(e) = msg.ack().await {
+                                            debug!(
+                                                error = %e,
+                                                "Failed to ack wallet TX confirm message"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!(
+                                            error = %e,
+                                            "JetStream wallet TX confirm fetch returned error"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "No new wallet TX confirm messages in JetStream");
+                        }
+                    }
+                }
+            }
+
             _ = interval.tick() => {
                 simulated_tick += 1;
 
@@ -8505,72 +8576,6 @@ async fn main() -> Result<()> {
                         Err(e) => {
                             // Expected when no new messages - keep debug-level
                             debug!(error = %e, "No new wallet snapshot messages in JetStream");
-                        }
-                    }
-                }
-
-                // PR3: WalletTxConfirmed from JetStream → pending confirm waiters (no RPC).
-                if wallet_tx_confirm_consumer_opt.is_none() {
-                    if let (Some(ref nats), Some(wallet)) = (&ctx.nats, ctx.wallet_pubkey) {
-                        wallet_tx_confirm_consumer_opt =
-                            create_wallet_tx_confirm_live_consumer(nats, &wallet).await;
-                    }
-                }
-                if let Some(ref mut consumer) = wallet_tx_confirm_consumer_opt {
-                    use futures::StreamExt;
-                    match consumer
-                        .fetch()
-                        .max_messages(100)
-                        .expires(std::time::Duration::from_millis(100))
-                        .messages()
-                        .await
-                    {
-                        Ok(mut messages) => {
-                            while let Some(msg_result) = messages.next().await {
-                                match msg_result {
-                                    Ok(msg) => {
-                                        match serde_json::from_slice::<MarketEvent>(&msg.payload) {
-                                            Ok(event) => {
-                                                if let MarketEventKind::WalletTxConfirmed {
-                                                    signature,
-                                                    slot,
-                                                    err,
-                                                    ..
-                                                } = event.kind
-                                                {
-                                                    dispatch_wallet_tx_confirmed(
-                                                        &ctx.pending_tx_confirms,
-                                                        &signature,
-                                                        slot,
-                                                        err,
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                debug!(
-                                                    error = %e,
-                                                    "Failed to deserialize WalletTxConfirmed MarketEvent"
-                                                );
-                                            }
-                                        }
-                                        if let Err(e) = msg.ack().await {
-                                            debug!(
-                                                error = %e,
-                                                "Failed to ack wallet TX confirm message"
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        debug!(
-                                            error = %e,
-                                            "JetStream wallet TX confirm fetch returned error"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            debug!(error = %e, "No new wallet TX confirm messages in JetStream");
                         }
                     }
                 }
