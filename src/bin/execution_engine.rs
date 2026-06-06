@@ -12218,6 +12218,25 @@ fn register_wallet_tx_confirm_waiter(
     ctx.pending_tx_confirms
         .write()
         .insert(signature_base58.to_string(), notify_tx);
+
+    // Second orphan check: dispatch may have buffered between the first check and pending insert.
+    if let Some(orphan) = ctx
+        .recent_orphan_tx_confirms
+        .write()
+        .remove(signature_base58)
+    {
+        if let Some(notify_tx) = ctx.pending_tx_confirms.write().remove(signature_base58) {
+            let slot = orphan.notify.slot;
+            let _ = notify_tx.send(orphan.notify);
+            TX_CONFIRM_JETSTREAM_ORPHAN_HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+            info!(
+                sig = %signature_base58,
+                slot,
+                "WalletTxConfirmed orphan buffer hit (confirm arrived before waiter registration)"
+            );
+        }
+    }
+
     notify_rx
 }
 
