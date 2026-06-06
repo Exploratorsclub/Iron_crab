@@ -2031,6 +2031,12 @@ pub static TX_CONFIRMED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0))
 pub static TX_CONFIRM_TIMEOUT_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // PR3: JetStream-based TX confirmation (market-data Geyser → JetStream → EE)
 pub static TX_CONFIRM_JETSTREAM_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// PR3.1: Orphan WalletTxConfirmed buffer (confirm arrived before waiter registration)
+pub static TX_CONFIRM_JETSTREAM_ORPHAN_BUFFERED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static TX_CONFIRM_JETSTREAM_ORPHAN_HIT_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TX_CONFIRM_JETSTREAM_ORPHAN_EVICTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 #[allow(dead_code)]
 pub static TX_CONFIRM_RPC_FALLBACK_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TX_CONFIRM_LATENCY_MS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -3729,6 +3735,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "tx_confirm_jetstream_total",
         TX_CONFIRM_JETSTREAM_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "tx_confirm_jetstream_orphan_buffered_total",
+        TX_CONFIRM_JETSTREAM_ORPHAN_BUFFERED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "tx_confirm_jetstream_orphan_hit_total",
+        TX_CONFIRM_JETSTREAM_ORPHAN_HIT_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "tx_confirm_jetstream_orphan_evicted_total",
+        TX_CONFIRM_JETSTREAM_ORPHAN_EVICTED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "tx_confirm_latency_ms",

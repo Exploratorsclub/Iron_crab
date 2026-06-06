@@ -89,9 +89,10 @@ use ironcrab::metrics::{
     PUMPSWAP_HOT_PATH_HEALING_SKIPPED_NO_NATS_TOTAL, PUMPSWAP_HOT_PATH_HEALING_TRIGGER_TOTAL,
     REJECT_CAPITAL_LOCK, REJECT_DUPLICATE, REJECT_RESOURCE_LOCK, REJECT_SEND_FAILED,
     REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL, TX_CONFIRMED_TOTAL,
-    TX_CONFIRM_JETSTREAM_TOTAL, TX_CONFIRM_LATENCY_MS, TX_CONFIRM_TIMEOUT_TOTAL,
-    TX_SEND_ATTEMPTS_TOTAL, TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL, TX_SEND_SUCCESS_TOTAL,
-    TX_SEND_TPU_TOTAL, WALLET_TOTAL_SOL_LAMPORTS,
+    TX_CONFIRM_JETSTREAM_ORPHAN_BUFFERED_TOTAL, TX_CONFIRM_JETSTREAM_ORPHAN_EVICTED_TOTAL,
+    TX_CONFIRM_JETSTREAM_ORPHAN_HIT_TOTAL, TX_CONFIRM_JETSTREAM_TOTAL, TX_CONFIRM_LATENCY_MS,
+    TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL, TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL,
+    TX_SEND_SUCCESS_TOTAL, TX_SEND_TPU_TOTAL, WALLET_TOTAL_SOL_LAMPORTS,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -2459,6 +2460,9 @@ struct ExecutionContext {
             std::collections::HashMap<String, tokio::sync::oneshot::Sender<WalletTxConfirmNotify>>,
         >,
     >,
+    /// PR3.1: Confirms that arrived before the intent waiter was registered (main-loop race).
+    recent_orphan_tx_confirms:
+        Arc<parking_lot::RwLock<std::collections::HashMap<String, OrphanTxConfirmEntry>>>,
 
     // Metrics
     intents_received: std::sync::atomic::AtomicU64,
@@ -7211,6 +7215,9 @@ async fn main() -> Result<()> {
             std::collections::HashMap<String, tokio::sync::oneshot::Sender<WalletTxConfirmNotify>>,
         >,
     > = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+    let recent_orphan_tx_confirms: Arc<
+        parking_lot::RwLock<std::collections::HashMap<String, OrphanTxConfirmEntry>>,
+    > = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
 
     let mut ctx = ExecutionContext {
         run_id: run_id.clone(),
@@ -7261,6 +7268,7 @@ async fn main() -> Result<()> {
         live_pool_cache: live_pool_cache.clone(),
         // PR3: JetStream WalletTxConfirmed waiters (market-data Geyser → JetStream)
         pending_tx_confirms,
+        recent_orphan_tx_confirms,
         // WsolManager balance updates (from JetStream); set when WsolManager enabled
         wsol_balance_tx: None,
         // Metrics
@@ -8402,6 +8410,7 @@ async fn main() -> Result<()> {
                                                 {
                                                     dispatch_wallet_tx_confirmed(
                                                         &ctx.pending_tx_confirms,
+                                                        &ctx.recent_orphan_tx_confirms,
                                                         &signature,
                                                         slot,
                                                         err,
@@ -8436,6 +8445,10 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                evict_stale_orphan_tx_confirms(
+                    &ctx.recent_orphan_tx_confirms,
+                    ORPHAN_TX_CONFIRM_TTL,
+                );
             }
 
             _ = interval.tick() => {
@@ -8853,6 +8866,9 @@ async fn build_replay_context(
         )),
         wsol_balance_tx: None,
         pending_tx_confirms: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+        recent_orphan_tx_confirms: Arc::new(parking_lot::RwLock::new(
+            std::collections::HashMap::new(),
+        )),
         intents_received: std::sync::atomic::AtomicU64::new(0),
         intents_rejected: std::sync::atomic::AtomicU64::new(0),
         sim_failures: std::sync::atomic::AtomicU64::new(0),
@@ -12166,14 +12182,61 @@ struct WalletTxConfirmNotify {
     err: Option<String>,
 }
 
+/// PR3.1: Orphan confirm buffered before `register_wallet_tx_confirm_waiter` (main-loop race).
+#[derive(Debug, Clone)]
+struct OrphanTxConfirmEntry {
+    notify: WalletTxConfirmNotify,
+    buffered_at: std::time::Instant,
+}
+
+/// Default TTL for orphan confirms — longer than typical `confirmation_timeout_ms` (30s).
+const ORPHAN_TX_CONFIRM_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
 fn register_wallet_tx_confirm_waiter(
     ctx: &ExecutionContext,
     signature_base58: &str,
 ) -> tokio::sync::oneshot::Receiver<WalletTxConfirmNotify> {
+    // PR3.1: Confirm may have arrived on the 100ms poll before post-send registration.
+    if let Some(orphan) = ctx
+        .recent_orphan_tx_confirms
+        .write()
+        .remove(signature_base58)
+    {
+        let slot = orphan.notify.slot;
+        let (notify_tx, notify_rx) = tokio::sync::oneshot::channel();
+        let _ = notify_tx.send(orphan.notify);
+        TX_CONFIRM_JETSTREAM_ORPHAN_HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+        info!(
+            sig = %signature_base58,
+            slot,
+            "WalletTxConfirmed orphan buffer hit (confirm arrived before waiter registration)"
+        );
+        return notify_rx;
+    }
+
     let (notify_tx, notify_rx) = tokio::sync::oneshot::channel();
     ctx.pending_tx_confirms
         .write()
         .insert(signature_base58.to_string(), notify_tx);
+
+    // Second orphan check: dispatch may have buffered between the first check and pending insert.
+    if let Some(orphan) = ctx
+        .recent_orphan_tx_confirms
+        .write()
+        .remove(signature_base58)
+    {
+        if let Some(notify_tx) = ctx.pending_tx_confirms.write().remove(signature_base58) {
+            let slot = orphan.notify.slot;
+            let _ = notify_tx.send(orphan.notify);
+            TX_CONFIRM_JETSTREAM_ORPHAN_HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+            info!(
+                sig = %signature_base58,
+                slot,
+                "WalletTxConfirmed orphan buffer hit (confirm arrived before waiter registration)"
+            );
+        }
+    }
+
     notify_rx
 }
 
@@ -12183,21 +12246,52 @@ fn dispatch_wallet_tx_confirmed(
             std::collections::HashMap<String, tokio::sync::oneshot::Sender<WalletTxConfirmNotify>>,
         >,
     >,
+    orphan_buffer: &Arc<
+        parking_lot::RwLock<std::collections::HashMap<String, OrphanTxConfirmEntry>>,
+    >,
     signature: &str,
     slot: u64,
     err: Option<String>,
 ) {
+    let notify = WalletTxConfirmNotify { slot, err };
     if let Some(notify_tx) = pending.write().remove(signature) {
-        let _ = notify_tx.send(WalletTxConfirmNotify { slot, err });
-    } else {
-        debug!(
-            sig = %signature,
-            slot = slot,
-            "WalletTxConfirmed with no pending waiter (late confirm or duplicate)"
-        );
+        let _ = notify_tx.send(notify);
+        return;
+    }
+
+    // PR3.1: Buffer orphan — main loop can consume confirm before register_wallet_tx_confirm_waiter.
+    orphan_buffer.write().insert(
+        signature.to_string(),
+        OrphanTxConfirmEntry {
+            notify,
+            buffered_at: std::time::Instant::now(),
+        },
+    );
+    TX_CONFIRM_JETSTREAM_ORPHAN_BUFFERED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    debug!(
+        sig = %signature,
+        slot,
+        "WalletTxConfirmed buffered (orphan, no waiter yet)"
+    );
+}
+
+fn evict_stale_orphan_tx_confirms(
+    orphan_buffer: &Arc<
+        parking_lot::RwLock<std::collections::HashMap<String, OrphanTxConfirmEntry>>,
+    >,
+    ttl: std::time::Duration,
+) {
+    let now = std::time::Instant::now();
+    let mut guard = orphan_buffer.write();
+    let before = guard.len();
+    guard.retain(|_, entry| now.duration_since(entry.buffered_at) < ttl);
+    let evicted = before.saturating_sub(guard.len());
+    if evicted > 0 {
+        TX_CONFIRM_JETSTREAM_ORPHAN_EVICTED_TOTAL.fetch_add(evicted as u64, Ordering::Relaxed);
     }
 }
 
+#[derive(Debug)]
 enum ConfirmOutcome {
     Confirmed {
         details: String,
@@ -14241,5 +14335,101 @@ mod execution_engine_tests {
             exec.metadata.get("sell_untracked_ata").map(|s| s.as_str()),
             Some("true")
         );
+    }
+
+    /// PR3.1: Confirm may arrive on the 100ms poll before post-send waiter registration.
+    #[tokio::test]
+    async fn orphan_confirm_dispatch_then_register_yields_confirmed() {
+        use super::{
+            build_replay_context, confirm_via_jetstream, dispatch_wallet_tx_confirmed,
+            register_wallet_tx_confirm_waiter, ConfirmOutcome,
+        };
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("orphan_confirm_decisions.jsonl");
+        let ctx = build_replay_context(&path, None).await.expect("replay ctx");
+        let sig = "OrphanRaceSigBase58Test123";
+
+        dispatch_wallet_tx_confirmed(
+            &ctx.pending_tx_confirms,
+            &ctx.recent_orphan_tx_confirms,
+            sig,
+            42,
+            None,
+        );
+        assert!(
+            ctx.recent_orphan_tx_confirms.read().contains_key(sig),
+            "confirm should be buffered as orphan"
+        );
+
+        let pre_rx = register_wallet_tx_confirm_waiter(&ctx, sig);
+        assert!(
+            ctx.recent_orphan_tx_confirms.read().is_empty(),
+            "orphan entry consumed on register"
+        );
+
+        let config = ctx.config.read().clone();
+        let outcome = confirm_via_jetstream(
+            &ctx,
+            sig,
+            Duration::from_secs(1),
+            Instant::now(),
+            &config,
+            Some(pre_rx),
+        )
+        .await
+        .expect("confirm_via_jetstream");
+
+        match outcome {
+            ConfirmOutcome::Confirmed { slot, .. } => assert_eq!(slot, Some(42)),
+            other => panic!("expected Confirmed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn orphan_confirm_ttl_eviction_removes_stale_entries() {
+        use super::{evict_stale_orphan_tx_confirms, OrphanTxConfirmEntry, WalletTxConfirmNotify};
+        use parking_lot::RwLock;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let orphan_buffer: Arc<RwLock<HashMap<String, OrphanTxConfirmEntry>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        orphan_buffer.write().insert(
+            "stale_sig".to_string(),
+            OrphanTxConfirmEntry {
+                notify: WalletTxConfirmNotify { slot: 1, err: None },
+                buffered_at: Instant::now() - Duration::from_secs(300),
+            },
+        );
+
+        evict_stale_orphan_tx_confirms(&orphan_buffer, Duration::from_secs(120));
+        assert!(orphan_buffer.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn normal_confirm_path_waiter_before_dispatch() {
+        use super::{dispatch_wallet_tx_confirmed, WalletTxConfirmNotify};
+        use parking_lot::RwLock;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::oneshot;
+
+        let pending: Arc<RwLock<HashMap<String, oneshot::Sender<WalletTxConfirmNotify>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let orphan_buffer: Arc<RwLock<HashMap<String, super::OrphanTxConfirmEntry>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        let (tx, rx) = oneshot::channel();
+        pending.write().insert("normal_sig".to_string(), tx);
+
+        dispatch_wallet_tx_confirmed(&pending, &orphan_buffer, "normal_sig", 77, None);
+
+        assert!(orphan_buffer.read().is_empty());
+        let confirm = rx.await.expect("waiter should receive confirm");
+        assert_eq!(confirm.slot, 77);
+        assert!(confirm.err.is_none());
     }
 }
