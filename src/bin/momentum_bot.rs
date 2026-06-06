@@ -6854,7 +6854,6 @@ impl MomentumContext {
         mint: &str,
         pool: &str,
         entry_kind: EntryKind,
-        applied_to_existing_position: bool,
     ) {
         let tk = Self::tracker_storage_key(mint, pool);
         let mut trackers = self.token_trackers.write();
@@ -6862,12 +6861,15 @@ impl MomentumContext {
             return;
         };
         let filled_at = Instant::now();
-        if applied_to_existing_position || entry_kind == EntryKind::ScaleIn {
-            tr.state = TrackerState::PositionOpenFull { filled_at };
-            ironcrab::metrics::record_momentum_orphan_scale_in_recovery_total();
-        } else {
-            tr.state = TrackerState::PositionOpenProbe { filled_at };
-            ironcrab::metrics::record_momentum_orphan_probe_recovery_total();
+        match entry_kind {
+            EntryKind::ScaleIn => {
+                tr.state = TrackerState::PositionOpenFull { filled_at };
+                ironcrab::metrics::record_momentum_orphan_scale_in_recovery_total();
+            }
+            EntryKind::Probe => {
+                tr.state = TrackerState::PositionOpenProbe { filled_at };
+                ironcrab::metrics::record_momentum_orphan_probe_recovery_total();
+            }
         }
         drop(trackers);
         self.mark_entry_eval_dirty_key(&tk);
@@ -7148,7 +7150,7 @@ impl MomentumContext {
                                         initial_bonding,
                                     });
                                     self.apply_orphan_buy_tracker_state_after_recovery(
-                                        mint, &pool, entry_kind, true,
+                                        mint, &pool, entry_kind,
                                     );
                                     let ctx_exit = Arc::clone(self);
                                     tokio::spawn(async move {
@@ -7205,7 +7207,7 @@ impl MomentumContext {
                                     initial_bonding,
                                 });
                                 self.apply_orphan_buy_tracker_state_after_recovery(
-                                    mint, &pool, entry_kind, false,
+                                    mint, &pool, entry_kind,
                                 );
                                 let ctx_exit = Arc::clone(self);
                                 tokio::spawn(async move {
@@ -7572,6 +7574,7 @@ impl MomentumContext {
                                     pos.exit_generated_at = None;
                                 }
                             }
+                            self.cache_wallet_balance_snapshot_raw(&pending.mint, remaining);
                             // Persist reduced position to KV
                             if let Some(pos) = self.positions.read().get(&pending.mint) {
                                 let tracker = pos.clone();
@@ -17451,6 +17454,7 @@ mod tests {
         let sol_spent = 3_750_000u64;
         let mut meta = std::collections::HashMap::new();
         meta.insert("side".to_string(), "BUY".to_string());
+        meta.insert("entry_kind".to_string(), "scale_in".to_string());
         let orphan = ExecutionResult {
             header: RecordHeader::new("test", BUILD_VERSION, "run-test"),
             execution_id: "ex-orphan".to_string(),
