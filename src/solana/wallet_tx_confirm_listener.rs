@@ -156,7 +156,7 @@ pub fn spawn_wallet_tx_confirm_listener(
                             err: err.clone(),
                         };
 
-                        match update_tx.try_send(update) {
+                        match update_tx.send(update).await {
                             Ok(()) => {
                                 debug!(
                                     sig = %sig_str,
@@ -165,13 +165,7 @@ pub fn spawn_wallet_tx_confirm_listener(
                                     "wallet_tx_confirm_listener: update enqueued"
                                 );
                             }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                warn!(
-                                    sig = %sig_str,
-                                    "wallet_tx_confirm_listener: update channel full, dropping confirm"
-                                );
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                            Err(_) => {
                                 info!("wallet_tx_confirm_listener: update channel closed, shutting down");
                                 WALLET_TX_CONFIRM_LISTENER_CONNECTED
                                     .store(false, Ordering::Relaxed);

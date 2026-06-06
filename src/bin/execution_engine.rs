@@ -8510,6 +8510,12 @@ async fn main() -> Result<()> {
                 }
 
                 // PR3: WalletTxConfirmed from JetStream → pending confirm waiters (no RPC).
+                if wallet_tx_confirm_consumer_opt.is_none() {
+                    if let (Some(ref nats), Some(wallet)) = (&ctx.nats, ctx.wallet_pubkey) {
+                        wallet_tx_confirm_consumer_opt =
+                            create_wallet_tx_confirm_live_consumer(nats, &wallet).await;
+                    }
+                }
                 if let Some(ref mut consumer) = wallet_tx_confirm_consumer_opt {
                     use futures::StreamExt;
                     match consumer
@@ -10968,6 +10974,16 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         None
     };
 
+    // Register JetStream confirm waiter before any async pre-confirm work so the main loop
+    // cannot ack WalletTxConfirmed while this intent task is still between send and confirm.
+    let mut wallet_tx_confirm_rx: Option<tokio::sync::oneshot::Receiver<WalletTxConfirmNotify>> =
+        None;
+    if config.send_enabled && sent_anything && !requires_bundle {
+        if let Some(ref sig) = send_signature {
+            wallet_tx_confirm_rx = Some(register_wallet_tx_confirm_waiter(ctx, sig));
+        }
+    }
+
     // PR1 Phase 2: pre-confirm ATA track — publish Sent ExecutionResult before confirm wait.
     if config.send_enabled && sent_anything {
         if let Some(ref sr) = send_result {
@@ -11067,6 +11083,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                     sig_str,
                     config.confirmation_timeout_ms,
                     sent_tx.as_ref(),
+                    wallet_tx_confirm_rx.take(),
                 )
                 .await
                 {
@@ -12132,6 +12149,17 @@ struct WalletTxConfirmNotify {
     err: Option<String>,
 }
 
+fn register_wallet_tx_confirm_waiter(
+    ctx: &ExecutionContext,
+    signature_base58: &str,
+) -> tokio::sync::oneshot::Receiver<WalletTxConfirmNotify> {
+    let (notify_tx, notify_rx) = tokio::sync::oneshot::channel();
+    ctx.pending_tx_confirms
+        .write()
+        .insert(signature_base58.to_string(), notify_tx);
+    notify_rx
+}
+
 fn dispatch_wallet_tx_confirmed(
     pending: &Arc<
         parking_lot::RwLock<
@@ -12326,6 +12354,7 @@ async fn confirm_signature_status(
     signature_base58: &str,
     timeout_ms: u64,
     rebroadcast_tx: Option<&Transaction>,
+    pre_registered_rx: Option<tokio::sync::oneshot::Receiver<WalletTxConfirmNotify>>,
 ) -> std::result::Result<ConfirmOutcome, String> {
     let start = std::time::Instant::now();
     let deadline = Duration::from_millis(timeout_ms.max(1));
@@ -12353,7 +12382,25 @@ async fn confirm_signature_status(
         None
     };
 
-    let outcome = confirm_via_jetstream(ctx, signature_base58, deadline, start, &config).await;
+    let outcome = {
+        #[cfg(windows)]
+        {
+            let _ = pre_registered_rx;
+            confirm_via_rpc_polling(ctx, signature_base58, deadline, start).await
+        }
+        #[cfg(not(windows))]
+        {
+            confirm_via_jetstream(
+                ctx,
+                signature_base58,
+                deadline,
+                start,
+                &config,
+                pre_registered_rx,
+            )
+            .await
+        }
+    };
 
     // Cancel rebroadcast task on completion
     if let Some(handle) = rebroadcast_handle {
@@ -12370,6 +12417,7 @@ async fn confirm_via_jetstream(
     deadline: Duration,
     start: std::time::Instant,
     config: &ExecutionConfig,
+    pre_registered_rx: Option<tokio::sync::oneshot::Receiver<WalletTxConfirmNotify>>,
 ) -> std::result::Result<ConfirmOutcome, String> {
     if !config.jetstream_tx_confirm_enabled {
         TX_CONFIRM_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -12381,10 +12429,10 @@ async fn confirm_via_jetstream(
         });
     }
 
-    let (notify_tx, notify_rx) = tokio::sync::oneshot::channel();
-    ctx.pending_tx_confirms
-        .write()
-        .insert(signature_base58.to_string(), notify_tx);
+    let notify_rx = match pre_registered_rx {
+        Some(rx) => rx,
+        None => register_wallet_tx_confirm_waiter(ctx, signature_base58),
+    };
 
     let remaining = deadline.saturating_sub(start.elapsed());
 
@@ -12442,6 +12490,89 @@ async fn confirm_via_jetstream(
     ctx.pending_tx_confirms.write().remove(signature_base58);
 
     outcome
+}
+
+/// RPC-polling fallback for environments without Geyser/JetStream confirm (e.g. Windows dev/CI).
+#[cfg(windows)]
+async fn confirm_via_rpc_polling(
+    ctx: &ExecutionContext,
+    signature_base58: &str,
+    deadline: Duration,
+    start: std::time::Instant,
+) -> std::result::Result<ConfirmOutcome, String> {
+    let signature =
+        Signature::from_str(signature_base58).map_err(|e| format!("invalid_signature:{e}"))?;
+
+    let mut attempt: u32 = 0;
+
+    loop {
+        if start.elapsed() >= deadline {
+            TX_CONFIRM_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+            return Ok(ConfirmOutcome::TimeoutSent {
+                details: format!(
+                    "method=rpc_polling timeout_ms={} elapsed_ms={} signature={signature_base58}",
+                    deadline.as_millis(),
+                    start.elapsed().as_millis()
+                ),
+            });
+        }
+
+        let res = ctx
+            .rpc
+            .rpc
+            .get_signature_statuses(&[signature])
+            .await
+            .map_err(|e| format!("rpc_error:{e}"))?;
+
+        let status_opt = res.value.first().cloned().unwrap_or(None);
+
+        if let Some(st) = status_opt {
+            if let Some(err) = st.err {
+                return Ok(ConfirmOutcome::FailedConfirmed {
+                    details: format!(
+                        "method=rpc_polling err={err:?} confirmations={:?} confirmation_status={:?} elapsed_ms={}",
+                        st.confirmations,
+                        st.confirmation_status,
+                        start.elapsed().as_millis()
+                    ),
+                    slot: Some(st.slot),
+                });
+            }
+
+            let config = ctx.config.read();
+            let require_finalized = config.confirm_commitment.eq_ignore_ascii_case("finalized");
+            drop(config);
+
+            let is_confirmed = match st.confirmation_status {
+                Some(solana_transaction_status::TransactionConfirmationStatus::Finalized) => true,
+                Some(solana_transaction_status::TransactionConfirmationStatus::Confirmed) => {
+                    !require_finalized
+                }
+                Some(solana_transaction_status::TransactionConfirmationStatus::Processed) => false,
+                None => false,
+            };
+
+            if is_confirmed {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                TX_CONFIRMED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                ironcrab::metrics::TX_CONFIRM_RPC_FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+                TX_CONFIRM_LATENCY_MS.store(elapsed_ms, Ordering::Relaxed);
+                return Ok(ConfirmOutcome::Confirmed {
+                    details: format!(
+                        "method=rpc_polling confirmations={:?} confirmation_status={:?} slot={} elapsed_ms={elapsed_ms}",
+                        st.confirmations,
+                        st.confirmation_status,
+                        st.slot,
+                    ),
+                    slot: Some(st.slot),
+                });
+            }
+        }
+
+        attempt = attempt.saturating_add(1);
+        let sleep_ms = (50u64 * attempt.min(20) as u64).min(1_000);
+        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+    }
 }
 
 /// Periodic rebroadcast loop running in a parallel task.
