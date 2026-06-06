@@ -400,7 +400,6 @@ pub enum MarketEventKind {
         wallet: String,
         /// Transaction signature (base58)
         signature: String,
-        slot: u64,
         /// `None` = success; `Some` = on-chain error string
         err: Option<String>,
     },
@@ -2147,6 +2146,74 @@ mod tests {
 
         let parsed: MarketEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.event_id, "evt-001");
+    }
+
+    #[test]
+    fn wallet_tx_confirmed_market_event_serde_roundtrip_single_slot() {
+        let slot = 424_701_631_u64;
+        let wallet = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
+        let signature = "51aMkHyfExampleSignatureForRegressionTestOnly";
+        let event = MarketEvent::new(
+            "market-data",
+            "v0.1.0",
+            "run-wallet-tx",
+            format!("wallet_tx_confirm_{signature}_{slot}"),
+            "geyser_wallet_tx_confirm",
+            Some(slot),
+            MarketEventKind::WalletTxConfirmed {
+                wallet: wallet.to_string(),
+                signature: signature.to_string(),
+                err: None,
+            },
+        );
+
+        let json = serde_json::to_string(&event).expect("serialize WalletTxConfirmed");
+        assert_eq!(
+            json.matches("\"slot\":").count(),
+            1,
+            "WalletTxConfirmed JSON must contain exactly one slot field (got: {json})"
+        );
+
+        let parsed: MarketEvent =
+            serde_json::from_str(&json).expect("deserialize WalletTxConfirmed");
+        assert_eq!(parsed.slot, Some(slot));
+        if let MarketEventKind::WalletTxConfirmed {
+            wallet: parsed_wallet,
+            signature: parsed_sig,
+            err,
+        } = parsed.kind
+        {
+            assert_eq!(parsed_wallet, wallet);
+            assert_eq!(parsed_sig, signature);
+            assert!(err.is_none());
+        } else {
+            panic!("expected WalletTxConfirmed variant");
+        }
+    }
+
+    #[test]
+    fn wallet_tx_confirmed_duplicate_slot_json_fails_deserialize() {
+        // Regression: pre-PR3.2 prod payloads had slot in both MarketEvent and kind (flatten collision).
+        let legacy_json = r#"{
+            "schema_version":1,
+            "ts_unix_ms":1,
+            "component":"market-data",
+            "build":"v0.1.0",
+            "run_id":"run-wallet-tx",
+            "event_id":"wallet_tx_confirm_legacy",
+            "source":"geyser_wallet_tx_confirm",
+            "slot":424701631,
+            "kind":"WalletTxConfirmed",
+            "wallet":"7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+            "signature":"51aMkHyfExampleSignatureForRegressionTestOnly",
+            "slot":424701631,
+            "err":null
+        }"#;
+        let err = serde_json::from_str::<MarketEvent>(legacy_json).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate field"),
+            "expected duplicate field serde error, got: {err}"
+        );
     }
 
     #[test]

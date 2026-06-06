@@ -89,10 +89,11 @@ use ironcrab::metrics::{
     PUMPSWAP_HOT_PATH_HEALING_SKIPPED_NO_NATS_TOTAL, PUMPSWAP_HOT_PATH_HEALING_TRIGGER_TOTAL,
     REJECT_CAPITAL_LOCK, REJECT_DUPLICATE, REJECT_RESOURCE_LOCK, REJECT_SEND_FAILED,
     REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL, TX_CONFIRMED_TOTAL,
-    TX_CONFIRM_JETSTREAM_ORPHAN_BUFFERED_TOTAL, TX_CONFIRM_JETSTREAM_ORPHAN_EVICTED_TOTAL,
-    TX_CONFIRM_JETSTREAM_ORPHAN_HIT_TOTAL, TX_CONFIRM_JETSTREAM_TOTAL, TX_CONFIRM_LATENCY_MS,
-    TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL, TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL,
-    TX_SEND_SUCCESS_TOTAL, TX_SEND_TPU_TOTAL, WALLET_TOTAL_SOL_LAMPORTS,
+    TX_CONFIRM_DESERIALIZE_ERRORS_TOTAL, TX_CONFIRM_JETSTREAM_ORPHAN_BUFFERED_TOTAL,
+    TX_CONFIRM_JETSTREAM_ORPHAN_EVICTED_TOTAL, TX_CONFIRM_JETSTREAM_ORPHAN_HIT_TOTAL,
+    TX_CONFIRM_JETSTREAM_TOTAL, TX_CONFIRM_LATENCY_MS, TX_CONFIRM_TIMEOUT_TOTAL,
+    TX_SEND_ATTEMPTS_TOTAL, TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL, TX_SEND_SUCCESS_TOTAL,
+    TX_SEND_TPU_TOTAL, WALLET_TOTAL_SOL_LAMPORTS,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -8403,22 +8404,30 @@ async fn main() -> Result<()> {
                                             Ok(event) => {
                                                 if let MarketEventKind::WalletTxConfirmed {
                                                     signature,
-                                                    slot,
                                                     err,
                                                     ..
                                                 } = event.kind
                                                 {
-                                                    dispatch_wallet_tx_confirmed(
-                                                        &ctx.pending_tx_confirms,
-                                                        &ctx.recent_orphan_tx_confirms,
-                                                        &signature,
-                                                        slot,
-                                                        err,
-                                                    );
+                                                    if let Some(slot) = event.slot {
+                                                        dispatch_wallet_tx_confirmed(
+                                                            &ctx.pending_tx_confirms,
+                                                            &ctx.recent_orphan_tx_confirms,
+                                                            &signature,
+                                                            slot,
+                                                            err,
+                                                        );
+                                                    } else {
+                                                        warn!(
+                                                            sig = %signature,
+                                                            "WalletTxConfirmed missing event.slot; skipping dispatch"
+                                                        );
+                                                    }
                                                 }
                                             }
                                             Err(e) => {
-                                                debug!(
+                                                TX_CONFIRM_DESERIALIZE_ERRORS_TOTAL
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                warn!(
                                                     error = %e,
                                                     "Failed to deserialize WalletTxConfirmed MarketEvent"
                                                 );
