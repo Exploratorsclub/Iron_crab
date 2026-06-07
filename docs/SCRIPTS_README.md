@@ -130,6 +130,21 @@ Plus Python-Services:
 - `control_plane/main.py` — REST API, Config, Kill-Switch
 - `scripts/trades_server.py` — Grafana Infinity Datasource
 
+### trades_server Run-Mode Performance (P174)
+
+`GET /trades?mode=run` loads **today** from `recent_trades` + `execution_results*` (rotated segments).
+**Yesterday** is tail-only (~500 recent lines) for prev-run context — no full execution scan.
+
+After deploying P174, remove any prod hotfix override:
+
+```bash
+# /etc/systemd/system/trades-server.service.d/override.conf
+# Delete IRONCRAB_TRADES_DAYS_LOOKBACK=0 (and reload/restart trades-server)
+sudo systemctl daemon-reload && sudo systemctl restart trades-server
+```
+
+Env vars: `IRONCRAB_TRADES_CACHE_TTL_SEC` (default 15), `IRONCRAB_TRADES_RUN_PREV_RECENT_TAIL`, `IRONCRAB_TRADES_RUN_PREV_EXEC_TAIL`.
+
 ## Prerequisites
 
 1. **Rust 1.89+**: Install from https://rustup.rs/
