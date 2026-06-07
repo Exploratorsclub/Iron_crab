@@ -54,6 +54,19 @@ impl NatsConfig {
             ..Default::default()
         }
     }
+
+    /// Request timeout from `IRONCRAB_NATS_REQUEST_TIMEOUT_SECS` or `default_secs`.
+    ///
+    /// JetStream `create_consumer` on large `POOL_CACHE` streams can exceed the 5s client default
+    /// during concurrent restarts (`ironcrab.target`).
+    pub fn request_timeout_from_env(default_secs: u64) -> Duration {
+        std::env::var("IRONCRAB_NATS_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&secs| secs > 0)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(default_secs))
+    }
 }
 
 // ============================================================================

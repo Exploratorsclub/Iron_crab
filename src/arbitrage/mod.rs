@@ -27,6 +27,7 @@
 //!
 //! See `docs/MULTI_HOP_ARBITRAGE.md` for full algorithm design.
 
+pub mod arb_slave_sync;
 pub mod cycle_finder;
 pub mod multi_hop_integration;
 pub mod pool_graph;
@@ -34,6 +35,10 @@ pub mod pool_ranker;
 pub mod types;
 
 // Re-exports for convenient access
+pub use arb_slave_sync::{
+    arb_known_pools_synced_bootstrap_total, arb_known_pools_synced_incremental_total,
+    populate_arb_slave_from_live_pool_cache, sync_arb_slave_from_pool_cache_update,
+};
 pub use cycle_finder::{BeamCycleFinder, CycleFinderConfig};
 pub use multi_hop_integration::{
     CachedQuoteProvider, MultiHopArbitrage, MultiHopConfig, MultiHopStats, WSOL_MINT,

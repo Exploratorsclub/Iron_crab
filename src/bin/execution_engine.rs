@@ -7072,7 +7072,8 @@ async fn main() -> Result<()> {
     // NOTE: `--dry-run` means "never send on-chain transactions".
     // It must NOT disable NATS consumption, otherwise we can't end-to-end test the pipeline.
     let nats = {
-        let config = NatsConfig::new(&args.nats_url, "execution-engine");
+        let mut config = NatsConfig::new(&args.nats_url, "execution-engine");
+        config.request_timeout = NatsConfig::request_timeout_from_env(180);
         let mut client = NatsClient::new(config);
         if let Err(e) = client.connect().await {
             warn!(error = %e, "Failed to connect to NATS (continuing without)");
