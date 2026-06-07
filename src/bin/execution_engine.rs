@@ -2512,12 +2512,13 @@ struct BurnOpRecord {
 impl ExecutionContext {
     /// Get a recent blockhash, preferring the Geyser-cached version.
     /// Falls back to RPC if cache is empty or stale (> MAX_BLOCKHASH_AGE_SECS).
-    async fn get_latest_blockhash(&self) -> Result<solana_sdk::hash::Hash, String> {
+    /// Returns the slot that corresponds to the blockhash source (cache or RPC).
+    async fn get_latest_blockhash(&self) -> Result<(solana_sdk::hash::Hash, Option<u64>), String> {
         // Try cached blockhash first
         if let Some(ref cached) = *self.cached_blockhash.read() {
             let age_secs = cached.received_at.elapsed().as_secs();
             if age_secs <= MAX_BLOCKHASH_AGE_SECS {
-                return Ok(cached.hash);
+                return Ok((cached.hash, Some(cached.slot)));
             }
             warn!(
                 age_secs,
@@ -2528,10 +2529,13 @@ impl ExecutionContext {
 
         // RPC fallback
         warn!("BLOCKHASH_SOURCE_RPC_FALLBACK: no fresh Geyser blockhash, using RPC");
-        self.rpc
+        let hash = self
+            .rpc
             .get_latest_blockhash_retry()
             .await
-            .map_err(|e| format!("rpc_error:{e}"))
+            .map_err(|e| format!("rpc_error:{e}"))?;
+        let slot = self.rpc.rpc.get_slot().await.ok();
+        Ok((hash, slot))
     }
 
     /// Get current config (read lock)
@@ -9117,11 +9121,6 @@ fn select_priority_fee_for_intent(
 }
 
 #[inline]
-fn slot_at_send_from_context(ctx: &ExecutionContext) -> Option<u64> {
-    ctx.cached_blockhash.read().as_ref().map(|c| c.slot)
-}
-
-#[inline]
 fn confirmed_slot_delta_slots(slot_at_send: u64, confirmed_slot: u64) -> u64 {
     if slot_at_send == 0 {
         0
@@ -10804,8 +10803,8 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                 .expect("bundle_config gate ensures jito_client is present");
 
             let signer = treasury.signer_ref();
-            let blockhash = match ctx.get_latest_blockhash().await {
-                Ok(bh) => bh,
+            let (blockhash, blockhash_slot) = match ctx.get_latest_blockhash().await {
+                Ok(pair) => pair,
                 Err(e) => {
                     let reason = RejectReason::BundleFailed;
                     checks.push(CheckResult {
@@ -10983,7 +10982,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                         record_tx_slot_to_send_ms(now_ms.saturating_sub(seen));
                     }
                     record_execution_slot_lag_at_send_if_applicable(ctx, &intent);
-                    slot_at_send = slot_at_send_from_context(ctx);
+                    slot_at_send = blockhash_slot;
                     record_tx_priority_fee_source(priority_fee_selection.source);
                     checks.push(CheckResult {
                         check_name: "send".to_string(),
@@ -11047,7 +11046,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                         record_tx_slot_to_send_ms(now_ms.saturating_sub(seen));
                     }
                     record_execution_slot_lag_at_send_if_applicable(ctx, &intent);
-                    slot_at_send = slot_at_send_from_context(ctx);
+                    slot_at_send = result.slot_at_send;
                     record_tx_priority_fee_source(priority_fee_selection.source);
                     send_signature = Some(result.signature.clone());
                     send_method_used = Some(result.method.clone());
@@ -12045,8 +12044,8 @@ async fn simulate_transaction(
             };
 
             // Get a recent blockhash (Geyser cache → RPC fallback)
-            let blockhash = match ctx.get_latest_blockhash().await {
-                Ok(bh) => bh,
+            let (blockhash, _) = match ctx.get_latest_blockhash().await {
+                Ok(pair) => pair,
                 Err(e) => {
                     return SimulationResult {
                         success: false,
@@ -12075,8 +12074,8 @@ async fn simulate_transaction(
             }
         } else {
             // Fallback to legacy transaction (will fail if too large)
-            let blockhash = match ctx.get_latest_blockhash().await {
-                Ok(bh) => bh,
+            let (blockhash, _) = match ctx.get_latest_blockhash().await {
+                Ok(pair) => pair,
                 Err(e) => {
                     return SimulationResult {
                         success: false,
@@ -12177,7 +12176,7 @@ async fn send_transaction_rpc(
         .ok_or_else(|| "no_signer_configured".to_string())?;
 
     let signer = treasury.signer_ref();
-    let blockhash = ctx.get_latest_blockhash().await?;
+    let (blockhash, _) = ctx.get_latest_blockhash().await?;
 
     // Build Versioned Transaction with ALT if available
     let tx: VersionedTransaction = if let Some(ref alt) = ctx.address_lookup_table {
@@ -12230,6 +12229,7 @@ struct SendTxResult {
     signature: String,
     method: String,  // "tpu", "jito", "rpc"
     tx: Transaction, // signed legacy transaction (for rebroadcast during confirm)
+    slot_at_send: Option<u64>,
 }
 
 /// Send transaction with TxSender fallback chain (TPU → Jito → RPC).
@@ -12253,7 +12253,7 @@ async fn send_transaction_with_fallback(
         .ok_or_else(|| "no_signer_configured".to_string())?;
 
     let signer = treasury.signer_ref();
-    let blockhash = ctx.get_latest_blockhash().await?;
+    let (blockhash, blockhash_slot) = ctx.get_latest_blockhash().await?;
 
     // Build legacy Transaction for TxSender (TxSender handles signing internally for TPU)
     // Note: We sign here because TxSender.send_with_fallback() expects a signed Transaction
@@ -12279,6 +12279,7 @@ async fn send_transaction_with_fallback(
                     signature: result.signature.to_string(),
                     method: method_str,
                     tx,
+                    slot_at_send: blockhash_slot,
                 });
             }
             Err(e) => {
@@ -12313,6 +12314,7 @@ async fn send_transaction_with_fallback(
             signature: sig.to_string(),
             method: "rpc".into(),
             tx,
+            slot_at_send: blockhash_slot,
         }),
         Err(e) => Err(format!("rpc_error:{e}")),
     }
