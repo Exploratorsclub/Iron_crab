@@ -25,13 +25,6 @@ pub fn arb_known_pools_synced_incremental_total() -> u64 {
     ARB_KNOWN_POOLS_SYNCED_INCREMENTAL.load(Ordering::Relaxed)
 }
 
-fn liquidity_usd_from_update(update: &PoolCacheUpdate) -> f64 {
-    update
-        .liquidity_lamports
-        .map(|l| l as f64 / 1e9 * 150.0)
-        .unwrap_or(10_000.0)
-}
-
 fn liquidity_usd_from_state(state: &CachedPoolState) -> f64 {
     let (base, quote) = match state {
         CachedPoolState::Orca(s) => (
@@ -64,13 +57,24 @@ fn mints_from_state(state: &CachedPoolState) -> (Pubkey, Pubkey) {
     }
 }
 
-fn upsert_multi_hop_from_update(multi_hop: &MultiHopArbitrage, update: &PoolCacheUpdate) {
+fn upsert_multi_hop_from_cache(
+    multi_hop: &MultiHopArbitrage,
+    live_pool_cache: &LivePoolCache,
+    pool_address: &str,
+) {
+    let Ok(pool_pk) = pool_address.parse::<Pubkey>() else {
+        return;
+    };
+    let Some(state) = live_pool_cache.get(&pool_pk) else {
+        return;
+    };
+    let (mint_a, mint_b) = mints_from_state(&state);
     multi_hop.upsert_pool(
-        &update.pool_address,
-        &update.dex,
-        &update.base_mint,
-        &update.quote_mint,
-        liquidity_usd_from_update(update),
+        pool_address,
+        state.dex_name(),
+        &mint_a.to_string(),
+        &mint_b.to_string(),
+        liquidity_usd_from_state(&state),
         30,
     );
 }
@@ -94,7 +98,7 @@ pub fn sync_arb_slave_from_pool_cache_update(
             let applied = apply_pool_cache_update(live_pool_cache, update);
             if applied {
                 known_pools.write().insert(update.pool_address.clone());
-                upsert_multi_hop_from_update(multi_hop, update);
+                upsert_multi_hop_from_cache(multi_hop, live_pool_cache, &update.pool_address);
                 ARB_KNOWN_POOLS_SYNCED_INCREMENTAL.fetch_add(1, Ordering::Relaxed);
             }
             applied
