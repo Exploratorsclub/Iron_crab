@@ -1978,6 +1978,28 @@ struct CachedBlockhash {
     received_at: std::time::Instant,
 }
 
+/// Blockhash + slot used to sign a TX (must stay paired for `slot_at_send` metrics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockhashForSend {
+    hash: solana_sdk::hash::Hash,
+    slot: u64,
+}
+
+/// Persist RPC-fallback blockhash so later readers see the same slot as the signing hash.
+fn apply_rpc_blockhash_cache_fallback(
+    cache: &mut Option<CachedBlockhash>,
+    hash: solana_sdk::hash::Hash,
+    slot: u64,
+    received_at: std::time::Instant,
+) {
+    *cache = Some(CachedBlockhash {
+        hash,
+        slot,
+        block_height: 0,
+        received_at,
+    });
+}
+
 /// Maximum age (in seconds) before we fall back to RPC for blockhash.
 /// Solana blockhashes expire after ~150 slots (~60s). We use a conservative 30s.
 const MAX_BLOCKHASH_AGE_SECS: u64 = 30;
@@ -2510,15 +2532,16 @@ struct BurnOpRecord {
 }
 
 impl ExecutionContext {
-    /// Get a recent blockhash, preferring the Geyser-cached version.
-    /// Falls back to RPC if cache is empty or stale (> MAX_BLOCKHASH_AGE_SECS).
-    /// Returns the slot that corresponds to the blockhash source (cache or RPC).
-    async fn get_latest_blockhash(&self) -> Result<(solana_sdk::hash::Hash, Option<u64>), String> {
-        // Try cached blockhash first
+    /// Blockhash + slot for TX signing. Slot is always paired with the hash we sign with.
+    /// Falls back to RPC if Geyser cache is empty/stale and refreshes `cached_blockhash`.
+    async fn get_latest_blockhash_for_send(&self) -> Result<BlockhashForSend, String> {
         if let Some(ref cached) = *self.cached_blockhash.read() {
             let age_secs = cached.received_at.elapsed().as_secs();
             if age_secs <= MAX_BLOCKHASH_AGE_SECS {
-                return Ok((cached.hash, Some(cached.slot)));
+                return Ok(BlockhashForSend {
+                    hash: cached.hash,
+                    slot: cached.slot,
+                });
             }
             warn!(
                 age_secs,
@@ -2527,15 +2550,32 @@ impl ExecutionContext {
             );
         }
 
-        // RPC fallback
         warn!("BLOCKHASH_SOURCE_RPC_FALLBACK: no fresh Geyser blockhash, using RPC");
         let hash = self
             .rpc
             .get_latest_blockhash_retry()
             .await
             .map_err(|e| format!("rpc_error:{e}"))?;
-        let slot = self.rpc.rpc.get_slot().await.ok();
-        Ok((hash, slot))
+        let slot = self
+            .rpc
+            .rpc
+            .get_slot()
+            .await
+            .map_err(|e| format!("rpc_error:{e}"))?;
+        let received_at = std::time::Instant::now();
+        apply_rpc_blockhash_cache_fallback(
+            &mut self.cached_blockhash.write(),
+            hash,
+            slot,
+            received_at,
+        );
+        Ok(BlockhashForSend { hash, slot })
+    }
+
+    /// Get a recent blockhash, preferring the Geyser-cached version.
+    /// Falls back to RPC if cache is empty or stale (> MAX_BLOCKHASH_AGE_SECS).
+    async fn get_latest_blockhash(&self) -> Result<solana_sdk::hash::Hash, String> {
+        Ok(self.get_latest_blockhash_for_send().await?.hash)
     }
 
     /// Get current config (read lock)
@@ -10803,8 +10843,8 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                 .expect("bundle_config gate ensures jito_client is present");
 
             let signer = treasury.signer_ref();
-            let (blockhash, blockhash_slot) = match ctx.get_latest_blockhash().await {
-                Ok(pair) => pair,
+            let blockhash_for_send = match ctx.get_latest_blockhash_for_send().await {
+                Ok(bh) => bh,
                 Err(e) => {
                     let reason = RejectReason::BundleFailed;
                     checks.push(CheckResult {
@@ -10821,6 +10861,8 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                     return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
                 }
             };
+            let blockhash = blockhash_for_send.hash;
+            let bundle_send_slot = blockhash_for_send.slot;
 
             // CRITICAL: Jito bundles REQUIRE tip instruction
             // If no tip instruction present, reject intent immediately
@@ -10982,7 +11024,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                         record_tx_slot_to_send_ms(now_ms.saturating_sub(seen));
                     }
                     record_execution_slot_lag_at_send_if_applicable(ctx, &intent);
-                    slot_at_send = blockhash_slot;
+                    slot_at_send = Some(bundle_send_slot);
                     record_tx_priority_fee_source(priority_fee_selection.source);
                     checks.push(CheckResult {
                         check_name: "send".to_string(),
@@ -11046,7 +11088,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                         record_tx_slot_to_send_ms(now_ms.saturating_sub(seen));
                     }
                     record_execution_slot_lag_at_send_if_applicable(ctx, &intent);
-                    slot_at_send = result.slot_at_send;
+                    slot_at_send = Some(result.slot_at_send);
                     record_tx_priority_fee_source(priority_fee_selection.source);
                     send_signature = Some(result.signature.clone());
                     send_method_used = Some(result.method.clone());
@@ -12044,8 +12086,8 @@ async fn simulate_transaction(
             };
 
             // Get a recent blockhash (Geyser cache → RPC fallback)
-            let (blockhash, _) = match ctx.get_latest_blockhash().await {
-                Ok(pair) => pair,
+            let blockhash = match ctx.get_latest_blockhash().await {
+                Ok(hash) => hash,
                 Err(e) => {
                     return SimulationResult {
                         success: false,
@@ -12074,8 +12116,8 @@ async fn simulate_transaction(
             }
         } else {
             // Fallback to legacy transaction (will fail if too large)
-            let (blockhash, _) = match ctx.get_latest_blockhash().await {
-                Ok(pair) => pair,
+            let blockhash = match ctx.get_latest_blockhash().await {
+                Ok(hash) => hash,
                 Err(e) => {
                     return SimulationResult {
                         success: false,
@@ -12176,7 +12218,7 @@ async fn send_transaction_rpc(
         .ok_or_else(|| "no_signer_configured".to_string())?;
 
     let signer = treasury.signer_ref();
-    let (blockhash, _) = ctx.get_latest_blockhash().await?;
+    let blockhash = ctx.get_latest_blockhash().await?;
 
     // Build Versioned Transaction with ALT if available
     let tx: VersionedTransaction = if let Some(ref alt) = ctx.address_lookup_table {
@@ -12229,7 +12271,7 @@ struct SendTxResult {
     signature: String,
     method: String,  // "tpu", "jito", "rpc"
     tx: Transaction, // signed legacy transaction (for rebroadcast during confirm)
-    slot_at_send: Option<u64>,
+    slot_at_send: u64,
 }
 
 /// Send transaction with TxSender fallback chain (TPU → Jito → RPC).
@@ -12253,7 +12295,7 @@ async fn send_transaction_with_fallback(
         .ok_or_else(|| "no_signer_configured".to_string())?;
 
     let signer = treasury.signer_ref();
-    let (blockhash, blockhash_slot) = ctx.get_latest_blockhash().await?;
+    let blockhash_for_send = ctx.get_latest_blockhash_for_send().await?;
 
     // Build legacy Transaction for TxSender (TxSender handles signing internally for TPU)
     // Note: We sign here because TxSender.send_with_fallback() expects a signed Transaction
@@ -12261,7 +12303,7 @@ async fn send_transaction_with_fallback(
         &plan.instructions,
         Some(&wallet_pubkey),
         &[signer],
-        blockhash,
+        blockhash_for_send.hash,
     );
 
     // If TxSender is available, use it for the fallback chain
@@ -12273,13 +12315,14 @@ async fn send_transaction_with_fallback(
                     signature = %result.signature,
                     method = %method_str,
                     bundle_id = ?result.bundle_id,
+                    slot_at_send = blockhash_for_send.slot,
                     "TX sent via TxSender"
                 );
                 return Ok(SendTxResult {
                     signature: result.signature.to_string(),
                     method: method_str,
                     tx,
-                    slot_at_send: blockhash_slot,
+                    slot_at_send: blockhash_for_send.slot,
                 });
             }
             Err(e) => {
@@ -12314,7 +12357,7 @@ async fn send_transaction_with_fallback(
             signature: sig.to_string(),
             method: "rpc".into(),
             tx,
-            slot_at_send: blockhash_slot,
+            slot_at_send: blockhash_for_send.slot,
         }),
         Err(e) => Err(format!("rpc_error:{e}")),
     }
@@ -14696,6 +14739,28 @@ mod execution_engine_tests {
         assert_eq!(confirmed_slot_delta_slots(0, 99), 0);
         assert_eq!(confirmed_slot_delta_slots(100, 102), 2);
         assert_eq!(confirmed_slot_delta_slots(200, 100), 0);
+    }
+
+    #[test]
+    fn rpc_blockhash_cache_fallback_pairs_signing_slot_with_hash() {
+        use super::{apply_rpc_blockhash_cache_fallback, CachedBlockhash};
+        use solana_sdk::hash::Hash;
+        use std::time::Instant;
+
+        let signing_hash = Hash::new_from_array([7u8; 32]);
+        let stale_hash = Hash::new_from_array([1u8; 32]);
+        let mut cache = Some(CachedBlockhash {
+            hash: stale_hash,
+            slot: 10,
+            block_height: 0,
+            received_at: Instant::now(),
+        });
+        let now = Instant::now();
+        apply_rpc_blockhash_cache_fallback(&mut cache, signing_hash, 42, now);
+        let updated = cache.expect("cache updated");
+        assert_eq!(updated.hash, signing_hash);
+        assert_eq!(updated.slot, 42);
+        assert_ne!(updated.slot, 10);
     }
 
     #[test]
