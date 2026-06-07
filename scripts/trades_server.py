@@ -31,6 +31,7 @@ Query params (GET /trades):
 """
 
 import argparse
+import copy
 import http.server
 import json
 import os
@@ -157,10 +158,10 @@ def _cached_trades_load(cache_key: str, paths: List[Path], loader: Callable[[], 
     fp = _paths_fingerprint(paths)
     entry = _trades_cache.get(cache_key)
     if entry and now - entry["ts"] < TRADES_CACHE_TTL_SEC and entry["fp"] == fp:
-        return entry["data"]
+        return copy.deepcopy(entry["data"])
     data = loader()
     _trades_cache[cache_key] = {"ts": now, "fp": fp, "data": data}
-    return data
+    return copy.deepcopy(data)
 
 
 def clear_trades_cache() -> None:

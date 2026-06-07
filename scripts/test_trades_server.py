@@ -203,7 +203,7 @@ class TestRunModeFastPath:
 
 
 class TestCache:
-    def test_cache_returns_same_object_within_ttl(self, log_dirs, monkeypatch):
+    def test_cache_returns_copy_within_ttl(self, log_dirs, monkeypatch):
         exec_dir, _, date = log_dirs
         path = exec_dir / f"execution_results-{date}.jsonl"
         path.write_text(
@@ -213,14 +213,18 @@ class TestCache:
         handler = ts.TradesHandler.__new__(ts.TradesHandler)
         first = handler.load_all_trades([0])
         second = handler.load_all_trades([0])
-        assert first is second
+        assert first == second
+        assert first is not second
+        first[0]["tx_hash"] = "mutated"
+        third = handler.load_all_trades([0])
+        assert third[0]["tx_hash"] == "cached"
 
         path.write_text(
             json.dumps(_minimal_buy_record("cached-new")) + "\n", encoding="utf-8"
         )
-        third = handler.load_all_trades([0])
-        assert third is not first
-        assert third[0]["tx_hash"] == "cached-new"
+        fourth = handler.load_all_trades([0])
+        assert fourth is not first
+        assert fourth[0]["tx_hash"] == "cached-new"
 
 
 class TestRunModePerformanceP174:
