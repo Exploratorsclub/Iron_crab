@@ -12946,7 +12946,7 @@ async fn spawn_rebroadcast_loop(
 
         if rebroadcast_use_tpu {
             if let Some(ref sender) = tx_sender {
-                match sender.send_with_fallback(&tx, false).await {
+                match sender.send_tpu_then_rpc(&tx).await {
                     Ok(result) => {
                         rebroadcasts += 1;
                         rebroadcast_count.store(rebroadcasts, Ordering::Relaxed);
