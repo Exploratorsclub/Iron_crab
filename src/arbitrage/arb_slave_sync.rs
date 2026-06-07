@@ -5,6 +5,7 @@
 
 use parking_lot::RwLock;
 use solana_sdk::pubkey::Pubkey;
+use spl_token::native_mint;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -52,7 +53,10 @@ fn mints_from_state(state: &CachedPoolState) -> (Pubkey, Pubkey) {
         CachedPoolState::RaydiumCpmm(s) => (s.token_0_mint, s.token_1_mint),
         CachedPoolState::Meteora(s) => (s.token_x_mint, s.token_y_mint),
         CachedPoolState::MeteoraCpmm(s) => (s.token_0_mint, s.token_1_mint),
-        CachedPoolState::PumpFun(s) => (s.token_mint, Pubkey::default()),
+        CachedPoolState::PumpFun(s) => (
+            s.token_mint,
+            Pubkey::new_from_array(native_mint::id().to_bytes()),
+        ),
         CachedPoolState::PumpAmm(s) => (s.base_mint, s.quote_mint),
     }
 }
