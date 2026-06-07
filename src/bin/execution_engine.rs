@@ -14662,7 +14662,8 @@ mod execution_engine_tests {
         fee_policy.default_priority_fee_micro_lamports = 100_000;
 
         let percentiles = PriorityFeePercentiles::new(
-            "test", "test", "run", 50, 100, 10_000, 50_000, 90_000, 120_000, 120_000, 60_000, 70_000,
+            "test", "test", "run", 50, 100, 10_000, 50_000, 90_000, 120_000, 120_000, 60_000,
+            70_000,
         );
         let sel = select_priority_fee_for_intent(&intent, &fee_policy, Some(&percentiles));
         assert_eq!(
