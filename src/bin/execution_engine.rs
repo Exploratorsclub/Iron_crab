@@ -14658,8 +14658,10 @@ mod execution_engine_tests {
             TradeSide::Buy,
             TradingRegime::Early,
         );
-        let mut fee_policy = FeePolicy::default();
-        fee_policy.default_priority_fee_micro_lamports = 100_000;
+        let fee_policy = FeePolicy {
+            default_priority_fee_micro_lamports: 100_000,
+            ..Default::default()
+        };
 
         let percentiles = PriorityFeePercentiles::new(
             "test", "test", "run", 50, 100, 10_000, 50_000, 90_000, 120_000, 120_000, 60_000,
@@ -14674,9 +14676,14 @@ mod execution_engine_tests {
             }
         );
 
-        fee_policy.tier1_fee_percentile = 75;
-        fee_policy.tier1_fee_multiplier = 1.2;
-        let sel_dynamic = select_priority_fee_for_intent(&intent, &fee_policy, Some(&percentiles));
+        let fee_policy_dynamic = FeePolicy {
+            default_priority_fee_micro_lamports: 100_000,
+            tier1_fee_percentile: 75,
+            tier1_fee_multiplier: 1.2,
+            ..Default::default()
+        };
+        let sel_dynamic =
+            select_priority_fee_for_intent(&intent, &fee_policy_dynamic, Some(&percentiles));
         assert_eq!(sel_dynamic.source, "dynamic");
         assert!(sel_dynamic.fee_micro_lamports > 100_000);
     }
