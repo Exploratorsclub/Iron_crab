@@ -14,6 +14,7 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+Environment="IRONCRAB_TRADES_CACHE_TTL_SEC=15"
 
 # Resource limits
 MemoryLimit=256M

@@ -11,8 +11,13 @@ Tail-read (P172): only the last N lines per file are scanned (not full-file O(n)
 Run mode (P173): recent_trades JSONL first, enrich from execution_results* (incl. rotated segments).
 Env:
   IRONCRAB_TRADES_JSONL_TAIL_LINES — max non-empty lines per file (default 15000)
-  IRONCRAB_TRADES_CACHE_TTL_SEC — in-memory cache TTL seconds (default 3)
-  IRONCRAB_TRADES_DAYS_LOOKBACK — optional override; endpoints use [0], [0,1], or [0,1] for pnl
+  IRONCRAB_TRADES_CACHE_TTL_SEC — in-memory cache TTL seconds (default 15)
+  IRONCRAB_TRADES_DAYS_LOOKBACK — optional override; limit=[0], pnl=[0,1]; run mode uses decoupled loader
+  IRONCRAB_TRADES_RUN_PREV_RECENT_TAIL — max lines from yesterday recent_trades for prev-run (default 500)
+  IRONCRAB_TRADES_RUN_PREV_EXEC_TAIL — max lines from yesterday execution tail for enrich (default 2000)
+
+Prod override cleanup (P174): remove /etc/systemd/system/trades-server.service.d/override.conf
+  entries IRONCRAB_TRADES_DAYS_LOOKBACK=0 once this fix is deployed.
 
 `timestamp_ms` on each trade is the on-chain block time (UTC) when `block_time_unix_ms`
 is present on the JSONL record; otherwise confirm wall-clock (`ts_unix_ms` / legacy).
@@ -25,6 +30,7 @@ Query params (GET /trades):
   Response adds: time_utc, time_age, time_display
 """
 
+import argparse
 import http.server
 import json
 import os
@@ -34,9 +40,9 @@ import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from socketserver import ThreadingMixIn
 from typing import Callable, Iterator, List, Optional, Tuple
-from urllib.parse import urlparse, parse_qs
-import argparse
+from urllib.parse import parse_qs, urlparse
 
 EXEC_LOG_DIR = os.environ.get("IRONCRAB_LOG_DIR", "trade_logs")
 EXECUTIONS_DIR = Path(EXEC_LOG_DIR) / "executions"
@@ -65,7 +71,14 @@ if _raw_lookback:
     DAYS_LOOKBACK_OVERRIDE = [int(x.strip()) for x in _raw_lookback.split(",") if x.strip() != ""]
 
 # In-memory cache for JSONL loads (Grafana polls every 5s).
-TRADES_CACHE_TTL_SEC = max(2, _env_int("IRONCRAB_TRADES_CACHE_TTL_SEC", 3))
+TRADES_CACHE_TTL_SEC = max(2, _env_int("IRONCRAB_TRADES_CACHE_TTL_SEC", 15))
+# Run mode: small tail reads for prev-run context (avoid yesterday full execution scan).
+RUN_MODE_PREV_RECENT_TAIL_LINES = max(
+    1, _env_int("IRONCRAB_TRADES_RUN_PREV_RECENT_TAIL", 500)
+)
+RUN_MODE_PREV_EXEC_TAIL_LINES = max(
+    1, _env_int("IRONCRAB_TRADES_RUN_PREV_EXEC_TAIL", 2000)
+)
 _trades_cache: dict = {}
 
 # Fields copied from execution_results when enriching recent_trades rows.
@@ -114,6 +127,16 @@ def _watch_paths_for_days(days_ago_list: List[int]) -> List[Path]:
     return paths
 
 
+def _watch_paths_for_run_mode() -> List[Path]:
+    """Run-mode cache invalidation: today recent_trades + today execution segments only."""
+    date = _utc_date_str(0)
+    paths = list(_jsonl_segment_paths(EXECUTIONS_DIR, "execution_results", date))
+    recent_path = RECENT_TRADES_DIR / f"recent_trades-{date}.jsonl"
+    if recent_path.is_file():
+        paths.append(recent_path)
+    return paths
+
+
 def _paths_fingerprint(paths: List[Path]) -> Tuple[tuple, ...]:
     fp: List[tuple] = []
     for path in paths:
@@ -146,12 +169,26 @@ def clear_trades_cache() -> None:
 
 
 def _days_for_endpoint(endpoint: str) -> List[int]:
-    """Lookback UTC days: limit=[0], run/pnl=[0,1] unless env override."""
+    """Lookback UTC days: limit=[0], pnl=[0,1] unless env override.
+
+    Run mode (`mode=run`) uses `_days_for_run_mode()` / `_load_run_mode_trades()` instead.
+    """
     if DAYS_LOOKBACK_OVERRIDE is not None:
         return DAYS_LOOKBACK_OVERRIDE
     if endpoint == "limit":
         return [0]
+    if endpoint == "pnl":
+        return [0, 1]
     return [0, 1]
+
+
+def _days_for_run_mode() -> Tuple[List[int], List[int]]:
+    """Decoupled run-mode lookback: recent [0]+tail[1], execution today [0] only."""
+    if DAYS_LOOKBACK_OVERRIDE is not None:
+        override = DAYS_LOOKBACK_OVERRIDE
+        exec_days = [d for d in override if d == 0]
+        return override, exec_days if exec_days else [0]
+    return [0, 1], [0]
 
 
 def _utc_date_str(days_ago: int) -> str:
@@ -403,11 +440,11 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
     def read_trades_by_run(self) -> list:
         """Read all trades from the current run + last 20 from the previous run.
 
-        Fast path (P173): load small recent_trades JSONL first, enrich from
-        execution_results* (rotated segments), then filter by run_id / time window.
+        Fast path (P173/P174): today recent_trades + today execution_results*;
+        yesterday recent_trades tail only (prev-run); optional yesterday execution
+        tail for tx_hash enrichment — no full yesterday execution scan.
         """
-        days = _days_for_endpoint("run")
-        all_trades = self._load_run_mode_trades(days)
+        all_trades = self._load_run_mode_trades()
 
         if not all_trades:
             return []
@@ -417,17 +454,24 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         trades.sort(key=lambda t: t.get('timestamp_ms', 0), reverse=True)
         return trades
 
-    def _load_run_mode_trades(self, days_ago_list: List[int]) -> list:
+    def _load_run_mode_trades(self) -> list:
         """Recent-trades-first load with execution_results enrichment (mode=run)."""
-        paths = _watch_paths_for_days(days_ago_list)
-        cache_key = f"run_mode:{tuple(days_ago_list)}"
+        days_recent, days_exec = _days_for_run_mode()
+        paths = _watch_paths_for_run_mode()
+        cache_key = f"run_mode:{tuple(days_recent)}:{tuple(days_exec)}"
 
         def loader() -> list:
             recent_all: list = []
+            if 0 in days_recent:
+                recent_all.extend(self._load_trades_from_recent_jsonl([0]))
+            if 1 in days_recent:
+                recent_all.extend(self._load_prev_day_recent_tail())
+
             exec_all: list = []
-            for days_ago in days_ago_list:
-                recent_all.extend(self._load_trades_from_recent_jsonl([days_ago]))
-                exec_all.extend(self._load_trades_from_execution_jsonl([days_ago]))
+            if days_exec:
+                exec_all.extend(self._load_trades_from_execution_jsonl(days_exec))
+            if 1 in days_recent:
+                exec_all.extend(self._load_prev_day_execution_enrichment())
 
             exec_by_hash = {t["tx_hash"]: t for t in exec_all if t.get("tx_hash")}
             merged: list = []
@@ -451,6 +495,49 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             return self._dedupe_trades_by_tx_hash(merged)
 
         return _cached_trades_load(cache_key, paths, loader)
+
+    def _load_prev_day_recent_tail(self) -> list:
+        """Tail-only read from yesterday recent_trades (prev-run context, max ~500 lines)."""
+        date = _utc_date_str(1)
+        jsonl_path = RECENT_TRADES_DIR / f"recent_trades-{date}.jsonl"
+        if not jsonl_path.is_file():
+            return []
+        trades: list = []
+        try:
+            for line in _iter_jsonl_tail(jsonl_path, RUN_MODE_PREV_RECENT_TAIL_LINES):
+                try:
+                    record = json.loads(line)
+                    trade = self.parse_recent_trade(record)
+                    if trade:
+                        trades.append(trade)
+                except json.JSONDecodeError:
+                    continue
+        except Exception as e:
+            print(f"Error reading {jsonl_path}: {e}")
+        return trades
+
+    def _load_prev_day_execution_enrichment(self) -> list:
+        """Tail-only read from yesterday's last execution segment (enrichment, not full scan)."""
+        date = _utc_date_str(1)
+        segments = _jsonl_segment_paths(EXECUTIONS_DIR, "execution_results", date)
+        if not segments:
+            return []
+        last_path = segments[-1]
+        trades: list = []
+        try:
+            for line in _iter_jsonl_tail(last_path, RUN_MODE_PREV_EXEC_TAIL_LINES):
+                try:
+                    record = json.loads(line)
+                    if _should_skip_execution_record(record):
+                        continue
+                    trade = self.parse_execution_result(record)
+                    if trade:
+                        trades.append(trade)
+                except json.JSONDecodeError:
+                    continue
+        except Exception as e:
+            print(f"Error reading {last_path}: {e}")
+        return trades
 
     def _select_trades_for_current_and_prev_run(self, all_trades: list) -> list:
         """Current run (+ run_id-less rows in its time window) + up to 20 prev-run rows."""
@@ -1250,6 +1337,12 @@ def _self_check():
     print("trades_server: self-check OK")
 
 
+class ThreadingHTTPServer(ThreadingMixIn, http.server.HTTPServer):
+    """Handle concurrent Grafana polls without blocking on slow run-mode loads."""
+
+    daemon_threads = True
+
+
 def main():
     parser = argparse.ArgumentParser(description='Trades history server')
     parser.add_argument('--port', type=int, default=9899, help='Port to listen on (default: 9899)')
@@ -1264,7 +1357,7 @@ def main():
         _self_check()
         return
 
-    server = http.server.HTTPServer(('0.0.0.0', args.port), TradesHandler)
+    server = ThreadingHTTPServer(('0.0.0.0', args.port), TradesHandler)
     print(f"Trades server running on http://0.0.0.0:{args.port}/trades")
     print(f"Reading from: {EXECUTIONS_DIR}")
     server.serve_forever()

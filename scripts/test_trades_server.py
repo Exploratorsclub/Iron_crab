@@ -221,3 +221,138 @@ class TestCache:
         third = handler.load_all_trades([0])
         assert third is not first
         assert third[0]["tx_hash"] == "cached-new"
+
+
+class TestRunModePerformanceP174:
+    def test_run_mode_does_not_load_yesterday_execution_full_scan(
+        self, log_dirs, monkeypatch
+    ):
+        exec_dir, recent_dir, today = log_dirs
+        yesterday = "20990605"
+        calls: list = []
+
+        def track_exec_load(self, days_ago_list, *args, **kwargs):
+            calls.append(list(days_ago_list))
+            return []
+
+        monkeypatch.setattr(
+            ts.TradesHandler,
+            "_load_trades_from_execution_jsonl",
+            track_exec_load,
+        )
+        monkeypatch.setattr(
+            ts,
+            "_utc_date_str",
+            lambda days_ago: today if days_ago == 0 else yesterday,
+        )
+
+        # Huge yesterday execution file — must not trigger full-day loader for [1].
+        huge_yesterday = exec_dir / f"execution_results-{yesterday}.jsonl"
+        huge_yesterday.write_text(
+            "\n".join(
+                json.dumps(_minimal_buy_record(f"y-{i}", run_id="run-old"))
+                for i in range(5000)
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (exec_dir / f"execution_results-{today}.jsonl").write_text(
+            json.dumps(_minimal_buy_record("today-buy", run_id="run-current"))
+            + "\n",
+            encoding="utf-8",
+        )
+        (recent_dir / f"recent_trades-{today}.jsonl").write_text(
+            json.dumps(
+                _recent_trade_line("today-buy", "BUY", run_id="run-current")
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        handler = ts.TradesHandler.__new__(ts.TradesHandler)
+        handler._load_run_mode_trades()
+
+        assert calls == [[0]]
+        assert all(1 not in c for c in calls)
+
+    def test_run_mode_prev_run_from_recent_tail(self, log_dirs, monkeypatch):
+        exec_dir, recent_dir, today = log_dirs
+        yesterday = "20990605"
+
+        monkeypatch.setattr(
+            ts,
+            "_utc_date_str",
+            lambda days_ago: today if days_ago == 0 else yesterday,
+        )
+
+        prev_lines = []
+        for i in range(25):
+            prev_lines.append(
+                json.dumps(
+                    _recent_trade_line(
+                        f"prev-{i}",
+                        "SELL" if i % 2 else "BUY",
+                        ts_ms=1_800_000_000_000 + i * 1000,
+                        run_id="run-prev",
+                    )
+                )
+            )
+        (recent_dir / f"recent_trades-{yesterday}.jsonl").write_text(
+            "\n".join(prev_lines) + "\n", encoding="utf-8"
+        )
+
+        (exec_dir / f"execution_results-{today}.jsonl").write_text(
+            json.dumps(_minimal_buy_record("cur-buy", run_id="run-current"))
+            + "\n"
+            + json.dumps(_minimal_sell_record("cur-sell", run_id="run-current"))
+            + "\n",
+            encoding="utf-8",
+        )
+        (recent_dir / f"recent_trades-{today}.jsonl").write_text(
+            json.dumps(
+                _recent_trade_line("cur-buy", "BUY", run_id="run-current")
+            )
+            + "\n"
+            + json.dumps(
+                _recent_trade_line(
+                    "cur-sell", "SELL", ts_ms=1_800_000_200_000, run_id="run-current"
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        handler = ts.TradesHandler.__new__(ts.TradesHandler)
+        trades = handler.read_trades_by_run()
+        prev_rows = [t for t in trades if t.get("run_id") == "run-prev"]
+        current_rows = [t for t in trades if t.get("run_id") == "run-current"]
+
+        assert len(prev_rows) == 20
+        assert len(current_rows) == 2
+
+    def test_run_mode_cold_under_budget(self, log_dirs, monkeypatch):
+        exec_dir, recent_dir, today = log_dirs
+        (exec_dir / f"execution_results-{today}.jsonl").write_text(
+            json.dumps(_minimal_buy_record("fast")) + "\n", encoding="utf-8"
+        )
+        (recent_dir / f"recent_trades-{today}.jsonl").write_text(
+            json.dumps(_recent_trade_line("fast", "BUY")) + "\n", encoding="utf-8"
+        )
+
+        handler = ts.TradesHandler.__new__(ts.TradesHandler)
+        start = datetime.now(timezone.utc)
+        trades = handler._load_run_mode_trades()
+        elapsed_ms = (
+            datetime.now(timezone.utc) - start
+        ).total_seconds() * 1000
+
+        assert trades
+        assert elapsed_ms < 100
+
+
+class TestThreadingHTTPServer:
+    def test_threading_server_class_exists(self):
+        import http.server
+
+        assert issubclass(ts.ThreadingHTTPServer, http.server.HTTPServer)
+        assert ts.ThreadingHTTPServer.daemon_threads is True
