@@ -57,7 +57,19 @@ Component name: `execution-engine`
 | `confirmation_timeout_ms` | u64 | 30000 | 500-300000 | Confirmation timeout after send (ms) |
 | `confirm_commitment` | string | "confirmed" | finalized, confirmed | Commitment level for TX confirmation. Default `"confirmed"`: lower confirmation latency with **reorg risk** (slot can still reorganize). `"finalized"`: typical ~12–15s extra latency, stronger fork resistance. **market-data** Geyser `transactions_status` subscription uses this value at market-data startup (restart market-data to apply consistently). execution-engine waits on JetStream `WalletTxConfirmed` only (no RPC fallback). |
 | `jetstream_tx_confirm_enabled` | bool | true | true/false | Wait for `WalletTxConfirmed` on JetStream after send (PR3). **Deprecated alias:** `geyser_confirm_enabled` (hot-reload still accepted). No RPC fallback on timeout (I-7). |
+| `rebroadcast_interval_ms` | u64 | 2000 | 500-30000 | Interval between rebroadcasts of the same signed TX during confirm wait (ms) |
+| `max_rebroadcasts` | u32 | 5 | 0-20 | Max rebroadcast attempts per TX during confirm wait |
+| `rebroadcast_use_tpu` | bool | true* | true/false | Rebroadcast via TxSender/TPU when available; RPC fallback on failure. *Default follows `[execution_engine.tx_submission].tpu_enabled` when unset. |
 | `send_enabled` | bool | false | true/false | If true, engine signs and submits transactions |
+
+### Fee policy (`[execution_engine.fee_policy]` TOML / hot-reload via nested updates)
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `tier1_fee_percentile` | u8 | 50 | 25, 50, 75, 90 | Percentile base for Tier1 dynamic fee (execution-engine recomputes from NATS `PriorityFeePercentiles`; does not raise static floor) |
+| `tier1_fee_multiplier` | f64 | 1.2 | > 0 | Multiplier applied to Tier1 percentile base; effective fee remains `max(dynamic, static_floor)` |
+
+Prometheus (execution-engine `:9803/metrics`): `tx_send_to_confirm_ms`, `tx_confirmed_slot_delta_slots`, `tx_priority_fee_source_total{source}`, `tx_rebroadcast_total`, `tx_rebroadcast_method_total{method}`.
 
 ### Validation Rules
 - `max_slippage_bps` must be between 1 and 10000 (0.01% to 100%)

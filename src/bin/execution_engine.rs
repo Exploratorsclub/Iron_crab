@@ -71,7 +71,9 @@ use ironcrab::ipc::{
 use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
     record_execution_process_intent_us, record_execution_slot_lag_at_send_slots,
-    record_recent_trade, record_tx_slot_to_send_ms, serve_metrics,
+    record_recent_trade, record_tx_confirmed_slot_delta_slots, record_tx_priority_fee_source,
+    record_tx_rebroadcast, record_tx_rebroadcast_during_confirm_ms, record_tx_rebroadcast_method,
+    record_tx_send_to_confirm_ms, record_tx_slot_to_send_ms, serve_metrics,
     set_readiness_control_response_sub_active, set_readiness_control_sub_active,
     set_readiness_mode, set_readiness_nats_connected, set_readiness_state_paths_initialized,
     try_record_execution_intent_header_to_receive_ms, try_record_execution_intent_to_confirm_ms,
@@ -1509,6 +1511,8 @@ struct ExecutionConfig {
     rebroadcast_interval_ms: u64,
     /// Max rebroadcasts per TX during confirmation
     max_rebroadcasts: u32,
+    /// Rebroadcast via TPU (TxSender) when available; RPC fallback on failure.
+    rebroadcast_use_tpu: bool,
 
     // === Account Janitor Config (hot-reloadable) ===
     janitor_enabled: bool,
@@ -1567,6 +1571,7 @@ impl Default for ExecutionConfig {
             confirm_commitment: "confirmed".to_string(),
             rebroadcast_interval_ms: 2_000,
             max_rebroadcasts: 5,
+            rebroadcast_use_tpu: true,
             // Account Janitor defaults
             janitor_enabled: false,
             janitor_close_ata_interval_secs: 3600,
@@ -2546,49 +2551,13 @@ impl ExecutionContext {
         self.kill_switch_context.read().clone()
     }
 
-    /// Get priority fee for an intent using dynamic percentiles with static config as floor.
-    ///
-    /// P2: Dynamic Priority Fee Usage
-    /// - If market-data is publishing percentiles via NATS, use tier-specific recommended fee
-    /// - Always use static config (fee_policy) as minimum floor to ensure configured fees
-    ///   (especially liquidation_priority_fee) are respected even when network fees are low
-    /// - This prevents time-critical operations (liquidation, exits) from using fees that
-    ///   are too low to land on-chain during normal network conditions
-    fn get_priority_fee_for_intent(&self, intent: &TradeIntent, fee_policy: &FeePolicy) -> u64 {
-        // Static fee from config serves as the floor (minimum guaranteed fee)
-        let static_fee = fee_policy.priority_fee_for_intent(intent);
-
-        if let Some(ref percentiles) = *self.dynamic_fee_percentiles.read() {
-            let dynamic_fee = match intent.tier {
-                IntentTier::Tier0 => percentiles.tier0_recommended,
-                IntentTier::Tier1 => percentiles.tier1_recommended,
-                IntentTier::Arb => percentiles.arb_recommended,
-            };
-
-            // Use maximum of dynamic and static fee to ensure config is respected as floor
-            let effective_fee = dynamic_fee.max(static_fee);
-
-            tracing::debug!(
-                intent_id = %intent.intent_id,
-                tier = ?intent.tier,
-                dynamic_fee_micro_lamports = dynamic_fee,
-                static_fee_micro_lamports = static_fee,
-                effective_fee_micro_lamports = effective_fee,
-                p50 = percentiles.p50,
-                p90 = percentiles.p90,
-                sample_count = percentiles.sample_count,
-                "Priority fee: max(dynamic, static) - static config as floor"
-            );
-            effective_fee
-        } else {
-            tracing::debug!(
-                intent_id = %intent.intent_id,
-                tier = ?intent.tier,
-                static_fee_micro_lamports = static_fee,
-                "Using STATIC priority fee (no dynamic percentiles available)"
-            );
-            static_fee
-        }
+    fn get_priority_fee_for_intent(
+        &self,
+        intent: &TradeIntent,
+        fee_policy: &FeePolicy,
+    ) -> PriorityFeeSelection {
+        let percentiles = self.dynamic_fee_percentiles.read();
+        select_priority_fee_for_intent(intent, fee_policy, percentiles.as_ref())
     }
 
     #[inline]
@@ -5917,6 +5886,15 @@ impl ExecutionContext {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
                 }
+                "rebroadcast_use_tpu" => {
+                    if let Some(v) = value.as_bool() {
+                        config.rebroadcast_use_tpu = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
                 "skip_preflight" => {
                     if let Some(v) = value.as_bool() {
                         config.send_skip_preflight = v;
@@ -6825,6 +6803,8 @@ async fn main() -> Result<()> {
             urgency_multiplier_urgent: 5.0,
             max_tx_cost_lamports: fp.max_tx_cost_lamports,
             min_profit_after_fees_bps: fp.min_profit_after_fees_bps,
+            tier1_fee_percentile: fp.tier1_fee_percentile,
+            tier1_fee_multiplier: fp.tier1_fee_multiplier,
         }
     } else {
         FeePolicy::default()
@@ -6898,6 +6878,14 @@ async fn main() -> Result<()> {
         confirm_commitment: exec_eng_cfg
             .and_then(|e| e.confirm_commitment.clone())
             .unwrap_or_else(|| "confirmed".to_string()),
+        rebroadcast_use_tpu: exec_eng_cfg
+            .and_then(|e| e.rebroadcast_use_tpu)
+            .unwrap_or_else(|| {
+                exec_eng_cfg
+                    .and_then(|e| e.tx_submission.as_ref())
+                    .map(|t| t.tpu_enabled)
+                    .unwrap_or(true)
+            }),
         ..Default::default()
     };
 
@@ -9064,6 +9052,98 @@ fn scale_in_max_open_positions_skip_details(
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PriorityFeeSelection {
+    fee_micro_lamports: u64,
+    source: &'static str,
+}
+
+fn tier1_dynamic_fee_from_percentiles(
+    percentiles: &PriorityFeePercentiles,
+    fee_policy: &FeePolicy,
+) -> u64 {
+    let base = match fee_policy.tier1_fee_percentile {
+        75 => percentiles.p75,
+        90 => percentiles.p90,
+        25 => percentiles.p25,
+        _ => percentiles.p50,
+    };
+    ((base as f64) * fee_policy.tier1_fee_multiplier) as u64
+}
+
+fn select_priority_fee_for_intent(
+    intent: &TradeIntent,
+    fee_policy: &FeePolicy,
+    dynamic_percentiles: Option<&PriorityFeePercentiles>,
+) -> PriorityFeeSelection {
+    let static_fee = fee_policy.priority_fee_for_intent(intent);
+
+    let Some(percentiles) = dynamic_percentiles else {
+        return PriorityFeeSelection {
+            fee_micro_lamports: static_fee,
+            source: "static_floor",
+        };
+    };
+
+    let dynamic_fee = match intent.tier {
+        IntentTier::Tier0 => percentiles.tier0_recommended,
+        IntentTier::Tier1 => tier1_dynamic_fee_from_percentiles(percentiles, fee_policy),
+        IntentTier::Arb => percentiles.arb_recommended,
+    };
+    let effective_fee = dynamic_fee.max(static_fee);
+    let source = if effective_fee > static_fee {
+        "dynamic"
+    } else {
+        "static_floor"
+    };
+
+    tracing::debug!(
+        intent_id = %intent.intent_id,
+        tier = ?intent.tier,
+        dynamic_fee_micro_lamports = dynamic_fee,
+        static_fee_micro_lamports = static_fee,
+        effective_fee_micro_lamports = effective_fee,
+        source = source,
+        p50 = percentiles.p50,
+        p90 = percentiles.p90,
+        sample_count = percentiles.sample_count,
+        "Priority fee: max(dynamic, static) - static config as floor"
+    );
+
+    PriorityFeeSelection {
+        fee_micro_lamports: effective_fee,
+        source,
+    }
+}
+
+#[inline]
+fn slot_at_send_from_context(ctx: &ExecutionContext) -> Option<u64> {
+    ctx.cached_blockhash.read().as_ref().map(|c| c.slot)
+}
+
+#[inline]
+fn confirmed_slot_delta_slots(slot_at_send: u64, confirmed_slot: u64) -> u64 {
+    if slot_at_send == 0 {
+        0
+    } else {
+        confirmed_slot.saturating_sub(slot_at_send)
+    }
+}
+
+#[inline]
+fn record_confirm_latency_metrics(
+    start: std::time::Instant,
+    slot_at_send: Option<u64>,
+    confirmed_slot: Option<u64>,
+) {
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    TX_CONFIRM_LATENCY_MS.store(elapsed_ms, Ordering::Relaxed);
+    record_tx_send_to_confirm_ms(elapsed_ms);
+    if let (Some(send_slot), Some(conf_slot)) = (slot_at_send, confirmed_slot) {
+        record_tx_confirmed_slot_delta_slots(confirmed_slot_delta_slots(send_slot, conf_slot));
+    }
+}
+
 /// After a successful send: `cached_blockhash.slot` minus intent metadata `slot` (Geyser chain position).
 #[inline]
 fn record_execution_slot_lag_at_send_if_applicable(ctx: &ExecutionContext, intent: &TradeIntent) {
@@ -9461,7 +9541,8 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
     });
 
     // Check: Priority fee within limit (P2: use dynamic fees if available)
-    let priority_fee = ctx.get_priority_fee_for_intent(&intent, &effective_fee_policy);
+    let priority_fee_selection = ctx.get_priority_fee_for_intent(&intent, &effective_fee_policy);
+    let priority_fee = priority_fee_selection.fee_micro_lamports;
     if priority_fee > effective_fee_policy.max_priority_fee_micro_lamports {
         let reason = RejectReason::FeePriorityExceedsLimit;
         checks.push(CheckResult {
@@ -9479,7 +9560,10 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         check_name: "fee_priority_limit".to_string(),
         passed: true,
         reason_code: None,
-        details: Some(format!("priority_fee_micro_lamports={}", priority_fee)),
+        details: Some(format!(
+            "priority_fee_micro_lamports={} source={}",
+            priority_fee, priority_fee_selection.source
+        )),
     });
 
     // Check: Total transaction cost within limit
@@ -9939,8 +10023,9 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                 // Include compute budget ixs so simulation matches send (and CU limit is sufficient).
                 // P2: Use dynamic priority fees if available from Geyser
                 let compute_units = effective_fee_policy.compute_units_for_intent(&intent);
-                let micro_lamports_per_cu =
-                    ctx.get_priority_fee_for_intent(&intent, &effective_fee_policy);
+                let micro_lamports_per_cu = ctx
+                    .get_priority_fee_for_intent(&intent, &effective_fee_policy)
+                    .fee_micro_lamports;
 
                 let mut ixs = Vec::new();
                 ixs.push(
@@ -10688,6 +10773,8 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
     let mut sent_tx: Option<Transaction> = None;
     let mut sent_anything = false;
     let mut send_failed = false;
+    let mut slot_at_send: Option<u64> = None;
+    let mut rebroadcast_count: u32 = 0;
 
     // === Send (if enabled) ===
     if config.send_enabled {
@@ -10896,6 +10983,8 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                         record_tx_slot_to_send_ms(now_ms.saturating_sub(seen));
                     }
                     record_execution_slot_lag_at_send_if_applicable(ctx, &intent);
+                    slot_at_send = slot_at_send_from_context(ctx);
+                    record_tx_priority_fee_source(priority_fee_selection.source);
                     checks.push(CheckResult {
                         check_name: "send".to_string(),
                         passed: true,
@@ -10905,7 +10994,14 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                             bundle_tip_lamports.unwrap_or(config.jito_tip_lamports)
                         )),
                     });
-                    info!(intent_id = %intent.intent_id, bundle_id = %bid, "Bundle submitted via Jito");
+                    info!(
+                        intent_id = %intent.intent_id,
+                        bundle_id = %bid,
+                        priority_fee_micro_lamports = priority_fee_selection.fee_micro_lamports,
+                        source = priority_fee_selection.source,
+                        slot_at_send = ?slot_at_send,
+                        "Bundle submitted via Jito"
+                    );
                 }
                 Err(e) => {
                     send_failed = true;
@@ -10951,6 +11047,8 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                         record_tx_slot_to_send_ms(now_ms.saturating_sub(seen));
                     }
                     record_execution_slot_lag_at_send_if_applicable(ctx, &intent);
+                    slot_at_send = slot_at_send_from_context(ctx);
+                    record_tx_priority_fee_source(priority_fee_selection.source);
                     send_signature = Some(result.signature.clone());
                     send_method_used = Some(result.method.clone());
                     sent_tx = Some(result.tx);
@@ -10967,6 +11065,9 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                         intent_id = %intent.intent_id,
                         signature = %result.signature,
                         method = %result.method,
+                        priority_fee_micro_lamports = priority_fee_selection.fee_micro_lamports,
+                        source = priority_fee_selection.source,
+                        slot_at_send = ?slot_at_send,
                         "Transaction submitted via TxSender"
                     );
                 }
@@ -11126,36 +11227,64 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                     config.confirmation_timeout_ms,
                     sent_tx.as_ref(),
                     wallet_tx_confirm_rx.take(),
+                    slot_at_send,
                 )
                 .await
                 {
-                    Ok(ConfirmOutcome::Confirmed { details, slot }) => {
+                    Ok((ConfirmOutcome::Confirmed { details, slot }, rb_count)) => {
                         tx_landing_slot = slot;
+                        rebroadcast_count = rb_count;
                         checks.push(CheckResult {
                             check_name: "confirm".to_string(),
                             passed: true,
                             reason_code: None,
                             details: Some(details),
                         });
+                        if rb_count > 0 {
+                            checks.push(CheckResult {
+                                check_name: "rebroadcast".to_string(),
+                                passed: true,
+                                reason_code: None,
+                                details: Some(format!("count={rb_count}")),
+                            });
+                        }
                         final_outcome = DecisionOutcome::Confirmed;
                     }
-                    Ok(ConfirmOutcome::FailedConfirmed { details, slot }) => {
+                    Ok((ConfirmOutcome::FailedConfirmed { details, slot }, rb_count)) => {
                         tx_landing_slot = slot;
+                        rebroadcast_count = rb_count;
                         checks.push(CheckResult {
                             check_name: "confirm".to_string(),
                             passed: false,
                             reason_code: Some("confirmed_err".to_string()),
                             details: Some(details),
                         });
+                        if rb_count > 0 {
+                            checks.push(CheckResult {
+                                check_name: "rebroadcast".to_string(),
+                                passed: true,
+                                reason_code: None,
+                                details: Some(format!("count={rb_count}")),
+                            });
+                        }
                         final_outcome = DecisionOutcome::FailedConfirmed;
                     }
-                    Ok(ConfirmOutcome::TimeoutSent { details }) => {
+                    Ok((ConfirmOutcome::TimeoutSent { details }, rb_count)) => {
+                        rebroadcast_count = rb_count;
                         checks.push(CheckResult {
                             check_name: "confirm".to_string(),
                             passed: false,
                             reason_code: Some("confirm_timeout".to_string()),
                             details: Some(details),
                         });
+                        if rb_count > 0 {
+                            checks.push(CheckResult {
+                                check_name: "rebroadcast".to_string(),
+                                passed: true,
+                                reason_code: None,
+                                details: Some(format!("count={rb_count}")),
+                            });
+                        }
                         final_outcome = DecisionOutcome::Sent;
                     }
                     Err(e) => {
@@ -11175,6 +11304,19 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
 
     let mut input_snapshots = build_input_snapshots(&intent);
     input_snapshots.insert("fee_policy".to_string(), fee_policy_label.to_string());
+    if let Some(s) = slot_at_send {
+        input_snapshots.insert("slot_at_send".to_string(), s.to_string());
+    }
+    if let (Some(send_slot), Some(conf_slot)) = (slot_at_send, tx_landing_slot) {
+        let delta = confirmed_slot_delta_slots(send_slot, conf_slot);
+        input_snapshots.insert("confirmed_slot_delta".to_string(), delta.to_string());
+    }
+    if sent_anything {
+        input_snapshots.insert(
+            "priority_fee_source".to_string(),
+            priority_fee_selection.source.to_string(),
+        );
+    }
 
     // Emit decision record
     let decision = if config.send_enabled && sent_anything {
@@ -11414,6 +11556,26 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                     exec.confirmed_slot = Some(slot);
                     exec.metadata
                         .insert("confirmed_slot".to_string(), slot.to_string());
+                }
+                if let Some(s) = slot_at_send {
+                    exec.metadata
+                        .insert("slot_at_send".to_string(), s.to_string());
+                }
+                if let (Some(send_slot), Some(conf_slot)) = (slot_at_send, tx_landing_slot) {
+                    exec.metadata.insert(
+                        "confirmed_slot_delta".to_string(),
+                        confirmed_slot_delta_slots(send_slot, conf_slot).to_string(),
+                    );
+                }
+                exec.metadata.insert(
+                    "priority_fee_source".to_string(),
+                    priority_fee_selection.source.to_string(),
+                );
+                if rebroadcast_count > 0 {
+                    exec.metadata.insert(
+                        "rebroadcast_count".to_string(),
+                        rebroadcast_count.to_string(),
+                    );
                 }
             }
             // Scope 48: always classify confirmed SELL for market-data, even when fill RPC path
@@ -12475,26 +12637,35 @@ async fn confirm_signature_status(
     timeout_ms: u64,
     rebroadcast_tx: Option<&Transaction>,
     pre_registered_rx: Option<tokio::sync::oneshot::Receiver<WalletTxConfirmNotify>>,
-) -> std::result::Result<ConfirmOutcome, String> {
+    slot_at_send: Option<u64>,
+) -> std::result::Result<(ConfirmOutcome, u32), String> {
     let start = std::time::Instant::now();
     let deadline = Duration::from_millis(timeout_ms.max(1));
     let config = ctx.config.read().clone();
+    let rebroadcast_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     // Spawn rebroadcast task (runs in parallel for both strategies)
     let rebroadcast_handle = if let Some(tx) = rebroadcast_tx {
         let rpc = Arc::clone(&ctx.rpc);
+        let tx_sender = ctx.tx_sender.clone();
         let sig_str = signature_base58.to_string();
         let tx_clone = tx.clone();
         let interval_ms = config.rebroadcast_interval_ms;
         let max_rebroadcasts = config.max_rebroadcasts;
+        let rebroadcast_use_tpu = config.rebroadcast_use_tpu;
+        let rb_count = Arc::clone(&rebroadcast_count);
         Some(tokio::spawn(async move {
             spawn_rebroadcast_loop(
                 rpc,
+                tx_sender,
+                rebroadcast_use_tpu,
                 &sig_str,
                 tx_clone,
                 deadline,
                 interval_ms,
                 max_rebroadcasts,
+                start,
+                rb_count,
             )
             .await;
         }))
@@ -12506,7 +12677,8 @@ async fn confirm_signature_status(
         #[cfg(windows)]
         {
             let _ = pre_registered_rx;
-            let outcome = confirm_via_rpc_polling(ctx, signature_base58, deadline, start).await;
+            let outcome =
+                confirm_via_rpc_polling(ctx, signature_base58, deadline, start, slot_at_send).await;
             ctx.pending_tx_confirms.write().remove(signature_base58);
             outcome
         }
@@ -12519,6 +12691,7 @@ async fn confirm_signature_status(
                 start,
                 &config,
                 pre_registered_rx,
+                slot_at_send,
             )
             .await
         }
@@ -12529,7 +12702,8 @@ async fn confirm_signature_status(
         handle.abort();
     }
 
-    outcome
+    let count = rebroadcast_count.load(Ordering::Relaxed);
+    outcome.map(|o| (o, count))
 }
 
 /// JetStream-based confirmation: register pending signature, wait for main-loop dispatch or timeout.
@@ -12540,6 +12714,7 @@ async fn confirm_via_jetstream(
     start: std::time::Instant,
     config: &ExecutionConfig,
     pre_registered_rx: Option<tokio::sync::oneshot::Receiver<WalletTxConfirmNotify>>,
+    slot_at_send: Option<u64>,
 ) -> std::result::Result<ConfirmOutcome, String> {
     if !config.jetstream_tx_confirm_enabled {
         ctx.pending_tx_confirms.write().remove(signature_base58);
@@ -12566,7 +12741,7 @@ async fn confirm_via_jetstream(
                     let elapsed_ms = start.elapsed().as_millis() as u64;
                     TX_CONFIRMED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     TX_CONFIRM_JETSTREAM_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    TX_CONFIRM_LATENCY_MS.store(elapsed_ms, Ordering::Relaxed);
+                    record_confirm_latency_metrics(start, slot_at_send, Some(confirm.slot));
                     Ok(ConfirmOutcome::Confirmed {
                         details: format!(
                             "method=jetstream slot={} elapsed_ms={elapsed_ms} signature={signature_base58}",
@@ -12577,7 +12752,7 @@ async fn confirm_via_jetstream(
                 }
                 Ok(confirm) => {
                     let elapsed_ms = start.elapsed().as_millis() as u64;
-                    TX_CONFIRM_LATENCY_MS.store(elapsed_ms, Ordering::Relaxed);
+                    record_confirm_latency_metrics(start, slot_at_send, Some(confirm.slot));
                     Ok(ConfirmOutcome::FailedConfirmed {
                         details: format!(
                             "method=jetstream err={} slot={} elapsed_ms={elapsed_ms} signature={signature_base58}",
@@ -12622,6 +12797,7 @@ async fn confirm_via_rpc_polling(
     signature_base58: &str,
     deadline: Duration,
     start: std::time::Instant,
+    slot_at_send: Option<u64>,
 ) -> std::result::Result<ConfirmOutcome, String> {
     let signature =
         Signature::from_str(signature_base58).map_err(|e| format!("invalid_signature:{e}"))?;
@@ -12679,7 +12855,7 @@ async fn confirm_via_rpc_polling(
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 TX_CONFIRMED_TOTAL.fetch_add(1, Ordering::Relaxed);
                 ironcrab::metrics::TX_CONFIRM_RPC_FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
-                TX_CONFIRM_LATENCY_MS.store(elapsed_ms, Ordering::Relaxed);
+                record_confirm_latency_metrics(start, slot_at_send, Some(st.slot));
                 return Ok(ConfirmOutcome::Confirmed {
                     details: format!(
                         "method=rpc_polling confirmations={:?} confirmation_status={:?} slot={} elapsed_ms={elapsed_ms}",
@@ -12700,49 +12876,105 @@ async fn confirm_via_rpc_polling(
 
 /// Periodic rebroadcast loop running in a parallel task.
 /// Aborted by the caller when confirmation arrives.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_rebroadcast_loop(
     rpc: Arc<ironcrab::solana::rpc::SolanaRpc>,
+    tx_sender: Option<Arc<TxSender>>,
+    rebroadcast_use_tpu: bool,
     signature_base58: &str,
     tx: Transaction,
     deadline: Duration,
     interval_ms: u64,
     max_rebroadcasts: u32,
+    confirm_start: std::time::Instant,
+    rebroadcast_count: Arc<std::sync::atomic::AtomicU32>,
 ) {
-    let start = std::time::Instant::now();
+    let loop_start = std::time::Instant::now();
     let mut rebroadcasts: u32 = 0;
     let interval = Duration::from_millis(interval_ms);
 
     // Wait one interval before first rebroadcast
     tokio::time::sleep(interval).await;
 
-    while rebroadcasts < max_rebroadcasts && start.elapsed() < deadline {
-        let cfg = RpcSendTransactionConfig {
-            skip_preflight: true,
-            preflight_commitment: None,
-            encoding: Some(UiTransactionEncoding::Base64),
-            max_retries: Some(3),
-            min_context_slot: None,
-        };
+    while rebroadcasts < max_rebroadcasts && loop_start.elapsed() < deadline {
+        let mut sent = false;
 
-        let vtx = solana_sdk::transaction::VersionedTransaction::from(tx.clone());
-        match rpc.rpc.send_transaction_with_config(&vtx, cfg).await {
-            Ok(sig) => {
-                rebroadcasts += 1;
-                info!(
-                    signature = %sig,
-                    original_signature = %signature_base58,
-                    rebroadcasts = rebroadcasts,
-                    "Rebroadcasted TX during confirmation wait"
-                );
+        if rebroadcast_use_tpu {
+            if let Some(ref sender) = tx_sender {
+                match sender.send_with_fallback(&tx, false).await {
+                    Ok(result) => {
+                        rebroadcasts += 1;
+                        rebroadcast_count.store(rebroadcasts, Ordering::Relaxed);
+                        record_tx_rebroadcast();
+                        record_tx_rebroadcast_during_confirm_ms(
+                            confirm_start.elapsed().as_millis() as u64,
+                        );
+                        let method = result.method.to_string();
+                        record_tx_rebroadcast_method(&method);
+                        info!(
+                            signature = %result.signature,
+                            original_signature = %signature_base58,
+                            rebroadcasts = rebroadcasts,
+                            method = %method,
+                            "Rebroadcasted TX during confirmation wait"
+                        );
+                        sent = true;
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            original_signature = %signature_base58,
+                            rebroadcasts = rebroadcasts + 1,
+                            "Rebroadcast TxSender failed, falling back to RPC"
+                        );
+                    }
+                }
             }
-            Err(e) => {
-                rebroadcasts += 1;
-                warn!(
-                    error = %e,
-                    original_signature = %signature_base58,
-                    rebroadcasts = rebroadcasts,
-                    "Rebroadcast attempt failed"
-                );
+        }
+
+        if !sent {
+            let cfg = RpcSendTransactionConfig {
+                skip_preflight: true,
+                preflight_commitment: None,
+                encoding: Some(UiTransactionEncoding::Base64),
+                max_retries: Some(3),
+                min_context_slot: None,
+            };
+
+            let vtx = solana_sdk::transaction::VersionedTransaction::from(tx.clone());
+            match rpc.rpc.send_transaction_with_config(&vtx, cfg).await {
+                Ok(sig) => {
+                    rebroadcasts += 1;
+                    rebroadcast_count.store(rebroadcasts, Ordering::Relaxed);
+                    record_tx_rebroadcast();
+                    record_tx_rebroadcast_during_confirm_ms(
+                        confirm_start.elapsed().as_millis() as u64
+                    );
+                    record_tx_rebroadcast_method("rpc");
+                    info!(
+                        signature = %sig,
+                        original_signature = %signature_base58,
+                        rebroadcasts = rebroadcasts,
+                        method = "rpc",
+                        "Rebroadcasted TX during confirmation wait"
+                    );
+                }
+                Err(e) => {
+                    rebroadcasts += 1;
+                    rebroadcast_count.store(rebroadcasts, Ordering::Relaxed);
+                    record_tx_rebroadcast();
+                    record_tx_rebroadcast_during_confirm_ms(
+                        confirm_start.elapsed().as_millis() as u64
+                    );
+                    record_tx_rebroadcast_method("rpc");
+                    warn!(
+                        error = %e,
+                        original_signature = %signature_base58,
+                        rebroadcasts = rebroadcasts,
+                        method = "rpc",
+                        "Rebroadcast attempt failed"
+                    );
+                }
             }
         }
 
@@ -14386,6 +14618,7 @@ mod execution_engine_tests {
             Instant::now(),
             &config,
             Some(pre_rx),
+            Some(40),
         )
         .await
         .expect("confirm_via_jetstream");
@@ -14394,6 +14627,65 @@ mod execution_engine_tests {
             ConfirmOutcome::Confirmed { slot, .. } => assert_eq!(slot, Some(42)),
             other => panic!("expected Confirmed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn priority_fee_static_floor_when_dynamic_below_config() {
+        use super::{select_priority_fee_for_intent, PriorityFeeSelection};
+        use ironcrab::ipc::{
+            ExplicitAmount, FeePolicy, IntentOrigin, IntentTier, PriorityFeePercentiles,
+            TradeIntent, TradeResources, TradeSide, TradingRegime,
+        };
+
+        let intent = TradeIntent::new(
+            "test",
+            "v0.1.0",
+            "run",
+            "id-1".to_string(),
+            "momentum-bot",
+            IntentTier::Tier1,
+            IntentOrigin::StrategyA,
+            ExplicitAmount::new(1_000_000, 9),
+            TradeResources {
+                input_mint: ironcrab::ipc::NATIVE_SOL_MINT.to_string(),
+                output_mint: "Mint111111111111111111111111111111111111111".to_string(),
+                pools: vec!["Pool123".to_string()],
+                accounts: vec![],
+                token_program: None,
+            },
+            0,
+            200,
+            TradeSide::Buy,
+            TradingRegime::Early,
+        );
+        let mut fee_policy = FeePolicy::default();
+        fee_policy.default_priority_fee_micro_lamports = 100_000;
+
+        let percentiles = PriorityFeePercentiles::new(
+            "test", "test", "run", 50, 100, 10_000, 50_000, 90_000, 120_000, 120_000, 60_000, 70_000,
+        );
+        let sel = select_priority_fee_for_intent(&intent, &fee_policy, Some(&percentiles));
+        assert_eq!(
+            sel,
+            PriorityFeeSelection {
+                fee_micro_lamports: 100_000,
+                source: "static_floor",
+            }
+        );
+
+        fee_policy.tier1_fee_percentile = 75;
+        fee_policy.tier1_fee_multiplier = 1.2;
+        let sel_dynamic = select_priority_fee_for_intent(&intent, &fee_policy, Some(&percentiles));
+        assert_eq!(sel_dynamic.source, "dynamic");
+        assert!(sel_dynamic.fee_micro_lamports > 100_000);
+    }
+
+    #[test]
+    fn confirmed_slot_delta_saturating_sub_edge_cases() {
+        use super::confirmed_slot_delta_slots;
+        assert_eq!(confirmed_slot_delta_slots(0, 99), 0);
+        assert_eq!(confirmed_slot_delta_slots(100, 102), 2);
+        assert_eq!(confirmed_slot_delta_slots(200, 100), 0);
     }
 
     #[test]

@@ -654,6 +654,14 @@ pub struct FeePolicy {
     /// Priority fee for Tier0 urgent intents
     pub tier0_priority_fee_micro_lamports: u64,
 
+    /// Tier1 dynamic fee percentile base when recomputing from NATS samples (50 or 75)
+    #[serde(default = "default_tier1_fee_percentile")]
+    pub tier1_fee_percentile: u8,
+
+    /// Tier1 dynamic fee multiplier applied to [`Self::tier1_fee_percentile`] base
+    #[serde(default = "default_tier1_fee_multiplier")]
+    pub tier1_fee_multiplier: f64,
+
     /// Multiplier for elevated urgency (urgency=1)
     pub urgency_multiplier_elevated: f64,
 
@@ -668,6 +676,14 @@ pub struct FeePolicy {
     pub min_profit_after_fees_bps: i32,
 }
 
+fn default_tier1_fee_percentile() -> u8 {
+    50
+}
+
+fn default_tier1_fee_multiplier() -> f64 {
+    1.2
+}
+
 impl Default for FeePolicy {
     fn default() -> Self {
         Self {
@@ -680,6 +696,8 @@ impl Default for FeePolicy {
             default_priority_fee_micro_lamports: 1_000, // 0.001 lamports/CU
             max_priority_fee_micro_lamports: 100_000,   // 0.1 lamports/CU
             tier0_priority_fee_micro_lamports: 10_000,  // 0.01 lamports/CU
+            tier1_fee_percentile: default_tier1_fee_percentile(),
+            tier1_fee_multiplier: default_tier1_fee_multiplier(),
 
             // Urgency multipliers
             urgency_multiplier_elevated: 2.0,

@@ -303,6 +303,9 @@ pub struct ExecutionEngineCfg {
     /// When set to `"finalized"`, confirmation accepts only finalized on-chain status (stricter than `"confirmed"`).
     #[serde(default)]
     pub confirm_commitment: Option<String>,
+    /// Rebroadcast signed TX via TPU when TxSender is available (fallback RPC). Default: true when TPU enabled.
+    #[serde(default)]
+    pub rebroadcast_use_tpu: Option<bool>,
 }
 
 /// Fee Policy Configuration
@@ -343,6 +346,12 @@ pub struct FeePolicyCfg {
     /// Optional: override max total TX cost for liquidation sells (lamports)
     #[serde(default)]
     pub liquidation_max_tx_cost_lamports: Option<u64>,
+    /// Tier1 dynamic fee percentile (50 = P50, 75 = P75). Default: 50
+    #[serde(default = "default_tier1_fee_percentile")]
+    pub tier1_fee_percentile: u8,
+    /// Tier1 dynamic fee multiplier. Default: 1.2
+    #[serde(default = "default_tier1_fee_multiplier")]
+    pub tier1_fee_multiplier: f64,
 }
 
 fn default_compute_units() -> u32 {
@@ -369,6 +378,12 @@ fn default_max_tx_cost() -> u64 {
 fn default_min_profit_after_fees() -> i32 {
     10
 }
+fn default_tier1_fee_percentile() -> u8 {
+    50
+}
+fn default_tier1_fee_multiplier() -> f64 {
+    1.2
+}
 
 impl Default for FeePolicyCfg {
     fn default() -> Self {
@@ -384,6 +399,8 @@ impl Default for FeePolicyCfg {
             liquidation_priority_fee_micro_lamports: None,
             liquidation_max_priority_fee_micro_lamports: None,
             liquidation_max_tx_cost_lamports: None,
+            tier1_fee_percentile: default_tier1_fee_percentile(),
+            tier1_fee_multiplier: default_tier1_fee_multiplier(),
         }
     }
 }

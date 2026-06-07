@@ -2107,6 +2107,46 @@ pub static TX_SLOT_TO_SEND_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(||
 pub static TX_SLOT_TO_SEND_MS_SUM_MS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TX_SLOT_TO_SEND_MS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+// Send → Geyser/JetStream confirm (wall clock from confirm wait start to success).
+const TX_SEND_TO_CONFIRM_MS_BUCKETS: &[u64] = EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS;
+pub static TX_SEND_TO_CONFIRM_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    TX_SEND_TO_CONFIRM_MS_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+pub static TX_SEND_TO_CONFIRM_MS_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TX_SEND_TO_CONFIRM_MS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+// Confirmed slot minus blockhash slot at send (slots until on-chain landing).
+const TX_CONFIRMED_SLOT_DELTA_SLOTS_BUCKETS: &[u64] = &[0, 1, 2, 3, 4, 5, 10, 20, 50];
+pub static TX_CONFIRMED_SLOT_DELTA_SLOTS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    TX_CONFIRMED_SLOT_DELTA_SLOTS_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+pub static TX_CONFIRMED_SLOT_DELTA_SLOTS_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TX_CONFIRMED_SLOT_DELTA_SLOTS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub static TX_PRIORITY_FEE_SOURCE_STATIC_FLOOR_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static TX_PRIORITY_FEE_SOURCE_DYNAMIC_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub static TX_REBROADCAST_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TX_REBROADCAST_METHOD_TPU_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TX_REBROADCAST_METHOD_RPC_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+const TX_REBROADCAST_DURING_CONFIRM_MS_BUCKETS: &[u64] = TX_SEND_TO_CONFIRM_MS_BUCKETS;
+pub static TX_REBROADCAST_DURING_CONFIRM_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    TX_REBROADCAST_DURING_CONFIRM_MS_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+pub static TX_REBROADCAST_DURING_CONFIRM_MS_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TX_REBROADCAST_DURING_CONFIRM_MS_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 // --- execution-engine pipeline latency (histograms; complements TX_CONFIRM_LATENCY_MS gauge) ---
 pub static EXECUTION_INTENT_HEADER_TO_RECEIVE_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
     Lazy::new(|| {
@@ -2836,6 +2876,77 @@ pub fn record_swap_latency(ns: u64) {
 /// Record swap latency from Duration
 pub fn record_swap_latency_duration(duration: std::time::Duration) {
     record_swap_latency(duration.as_nanos() as u64);
+}
+
+/// Wall-clock send→confirm latency (ms). Canonical histogram vs `TX_CONFIRM_LATENCY_MS` gauge.
+#[inline]
+pub fn record_tx_send_to_confirm_ms(ms: u64) {
+    record_histogram_u64_into(
+        TX_SEND_TO_CONFIRM_MS_BUCKETS,
+        TX_SEND_TO_CONFIRM_MS_BUCKET_COUNTS.as_slice(),
+        &TX_SEND_TO_CONFIRM_MS_SUM,
+        &TX_SEND_TO_CONFIRM_MS_COUNT,
+        ms,
+        MOMENTUM_LATENCY_MS_SUM_CAP,
+    );
+}
+
+/// On-chain slot delta: `confirmed_slot.saturating_sub(slot_at_send)` (0 when `slot_at_send==0`).
+#[inline]
+pub fn record_tx_confirmed_slot_delta_slots(delta_slots: u64) {
+    record_histogram_u64_into(
+        TX_CONFIRMED_SLOT_DELTA_SLOTS_BUCKETS,
+        TX_CONFIRMED_SLOT_DELTA_SLOTS_BUCKET_COUNTS.as_slice(),
+        &TX_CONFIRMED_SLOT_DELTA_SLOTS_SUM,
+        &TX_CONFIRMED_SLOT_DELTA_SLOTS_COUNT,
+        delta_slots,
+        u64::MAX,
+    );
+}
+
+/// `source` must be `"static_floor"` or `"dynamic"`.
+#[inline]
+pub fn record_tx_priority_fee_source(source: &str) {
+    match source {
+        "static_floor" => {
+            TX_PRIORITY_FEE_SOURCE_STATIC_FLOOR_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        "dynamic" => {
+            TX_PRIORITY_FEE_SOURCE_DYNAMIC_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+#[inline]
+pub fn record_tx_rebroadcast() {
+    TX_REBROADCAST_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `method` must be `"tpu"` or `"rpc"`.
+#[inline]
+pub fn record_tx_rebroadcast_method(method: &str) {
+    match method {
+        "tpu" => {
+            TX_REBROADCAST_METHOD_TPU_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        "rpc" => {
+            TX_REBROADCAST_METHOD_RPC_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+#[inline]
+pub fn record_tx_rebroadcast_during_confirm_ms(ms: u64) {
+    record_histogram_u64_into(
+        TX_REBROADCAST_DURING_CONFIRM_MS_BUCKETS,
+        TX_REBROADCAST_DURING_CONFIRM_MS_BUCKET_COUNTS.as_slice(),
+        &TX_REBROADCAST_DURING_CONFIRM_MS_SUM,
+        &TX_REBROADCAST_DURING_CONFIRM_MS_COUNT,
+        ms,
+        MOMENTUM_LATENCY_MS_SUM_CAP,
+    );
 }
 
 /// Record slot-to-send latency (ms): time from Geyser event/slot observation to TX send.
@@ -3868,6 +3979,62 @@ async fn metrics_response() -> Response<Body> {
     ));
     out.push_str(&format!("tx_slot_to_send_ms_sum {}\n", sts_sum));
     out.push_str(&format!("tx_slot_to_send_ms_count {}\n", sts_count));
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "tx_send_to_confirm_ms",
+        TX_SEND_TO_CONFIRM_MS_BUCKETS,
+        &TX_SEND_TO_CONFIRM_MS_BUCKET_COUNTS,
+        &TX_SEND_TO_CONFIRM_MS_SUM,
+        &TX_SEND_TO_CONFIRM_MS_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "tx_confirmed_slot_delta_slots",
+        TX_CONFIRMED_SLOT_DELTA_SLOTS_BUCKETS,
+        &TX_CONFIRMED_SLOT_DELTA_SLOTS_BUCKET_COUNTS,
+        &TX_CONFIRMED_SLOT_DELTA_SLOTS_SUM,
+        &TX_CONFIRMED_SLOT_DELTA_SLOTS_COUNT,
+    );
+    out.push_str("tx_priority_fee_source_total{source=\"static_floor\"} ");
+    out.push_str(
+        &TX_PRIORITY_FEE_SOURCE_STATIC_FLOOR_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("tx_priority_fee_source_total{source=\"dynamic\"} ");
+    out.push_str(
+        &TX_PRIORITY_FEE_SOURCE_DYNAMIC_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "tx_rebroadcast_total",
+        TX_REBROADCAST_TOTAL.load(Ordering::Relaxed)
+    );
+    out.push_str("tx_rebroadcast_method_total{method=\"tpu\"} ");
+    out.push_str(
+        &TX_REBROADCAST_METHOD_TPU_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("tx_rebroadcast_method_total{method=\"rpc\"} ");
+    out.push_str(
+        &TX_REBROADCAST_METHOD_RPC_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "tx_rebroadcast_during_confirm_ms",
+        TX_REBROADCAST_DURING_CONFIRM_MS_BUCKETS,
+        &TX_REBROADCAST_DURING_CONFIRM_MS_BUCKET_COUNTS,
+        &TX_REBROADCAST_DURING_CONFIRM_MS_SUM,
+        &TX_REBROADCAST_DURING_CONFIRM_MS_COUNT,
+    );
     append_momentum_latency_histogram_prometheus(
         &mut out,
         "execution_intent_header_to_receive_ms",
