@@ -400,12 +400,27 @@ pub fn slave_consumer_config() -> jetstream::consumer::pull::Config {
     }
 }
 
+/// Ephemeral fallback when JetStream bootstrap did not run (empty SLAVE cache).
+///
+/// `DeliverPolicy::New` — no replay of per-subject historical snapshots. Used by execution-engine
+/// and arb-strategy when bootstrap failed or was skipped (FIX-12).
+pub fn pool_cache_live_fallback_consumer_config() -> jetstream::consumer::pull::Config {
+    jetstream::consumer::pull::Config {
+        deliver_policy: jetstream::consumer::DeliverPolicy::New,
+        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+        max_ack_pending: 1000,
+        filter_subject: "ironcrab.pool_cache.>".to_string(),
+        ..Default::default()
+    }
+}
+
 /// Consumer config for live `POOL_CACHE` updates only (`DeliverPolicy::New`).
 ///
 /// Used by **momentum-bot** so the runtime does not replay the per-subject last snapshot for every
-/// pool in the stream (hundreds of thousands of messages). Cold-path tools (execution-engine,
-/// `sell_all_keyless`, arb-strategy known-pools bootstrap) continue to use
-/// `slave_consumer_config` / `pool_cache_sync::bootstrap_pool_cache_from_jetstream`.
+/// pool in the stream (hundreds of thousands of messages). Cold-path bootstrap (execution-engine,
+/// arb-strategy, `sell_all_keyless`) uses `slave_consumer_config` via
+/// `pool_cache_sync::bootstrap_pool_cache_from_jetstream`; live fallback uses
+/// [`pool_cache_live_fallback_consumer_config`].
 pub fn pool_cache_live_consumer_config() -> jetstream::consumer::pull::Config {
     jetstream::consumer::pull::Config {
         deliver_policy: jetstream::consumer::DeliverPolicy::New,

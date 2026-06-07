@@ -419,6 +419,15 @@ Für lokale UI-Entwicklung mit SSH-Tunnel zum Server:
 
 Siehe `.github/copilot-instructions.md` für Details.
 
+## arb-strategy JetStream SLAVE-Sync (`known_pools`)
+
+arb-strategy synchronisiert den JetStream-`POOL_CACHE` **gleichwertig** zu execution-engine (`pool_cache_sync`):
+
+- Nach erfolgreichem Bootstrap: Heartbeat-Feld `known_pools` in der Größenordnung **>50_000** (nicht ~400), nahe der JetStream-Subject-Anzahl.
+- `pools_tracked` zählt Pools aus **MarketEvents** (Trade/PoolCreated); `known_pools` zählt den **MASTER/JetStream-SSOT** — beide Werte sind bewusst unterschiedlich.
+- Bei Concurrent-Deploy (`ironcrab.target`): `IRONCRAB_NATS_REQUEST_TIMEOUT_SECS=180` setzen (Default für arb-strategy und execution-engine), damit `create_consumer` auf großen Streams nicht nach 5s abbricht.
+- Log nach Restart: `SLAVE CACHE BOOTSTRAP: Complete pools_recovered=...` mit **>100_000** erwartet; kein zweites `LastPerSubject`-Consumer-Subscribe nach Bootstrap.
+
 ## 2-Hop Cross-DEX (arb-strategy)
 
 Nach `two_hop_enabled=true` (Control Plane / UI) liefert **arb-strategy** (Port 9803) Prometheus-Metriken für Debug und Prod-Gate:
