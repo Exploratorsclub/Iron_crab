@@ -54,6 +54,8 @@ use ironcrab::nats::{
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
+use solana_sdk::pubkey::Pubkey;
+use std::str::FromStr;
 
 /// Build version for decision records
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -472,8 +474,133 @@ fn sol_quoted_pool_seed(state: &CachedPoolState) -> Option<SolQuotedPoolSeed> {
     }
 }
 
+/// Upsert one pool into tracker + vault_balances from SLAVE cache. Returns true when newly added.
+fn seed_one_pool_from_live_cache(
+    mint: &str,
+    live_pool_cache: &LivePoolCache,
+    pool_pk: Pubkey,
+    state: &CachedPoolState,
+    trackers: &mut HashMap<String, TokenArbTracker>,
+    vault_balances: &mut HashMap<String, VaultBalanceCache>,
+) -> bool {
+    let dex = state.dex_name();
+    if !is_known_dex_label(dex) {
+        return false;
+    }
+    let Some((token_mint, reserve_base, reserve_quote, active_id, bin_step)) =
+        sol_quoted_pool_seed(state)
+    else {
+        return false;
+    };
+    if token_mint != mint || reserve_base == 0 || reserve_quote == 0 {
+        return false;
+    }
+
+    let pool_addr = pool_pk.to_string();
+    let (_, slot, age_ms) =
+        live_pool_cache
+            .get_with_metadata(&pool_pk)
+            .unwrap_or((state.clone(), 0, 0));
+    let cache_updated_at = Instant::now()
+        .checked_sub(Duration::from_millis(age_ms))
+        .unwrap_or_else(Instant::now);
+    let dlmm_sol_is_x = matches!(
+        state,
+        CachedPoolState::Meteora(s) if s.token_x_mint.to_string() == NATIVE_SOL_MINT
+    );
+
+    // Monotonic merge: lagging JetStream must not regress fresher Geyser PoolStateUpdate.
+    let should_update_vault = match vault_balances.get(&pool_addr) {
+        Some(existing) => slot >= existing.update_slot,
+        None => true,
+    };
+
+    if should_update_vault {
+        vault_balances.insert(
+            pool_addr.clone(),
+            VaultBalanceCache {
+                reserve_base,
+                reserve_quote,
+                update_slot: slot,
+                active_id,
+                bin_step,
+                updated_at: cache_updated_at,
+                dlmm_sol_is_x,
+            },
+        );
+    }
+
+    let vault_ref = vault_balances
+        .get(&pool_addr)
+        .expect("vault_balances entry must exist after seed merge");
+    let eff_reserve_base = vault_ref.reserve_base;
+    let eff_reserve_quote = vault_ref.reserve_quote;
+    let eff_updated_at = vault_ref.updated_at;
+
+    let tracker = trackers
+        .entry(mint.to_string())
+        .or_insert_with(|| TokenArbTracker::new(mint));
+    let token_decimals = tracker.token_decimals.unwrap_or(6);
+    let liquidity_sol = Decimal::from(eff_reserve_quote) / Decimal::from(1_000_000_000u64);
+    let reserve_price =
+        reserve_mid_sol_per_token(eff_reserve_base, eff_reserve_quote, token_decimals);
+    let (trade_price_buy, trade_price_sell, trade_count, dex_accounts) = tracker
+        .pools
+        .get(&pool_addr)
+        .map(|p| {
+            (
+                p.trade_price_buy,
+                p.trade_price_sell,
+                p.trade_count,
+                p.dex_accounts.clone(),
+            )
+        })
+        .unwrap_or((None, None, 0, None));
+    let pool_last_update = match tracker.pools.get(&pool_addr) {
+        Some(p) if !should_update_vault => p.last_update.max(eff_updated_at),
+        _ => eff_updated_at,
+    };
+    let seed_pool = PoolState {
+        pool_address: pool_addr.clone(),
+        dex: dex.to_string(),
+        last_price: reserve_price,
+        trade_price_buy,
+        trade_price_sell,
+        liquidity_sol,
+        has_reserve_data: eff_reserve_base > 0 && eff_reserve_quote > 0,
+        last_update: pool_last_update,
+        trade_count,
+        dex_accounts,
+    };
+    let vault_entry = vault_balances.get(&pool_addr);
+    let dlmm_bins = None::<&HashMap<i64, BinArrayCache>>;
+    let last_price = comparable_price_sol_per_token(
+        &seed_pool,
+        Some((eff_reserve_base, eff_reserve_quote)),
+        token_decimals,
+        vault_entry,
+        dlmm_bins,
+    )
+    .or(reserve_price);
+
+    let is_new_pool = !tracker.pools.contains_key(&pool_addr);
+    tracker.upsert_pool(PoolState {
+        pool_address: pool_addr,
+        dex: dex.to_string(),
+        last_price,
+        trade_price_buy: seed_pool.trade_price_buy,
+        trade_price_sell: seed_pool.trade_price_sell,
+        liquidity_sol,
+        has_reserve_data: eff_reserve_base > 0 && eff_reserve_quote > 0,
+        last_update: pool_last_update,
+        trade_count: seed_pool.trade_count,
+        dex_accounts: seed_pool.dex_accounts,
+    });
+    is_new_pool
+}
+
 /// Seed TokenArbTracker pools for one mint from SLAVE LivePoolCache (Geyser-only, no RPC).
-/// When `only_pool` is set, only that pool address is upserted (incremental JetStream updates).
+/// When `only_pool` is set, uses O(1) `get` (incremental JetStream); bootstrap uses full `iter`.
 fn seed_token_tracker_from_live_pool_cache(
     mint: &str,
     live_pool_cache: &LivePoolCache,
@@ -482,127 +609,39 @@ fn seed_token_tracker_from_live_pool_cache(
     only_pool: Option<&str>,
 ) -> usize {
     let mut seeded = 0usize;
-    for (pool_pk, state) in live_pool_cache.iter() {
-        let dex = state.dex_name();
-        if !is_known_dex_label(dex) {
-            continue;
-        }
-        let Some((token_mint, reserve_base, reserve_quote, active_id, bin_step)) =
-            sol_quoted_pool_seed(&state)
-        else {
-            continue;
+
+    if let Some(pool_filter) = only_pool {
+        let Ok(pool_pk) = Pubkey::from_str(pool_filter) else {
+            return 0;
         };
-        if token_mint != mint || reserve_base == 0 || reserve_quote == 0 {
-            continue;
-        }
-
-        let pool_addr = pool_pk.to_string();
-        if only_pool.is_some_and(|filter| filter != pool_addr) {
-            continue;
-        }
-        let (_, slot, age_ms) =
-            live_pool_cache
-                .get_with_metadata(&pool_pk)
-                .unwrap_or((state.clone(), 0, 0));
-        let cache_updated_at = Instant::now()
-            .checked_sub(Duration::from_millis(age_ms))
-            .unwrap_or_else(Instant::now);
-        let dlmm_sol_is_x = matches!(
-            state,
-            CachedPoolState::Meteora(s) if s.token_x_mint.to_string() == NATIVE_SOL_MINT
-        );
-
-        // Monotonic merge: lagging JetStream must not regress fresher Geyser PoolStateUpdate.
-        let should_update_vault = match vault_balances.get(&pool_addr) {
-            Some(existing) => slot >= existing.update_slot,
-            None => true,
+        let Some((state, _, _)) = live_pool_cache.get_with_metadata(&pool_pk) else {
+            return 0;
         };
-
-        if should_update_vault {
-            vault_balances.insert(
-                pool_addr.clone(),
-                VaultBalanceCache {
-                    reserve_base,
-                    reserve_quote,
-                    update_slot: slot,
-                    active_id,
-                    bin_step,
-                    updated_at: cache_updated_at,
-                    dlmm_sol_is_x,
-                },
-            );
+        if seed_one_pool_from_live_cache(
+            mint,
+            live_pool_cache,
+            pool_pk,
+            &state,
+            trackers,
+            vault_balances,
+        ) {
+            seeded = 1;
         }
-
-        let vault_ref = vault_balances
-            .get(&pool_addr)
-            .expect("vault_balances entry must exist after seed merge");
-        let eff_reserve_base = vault_ref.reserve_base;
-        let eff_reserve_quote = vault_ref.reserve_quote;
-        let eff_updated_at = vault_ref.updated_at;
-
-        let tracker = trackers
-            .entry(mint.to_string())
-            .or_insert_with(|| TokenArbTracker::new(mint));
-        let token_decimals = tracker.token_decimals.unwrap_or(6);
-        let liquidity_sol = Decimal::from(eff_reserve_quote) / Decimal::from(1_000_000_000u64);
-        let reserve_price =
-            reserve_mid_sol_per_token(eff_reserve_base, eff_reserve_quote, token_decimals);
-        let (trade_price_buy, trade_price_sell, trade_count, dex_accounts) = tracker
-            .pools
-            .get(&pool_addr)
-            .map(|p| {
-                (
-                    p.trade_price_buy,
-                    p.trade_price_sell,
-                    p.trade_count,
-                    p.dex_accounts.clone(),
-                )
-            })
-            .unwrap_or((None, None, 0, None));
-        let pool_last_update = match tracker.pools.get(&pool_addr) {
-            Some(p) if !should_update_vault => p.last_update.max(eff_updated_at),
-            _ => eff_updated_at,
-        };
-        let seed_pool = PoolState {
-            pool_address: pool_addr.clone(),
-            dex: dex.to_string(),
-            last_price: reserve_price,
-            trade_price_buy,
-            trade_price_sell,
-            liquidity_sol,
-            has_reserve_data: eff_reserve_base > 0 && eff_reserve_quote > 0,
-            last_update: pool_last_update,
-            trade_count,
-            dex_accounts,
-        };
-        let vault_entry = vault_balances.get(&pool_addr);
-        let dlmm_bins = None::<&HashMap<i64, BinArrayCache>>;
-        let last_price = comparable_price_sol_per_token(
-            &seed_pool,
-            Some((eff_reserve_base, eff_reserve_quote)),
-            token_decimals,
-            vault_entry,
-            dlmm_bins,
-        )
-        .or(reserve_price);
-
-        let is_new_pool = !tracker.pools.contains_key(&pool_addr);
-        tracker.upsert_pool(PoolState {
-            pool_address: pool_addr,
-            dex: dex.to_string(),
-            last_price,
-            trade_price_buy: seed_pool.trade_price_buy,
-            trade_price_sell: seed_pool.trade_price_sell,
-            liquidity_sol,
-            has_reserve_data: eff_reserve_base > 0 && eff_reserve_quote > 0,
-            last_update: pool_last_update,
-            trade_count: seed_pool.trade_count,
-            dex_accounts: seed_pool.dex_accounts,
-        });
-        if is_new_pool {
-            seeded += 1;
+    } else {
+        for (pool_pk, state) in live_pool_cache.iter() {
+            if seed_one_pool_from_live_cache(
+                mint,
+                live_pool_cache,
+                pool_pk,
+                &state,
+                trackers,
+                vault_balances,
+            ) {
+                seeded += 1;
+            }
         }
     }
+
     if seeded > 0 {
         arb_two_hop_tracker_seeded_pools_add(seeded as u64);
     }
@@ -3350,6 +3389,47 @@ mod two_hop_price_tests {
         assert_eq!(vault.update_slot, 101);
         assert_eq!(vault.reserve_base, 1_000_000_000_000);
         assert_eq!(vault.reserve_quote, 2_000_000_000);
+    }
+
+    #[test]
+    fn incremental_only_pool_targets_single_cache_entry() {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+
+        for (pool, slot) in [(pool_a, 1u64), (pool_b, 2u64)] {
+            let update = PoolCacheUpdate::new_balance_updated(
+                TEST_COMPONENT,
+                TEST_BUILD,
+                TEST_RUN,
+                pool.to_string(),
+                "orca".to_string(),
+                mint_str.clone(),
+                NATIVE_SOL_MINT.to_string(),
+                1_000_000_000_000,
+                1_000_000_000,
+                slot,
+            );
+            ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update);
+        }
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        let seeded = seed_token_tracker_from_live_pool_cache(
+            &mint_str,
+            &cache,
+            &mut trackers,
+            &mut vault_balances,
+            Some(&pool_a.to_string()),
+        );
+        assert_eq!(seeded, 1);
+        let tracker = trackers.get(&mint_str).unwrap();
+        assert!(tracker.pools.contains_key(&pool_a.to_string()));
+        assert!(!tracker.pools.contains_key(&pool_b.to_string()));
+        assert!(vault_balances.contains_key(&pool_a.to_string()));
+        assert!(!vault_balances.contains_key(&pool_b.to_string()));
     }
 }
 
