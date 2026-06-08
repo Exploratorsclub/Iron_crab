@@ -238,6 +238,7 @@ fn dlmm_token_output_from_bins(
     bin_step: u16,
     sol_in_lamports: u64,
     bin_arrays: &HashMap<i64, Vec<BinData>>,
+    sol_is_x: bool,
 ) -> Option<u64> {
     if bin_arrays.is_empty() {
         return None;
@@ -274,8 +275,11 @@ fn dlmm_token_output_from_bins(
         if remaining_sol == 0 {
             break;
         }
-        let sol_in_bin = bin.amount_y as u128;
-        let tokens_in_bin = bin.amount_x as u128;
+        let (sol_in_bin, tokens_in_bin) = if sol_is_x {
+            (bin.amount_x as u128, bin.amount_y as u128)
+        } else {
+            (bin.amount_y as u128, bin.amount_x as u128)
+        };
         if tokens_in_bin == 0 {
             continue;
         }
@@ -336,9 +340,14 @@ fn comparable_price_sol_per_token(
         if let (Some(vault), Some(arrays)) = (vault_cache, dlmm_bin_arrays) {
             if let (Some(active_id), Some(bin_step)) = (vault.active_id, vault.bin_step) {
                 let flat = flatten_bin_array_cache(arrays);
-                if let Some(tokens_out) =
-                    dlmm_token_output_from_bins(active_id, bin_step, DLMM_PROBE_SOL_LAMPORTS, &flat)
-                {
+                let sol_is_x = vault_cache.map(|v| v.dlmm_sol_is_x).unwrap_or(false);
+                if let Some(tokens_out) = dlmm_token_output_from_bins(
+                    active_id,
+                    bin_step,
+                    DLMM_PROBE_SOL_LAMPORTS,
+                    &flat,
+                    sol_is_x,
+                ) {
                     if tokens_out > 0 {
                         return Some(trade_implied_sol_per_token(
                             DLMM_PROBE_SOL_LAMPORTS,
@@ -486,13 +495,15 @@ fn seed_token_tracker_from_live_pool_cache(
         }
 
         let pool_addr = pool_pk.to_string();
-        let (_, slot, age_ms) =
+        let (_, slot, _) =
             live_pool_cache
                 .get_with_metadata(&pool_pk)
                 .unwrap_or((state.clone(), 0, 0));
-        let updated_at = Instant::now()
-            .checked_sub(Duration::from_millis(age_ms))
-            .unwrap_or_else(Instant::now);
+        let updated_at = Instant::now();
+        let dlmm_sol_is_x = matches!(
+            state,
+            CachedPoolState::Meteora(s) if s.token_x_mint.to_string() == NATIVE_SOL_MINT
+        );
 
         vault_balances.insert(
             pool_addr.clone(),
@@ -503,6 +514,7 @@ fn seed_token_tracker_from_live_pool_cache(
                 active_id,
                 bin_step,
                 updated_at,
+                dlmm_sol_is_x,
             },
         );
 
@@ -511,19 +523,53 @@ fn seed_token_tracker_from_live_pool_cache(
             .or_insert_with(|| TokenArbTracker::new(mint));
         let token_decimals = tracker.token_decimals.unwrap_or(6);
         let liquidity_sol = Decimal::from(reserve_quote) / Decimal::from(1_000_000_000u64);
-        let last_price = reserve_mid_sol_per_token(reserve_base, reserve_quote, token_decimals);
+        let reserve_price = reserve_mid_sol_per_token(reserve_base, reserve_quote, token_decimals);
+        let (trade_price_buy, trade_price_sell, trade_count, dex_accounts) = tracker
+            .pools
+            .get(&pool_addr)
+            .map(|p| {
+                (
+                    p.trade_price_buy,
+                    p.trade_price_sell,
+                    p.trade_count,
+                    p.dex_accounts.clone(),
+                )
+            })
+            .unwrap_or((None, None, 0, None));
+        let vault_entry = vault_balances.get(&pool_addr);
+        let dlmm_bins = None::<&HashMap<i64, BinArrayCache>>;
+        let seed_pool = PoolState {
+            pool_address: pool_addr.clone(),
+            dex: dex.to_string(),
+            last_price: reserve_price,
+            trade_price_buy,
+            trade_price_sell,
+            liquidity_sol,
+            has_reserve_data: true,
+            last_update: updated_at,
+            trade_count,
+            dex_accounts,
+        };
+        let last_price = comparable_price_sol_per_token(
+            &seed_pool,
+            Some((reserve_base, reserve_quote)),
+            token_decimals,
+            vault_entry,
+            dlmm_bins,
+        )
+        .or(reserve_price);
 
         tracker.upsert_pool(PoolState {
             pool_address: pool_addr,
             dex: dex.to_string(),
             last_price,
-            trade_price_buy: None,
-            trade_price_sell: None,
+            trade_price_buy: seed_pool.trade_price_buy,
+            trade_price_sell: seed_pool.trade_price_sell,
             liquidity_sol,
             has_reserve_data: true,
             last_update: updated_at,
-            trade_count: 0,
-            dex_accounts: None,
+            trade_count: seed_pool.trade_count,
+            dex_accounts: seed_pool.dex_accounts,
         });
         seeded += 1;
     }
@@ -1009,6 +1055,8 @@ struct VaultBalanceCache {
     bin_step: Option<u16>,
     /// Wall-clock freshness for reserve-based price (Geyser PoolStateUpdate or SLAVE seed).
     updated_at: Instant,
+    /// Meteora DLMM: on-chain token X is SOL (bins stay in native X/Y layout).
+    dlmm_sol_is_x: bool,
 }
 
 /// Cached bin array data from BinArrayUpdate events
@@ -1517,15 +1565,24 @@ impl ArbContext {
     fn handle_pool_state_update(
         &self,
         pool_address: &str,
-        _dex: &str,
+        dex: &str,
         reserve_base: u64,
         reserve_quote: u64,
         update_slot: u64,
         active_id: Option<i32>,
         bin_step: Option<u16>,
+        base_mint: &str,
     ) {
         let mut cache = self.vault_balances.write();
         let is_new = !cache.contains_key(pool_address);
+        let dlmm_sol_is_x = if dex == "meteora_dlmm" {
+            base_mint == NATIVE_SOL_MINT
+        } else {
+            cache
+                .get(pool_address)
+                .map(|v| v.dlmm_sol_is_x)
+                .unwrap_or(false)
+        };
         cache.insert(
             pool_address.to_string(),
             VaultBalanceCache {
@@ -1535,6 +1592,7 @@ impl ArbContext {
                 active_id,
                 bin_step,
                 updated_at: Instant::now(),
+                dlmm_sol_is_x,
             },
         );
         if is_new {
@@ -1738,8 +1796,13 @@ impl ArbContext {
             return None;
         }
 
-        let result =
-            dlmm_token_output_from_bins(active_id, bin_step, sol_in_lamports, &bin_arrays)?;
+        let result = dlmm_token_output_from_bins(
+            active_id,
+            bin_step,
+            sol_in_lamports,
+            &bin_arrays,
+            pool_state.dlmm_sol_is_x,
+        )?;
 
         info!(
             pool = %pool_address,
@@ -2868,6 +2931,7 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             update_slot,
             active_id,
             bin_step,
+            base_mint,
             ..
         } => {
             ctx.handle_pool_state_update(
@@ -2878,6 +2942,7 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
                 *update_slot,
                 *active_id,
                 *bin_step,
+                base_mint,
             );
             None
         }
@@ -2953,6 +3018,7 @@ mod two_hop_price_tests {
             active_id,
             bin_step,
             updated_at: Instant::now(),
+            dlmm_sol_is_x: false,
         }
     }
 
@@ -3082,6 +3148,7 @@ mod two_hop_price_tests {
             active_id: None,
             bin_step: None,
             updated_at: Instant::now(),
+            dlmm_sol_is_x: false,
         };
         let max_age = Duration::from_millis(MAX_PRICE_AGE_MS);
         assert!(!pool.last_update.elapsed().le(&max_age));
