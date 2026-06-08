@@ -495,11 +495,13 @@ fn seed_token_tracker_from_live_pool_cache(
         }
 
         let pool_addr = pool_pk.to_string();
-        let (_, slot, _) =
+        let (_, slot, age_ms) =
             live_pool_cache
                 .get_with_metadata(&pool_pk)
                 .unwrap_or((state.clone(), 0, 0));
-        let updated_at = Instant::now();
+        let updated_at = Instant::now()
+            .checked_sub(Duration::from_millis(age_ms))
+            .unwrap_or_else(Instant::now);
         let dlmm_sol_is_x = matches!(
             state,
             CachedPoolState::Meteora(s) if s.token_x_mint.to_string() == NATIVE_SOL_MINT
