@@ -46,7 +46,15 @@ Shadow-Mode loggt Zyklen zur Prod-Validierung. Ohne Caps explodieren kumulative 
 | `MIN_RETURN_BPS` / `MAX_RETURN_BPS` | −10_000 / 50_000 | −100% .. +500% ROI-Schätzung |
 | `is_trustworthy_profit_estimate()` | — | `false` bei Cap/Saturierung → nicht „profitable“, kein Intent |
 
-Prometheus (arb-strategy :9803): `multi_hop_return_bps_saturated_total`, `multi_hop_cycle_rejected_sanity_total{reason=edge_ratio|profit_cap|return_bps_cap}`, `multi_hop_hop_missing_quote_total`, `multi_hop_shadow_logged_total`.
+Prometheus (arb-strategy :9803): `multi_hop_return_bps_saturated_total`, `multi_hop_cycle_rejected_sanity_total{reason=edge_ratio|profit_cap|return_bps_cap}`, `multi_hop_hop_missing_quote_total`, `multi_hop_shadow_logged_total`, `multi_hop_quote_from_cache_total`, `multi_hop_quote_from_trade_cache_total`.
+
+### Quote-Priorität (PoolRanker / `CachedQuoteProvider`)
+
+1. **Trade-Cache** — normalisierte Probe-Quotes aus beobachteten Trades (`update_quote` bei `on_pool_price_update`)
+2. **LivePoolCache** — `quote_calculator::quote_output_amount` aus Geyser-gespeister `CachedPoolState` (kein RPC)
+3. **Conservative default** — `edge_ratio = 0.99` nur wenn (1) und (2) fehlen; `multi_hop_hop_missing_quote_total`++
+
+Nach JetStream-Bootstrap: `warmup_quotes_from_live_pool_cache` seedet Top-N WSOL-Pools in den Trade-Cache.
 
 ## Motivation
 

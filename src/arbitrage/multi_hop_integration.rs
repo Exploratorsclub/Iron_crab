@@ -15,13 +15,16 @@ use crate::arbitrage::{
     ArbCycle, BeamCycleFinder, CycleFinderConfig, DexType, PoolEdge, PoolGraph, PoolRanker,
     QuoteProvider, RankerConfig, MAX_RETURN_BPS,
 };
+use crate::execution::live_pool_cache::{CachedPoolState, SharedLivePoolCache};
+use crate::execution::quote_calculator;
 use crate::ipc::{
     ExplicitAmount, IntentOrigin, IntentTier, PoolAlternative, RecordHeader, SwapHop, TradeIntent,
     TradeResources, TradeSide, TradingRegime,
 };
 use crate::metrics::{
-    multi_hop_cycle_rejected_sanity_inc, multi_hop_return_bps_saturated_inc,
-    multi_hop_shadow_logged_inc, MultiHopSanityRejectReason,
+    multi_hop_cycle_rejected_sanity_inc, multi_hop_hop_missing_quote_inc,
+    multi_hop_quote_from_cache_inc, multi_hop_quote_from_trade_cache_inc,
+    multi_hop_return_bps_saturated_inc, multi_hop_shadow_logged_inc, MultiHopSanityRejectReason,
 };
 use parking_lot::RwLock;
 use solana_sdk::pubkey::Pubkey;
@@ -34,6 +37,12 @@ use tracing::{debug, info, trace, warn};
 
 /// WSOL mint (native SOL wrapped)
 pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+/// Probe amount for trade-cache normalization (0.01 SOL).
+const PROBE_LAMPORTS: u64 = 10_000_000;
+
+/// Top-N WSOL pools to seed trade-cache quotes after JetStream bootstrap.
+const QUOTE_WARMUP_TOP_N: usize = 1000;
 
 /// Multi-hop arbitrage configuration
 #[derive(Debug, Clone)]
@@ -88,7 +97,7 @@ type QuoteCacheKey = (Pubkey, Pubkey, Pubkey);
 /// Cache value: (output_amount, timestamp)
 type QuoteCacheValue = (u64, Instant);
 
-/// Quote provider that uses cached pool data
+/// Quote provider: trade-normalized cache, then LivePoolCache (Geyser), then conservative default.
 pub struct CachedQuoteProvider {
     /// Cache: (pool, input_mint, output_mint) -> (output_amount, timestamp)
     cache: RwLock<HashMap<QuoteCacheKey, QuoteCacheValue>>,
@@ -96,14 +105,143 @@ pub struct CachedQuoteProvider {
     cache_ttl: Duration,
     /// Default edge ratio when no quote available (conservative)
     default_edge_ratio: f64,
+    /// SLAVE LivePoolCache (same SSOT as execution-engine) — no RPC on miss.
+    live_pool_cache: SharedLivePoolCache,
 }
 
 impl CachedQuoteProvider {
-    pub fn new(cache_ttl: Duration) -> Self {
+    pub fn new(cache_ttl: Duration, live_pool_cache: SharedLivePoolCache) -> Self {
         Self {
             cache: RwLock::new(HashMap::new()),
             cache_ttl,
             default_edge_ratio: 0.99, // Assume 1% loss when no data
+            live_pool_cache,
+        }
+    }
+
+    fn mints_from_state(state: &CachedPoolState) -> (Pubkey, Pubkey) {
+        match state {
+            CachedPoolState::Orca(s) => (s.token_mint_a, s.token_mint_b),
+            CachedPoolState::RaydiumAmm(s) => (s.base_mint, s.quote_mint),
+            CachedPoolState::RaydiumCpmm(s) => (s.token_0_mint, s.token_1_mint),
+            CachedPoolState::Meteora(s) => (s.token_x_mint, s.token_y_mint),
+            CachedPoolState::MeteoraCpmm(s) => (s.token_0_mint, s.token_1_mint),
+            CachedPoolState::PumpFun(s) => (
+                s.token_mint,
+                Pubkey::from_str(WSOL_MINT).unwrap_or_default(),
+            ),
+            CachedPoolState::PumpAmm(s) => (s.base_mint, s.quote_mint),
+        }
+    }
+
+    fn liquidity_usd_estimate(state: &CachedPoolState) -> f64 {
+        let (base, quote) = match state {
+            CachedPoolState::Orca(s) => (
+                s.vault_a_balance.unwrap_or(0),
+                s.vault_b_balance.unwrap_or(0),
+            ),
+            CachedPoolState::RaydiumAmm(s) => {
+                (s.coin_reserve.unwrap_or(0), s.pc_reserve.unwrap_or(0))
+            }
+            CachedPoolState::RaydiumCpmm(s) => (s.reserve_0.unwrap_or(0), s.reserve_1.unwrap_or(0)),
+            CachedPoolState::Meteora(s) => (
+                s.reserve_x_balance.unwrap_or(0),
+                s.reserve_y_balance.unwrap_or(0),
+            ),
+            CachedPoolState::PumpAmm(s) => {
+                (s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0))
+            }
+            CachedPoolState::PumpFun(s) => (s.virtual_token_reserves, s.virtual_sol_reserves),
+            CachedPoolState::MeteoraCpmm(s) => (s.reserve_0, s.reserve_1),
+        };
+        let sol_side = base.max(quote) as f64 / 1e9 * 150.0;
+        sol_side.max(10_000.0)
+    }
+
+    fn try_quote_from_live_pool_cache(
+        &self,
+        pool_address: &Pubkey,
+        input_mint: &Pubkey,
+        amount_in: u64,
+    ) -> Option<u64> {
+        let state = self.live_pool_cache.get(pool_address)?;
+        let out = quote_calculator::quote_output_amount(&state, amount_in, input_mint).ok()?;
+        (out > 0).then_some(out)
+    }
+
+    fn quote_from_live_pool_cache(
+        &self,
+        pool_address: &Pubkey,
+        input_mint: &Pubkey,
+        amount_in: u64,
+    ) -> Option<u64> {
+        let out = self.try_quote_from_live_pool_cache(pool_address, input_mint, amount_in)?;
+        multi_hop_quote_from_cache_inc();
+        Some(out)
+    }
+
+    fn trade_cache_quote(
+        &self,
+        pool_address: &Pubkey,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+        amount_in: u64,
+    ) -> Option<u64> {
+        let cache = self.cache.read();
+        let (cached_output, ts) = cache.get(&(*pool_address, *input_mint, *output_mint))?;
+        if ts.elapsed() >= self.cache_ttl {
+            return None;
+        }
+        multi_hop_quote_from_trade_cache_inc();
+        Some((*cached_output as u128 * amount_in as u128 / PROBE_LAMPORTS as u128) as u64)
+    }
+
+    /// Seed trade-cache probe quotes from LivePoolCache for top WSOL pools (cold-start).
+    pub fn warmup_from_live_pool_cache(&self, top_n: usize) {
+        let Ok(wsol) = Pubkey::from_str(WSOL_MINT) else {
+            return;
+        };
+
+        let mut candidates: Vec<(Pubkey, CachedPoolState, f64)> = self
+            .live_pool_cache
+            .iter()
+            .filter_map(|(pool_pk, state)| {
+                let (mint_a, mint_b) = Self::mints_from_state(&state);
+                if mint_a != wsol && mint_b != wsol {
+                    return None;
+                }
+                let liq = Self::liquidity_usd_estimate(&state);
+                Some((pool_pk, state, liq))
+            })
+            .collect();
+
+        candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.truncate(top_n);
+        let pool_count = candidates.len();
+
+        let mut seeded = 0usize;
+        for (pool_pk, state, _) in candidates {
+            let (mint_a, mint_b) = Self::mints_from_state(&state);
+            let other = if mint_a == wsol { mint_b } else { mint_a };
+
+            if let Some(out) = self.try_quote_from_live_pool_cache(&pool_pk, &wsol, PROBE_LAMPORTS)
+            {
+                self.update_quote(pool_pk, wsol, other, PROBE_LAMPORTS, out);
+                seeded += 1;
+            }
+            if let Some(out) = self.try_quote_from_live_pool_cache(&pool_pk, &other, PROBE_LAMPORTS)
+            {
+                self.update_quote(pool_pk, other, wsol, PROBE_LAMPORTS, out);
+                seeded += 1;
+            }
+        }
+
+        if seeded > 0 {
+            info!(
+                pools = pool_count,
+                quotes_seeded = seeded,
+                "Multi-hop quote warmup from LivePoolCache"
+            );
         }
     }
 
@@ -117,9 +255,8 @@ impl CachedQuoteProvider {
         output_amount: u64,
     ) {
         // Normalize to probe amount for consistent edge ratio
-        let probe = 10_000_000u64; // 0.01 SOL
         let normalized_output = if input_amount > 0 {
-            (output_amount as u128 * probe as u128 / input_amount as u128) as u64
+            (output_amount as u128 * PROBE_LAMPORTS as u128 / input_amount as u128) as u64
         } else {
             0
         };
@@ -164,16 +301,16 @@ impl QuoteProvider for CachedQuoteProvider {
         output_mint: &Pubkey,
         amount_in: u64,
     ) -> Option<u64> {
-        let cache = self.cache.read();
-
-        if let Some((cached_output, ts)) = cache.get(&(*pool_address, *input_mint, *output_mint)) {
-            if ts.elapsed() < self.cache_ttl {
-                let probe = 10_000_000u64;
-                return Some((*cached_output as u128 * amount_in as u128 / probe as u128) as u64);
-            }
+        if let Some(out) = self.trade_cache_quote(pool_address, input_mint, output_mint, amount_in)
+        {
+            return Some(out);
         }
 
-        // No cached quote - return conservative estimate (ranker skips via has_cached_quote)
+        if let Some(out) = self.quote_from_live_pool_cache(pool_address, input_mint, amount_in) {
+            return Some(out);
+        }
+
+        multi_hop_hop_missing_quote_inc();
         Some((amount_in as f64 * self.default_edge_ratio) as u64)
     }
 
@@ -184,9 +321,14 @@ impl QuoteProvider for CachedQuoteProvider {
         output_mint: &Pubkey,
     ) -> bool {
         let cache = self.cache.read();
-        cache
+        if cache
             .get(&(*pool_address, *input_mint, *output_mint))
             .is_some_and(|(_, ts)| ts.elapsed() < self.cache_ttl)
+        {
+            return true;
+        }
+        self.try_quote_from_live_pool_cache(pool_address, input_mint, PROBE_LAMPORTS)
+            .is_some()
     }
 
     fn get_cached_probe_quote(
@@ -197,13 +339,12 @@ impl QuoteProvider for CachedQuoteProvider {
         output_mint: &Pubkey,
         amount_in: u64,
     ) -> Option<u64> {
-        let cache = self.cache.read();
-        let (cached_output, ts) = cache.get(&(*pool_address, *input_mint, *output_mint))?;
-        if ts.elapsed() >= self.cache_ttl {
-            return None;
+        if let Some(out) = self.trade_cache_quote(pool_address, input_mint, output_mint, amount_in)
+        {
+            return Some(out);
         }
-        let probe = 10_000_000u64;
-        Some((*cached_output as u128 * amount_in as u128 / probe as u128) as u64)
+
+        self.quote_from_live_pool_cache(pool_address, input_mint, amount_in)
     }
 }
 
@@ -232,11 +373,14 @@ pub struct MultiHopArbitrage {
 }
 
 impl MultiHopArbitrage {
-    pub fn new(config: MultiHopConfig) -> Self {
+    pub fn new(config: MultiHopConfig, live_pool_cache: SharedLivePoolCache) -> Self {
         Self {
             config: RwLock::new(config),
             graph: PoolGraph::new(),
-            quote_provider: Arc::new(CachedQuoteProvider::new(Duration::from_secs(30))),
+            quote_provider: Arc::new(CachedQuoteProvider::new(
+                Duration::from_secs(30),
+                live_pool_cache,
+            )),
             token_state: RwLock::new(HashMap::new()),
             pool_mints: RwLock::new(HashMap::new()),
             searches_triggered: AtomicU64::new(0),
@@ -663,6 +807,12 @@ impl MultiHopArbitrage {
     pub fn is_enabled(&self) -> bool {
         self.config.read().enabled
     }
+
+    /// Seed trade-cache probe quotes from LivePoolCache (post-bootstrap cold-start).
+    pub fn warmup_quotes_from_live_pool_cache(&self) {
+        self.quote_provider
+            .warmup_from_live_pool_cache(QUOTE_WARMUP_TOP_N);
+    }
 }
 
 /// Stats for monitoring
@@ -715,6 +865,9 @@ impl QuoteProvider for Arc<CachedQuoteProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::live_pool_cache::{
+        create_shared_cache, CachedPoolState, RaydiumAmmState,
+    };
 
     #[test]
     fn test_multi_hop_config_default() {
@@ -728,11 +881,14 @@ mod tests {
 
     #[test]
     fn test_pool_upsert() {
-        let arb = MultiHopArbitrage::new(MultiHopConfig {
-            enabled: true,
-            min_liquidity_usd: 0.0,
-            ..Default::default()
-        });
+        let arb = MultiHopArbitrage::new(
+            MultiHopConfig {
+                enabled: true,
+                min_liquidity_usd: 0.0,
+                ..Default::default()
+            },
+            create_shared_cache(),
+        );
 
         arb.upsert_pool(
             "11111111111111111111111111111111",
@@ -749,8 +905,48 @@ mod tests {
     }
 
     #[test]
+    fn test_live_pool_cache_quote_without_trade() {
+        let cache = create_shared_cache();
+        let provider = CachedQuoteProvider::new(Duration::from_secs(30), cache.clone());
+
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let token = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumAmm(RaydiumAmmState {
+                base_mint: token,
+                quote_mint: wsol,
+                coin_vault: Pubkey::new_unique(),
+                pc_vault: Pubkey::new_unique(),
+                base_decimals: 9,
+                quote_decimals: 9,
+                coin_reserve: Some(10_000_000_000_000),
+                pc_reserve: Some(1_000_000_000_000),
+                market_id: Pubkey::new_unique(),
+                serum_bids: None,
+                serum_asks: None,
+                serum_event_queue: None,
+            }),
+            1,
+        );
+
+        let probe = PROBE_LAMPORTS;
+        let out = provider
+            .get_cached_probe_quote(&pool, DexType::RaydiumAmmV4, &wsol, &token, probe)
+            .expect("LivePoolCache quote expected");
+        let default_out = (probe as f64 * 0.99) as u64;
+        assert_ne!(
+            out, default_out,
+            "LivePoolCache quote must differ from conservative default"
+        );
+        assert!(out > 0);
+    }
+
+    #[test]
     fn test_cached_quote_provider() {
-        let provider = CachedQuoteProvider::new(Duration::from_secs(30));
+        let provider = CachedQuoteProvider::new(Duration::from_secs(30), create_shared_cache());
 
         let pool = Pubkey::new_unique();
         let input = Pubkey::new_unique();
@@ -767,10 +963,13 @@ mod tests {
 
     #[test]
     fn test_event_driven_disabled() {
-        let arb = MultiHopArbitrage::new(MultiHopConfig {
-            enabled: false, // Disabled
-            ..Default::default()
-        });
+        let arb = MultiHopArbitrage::new(
+            MultiHopConfig {
+                enabled: false, // Disabled
+                ..Default::default()
+            },
+            create_shared_cache(),
+        );
 
         let intents = arb.on_pool_price_update(
             "11111111111111111111111111111111",

@@ -2423,6 +2423,9 @@ pub fn arb_two_hop_opportunity_inc() {
 pub static MULTI_HOP_RETURN_BPS_SATURATED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MULTI_HOP_SHADOW_LOGGED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MULTI_HOP_HOP_MISSING_QUOTE_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MULTI_HOP_QUOTE_FROM_CACHE_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MULTI_HOP_QUOTE_FROM_TRADE_CACHE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static MULTI_HOP_CYCLE_REJECTED_SANITY_EDGE_RATIO: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static MULTI_HOP_CYCLE_REJECTED_SANITY_PROFIT_CAP: Lazy<AtomicU64> =
@@ -2448,6 +2451,14 @@ pub fn multi_hop_shadow_logged_inc() {
 
 pub fn multi_hop_hop_missing_quote_inc() {
     MULTI_HOP_HOP_MISSING_QUOTE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn multi_hop_quote_from_cache_inc() {
+    MULTI_HOP_QUOTE_FROM_CACHE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn multi_hop_quote_from_trade_cache_inc() {
+    MULTI_HOP_QUOTE_FROM_TRADE_CACHE_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn multi_hop_cycle_rejected_sanity_inc(reason: MultiHopSanityRejectReason) {
@@ -4329,6 +4340,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "multi_hop_hop_missing_quote_total",
         MULTI_HOP_HOP_MISSING_QUOTE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "multi_hop_quote_from_cache_total",
+        MULTI_HOP_QUOTE_FROM_CACHE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "multi_hop_quote_from_trade_cache_total",
+        MULTI_HOP_QUOTE_FROM_TRADE_CACHE_TOTAL.load(Ordering::Relaxed)
     );
     out.push_str("multi_hop_cycle_rejected_sanity_total{reason=\"edge_ratio\"} ");
     out.push_str(

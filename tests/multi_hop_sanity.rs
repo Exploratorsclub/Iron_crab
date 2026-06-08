@@ -107,6 +107,54 @@ fn find_cycles_never_emits_i32_max_return_bps() {
 }
 
 #[test]
+fn two_hop_sol_token_sol_plausible_return_bps() {
+    let graph = PoolGraph::new();
+    let mut mock = MockQuoteProvider::new();
+    let wsol = test_pubkey(0x01);
+    let token = test_pubkey(0x02);
+    let probe = 10_000_000u64;
+
+    let pool_out = test_pubkey(0x10);
+    let pool_back = test_pubkey(0x11);
+
+    graph.upsert_pool(PoolEdge::new(
+        pool_out,
+        DexType::RaydiumAmmV4,
+        wsol,
+        token,
+        500_000.0,
+        30,
+    ));
+    graph.upsert_pool(PoolEdge::new(
+        pool_back,
+        DexType::RaydiumAmmV4,
+        token,
+        wsol,
+        500_000.0,
+        30,
+    ));
+
+    // ~2% edge per hop → ~4% round-trip (before sanity caps)
+    mock.add_quote(pool_out, wsol, token, probe, 10_200_000);
+    mock.add_quote(pool_back, token, wsol, probe, 10_200_000);
+
+    let config = CycleFinderConfig {
+        min_profit_bps: 30,
+        base_mint: wsol,
+        max_hops: 3,
+        ..Default::default()
+    };
+    let finder = BeamCycleFinder::new(config, PoolRanker::new(mock));
+    let cycles = finder.find_cycles(&graph);
+
+    assert!(!cycles.is_empty(), "expected profitable 2-hop WSOL cycle");
+    let best = &cycles[0];
+    assert!(best.estimated_return_bps >= 30);
+    assert_ne!(best.estimated_return_bps, i32::MAX);
+    assert!(best.estimated_return_bps <= MAX_RETURN_BPS);
+}
+
+#[test]
 fn profit_to_return_bps_clamp_semantics() {
     let (bps, sat) = profit_to_return_bps(100.0);
     assert!(sat);
