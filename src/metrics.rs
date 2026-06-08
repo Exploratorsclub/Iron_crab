@@ -2371,6 +2371,9 @@ pub static ARB_REJECTED_MISSING_ACCOUNTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU
 /// 2-hop cross-DEX opportunities that passed all filters in arb-strategy
 pub static ARB_TWO_HOP_OPPORTUNITIES: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+/// Pools seeded into TokenArbTracker from SLAVE LivePoolCache (reserve-mid, no Trade event).
+pub static ARB_TWO_HOP_TRACKER_SEEDED_POOLS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
 /// 2-hop reject breakdown (arb-strategy `check_arbitrage`)
 pub static ARB_TWO_HOP_REJECTED_SPREAD_TOO_LARGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_REJECTED_SPREAD_BELOW_MIN: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -2417,6 +2420,11 @@ pub fn arb_two_hop_rejected_inc(reason: ArbTwoHopRejectReason) {
 /// Increment `arb_two_hop_opportunities_total`.
 pub fn arb_two_hop_opportunity_inc() {
     ARB_TWO_HOP_OPPORTUNITIES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Add to `arb_two_hop_tracker_seeded_pools_total` after SLAVE cache tracker seed.
+pub fn arb_two_hop_tracker_seeded_pools_add(count: u64) {
+    ARB_TWO_HOP_TRACKER_SEEDED_POOLS.fetch_add(count, Ordering::Relaxed);
 }
 
 // --- Multi-hop shadow / cycle sanity (arb-strategy) ---
@@ -4265,6 +4273,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_two_hop_opportunities_total",
         ARB_TWO_HOP_OPPORTUNITIES.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_two_hop_tracker_seeded_pools_total",
+        ARB_TWO_HOP_TRACKER_SEEDED_POOLS.load(Ordering::Relaxed)
     );
     out.push_str("arb_two_hop_rejected_total{reason=\"spread_too_large\"} ");
     out.push_str(
