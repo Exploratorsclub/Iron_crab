@@ -22,7 +22,7 @@ fn empty_known_pools() -> RwLock<HashSet<String>> {
 fn balance_updated_only_populates_known_pools() {
     let cache = create_shared_cache();
     let known_pools = empty_known_pools();
-    let multi_hop = MultiHopArbitrage::new(MultiHopConfig::default());
+    let multi_hop = MultiHopArbitrage::new(MultiHopConfig::default(), cache.clone());
 
     let pool = Pubkey::new_unique().to_string();
     let base_mint = Pubkey::new_unique().to_string();
@@ -54,7 +54,7 @@ fn balance_updated_only_populates_known_pools() {
 fn pool_removed_evicts_known_pools_entry() {
     let cache = create_shared_cache();
     let known_pools = empty_known_pools();
-    let multi_hop = MultiHopArbitrage::new(MultiHopConfig::default());
+    let multi_hop = MultiHopArbitrage::new(MultiHopConfig::default(), cache.clone());
 
     let pool = Pubkey::new_unique().to_string();
     let base_mint = Pubkey::new_unique().to_string();
@@ -92,7 +92,7 @@ fn pool_removed_evicts_known_pools_entry() {
 fn pool_discovered_then_balance_updated_keeps_single_known_pools_entry() {
     let cache = create_shared_cache();
     let known_pools = empty_known_pools();
-    let multi_hop = MultiHopArbitrage::new(MultiHopConfig::default());
+    let multi_hop = MultiHopArbitrage::new(MultiHopConfig::default(), cache.clone());
 
     let pool = Pubkey::new_unique().to_string();
     let base_mint = Pubkey::new_unique().to_string();
@@ -136,7 +136,7 @@ fn pool_discovered_then_balance_updated_keeps_single_known_pools_entry() {
 fn balance_updated_upserts_multi_hop_idempotently() {
     let cache = create_shared_cache();
     let known_pools = empty_known_pools();
-    let multi_hop = MultiHopArbitrage::new(MultiHopConfig::default());
+    let multi_hop = MultiHopArbitrage::new(MultiHopConfig::default(), cache.clone());
 
     let pool = Pubkey::new_unique().to_string();
     let base_mint = Pubkey::new_unique().to_string();
@@ -169,7 +169,7 @@ fn balance_updated_upserts_multi_hop_idempotently() {
 fn populate_from_live_cache_matches_cache_len() {
     let cache = create_shared_cache();
     let known_pools = empty_known_pools();
-    let multi_hop = MultiHopArbitrage::new(MultiHopConfig::default());
+    let multi_hop = MultiHopArbitrage::new(MultiHopConfig::default(), cache.clone());
 
     let pool = Pubkey::new_unique().to_string();
     let update = PoolCacheUpdate::new_balance_updated(

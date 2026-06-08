@@ -1998,6 +1998,9 @@ async fn main() -> Result<()> {
         Some(client)
     };
 
+    let live_pool_cache = create_shared_cache();
+    let multi_hop = MultiHopArbitrage::new(MultiHopConfig::default(), live_pool_cache.clone());
+
     let ctx = Arc::new(ArbContext {
         run_id: run_id.clone(),
         config: RwLock::new(initial_config),
@@ -2014,10 +2017,9 @@ async fn main() -> Result<()> {
         last_market_event: RwLock::new(Instant::now()),
         vault_balances: RwLock::new(HashMap::new()),
         bin_arrays: RwLock::new(HashMap::new()),
-        live_pool_cache: create_shared_cache(),
+        live_pool_cache,
         known_pools: RwLock::new(HashSet::new()),
-        // Multi-hop arbitrage: disabled and shadow mode by default for safe rollout
-        multi_hop: MultiHopArbitrage::new(MultiHopConfig::default()),
+        multi_hop,
     });
 
     // Bootstrap SLAVE LivePoolCache from JetStream (same path as execution-engine).
@@ -2030,6 +2032,7 @@ async fn main() -> Result<()> {
                     &ctx.known_pools,
                     &ctx.multi_hop,
                 );
+                ctx.multi_hop.warmup_quotes_from_live_pool_cache();
                 let mh_stats = ctx.multi_hop.stats();
                 info!(
                     pools_recovered,
