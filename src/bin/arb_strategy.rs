@@ -473,11 +473,13 @@ fn sol_quoted_pool_seed(state: &CachedPoolState) -> Option<SolQuotedPoolSeed> {
 }
 
 /// Seed TokenArbTracker pools for one mint from SLAVE LivePoolCache (Geyser-only, no RPC).
+/// When `only_pool` is set, only that pool address is upserted (incremental JetStream updates).
 fn seed_token_tracker_from_live_pool_cache(
     mint: &str,
     live_pool_cache: &LivePoolCache,
     trackers: &mut HashMap<String, TokenArbTracker>,
     vault_balances: &mut HashMap<String, VaultBalanceCache>,
+    only_pool: Option<&str>,
 ) -> usize {
     let mut seeded = 0usize;
     for (pool_pk, state) in live_pool_cache.iter() {
@@ -495,6 +497,9 @@ fn seed_token_tracker_from_live_pool_cache(
         }
 
         let pool_addr = pool_pk.to_string();
+        if only_pool.is_some_and(|filter| filter != pool_addr) {
+            continue;
+        }
         let (_, slot, age_ms) =
             live_pool_cache
                 .get_with_metadata(&pool_pk)
@@ -561,6 +566,7 @@ fn seed_token_tracker_from_live_pool_cache(
         )
         .or(reserve_price);
 
+        let is_new_pool = !tracker.pools.contains_key(&pool_addr);
         tracker.upsert_pool(PoolState {
             pool_address: pool_addr,
             dex: dex.to_string(),
@@ -573,7 +579,9 @@ fn seed_token_tracker_from_live_pool_cache(
             trade_count: seed_pool.trade_count,
             dex_accounts: seed_pool.dex_accounts,
         });
-        seeded += 1;
+        if is_new_pool {
+            seeded += 1;
+        }
     }
     if seeded > 0 {
         arb_two_hop_tracker_seeded_pools_add(seeded as u64);
@@ -605,6 +613,7 @@ fn seed_all_trackers_from_live_pool_cache(
             live_pool_cache,
             trackers,
             vault_balances,
+            None,
         );
     }
     total
@@ -1512,18 +1521,6 @@ impl ArbContext {
         }
     }
 
-    /// Seed TokenArbTracker for one mint from SLAVE LivePoolCache (no RPC).
-    fn seed_trackers_for_mint(&self, mint: &str) -> usize {
-        let mut trackers = self.trackers.write();
-        let mut vault_balances = self.vault_balances.write();
-        seed_token_tracker_from_live_pool_cache(
-            mint,
-            &self.live_pool_cache,
-            &mut trackers,
-            &mut vault_balances,
-        )
-    }
-
     /// Seed all SOL-quoted mints after JetStream bootstrap.
     fn seed_all_trackers_from_live_pool_cache(&self) -> usize {
         let mut trackers = self.trackers.write();
@@ -1550,7 +1547,15 @@ impl ArbContext {
         if mint == NATIVE_SOL_MINT {
             return;
         }
-        let seeded = self.seed_trackers_for_mint(mint);
+        let mut trackers = self.trackers.write();
+        let mut vault_balances = self.vault_balances.write();
+        let seeded = seed_token_tracker_from_live_pool_cache(
+            mint,
+            &self.live_pool_cache,
+            &mut trackers,
+            &mut vault_balances,
+            Some(&update.pool_address),
+        );
         if seeded > 0 {
             debug!(
                 mint = %mint,
@@ -3199,6 +3204,7 @@ mod two_hop_price_tests {
             &cache,
             &mut trackers,
             &mut vault_balances,
+            None,
         );
         assert_eq!(seeded, 2);
 
