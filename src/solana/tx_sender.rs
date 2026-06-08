@@ -209,6 +209,37 @@ impl TxSender {
         self.send_sequential(tx).await
     }
 
+    /// Rebroadcast-safe send: TPU and/or RPC only, never Jito.
+    ///
+    /// Used during confirmation wait where rebroadcast must mirror the
+    /// documented TPU-with-RPC-fallback semantics, not the full fallback chain.
+    pub async fn send_tpu_then_rpc(&self, tx: &Transaction) -> Result<SendResult, SendError> {
+        if self.config.parallel_send && self.tpu.is_some() {
+            return self.send_parallel(tx).await;
+        }
+
+        if self.tpu.is_some() {
+            match self.send_via_tpu(tx).await {
+                Ok(sig) => {
+                    return Ok(SendResult {
+                        signature: sig,
+                        method: SendMethod::TpuDirect,
+                        bundle_id: None,
+                    });
+                }
+                Err(e) => {
+                    warn!(error = %e, "Rebroadcast: TPU failed, falling back to RPC");
+                }
+            }
+        }
+
+        self.send_via_rpc(tx).await.map(|sig| SendResult {
+            signature: sig,
+            method: SendMethod::Rpc,
+            bundle_id: None,
+        })
+    }
+
     /// Send via TPU and RPC in parallel. First success wins.
     /// Both methods send the same signed TX, so Solana deduplicates by signature.
     /// This ensures maximum reliability without paying double fees.

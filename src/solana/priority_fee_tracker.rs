@@ -55,7 +55,9 @@ pub struct PriorityFeeConfig {
     pub max_priority_fee_micro_lamports: u64,
     /// Tier0 multiplier (applied to P90)
     pub tier0_multiplier: f64,
-    /// Tier1 multiplier (applied to P50)
+    /// Tier1 percentile base (50 = P50, 75 = P75)
+    pub tier1_fee_percentile: u8,
+    /// Tier1 multiplier (applied to tier1 percentile)
     pub tier1_multiplier: f64,
     /// Arb multiplier (applied to P75)
     pub arb_multiplier: f64,
@@ -70,6 +72,7 @@ impl Default for PriorityFeeConfig {
             min_priority_fee_micro_lamports: 10_000, // 0.01 lamports/CU
             max_priority_fee_micro_lamports: 2_000_000, // 2 lamports/CU
             tier0_multiplier: 1.5,
+            tier1_fee_percentile: 50,
             tier1_multiplier: 1.2,
             arb_multiplier: 1.3,
             base_fee_lamports: 5_000,
@@ -229,7 +232,10 @@ impl PriorityFeeTracker {
 
         let (base_percentile, multiplier) = match tier {
             IntentTier::Tier0 => (percentiles.p90, self.config.tier0_multiplier),
-            IntentTier::Tier1 => (percentiles.p50, self.config.tier1_multiplier),
+            IntentTier::Tier1 => (
+                Self::percentile_for_tier1(self.config.tier1_fee_percentile, &percentiles),
+                self.config.tier1_multiplier,
+            ),
             IntentTier::Arb => (percentiles.p75, self.config.arb_multiplier),
         };
 
@@ -240,6 +246,16 @@ impl PriorityFeeTracker {
             self.config.min_priority_fee_micro_lamports,
             self.config.max_priority_fee_micro_lamports,
         )
+    }
+
+    /// Resolve configured Tier1 percentile (50 or 75) from cached percentiles.
+    fn percentile_for_tier1(percentile: u8, percentiles: &FeePercentiles) -> u64 {
+        match percentile {
+            75 => percentiles.p75,
+            90 => percentiles.p90,
+            25 => percentiles.p25,
+            _ => percentiles.p50,
+        }
     }
 
     /// Get sample count
@@ -325,6 +341,37 @@ mod tests {
         // Should be clamped to minimum
         let fee = tracker.get_fee_for_tier(IntentTier::Tier1);
         assert!(fee >= 50_000);
+    }
+
+    #[test]
+    fn test_tier1_p50_vs_p75_percentile_config() {
+        let tracker_p50 = PriorityFeeTracker::with_config(PriorityFeeConfig {
+            tier1_fee_percentile: 50,
+            tier1_multiplier: 1.2,
+            min_priority_fee_micro_lamports: 1_000,
+            max_priority_fee_micro_lamports: 10_000_000,
+            ..PriorityFeeConfig::default()
+        });
+        let tracker_p75 = PriorityFeeTracker::with_config(PriorityFeeConfig {
+            tier1_fee_percentile: 75,
+            tier1_multiplier: 1.2,
+            min_priority_fee_micro_lamports: 1_000,
+            max_priority_fee_micro_lamports: 10_000_000,
+            ..PriorityFeeConfig::default()
+        });
+
+        for i in 1..=20u64 {
+            let fee = 5_000 + i * 2_000;
+            tracker_p50.add_sample(i, fee, Some(100_000));
+            tracker_p75.add_sample(i, fee, Some(100_000));
+        }
+
+        let fee_p50 = tracker_p50.get_fee_for_tier(IntentTier::Tier1);
+        let fee_p75 = tracker_p75.get_fee_for_tier(IntentTier::Tier1);
+        assert!(
+            fee_p75 > fee_p50,
+            "P75×1.2 should exceed P50×1.2 on same samples"
+        );
     }
 
     #[test]

@@ -11624,10 +11624,11 @@ async fn handle_geyser_transaction(
                     debug!(error = %e, "Failed to publish priority fee percentiles");
                 }
             }
-            debug!(
+            info!(
                 samples = sample_count,
                 p50 = percentiles.p50,
                 p90 = percentiles.p90,
+                tier1_recommended = ctx.priority_fee_tracker.get_fee_for_tier(IntentTier::Tier1),
                 last_fee = priority_fee,
                 "priority_fee: published percentiles"
             );
