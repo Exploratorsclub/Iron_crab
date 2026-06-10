@@ -11660,7 +11660,13 @@ mod tests {
     ) -> Arc<MomentumContext> {
         let (intent_publish_tx, intent_publish_rx) = mpsc::channel(INTENT_PUBLISH_QUEUE_CAP);
         let ctx = empty_test_context_with_publish_sender(jsonl_writer, config, intent_publish_tx);
-        let _ = spawn_intent_publish_worker(Arc::clone(&ctx), intent_publish_rx, None, None);
+        // Detach worker for test lifetime: aborting the JoinHandle would stop in-flight publishes.
+        std::mem::forget(spawn_intent_publish_worker(
+            Arc::clone(&ctx),
+            intent_publish_rx,
+            None,
+            None,
+        ));
         ctx
     }
 
@@ -11732,8 +11738,12 @@ mod tests {
         let (tx, rx) = mpsc::channel(INTENT_PUBLISH_QUEUE_CAP);
         let ctx =
             empty_test_context_with_publish_sender(jsonl_writer, MomentumConfig::default(), tx);
-        let _ =
-            spawn_intent_publish_worker(Arc::clone(&ctx), rx, None, Some(Arc::clone(&processed)));
+        std::mem::forget(spawn_intent_publish_worker(
+            Arc::clone(&ctx),
+            rx,
+            None,
+            Some(Arc::clone(&processed)),
+        ));
 
         let ids = ["int-order-001", "int-order-002", "int-order-003"];
         for intent_id in ids {
