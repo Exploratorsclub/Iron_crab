@@ -234,6 +234,28 @@ impl<Q: QuoteProvider> PoolRanker<Q> {
         self.max_edge_ratio.write().clear();
     }
 
+    /// Whether a fresh cached probe quote exists for this hop direction.
+    ///
+    /// Uses the same `probe_amount` as beam expansion (`rank_single_pool`) so the
+    /// final cycle gate cannot reject hops that were already ranked successfully.
+    pub fn hop_has_cached_quote(
+        &self,
+        pool_address: &Pubkey,
+        dex: DexType,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+    ) -> bool {
+        self.quote_provider
+            .get_cached_probe_quote(
+                pool_address,
+                dex,
+                input_mint,
+                output_mint,
+                self.config.probe_amount,
+            )
+            .is_some()
+    }
+
     fn update_max_edge_ratios(&self, updates: Vec<(Pubkey, f64)>) {
         if updates.is_empty() {
             return;
@@ -253,6 +275,8 @@ impl<Q: QuoteProvider> PoolRanker<Q> {
 #[cfg(any(test, feature = "test_helpers"))]
 pub struct MockQuoteProvider {
     quotes: HashMap<(Pubkey, Pubkey, Pubkey), u64>, // (pool, input, output) -> quote
+    /// Probe-quote lookups (for subgraph search tests).
+    probe_lookups: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(any(test, feature = "test_helpers"))]
@@ -260,7 +284,18 @@ impl MockQuoteProvider {
     pub fn new() -> Self {
         Self {
             quotes: HashMap::new(),
+            probe_lookups: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    pub fn probe_lookup_count(&self) -> u64 {
+        self.probe_lookups
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn reset_probe_lookup_count(&self) {
+        self.probe_lookups
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn add_quote(
@@ -275,12 +310,50 @@ impl MockQuoteProvider {
         let _ = input_amount; // We ignore input amount for simplicity in mock
         self.quotes.insert((pool, input, output), output_amount);
     }
+
+    pub fn remove_quote(&mut self, pool: Pubkey, input: Pubkey, output: Pubkey) {
+        self.quotes.remove(&(pool, input, output));
+    }
 }
 
 #[cfg(any(test, feature = "test_helpers"))]
 impl Default for MockQuoteProvider {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "test_helpers"))]
+impl QuoteProvider for std::sync::Arc<MockQuoteProvider> {
+    fn get_quote(
+        &self,
+        pool_address: &Pubkey,
+        dex: DexType,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+        amount_in: u64,
+    ) -> Option<u64> {
+        (**self).get_quote(pool_address, dex, input_mint, output_mint, amount_in)
+    }
+
+    fn has_cached_quote(
+        &self,
+        pool_address: &Pubkey,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+    ) -> bool {
+        (**self).has_cached_quote(pool_address, input_mint, output_mint)
+    }
+
+    fn get_cached_probe_quote(
+        &self,
+        pool_address: &Pubkey,
+        dex: DexType,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+        amount_in: u64,
+    ) -> Option<u64> {
+        (**self).get_cached_probe_quote(pool_address, dex, input_mint, output_mint, amount_in)
     }
 }
 
@@ -297,6 +370,32 @@ impl QuoteProvider for MockQuoteProvider {
         self.quotes
             .get(&(*pool_address, *input_mint, *output_mint))
             .copied()
+    }
+
+    fn has_cached_quote(
+        &self,
+        pool_address: &Pubkey,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+    ) -> bool {
+        self.quotes
+            .contains_key(&(*pool_address, *input_mint, *output_mint))
+    }
+
+    fn get_cached_probe_quote(
+        &self,
+        pool_address: &Pubkey,
+        dex: DexType,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+        amount_in: u64,
+    ) -> Option<u64> {
+        self.probe_lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !self.has_cached_quote(pool_address, input_mint, output_mint) {
+            return None;
+        }
+        self.get_quote(pool_address, dex, input_mint, output_mint, amount_in)
     }
 }
 
