@@ -3599,7 +3599,7 @@ impl MarketDataContext {
                 let was_arb = v.pin == Some(GeyserPinReason::ArbMultiDex);
                 v.pinned = true;
                 v.pin = Some(GeyserPinReason::ArbMultiDex);
-                pin_map.entry(pk).or_insert(now);
+                pin_map.insert(pk, now);
                 changed |= !was_arb;
             } else if let Some(b) = bins.get_mut(&pk) {
                 if b.pin == Some(GeyserPinReason::Wallet)
@@ -3610,7 +3610,7 @@ impl MarketDataContext {
                 let was_arb = b.pin == Some(GeyserPinReason::ArbMultiDex);
                 b.pinned = true;
                 b.pin = Some(GeyserPinReason::ArbMultiDex);
-                pin_map.entry(pk).or_insert(now);
+                pin_map.insert(pk, now);
                 changed |= !was_arb;
             }
         }
@@ -4283,14 +4283,22 @@ impl MarketDataContext {
             let cfg = self.config.read();
             (cfg.enable_meteora_cpmm, cfg.enable_meteora_dlmm)
         };
-        self.register_four_dex_pool_vaults_from_cached_state(
+        let now = Instant::now();
+        let mut changed = self.register_four_dex_pool_vaults_from_cached_state(
             pool,
             &cached_state,
-            Instant::now(),
+            now,
             enable_meteora_cpmm,
             enable_meteora_dlmm,
             true,
-        )
+        );
+        if !self.active_pool_set.pool_has_any_pin(pool)
+            && self.pool_admitted_for_arb_multi_dex(pool)
+            && self.apply_arb_multi_dex_pins_for_pool(pool, now)
+        {
+            changed = true;
+        }
+        changed
     }
 
     /// PR-D: explicit vault/bin subscriptions for momentum active `(mint, pool)` when cache has layout.
