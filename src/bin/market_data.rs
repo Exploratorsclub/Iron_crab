@@ -3317,29 +3317,39 @@ fn is_arb_common_quote_mint(mint: &Pubkey) -> bool {
     *mint == sol || *mint == usdc || *mint == usdt
 }
 
-/// Arb-relevant token leg: the mint that is not a common quote asset when exactly one leg is.
-fn arb_token_mint_from_pair(mint_a: Pubkey, mint_b: Pubkey) -> Option<Pubkey> {
+/// Arb-relevant token leg(s): non-quote mint when exactly one leg is a common quote; both legs for token-token.
+fn arb_candidate_mints_from_pair(mint_a: Pubkey, mint_b: Pubkey) -> Vec<Pubkey> {
     let a_quote = is_arb_common_quote_mint(&mint_a);
     let b_quote = is_arb_common_quote_mint(&mint_b);
     match (a_quote, b_quote) {
-        (true, false) => Some(mint_b),
-        (false, true) => Some(mint_a),
-        (false, false) => Some(mint_a),
-        (true, true) => None,
+        (true, false) => vec![mint_b],
+        (false, true) => vec![mint_a],
+        (false, false) => vec![mint_a, mint_b],
+        (true, true) => Vec::new(),
     }
 }
 
-/// Non-SOL token leg from a cached pool row (arb-relevant base mint).
-fn arb_token_mint_from_cached_pool(state: &CachedPoolState) -> Option<Pubkey> {
+/// Arb-relevant mint candidates from a cached pool row (one or both legs for token-token pairs).
+fn arb_candidate_mints_from_cached_pool(state: &CachedPoolState) -> Vec<Pubkey> {
     match state {
-        CachedPoolState::RaydiumCpmm(s) => arb_token_mint_from_pair(s.token_0_mint, s.token_1_mint),
-        CachedPoolState::MeteoraCpmm(s) => arb_token_mint_from_pair(s.token_0_mint, s.token_1_mint),
-        CachedPoolState::Meteora(s) => arb_token_mint_from_pair(s.token_x_mint, s.token_y_mint),
-        CachedPoolState::PumpAmm(s) => arb_token_mint_from_pair(s.base_mint, s.quote_mint),
-        CachedPoolState::Orca(s) => arb_token_mint_from_pair(s.token_mint_a, s.token_mint_b),
-        CachedPoolState::RaydiumAmm(s) => arb_token_mint_from_pair(s.base_mint, s.quote_mint),
-        CachedPoolState::PumpFun(s) => Some(s.token_mint),
+        CachedPoolState::RaydiumCpmm(s) => {
+            arb_candidate_mints_from_pair(s.token_0_mint, s.token_1_mint)
+        }
+        CachedPoolState::MeteoraCpmm(s) => {
+            arb_candidate_mints_from_pair(s.token_0_mint, s.token_1_mint)
+        }
+        CachedPoolState::Meteora(s) => {
+            arb_candidate_mints_from_pair(s.token_x_mint, s.token_y_mint)
+        }
+        CachedPoolState::PumpAmm(s) => arb_candidate_mints_from_pair(s.base_mint, s.quote_mint),
+        CachedPoolState::Orca(s) => arb_candidate_mints_from_pair(s.token_mint_a, s.token_mint_b),
+        CachedPoolState::RaydiumAmm(s) => arb_candidate_mints_from_pair(s.base_mint, s.quote_mint),
+        CachedPoolState::PumpFun(s) => vec![s.token_mint],
     }
+}
+
+fn token_mint_is_multi_dex_in_cache(cache: &LivePoolCache, token_mint: &Pubkey) -> bool {
+    distinct_dex_count_for_token_mint(cache, token_mint) >= 2
 }
 
 /// Base + quote mint pubkeys for explicit mint-account Geyser tracking (metadata).
@@ -3466,15 +3476,64 @@ impl MarketDataContext {
             || self.pool_admitted_for_arb_multi_dex(pool)
     }
 
-    /// True when the pool's arb-relevant token mint appears on ≥2 distinct DEXes in MASTER cache.
+    /// True when any arb-relevant pool leg appears on ≥2 distinct DEXes in MASTER cache.
     fn pool_admitted_for_arb_multi_dex(&self, pool: Pubkey) -> bool {
         let Some(state) = self.live_pool_cache.get(&pool) else {
             return false;
         };
-        let Some(token_mint) = arb_token_mint_from_cached_pool(&state) else {
-            return false;
-        };
-        distinct_dex_count_for_token_mint(self.live_pool_cache.as_ref(), &token_mint) >= 2
+        let cache = self.live_pool_cache.as_ref();
+        arb_candidate_mints_from_cached_pool(&state)
+            .iter()
+            .any(|mint| token_mint_is_multi_dex_in_cache(cache, mint))
+    }
+
+    fn arb_pinned_pubkeys_for_pool(&self, pool: Pubkey) -> Vec<Pubkey> {
+        let mut out = Vec::new();
+        for (pk, v) in self.tracked_vaults.read().iter() {
+            if v.pool_address == pool && v.pin == Some(GeyserPinReason::ArbMultiDex) {
+                out.push(*pk);
+            }
+        }
+        for (pk, b) in self.tracked_bin_arrays.read().iter() {
+            if b.pool_address == pool && b.pin == Some(GeyserPinReason::ArbMultiDex) {
+                out.push(*pk);
+            }
+        }
+        out
+    }
+
+    /// Pool whose oldest arb pin timestamp is globally minimum (LRU eviction unit = whole pool).
+    fn oldest_arb_pinned_pool_to_evict(&self) -> Option<Pubkey> {
+        let pins = self.arb_pin_set.read();
+        let vaults = self.tracked_vaults.read();
+        let bins = self.tracked_bin_arrays.read();
+        let mut pool_oldest: HashMap<Pubkey, Instant> = HashMap::new();
+        for (pk, pinned_at) in pins.iter() {
+            let pool = vaults
+                .get(pk)
+                .filter(|v| v.pin == Some(GeyserPinReason::ArbMultiDex))
+                .map(|v| v.pool_address)
+                .or_else(|| {
+                    bins.get(pk)
+                        .filter(|b| b.pin == Some(GeyserPinReason::ArbMultiDex))
+                        .map(|b| b.pool_address)
+                });
+            let Some(pool) = pool else {
+                continue;
+            };
+            pool_oldest
+                .entry(pool)
+                .and_modify(|oldest| {
+                    if *pinned_at < *oldest {
+                        *oldest = *pinned_at;
+                    }
+                })
+                .or_insert(*pinned_at);
+        }
+        pool_oldest
+            .into_iter()
+            .min_by_key(|(_, oldest)| *oldest)
+            .map(|(pool, _)| pool)
     }
 
     fn demote_arb_pin_pubkey(&self, pubkey: Pubkey) {
@@ -3493,6 +3552,16 @@ impl MarketDataContext {
         }
     }
 
+    /// Demote all arb-multi-dex pins for one pool (vault legs + bin arrays atomically).
+    fn demote_arb_pins_for_pool(&self, pool: Pubkey) -> usize {
+        let pubkeys = self.arb_pinned_pubkeys_for_pool(pool);
+        let n = pubkeys.len();
+        for pk in pubkeys {
+            self.demote_arb_pin_pubkey(pk);
+        }
+        n
+    }
+
     /// Evict oldest arb-multi-dex pins until `slots_needed` new pins can fit under budget.
     fn evict_oldest_arb_pins_for_budget(&self, slots_needed: usize) {
         loop {
@@ -3505,16 +3574,13 @@ impl MarketDataContext {
             if need_evict == 0 {
                 break;
             }
-            let oldest_pk = {
-                let pins = self.arb_pin_set.read();
-                pins.iter()
-                    .min_by_key(|(_, pinned_at)| *pinned_at)
-                    .map(|(pk, _)| *pk)
-            };
-            let Some(oldest_pk) = oldest_pk else {
+            let Some(oldest_pool) = self.oldest_arb_pinned_pool_to_evict() else {
                 break;
             };
-            self.demote_arb_pin_pubkey(oldest_pk);
+            let freed = self.demote_arb_pins_for_pool(oldest_pool);
+            if freed == 0 {
+                break;
+            }
             inc_market_data_arb_pin_evictions_total();
         }
     }
@@ -16201,6 +16267,172 @@ mod pr_b_geyser_tracking_tests {
             second > first,
             "arb pin LRU timestamp must refresh on reapply"
         );
+    }
+
+    #[test]
+    fn pool_admitted_for_arb_multi_dex_checks_both_legs_on_token_token_pool() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let token_a = Pubkey::new_unique();
+        let token_b = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let pool_token_token = Pubkey::new_unique();
+        let pool_b_orca = Pubkey::new_unique();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool_token_token,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: token_a,
+                token_1_mint: token_b,
+                token_0_vault: coin_vault,
+                token_1_vault: pc_vault,
+                reserve_0: None,
+                reserve_1: None,
+            }),
+            1,
+        );
+        ctx.live_pool_cache.upsert(
+            pool_b_orca,
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: token_b,
+                token_mint_b: other,
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+                tick_current_index: 0,
+                sqrt_price: 1u128 << 64,
+                liquidity: 1,
+                fee_rate: 3000,
+                protocol_fee_rate: 300,
+                tick_spacing: 64,
+                vault_a_balance: None,
+                vault_b_balance: None,
+                token_a_program: None,
+                token_b_program: None,
+            }),
+            1,
+        );
+
+        assert_eq!(
+            distinct_dex_count_for_token_mint(&ctx.live_pool_cache, &token_a),
+            1
+        );
+        assert!(distinct_dex_count_for_token_mint(&ctx.live_pool_cache, &token_b) >= 2);
+        assert!(ctx.pool_admitted_for_arb_multi_dex(pool_token_token));
+
+        MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool_token_token);
+        let vs = ctx.tracked_vaults.read();
+        assert_eq!(
+            vs.get(&coin_vault).unwrap().pin,
+            Some(GeyserPinReason::ArbMultiDex)
+        );
+        assert_eq!(
+            vs.get(&pc_vault).unwrap().pin,
+            Some(GeyserPinReason::ArbMultiDex)
+        );
+    }
+
+    #[test]
+    fn demote_arb_pins_for_pool_clears_both_vault_legs() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        let now = Instant::now();
+        let mk_vault = |is_base: bool| VaultInfo {
+            pool_address: pool,
+            dex: "raydium_cpmm".to_string(),
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+            is_base_vault: is_base,
+            last_balance: std::sync::atomic::AtomicU64::new(0),
+            last_used_at: now,
+            pinned: true,
+            pin: Some(GeyserPinReason::ArbMultiDex),
+            active_id: None,
+            bin_step: None,
+        };
+        {
+            let mut vs = ctx.tracked_vaults.write();
+            vs.insert(base_vault, mk_vault(true));
+            vs.insert(quote_vault, mk_vault(false));
+        }
+        {
+            let mut pins = ctx.arb_pin_set.write();
+            pins.insert(base_vault, now);
+            pins.insert(quote_vault, now);
+        }
+
+        assert_eq!(ctx.demote_arb_pins_for_pool(pool), 2);
+        let vs = ctx.tracked_vaults.read();
+        assert!(!vs.get(&base_vault).unwrap().pinned);
+        assert!(!vs.get(&quote_vault).unwrap().pinned);
+        assert!(ctx.arb_pin_set.read().is_empty());
+    }
+
+    #[test]
+    fn evict_oldest_arb_pins_demotes_whole_pool_not_single_leg() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool_old = Pubkey::new_unique();
+        let pool_new = Pubkey::new_unique();
+        let old_base = Pubkey::new_unique();
+        let old_quote = Pubkey::new_unique();
+        let new_base = Pubkey::new_unique();
+        let new_quote = Pubkey::new_unique();
+        let old_at = Instant::now() - Duration::from_secs(120);
+        let new_at = Instant::now();
+
+        let mk_vault = |pool: Pubkey, is_base: bool| VaultInfo {
+            pool_address: pool,
+            dex: "raydium_cpmm".to_string(),
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+            is_base_vault: is_base,
+            last_balance: std::sync::atomic::AtomicU64::new(0),
+            last_used_at: Instant::now(),
+            pinned: true,
+            pin: Some(GeyserPinReason::ArbMultiDex),
+            active_id: None,
+            bin_step: None,
+        };
+        {
+            let mut vs = ctx.tracked_vaults.write();
+            vs.insert(old_base, mk_vault(pool_old, true));
+            vs.insert(old_quote, mk_vault(pool_old, false));
+            vs.insert(new_base, mk_vault(pool_new, true));
+            vs.insert(new_quote, mk_vault(pool_new, false));
+        }
+        {
+            let mut pins = ctx.arb_pin_set.write();
+            pins.insert(old_base, old_at);
+            pins.insert(old_quote, old_at);
+            pins.insert(new_base, new_at);
+            pins.insert(new_quote, new_at);
+            for _ in 0..ARB_MULTI_DEX_PIN_ACCOUNT_BUDGET.saturating_sub(4) {
+                pins.insert(Pubkey::new_unique(), new_at);
+            }
+        }
+
+        ctx.evict_oldest_arb_pins_for_budget(1);
+
+        let vs = ctx.tracked_vaults.read();
+        assert!(!vs.get(&old_base).unwrap().pinned);
+        assert!(!vs.get(&old_quote).unwrap().pinned);
+        assert!(vs.get(&new_base).unwrap().pinned);
+        assert!(vs.get(&new_quote).unwrap().pinned);
+        assert_eq!(ctx.oldest_arb_pinned_pool_to_evict(), Some(pool_new));
     }
 
     #[tokio::test]
