@@ -654,28 +654,32 @@ fn seed_all_trackers_from_live_pool_cache(
     trackers: &mut HashMap<String, TokenArbTracker>,
     vault_balances: &mut HashMap<String, VaultBalanceCache>,
 ) -> usize {
-    let mut mints = HashSet::new();
-    for (_, state) in live_pool_cache.iter() {
+    let mut seeded = 0usize;
+    for (pool_pk, state) in live_pool_cache.iter() {
         if !is_known_dex_label(state.dex_name()) {
             continue;
         }
-        if let Some((token_mint, rb, rq, _, _)) = sol_quoted_pool_seed(&state) {
-            if rb > 0 && rq > 0 && token_mint != NATIVE_SOL_MINT {
-                mints.insert(token_mint);
-            }
+        let Some((token_mint, rb, rq, _, _)) = sol_quoted_pool_seed(&state) else {
+            continue;
+        };
+        if rb == 0 || rq == 0 || token_mint == NATIVE_SOL_MINT {
+            continue;
         }
-    }
-    let mut total = 0usize;
-    for mint in mints {
-        total += seed_token_tracker_from_live_pool_cache(
-            &mint,
+        if seed_one_pool_from_live_cache(
+            &token_mint,
             live_pool_cache,
+            pool_pk,
+            &state,
             trackers,
             vault_balances,
-            None,
-        );
+        ) {
+            seeded += 1;
+        }
     }
-    total
+    if seeded > 0 {
+        arb_two_hop_tracker_seeded_pools_add(seeded as u64);
+    }
+    seeded
 }
 
 /// Tracks a pool's price/liquidity state
@@ -1640,6 +1644,13 @@ impl ArbContext {
         base_mint: &str,
     ) {
         let mut cache = self.vault_balances.write();
+        let should_update_vault = match cache.get(pool_address) {
+            Some(existing) => update_slot >= existing.update_slot,
+            None => true,
+        };
+        if !should_update_vault {
+            return;
+        }
         let is_new = !cache.contains_key(pool_address);
         let dlmm_sol_is_x = if dex == "meteora_dlmm" {
             base_mint == NATIVE_SOL_MINT
