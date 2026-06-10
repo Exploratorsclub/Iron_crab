@@ -37,7 +37,11 @@ use solana_message::{v0, AddressLookupTableAccount, VersionedMessage};
 use solana_sdk::bs58;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
-use solana_sdk::transaction::Transaction;
+use solana_sdk::{
+    hash::Hash,
+    signature::Signer,
+    transaction::{Transaction, VersionedTransaction},
+};
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding, UiTransactionTokenBalance,
 };
@@ -10810,7 +10814,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
     let mut bundle_id: Option<String> = None;
     let mut send_signature: Option<String> = None;
     let mut send_method_used: Option<String> = None;
-    let mut sent_tx: Option<Transaction> = None;
+    let mut sent_tx: Option<VersionedTransaction> = None;
     let mut sent_anything = false;
     let mut send_failed = false;
     let mut slot_at_send: Option<u64> = None;
@@ -11093,7 +11097,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                     record_tx_priority_fee_source(priority_fee_selection.source);
                     send_signature = Some(result.signature.clone());
                     send_method_used = Some(result.method.clone());
-                    sent_tx = Some(result.tx);
+                    sent_tx = Some(result.vtx);
                     checks.push(CheckResult {
                         check_name: "send".to_string(),
                         passed: true,
@@ -12064,79 +12068,107 @@ async fn emit_sim_failed_decision(
     Err(anyhow::anyhow!("Simulation failed: {}", sim_error_str))
 }
 
+/// Solana wire-format size limit for serialized transactions.
+const MAX_SERIALIZED_TX_BYTES: usize = 1232;
+
+/// Build the versioned message shared by simulation and send.
+///
+/// v0+ALT when an ALT is configured, otherwise legacy.
+fn build_versioned_message(
+    wallet_pubkey: &Pubkey,
+    plan: &tx_builder::TxPlan,
+    blockhash: Hash,
+    alt: Option<&ironcrab::solana::address_lookup_table::LoadedAlt>,
+) -> Result<VersionedMessage, String> {
+    if let Some(alt) = alt {
+        let alt_account = AddressLookupTableAccount {
+            key: alt.address,
+            addresses: alt.accounts.clone(),
+        };
+        v0::Message::try_compile(wallet_pubkey, &plan.instructions, &[alt_account], blockhash)
+            .map(VersionedMessage::V0)
+            .map_err(|e| format!("v0_compile_error:{e}"))
+    } else {
+        let message = solana_sdk::message::Message::new_with_blockhash(
+            &plan.instructions,
+            Some(wallet_pubkey),
+            &blockhash,
+        );
+        Ok(VersionedMessage::Legacy(message))
+    }
+}
+
+/// Unsigned versioned transaction for RPC simulation (`sig_verify=false`).
+fn build_unsigned_versioned_tx(
+    wallet_pubkey: &Pubkey,
+    plan: &tx_builder::TxPlan,
+    blockhash: Hash,
+    alt: Option<&ironcrab::solana::address_lookup_table::LoadedAlt>,
+) -> Result<VersionedTransaction, String> {
+    let message = build_versioned_message(wallet_pubkey, plan, blockhash, alt)?;
+    Ok(VersionedTransaction {
+        signatures: vec![Signature::default()],
+        message,
+    })
+}
+
+/// Signed versioned transaction for send and rebroadcast.
+fn build_signed_versioned_tx(
+    wallet_pubkey: &Pubkey,
+    plan: &tx_builder::TxPlan,
+    blockhash: Hash,
+    alt: Option<&ironcrab::solana::address_lookup_table::LoadedAlt>,
+    signers: &[&dyn Signer],
+) -> Result<VersionedTransaction, String> {
+    let message = build_versioned_message(wallet_pubkey, plan, blockhash, alt)?;
+    VersionedTransaction::try_new(message, signers).map_err(|e| format!("sign_error:{e}"))
+}
+
+fn versioned_tx_serialized_len(tx: &VersionedTransaction) -> Result<usize, String> {
+    bincode::serialize(tx)
+        .map(|bytes| bytes.len())
+        .map_err(|e| format!("serialize_error:{e}"))
+}
+
+fn check_versioned_tx_size(tx: &VersionedTransaction) -> Result<(), String> {
+    let size = versioned_tx_serialized_len(tx)?;
+    if size > MAX_SERIALIZED_TX_BYTES {
+        return Err(format!(
+            "tx_too_large:{size}_bytes_max_{MAX_SERIALIZED_TX_BYTES}"
+        ));
+    }
+    Ok(())
+}
+
 /// Real RPC simulation (RS-3.1).
 ///
 /// Notes:
 /// - Uses `sig_verify=false` (unsigned tx is fine for simulation).
 /// - Uses `replace_recent_blockhash=true` so simulation does not depend on blockhash freshness.
-/// - Uses Versioned Transaction (v0) with Address Lookup Table if configured.
+/// - Uses the same message form as send (v0+ALT or legacy).
 async fn simulate_transaction(
     ctx: &ExecutionContext,
     wallet_pubkey: Pubkey,
     plan: &tx_builder::TxPlan,
 ) -> SimulationResult {
-    use solana_sdk::transaction::VersionedTransaction;
-
-    // Build Versioned Transaction with ALT if available
-    let tx_result: Result<VersionedTransaction, String> =
-        if let Some(ref alt) = ctx.address_lookup_table {
-            // Use v0 message with ALT for size reduction
-            let alt_account = AddressLookupTableAccount {
-                key: alt.address,
-                addresses: alt.accounts.clone(),
+    let blockhash = match ctx.get_latest_blockhash().await {
+        Ok(hash) => hash,
+        Err(e) => {
+            return SimulationResult {
+                success: false,
+                error_code: Some(format!("blockhash_error:{e}")),
+                logs_preview: None,
+                compute_units_consumed: None,
             };
+        }
+    };
 
-            // Get a recent blockhash (Geyser cache → RPC fallback)
-            let blockhash = match ctx.get_latest_blockhash().await {
-                Ok(hash) => hash,
-                Err(e) => {
-                    return SimulationResult {
-                        success: false,
-                        error_code: Some(format!("blockhash_error:{e}")),
-                        logs_preview: None,
-                        compute_units_consumed: None,
-                    };
-                }
-            };
-
-            match v0::Message::try_compile(
-                &wallet_pubkey,
-                &plan.instructions,
-                &[alt_account],
-                blockhash,
-            ) {
-                Ok(message) => {
-                    let versioned_message = VersionedMessage::V0(message);
-                    // Create unsigned versioned transaction
-                    Ok(VersionedTransaction {
-                        signatures: vec![solana_sdk::signature::Signature::default()],
-                        message: versioned_message,
-                    })
-                }
-                Err(e) => Err(format!("v0_compile_error:{e}")),
-            }
-        } else {
-            // Fallback to legacy transaction (will fail if too large)
-            let blockhash = match ctx.get_latest_blockhash().await {
-                Ok(hash) => hash,
-                Err(e) => {
-                    return SimulationResult {
-                        success: false,
-                        error_code: Some(format!("blockhash_error:{e}")),
-                        logs_preview: None,
-                        compute_units_consumed: None,
-                    };
-                }
-            };
-            let message = solana_sdk::message::Message::new_with_blockhash(
-                &plan.instructions,
-                Some(&wallet_pubkey),
-                &blockhash,
-            );
-            Ok(VersionedTransaction::from(Transaction::new_unsigned(
-                message,
-            )))
-        };
+    let tx_result = build_unsigned_versioned_tx(
+        &wallet_pubkey,
+        plan,
+        blockhash,
+        ctx.address_lookup_table.as_ref(),
+    );
 
     let tx = match tx_result {
         Ok(tx) => tx,
@@ -12209,9 +12241,6 @@ async fn send_transaction_rpc(
     skip_preflight: bool,
     preflight_commitment: Option<CommitmentLevel>,
 ) -> std::result::Result<String, String> {
-    use solana_sdk::message::{v0, VersionedMessage};
-    use solana_sdk::transaction::VersionedTransaction;
-
     TX_SEND_ATTEMPTS_TOTAL.fetch_add(1, Ordering::Relaxed);
     let treasury = ctx
         .treasury
@@ -12221,35 +12250,14 @@ async fn send_transaction_rpc(
     let signer = treasury.signer_ref();
     let blockhash = ctx.get_latest_blockhash().await?;
 
-    // Build Versioned Transaction with ALT if available
-    let tx: VersionedTransaction = if let Some(ref alt) = ctx.address_lookup_table {
-        // Use v0 message with ALT for size reduction
-        let alt_account = AddressLookupTableAccount {
-            key: alt.address,
-            addresses: alt.accounts.clone(),
-        };
-
-        let message = v0::Message::try_compile(
-            &wallet_pubkey,
-            &plan.instructions,
-            &[alt_account],
-            blockhash,
-        )
-        .map_err(|e| format!("v0_compile_error:{e}"))?;
-
-        let versioned_message = VersionedMessage::V0(message);
-        VersionedTransaction::try_new(versioned_message, &[signer])
-            .map_err(|e| format!("v0_sign_error:{e}"))?
-    } else {
-        // Fallback to legacy transaction
-        let legacy_tx = Transaction::new_signed_with_payer(
-            &plan.instructions,
-            Some(&wallet_pubkey),
-            &[signer],
-            blockhash,
-        );
-        VersionedTransaction::from(legacy_tx)
-    };
+    let tx = build_signed_versioned_tx(
+        &wallet_pubkey,
+        plan,
+        blockhash,
+        ctx.address_lookup_table.as_ref(),
+        &[signer],
+    )?;
+    check_versioned_tx_size(&tx)?;
 
     let config = RpcSendTransactionConfig {
         skip_preflight,
@@ -12270,8 +12278,8 @@ async fn send_transaction_rpc(
 /// Send transaction result with method tracking
 struct SendTxResult {
     signature: String,
-    method: String,  // "tpu", "jito", "rpc"
-    tx: Transaction, // signed legacy transaction (for rebroadcast during confirm)
+    method: String,            // "tpu", "jito", "rpc"
+    vtx: VersionedTransaction, // exact signed TX for rebroadcast during confirm
     slot_at_send: u64,
 }
 
@@ -12298,18 +12306,22 @@ async fn send_transaction_with_fallback(
     let signer = treasury.signer_ref();
     let blockhash_for_send = ctx.get_latest_blockhash_for_send().await?;
 
-    // Build legacy Transaction for TxSender (TxSender handles signing internally for TPU)
-    // Note: We sign here because TxSender.send_with_fallback() expects a signed Transaction
-    let tx = Transaction::new_signed_with_payer(
-        &plan.instructions,
-        Some(&wallet_pubkey),
-        &[signer],
+    // Same message form as simulation: v0+ALT when configured, else legacy.
+    let vtx = build_signed_versioned_tx(
+        &wallet_pubkey,
+        plan,
         blockhash_for_send.hash,
-    );
+        ctx.address_lookup_table.as_ref(),
+        &[signer],
+    )?;
+    check_versioned_tx_size(&vtx)?;
 
     // If TxSender is available, use it for the fallback chain
     if let Some(ref tx_sender) = ctx.tx_sender {
-        match tx_sender.send_with_fallback(&tx, require_bundle).await {
+        match tx_sender
+            .send_versioned_with_fallback(&vtx, require_bundle)
+            .await
+        {
             Ok(result) => {
                 let method_str = result.method.to_string();
                 info!(
@@ -12322,7 +12334,7 @@ async fn send_transaction_with_fallback(
                 return Ok(SendTxResult {
                     signature: result.signature.to_string(),
                     method: method_str,
-                    tx,
+                    vtx,
                     slot_at_send: blockhash_for_send.slot,
                 });
             }
@@ -12346,18 +12358,11 @@ async fn send_transaction_with_fallback(
     // Reuse the *exact* signed transaction we are sending as `sent_tx` for any rebroadcasts
     // during confirmation polling. Creating a new Transaction here could change the signature
     // (e.g. if blockhash changes or signing is not perfectly deterministic).
-    let versioned = solana_sdk::transaction::VersionedTransaction::from(tx.clone());
-
-    match ctx
-        .rpc
-        .rpc
-        .send_transaction_with_config(&versioned, config)
-        .await
-    {
+    match ctx.rpc.rpc.send_transaction_with_config(&vtx, config).await {
         Ok(sig) => Ok(SendTxResult {
             signature: sig.to_string(),
             method: "rpc".into(),
-            tx,
+            vtx,
             slot_at_send: blockhash_for_send.slot,
         }),
         Err(e) => Err(format!("rpc_error:{e}")),
@@ -12681,7 +12686,7 @@ async fn confirm_signature_status(
     ctx: &ExecutionContext,
     signature_base58: &str,
     timeout_ms: u64,
-    rebroadcast_tx: Option<&Transaction>,
+    rebroadcast_tx: Option<&VersionedTransaction>,
     pre_registered_rx: Option<tokio::sync::oneshot::Receiver<WalletTxConfirmNotify>>,
     slot_at_send: Option<u64>,
 ) -> std::result::Result<(ConfirmOutcome, u32), String> {
@@ -12928,7 +12933,7 @@ async fn spawn_rebroadcast_loop(
     tx_sender: Option<Arc<TxSender>>,
     rebroadcast_use_tpu: bool,
     signature_base58: &str,
-    tx: Transaction,
+    vtx: VersionedTransaction,
     deadline: Duration,
     interval_ms: u64,
     max_rebroadcasts: u32,
@@ -12947,7 +12952,7 @@ async fn spawn_rebroadcast_loop(
 
         if rebroadcast_use_tpu {
             if let Some(ref sender) = tx_sender {
-                match sender.send_tpu_then_rpc(&tx).await {
+                match sender.send_versioned_tpu_then_rpc(&vtx).await {
                     Ok(result) => {
                         rebroadcasts += 1;
                         rebroadcast_count.store(rebroadcasts, Ordering::Relaxed);
@@ -12987,7 +12992,6 @@ async fn spawn_rebroadcast_loop(
                 min_context_slot: None,
             };
 
-            let vtx = solana_sdk::transaction::VersionedTransaction::from(tx.clone());
             match rpc.rpc.send_transaction_with_config(&vtx, cfg).await {
                 Ok(sig) => {
                     rebroadcasts += 1;
@@ -13031,7 +13035,8 @@ async fn spawn_rebroadcast_loop(
 #[cfg(test)]
 mod execution_engine_tests {
     use super::{
-        apply_scope48_confirmed_sell_execution_metadata,
+        apply_scope48_confirmed_sell_execution_metadata, build_signed_versioned_tx,
+        build_unsigned_versioned_tx, check_versioned_tx_size,
         cold_path_dex_sim_failure_triggers_discovery_recovery, is_cold_path_recovery_sell,
         is_pump_amm_structural_sim_error, is_pumpfun_bonding_curve_structural_sim_error,
         is_regular_momentum_hot_path_sell, liquidation_pumpfun_sell_preference,
@@ -13052,18 +13057,100 @@ mod execution_engine_tests {
         CachedPoolState, LivePoolCache, MeteoraState, PumpAmmState, PumpFunState,
     };
     use ironcrab::execution::pool_cache_sync::apply_pool_cache_update;
+    use ironcrab::execution::tx_builder::TxPlan;
     use ironcrab::ipc::{
         ControlResponse, ControlResponseStatus, DexPoolReadiness, ExecutionResult, ExecutionStatus,
         ExplicitAmount, IntentOrigin, IntentTier, PoolCacheUpdate, TradeIntent, TradeResources,
         TradeSide, TradingRegime,
     };
+    use ironcrab::solana::address_lookup_table::LoadedAlt;
     use ironcrab::solana::dex::pumpfun::PumpFunDex;
     use ironcrab::storage::locks::{LockHolder, LockManager, LockResult};
     use parking_lot::Mutex as ParkingMutex;
-    use solana_sdk::pubkey::Pubkey;
+    use solana_message::VersionedMessage;
+    use solana_sdk::{
+        hash::Hash,
+        instruction::{AccountMeta, Instruction},
+        pubkey::Pubkey,
+        signature::{Keypair, Signer},
+    };
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::time::Instant;
+
+    fn test_system_transfer(from: &Pubkey, to: &Pubkey, lamports: u64) -> Instruction {
+        let mut data = vec![2, 0, 0, 0];
+        data.extend_from_slice(&lamports.to_le_bytes());
+        Instruction {
+            program_id: solana_system_program::id(),
+            accounts: vec![
+                AccountMeta::new(*from, true),
+                AccountMeta::new(*to, false),
+            ],
+            data,
+        }
+    }
+
+    #[test]
+    fn sim_and_send_share_identical_message_without_alt() {
+        let wallet = Keypair::new();
+        let blockhash = Hash::new_unique();
+        let recipient = Pubkey::new_unique();
+        let plan = TxPlan {
+            instructions: vec![test_system_transfer(&wallet.pubkey(), &recipient, 1)],
+        };
+
+        let unsigned = build_unsigned_versioned_tx(&wallet.pubkey(), &plan, blockhash, None)
+            .expect("unsigned legacy tx");
+        let signed =
+            build_signed_versioned_tx(&wallet.pubkey(), &plan, blockhash, None, &[&wallet])
+                .expect("signed legacy tx");
+
+        assert_eq!(unsigned.message, signed.message);
+        assert!(matches!(unsigned.message, VersionedMessage::Legacy(_)));
+    }
+
+    #[test]
+    fn sim_and_send_share_identical_message_with_alt() {
+        let wallet = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let blockhash = Hash::new_unique();
+        let alt = LoadedAlt {
+            address: Pubkey::new_unique(),
+            accounts: vec![recipient],
+        };
+        let plan = TxPlan {
+            instructions: vec![test_system_transfer(&wallet.pubkey(), &recipient, 1)],
+        };
+
+        let unsigned = build_unsigned_versioned_tx(&wallet.pubkey(), &plan, blockhash, Some(&alt))
+            .expect("unsigned v0 tx");
+        let signed =
+            build_signed_versioned_tx(&wallet.pubkey(), &plan, blockhash, Some(&alt), &[&wallet])
+                .expect("signed v0 tx");
+
+        assert_eq!(unsigned.message, signed.message);
+        assert!(matches!(unsigned.message, VersionedMessage::V0(_)));
+    }
+
+    #[test]
+    fn tx_size_check_rejects_oversized_serialized_transaction() {
+        let wallet = Keypair::new();
+        let blockhash = Hash::new_unique();
+        let mut instructions = Vec::new();
+        for _ in 0..40 {
+            instructions.push(test_system_transfer(
+                &wallet.pubkey(),
+                &Pubkey::new_unique(),
+                1,
+            ));
+        }
+        let plan = TxPlan { instructions };
+        let tx = build_signed_versioned_tx(&wallet.pubkey(), &plan, blockhash, None, &[&wallet])
+            .unwrap();
+        let err = check_versioned_tx_size(&tx).expect_err("oversized legacy tx should be rejected");
+        assert!(err.starts_with("tx_too_large:"));
+    }
 
     #[test]
     fn max_open_positions_gate_rejects_when_lock_manager_exceeds_metadata() {
