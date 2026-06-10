@@ -426,50 +426,36 @@ fn comparable_price_sol_per_token(
                 });
                 let trade_mid = trade_mid_sol_per_token(pool);
                 let marginal = match side {
-                    ComparablePriceSide::Buy => {
-                        let tokens_out = dlmm_token_output_from_bins(
-                            active_id,
-                            bin_step,
-                            DLMM_PROBE_SOL_LAMPORTS,
-                            &flat,
-                            sol_is_x,
-                        )?;
-                        if tokens_out == 0 {
-                            return None;
-                        }
-                        Some(trade_implied_sol_per_token(
+                    ComparablePriceSide::Buy => dlmm_token_output_from_bins(
+                        active_id,
+                        bin_step,
+                        DLMM_PROBE_SOL_LAMPORTS,
+                        &flat,
+                        sol_is_x,
+                    )
+                    .filter(|tokens_out| *tokens_out > 0)
+                    .map(|tokens_out| {
+                        trade_implied_sol_per_token(
                             DLMM_PROBE_SOL_LAMPORTS,
                             tokens_out,
                             token_decimals,
-                        ))
-                    }
-                    ComparablePriceSide::Sell => {
-                        let token_probe = dlmm_token_output_from_bins(
-                            active_id,
-                            bin_step,
-                            DLMM_PROBE_SOL_LAMPORTS,
-                            &flat,
-                            sol_is_x,
-                        )?;
-                        if token_probe == 0 {
-                            return None;
-                        }
-                        let sol_out = dlmm_sol_output_from_bins(
-                            active_id,
-                            bin_step,
-                            token_probe,
-                            &flat,
-                            sol_is_x,
-                        )?;
-                        if sol_out == 0 {
-                            return None;
-                        }
-                        Some(trade_implied_sol_per_token(
-                            sol_out,
-                            token_probe,
-                            token_decimals,
-                        ))
-                    }
+                        )
+                    }),
+                    ComparablePriceSide::Sell => dlmm_token_output_from_bins(
+                        active_id,
+                        bin_step,
+                        DLMM_PROBE_SOL_LAMPORTS,
+                        &flat,
+                        sol_is_x,
+                    )
+                    .filter(|token_probe| *token_probe > 0)
+                    .and_then(|token_probe| {
+                        dlmm_sol_output_from_bins(active_id, bin_step, token_probe, &flat, sol_is_x)
+                            .filter(|sol_out| *sol_out > 0)
+                            .map(|sol_out| {
+                                trade_implied_sol_per_token(sol_out, token_probe, token_decimals)
+                            })
+                    }),
                 };
                 if let Some(price) = marginal.filter(|p| *p > Decimal::ZERO) {
                     if dlmm_marginal_price_plausible(price, reserve_mid, trade_mid) {
@@ -3434,6 +3420,51 @@ mod two_hop_price_tests {
                 "sol_is_x={sol_is_x}: DLMM marginal vs AMM mid spread {spread_bps} bps should be sane"
             );
         }
+    }
+
+    #[test]
+    fn dlmm_incomplete_bin_arrays_falls_back_to_reserve_mid() {
+        let reserve_base = 1_000_000_000_000u64;
+        let reserve_quote = 1_000_000_000_000u64;
+        let active_id: i32 = 0;
+        let bin_step: u16 = 10;
+        let expected_mid = reserve_mid_sol_per_token(reserve_base, reserve_quote, 6).unwrap();
+
+        // Active bin 0 missing: only liquidity in array index 1 (bin_id 70).
+        let mut bin_arrays: HashMap<i64, BinArrayCache> = HashMap::new();
+        bin_arrays.insert(
+            1,
+            BinArrayCache {
+                bins: vec![BinData {
+                    offset: 0,
+                    amount_x: reserve_base,
+                    amount_y: reserve_quote,
+                }],
+                update_slot: 1,
+            },
+        );
+
+        let vault = sample_vault(
+            reserve_base,
+            reserve_quote,
+            Some(active_id),
+            Some(bin_step),
+            false,
+            Some(USDC_MINT),
+        );
+        let dlmm_pool = sample_pool("meteora_dlmm", "dlmmPool", None, None);
+
+        let price = comparable_price_sol_per_token(
+            &dlmm_pool,
+            Some((reserve_base, reserve_quote)),
+            6,
+            Some(&vault),
+            Some(&bin_arrays),
+            ComparablePriceSide::Buy,
+        )
+        .expect("incomplete bin data must fall back to reserve mid, not None");
+
+        assert_eq!(price, expected_mid);
     }
 
     #[test]
