@@ -235,14 +235,25 @@ impl<Q: QuoteProvider> PoolRanker<Q> {
     }
 
     /// Whether a fresh cached probe quote exists for this hop direction.
+    ///
+    /// Uses the same `probe_amount` as beam expansion (`rank_single_pool`) so the
+    /// final cycle gate cannot reject hops that were already ranked successfully.
     pub fn hop_has_cached_quote(
         &self,
         pool_address: &Pubkey,
+        dex: DexType,
         input_mint: &Pubkey,
         output_mint: &Pubkey,
     ) -> bool {
         self.quote_provider
-            .has_cached_quote(pool_address, input_mint, output_mint)
+            .get_cached_probe_quote(
+                pool_address,
+                dex,
+                input_mint,
+                output_mint,
+                self.config.probe_amount,
+            )
+            .is_some()
     }
 
     fn update_max_edge_ratios(&self, updates: Vec<(Pubkey, f64)>) {

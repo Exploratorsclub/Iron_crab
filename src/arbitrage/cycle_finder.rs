@@ -141,10 +141,12 @@ impl<Q: QuoteProvider> BeamCycleFinder<Q> {
             let Some(primary) = pool_options.first() else {
                 return false;
             };
-            if !self
-                .ranker
-                .hop_has_cached_quote(&primary.pool_address, input_mint, output_mint)
-            {
+            if !self.ranker.hop_has_cached_quote(
+                &primary.pool_address,
+                primary.dex,
+                input_mint,
+                output_mint,
+            ) {
                 return false;
             }
         }
