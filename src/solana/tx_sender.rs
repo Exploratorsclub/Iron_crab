@@ -19,7 +19,10 @@ use crate::solana::tpu_client::{TpuError, TpuSubmitter, TpuSubmitterConfig};
 use anyhow::Result;
 use solana_client::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
-use solana_sdk::{signature::Signature, transaction::Transaction};
+use solana_sdk::{
+    signature::Signature,
+    transaction::{Transaction, VersionedTransaction},
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -209,6 +212,32 @@ impl TxSender {
         self.send_sequential(tx).await
     }
 
+    /// Send a versioned transaction with automatic fallback (TPU / RPC).
+    ///
+    /// Legacy `Transaction` callers should keep using [`Self::send_with_fallback`].
+    pub async fn send_versioned_with_fallback(
+        &self,
+        tx: &VersionedTransaction,
+        require_bundle: bool,
+    ) -> Result<SendResult, SendError> {
+        if require_bundle && (self.config.skip_tpu_for_bundles || self.jito.is_none()) {
+            return self
+                .send_via_jito_versioned(tx)
+                .await
+                .map(|(sig, bundle_id)| SendResult {
+                    signature: sig,
+                    method: SendMethod::JitoBundle,
+                    bundle_id: Some(bundle_id),
+                });
+        }
+
+        if self.config.parallel_send && self.tpu.is_some() {
+            return self.send_versioned_parallel(tx).await;
+        }
+
+        self.send_versioned_sequential(tx).await
+    }
+
     /// Rebroadcast-safe send: TPU and/or RPC only, never Jito.
     ///
     /// Used during confirmation wait where rebroadcast must mirror the
@@ -234,6 +263,37 @@ impl TxSender {
         }
 
         self.send_via_rpc(tx).await.map(|sig| SendResult {
+            signature: sig,
+            method: SendMethod::Rpc,
+            bundle_id: None,
+        })
+    }
+
+    /// Rebroadcast-safe versioned send: TPU and/or RPC only, never Jito.
+    pub async fn send_versioned_tpu_then_rpc(
+        &self,
+        tx: &VersionedTransaction,
+    ) -> Result<SendResult, SendError> {
+        if self.config.parallel_send && self.tpu.is_some() {
+            return self.send_versioned_parallel(tx).await;
+        }
+
+        if self.tpu.is_some() {
+            match self.send_versioned_via_tpu(tx).await {
+                Ok(sig) => {
+                    return Ok(SendResult {
+                        signature: sig,
+                        method: SendMethod::TpuDirect,
+                        bundle_id: None,
+                    });
+                }
+                Err(e) => {
+                    warn!(error = %e, "Rebroadcast: TPU failed, falling back to RPC");
+                }
+            }
+        }
+
+        self.send_versioned_via_rpc(tx).await.map(|sig| SendResult {
             signature: sig,
             method: SendMethod::Rpc,
             bundle_id: None,
@@ -374,6 +434,122 @@ impl TxSender {
         Err(last_error.unwrap_or(SendError::NoMethodAvailable))
     }
 
+    /// Sequential send with fallback chain for versioned transactions.
+    async fn send_versioned_sequential(
+        &self,
+        tx: &VersionedTransaction,
+    ) -> Result<SendResult, SendError> {
+        let methods: Vec<&str> = std::iter::once(self.config.primary_method.as_str())
+            .chain(self.config.fallback_chain.iter().map(|s| s.as_str()))
+            .collect();
+
+        debug!(methods = ?methods, "Versioned TX send method chain (sequential)");
+
+        let mut last_error: Option<SendError> = None;
+
+        for method in methods {
+            let result = match method {
+                "tpu" => self.send_versioned_via_tpu(tx).await.map(|sig| SendResult {
+                    signature: sig,
+                    method: SendMethod::TpuDirect,
+                    bundle_id: None,
+                }),
+                "jito" => self
+                    .send_via_jito_versioned(tx)
+                    .await
+                    .map(|(sig, bundle_id)| SendResult {
+                        signature: sig,
+                        method: SendMethod::JitoBundle,
+                        bundle_id: Some(bundle_id),
+                    }),
+                "rpc" => self.send_versioned_via_rpc(tx).await.map(|sig| SendResult {
+                    signature: sig,
+                    method: SendMethod::Rpc,
+                    bundle_id: None,
+                }),
+                _ => {
+                    warn!(method = method, "Unknown send method, skipping");
+                    continue;
+                }
+            };
+
+            match result {
+                Ok(send_result) => {
+                    info!(
+                        signature = %send_result.signature,
+                        method = %send_result.method,
+                        "Versioned TX sent successfully"
+                    );
+                    return Ok(send_result);
+                }
+                Err(e) => {
+                    warn!(
+                        method = method,
+                        error = %e,
+                        "Versioned send method failed, trying next"
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or(SendError::NoMethodAvailable))
+    }
+
+    /// Send versioned TX via TPU and RPC in parallel. First success wins.
+    async fn send_versioned_parallel(
+        &self,
+        tx: &VersionedTransaction,
+    ) -> Result<SendResult, SendError> {
+        debug!("Parallel send: TPU + RPC simultaneously (versioned)");
+
+        let tx_clone = tx.clone();
+        let tpu_future = async {
+            match self.send_versioned_via_tpu(tx).await {
+                Ok(sig) => Some((sig, SendMethod::TpuDirect)),
+                Err(e) => {
+                    warn!(error = %e, "Parallel send: TPU failed");
+                    None
+                }
+            }
+        };
+
+        let rpc_future = async {
+            match self.send_versioned_via_rpc(&tx_clone).await {
+                Ok(sig) => Some((sig, SendMethod::Rpc)),
+                Err(e) => {
+                    warn!(error = %e, "Parallel send: RPC failed");
+                    None
+                }
+            }
+        };
+
+        let (tpu_result, rpc_result) = tokio::join!(tpu_future, rpc_future);
+
+        info!(
+            tpu_ok = tpu_result.is_some(),
+            rpc_ok = rpc_result.is_some(),
+            "Parallel versioned send results collected"
+        );
+
+        match (tpu_result, rpc_result) {
+            (Some((sig, method)), _) => Ok(SendResult {
+                signature: sig,
+                method,
+                bundle_id: None,
+            }),
+            (None, Some((sig, method))) => Ok(SendResult {
+                signature: sig,
+                method,
+                bundle_id: None,
+            }),
+            (None, None) => {
+                error!("Parallel send: Both TPU and RPC failed (versioned)");
+                Err(SendError::AllMethodsFailed)
+            }
+        }
+    }
+
     /// Send via TPU Direct
     async fn send_via_tpu(&self, tx: &Transaction) -> Result<Signature, SendError> {
         let tpu = self
@@ -434,7 +610,66 @@ impl TxSender {
         Err(SendError::TpuError("Max retries exceeded".into()))
     }
 
-    /// Send via Jito bundle
+    /// Send a versioned transaction via TPU Direct.
+    async fn send_versioned_via_tpu(
+        &self,
+        tx: &VersionedTransaction,
+    ) -> Result<Signature, SendError> {
+        let tpu = self
+            .tpu
+            .as_ref()
+            .ok_or(SendError::MethodNotConfigured("tpu"))?;
+
+        if let Err(e) = tpu.check_leader_cache_health() {
+            warn!(error = %e, "Leader cache stale, attempting reconnect");
+            if tpu.can_reconnect(15_000) {
+                if let Err(reconnect_err) = tpu.reconnect().await {
+                    warn!(error = %reconnect_err, "TPU reconnect failed, continuing with stale cache");
+                }
+            }
+        }
+
+        if tpu.should_reconnect(self.config.tpu_reconnect_failure_threshold) {
+            warn!(
+                consecutive_failures = tpu.consecutive_failures(),
+                threshold = self.config.tpu_reconnect_failure_threshold,
+                "TPU client has many failures, attempting reconnect"
+            );
+            if tpu.can_reconnect(15_000) {
+                if let Err(e) = tpu.reconnect().await {
+                    warn!(error = %e, "TPU reconnect failed");
+                }
+            }
+        }
+
+        let timeout_duration = Duration::from_millis(self.config.method_timeout_ms);
+
+        for attempt in 0..self.config.retries_per_method {
+            let result = timeout(timeout_duration, tpu.send_versioned_transaction(tx)).await;
+
+            match result {
+                Ok(Ok(signature)) => return Ok(signature),
+                Ok(Err(e)) => {
+                    if attempt + 1 < self.config.retries_per_method {
+                        debug!(attempt = attempt, error = %e, "TPU versioned send failed, retrying");
+                    } else {
+                        return Err(SendError::TpuError(e.to_string()));
+                    }
+                }
+                Err(_) => {
+                    if attempt + 1 < self.config.retries_per_method {
+                        debug!(attempt = attempt, "TPU versioned send timed out, retrying");
+                    } else {
+                        return Err(SendError::Timeout("tpu"));
+                    }
+                }
+            }
+        }
+
+        Err(SendError::TpuError("Max retries exceeded".into()))
+    }
+
+    /// Send via Jito bundle (legacy transaction)
     async fn send_via_jito(&self, tx: &Transaction) -> Result<(Signature, String), SendError> {
         let jito = self
             .jito
@@ -442,7 +677,6 @@ impl TxSender {
             .ok_or(SendError::MethodNotConfigured("jito"))?;
 
         let signature = tx.signatures.first().copied().unwrap_or_default();
-
         let timeout_duration = Duration::from_millis(self.config.method_timeout_ms);
 
         for attempt in 0..self.config.retries_per_method {
@@ -464,6 +698,51 @@ impl TxSender {
                 Err(_) => {
                     if attempt + 1 < self.config.retries_per_method {
                         debug!(attempt = attempt, "Jito send timed out, retrying");
+                    } else {
+                        return Err(SendError::Timeout("jito"));
+                    }
+                }
+            }
+        }
+
+        Err(SendError::JitoError("Max retries exceeded".into()))
+    }
+
+    /// Send via Jito bundle (versioned transaction)
+    async fn send_via_jito_versioned(
+        &self,
+        tx: &VersionedTransaction,
+    ) -> Result<(Signature, String), SendError> {
+        let jito = self
+            .jito
+            .as_ref()
+            .ok_or(SendError::MethodNotConfigured("jito"))?;
+
+        let signature = tx.signatures.first().copied().unwrap_or_default();
+        let timeout_duration = Duration::from_millis(self.config.method_timeout_ms);
+
+        for attempt in 0..self.config.retries_per_method {
+            let result = timeout(
+                timeout_duration,
+                jito.send_versioned_bundle(std::slice::from_ref(tx)),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(bundle_id)) => {
+                    info!(bundle_id = %bundle_id, "Jito versioned bundle submitted");
+                    return Ok((signature, bundle_id));
+                }
+                Ok(Err(e)) => {
+                    if attempt + 1 < self.config.retries_per_method {
+                        debug!(attempt = attempt, error = %e, "Jito versioned send failed, retrying");
+                    } else {
+                        return Err(SendError::JitoError(e.to_string()));
+                    }
+                }
+                Err(_) => {
+                    if attempt + 1 < self.config.retries_per_method {
+                        debug!(attempt = attempt, "Jito versioned send timed out, retrying");
                     } else {
                         return Err(SendError::Timeout("jito"));
                     }
@@ -516,6 +795,58 @@ impl TxSender {
                 Err(_) => {
                     if attempt + 1 < self.config.retries_per_method {
                         debug!(attempt = attempt, "RPC send timed out, retrying");
+                    } else {
+                        return Err(SendError::Timeout("rpc"));
+                    }
+                }
+            }
+        }
+
+        Err(SendError::RpcError("Max retries exceeded".into()))
+    }
+
+    /// Send a versioned transaction via RPC sendTransaction.
+    async fn send_versioned_via_rpc(
+        &self,
+        tx: &VersionedTransaction,
+    ) -> Result<Signature, SendError> {
+        let timeout_duration = Duration::from_millis(self.config.method_timeout_ms);
+
+        for attempt in 0..self.config.retries_per_method {
+            let rpc = Arc::clone(&self.rpc);
+            let tx_clone = tx.clone();
+
+            let result = timeout(
+                timeout_duration,
+                tokio::task::spawn_blocking(move || {
+                    rpc.send_transaction_with_config(
+                        &tx_clone,
+                        solana_client::rpc_config::RpcSendTransactionConfig {
+                            skip_preflight: true,
+                            preflight_commitment: Some(CommitmentConfig::confirmed().commitment),
+                            max_retries: Some(0),
+                            ..Default::default()
+                        },
+                    )
+                }),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(Ok(signature))) => return Ok(signature),
+                Ok(Ok(Err(e))) => {
+                    if attempt + 1 < self.config.retries_per_method {
+                        debug!(attempt = attempt, error = %e, "RPC versioned send failed, retrying");
+                    } else {
+                        return Err(SendError::RpcError(e.to_string()));
+                    }
+                }
+                Ok(Err(e)) => {
+                    return Err(SendError::RpcError(format!("Task join error: {}", e)));
+                }
+                Err(_) => {
+                    if attempt + 1 < self.config.retries_per_method {
+                        debug!(attempt = attempt, "RPC versioned send timed out, retrying");
                     } else {
                         return Err(SendError::Timeout("rpc"));
                     }

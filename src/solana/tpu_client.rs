@@ -25,7 +25,10 @@
 //! - This module provides health checks and automatic reconnection
 
 use anyhow::Result;
-use solana_sdk::{signature::Signature, transaction::Transaction};
+use solana_sdk::{
+    signature::Signature,
+    transaction::{Transaction, VersionedTransaction},
+};
 use std::sync::Arc;
 
 #[cfg(not(windows))]
@@ -174,6 +177,32 @@ impl TpuSubmitter {
 
         // try_send_transaction returns TransportResult
         match client.try_send_transaction(tx) {
+            Ok(()) => {
+                self.consecutive_failures
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                Ok(signature)
+            }
+            Err(e) => {
+                self.consecutive_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(TpuError::SendFailed(format!("{:?}", e)))
+            }
+        }
+    }
+
+    /// Send a versioned transaction (v0+ALT or legacy) via TPU Direct wire format.
+    pub async fn send_versioned_transaction(
+        &self,
+        tx: &VersionedTransaction,
+    ) -> Result<Signature, TpuError> {
+        let guard = self.tpu_client.read().await;
+        let client = guard.as_ref().ok_or(TpuError::NotInitialized)?;
+
+        let signature = tx.signatures.first().copied().unwrap_or_default();
+        let wire_transaction =
+            bincode::serialize(tx).map_err(|e| TpuError::SendFailed(format!("serialize: {e}")))?;
+
+        match client.try_send_wire_transaction(wire_transaction) {
             Ok(()) => {
                 self.consecutive_failures
                     .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -336,6 +365,13 @@ impl TpuSubmitter {
     }
 
     pub async fn send_transaction(&self, _tx: &Transaction) -> Result<Signature, TpuError> {
+        Err(TpuError::NotSupported)
+    }
+
+    pub async fn send_versioned_transaction(
+        &self,
+        _tx: &VersionedTransaction,
+    ) -> Result<Signature, TpuError> {
         Err(TpuError::NotSupported)
     }
 
