@@ -109,7 +109,8 @@ impl<Q: QuoteProvider> BeamCycleFinder<Q> {
 
         let mut queue = VecDeque::new();
         for &seed in seeds {
-            if graph.has_token(&seed) && allowed.insert(seed) {
+            if graph.has_token(&seed) {
+                allowed.insert(seed);
                 queue.push_back((seed, 0usize));
             }
         }
