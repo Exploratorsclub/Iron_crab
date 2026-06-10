@@ -3306,64 +3306,38 @@ fn distinct_dex_count_for_token_mint(cache: &LivePoolCache, token_mint: &Pubkey)
     dexes.len()
 }
 
+const ARB_USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const ARB_USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+
+/// True for quote legs that must not be used as arb base-mint keys (SOL, USDC, USDT).
+fn is_arb_common_quote_mint(mint: &Pubkey) -> bool {
+    let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+    let usdc = Pubkey::from_str(ARB_USDC_MINT).unwrap_or_default();
+    let usdt = Pubkey::from_str(ARB_USDT_MINT).unwrap_or_default();
+    *mint == sol || *mint == usdc || *mint == usdt
+}
+
+/// Arb-relevant token leg: the mint that is not a common quote asset when exactly one leg is.
+fn arb_token_mint_from_pair(mint_a: Pubkey, mint_b: Pubkey) -> Option<Pubkey> {
+    let a_quote = is_arb_common_quote_mint(&mint_a);
+    let b_quote = is_arb_common_quote_mint(&mint_b);
+    match (a_quote, b_quote) {
+        (true, false) => Some(mint_b),
+        (false, true) => Some(mint_a),
+        (false, false) => Some(mint_a),
+        (true, true) => None,
+    }
+}
+
 /// Non-SOL token leg from a cached pool row (arb-relevant base mint).
 fn arb_token_mint_from_cached_pool(state: &CachedPoolState) -> Option<Pubkey> {
-    let wsol = Pubkey::from_str(NATIVE_SOL_MINT).ok()?;
     match state {
-        CachedPoolState::RaydiumCpmm(s) => {
-            let (base, _, _, _) = cpmm_token_mints_and_vaults_sol_normalized(
-                s.token_0_mint,
-                s.token_1_mint,
-                s.token_0_vault,
-                s.token_1_vault,
-            );
-            Some(base)
-        }
-        CachedPoolState::MeteoraCpmm(s) => {
-            let (base, _, _, _) = cpmm_token_mints_and_vaults_sol_normalized(
-                s.token_0_mint,
-                s.token_1_mint,
-                s.token_0_vault,
-                s.token_1_vault,
-            );
-            Some(base)
-        }
-        CachedPoolState::Meteora(s) => {
-            if s.token_y_mint == wsol {
-                Some(s.token_x_mint)
-            } else if s.token_x_mint == wsol {
-                Some(s.token_y_mint)
-            } else {
-                Some(s.token_x_mint)
-            }
-        }
-        CachedPoolState::PumpAmm(s) => {
-            if s.quote_mint == wsol {
-                Some(s.base_mint)
-            } else if s.base_mint == wsol {
-                Some(s.quote_mint)
-            } else {
-                Some(s.base_mint)
-            }
-        }
-        CachedPoolState::Orca(s) => {
-            if s.token_mint_b == wsol {
-                Some(s.token_mint_a)
-            } else if s.token_mint_a == wsol {
-                Some(s.token_mint_b)
-            } else {
-                Some(s.token_mint_a)
-            }
-        }
-        CachedPoolState::RaydiumAmm(s) => {
-            if s.quote_mint == wsol {
-                Some(s.base_mint)
-            } else if s.base_mint == wsol {
-                Some(s.quote_mint)
-            } else {
-                Some(s.base_mint)
-            }
-        }
+        CachedPoolState::RaydiumCpmm(s) => arb_token_mint_from_pair(s.token_0_mint, s.token_1_mint),
+        CachedPoolState::MeteoraCpmm(s) => arb_token_mint_from_pair(s.token_0_mint, s.token_1_mint),
+        CachedPoolState::Meteora(s) => arb_token_mint_from_pair(s.token_x_mint, s.token_y_mint),
+        CachedPoolState::PumpAmm(s) => arb_token_mint_from_pair(s.base_mint, s.quote_mint),
+        CachedPoolState::Orca(s) => arb_token_mint_from_pair(s.token_mint_a, s.token_mint_b),
+        CachedPoolState::RaydiumAmm(s) => arb_token_mint_from_pair(s.base_mint, s.quote_mint),
         CachedPoolState::PumpFun(s) => Some(s.token_mint),
     }
 }
