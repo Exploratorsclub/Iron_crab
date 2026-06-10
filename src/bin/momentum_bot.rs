@@ -10577,52 +10577,54 @@ async fn intent_publish_worker_loop(
 ) {
     while let Some(job) = rx.recv().await {
         let intent = job.intent;
-        intent_publish_jsonl_write(&ctx.jsonl_writer, &intent).await;
 
+        // FIX-30b may remove queued BUY rows from `pending_intents` before this worker runs.
         if let IntentPublishPostAction::Buy {
-            ref entry_signal,
-            ref effective_pool,
-            ref effective_dex,
-            ..
+            ref entry_signal, ..
         } = job.post_action
         {
-            ctx.register_buy_intent(
-                &intent.intent_id,
-                &entry_signal.mint,
-                effective_pool,
-                effective_dex,
-                entry_signal.sol_amount,
-                Some(entry_signal.kind),
-            );
+            if !ctx.pending_intents.read().contains_key(&intent.intent_id) {
+                ctx.unwind_stale_entry_pending_after_publish_failure(entry_signal, true);
+                continue;
+            }
         }
+
+        intent_publish_jsonl_write(&ctx.jsonl_writer, &intent).await;
 
         let mut publish_ok = nats.is_none();
         if let Some(ref nats) = nats {
-            match nats.jetstream_publish(TOPIC_TRADE_INTENTS, &intent).await {
-                Ok(true) => {
-                    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    let now_ms = wall_clock_unix_ms_now();
-                    try_record_momentum_intent_header_to_publish_ms(
-                        now_ms,
-                        intent.header.ts_unix_ms,
-                    );
-                    publish_ok = true;
-                }
-                Ok(false) => {
-                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        intent_id = %intent.intent_id,
-                        topic = TOPIC_TRADE_INTENTS,
-                        "Intent JetStream publish dropped/failed in worker"
-                    );
-                }
-                Err(e) => {
-                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        intent_id = %intent.intent_id,
-                        error = %e,
-                        "Intent JetStream publish error in worker"
-                    );
+            let buy_cancelled_before_publish =
+                matches!(&job.post_action, IntentPublishPostAction::Buy { .. })
+                    && !ctx.pending_intents.read().contains_key(&intent.intent_id);
+            if buy_cancelled_before_publish {
+                publish_ok = false;
+            } else {
+                match nats.jetstream_publish(TOPIC_TRADE_INTENTS, &intent).await {
+                    Ok(true) => {
+                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        let now_ms = wall_clock_unix_ms_now();
+                        try_record_momentum_intent_header_to_publish_ms(
+                            now_ms,
+                            intent.header.ts_unix_ms,
+                        );
+                        publish_ok = true;
+                    }
+                    Ok(false) => {
+                        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            intent_id = %intent.intent_id,
+                            topic = TOPIC_TRADE_INTENTS,
+                            "Intent JetStream publish dropped/failed in worker"
+                        );
+                    }
+                    Err(e) => {
+                        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            intent_id = %intent.intent_id,
+                            error = %e,
+                            "Intent JetStream publish error in worker"
+                        );
+                    }
                 }
             }
         }
@@ -10681,9 +10683,11 @@ async fn intent_publish_worker_loop(
                         creator: meta_creator,
                         token_program,
                     });
-                } else {
+                } else if ctx.pending_intents.read().contains_key(&intent.intent_id) {
                     let intent_id = intent.intent_id.clone();
                     ctx.pending_intents.write().remove(&intent_id);
+                    ctx.unwind_stale_entry_pending_after_publish_failure(&entry_signal, true);
+                } else {
                     ctx.unwind_stale_entry_pending_after_publish_failure(&entry_signal, true);
                 }
             }
@@ -11032,6 +11036,16 @@ async fn generate_and_publish_buy_intent_inner(
         reason = %signal.reason,
         alternatives_checked = alternatives_checked,
         "🚀 Generated BUY TradeIntent"
+    );
+
+    // Register pending intent before enqueue so FIX-30b can cancel queued buys on exit ticks.
+    ctx.register_buy_intent(
+        intent_id,
+        &signal.mint,
+        &effective_pool,
+        &effective_dex,
+        signal.sol_amount,
+        Some(signal.kind),
     );
 
     ctx.enqueue_intent_publish(IntentPublishJob {
