@@ -105,15 +105,19 @@ impl<Q: QuoteProvider> BeamCycleFinder<Q> {
     /// BFS subgraph around seed tokens (plus base) within `max_hops`.
     fn build_search_subgraph(&self, graph: &PoolGraph, seeds: &[Pubkey]) -> HashSet<Pubkey> {
         let mut allowed = HashSet::new();
-        allowed.insert(self.config.base_mint);
-
         let mut queue = VecDeque::new();
+
         for &seed in seeds {
-            if graph.has_token(&seed) {
-                allowed.insert(seed);
-                queue.push_back((seed, 0usize));
+            if !graph.has_token(&seed) {
+                continue;
             }
+            allowed.insert(seed);
+            // Enqueue even when seed == base_mint (already in allowed from a prior seed).
+            queue.push_back((seed, 0usize));
         }
+
+        // Base is always reachable for cycle closing.
+        allowed.insert(self.config.base_mint);
 
         while let Some((token, depth)) = queue.pop_front() {
             if depth >= self.config.max_hops {
@@ -692,5 +696,38 @@ mod tests {
                 "Cycle should contain intermediate token"
             );
         }
+    }
+
+    #[test]
+    fn test_find_cycles_through_wsol_matches_find_cycles() {
+        let wsol = test_pubkey(0x01);
+
+        let config = CycleFinderConfig {
+            min_profit_bps: 50,
+            base_mint: wsol,
+            ..Default::default()
+        };
+
+        let (graph, mock) = setup_triangle_graph();
+        let finder_full = BeamCycleFinder::new(config.clone(), PoolRanker::new(mock));
+        let full_cycles = finder_full.find_cycles(&graph);
+
+        let (graph2, mock2) = setup_triangle_graph();
+        let finder_through = BeamCycleFinder::new(config, PoolRanker::new(mock2));
+        let through_cycles = finder_through.find_cycles_through(&graph2, &[wsol]);
+
+        assert!(
+            !full_cycles.is_empty(),
+            "Full-graph search should find cycles on triangle graph"
+        );
+        assert_eq!(
+            full_cycles.len(),
+            through_cycles.len(),
+            "WSOL-only targeted search should match full-graph cycle count"
+        );
+        assert_eq!(
+            full_cycles[0].estimated_return_bps, through_cycles[0].estimated_return_bps,
+            "Best cycle return should match between full and WSOL-targeted search"
+        );
     }
 }
