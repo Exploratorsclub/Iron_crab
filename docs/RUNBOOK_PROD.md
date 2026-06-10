@@ -442,8 +442,19 @@ curl -s http://127.0.0.1:9803/metrics | grep arb_two_hop
 | `arb_two_hop_rejected_total{reason="spread_too_large"}` | Vergleichbare Preise wahrscheinlich inkonsistent (>10% bps, bzw. 2% Stable) |
 | `arb_two_hop_rejected_total{reason="spread_below_min"}` | Spread unter `min_spread_bps` |
 | `arb_two_hop_rejected_total{reason="profit_below_min"}` | Geschätzter Netto-Profit unter Schwellwert |
-| `arb_two_hop_rejected_total{reason="stale_price"}` | Pool-Preis älter als 30s |
-| `arb_two_hop_rejected_total{reason="insufficient_pools"}` | Weniger als 2 Pools mit vergleichbarem Preis (MASTER cache) |
+| `arb_two_hop_rejected_total{reason="stale_price"}` | Pool-Preis älter als 30s (Trade **oder** Reserve-Daten) |
+| `arb_two_hop_rejected_total{reason="insufficient_pools"}` | Weniger als 2 Pools mit `comparable_price` **im Token-Tracker** (nicht `known_pools`!) |
+| `arb_two_hop_tracker_seeded_pools_total` | Pools aus SLAVE `LivePoolCache` in TokenArbTracker geseedet (Reserve-Mid) |
+
+**Wichtig — `insufficient_pools` vs. `known_pools`:** `known_pools` (~670k) ist der JetStream-SSOT-Gate für ausführbare Pools. `insufficient_pools` zählt nur Pools **im TokenArbTracker** mit vergleichbarem Preis — primär Trade-getrieben, ergänzt durch Tracker-Seed aus `LivePoolCache` nach Bootstrap/PoolDiscovered.
+
+**Prod-Gate nach Phase-2-Deploy (10 min, `two_hop_enabled=true`):**
+
+1. `arb_two_hop_rejected_total{reason="insufficient_pools"}` — Rate **deutlich sinken** (war ~62%)
+2. `arb_two_hop_rejected_total{reason="spread_too_large"}` — **sinken** (DLMM marginal vs. AMM)
+3. Heartbeat `multi_dex_tokens` — **steigen** (Tracker-Seed)
+4. `arb_two_hop_opportunities_total > 0` **oder** plausible `profit_below_min` mit `sell_liquidity_known=true`
+5. `known_pools` bleibt ~670k (keine Regression PR #210)
 
 **Erwartung nach Preis-Fix:** `spread_too_large` sinkt stark; `opportunities_total` oder plausible `profit_below_min` (mit bekannter Liquidität auf mindestens einer Seite) steigen.
 

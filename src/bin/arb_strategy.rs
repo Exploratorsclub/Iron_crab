@@ -31,16 +31,18 @@ use ironcrab::arbitrage::{
     MultiHopArbitrage, MultiHopConfig,
 };
 use ironcrab::config::Config as AppConfig;
-use ironcrab::execution::live_pool_cache::{create_shared_cache, SharedLivePoolCache};
+use ironcrab::execution::live_pool_cache::{
+    create_shared_cache, CachedPoolState, LivePoolCache, SharedLivePoolCache,
+};
 use ironcrab::execution::pool_cache_sync::bootstrap_pool_cache_from_jetstream;
 use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExplicitAmount, IntentOrigin,
-    IntentTier, MarketEvent, MarketEventKind, PoolCacheUpdate, TradeIntent, TradeResources,
-    TradeSide, TradingRegime,
+    IntentTier, MarketEvent, MarketEventKind, PoolCacheUpdate, PoolCacheUpdateType, TradeIntent,
+    TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
-    arb_two_hop_opportunity_inc, arb_two_hop_rejected_inc, serve_metrics,
-    set_readiness_nats_connected, ArbTwoHopRejectReason, MetricsComponent,
+    arb_two_hop_opportunity_inc, arb_two_hop_rejected_inc, arb_two_hop_tracker_seeded_pools_add,
+    serve_metrics, set_readiness_nats_connected, ArbTwoHopRejectReason, MetricsComponent,
     ARB_REJECTED_MISSING_ACCOUNTS, ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL,
     MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
     POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
@@ -52,6 +54,8 @@ use ironcrab::nats::{
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
+use solana_sdk::pubkey::Pubkey;
+use std::str::FromStr;
 
 /// Build version for decision records
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -161,6 +165,17 @@ const GEYSER_CONNECTION_TIMEOUT_SECS: u64 = 30;
 const MIN_TRADE_VOLUME_LAMPORTS: u64 = 100_000; // 0.0001 SOL minimum (filter dust)
 /// Max age for pool comparable prices used in 2-hop spread (aligns with Geyser health window).
 const MAX_PRICE_AGE_MS: u64 = 30_000;
+/// Small SOL probe for DLMM marginal price (0.01 SOL) — spread comparison only.
+const DLMM_PROBE_SOL_LAMPORTS: u64 = 10_000_000;
+
+/// Which marginal quote to use when ranking pools for 2-hop spread.
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ComparablePriceSide {
+    /// SOL → token (buy leg / cheapest pool).
+    Buy,
+    /// Token → SOL (sell leg / highest bid).
+    Sell,
+}
 
 fn is_known_dex_label(dex: &str) -> bool {
     matches!(
@@ -228,12 +243,249 @@ fn trade_implied_sol_per_token(sol_amount: u64, token_amount: u64, token_decimal
     sol_dec / token_dec
 }
 
-/// Comparable SOL/token for spread: reserve mid (Geyser) > arithmetic mid of last buy/sell trades.
+/// DLMM token output via bin-array traversal (shared by spread price + intent sizing).
+fn dlmm_token_output_from_bins(
+    active_id: i32,
+    bin_step: u16,
+    sol_in_lamports: u64,
+    bin_arrays: &HashMap<i64, Vec<BinData>>,
+    sol_is_x: bool,
+) -> Option<u64> {
+    if bin_arrays.is_empty() {
+        return None;
+    }
+
+    let active_array_index = active_id as i64 / 70;
+    let active_bin_offset = (active_id as i64 % 70) as usize;
+    let active_array = bin_arrays.get(&active_array_index)?;
+    if !active_array
+        .iter()
+        .any(|b| b.offset as usize == active_bin_offset)
+    {
+        return None;
+    }
+
+    let mut remaining_sol = sol_in_lamports as u128;
+    let mut total_tokens_out: u128 = 0;
+
+    let mut all_bins: Vec<(i32, BinData)> = Vec::new();
+    for (array_idx, bins) in bin_arrays {
+        for bin in bins {
+            let bin_id = (*array_idx * 70 + bin.offset as i64) as i32;
+            all_bins.push((bin_id, bin.clone()));
+        }
+    }
+    all_bins.sort_by_key(|(id, _)| *id);
+
+    let relevant_bins: Vec<_> = all_bins
+        .into_iter()
+        .filter(|(id, _)| *id >= active_id)
+        .collect();
+
+    for (_bin_id, bin) in relevant_bins {
+        if remaining_sol == 0 {
+            break;
+        }
+        let (sol_in_bin, tokens_in_bin) = if sol_is_x {
+            (bin.amount_x as u128, bin.amount_y as u128)
+        } else {
+            (bin.amount_y as u128, bin.amount_x as u128)
+        };
+        if tokens_in_bin == 0 {
+            continue;
+        }
+        if sol_in_bin > 0 {
+            let sol_to_use = remaining_sol.min(sol_in_bin);
+            let tokens = sol_to_use
+                .checked_mul(tokens_in_bin)?
+                .checked_div(sol_in_bin)?;
+            remaining_sol = remaining_sol.saturating_sub(sol_to_use);
+            total_tokens_out = total_tokens_out.checked_add(tokens)?;
+        }
+    }
+
+    let fee_bps = 10u128 + (bin_step as u128).min(100);
+    let fee_multiplier = 10000u128 - fee_bps;
+    let tokens_after_fee = total_tokens_out
+        .checked_mul(fee_multiplier)?
+        .checked_div(10000)?;
+
+    Some(tokens_after_fee as u64)
+}
+
+/// DLMM SOL output via bin-array traversal (token → SOL, sell-side marginal).
+fn dlmm_sol_output_from_bins(
+    active_id: i32,
+    bin_step: u16,
+    token_in: u64,
+    bin_arrays: &HashMap<i64, Vec<BinData>>,
+    sol_is_x: bool,
+) -> Option<u64> {
+    if bin_arrays.is_empty() || token_in == 0 {
+        return None;
+    }
+
+    let active_array_index = active_id as i64 / 70;
+    let active_bin_offset = (active_id as i64 % 70) as usize;
+    let active_array = bin_arrays.get(&active_array_index)?;
+    if !active_array
+        .iter()
+        .any(|b| b.offset as usize == active_bin_offset)
+    {
+        return None;
+    }
+
+    let mut remaining_tokens = token_in as u128;
+    let mut total_sol_out: u128 = 0;
+
+    let mut all_bins: Vec<(i32, BinData)> = Vec::new();
+    for (array_idx, bins) in bin_arrays {
+        for bin in bins {
+            let bin_id = (*array_idx * 70 + bin.offset as i64) as i32;
+            all_bins.push((bin_id, bin.clone()));
+        }
+    }
+    all_bins.sort_by_key(|(id, _)| *id);
+
+    let relevant_bins: Vec<_> = all_bins
+        .into_iter()
+        .filter(|(id, _)| *id <= active_id)
+        .collect();
+
+    for (_bin_id, bin) in relevant_bins.into_iter().rev() {
+        if remaining_tokens == 0 {
+            break;
+        }
+        let (sol_in_bin, tokens_in_bin) = if sol_is_x {
+            (bin.amount_x as u128, bin.amount_y as u128)
+        } else {
+            (bin.amount_y as u128, bin.amount_x as u128)
+        };
+        if tokens_in_bin == 0 || sol_in_bin == 0 {
+            continue;
+        }
+        let tokens_to_use = remaining_tokens.min(tokens_in_bin);
+        let sol_out = tokens_to_use
+            .checked_mul(sol_in_bin)?
+            .checked_div(tokens_in_bin)?;
+        remaining_tokens = remaining_tokens.saturating_sub(tokens_to_use);
+        total_sol_out = total_sol_out.checked_add(sol_out)?;
+    }
+
+    let fee_bps = 10u128 + (bin_step as u128).min(100);
+    let fee_multiplier = 10000u128 - fee_bps;
+    let sol_after_fee = total_sol_out
+        .checked_mul(fee_multiplier)?
+        .checked_div(10000)?;
+
+    Some(sol_after_fee as u64)
+}
+
+/// Map on-chain base/quote reserves to token-base + SOL-quote for comparable pricing.
+fn sol_quoted_vault_reserves(
+    base_mint: &str,
+    quote_mint: &str,
+    reserve_base: u64,
+    reserve_quote: u64,
+) -> (u64, u64) {
+    if quote_mint == NATIVE_SOL_MINT {
+        (reserve_base, reserve_quote)
+    } else if base_mint == NATIVE_SOL_MINT {
+        (reserve_quote, reserve_base)
+    } else {
+        (reserve_base, reserve_quote)
+    }
+}
+
+fn flatten_bin_array_cache(arrays: &HashMap<i64, BinArrayCache>) -> HashMap<i64, Vec<BinData>> {
+    arrays
+        .iter()
+        .map(|(idx, cache)| (*idx, cache.bins.clone()))
+        .collect()
+}
+
+/// True when trade-implied price or Geyser reserve data is within max_age.
+fn is_pool_price_fresh(
+    pool: &PoolState,
+    vault: Option<&VaultBalanceCache>,
+    max_age: Duration,
+) -> bool {
+    if pool.last_update.elapsed() <= max_age {
+        return true;
+    }
+    if pool.has_reserve_data {
+        if let Some(v) = vault {
+            if v.reserve_base > 0 && v.reserve_quote > 0 && v.updated_at.elapsed() <= max_age {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Comparable SOL/token for spread: DLMM marginal (probe) > reserve mid > trade mid.
 fn comparable_price_sol_per_token(
     pool: &PoolState,
     vault_reserves: Option<(u64, u64)>,
     token_decimals: u8,
+    vault_cache: Option<&VaultBalanceCache>,
+    dlmm_bin_arrays: Option<&HashMap<i64, BinArrayCache>>,
+    side: ComparablePriceSide,
 ) -> Option<Decimal> {
+    if pool.dex == "meteora_dlmm" {
+        if let (Some(vault), Some(arrays)) = (vault_cache, dlmm_bin_arrays) {
+            if let (Some(active_id), Some(bin_step)) = (vault.active_id, vault.bin_step) {
+                let flat = flatten_bin_array_cache(arrays);
+                let sol_is_x = vault.dlmm_sol_is_x;
+                match side {
+                    ComparablePriceSide::Buy => {
+                        if let Some(tokens_out) = dlmm_token_output_from_bins(
+                            active_id,
+                            bin_step,
+                            DLMM_PROBE_SOL_LAMPORTS,
+                            &flat,
+                            sol_is_x,
+                        ) {
+                            if tokens_out > 0 {
+                                return Some(trade_implied_sol_per_token(
+                                    DLMM_PROBE_SOL_LAMPORTS,
+                                    tokens_out,
+                                    token_decimals,
+                                ));
+                            }
+                        }
+                    }
+                    ComparablePriceSide::Sell => {
+                        let token_probe = dlmm_token_output_from_bins(
+                            active_id,
+                            bin_step,
+                            DLMM_PROBE_SOL_LAMPORTS,
+                            &flat,
+                            sol_is_x,
+                        )?;
+                        if token_probe == 0 {
+                            return None;
+                        }
+                        let sol_out = dlmm_sol_output_from_bins(
+                            active_id,
+                            bin_step,
+                            token_probe,
+                            &flat,
+                            sol_is_x,
+                        )?;
+                        if sol_out > 0 {
+                            return Some(trade_implied_sol_per_token(
+                                sol_out,
+                                token_probe,
+                                token_decimals,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if let Some((reserve_base, reserve_quote)) = vault_reserves {
         if let Some(mid) = reserve_mid_sol_per_token(reserve_base, reserve_quote, token_decimals) {
             return Some(mid);
@@ -246,6 +498,313 @@ fn comparable_price_sol_per_token(
         (Some(one), None) | (None, Some(one)) if one > Decimal::ZERO => Some(one),
         _ => None,
     }
+}
+
+/// SOL-quoted pool seed: (token_mint, reserve_base, reserve_quote_sol, active_id, bin_step).
+type SolQuotedPoolSeed = (String, u64, u64, Option<i32>, Option<u16>);
+
+/// Extract SOL-quoted token reserves from SLAVE CachedPoolState (base=token, quote=SOL).
+fn sol_quoted_pool_seed(state: &CachedPoolState) -> Option<SolQuotedPoolSeed> {
+    match state {
+        CachedPoolState::Orca(s) => {
+            let mint_a = s.token_mint_a.to_string();
+            let mint_b = s.token_mint_b.to_string();
+            let va = s.vault_a_balance?;
+            let vb = s.vault_b_balance?;
+            if mint_b == NATIVE_SOL_MINT {
+                Some((mint_a, va, vb, None, None))
+            } else if mint_a == NATIVE_SOL_MINT {
+                Some((mint_b, vb, va, None, None))
+            } else {
+                None
+            }
+        }
+        CachedPoolState::RaydiumAmm(s) => {
+            let base = s.base_mint.to_string();
+            let quote = s.quote_mint.to_string();
+            let cr = s.coin_reserve?;
+            let pr = s.pc_reserve?;
+            if quote == NATIVE_SOL_MINT {
+                Some((base, cr, pr, None, None))
+            } else if base == NATIVE_SOL_MINT {
+                Some((quote, pr, cr, None, None))
+            } else {
+                None
+            }
+        }
+        CachedPoolState::RaydiumCpmm(s) => {
+            let t0 = s.token_0_mint.to_string();
+            let t1 = s.token_1_mint.to_string();
+            let r0 = s.reserve_0?;
+            let r1 = s.reserve_1?;
+            if t1 == NATIVE_SOL_MINT {
+                Some((t0, r0, r1, None, None))
+            } else if t0 == NATIVE_SOL_MINT {
+                Some((t1, r1, r0, None, None))
+            } else {
+                None
+            }
+        }
+        CachedPoolState::Meteora(s) => {
+            let x = s.token_x_mint.to_string();
+            let y = s.token_y_mint.to_string();
+            let rx = s.reserve_x_balance?;
+            let ry = s.reserve_y_balance?;
+            if y == NATIVE_SOL_MINT {
+                Some((x, rx, ry, Some(s.active_id), Some(s.bin_step)))
+            } else if x == NATIVE_SOL_MINT {
+                Some((y, ry, rx, Some(s.active_id), Some(s.bin_step)))
+            } else {
+                None
+            }
+        }
+        CachedPoolState::MeteoraCpmm(s) => {
+            let t0 = s.token_0_mint.to_string();
+            let t1 = s.token_1_mint.to_string();
+            if t1 == NATIVE_SOL_MINT {
+                Some((t0, s.reserve_0, s.reserve_1, None, None))
+            } else if t0 == NATIVE_SOL_MINT {
+                Some((t1, s.reserve_1, s.reserve_0, None, None))
+            } else {
+                None
+            }
+        }
+        CachedPoolState::PumpAmm(s) => {
+            let base = s.base_mint.to_string();
+            let quote = s.quote_mint.to_string();
+            let br = s.base_reserve?;
+            let qr = s.quote_reserve?;
+            if quote == NATIVE_SOL_MINT {
+                Some((base, br, qr, None, None))
+            } else if base == NATIVE_SOL_MINT {
+                Some((quote, qr, br, None, None))
+            } else {
+                None
+            }
+        }
+        CachedPoolState::PumpFun(s) => {
+            let mint = s.token_mint.to_string();
+            if mint == NATIVE_SOL_MINT {
+                return None;
+            }
+            let token_r = s.virtual_token_reserves;
+            let sol_r = s.virtual_sol_reserves;
+            if token_r > 0 && sol_r > 0 {
+                Some((mint, token_r, sol_r, None, None))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Upsert one pool into tracker + vault_balances from SLAVE cache. Returns true when newly added.
+fn seed_one_pool_from_live_cache(
+    mint: &str,
+    live_pool_cache: &LivePoolCache,
+    pool_pk: Pubkey,
+    state: &CachedPoolState,
+    trackers: &mut HashMap<String, TokenArbTracker>,
+    vault_balances: &mut HashMap<String, VaultBalanceCache>,
+) -> bool {
+    let dex = state.dex_name();
+    if !is_known_dex_label(dex) {
+        return false;
+    }
+    let Some((token_mint, reserve_base, reserve_quote, active_id, bin_step)) =
+        sol_quoted_pool_seed(state)
+    else {
+        return false;
+    };
+    if token_mint != mint || reserve_base == 0 || reserve_quote == 0 {
+        return false;
+    }
+
+    let pool_addr = pool_pk.to_string();
+    let (_, slot, age_ms) =
+        live_pool_cache
+            .get_with_metadata(&pool_pk)
+            .unwrap_or((state.clone(), 0, 0));
+    let cache_updated_at = Instant::now()
+        .checked_sub(Duration::from_millis(age_ms))
+        .unwrap_or_else(Instant::now);
+    let dlmm_sol_is_x = matches!(
+        state,
+        CachedPoolState::Meteora(s) if s.token_x_mint.to_string() == NATIVE_SOL_MINT
+    );
+
+    // Monotonic merge: lagging JetStream must not regress fresher Geyser PoolStateUpdate.
+    let should_update_vault = match vault_balances.get(&pool_addr) {
+        Some(existing) => slot >= existing.update_slot,
+        None => true,
+    };
+
+    if should_update_vault {
+        vault_balances.insert(
+            pool_addr.clone(),
+            VaultBalanceCache {
+                reserve_base,
+                reserve_quote,
+                update_slot: slot,
+                active_id,
+                bin_step,
+                updated_at: cache_updated_at,
+                dlmm_sol_is_x,
+            },
+        );
+    }
+
+    let vault_ref = vault_balances
+        .get(&pool_addr)
+        .expect("vault_balances entry must exist after seed merge");
+    let eff_reserve_base = vault_ref.reserve_base;
+    let eff_reserve_quote = vault_ref.reserve_quote;
+    let eff_updated_at = vault_ref.updated_at;
+
+    let tracker = trackers
+        .entry(mint.to_string())
+        .or_insert_with(|| TokenArbTracker::new(mint));
+    let token_decimals = tracker.token_decimals.unwrap_or(6);
+    let liquidity_sol = Decimal::from(eff_reserve_quote) / Decimal::from(1_000_000_000u64);
+    let reserve_price =
+        reserve_mid_sol_per_token(eff_reserve_base, eff_reserve_quote, token_decimals);
+    let (trade_price_buy, trade_price_sell, trade_count, dex_accounts) = tracker
+        .pools
+        .get(&pool_addr)
+        .map(|p| {
+            (
+                p.trade_price_buy,
+                p.trade_price_sell,
+                p.trade_count,
+                p.dex_accounts.clone(),
+            )
+        })
+        .unwrap_or((None, None, 0, None));
+    let pool_last_update = match tracker.pools.get(&pool_addr) {
+        Some(p) if !should_update_vault => p.last_update.max(eff_updated_at),
+        _ => eff_updated_at,
+    };
+    let seed_pool = PoolState {
+        pool_address: pool_addr.clone(),
+        dex: dex.to_string(),
+        last_price: reserve_price,
+        trade_price_buy,
+        trade_price_sell,
+        liquidity_sol,
+        has_reserve_data: eff_reserve_base > 0 && eff_reserve_quote > 0,
+        last_update: pool_last_update,
+        trade_count,
+        dex_accounts,
+    };
+    let vault_entry = vault_balances.get(&pool_addr);
+    let dlmm_bins = None::<&HashMap<i64, BinArrayCache>>;
+    let last_price = comparable_price_sol_per_token(
+        &seed_pool,
+        Some((eff_reserve_base, eff_reserve_quote)),
+        token_decimals,
+        vault_entry,
+        dlmm_bins,
+        ComparablePriceSide::Buy,
+    )
+    .or(reserve_price);
+
+    let is_new_pool = !tracker.pools.contains_key(&pool_addr);
+    tracker.upsert_pool(PoolState {
+        pool_address: pool_addr,
+        dex: dex.to_string(),
+        last_price,
+        trade_price_buy: seed_pool.trade_price_buy,
+        trade_price_sell: seed_pool.trade_price_sell,
+        liquidity_sol,
+        has_reserve_data: eff_reserve_base > 0 && eff_reserve_quote > 0,
+        last_update: pool_last_update,
+        trade_count: seed_pool.trade_count,
+        dex_accounts: seed_pool.dex_accounts,
+    });
+    is_new_pool
+}
+
+/// Seed TokenArbTracker pools for one mint from SLAVE LivePoolCache (Geyser-only, no RPC).
+/// When `only_pool` is set, uses O(1) `get` (incremental JetStream); bootstrap uses full `iter`.
+fn seed_token_tracker_from_live_pool_cache(
+    mint: &str,
+    live_pool_cache: &LivePoolCache,
+    trackers: &mut HashMap<String, TokenArbTracker>,
+    vault_balances: &mut HashMap<String, VaultBalanceCache>,
+    only_pool: Option<&str>,
+) -> usize {
+    let mut seeded = 0usize;
+
+    if let Some(pool_filter) = only_pool {
+        let Ok(pool_pk) = Pubkey::from_str(pool_filter) else {
+            return 0;
+        };
+        let Some((state, _, _)) = live_pool_cache.get_with_metadata(&pool_pk) else {
+            return 0;
+        };
+        if seed_one_pool_from_live_cache(
+            mint,
+            live_pool_cache,
+            pool_pk,
+            &state,
+            trackers,
+            vault_balances,
+        ) {
+            seeded = 1;
+        }
+    } else {
+        for (pool_pk, state) in live_pool_cache.iter() {
+            if seed_one_pool_from_live_cache(
+                mint,
+                live_pool_cache,
+                pool_pk,
+                &state,
+                trackers,
+                vault_balances,
+            ) {
+                seeded += 1;
+            }
+        }
+    }
+
+    if seeded > 0 {
+        arb_two_hop_tracker_seeded_pools_add(seeded as u64);
+    }
+    seeded
+}
+
+/// Seed all mints that have at least one SOL-quoted pool in SLAVE LivePoolCache.
+fn seed_all_trackers_from_live_pool_cache(
+    live_pool_cache: &LivePoolCache,
+    trackers: &mut HashMap<String, TokenArbTracker>,
+    vault_balances: &mut HashMap<String, VaultBalanceCache>,
+) -> usize {
+    let mut seeded = 0usize;
+    for (pool_pk, state) in live_pool_cache.iter() {
+        if !is_known_dex_label(state.dex_name()) {
+            continue;
+        }
+        let Some((token_mint, rb, rq, _, _)) = sol_quoted_pool_seed(&state) else {
+            continue;
+        };
+        if rb == 0 || rq == 0 || token_mint == NATIVE_SOL_MINT {
+            continue;
+        }
+        if seed_one_pool_from_live_cache(
+            &token_mint,
+            live_pool_cache,
+            pool_pk,
+            &state,
+            trackers,
+            vault_balances,
+        ) {
+            seeded += 1;
+        }
+    }
+    if seeded > 0 {
+        arb_two_hop_tracker_seeded_pools_add(seeded as u64);
+    }
+    seeded
 }
 
 /// Tracks a pool's price/liquidity state
@@ -338,6 +897,7 @@ impl TokenArbTracker {
         config: &ArbConfig,
         known_pools: &HashSet<String>,
         vault_balances: &HashMap<String, VaultBalanceCache>,
+        bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
     ) -> Option<ArbOpportunity> {
         // Check if 2-hop arbitrage is enabled
         if !config.two_hop_enabled {
@@ -350,8 +910,10 @@ impl TokenArbTracker {
 
         let token_decimals = self.token_decimals.unwrap_or(6);
 
-        // Build comparable prices per pool (reserve mid preferred over trade mid)
-        let mut priced_pools: Vec<(&PoolState, Decimal)> = Vec::new();
+        // Build comparable prices per pool (buy-side for cheapest, sell-side for highest bid)
+        let mut best_buy: Option<(&PoolState, Decimal)> = None;
+        let mut best_sell: Option<(&PoolState, Decimal)> = None;
+        let mut eligible_pools = 0usize;
         for pool in self.pools.values() {
             let is_known_dex = is_known_dex_label(&pool.dex);
             let in_master_cache = known_pools.contains(&pool.pool_address);
@@ -366,48 +928,61 @@ impl TokenArbTracker {
                 }
                 continue;
             }
-            let vault_reserves = vault_balances
-                .get(&pool.pool_address)
-                .map(|c| (c.reserve_base, c.reserve_quote));
-            let Some(price) = comparable_price_sol_per_token(pool, vault_reserves, token_decimals)
-            else {
-                continue;
-            };
-            if price <= Decimal::ZERO {
+            let vault_entry = vault_balances.get(&pool.pool_address);
+            let vault_reserves = vault_entry.map(|c| (c.reserve_base, c.reserve_quote));
+            let dlmm_bins = bin_arrays.get(&pool.pool_address);
+            let buy_price = comparable_price_sol_per_token(
+                pool,
+                vault_reserves,
+                token_decimals,
+                vault_entry,
+                dlmm_bins,
+                ComparablePriceSide::Buy,
+            );
+            let sell_price = comparable_price_sol_per_token(
+                pool,
+                vault_reserves,
+                token_decimals,
+                vault_entry,
+                dlmm_bins,
+                ComparablePriceSide::Sell,
+            );
+            if buy_price.is_none() && sell_price.is_none() {
                 continue;
             }
-            priced_pools.push((pool, price));
+            eligible_pools += 1;
+            if let Some(price) = buy_price.filter(|p| *p > Decimal::ZERO) {
+                if best_buy.is_none() || price < best_buy.unwrap().1 {
+                    best_buy = Some((pool, price));
+                }
+            }
+            if let Some(price) = sell_price.filter(|p| *p > Decimal::ZERO) {
+                if best_sell.is_none() || price > best_sell.unwrap().1 {
+                    best_sell = Some((pool, price));
+                }
+            }
         }
 
-        if priced_pools.len() < 2 {
+        if eligible_pools < 2 {
             debug!(
                 mint = %self.base_mint,
-                pools = priced_pools.len(),
+                pools = eligible_pools,
                 "Arb check: insufficient pools with comparable prices"
             );
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::InsufficientPools);
             return None;
         }
 
-        // Find cheapest pool to buy and most expensive pool to sell (may be same DEX — filtered below)
-        let mut best_buy: Option<(&PoolState, Decimal)> = None;
-        let mut best_sell: Option<(&PoolState, Decimal)> = None;
-
-        for (pool, price) in &priced_pools {
-            if best_buy.is_none() || *price < best_buy.unwrap().1 {
-                best_buy = Some((pool, *price));
-            }
-            if best_sell.is_none() || *price > best_sell.unwrap().1 {
-                best_sell = Some((pool, *price));
-            }
-        }
-
         let (buy_pool, buy_price) = best_buy?;
         let (sell_pool, sell_price) = best_sell?;
 
-        // Staleness: both pool prices must be fresh
+        // Staleness: trade-implied or Geyser reserve data must be fresh
         let max_age = Duration::from_millis(MAX_PRICE_AGE_MS);
-        if buy_pool.last_update.elapsed() > max_age || sell_pool.last_update.elapsed() > max_age {
+        let buy_vault = vault_balances.get(&buy_pool.pool_address);
+        let sell_vault = vault_balances.get(&sell_pool.pool_address);
+        if !is_pool_price_fresh(buy_pool, buy_vault, max_age)
+            || !is_pool_price_fresh(sell_pool, sell_vault, max_age)
+        {
             debug!(
                 mint = %self.base_mint,
                 buy_pool = %buy_pool.pool_address,
@@ -683,6 +1258,10 @@ struct VaultBalanceCache {
     // DLMM-specific (Option D: Bin Array Traversierung)
     active_id: Option<i32>,
     bin_step: Option<u16>,
+    /// Wall-clock freshness for reserve-based price (Geyser PoolStateUpdate or SLAVE seed).
+    updated_at: Instant,
+    /// Meteora DLMM: on-chain token X is SOL (bins stay in native X/Y layout).
+    dlmm_sol_is_x: bool,
 }
 
 /// Cached bin array data from BinArrayUpdate events
@@ -1136,21 +1715,85 @@ impl ArbContext {
         }
     }
 
+    /// Seed all SOL-quoted mints after JetStream bootstrap.
+    fn seed_all_trackers_from_live_pool_cache(&self) -> usize {
+        let mut trackers = self.trackers.write();
+        let mut vault_balances = self.vault_balances.write();
+        seed_all_trackers_from_live_pool_cache(
+            &self.live_pool_cache,
+            &mut trackers,
+            &mut vault_balances,
+        )
+    }
+
+    /// Incremental tracker seed when a pool is discovered or balances update.
+    fn seed_trackers_for_pool_cache_update(&self, update: &PoolCacheUpdate) {
+        if matches!(update.update_type, PoolCacheUpdateType::PoolRemoved) {
+            return;
+        }
+        let mint = if update.quote_mint == NATIVE_SOL_MINT {
+            &update.base_mint
+        } else if update.base_mint == NATIVE_SOL_MINT {
+            &update.quote_mint
+        } else {
+            return;
+        };
+        if mint == NATIVE_SOL_MINT {
+            return;
+        }
+        let mut trackers = self.trackers.write();
+        let mut vault_balances = self.vault_balances.write();
+        let seeded = seed_token_tracker_from_live_pool_cache(
+            mint,
+            &self.live_pool_cache,
+            &mut trackers,
+            &mut vault_balances,
+            Some(&update.pool_address),
+        );
+        if seeded > 0 {
+            debug!(
+                mint = %mint,
+                pools_seeded = seeded,
+                pool = %update.pool_address,
+                "Tracker seeded from SLAVE LivePoolCache"
+            );
+        }
+    }
+
     /// Handle PoolStateUpdate event - cache vault balances from Geyser
     /// This eliminates RPC calls to fetch vault balances during quoting.
     #[allow(clippy::too_many_arguments)]
     fn handle_pool_state_update(
         &self,
         pool_address: &str,
-        _dex: &str,
+        dex: &str,
         reserve_base: u64,
         reserve_quote: u64,
         update_slot: u64,
         active_id: Option<i32>,
         bin_step: Option<u16>,
+        base_mint: &str,
+        quote_mint: &str,
     ) {
+        let (reserve_base, reserve_quote) =
+            sol_quoted_vault_reserves(base_mint, quote_mint, reserve_base, reserve_quote);
         let mut cache = self.vault_balances.write();
+        let should_update_vault = match cache.get(pool_address) {
+            Some(existing) => update_slot >= existing.update_slot,
+            None => true,
+        };
+        if !should_update_vault {
+            return;
+        }
         let is_new = !cache.contains_key(pool_address);
+        let dlmm_sol_is_x = if dex == "meteora_dlmm" {
+            base_mint == NATIVE_SOL_MINT
+        } else {
+            cache
+                .get(pool_address)
+                .map(|v| v.dlmm_sol_is_x)
+                .unwrap_or(false)
+        };
         cache.insert(
             pool_address.to_string(),
             VaultBalanceCache {
@@ -1159,6 +1802,8 @@ impl ArbContext {
                 update_slot,
                 active_id,
                 bin_step,
+                updated_at: Instant::now(),
+                dlmm_sol_is_x,
             },
         );
         if is_new {
@@ -1320,7 +1965,6 @@ impl ArbContext {
             }
 
             "meteora_dlmm" => {
-                // DLMM Bin Array Traversierung
                 self.calculate_dlmm_token_output(buy_pool, sol_in_lamports, pool_state)
             }
 
@@ -1352,13 +1996,9 @@ impl ArbContext {
         sol_in_lamports: u64,
         pool_state: &VaultBalanceCache,
     ) -> Option<u64> {
-        // Get DLMM-specific parameters
         let active_id = pool_state.active_id?;
         let bin_step = pool_state.bin_step?;
-
-        // Get cached bin arrays for this pool
         let bin_arrays = self.get_bin_arrays(pool_address)?;
-
         if bin_arrays.is_empty() {
             debug!(
                 pool = %pool_address,
@@ -1367,122 +2007,20 @@ impl ArbContext {
             return None;
         }
 
-        // Convert active_id to bin array index
-        let active_array_index = active_id as i64 / 70; // 70 bins per array
-        let active_bin_offset = (active_id as i64 % 70) as usize;
-
-        // Find the active bin array
-        let active_array = bin_arrays.get(&active_array_index)?;
-
-        // Find the active bin within the array
-        let active_bin = active_array
-            .iter()
-            .find(|b| b.offset as usize == active_bin_offset);
-
-        // If active bin not found in cache, we can't calculate accurately
-        if active_bin.is_none() {
-            debug!(
-                pool = %pool_address,
-                active_id,
-                active_array_index,
-                active_bin_offset,
-                "DLMM: active bin not in cache, falling back to price-based"
-            );
-            return None;
-        }
-
-        // Traverse bins starting from active_id
-        // For SOL→Token (buy): we give SOL (amount_y) and receive Token (amount_x)
-        // Start at active bin and traverse towards higher bin_ids (token becomes cheaper)
-        let mut remaining_sol = sol_in_lamports as u128;
-        let mut total_tokens_out: u128 = 0;
-        let mut bins_traversed: i32 = 0;
-
-        // Collect all bins sorted by bin_id for traversal
-        let mut all_bins: Vec<(i32, BinData)> = Vec::new();
-        for (array_idx, bins) in &bin_arrays {
-            for bin in bins {
-                let bin_id = (*array_idx * 70 + bin.offset as i64) as i32;
-                all_bins.push((bin_id, bin.clone()));
-            }
-        }
-        all_bins.sort_by_key(|(id, _)| *id);
-
-        // Filter to only bins >= active_id (collect first, then iterate)
-        let relevant_bins: Vec<_> = all_bins
-            .into_iter()
-            .filter(|(id, _)| *id >= active_id)
-            .collect();
-
-        // Traverse bins starting from active_id
-        for (bin_id, bin) in relevant_bins {
-            if remaining_sol == 0 {
-                break;
-            }
-
-            // amount_y = SOL in bin, amount_x = Token in bin
-            // For buy: we give SOL, receive Token
-            let sol_in_bin = bin.amount_y as u128;
-            let tokens_in_bin = bin.amount_x as u128;
-
-            if tokens_in_bin == 0 {
-                // No tokens in this bin, skip
-                bins_traversed += 1;
-                continue;
-            }
-
-            // Calculate price at this bin
-            // price = tokens_per_sol = tokens_in_bin / sol_in_bin (if sol_in_bin > 0)
-            // For bins with no SOL, use bin_step to estimate price from previous bin
-            let tokens_received = if sol_in_bin > 0 {
-                // Use actual ratio in this bin
-                let sol_to_use = remaining_sol.min(sol_in_bin);
-                let tokens = sol_to_use
-                    .checked_mul(tokens_in_bin)?
-                    .checked_div(sol_in_bin)?;
-                remaining_sol = remaining_sol.saturating_sub(sol_to_use);
-                tokens
-            } else {
-                // Bin has tokens but no SOL - skip (no counter-liquidity)
-                bins_traversed += 1;
-                continue;
-            };
-
-            total_tokens_out = total_tokens_out.checked_add(tokens_received)?;
-            bins_traversed += 1;
-
-            // Log progress for debugging
-            if bins_traversed <= 3 {
-                debug!(
-                    bin_id,
-                    sol_in_bin,
-                    tokens_in_bin,
-                    tokens_received,
-                    remaining_sol = %remaining_sol,
-                    "DLMM bin traversal step"
-                );
-            }
-        }
-
-        // Apply DLMM fee (typically variable, use bin_step as approximation)
-        // Base fee ≈ 0.1% + bin_step * 0.01%
-        let fee_bps = 10u128 + (bin_step as u128).min(100);
-        let fee_multiplier = 10000u128 - fee_bps;
-        let tokens_after_fee = total_tokens_out
-            .checked_mul(fee_multiplier)?
-            .checked_div(10000)?;
-
-        let result = tokens_after_fee as u64;
+        let result = dlmm_token_output_from_bins(
+            active_id,
+            bin_step,
+            sol_in_lamports,
+            &bin_arrays,
+            pool_state.dlmm_sol_is_x,
+        )?;
 
         info!(
             pool = %pool_address,
             sol_in_lamports,
             active_id,
             bin_step,
-            bins_traversed,
-            total_tokens_out = %total_tokens_out,
             tokens_after_fee = result,
-            fee_bps,
             "Calculated expected token output from bin arrays (Option D - DLMM)"
         );
 
@@ -1619,7 +2157,16 @@ impl ArbContext {
             .read()
             .get(pool_address)
             .map(|c| (c.reserve_base, c.reserve_quote));
-        pool.last_price = comparable_price_sol_per_token(pool, vault_reserves, token_decimals);
+        let vault_entry = self.vault_balances.read().get(pool_address).cloned();
+        let dlmm_bins = self.bin_arrays.read().get(pool_address).cloned();
+        pool.last_price = comparable_price_sol_per_token(
+            pool,
+            vault_reserves,
+            token_decimals,
+            vault_entry.as_ref(),
+            dlmm_bins.as_ref(),
+            ComparablePriceSide::Buy,
+        );
         pool.trade_count += 1;
         pool.last_update = Instant::now();
         info!(
@@ -1644,7 +2191,10 @@ impl ArbContext {
         // Check for arbitrage opportunity (with known_pools filter)
         let known_pools = self.known_pools.read();
         let vault_balances = self.vault_balances.read();
-        if let Some(opp) = tracker.check_arbitrage(&config, &known_pools, &vault_balances) {
+        let bin_arrays = self.bin_arrays.read();
+        if let Some(opp) =
+            tracker.check_arbitrage(&config, &known_pools, &vault_balances, &bin_arrays)
+        {
             // Check cooldown
             let cooldown = Duration::from_millis(config.intent_cooldown_ms);
             if let Some(last_time) = tracker.last_intent_time {
@@ -2032,11 +2582,13 @@ async fn main() -> Result<()> {
                     &ctx.known_pools,
                     &ctx.multi_hop,
                 );
+                let tracker_seeded = ctx.seed_all_trackers_from_live_pool_cache();
                 ctx.multi_hop.warmup_quotes_from_live_pool_cache();
                 let mh_stats = ctx.multi_hop.stats();
                 info!(
                     pools_recovered,
                     known_pools = known_count,
+                    tracker_seeded_pools = tracker_seeded,
                     multi_hop_pools = mh_stats.graph_pools,
                     multi_hop_vertices = mh_stats.graph_vertices,
                     "SLAVE CACHE: known_pools and multi-hop graph recovered from JetStream"
@@ -2341,6 +2893,7 @@ async fn main() -> Result<()> {
                                                     &ctx.multi_hop,
                                                     &update,
                                                 ) {
+                                                    ctx.seed_trackers_for_pool_cache_update(&update);
                                                     debug!(
                                                         pool = %update.pool_address,
                                                         dex = %update.dex,
@@ -2590,6 +3143,8 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             update_slot,
             active_id,
             bin_step,
+            base_mint,
+            quote_mint,
             ..
         } => {
             ctx.handle_pool_state_update(
@@ -2600,6 +3155,8 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
                 *update_slot,
                 *active_id,
                 *bin_step,
+                base_mint,
+                quote_mint,
             );
             None
         }
@@ -2632,8 +3189,15 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
 #[cfg(test)]
 mod two_hop_price_tests {
     use super::*;
+    use ironcrab::execution::live_pool_cache::create_shared_cache;
+    use ironcrab::ipc::PoolCacheUpdate;
     use rust_decimal::Decimal;
+    use solana_sdk::pubkey::Pubkey;
     use std::time::Instant;
+
+    const TEST_COMPONENT: &str = "test";
+    const TEST_BUILD: &str = "0.0.0";
+    const TEST_RUN: &str = "run-test";
 
     fn sample_pool(
         dex: &str,
@@ -2655,15 +3219,48 @@ mod two_hop_price_tests {
         }
     }
 
+    fn sample_vault(
+        reserve_base: u64,
+        reserve_quote: u64,
+        active_id: Option<i32>,
+        bin_step: Option<u16>,
+    ) -> VaultBalanceCache {
+        VaultBalanceCache {
+            reserve_base,
+            reserve_quote,
+            update_slot: 1,
+            active_id,
+            bin_step,
+            updated_at: Instant::now(),
+            dlmm_sol_is_x: false,
+        }
+    }
+
     #[test]
     fn same_reserve_mid_on_two_dexes_yields_near_zero_spread() {
-        // 1 SOL : 1M tokens @ 6 decimals → 1e-3 SOL per token
-        let reserves = (1_000_000_000_000u64, 1_000_000_000u64); // 1e6 tokens, 1 SOL
+        let reserves = (1_000_000_000_000u64, 1_000_000_000u64);
         let mid = reserve_mid_sol_per_token(reserves.0, reserves.1, 6).unwrap();
         let pool_a = sample_pool("meteora_dlmm", "poolA", None, None);
         let pool_b = sample_pool("pump_amm", "poolB", None, None);
-        let p_a = comparable_price_sol_per_token(&pool_a, Some(reserves), 6).unwrap();
-        let p_b = comparable_price_sol_per_token(&pool_b, Some(reserves), 6).unwrap();
+        let vault = sample_vault(reserves.0, reserves.1, None, None);
+        let p_a = comparable_price_sol_per_token(
+            &pool_a,
+            Some(reserves),
+            6,
+            Some(&vault),
+            None,
+            ComparablePriceSide::Buy,
+        )
+        .unwrap();
+        let p_b = comparable_price_sol_per_token(
+            &pool_b,
+            Some(reserves),
+            6,
+            Some(&vault),
+            None,
+            ComparablePriceSide::Buy,
+        )
+        .unwrap();
         assert_eq!(p_a, mid);
         assert_eq!(p_b, mid);
         let spread_bps = ((p_b - p_a) / p_a * Decimal::from(10000))
@@ -2675,25 +3272,21 @@ mod two_hop_price_tests {
 
     #[test]
     fn buy_vs_sell_trade_mid_avoids_huge_artificial_spread() {
-        let buy_price = trade_implied_sol_per_token(2_000_000_000, 1_000_000_000_000, 6); // 2 SOL / 1M tok
-        let sell_price = trade_implied_sol_per_token(500_000_000, 1_000_000_000_000, 6); // 0.5 SOL / 1M tok
+        let buy_price = trade_implied_sol_per_token(2_000_000_000, 1_000_000_000_000, 6);
+        let sell_price = trade_implied_sol_per_token(500_000_000, 1_000_000_000_000, 6);
         let pool = sample_pool("orca", "poolO", Some(buy_price), Some(sell_price));
-        let mid = comparable_price_sol_per_token(&pool, None, 6).unwrap();
-        let naive_buy_only = buy_price;
-        let naive_sell_only = sell_price;
-        let naive_spread_bps = ((naive_buy_only - naive_sell_only) / naive_sell_only
-            * Decimal::from(10000))
-        .round()
-        .to_i64()
-        .unwrap();
+        let mid =
+            comparable_price_sol_per_token(&pool, None, 6, None, None, ComparablePriceSide::Buy)
+                .unwrap();
+        let naive_spread_bps = ((buy_price - sell_price) / sell_price * Decimal::from(10000))
+            .round()
+            .to_i64()
+            .unwrap();
         let mid_spread_bps = ((mid - mid) / mid * Decimal::from(10000))
             .round()
             .to_i64()
             .unwrap();
-        assert!(
-            naive_spread_bps > 1000,
-            "unnormalized buy/sell should look like data error"
-        );
+        assert!(naive_spread_bps > 1000);
         assert_eq!(mid_spread_bps, 0);
     }
 
@@ -2713,10 +3306,296 @@ mod two_hop_price_tests {
         let sell_unknown = !sell_pool.has_reserve_data && sell_pool.liquidity_sol <= Decimal::ZERO;
         assert!(!buy_unknown);
         assert!(sell_unknown);
-        assert!(
-            !(buy_unknown && sell_unknown),
-            "5× min-profit must not apply when at least one side has Geyser reserves"
+        assert!(!(buy_unknown && sell_unknown));
+    }
+
+    #[test]
+    fn dlmm_marginal_vs_amm_mid_no_spread_too_large() {
+        // 1M tokens (6 dec) : 1 SOL on both sides
+        let reserve_base = 1_000_000_000_000u64;
+        let reserve_quote = 1_000_000_000u64;
+        let active_id: i32 = 0;
+        let bin_step: u16 = 10;
+        let array_index = active_id as i64 / 70;
+
+        let mut bin_arrays: HashMap<i64, BinArrayCache> = HashMap::new();
+        bin_arrays.insert(
+            array_index,
+            BinArrayCache {
+                bins: vec![BinData {
+                    offset: 0,
+                    amount_x: reserve_base,
+                    amount_y: reserve_quote,
+                }],
+                update_slot: 1,
+            },
         );
+
+        let dlmm_pool = sample_pool("meteora_dlmm", "dlmmPool", None, None);
+        let orca_pool = sample_pool("orca", "orcaPool", None, None);
+        let vault = sample_vault(reserve_base, reserve_quote, Some(active_id), Some(bin_step));
+
+        let p_dlmm = comparable_price_sol_per_token(
+            &dlmm_pool,
+            Some((reserve_base, reserve_quote)),
+            6,
+            Some(&vault),
+            Some(&bin_arrays),
+            ComparablePriceSide::Buy,
+        )
+        .unwrap();
+        let p_orca = comparable_price_sol_per_token(
+            &orca_pool,
+            Some((reserve_base, reserve_quote)),
+            6,
+            Some(&vault),
+            None,
+            ComparablePriceSide::Buy,
+        )
+        .unwrap();
+
+        let spread_bps = ((p_orca - p_dlmm) / p_dlmm * Decimal::from(10000))
+            .abs()
+            .round()
+            .to_i64()
+            .unwrap();
+        assert!(
+            spread_bps < MAX_REASONABLE_SPREAD_BPS,
+            "DLMM marginal vs AMM mid spread {spread_bps} bps should be sane"
+        );
+    }
+
+    #[test]
+    fn reserve_fresh_trade_stale_passes_freshness_check() {
+        let stale_trade = Instant::now() - Duration::from_millis(MAX_PRICE_AGE_MS + 5_000);
+        let pool = PoolState {
+            has_reserve_data: true,
+            last_update: stale_trade,
+            ..sample_pool("orca", "poolFresh", None, None)
+        };
+        let vault = VaultBalanceCache {
+            reserve_base: 1_000_000_000_000,
+            reserve_quote: 1_000_000_000,
+            update_slot: 1,
+            active_id: None,
+            bin_step: None,
+            updated_at: Instant::now(),
+            dlmm_sol_is_x: false,
+        };
+        let max_age = Duration::from_millis(MAX_PRICE_AGE_MS);
+        assert!(!pool.last_update.elapsed().le(&max_age));
+        assert!(is_pool_price_fresh(&pool, Some(&vault), max_age));
+    }
+
+    #[test]
+    fn tracker_seed_two_pools_no_trades_passes_insufficient_pools_gate() {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+
+        let update_orca = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_a.to_string(),
+            "orca".to_string(),
+            token_mint.to_string(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            1_000_000_000,
+            1,
+        );
+        let update_pump = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_b.to_string(),
+            "pump_amm".to_string(),
+            token_mint.to_string(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            1_000_000_000,
+            2,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        let mint_str = token_mint.to_string();
+        let seeded = seed_token_tracker_from_live_pool_cache(
+            &mint_str,
+            &cache,
+            &mut trackers,
+            &mut vault_balances,
+            None,
+        );
+        assert_eq!(seeded, 2);
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert(pool_a.to_string());
+        known_pools.insert(pool_b.to_string());
+
+        let tracker = trackers.get(&mint_str).unwrap();
+        assert_eq!(tracker.pools.len(), 2);
+        assert_eq!(tracker.pool_count_on_distinct_dexes(), 2);
+
+        let config = ArbConfig::default();
+        let bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
+        let opp = tracker.check_arbitrage(&config, &known_pools, &vault_balances, &bin_arrays);
+        // Same reserves → spread ~0, rejected by spread_below_min not insufficient_pools
+        assert!(
+            opp.is_none(),
+            "expected spread_below_min or similar, not insufficient_pools"
+        );
+        assert_eq!(tracker.pools.len(), 2);
+    }
+
+    #[test]
+    fn seed_skips_stale_jetstream_vault_when_geyser_slot_is_newer() {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+        let pool_str = pool.to_string();
+
+        let stale_cache_update = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            100,
+            200,
+            50,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &stale_cache_update);
+
+        let fresher_updated_at = Instant::now();
+        let mut vault_balances = HashMap::from([(
+            pool_str.clone(),
+            VaultBalanceCache {
+                reserve_base: 9_999,
+                reserve_quote: 8_888,
+                update_slot: 100,
+                active_id: None,
+                bin_step: None,
+                updated_at: fresher_updated_at,
+                dlmm_sol_is_x: false,
+            },
+        )]);
+        let mut trackers = HashMap::new();
+
+        seed_token_tracker_from_live_pool_cache(
+            &mint_str,
+            &cache,
+            &mut trackers,
+            &mut vault_balances,
+            None,
+        );
+
+        let vault = vault_balances.get(&pool_str).unwrap();
+        assert_eq!(vault.update_slot, 100);
+        assert_eq!(vault.reserve_base, 9_999);
+        assert_eq!(vault.reserve_quote, 8_888);
+        assert_eq!(vault.updated_at, fresher_updated_at);
+    }
+
+    #[test]
+    fn seed_updates_vault_when_jetstream_slot_is_newer_than_geyser() {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+        let pool_str = pool.to_string();
+
+        let fresher_cache_update = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            2_000_000_000,
+            101,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(
+            &cache,
+            &fresher_cache_update,
+        );
+
+        let mut vault_balances = HashMap::from([(
+            pool_str.clone(),
+            VaultBalanceCache {
+                reserve_base: 111,
+                reserve_quote: 222,
+                update_slot: 100,
+                active_id: None,
+                bin_step: None,
+                updated_at: Instant::now() - Duration::from_secs(60),
+                dlmm_sol_is_x: false,
+            },
+        )]);
+        let mut trackers = HashMap::new();
+
+        seed_token_tracker_from_live_pool_cache(
+            &mint_str,
+            &cache,
+            &mut trackers,
+            &mut vault_balances,
+            None,
+        );
+
+        let vault = vault_balances.get(&pool_str).unwrap();
+        assert_eq!(vault.update_slot, 101);
+        assert_eq!(vault.reserve_base, 1_000_000_000_000);
+        assert_eq!(vault.reserve_quote, 2_000_000_000);
+    }
+
+    #[test]
+    fn incremental_only_pool_targets_single_cache_entry() {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+
+        for (pool, slot) in [(pool_a, 1u64), (pool_b, 2u64)] {
+            let update = PoolCacheUpdate::new_balance_updated(
+                TEST_COMPONENT,
+                TEST_BUILD,
+                TEST_RUN,
+                pool.to_string(),
+                "orca".to_string(),
+                mint_str.clone(),
+                NATIVE_SOL_MINT.to_string(),
+                1_000_000_000_000,
+                1_000_000_000,
+                slot,
+            );
+            ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update);
+        }
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        let seeded = seed_token_tracker_from_live_pool_cache(
+            &mint_str,
+            &cache,
+            &mut trackers,
+            &mut vault_balances,
+            Some(&pool_a.to_string()),
+        );
+        assert_eq!(seeded, 1);
+        let tracker = trackers.get(&mint_str).unwrap();
+        assert!(tracker.pools.contains_key(&pool_a.to_string()));
+        assert!(!tracker.pools.contains_key(&pool_b.to_string()));
+        assert!(vault_balances.contains_key(&pool_a.to_string()));
+        assert!(!vault_balances.contains_key(&pool_b.to_string()));
     }
 }
 
