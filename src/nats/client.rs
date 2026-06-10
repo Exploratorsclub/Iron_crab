@@ -76,6 +76,8 @@ impl NatsConfig {
 pub struct NatsClient {
     config: NatsConfig,
     client: Option<async_nats::Client>,
+    /// Cached JetStream context — created once per connected client, reused for publishes/KV.
+    jetstream: std::sync::Mutex<Option<async_nats::jetstream::Context>>,
     messages_published: std::sync::atomic::AtomicU64,
     messages_dropped: std::sync::atomic::AtomicU64,
 }
@@ -85,6 +87,7 @@ impl NatsClient {
         Self {
             config,
             client: None,
+            jetstream: std::sync::Mutex::new(None),
             messages_published: std::sync::atomic::AtomicU64::new(0),
             messages_dropped: std::sync::atomic::AtomicU64::new(0),
         }
@@ -92,12 +95,23 @@ impl NatsClient {
 
     /// Second handle for `tokio::spawn` publish paths (metrics counters are per-handle).
     pub fn clone_for_spawned_publish(&self) -> Self {
+        let jetstream = self.jetstream.lock().unwrap().clone();
         Self {
             config: self.config.clone(),
             client: self.client.clone(),
+            jetstream: std::sync::Mutex::new(jetstream),
             messages_published: std::sync::atomic::AtomicU64::new(0),
             messages_dropped: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    fn jetstream_context(&self) -> Option<async_nats::jetstream::Context> {
+        let client = self.client.as_ref()?;
+        let mut guard = self.jetstream.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(async_nats::jetstream::new(client.clone()));
+        }
+        guard.clone()
     }
 
     pub async fn connect(&mut self) -> anyhow::Result<()> {
@@ -111,6 +125,7 @@ impl NatsClient {
 
         info!(url = %self.config.url, "Connected to NATS");
         self.client = Some(client);
+        *self.jetstream.lock().unwrap() = None;
         Ok(())
     }
 
@@ -122,6 +137,7 @@ impl NatsClient {
     /// Drop the client handle and establish a fresh TCP connection (same URL/options).
     pub async fn reconnect(&mut self) -> anyhow::Result<()> {
         self.client = None;
+        *self.jetstream.lock().unwrap() = None;
         self.connect().await
     }
 
@@ -212,14 +228,18 @@ impl NatsClient {
         subject: &str,
         msg: &T,
     ) -> anyhow::Result<bool> {
-        let Some(ref client) = self.client else {
+        if self.client.is_none() {
+            self.messages_dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(false);
+        }
+
+        let json = serde_json::to_vec(msg)?;
+        let Some(jetstream) = self.jetstream_context() else {
             self.messages_dropped
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(false);
         };
-
-        let json = serde_json::to_vec(msg)?;
-        let jetstream = async_nats::jetstream::new(client.clone());
 
         match tokio::time::timeout(
             self.config.publish_timeout,
@@ -254,11 +274,9 @@ impl NatsClient {
         &self,
         bucket_name: &str,
     ) -> anyhow::Result<async_nats::jetstream::kv::Store> {
-        let Some(ref client) = self.client else {
+        let Some(jetstream) = self.jetstream_context() else {
             anyhow::bail!("NATS not connected");
         };
-
-        let jetstream = async_nats::jetstream::new(client.clone());
 
         // Try to get existing bucket first
         match jetstream.get_key_value(bucket_name).await {

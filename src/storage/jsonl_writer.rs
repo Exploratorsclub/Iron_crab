@@ -334,6 +334,7 @@ enum QueuedJsonlMsg {
 
 /// Non-blocking JSONL enqueue from Geyser paths; actual I/O on `jsonl-writer` thread.
 pub struct QueuedJsonlWriter {
+    config: JsonlWriterConfig,
     sender: std::sync::mpsc::SyncSender<QueuedJsonlMsg>,
     /// Max in-flight + channel records (matches `sync_channel` capacity).
     queue_capacity: usize,
@@ -355,10 +356,11 @@ impl QueuedJsonlWriter {
         let bytes_for_thread = Arc::clone(&bytes_written);
         let depth_for_thread = Arc::clone(&queue_depth);
         let flush_each_write = config.flush_each_write;
+        let config_for_thread = config.clone();
         let join = std::thread::Builder::new()
             .name("jsonl-writer".into())
             .spawn(move || {
-                let writer = match JsonlWriter::new(config) {
+                let writer = match JsonlWriter::new(config_for_thread) {
                     Ok(w) => w,
                     Err(e) => {
                         error!(error = %e, "QueuedJsonlWriter: failed to open log file");
@@ -432,6 +434,7 @@ impl QueuedJsonlWriter {
             })?;
 
         Ok(Self {
+            config,
             sender: tx,
             queue_capacity,
             queue_depth,
@@ -439,6 +442,16 @@ impl QueuedJsonlWriter {
             bytes_written,
             join: Mutex::new(Some(join)),
         })
+    }
+
+    /// Expected active JSONL path (same naming as [`JsonlWriter`]; writer thread may rotate segments).
+    pub fn current_path(&self) -> Option<PathBuf> {
+        let today = Utc::now().format("%Y%m%d").to_string();
+        Some(
+            self.config
+                .log_dir
+                .join(format!("{}-{}.jsonl", self.config.prefix, today)),
+        )
     }
 
     fn try_enqueue_msg(&self, msg: QueuedJsonlMsg) -> bool {
