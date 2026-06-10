@@ -10548,7 +10548,6 @@ async fn main() -> Result<()> {
     if let Err(e) = intent_publish_worker.await {
         warn!(error = %e, "intent publish worker task join error");
     }
-    info!(run_id = %run_id, "momentum-bot main loop ended; flushing JSONL");
     ctx.jsonl_writer.flush()?;
     info!(run_id = %run_id, "momentum-bot shutdown complete");
 
@@ -11661,7 +11660,7 @@ mod tests {
     ) -> Arc<MomentumContext> {
         let (intent_publish_tx, intent_publish_rx) = mpsc::channel(INTENT_PUBLISH_QUEUE_CAP);
         let ctx = empty_test_context_with_publish_sender(jsonl_writer, config, intent_publish_tx);
-        spawn_intent_publish_worker(Arc::clone(&ctx), intent_publish_rx, None, None);
+        let _ = spawn_intent_publish_worker(Arc::clone(&ctx), intent_publish_rx, None, None);
         ctx
     }
 
@@ -11733,7 +11732,8 @@ mod tests {
         let (tx, rx) = mpsc::channel(INTENT_PUBLISH_QUEUE_CAP);
         let ctx =
             empty_test_context_with_publish_sender(jsonl_writer, MomentumConfig::default(), tx);
-        spawn_intent_publish_worker(Arc::clone(&ctx), rx, None, Some(Arc::clone(&processed)));
+        let _ =
+            spawn_intent_publish_worker(Arc::clone(&ctx), rx, None, Some(Arc::clone(&processed)));
 
         let ids = ["int-order-001", "int-order-002", "int-order-003"];
         for intent_id in ids {
