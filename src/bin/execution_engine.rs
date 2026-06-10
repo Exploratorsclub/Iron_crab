@@ -12140,6 +12140,18 @@ fn check_versioned_tx_size(tx: &VersionedTransaction) -> Result<(), String> {
     Ok(())
 }
 
+/// Build + size-gate the unsigned TX used for simulation (same form as send, no RPC yet).
+fn prepare_unsigned_versioned_tx_for_simulation(
+    wallet_pubkey: &Pubkey,
+    plan: &tx_builder::TxPlan,
+    blockhash: Hash,
+    alt: Option<&ironcrab::solana::address_lookup_table::LoadedAlt>,
+) -> Result<VersionedTransaction, String> {
+    let tx = build_unsigned_versioned_tx(wallet_pubkey, plan, blockhash, alt)?;
+    check_versioned_tx_size(&tx)?;
+    Ok(tx)
+}
+
 /// Real RPC simulation (RS-3.1).
 ///
 /// Notes:
@@ -12163,7 +12175,7 @@ async fn simulate_transaction(
         }
     };
 
-    let tx_result = build_unsigned_versioned_tx(
+    let tx_result = prepare_unsigned_versioned_tx_for_simulation(
         &wallet_pubkey,
         plan,
         blockhash,
@@ -13036,11 +13048,11 @@ async fn spawn_rebroadcast_loop(
 mod execution_engine_tests {
     use super::{
         apply_scope48_confirmed_sell_execution_metadata, build_signed_versioned_tx,
-        build_unsigned_versioned_tx, check_versioned_tx_size,
-        cold_path_dex_sim_failure_triggers_discovery_recovery, is_cold_path_recovery_sell,
-        is_pump_amm_structural_sim_error, is_pumpfun_bonding_curve_structural_sim_error,
-        is_regular_momentum_hot_path_sell, liquidation_pumpfun_sell_preference,
-        liquidation_store_multi_pool_fallback_metadata, max_open_positions_buy_gate,
+        build_unsigned_versioned_tx, cold_path_dex_sim_failure_triggers_discovery_recovery,
+        is_cold_path_recovery_sell, is_pump_amm_structural_sim_error,
+        is_pumpfun_bonding_curve_structural_sim_error, is_regular_momentum_hot_path_sell,
+        liquidation_pumpfun_sell_preference, liquidation_store_multi_pool_fallback_metadata,
+        max_open_positions_buy_gate, prepare_unsigned_versioned_tx_for_simulation,
         pump_amm_hint_pool_cache_usable_for_tx_plan_builder,
         pump_amm_hot_path_quote_not_ready_detail, pump_amm_liquidation_discovery_force_refresh,
         pump_amm_liquidation_quote_timeout_str, pump_amm_pool_market_hint_merge,
@@ -13130,9 +13142,7 @@ mod execution_engine_tests {
         assert!(matches!(unsigned.message, VersionedMessage::V0(_)));
     }
 
-    #[test]
-    fn tx_size_check_rejects_oversized_serialized_transaction() {
-        let wallet = Keypair::new();
+    fn oversized_legacy_tx_plan(wallet: &Keypair) -> (TxPlan, Hash) {
         let blockhash = Hash::new_unique();
         let mut instructions = Vec::new();
         for _ in 0..40 {
@@ -13142,10 +13152,27 @@ mod execution_engine_tests {
                 1,
             ));
         }
-        let plan = TxPlan { instructions };
+        (TxPlan { instructions }, blockhash)
+    }
+
+    #[test]
+    fn tx_size_check_rejects_oversized_serialized_transaction_on_send_path() {
+        let wallet = Keypair::new();
+        let (plan, blockhash) = oversized_legacy_tx_plan(&wallet);
         let tx = build_signed_versioned_tx(&wallet.pubkey(), &plan, blockhash, None, &[&wallet])
             .unwrap();
-        let err = check_versioned_tx_size(&tx).expect_err("oversized legacy tx should be rejected");
+        let err = super::check_versioned_tx_size(&tx)
+            .expect_err("oversized legacy tx should be rejected on send");
+        assert!(err.starts_with("tx_too_large:"));
+    }
+
+    #[test]
+    fn oversized_tx_rejected_before_simulation() {
+        let wallet = Keypair::new();
+        let (plan, blockhash) = oversized_legacy_tx_plan(&wallet);
+        let err =
+            prepare_unsigned_versioned_tx_for_simulation(&wallet.pubkey(), &plan, blockhash, None)
+                .expect_err("oversized legacy tx should be rejected before simulation RPC");
         assert!(err.starts_with("tx_too_large:"));
     }
 
