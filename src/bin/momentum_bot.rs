@@ -6411,7 +6411,15 @@ impl MomentumContext {
         );
     }
 
-    fn record_exit_intent_published(&self, mint: &str) {
+    fn record_exit_intent_published(&self, intent_id: &str, mint: &str) {
+        if !self.pending_intents.read().contains_key(intent_id) {
+            debug!(
+                intent_id = %intent_id,
+                mint = %mint,
+                "Skipping exit latch — pending intent already consumed"
+            );
+            return;
+        }
         self.mark_exit_generated(mint);
         self.exits_generated
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10466,9 +10474,6 @@ async fn main() -> Result<()> {
 
                         if let Err(e) = generate_and_publish_buy_intent(&ctx, &s).await {
                             error!(error = %e, mint = %s.mint, "Failed to generate/publish buy intent");
-                        } else {
-                            ctx.intents_generated
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 }
@@ -10574,6 +10579,23 @@ async fn intent_publish_worker_loop(
         let intent = job.intent;
         intent_publish_jsonl_write(&ctx.jsonl_writer, &intent).await;
 
+        if let IntentPublishPostAction::Buy {
+            ref entry_signal,
+            ref effective_pool,
+            ref effective_dex,
+            ..
+        } = job.post_action
+        {
+            ctx.register_buy_intent(
+                &intent.intent_id,
+                &entry_signal.mint,
+                effective_pool,
+                effective_dex,
+                entry_signal.sol_amount,
+                Some(entry_signal.kind),
+            );
+        }
+
         let mut publish_ok = nats.is_none();
         if let Some(ref nats) = nats {
             match nats.jetstream_publish(TOPIC_TRADE_INTENTS, &intent).await {
@@ -10624,7 +10646,7 @@ async fn intent_publish_worker_loop(
                             ts,
                         );
                     }
-                    ctx.record_exit_intent_published(&mint);
+                    ctx.record_exit_intent_published(&intent.intent_id, &mint);
                 } else {
                     ctx.rollback_exit_intent_after_publish_failure(&intent.intent_id, &mint);
                 }
@@ -10645,6 +10667,8 @@ async fn intent_publish_worker_loop(
                         );
                     }
                     let meta_creator = intent.metadata.get("creator").cloned();
+                    ctx.intents_generated
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
                         intent_id: &intent.intent_id,
                         mint: &entry_signal.mint,
@@ -11008,16 +11032,6 @@ async fn generate_and_publish_buy_intent_inner(
         reason = %signal.reason,
         alternatives_checked = alternatives_checked,
         "🚀 Generated BUY TradeIntent"
-    );
-
-    // Register pending intent for execution-result correlation before worker publish.
-    ctx.register_buy_intent(
-        intent_id,
-        &signal.mint,
-        &effective_pool,
-        &effective_dex,
-        signal.sol_amount,
-        Some(signal.kind),
     );
 
     ctx.enqueue_intent_publish(IntentPublishJob {
