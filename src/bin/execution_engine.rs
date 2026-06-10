@@ -12194,6 +12194,15 @@ async fn simulate_transaction(
         }
     };
 
+    if let Err(e) = check_versioned_tx_size(&tx) {
+        return SimulationResult {
+            success: false,
+            error_code: Some(e),
+            logs_preview: None,
+            compute_units_consumed: None,
+        };
+    }
+
     let cfg = RpcSimulateTransactionConfig {
         sig_verify: false,
         replace_recent_blockhash: true,
