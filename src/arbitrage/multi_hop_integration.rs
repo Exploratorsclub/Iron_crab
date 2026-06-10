@@ -97,14 +97,12 @@ type QuoteCacheKey = (Pubkey, Pubkey, Pubkey);
 /// Cache value: (output_amount, timestamp)
 type QuoteCacheValue = (u64, Instant);
 
-/// Quote provider: trade-normalized cache, then LivePoolCache (Geyser), then conservative default.
+/// Quote provider: trade-normalized cache, then LivePoolCache (Geyser). No synthetic fallback.
 pub struct CachedQuoteProvider {
     /// Cache: (pool, input_mint, output_mint) -> (output_amount, timestamp)
     cache: RwLock<HashMap<QuoteCacheKey, QuoteCacheValue>>,
     /// Cache TTL
     cache_ttl: Duration,
-    /// Default edge ratio when no quote available (conservative)
-    default_edge_ratio: f64,
     /// SLAVE LivePoolCache (same SSOT as execution-engine) — no RPC on miss.
     live_pool_cache: SharedLivePoolCache,
 }
@@ -114,7 +112,6 @@ impl CachedQuoteProvider {
         Self {
             cache: RwLock::new(HashMap::new()),
             cache_ttl,
-            default_edge_ratio: 0.99, // Assume 1% loss when no data
             live_pool_cache,
         }
     }
@@ -311,7 +308,7 @@ impl QuoteProvider for CachedQuoteProvider {
         }
 
         multi_hop_hop_missing_quote_inc();
-        Some((amount_in as f64 * self.default_edge_ratio) as u64)
+        None
     }
 
     fn has_cached_quote(
@@ -494,9 +491,27 @@ impl MultiHopArbitrage {
             None => (input, output), // Fallback if not in index
         };
 
-        // Check cooldown and price change for both tokens
-        let tokens_to_search =
-            self.filter_tokens_for_search(&[mint_a, mint_b], normalized_price, &config);
+        // Per-mint directional price ratios (inverse for the output side of the trade)
+        let output_ratio = if output_amount > 0 {
+            (input_amount as u128 * 10_000 / output_amount as u128) as u64
+        } else {
+            return vec![];
+        };
+        let mut token_ratios = Vec::with_capacity(2);
+        for &mint in &[mint_a, mint_b] {
+            let ratio = if mint == input {
+                normalized_price
+            } else if mint == output {
+                output_ratio
+            } else {
+                continue;
+            };
+            if !token_ratios.iter().any(|(m, _)| *m == mint) {
+                token_ratios.push((mint, ratio));
+            }
+        }
+
+        let tokens_to_search = self.filter_tokens_for_search(&token_ratios, &config);
 
         if tokens_to_search.is_empty() {
             return vec![];
@@ -508,11 +523,10 @@ impl MultiHopArbitrage {
         self.search_from_tokens(&tokens_to_search, &config, component, build, run_id)
     }
 
-    /// Filter tokens that should be searched (cooldown + price change check)
+    /// Filter tokens that should be searched (cooldown + per-mint price change check)
     fn filter_tokens_for_search(
         &self,
-        tokens: &[Pubkey],
-        new_price_ratio: u64,
+        token_ratios: &[(Pubkey, u64)],
         config: &MultiHopConfig,
     ) -> Vec<Pubkey> {
         let now = Instant::now();
@@ -520,7 +534,7 @@ impl MultiHopArbitrage {
         let mut state = self.token_state.write();
         let mut result = Vec::new();
 
-        for &token in tokens {
+        for &(token, new_price_ratio) in token_ratios {
             let entry = state.entry(token).or_insert(TokenSearchState {
                 last_search: Instant::now() - cooldown, // Allow immediate first search
                 last_price_ratio: None,
@@ -534,7 +548,7 @@ impl MultiHopArbitrage {
                 continue;
             }
 
-            // Check price change threshold
+            // Check price change threshold (directional ratio for this mint)
             if let Some(last_ratio) = entry.last_price_ratio {
                 let change_bps = if last_ratio > 0 {
                     ((new_price_ratio as i64 - last_ratio as i64).abs() * 10_000
@@ -605,8 +619,8 @@ impl MultiHopArbitrage {
         let ranker = PoolRanker::with_config(ranker_config, self.quote_provider.clone());
         let finder = BeamCycleFinder::new(finder_config, ranker);
 
-        // Find cycles (searches from WSOL through the graph)
-        let cycles = finder.find_cycles(&self.graph);
+        // Targeted search: only expand subgraph around affected tokens
+        let cycles = finder.find_cycles_through(&self.graph, tokens);
         self.cycles_found
             .fetch_add(cycles.len() as u64, Ordering::Relaxed);
 
@@ -936,12 +950,28 @@ mod tests {
         let out = provider
             .get_cached_probe_quote(&pool, DexType::RaydiumAmmV4, &wsol, &token, probe)
             .expect("LivePoolCache quote expected");
-        let default_out = (probe as f64 * 0.99) as u64;
-        assert_ne!(
-            out, default_out,
-            "LivePoolCache quote must differ from conservative default"
-        );
         assert!(out > 0);
+    }
+
+    #[test]
+    fn test_get_quote_without_cache_returns_none() {
+        let provider = CachedQuoteProvider::new(Duration::from_secs(30), create_shared_cache());
+
+        let pool = Pubkey::new_unique();
+        let input = Pubkey::new_unique();
+        let output = Pubkey::new_unique();
+
+        let result = provider.get_quote(
+            &pool,
+            DexType::RaydiumAmmV4,
+            &input,
+            &output,
+            PROBE_LAMPORTS,
+        );
+        assert!(
+            result.is_none(),
+            "get_quote must return None without cache data"
+        );
     }
 
     #[test]

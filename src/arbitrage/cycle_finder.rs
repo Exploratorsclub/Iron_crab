@@ -18,7 +18,7 @@ use super::pool_graph::PoolGraph;
 use super::pool_ranker::{PoolRanker, QuoteProvider};
 use super::types::{ArbCycle, PoolEdge, SearchNode};
 use solana_sdk::pubkey::Pubkey;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 
 /// WSOL mint address (native mint)
@@ -74,8 +74,89 @@ impl<Q: QuoteProvider> BeamCycleFinder<Q> {
     ///
     /// Returns cycles sorted by estimated return (descending)
     pub fn find_cycles(&self, graph: &PoolGraph) -> Vec<ArbCycle> {
+        self.find_cycles_inner(graph, None)
+    }
+
+    /// Find cycles through affected tokens (targeted subgraph search).
+    ///
+    /// Only expands vertices within `max_hops` of the seed tokens and requires
+    /// found cycles to pass through at least one seed token.
+    pub fn find_cycles_through(
+        &self,
+        graph: &PoolGraph,
+        through_tokens: &[Pubkey],
+    ) -> Vec<ArbCycle> {
+        if through_tokens.is_empty() {
+            return vec![];
+        }
+
+        let seeds: Vec<Pubkey> = through_tokens
+            .iter()
+            .copied()
+            .filter(|t| graph.has_token(t))
+            .collect();
+        if seeds.is_empty() {
+            return vec![];
+        }
+
+        self.find_cycles_inner(graph, Some(&seeds))
+    }
+
+    /// BFS subgraph around seed tokens (plus base) within `max_hops`.
+    fn build_search_subgraph(&self, graph: &PoolGraph, seeds: &[Pubkey]) -> HashSet<Pubkey> {
+        let mut allowed = HashSet::new();
+        allowed.insert(self.config.base_mint);
+
+        let mut queue = VecDeque::new();
+        for &seed in seeds {
+            if graph.has_token(&seed) && allowed.insert(seed) {
+                queue.push_back((seed, 0usize));
+            }
+        }
+
+        while let Some((token, depth)) = queue.pop_front() {
+            if depth >= self.config.max_hops {
+                continue;
+            }
+            for (neighbor, _) in graph.neighbors(&token) {
+                if allowed.insert(neighbor) {
+                    queue.push_back((neighbor, depth + 1));
+                }
+            }
+        }
+
+        allowed
+    }
+
+    /// True when every hop has a fresh trade-cache or LivePoolCache quote.
+    fn cycle_all_hops_quoted(&self, cycle: &ArbCycle) -> bool {
+        for (hop_idx, pool_options) in cycle.pools.iter().enumerate() {
+            let input_mint = &cycle.path[hop_idx];
+            let output_mint = &cycle.path[hop_idx + 1];
+            let Some(primary) = pool_options.first() else {
+                return false;
+            };
+            if !self
+                .ranker
+                .hop_has_cached_quote(&primary.pool_address, input_mint, output_mint)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn find_cycles_inner(
+        &self,
+        graph: &PoolGraph,
+        through_tokens: Option<&[Pubkey]>,
+    ) -> Vec<ArbCycle> {
         let mut results = Vec::new();
         let min_profit_multiplier = 1.0 + (self.config.min_profit_bps as f64 / 10000.0);
+
+        let allowed_tokens = through_tokens.map(|seeds| self.build_search_subgraph(graph, seeds));
+        let required_tokens: Option<HashSet<Pubkey>> =
+            through_tokens.map(|seeds| seeds.iter().copied().collect());
 
         // Priority queue: max-heap by score
         let mut pq: BinaryHeap<SearchNode> = BinaryHeap::new();
@@ -92,7 +173,15 @@ impl<Q: QuoteProvider> BeamCycleFinder<Q> {
             // Check if we've found a cycle (back to base)
             if node.depth > 0 && node.token == self.config.base_mint {
                 if node.profit >= min_profit_multiplier {
+                    if let Some(required) = &required_tokens {
+                        if !node.path.iter().any(|t| required.contains(t)) {
+                            continue;
+                        }
+                    }
                     if let Some(cycle) = node.to_arb_cycle() {
+                        if !self.cycle_all_hops_quoted(&cycle) {
+                            continue;
+                        }
                         results.push(cycle);
                         if results.len() >= self.config.max_results {
                             break;
@@ -116,14 +205,21 @@ impl<Q: QuoteProvider> BeamCycleFinder<Q> {
                 continue; // Prune: even best case can't meet threshold
             }
 
-            // Get ranked neighbors
+            // Get ranked neighbors (pools without real quotes are skipped in ranker)
             let neighbors = self.ranker.rank_pools_from(graph, &node.token);
 
             for (next_token, ranked_pools) in neighbors {
-                // Skip if already visited (except returning to base at depth > 1)
+                // Skip if already visited (except returning to base at depth > 0)
                 let is_return_to_base = next_token == self.config.base_mint && node.depth > 0;
                 if !is_return_to_base && node.has_visited(&next_token) {
                     continue;
+                }
+
+                // Targeted search: stay within subgraph around affected tokens
+                if let Some(ref allowed) = allowed_tokens {
+                    if !is_return_to_base && !allowed.contains(&next_token) {
+                        continue;
+                    }
                 }
 
                 // Get top pools as alternatives (for execution fallback)
@@ -175,26 +271,6 @@ impl<Q: QuoteProvider> BeamCycleFinder<Q> {
         results.sort_by(|a, b| b.estimated_return_bps.cmp(&a.estimated_return_bps));
 
         results
-    }
-
-    /// Find cycles with a specific intermediate token (targeted search)
-    ///
-    /// Useful when you know a token might have an arbitrage opportunity
-    pub fn find_cycles_through(
-        &self,
-        graph: &PoolGraph,
-        intermediate_token: &Pubkey,
-    ) -> Vec<ArbCycle> {
-        // First check if there's a path: base -> intermediate -> base
-        if !graph.has_token(intermediate_token) {
-            return vec![];
-        }
-
-        // Get all cycles and filter
-        self.find_cycles(graph)
-            .into_iter()
-            .filter(|cycle| cycle.path.contains(intermediate_token))
-            .collect()
     }
 
     /// Quick check if any profitable cycle exists (for metrics/monitoring)
@@ -468,6 +544,131 @@ mod tests {
     }
 
     #[test]
+    fn test_cycle_with_missing_quote_hop_not_reported() {
+        let (graph, mut mock) = setup_triangle_graph();
+        let wsol = test_pubkey(0x01);
+        let pool_token_a_wsol = test_pubkey(0x12);
+        let token_a = test_pubkey(0x03);
+
+        // Remove quote for the final hop — path cannot be completed with real quotes
+        mock.remove_quote(pool_token_a_wsol, token_a, wsol);
+
+        let config = CycleFinderConfig {
+            min_profit_bps: 50,
+            base_mint: wsol,
+            ..Default::default()
+        };
+
+        let ranker = PoolRanker::new(mock);
+        let finder = BeamCycleFinder::new(config, ranker);
+
+        let cycles = finder.find_cycles(&graph);
+        assert!(
+            cycles.is_empty(),
+            "Cycle with a quote-less hop must not be reported"
+        );
+
+        // Sanity: profitable triangle exists when all quotes present
+        let (graph2, mock2) = setup_triangle_graph();
+        let finder2 = BeamCycleFinder::new(
+            CycleFinderConfig {
+                min_profit_bps: 50,
+                base_mint: wsol,
+                ..Default::default()
+            },
+            PoolRanker::new(mock2),
+        );
+        assert!(!finder2.find_cycles(&graph2).is_empty());
+    }
+
+    fn setup_local_triangle_plus_distant_chain() -> (PoolGraph, std::sync::Arc<MockQuoteProvider>) {
+        use std::sync::Arc;
+
+        let graph = PoolGraph::new();
+        let mut mock = MockQuoteProvider::new();
+        let wsol = test_pubkey(0x01);
+        let usdc = test_pubkey(0x02);
+        let token_a = test_pubkey(0x03);
+        let probe = 10_000_000u64;
+
+        let pool_wsol_usdc = test_pubkey(0x10);
+        let pool_usdc_token_a = test_pubkey(0x11);
+        let pool_token_a_wsol = test_pubkey(0x12);
+
+        graph.upsert_pool(make_edge(0x10, 0x01, 0x02, 1_000_000.0));
+        graph.upsert_pool(make_edge(0x11, 0x02, 0x03, 500_000.0));
+        graph.upsert_pool(make_edge(0x12, 0x03, 0x01, 300_000.0));
+
+        mock.add_quote(pool_wsol_usdc, wsol, usdc, probe, 9_900_000);
+        mock.add_quote(pool_usdc_token_a, usdc, token_a, probe, 10_200_000);
+        mock.add_quote(pool_token_a_wsol, token_a, wsol, probe, 10_200_000);
+        mock.add_quote(pool_wsol_usdc, usdc, wsol, probe, 9_900_000);
+        mock.add_quote(pool_usdc_token_a, token_a, usdc, probe, 9_800_000);
+        mock.add_quote(pool_token_a_wsol, wsol, token_a, probe, 9_800_000);
+
+        // Distant chain from WSOL (adds many probe lookups on full-graph search)
+        for i in 0..5 {
+            let from = if i == 0 { 0x01 } else { 0x20 + i - 1 };
+            let to = 0x20 + i;
+            let pool = 0x30 + i;
+            graph.upsert_pool(make_edge(pool, from, to, 50_000.0));
+            mock.add_quote(
+                test_pubkey(pool),
+                test_pubkey(from),
+                test_pubkey(to),
+                probe,
+                9_900_000,
+            );
+            mock.add_quote(
+                test_pubkey(pool),
+                test_pubkey(to),
+                test_pubkey(from),
+                probe,
+                9_900_000,
+            );
+        }
+
+        (graph, Arc::new(mock))
+    }
+
+    #[test]
+    fn test_find_cycles_through_limits_subgraph_probe_lookups() {
+        let (graph, mock) = setup_local_triangle_plus_distant_chain();
+        let token_a = test_pubkey(0x03);
+        let wsol = test_pubkey(0x01);
+
+        let config = CycleFinderConfig {
+            beam_width: 10,
+            max_hops: 4,
+            min_profit_bps: 50,
+            base_mint: wsol,
+            ..Default::default()
+        };
+
+        mock.reset_probe_lookup_count();
+        let finder_full = BeamCycleFinder::new(config.clone(), PoolRanker::new(mock.clone()));
+        let _ = finder_full.find_cycles(&graph);
+        let full_lookups = mock.probe_lookup_count();
+
+        mock.reset_probe_lookup_count();
+        let finder_targeted = BeamCycleFinder::new(config, PoolRanker::new(mock.clone()));
+        let targeted_cycles = finder_targeted.find_cycles_through(&graph, &[token_a]);
+        let targeted_lookups = mock.probe_lookup_count();
+
+        assert!(
+            targeted_lookups < full_lookups,
+            "Targeted search should probe fewer pools than full-graph search (targeted={targeted_lookups}, full={full_lookups})"
+        );
+        assert!(
+            !targeted_cycles.is_empty(),
+            "Should still find the local triangle through token_a"
+        );
+        for cycle in &targeted_cycles {
+            assert!(cycle.path.contains(&token_a));
+        }
+    }
+
+    #[test]
     fn test_finds_cycles_through_specific_token() {
         let (graph, mock) = setup_triangle_graph();
 
@@ -481,7 +682,7 @@ mod tests {
         let finder = BeamCycleFinder::new(config, ranker);
 
         // Search for cycles through USDC (0x02)
-        let cycles = finder.find_cycles_through(&graph, &test_pubkey(0x02));
+        let cycles = finder.find_cycles_through(&graph, &[test_pubkey(0x02)]);
 
         // Should find cycles containing USDC
         for cycle in &cycles {
