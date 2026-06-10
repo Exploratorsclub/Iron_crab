@@ -3118,6 +3118,7 @@ static MOMENTUM_INTENT_PUBLISH_BACKPRESSURE_TOTAL: std::sync::atomic::AtomicU64 
 #[derive(Debug, Clone)]
 enum IntentPublishPostAction {
     Exit {
+        mint: String,
         source_event_ts_unix_ms: Option<u64>,
         slot_seen_at_ms: u64,
     },
@@ -3183,7 +3184,9 @@ struct MomentumContext {
     config: parking_lot::RwLock<MomentumConfig>,
     nats: Option<NatsClient>,
     jsonl_writer: QueuedJsonlWriter,
-    intent_publish_tx: mpsc::Sender<IntentPublishJob>,
+    /// Held in `Option` so shutdown can `take()` the sender and drain the worker without the
+    /// worker's `Arc<Self>` keeping the channel open.
+    intent_publish_tx: parking_lot::Mutex<Option<mpsc::Sender<IntentPublishJob>>>,
     intent_counter: std::sync::atomic::AtomicU64,
     /// Track known pools (pool_address -> first_seen_slot)
     pool_first_seen: parking_lot::RwLock<std::collections::HashMap<String, u64>>,
@@ -6031,11 +6034,22 @@ impl MomentumContext {
         // waiting for a scale-in that no longer makes sense. Orphaned Buy Recovery
         // (handle_execution_result) handles any BUY that confirms after exit.
 
+        let pending_sell_mints: std::collections::HashSet<String> = self
+            .pending_intents
+            .read()
+            .values()
+            .filter(|p| p.side == TradeSide::Sell)
+            .map(|p| p.mint.clone())
+            .collect();
+
         let mut positions = self.positions.write();
         let mut exits = Vec::new();
 
         for (mint, pos) in positions.iter_mut() {
             if pos.exit_generated {
+                continue;
+            }
+            if pending_sell_mints.contains(mint) {
                 continue;
             }
 
@@ -6292,10 +6306,6 @@ impl MomentumContext {
                     mint = %mint,
                     "Failed to generate/publish sell intent - will retry on next event"
                 );
-            } else {
-                self.mark_exit_generated(&mint);
-                self.exits_generated
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -6379,12 +6389,32 @@ impl MomentumContext {
                     mint = %candidate.mint,
                     "Failed to publish timed-exit reconcile intent"
                 );
-            } else {
-                self.mark_exit_generated(&candidate.mint);
-                self.exits_generated
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
+    }
+
+    fn shutdown_intent_publish_sender(&self) {
+        let _ = self.intent_publish_tx.lock().take();
+    }
+
+    fn rollback_exit_intent_after_publish_failure(&self, intent_id: &str, mint: &str) {
+        self.pending_intents.write().remove(intent_id);
+        let mut positions = self.positions.write();
+        if let Some(pos) = positions.get_mut(mint) {
+            pos.exit_generated = false;
+            pos.exit_generated_at = None;
+        }
+        warn!(
+            mint = %mint,
+            intent_id = %intent_id,
+            "Rolled back exit intent after JetStream publish failure — will retry"
+        );
+    }
+
+    fn record_exit_intent_published(&self, mint: &str) {
+        self.mark_exit_generated(mint);
+        self.exits_generated
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Mark a position's exit as generated (call after successful SELL intent publish)
@@ -6465,17 +6495,17 @@ impl MomentumContext {
     }
 
     async fn enqueue_intent_publish(&self, job: IntentPublishJob) -> Result<()> {
-        match self.intent_publish_tx.try_send(job) {
+        let tx = self
+            .intent_publish_tx
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("intent publish worker closed"))?;
+        match tx.try_send(job) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(job)) => {
                 MOMENTUM_INTENT_PUBLISH_BACKPRESSURE_TOTAL
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                match tokio::time::timeout(
-                    INTENT_PUBLISH_ENQUEUE_TIMEOUT,
-                    self.intent_publish_tx.send(job),
-                )
-                .await
-                {
+                match tokio::time::timeout(INTENT_PUBLISH_ENQUEUE_TIMEOUT, tx.send(job)).await {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(_)) => anyhow::bail!("intent publish worker closed"),
                     Err(_) => {
@@ -9412,7 +9442,7 @@ async fn main() -> Result<()> {
         config: parking_lot::RwLock::new(momentum_config),
         nats,
         jsonl_writer,
-        intent_publish_tx,
+        intent_publish_tx: parking_lot::Mutex::new(Some(intent_publish_tx)),
         intent_counter: std::sync::atomic::AtomicU64::new(0),
         pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
         pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -9450,7 +9480,7 @@ async fn main() -> Result<()> {
         ),
     });
 
-    spawn_intent_publish_worker(
+    let intent_publish_worker = spawn_intent_publish_worker(
         Arc::clone(&ctx),
         intent_publish_rx,
         nats_for_intent_worker,
@@ -9495,11 +9525,6 @@ async fn main() -> Result<()> {
             .await
             {
                 error!(error = %e, mint = %mint, "Failed to generate/publish immediate exit intent - will retry in main loop");
-            } else {
-                // Only mark exit_generated AFTER successful publish
-                ctx.mark_exit_generated(&mint);
-                ctx.exits_generated
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -10518,21 +10543,25 @@ async fn main() -> Result<()> {
         }
     }
 
+    info!(run_id = %run_id, "momentum-bot main loop ended; draining intent publish worker");
+    ctx.shutdown_intent_publish_sender();
+    if let Err(e) = intent_publish_worker.await {
+        warn!(error = %e, "intent publish worker task join error");
+    }
     info!(run_id = %run_id, "momentum-bot main loop ended; flushing JSONL");
-    // Flush JSONL on shutdown
     ctx.jsonl_writer.flush()?;
     info!(run_id = %run_id, "momentum-bot shutdown complete");
 
     Ok(())
 }
 
-fn intent_publish_jsonl_write(writer: &QueuedJsonlWriter, intent: &TradeIntent) {
+async fn intent_publish_jsonl_write(writer: &QueuedJsonlWriter, intent: &TradeIntent) {
     let intent = intent.clone();
     loop {
         if writer.try_write(intent.clone()) {
             return;
         }
-        std::thread::sleep(Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -10544,7 +10573,7 @@ async fn intent_publish_worker_loop(
 ) {
     while let Some(job) = rx.recv().await {
         let intent = job.intent;
-        intent_publish_jsonl_write(&ctx.jsonl_writer, &intent);
+        intent_publish_jsonl_write(&ctx.jsonl_writer, &intent).await;
 
         let mut publish_ok = nats.is_none();
         if let Some(ref nats) = nats {
@@ -10579,6 +10608,7 @@ async fn intent_publish_worker_loop(
 
         match job.post_action {
             IntentPublishPostAction::Exit {
+                mint,
                 source_event_ts_unix_ms,
                 slot_seen_at_ms,
             } => {
@@ -10595,6 +10625,9 @@ async fn intent_publish_worker_loop(
                             ts,
                         );
                     }
+                    ctx.record_exit_intent_published(&mint);
+                } else {
+                    ctx.rollback_exit_intent_after_publish_failure(&intent.intent_id, &mint);
                 }
             }
             IntentPublishPostAction::Buy {
@@ -10637,6 +10670,7 @@ async fn intent_publish_worker_loop(
             recorder.lock().push(intent.intent_id.clone());
         }
     }
+    info!("intent publish worker drained and exiting");
 }
 
 fn spawn_intent_publish_worker(
@@ -10644,8 +10678,8 @@ fn spawn_intent_publish_worker(
     rx: mpsc::Receiver<IntentPublishJob>,
     nats: Option<NatsClient>,
     order_recorder: Option<IntentPublishOrderRecorder>,
-) {
-    tokio::spawn(intent_publish_worker_loop(ctx, rx, nats, order_recorder));
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(intent_publish_worker_loop(ctx, rx, nats, order_recorder))
 }
 
 /// Generate and publish a BUY TradeIntent based on an entry signal.
@@ -11575,7 +11609,7 @@ mod tests {
             config: parking_lot::RwLock::new(config),
             nats: None,
             jsonl_writer,
-            intent_publish_tx,
+            intent_publish_tx: parking_lot::Mutex::new(Some(intent_publish_tx)),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -11721,6 +11755,7 @@ mod tests {
             ctx.enqueue_intent_publish(IntentPublishJob {
                 intent,
                 post_action: IntentPublishPostAction::Exit {
+                    mint: "fifo-test-mint".to_string(),
                     source_event_ts_unix_ms: None,
                     slot_seen_at_ms: 0,
                 },
@@ -13387,7 +13422,7 @@ mod tests {
             config: parking_lot::RwLock::new(MomentumConfig::default()),
             nats: None,
             jsonl_writer,
-            intent_publish_tx: noop_intent_publish_tx(),
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -13456,7 +13491,7 @@ mod tests {
             config: parking_lot::RwLock::new(MomentumConfig::default()),
             nats: None,
             jsonl_writer,
-            intent_publish_tx: noop_intent_publish_tx(),
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -15815,7 +15850,7 @@ mod tests {
             config: parking_lot::RwLock::new(cfg.clone()),
             nats: None,
             jsonl_writer,
-            intent_publish_tx: noop_intent_publish_tx(),
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -15906,7 +15941,7 @@ mod tests {
             config: parking_lot::RwLock::new(cfg.clone()),
             nats: None,
             jsonl_writer,
-            intent_publish_tx: noop_intent_publish_tx(),
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -15991,7 +16026,7 @@ mod tests {
             config: parking_lot::RwLock::new(cfg),
             nats: None,
             jsonl_writer,
-            intent_publish_tx: noop_intent_publish_tx(),
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -16161,7 +16196,7 @@ mod tests {
             config: parking_lot::RwLock::new(cfg.clone()),
             nats: None,
             jsonl_writer,
-            intent_publish_tx: noop_intent_publish_tx(),
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -16276,7 +16311,7 @@ mod tests {
             config: parking_lot::RwLock::new(MomentumConfig::default()),
             nats: None,
             jsonl_writer,
-            intent_publish_tx: noop_intent_publish_tx(),
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -16376,7 +16411,7 @@ mod tests {
             config: parking_lot::RwLock::new(cfg.clone()),
             nats: None,
             jsonl_writer,
-            intent_publish_tx: noop_intent_publish_tx(),
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -16453,7 +16488,7 @@ mod tests {
             config: parking_lot::RwLock::new(MomentumConfig::default()),
             nats: None,
             jsonl_writer,
-            intent_publish_tx: noop_intent_publish_tx(),
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -16522,7 +16557,7 @@ mod tests {
             config: parking_lot::RwLock::new(MomentumConfig::default()),
             nats: None,
             jsonl_writer,
-            intent_publish_tx: noop_intent_publish_tx(),
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -17529,7 +17564,7 @@ mod tests {
             config: parking_lot::RwLock::new(cfg),
             nats: None,
             jsonl_writer,
-            intent_publish_tx: noop_intent_publish_tx(),
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -17679,7 +17714,7 @@ mod tests {
             config: parking_lot::RwLock::new(cfg),
             nats: None,
             jsonl_writer,
-            intent_publish_tx: noop_intent_publish_tx(),
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -19116,6 +19151,7 @@ async fn generate_and_publish_exit_intent(
     ctx.enqueue_intent_publish(IntentPublishJob {
         intent,
         post_action: IntentPublishPostAction::Exit {
+            mint: mint.to_string(),
             source_event_ts_unix_ms,
             slot_seen_at_ms: ts_ms,
         },
