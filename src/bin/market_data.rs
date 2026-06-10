@@ -4608,6 +4608,12 @@ impl MarketDataContext {
                     }
                 }
             }
+            // Mirror trade-path follow-up: restore arb-multi-dex pin tier when momentum ends.
+            if self.pool_admitted_for_arb_multi_dex(pool)
+                && self.apply_arb_multi_dex_pins_for_pool(pool, Instant::now())
+            {
+                changed = true;
+            }
             if let Some(state) = self.live_pool_cache.get(&pool) {
                 if let Some((leg_a, leg_b)) = pool_mints_for_geyser_explicit_tracking(&state) {
                     for leg in [leg_a, leg_b] {
