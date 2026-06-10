@@ -13083,10 +13083,7 @@ mod execution_engine_tests {
         data.extend_from_slice(&lamports.to_le_bytes());
         Instruction {
             program_id: solana_system_program::id(),
-            accounts: vec![
-                AccountMeta::new(*from, true),
-                AccountMeta::new(*to, false),
-            ],
+            accounts: vec![AccountMeta::new(*from, true), AccountMeta::new(*to, false)],
             data,
         }
     }
