@@ -19158,15 +19158,20 @@ async fn generate_and_publish_exit_intent(
         "🔴 Generated EXIT TradeIntent"
     );
 
-    ctx.enqueue_intent_publish(IntentPublishJob {
-        intent,
-        post_action: IntentPublishPostAction::Exit {
-            mint: mint.to_string(),
-            source_event_ts_unix_ms,
-            slot_seen_at_ms: ts_ms,
-        },
-    })
-    .await?;
+    if let Err(e) = ctx
+        .enqueue_intent_publish(IntentPublishJob {
+            intent,
+            post_action: IntentPublishPostAction::Exit {
+                mint: mint.to_string(),
+                source_event_ts_unix_ms,
+                slot_seen_at_ms: ts_ms,
+            },
+        })
+        .await
+    {
+        ctx.pending_intents.write().remove(&intent_id);
+        return Err(e);
+    }
 
     Ok(())
 }
