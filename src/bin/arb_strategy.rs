@@ -53,6 +53,7 @@ use ironcrab::nats::{
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
+use ironcrab::solana::dex::meteora_bin_walker::{dlmm_fee_bps, walker_from_bins};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
@@ -167,6 +168,12 @@ const MIN_TRADE_VOLUME_LAMPORTS: u64 = 100_000; // 0.0001 SOL minimum (filter du
 const MAX_PRICE_AGE_MS: u64 = 30_000;
 /// Small SOL probe for DLMM marginal price (0.01 SOL) — spread comparison only.
 const DLMM_PROBE_SOL_LAMPORTS: u64 = 10_000_000;
+/// Reject DLMM marginal price when it deviates more than this factor from reserve/trade mid.
+const DLMM_MARGINAL_MAX_DEVIATION_FACTOR: u64 = 100;
+/// Deduplicate per-mint "spread too large" WARN logs.
+const SPREAD_TOO_LARGE_WARN_COOLDOWN: Duration = Duration::from_secs(30);
+
+static DLMM_MARGINAL_PRICE_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Which marginal quote to use when ranking pools for 2-hop spread.
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -243,7 +250,62 @@ fn trade_implied_sol_per_token(sol_amount: u64, token_amount: u64, token_decimal
     sol_dec / token_dec
 }
 
-/// DLMM token output via bin-array traversal (shared by spread price + intent sizing).
+fn flatten_bins_for_walker(bin_arrays: &HashMap<i64, Vec<BinData>>) -> Vec<(i32, u64, u64)> {
+    let mut all_bins: Vec<(i32, u64, u64)> = Vec::new();
+    for (array_idx, bins) in bin_arrays {
+        for bin in bins {
+            let bin_id = (*array_idx * 70 + bin.offset as i64) as i32;
+            all_bins.push((bin_id, bin.amount_x, bin.amount_y));
+        }
+    }
+    all_bins.sort_by_key(|(id, _, _)| *id);
+    all_bins
+}
+
+fn active_bin_present(active_id: i32, flat_bins: &[(i32, u64, u64)]) -> bool {
+    flat_bins.iter().any(|(id, _, _)| *id == active_id)
+}
+
+/// Derive whether on-chain token X is SOL (SSOT: Meteora `token_x_mint`).
+fn vault_dlmm_sol_is_x(vault: &VaultBalanceCache) -> bool {
+    vault
+        .dlmm_token_x_mint
+        .as_deref()
+        .map(|m| m == NATIVE_SOL_MINT)
+        .unwrap_or(vault.dlmm_sol_is_x)
+}
+
+fn trade_mid_sol_per_token(pool: &PoolState) -> Option<Decimal> {
+    match (pool.trade_price_buy, pool.trade_price_sell) {
+        (Some(buy), Some(sell)) if buy > Decimal::ZERO && sell > Decimal::ZERO => {
+            Some((buy + sell) / Decimal::from(2))
+        }
+        (Some(one), None) | (None, Some(one)) if one > Decimal::ZERO => Some(one),
+        _ => None,
+    }
+}
+
+fn dlmm_marginal_price_plausible(
+    marginal: Decimal,
+    reserve_mid: Option<Decimal>,
+    trade_mid: Option<Decimal>,
+) -> bool {
+    let reference = match reserve_mid.or(trade_mid) {
+        Some(mid) if mid > Decimal::ZERO => mid,
+        _ => return true,
+    };
+    if marginal <= Decimal::ZERO {
+        return false;
+    }
+    let ratio = if marginal > reference {
+        marginal / reference
+    } else {
+        reference / marginal
+    };
+    ratio <= Decimal::from(DLMM_MARGINAL_MAX_DEVIATION_FACTOR)
+}
+
+/// DLMM token output via BinWalker (shared by spread price + intent sizing).
 fn dlmm_token_output_from_bins(
     active_id: i32,
     bin_step: u16,
@@ -251,69 +313,29 @@ fn dlmm_token_output_from_bins(
     bin_arrays: &HashMap<i64, Vec<BinData>>,
     sol_is_x: bool,
 ) -> Option<u64> {
-    if bin_arrays.is_empty() {
+    if bin_arrays.is_empty() || sol_in_lamports == 0 {
         return None;
     }
 
-    let active_array_index = active_id as i64 / 70;
-    let active_bin_offset = (active_id as i64 % 70) as usize;
-    let active_array = bin_arrays.get(&active_array_index)?;
-    if !active_array
-        .iter()
-        .any(|b| b.offset as usize == active_bin_offset)
-    {
+    let flat_bins = flatten_bins_for_walker(bin_arrays);
+    if !active_bin_present(active_id, &flat_bins) {
         return None;
     }
 
-    let mut remaining_sol = sol_in_lamports as u128;
-    let mut total_tokens_out: u128 = 0;
-
-    let mut all_bins: Vec<(i32, BinData)> = Vec::new();
-    for (array_idx, bins) in bin_arrays {
-        for bin in bins {
-            let bin_id = (*array_idx * 70 + bin.offset as i64) as i32;
-            all_bins.push((bin_id, bin.clone()));
-        }
+    let walker = walker_from_bins(active_id, bin_step, &flat_bins);
+    let fee_bps = dlmm_fee_bps(bin_step);
+    let (amount_out, _, _) = if sol_is_x {
+        walker.quote_x_to_y(sol_in_lamports, fee_bps).ok()?
+    } else {
+        walker.quote_y_to_x(sol_in_lamports, fee_bps).ok()?
+    };
+    if amount_out == 0 {
+        return None;
     }
-    all_bins.sort_by_key(|(id, _)| *id);
-
-    let relevant_bins: Vec<_> = all_bins
-        .into_iter()
-        .filter(|(id, _)| *id >= active_id)
-        .collect();
-
-    for (_bin_id, bin) in relevant_bins {
-        if remaining_sol == 0 {
-            break;
-        }
-        let (sol_in_bin, tokens_in_bin) = if sol_is_x {
-            (bin.amount_x as u128, bin.amount_y as u128)
-        } else {
-            (bin.amount_y as u128, bin.amount_x as u128)
-        };
-        if tokens_in_bin == 0 {
-            continue;
-        }
-        if sol_in_bin > 0 {
-            let sol_to_use = remaining_sol.min(sol_in_bin);
-            let tokens = sol_to_use
-                .checked_mul(tokens_in_bin)?
-                .checked_div(sol_in_bin)?;
-            remaining_sol = remaining_sol.saturating_sub(sol_to_use);
-            total_tokens_out = total_tokens_out.checked_add(tokens)?;
-        }
-    }
-
-    let fee_bps = 10u128 + (bin_step as u128).min(100);
-    let fee_multiplier = 10000u128 - fee_bps;
-    let tokens_after_fee = total_tokens_out
-        .checked_mul(fee_multiplier)?
-        .checked_div(10000)?;
-
-    Some(tokens_after_fee as u64)
+    Some(amount_out)
 }
 
-/// DLMM SOL output via bin-array traversal (token → SOL, sell-side marginal).
+/// DLMM SOL output via BinWalker (token → SOL, sell-side marginal).
 fn dlmm_sol_output_from_bins(
     active_id: i32,
     bin_step: u16,
@@ -325,60 +347,22 @@ fn dlmm_sol_output_from_bins(
         return None;
     }
 
-    let active_array_index = active_id as i64 / 70;
-    let active_bin_offset = (active_id as i64 % 70) as usize;
-    let active_array = bin_arrays.get(&active_array_index)?;
-    if !active_array
-        .iter()
-        .any(|b| b.offset as usize == active_bin_offset)
-    {
+    let flat_bins = flatten_bins_for_walker(bin_arrays);
+    if !active_bin_present(active_id, &flat_bins) {
         return None;
     }
 
-    let mut remaining_tokens = token_in as u128;
-    let mut total_sol_out: u128 = 0;
-
-    let mut all_bins: Vec<(i32, BinData)> = Vec::new();
-    for (array_idx, bins) in bin_arrays {
-        for bin in bins {
-            let bin_id = (*array_idx * 70 + bin.offset as i64) as i32;
-            all_bins.push((bin_id, bin.clone()));
-        }
+    let walker = walker_from_bins(active_id, bin_step, &flat_bins);
+    let fee_bps = dlmm_fee_bps(bin_step);
+    let (amount_out, _, _) = if sol_is_x {
+        walker.quote_y_to_x(token_in, fee_bps).ok()?
+    } else {
+        walker.quote_x_to_y(token_in, fee_bps).ok()?
+    };
+    if amount_out == 0 {
+        return None;
     }
-    all_bins.sort_by_key(|(id, _)| *id);
-
-    let relevant_bins: Vec<_> = all_bins
-        .into_iter()
-        .filter(|(id, _)| *id <= active_id)
-        .collect();
-
-    for (_bin_id, bin) in relevant_bins.into_iter().rev() {
-        if remaining_tokens == 0 {
-            break;
-        }
-        let (sol_in_bin, tokens_in_bin) = if sol_is_x {
-            (bin.amount_x as u128, bin.amount_y as u128)
-        } else {
-            (bin.amount_y as u128, bin.amount_x as u128)
-        };
-        if tokens_in_bin == 0 || sol_in_bin == 0 {
-            continue;
-        }
-        let tokens_to_use = remaining_tokens.min(tokens_in_bin);
-        let sol_out = tokens_to_use
-            .checked_mul(sol_in_bin)?
-            .checked_div(tokens_in_bin)?;
-        remaining_tokens = remaining_tokens.saturating_sub(tokens_to_use);
-        total_sol_out = total_sol_out.checked_add(sol_out)?;
-    }
-
-    let fee_bps = 10u128 + (bin_step as u128).min(100);
-    let fee_multiplier = 10000u128 - fee_bps;
-    let sol_after_fee = total_sol_out
-        .checked_mul(fee_multiplier)?
-        .checked_div(10000)?;
-
-    Some(sol_after_fee as u64)
+    Some(amount_out)
 }
 
 /// Map on-chain base/quote reserves to token-base + SOL-quote for comparable pricing.
@@ -436,24 +420,28 @@ fn comparable_price_sol_per_token(
         if let (Some(vault), Some(arrays)) = (vault_cache, dlmm_bin_arrays) {
             if let (Some(active_id), Some(bin_step)) = (vault.active_id, vault.bin_step) {
                 let flat = flatten_bin_array_cache(arrays);
-                let sol_is_x = vault.dlmm_sol_is_x;
-                match side {
+                let sol_is_x = vault_dlmm_sol_is_x(vault);
+                let reserve_mid = vault_reserves.and_then(|(base, quote)| {
+                    reserve_mid_sol_per_token(base, quote, token_decimals)
+                });
+                let trade_mid = trade_mid_sol_per_token(pool);
+                let marginal = match side {
                     ComparablePriceSide::Buy => {
-                        if let Some(tokens_out) = dlmm_token_output_from_bins(
+                        let tokens_out = dlmm_token_output_from_bins(
                             active_id,
                             bin_step,
                             DLMM_PROBE_SOL_LAMPORTS,
                             &flat,
                             sol_is_x,
-                        ) {
-                            if tokens_out > 0 {
-                                return Some(trade_implied_sol_per_token(
-                                    DLMM_PROBE_SOL_LAMPORTS,
-                                    tokens_out,
-                                    token_decimals,
-                                ));
-                            }
+                        )?;
+                        if tokens_out == 0 {
+                            return None;
                         }
+                        Some(trade_implied_sol_per_token(
+                            DLMM_PROBE_SOL_LAMPORTS,
+                            tokens_out,
+                            token_decimals,
+                        ))
                     }
                     ComparablePriceSide::Sell => {
                         let token_probe = dlmm_token_output_from_bins(
@@ -473,14 +461,21 @@ fn comparable_price_sol_per_token(
                             &flat,
                             sol_is_x,
                         )?;
-                        if sol_out > 0 {
-                            return Some(trade_implied_sol_per_token(
-                                sol_out,
-                                token_probe,
-                                token_decimals,
-                            ));
+                        if sol_out == 0 {
+                            return None;
                         }
+                        Some(trade_implied_sol_per_token(
+                            sol_out,
+                            token_probe,
+                            token_decimals,
+                        ))
                     }
+                };
+                if let Some(price) = marginal.filter(|p| *p > Decimal::ZERO) {
+                    if dlmm_marginal_price_plausible(price, reserve_mid, trade_mid) {
+                        return Some(price);
+                    }
+                    DLMM_MARGINAL_PRICE_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -628,10 +623,11 @@ fn seed_one_pool_from_live_cache(
     let cache_updated_at = Instant::now()
         .checked_sub(Duration::from_millis(age_ms))
         .unwrap_or_else(Instant::now);
-    let dlmm_sol_is_x = matches!(
-        state,
-        CachedPoolState::Meteora(s) if s.token_x_mint.to_string() == NATIVE_SOL_MINT
-    );
+    let dlmm_token_x_mint = match state {
+        CachedPoolState::Meteora(s) => Some(s.token_x_mint.to_string()),
+        _ => None,
+    };
+    let dlmm_sol_is_x = dlmm_token_x_mint.as_deref() == Some(NATIVE_SOL_MINT);
 
     // Monotonic merge: lagging JetStream must not regress fresher Geyser PoolStateUpdate.
     let should_update_vault = match vault_balances.get(&pool_addr) {
@@ -650,6 +646,7 @@ fn seed_one_pool_from_live_cache(
                 bin_step,
                 updated_at: cache_updated_at,
                 dlmm_sol_is_x,
+                dlmm_token_x_mint,
             },
         );
     }
@@ -898,6 +895,7 @@ impl TokenArbTracker {
         known_pools: &HashSet<String>,
         vault_balances: &HashMap<String, VaultBalanceCache>,
         bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
+        spread_warn_last: &RwLock<HashMap<String, Instant>>,
     ) -> Option<ArbOpportunity> {
         // Check if 2-hop arbitrage is enabled
         if !config.two_hop_enabled {
@@ -1053,16 +1051,29 @@ impl TokenArbTracker {
         };
 
         if spread_bps > max_spread {
-            warn!(
-                mint = %self.base_mint,
-                spread_bps = spread_bps,
-                max_spread = max_spread,
-                buy_price = %buy_price,
-                sell_price = %sell_price,
-                buy_dex = %buy_pool.dex,
-                sell_dex = %sell_pool.dex,
-                "Arb check rejected: spread too large (likely data error)"
-            );
+            let should_warn = {
+                let mut warn_map = spread_warn_last.write();
+                let emit = match warn_map.get(&self.base_mint) {
+                    Some(last) => last.elapsed() >= SPREAD_TOO_LARGE_WARN_COOLDOWN,
+                    None => true,
+                };
+                if emit {
+                    warn_map.insert(self.base_mint.clone(), Instant::now());
+                }
+                emit
+            };
+            if should_warn {
+                warn!(
+                    mint = %self.base_mint,
+                    spread_bps = spread_bps,
+                    max_spread = max_spread,
+                    buy_price = %buy_price,
+                    sell_price = %sell_price,
+                    buy_dex = %buy_pool.dex,
+                    sell_dex = %sell_pool.dex,
+                    "Arb check rejected: spread too large (likely data error)"
+                );
+            }
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::SpreadTooLarge);
             return None;
         }
@@ -1246,6 +1257,9 @@ struct ArbContext {
     /// Multi-hop arbitrage engine for N-hop cycle detection.
     /// Disabled by default (shadow_mode=true). See docs/MULTI_HOP_ARBITRAGE.md
     multi_hop: MultiHopArbitrage,
+
+    /// Per-mint last WARN time for "spread too large" deduplication.
+    spread_too_large_warn_last: RwLock<HashMap<String, Instant>>,
 }
 
 /// Cached vault balances from PoolStateUpdate events
@@ -1262,6 +1276,8 @@ struct VaultBalanceCache {
     updated_at: Instant,
     /// Meteora DLMM: on-chain token X is SOL (bins stay in native X/Y layout).
     dlmm_sol_is_x: bool,
+    /// Meteora DLMM SSOT: on-chain `token_x_mint` (lb_pair order, not SOL-quoted remap).
+    dlmm_token_x_mint: Option<String>,
 }
 
 /// Cached bin array data from BinArrayUpdate events
@@ -1786,14 +1802,14 @@ impl ArbContext {
             return;
         }
         let is_new = !cache.contains_key(pool_address);
-        let dlmm_sol_is_x = if dex == "meteora_dlmm" {
-            base_mint == NATIVE_SOL_MINT
+        let dlmm_token_x_mint = if dex == "meteora_dlmm" {
+            Some(base_mint.to_string())
         } else {
             cache
                 .get(pool_address)
-                .map(|v| v.dlmm_sol_is_x)
-                .unwrap_or(false)
+                .and_then(|v| v.dlmm_token_x_mint.clone())
         };
+        let dlmm_sol_is_x = dlmm_token_x_mint.as_deref() == Some(NATIVE_SOL_MINT);
         cache.insert(
             pool_address.to_string(),
             VaultBalanceCache {
@@ -1804,6 +1820,7 @@ impl ArbContext {
                 bin_step,
                 updated_at: Instant::now(),
                 dlmm_sol_is_x,
+                dlmm_token_x_mint,
             },
         );
         if is_new {
@@ -1856,6 +1873,13 @@ impl ArbContext {
         let mut cache = self.bin_arrays.write();
         let pool_cache = cache.entry(pool_address.to_string()).or_default();
         let bins_count = bins.len();
+        let should_update = match pool_cache.get(&bin_array_index) {
+            Some(existing) => update_slot >= existing.update_slot,
+            None => true,
+        };
+        if !should_update {
+            return;
+        }
         pool_cache.insert(bin_array_index, BinArrayCache { bins, update_slot });
         debug!(
             pool = %pool_address,
@@ -2012,7 +2036,7 @@ impl ArbContext {
             bin_step,
             sol_in_lamports,
             &bin_arrays,
-            pool_state.dlmm_sol_is_x,
+            vault_dlmm_sol_is_x(pool_state),
         )?;
 
         info!(
@@ -2192,9 +2216,13 @@ impl ArbContext {
         let known_pools = self.known_pools.read();
         let vault_balances = self.vault_balances.read();
         let bin_arrays = self.bin_arrays.read();
-        if let Some(opp) =
-            tracker.check_arbitrage(&config, &known_pools, &vault_balances, &bin_arrays)
-        {
+        if let Some(opp) = tracker.check_arbitrage(
+            &config,
+            &known_pools,
+            &vault_balances,
+            &bin_arrays,
+            &self.spread_too_large_warn_last,
+        ) {
             // Check cooldown
             let cooldown = Duration::from_millis(config.intent_cooldown_ms);
             if let Some(last_time) = tracker.last_intent_time {
@@ -2570,6 +2598,7 @@ async fn main() -> Result<()> {
         live_pool_cache,
         known_pools: RwLock::new(HashSet::new()),
         multi_hop,
+        spread_too_large_warn_last: RwLock::new(HashMap::new()),
     });
 
     // Bootstrap SLAVE LivePoolCache from JetStream (same path as execution-engine).
@@ -3224,6 +3253,8 @@ mod two_hop_price_tests {
         reserve_quote: u64,
         active_id: Option<i32>,
         bin_step: Option<u16>,
+        dlmm_sol_is_x: bool,
+        dlmm_token_x_mint: Option<&str>,
     ) -> VaultBalanceCache {
         VaultBalanceCache {
             reserve_base,
@@ -3232,8 +3263,46 @@ mod two_hop_price_tests {
             active_id,
             bin_step,
             updated_at: Instant::now(),
-            dlmm_sol_is_x: false,
+            dlmm_sol_is_x,
+            dlmm_token_x_mint: dlmm_token_x_mint.map(str::to_string),
         }
+    }
+
+    fn usdc_sol_dlmm_fixture(
+        sol_is_x: bool,
+        token_amount: u64,
+        sol_amount: u64,
+        active_id: i32,
+        bin_step: u16,
+    ) -> (HashMap<i64, BinArrayCache>, VaultBalanceCache, u8) {
+        let array_index = active_id as i64 / 70;
+        let (amount_x, amount_y) = if sol_is_x {
+            (sol_amount, token_amount)
+        } else {
+            (token_amount, sol_amount)
+        };
+        let token_x_mint = if sol_is_x { NATIVE_SOL_MINT } else { USDC_MINT };
+        let mut bin_arrays: HashMap<i64, BinArrayCache> = HashMap::new();
+        bin_arrays.insert(
+            array_index,
+            BinArrayCache {
+                bins: vec![BinData {
+                    offset: (active_id as i64 % 70) as u8,
+                    amount_x,
+                    amount_y,
+                }],
+                update_slot: 1,
+            },
+        );
+        let vault = sample_vault(
+            token_amount,
+            sol_amount,
+            Some(active_id),
+            Some(bin_step),
+            sol_is_x,
+            Some(token_x_mint),
+        );
+        (bin_arrays, vault, 6)
     }
 
     #[test]
@@ -3242,7 +3311,7 @@ mod two_hop_price_tests {
         let mid = reserve_mid_sol_per_token(reserves.0, reserves.1, 6).unwrap();
         let pool_a = sample_pool("meteora_dlmm", "poolA", None, None);
         let pool_b = sample_pool("pump_amm", "poolB", None, None);
-        let vault = sample_vault(reserves.0, reserves.1, None, None);
+        let vault = sample_vault(reserves.0, reserves.1, None, None, false, None);
         let p_a = comparable_price_sol_per_token(
             &pool_a,
             Some(reserves),
@@ -3311,58 +3380,60 @@ mod two_hop_price_tests {
 
     #[test]
     fn dlmm_marginal_vs_amm_mid_no_spread_too_large() {
-        // 1M tokens (6 dec) : 1 SOL on both sides
+        // USDC/SOL DLMM: 1M USDC (6 dec) : 1000 SOL (9 dec) — both token_x orientations.
         let reserve_base = 1_000_000_000_000u64;
-        let reserve_quote = 1_000_000_000u64;
+        let reserve_quote = 1_000_000_000_000u64;
         let active_id: i32 = 0;
         let bin_step: u16 = 10;
-        let array_index = active_id as i64 / 70;
 
-        let mut bin_arrays: HashMap<i64, BinArrayCache> = HashMap::new();
-        bin_arrays.insert(
-            array_index,
-            BinArrayCache {
-                bins: vec![BinData {
-                    offset: 0,
-                    amount_x: reserve_base,
-                    amount_y: reserve_quote,
-                }],
-                update_slot: 1,
-            },
-        );
+        for sol_is_x in [false, true] {
+            let (bin_arrays, vault, token_decimals) =
+                usdc_sol_dlmm_fixture(sol_is_x, reserve_base, reserve_quote, active_id, bin_step);
+            let reserve_mid =
+                reserve_mid_sol_per_token(reserve_base, reserve_quote, token_decimals).unwrap();
 
-        let dlmm_pool = sample_pool("meteora_dlmm", "dlmmPool", None, None);
-        let orca_pool = sample_pool("orca", "orcaPool", None, None);
-        let vault = sample_vault(reserve_base, reserve_quote, Some(active_id), Some(bin_step));
+            let dlmm_pool = sample_pool("meteora_dlmm", "dlmmPool", None, None);
+            let orca_pool = sample_pool("orca", "orcaPool", None, None);
 
-        let p_dlmm = comparable_price_sol_per_token(
-            &dlmm_pool,
-            Some((reserve_base, reserve_quote)),
-            6,
-            Some(&vault),
-            Some(&bin_arrays),
-            ComparablePriceSide::Buy,
-        )
-        .unwrap();
-        let p_orca = comparable_price_sol_per_token(
-            &orca_pool,
-            Some((reserve_base, reserve_quote)),
-            6,
-            Some(&vault),
-            None,
-            ComparablePriceSide::Buy,
-        )
-        .unwrap();
-
-        let spread_bps = ((p_orca - p_dlmm) / p_dlmm * Decimal::from(10000))
-            .abs()
-            .round()
-            .to_i64()
+            let p_dlmm = comparable_price_sol_per_token(
+                &dlmm_pool,
+                Some((reserve_base, reserve_quote)),
+                token_decimals,
+                Some(&vault),
+                Some(&bin_arrays),
+                ComparablePriceSide::Buy,
+            )
             .unwrap();
-        assert!(
-            spread_bps < MAX_REASONABLE_SPREAD_BPS,
-            "DLMM marginal vs AMM mid spread {spread_bps} bps should be sane"
-        );
+            let p_orca = comparable_price_sol_per_token(
+                &orca_pool,
+                Some((reserve_base, reserve_quote)),
+                token_decimals,
+                Some(&vault),
+                None,
+                ComparablePriceSide::Buy,
+            )
+            .unwrap();
+
+            let ratio = if p_dlmm > reserve_mid {
+                p_dlmm / reserve_mid
+            } else {
+                reserve_mid / p_dlmm
+            };
+            assert!(
+                ratio <= Decimal::from(2),
+                "sol_is_x={sol_is_x}: DLMM marginal {p_dlmm} vs reserve mid {reserve_mid} (ratio {ratio})"
+            );
+
+            let spread_bps = ((p_orca - p_dlmm) / p_dlmm * Decimal::from(10000))
+                .abs()
+                .round()
+                .to_i64()
+                .unwrap();
+            assert!(
+                spread_bps < MAX_REASONABLE_SPREAD_BPS,
+                "sol_is_x={sol_is_x}: DLMM marginal vs AMM mid spread {spread_bps} bps should be sane"
+            );
+        }
     }
 
     #[test]
@@ -3381,6 +3452,7 @@ mod two_hop_price_tests {
             bin_step: None,
             updated_at: Instant::now(),
             dlmm_sol_is_x: false,
+            dlmm_token_x_mint: None,
         };
         let max_age = Duration::from_millis(MAX_PRICE_AGE_MS);
         assert!(!pool.last_update.elapsed().le(&max_age));
@@ -3443,7 +3515,14 @@ mod two_hop_price_tests {
 
         let config = ArbConfig::default();
         let bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
-        let opp = tracker.check_arbitrage(&config, &known_pools, &vault_balances, &bin_arrays);
+        let spread_warn_last = RwLock::new(HashMap::new());
+        let opp = tracker.check_arbitrage(
+            &config,
+            &known_pools,
+            &vault_balances,
+            &bin_arrays,
+            &spread_warn_last,
+        );
         // Same reserves → spread ~0, rejected by spread_below_min not insufficient_pools
         assert!(
             opp.is_none(),
@@ -3485,6 +3564,7 @@ mod two_hop_price_tests {
                 bin_step: None,
                 updated_at: fresher_updated_at,
                 dlmm_sol_is_x: false,
+                dlmm_token_x_mint: None,
             },
         )]);
         let mut trackers = HashMap::new();
@@ -3539,6 +3619,7 @@ mod two_hop_price_tests {
                 bin_step: None,
                 updated_at: Instant::now() - Duration::from_secs(60),
                 dlmm_sol_is_x: false,
+                dlmm_token_x_mint: None,
             },
         )]);
         let mut trackers = HashMap::new();

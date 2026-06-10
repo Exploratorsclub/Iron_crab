@@ -54,7 +54,7 @@ impl BinWalker {
 
     /// Convert bin ID to price
     /// Formula: price = (1 + bin_step/10000)^bin_id
-    fn bin_id_to_price(&self, bin_id: i32) -> f64 {
+    pub fn bin_id_to_price(&self, bin_id: i32) -> f64 {
         let step_multiplier = 1.0 + (self.bin_step as f64 / 10000.0);
         step_multiplier.powi(bin_id)
     }
@@ -218,6 +218,22 @@ impl BinWalker {
 
         ((effective_price - spot_price).abs() / spot_price * 10000.0) as u32
     }
+}
+
+/// DLMM fee estimate used by arb-strategy marginal probe (matches legacy arb formula).
+pub fn dlmm_fee_bps(bin_step: u16) -> u32 {
+    10 + (bin_step as u32).min(100)
+}
+
+/// Build a walker from flattened bin liquidity `(bin_id, amount_x, amount_y)`.
+pub fn walker_from_bins(active_id: i32, bin_step: u16, bins: &[(i32, u64, u64)]) -> BinWalker {
+    let mut walker = BinWalker::new(active_id, bin_step);
+    for &(id, amount_x, amount_y) in bins {
+        if amount_x > 0 || amount_y > 0 {
+            walker.add_bin(id, amount_x, amount_y);
+        }
+    }
+    walker
 }
 
 #[cfg(test)]
