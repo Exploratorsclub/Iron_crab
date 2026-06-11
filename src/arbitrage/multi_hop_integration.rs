@@ -516,6 +516,13 @@ struct TokenSearchState {
     last_price_ratio: Option<u64>, // Normalized price for change detection
 }
 
+/// Coalesced dirty-token entry (price + originating event metadata).
+struct DirtyTokenEntry {
+    price_ratio: u64,
+    event_slot: Option<u64>,
+    event_seen_at_ms: u64,
+}
+
 /// Multi-hop arbitrage engine (Event-Driven)
 pub struct MultiHopArbitrage {
     config: RwLock<MultiHopConfig>,
@@ -526,9 +533,7 @@ pub struct MultiHopArbitrage {
     /// Pool -> (mint_a, mint_b) reverse index for quick lookup
     pool_mints: RwLock<HashMap<Pubkey, (Pubkey, Pubkey)>>,
     /// Coalescing queue: latest price ratio per dirty token (search worker drains).
-    dirty_tokens: RwLock<HashMap<Pubkey, u64>>,
-    /// Latest trade event metadata (slot / ts) for intent publishing.
-    latest_event_meta: RwLock<(Option<u64>, u64)>,
+    dirty_tokens: RwLock<HashMap<Pubkey, DirtyTokenEntry>>,
     search_notify: Arc<Notify>,
     /// Stats
     searches_triggered: AtomicU64,
@@ -551,7 +556,6 @@ impl MultiHopArbitrage {
             token_state: RwLock::new(HashMap::new()),
             pool_mints: RwLock::new(HashMap::new()),
             dirty_tokens: RwLock::new(HashMap::new()),
-            latest_event_meta: RwLock::new((None, 0)),
             search_notify: Arc::new(Notify::new()),
             searches_triggered: AtomicU64::new(0),
             searches_skipped_cooldown: AtomicU64::new(0),
@@ -642,7 +646,6 @@ impl MultiHopArbitrage {
 
         self.quote_provider
             .update_quote(pool, input, output, input_amount, output_amount);
-        *self.latest_event_meta.write() = (event_slot, event_seen_at_ms);
 
         if input_amount == 0 || output_amount == 0 {
             return;
@@ -663,24 +666,35 @@ impl MultiHopArbitrage {
             } else {
                 continue;
             };
-            self.enqueue_dirty_token(mint, ratio);
+            self.enqueue_dirty_token(mint, ratio, event_slot, event_seen_at_ms);
         }
 
         self.search_notify.notify_one();
     }
 
-    fn enqueue_dirty_token(&self, token: Pubkey, price_ratio: u64) {
+    fn enqueue_dirty_token(
+        &self,
+        token: Pubkey,
+        price_ratio: u64,
+        event_slot: Option<u64>,
+        event_seen_at_ms: u64,
+    ) {
         let mut dirty = self.dirty_tokens.write();
         if dirty.len() >= MAX_DIRTY_TOKENS && !dirty.contains_key(&token) {
             return;
         }
-        if dirty.insert(token, price_ratio).is_some() {
+        let entry = DirtyTokenEntry {
+            price_ratio,
+            event_slot,
+            event_seen_at_ms,
+        };
+        if dirty.insert(token, entry).is_some() {
             multi_hop_searches_coalesced_inc();
         }
         multi_hop_search_worker_queue_depth_set(dirty.len() as u64);
     }
 
-    fn drain_dirty_tokens(&self) -> Vec<(Pubkey, u64)> {
+    fn drain_dirty_tokens(&self) -> Vec<(Pubkey, DirtyTokenEntry)> {
         let mut dirty = self.dirty_tokens.write();
         if dirty.is_empty() {
             return vec![];
@@ -688,6 +702,19 @@ impl MultiHopArbitrage {
         let batch: Vec<_> = dirty.drain().collect();
         multi_hop_search_worker_queue_depth_set(0);
         batch
+    }
+
+    fn batch_event_meta_for_tokens(
+        batch: &[(Pubkey, DirtyTokenEntry)],
+        tokens: &[Pubkey],
+    ) -> (Option<u64>, u64) {
+        let token_set: HashSet<_> = tokens.iter().collect();
+        batch
+            .iter()
+            .filter(|(token, _)| token_set.contains(token))
+            .min_by_key(|(_, entry)| entry.event_seen_at_ms)
+            .map(|(_, entry)| (entry.event_slot, entry.event_seen_at_ms))
+            .unwrap_or((None, 0))
     }
 
     /// Worker batch: apply cooldown/price filters then run beam search.
@@ -700,25 +727,29 @@ impl MultiHopArbitrage {
         self.quote_provider.maybe_cleanup();
 
         let config = self.config.read().clone();
-        let (slot, seen_at_ms) = *self.latest_event_meta.read();
-        if !config.enabled {
-            return MultiHopIntentBatch {
-                intents: vec![],
-                slot,
-                seen_at_ms,
-            };
-        }
-
         let batch = self.drain_dirty_tokens();
         if batch.is_empty() {
             return MultiHopIntentBatch {
                 intents: vec![],
-                slot,
-                seen_at_ms,
+                slot: None,
+                seen_at_ms: 0,
             };
         }
 
-        let tokens_to_search = self.filter_tokens_for_search(&batch, &config);
+        if !config.enabled {
+            return MultiHopIntentBatch {
+                intents: vec![],
+                slot: None,
+                seen_at_ms: 0,
+            };
+        }
+
+        let token_ratios: Vec<(Pubkey, u64)> = batch
+            .iter()
+            .map(|(token, entry)| (*token, entry.price_ratio))
+            .collect();
+        let tokens_to_search = self.filter_tokens_for_search(&token_ratios, &config);
+        let (slot, seen_at_ms) = Self::batch_event_meta_for_tokens(&batch, &tokens_to_search);
         if tokens_to_search.is_empty() {
             return MultiHopIntentBatch {
                 intents: vec![],
@@ -750,7 +781,7 @@ impl MultiHopArbitrage {
                 notify.notified().await;
                 let batch = self.process_dirty_batch(&component, &build, &run_id);
                 if !batch.intents.is_empty() && intent_tx.send(batch).await.is_err() {
-                    break;
+                    warn!("Multi-hop search worker: intent channel closed, continuing search");
                 }
             }
         })
