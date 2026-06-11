@@ -80,7 +80,8 @@ use ironcrab::nats::{
     TOPIC_MOMENTUM_MARKET_EVENTS, TOPIC_TRADE_INTENTS, WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::solana::dex_parser::SOL_MINT_PUBKEY;
-use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
+use ironcrab::storage::{JsonlWriterConfig, QueuedJsonlWriter};
+use tokio::sync::mpsc;
 
 /// NATS topic for config reload (P1: Runtime Configuration via UI)
 const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
@@ -328,34 +329,6 @@ impl BoundedIntentIdCache {
         removed
     }
 }
-
-// #region agent log
-fn dbg_log(location: &str, message: &str, data: serde_json::Value, hypothesis_id: &str) {
-    if let Ok(path) = std::env::current_dir().map(|p| p.join("debug-79f8ff.log")) {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let payload = serde_json::json!({
-            "sessionId": "79f8ff",
-            "id": format!("log_{}_x", ts),
-            "timestamp": ts,
-            "location": location,
-            "message": message,
-            "data": data,
-            "hypothesisId": hypothesis_id
-        });
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            use std::io::Write;
-            let _ = writeln!(f, "{}", payload);
-        }
-    }
-}
-// #endregion
 
 /// Drop guard: records `momentum_process_market_event_us` (full async scope of `process_market_event`).
 struct MomentumProcessMarketEventTimer(std::time::Instant);
@@ -3135,6 +3108,37 @@ struct EntrySignal {
     reason: String,
 }
 
+/// Bounded queue for offloading TradeIntent JSONL + JetStream publish from the event loop.
+const INTENT_PUBLISH_QUEUE_CAP: usize = 1024;
+const INTENT_PUBLISH_ENQUEUE_TIMEOUT: Duration = Duration::from_millis(50);
+
+static MOMENTUM_INTENT_PUBLISH_BACKPRESSURE_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Debug, Clone)]
+enum IntentPublishPostAction {
+    Exit {
+        mint: String,
+        source_event_ts_unix_ms: Option<u64>,
+        slot_seen_at_ms: u64,
+    },
+    Buy {
+        entry_signal: EntrySignal,
+        effective_pool: String,
+        effective_dex: String,
+        token_program: Option<String>,
+        signal_slot: u64,
+        slot_seen_at_ms: u64,
+    },
+}
+
+struct IntentPublishJob {
+    intent: TradeIntent,
+    post_action: IntentPublishPostAction,
+}
+
+type IntentPublishOrderRecorder = Arc<parking_lot::Mutex<Vec<String>>>;
+
 /// Information about a pool for multi-pool routing
 #[derive(Debug, Clone)]
 struct PoolInfo {
@@ -3179,7 +3183,10 @@ struct MomentumContext {
     /// P1: Config in RwLock for runtime hot-reload
     config: parking_lot::RwLock<MomentumConfig>,
     nats: Option<NatsClient>,
-    jsonl_writer: JsonlWriter,
+    jsonl_writer: QueuedJsonlWriter,
+    /// Held in `Option` so shutdown can `take()` the sender and drain the worker without the
+    /// worker's `Arc<Self>` keeping the channel open.
+    intent_publish_tx: parking_lot::Mutex<Option<mpsc::Sender<IntentPublishJob>>>,
     intent_counter: std::sync::atomic::AtomicU64,
     /// Track known pools (pool_address -> first_seen_slot)
     pool_first_seen: parking_lot::RwLock<std::collections::HashMap<String, u64>>,
@@ -6027,11 +6034,22 @@ impl MomentumContext {
         // waiting for a scale-in that no longer makes sense. Orphaned Buy Recovery
         // (handle_execution_result) handles any BUY that confirms after exit.
 
+        let pending_sell_mints: std::collections::HashSet<String> = self
+            .pending_intents
+            .read()
+            .values()
+            .filter(|p| p.side == TradeSide::Sell)
+            .map(|p| p.mint.clone())
+            .collect();
+
         let mut positions = self.positions.write();
         let mut exits = Vec::new();
 
         for (mint, pos) in positions.iter_mut() {
             if pos.exit_generated {
+                continue;
+            }
+            if pending_sell_mints.contains(mint) {
                 continue;
             }
 
@@ -6288,10 +6306,6 @@ impl MomentumContext {
                     mint = %mint,
                     "Failed to generate/publish sell intent - will retry on next event"
                 );
-            } else {
-                self.mark_exit_generated(&mint);
-                self.exits_generated
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -6375,12 +6389,40 @@ impl MomentumContext {
                     mint = %candidate.mint,
                     "Failed to publish timed-exit reconcile intent"
                 );
-            } else {
-                self.mark_exit_generated(&candidate.mint);
-                self.exits_generated
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
+    }
+
+    fn shutdown_intent_publish_sender(&self) {
+        let _ = self.intent_publish_tx.lock().take();
+    }
+
+    fn rollback_exit_intent_after_publish_failure(&self, intent_id: &str, mint: &str) {
+        self.pending_intents.write().remove(intent_id);
+        let mut positions = self.positions.write();
+        if let Some(pos) = positions.get_mut(mint) {
+            pos.exit_generated = false;
+            pos.exit_generated_at = None;
+        }
+        warn!(
+            mint = %mint,
+            intent_id = %intent_id,
+            "Rolled back exit intent after JetStream publish failure — will retry"
+        );
+    }
+
+    fn record_exit_intent_published(&self, intent_id: &str, mint: &str) {
+        if !self.pending_intents.read().contains_key(intent_id) {
+            debug!(
+                intent_id = %intent_id,
+                mint = %mint,
+                "Skipping exit latch — pending intent already consumed"
+            );
+            return;
+        }
+        self.mark_exit_generated(mint);
+        self.exits_generated
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Mark a position's exit as generated (call after successful SELL intent publish)
@@ -6458,6 +6500,33 @@ impl MomentumContext {
             },
         );
         debug!(intent_id = %intent_id, mint = %mint, "Registered pending SELL intent");
+    }
+
+    async fn enqueue_intent_publish(&self, job: IntentPublishJob) -> Result<()> {
+        let tx = self
+            .intent_publish_tx
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("intent publish worker closed"))?;
+        match tx.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(job)) => {
+                MOMENTUM_INTENT_PUBLISH_BACKPRESSURE_TOTAL
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match tokio::time::timeout(INTENT_PUBLISH_ENQUEUE_TIMEOUT, tx.send(job)).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(_)) => anyhow::bail!("intent publish worker closed"),
+                    Err(_) => {
+                        MOMENTUM_INTENT_PUBLISH_BACKPRESSURE_TOTAL
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        anyhow::bail!("intent publish queue backpressure timeout");
+                    }
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!("intent publish worker closed")
+            }
+        }
     }
 
     /// Merge a Geyser `BondingCurveProgress` observation (slot-/ts-monotonic). Updates global
@@ -7463,21 +7532,15 @@ impl MomentumContext {
                                     .filter(|tp| !tp.is_empty())
                             });
 
-                        // #region agent log
-                        dbg_log(
-                            "momentum_bot.rs:open_position",
-                            "BUY CONFIRMED opening position",
-                            serde_json::json!({
-                                "mint": pending.mint,
-                                "entry_price": entry_price,
-                                "sol_ui_for_price": sol_ui_for_price,
-                                "tok_ui": tok_ui,
-                                "fill_in_raw": result.fill_in.as_ref().map(|a| a.raw),
-                                "fill_out_raw": result.fill_out.as_ref().map(|a| a.raw)
-                            }),
-                            "H-C",
+                        trace!(
+                            mint = %pending.mint,
+                            entry_price,
+                            sol_ui_for_price,
+                            tok_ui,
+                            fill_in_raw = ?result.fill_in.as_ref().map(|a| a.raw),
+                            fill_out_raw = ?result.fill_out.as_ref().map(|a| a.raw),
+                            "BUY CONFIRMED opening position"
                         );
-                        // #endregion
                         // A.2: Resolve creator for pumpfun BC-SELL (Position → TokenTracker)
                         let creator = if pending.dex == "pumpfun" {
                             let tk = Self::tracker_storage_key(&pending.mint, &pending.pool);
@@ -9241,9 +9304,9 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| PathBuf::from("trade_logs/intents"));
     let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(&log_dir);
-    let jsonl_writer = JsonlWriter::new(jsonl_config)?;
+    let jsonl_writer = QueuedJsonlWriter::spawn(jsonl_config, INTENT_PUBLISH_QUEUE_CAP)?;
 
-    info!(log_dir = %log_dir.display(), "JSONL writer initialized");
+    info!(log_dir = %log_dir.display(), "Queued JSONL writer initialized for trade_intents");
 
     // Setup NATS first (needed for KV recovery)
     let nats = if args.dry_run {
@@ -9379,11 +9442,15 @@ async fn main() -> Result<()> {
     // FIX-21: Create SLAVE LivePoolCache for reserve-based quoting
     let live_pool_cache = LivePoolCache::new();
 
+    let (intent_publish_tx, intent_publish_rx) = mpsc::channel(INTENT_PUBLISH_QUEUE_CAP);
+    let nats_for_intent_worker = nats.as_ref().map(NatsClient::clone_for_spawned_publish);
+
     let ctx = Arc::new(MomentumContext {
         run_id: run_id.clone(),
         config: parking_lot::RwLock::new(momentum_config),
         nats,
         jsonl_writer,
+        intent_publish_tx: parking_lot::Mutex::new(Some(intent_publish_tx)),
         intent_counter: std::sync::atomic::AtomicU64::new(0),
         pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
         pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -9420,6 +9487,13 @@ async fn main() -> Result<()> {
             MomentumActivePoolPublishQueue::default(),
         ),
     });
+
+    let intent_publish_worker = spawn_intent_publish_worker(
+        Arc::clone(&ctx),
+        intent_publish_rx,
+        nats_for_intent_worker,
+        None,
+    );
 
     // === P0: Wallet snapshot recovery from JetStream ===
     if let Ok(recovered) = bootstrap_wallet_snapshot_from_jetstream(&ctx).await {
@@ -9459,11 +9533,6 @@ async fn main() -> Result<()> {
             .await
             {
                 error!(error = %e, mint = %mint, "Failed to generate/publish immediate exit intent - will retry in main loop");
-            } else {
-                // Only mark exit_generated AFTER successful publish
-                ctx.mark_exit_generated(&mint);
-                ctx.exits_generated
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -10405,9 +10474,6 @@ async fn main() -> Result<()> {
 
                         if let Err(e) = generate_and_publish_buy_intent(&ctx, &s).await {
                             error!(error = %e, mint = %s.mint, "Failed to generate/publish buy intent");
-                        } else {
-                            ctx.intents_generated
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 }
@@ -10482,12 +10548,165 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!(run_id = %run_id, "momentum-bot main loop ended; flushing JSONL");
-    // Flush JSONL on shutdown
+    info!(run_id = %run_id, "momentum-bot main loop ended; draining intent publish worker");
+    ctx.shutdown_intent_publish_sender();
+    if let Err(e) = intent_publish_worker.await {
+        warn!(error = %e, "intent publish worker task join error");
+    }
     ctx.jsonl_writer.flush()?;
     info!(run_id = %run_id, "momentum-bot shutdown complete");
 
     Ok(())
+}
+
+async fn intent_publish_jsonl_write(writer: &QueuedJsonlWriter, intent: &TradeIntent) {
+    let intent = intent.clone();
+    loop {
+        if writer.try_write(intent.clone()) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+async fn intent_publish_worker_loop(
+    ctx: Arc<MomentumContext>,
+    mut rx: mpsc::Receiver<IntentPublishJob>,
+    nats: Option<NatsClient>,
+    order_recorder: Option<IntentPublishOrderRecorder>,
+) {
+    while let Some(job) = rx.recv().await {
+        let intent = job.intent;
+
+        // FIX-30b may remove queued BUY rows from `pending_intents` before this worker runs.
+        if let IntentPublishPostAction::Buy {
+            ref entry_signal, ..
+        } = job.post_action
+        {
+            if !ctx.pending_intents.read().contains_key(&intent.intent_id) {
+                ctx.unwind_stale_entry_pending_after_publish_failure(entry_signal, true);
+                continue;
+            }
+        }
+
+        intent_publish_jsonl_write(&ctx.jsonl_writer, &intent).await;
+
+        let mut publish_ok = nats.is_none();
+        if let Some(ref nats) = nats {
+            let buy_cancelled_before_publish =
+                matches!(&job.post_action, IntentPublishPostAction::Buy { .. })
+                    && !ctx.pending_intents.read().contains_key(&intent.intent_id);
+            if buy_cancelled_before_publish {
+                publish_ok = false;
+            } else {
+                match nats.jetstream_publish(TOPIC_TRADE_INTENTS, &intent).await {
+                    Ok(true) => {
+                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        let now_ms = wall_clock_unix_ms_now();
+                        try_record_momentum_intent_header_to_publish_ms(
+                            now_ms,
+                            intent.header.ts_unix_ms,
+                        );
+                        publish_ok = true;
+                    }
+                    Ok(false) => {
+                        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            intent_id = %intent.intent_id,
+                            topic = TOPIC_TRADE_INTENTS,
+                            "Intent JetStream publish dropped/failed in worker"
+                        );
+                    }
+                    Err(e) => {
+                        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            intent_id = %intent.intent_id,
+                            error = %e,
+                            "Intent JetStream publish error in worker"
+                        );
+                    }
+                }
+            }
+        }
+
+        match job.post_action {
+            IntentPublishPostAction::Exit {
+                mint,
+                source_event_ts_unix_ms,
+                slot_seen_at_ms,
+            } => {
+                if publish_ok {
+                    if slot_seen_at_ms > 0 && slot_seen_at_ms <= intent.header.ts_unix_ms {
+                        try_record_momentum_publish_to_intent_ms(
+                            intent.header.ts_unix_ms,
+                            slot_seen_at_ms,
+                        );
+                    }
+                    if let Some(ts) = source_event_ts_unix_ms {
+                        try_record_momentum_event_to_intent_publish_ms(
+                            wall_clock_unix_ms_now(),
+                            ts,
+                        );
+                    }
+                    ctx.record_exit_intent_published(&intent.intent_id, &mint);
+                } else {
+                    ctx.rollback_exit_intent_after_publish_failure(&intent.intent_id, &mint);
+                }
+            }
+            IntentPublishPostAction::Buy {
+                entry_signal,
+                effective_pool,
+                effective_dex,
+                token_program,
+                signal_slot,
+                slot_seen_at_ms,
+            } => {
+                if publish_ok {
+                    if slot_seen_at_ms > 0 && slot_seen_at_ms <= intent.header.ts_unix_ms {
+                        try_record_momentum_publish_to_intent_ms(
+                            intent.header.ts_unix_ms,
+                            slot_seen_at_ms,
+                        );
+                    }
+                    let meta_creator = intent.metadata.get("creator").cloned();
+                    ctx.intents_generated
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
+                        intent_id: &intent.intent_id,
+                        mint: &entry_signal.mint,
+                        pool: &effective_pool,
+                        dex: &effective_dex,
+                        intended_sol: entry_signal.sol_amount,
+                        entry_kind: Some(entry_signal.kind),
+                        signal_slot,
+                        slot_seen_at_ms,
+                        creator: meta_creator,
+                        token_program,
+                    });
+                } else if ctx.pending_intents.read().contains_key(&intent.intent_id) {
+                    let intent_id = intent.intent_id.clone();
+                    ctx.pending_intents.write().remove(&intent_id);
+                    ctx.unwind_stale_entry_pending_after_publish_failure(&entry_signal, true);
+                } else {
+                    ctx.unwind_stale_entry_pending_after_publish_failure(&entry_signal, true);
+                }
+            }
+        }
+
+        if let Some(recorder) = order_recorder.as_ref() {
+            recorder.lock().push(intent.intent_id.clone());
+        }
+    }
+    info!("intent publish worker drained and exiting");
+}
+
+fn spawn_intent_publish_worker(
+    ctx: Arc<MomentumContext>,
+    rx: mpsc::Receiver<IntentPublishJob>,
+    nats: Option<NatsClient>,
+    order_recorder: Option<IntentPublishOrderRecorder>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(intent_publish_worker_loop(ctx, rx, nats, order_recorder))
 }
 
 /// Generate and publish a BUY TradeIntent based on an entry signal.
@@ -10819,10 +11038,7 @@ async fn generate_and_publish_buy_intent_inner(
         "🚀 Generated BUY TradeIntent"
     );
 
-    // Write to JSONL (P0 requirement) before registering in-memory pending correlation state.
-    ctx.jsonl_writer.write(&intent)?;
-
-    // Register pending intent for execution-result correlation (after durable local write).
+    // Register pending intent before enqueue so FIX-30b can cancel queued buys on exit ticks.
     ctx.register_buy_intent(
         intent_id,
         &signal.mint,
@@ -10832,48 +11048,18 @@ async fn generate_and_publish_buy_intent_inner(
         Some(signal.kind),
     );
 
-    // Publish to JetStream (persistent; avoids execution-engine startup race with Core NATS)
-    let mut publish_ok = ctx.nats.is_none();
-    if let Some(ref nats) = ctx.nats {
-        match nats.jetstream_publish(TOPIC_TRADE_INTENTS, &intent).await {
-            Ok(true) => {
-                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                let now_ms = wall_clock_unix_ms_now();
-                try_record_momentum_intent_header_to_publish_ms(now_ms, intent.header.ts_unix_ms);
-                if ts_ms > 0 && ts_ms <= intent.header.ts_unix_ms {
-                    try_record_momentum_publish_to_intent_ms(intent.header.ts_unix_ms, ts_ms);
-                }
-                publish_ok = true;
-            }
-            Ok(false) => {
-                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                anyhow::bail!(
-                    "JetStream publish dropped/failed topic={}",
-                    TOPIC_TRADE_INTENTS
-                );
-            }
-            Err(e) => {
-                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                return Err(e);
-            }
-        }
-    }
-
-    if publish_ok {
-        let meta_creator = intent.metadata.get("creator").cloned();
-        ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
-            intent_id,
-            mint: &signal.mint,
-            pool: &effective_pool,
-            dex: &effective_dex,
-            intended_sol: signal.sol_amount,
-            entry_kind: Some(signal.kind),
+    ctx.enqueue_intent_publish(IntentPublishJob {
+        intent,
+        post_action: IntentPublishPostAction::Buy {
+            entry_signal: signal.clone(),
+            effective_pool,
+            effective_dex,
+            token_program: token_program_override.clone(),
             signal_slot: slot,
             slot_seen_at_ms: ts_ms,
-            creator: meta_creator,
-            token_program: token_program_override.clone(),
-        });
-    }
+        },
+    })
+    .await?;
 
     Ok(())
 }
@@ -11159,21 +11345,17 @@ async fn momentum_apply_pool_cache_jetstream_batch_items(
                 );
             }
         }
-        dbg_log(
-            "momentum_bot.rs:PoolCache_price_update",
-            "PoolCacheUpdate updating position price",
-            serde_json::json!({
-                "mint": token_mint,
-                "pool": update.pool_address,
-                "dex": update.dex,
-                "base_reserve": update.base_reserve,
-                "quote_reserve": update.quote_reserve,
-                "base_mint": update.base_mint,
-                "token_ui": token_ui,
-                "sol_ui": sol_ui,
-                "tokens_per_sol": tokens_per_sol
-            }),
-            "H-E",
+        trace!(
+            mint = %token_mint,
+            pool = %update.pool_address,
+            dex = %update.dex,
+            base_reserve = update.base_reserve,
+            quote_reserve = update.quote_reserve,
+            base_mint = %update.base_mint,
+            token_ui,
+            sol_ui,
+            tokens_per_sol,
+            "PoolCacheUpdate updating position price"
         );
         if ctx.update_position_price(
             token_mint,
@@ -11418,13 +11600,43 @@ mod tests {
     use ironcrab::ipc::{FillStatus, PoolCacheUpdate, PoolCacheUpdateType, RecordHeader};
     use tempfile::TempDir;
 
-    fn empty_test_context(jsonl_writer: JsonlWriter) -> MomentumContext {
-        MomentumContext {
+    fn test_queued_jsonl_writer(dir: &std::path::Path) -> QueuedJsonlWriter {
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(dir);
+        QueuedJsonlWriter::spawn(jsonl_config, 64).expect("jsonl writer")
+    }
+
+    fn noop_intent_publish_tx() -> mpsc::Sender<IntentPublishJob> {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        tx
+    }
+
+    async fn wait_for_intent_jsonl_records(ctx: &MomentumContext, min_records: u64) {
+        for _ in 0..200 {
+            let _ = ctx.jsonl_writer.flush();
+            if ctx.jsonl_writer.stats().0 >= min_records {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "timed out waiting for >= {min_records} JSONL records (got {})",
+            ctx.jsonl_writer.stats().0
+        );
+    }
+
+    fn empty_test_context_with_publish_sender(
+        jsonl_writer: QueuedJsonlWriter,
+        config: MomentumConfig,
+        intent_publish_tx: mpsc::Sender<IntentPublishJob>,
+    ) -> Arc<MomentumContext> {
+        Arc::new(MomentumContext {
             // `next_intent_id` prefixes with `run_id[..8]`; keep at least 8 chars.
             run_id: "run-test00".to_string(),
-            config: parking_lot::RwLock::new(MomentumConfig::default()),
+            config: parking_lot::RwLock::new(config),
             nats: None,
             jsonl_writer,
+            intent_publish_tx: parking_lot::Mutex::new(Some(intent_publish_tx)),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -11460,7 +11672,143 @@ mod tests {
             momentum_active_pool_publish_queue: parking_lot::Mutex::new(
                 MomentumActivePoolPublishQueue::default(),
             ),
+        })
+    }
+
+    fn empty_test_context_with_config(
+        jsonl_writer: QueuedJsonlWriter,
+        config: MomentumConfig,
+    ) -> Arc<MomentumContext> {
+        empty_test_context_with_publish_sender(jsonl_writer, config, noop_intent_publish_tx())
+    }
+
+    fn empty_test_context_with_intent_worker(
+        jsonl_writer: QueuedJsonlWriter,
+        config: MomentumConfig,
+    ) -> Arc<MomentumContext> {
+        let (intent_publish_tx, intent_publish_rx) = mpsc::channel(INTENT_PUBLISH_QUEUE_CAP);
+        let ctx = empty_test_context_with_publish_sender(jsonl_writer, config, intent_publish_tx);
+        // Detach worker for test lifetime: aborting the JoinHandle would stop in-flight publishes.
+        std::mem::forget(spawn_intent_publish_worker(
+            Arc::clone(&ctx),
+            intent_publish_rx,
+            None,
+            None,
+        ));
+        ctx
+    }
+
+    fn empty_test_context(jsonl_writer: QueuedJsonlWriter) -> Arc<MomentumContext> {
+        empty_test_context_with_config(jsonl_writer, MomentumConfig::default())
+    }
+
+    #[tokio::test]
+    async fn exit_intent_enqueue_does_not_publish_in_caller_path() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let (tx, mut rx) = mpsc::channel(INTENT_PUBLISH_QUEUE_CAP);
+        let ctx =
+            empty_test_context_with_publish_sender(jsonl_writer, MomentumConfig::default(), tx);
+
+        let mint = "ExitEnqueueMinttttttttttttttttttttttttttttt";
+        let pool = "ExitEnqueuePooltttttttttttttttttttttttttttt";
+        ctx.register_pool(mint, pool, "raydium", 1);
+        ctx.update_pool_accounts(mint, pool, vec!["a0".to_string(), "a1".to_string()]);
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool,
+            dex: "raydium",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 1_000_000,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 1,
+            initial_bonding: None,
+        });
+
+        let published_before = NATS_MESSAGES_PUBLISHED_TOTAL.load(Ordering::Relaxed);
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            generate_and_publish_exit_intent(
+                ctx.as_ref(),
+                mint,
+                pool,
+                "raydium",
+                "TIME_EXIT",
+                "enqueue test",
+                1_000_000,
+                None,
+            ),
+        )
+        .await
+        .expect("exit intent enqueue should return quickly without awaiting worker publish")
+        .expect("exit intent enqueue");
+
+        assert_eq!(
+            NATS_MESSAGES_PUBLISHED_TOTAL.load(Ordering::Relaxed),
+            published_before,
+            "caller path must not JetStream-publish"
+        );
+        let job = rx
+            .try_recv()
+            .expect("exit intent must be enqueued for worker");
+        assert_eq!(job.intent.side, TradeSide::Sell);
+        assert!(!job.intent.intent_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn intent_publish_worker_preserves_fifo_order() {
+        let processed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let (tx, rx) = mpsc::channel(INTENT_PUBLISH_QUEUE_CAP);
+        let ctx =
+            empty_test_context_with_publish_sender(jsonl_writer, MomentumConfig::default(), tx);
+        std::mem::forget(spawn_intent_publish_worker(
+            Arc::clone(&ctx),
+            rx,
+            None,
+            Some(Arc::clone(&processed)),
+        ));
+
+        let ids = ["int-order-001", "int-order-002", "int-order-003"];
+        for intent_id in ids {
+            let intent = TradeIntent::new(
+                "momentum-bot",
+                BUILD_VERSION,
+                &ctx.run_id,
+                intent_id.to_string(),
+                "momentum-bot",
+                IntentTier::Tier1,
+                IntentOrigin::StrategyA,
+                ExplicitAmount::new(1, 6),
+                TradeResources::default(),
+                0,
+                500,
+                TradeSide::Sell,
+                TradingRegime::Early,
+            );
+            ctx.enqueue_intent_publish(IntentPublishJob {
+                intent,
+                post_action: IntentPublishPostAction::Exit {
+                    mint: "fifo-test-mint".to_string(),
+                    source_event_ts_unix_ms: None,
+                    slot_seen_at_ms: 0,
+                },
+            })
+            .await
+            .expect("enqueue");
         }
+
+        for _ in 0..200 {
+            if processed.lock().len() >= ids.len() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(&*processed.lock(), ids.as_slice());
     }
 
     #[test]
@@ -11579,8 +11927,7 @@ mod tests {
     #[test]
     fn get_or_create_tracker_skips_non_tradeable_mints() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
 
         let before_tracked = ctx.tokens_tracked.load(Ordering::Relaxed);
@@ -11611,8 +11958,7 @@ mod tests {
     #[test]
     fn prune_stale_discovery_retains_new_tracker_without_market_trades() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         let mint = "MintPruneNew1111111111111111111111111111";
         let pool = "poolPruneNew1";
@@ -11638,8 +11984,7 @@ mod tests {
     #[test]
     fn prune_stale_discovery_removes_tracker_idle_over_30m_no_position() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         let mint = "MintPruneOld1111111111111111111111111111";
         let pool = "poolPruneOld1";
@@ -11663,8 +12008,7 @@ mod tests {
     #[test]
     fn prune_stale_discovery_skips_when_open_position_same_pool() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         let mint = "MintPrunePos1111111111111111111111111111";
         let pool = "poolPrunePos1";
@@ -11691,9 +12035,8 @@ mod tests {
     #[test]
     fn momentum_active_pool_flush_skipped_without_nats_keeps_queue() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         ctx.queue_momentum_active_pool_active(
             "MintAct11111111111111111111111111111111",
             "poolAct11111111111111111111111111111111",
@@ -11833,8 +12176,7 @@ mod tests {
         };
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg.clone();
 
@@ -11871,8 +12213,7 @@ mod tests {
     #[test]
     fn mint_index_registers_two_pool_rows_same_mint_and_resync_prunes() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
 
         let mint = "MintIdxTwin22222222222222222222222222222";
@@ -11902,8 +12243,7 @@ mod tests {
     #[test]
     fn record_dev_info_same_mint_index_leaves_other_mint_untouched() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
 
         let mint_a = "MintIdxSameA33333333333333333333333333333";
@@ -11969,8 +12309,7 @@ mod tests {
         };
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg.clone();
 
@@ -12056,8 +12395,7 @@ mod tests {
         };
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg.clone();
 
@@ -12125,8 +12463,7 @@ mod tests {
         };
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg;
 
@@ -12191,8 +12528,7 @@ mod tests {
     #[test]
     fn unwind_probe_and_scale_in_pending_restores_evaluable_states() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
 
         let mint = "MintUnwindManual88888888888888888888888888";
@@ -12319,8 +12655,7 @@ mod tests {
     #[test]
     fn sticky_pool_reserve_hint_non_wsol_pair_not_cached() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         ctx.merge_latest_pool_reserve_price_hint_from_update(
             &pool_cache_update_two_tokens_no_wsol(
@@ -12341,9 +12676,8 @@ mod tests {
     #[tokio::test]
     async fn sticky_pool_reserve_hint_non_wsol_pair_does_not_move_later_position_mark() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         let mint = "MintLaterPos";
         ctx.record_mint_info(
             mint,
@@ -12393,9 +12727,8 @@ mod tests {
     #[tokio::test]
     async fn sticky_pool_reserve_hint_rejects_stale_slot_merge_by_apply() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         let mint = "MintStickyPool";
         ctx.record_mint_info(
             mint,
@@ -12450,9 +12783,8 @@ mod tests {
     #[tokio::test]
     async fn sticky_pool_reserve_hint_applies_on_open_after_confirm_slot() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         let mint = "MintOpenApply";
         ctx.record_mint_info(
             mint,
@@ -12499,9 +12831,8 @@ mod tests {
     #[tokio::test]
     async fn sticky_pool_reserve_hint_wrong_pool_not_applied() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         let mint = "MintOtherPool";
         ctx.record_mint_info(
             mint,
@@ -12547,9 +12878,8 @@ mod tests {
     #[tokio::test]
     async fn sticky_mint_info_token_program_applied_when_mint_info_arrives() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         let mint = "MintTP";
         ctx.open_position(OpenPositionParams {
             mint,
@@ -12586,8 +12916,7 @@ mod tests {
     #[test]
     fn sticky_pumpfun_migration_complete_surfaces_in_evidence_probe() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         let mint = "NotAValidPubkeyString";
         ctx.merge_pumpfun_migration_complete_evidence(mint, 10, 20);
@@ -12598,9 +12927,8 @@ mod tests {
     #[tokio::test]
     async fn scope1_slot_gate_position_price_updates() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
 
         ctx.open_position(OpenPositionParams {
             mint: "m1",
@@ -12831,8 +13159,7 @@ mod tests {
         cfg.dump_recovery_window_secs = 0;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg.clone();
 
@@ -12869,9 +13196,8 @@ mod tests {
         let cfg = MomentumConfig::default();
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg;
 
         let mint = "MintPr170Disc1111111111111111111111111111";
@@ -12973,9 +13299,8 @@ mod tests {
         cfg.min_token_age_secs = 0;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg.clone();
 
         let mint = "MintPr170Xhat1111111111111111111111111111";
@@ -13128,14 +13453,14 @@ mod tests {
     #[test]
     fn find_best_sell_pool_skips_migrated_pumpfun() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
 
         let ctx = MomentumContext {
             run_id: "test".to_string(),
             config: parking_lot::RwLock::new(MomentumConfig::default()),
             nats: None,
             jsonl_writer,
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -13197,14 +13522,14 @@ mod tests {
     #[test]
     fn find_best_sell_pool_skips_high_fail_count_in_cooldown() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
 
         let ctx = MomentumContext {
             run_id: "test".to_string(),
             config: parking_lot::RwLock::new(MomentumConfig::default()),
             nats: None,
             jsonl_writer,
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -13271,8 +13596,7 @@ mod tests {
     #[test]
     fn select_reconcile_pool_prefers_active_pumpfun_over_newer_pump_amm() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
 
         let mint = "y7bgE68ZWVodvVmMUWQhShAnjVTmJVGpdnC1wYspump";
@@ -13302,8 +13626,7 @@ mod tests {
     #[test]
     fn select_reconcile_pool_refuses_pumpswap_only_without_migration_evidence() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
 
         let mint = "MintOnlyAmm11111111111111111111111111111111";
@@ -13326,8 +13649,7 @@ mod tests {
     #[test]
     fn find_best_sell_pool_keeps_original_pumpfun_when_not_complete() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
 
         let mint = "y7bgE68ZWVodvVmMUWQhShAnjVTmJVGpdnC1wYspump";
@@ -13359,8 +13681,7 @@ mod tests {
     #[test]
     fn find_best_sell_pool_allows_pump_amm_after_pumpfun_complete() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
 
         let mint = "MintPumpComplete111111111111111111111111111";
@@ -13389,8 +13710,7 @@ mod tests {
     #[test]
     fn scope57_y7_class_exit_does_not_use_pump_amm_without_complete_evidence() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
 
         let mint = "y7bgE68ZWVodvVmMUWQhShAnjVTmJVGpdnC1wYspump";
@@ -13443,9 +13763,8 @@ mod tests {
         cfg.min_token_age_secs = 0;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg;
 
         let mint = Pubkey::new_from_array([0xA1u8; 32]).to_string();
@@ -13554,9 +13873,8 @@ mod tests {
         cfg.min_token_age_secs = 0;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg;
 
         let mint = Pubkey::new_from_array([0xC3u8; 32]).to_string();
@@ -13661,9 +13979,8 @@ mod tests {
         cfg.min_token_age_secs = 0;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg;
 
         let mint = Pubkey::new_from_array([0xE5u8; 32]).to_string();
@@ -13742,9 +14059,8 @@ mod tests {
         cfg.min_token_age_secs = 0;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg;
 
         let mint = Pubkey::new_from_array([0x11u8; 32]).to_string();
@@ -13837,8 +14153,7 @@ mod tests {
         };
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg.clone();
 
@@ -13908,8 +14223,7 @@ mod tests {
         };
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg.clone();
 
@@ -13982,8 +14296,7 @@ mod tests {
     #[test]
     fn pumpfun_entry_blocked_by_migration_never_true_for_pump_amm_with_sticky_evidence() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
 
         let mint = "MintPFAmmGate444444444444444444444444444444";
@@ -14010,8 +14323,7 @@ mod tests {
         cfg.max_dev_supply_pct = 50.0;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg;
 
@@ -14045,8 +14357,7 @@ mod tests {
     #[test]
     fn tokens_tracked_unique_mint_two_pool_rows_via_get_or_create_tracker() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
 
         let mint = "MintTracked777777777777777777777777777777777";
@@ -14072,8 +14383,7 @@ mod tests {
         cfg.max_dev_supply_pct = 50.0;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg;
 
@@ -14117,8 +14427,7 @@ mod tests {
         cfg.max_dev_supply_pct = 50.0;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg;
 
@@ -14154,8 +14463,7 @@ mod tests {
     #[test]
     fn tokens_blacklisted_once_per_mint_for_record_lp_removal_two_pool_trackers() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
 
         let mint = "MintLpBlacklistDedupe555555555555555555555555";
@@ -14213,8 +14521,7 @@ mod tests {
         };
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg;
 
@@ -14276,8 +14583,7 @@ mod tests {
         };
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg.clone();
 
@@ -14338,8 +14644,7 @@ mod tests {
         };
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg.clone();
 
@@ -14405,8 +14710,7 @@ mod tests {
         };
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg.clone();
 
@@ -14474,9 +14778,8 @@ mod tests {
         let cfg = MomentumConfig::default();
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg.clone();
 
         const WSOL: &str = "So11111111111111111111111111111111111111112";
@@ -14550,8 +14853,7 @@ mod tests {
         cfg.max_single_dump_lamports = 1;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg;
 
@@ -14627,8 +14929,7 @@ mod tests {
         cfg.min_token_age_secs = 0;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg.clone();
 
@@ -15480,8 +15781,8 @@ mod tests {
         assert!(observed.elapsed().as_secs() < 5);
     }
 
-    #[test]
-    fn emitted_buy_intent_includes_reason_metadata_and_stable_source() {
+    #[tokio::test]
+    async fn emitted_buy_intent_includes_reason_metadata_and_stable_source() {
         let mut cfg = MomentumConfig::default();
 
         // Disable all entry gates so we can emit an intent deterministically.
@@ -15502,50 +15803,8 @@ mod tests {
         cfg.default_position_lamports = 1_000;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-
-        let ctx = MomentumContext {
-            run_id: "run-test".to_string(),
-            config: parking_lot::RwLock::new(cfg.clone()),
-            nats: None,
-            jsonl_writer,
-            intent_counter: std::sync::atomic::AtomicU64::new(0),
-            pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
-            pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
-            pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
-            mint_infos: parking_lot::RwLock::new(HashMap::new()),
-            token_trackers: parking_lot::RwLock::new(HashMap::new()),
-            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
-            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
-            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            positions: parking_lot::RwLock::new(HashMap::new()),
-            pending_intents: parking_lot::RwLock::new(HashMap::new()),
-            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
-            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
-            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
-            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
-            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
-            mint_pools: parking_lot::RwLock::new(HashMap::new()),
-            live_pool_cache: LivePoolCache::new(),
-            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
-            position_kv: tokio::sync::OnceCell::new(),
-            orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
-                ORPHANED_RECOVERED_INTENT_IDS_CAP,
-            )),
-            latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
-            tokens_tracked: std::sync::atomic::AtomicU64::new(0),
-            tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
-            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
-            intents_generated: std::sync::atomic::AtomicU64::new(0),
-            exits_generated: std::sync::atomic::AtomicU64::new(0),
-            last_event_slot: std::sync::atomic::AtomicU64::new(0),
-            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            momentum_active_pool_publish_queue: parking_lot::Mutex::new(
-                MomentumActivePoolPublishQueue::default(),
-            ),
-        };
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context_with_intent_worker(jsonl_writer, cfg.clone());
 
         // Seed tracker with a last_trade_ratio so intent generation can compute min_out.
         {
@@ -15583,12 +15842,10 @@ mod tests {
             reason: "ENTER_PROBE_BUY: test".to_string(),
         };
 
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        rt.block_on(async {
-            generate_and_publish_buy_intent(&ctx, &signal)
-                .await
-                .expect("buy intent");
-        });
+        generate_and_publish_buy_intent(ctx.as_ref(), &signal)
+            .await
+            .expect("buy intent");
+        wait_for_intent_jsonl_records(ctx.as_ref(), 1).await;
 
         let path = ctx
             .jsonl_writer
@@ -15624,14 +15881,14 @@ mod tests {
         cfg.momentum_exit_min_trades = 999_999;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
 
         let ctx = MomentumContext {
             run_id: "run-test".to_string(),
             config: parking_lot::RwLock::new(cfg.clone()),
             nats: None,
             jsonl_writer,
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -15715,14 +15972,14 @@ mod tests {
         cfg.momentum_exit_min_trades = 999_999;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
 
         let ctx = MomentumContext {
             run_id: "run-test".to_string(),
             config: parking_lot::RwLock::new(cfg.clone()),
             nats: None,
             jsonl_writer,
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -15800,14 +16057,14 @@ mod tests {
         cfg.max_hold_time_secs = 60;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
 
         let ctx = MomentumContext {
             run_id: "run-test".to_string(),
             config: parking_lot::RwLock::new(cfg),
             nats: None,
             jsonl_writer,
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -15890,50 +16147,8 @@ mod tests {
         cfg.max_hold_time_secs = 999_999;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-
-        let ctx = Arc::new(MomentumContext {
-            run_id: "run-test".to_string(),
-            config: parking_lot::RwLock::new(cfg),
-            nats: None,
-            jsonl_writer,
-            intent_counter: std::sync::atomic::AtomicU64::new(0),
-            pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
-            pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
-            pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
-            mint_infos: parking_lot::RwLock::new(HashMap::new()),
-            token_trackers: parking_lot::RwLock::new(HashMap::new()),
-            tracker_keys_by_mint: parking_lot::RwLock::new(HashMap::new()),
-            dirty_entry_tracker_keys: parking_lot::RwLock::new(BTreeSet::new()),
-            pumpfun_buy_missing_creator_suppress_until: parking_lot::RwLock::new(HashMap::new()),
-            positions: parking_lot::RwLock::new(HashMap::new()),
-            pending_intents: parking_lot::RwLock::new(HashMap::new()),
-            latest_bonding_by_mint: parking_lot::RwLock::new(HashMap::new()),
-            latest_pumpfun_migration_complete_by_mint: parking_lot::RwLock::new(HashMap::new()),
-            latest_pool_reserve_price_hint_by_mint_pool: parking_lot::RwLock::new(HashMap::new()),
-            pending_buy_entries: parking_lot::RwLock::new(HashMap::new()),
-            pending_buy_mint_index: parking_lot::RwLock::new(HashMap::new()),
-            mint_pools: parking_lot::RwLock::new(HashMap::new()),
-            live_pool_cache: LivePoolCache::new(),
-            open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
-            position_kv: tokio::sync::OnceCell::new(),
-            orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
-            orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
-                ORPHANED_RECOVERED_INTENT_IDS_CAP,
-            )),
-            latest_wallet_balance_raw_by_mint: parking_lot::RwLock::new(HashMap::new()),
-            tokens_tracked: std::sync::atomic::AtomicU64::new(0),
-            tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
-            blacklisted_mints_for_metric: parking_lot::RwLock::new(HashSet::new()),
-            intents_generated: std::sync::atomic::AtomicU64::new(0),
-            exits_generated: std::sync::atomic::AtomicU64::new(0),
-            last_event_slot: std::sync::atomic::AtomicU64::new(0),
-            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
-            momentum_active_pool_publish_queue: parking_lot::Mutex::new(
-                MomentumActivePoolPublishQueue::default(),
-            ),
-        });
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context_with_intent_worker(jsonl_writer, cfg);
 
         ctx.register_pool("mintX", "poolX", "raydium", 1);
         ctx.update_pool_trade_data("mintX", "poolX", "raydium", 1_000_000_000, 1_000_000, 1);
@@ -15992,6 +16207,7 @@ mod tests {
         )
         .await
         .expect("exit intent");
+        wait_for_intent_jsonl_records(ctx.as_ref(), 1).await;
 
         let path = ctx.jsonl_writer.current_path().expect("jsonl path");
         let content = std::fs::read_to_string(path).expect("read jsonl");
@@ -16011,14 +16227,14 @@ mod tests {
         cfg.max_hold_time_secs = 60;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
 
         let ctx = Arc::new(MomentumContext {
             run_id: "run-test".to_string(),
             config: parking_lot::RwLock::new(cfg.clone()),
             nats: None,
             jsonl_writer,
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -16126,14 +16342,14 @@ mod tests {
     #[tokio::test]
     async fn sell_execution_failure_resets_exit_generated() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
 
         let ctx = Arc::new(MomentumContext {
             run_id: "run-test".to_string(),
             config: parking_lot::RwLock::new(MomentumConfig::default()),
             nats: None,
             jsonl_writer,
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -16226,14 +16442,14 @@ mod tests {
         cfg.max_hold_time_secs = 60;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
 
         let ctx = MomentumContext {
             run_id: "run-test".to_string(),
             config: parking_lot::RwLock::new(cfg.clone()),
             nats: None,
             jsonl_writer,
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -16303,14 +16519,14 @@ mod tests {
     #[test]
     fn pump_amm_dex_pool_accounts_short_list_not_cached() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
 
         let ctx = MomentumContext {
             run_id: "test".to_string(),
             config: parking_lot::RwLock::new(MomentumConfig::default()),
             nats: None,
             jsonl_writer,
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -16372,14 +16588,14 @@ mod tests {
     #[test]
     fn pump_amm_dex_pool_accounts_full_list_cached_for_buy() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
 
         let ctx = MomentumContext {
             run_id: "test".to_string(),
             config: parking_lot::RwLock::new(MomentumConfig::default()),
             nats: None,
             jsonl_writer,
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -16469,9 +16685,8 @@ mod tests {
     #[tokio::test]
     async fn pool_cache_reserve_mark_does_not_advance_trailing_session_high() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         let mint = "TrailSessMint1111111111111111111111111111";
         ctx.open_position(OpenPositionParams {
             mint,
@@ -16505,9 +16720,8 @@ mod tests {
     #[tokio::test]
     async fn trade_derived_price_advances_session_high_and_can_activate_trailing() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         let mint = "TrailSessMint2222222222222222222222222222";
         ctx.open_position(OpenPositionParams {
             mint,
@@ -16550,9 +16764,8 @@ mod tests {
     #[tokio::test]
     async fn modest_trade_then_reserve_spike_does_not_activate_trailing() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         let mint = "TrailSessMint3333333333333333333333333333";
         ctx.open_position(OpenPositionParams {
             mint,
@@ -17204,9 +17417,8 @@ mod tests {
         cfg.take_profit_pct = 1_000.0;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg.clone();
 
         let mint = "TimedExitMint1111111111111111111111111111";
@@ -17383,14 +17595,14 @@ mod tests {
         cfg.max_hold_time_secs = 300;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
 
         let ctx = Arc::new(MomentumContext {
             run_id: "run-test".to_string(),
             config: parking_lot::RwLock::new(cfg),
             nats: None,
             jsonl_writer,
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -17533,14 +17745,14 @@ mod tests {
         cfg.max_hold_time_secs = 300;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
 
         let ctx = Arc::new(MomentumContext {
             run_id: "run-test".to_string(),
             config: parking_lot::RwLock::new(cfg),
             nats: None,
             jsonl_writer,
+            intent_publish_tx: parking_lot::Mutex::new(Some(noop_intent_publish_tx())),
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
@@ -17654,9 +17866,8 @@ mod tests {
     #[tokio::test]
     async fn scope57_orphan_probe_recovery_sets_position_open_probe() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
 
         let mint = "OrphProbeMintttttttttttttttttttttttttttttttt";
         let pool = "OrphProbePoolttttttttttttttttttttttttttttttt";
@@ -17737,9 +17948,8 @@ mod tests {
         cfg.scale_in_min_probe_executable_pnl_pct = 0.0;
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg;
 
         let mint = Pubkey::new_from_array([0xC3u8; 32]).to_string();
@@ -17813,9 +18023,8 @@ mod tests {
     #[tokio::test]
     async fn scope57_exit_amount_uses_wallet_authority_when_overlay_smaller() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context_with_intent_worker(jsonl_writer, MomentumConfig::default());
 
         let mint = "WalletAuthMintttttttttttttttttttttttttttttt";
         let pool = "WalletAuthPoolttttttttttttttttttttttttttttt";
@@ -17851,6 +18060,7 @@ mod tests {
         )
         .await
         .expect("exit intent");
+        wait_for_intent_jsonl_records(ctx.as_ref(), 1).await;
 
         let path = ctx.jsonl_writer.current_path().expect("jsonl path");
         let content = std::fs::read_to_string(path).expect("read jsonl");
@@ -17866,9 +18076,8 @@ mod tests {
     #[tokio::test]
     async fn pending_bonding_complete_before_open_applied_at_confirm() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
 
         let mint = "mintBC";
         ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
@@ -17912,8 +18121,7 @@ mod tests {
     #[test]
     fn bonding_geyser_rejects_stale_lower_slot_update() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         let mint = "mStale";
         ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
@@ -17937,8 +18145,7 @@ mod tests {
     #[test]
     fn failed_buy_removes_pending_buy_lifecycle() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
             intent_id: "int-1",
@@ -17961,9 +18168,8 @@ mod tests {
     #[tokio::test]
     async fn bonding_position_sync_max_guard_newer_slot_lower_progress() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         let mint = "mintMaxGuard";
 
         ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
@@ -18025,9 +18231,8 @@ mod tests {
     #[tokio::test]
     async fn close_position_clears_latest_bonding_without_pending_buy() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         let mint = "mintClr";
 
         ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
@@ -18091,9 +18296,8 @@ mod tests {
     #[tokio::test]
     async fn close_position_keeps_latest_bonding_when_pending_buy_exists() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         let mint = "mintKeep";
 
         ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
@@ -18136,9 +18340,8 @@ mod tests {
     #[tokio::test]
     async fn close_position_keeps_scope_b_sticky_when_pending_buy_exists() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         let mint = "mintScopeBKeep";
 
         ctx.register_pending_buy_entry_after_publish(PendingBuyPublishMeta {
@@ -18239,8 +18442,7 @@ mod tests {
     #[test]
     fn strategy_entry_tick_returns_empty_without_dirty_markers() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         assert!(
             ctx.check_for_signals_dirty_priority_tick().is_empty(),
@@ -18290,8 +18492,7 @@ mod tests {
         };
 
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         *ctx.config.write() = cfg.clone();
 
@@ -18520,8 +18721,7 @@ mod tests {
     #[test]
     fn scope_c_pool_cache_price_path_winner_and_stale_derive_count() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
         ctx.record_mint_info(
             "TokM",
@@ -18551,9 +18751,8 @@ mod tests {
     #[tokio::test]
     async fn scope_c_pool_cache_coalesced_price_respects_position_pool_only() {
         let tmp = TempDir::new().expect("tempdir");
-        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
-        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
-        let ctx = Arc::new(empty_test_context(jsonl_writer));
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
         let mint = "TokPool";
         ctx.record_mint_info(
             mint,
@@ -18987,35 +19186,19 @@ async fn generate_and_publish_exit_intent(
         "🔴 Generated EXIT TradeIntent"
     );
 
-    // Write to JSONL (P0 requirement)
-    ctx.jsonl_writer.write(&intent)?;
-
-    // Publish to JetStream (persistent; avoids execution-engine startup race with Core NATS)
-    if let Some(ref nats) = ctx.nats {
-        match nats.jetstream_publish(TOPIC_TRADE_INTENTS, &intent).await {
-            Ok(true) => {
-                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                let now_ms = wall_clock_unix_ms_now();
-                try_record_momentum_intent_header_to_publish_ms(now_ms, intent.header.ts_unix_ms);
-                if ts_ms > 0 && ts_ms <= intent.header.ts_unix_ms {
-                    try_record_momentum_publish_to_intent_ms(intent.header.ts_unix_ms, ts_ms);
-                }
-                if let Some(ts) = source_event_ts_unix_ms {
-                    try_record_momentum_event_to_intent_publish_ms(now_ms, ts);
-                }
-            }
-            Ok(false) => {
-                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                anyhow::bail!(
-                    "JetStream publish dropped/failed topic={}",
-                    TOPIC_TRADE_INTENTS
-                );
-            }
-            Err(e) => {
-                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                return Err(e);
-            }
-        }
+    if let Err(e) = ctx
+        .enqueue_intent_publish(IntentPublishJob {
+            intent,
+            post_action: IntentPublishPostAction::Exit {
+                mint: mint.to_string(),
+                source_event_ts_unix_ms,
+                slot_seen_at_ms: ts_ms,
+            },
+        })
+        .await
+    {
+        ctx.pending_intents.write().remove(&intent_id);
+        return Err(e);
     }
 
     Ok(())
@@ -19375,23 +19558,17 @@ async fn process_market_event(
                 let tok_ui = token_raw as f64 / 10f64.powi(token_decimals as i32);
                 let sol_ui = sol_lamports as f64 / 1_000_000_000.0;
                 let tokens_per_sol = tok_ui / sol_ui;
-                // #region agent log
-                dbg_log(
-                    "momentum_bot.rs:Trade_price_update",
-                    "Trade event updating position price",
-                    serde_json::json!({
-                        "mint": mint,
-                        "is_buy": is_buy,
-                        "sol_lamports": sol_lamports,
-                        "token_raw": token_raw,
-                        "token_decimals": token_decimals,
-                        "tok_ui": tok_ui,
-                        "sol_ui": sol_ui,
-                        "tokens_per_sol": tokens_per_sol
-                    }),
-                    "H-A_H-B",
+                trace!(
+                    mint = %mint,
+                    is_buy = *is_buy,
+                    sol_lamports,
+                    token_raw,
+                    token_decimals,
+                    tok_ui,
+                    sol_ui,
+                    tokens_per_sol,
+                    "Trade event updating position price"
                 );
-                // #endregion
                 let trade = TradeEvent {
                     timestamp: Instant::now(),
                     slot: event.slot.unwrap_or(0),
