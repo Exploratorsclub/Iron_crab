@@ -286,6 +286,14 @@ pub static MARKET_DATA_MOMENTUM_COALESCED_MESSAGES_TOTAL: Lazy<AtomicU64> =
 /// Merged `ApplyMomentumActivePools` batches enqueued to the tracking actor (PR169c).
 pub static MARKET_DATA_MOMENTUM_COALESCED_BATCHES_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Vaults registered via arb multi-dex admission (no momentum pin).
+pub static MARKET_DATA_ARB_REGISTERED_VAULTS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Account worker dispatch: tracked vault pubkey classified HIGH.
+pub static MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Arb-multi-dex pin tier evictions when pin budget is full.
+pub static MARKET_DATA_ARB_PIN_EVICTIONS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 /// Geyser explicit-tracked subscription list syncs coalesced from the TX trade path (debounced flush).
 pub static MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -401,6 +409,21 @@ pub fn inc_market_data_momentum_coalesced_messages_total() {
 #[inline]
 pub fn inc_market_data_momentum_coalesced_batches_total() {
     MARKET_DATA_MOMENTUM_COALESCED_BATCHES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_registered_vaults_total() {
+    MARKET_DATA_ARB_REGISTERED_VAULTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_vault_high_priority_dispatch_total() {
+    MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_pin_evictions_total() {
+    MARKET_DATA_ARB_PIN_EVICTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -3287,6 +3310,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_momentum_coalesced_batches_total",
         MARKET_DATA_MOMENTUM_COALESCED_BATCHES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_arb_registered_vaults_total",
+        MARKET_DATA_ARB_REGISTERED_VAULTS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_vault_high_priority_dispatch_total",
+        MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_arb_pin_evictions_total",
+        MARKET_DATA_ARB_PIN_EVICTIONS_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_geyser_sync_batch_total",
