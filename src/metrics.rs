@@ -2097,6 +2097,10 @@ pub static INTENTS_RECEIVED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new
 pub static INTENTS_EXECUTED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static INTENTS_REJECTED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static SIMULATION_FAILURES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Simulation RPC calls that exceeded `simulation_timeout_ms` (execution-engine).
+pub static SIM_TIMEOUT_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Intents rejected with `DecisionOutcome::Expired` (TTL elapsed before processing).
+pub static INTENTS_EXPIRED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // RS-5.1: Real-send lifecycle counters (operator truth)
 pub static TX_SEND_ATTEMPTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TX_SEND_SUCCESS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -4136,6 +4140,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "simulation_failures_total",
         SIMULATION_FAILURES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "sim_timeout_total",
+        SIM_TIMEOUT_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "intents_expired_total",
+        INTENTS_EXPIRED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "available_sol_lamports",

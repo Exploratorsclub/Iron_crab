@@ -83,23 +83,23 @@ use ironcrab::metrics::{
     try_record_execution_intent_header_to_receive_ms, try_record_execution_intent_to_confirm_ms,
     update_readiness_execution_engine_current, wall_clock_unix_ms_now, MetricsComponent,
     RecentTrade, ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS, AVAILABLE_SOL_LAMPORTS,
-    CONCURRENT_INTENTS_GAUGE, INTENTS_EXECUTED_TOTAL, INTENTS_RECEIVED_TOTAL,
-    INTENTS_REJECTED_TOTAL, JITO_BUNDLES_LANDED_TOTAL, JITO_BUNDLES_REJECTED_TOTAL,
-    JITO_BUNDLES_SUBMITTED_TOTAL, JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL,
-    KILL_SWITCH_ACTIVE, NATS_MESSAGES_RECEIVED_TOTAL, OPEN_POSITIONS_GAUGE,
-    POSITION_AUTHORITY_DRIFT_LOCKMANAGER, POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE,
-    POSITION_AUTHORITY_OPEN_GAUGE, POSITION_AUTHORITY_RECONCILE_NEEDED_GAUGE,
-    PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_FAIL_TOTAL,
+    CONCURRENT_INTENTS_GAUGE, INTENTS_EXECUTED_TOTAL, INTENTS_EXPIRED_TOTAL,
+    INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL, JITO_BUNDLES_LANDED_TOTAL,
+    JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL, JITO_BUNDLES_TIMEOUT_TOTAL,
+    JITO_TIP_LAMPORTS_TOTAL, KILL_SWITCH_ACTIVE, NATS_MESSAGES_RECEIVED_TOTAL,
+    OPEN_POSITIONS_GAUGE, POSITION_AUTHORITY_DRIFT_LOCKMANAGER,
+    POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE, POSITION_AUTHORITY_OPEN_GAUGE,
+    POSITION_AUTHORITY_RECONCILE_NEEDED_GAUGE, PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_FAIL_TOTAL,
     PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_SUCCESS_TOTAL,
     PUMPSWAP_HOT_PATH_HEALING_COOLDOWN_SUPPRESSED_TOTAL,
     PUMPSWAP_HOT_PATH_HEALING_SKIPPED_NO_NATS_TOTAL, PUMPSWAP_HOT_PATH_HEALING_TRIGGER_TOTAL,
     REJECT_CAPITAL_LOCK, REJECT_DUPLICATE, REJECT_RESOURCE_LOCK, REJECT_SEND_FAILED,
-    REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL, TX_CONFIRMED_TOTAL,
-    TX_CONFIRM_DESERIALIZE_ERRORS_TOTAL, TX_CONFIRM_JETSTREAM_ORPHAN_BUFFERED_TOTAL,
-    TX_CONFIRM_JETSTREAM_ORPHAN_EVICTED_TOTAL, TX_CONFIRM_JETSTREAM_ORPHAN_HIT_TOTAL,
-    TX_CONFIRM_JETSTREAM_TOTAL, TX_CONFIRM_LATENCY_MS, TX_CONFIRM_TIMEOUT_TOTAL,
-    TX_SEND_ATTEMPTS_TOTAL, TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL, TX_SEND_SUCCESS_TOTAL,
-    TX_SEND_TPU_TOTAL, WALLET_TOTAL_SOL_LAMPORTS,
+    REJECT_SIMULATION_FAIL, REJECT_TTL_EXPIRED, SIMULATION_FAILURES_TOTAL, SIM_TIMEOUT_TOTAL,
+    TX_CONFIRMED_TOTAL, TX_CONFIRM_DESERIALIZE_ERRORS_TOTAL,
+    TX_CONFIRM_JETSTREAM_ORPHAN_BUFFERED_TOTAL, TX_CONFIRM_JETSTREAM_ORPHAN_EVICTED_TOTAL,
+    TX_CONFIRM_JETSTREAM_ORPHAN_HIT_TOTAL, TX_CONFIRM_JETSTREAM_TOTAL, TX_CONFIRM_LATENCY_MS,
+    TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL, TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL,
+    TX_SEND_SUCCESS_TOTAL, TX_SEND_TPU_TOTAL, WALLET_TOTAL_SOL_LAMPORTS,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -1455,6 +1455,9 @@ struct ExecutionConfig {
     /// Simulation timeout (ms)
     simulation_timeout_ms: u64,
 
+    /// Default intent TTL (ms) when intent.ttl_ms is missing or zero
+    intent_ttl_ms: u64,
+
     /// Confirmation timeout (ms) for RPC send path
     confirmation_timeout_ms: u64,
 
@@ -1543,7 +1546,8 @@ impl Default for ExecutionConfig {
             max_open_positions: 5,                   // max 5 concurrent positions
             max_slippage_bps: 500,                   // max 5% slippage allowed
             // Operational
-            simulation_timeout_ms: 2000,
+            simulation_timeout_ms: 500,
+            intent_ttl_ms: 5_000,
             confirmation_timeout_ms: 15_000,
             send_skip_preflight: true,
             send_preflight_commitment: None,
@@ -5843,6 +5847,19 @@ impl ExecutionContext {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
                 }
+                "intent_ttl_ms" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.intent_ttl_ms = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
                 "confirmation_timeout_ms" => {
                     if let Some(v) = value.as_u64() {
                         if (500..=300_000).contains(&v) {
@@ -9207,6 +9224,39 @@ fn record_execution_slot_lag_at_send_if_applicable(ctx: &ExecutionContext, inten
     }
 }
 
+/// Effective TTL for an intent: use intent field when > 0, else engine default.
+fn effective_intent_ttl_ms(intent_ttl_ms: Option<u64>, default_ttl_ms: u64) -> u64 {
+    intent_ttl_ms.filter(|t| *t > 0).unwrap_or(default_ttl_ms)
+}
+
+/// Returns true when the intent is past its TTL (stale).
+fn intent_is_expired(
+    now_unix_ms: u64,
+    intent_ts_unix_ms: u64,
+    intent_ttl_ms: Option<u64>,
+    default_ttl_ms: u64,
+) -> bool {
+    let ttl = effective_intent_ttl_ms(intent_ttl_ms, default_ttl_ms);
+    now_unix_ms > intent_ts_unix_ms.saturating_add(ttl)
+}
+
+fn sim_failure_reject_reason(error_code: Option<&str>) -> RejectReason {
+    if error_code == Some("sim_timeout") {
+        RejectReason::SimTimeout
+    } else {
+        RejectReason::SimFailed
+    }
+}
+
+fn simulation_result_on_rpc_timeout() -> SimulationResult {
+    SimulationResult {
+        success: false,
+        error_code: Some("sim_timeout".to_string()),
+        logs_preview: None,
+        compute_units_consumed: None,
+    }
+}
+
 /// Process a single TradeIntent through the execution pipeline
 async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Result<()> {
     try_record_execution_intent_header_to_receive_ms(
@@ -9283,13 +9333,35 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         details: None,
     });
 
-    // === Check 2: TTL validity ===
-    // For MVP, assume TTL is valid (would check against current time/slot)
+    // === Check 2: TTL validity (before locks/planning — stale intents must not bind resources) ===
+    let now_unix_ms = wall_clock_unix_ms_now();
+    let effective_ttl_ms = effective_intent_ttl_ms(intent.ttl_ms, config.intent_ttl_ms);
+    if intent_is_expired(
+        now_unix_ms,
+        intent.header.ts_unix_ms,
+        intent.ttl_ms,
+        config.intent_ttl_ms,
+    ) {
+        let reason = RejectReason::TtlExpired;
+        checks.push(CheckResult {
+            check_name: "ttl_valid".to_string(),
+            passed: false,
+            reason_code: Some(reason.to_string()),
+            details: Some(format!(
+                "now_ms={now_unix_ms} intent_ts_ms={} ttl_ms={effective_ttl_ms}",
+                intent.header.ts_unix_ms
+            )),
+        });
+        return emit_expired_decision(ctx, decision_id, &intent, checks, reason).await;
+    }
     checks.push(CheckResult {
         check_name: "ttl_valid".to_string(),
         passed: true,
         reason_code: None,
-        details: None,
+        details: Some(format!(
+            "now_ms={now_unix_ms} intent_ts_ms={} ttl_ms={effective_ttl_ms}",
+            intent.header.ts_unix_ms
+        )),
     });
 
     // === Risk Invariant Checks (DoD J) ===
@@ -10779,7 +10851,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
     let plan_hash: Option<String> = Some(plan_hash_str.clone());
 
     if !sim_result.success {
-        let reason = RejectReason::SimFailed;
+        let reason = sim_failure_reject_reason(sim_result.error_code.as_deref());
         checks.push(CheckResult {
             check_name: "simulation".to_string(),
             passed: false,
@@ -11865,6 +11937,56 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
     Ok(())
 }
 
+/// Emit an expired decision record (I-11: `DecisionOutcome::Expired`)
+async fn emit_expired_decision(
+    ctx: &ExecutionContext,
+    decision_id: String,
+    intent: &TradeIntent,
+    checks: Vec<CheckResult>,
+    reason: RejectReason,
+) -> Result<()> {
+    REJECT_TTL_EXPIRED.fetch_add(1, Ordering::Relaxed);
+    INTENTS_EXPIRED_TOTAL.fetch_add(1, Ordering::Relaxed);
+
+    let mut decision = DecisionRecord::new_rejected(
+        "execution-engine",
+        BUILD_VERSION,
+        &ctx.run_id,
+        decision_id.clone(),
+        intent.intent_id.clone(),
+        intent.source.clone(),
+        intent.origin_type,
+        intent.regime,
+        checks,
+        reason.to_string(),
+    );
+    decision.outcome = DecisionOutcome::Expired;
+    if let Some(sell_routing) = intent.metadata.get("sell_routing") {
+        decision = decision.with_input_snapshot("sell_routing".to_string(), sell_routing.clone());
+    }
+    if let Some(exit_type) = intent.metadata.get("exit_type") {
+        decision = decision.with_input_snapshot("exit_type".to_string(), exit_type.clone());
+    }
+    if let Some(reason_detail) = intent.metadata.get("reason_detail") {
+        decision = decision.with_input_snapshot("reason_detail".to_string(), reason_detail.clone());
+    }
+
+    ctx.decision_writer.write(&decision)?;
+
+    if let Some(ref nats) = ctx.nats {
+        nats.publish(TOPIC_DECISION_RECORDS, &decision).await?;
+    }
+
+    warn!(
+        intent_id = %intent.intent_id,
+        decision_id = %decision_id,
+        reason = %reason,
+        "Intent expired"
+    );
+
+    Ok(())
+}
+
 /// Emit a rejected decision record
 async fn emit_rejected_decision(
     ctx: &ExecutionContext,
@@ -12210,8 +12332,10 @@ async fn simulate_transaction(
         ..RpcSimulateTransactionConfig::default()
     };
 
-    match ctx.rpc.rpc.simulate_transaction_with_config(&tx, cfg).await {
-        Ok(res) => {
+    let timeout_ms = ctx.get_config().simulation_timeout_ms;
+    let rpc_future = ctx.rpc.rpc.simulate_transaction_with_config(&tx, cfg);
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), rpc_future).await {
+        Ok(Ok(res)) => {
             let value = res.value;
 
             let logs_preview = value.logs.as_ref().map(|lines| {
@@ -12239,12 +12363,16 @@ async fn simulate_transaction(
                 },
             }
         }
-        Err(e) => SimulationResult {
+        Ok(Err(e)) => SimulationResult {
             success: false,
             error_code: Some(format!("rpc_error:{e}")),
             logs_preview: None,
             compute_units_consumed: None,
         },
+        Err(_elapsed) => {
+            SIM_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+            simulation_result_on_rpc_timeout()
+        }
     }
 }
 
@@ -13058,15 +13186,17 @@ mod execution_engine_tests {
     use super::{
         apply_scope48_confirmed_sell_execution_metadata, build_signed_versioned_tx,
         build_unsigned_versioned_tx, cold_path_dex_sim_failure_triggers_discovery_recovery,
-        is_cold_path_recovery_sell, is_pump_amm_structural_sim_error,
-        is_pumpfun_bonding_curve_structural_sim_error, is_regular_momentum_hot_path_sell,
-        liquidation_pumpfun_sell_preference, liquidation_store_multi_pool_fallback_metadata,
-        max_open_positions_buy_gate, prepare_unsigned_versioned_tx_for_simulation,
+        effective_intent_ttl_ms, intent_is_expired, is_cold_path_recovery_sell,
+        is_pump_amm_structural_sim_error, is_pumpfun_bonding_curve_structural_sim_error,
+        is_regular_momentum_hot_path_sell, liquidation_pumpfun_sell_preference,
+        liquidation_store_multi_pool_fallback_metadata, max_open_positions_buy_gate,
+        prepare_unsigned_versioned_tx_for_simulation,
         pump_amm_hint_pool_cache_usable_for_tx_plan_builder,
         pump_amm_hot_path_quote_not_ready_detail, pump_amm_liquidation_discovery_force_refresh,
         pump_amm_liquidation_quote_timeout_str, pump_amm_pool_market_hint_merge,
         pump_amm_slave_recovery_snapshot, record_pump_amm_hot_path_refresh_after_success,
         scale_in_max_open_positions_skip_details, scope48_confirmed_sell_close_decision,
+        sim_failure_reject_reason, simulation_result_on_rpc_timeout,
         sort_route_candidates_by_amount_out, take_next_multi_pool_buildable_fallback_route,
         try_pump_amm_hot_path_refresh_publish, wait_for_meteora_dlmm_slave_after_recovery,
         wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder,
@@ -13079,10 +13209,11 @@ mod execution_engine_tests {
     };
     use ironcrab::execution::pool_cache_sync::apply_pool_cache_update;
     use ironcrab::execution::tx_builder::TxPlan;
+    use ironcrab::ipc::RejectReason;
     use ironcrab::ipc::{
-        ControlResponse, ControlResponseStatus, DexPoolReadiness, ExecutionResult, ExecutionStatus,
-        ExplicitAmount, IntentOrigin, IntentTier, PoolCacheUpdate, TradeIntent, TradeResources,
-        TradeSide, TradingRegime,
+        CheckResult, ControlResponse, ControlResponseStatus, DecisionOutcome, DecisionRecord,
+        DexPoolReadiness, ExecutionResult, ExecutionStatus, ExplicitAmount, IntentOrigin,
+        IntentTier, PoolCacheUpdate, TradeIntent, TradeResources, TradeSide, TradingRegime,
     };
     use ironcrab::solana::address_lookup_table::LoadedAlt;
     use ironcrab::solana::dex::pumpfun::PumpFunDex;
@@ -13183,6 +13314,99 @@ mod execution_engine_tests {
             prepare_unsigned_versioned_tx_for_simulation(&wallet.pubkey(), &plan, blockhash, None)
                 .expect_err("oversized legacy tx should be rejected before simulation RPC");
         assert!(err.starts_with("tx_too_large:"));
+    }
+
+    #[test]
+    fn simulation_rpc_timeout_maps_to_sim_failed_with_sim_timeout_code() {
+        let result = simulation_result_on_rpc_timeout();
+        assert!(!result.success);
+        assert_eq!(result.error_code.as_deref(), Some("sim_timeout"));
+        assert_eq!(
+            sim_failure_reject_reason(result.error_code.as_deref()),
+            RejectReason::SimTimeout
+        );
+    }
+
+    #[test]
+    fn sim_failure_reject_reason_defaults_to_sim_failed_for_other_errors() {
+        assert_eq!(
+            sim_failure_reject_reason(Some("rpc_error:timeout")),
+            RejectReason::SimFailed
+        );
+        assert_eq!(sim_failure_reject_reason(None), RejectReason::SimFailed);
+    }
+
+    #[test]
+    fn intent_ttl_expired_when_now_past_header_ts_plus_ttl() {
+        let intent_ts = 1_000_000u64;
+        let ttl = 5_000u64;
+        assert!(intent_is_expired(
+            intent_ts + ttl + 1,
+            intent_ts,
+            Some(ttl),
+            5_000
+        ));
+    }
+
+    #[test]
+    fn intent_ttl_passes_when_within_window() {
+        let intent_ts = 1_000_000u64;
+        let ttl = 5_000u64;
+        assert!(!intent_is_expired(
+            intent_ts + ttl,
+            intent_ts,
+            Some(ttl),
+            5_000
+        ));
+        assert!(!intent_is_expired(intent_ts, intent_ts, Some(ttl), 5_000));
+    }
+
+    #[test]
+    fn intent_ttl_uses_engine_default_when_intent_ttl_missing_or_zero() {
+        assert_eq!(effective_intent_ttl_ms(None, 5_000), 5_000);
+        assert_eq!(effective_intent_ttl_ms(Some(0), 5_000), 5_000);
+        let intent_ts = 10_000u64;
+        assert!(intent_is_expired(intent_ts + 5_001, intent_ts, None, 5_000));
+        assert!(!intent_is_expired(
+            intent_ts + 5_000,
+            intent_ts,
+            Some(0),
+            5_000
+        ));
+    }
+
+    #[test]
+    fn expired_intent_decision_record_uses_expired_outcome() {
+        let checks = vec![CheckResult {
+            check_name: "ttl_valid".to_string(),
+            passed: false,
+            reason_code: Some(RejectReason::TtlExpired.to_string()),
+            details: Some("now_ms=20000 intent_ts_ms=10000 ttl_ms=5000".to_string()),
+        }];
+        let mut decision = DecisionRecord::new_rejected(
+            "execution-engine",
+            "test",
+            "run",
+            "dec-1".to_string(),
+            "int-1".to_string(),
+            "momentum-bot".to_string(),
+            IntentOrigin::StrategyA,
+            TradingRegime::Early,
+            checks,
+            RejectReason::TtlExpired.to_string(),
+        );
+        decision.outcome = DecisionOutcome::Expired;
+        assert_eq!(decision.outcome, DecisionOutcome::Expired);
+        assert_eq!(
+            decision.primary_reject_reason.as_deref(),
+            Some(RejectReason::TtlExpired.as_str())
+        );
+        let ttl_check = decision
+            .checks
+            .iter()
+            .find(|c| c.check_name == "ttl_valid")
+            .expect("ttl check present");
+        assert!(!ttl_check.passed);
     }
 
     #[test]
