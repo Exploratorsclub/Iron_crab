@@ -47,6 +47,12 @@ const PROBE_LAMPORTS: u64 = 10_000_000;
 /// Top-N WSOL pools to seed trade-cache quotes after JetStream bootstrap.
 const QUOTE_WARMUP_TOP_N: usize = 1000;
 
+/// Hard cap on trade-cache entries after TTL sweep (evict oldest).
+const MAX_QUOTE_CACHE_ENTRIES: usize = 50_000;
+
+/// TTL sweep interval for the search worker (cold path).
+const QUOTE_CACHE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Max dirty tokens queued before new mints are dropped (existing mints still coalesce).
 const MAX_DIRTY_TOKENS: usize = 10_000;
 
@@ -75,10 +81,6 @@ impl QuoteReadyIndex {
 
     pub fn contains(&self, pool: &Pubkey) -> bool {
         self.pools.read().contains(pool)
-    }
-
-    pub fn snapshot(&self) -> HashSet<Pubkey> {
-        self.pools.read().clone()
     }
 
     pub fn len(&self) -> usize {
@@ -147,21 +149,26 @@ type QuoteCacheValue = (u64, Instant);
 pub struct CachedQuoteProvider {
     /// Cache: (pool, input_mint, output_mint) -> (output_amount, timestamp)
     cache: RwLock<HashMap<QuoteCacheKey, QuoteCacheValue>>,
+    /// pool -> (mint_a, mint_b) for O(1) freshness checks (no full-cache scan).
+    pool_mints: RwLock<HashMap<Pubkey, (Pubkey, Pubkey)>>,
     /// Cache TTL
     cache_ttl: Duration,
     /// SLAVE LivePoolCache (same SSOT as execution-engine) — no RPC on miss.
     live_pool_cache: SharedLivePoolCache,
     /// Pools with at least one quotable direction (beam expansion pruning).
     quote_ready: QuoteReadyIndex,
+    last_cleanup: RwLock<Instant>,
 }
 
 impl CachedQuoteProvider {
     pub fn new(cache_ttl: Duration, live_pool_cache: SharedLivePoolCache) -> Self {
         Self {
             cache: RwLock::new(HashMap::new()),
+            pool_mints: RwLock::new(HashMap::new()),
             cache_ttl,
             live_pool_cache,
             quote_ready: QuoteReadyIndex::default(),
+            last_cleanup: RwLock::new(Instant::now()),
         }
     }
 
@@ -186,16 +193,37 @@ impl CachedQuoteProvider {
         }
     }
 
-    fn pool_still_quote_ready(&self, pool: &Pubkey) -> bool {
-        let cache = self.cache.read();
-        let now = Instant::now();
-        if cache
-            .iter()
-            .any(|((p, _, _), (_, ts))| p == pool && now.duration_since(*ts) < self.cache_ttl)
-        {
-            return true;
+    fn resolve_pool_mints(&self, pool: &Pubkey) -> Option<(Pubkey, Pubkey)> {
+        if let Some(mints) = self.pool_mints.read().get(pool).copied() {
+            return Some(mints);
         }
-        drop(cache);
+        let state = self.live_pool_cache.get(pool)?;
+        Some(Self::mints_from_state(&state))
+    }
+
+    fn trade_direction_fresh(
+        &self,
+        cache: &HashMap<QuoteCacheKey, QuoteCacheValue>,
+        pool: Pubkey,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+        now: Instant,
+    ) -> bool {
+        cache
+            .get(&(pool, input_mint, output_mint))
+            .is_some_and(|(_, ts)| now.duration_since(*ts) < self.cache_ttl)
+    }
+
+    fn pool_still_quote_ready(&self, pool: &Pubkey) -> bool {
+        let now = Instant::now();
+        if let Some((mint_a, mint_b)) = self.resolve_pool_mints(pool) {
+            let cache = self.cache.read();
+            if self.trade_direction_fresh(&cache, *pool, mint_a, mint_b, now)
+                || self.trade_direction_fresh(&cache, *pool, mint_b, mint_a, now)
+            {
+                return true;
+            }
+        }
 
         let Some(state) = self.live_pool_cache.get(pool) else {
             return false;
@@ -352,11 +380,16 @@ impl CachedQuoteProvider {
             0
         };
 
+        self.pool_mints
+            .write()
+            .insert(pool, (input_mint, output_mint));
+
         let mut cache = self.cache.write();
         cache.insert(
             (pool, input_mint, output_mint),
             (normalized_output, Instant::now()),
         );
+        drop(cache);
         self.quote_ready.mark_ready(pool);
     }
 
@@ -375,12 +408,37 @@ impl CachedQuoteProvider {
             .map(|(out, ts)| (*out, ts.elapsed().as_millis() as u64))
     }
 
-    /// Clear stale entries
-    #[allow(dead_code)]
+    /// TTL sweep + bounded eviction (search worker cold path).
     pub fn cleanup(&self) {
         let mut cache = self.cache.write();
         let now = Instant::now();
         cache.retain(|_, (_, ts)| now.duration_since(*ts) < self.cache_ttl);
+
+        if cache.len() > MAX_QUOTE_CACHE_ENTRIES {
+            let mut entries: Vec<(QuoteCacheKey, Instant)> =
+                cache.iter().map(|(k, (_, ts))| (*k, *ts)).collect();
+            entries.sort_by_key(|(_, ts)| *ts);
+            let to_remove = cache.len().saturating_sub(MAX_QUOTE_CACHE_ENTRIES);
+            for (key, _) in entries.into_iter().take(to_remove) {
+                cache.remove(&key);
+            }
+        }
+    }
+
+    /// Periodic TTL sweep from the search worker (not hot path).
+    pub fn maybe_cleanup(&self) {
+        let should_run = {
+            let mut last = self.last_cleanup.write();
+            if last.elapsed() < QUOTE_CACHE_CLEANUP_INTERVAL {
+                false
+            } else {
+                *last = Instant::now();
+                true
+            }
+        };
+        if should_run {
+            self.cleanup();
+        }
     }
 }
 
@@ -639,6 +697,8 @@ impl MultiHopArbitrage {
         build: &str,
         run_id: &str,
     ) -> MultiHopIntentBatch {
+        self.quote_provider.maybe_cleanup();
+
         let config = self.config.read().clone();
         let (slot, seen_at_ms) = *self.latest_event_meta.read();
         if !config.enabled {
@@ -1265,6 +1325,42 @@ mod tests {
 
         assert!(arb.dirty_token_count() > 0);
         assert_eq!(arb.stats().searches_triggered, 0);
+    }
+
+    #[test]
+    fn pool_quote_ready_check_is_constant_per_pool() {
+        let provider = CachedQuoteProvider::new(Duration::from_secs(30), create_shared_cache());
+        let pool = Pubkey::new_unique();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+
+        provider.update_quote(pool, mint_a, mint_b, 1_000_000, 990_000);
+
+        for i in 0..5_000 {
+            let noise_pool = Pubkey::new_unique();
+            let noise_mint = Pubkey::new_unique();
+            provider.update_quote(
+                noise_pool,
+                noise_mint,
+                Pubkey::new_unique(),
+                1_000_000,
+                990_000 + i,
+            );
+        }
+
+        assert!(provider.is_pool_quote_ready(&pool));
+    }
+
+    #[test]
+    fn quote_cache_cleanup_evicts_stale_entries() {
+        let provider = CachedQuoteProvider::new(Duration::from_millis(1), create_shared_cache());
+        let pool = Pubkey::new_unique();
+        let input = Pubkey::new_unique();
+        let output = Pubkey::new_unique();
+        provider.update_quote(pool, input, output, 1_000_000, 990_000);
+        std::thread::sleep(Duration::from_millis(5));
+        provider.cleanup();
+        assert!(!provider.is_pool_quote_ready(&pool));
     }
 
     #[test]

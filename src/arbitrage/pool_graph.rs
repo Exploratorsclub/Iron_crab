@@ -86,28 +86,6 @@ impl PoolGraph {
         }
     }
 
-    /// Neighbors whose pools are all in `quote_ready` (beam expansion pruning).
-    pub fn neighbors_quote_ready(
-        &self,
-        mint: &Pubkey,
-        quote_ready: &std::collections::HashSet<Pubkey>,
-    ) -> Vec<(Pubkey, Vec<PoolEdge>)> {
-        self.neighbors(mint)
-            .into_iter()
-            .filter_map(|(neighbor, pools)| {
-                let filtered: Vec<PoolEdge> = pools
-                    .into_iter()
-                    .filter(|edge| quote_ready.contains(&edge.pool_address))
-                    .collect();
-                if filtered.is_empty() {
-                    None
-                } else {
-                    Some((neighbor, filtered))
-                }
-            })
-            .collect()
-    }
-
     /// Get all neighbors of a token with their pools
     ///
     /// Returns: Vec<(neighbor_mint, Vec<PoolEdge>)>
