@@ -184,3 +184,8 @@ name = "multi_hop_sanity"
 path = "tests/multi_hop_sanity.rs"
 required-features = ["test_helpers"]
 
+[[test]]
+name = "multi_hop_search_worker"
+path = "tests/multi_hop_search_worker.rs"
+required-features = ["test_helpers"]
+

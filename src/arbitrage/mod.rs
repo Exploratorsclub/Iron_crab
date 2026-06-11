@@ -41,7 +41,8 @@ pub use arb_slave_sync::{
 };
 pub use cycle_finder::{BeamCycleFinder, CycleFinderConfig};
 pub use multi_hop_integration::{
-    CachedQuoteProvider, MultiHopArbitrage, MultiHopConfig, MultiHopStats, WSOL_MINT,
+    CachedQuoteProvider, MultiHopArbitrage, MultiHopConfig, MultiHopIntentBatch, MultiHopStats,
+    QuoteReadyIndex, WSOL_MINT,
 };
 pub use pool_graph::{GraphStats, PoolGraph};
 pub use pool_ranker::{PoolRanker, QuoteProvider, RankerConfig};

@@ -2454,6 +2454,8 @@ pub fn arb_two_hop_tracker_seeded_pools_add(count: u64) {
 pub static MULTI_HOP_RETURN_BPS_SATURATED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MULTI_HOP_SHADOW_LOGGED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MULTI_HOP_HOP_MISSING_QUOTE_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MULTI_HOP_SEARCH_WORKER_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MULTI_HOP_SEARCHES_COALESCED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MULTI_HOP_QUOTE_FROM_CACHE_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MULTI_HOP_QUOTE_FROM_TRADE_CACHE_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -2482,6 +2484,14 @@ pub fn multi_hop_shadow_logged_inc() {
 
 pub fn multi_hop_hop_missing_quote_inc() {
     MULTI_HOP_HOP_MISSING_QUOTE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn multi_hop_search_worker_queue_depth_set(depth: u64) {
+    MULTI_HOP_SEARCH_WORKER_QUEUE_DEPTH.store(depth, Ordering::Relaxed);
+}
+
+pub fn multi_hop_searches_coalesced_inc() {
+    MULTI_HOP_SEARCHES_COALESCED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn multi_hop_quote_from_cache_inc() {
@@ -4387,6 +4397,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "multi_hop_hop_missing_quote_total",
         MULTI_HOP_HOP_MISSING_QUOTE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "multi_hop_search_worker_queue_depth",
+        MULTI_HOP_SEARCH_WORKER_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "multi_hop_searches_coalesced_total",
+        MULTI_HOP_SEARCHES_COALESCED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "multi_hop_quote_from_cache_total",
