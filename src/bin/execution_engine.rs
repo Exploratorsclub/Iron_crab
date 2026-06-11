@@ -9334,35 +9334,45 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
     });
 
     // === Check 2: TTL validity (before locks/planning — stale intents must not bind resources) ===
-    let now_unix_ms = wall_clock_unix_ms_now();
-    let effective_ttl_ms = effective_intent_ttl_ms(intent.ttl_ms, config.intent_ttl_ms);
-    if intent_is_expired(
-        now_unix_ms,
-        intent.header.ts_unix_ms,
-        intent.ttl_ms,
-        config.intent_ttl_ms,
-    ) {
-        let reason = RejectReason::TtlExpired;
+    // Golden replay fixtures carry historical header.ts_unix_ms; wall-clock TTL would expire them all.
+    if ctx.replay_mode {
         checks.push(CheckResult {
             check_name: "ttl_valid".to_string(),
-            passed: false,
-            reason_code: Some(reason.to_string()),
+            passed: true,
+            reason_code: None,
+            details: Some("replay mode".to_string()),
+        });
+    } else {
+        let now_unix_ms = wall_clock_unix_ms_now();
+        let effective_ttl_ms = effective_intent_ttl_ms(intent.ttl_ms, config.intent_ttl_ms);
+        if intent_is_expired(
+            now_unix_ms,
+            intent.header.ts_unix_ms,
+            intent.ttl_ms,
+            config.intent_ttl_ms,
+        ) {
+            let reason = RejectReason::TtlExpired;
+            checks.push(CheckResult {
+                check_name: "ttl_valid".to_string(),
+                passed: false,
+                reason_code: Some(reason.to_string()),
+                details: Some(format!(
+                    "now_ms={now_unix_ms} intent_ts_ms={} ttl_ms={effective_ttl_ms}",
+                    intent.header.ts_unix_ms
+                )),
+            });
+            return emit_expired_decision(ctx, decision_id, &intent, checks, reason).await;
+        }
+        checks.push(CheckResult {
+            check_name: "ttl_valid".to_string(),
+            passed: true,
+            reason_code: None,
             details: Some(format!(
                 "now_ms={now_unix_ms} intent_ts_ms={} ttl_ms={effective_ttl_ms}",
                 intent.header.ts_unix_ms
             )),
         });
-        return emit_expired_decision(ctx, decision_id, &intent, checks, reason).await;
     }
-    checks.push(CheckResult {
-        check_name: "ttl_valid".to_string(),
-        passed: true,
-        reason_code: None,
-        details: Some(format!(
-            "now_ms={now_unix_ms} intent_ts_ms={} ttl_ms={effective_ttl_ms}",
-            intent.header.ts_unix_ms
-        )),
-    });
 
     // === Risk Invariant Checks (DoD J) ===
 
