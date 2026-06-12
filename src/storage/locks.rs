@@ -751,6 +751,16 @@ impl LockManager {
         LockResult::Acquired
     }
 
+    /// Try to acquire a resource lock (pre-send TTL = [`Self::default_ttl`]).
+    pub fn try_lock_resource(
+        &self,
+        holder: LockHolder,
+        resource_id: &str,
+        resource_type: ResourceType,
+    ) -> LockResult {
+        self.try_lock_resource_with_ttl(holder, resource_id, resource_type, None)
+    }
+
     /// Try to acquire a resource lock with preemption support (DoD L) P0)
     ///
     /// If the resource is locked by a lower-priority intent (higher tier number),
@@ -758,11 +768,12 @@ impl LockManager {
     ///
     /// P1: Fairness policy may block preemption if the target source has been
     /// preempted too many times recently (starvation protection).
-    pub fn try_lock_resource(
+    pub fn try_lock_resource_with_ttl(
         &self,
         holder: LockHolder,
         resource_id: &str,
         resource_type: ResourceType,
+        ttl: Option<Duration>,
     ) -> LockResult {
         self.cleanup_expired();
 
@@ -818,7 +829,7 @@ impl LockManager {
             resource_id: resource_id.to_string(),
             resource_type,
             created_at: Instant::now(),
-            ttl: self.default_ttl,
+            ttl: ttl.unwrap_or(self.default_ttl),
         };
 
         debug!(

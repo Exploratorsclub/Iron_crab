@@ -9817,12 +9817,15 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         .with_tier(intent.tier as u8)
         .with_source(&intent.source); // P1: Source for fairness tracking
 
+    let pre_send_lock_ttl = compute_pre_send_capital_lock_ttl(&config);
     let mut locked_resources = 0u64;
     for pool in &intent.resources.pools {
-        match ctx
-            .lock_manager
-            .try_lock_resource(holder.clone(), pool, ResourceType::Pool)
-        {
+        match ctx.lock_manager.try_lock_resource_with_ttl(
+            holder.clone(),
+            pool,
+            ResourceType::Pool,
+            Some(pre_send_lock_ttl),
+        ) {
             LockResult::Acquired | LockResult::AcquiredByPreemption { .. } => {
                 locked_resources += 1;
             }
@@ -9859,7 +9862,6 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
     });
 
     // === Check 5: Capital lock (BUY: trading WSOL after first WSOL snapshot, else native SOL; SELL: input tokens) ===
-    let pre_send_lock_ttl = compute_pre_send_capital_lock_ttl(&config);
     let lock_result = if intent.side == TradeSide::Buy {
         ctx.lock_manager.try_lock_capital_with_ttl(
             holder,
