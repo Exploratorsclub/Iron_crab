@@ -11987,6 +11987,8 @@ async fn emit_expired_decision(
         nats.publish(TOPIC_DECISION_RECORDS, &decision).await?;
     }
 
+    ctx.lock_manager.mark_processed(&intent.intent_id);
+
     warn!(
         intent_id = %intent.intent_id,
         decision_id = %decision_id,
