@@ -2223,6 +2223,10 @@ pub static WALLET_TX_CONFIRM_LISTENER_CONNECTED: Lazy<AtomicBool> =
 pub static AVAILABLE_SOL_LAMPORTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ACTIVE_CAPITAL_LOCKS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ACTIVE_RESOURCE_LOCKS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Post-send capital reservations (confirm pending; not subject to pre-send TTL).
+pub static IN_FLIGHT_CAPITAL_RESERVATIONS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Pre-send capital locks released by TTL expiry (`cleanup_expired` only).
+pub static CAPITAL_LOCK_EXPIRED_RELEASED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Rejection reasons (labeled counters)
 pub static REJECT_TTL_EXPIRED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static REJECT_DUPLICATE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -4174,6 +4178,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "active_resource_locks",
         ACTIVE_RESOURCE_LOCKS.load(Ordering::Relaxed)
+    );
+    line!(
+        "in_flight_capital_reservations",
+        IN_FLIGHT_CAPITAL_RESERVATIONS.load(Ordering::Relaxed)
+    );
+    line!(
+        "capital_lock_expired_released_total",
+        CAPITAL_LOCK_EXPIRED_RELEASED_TOTAL.load(Ordering::Relaxed)
     );
     // Intent rejection reasons breakdown
     out.push_str("intent_rejection_by_reason{reason=\"ttl_expired\"} ");
