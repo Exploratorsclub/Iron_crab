@@ -43,6 +43,7 @@ fn live_pool_cache_quotes_rank_both_directions_without_trades() {
         }),
         1,
     );
+    provider.mark_ready_from_live_pool_cache(&pool);
 
     let graph = PoolGraph::new();
     graph.upsert_pool(PoolEdge::new(

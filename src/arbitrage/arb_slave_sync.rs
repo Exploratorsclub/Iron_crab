@@ -130,6 +130,7 @@ pub fn populate_arb_slave_from_live_pool_cache(
             liquidity_usd_from_state(&state),
             30,
         );
+        multi_hop.touch_live_pool_quote_ready(&pool_pk.to_string());
         count += 1;
     }
     ARB_KNOWN_POOLS_SYNCED_BOOTSTRAP.store(count as u64, Ordering::Relaxed);

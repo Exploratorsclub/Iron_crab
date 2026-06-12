@@ -24,15 +24,18 @@ use crate::ipc::{
 use crate::metrics::{
     multi_hop_cycle_rejected_sanity_inc, multi_hop_hop_missing_quote_inc,
     multi_hop_quote_from_cache_inc, multi_hop_quote_from_trade_cache_inc,
-    multi_hop_return_bps_saturated_inc, multi_hop_shadow_logged_inc, MultiHopSanityRejectReason,
+    multi_hop_return_bps_saturated_inc, multi_hop_search_worker_queue_depth_set,
+    multi_hop_searches_coalesced_inc, multi_hop_shadow_logged_inc, MultiHopSanityRejectReason,
 };
 use parking_lot::RwLock;
 use solana_sdk::pubkey::Pubkey;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, Notify};
+use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
 
 /// WSOL mint (native SOL wrapped)
@@ -43,6 +46,51 @@ const PROBE_LAMPORTS: u64 = 10_000_000;
 
 /// Top-N WSOL pools to seed trade-cache quotes after JetStream bootstrap.
 const QUOTE_WARMUP_TOP_N: usize = 1000;
+
+/// Hard cap on trade-cache entries after TTL sweep (evict oldest).
+const MAX_QUOTE_CACHE_ENTRIES: usize = 50_000;
+
+/// TTL sweep interval for the search worker (cold path).
+const QUOTE_CACHE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Max dirty tokens queued before new mints are dropped (existing mints still coalesce).
+const MAX_DIRTY_TOKENS: usize = 10_000;
+
+/// Intents produced by the search worker (includes originating event metadata).
+#[derive(Debug, Clone)]
+pub struct MultiHopIntentBatch {
+    pub intents: Vec<TradeIntent>,
+    pub slot: Option<u64>,
+    pub seen_at_ms: u64,
+}
+
+/// Incrementally maintained set of pools with a fresh trade-cache or LivePoolCache quote.
+#[derive(Debug, Default)]
+pub struct QuoteReadyIndex {
+    pools: RwLock<HashSet<Pubkey>>,
+}
+
+impl QuoteReadyIndex {
+    pub fn mark_ready(&self, pool: Pubkey) {
+        self.pools.write().insert(pool);
+    }
+
+    pub fn remove(&self, pool: &Pubkey) {
+        self.pools.write().remove(pool);
+    }
+
+    pub fn contains(&self, pool: &Pubkey) -> bool {
+        self.pools.read().contains(pool)
+    }
+
+    pub fn len(&self) -> usize {
+        self.pools.read().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pools.read().is_empty()
+    }
+}
 
 /// Multi-hop arbitrage configuration
 #[derive(Debug, Clone)]
@@ -101,19 +149,91 @@ type QuoteCacheValue = (u64, Instant);
 pub struct CachedQuoteProvider {
     /// Cache: (pool, input_mint, output_mint) -> (output_amount, timestamp)
     cache: RwLock<HashMap<QuoteCacheKey, QuoteCacheValue>>,
+    /// pool -> (mint_a, mint_b) for O(1) freshness checks (no full-cache scan).
+    pool_mints: RwLock<HashMap<Pubkey, (Pubkey, Pubkey)>>,
     /// Cache TTL
     cache_ttl: Duration,
     /// SLAVE LivePoolCache (same SSOT as execution-engine) — no RPC on miss.
     live_pool_cache: SharedLivePoolCache,
+    /// Pools with at least one quotable direction (beam expansion pruning).
+    quote_ready: QuoteReadyIndex,
+    last_cleanup: RwLock<Instant>,
 }
 
 impl CachedQuoteProvider {
     pub fn new(cache_ttl: Duration, live_pool_cache: SharedLivePoolCache) -> Self {
         Self {
             cache: RwLock::new(HashMap::new()),
+            pool_mints: RwLock::new(HashMap::new()),
             cache_ttl,
             live_pool_cache,
+            quote_ready: QuoteReadyIndex::default(),
+            last_cleanup: RwLock::new(Instant::now()),
         }
+    }
+
+    pub fn quote_ready_index(&self) -> &QuoteReadyIndex {
+        &self.quote_ready
+    }
+
+    /// Mark pool ready when LivePoolCache gains reserves (incremental SSOT sync).
+    pub fn mark_ready_from_live_pool_cache(&self, pool_address: &Pubkey) {
+        let Some(state) = self.live_pool_cache.get(pool_address) else {
+            return;
+        };
+        let (mint_a, mint_b) = Self::mints_from_state(&state);
+        if self
+            .try_quote_from_live_pool_cache(pool_address, &mint_a, PROBE_LAMPORTS)
+            .is_some()
+            || self
+                .try_quote_from_live_pool_cache(pool_address, &mint_b, PROBE_LAMPORTS)
+                .is_some()
+        {
+            self.quote_ready.mark_ready(*pool_address);
+        }
+    }
+
+    fn resolve_pool_mints(&self, pool: &Pubkey) -> Option<(Pubkey, Pubkey)> {
+        if let Some(mints) = self.pool_mints.read().get(pool).copied() {
+            return Some(mints);
+        }
+        let state = self.live_pool_cache.get(pool)?;
+        Some(Self::mints_from_state(&state))
+    }
+
+    fn trade_direction_fresh(
+        &self,
+        cache: &HashMap<QuoteCacheKey, QuoteCacheValue>,
+        pool: Pubkey,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+        now: Instant,
+    ) -> bool {
+        cache
+            .get(&(pool, input_mint, output_mint))
+            .is_some_and(|(_, ts)| now.duration_since(*ts) < self.cache_ttl)
+    }
+
+    fn pool_still_quote_ready(&self, pool: &Pubkey) -> bool {
+        let now = Instant::now();
+        if let Some((mint_a, mint_b)) = self.resolve_pool_mints(pool) {
+            let cache = self.cache.read();
+            if self.trade_direction_fresh(&cache, *pool, mint_a, mint_b, now)
+                || self.trade_direction_fresh(&cache, *pool, mint_b, mint_a, now)
+            {
+                return true;
+            }
+        }
+
+        let Some(state) = self.live_pool_cache.get(pool) else {
+            return false;
+        };
+        let (mint_a, mint_b) = Self::mints_from_state(&state);
+        self.try_quote_from_live_pool_cache(pool, &mint_a, PROBE_LAMPORTS)
+            .is_some()
+            || self
+                .try_quote_from_live_pool_cache(pool, &mint_b, PROBE_LAMPORTS)
+                .is_some()
     }
 
     fn mints_from_state(state: &CachedPoolState) -> (Pubkey, Pubkey) {
@@ -224,11 +344,13 @@ impl CachedQuoteProvider {
             if let Some(out) = self.try_quote_from_live_pool_cache(&pool_pk, &wsol, PROBE_LAMPORTS)
             {
                 self.update_quote(pool_pk, wsol, other, PROBE_LAMPORTS, out);
+                self.quote_ready.mark_ready(pool_pk);
                 seeded += 1;
             }
             if let Some(out) = self.try_quote_from_live_pool_cache(&pool_pk, &other, PROBE_LAMPORTS)
             {
                 self.update_quote(pool_pk, other, wsol, PROBE_LAMPORTS, out);
+                self.quote_ready.mark_ready(pool_pk);
                 seeded += 1;
             }
         }
@@ -258,11 +380,17 @@ impl CachedQuoteProvider {
             0
         };
 
+        self.pool_mints
+            .write()
+            .insert(pool, (input_mint, output_mint));
+
         let mut cache = self.cache.write();
         cache.insert(
             (pool, input_mint, output_mint),
             (normalized_output, Instant::now()),
         );
+        drop(cache);
+        self.quote_ready.mark_ready(pool);
     }
 
     /// Get cached edge ratio for a pool direction
@@ -280,12 +408,37 @@ impl CachedQuoteProvider {
             .map(|(out, ts)| (*out, ts.elapsed().as_millis() as u64))
     }
 
-    /// Clear stale entries
-    #[allow(dead_code)]
+    /// TTL sweep + bounded eviction (search worker cold path).
     pub fn cleanup(&self) {
         let mut cache = self.cache.write();
         let now = Instant::now();
         cache.retain(|_, (_, ts)| now.duration_since(*ts) < self.cache_ttl);
+
+        if cache.len() > MAX_QUOTE_CACHE_ENTRIES {
+            let mut entries: Vec<(QuoteCacheKey, Instant)> =
+                cache.iter().map(|(k, (_, ts))| (*k, *ts)).collect();
+            entries.sort_by_key(|(_, ts)| *ts);
+            let to_remove = cache.len().saturating_sub(MAX_QUOTE_CACHE_ENTRIES);
+            for (key, _) in entries.into_iter().take(to_remove) {
+                cache.remove(&key);
+            }
+        }
+    }
+
+    /// Periodic TTL sweep from the search worker (not hot path).
+    pub fn maybe_cleanup(&self) {
+        let should_run = {
+            let mut last = self.last_cleanup.write();
+            if last.elapsed() < QUOTE_CACHE_CLEANUP_INTERVAL {
+                false
+            } else {
+                *last = Instant::now();
+                true
+            }
+        };
+        if should_run {
+            self.cleanup();
+        }
     }
 }
 
@@ -309,6 +462,18 @@ impl QuoteProvider for CachedQuoteProvider {
 
         multi_hop_hop_missing_quote_inc();
         None
+    }
+
+    fn is_pool_quote_ready(&self, pool_address: &Pubkey) -> bool {
+        if !self.quote_ready.contains(pool_address) {
+            return false;
+        }
+        if self.pool_still_quote_ready(pool_address) {
+            true
+        } else {
+            self.quote_ready.remove(pool_address);
+            false
+        }
     }
 
     fn has_cached_quote(
@@ -351,6 +516,13 @@ struct TokenSearchState {
     last_price_ratio: Option<u64>, // Normalized price for change detection
 }
 
+/// Coalesced dirty-token entry (price + originating event metadata).
+struct DirtyTokenEntry {
+    price_ratio: u64,
+    event_slot: Option<u64>,
+    event_seen_at_ms: u64,
+}
+
 /// Multi-hop arbitrage engine (Event-Driven)
 pub struct MultiHopArbitrage {
     config: RwLock<MultiHopConfig>,
@@ -360,6 +532,9 @@ pub struct MultiHopArbitrage {
     token_state: RwLock<HashMap<Pubkey, TokenSearchState>>,
     /// Pool -> (mint_a, mint_b) reverse index for quick lookup
     pool_mints: RwLock<HashMap<Pubkey, (Pubkey, Pubkey)>>,
+    /// Coalescing queue: latest price ratio per dirty token (search worker drains).
+    dirty_tokens: RwLock<HashMap<Pubkey, DirtyTokenEntry>>,
+    search_notify: Arc<Notify>,
     /// Stats
     searches_triggered: AtomicU64,
     searches_skipped_cooldown: AtomicU64,
@@ -380,6 +555,8 @@ impl MultiHopArbitrage {
             )),
             token_state: RwLock::new(HashMap::new()),
             pool_mints: RwLock::new(HashMap::new()),
+            dirty_tokens: RwLock::new(HashMap::new()),
+            search_notify: Arc::new(Notify::new()),
             searches_triggered: AtomicU64::new(0),
             searches_skipped_cooldown: AtomicU64::new(0),
             searches_skipped_small_change: AtomicU64::new(0),
@@ -438,10 +615,187 @@ impl MultiHopArbitrage {
         }
     }
 
-    /// EVENT-DRIVEN: Called when a pool price updates (trade observed)
-    ///
-    /// This is the main entry point for cycle detection.
-    /// Returns intents if profitable cycles found (empty if shadow_mode).
+    /// Hot-path enqueue: update quote cache and coalesce dirty tokens (O(1), no search).
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_pool_price_update(
+        &self,
+        pool_address: &str,
+        input_mint: &str,
+        output_mint: &str,
+        input_amount: u64,
+        output_amount: u64,
+        event_slot: Option<u64>,
+        event_seen_at_ms: u64,
+    ) {
+        if !self.config.read().enabled {
+            return;
+        }
+
+        let pool = match Pubkey::from_str(pool_address) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let input = match Pubkey::from_str(input_mint) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let output = match Pubkey::from_str(output_mint) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+
+        self.quote_provider
+            .update_quote(pool, input, output, input_amount, output_amount);
+
+        if input_amount == 0 || output_amount == 0 {
+            return;
+        }
+
+        let normalized_price = (output_amount as u128 * 10_000 / input_amount as u128) as u64;
+        let (mint_a, mint_b) = match self.pool_mints.read().get(&pool) {
+            Some(&mints) => mints,
+            None => (input, output),
+        };
+
+        let output_ratio = (input_amount as u128 * 10_000 / output_amount as u128) as u64;
+        for &mint in &[mint_a, mint_b] {
+            let ratio = if mint == input {
+                normalized_price
+            } else if mint == output {
+                output_ratio
+            } else {
+                continue;
+            };
+            self.enqueue_dirty_token(mint, ratio, event_slot, event_seen_at_ms);
+        }
+
+        self.search_notify.notify_one();
+    }
+
+    fn enqueue_dirty_token(
+        &self,
+        token: Pubkey,
+        price_ratio: u64,
+        event_slot: Option<u64>,
+        event_seen_at_ms: u64,
+    ) {
+        let mut dirty = self.dirty_tokens.write();
+        if dirty.len() >= MAX_DIRTY_TOKENS && !dirty.contains_key(&token) {
+            return;
+        }
+        let entry = DirtyTokenEntry {
+            price_ratio,
+            event_slot,
+            event_seen_at_ms,
+        };
+        if dirty.insert(token, entry).is_some() {
+            multi_hop_searches_coalesced_inc();
+        }
+        multi_hop_search_worker_queue_depth_set(dirty.len() as u64);
+    }
+
+    fn drain_dirty_tokens(&self) -> Vec<(Pubkey, DirtyTokenEntry)> {
+        let mut dirty = self.dirty_tokens.write();
+        if dirty.is_empty() {
+            return vec![];
+        }
+        let batch: Vec<_> = dirty.drain().collect();
+        multi_hop_search_worker_queue_depth_set(0);
+        batch
+    }
+
+    fn batch_event_meta_for_tokens(
+        batch: &[(Pubkey, DirtyTokenEntry)],
+        tokens: &[Pubkey],
+    ) -> (Option<u64>, u64) {
+        let token_set: HashSet<_> = tokens.iter().collect();
+        batch
+            .iter()
+            .filter(|(token, _)| token_set.contains(token))
+            .min_by_key(|(_, entry)| entry.event_seen_at_ms)
+            .map(|(_, entry)| (entry.event_slot, entry.event_seen_at_ms))
+            .unwrap_or((None, 0))
+    }
+
+    /// Worker batch: apply cooldown/price filters then run beam search.
+    fn process_dirty_batch(
+        &self,
+        component: &str,
+        build: &str,
+        run_id: &str,
+    ) -> MultiHopIntentBatch {
+        self.quote_provider.maybe_cleanup();
+
+        let config = self.config.read().clone();
+        let batch = self.drain_dirty_tokens();
+        if batch.is_empty() {
+            return MultiHopIntentBatch {
+                intents: vec![],
+                slot: None,
+                seen_at_ms: 0,
+            };
+        }
+
+        if !config.enabled {
+            return MultiHopIntentBatch {
+                intents: vec![],
+                slot: None,
+                seen_at_ms: 0,
+            };
+        }
+
+        let token_ratios: Vec<(Pubkey, u64)> = batch
+            .iter()
+            .map(|(token, entry)| (*token, entry.price_ratio))
+            .collect();
+        let tokens_to_search = self.filter_tokens_for_search(&token_ratios, &config);
+        let (slot, seen_at_ms) = Self::batch_event_meta_for_tokens(&batch, &tokens_to_search);
+        if tokens_to_search.is_empty() {
+            return MultiHopIntentBatch {
+                intents: vec![],
+                slot,
+                seen_at_ms,
+            };
+        }
+
+        self.searches_triggered.fetch_add(1, Ordering::Relaxed);
+        let intents = self.search_from_tokens(&tokens_to_search, &config, component, build, run_id);
+        MultiHopIntentBatch {
+            intents,
+            slot,
+            seen_at_ms,
+        }
+    }
+
+    /// Dedicated search worker (decoupled from NATS event loop).
+    pub fn spawn_search_worker(
+        self: Arc<Self>,
+        intent_tx: mpsc::Sender<MultiHopIntentBatch>,
+        component: String,
+        build: String,
+        run_id: String,
+    ) -> JoinHandle<()> {
+        let notify = self.search_notify.clone();
+        tokio::spawn(async move {
+            loop {
+                notify.notified().await;
+                let batch = self.process_dirty_batch(&component, &build, &run_id);
+                if !batch.intents.is_empty() && intent_tx.send(batch).await.is_err() {
+                    warn!("Multi-hop search worker: intent channel closed, continuing search");
+                }
+            }
+        })
+    }
+
+    /// Incrementally mark pool quote-ready when LivePoolCache reserves update.
+    pub fn touch_live_pool_quote_ready(&self, pool_address: &str) {
+        if let Ok(pool) = Pubkey::from_str(pool_address) {
+            self.quote_provider.mark_ready_from_live_pool_cache(&pool);
+        }
+    }
+
+    /// Legacy synchronous entry (tests only).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn on_pool_price_update(
         &self,
@@ -454,73 +808,21 @@ impl MultiHopArbitrage {
         build: &str,
         run_id: &str,
     ) -> Vec<TradeIntent> {
-        let config = self.config.read().clone();
+        self.enqueue_pool_price_update(
+            pool_address,
+            input_mint,
+            output_mint,
+            input_amount,
+            output_amount,
+            None,
+            0,
+        );
+        self.process_dirty_batch(component, build, run_id).intents
+    }
 
-        if !config.enabled {
-            return vec![];
-        }
-
-        // Parse addresses
-        let pool = match Pubkey::from_str(pool_address) {
-            Ok(p) => p,
-            Err(_) => return vec![],
-        };
-        let input = match Pubkey::from_str(input_mint) {
-            Ok(m) => m,
-            Err(_) => return vec![],
-        };
-        let output = match Pubkey::from_str(output_mint) {
-            Ok(m) => m,
-            Err(_) => return vec![],
-        };
-
-        // Update quote cache
-        self.quote_provider
-            .update_quote(pool, input, output, input_amount, output_amount);
-
-        // Check if this is a significant price change
-        let normalized_price = if input_amount > 0 {
-            (output_amount as u128 * 10_000 / input_amount as u128) as u64
-        } else {
-            return vec![];
-        };
-
-        // Get the affected tokens (both sides of the pool)
-        let (mint_a, mint_b) = match self.pool_mints.read().get(&pool) {
-            Some(&mints) => mints,
-            None => (input, output), // Fallback if not in index
-        };
-
-        // Per-mint directional price ratios (inverse for the output side of the trade)
-        let output_ratio = if output_amount > 0 {
-            (input_amount as u128 * 10_000 / output_amount as u128) as u64
-        } else {
-            return vec![];
-        };
-        let mut token_ratios = Vec::with_capacity(2);
-        for &mint in &[mint_a, mint_b] {
-            let ratio = if mint == input {
-                normalized_price
-            } else if mint == output {
-                output_ratio
-            } else {
-                continue;
-            };
-            if !token_ratios.iter().any(|(m, _)| *m == mint) {
-                token_ratios.push((mint, ratio));
-            }
-        }
-
-        let tokens_to_search = self.filter_tokens_for_search(&token_ratios, &config);
-
-        if tokens_to_search.is_empty() {
-            return vec![];
-        }
-
-        self.searches_triggered.fetch_add(1, Ordering::Relaxed);
-
-        // Search for cycles starting from affected tokens
-        self.search_from_tokens(&tokens_to_search, &config, component, build, run_id)
+    #[cfg(test)]
+    pub fn dirty_token_count(&self) -> usize {
+        self.dirty_tokens.read().len()
     }
 
     /// Filter tokens that should be searched (cooldown + per-mint price change check)
@@ -864,6 +1166,10 @@ impl QuoteProvider for Arc<CachedQuoteProvider> {
         (**self).has_cached_quote(pool_address, input_mint, output_mint)
     }
 
+    fn is_pool_quote_ready(&self, pool_address: &Pubkey) -> bool {
+        (**self).is_pool_quote_ready(pool_address)
+    }
+
     fn get_cached_probe_quote(
         &self,
         pool_address: &Pubkey,
@@ -1014,5 +1320,118 @@ mod tests {
 
         assert!(intents.is_empty());
         assert_eq!(arb.stats().searches_triggered, 0);
+    }
+
+    #[test]
+    fn enqueue_does_not_search_synchronously() {
+        let arb = MultiHopArbitrage::new(
+            MultiHopConfig {
+                enabled: true,
+                min_liquidity_usd: 0.0,
+                min_price_change_bps: 0,
+                token_cooldown_ms: 0,
+                ..Default::default()
+            },
+            create_shared_cache(),
+        );
+
+        arb.upsert_pool(
+            "11111111111111111111111111111111",
+            "raydium",
+            WSOL_MINT,
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            100_000.0,
+            30,
+        );
+
+        arb.enqueue_pool_price_update(
+            "11111111111111111111111111111111",
+            WSOL_MINT,
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            1_000_000,
+            990_000,
+            None,
+            0,
+        );
+
+        assert!(arb.dirty_token_count() > 0);
+        assert_eq!(arb.stats().searches_triggered, 0);
+    }
+
+    #[test]
+    fn pool_quote_ready_check_is_constant_per_pool() {
+        let provider = CachedQuoteProvider::new(Duration::from_secs(30), create_shared_cache());
+        let pool = Pubkey::new_unique();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+
+        provider.update_quote(pool, mint_a, mint_b, 1_000_000, 990_000);
+
+        for i in 0..5_000 {
+            let noise_pool = Pubkey::new_unique();
+            let noise_mint = Pubkey::new_unique();
+            provider.update_quote(
+                noise_pool,
+                noise_mint,
+                Pubkey::new_unique(),
+                1_000_000,
+                990_000 + i,
+            );
+        }
+
+        assert!(provider.is_pool_quote_ready(&pool));
+    }
+
+    #[test]
+    fn quote_cache_cleanup_evicts_stale_entries() {
+        let provider = CachedQuoteProvider::new(Duration::from_millis(1), create_shared_cache());
+        let pool = Pubkey::new_unique();
+        let input = Pubkey::new_unique();
+        let output = Pubkey::new_unique();
+        provider.update_quote(pool, input, output, 1_000_000, 990_000);
+        std::thread::sleep(Duration::from_millis(5));
+        provider.cleanup();
+        assert!(!provider.is_pool_quote_ready(&pool));
+    }
+
+    #[test]
+    fn coalesced_dirty_tokens_produce_single_search() {
+        let arb = MultiHopArbitrage::new(
+            MultiHopConfig {
+                enabled: true,
+                min_liquidity_usd: 0.0,
+                min_price_change_bps: 0,
+                token_cooldown_ms: 0,
+                ..Default::default()
+            },
+            create_shared_cache(),
+        );
+
+        arb.upsert_pool(
+            "11111111111111111111111111111111111",
+            "raydium",
+            WSOL_MINT,
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            100_000.0,
+            30,
+        );
+
+        let usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        for i in 0..5 {
+            arb.enqueue_pool_price_update(
+                "11111111111111111111111111111111",
+                WSOL_MINT,
+                usdc,
+                1_000_000 + i,
+                990_000,
+                None,
+                0,
+            );
+        }
+
+        assert_eq!(arb.dirty_token_count(), 2, "WSOL + USDC dirty entries");
+        let _ = arb.process_dirty_batch("test", "0.1.0", "run");
+        assert_eq!(arb.stats().searches_triggered, 1);
+        assert_eq!(arb.dirty_token_count(), 0);
     }
 }

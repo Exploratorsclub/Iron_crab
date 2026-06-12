@@ -23,12 +23,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use ironcrab::arbitrage::{
     populate_arb_slave_from_live_pool_cache, sync_arb_slave_from_pool_cache_update,
-    MultiHopArbitrage, MultiHopConfig,
+    MultiHopArbitrage, MultiHopConfig, MultiHopIntentBatch,
 };
 use ironcrab::config::Config as AppConfig;
 use ironcrab::execution::live_pool_cache::{
@@ -1242,7 +1243,7 @@ struct ArbContext {
     // =========================================================================
     /// Multi-hop arbitrage engine for N-hop cycle detection.
     /// Disabled by default (shadow_mode=true). See docs/MULTI_HOP_ARBITRAGE.md
-    multi_hop: MultiHopArbitrage,
+    multi_hop: Arc<MultiHopArbitrage>,
 
     /// Per-mint last WARN time for "spread too large" deduplication.
     spread_too_large_warn_last: RwLock<HashMap<String, Instant>>,
@@ -2103,7 +2104,7 @@ impl ArbContext {
 
         let price = trade_implied_sol_per_token(sol_amount, token_amount, token_decimals);
 
-        info!(
+        trace!(
             pool = %pool_address,
             mint = %mint,
             sol_amount = sol_amount,
@@ -2179,7 +2180,7 @@ impl ArbContext {
         );
         pool.trade_count += 1;
         pool.last_update = Instant::now();
-        info!(
+        trace!(
             pool = %pool_address,
             mint = %mint,
             dex = %pool.dex,
@@ -2563,7 +2564,18 @@ async fn main() -> Result<()> {
     };
 
     let live_pool_cache = create_shared_cache();
-    let multi_hop = MultiHopArbitrage::new(MultiHopConfig::default(), live_pool_cache.clone());
+    let multi_hop = Arc::new(MultiHopArbitrage::new(
+        MultiHopConfig::default(),
+        live_pool_cache.clone(),
+    ));
+
+    let (multi_hop_intent_tx, mut multi_hop_intent_rx) = mpsc::channel::<MultiHopIntentBatch>(256);
+    let _multi_hop_search_worker = multi_hop.clone().spawn_search_worker(
+        multi_hop_intent_tx,
+        "arb-strategy".to_string(),
+        BUILD_VERSION.to_string(),
+        run_id.clone(),
+    );
 
     let ctx = Arc::new(ArbContext {
         run_id: run_id.clone(),
@@ -2753,6 +2765,41 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Multi-hop intent publisher (decoupled from search worker)
+    let multi_hop_publish_ctx = ctx.clone();
+    tokio::spawn(async move {
+        while let Some(batch) = multi_hop_intent_rx.recv().await {
+            for mut intent in batch.intents {
+                if let Some(slot) = batch.slot {
+                    intent.metadata.insert("slot".to_string(), slot.to_string());
+                }
+                intent
+                    .metadata
+                    .insert("slot_seen_at_ms".to_string(), batch.seen_at_ms.to_string());
+                if let Err(e) = multi_hop_publish_ctx.jsonl_writer.write(&intent) {
+                    error!(error = %e, "Failed to write multi-hop intent to JSONL");
+                }
+                if let Some(ref nats) = multi_hop_publish_ctx.nats {
+                    if let Err(e) = nats.publish(TOPIC_TRADE_INTENTS, &intent).await {
+                        warn!(error = %e, "Failed to publish multi-hop intent");
+                    } else {
+                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        INTENTS_GENERATED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        multi_hop_publish_ctx
+                            .intents_generated
+                            .fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            intent_id = %intent.intent_id,
+                            hops = intent.hop_count(),
+                            return_bps = intent.expected_roi_bps,
+                            "🎯 Multi-hop arb intent published"
+                        );
+                    }
+                }
+            }
+        }
+    });
+
     // Main event loop
     info!("Entering main event loop");
 
@@ -2905,9 +2952,11 @@ async fn main() -> Result<()> {
                                                 if sync_arb_slave_from_pool_cache_update(
                                                     &ctx.live_pool_cache,
                                                     &ctx.known_pools,
-                                                    &ctx.multi_hop,
+                                                    ctx.multi_hop.as_ref(),
                                                     &update,
                                                 ) {
+                                                    ctx.multi_hop
+                                                        .touch_live_pool_quote_ready(&update.pool_address);
                                                     ctx.seed_trackers_for_pool_cache_update(&update);
                                                     debug!(
                                                         pool = %update.pool_address,
@@ -3040,55 +3089,21 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             // Multi-hop: Event-driven cycle detection on every trade
             // This runs in parallel with the existing 2-hop detection
             if ctx.multi_hop.is_enabled() {
-                // Determine input/output mints based on trade direction
                 let (input_mint, output_mint) = if *is_buy {
-                    // Buy token: SOL -> Token
                     (NATIVE_SOL_MINT, mint.as_str())
                 } else {
-                    // Sell token: Token -> SOL
                     (mint.as_str(), NATIVE_SOL_MINT)
                 };
 
-                let multi_hop_intents = ctx.multi_hop.on_pool_price_update(
+                ctx.multi_hop.enqueue_pool_price_update(
                     pool_address,
                     input_mint,
                     output_mint,
                     *sol_amount,
                     *token_amount,
-                    "arb-strategy",
-                    BUILD_VERSION,
-                    &ctx.run_id,
+                    event.slot,
+                    event.header.ts_unix_ms,
                 );
-
-                // Publish any multi-hop intents found
-                for mut intent in multi_hop_intents {
-                    // K Phase 1: Slot-to-Send Latency - propagate slot from event
-                    if let Some(slot) = event.slot {
-                        intent.metadata.insert("slot".to_string(), slot.to_string());
-                    }
-                    intent.metadata.insert(
-                        "slot_seen_at_ms".to_string(),
-                        event.header.ts_unix_ms.to_string(),
-                    );
-                    if let Err(e) = ctx.jsonl_writer.write(&intent) {
-                        error!(error = %e, "Failed to write multi-hop intent to JSONL");
-                    }
-                    if let Some(ref nats) = ctx.nats {
-                        if let Err(e) = nats.publish(TOPIC_TRADE_INTENTS, &intent).await {
-                            warn!(error = %e, "Failed to publish multi-hop intent");
-                        } else {
-                            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            INTENTS_GENERATED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            ctx.intents_generated.fetch_add(1, Ordering::Relaxed);
-                            info!(
-                                intent_id = %intent.intent_id,
-                                hops = intent.hop_count(),
-                                return_bps = intent.expected_roi_bps,
-                                "🎯 Multi-hop arb intent published"
-                            );
-                        }
-                    }
-                }
             }
 
             // Existing 2-hop arbitrage detection

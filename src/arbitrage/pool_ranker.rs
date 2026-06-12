@@ -77,6 +77,12 @@ pub trait QuoteProvider: Send + Sync {
         true
     }
 
+    /// Whether the pool is in the quote-ready set (beam expansion skips others).
+    /// Default `true` for mocks / providers without a ready index.
+    fn is_pool_quote_ready(&self, _pool_address: &Pubkey) -> bool {
+        true
+    }
+
     /// Fresh cached probe quote, or `None` if missing/stale.
     /// Default uses separate cache checks (fine for mocks); TTL caches should override.
     fn get_cached_probe_quote(
@@ -135,6 +141,9 @@ impl<Q: QuoteProvider> PoolRanker<Q> {
             let mut ranked_pools = Vec::with_capacity(pools.len());
 
             for edge in pools {
+                if !self.quote_provider.is_pool_quote_ready(&edge.pool_address) {
+                    continue;
+                }
                 if let Some(ranked) = self.rank_single_pool(&edge, input_mint, &output_mint) {
                     // Track max edge ratio for upper bound pruning
                     max_edge_updates.push((*input_mint, clamp_edge_ratio(ranked.edge_ratio)));
@@ -345,6 +354,10 @@ impl QuoteProvider for std::sync::Arc<MockQuoteProvider> {
         (**self).has_cached_quote(pool_address, input_mint, output_mint)
     }
 
+    fn is_pool_quote_ready(&self, pool_address: &Pubkey) -> bool {
+        (**self).is_pool_quote_ready(pool_address)
+    }
+
     fn get_cached_probe_quote(
         &self,
         pool_address: &Pubkey,
@@ -380,6 +393,10 @@ impl QuoteProvider for MockQuoteProvider {
     ) -> bool {
         self.quotes
             .contains_key(&(*pool_address, *input_mint, *output_mint))
+    }
+
+    fn is_pool_quote_ready(&self, pool_address: &Pubkey) -> bool {
+        self.quotes.keys().any(|(pool, _, _)| pool == pool_address)
     }
 
     fn get_cached_probe_quote(
