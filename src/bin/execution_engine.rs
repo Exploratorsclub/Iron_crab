@@ -6969,6 +6969,9 @@ async fn main() -> Result<()> {
                     .map(|t| t.tpu_enabled)
                     .unwrap_or(true)
             }),
+        capital_lock_ttl_buffer_ms: exec_eng_cfg
+            .and_then(|e| e.capital_lock_ttl_buffer_ms)
+            .unwrap_or(10_000),
         ..Default::default()
     };
 
@@ -10621,6 +10624,12 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                     .live_pool_cache
                     .as_ref()
                     .and_then(|c| pump_amm_slave_recovery_snapshot(c, &pool_pk));
+                // Pre-plan discovery may have consumed most of the initial pre-send TTL; renew
+                // before the second discovery+SLAVE wait so cleanup_expired cannot release capital.
+                ctx.lock_manager.renew_capital_lock_ttl(
+                    &intent.intent_id,
+                    compute_pre_send_capital_lock_ttl(&config),
+                );
                 if let DiscoveryRequestOutcome::Ok = ctx
                     .request_discovery_and_wait(
                         &intent.resources.input_mint,
