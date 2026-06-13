@@ -83,13 +83,14 @@ use ironcrab::metrics::{
     try_record_execution_intent_header_to_receive_ms, try_record_execution_intent_to_confirm_ms,
     update_readiness_execution_engine_current, wall_clock_unix_ms_now, MetricsComponent,
     RecentTrade, ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS, AVAILABLE_SOL_LAMPORTS,
-    CONCURRENT_INTENTS_GAUGE, INTENTS_EXECUTED_TOTAL, INTENTS_EXPIRED_TOTAL,
-    INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL, JITO_BUNDLES_LANDED_TOTAL,
-    JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL, JITO_BUNDLES_TIMEOUT_TOTAL,
-    JITO_TIP_LAMPORTS_TOTAL, KILL_SWITCH_ACTIVE, NATS_MESSAGES_RECEIVED_TOTAL,
-    OPEN_POSITIONS_GAUGE, POSITION_AUTHORITY_DRIFT_LOCKMANAGER,
-    POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE, POSITION_AUTHORITY_OPEN_GAUGE,
-    POSITION_AUTHORITY_RECONCILE_NEEDED_GAUGE, PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_FAIL_TOTAL,
+    CAPITAL_LOCK_EXPIRED_RELEASED_TOTAL, CONCURRENT_INTENTS_GAUGE, INTENTS_EXECUTED_TOTAL,
+    INTENTS_EXPIRED_TOTAL, INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL,
+    IN_FLIGHT_CAPITAL_RESERVATIONS, JITO_BUNDLES_LANDED_TOTAL, JITO_BUNDLES_REJECTED_TOTAL,
+    JITO_BUNDLES_SUBMITTED_TOTAL, JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL,
+    KILL_SWITCH_ACTIVE, NATS_MESSAGES_RECEIVED_TOTAL, OPEN_POSITIONS_GAUGE,
+    POSITION_AUTHORITY_DRIFT_LOCKMANAGER, POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE,
+    POSITION_AUTHORITY_OPEN_GAUGE, POSITION_AUTHORITY_RECONCILE_NEEDED_GAUGE,
+    PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_FAIL_TOTAL,
     PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_SUCCESS_TOTAL,
     PUMPSWAP_HOT_PATH_HEALING_COOLDOWN_SUPPRESSED_TOTAL,
     PUMPSWAP_HOT_PATH_HEALING_SKIPPED_NO_NATS_TOTAL, PUMPSWAP_HOT_PATH_HEALING_TRIGGER_TOTAL,
@@ -1461,6 +1462,9 @@ struct ExecutionConfig {
     /// Confirmation timeout (ms) for RPC send path
     confirmation_timeout_ms: u64,
 
+    /// Buffer (ms) added to discovery + simulation when computing pre-send capital-lock TTL.
+    capital_lock_ttl_buffer_ms: u64,
+
     /// RPC sendTransaction: skip preflight (safe default when simulate-gated)
     send_skip_preflight: bool,
 
@@ -1549,6 +1553,7 @@ impl Default for ExecutionConfig {
             simulation_timeout_ms: 500,
             intent_ttl_ms: 5_000,
             confirmation_timeout_ms: 15_000,
+            capital_lock_ttl_buffer_ms: 10_000,
             send_skip_preflight: true,
             send_preflight_commitment: None,
             send_enabled: false, // Default: simulate only
@@ -5860,6 +5865,19 @@ impl ExecutionContext {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
                 }
+                "capital_lock_ttl_buffer_ms" => {
+                    if let Some(v) = value.as_u64() {
+                        if (1_000..=120_000).contains(&v) {
+                            config.capital_lock_ttl_buffer_ms = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 1000-120000".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
                 "confirmation_timeout_ms" => {
                     if let Some(v) = value.as_u64() {
                         if (500..=300_000).contains(&v) {
@@ -6951,6 +6969,9 @@ async fn main() -> Result<()> {
                     .map(|t| t.tpu_enabled)
                     .unwrap_or(true)
             }),
+        capital_lock_ttl_buffer_ms: exec_eng_cfg
+            .and_then(|e| e.capital_lock_ttl_buffer_ms)
+            .unwrap_or(10_000),
         ..Default::default()
     };
 
@@ -8683,9 +8704,19 @@ async fn main() -> Result<()> {
 
                 // Periodic cleanup and stats
                 if simulated_tick % 30 == 0 {
-                    ctx.lock_manager.cleanup_expired();
+                    let expired_pre_send = ctx.lock_manager.cleanup_expired();
+                    if expired_pre_send > 0 {
+                        CAPITAL_LOCK_EXPIRED_RELEASED_TOTAL.fetch_add(
+                            expired_pre_send as u64,
+                            Ordering::Relaxed,
+                        );
+                    }
 
                     let (cap_locks, res_locks) = ctx.lock_manager.active_lock_count();
+                    IN_FLIGHT_CAPITAL_RESERVATIONS.store(
+                        ctx.lock_manager.in_flight_reservation_count() as u64,
+                        Ordering::Relaxed,
+                    );
                     let received = ctx.intents_received.load(std::sync::atomic::Ordering::Relaxed);
                     let rejected = ctx.intents_rejected.load(std::sync::atomic::Ordering::Relaxed);
                     let sim_fail = ctx.sim_failures.load(std::sync::atomic::Ordering::Relaxed);
@@ -9227,6 +9258,23 @@ fn record_execution_slot_lag_at_send_if_applicable(ctx: &ExecutionContext, inten
 /// Effective TTL for an intent: use intent field when > 0, else engine default.
 fn effective_intent_ttl_ms(intent_ttl_ms: Option<u64>, default_ttl_ms: u64) -> u64 {
     intent_ttl_ms.filter(|t| *t > 0).unwrap_or(default_ttl_ms)
+}
+
+/// Pre-send capital-lock TTL: worst-case cold-path discovery + simulation + buffer.
+///
+/// Covers PumpSwap liquidation discovery (45s) + SLAVE wait (20s) without the 30s default
+/// TTL racing ahead of an in-flight intent task (I-20).
+fn compute_pre_send_capital_lock_ttl(config: &ExecutionConfig) -> std::time::Duration {
+    let cold_discovery_ms = PUMPSWAP_LIQUIDATION_QUOTE_TIMEOUT_SECS
+        .saturating_mul(1000)
+        .saturating_add(PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS);
+    let warm_discovery_ms = DISCOVERY_CACHE_WAIT_TIMEOUT_MS
+        .saturating_add(PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS);
+    let discovery_ms = cold_discovery_ms.max(warm_discovery_ms);
+    let total_ms = discovery_ms
+        .saturating_add(config.simulation_timeout_ms)
+        .saturating_add(config.capital_lock_ttl_buffer_ms);
+    std::time::Duration::from_millis(total_ms)
 }
 
 /// Returns true when the intent is past its TTL (stale).
@@ -9772,12 +9820,15 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         .with_tier(intent.tier as u8)
         .with_source(&intent.source); // P1: Source for fairness tracking
 
+    let pre_send_lock_ttl = compute_pre_send_capital_lock_ttl(&config);
     let mut locked_resources = 0u64;
     for pool in &intent.resources.pools {
-        match ctx
-            .lock_manager
-            .try_lock_resource(holder.clone(), pool, ResourceType::Pool)
-        {
+        match ctx.lock_manager.try_lock_resource_with_ttl(
+            holder.clone(),
+            pool,
+            ResourceType::Pool,
+            Some(pre_send_lock_ttl),
+        ) {
             LockResult::Acquired | LockResult::AcquiredByPreemption { .. } => {
                 locked_resources += 1;
             }
@@ -9815,10 +9866,11 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
 
     // === Check 5: Capital lock (BUY: trading WSOL after first WSOL snapshot, else native SOL; SELL: input tokens) ===
     let lock_result = if intent.side == TradeSide::Buy {
-        ctx.lock_manager.try_lock_capital(
+        ctx.lock_manager.try_lock_capital_with_ttl(
             holder,
             intent.required_capital.raw,
             std::collections::HashMap::new(),
+            Some(pre_send_lock_ttl),
         )
     } else {
         let mut tokens = std::collections::HashMap::new();
@@ -9826,7 +9878,8 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
             intent.resources.input_mint.clone(),
             intent.required_capital.raw,
         );
-        ctx.lock_manager.try_lock_capital(holder, 0, tokens)
+        ctx.lock_manager
+            .try_lock_capital_with_ttl(holder, 0, tokens, Some(pre_send_lock_ttl))
     };
 
     match lock_result {
@@ -10571,6 +10624,12 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                     .live_pool_cache
                     .as_ref()
                     .and_then(|c| pump_amm_slave_recovery_snapshot(c, &pool_pk));
+                // Pre-plan discovery may have consumed most of the initial pre-send TTL; renew
+                // before the second discovery+SLAVE wait so cleanup_expired cannot release capital.
+                ctx.lock_manager.renew_capital_lock_ttl(
+                    &intent.intent_id,
+                    compute_pre_send_capital_lock_ttl(&config),
+                );
                 if let DiscoveryRequestOutcome::Ok = ctx
                     .request_discovery_and_wait(
                         &intent.resources.input_mint,
@@ -11245,6 +11304,20 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         None
     };
 
+    // After successful send: capital reservation stays (I-20) but is immune to pre-send TTL;
+    // pool resource locks are released (no second TX build on this intent).
+    if config.send_enabled
+        && sent_anything
+        && ctx
+            .lock_manager
+            .promote_capital_lock_to_in_flight(&intent.intent_id)
+    {
+        IN_FLIGHT_CAPITAL_RESERVATIONS.store(
+            ctx.lock_manager.in_flight_reservation_count() as u64,
+            Ordering::Relaxed,
+        );
+    }
+
     // Register JetStream confirm waiter before any async pre-confirm work so the main loop
     // cannot ack WalletTxConfirmed while this intent task is still between send and confirm.
     let mut wallet_tx_confirm_rx: Option<tokio::sync::oneshot::Receiver<WalletTxConfirmNotify>> =
@@ -11561,6 +11634,8 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
 
     // Emit an ExecutionResult so strategy-plane components (e.g. momentum-bot) can
     // manage positions and exits (stop-loss / take-profit) based on confirmed outcomes.
+    // Best-effort fills from confirmed TX meta — computed at most once per signature.
+    let mut intent_fills_cache: Option<ComputedIntentFills> = None;
     // Capture fill_out for immediate LockManager update after confirmed BUY.
     // Populated inside the should_emit block when fills are available.
     let mut confirmed_buy_fill_out_raw: Option<u64> = None;
@@ -11640,8 +11715,12 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                     (ctx.wallet_pubkey, exec.signature.as_deref())
                 {
                     if let Ok(sig) = Signature::from_str(sig_str) {
-                        let fills =
-                            compute_intent_fills_best_effort(ctx, wallet, &sig, &intent).await;
+                        if intent_fills_cache.is_none() {
+                            intent_fills_cache = Some(
+                                compute_intent_fills_best_effort(ctx, wallet, &sig, &intent).await,
+                            );
+                        }
+                        let fills = intent_fills_cache.as_ref().expect("fills cached");
 
                         // Capture fill_out for immediate LockManager update (Fix: SIM_INSUFFICIENT_BALANCE)
                         if intent.side == TradeSide::Buy {
@@ -11658,7 +11737,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                         }
 
                         exec = exec
-                            .with_fills(fills.fill_in, fills.fill_out)
+                            .with_fills(fills.fill_in.clone(), fills.fill_out.clone())
                             .with_fill_diagnostics(
                                 fills.fill_status,
                                 fills.fill_unavailable_reason,
@@ -11859,15 +11938,20 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
             .or_else(|| send_signature.clone())
             .unwrap_or_default();
 
-        let (fill_in, fill_out, _fill_status, _fill_reason, _wallet_sol_delta) =
+        if intent_fills_cache.is_none() {
             if let (Some(wallet), Ok(sig)) = (ctx.wallet_pubkey, Signature::from_str(&tx_hash)) {
-                let f = compute_intent_fills_best_effort(ctx, wallet, &sig, &intent).await;
+                intent_fills_cache =
+                    Some(compute_intent_fills_best_effort(ctx, wallet, &sig, &intent).await);
+            }
+        }
+        let (fill_in, fill_out, _fill_status, _fill_reason, _wallet_sol_delta) =
+            if let Some(ref f) = intent_fills_cache {
                 if confirmed_block_time_unix_ms.is_none() {
                     confirmed_block_time_unix_ms = f.block_time_unix_ms;
                 }
                 (
-                    f.fill_in,
-                    f.fill_out,
+                    f.fill_in.clone(),
+                    f.fill_out.clone(),
                     f.fill_status,
                     f.fill_unavailable_reason,
                     f.wallet_sol_delta,
@@ -11921,7 +12005,12 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         });
     }
 
-    // Release lock (in production: would release after confirmation)
+    IN_FLIGHT_CAPITAL_RESERVATIONS.store(
+        ctx.lock_manager.in_flight_reservation_count() as u64,
+        Ordering::Relaxed,
+    );
+
+    // Release lock at terminal outcome (confirmed / failed-confirmed / timeout-sent path).
     if matches!(decision.outcome, DecisionOutcome::Confirmed) && intent.side == TradeSide::Sell {
         // Do not re-add the sold input tokens to `available_tokens` (ghost open_positions).
         ctx.lock_manager
@@ -13198,11 +13287,11 @@ mod execution_engine_tests {
     use super::{
         apply_scope48_confirmed_sell_execution_metadata, build_signed_versioned_tx,
         build_unsigned_versioned_tx, cold_path_dex_sim_failure_triggers_discovery_recovery,
-        effective_intent_ttl_ms, intent_is_expired, is_cold_path_recovery_sell,
-        is_pump_amm_structural_sim_error, is_pumpfun_bonding_curve_structural_sim_error,
-        is_regular_momentum_hot_path_sell, liquidation_pumpfun_sell_preference,
-        liquidation_store_multi_pool_fallback_metadata, max_open_positions_buy_gate,
-        prepare_unsigned_versioned_tx_for_simulation,
+        compute_pre_send_capital_lock_ttl, effective_intent_ttl_ms, intent_is_expired,
+        is_cold_path_recovery_sell, is_pump_amm_structural_sim_error,
+        is_pumpfun_bonding_curve_structural_sim_error, is_regular_momentum_hot_path_sell,
+        liquidation_pumpfun_sell_preference, liquidation_store_multi_pool_fallback_metadata,
+        max_open_positions_buy_gate, prepare_unsigned_versioned_tx_for_simulation,
         pump_amm_hint_pool_cache_usable_for_tx_plan_builder,
         pump_amm_hot_path_quote_not_ready_detail, pump_amm_liquidation_discovery_force_refresh,
         pump_amm_liquidation_quote_timeout_str, pump_amm_pool_market_hint_merge,
@@ -13213,8 +13302,9 @@ mod execution_engine_tests {
         try_pump_amm_hot_path_refresh_publish, wait_for_meteora_dlmm_slave_after_recovery,
         wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder,
         wait_for_pump_amm_slave_after_recovery, wait_for_pumpfun_bonding_cache_refresh,
-        DiscoveryRequestOutcome, PumpAmmHotPathRefreshDecision, RouteCandidate,
-        PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN, WSOL_MINT,
+        ComputedIntentFills, DiscoveryRequestOutcome, ExecutionConfig,
+        PumpAmmHotPathRefreshDecision, RouteCandidate, PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN,
+        WSOL_MINT,
     };
     use ironcrab::execution::live_pool_cache::{
         CachedPoolState, LivePoolCache, MeteoraState, PumpAmmState, PumpFunState,
@@ -13224,8 +13314,9 @@ mod execution_engine_tests {
     use ironcrab::ipc::RejectReason;
     use ironcrab::ipc::{
         CheckResult, ControlResponse, ControlResponseStatus, DecisionOutcome, DecisionRecord,
-        DexPoolReadiness, ExecutionResult, ExecutionStatus, ExplicitAmount, IntentOrigin,
-        IntentTier, PoolCacheUpdate, TradeIntent, TradeResources, TradeSide, TradingRegime,
+        DexPoolReadiness, ExecutionResult, ExecutionStatus, ExplicitAmount, FillStatus,
+        IntentOrigin, IntentTier, PoolCacheUpdate, TradeIntent, TradeResources, TradeSide,
+        TradingRegime,
     };
     use ironcrab::solana::address_lookup_table::LoadedAlt;
     use ironcrab::solana::dex::pumpfun::PumpFunDex;
@@ -13371,6 +13462,62 @@ mod execution_engine_tests {
             5_000
         ));
         assert!(!intent_is_expired(intent_ts, intent_ts, Some(ttl), 5_000));
+    }
+
+    #[test]
+    fn pre_send_capital_lock_ttl_covers_cold_path_discovery_plus_sim_plus_buffer() {
+        let config = ExecutionConfig::default();
+        let ttl = compute_pre_send_capital_lock_ttl(&config);
+        // 45s liquidation + 20s SLAVE + 500ms sim + 10s buffer = 75.5s
+        assert!(
+            ttl.as_millis() >= 75_000,
+            "TTL must cover 65s+ cold path; got {}ms",
+            ttl.as_millis()
+        );
+        assert!(
+            ttl.as_millis() > 30_000,
+            "must exceed legacy 30s default lock TTL"
+        );
+    }
+
+    /// Mirrors `process_intent` fill cache: second consumer must not re-invoke the compute closure.
+    fn cached_or_compute_intent_fills_for_test(
+        cache: &mut Option<ComputedIntentFills>,
+        compute: impl FnOnce() -> ComputedIntentFills,
+    ) -> &ComputedIntentFills {
+        cache.get_or_insert_with(compute)
+    }
+
+    #[test]
+    fn fill_computation_runs_once_per_signature_cache() {
+        let mut cache: Option<ComputedIntentFills> = None;
+        let mut calls = 0u32;
+        cached_or_compute_intent_fills_for_test(&mut cache, || {
+            calls += 1;
+            ComputedIntentFills {
+                fill_in: None,
+                fill_out: None,
+                fill_status: FillStatus::Unavailable,
+                fill_unavailable_reason: None,
+                wallet_sol_delta: None,
+                block_time_unix_ms: Some(42),
+                wallet_token_balance_absent_after_tx: false,
+            }
+        });
+        cached_or_compute_intent_fills_for_test(&mut cache, || {
+            calls += 1;
+            ComputedIntentFills {
+                fill_in: None,
+                fill_out: None,
+                fill_status: FillStatus::Unavailable,
+                fill_unavailable_reason: None,
+                wallet_sol_delta: None,
+                block_time_unix_ms: Some(99),
+                wallet_token_balance_absent_after_tx: false,
+            }
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(cache.as_ref().unwrap().block_time_unix_ms, Some(42));
     }
 
     #[test]

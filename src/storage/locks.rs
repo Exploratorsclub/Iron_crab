@@ -51,6 +51,15 @@ impl LockHolder {
     }
 }
 
+/// Lifecycle phase for a capital lock / reservation (I-20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapitalLockPhase {
+    /// Planning, simulation, cold-path recovery — subject to TTL / `cleanup_expired`.
+    PreSend,
+    /// TX sent, confirm pending — immune to TTL cleanup; released only at terminal outcome.
+    InFlight,
+}
+
 /// Capital lock for SOL/token amounts
 #[derive(Debug, Clone)]
 pub struct CapitalLock {
@@ -75,6 +84,7 @@ pub struct CapitalLock {
     pub token_position_total_at_lock: HashMap<String, u64>,
     pub created_at: Instant,
     pub ttl: Duration,
+    pub phase: CapitalLockPhase,
 }
 
 /// Resource lock for pools/accounts
@@ -635,14 +645,25 @@ impl LockManager {
         self.processed_intents.write().insert(intent_id.to_string());
     }
 
-    /// Try to acquire a capital lock
+    /// Try to acquire a capital lock (pre-send TTL = [`Self::default_ttl`]).
     pub fn try_lock_capital(
         &self,
         holder: LockHolder,
         sol_lamports: u64,
         tokens: HashMap<String, u64>,
     ) -> LockResult {
-        // Clean expired locks first
+        self.try_lock_capital_with_ttl(holder, sol_lamports, tokens, None)
+    }
+
+    /// Try to acquire a capital lock with an optional pre-send TTL override.
+    pub fn try_lock_capital_with_ttl(
+        &self,
+        holder: LockHolder,
+        sol_lamports: u64,
+        tokens: HashMap<String, u64>,
+        ttl: Option<Duration>,
+    ) -> LockResult {
+        // Clean expired pre-send locks first (in-flight reservations are never expired here).
         self.cleanup_expired();
 
         // BUY: reserve quote spend. After WSOL is known from Geyser, reserve from the
@@ -715,7 +736,8 @@ impl LockManager {
             tokens,
             token_position_total_at_lock,
             created_at: Instant::now(),
-            ttl: self.default_ttl,
+            ttl: ttl.unwrap_or(self.default_ttl),
+            phase: CapitalLockPhase::PreSend,
         };
 
         debug!(
@@ -729,6 +751,16 @@ impl LockManager {
         LockResult::Acquired
     }
 
+    /// Try to acquire a resource lock (pre-send TTL = [`Self::default_ttl`]).
+    pub fn try_lock_resource(
+        &self,
+        holder: LockHolder,
+        resource_id: &str,
+        resource_type: ResourceType,
+    ) -> LockResult {
+        self.try_lock_resource_with_ttl(holder, resource_id, resource_type, None)
+    }
+
     /// Try to acquire a resource lock with preemption support (DoD L) P0)
     ///
     /// If the resource is locked by a lower-priority intent (higher tier number),
@@ -736,11 +768,12 @@ impl LockManager {
     ///
     /// P1: Fairness policy may block preemption if the target source has been
     /// preempted too many times recently (starvation protection).
-    pub fn try_lock_resource(
+    pub fn try_lock_resource_with_ttl(
         &self,
         holder: LockHolder,
         resource_id: &str,
         resource_type: ResourceType,
+        ttl: Option<Duration>,
     ) -> LockResult {
         self.cleanup_expired();
 
@@ -796,7 +829,7 @@ impl LockManager {
             resource_id: resource_id.to_string(),
             resource_type,
             created_at: Instant::now(),
-            ttl: self.default_ttl,
+            ttl: ttl.unwrap_or(self.default_ttl),
         };
 
         debug!(
@@ -815,6 +848,50 @@ impl LockManager {
             }
             _ => LockResult::Acquired,
         }
+    }
+
+    /// Extend the pre-send TTL for an intent that already holds a capital lock.
+    pub fn renew_capital_lock_ttl(&self, intent_id: &str, ttl: Duration) -> bool {
+        let mut locks = self.capital_locks.write();
+        if let Some(lock) = locks.get_mut(intent_id) {
+            if lock.phase == CapitalLockPhase::PreSend {
+                lock.ttl = ttl;
+                lock.created_at = Instant::now();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// After successful TX send: keep the capital reservation (I-20) but stop TTL expiry.
+    ///
+    /// Pool [`ResourceLock`]s are released here — they only serialize TX *build* for the same
+    /// pool/accounts; once the TX is sent this intent will not build a second TX on those resources.
+    /// Capital stays reserved until terminal outcome (`release_locks` / confirmed-SELL path).
+    pub fn promote_capital_lock_to_in_flight(&self, intent_id: &str) -> bool {
+        let promoted = {
+            let mut locks = self.capital_locks.write();
+            if let Some(lock) = locks.get_mut(intent_id) {
+                lock.phase = CapitalLockPhase::InFlight;
+                true
+            } else {
+                false
+            }
+        };
+        if promoted {
+            self.release_resource_locks_for_intent(intent_id);
+            debug!(intent_id, "Capital lock promoted to in-flight reservation");
+        }
+        promoted
+    }
+
+    /// Count capital locks in the in-flight (post-send) phase.
+    pub fn in_flight_reservation_count(&self) -> usize {
+        self.capital_locks
+            .read()
+            .values()
+            .filter(|l| l.phase == CapitalLockPhase::InFlight)
+            .count()
     }
 
     /// Release all locks for an intent
@@ -871,17 +948,23 @@ impl LockManager {
         }
     }
 
-    /// Cleanup expired locks
-    pub fn cleanup_expired(&self) {
+    /// Cleanup expired pre-send locks. In-flight reservations are never released here.
+    ///
+    /// Returns the number of pre-send capital locks released by TTL expiry.
+    pub fn cleanup_expired(&self) -> usize {
         let now = Instant::now();
 
-        // Cleanup capital locks
+        // Cleanup capital locks (pre-send only — in-flight reservations are immune).
         let mut capital_locks = self.capital_locks.write();
         let expired: Vec<_> = capital_locks
             .iter()
-            .filter(|(_, lock)| now.duration_since(lock.created_at) > lock.ttl)
+            .filter(|(_, lock)| {
+                lock.phase == CapitalLockPhase::PreSend
+                    && now.duration_since(lock.created_at) > lock.ttl
+            })
             .map(|(k, _)| k.clone())
             .collect();
+        let pre_send_expired_count = expired.len();
 
         for key in expired {
             if let Some(lock) = capital_locks.remove(&key) {
@@ -896,9 +979,10 @@ impl LockManager {
                 for (mint, amount) in lock.tokens {
                     *available_tokens.entry(mint).or_insert(0) += amount;
                 }
-                warn!(intent_id = %key, "Capital lock expired and released");
+                warn!(intent_id = %key, "Pre-send capital lock expired and released");
             }
         }
+        drop(capital_locks);
 
         // Cleanup resource locks
         let mut resource_locks = self.resource_locks.write();
@@ -912,6 +996,8 @@ impl LockManager {
             resource_locks.remove(&key);
             warn!(resource_id = %key, "Resource lock expired and released");
         }
+
+        pre_send_expired_count
     }
 
     /// Get current available SOL
@@ -1713,5 +1799,98 @@ mod tests {
             LockResult::Acquired
         ));
         assert_eq!(m.intent_token_position_total_at_lock("x", M), Some(100));
+    }
+
+    // --- Capital lock lifecycle: pre-send TTL vs in-flight reservation (I-20) ---
+
+    #[test]
+    fn test_in_flight_reservation_survives_cleanup_expired() {
+        let m = LockManager::new(1_000_000_000).with_ttl(Duration::from_millis(1));
+        assert!(matches!(
+            m.try_lock_capital_with_ttl(
+                LockHolder::new("sent-wait-confirm"),
+                400_000_000,
+                HashMap::new(),
+                Some(Duration::from_millis(1)),
+            ),
+            LockResult::Acquired
+        ));
+        assert_eq!(m.available_sol(), 600_000_000);
+        assert!(m.promote_capital_lock_to_in_flight("sent-wait-confirm"));
+        assert_eq!(m.in_flight_reservation_count(), 1);
+
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(m.cleanup_expired(), 0);
+        assert_eq!(m.available_sol(), 600_000_000);
+        assert_eq!(m.in_flight_reservation_count(), 1);
+    }
+
+    #[test]
+    fn test_second_intent_cannot_overbook_while_in_flight_reservation_active() {
+        let m = LockManager::new(500_000_000);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("first"), 400_000_000, HashMap::new()),
+            LockResult::Acquired
+        ));
+        assert!(m.promote_capital_lock_to_in_flight("first"));
+        let r = m.try_lock_capital(LockHolder::new("second"), 200_000_000, HashMap::new());
+        assert!(matches!(r, LockResult::InsufficientCapital { .. }));
+        m.release_locks("first");
+        assert_eq!(m.available_sol(), 500_000_000);
+    }
+
+    #[test]
+    fn test_in_flight_reservation_released_on_terminal_outcome() {
+        let m = LockManager::new(1_000_000_000);
+        assert!(matches!(
+            m.try_lock_capital(LockHolder::new("confirmed"), 300_000_000, HashMap::new()),
+            LockResult::Acquired
+        ));
+        assert!(m.promote_capital_lock_to_in_flight("confirmed"));
+        assert_eq!(m.in_flight_reservation_count(), 1);
+        m.release_locks("confirmed");
+        assert_eq!(m.in_flight_reservation_count(), 0);
+        assert_eq!(m.available_sol(), 1_000_000_000);
+    }
+
+    #[test]
+    fn test_pre_send_lock_expired_by_cleanup_expired() {
+        let m = LockManager::new(1_000_000_000).with_ttl(Duration::from_millis(1));
+        assert!(matches!(
+            m.try_lock_capital_with_ttl(
+                LockHolder::new("planning"),
+                250_000_000,
+                HashMap::new(),
+                Some(Duration::from_millis(1)),
+            ),
+            LockResult::Acquired
+        ));
+        assert_eq!(m.available_sol(), 750_000_000);
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(m.cleanup_expired(), 1);
+        assert_eq!(m.available_sol(), 1_000_000_000);
+        assert_eq!(m.in_flight_reservation_count(), 0);
+    }
+
+    #[test]
+    fn test_promote_releases_pool_resource_locks_not_capital() {
+        let m = LockManager::new(1_000_000_000);
+        let holder = LockHolder::new("pool-tx");
+        assert!(matches!(
+            m.try_lock_resource(holder.clone(), "pool-abc", ResourceType::Pool),
+            LockResult::Acquired
+        ));
+        assert!(matches!(
+            m.try_lock_capital(holder, 100_000_000, HashMap::new()),
+            LockResult::Acquired
+        ));
+        let (_, res_before) = m.active_lock_count();
+        assert_eq!(res_before, 1);
+        assert!(m.promote_capital_lock_to_in_flight("pool-tx"));
+        let (cap, res_after) = m.active_lock_count();
+        assert_eq!(cap, 1, "capital reservation must remain");
+        assert_eq!(res_after, 0, "pool lock released after send");
+        assert_eq!(m.available_sol(), 900_000_000);
+        m.release_locks("pool-tx");
     }
 }

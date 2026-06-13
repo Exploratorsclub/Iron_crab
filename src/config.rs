@@ -306,6 +306,9 @@ pub struct ExecutionEngineCfg {
     /// Rebroadcast signed TX via TPU when TxSender is available (fallback RPC). Default: true when TPU enabled.
     #[serde(default)]
     pub rebroadcast_use_tpu: Option<bool>,
+    /// Buffer (ms) added to discovery + simulation when computing pre-send capital-lock TTL. Default: 10000.
+    #[serde(default)]
+    pub capital_lock_ttl_buffer_ms: Option<u64>,
 }
 
 /// Fee Policy Configuration
