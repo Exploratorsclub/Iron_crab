@@ -42,11 +42,15 @@ use ironcrab::ipc::{
     TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
-    arb_two_hop_opportunity_inc, arb_two_hop_rejected_inc, arb_two_hop_tracker_seeded_pools_add,
-    serve_metrics, set_readiness_nats_connected, ArbTwoHopRejectReason, MetricsComponent,
-    ARB_REJECTED_MISSING_ACCOUNTS, ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL,
-    MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
-    POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
+    arb_subscriber_high_processed_inc, arb_subscriber_high_queue_depth_set,
+    arb_subscriber_low_coalesced_inc, arb_subscriber_low_dropped_inc,
+    arb_subscriber_low_processed_inc, arb_subscriber_low_queue_depth_set,
+    arb_subscriber_pool_created_skipped_inc, arb_two_hop_opportunity_inc, arb_two_hop_rejected_inc,
+    arb_two_hop_tracker_seeded_pools_add, serve_metrics, set_readiness_nats_connected,
+    ArbTwoHopRejectReason, MetricsComponent, ARB_REJECTED_MISSING_ACCOUNTS,
+    ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL,
+    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
+    TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, pool_cache_live_fallback_consumer_config,
@@ -173,6 +177,11 @@ const DLMM_PROBE_SOL_LAMPORTS: u64 = 10_000_000;
 const DLMM_MARGINAL_MAX_DEVIATION_FACTOR: u64 = 100;
 /// Deduplicate per-mint "spread too large" WARN logs.
 const SPREAD_TOO_LARGE_WARN_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Bounded HIGH-priority MarketEvent queue (Trade + active-pool state updates).
+const ARB_HIGH_EVENT_QUEUE_CAP: usize = 8192;
+/// Max distinct LOW-priority pool keys coalesced before latest-wins eviction.
+const ARB_LOW_COALESCER_CAP: usize = 2048;
 
 static DLMM_MARGINAL_PRICE_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
@@ -1185,6 +1194,276 @@ struct ArbOpportunity {
 }
 
 // ============================================================================
+// MarketEvent ingress pipeline (decoupled NATS reader + prioritized worker)
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArbEventPriority {
+    High,
+    Low,
+}
+
+fn is_common_quote_mint(mint: &str) -> bool {
+    mint == NATIVE_SOL_MINT || mint == USDC_MINT || mint == USDT_MINT
+}
+
+/// True when the pair may matter for 2-hop (SOL-quoted) or multi-hop (common quote on either side).
+fn is_arb_relevant_pool_pair(base_mint: &str, quote_mint: &str) -> bool {
+    is_common_quote_mint(quote_mint) || is_common_quote_mint(base_mint)
+}
+
+fn market_event_pool_key(event: &MarketEvent) -> Option<String> {
+    match &event.kind {
+        MarketEventKind::PoolCreated { pool_address, .. }
+        | MarketEventKind::DexPoolAccounts { pool_address, .. }
+        | MarketEventKind::PoolStateUpdate { pool_address, .. }
+        | MarketEventKind::BinArrayUpdate { pool_address, .. }
+        | MarketEventKind::Trade { pool_address, .. } => Some(pool_address.clone()),
+        _ => None,
+    }
+}
+
+fn classify_market_event_priority(
+    event: &MarketEvent,
+    known_pools: &HashSet<String>,
+) -> ArbEventPriority {
+    match &event.kind {
+        MarketEventKind::Trade { .. } => ArbEventPriority::High,
+        MarketEventKind::PoolStateUpdate { pool_address, .. }
+        | MarketEventKind::BinArrayUpdate { pool_address, .. } => {
+            if known_pools.contains(pool_address) {
+                ArbEventPriority::High
+            } else {
+                ArbEventPriority::Low
+            }
+        }
+        MarketEventKind::PoolCreated { .. }
+        | MarketEventKind::DexPoolAccounts { .. }
+        | MarketEventKind::TokenMintInfo { .. } => ArbEventPriority::Low,
+        _ => ArbEventPriority::Low,
+    }
+}
+
+/// Whether a `PoolCreated` should enter the LOW coalescer (filter + per-pool dedupe).
+fn should_enqueue_pool_created(
+    pool_address: &str,
+    base_mint: &str,
+    quote_mint: &str,
+    seen: &mut HashSet<String>,
+) -> bool {
+    if !is_arb_relevant_pool_pair(base_mint, quote_mint) {
+        return false;
+    }
+    seen.insert(pool_address.to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LowCoalescerInsert {
+    Queued,
+    Coalesced,
+    Dropped,
+}
+
+/// Latest-wins coalescer for LOW MarketEvents keyed by pool address.
+struct ArbLowEventCoalescer {
+    by_pool: HashMap<String, MarketEvent>,
+}
+
+impl ArbLowEventCoalescer {
+    fn new() -> Self {
+        Self {
+            by_pool: HashMap::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.by_pool.len()
+    }
+
+    fn insert(&mut self, event: MarketEvent, cap: usize) -> LowCoalescerInsert {
+        let Some(key) = market_event_pool_key(&event) else {
+            if self.by_pool.len() >= cap {
+                arb_subscriber_low_dropped_inc();
+                return LowCoalescerInsert::Dropped;
+            }
+            let key = format!("__anon_{}", self.by_pool.len());
+            self.by_pool.insert(key, event);
+            return LowCoalescerInsert::Queued;
+        };
+
+        if let Some(existing) = self.by_pool.get_mut(&key) {
+            *existing = event;
+            arb_subscriber_low_coalesced_inc();
+            return LowCoalescerInsert::Coalesced;
+        }
+
+        if self.by_pool.len() >= cap {
+            if let Some(evict_key) = self.by_pool.keys().next().cloned() {
+                self.by_pool.remove(&evict_key);
+                arb_subscriber_low_dropped_inc();
+            }
+        }
+
+        self.by_pool.insert(key, event);
+        LowCoalescerInsert::Queued
+    }
+
+    fn drain(&mut self) -> Vec<MarketEvent> {
+        self.by_pool.drain().map(|(_, event)| event).collect()
+    }
+}
+
+async fn publish_arb_intent(ctx: &ArbContext, intent: &TradeIntent) {
+    if let Err(e) = ctx.jsonl_writer.write(intent) {
+        error!(error = %e, "Failed to write intent to JSONL");
+    }
+
+    if let Some(ref nats) = ctx.nats {
+        if let Err(e) = nats.publish(TOPIC_TRADE_INTENTS, intent).await {
+            warn!(error = %e, "Failed to publish intent to NATS");
+        } else {
+            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            INTENTS_GENERATED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            ctx.intents_generated.fetch_add(1, Ordering::Relaxed);
+            info!(
+                intent_id = %intent.intent_id,
+                mint = %intent.resources.output_mint,
+                spread_bps = intent.expected_roi_bps,
+                "🎯 Arb intent published"
+            );
+        }
+    }
+}
+
+async fn process_arb_market_event(
+    ctx: &ArbContext,
+    event: MarketEvent,
+    priority: ArbEventPriority,
+) {
+    MARKET_EVENTS_CONSUMED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    match priority {
+        ArbEventPriority::High => arb_subscriber_high_processed_inc(),
+        ArbEventPriority::Low => arb_subscriber_low_processed_inc(),
+    }
+
+    if let Some(intent) = handle_market_event(ctx, &event).await {
+        publish_arb_intent(ctx, &intent).await;
+    }
+}
+
+fn spawn_arb_market_event_pipeline(
+    ctx: Arc<ArbContext>,
+    mut market_sub: ironcrab::nats::NatsSubscription,
+) {
+    let (high_tx, mut high_rx) = mpsc::channel::<MarketEvent>(ARB_HIGH_EVENT_QUEUE_CAP);
+    let low_coalescer = Arc::new(parking_lot::Mutex::new(ArbLowEventCoalescer::new()));
+    let low_notify = Arc::new(tokio::sync::Notify::new());
+
+    let reader_ctx = ctx.clone();
+    let reader_coalescer = low_coalescer.clone();
+    let reader_notify = low_notify.clone();
+    tokio::spawn(async move {
+        let mut pool_created_seen = HashSet::new();
+        while let Some(nats_msg) = market_sub.next().await {
+            NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            reader_ctx.events_received.fetch_add(1, Ordering::Relaxed);
+
+            let event = match serde_json::from_slice::<MarketEvent>(&nats_msg.payload) {
+                Ok(event) => event,
+                Err(e) => {
+                    warn!(error = %e, "Failed to deserialize MarketEvent");
+                    continue;
+                }
+            };
+
+            if let MarketEventKind::PoolCreated {
+                pool_address,
+                base_mint,
+                quote_mint,
+                ..
+            } = &event.kind
+            {
+                if !should_enqueue_pool_created(
+                    pool_address,
+                    base_mint,
+                    quote_mint,
+                    &mut pool_created_seen,
+                ) {
+                    arb_subscriber_pool_created_skipped_inc();
+                    continue;
+                }
+            }
+
+            let known_pools = reader_ctx.known_pools.read().clone();
+            let priority = classify_market_event_priority(&event, &known_pools);
+
+            match priority {
+                ArbEventPriority::High => {
+                    let depth = ARB_HIGH_EVENT_QUEUE_CAP.saturating_sub(high_tx.capacity());
+                    arb_subscriber_high_queue_depth_set(depth as u64);
+                    if high_tx.try_send(event.clone()).is_err()
+                        && high_tx.send(event).await.is_err()
+                    {
+                        warn!("arb-strategy HIGH event queue closed; stopping NATS reader");
+                        break;
+                    }
+                    arb_subscriber_high_queue_depth_set(
+                        ARB_HIGH_EVENT_QUEUE_CAP.saturating_sub(high_tx.capacity()) as u64,
+                    );
+                }
+                ArbEventPriority::Low => {
+                    let mut coalescer = reader_coalescer.lock();
+                    coalescer.insert(event, ARB_LOW_COALESCER_CAP);
+                    arb_subscriber_low_queue_depth_set(coalescer.len() as u64);
+                    drop(coalescer);
+                    reader_notify.notify_one();
+                }
+            }
+        }
+        info!("arb-strategy NATS MarketEvent reader stopped");
+    });
+
+    let worker_ctx = ctx.clone();
+    let worker_coalescer = low_coalescer.clone();
+    let worker_notify = low_notify.clone();
+    tokio::spawn(async move {
+        let mut low_interval = tokio::time::interval(Duration::from_millis(2));
+        low_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            while let Ok(event) = high_rx.try_recv() {
+                process_arb_market_event(&worker_ctx, event, ArbEventPriority::High).await;
+            }
+
+            tokio::select! {
+                biased;
+                maybe_high = high_rx.recv() => {
+                    match maybe_high {
+                        Some(event) => {
+                            process_arb_market_event(&worker_ctx, event, ArbEventPriority::High).await;
+                        }
+                        None => break,
+                    }
+                }
+                _ = worker_notify.notified() => {}
+                _ = low_interval.tick() => {}
+            }
+
+            let low_batch = {
+                let mut coalescer = worker_coalescer.lock();
+                let batch = coalescer.drain();
+                arb_subscriber_low_queue_depth_set(coalescer.len() as u64);
+                batch
+            };
+            for event in low_batch {
+                process_arb_market_event(&worker_ctx, event, ArbEventPriority::Low).await;
+            }
+        }
+        info!("arb-strategy MarketEvent worker stopped");
+    });
+}
+
+// ============================================================================
 // Runtime Context
 // ============================================================================
 
@@ -1615,6 +1894,10 @@ impl ArbContext {
         let tracker = trackers
             .entry(base_mint.to_string())
             .or_insert_with(|| TokenArbTracker::new(base_mint));
+
+        if tracker.pools.contains_key(pool_address) {
+            return;
+        }
 
         let pool_state = PoolState {
             pool_address: pool_address.to_string(),
@@ -2499,7 +2782,9 @@ async fn main() -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("arb_strategy=info".parse()?)
-                .add_directive("ironcrab=info".parse()?),
+                .add_directive("ironcrab=info".parse()?)
+                // async_nats logs slow-consumer INFO per dropped message — journald amplification.
+                .add_directive("async_nats=warn".parse()?),
         )
         .init();
 
@@ -2800,13 +3085,23 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Main event loop
+    // Subscribe to MarketEvents and spawn decoupled ingress pipeline (NATS reader + prioritized worker).
+    if let Some(sub) = market_subscription {
+        info!(
+            topic = TOPIC_MARKET_EVENTS,
+            high_queue_cap = ARB_HIGH_EVENT_QUEUE_CAP,
+            low_coalescer_cap = ARB_LOW_COALESCER_CAP,
+            "Starting MarketEvent ingress pipeline (HIGH/LOW priority)"
+        );
+        spawn_arb_market_event_pipeline(ctx.clone(), sub);
+    }
+
+    // Main event loop (config, JetStream cache sync, heartbeat — MarketEvents handled by pipeline)
     info!("Entering main event loop");
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
-    let mut market_sub = market_subscription;
     let mut cfg_sub = config_subscription;
     let config_js_consumer_opt = config_js_consumer;
     let pool_cache_consumer_opt = pool_cache_consumer;
@@ -2814,55 +3109,6 @@ async fn main() -> Result<()> {
 
     loop {
         tokio::select! {
-            // MarketEvents
-            msg = async {
-                if let Some(ref mut sub) = market_sub {
-                    sub.next().await
-                } else {
-                    std::future::pending::<Option<ironcrab::nats::NatsMessage>>().await
-                }
-            } => {
-                if let Some(nats_msg) = msg {
-                    // Prometheus: count inbound NATS messages for this process
-                    NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    ctx.events_received.fetch_add(1, Ordering::Relaxed);
-
-                    match serde_json::from_slice::<MarketEvent>(&nats_msg.payload) {
-                        Ok(event) => {
-                            // Prometheus: count consumed MarketEvents for this process
-                            MARKET_EVENTS_CONSUMED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            if let Some(intent) = handle_market_event(&ctx, &event).await {
-                                // Write to JSONL
-                                if let Err(e) = ctx.jsonl_writer.write(&intent) {
-                                    error!(error = %e, "Failed to write intent to JSONL");
-                                }
-
-                                // Publish to NATS
-                                if let Some(ref nats) = ctx.nats {
-                                    if let Err(e) = nats.publish(TOPIC_TRADE_INTENTS, &intent).await {
-                                        warn!(error = %e, "Failed to publish intent to NATS");
-                                    } else {
-                                        // Prometheus: count outbound NATS messages and intents
-                                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                        INTENTS_GENERATED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                        ctx.intents_generated.fetch_add(1, Ordering::Relaxed);
-                                        info!(
-                                            intent_id = %intent.intent_id,
-                                            mint = %intent.resources.output_mint,
-                                            spread_bps = intent.expected_roi_bps,
-                                            "🎯 Arb intent published"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Failed to deserialize MarketEvent");
-                        }
-                    }
-                }
-            }
-
             // Config updates (Core NATS fallback)
             msg = async {
                 if let Some(ref mut sub) = cfg_sub {
@@ -3047,17 +3293,16 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
     // Update Geyser connection health timestamp on every event
     *ctx.last_market_event.write() = Instant::now();
 
-    // Debug: Log event type to verify Trade events are arriving
     match &event.kind {
         MarketEventKind::Trade {
             sol_amount,
             token_amount,
             ..
         } => {
-            info!(sol_amount, token_amount, "Received Trade event");
+            trace!(sol_amount, token_amount, "Trade event");
         }
-        MarketEventKind::PoolCreated { .. } => {
-            info!("Received PoolCreated event");
+        MarketEventKind::PoolCreated { pool_address, .. } => {
+            trace!(pool = %pool_address, "PoolCreated event");
         }
         _ => {}
     }
@@ -3213,6 +3458,213 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
         }
 
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod event_pipeline_tests {
+    use super::*;
+    use ironcrab::ipc::MarketEventKind;
+
+    const TEST_COMPONENT: &str = "test";
+    const TEST_BUILD: &str = "0.0.0";
+    const TEST_RUN: &str = "run-test";
+
+    fn sample_trade_event(pool: &str) -> MarketEvent {
+        MarketEvent::new(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            format!("evt-trade-{pool}"),
+            "geyser",
+            Some(1),
+            MarketEventKind::Trade {
+                pool_address: pool.to_string(),
+                mint: "TokenMint11111111111111111111111111111111".to_string(),
+                quote_mint: NATIVE_SOL_MINT.to_string(),
+                trader: "Trader111111111111111111111111111111111111".to_string(),
+                sol_amount: 1_000_000,
+                token_amount: 1_000_000,
+                token_decimals: 6,
+                is_buy: true,
+                signature: None,
+                dex: "raydium".to_string(),
+                creator: None,
+                token_program: None,
+            },
+        )
+    }
+
+    fn sample_pool_created(pool: &str, base: &str, quote: &str) -> MarketEvent {
+        MarketEvent::new(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            format!("evt-pc-{pool}"),
+            "geyser",
+            Some(1),
+            MarketEventKind::PoolCreated {
+                pool_address: pool.to_string(),
+                base_mint: base.to_string(),
+                quote_mint: quote.to_string(),
+                dex: "raydium".to_string(),
+                initial_liquidity_sol: Some(Decimal::ONE),
+            },
+        )
+    }
+
+    #[test]
+    fn pool_created_dedupe_skips_duplicate_pool_id() {
+        let mut seen = HashSet::new();
+        assert!(should_enqueue_pool_created(
+            "pool-a",
+            "TokenMint11111111111111111111111111111111",
+            NATIVE_SOL_MINT,
+            &mut seen,
+        ));
+        assert!(!should_enqueue_pool_created(
+            "pool-a",
+            "TokenMint11111111111111111111111111111111",
+            NATIVE_SOL_MINT,
+            &mut seen,
+        ));
+    }
+
+    #[test]
+    fn pool_created_filter_skips_non_relevant_pairs() {
+        let mut seen = HashSet::new();
+        assert!(!should_enqueue_pool_created(
+            "pool-x",
+            "TokenA1111111111111111111111111111111111",
+            "TokenB1111111111111111111111111111111111",
+            &mut seen,
+        ));
+        assert!(should_enqueue_pool_created(
+            "pool-sol",
+            "TokenMint11111111111111111111111111111111",
+            NATIVE_SOL_MINT,
+            &mut seen,
+        ));
+    }
+
+    #[test]
+    fn trade_events_classify_as_high_priority() {
+        let known = HashSet::new();
+        let event = sample_trade_event("pool-trade");
+        assert_eq!(
+            classify_market_event_priority(&event, &known),
+            ArbEventPriority::High
+        );
+    }
+
+    #[test]
+    fn known_pool_state_update_is_high_unknown_is_low() {
+        let mut known = HashSet::new();
+        known.insert("pool-known".to_string());
+        let high_event = MarketEvent::new(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            "evt-psu-high".to_string(),
+            "geyser",
+            Some(1),
+            MarketEventKind::PoolStateUpdate {
+                pool_address: "pool-known".to_string(),
+                dex: "orca".to_string(),
+                reserve_base: 1,
+                reserve_quote: 1,
+                update_slot: 1,
+                active_id: None,
+                bin_step: None,
+                base_mint: NATIVE_SOL_MINT.to_string(),
+                quote_mint: "TokenMint11111111111111111111111111111111".to_string(),
+            },
+        );
+        let low_event = MarketEvent::new(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            "evt-psu-low".to_string(),
+            "geyser",
+            Some(1),
+            MarketEventKind::PoolStateUpdate {
+                pool_address: "pool-unknown".to_string(),
+                dex: "orca".to_string(),
+                reserve_base: 1,
+                reserve_quote: 1,
+                update_slot: 1,
+                active_id: None,
+                bin_step: None,
+                base_mint: NATIVE_SOL_MINT.to_string(),
+                quote_mint: "TokenMint11111111111111111111111111111111".to_string(),
+            },
+        );
+        assert_eq!(
+            classify_market_event_priority(&high_event, &known),
+            ArbEventPriority::High
+        );
+        assert_eq!(
+            classify_market_event_priority(&low_event, &known),
+            ArbEventPriority::Low
+        );
+    }
+
+    #[test]
+    fn low_coalescer_latest_wins_and_counts_coalesce() {
+        let before = ironcrab::metrics::ARB_SUBSCRIBER_LOW_COALESCED_TOTAL.load(Ordering::Relaxed);
+        let mut coalescer = ArbLowEventCoalescer::new();
+        let e1 = sample_pool_created(
+            "pool-1",
+            "TokenMint11111111111111111111111111111111",
+            NATIVE_SOL_MINT,
+        );
+        let e2 = sample_pool_created(
+            "pool-1",
+            "TokenMint22222222222222222222222222222222",
+            NATIVE_SOL_MINT,
+        );
+        assert_eq!(coalescer.insert(e1, 16), LowCoalescerInsert::Queued);
+        assert_eq!(coalescer.insert(e2, 16), LowCoalescerInsert::Coalesced);
+        let drained = coalescer.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(
+            drained[0].kind,
+            MarketEventKind::PoolCreated {
+                pool_address: "pool-1".to_string(),
+                base_mint: "TokenMint22222222222222222222222222222222".to_string(),
+                quote_mint: NATIVE_SOL_MINT.to_string(),
+                dex: "raydium".to_string(),
+                initial_liquidity_sol: Some(Decimal::ONE),
+            }
+        );
+        let after = ironcrab::metrics::ARB_SUBSCRIBER_LOW_COALESCED_TOTAL.load(Ordering::Relaxed);
+        assert!(after > before);
+    }
+
+    #[test]
+    fn low_coalescer_eviction_increments_dropped_metric() {
+        let before = ironcrab::metrics::ARB_SUBSCRIBER_LOW_DROPPED_TOTAL.load(Ordering::Relaxed);
+        let mut coalescer = ArbLowEventCoalescer::new();
+        for i in 0..5 {
+            let pool = format!("pool-{i}");
+            let event = sample_pool_created(
+                &pool,
+                "TokenMint11111111111111111111111111111111",
+                NATIVE_SOL_MINT,
+            );
+            let _ = coalescer.insert(event, 2);
+        }
+        let after = ironcrab::metrics::ARB_SUBSCRIBER_LOW_DROPPED_TOTAL.load(Ordering::Relaxed);
+        assert!(after > before);
+    }
+
+    #[test]
+    fn high_priority_channel_does_not_drop_when_within_capacity() {
+        let (tx, mut rx) = mpsc::channel::<MarketEvent>(8);
+        let event = sample_trade_event("pool-h");
+        tx.try_send(event)
+            .expect("HIGH trade must enqueue without drop");
+        assert!(rx.try_recv().is_ok());
     }
 }
 

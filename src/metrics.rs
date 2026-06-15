@@ -2458,6 +2458,44 @@ pub fn arb_two_hop_tracker_seeded_pools_add(count: u64) {
     ARB_TWO_HOP_TRACKER_SEEDED_POOLS.fetch_add(count, Ordering::Relaxed);
 }
 
+// --- Arb-strategy MarketEvent subscriber pipeline ---
+pub static ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_SUBSCRIBER_LOW_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_SUBSCRIBER_LOW_PROCESSED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_SUBSCRIBER_LOW_COALESCED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_SUBSCRIBER_LOW_DROPPED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_SUBSCRIBER_POOL_CREATED_SKIPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub fn arb_subscriber_high_queue_depth_set(depth: u64) {
+    ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH.store(depth, Ordering::Relaxed);
+}
+
+pub fn arb_subscriber_low_queue_depth_set(depth: u64) {
+    ARB_SUBSCRIBER_LOW_QUEUE_DEPTH.store(depth, Ordering::Relaxed);
+}
+
+pub fn arb_subscriber_high_processed_inc() {
+    ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn arb_subscriber_low_processed_inc() {
+    ARB_SUBSCRIBER_LOW_PROCESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn arb_subscriber_low_coalesced_inc() {
+    ARB_SUBSCRIBER_LOW_COALESCED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn arb_subscriber_low_dropped_inc() {
+    ARB_SUBSCRIBER_LOW_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn arb_subscriber_pool_created_skipped_inc() {
+    ARB_SUBSCRIBER_POOL_CREATED_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 // --- Multi-hop shadow / cycle sanity (arb-strategy) ---
 pub static MULTI_HOP_RETURN_BPS_SATURATED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MULTI_HOP_SHADOW_LOGGED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -4346,6 +4384,34 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_two_hop_tracker_seeded_pools_total",
         ARB_TWO_HOP_TRACKER_SEEDED_POOLS.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_subscriber_high_queue_depth",
+        ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_subscriber_low_queue_depth",
+        ARB_SUBSCRIBER_LOW_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_subscriber_high_processed_total",
+        ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_subscriber_low_processed_total",
+        ARB_SUBSCRIBER_LOW_PROCESSED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_subscriber_low_coalesced_total",
+        ARB_SUBSCRIBER_LOW_COALESCED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_subscriber_low_dropped_total",
+        ARB_SUBSCRIBER_LOW_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_subscriber_pool_created_skipped_total",
+        ARB_SUBSCRIBER_POOL_CREATED_SKIPPED_TOTAL.load(Ordering::Relaxed)
     );
     out.push_str("arb_two_hop_rejected_total{reason=\"spread_too_large\"} ");
     out.push_str(
