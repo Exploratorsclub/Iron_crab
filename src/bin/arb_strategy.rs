@@ -1421,23 +1421,26 @@ fn spawn_arb_market_event_pipeline(
         let mut low_interval = tokio::time::interval(Duration::from_millis(2));
         low_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        let mut shutting_down = false;
         loop {
             while let Ok(event) = high_rx.try_recv() {
                 process_arb_market_event(&worker_ctx, event, ArbEventPriority::High).await;
             }
 
-            tokio::select! {
-                biased;
-                maybe_high = high_rx.recv() => {
-                    match maybe_high {
-                        Some(event) => {
-                            process_arb_market_event(&worker_ctx, event, ArbEventPriority::High).await;
+            if !shutting_down {
+                tokio::select! {
+                    biased;
+                    maybe_high = high_rx.recv() => {
+                        match maybe_high {
+                            Some(event) => {
+                                process_arb_market_event(&worker_ctx, event, ArbEventPriority::High).await;
+                            }
+                            None => shutting_down = true,
                         }
-                        None => break,
                     }
+                    _ = worker_notify.notified() => {}
+                    _ = low_interval.tick() => {}
                 }
-                _ = worker_notify.notified() => {}
-                _ = low_interval.tick() => {}
             }
 
             let low_batch = {
@@ -1447,7 +1450,14 @@ fn spawn_arb_market_event_pipeline(
                 batch
             };
             for event in low_batch {
+                while let Ok(high_event) = high_rx.try_recv() {
+                    process_arb_market_event(&worker_ctx, high_event, ArbEventPriority::High).await;
+                }
                 process_arb_market_event(&worker_ctx, event, ArbEventPriority::Low).await;
+            }
+
+            if shutting_down {
+                break;
             }
         }
         info!("arb-strategy MarketEvent worker stopped");
