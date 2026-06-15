@@ -1214,11 +1214,17 @@ fn is_arb_relevant_pool_pair(base_mint: &str, quote_mint: &str) -> bool {
 
 fn market_event_pool_key(event: &MarketEvent) -> Option<String> {
     match &event.kind {
-        MarketEventKind::PoolCreated { pool_address, .. }
-        | MarketEventKind::DexPoolAccounts { pool_address, .. }
-        | MarketEventKind::PoolStateUpdate { pool_address, .. }
-        | MarketEventKind::BinArrayUpdate { pool_address, .. }
-        | MarketEventKind::Trade { pool_address, .. } => Some(pool_address.clone()),
+        MarketEventKind::PoolCreated { pool_address, .. } => {
+            Some(format!("{pool_address}:created"))
+        }
+        MarketEventKind::DexPoolAccounts { pool_address, .. } => {
+            Some(format!("{pool_address}:accounts"))
+        }
+        MarketEventKind::PoolStateUpdate { pool_address, .. } => {
+            Some(format!("{pool_address}:state"))
+        }
+        MarketEventKind::BinArrayUpdate { pool_address, .. } => Some(format!("{pool_address}:bin")),
+        MarketEventKind::Trade { pool_address, .. } => Some(format!("{pool_address}:trade")),
         _ => None,
     }
 }
@@ -1244,17 +1250,9 @@ fn classify_market_event_priority(
     }
 }
 
-/// Whether a `PoolCreated` should enter the LOW coalescer (filter + per-pool dedupe).
-fn should_enqueue_pool_created(
-    pool_address: &str,
-    base_mint: &str,
-    quote_mint: &str,
-    seen: &mut HashSet<String>,
-) -> bool {
-    if !is_arb_relevant_pool_pair(base_mint, quote_mint) {
-        return false;
-    }
-    seen.insert(pool_address.to_string())
+/// Whether a `PoolCreated` should enter the LOW coalescer (arb-relevance filter only).
+fn should_enqueue_pool_created(base_mint: &str, quote_mint: &str) -> bool {
+    is_arb_relevant_pool_pair(base_mint, quote_mint)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1363,7 +1361,6 @@ fn spawn_arb_market_event_pipeline(
     let reader_coalescer = low_coalescer.clone();
     let reader_notify = low_notify.clone();
     tokio::spawn(async move {
-        let mut pool_created_seen = HashSet::new();
         while let Some(nats_msg) = market_sub.next().await {
             NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
             reader_ctx.events_received.fetch_add(1, Ordering::Relaxed);
@@ -1377,18 +1374,12 @@ fn spawn_arb_market_event_pipeline(
             };
 
             if let MarketEventKind::PoolCreated {
-                pool_address,
                 base_mint,
                 quote_mint,
                 ..
             } = &event.kind
             {
-                if !should_enqueue_pool_created(
-                    pool_address,
-                    base_mint,
-                    quote_mint,
-                    &mut pool_created_seen,
-                ) {
+                if !should_enqueue_pool_created(base_mint, quote_mint) {
                     arb_subscriber_pool_created_skipped_inc();
                     continue;
                 }
@@ -3514,36 +3505,14 @@ mod event_pipeline_tests {
     }
 
     #[test]
-    fn pool_created_dedupe_skips_duplicate_pool_id() {
-        let mut seen = HashSet::new();
-        assert!(should_enqueue_pool_created(
-            "pool-a",
-            "TokenMint11111111111111111111111111111111",
-            NATIVE_SOL_MINT,
-            &mut seen,
-        ));
-        assert!(!should_enqueue_pool_created(
-            "pool-a",
-            "TokenMint11111111111111111111111111111111",
-            NATIVE_SOL_MINT,
-            &mut seen,
-        ));
-    }
-
-    #[test]
     fn pool_created_filter_skips_non_relevant_pairs() {
-        let mut seen = HashSet::new();
         assert!(!should_enqueue_pool_created(
-            "pool-x",
             "TokenA1111111111111111111111111111111111",
             "TokenB1111111111111111111111111111111111",
-            &mut seen,
         ));
         assert!(should_enqueue_pool_created(
-            "pool-sol",
             "TokenMint11111111111111111111111111111111",
             NATIVE_SOL_MINT,
-            &mut seen,
         ));
     }
 
