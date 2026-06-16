@@ -1259,6 +1259,28 @@ fn should_enqueue_pool_created(base_mint: &str, quote_mint: &str) -> bool {
     is_arb_relevant_pool_pair(base_mint, quote_mint)
 }
 
+/// NATS-reader ingress after deserialize: liveness is already marked; returns priority to enqueue.
+fn arb_market_event_ingress_priority(
+    event: &MarketEvent,
+    known_pools: &HashSet<String>,
+) -> Option<ArbEventPriority> {
+    if let MarketEventKind::PoolCreated {
+        base_mint,
+        quote_mint,
+        ..
+    } = &event.kind
+    {
+        if !should_enqueue_pool_created(base_mint, quote_mint) {
+            arb_subscriber_pool_created_skipped_inc();
+            return None;
+        }
+    }
+    if !is_arb_handled_market_event(&event.kind) {
+        return None;
+    }
+    Some(classify_market_event_priority(event, known_pools))
+}
+
 /// Kinds that `handle_market_event` processes; all others are no-ops for arb-strategy.
 fn is_arb_handled_market_event(kind: &MarketEventKind) -> bool {
     matches!(
@@ -1390,26 +1412,13 @@ fn spawn_arb_market_event_pipeline(
                 }
             };
 
-            if let MarketEventKind::PoolCreated {
-                base_mint,
-                quote_mint,
-                ..
-            } = &event.kind
-            {
-                if !should_enqueue_pool_created(base_mint, quote_mint) {
-                    arb_subscriber_pool_created_skipped_inc();
-                    continue;
-                }
-            }
-
-            if !is_arb_handled_market_event(&event.kind) {
-                // Heartbeats still prove Geyser/NATS is alive for connection health.
-                *reader_ctx.last_market_event.write() = Instant::now();
-                continue;
-            }
+            // Count every deserialized MarketEvent as Geyser/NATS liveness before filters/drops.
+            reader_ctx.mark_market_event_seen();
 
             let known_pools = reader_ctx.known_pools.read().clone();
-            let priority = classify_market_event_priority(&event, &known_pools);
+            let Some(priority) = arb_market_event_ingress_priority(&event, &known_pools) else {
+                continue;
+            };
 
             match priority {
                 ArbEventPriority::High => {
@@ -1582,6 +1591,11 @@ impl ArbContext {
     fn next_intent_id(&self) -> String {
         let n = self.intent_counter.fetch_add(1, Ordering::Relaxed);
         format!("arb-{}-{:06}", &self.run_id[..8], n)
+    }
+
+    /// Record that a MarketEvent was received on the NATS wire (Geyser liveness).
+    fn mark_market_event_seen(&self) {
+        *self.last_market_event.write() = Instant::now();
     }
 
     /// Check if the Geyser connection is healthy.
@@ -3568,6 +3582,32 @@ mod event_pipeline_tests {
             "TokenMint11111111111111111111111111111111",
             NATIVE_SOL_MINT,
         ));
+    }
+
+    #[test]
+    fn filtered_pool_created_marks_liveness_without_low_enqueue() {
+        let last = RwLock::new(Instant::now() - Duration::from_secs(3600));
+        let event = sample_pool_created(
+            "pool-irrelevant",
+            "TokenA1111111111111111111111111111111111",
+            "TokenB1111111111111111111111111111111111",
+        );
+
+        *last.write() = Instant::now();
+        assert!(
+            last.read().elapsed().as_secs() < GEYSER_CONNECTION_TIMEOUT_SECS,
+            "deserialized MarketEvent should refresh Geyser liveness before ingress filters"
+        );
+
+        let known = HashSet::new();
+        let decision = arb_market_event_ingress_priority(&event, &known);
+        assert_eq!(decision, None);
+
+        let mut coalescer = ArbLowEventCoalescer::new();
+        if let Some(ArbEventPriority::Low) = decision {
+            coalescer.insert(event, 16);
+        }
+        assert_eq!(coalescer.len(), 0);
     }
 
     #[test]
