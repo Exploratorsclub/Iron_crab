@@ -1223,7 +1223,11 @@ fn market_event_pool_key(event: &MarketEvent) -> Option<String> {
         MarketEventKind::PoolStateUpdate { pool_address, .. } => {
             Some(format!("{pool_address}:state"))
         }
-        MarketEventKind::BinArrayUpdate { pool_address, .. } => Some(format!("{pool_address}:bin")),
+        MarketEventKind::BinArrayUpdate {
+            pool_address,
+            bin_array_index,
+            ..
+        } => Some(format!("{pool_address}:bin:{bin_array_index}")),
         MarketEventKind::Trade { pool_address, .. } => Some(format!("{pool_address}:trade")),
         _ => None,
     }
@@ -1275,7 +1279,7 @@ enum LowCoalescerInsert {
     Dropped,
 }
 
-/// Latest-wins coalescer for LOW MarketEvents keyed by pool address.
+/// Latest-wins coalescer for LOW MarketEvents keyed by pool (or pool+bin index).
 struct ArbLowEventCoalescer {
     by_pool: HashMap<String, MarketEvent>,
 }
@@ -3533,6 +3537,27 @@ mod event_pipeline_tests {
         )
     }
 
+    fn sample_bin_array_update(pool: &str, bin_array_index: i64, update_slot: u64) -> MarketEvent {
+        MarketEvent::new(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            format!("evt-bin-{pool}-{bin_array_index}-{update_slot}"),
+            "geyser",
+            Some(1),
+            MarketEventKind::BinArrayUpdate {
+                pool_address: pool.to_string(),
+                bin_array_index,
+                bins: vec![ironcrab::ipc::BinData {
+                    offset: 0,
+                    amount_x: update_slot,
+                    amount_y: 1,
+                }],
+                update_slot,
+            },
+        )
+    }
+
     #[test]
     fn pool_created_filter_skips_non_relevant_pairs() {
         assert!(!should_enqueue_pool_created(
@@ -3604,6 +3629,52 @@ mod event_pipeline_tests {
         assert_eq!(
             classify_market_event_priority(&low_event, &known),
             ArbEventPriority::Low
+        );
+    }
+
+    #[test]
+    fn low_coalescer_keeps_distinct_bin_array_indices_per_pool() {
+        let mut coalescer = ArbLowEventCoalescer::new();
+        let e0 = sample_bin_array_update("pool-dlmm", 0, 100);
+        let e1 = sample_bin_array_update("pool-dlmm", 1, 200);
+        assert_eq!(coalescer.insert(e0, 16), LowCoalescerInsert::Queued);
+        assert_eq!(coalescer.insert(e1, 16), LowCoalescerInsert::Queued);
+        let drained = coalescer.drain();
+        assert_eq!(drained.len(), 2);
+        let mut indices: Vec<i64> = drained
+            .iter()
+            .filter_map(|event| match &event.kind {
+                MarketEventKind::BinArrayUpdate {
+                    bin_array_index, ..
+                } => Some(*bin_array_index),
+                _ => None,
+            })
+            .collect();
+        indices.sort_unstable();
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn low_coalescer_coalesces_same_bin_array_index_latest_wins() {
+        let mut coalescer = ArbLowEventCoalescer::new();
+        let e_old = sample_bin_array_update("pool-dlmm", 3, 100);
+        let e_new = sample_bin_array_update("pool-dlmm", 3, 999);
+        assert_eq!(coalescer.insert(e_old, 16), LowCoalescerInsert::Queued);
+        assert_eq!(coalescer.insert(e_new, 16), LowCoalescerInsert::Coalesced);
+        let drained = coalescer.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(
+            drained[0].kind,
+            MarketEventKind::BinArrayUpdate {
+                pool_address: "pool-dlmm".to_string(),
+                bin_array_index: 3,
+                bins: vec![ironcrab::ipc::BinData {
+                    offset: 0,
+                    amount_x: 999,
+                    amount_y: 1,
+                }],
+                update_slot: 999,
+            }
         );
     }
 
