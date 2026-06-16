@@ -1255,6 +1255,19 @@ fn should_enqueue_pool_created(base_mint: &str, quote_mint: &str) -> bool {
     is_arb_relevant_pool_pair(base_mint, quote_mint)
 }
 
+/// Kinds that `handle_market_event` processes; all others are no-ops for arb-strategy.
+fn is_arb_handled_market_event(kind: &MarketEventKind) -> bool {
+    matches!(
+        kind,
+        MarketEventKind::PoolCreated { .. }
+            | MarketEventKind::Trade { .. }
+            | MarketEventKind::DexPoolAccounts { .. }
+            | MarketEventKind::PoolStateUpdate { .. }
+            | MarketEventKind::BinArrayUpdate { .. }
+            | MarketEventKind::TokenMintInfo { .. }
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LowCoalescerInsert {
     Queued,
@@ -1383,6 +1396,12 @@ fn spawn_arb_market_event_pipeline(
                     arb_subscriber_pool_created_skipped_inc();
                     continue;
                 }
+            }
+
+            if !is_arb_handled_market_event(&event.kind) {
+                // Heartbeats still prove Geyser/NATS is alive for connection health.
+                *reader_ctx.last_market_event.write() = Instant::now();
+                continue;
             }
 
             let known_pools = reader_ctx.known_pools.read().clone();
