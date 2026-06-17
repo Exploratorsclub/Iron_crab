@@ -42,8 +42,9 @@ use ironcrab::ipc::{
     ExecutionStatus, IntentTier, MarketEvent, MarketEventKind, PoolCacheUpdate,
     PriorityFeePercentiles, NATIVE_SOL_MINT, POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY,
     POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY,
-    POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY,
-    POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY,
+    POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_ONCHAIN_MINTS_KEY,
+    POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY, POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY,
+    POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY, POOL_CACHE_UPDATE_ORCA_ONCHAIN_MINTS_KEY,
     POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY,
     POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY, POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY,
     POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY, POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY,
@@ -2532,12 +2533,21 @@ fn meteora_cpmm_onchain_mints_for_pool_cache_update(s: &MeteoraCpmmState) -> Str
     format!("{},{}", s.token_0_mint, s.token_1_mint)
 }
 
+/// On-chain `token_mint_a,token_mint_b` for SLAVE bootstrap when JetStream uses normalized base/quote.
+fn orca_onchain_mints_for_pool_cache_update(s: &OrcaWhirlpoolState) -> String {
+    format!("{},{}", s.token_mint_a, s.token_mint_b)
+}
+
 /// Orca Whirlpool: PoolCacheUpdate metadata keys for SLAVE bootstrap (BalanceUpdated + PoolDiscovered).
 fn orca_metadata_for_pool_cache_update(s: &OrcaWhirlpoolState) -> HashMap<String, String> {
     let mut meta = HashMap::new();
     meta.insert(
         POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY.to_string(),
         format!("{},{}", s.token_vault_a, s.token_vault_b),
+    );
+    meta.insert(
+        POOL_CACHE_UPDATE_ORCA_ONCHAIN_MINTS_KEY.to_string(),
+        orca_onchain_mints_for_pool_cache_update(s),
     );
     meta.insert(
         POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY.to_string(),
@@ -2578,12 +2588,21 @@ fn orca_metadata_for_pool_cache_update(s: &OrcaWhirlpoolState) -> HashMap<String
     meta
 }
 
+/// On-chain `token_x_mint,token_y_mint` for SLAVE bootstrap when JetStream uses normalized base/quote.
+fn meteora_dlmm_onchain_mints_for_pool_cache_update(s: &MeteoraState) -> String {
+    format!("{},{}", s.token_x_mint, s.token_y_mint)
+}
+
 /// Meteora DLMM: vault pubkeys + static pool fields for JetStream / SLAVE bootstrap.
 fn meteora_dlmm_metadata_for_pool_cache_update(s: &MeteoraState) -> HashMap<String, String> {
     let mut meta = HashMap::new();
     meta.insert(
         POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY.to_string(),
         format!("{},{}", s.reserve_x, s.reserve_y),
+    );
+    meta.insert(
+        POOL_CACHE_UPDATE_METEORA_DLMM_ONCHAIN_MINTS_KEY.to_string(),
+        meteora_dlmm_onchain_mints_for_pool_cache_update(s),
     );
     meta.insert(
         POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY.to_string(),
@@ -4353,7 +4372,14 @@ impl MarketDataContext {
 
         if enable_meteora_dlmm {
             if let CachedPoolState::Meteora(s) = cached_state {
-                if admit(s.token_x_mint, s.token_y_mint) {
+                let (base_mint_v, quote_mint_v, base_vault, quote_vault) =
+                    cpmm_token_mints_and_vaults_sol_normalized(
+                        s.token_x_mint,
+                        s.token_y_mint,
+                        s.reserve_x,
+                        s.reserve_y,
+                    );
+                if admit(base_mint_v, quote_mint_v) {
                     let mut vaults = self.tracked_vaults.write();
                     insert_tracked_vault_pair(
                         &mut vaults,
@@ -4362,15 +4388,43 @@ impl MarketDataContext {
                             pool,
                             now,
                             dex: "meteora_dlmm",
-                            base_mint: s.token_x_mint,
-                            quote_mint: s.token_y_mint,
-                            base_vault: s.reserve_x,
-                            quote_vault: s.reserve_y,
+                            base_mint: base_mint_v,
+                            quote_mint: quote_mint_v,
+                            base_vault,
+                            quote_vault,
                             active_id: Some(s.active_id),
                             bin_step: Some(s.bin_step),
                         },
                     );
                 }
+            }
+        }
+
+        if let CachedPoolState::Orca(s) = cached_state {
+            let (base_mint_v, quote_mint_v, base_vault, quote_vault) =
+                cpmm_token_mints_and_vaults_sol_normalized(
+                    s.token_mint_a,
+                    s.token_mint_b,
+                    s.token_vault_a,
+                    s.token_vault_b,
+                );
+            if admit(base_mint_v, quote_mint_v) {
+                let mut vaults = self.tracked_vaults.write();
+                insert_tracked_vault_pair(
+                    &mut vaults,
+                    &mut vaults_changed,
+                    TrackedVaultPairInsert {
+                        pool,
+                        now,
+                        dex: "orca",
+                        base_mint: base_mint_v,
+                        quote_mint: quote_mint_v,
+                        base_vault,
+                        quote_vault,
+                        active_id: None,
+                        bin_step: None,
+                    },
+                );
             }
         }
 
@@ -4486,44 +4540,6 @@ impl MarketDataContext {
                             });
                         }
                     }
-                }
-            }
-            CachedPoolState::Orca(s) => {
-                let dex_str = "orca".to_string();
-                {
-                    let mut vaults = self.tracked_vaults.write();
-                    vaults.entry(s.token_vault_a).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: pool,
-                            dex: dex_str.clone(),
-                            base_mint: s.token_mint_a,
-                            quote_mint: s.token_mint_b,
-                            is_base_vault: true,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: now,
-                            pinned: false,
-                            pin: None,
-                            active_id: None,
-                            bin_step: None,
-                        }
-                    });
-                    vaults.entry(s.token_vault_b).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: pool,
-                            dex: dex_str,
-                            base_mint: s.token_mint_a,
-                            quote_mint: s.token_mint_b,
-                            is_base_vault: false,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: now,
-                            pinned: false,
-                            pin: None,
-                            active_id: None,
-                            bin_step: None,
-                        }
-                    });
                 }
             }
             CachedPoolState::RaydiumAmm(s) => {

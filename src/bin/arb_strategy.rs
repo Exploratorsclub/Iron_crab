@@ -20,6 +20,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -61,7 +62,6 @@ use ironcrab::nats::{TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
 use ironcrab::solana::dex::meteora_bin_walker::{dlmm_fee_bps, walker_from_bins};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 use solana_sdk::pubkey::Pubkey;
-use std::str::FromStr;
 
 /// Build version for decision records
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -164,6 +164,9 @@ const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 // Maximum reasonable spread before considering it a data error
 const MAX_REASONABLE_SPREAD_BPS: i64 = 1000; // 10%
 const STABLECOIN_MAX_SPREAD_BPS: i64 = 200; // 2% for stablecoins
+/// Broad stablecoin comparable-price guard (SOL per 1 whole token); not a hardcoded SOL/USD peg.
+const STABLECOIN_MIN_SOL_PER_TOKEN: &str = "0.0001";
+const STABLECOIN_MAX_SOL_PER_TOKEN: &str = "1";
 /// Geyser connection is considered broken if no MarketEvent received for this duration.
 /// This is NOT about individual pool staleness - it's about connection health.
 /// If Geyser is connected but a pool has no updates, the data IS current (pool is inactive).
@@ -285,6 +288,28 @@ fn vault_dlmm_sol_is_x(vault: &VaultBalanceCache) -> bool {
         .unwrap_or(vault.dlmm_sol_is_x)
 }
 
+/// Resolve on-chain `token_x_mint` for DLMM PoolStateUpdate (normalized base/quote ≠ token_x/y).
+fn resolve_dlmm_token_x_mint_for_pool_update(
+    pool_address: &str,
+    vault_cache: &HashMap<String, VaultBalanceCache>,
+    live_pool_cache: &SharedLivePoolCache,
+) -> Option<String> {
+    if let Some(existing) = vault_cache
+        .get(pool_address)
+        .and_then(|v| v.dlmm_token_x_mint.clone())
+    {
+        return Some(existing);
+    }
+    let pool_pk = Pubkey::from_str(pool_address).ok()?;
+    live_pool_cache.get(&pool_pk).and_then(|state| {
+        if let CachedPoolState::Meteora(s) = state {
+            Some(s.token_x_mint.to_string())
+        } else {
+            None
+        }
+    })
+}
+
 fn trade_mid_sol_per_token(pool: &PoolState) -> Option<Decimal> {
     match (pool.trade_price_buy, pool.trade_price_sell) {
         (Some(buy), Some(sell)) if buy > Decimal::ZERO && sell > Decimal::ZERO => {
@@ -375,6 +400,36 @@ fn dlmm_sol_output_from_bins(
     Some(amount_out)
 }
 
+fn is_stablecoin_mint(mint: &str) -> bool {
+    mint == USDC_MINT || mint == USDT_MINT
+}
+
+/// Reject obviously wrong side/decimal comparable prices (stablecoins only).
+fn is_plausible_sol_per_token_price(mint: &str, price: Decimal) -> bool {
+    if price <= Decimal::ZERO {
+        return false;
+    }
+    if is_stablecoin_mint(mint) {
+        let min = Decimal::from_str(STABLECOIN_MIN_SOL_PER_TOKEN).unwrap_or(Decimal::ZERO);
+        let max = Decimal::from_str(STABLECOIN_MAX_SOL_PER_TOKEN).unwrap_or(Decimal::ONE);
+        price >= min && price <= max
+    } else {
+        true
+    }
+}
+
+fn reserves_plausible_for_comparable_price(
+    reserve_base: u64,
+    reserve_quote: u64,
+    token_decimals: u8,
+    token_mint: &str,
+) -> bool {
+    reserve_base > 0
+        && reserve_quote > 0
+        && reserve_mid_sol_per_token(reserve_base, reserve_quote, token_decimals)
+            .is_some_and(|mid| is_plausible_sol_per_token_price(token_mint, mid))
+}
+
 /// Map on-chain base/quote reserves to token-base + SOL-quote for comparable pricing.
 fn sol_quoted_vault_reserves(
     base_mint: &str,
@@ -388,6 +443,22 @@ fn sol_quoted_vault_reserves(
         (reserve_quote, reserve_base)
     } else {
         (reserve_base, reserve_quote)
+    }
+}
+
+/// Explicit Orca WSOL-side mapping: vault_a/vault_b → (token_reserve, sol_reserve).
+fn orca_sol_quoted_vault_reserves(
+    token_mint_a: &str,
+    token_mint_b: &str,
+    vault_a_balance: u64,
+    vault_b_balance: u64,
+) -> Option<(u64, u64)> {
+    if token_mint_a == NATIVE_SOL_MINT {
+        Some((vault_b_balance, vault_a_balance))
+    } else if token_mint_b == NATIVE_SOL_MINT {
+        Some((vault_a_balance, vault_b_balance))
+    } else {
+        None
     }
 }
 
@@ -421,20 +492,33 @@ fn is_pool_price_fresh(
 fn comparable_price_sol_per_token(
     pool: &PoolState,
     vault_reserves: Option<(u64, u64)>,
-    token_decimals: u8,
+    token_decimals: Option<u8>,
+    token_mint: &str,
     vault_cache: Option<&VaultBalanceCache>,
     dlmm_bin_arrays: Option<&HashMap<i64, BinArrayCache>>,
     side: ComparablePriceSide,
 ) -> Option<Decimal> {
+    let token_decimals = token_decimals?;
+
     if pool.dex == "meteora_dlmm" {
         if let (Some(vault), Some(arrays)) = (vault_cache, dlmm_bin_arrays) {
             if let (Some(active_id), Some(bin_step)) = (vault.active_id, vault.bin_step) {
                 let flat = flatten_bin_array_cache(arrays);
                 let sol_is_x = vault_dlmm_sol_is_x(vault);
                 let reserve_mid = vault_reserves.and_then(|(base, quote)| {
-                    reserve_mid_sol_per_token(base, quote, token_decimals)
+                    if reserves_plausible_for_comparable_price(
+                        base,
+                        quote,
+                        token_decimals,
+                        token_mint,
+                    ) {
+                        reserve_mid_sol_per_token(base, quote, token_decimals)
+                    } else {
+                        None
+                    }
                 });
-                let trade_mid = trade_mid_sol_per_token(pool);
+                let trade_mid = trade_mid_sol_per_token(pool)
+                    .filter(|p| is_plausible_sol_per_token_price(token_mint, *p));
                 let marginal = match side {
                     ComparablePriceSide::Buy => dlmm_token_output_from_bins(
                         active_id,
@@ -468,7 +552,9 @@ fn comparable_price_sol_per_token(
                     }),
                 };
                 if let Some(price) = marginal.filter(|p| *p > Decimal::ZERO) {
-                    if dlmm_marginal_price_plausible(price, reserve_mid, trade_mid) {
+                    if dlmm_marginal_price_plausible(price, reserve_mid, trade_mid)
+                        && is_plausible_sol_per_token_price(token_mint, price)
+                    {
                         return Some(price);
                     }
                     DLMM_MARGINAL_PRICE_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -478,15 +564,35 @@ fn comparable_price_sol_per_token(
     }
 
     if let Some((reserve_base, reserve_quote)) = vault_reserves {
-        if let Some(mid) = reserve_mid_sol_per_token(reserve_base, reserve_quote, token_decimals) {
-            return Some(mid);
+        if reserves_plausible_for_comparable_price(
+            reserve_base,
+            reserve_quote,
+            token_decimals,
+            token_mint,
+        ) {
+            if let Some(mid) =
+                reserve_mid_sol_per_token(reserve_base, reserve_quote, token_decimals)
+            {
+                return Some(mid);
+            }
         }
     }
     match (pool.trade_price_buy, pool.trade_price_sell) {
         (Some(buy), Some(sell)) if buy > Decimal::ZERO && sell > Decimal::ZERO => {
-            Some((buy + sell) / Decimal::from(2))
+            let mid = (buy + sell) / Decimal::from(2);
+            if is_plausible_sol_per_token_price(token_mint, mid) {
+                Some(mid)
+            } else {
+                None
+            }
         }
-        (Some(one), None) | (None, Some(one)) if one > Decimal::ZERO => Some(one),
+        (Some(one), None) | (None, Some(one)) if one > Decimal::ZERO => {
+            if is_plausible_sol_per_token_price(token_mint, one) {
+                Some(one)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -502,13 +608,14 @@ fn sol_quoted_pool_seed(state: &CachedPoolState) -> Option<SolQuotedPoolSeed> {
             let mint_b = s.token_mint_b.to_string();
             let va = s.vault_a_balance?;
             let vb = s.vault_b_balance?;
-            if mint_b == NATIVE_SOL_MINT {
-                Some((mint_a, va, vb, None, None))
-            } else if mint_a == NATIVE_SOL_MINT {
-                Some((mint_b, vb, va, None, None))
+            let (reserve_base, reserve_quote) =
+                orca_sol_quoted_vault_reserves(&mint_a, &mint_b, va, vb)?;
+            let token_mint = if mint_a == NATIVE_SOL_MINT {
+                mint_b
             } else {
-                None
-            }
+                mint_a
+            };
+            Some((token_mint, reserve_base, reserve_quote, None, None))
         }
         CachedPoolState::RaydiumAmm(s) => {
             let base = s.base_mint.to_string();
@@ -657,10 +764,19 @@ fn seed_one_pool_from_live_cache(
     let tracker = trackers
         .entry(mint.to_string())
         .or_insert_with(|| TokenArbTracker::new(mint));
-    let token_decimals = tracker.token_decimals.unwrap_or(6);
     let liquidity_sol = Decimal::from(eff_reserve_quote) / Decimal::from(1_000_000_000u64);
-    let reserve_price =
-        reserve_mid_sol_per_token(eff_reserve_base, eff_reserve_quote, token_decimals);
+    let reserve_price = tracker.token_decimals.and_then(|token_decimals| {
+        if reserves_plausible_for_comparable_price(
+            eff_reserve_base,
+            eff_reserve_quote,
+            token_decimals,
+            mint,
+        ) {
+            reserve_mid_sol_per_token(eff_reserve_base, eff_reserve_quote, token_decimals)
+        } else {
+            None
+        }
+    });
     let (trade_price_buy, trade_price_sell, trade_count, dex_accounts) = tracker
         .pools
         .get(&pool_addr)
@@ -694,7 +810,8 @@ fn seed_one_pool_from_live_cache(
     let last_price = comparable_price_sol_per_token(
         &seed_pool,
         Some((eff_reserve_base, eff_reserve_quote)),
-        token_decimals,
+        tracker.token_decimals,
+        mint,
         vault_entry,
         dlmm_bins,
         ComparablePriceSide::Buy,
@@ -892,6 +1009,7 @@ impl TokenArbTracker {
         vault_balances: &HashMap<String, VaultBalanceCache>,
         bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
         spread_warn_last: &RwLock<HashMap<String, Instant>>,
+        data_quality_rejects: &AtomicU64,
     ) -> Option<ArbOpportunity> {
         // Check if 2-hop arbitrage is enabled
         if !config.two_hop_enabled {
@@ -902,7 +1020,14 @@ impl TokenArbTracker {
             return None;
         }
 
-        let token_decimals = self.token_decimals.unwrap_or(6);
+        let Some(token_decimals) = self.token_decimals else {
+            debug!(
+                mint = %self.base_mint,
+                "Arb check: token decimals unknown — no synthetic fallback"
+            );
+            arb_two_hop_rejected_inc(ArbTwoHopRejectReason::NoComparablePrice);
+            return None;
+        };
 
         // Build comparable prices per pool (buy-side for cheapest, sell-side for highest bid)
         let mut best_buy: Option<(&PoolState, Decimal)> = None;
@@ -928,7 +1053,8 @@ impl TokenArbTracker {
             let buy_price = comparable_price_sol_per_token(
                 pool,
                 vault_reserves,
-                token_decimals,
+                Some(token_decimals),
+                &self.base_mint,
                 vault_entry,
                 dlmm_bins,
                 ComparablePriceSide::Buy,
@@ -936,7 +1062,8 @@ impl TokenArbTracker {
             let sell_price = comparable_price_sol_per_token(
                 pool,
                 vault_reserves,
-                token_decimals,
+                Some(token_decimals),
+                &self.base_mint,
                 vault_entry,
                 dlmm_bins,
                 ComparablePriceSide::Sell,
@@ -946,11 +1073,21 @@ impl TokenArbTracker {
             }
             eligible_pools += 1;
             if let Some(price) = buy_price.filter(|p| *p > Decimal::ZERO) {
+                if !is_plausible_sol_per_token_price(&self.base_mint, price) {
+                    data_quality_rejects.fetch_add(1, Ordering::Relaxed);
+                    arb_two_hop_rejected_inc(ArbTwoHopRejectReason::DataQuality);
+                    continue;
+                }
                 if best_buy.is_none() || price < best_buy.unwrap().1 {
                     best_buy = Some((pool, price));
                 }
             }
             if let Some(price) = sell_price.filter(|p| *p > Decimal::ZERO) {
+                if !is_plausible_sol_per_token_price(&self.base_mint, price) {
+                    data_quality_rejects.fetch_add(1, Ordering::Relaxed);
+                    arb_two_hop_rejected_inc(ArbTwoHopRejectReason::DataQuality);
+                    continue;
+                }
                 if best_sell.is_none() || price > best_sell.unwrap().1 {
                     best_sell = Some((pool, price));
                 }
@@ -969,6 +1106,14 @@ impl TokenArbTracker {
 
         let (buy_pool, buy_price) = best_buy?;
         let (sell_pool, sell_price) = best_sell?;
+
+        if !is_plausible_sol_per_token_price(&self.base_mint, buy_price)
+            || !is_plausible_sol_per_token_price(&self.base_mint, sell_price)
+        {
+            data_quality_rejects.fetch_add(1, Ordering::Relaxed);
+            arb_two_hop_rejected_inc(ArbTwoHopRejectReason::DataQuality);
+            return None;
+        }
 
         // Staleness: trade-implied or Geyser reserve data must be fresh
         let max_age = Duration::from_millis(MAX_PRICE_AGE_MS);
@@ -2111,7 +2256,7 @@ impl ArbContext {
         }
         let is_new = !cache.contains_key(pool_address);
         let dlmm_token_x_mint = if dex == "meteora_dlmm" {
-            Some(base_mint.to_string())
+            resolve_dlmm_token_x_mint_for_pool_update(pool_address, &cache, &self.live_pool_cache)
         } else {
             cache
                 .get(pool_address)
@@ -2159,11 +2304,19 @@ impl ArbContext {
                 pool.liquidity_sol = liquidity_sol;
                 pool.has_reserve_data = reserve_base > 0 && reserve_quote > 0;
                 pool.last_update = Instant::now();
-                let token_decimals = tracker.token_decimals.unwrap_or(6);
-                if let Some(mid) =
-                    reserve_mid_sol_per_token(reserve_base, reserve_quote, token_decimals)
-                {
-                    pool.last_price = Some(mid);
+                if let Some(token_decimals) = tracker.token_decimals {
+                    if reserves_plausible_for_comparable_price(
+                        reserve_base,
+                        reserve_quote,
+                        token_decimals,
+                        &tracker.base_mint,
+                    ) {
+                        if let Some(mid) =
+                            reserve_mid_sol_per_token(reserve_base, reserve_quote, token_decimals)
+                        {
+                            pool.last_price = Some(mid);
+                        }
+                    }
                 }
             }
         }
@@ -2494,7 +2647,8 @@ impl ArbContext {
         pool.last_price = comparable_price_sol_per_token(
             pool,
             vault_reserves,
-            token_decimals,
+            Some(token_decimals),
+            mint,
             vault_entry.as_ref(),
             dlmm_bins.as_ref(),
             ComparablePriceSide::Buy,
@@ -2530,6 +2684,7 @@ impl ArbContext {
             &vault_balances,
             &bin_arrays,
             &self.spread_too_large_warn_last,
+            &self.data_quality_rejects,
         ) {
             // Check cooldown
             let cooldown = Duration::from_millis(config.intent_cooldown_ms);
@@ -3877,7 +4032,8 @@ mod two_hop_price_tests {
         let p_a = comparable_price_sol_per_token(
             &pool_a,
             Some(reserves),
-            6,
+            Some(6),
+            "TokenMint11111111111111111111111111111111",
             Some(&vault),
             None,
             ComparablePriceSide::Buy,
@@ -3886,7 +4042,8 @@ mod two_hop_price_tests {
         let p_b = comparable_price_sol_per_token(
             &pool_b,
             Some(reserves),
-            6,
+            Some(6),
+            "TokenMint11111111111111111111111111111111",
             Some(&vault),
             None,
             ComparablePriceSide::Buy,
@@ -3906,9 +4063,16 @@ mod two_hop_price_tests {
         let buy_price = trade_implied_sol_per_token(2_000_000_000, 1_000_000_000_000, 6);
         let sell_price = trade_implied_sol_per_token(500_000_000, 1_000_000_000_000, 6);
         let pool = sample_pool("orca", "poolO", Some(buy_price), Some(sell_price));
-        let mid =
-            comparable_price_sol_per_token(&pool, None, 6, None, None, ComparablePriceSide::Buy)
-                .unwrap();
+        let mid = comparable_price_sol_per_token(
+            &pool,
+            None,
+            Some(6),
+            "TokenMint11111111111111111111111111111111",
+            None,
+            None,
+            ComparablePriceSide::Buy,
+        )
+        .unwrap();
         let naive_spread_bps = ((buy_price - sell_price) / sell_price * Decimal::from(10000))
             .round()
             .to_i64()
@@ -3960,7 +4124,8 @@ mod two_hop_price_tests {
             let p_dlmm = comparable_price_sol_per_token(
                 &dlmm_pool,
                 Some((reserve_base, reserve_quote)),
-                token_decimals,
+                Some(token_decimals),
+                USDC_MINT,
                 Some(&vault),
                 Some(&bin_arrays),
                 ComparablePriceSide::Buy,
@@ -3969,7 +4134,8 @@ mod two_hop_price_tests {
             let p_orca = comparable_price_sol_per_token(
                 &orca_pool,
                 Some((reserve_base, reserve_quote)),
-                token_decimals,
+                Some(token_decimals),
+                USDC_MINT,
                 Some(&vault),
                 None,
                 ComparablePriceSide::Buy,
@@ -4033,7 +4199,8 @@ mod two_hop_price_tests {
         let price = comparable_price_sol_per_token(
             &dlmm_pool,
             Some((reserve_base, reserve_quote)),
-            6,
+            Some(6),
+            USDC_MINT,
             Some(&vault),
             Some(&bin_arrays),
             ComparablePriceSide::Buy,
@@ -4116,19 +4283,22 @@ mod two_hop_price_tests {
         known_pools.insert(pool_a.to_string());
         known_pools.insert(pool_b.to_string());
 
-        let tracker = trackers.get(&mint_str).unwrap();
+        let tracker = trackers.get_mut(&mint_str).unwrap();
+        tracker.token_decimals = Some(6);
         assert_eq!(tracker.pools.len(), 2);
         assert_eq!(tracker.pool_count_on_distinct_dexes(), 2);
 
         let config = ArbConfig::default();
         let bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
         let spread_warn_last = RwLock::new(HashMap::new());
+        let data_quality_rejects = AtomicU64::new(0);
         let opp = tracker.check_arbitrage(
             &config,
             &known_pools,
             &vault_balances,
             &bin_arrays,
             &spread_warn_last,
+            &data_quality_rejects,
         );
         // Same reserves → spread ~0, rejected by spread_below_min not insufficient_pools
         assert!(
@@ -4284,6 +4454,191 @@ mod two_hop_price_tests {
         assert!(!tracker.pools.contains_key(&pool_b.to_string()));
         assert!(vault_balances.contains_key(&pool_a.to_string()));
         assert!(!vault_balances.contains_key(&pool_b.to_string()));
+    }
+
+    #[test]
+    fn orca_wsol_usdc_mint_a_sol_comparable_price_sane() {
+        let sol_lamports = 1_000_000_000u64;
+        let usdc_raw = 65_000_000u64;
+        let (token_reserve, sol_reserve) =
+            orca_sol_quoted_vault_reserves(NATIVE_SOL_MINT, USDC_MINT, sol_lamports, usdc_raw)
+                .expect("WSOL/USDC Orca pool");
+        assert_eq!(token_reserve, usdc_raw);
+        assert_eq!(sol_reserve, sol_lamports);
+
+        let price = reserve_mid_sol_per_token(token_reserve, sol_reserve, 6).unwrap();
+        let expected = Decimal::from(1u64) / Decimal::from(65u64);
+        let ratio = if price > expected {
+            price / expected
+        } else {
+            expected / price
+        };
+        assert!(
+            ratio <= Decimal::from(2),
+            "price {price} should be near 1/65 SOL/USDC, not 1e-7 or 0.026"
+        );
+        assert!(is_plausible_sol_per_token_price(USDC_MINT, price));
+    }
+
+    #[test]
+    fn orca_usdc_wsol_swapped_orientation_same_price() {
+        let sol_lamports = 1_000_000_000u64;
+        let usdc_raw = 65_000_000u64;
+        let price_a =
+            orca_sol_quoted_vault_reserves(NATIVE_SOL_MINT, USDC_MINT, sol_lamports, usdc_raw)
+                .and_then(|(tb, tq)| reserve_mid_sol_per_token(tb, tq, 6));
+        let price_b =
+            orca_sol_quoted_vault_reserves(USDC_MINT, NATIVE_SOL_MINT, usdc_raw, sol_lamports)
+                .and_then(|(tb, tq)| reserve_mid_sol_per_token(tb, tq, 6));
+        assert_eq!(price_a, price_b);
+    }
+
+    #[test]
+    fn orca_and_dlmm_realistic_reserves_no_spread_too_large() {
+        let reserve_base = 65_000_000u64;
+        let reserve_quote = 1_000_000_000u64;
+        let active_id: i32 = 0;
+        let bin_step: u16 = 10;
+        let (bin_arrays, vault, token_decimals) =
+            usdc_sol_dlmm_fixture(false, reserve_base, reserve_quote, active_id, bin_step);
+
+        let dlmm_pool = sample_pool("meteora_dlmm", "dlmmUsdc", None, None);
+        let orca_pool = sample_pool("orca", "orcaUsdc", None, None);
+        let p_dlmm = comparable_price_sol_per_token(
+            &dlmm_pool,
+            Some((reserve_base, reserve_quote)),
+            Some(token_decimals),
+            USDC_MINT,
+            Some(&vault),
+            Some(&bin_arrays),
+            ComparablePriceSide::Buy,
+        )
+        .unwrap();
+        let p_orca = comparable_price_sol_per_token(
+            &orca_pool,
+            Some((reserve_base, reserve_quote)),
+            Some(token_decimals),
+            USDC_MINT,
+            Some(&vault),
+            None,
+            ComparablePriceSide::Buy,
+        )
+        .unwrap();
+        let spread_bps = ((p_orca - p_dlmm) / p_dlmm * Decimal::from(10000))
+            .abs()
+            .round()
+            .to_i64()
+            .unwrap();
+        assert!(
+            spread_bps < STABLECOIN_MAX_SPREAD_BPS,
+            "realistic Orca/DLMM reserves should not trip spread_too_large ({spread_bps} bps)"
+        );
+    }
+
+    #[test]
+    fn prod_like_swapped_reserves_rejected_not_spread_too_large() {
+        let sol_in_base = 1_000_000_000u64;
+        let usdc_in_quote = 65_000_000u64;
+        assert!(!reserves_plausible_for_comparable_price(
+            sol_in_base,
+            usdc_in_quote,
+            6,
+            USDC_MINT
+        ));
+
+        let pool = sample_pool("orca", "orcaSwapped", None, None);
+        let price = comparable_price_sol_per_token(
+            &pool,
+            Some((sol_in_base, usdc_in_quote)),
+            Some(6),
+            USDC_MINT,
+            None,
+            None,
+            ComparablePriceSide::Buy,
+        );
+        assert!(
+            price.is_none(),
+            "prod-like swapped reserves must not produce comparable price"
+        );
+
+        let before_spread =
+            ironcrab::metrics::ARB_TWO_HOP_REJECTED_SPREAD_TOO_LARGE.load(Ordering::Relaxed);
+        let mut tracker = TokenArbTracker::new(USDC_MINT);
+        tracker.token_decimals = Some(6);
+        tracker.upsert_pool(pool);
+        let mut known_pools = HashSet::new();
+        known_pools.insert("orcaSwapped".to_string());
+        let opp = tracker.check_arbitrage(
+            &ArbConfig::default(),
+            &known_pools,
+            &HashMap::from([(
+                "orcaSwapped".to_string(),
+                VaultBalanceCache {
+                    reserve_base: sol_in_base,
+                    reserve_quote: usdc_in_quote,
+                    update_slot: 1,
+                    active_id: None,
+                    bin_step: None,
+                    updated_at: Instant::now(),
+                    dlmm_sol_is_x: false,
+                    dlmm_token_x_mint: None,
+                },
+            )]),
+            &HashMap::new(),
+            &RwLock::new(HashMap::new()),
+            &AtomicU64::new(0),
+        );
+        assert!(opp.is_none());
+        assert_eq!(
+            ironcrab::metrics::ARB_TWO_HOP_REJECTED_SPREAD_TOO_LARGE.load(Ordering::Relaxed),
+            before_spread
+        );
+    }
+
+    #[test]
+    fn stablecoin_out_of_range_trade_mid_rejected() {
+        let bad_buy = Decimal::from_str("0.000000094").unwrap();
+        let bad_sell = Decimal::from_str("5.0").unwrap();
+        assert!(!is_plausible_sol_per_token_price(USDC_MINT, bad_buy));
+        assert!(!is_plausible_sol_per_token_price(USDC_MINT, bad_sell));
+
+        let pool = sample_pool("orca", "orcaBad", Some(bad_buy), Some(bad_sell));
+        let buy = comparable_price_sol_per_token(
+            &pool,
+            None,
+            Some(6),
+            USDC_MINT,
+            None,
+            None,
+            ComparablePriceSide::Buy,
+        );
+        let sell = comparable_price_sol_per_token(
+            &pool,
+            None,
+            Some(6),
+            USDC_MINT,
+            None,
+            None,
+            ComparablePriceSide::Sell,
+        );
+        assert!(buy.is_none());
+        assert!(sell.is_none());
+    }
+
+    #[test]
+    fn missing_decimals_no_synthetic_reserve_mid() {
+        let pool = sample_pool("orca", "orcaNoDec", None, None);
+        let reserves = (65_000_000u64, 1_000_000_000u64);
+        let price = comparable_price_sol_per_token(
+            &pool,
+            Some(reserves),
+            None,
+            USDC_MINT,
+            None,
+            None,
+            ComparablePriceSide::Buy,
+        );
+        assert!(price.is_none(), "must not assume 6 decimals when unknown");
     }
 }
 
