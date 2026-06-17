@@ -2879,10 +2879,17 @@ pub const POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY: &str = "meteora_cpmm
 
 /// Metadata key for Orca Whirlpool: `token_vault_a,token_vault_b` (comma-separated base58).
 ///
-/// Order matches on-chain Whirlpool layout (`token_mint_a` / `token_mint_b` on the pool), which is
-/// the same order as [`PoolCacheUpdate::base_mint`] / [`PoolCacheUpdate::quote_mint`] for Orca
-/// publishes from market-data (token A then token B).
+/// Order matches on-chain Whirlpool layout (`token_mint_a` / `token_mint_b` on the pool), **not**
+/// normalized JetStream `base_mint` / `quote_mint`.
 pub const POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY: &str = "orca_whirlpool_vaults";
+
+/// Metadata key for Orca Whirlpool: `token_mint_a,token_mint_b` (comma-separated base58), **on-chain**
+/// Whirlpool order (not normalized base/quote).
+///
+/// Lets SLAVE `build_minimal_pool_state` map JetStream `base_reserve`/`quote_reserve` (normalized:
+/// non-SOL base first) onto the correct `vault_a_balance`/`vault_b_balance` even when SOL is
+/// `token_mint_a` on-chain.
+pub const POOL_CACHE_UPDATE_ORCA_ONCHAIN_MINTS_KEY: &str = "orca_onchain_mints";
 
 /// Orca Whirlpool static fields from the pool account (Geyser parse), as decimal strings in metadata.
 pub const POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY: &str = "orca_tick_current_index";

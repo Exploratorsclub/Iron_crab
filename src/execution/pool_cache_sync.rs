@@ -30,10 +30,11 @@ use crate::ipc::{
     POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY,
     POOL_CACHE_UPDATE_METEORA_DLMM_ONCHAIN_MINTS_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY,
     POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY,
-    POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY,
-    POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY, POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY,
-    POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY, POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY,
-    POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
+    POOL_CACHE_UPDATE_ORCA_ONCHAIN_MINTS_KEY, POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY,
+    POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY, POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY,
+    POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY, POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY,
+    POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY, POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY,
+    POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use crate::nats::{slave_consumer_config, NatsClient, STREAM_NAME};
 
@@ -161,9 +162,36 @@ fn build_minimal_pool_state_with_reserves(
                 .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY))
                 .and_then(|s| Pubkey::from_str(s.trim()).ok());
 
+            let (token_mint_a, token_mint_b, vault_a_balance, vault_b_balance) = meta
+                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_ONCHAIN_MINTS_KEY))
+                .and_then(|s| {
+                    let mut it = s.split(',').filter_map(|a| Pubkey::from_str(a.trim()).ok());
+                    match (it.next(), it.next()) {
+                        (Some(ma), Some(mb)) => Some((ma, mb)),
+                        _ => None,
+                    }
+                })
+                .map(|(ma, mb)| {
+                    let (va, vb) = orca_map_normalized_reserves_to_vault_balances(
+                        ma,
+                        mb,
+                        base_mint,
+                        quote_mint,
+                        base_reserve,
+                        quote_reserve,
+                    );
+                    (ma, mb, va, vb)
+                })
+                .unwrap_or((
+                    base_mint,
+                    quote_mint,
+                    Some(base_reserve),
+                    Some(quote_reserve),
+                ));
+
             CachedPoolState::Orca(OrcaWhirlpoolState {
-                token_mint_a: base_mint,
-                token_mint_b: quote_mint,
+                token_mint_a,
+                token_mint_b,
                 token_vault_a,
                 token_vault_b,
                 tick_current_index,
@@ -172,8 +200,8 @@ fn build_minimal_pool_state_with_reserves(
                 fee_rate,
                 protocol_fee_rate,
                 tick_spacing,
-                vault_a_balance: Some(base_reserve),
-                vault_b_balance: Some(quote_reserve),
+                vault_a_balance,
+                vault_b_balance,
                 token_a_program,
                 token_b_program,
             })
@@ -2902,6 +2930,51 @@ mod tests {
             "merge must not downgrade Ready to Observed for Orca"
         );
         assert_eq!(cache.orca_readiness(&pool), Some(DexPoolReadiness::Ready));
+    }
+
+    #[test]
+    fn test_orca_balance_updated_bootstrap_maps_normalized_reserves_when_sol_is_token_a() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let usdc = Pubkey::new_unique();
+        let sol = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let va = Pubkey::new_unique();
+        let vb = Pubkey::new_unique();
+
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY.to_string(),
+            format!("{va},{vb}"),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_ONCHAIN_MINTS_KEY.to_string(),
+            format!("{sol},{usdc}"),
+        );
+
+        let mut update = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "orca".to_string(),
+            usdc.to_string(),
+            sol.to_string(),
+            66_000_000,
+            1_100_000_000,
+            2,
+        );
+        update.metadata = Some(meta);
+        assert!(apply_pool_cache_update(&cache, &update));
+
+        let state = cache.get(&pool).expect("orca pool");
+        if let CachedPoolState::Orca(s) = state {
+            assert_eq!(s.token_mint_a, sol);
+            assert_eq!(s.token_mint_b, usdc);
+            assert_eq!(s.vault_a_balance, Some(1_100_000_000));
+            assert_eq!(s.vault_b_balance, Some(66_000_000));
+        } else {
+            panic!("expected Orca state");
+        }
     }
 
     #[test]

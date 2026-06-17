@@ -44,11 +44,11 @@ use ironcrab::ipc::{
     POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY,
     POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_ONCHAIN_MINTS_KEY,
     POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY, POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY,
-    POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY, POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY,
-    POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY, POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY,
-    POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY, POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY,
-    POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY, POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY,
-    POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
+    POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY, POOL_CACHE_UPDATE_ORCA_ONCHAIN_MINTS_KEY,
+    POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY,
+    POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY, POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY,
+    POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY, POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY,
+    POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use ironcrab::metrics::{
     dec_market_data_account_high_priority_queue_depth,
@@ -2533,12 +2533,21 @@ fn meteora_cpmm_onchain_mints_for_pool_cache_update(s: &MeteoraCpmmState) -> Str
     format!("{},{}", s.token_0_mint, s.token_1_mint)
 }
 
+/// On-chain `token_mint_a,token_mint_b` for SLAVE bootstrap when JetStream uses normalized base/quote.
+fn orca_onchain_mints_for_pool_cache_update(s: &OrcaWhirlpoolState) -> String {
+    format!("{},{}", s.token_mint_a, s.token_mint_b)
+}
+
 /// Orca Whirlpool: PoolCacheUpdate metadata keys for SLAVE bootstrap (BalanceUpdated + PoolDiscovered).
 fn orca_metadata_for_pool_cache_update(s: &OrcaWhirlpoolState) -> HashMap<String, String> {
     let mut meta = HashMap::new();
     meta.insert(
         POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY.to_string(),
         format!("{},{}", s.token_vault_a, s.token_vault_b),
+    );
+    meta.insert(
+        POOL_CACHE_UPDATE_ORCA_ONCHAIN_MINTS_KEY.to_string(),
+        orca_onchain_mints_for_pool_cache_update(s),
     );
     meta.insert(
         POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY.to_string(),
