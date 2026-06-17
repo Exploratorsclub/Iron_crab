@@ -28,12 +28,12 @@ use crate::ipc::{
     PoolCacheUpdate, PoolCacheUpdateType, NATIVE_SOL_MINT,
     POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY, POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY,
     POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY,
-    POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY, POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY,
-    POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY, POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY,
-    POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY, POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY,
-    POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY, POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY,
-    POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY, POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY,
-    POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
+    POOL_CACHE_UPDATE_METEORA_DLMM_ONCHAIN_MINTS_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY,
+    POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY,
+    POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY,
+    POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY, POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY,
+    POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY, POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY,
+    POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use crate::nats::{slave_consumer_config, NatsClient, STREAM_NAME};
 
@@ -46,10 +46,18 @@ fn extract_reserves(state: &CachedPoolState) -> (u64, u64) {
         ),
         CachedPoolState::RaydiumAmm(s) => (s.coin_reserve.unwrap_or(0), s.pc_reserve.unwrap_or(0)),
         CachedPoolState::RaydiumCpmm(s) => (s.reserve_0.unwrap_or(0), s.reserve_1.unwrap_or(0)),
-        CachedPoolState::Meteora(s) => (
-            s.reserve_x_balance.unwrap_or(0),
-            s.reserve_y_balance.unwrap_or(0),
-        ),
+        CachedPoolState::Meteora(s) => {
+            let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+            let rx = s.reserve_x_balance.unwrap_or(0);
+            let ry = s.reserve_y_balance.unwrap_or(0);
+            if s.token_y_mint == sol {
+                (rx, ry)
+            } else if s.token_x_mint == sol {
+                (ry, rx)
+            } else {
+                (rx, ry)
+            }
+        }
         CachedPoolState::PumpAmm(s) => (s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0)),
         CachedPoolState::PumpFun(s) => (s.virtual_token_reserves, s.virtual_sol_reserves),
         CachedPoolState::MeteoraCpmm(s) => {
@@ -238,15 +246,36 @@ fn build_minimal_pool_state_with_reserves(
                 .and_then(|s| s.parse::<u16>().ok())
                 .unwrap_or(0);
 
+            let (token_x_mint, token_y_mint, reserve_x_balance, reserve_y_balance) = meta
+                .and_then(|m| m.get(POOL_CACHE_UPDATE_METEORA_DLMM_ONCHAIN_MINTS_KEY))
+                .and_then(|s| {
+                    let mut it = s.split(',').filter_map(|a| Pubkey::from_str(a.trim()).ok());
+                    match (it.next(), it.next()) {
+                        (Some(tx), Some(ty)) => Some((tx, ty)),
+                        _ => None,
+                    }
+                })
+                .map(|(tx, ty)| {
+                    let (rx, ry) = if tx == base_mint && ty == quote_mint {
+                        (base_reserve, quote_reserve)
+                    } else if tx == quote_mint && ty == base_mint {
+                        (quote_reserve, base_reserve)
+                    } else {
+                        (base_reserve, quote_reserve)
+                    };
+                    (tx, ty, rx, ry)
+                })
+                .unwrap_or((base_mint, quote_mint, base_reserve, quote_reserve));
+
             CachedPoolState::Meteora(MeteoraState {
-                token_x_mint: base_mint,
-                token_y_mint: quote_mint,
+                token_x_mint,
+                token_y_mint,
                 reserve_x,
                 reserve_y,
                 active_id,
                 bin_step,
-                reserve_x_balance: Some(base_reserve),
-                reserve_y_balance: Some(quote_reserve),
+                reserve_x_balance: Some(reserve_x_balance),
+                reserve_y_balance: Some(reserve_y_balance),
             })
         }
         "meteora_cpmm" => {
@@ -963,6 +992,34 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 if update.dex == "meteora_dlmm" {
                     let um = update.metadata.as_ref();
                     if let CachedPoolState::Meteora(ref mut new_m) = minimal_state {
+                        let update_has_onchain_mints = um
+                            .and_then(|m| m.get(POOL_CACHE_UPDATE_METEORA_DLMM_ONCHAIN_MINTS_KEY))
+                            .is_some();
+                        if !update_has_onchain_mints {
+                            if let Some(CachedPoolState::Meteora(ex)) = existing.as_ref() {
+                                new_m.token_x_mint = ex.token_x_mint;
+                                new_m.token_y_mint = ex.token_y_mint;
+                                if let (Ok(up_base), Ok(up_quote)) = (
+                                    Pubkey::from_str(&update.base_mint),
+                                    Pubkey::from_str(&update.quote_mint),
+                                ) {
+                                    new_m.reserve_x_balance = if ex.token_x_mint == up_base {
+                                        Some(base_reserve)
+                                    } else if ex.token_x_mint == up_quote {
+                                        Some(quote_reserve)
+                                    } else {
+                                        new_m.reserve_x_balance
+                                    };
+                                    new_m.reserve_y_balance = if ex.token_y_mint == up_base {
+                                        Some(base_reserve)
+                                    } else if ex.token_y_mint == up_quote {
+                                        Some(quote_reserve)
+                                    } else {
+                                        new_m.reserve_y_balance
+                                    };
+                                }
+                            }
+                        }
                         if let Some(CachedPoolState::Meteora(ex)) = existing.as_ref() {
                             if new_m.reserve_x == Pubkey::default()
                                 && ex.reserve_x != Pubkey::default()

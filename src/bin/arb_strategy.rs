@@ -288,6 +288,28 @@ fn vault_dlmm_sol_is_x(vault: &VaultBalanceCache) -> bool {
         .unwrap_or(vault.dlmm_sol_is_x)
 }
 
+/// Resolve on-chain `token_x_mint` for DLMM PoolStateUpdate (normalized base/quote ≠ token_x/y).
+fn resolve_dlmm_token_x_mint_for_pool_update(
+    pool_address: &str,
+    vault_cache: &HashMap<String, VaultBalanceCache>,
+    live_pool_cache: &SharedLivePoolCache,
+) -> Option<String> {
+    if let Some(existing) = vault_cache
+        .get(pool_address)
+        .and_then(|v| v.dlmm_token_x_mint.clone())
+    {
+        return Some(existing);
+    }
+    let pool_pk = Pubkey::from_str(pool_address).ok()?;
+    live_pool_cache.get(&pool_pk).and_then(|state| {
+        if let CachedPoolState::Meteora(s) = state {
+            Some(s.token_x_mint.to_string())
+        } else {
+            None
+        }
+    })
+}
+
 fn trade_mid_sol_per_token(pool: &PoolState) -> Option<Decimal> {
     match (pool.trade_price_buy, pool.trade_price_sell) {
         (Some(buy), Some(sell)) if buy > Decimal::ZERO && sell > Decimal::ZERO => {
@@ -2234,7 +2256,7 @@ impl ArbContext {
         }
         let is_new = !cache.contains_key(pool_address);
         let dlmm_token_x_mint = if dex == "meteora_dlmm" {
-            Some(base_mint.to_string())
+            resolve_dlmm_token_x_mint_for_pool_update(pool_address, &cache, &self.live_pool_cache)
         } else {
             cache
                 .get(pool_address)

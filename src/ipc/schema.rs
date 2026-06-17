@@ -2898,10 +2898,17 @@ pub const POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY: &str = "orca_token_b_progr
 
 /// Meteora DLMM: `reserve_x_vault,reserve_y_vault` (comma-separated base58).
 ///
-/// Order matches on-chain LB pair layout (`token_x_mint` / `token_y_mint`), which is the same as
-/// [`PoolCacheUpdate::base_mint`] / [`PoolCacheUpdate::quote_mint`] for Meteora DLMM publishes from
-/// market-data (`token_x` → base, `token_y` → quote).
+/// Order matches on-chain LB pair layout (`reserve_x` / `reserve_y` vault ATAs), **not** normalized
+/// JetStream `base_mint` / `quote_mint` (token-as-base, SOL-as-quote when present).
 pub const POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY: &str = "meteora_dlmm_vaults";
+
+/// Metadata key for Meteora DLMM: `token_x_mint,token_y_mint` (comma-separated base58), **on-chain**
+/// LB pair order (not normalized base/quote).
+///
+/// Lets SLAVE `build_minimal_pool_state` map JetStream `base_reserve`/`quote_reserve` (normalized:
+/// non-SOL base first) onto the correct `reserve_x_balance`/`reserve_y_balance` even when SOL is
+/// token_x on-chain.
+pub const POOL_CACHE_UPDATE_METEORA_DLMM_ONCHAIN_MINTS_KEY: &str = "meteora_dlmm_onchain_mints";
 
 /// Meteora DLMM: active bin id from pool account (decimal string, signed i32).
 pub const POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY: &str = "meteora_dlmm_active_id";
