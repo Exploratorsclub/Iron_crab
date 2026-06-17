@@ -2448,6 +2448,7 @@ pub static ARB_TWO_HOP_REJECTED_STALE_PRICE: Lazy<AtomicU64> = Lazy::new(|| Atom
 pub static ARB_TWO_HOP_REJECTED_NO_COMPARABLE_PRICE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_REJECTED_NATIVE_SOL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECTED_DATA_QUALITY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 /// Rejection reason for 2-hop cross-DEX arb checks (Prometheus label `reason`).
 #[derive(Debug, Clone, Copy)]
@@ -2461,6 +2462,7 @@ pub enum ArbTwoHopRejectReason {
     StalePrice,
     NoComparablePrice,
     NativeSol,
+    DataQuality,
 }
 
 /// Increment `arb_two_hop_rejected_total{reason=...}` for the given rejection.
@@ -2475,6 +2477,7 @@ pub fn arb_two_hop_rejected_inc(reason: ArbTwoHopRejectReason) {
         ArbTwoHopRejectReason::StalePrice => &*ARB_TWO_HOP_REJECTED_STALE_PRICE,
         ArbTwoHopRejectReason::NoComparablePrice => &*ARB_TWO_HOP_REJECTED_NO_COMPARABLE_PRICE,
         ArbTwoHopRejectReason::NativeSol => &*ARB_TWO_HOP_REJECTED_NATIVE_SOL,
+        ArbTwoHopRejectReason::DataQuality => &*ARB_TWO_HOP_REJECTED_DATA_QUALITY,
     };
     counter.fetch_add(1, Ordering::Relaxed);
 }
@@ -4522,6 +4525,13 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("arb_two_hop_rejected_total{reason=\"native_sol\"} ");
     out.push_str(
         &ARB_TWO_HOP_REJECTED_NATIVE_SOL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_rejected_total{reason=\"data_quality\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECTED_DATA_QUALITY
             .load(Ordering::Relaxed)
             .to_string(),
     );

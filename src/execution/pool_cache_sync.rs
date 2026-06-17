@@ -78,6 +78,24 @@ pub fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, Cac
     build_minimal_pool_state_with_reserves(update, update.base_reserve, update.quote_reserve)
 }
 
+/// Map normalized JetStream reserves onto on-chain Orca vault_a/vault_b balances.
+fn orca_map_normalized_reserves_to_vault_balances(
+    onchain_mint_a: Pubkey,
+    onchain_mint_b: Pubkey,
+    normalized_base: Pubkey,
+    normalized_quote: Pubkey,
+    base_reserve: u64,
+    quote_reserve: u64,
+) -> (Option<u64>, Option<u64>) {
+    if onchain_mint_a == normalized_base && onchain_mint_b == normalized_quote {
+        (Some(base_reserve), Some(quote_reserve))
+    } else if onchain_mint_a == normalized_quote && onchain_mint_b == normalized_base {
+        (Some(quote_reserve), Some(base_reserve))
+    } else {
+        (Some(base_reserve), Some(quote_reserve))
+    }
+}
+
 /// Build minimal state with explicit reserves (used for BalanceUpdated merge).
 fn build_minimal_pool_state_with_reserves(
     update: &PoolCacheUpdate,
@@ -863,6 +881,23 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                     let um = update.metadata.as_ref();
                     if let CachedPoolState::Orca(ref mut new_o) = minimal_state {
                         if let Some(CachedPoolState::Orca(ex)) = existing.as_ref() {
+                            new_o.token_mint_a = ex.token_mint_a;
+                            new_o.token_mint_b = ex.token_mint_b;
+                            if let (Ok(up_base), Ok(up_quote)) = (
+                                Pubkey::from_str(&update.base_mint),
+                                Pubkey::from_str(&update.quote_mint),
+                            ) {
+                                let (va, vb) = orca_map_normalized_reserves_to_vault_balances(
+                                    ex.token_mint_a,
+                                    ex.token_mint_b,
+                                    up_base,
+                                    up_quote,
+                                    base_reserve,
+                                    quote_reserve,
+                                );
+                                new_o.vault_a_balance = va;
+                                new_o.vault_b_balance = vb;
+                            }
                             if new_o.token_vault_a == Pubkey::default()
                                 && ex.token_vault_a != Pubkey::default()
                             {
@@ -2810,5 +2845,60 @@ mod tests {
             "merge must not downgrade Ready to Observed for Orca"
         );
         assert_eq!(cache.orca_readiness(&pool), Some(DexPoolReadiness::Ready));
+    }
+
+    #[test]
+    fn test_orca_balance_updated_maps_normalized_reserves_when_sol_is_token_a() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let usdc = Pubkey::new_unique();
+        let sol = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let va = Pubkey::new_unique();
+        let vb = Pubkey::new_unique();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: sol,
+                token_mint_b: usdc,
+                token_vault_a: va,
+                token_vault_b: vb,
+                tick_current_index: 0,
+                sqrt_price: 1,
+                liquidity: 1,
+                fee_rate: 1,
+                protocol_fee_rate: 1,
+                tick_spacing: 64,
+                vault_a_balance: Some(1_000_000_000),
+                vault_b_balance: Some(65_000_000),
+                token_a_program: None,
+                token_b_program: None,
+            }),
+            1,
+        );
+
+        let update = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "orca".to_string(),
+            usdc.to_string(),
+            sol.to_string(),
+            66_000_000,
+            1_100_000_000,
+            2,
+        );
+        assert!(apply_pool_cache_update(&cache, &update));
+
+        let state = cache.get(&pool).expect("orca pool");
+        if let CachedPoolState::Orca(s) = state {
+            assert_eq!(s.token_mint_a, sol);
+            assert_eq!(s.token_mint_b, usdc);
+            assert_eq!(s.vault_a_balance, Some(1_100_000_000));
+            assert_eq!(s.vault_b_balance, Some(66_000_000));
+        } else {
+            panic!("expected Orca state");
+        }
     }
 }
