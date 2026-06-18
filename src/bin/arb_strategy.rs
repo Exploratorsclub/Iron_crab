@@ -979,6 +979,8 @@ struct PoolEligibilityRow {
     comparable_price_present: bool,
     comparable_price_plausible: bool,
     eligible: bool,
+    buy_price: Option<Decimal>,
+    sell_price: Option<Decimal>,
 }
 
 /// Aggregated mint-level eligibility breakdown for metrics + snapshots.
@@ -1156,6 +1158,14 @@ fn record_eligibility_metrics(breakdown: &MintEligibilityBreakdown) {
     }
 }
 
+fn set_reject_subreason(
+    breakdown: &mut MintEligibilityBreakdown,
+    subreason: ArbTwoHopInsufficientSubreason,
+) {
+    breakdown.reject_subreason = Some(subreason);
+    arb_two_hop_insufficient_subreason_inc(subreason);
+}
+
 fn determine_insufficient_subreason(
     breakdown: &MintEligibilityBreakdown,
 ) -> ArbTwoHopInsufficientSubreason {
@@ -1260,6 +1270,8 @@ fn analyze_pool_eligibility(
         comparable_price_present,
         comparable_price_plausible,
         eligible,
+        buy_price,
+        sell_price,
     }
 }
 
@@ -1423,12 +1435,15 @@ impl TokenArbTracker {
         let mut breakdown =
             self.build_eligibility_breakdown(known_pools, vault_balances, bin_arrays);
 
-        let Some(token_decimals) = self.token_decimals else {
+        let Some(_token_decimals) = self.token_decimals else {
             debug!(
                 mint = %self.base_mint,
                 "Arb check: token decimals unknown — no synthetic fallback"
             );
-            breakdown.reject_subreason = Some(ArbTwoHopInsufficientSubreason::MissingDecimals);
+            set_reject_subreason(
+                &mut breakdown,
+                ArbTwoHopInsufficientSubreason::MissingDecimals,
+            );
             self.emit_eligibility_forensics(breakdown, forensics);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::NoComparablePrice);
             return None;
@@ -1439,42 +1454,24 @@ impl TokenArbTracker {
         let mut best_sell: Option<(&PoolState, Decimal)> = None;
         let mut eligible_pools = 0usize;
 
-        for pool in self.pools.values() {
-            let is_known_dex = is_known_dex_label(&pool.dex);
-            let in_master_cache = known_pools.contains(&pool.pool_address);
-            if !is_known_dex || !in_master_cache {
-                if is_known_dex && !in_master_cache {
+        for row in &breakdown.pool_rows {
+            if !row.known {
+                if is_known_dex_label(&row.dex) {
                     debug!(
-                        pool = %pool.pool_address,
-                        dex = %pool.dex,
+                        pool = %row.pool_address,
+                        dex = %row.dex,
                         mint = %self.base_mint,
                         "Pool filtered: not in market-data MASTER cache (parse_pool_account failed)"
                     );
                 }
                 continue;
             }
-            let vault_entry = vault_balances.get(&pool.pool_address);
-            let vault_reserves = vault_entry.map(|c| (c.reserve_base, c.reserve_quote));
-            let dlmm_bins = bin_arrays.get(&pool.pool_address);
-            let buy_price = comparable_price_sol_per_token(
-                pool,
-                vault_reserves,
-                Some(token_decimals),
-                &self.base_mint,
-                vault_entry,
-                dlmm_bins,
-                ComparablePriceSide::Buy,
-            );
-            let sell_price = comparable_price_sol_per_token(
-                pool,
-                vault_reserves,
-                Some(token_decimals),
-                &self.base_mint,
-                vault_entry,
-                dlmm_bins,
-                ComparablePriceSide::Sell,
-            );
-            if buy_price.is_none() && sell_price.is_none() {
+            let Some(pool) = self.pools.get(&row.pool_address) else {
+                continue;
+            };
+            let buy_price = row.buy_price;
+            let sell_price = row.sell_price;
+            if !row.comparable_price_present {
                 continue;
             }
             eligible_pools += 1;
@@ -1506,23 +1503,27 @@ impl TokenArbTracker {
                 pools = eligible_pools,
                 "Arb check: insufficient pools with comparable prices"
             );
-            breakdown.reject_subreason = Some(determine_insufficient_subreason(&breakdown));
-            if let Some(subreason) = breakdown.reject_subreason {
-                arb_two_hop_insufficient_subreason_inc(subreason);
-            }
+            let subreason = determine_insufficient_subreason(&breakdown);
+            set_reject_subreason(&mut breakdown, subreason);
             self.emit_eligibility_forensics(breakdown, forensics);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::InsufficientPools);
             return None;
         }
 
         let Some((buy_pool, buy_price)) = best_buy else {
-            breakdown.reject_subreason = Some(ArbTwoHopInsufficientSubreason::ImplausiblePrice);
+            set_reject_subreason(
+                &mut breakdown,
+                ArbTwoHopInsufficientSubreason::ImplausiblePrice,
+            );
             self.emit_eligibility_forensics(breakdown, forensics);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::DataQuality);
             return None;
         };
         let Some((sell_pool, sell_price)) = best_sell else {
-            breakdown.reject_subreason = Some(ArbTwoHopInsufficientSubreason::ImplausiblePrice);
+            set_reject_subreason(
+                &mut breakdown,
+                ArbTwoHopInsufficientSubreason::ImplausiblePrice,
+            );
             self.emit_eligibility_forensics(breakdown, forensics);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::DataQuality);
             return None;
@@ -1532,7 +1533,10 @@ impl TokenArbTracker {
             || !is_plausible_sol_per_token_price(&self.base_mint, sell_price)
         {
             data_quality_rejects.fetch_add(1, Ordering::Relaxed);
-            breakdown.reject_subreason = Some(ArbTwoHopInsufficientSubreason::ImplausiblePrice);
+            set_reject_subreason(
+                &mut breakdown,
+                ArbTwoHopInsufficientSubreason::ImplausiblePrice,
+            );
             self.emit_eligibility_forensics(breakdown, forensics);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::DataQuality);
             return None;
@@ -1550,7 +1554,7 @@ impl TokenArbTracker {
                 max_age_ms = MAX_PRICE_AGE_MS,
                 "Arb check rejected: stale comparable price"
             );
-            breakdown.reject_subreason = Some(ArbTwoHopInsufficientSubreason::StalePrice);
+            set_reject_subreason(&mut breakdown, ArbTwoHopInsufficientSubreason::StalePrice);
             self.emit_eligibility_forensics(breakdown, forensics);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::StalePrice);
             return None;
@@ -1562,7 +1566,12 @@ impl TokenArbTracker {
                 dex = %buy_pool.dex,
                 "Arb check rejected: same DEX for buy/sell"
             );
-            breakdown.reject_subreason = Some(ArbTwoHopInsufficientSubreason::SameDexOnly);
+            let subreason = if breakdown.eligible_dexes < 2 {
+                ArbTwoHopInsufficientSubreason::OnlyOneEligibleDex
+            } else {
+                ArbTwoHopInsufficientSubreason::SameDexOnly
+            };
+            set_reject_subreason(&mut breakdown, subreason);
             self.emit_eligibility_forensics(breakdown, forensics);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::SameDex);
             return None;
@@ -5127,8 +5136,8 @@ mod two_hop_price_tests {
 
     #[test]
     fn forensics_same_dex_only_when_both_pools_on_one_dex() {
-        let before_subreason =
-            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_SAME_DEX_ONLY.load(Ordering::Relaxed);
+        let before_subreason = ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_DEX
+            .load(Ordering::Relaxed);
         let before_reject =
             ironcrab::metrics::ARB_TWO_HOP_REJECTED_SAME_DEX.load(Ordering::Relaxed);
         let reserves = (1_000_000_000_000u64, 1_000_000_000u64);
@@ -5155,9 +5164,10 @@ mod two_hop_price_tests {
             ironcrab::metrics::ARB_TWO_HOP_REJECTED_SAME_DEX.load(Ordering::Relaxed)
                 > before_reject
         );
-        assert_eq!(
-            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_SAME_DEX_ONLY.load(Ordering::Relaxed),
-            before_subreason
+        assert!(
+            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_DEX
+                .load(Ordering::Relaxed)
+                > before_subreason
         );
     }
 
@@ -5208,9 +5218,9 @@ mod two_hop_price_tests {
             ironcrab::metrics::ARB_TWO_HOP_REJECTED_STALE_PRICE.load(Ordering::Relaxed)
                 > before_reject
         );
-        assert_eq!(
-            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_STALE_PRICE.load(Ordering::Relaxed),
-            before_subreason
+        assert!(
+            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_STALE_PRICE.load(Ordering::Relaxed)
+                > before_subreason
         );
     }
 
@@ -5241,9 +5251,9 @@ mod two_hop_price_tests {
             ironcrab::metrics::ARB_TWO_HOP_REJECTED_NO_COMPARABLE_PRICE.load(Ordering::Relaxed)
                 > before_reject
         );
-        assert_eq!(
-            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_MISSING_DECIMALS.load(Ordering::Relaxed),
-            before_subreason
+        assert!(
+            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_MISSING_DECIMALS.load(Ordering::Relaxed)
+                > before_subreason
         );
     }
 
