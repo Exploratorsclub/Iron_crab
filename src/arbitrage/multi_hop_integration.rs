@@ -442,6 +442,11 @@ impl CachedQuoteProvider {
             self.cleanup();
         }
     }
+
+    /// Read-only quote-ready probe for metrics/diagnostics (does not evict stale index entries).
+    pub fn probe_pool_quote_ready(&self, pool_address: &Pubkey) -> bool {
+        self.quote_ready.contains(pool_address) && self.pool_still_quote_ready(pool_address)
+    }
 }
 
 impl QuoteProvider for CachedQuoteProvider {
@@ -934,7 +939,10 @@ impl MultiHopArbitrage {
                 let quote_ready_neighbors = neighbors
                     .iter()
                     .flat_map(|(_, edges)| edges)
-                    .filter(|edge| self.quote_provider.is_pool_quote_ready(&edge.pool_address))
+                    .filter(|edge| {
+                        self.quote_provider
+                            .probe_pool_quote_ready(&edge.pool_address)
+                    })
                     .count();
                 if quote_ready_neighbors < 2 {
                     multi_hop_search_no_quote_neighbors_inc();
@@ -1161,7 +1169,7 @@ impl MultiHopArbitrage {
             .iter()
             .filter(|(pool, (mint_a, mint_b))| {
                 (*mint_a == wsol || *mint_b == wsol)
-                    && self.quote_provider.is_pool_quote_ready(pool)
+                    && self.quote_provider.probe_pool_quote_ready(pool)
             })
             .count() as u64;
         multi_hop_quote_ready_wsol_edge_pools_set(wsol_edge);

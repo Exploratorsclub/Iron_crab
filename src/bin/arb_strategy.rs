@@ -1489,6 +1489,14 @@ impl TokenArbTracker {
 
         for row in &breakdown.pool_rows {
             if !row.known {
+                if is_known_dex_label(&row.dex) {
+                    debug!(
+                        pool = %row.pool_address,
+                        dex = %row.dex,
+                        mint = %self.base_mint,
+                        "Pool filtered: not in market-data MASTER cache (parse_pool_account failed)"
+                    );
+                }
                 continue;
             }
             let Some(pool) = self.pools.get(&row.pool_address) else {
@@ -1541,11 +1549,13 @@ impl TokenArbTracker {
         let Some((buy_pool, buy_price)) = best_buy else {
             breakdown.reject_subreason = Some(ArbTwoHopRejectSubreason::ImplausiblePrice);
             self.emit_eligibility_forensics(breakdown, forensics);
+            arb_two_hop_rejected_inc(ArbTwoHopRejectReason::DataQuality);
             return None;
         };
         let Some((sell_pool, sell_price)) = best_sell else {
             breakdown.reject_subreason = Some(ArbTwoHopRejectSubreason::ImplausiblePrice);
             self.emit_eligibility_forensics(breakdown, forensics);
+            arb_two_hop_rejected_inc(ArbTwoHopRejectReason::DataQuality);
             return None;
         };
 
