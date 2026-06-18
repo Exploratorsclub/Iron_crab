@@ -1518,11 +1518,13 @@ impl TokenArbTracker {
         let Some((buy_pool, buy_price)) = best_buy else {
             breakdown.reject_subreason = Some(ArbTwoHopInsufficientSubreason::ImplausiblePrice);
             self.emit_eligibility_forensics(breakdown, forensics);
+            arb_two_hop_rejected_inc(ArbTwoHopRejectReason::DataQuality);
             return None;
         };
         let Some((sell_pool, sell_price)) = best_sell else {
             breakdown.reject_subreason = Some(ArbTwoHopInsufficientSubreason::ImplausiblePrice);
             self.emit_eligibility_forensics(breakdown, forensics);
+            arb_two_hop_rejected_inc(ArbTwoHopRejectReason::DataQuality);
             return None;
         };
 
