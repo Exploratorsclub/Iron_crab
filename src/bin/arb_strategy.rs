@@ -1062,9 +1062,9 @@ impl ArbEligibilityForensics {
 
         let mut ranked: Vec<MintEligibilityBreakdown> = pending.drain().map(|(_, b)| b).collect();
         ranked.sort_by(|a, b| {
-            b.eligible_pools
-                .cmp(&a.eligible_pools)
-                .then_with(|| a.candidate_pools_total.cmp(&b.candidate_pools_total))
+            a.eligible_pools
+                .cmp(&b.eligible_pools)
+                .then_with(|| b.candidate_pools_total.cmp(&a.candidate_pools_total))
         });
         ranked.truncate(ELIGIBILITY_SNAPSHOT_TOP_N);
 
@@ -1153,9 +1153,6 @@ fn record_eligibility_metrics(breakdown: &MintEligibilityBreakdown) {
     arb_two_hop_eligible_dexes_add(breakdown.eligible_dexes as u64);
     for (dex, count) in &breakdown.eligible_by_dex {
         arb_two_hop_eligible_pools_by_dex_add(dex, *count as u64);
-    }
-    if let Some(subreason) = breakdown.reject_subreason {
-        arb_two_hop_insufficient_subreason_inc(subreason);
     }
 }
 
@@ -1510,6 +1507,9 @@ impl TokenArbTracker {
                 "Arb check: insufficient pools with comparable prices"
             );
             breakdown.reject_subreason = Some(determine_insufficient_subreason(&breakdown));
+            if let Some(subreason) = breakdown.reject_subreason {
+                arb_two_hop_insufficient_subreason_inc(subreason);
+            }
             self.emit_eligibility_forensics(breakdown, forensics);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::InsufficientPools);
             return None;
@@ -5127,8 +5127,10 @@ mod two_hop_price_tests {
 
     #[test]
     fn forensics_same_dex_only_when_both_pools_on_one_dex() {
-        let before =
+        let before_subreason =
             ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_SAME_DEX_ONLY.load(Ordering::Relaxed);
+        let before_reject =
+            ironcrab::metrics::ARB_TWO_HOP_REJECTED_SAME_DEX.load(Ordering::Relaxed);
         let reserves = (1_000_000_000_000u64, 1_000_000_000u64);
         let mint = "TokenMint22222222222222222222222222222222";
         let mut tracker = TokenArbTracker::new(mint);
@@ -5150,15 +5152,21 @@ mod two_hop_price_tests {
             check_with_forensics(&tracker, &known_pools, &vault_balances, &forensics).is_none()
         );
         assert!(
-            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_SAME_DEX_ONLY.load(Ordering::Relaxed)
-                > before
+            ironcrab::metrics::ARB_TWO_HOP_REJECTED_SAME_DEX.load(Ordering::Relaxed)
+                > before_reject
+        );
+        assert_eq!(
+            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_SAME_DEX_ONLY.load(Ordering::Relaxed),
+            before_subreason
         );
     }
 
     #[test]
     fn forensics_stale_price_when_one_dex_stale() {
-        let before =
+        let before_subreason =
             ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_STALE_PRICE.load(Ordering::Relaxed);
+        let before_reject =
+            ironcrab::metrics::ARB_TWO_HOP_REJECTED_STALE_PRICE.load(Ordering::Relaxed);
         let mint = "TokenMint33333333333333333333333333333333";
         let mut tracker = TokenArbTracker::new(mint);
         tracker.token_decimals = Some(6);
@@ -5197,15 +5205,21 @@ mod two_hop_price_tests {
             check_with_forensics(&tracker, &known_pools, &vault_balances, &forensics).is_none()
         );
         assert!(
-            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_STALE_PRICE.load(Ordering::Relaxed)
-                > before
+            ironcrab::metrics::ARB_TWO_HOP_REJECTED_STALE_PRICE.load(Ordering::Relaxed)
+                > before_reject
+        );
+        assert_eq!(
+            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_STALE_PRICE.load(Ordering::Relaxed),
+            before_subreason
         );
     }
 
     #[test]
     fn forensics_missing_decimals_subreason() {
-        let before =
+        let before_subreason =
             ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_MISSING_DECIMALS.load(Ordering::Relaxed);
+        let before_reject =
+            ironcrab::metrics::ARB_TWO_HOP_REJECTED_NO_COMPARABLE_PRICE.load(Ordering::Relaxed);
         let reserves = (1_000_000_000_000u64, 1_000_000_000u64);
         let mut tracker = TokenArbTracker::new("TokenMint44444444444444444444444444444444");
         tracker.upsert_pool(sample_pool("orca", "poolA", None, None));
@@ -5224,8 +5238,12 @@ mod two_hop_price_tests {
             check_with_forensics(&tracker, &known_pools, &vault_balances, &forensics).is_none()
         );
         assert!(
-            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_MISSING_DECIMALS.load(Ordering::Relaxed)
-                > before
+            ironcrab::metrics::ARB_TWO_HOP_REJECTED_NO_COMPARABLE_PRICE.load(Ordering::Relaxed)
+                > before_reject
+        );
+        assert_eq!(
+            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_MISSING_DECIMALS.load(Ordering::Relaxed),
+            before_subreason
         );
     }
 
