@@ -1103,15 +1103,18 @@ impl ArbEligibilityForensics {
             return false;
         }
 
-        let mut ranked: Vec<MintEligibilityBreakdown> = pending.drain().map(|(_, b)| b).collect();
+        let mut ranked: Vec<MintEligibilityBreakdown> = pending.values().cloned().collect();
         ranked.sort_by(|a, b| {
             b.eligible_pools
                 .cmp(&a.eligible_pools)
                 .then_with(|| a.candidate_pools_total.cmp(&b.candidate_pools_total))
         });
-        ranked.truncate(ELIGIBILITY_SNAPSHOT_TOP_N);
+        let logged: Vec<MintEligibilityBreakdown> = ranked
+            .into_iter()
+            .take(ELIGIBILITY_SNAPSHOT_TOP_N)
+            .collect();
 
-        for entry in &ranked {
+        for entry in &logged {
             let top_pools: Vec<_> = entry
                 .pool_rows
                 .iter()
@@ -1143,8 +1146,17 @@ impl ArbEligibilityForensics {
             );
         }
 
+        for entry in &logged {
+            pending.remove(&entry.mint);
+        }
+
         self.snapshots_emitted.fetch_add(1, Ordering::Relaxed);
         true
+    }
+
+    #[cfg(test)]
+    fn pending_mint_count(&self) -> usize {
+        self.pending.read().len()
     }
 
     #[cfg(test)]
@@ -1210,12 +1222,6 @@ fn record_reject_subreason(reason: ArbTwoHopRejectSubreason) {
 fn determine_insufficient_subreason(
     breakdown: &MintEligibilityBreakdown,
 ) -> ArbTwoHopInsufficientSubreason {
-    if breakdown.eligible_pools == 1 {
-        return ArbTwoHopInsufficientSubreason::OnlyOneEligiblePool;
-    }
-    if breakdown.eligible_pools >= 2 && breakdown.eligible_dexes < 2 {
-        return ArbTwoHopInsufficientSubreason::OnlyOneEligibleDex;
-    }
     if breakdown.known_pools < 2 && breakdown.candidate_pools_total >= 2 {
         return ArbTwoHopInsufficientSubreason::NotKnownPool;
     }
@@ -1227,6 +1233,18 @@ fn determine_insufficient_subreason(
             return ArbTwoHopInsufficientSubreason::MissingTradePrice;
         }
         return ArbTwoHopInsufficientSubreason::NoComparablePrice;
+    }
+    if breakdown.known_pools >= 2
+        && breakdown.has_decimals < breakdown.known_pools
+        && breakdown.eligible_pools < 2
+    {
+        return ArbTwoHopInsufficientSubreason::NoComparablePrice;
+    }
+    if breakdown.eligible_pools == 1 {
+        return ArbTwoHopInsufficientSubreason::OnlyOneEligiblePool;
+    }
+    if breakdown.eligible_pools >= 2 && breakdown.eligible_dexes < 2 {
+        return ArbTwoHopInsufficientSubreason::OnlyOneEligibleDex;
     }
     ArbTwoHopInsufficientSubreason::NoComparablePrice
 }
@@ -5126,7 +5144,7 @@ mod two_hop_price_tests {
 
     #[test]
     fn forensics_not_known_pool_when_only_one_in_master_cache() {
-        let before =
+        let before_known =
             ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_NOT_KNOWN_POOL.load(Ordering::Relaxed);
         let reserves = (1_000_000_000_000u64, 1_000_000_000u64);
         let mut tracker = TokenArbTracker::new("TokenMint11111111111111111111111111111111");
@@ -5147,12 +5165,8 @@ mod two_hop_price_tests {
             check_with_forensics(&tracker, &known_pools, &vault_balances, &forensics).is_none()
         );
         assert!(
-            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_POOL
-                .load(Ordering::Relaxed)
-                > before
-                || ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_NOT_KNOWN_POOL
-                    .load(Ordering::Relaxed)
-                    > before
+            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_NOT_KNOWN_POOL.load(Ordering::Relaxed)
+                > before_known
         );
     }
 
@@ -5309,6 +5323,58 @@ mod two_hop_price_tests {
         assert_eq!(
             determine_insufficient_subreason(&breakdown),
             ArbTwoHopInsufficientSubreason::MissingReserves
+        );
+    }
+
+    #[test]
+    fn determine_insufficient_subreason_prefers_not_known_pool_over_only_one_eligible() {
+        let breakdown = MintEligibilityBreakdown {
+            mint: "TokenMint11111111111111111111111111111111".to_string(),
+            candidate_pools_total: 2,
+            known_pools: 1,
+            fresh_price: 2,
+            has_reserve_data: 2,
+            has_trade_mid: 0,
+            has_decimals: 2,
+            comparable_price_present: 1,
+            comparable_price_plausible: 1,
+            eligible_pools: 1,
+            eligible_dexes: 1,
+            eligible_by_dex: HashMap::new(),
+            reject_subreason: None,
+            pool_rows: vec![],
+        };
+        assert_eq!(
+            determine_insufficient_subreason(&breakdown),
+            ArbTwoHopInsufficientSubreason::NotKnownPool
+        );
+    }
+
+    #[test]
+    fn eligibility_snapshot_retains_pending_mints_beyond_top_n() {
+        let forensics = ArbEligibilityForensics::new();
+        let reserves = (1_000_000_000_000u64, 1_000_000_000u64);
+
+        for i in 0..11 {
+            let mint = format!("TokenMint{i:032}");
+            let pool = format!("pool{i}");
+            let mut tracker = TokenArbTracker::new(&mint);
+            tracker.token_decimals = Some(6);
+            tracker.upsert_pool(sample_pool("orca", &pool, None, None));
+            let mut known_pools = HashSet::new();
+            known_pools.insert(pool.clone());
+            let vault_balances = HashMap::from([(pool, vault(reserves.0, reserves.1))]);
+            let _ = check_with_forensics(&tracker, &known_pools, &vault_balances, &forensics);
+        }
+
+        assert_eq!(forensics.pending_mint_count(), 11);
+        forensics.force_snapshot_ready();
+        assert!(forensics.maybe_emit_snapshot());
+        assert_eq!(forensics.snapshots_emitted_count(), 1);
+        assert_eq!(
+            forensics.pending_mint_count(),
+            1,
+            "only top 10 logged mints should be removed from pending"
         );
     }
 

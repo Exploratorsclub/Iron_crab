@@ -92,6 +92,10 @@ impl QuoteReadyIndex {
     pub fn is_empty(&self) -> bool {
         self.pools.read().is_empty()
     }
+
+    pub fn snapshot_keys(&self) -> Vec<Pubkey> {
+        self.pools.read().iter().copied().collect()
+    }
 }
 
 /// Multi-hop arbitrage configuration
@@ -446,6 +450,14 @@ impl CachedQuoteProvider {
     /// Read-only quote-ready probe for metrics/diagnostics (does not evict stale index entries).
     pub fn probe_pool_quote_ready(&self, pool_address: &Pubkey) -> bool {
         self.quote_ready.contains(pool_address) && self.pool_still_quote_ready(pool_address)
+    }
+
+    /// Count pools that remain quote-ready after freshness probe; evicts stale index entries.
+    pub fn count_fresh_quote_ready_pools(&self) -> u64 {
+        let keys = self.quote_ready.snapshot_keys();
+        keys.iter()
+            .filter(|pool| self.is_pool_quote_ready(pool))
+            .count() as u64
     }
 }
 
@@ -1156,7 +1168,7 @@ impl MultiHopArbitrage {
 
     /// Publish quote-readiness gauges for Prometheus (no algorithm change).
     pub fn refresh_quote_readiness_metrics(&self) {
-        let ready_total = self.quote_provider.quote_ready_index().len() as u64;
+        let ready_total = self.quote_provider.count_fresh_quote_ready_pools();
         multi_hop_quote_ready_pools_set(ready_total);
 
         let wsol = match Pubkey::from_str(WSOL_MINT) {
@@ -1340,6 +1352,22 @@ mod tests {
 
         let out = result.unwrap();
         assert!(out > 9_700_000 && out < 9_900_000, "Got {out}");
+    }
+
+    #[test]
+    fn count_fresh_quote_ready_pools_excludes_stale_index_entries() {
+        let provider = CachedQuoteProvider::new(Duration::from_secs(30), create_shared_cache());
+        let fresh_pool = Pubkey::new_unique();
+        let stale_pool = Pubkey::new_unique();
+        let input = Pubkey::new_unique();
+        let output = Pubkey::new_unique();
+
+        provider.update_quote(fresh_pool, input, output, 1_000_000, 980_000);
+        provider.quote_ready_index().mark_ready(stale_pool);
+
+        assert_eq!(provider.quote_ready_index().len(), 2);
+        assert_eq!(provider.count_fresh_quote_ready_pools(), 1);
+        assert_eq!(provider.quote_ready_index().len(), 1);
     }
 
     #[test]
