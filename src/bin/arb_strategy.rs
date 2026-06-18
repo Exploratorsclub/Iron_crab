@@ -1092,11 +1092,12 @@ impl ArbEligibilityForensics {
     }
 
     fn maybe_emit_snapshot(&self) -> bool {
-        let mut last = self.last_snapshot.write();
-        if last.elapsed() < ELIGIBILITY_SNAPSHOT_COOLDOWN {
-            return false;
+        {
+            let last = self.last_snapshot.read();
+            if last.elapsed() < ELIGIBILITY_SNAPSHOT_COOLDOWN {
+                return false;
+            }
         }
-        *last = Instant::now();
 
         let mut pending = self.pending.write();
         if pending.is_empty() {
@@ -1150,6 +1151,7 @@ impl ArbEligibilityForensics {
             pending.remove(&entry.mint);
         }
 
+        *self.last_snapshot.write() = Instant::now();
         self.snapshots_emitted.fetch_add(1, Ordering::Relaxed);
         true
     }
@@ -5402,6 +5404,32 @@ mod two_hop_price_tests {
             4,
             "buy+sell once per known pool"
         );
+    }
+
+    #[test]
+    fn eligibility_snapshot_empty_pending_does_not_reset_cooldown() {
+        let forensics = ArbEligibilityForensics::new();
+        forensics.force_snapshot_ready();
+
+        assert!(!forensics.maybe_emit_snapshot());
+        assert_eq!(forensics.snapshots_emitted_count(), 0);
+
+        let reserves = (1_000_000_000_000u64, 1_000_000_000u64);
+        let mut tracker = TokenArbTracker::new("TokenMint33333333333333333333333333333333");
+        tracker.token_decimals = Some(6);
+        tracker.upsert_pool(sample_pool("orca", "poolOnly", None, None));
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert("poolOnly".to_string());
+        let vault_balances =
+            HashMap::from([("poolOnly".to_string(), vault(reserves.0, reserves.1))]);
+
+        let _ = check_with_forensics(&tracker, &known_pools, &vault_balances, &forensics);
+        assert!(
+            forensics.maybe_emit_snapshot(),
+            "empty pending must not advance cooldown; mint should snapshot immediately"
+        );
+        assert_eq!(forensics.snapshots_emitted_count(), 1);
     }
 
     #[test]

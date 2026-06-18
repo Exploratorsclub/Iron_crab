@@ -2533,18 +2533,11 @@ impl From<ArbTwoHopInsufficientSubreason> for ArbTwoHopRejectSubreason {
 
 pub static ARB_TWO_HOP_INSUFFICIENT_NOT_KNOWN_POOL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
-pub static ARB_TWO_HOP_INSUFFICIENT_MISSING_DECIMALS: Lazy<AtomicU64> =
-    Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_INSUFFICIENT_MISSING_RESERVES: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_INSUFFICIENT_MISSING_TRADE_PRICE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_INSUFFICIENT_NO_COMPARABLE_PRICE: Lazy<AtomicU64> =
-    Lazy::new(|| AtomicU64::new(0));
-pub static ARB_TWO_HOP_INSUFFICIENT_STALE_PRICE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
-pub static ARB_TWO_HOP_INSUFFICIENT_SAME_DEX_ONLY: Lazy<AtomicU64> =
-    Lazy::new(|| AtomicU64::new(0));
-pub static ARB_TWO_HOP_INSUFFICIENT_IMPLAUSIBLE_PRICE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_POOL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -2588,6 +2581,124 @@ pub fn arb_two_hop_insufficient_subreason_inc(reason: ArbTwoHopInsufficientSubre
     };
     counter.fetch_add(1, Ordering::Relaxed);
     arb_two_hop_reject_subreason_inc(reason.into());
+}
+
+fn append_arb_two_hop_insufficient_subreason_total(out: &mut String) {
+    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"not_known_pool\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_INSUFFICIENT_NOT_KNOWN_POOL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"missing_reserves\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_INSUFFICIENT_MISSING_RESERVES
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"missing_trade_price\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_INSUFFICIENT_MISSING_TRADE_PRICE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"no_comparable_price\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_INSUFFICIENT_NO_COMPARABLE_PRICE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"only_one_eligible_pool\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_POOL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"only_one_eligible_dex\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_DEX
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+}
+
+fn append_arb_two_hop_reject_subreason_total(out: &mut String) {
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"not_known_pool\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_NOT_KNOWN_POOL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"missing_decimals\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_MISSING_DECIMALS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"missing_reserves\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_MISSING_RESERVES
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"missing_trade_price\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_MISSING_TRADE_PRICE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"no_comparable_price\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_NO_COMPARABLE_PRICE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"stale_price\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_STALE_PRICE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"same_dex_only\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_SAME_DEX_ONLY
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"implausible_price\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_IMPLAUSIBLE_PRICE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"only_one_eligible_pool\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_ONLY_ONE_ELIGIBLE_POOL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"only_one_eligible_dex\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_ONLY_ONE_ELIGIBLE_DEX
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
 }
 
 /// Increment `arb_two_hop_reject_subreason_total{reason=...}` for any documented reject subreason.
@@ -4748,146 +4859,8 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
-    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"not_known_pool\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_INSUFFICIENT_NOT_KNOWN_POOL
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"missing_decimals\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_INSUFFICIENT_MISSING_DECIMALS
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"missing_reserves\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_INSUFFICIENT_MISSING_RESERVES
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"missing_trade_price\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_INSUFFICIENT_MISSING_TRADE_PRICE
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"no_comparable_price\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_INSUFFICIENT_NO_COMPARABLE_PRICE
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"stale_price\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_INSUFFICIENT_STALE_PRICE
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"same_dex_only\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_INSUFFICIENT_SAME_DEX_ONLY
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"implausible_price\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_INSUFFICIENT_IMPLAUSIBLE_PRICE
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"only_one_eligible_pool\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_POOL
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"only_one_eligible_dex\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_DEX
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_reject_subreason_total{reason=\"not_known_pool\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_REJECT_NOT_KNOWN_POOL
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_reject_subreason_total{reason=\"missing_decimals\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_REJECT_MISSING_DECIMALS
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_reject_subreason_total{reason=\"missing_reserves\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_REJECT_MISSING_RESERVES
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_reject_subreason_total{reason=\"missing_trade_price\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_REJECT_MISSING_TRADE_PRICE
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_reject_subreason_total{reason=\"no_comparable_price\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_REJECT_NO_COMPARABLE_PRICE
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_reject_subreason_total{reason=\"stale_price\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_REJECT_STALE_PRICE
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_reject_subreason_total{reason=\"same_dex_only\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_REJECT_SAME_DEX_ONLY
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_reject_subreason_total{reason=\"implausible_price\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_REJECT_IMPLAUSIBLE_PRICE
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_reject_subreason_total{reason=\"only_one_eligible_pool\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_REJECT_ONLY_ONE_ELIGIBLE_POOL
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
-    out.push_str("arb_two_hop_reject_subreason_total{reason=\"only_one_eligible_dex\"} ");
-    out.push_str(
-        &ARB_TWO_HOP_REJECT_ONLY_ONE_ELIGIBLE_DEX
-            .load(Ordering::Relaxed)
-            .to_string(),
-    );
-    out.push('\n');
+    append_arb_two_hop_insufficient_subreason_total(&mut out);
+    append_arb_two_hop_reject_subreason_total(&mut out);
     out.push_str("arb_two_hop_pool_gate_pools_total{gate=\"candidate_pools\"} ");
     out.push_str(
         &ARB_TWO_HOP_GATE_CANDIDATE_POOLS
@@ -5855,5 +5828,61 @@ mod momentum_latency_metrics_tests {
             MOMENTUM_CORE_MARKET_EVENTS_INGEST_CONSECUTIVE_CAP_HIT_STREAK.load(Ordering::Relaxed),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod arb_two_hop_subreason_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn insufficient_subreason_prometheus_exposes_only_incrementable_labels() {
+        let mut out = String::new();
+        append_arb_two_hop_insufficient_subreason_total(&mut out);
+
+        for label in [
+            "not_known_pool",
+            "missing_reserves",
+            "missing_trade_price",
+            "no_comparable_price",
+            "only_one_eligible_pool",
+            "only_one_eligible_dex",
+        ] {
+            assert!(
+                out.contains(&format!("reason=\"{label}\"")),
+                "missing insufficient label {label}"
+            );
+        }
+        for label in [
+            "missing_decimals",
+            "stale_price",
+            "same_dex_only",
+            "implausible_price",
+        ] {
+            assert!(
+                !out.contains(&format!("reason=\"{label}\"")),
+                "insufficient metric must not expose {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_subreason_prometheus_exposes_generic_reject_labels() {
+        let mut out = String::new();
+        append_arb_two_hop_reject_subreason_total(&mut out);
+
+        for label in [
+            "missing_decimals",
+            "stale_price",
+            "same_dex_only",
+            "implausible_price",
+            "not_known_pool",
+            "missing_reserves",
+        ] {
+            assert!(
+                out.contains(&format!("reason=\"{label}\"")),
+                "missing reject label {label}"
+            );
+        }
     }
 }
