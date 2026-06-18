@@ -2492,6 +2492,151 @@ pub fn arb_two_hop_tracker_seeded_pools_add(count: u64) {
     ARB_TWO_HOP_TRACKER_SEEDED_POOLS.fetch_add(count, Ordering::Relaxed);
 }
 
+/// Sub-reason when a mint hits the `insufficient_pools` gate (low-cardinality `reason` label).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbTwoHopInsufficientSubreason {
+    NotKnownPool,
+    MissingDecimals,
+    MissingReserves,
+    MissingTradePrice,
+    NoComparablePrice,
+    StalePrice,
+    SameDexOnly,
+    ImplausiblePrice,
+    OnlyOneEligiblePool,
+    OnlyOneEligibleDex,
+}
+
+pub static ARB_TWO_HOP_INSUFFICIENT_NOT_KNOWN_POOL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_INSUFFICIENT_MISSING_DECIMALS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_INSUFFICIENT_MISSING_RESERVES: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_INSUFFICIENT_MISSING_TRADE_PRICE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_INSUFFICIENT_NO_COMPARABLE_PRICE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_INSUFFICIENT_STALE_PRICE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_INSUFFICIENT_SAME_DEX_ONLY: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_INSUFFICIENT_IMPLAUSIBLE_PRICE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_POOL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_DEX: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Increment `arb_two_hop_insufficient_subreason_total{reason=...}` once per mint rejection.
+pub fn arb_two_hop_insufficient_subreason_inc(reason: ArbTwoHopInsufficientSubreason) {
+    let counter = match reason {
+        ArbTwoHopInsufficientSubreason::NotKnownPool => &*ARB_TWO_HOP_INSUFFICIENT_NOT_KNOWN_POOL,
+        ArbTwoHopInsufficientSubreason::MissingDecimals => {
+            &*ARB_TWO_HOP_INSUFFICIENT_MISSING_DECIMALS
+        }
+        ArbTwoHopInsufficientSubreason::MissingReserves => {
+            &*ARB_TWO_HOP_INSUFFICIENT_MISSING_RESERVES
+        }
+        ArbTwoHopInsufficientSubreason::MissingTradePrice => {
+            &*ARB_TWO_HOP_INSUFFICIENT_MISSING_TRADE_PRICE
+        }
+        ArbTwoHopInsufficientSubreason::NoComparablePrice => {
+            &*ARB_TWO_HOP_INSUFFICIENT_NO_COMPARABLE_PRICE
+        }
+        ArbTwoHopInsufficientSubreason::StalePrice => &*ARB_TWO_HOP_INSUFFICIENT_STALE_PRICE,
+        ArbTwoHopInsufficientSubreason::SameDexOnly => &*ARB_TWO_HOP_INSUFFICIENT_SAME_DEX_ONLY,
+        ArbTwoHopInsufficientSubreason::ImplausiblePrice => {
+            &*ARB_TWO_HOP_INSUFFICIENT_IMPLAUSIBLE_PRICE
+        }
+        ArbTwoHopInsufficientSubreason::OnlyOneEligiblePool => {
+            &*ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_POOL
+        }
+        ArbTwoHopInsufficientSubreason::OnlyOneEligibleDex => {
+            &*ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_DEX
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Pool-gate stages aggregated across 2-hop eligibility checks (`gate` label).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbTwoHopPoolGate {
+    CandidatePools,
+    InKnownPools,
+    FreshPrice,
+    HasReserveData,
+    HasTradeMid,
+    HasDecimals,
+    ComparablePricePresent,
+    ComparablePricePlausible,
+    EligiblePools,
+}
+
+pub static ARB_TWO_HOP_GATE_CANDIDATE_POOLS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_GATE_IN_KNOWN_POOLS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_GATE_FRESH_PRICE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_GATE_HAS_RESERVE_DATA: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_GATE_HAS_TRADE_MID: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_GATE_HAS_DECIMALS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_GATE_COMPARABLE_PRICE_PRESENT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_GATE_COMPARABLE_PRICE_PLAUSIBLE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_GATE_ELIGIBLE_POOLS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_ELIGIBLE_DEXES_CHECKS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_ELIGIBLE_ORCA: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_ELIGIBLE_METEORA_DLMM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_ELIGIBLE_PUMP_AMM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_ELIGIBLE_RAYDIUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_ELIGIBLE_RAYDIUM_CPMM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_ELIGIBLE_PUMPFUN: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// Add pool counts from one mint eligibility check to gate aggregate counters.
+pub fn arb_two_hop_pool_gate_add(gate: ArbTwoHopPoolGate, count: u64) {
+    if count == 0 {
+        return;
+    }
+    let counter = match gate {
+        ArbTwoHopPoolGate::CandidatePools => &*ARB_TWO_HOP_GATE_CANDIDATE_POOLS,
+        ArbTwoHopPoolGate::InKnownPools => &*ARB_TWO_HOP_GATE_IN_KNOWN_POOLS,
+        ArbTwoHopPoolGate::FreshPrice => &*ARB_TWO_HOP_GATE_FRESH_PRICE,
+        ArbTwoHopPoolGate::HasReserveData => &*ARB_TWO_HOP_GATE_HAS_RESERVE_DATA,
+        ArbTwoHopPoolGate::HasTradeMid => &*ARB_TWO_HOP_GATE_HAS_TRADE_MID,
+        ArbTwoHopPoolGate::HasDecimals => &*ARB_TWO_HOP_GATE_HAS_DECIMALS,
+        ArbTwoHopPoolGate::ComparablePricePresent => &*ARB_TWO_HOP_GATE_COMPARABLE_PRICE_PRESENT,
+        ArbTwoHopPoolGate::ComparablePricePlausible => {
+            &*ARB_TWO_HOP_GATE_COMPARABLE_PRICE_PLAUSIBLE
+        }
+        ArbTwoHopPoolGate::EligiblePools => &*ARB_TWO_HOP_GATE_ELIGIBLE_POOLS,
+    };
+    counter.fetch_add(count, Ordering::Relaxed);
+}
+
+/// Add distinct eligible DEX count from one mint check.
+pub fn arb_two_hop_eligible_dexes_add(count: u64) {
+    if count > 0 {
+        ARB_TWO_HOP_ELIGIBLE_DEXES_CHECKS_TOTAL.fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+/// Add eligible pool count per DEX from one mint check (fixed DEX labels only).
+pub fn arb_two_hop_eligible_pools_by_dex_add(dex: &str, count: u64) {
+    if count == 0 {
+        return;
+    }
+    let counter = match dex {
+        "orca" => &*ARB_TWO_HOP_ELIGIBLE_ORCA,
+        "meteora_dlmm" => &*ARB_TWO_HOP_ELIGIBLE_METEORA_DLMM,
+        "pump_amm" => &*ARB_TWO_HOP_ELIGIBLE_PUMP_AMM,
+        "raydium" => &*ARB_TWO_HOP_ELIGIBLE_RAYDIUM,
+        "raydium_cpmm" => &*ARB_TWO_HOP_ELIGIBLE_RAYDIUM_CPMM,
+        "pumpfun" => &*ARB_TWO_HOP_ELIGIBLE_PUMPFUN,
+        _ => return,
+    };
+    counter.fetch_add(count, Ordering::Relaxed);
+}
+
 // --- Arb-strategy MarketEvent subscriber pipeline ---
 pub static ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_SUBSCRIBER_LOW_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -2545,6 +2690,22 @@ pub static MULTI_HOP_CYCLE_REJECTED_SANITY_PROFIT_CAP: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static MULTI_HOP_CYCLE_REJECTED_SANITY_RETURN_BPS_CAP: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+pub static MULTI_HOP_QUOTE_READY_POOLS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MULTI_HOP_QUOTE_READY_WSOL_EDGE_POOLS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MULTI_HOP_SEARCH_NO_QUOTE_NEIGHBORS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub fn multi_hop_quote_ready_pools_set(count: u64) {
+    MULTI_HOP_QUOTE_READY_POOLS.store(count, Ordering::Relaxed);
+}
+
+pub fn multi_hop_quote_ready_wsol_edge_pools_set(count: u64) {
+    MULTI_HOP_QUOTE_READY_WSOL_EDGE_POOLS.store(count, Ordering::Relaxed);
+}
+
+pub fn multi_hop_search_no_quote_neighbors_inc() {
+    MULTI_HOP_SEARCH_NO_QUOTE_NEIGHBORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Sanity rejection reason for multi-hop cycles (Prometheus label `reason`).
 #[derive(Debug, Clone, Copy)]
@@ -4536,6 +4697,185 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
+    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"not_known_pool\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_INSUFFICIENT_NOT_KNOWN_POOL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"missing_decimals\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_INSUFFICIENT_MISSING_DECIMALS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"missing_reserves\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_INSUFFICIENT_MISSING_RESERVES
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"missing_trade_price\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_INSUFFICIENT_MISSING_TRADE_PRICE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"no_comparable_price\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_INSUFFICIENT_NO_COMPARABLE_PRICE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"stale_price\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_INSUFFICIENT_STALE_PRICE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"same_dex_only\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_INSUFFICIENT_SAME_DEX_ONLY
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"implausible_price\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_INSUFFICIENT_IMPLAUSIBLE_PRICE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"only_one_eligible_pool\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_POOL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"only_one_eligible_dex\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_DEX
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_pool_gate_pools_total{gate=\"candidate_pools\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_GATE_CANDIDATE_POOLS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_pool_gate_pools_total{gate=\"known_pools\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_GATE_IN_KNOWN_POOLS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_pool_gate_pools_total{gate=\"fresh_price\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_GATE_FRESH_PRICE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_pool_gate_pools_total{gate=\"has_reserve_data\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_GATE_HAS_RESERVE_DATA
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_pool_gate_pools_total{gate=\"has_trade_mid\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_GATE_HAS_TRADE_MID
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_pool_gate_pools_total{gate=\"has_decimals\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_GATE_HAS_DECIMALS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_pool_gate_pools_total{gate=\"comparable_price_present\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_GATE_COMPARABLE_PRICE_PRESENT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_pool_gate_pools_total{gate=\"comparable_price_plausible\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_GATE_COMPARABLE_PRICE_PLAUSIBLE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_pool_gate_pools_total{gate=\"eligible_pools\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_GATE_ELIGIBLE_POOLS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "arb_two_hop_eligible_dexes_checks_total",
+        ARB_TWO_HOP_ELIGIBLE_DEXES_CHECKS_TOTAL.load(Ordering::Relaxed)
+    );
+    out.push_str("arb_two_hop_eligible_pools_by_dex_total{dex=\"orca\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_ELIGIBLE_ORCA
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_eligible_pools_by_dex_total{dex=\"meteora_dlmm\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_ELIGIBLE_METEORA_DLMM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_eligible_pools_by_dex_total{dex=\"pump_amm\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_ELIGIBLE_PUMP_AMM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_eligible_pools_by_dex_total{dex=\"raydium\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_ELIGIBLE_RAYDIUM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_eligible_pools_by_dex_total{dex=\"raydium_cpmm\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_ELIGIBLE_RAYDIUM_CPMM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_eligible_pools_by_dex_total{dex=\"pumpfun\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_ELIGIBLE_PUMPFUN
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     line!(
         "multi_hop_return_bps_saturated_total",
         MULTI_HOP_RETURN_BPS_SATURATED_TOTAL.load(Ordering::Relaxed)
@@ -4585,6 +4925,18 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
+    line!(
+        "multi_hop_quote_ready_pools_total",
+        MULTI_HOP_QUOTE_READY_POOLS.load(Ordering::Relaxed)
+    );
+    line!(
+        "multi_hop_quote_ready_wsol_edge_pools_total",
+        MULTI_HOP_QUOTE_READY_WSOL_EDGE_POOLS.load(Ordering::Relaxed)
+    );
+    line!(
+        "multi_hop_search_no_quote_neighbors_total",
+        MULTI_HOP_SEARCH_NO_QUOTE_NEIGHBORS_TOTAL.load(Ordering::Relaxed)
+    );
     line!(
         "cycle_partial_examined_total",
         CYCLE_PARTIAL_EXAMINED.load(Ordering::Relaxed)

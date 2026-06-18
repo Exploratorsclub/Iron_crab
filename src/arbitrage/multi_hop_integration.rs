@@ -24,8 +24,10 @@ use crate::ipc::{
 use crate::metrics::{
     multi_hop_cycle_rejected_sanity_inc, multi_hop_hop_missing_quote_inc,
     multi_hop_quote_from_cache_inc, multi_hop_quote_from_trade_cache_inc,
-    multi_hop_return_bps_saturated_inc, multi_hop_search_worker_queue_depth_set,
-    multi_hop_searches_coalesced_inc, multi_hop_shadow_logged_inc, MultiHopSanityRejectReason,
+    multi_hop_quote_ready_pools_set, multi_hop_quote_ready_wsol_edge_pools_set,
+    multi_hop_return_bps_saturated_inc, multi_hop_search_no_quote_neighbors_inc,
+    multi_hop_search_worker_queue_depth_set, multi_hop_searches_coalesced_inc,
+    multi_hop_shadow_logged_inc, MultiHopSanityRejectReason,
 };
 use parking_lot::RwLock;
 use solana_sdk::pubkey::Pubkey;
@@ -926,6 +928,20 @@ impl MultiHopArbitrage {
         self.cycles_found
             .fetch_add(cycles.len() as u64, Ordering::Relaxed);
 
+        if cycles.is_empty() {
+            for token in tokens {
+                let neighbors = self.graph.neighbors(token);
+                let quote_ready_neighbors = neighbors
+                    .iter()
+                    .flat_map(|(_, edges)| edges)
+                    .filter(|edge| self.quote_provider.is_pool_quote_ready(&edge.pool_address))
+                    .count();
+                if quote_ready_neighbors < 2 {
+                    multi_hop_search_no_quote_neighbors_inc();
+                }
+            }
+        }
+
         // Filter: trustworthy profit estimate + min threshold
         let profitable: Vec<_> = cycles
             .into_iter()
@@ -1128,6 +1144,27 @@ impl MultiHopArbitrage {
     pub fn warmup_quotes_from_live_pool_cache(&self) {
         self.quote_provider
             .warmup_from_live_pool_cache(QUOTE_WARMUP_TOP_N);
+    }
+
+    /// Publish quote-readiness gauges for Prometheus (no algorithm change).
+    pub fn refresh_quote_readiness_metrics(&self) {
+        let ready_total = self.quote_provider.quote_ready_index().len() as u64;
+        multi_hop_quote_ready_pools_set(ready_total);
+
+        let wsol = match Pubkey::from_str(WSOL_MINT) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+        let wsol_edge = self
+            .pool_mints
+            .read()
+            .iter()
+            .filter(|(pool, (mint_a, mint_b))| {
+                (*mint_a == wsol || *mint_b == wsol)
+                    && self.quote_provider.is_pool_quote_ready(pool)
+            })
+            .count() as u64;
+        multi_hop_quote_ready_wsol_edge_pools_set(wsol_edge);
     }
 }
 

@@ -46,12 +46,14 @@ use ironcrab::metrics::{
     arb_subscriber_high_processed_inc, arb_subscriber_high_queue_depth_set,
     arb_subscriber_low_coalesced_inc, arb_subscriber_low_dropped_inc,
     arb_subscriber_low_processed_inc, arb_subscriber_low_queue_depth_set,
-    arb_subscriber_pool_created_skipped_inc, arb_two_hop_opportunity_inc, arb_two_hop_rejected_inc,
+    arb_subscriber_pool_created_skipped_inc, arb_two_hop_eligible_dexes_add,
+    arb_two_hop_eligible_pools_by_dex_add, arb_two_hop_insufficient_subreason_inc,
+    arb_two_hop_opportunity_inc, arb_two_hop_pool_gate_add, arb_two_hop_rejected_inc,
     arb_two_hop_tracker_seeded_pools_add, serve_metrics, set_readiness_nats_connected,
-    ArbTwoHopRejectReason, MetricsComponent, ARB_REJECTED_MISSING_ACCOUNTS,
-    ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL,
-    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
-    TOKENS_TRACKED_GAUGE,
+    ArbTwoHopInsufficientSubreason, ArbTwoHopPoolGate, ArbTwoHopRejectReason, MetricsComponent,
+    ARB_REJECTED_MISSING_ACCOUNTS, ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL,
+    MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
+    POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, pool_cache_live_fallback_consumer_config,
@@ -180,6 +182,11 @@ const DLMM_PROBE_SOL_LAMPORTS: u64 = 10_000_000;
 const DLMM_MARGINAL_MAX_DEVIATION_FACTOR: u64 = 100;
 /// Deduplicate per-mint "spread too large" WARN logs.
 const SPREAD_TOO_LARGE_WARN_COOLDOWN: Duration = Duration::from_secs(30);
+/// Rate limit for 2-hop eligibility diagnostic snapshots.
+const ELIGIBILITY_SNAPSHOT_COOLDOWN: Duration = Duration::from_secs(60);
+const ELIGIBILITY_SNAPSHOT_TOP_N: usize = 10;
+const ELIGIBILITY_SNAPSHOT_POOL_ROWS: usize = 5;
+const ELIGIBILITY_PENDING_CAP: usize = 256;
 
 /// Bounded HIGH-priority MarketEvent queue (Trade + active-pool state updates).
 const ARB_HIGH_EVENT_QUEUE_CAP: usize = 8192;
@@ -959,6 +966,313 @@ struct TokenArbTracker {
     last_intent_time: Option<Instant>,
 }
 
+/// Per-pool row for 2-hop eligibility forensics (bounded, no dynamic Prometheus labels).
+#[derive(Debug, Clone)]
+struct PoolEligibilityRow {
+    pool_address: String,
+    dex: String,
+    known: bool,
+    has_reserve_data: bool,
+    has_trade_mid: bool,
+    has_decimals: bool,
+    fresh: bool,
+    comparable_price_present: bool,
+    comparable_price_plausible: bool,
+    eligible: bool,
+}
+
+/// Aggregated mint-level eligibility breakdown for metrics + snapshots.
+#[derive(Debug, Clone)]
+struct MintEligibilityBreakdown {
+    mint: String,
+    candidate_pools_total: usize,
+    known_pools: usize,
+    fresh_price: usize,
+    has_reserve_data: usize,
+    has_trade_mid: usize,
+    has_decimals: usize,
+    comparable_price_present: usize,
+    comparable_price_plausible: usize,
+    eligible_pools: usize,
+    eligible_dexes: usize,
+    eligible_by_dex: HashMap<String, usize>,
+    reject_subreason: Option<ArbTwoHopInsufficientSubreason>,
+    pool_rows: Vec<PoolEligibilityRow>,
+}
+
+/// Rate-limited collector for top offending mints (insufficient_pools / stale_price).
+struct ArbEligibilityForensics {
+    last_snapshot: RwLock<Instant>,
+    pending: RwLock<HashMap<String, MintEligibilityBreakdown>>,
+    snapshots_emitted: AtomicU64,
+}
+
+impl ArbEligibilityForensics {
+    fn new() -> Self {
+        Self {
+            last_snapshot: RwLock::new(Instant::now()),
+            pending: RwLock::new(HashMap::new()),
+            snapshots_emitted: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, breakdown: MintEligibilityBreakdown) {
+        let Some(subreason) = breakdown.reject_subreason else {
+            return;
+        };
+        if !matches!(
+            subreason,
+            ArbTwoHopInsufficientSubreason::StalePrice
+                | ArbTwoHopInsufficientSubreason::NotKnownPool
+                | ArbTwoHopInsufficientSubreason::MissingDecimals
+                | ArbTwoHopInsufficientSubreason::MissingReserves
+                | ArbTwoHopInsufficientSubreason::MissingTradePrice
+                | ArbTwoHopInsufficientSubreason::NoComparablePrice
+                | ArbTwoHopInsufficientSubreason::SameDexOnly
+                | ArbTwoHopInsufficientSubreason::ImplausiblePrice
+                | ArbTwoHopInsufficientSubreason::OnlyOneEligiblePool
+                | ArbTwoHopInsufficientSubreason::OnlyOneEligibleDex
+        ) {
+            return;
+        }
+
+        let mut pending = self.pending.write();
+        pending.insert(breakdown.mint.clone(), breakdown);
+        if pending.len() > ELIGIBILITY_PENDING_CAP {
+            let drop_key = pending
+                .keys()
+                .next()
+                .cloned()
+                .expect("pending non-empty after cap exceeded");
+            pending.remove(&drop_key);
+        }
+    }
+
+    fn maybe_emit_snapshot(&self) -> bool {
+        let mut last = self.last_snapshot.write();
+        if last.elapsed() < ELIGIBILITY_SNAPSHOT_COOLDOWN {
+            return false;
+        }
+        *last = Instant::now();
+
+        let mut pending = self.pending.write();
+        if pending.is_empty() {
+            return false;
+        }
+
+        let mut ranked: Vec<MintEligibilityBreakdown> = pending.drain().map(|(_, b)| b).collect();
+        ranked.sort_by(|a, b| {
+            b.eligible_pools
+                .cmp(&a.eligible_pools)
+                .then_with(|| a.candidate_pools_total.cmp(&b.candidate_pools_total))
+        });
+        ranked.truncate(ELIGIBILITY_SNAPSHOT_TOP_N);
+
+        for entry in &ranked {
+            let top_pools: Vec<_> = entry
+                .pool_rows
+                .iter()
+                .take(ELIGIBILITY_SNAPSHOT_POOL_ROWS)
+                .map(|row| {
+                    serde_json::json!({
+                        "pool": row.pool_address,
+                        "dex": row.dex,
+                        "known": row.known,
+                        "has_reserve_data": row.has_reserve_data,
+                        "has_trade_mid": row.has_trade_mid,
+                        "has_decimals": row.has_decimals,
+                        "fresh": row.fresh,
+                        "comparable_price_present": row.comparable_price_present,
+                        "comparable_price_plausible": row.comparable_price_plausible,
+                    })
+                })
+                .collect();
+
+            info!(
+                kind = "arb_two_hop_eligibility_snapshot",
+                mint = %entry.mint,
+                total_pools = entry.candidate_pools_total,
+                eligible_pools = entry.eligible_pools,
+                eligible_dexes = entry.eligible_dexes,
+                reject_subreason = ?entry.reject_subreason,
+                top_pools = %serde_json::to_string(&top_pools).unwrap_or_else(|_| "[]".to_string()),
+                "2-hop eligibility forensics snapshot"
+            );
+        }
+
+        self.snapshots_emitted.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    #[cfg(test)]
+    fn snapshots_emitted_count(&self) -> u64 {
+        self.snapshots_emitted.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn force_snapshot_ready(&self) {
+        *self.last_snapshot.write() =
+            Instant::now() - ELIGIBILITY_SNAPSHOT_COOLDOWN - Duration::from_secs(1);
+    }
+}
+
+fn record_eligibility_metrics(breakdown: &MintEligibilityBreakdown) {
+    arb_two_hop_pool_gate_add(
+        ArbTwoHopPoolGate::CandidatePools,
+        breakdown.candidate_pools_total as u64,
+    );
+    arb_two_hop_pool_gate_add(
+        ArbTwoHopPoolGate::InKnownPools,
+        breakdown.known_pools as u64,
+    );
+    arb_two_hop_pool_gate_add(ArbTwoHopPoolGate::FreshPrice, breakdown.fresh_price as u64);
+    arb_two_hop_pool_gate_add(
+        ArbTwoHopPoolGate::HasReserveData,
+        breakdown.has_reserve_data as u64,
+    );
+    arb_two_hop_pool_gate_add(
+        ArbTwoHopPoolGate::HasTradeMid,
+        breakdown.has_trade_mid as u64,
+    );
+    arb_two_hop_pool_gate_add(
+        ArbTwoHopPoolGate::HasDecimals,
+        breakdown.has_decimals as u64,
+    );
+    arb_two_hop_pool_gate_add(
+        ArbTwoHopPoolGate::ComparablePricePresent,
+        breakdown.comparable_price_present as u64,
+    );
+    arb_two_hop_pool_gate_add(
+        ArbTwoHopPoolGate::ComparablePricePlausible,
+        breakdown.comparable_price_plausible as u64,
+    );
+    arb_two_hop_pool_gate_add(
+        ArbTwoHopPoolGate::EligiblePools,
+        breakdown.eligible_pools as u64,
+    );
+    arb_two_hop_eligible_dexes_add(breakdown.eligible_dexes as u64);
+    for (dex, count) in &breakdown.eligible_by_dex {
+        arb_two_hop_eligible_pools_by_dex_add(dex, *count as u64);
+    }
+    if let Some(subreason) = breakdown.reject_subreason {
+        arb_two_hop_insufficient_subreason_inc(subreason);
+    }
+}
+
+fn determine_insufficient_subreason(
+    breakdown: &MintEligibilityBreakdown,
+) -> ArbTwoHopInsufficientSubreason {
+    if breakdown.has_decimals == 0 && breakdown.candidate_pools_total > 0 {
+        return ArbTwoHopInsufficientSubreason::MissingDecimals;
+    }
+    if breakdown.eligible_pools == 1 {
+        return ArbTwoHopInsufficientSubreason::OnlyOneEligiblePool;
+    }
+    if breakdown.eligible_pools >= 2 && breakdown.eligible_dexes < 2 {
+        return ArbTwoHopInsufficientSubreason::OnlyOneEligibleDex;
+    }
+    if breakdown.known_pools < 2 && breakdown.candidate_pools_total >= 2 {
+        return ArbTwoHopInsufficientSubreason::NotKnownPool;
+    }
+    if breakdown.comparable_price_present >= 2 && breakdown.comparable_price_plausible < 2 {
+        return ArbTwoHopInsufficientSubreason::ImplausiblePrice;
+    }
+    if breakdown.comparable_price_present == 0 {
+        if breakdown.has_reserve_data == 0 && breakdown.has_trade_mid == 0 {
+            return ArbTwoHopInsufficientSubreason::MissingReserves;
+        }
+        if breakdown.has_trade_mid == 0 {
+            return ArbTwoHopInsufficientSubreason::MissingTradePrice;
+        }
+        return ArbTwoHopInsufficientSubreason::NoComparablePrice;
+    }
+    if breakdown.comparable_price_plausible == 0 {
+        return ArbTwoHopInsufficientSubreason::ImplausiblePrice;
+    }
+    ArbTwoHopInsufficientSubreason::NoComparablePrice
+}
+
+fn analyze_pool_eligibility(
+    pool: &PoolState,
+    base_mint: &str,
+    known_pools: &HashSet<String>,
+    token_decimals: Option<u8>,
+    vault_balances: &HashMap<String, VaultBalanceCache>,
+    bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
+    max_age: Duration,
+) -> PoolEligibilityRow {
+    let is_known_dex = is_known_dex_label(&pool.dex);
+    let known = is_known_dex && known_pools.contains(&pool.pool_address);
+    let vault_entry = vault_balances.get(&pool.pool_address);
+    let has_reserve_data = pool.has_reserve_data
+        || vault_entry
+            .map(|v| v.reserve_base > 0 && v.reserve_quote > 0)
+            .unwrap_or(false);
+    let has_trade_mid = trade_mid_sol_per_token(pool).is_some();
+    let has_decimals = token_decimals.is_some();
+    let fresh = known && is_pool_price_fresh(pool, vault_entry, max_age);
+
+    let vault_reserves = vault_entry.map(|c| (c.reserve_base, c.reserve_quote));
+    let dlmm_bins = bin_arrays.get(&pool.pool_address);
+    let buy_price = if known && has_decimals {
+        comparable_price_sol_per_token(
+            pool,
+            vault_reserves,
+            token_decimals,
+            base_mint,
+            vault_entry,
+            dlmm_bins,
+            ComparablePriceSide::Buy,
+        )
+    } else {
+        None
+    };
+    let sell_price = if known && has_decimals {
+        comparable_price_sol_per_token(
+            pool,
+            vault_reserves,
+            token_decimals,
+            base_mint,
+            vault_entry,
+            dlmm_bins,
+            ComparablePriceSide::Sell,
+        )
+    } else {
+        None
+    };
+    let comparable_price_present = buy_price.is_some() || sell_price.is_some();
+    let buy_plausible = buy_price
+        .filter(|p| *p > Decimal::ZERO)
+        .map(|p| is_plausible_sol_per_token_price(base_mint, p))
+        .unwrap_or(false);
+    let sell_plausible = sell_price
+        .filter(|p| *p > Decimal::ZERO)
+        .map(|p| is_plausible_sol_per_token_price(base_mint, p))
+        .unwrap_or(false);
+    let comparable_price_plausible = comparable_price_present && (buy_plausible || sell_plausible);
+    let eligible = known && comparable_price_present;
+
+    PoolEligibilityRow {
+        pool_address: pool.pool_address.clone(),
+        dex: pool.dex.clone(),
+        known,
+        has_reserve_data,
+        has_trade_mid,
+        has_decimals,
+        fresh,
+        comparable_price_present,
+        comparable_price_plausible,
+        eligible,
+    }
+}
+
+/// Ancillary inputs for `check_arbitrage` (keeps signature within clippy limits).
+struct ArbCheckContext<'a> {
+    spread_warn_last: &'a RwLock<HashMap<String, Instant>>,
+    data_quality_rejects: &'a AtomicU64,
+    forensics: Option<&'a ArbEligibilityForensics>,
+}
+
 impl TokenArbTracker {
     fn new(base_mint: &str) -> Self {
         Self {
@@ -1000,6 +1314,94 @@ impl TokenArbTracker {
         dexes.len()
     }
 
+    fn build_eligibility_breakdown(
+        &self,
+        known_pools: &HashSet<String>,
+        vault_balances: &HashMap<String, VaultBalanceCache>,
+        bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
+    ) -> MintEligibilityBreakdown {
+        let max_age = Duration::from_millis(MAX_PRICE_AGE_MS);
+        let mut pool_rows = Vec::with_capacity(self.pools.len());
+        let mut known_pools_count = 0usize;
+        let mut fresh_price = 0usize;
+        let mut has_reserve_data = 0usize;
+        let mut has_trade_mid = 0usize;
+        let mut has_decimals = 0usize;
+        let mut comparable_price_present = 0usize;
+        let mut comparable_price_plausible = 0usize;
+
+        for pool in self.pools.values() {
+            let row = analyze_pool_eligibility(
+                pool,
+                &self.base_mint,
+                known_pools,
+                self.token_decimals,
+                vault_balances,
+                bin_arrays,
+                max_age,
+            );
+            if row.known {
+                known_pools_count += 1;
+            }
+            if row.fresh {
+                fresh_price += 1;
+            }
+            if row.has_reserve_data {
+                has_reserve_data += 1;
+            }
+            if row.has_trade_mid {
+                has_trade_mid += 1;
+            }
+            if row.has_decimals {
+                has_decimals += 1;
+            }
+            if row.comparable_price_present {
+                comparable_price_present += 1;
+            }
+            if row.comparable_price_plausible {
+                comparable_price_plausible += 1;
+            }
+            pool_rows.push(row);
+        }
+
+        let mut eligible_by_dex: HashMap<String, usize> = HashMap::new();
+        let mut eligible_pools = 0usize;
+        for row in &pool_rows {
+            if row.eligible {
+                eligible_pools += 1;
+                *eligible_by_dex.entry(row.dex.clone()).or_default() += 1;
+            }
+        }
+
+        MintEligibilityBreakdown {
+            mint: self.base_mint.clone(),
+            candidate_pools_total: pool_rows.len(),
+            known_pools: known_pools_count,
+            fresh_price,
+            has_reserve_data,
+            has_trade_mid,
+            has_decimals,
+            comparable_price_present,
+            comparable_price_plausible,
+            eligible_pools,
+            eligible_dexes: eligible_by_dex.len(),
+            eligible_by_dex,
+            reject_subreason: None,
+            pool_rows,
+        }
+    }
+
+    fn emit_eligibility_forensics(
+        &self,
+        breakdown: MintEligibilityBreakdown,
+        forensics: Option<&ArbEligibilityForensics>,
+    ) {
+        record_eligibility_metrics(&breakdown);
+        if let Some(collector) = forensics {
+            collector.record(breakdown);
+        }
+    }
+
     /// Check for arbitrage opportunity between DEXes
     /// Returns: Option<(buy_dex, sell_dex, spread_bps, estimated_profit_lamports)>
     fn check_arbitrage(
@@ -1008,10 +1410,11 @@ impl TokenArbTracker {
         known_pools: &HashSet<String>,
         vault_balances: &HashMap<String, VaultBalanceCache>,
         bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
-        spread_warn_last: &RwLock<HashMap<String, Instant>>,
-        data_quality_rejects: &AtomicU64,
+        check_ctx: &ArbCheckContext<'_>,
     ) -> Option<ArbOpportunity> {
-        // Check if 2-hop arbitrage is enabled
+        let spread_warn_last = check_ctx.spread_warn_last;
+        let data_quality_rejects = check_ctx.data_quality_rejects;
+        let forensics = check_ctx.forensics;
         if !config.two_hop_enabled {
             debug!(
                 mint = %self.base_mint,
@@ -1020,19 +1423,25 @@ impl TokenArbTracker {
             return None;
         }
 
+        let mut breakdown =
+            self.build_eligibility_breakdown(known_pools, vault_balances, bin_arrays);
+
         let Some(token_decimals) = self.token_decimals else {
             debug!(
                 mint = %self.base_mint,
                 "Arb check: token decimals unknown — no synthetic fallback"
             );
+            breakdown.reject_subreason = Some(ArbTwoHopInsufficientSubreason::MissingDecimals);
+            self.emit_eligibility_forensics(breakdown, forensics);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::NoComparablePrice);
             return None;
         };
 
-        // Build comparable prices per pool (buy-side for cheapest, sell-side for highest bid)
+        let max_age = Duration::from_millis(MAX_PRICE_AGE_MS);
         let mut best_buy: Option<(&PoolState, Decimal)> = None;
         let mut best_sell: Option<(&PoolState, Decimal)> = None;
         let mut eligible_pools = 0usize;
+
         for pool in self.pools.values() {
             let is_known_dex = is_known_dex_label(&pool.dex);
             let in_master_cache = known_pools.contains(&pool.pool_address);
@@ -1100,23 +1509,33 @@ impl TokenArbTracker {
                 pools = eligible_pools,
                 "Arb check: insufficient pools with comparable prices"
             );
+            breakdown.reject_subreason = Some(determine_insufficient_subreason(&breakdown));
+            self.emit_eligibility_forensics(breakdown, forensics);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::InsufficientPools);
             return None;
         }
 
-        let (buy_pool, buy_price) = best_buy?;
-        let (sell_pool, sell_price) = best_sell?;
+        let Some((buy_pool, buy_price)) = best_buy else {
+            breakdown.reject_subreason = Some(ArbTwoHopInsufficientSubreason::ImplausiblePrice);
+            self.emit_eligibility_forensics(breakdown, forensics);
+            return None;
+        };
+        let Some((sell_pool, sell_price)) = best_sell else {
+            breakdown.reject_subreason = Some(ArbTwoHopInsufficientSubreason::ImplausiblePrice);
+            self.emit_eligibility_forensics(breakdown, forensics);
+            return None;
+        };
 
         if !is_plausible_sol_per_token_price(&self.base_mint, buy_price)
             || !is_plausible_sol_per_token_price(&self.base_mint, sell_price)
         {
             data_quality_rejects.fetch_add(1, Ordering::Relaxed);
+            breakdown.reject_subreason = Some(ArbTwoHopInsufficientSubreason::ImplausiblePrice);
+            self.emit_eligibility_forensics(breakdown, forensics);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::DataQuality);
             return None;
         }
 
-        // Staleness: trade-implied or Geyser reserve data must be fresh
-        let max_age = Duration::from_millis(MAX_PRICE_AGE_MS);
         let buy_vault = vault_balances.get(&buy_pool.pool_address);
         let sell_vault = vault_balances.get(&sell_pool.pool_address);
         if !is_pool_price_fresh(buy_pool, buy_vault, max_age)
@@ -1129,22 +1548,24 @@ impl TokenArbTracker {
                 max_age_ms = MAX_PRICE_AGE_MS,
                 "Arb check rejected: stale comparable price"
             );
+            breakdown.reject_subreason = Some(ArbTwoHopInsufficientSubreason::StalePrice);
+            self.emit_eligibility_forensics(breakdown, forensics);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::StalePrice);
             return None;
         }
 
-        // Don't arb same DEX
         if buy_pool.dex == sell_pool.dex {
             debug!(
                 mint = %self.base_mint,
                 dex = %buy_pool.dex,
                 "Arb check rejected: same DEX for buy/sell"
             );
+            breakdown.reject_subreason = Some(ArbTwoHopInsufficientSubreason::SameDexOnly);
+            self.emit_eligibility_forensics(breakdown, forensics);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::SameDex);
             return None;
         }
 
-        // CRITICAL: Exclude pumpfun (bonding curve) from ALL arbitrage!
         if buy_pool.dex == "pumpfun" || sell_pool.dex == "pumpfun" {
             debug!(
                 mint = %self.base_mint,
@@ -1152,39 +1573,29 @@ impl TokenArbTracker {
                 sell_dex = %sell_pool.dex,
                 "Arb check rejected: pumpfun (bonding curve) has no other pools to arb against"
             );
+            record_eligibility_metrics(&breakdown);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::Pumpfun);
             return None;
         }
 
-        // Calculate spread in bps
-        // spread = (sell_price - buy_price) / buy_price * 10000
         if buy_price <= Decimal::ZERO {
+            record_eligibility_metrics(&breakdown);
             return None;
         }
 
         let spread = (sell_price - buy_price) / buy_price * Decimal::from(10000);
-        // Convert to i64, handling large spreads correctly
         let spread_bps = spread.round().to_i64().unwrap_or(i64::MAX);
 
-        // DATA QUALITY FILTERS
-
-        // Filter 1: Exclude Native SOL arbitrage (these are wrap/unwrap, not real arb)
         if self.base_mint == NATIVE_SOL_MINT {
             debug!(
                 mint = %self.base_mint,
                 "Arb check rejected: Native SOL trades are wrap/unwrap, not arbitrage"
             );
+            record_eligibility_metrics(&breakdown);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::NativeSol);
             return None;
         }
 
-        // NOTE: Per-pool staleness check REMOVED.
-        // Geyser streams directly from validator - if pool has no updates, that means:
-        // - Pool is inactive (no trades/events), data IS current
-        // - RPC would have same or older data
-        // Geyser connection health is checked globally in ArbContext::is_geyser_connection_healthy()
-
-        // Filter 2: Sanity check for unrealistic spreads
         let max_spread = if self.base_mint == USDC_MINT || self.base_mint == USDT_MINT {
             STABLECOIN_MAX_SPREAD_BPS
         } else {
@@ -1215,6 +1626,7 @@ impl TokenArbTracker {
                     "Arb check rejected: spread too large (likely data error)"
                 );
             }
+            record_eligibility_metrics(&breakdown);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::SpreadTooLarge);
             return None;
         }
@@ -1230,34 +1642,28 @@ impl TokenArbTracker {
                 min_spread = config.min_spread_bps,
                 "Arb check rejected: spread below minimum"
             );
+            record_eligibility_metrics(&breakdown);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::SpreadBelowMin);
             return None;
         }
 
-        // Estimate profit
-        // Use smaller liquidity pool as constraint (fallback to max_position if liquidity unknown)
         let max_trade_sol =
             if buy_pool.liquidity_sol > Decimal::ZERO && sell_pool.liquidity_sol > Decimal::ZERO {
                 buy_pool.liquidity_sol.min(sell_pool.liquidity_sol).min(
                     Decimal::from(config.max_position_lamports) / Decimal::from(1_000_000_000u64),
                 )
             } else {
-                // Liquidity unknown (trade-based pools) - use max_position as conservative estimate
                 Decimal::from(config.max_position_lamports) / Decimal::from(1_000_000_000u64)
             };
 
-        // Gross profit = trade_amount * spread_pct
         let gross_profit = max_trade_sol * (spread / Decimal::from(10000));
-        // Convert to lamports using proper Decimal methods
         let gross_profit_lamports = (gross_profit * Decimal::from(1_000_000_000u64))
             .round()
             .to_u64()
             .unwrap_or(0);
 
-        // Net profit after tx costs
         let net_profit = gross_profit_lamports.saturating_sub(config.est_tx_cost_lamports);
 
-        // 5× profit penalty only when BOTH sides lack Geyser reserve data and SOL liquidity
         let buy_liquidity_unknown =
             !buy_pool.has_reserve_data && buy_pool.liquidity_sol <= Decimal::ZERO;
         let sell_liquidity_unknown =
@@ -1296,10 +1702,12 @@ impl TokenArbTracker {
                 sell_liquidity_known = !sell_liquidity_unknown,
                 "Arb check rejected: profit below minimum"
             );
+            record_eligibility_metrics(&breakdown);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::ProfitBelowMin);
             return None;
         }
 
+        record_eligibility_metrics(&breakdown);
         arb_two_hop_opportunity_inc();
 
         let trade_amount_lamports = (max_trade_sol * Decimal::from(1_000_000_000u64))
@@ -1704,6 +2112,9 @@ struct ArbContext {
 
     /// Per-mint last WARN time for "spread too large" deduplication.
     spread_too_large_warn_last: RwLock<HashMap<String, Instant>>,
+
+    /// Bounded 2-hop eligibility forensics (rate-limited snapshots).
+    eligibility_forensics: ArbEligibilityForensics,
 }
 
 /// Cached vault balances from PoolStateUpdate events
@@ -2683,8 +3094,11 @@ impl ArbContext {
             &known_pools,
             &vault_balances,
             &bin_arrays,
-            &self.spread_too_large_warn_last,
-            &self.data_quality_rejects,
+            &ArbCheckContext {
+                spread_warn_last: &self.spread_too_large_warn_last,
+                data_quality_rejects: &self.data_quality_rejects,
+                forensics: Some(&self.eligibility_forensics),
+            },
         ) {
             // Check cooldown
             let cooldown = Duration::from_millis(config.intent_cooldown_ms);
@@ -3075,6 +3489,7 @@ async fn main() -> Result<()> {
         known_pools: RwLock::new(HashSet::new()),
         multi_hop,
         spread_too_large_warn_last: RwLock::new(HashMap::new()),
+        eligibility_forensics: ArbEligibilityForensics::new(),
     });
 
     // Bootstrap SLAVE LivePoolCache from JetStream (same path as execution-engine).
@@ -3439,6 +3854,8 @@ async fn main() -> Result<()> {
 
                 let known_pools_count = ctx.known_pools.read().len();
                 let multi_hop_stats = ctx.multi_hop.stats();
+                ctx.multi_hop.refresh_quote_readiness_metrics();
+                ctx.eligibility_forensics.maybe_emit_snapshot();
 
                 // Prometheus: publish current gauges for this process
                 POOLS_TRACKED_GAUGE.store(ctx.pools_tracked.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -4297,8 +4714,11 @@ mod two_hop_price_tests {
             &known_pools,
             &vault_balances,
             &bin_arrays,
-            &spread_warn_last,
-            &data_quality_rejects,
+            &ArbCheckContext {
+                spread_warn_last: &spread_warn_last,
+                data_quality_rejects: &data_quality_rejects,
+                forensics: None,
+            },
         );
         // Same reserves → spread ~0, rejected by spread_below_min not insufficient_pools
         assert!(
@@ -4568,6 +4988,8 @@ mod two_hop_price_tests {
         tracker.upsert_pool(pool);
         let mut known_pools = HashSet::new();
         known_pools.insert("orcaSwapped".to_string());
+        let spread_warn_last = RwLock::new(HashMap::new());
+        let data_quality_rejects = AtomicU64::new(0);
         let opp = tracker.check_arbitrage(
             &ArbConfig::default(),
             &known_pools,
@@ -4585,8 +5007,11 @@ mod two_hop_price_tests {
                 },
             )]),
             &HashMap::new(),
-            &RwLock::new(HashMap::new()),
-            &AtomicU64::new(0),
+            &ArbCheckContext {
+                spread_warn_last: &spread_warn_last,
+                data_quality_rejects: &data_quality_rejects,
+                forensics: None,
+            },
         );
         assert!(opp.is_none());
         assert_eq!(
@@ -4639,6 +5064,253 @@ mod two_hop_price_tests {
             ComparablePriceSide::Buy,
         );
         assert!(price.is_none(), "must not assume 6 decimals when unknown");
+    }
+
+    fn check_with_forensics(
+        tracker: &TokenArbTracker,
+        known_pools: &HashSet<String>,
+        vault_balances: &HashMap<String, VaultBalanceCache>,
+        forensics: &ArbEligibilityForensics,
+    ) -> Option<ArbOpportunity> {
+        let spread_warn_last = RwLock::new(HashMap::new());
+        let data_quality_rejects = AtomicU64::new(0);
+        tracker.check_arbitrage(
+            &ArbConfig::default(),
+            known_pools,
+            vault_balances,
+            &HashMap::new(),
+            &ArbCheckContext {
+                spread_warn_last: &spread_warn_last,
+                data_quality_rejects: &data_quality_rejects,
+                forensics: Some(forensics),
+            },
+        )
+    }
+
+    fn vault(reserve_base: u64, reserve_quote: u64) -> VaultBalanceCache {
+        sample_vault(reserve_base, reserve_quote, None, None, false, None)
+    }
+
+    #[test]
+    fn forensics_not_known_pool_when_only_one_in_master_cache() {
+        let before =
+            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_NOT_KNOWN_POOL.load(Ordering::Relaxed);
+        let reserves = (1_000_000_000_000u64, 1_000_000_000u64);
+        let mut tracker = TokenArbTracker::new("TokenMint11111111111111111111111111111111");
+        tracker.token_decimals = Some(6);
+        tracker.upsert_pool(sample_pool("orca", "poolKnown", None, None));
+        tracker.upsert_pool(sample_pool("pump_amm", "poolUnknown", None, None));
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert("poolKnown".to_string());
+
+        let vault_balances = HashMap::from([
+            ("poolKnown".to_string(), vault(reserves.0, reserves.1)),
+            ("poolUnknown".to_string(), vault(reserves.0, reserves.1)),
+        ]);
+
+        let forensics = ArbEligibilityForensics::new();
+        assert!(
+            check_with_forensics(&tracker, &known_pools, &vault_balances, &forensics).is_none()
+        );
+        assert!(
+            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_POOL
+                .load(Ordering::Relaxed)
+                > before
+                || ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_NOT_KNOWN_POOL
+                    .load(Ordering::Relaxed)
+                    > before
+        );
+    }
+
+    #[test]
+    fn forensics_same_dex_only_when_both_pools_on_one_dex() {
+        let before =
+            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_SAME_DEX_ONLY.load(Ordering::Relaxed);
+        let reserves = (1_000_000_000_000u64, 1_000_000_000u64);
+        let mint = "TokenMint22222222222222222222222222222222";
+        let mut tracker = TokenArbTracker::new(mint);
+        tracker.token_decimals = Some(6);
+        tracker.upsert_pool(sample_pool("orca", "poolA", None, None));
+        tracker.upsert_pool(sample_pool("orca", "poolB", None, None));
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert("poolA".to_string());
+        known_pools.insert("poolB".to_string());
+
+        let vault_balances = HashMap::from([
+            ("poolA".to_string(), vault(reserves.0, reserves.1)),
+            ("poolB".to_string(), vault(reserves.0, reserves.1)),
+        ]);
+
+        let forensics = ArbEligibilityForensics::new();
+        assert!(
+            check_with_forensics(&tracker, &known_pools, &vault_balances, &forensics).is_none()
+        );
+        assert!(
+            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_SAME_DEX_ONLY.load(Ordering::Relaxed)
+                > before
+        );
+    }
+
+    #[test]
+    fn forensics_stale_price_when_one_dex_stale() {
+        let before =
+            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_STALE_PRICE.load(Ordering::Relaxed);
+        let mint = "TokenMint33333333333333333333333333333333";
+        let mut tracker = TokenArbTracker::new(mint);
+        tracker.token_decimals = Some(6);
+        tracker.upsert_pool(PoolState {
+            has_reserve_data: true,
+            ..sample_pool("orca", "poolFresh", None, None)
+        });
+        tracker.upsert_pool(PoolState {
+            has_reserve_data: true,
+            last_update: Instant::now() - Duration::from_millis(MAX_PRICE_AGE_MS + 5_000),
+            ..sample_pool("pump_amm", "poolStale", None, None)
+        });
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert("poolFresh".to_string());
+        known_pools.insert("poolStale".to_string());
+
+        let vault_balances = HashMap::from([
+            (
+                "poolFresh".to_string(),
+                vault(1_000_000_000_000, 1_000_000_000),
+            ),
+            (
+                "poolStale".to_string(),
+                VaultBalanceCache {
+                    reserve_base: 500_000_000_000,
+                    reserve_quote: 1_000_000_000,
+                    updated_at: Instant::now() - Duration::from_millis(MAX_PRICE_AGE_MS + 5_000),
+                    ..vault(500_000_000_000, 1_000_000_000)
+                },
+            ),
+        ]);
+
+        let forensics = ArbEligibilityForensics::new();
+        assert!(
+            check_with_forensics(&tracker, &known_pools, &vault_balances, &forensics).is_none()
+        );
+        assert!(
+            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_STALE_PRICE.load(Ordering::Relaxed)
+                > before
+        );
+    }
+
+    #[test]
+    fn forensics_missing_decimals_subreason() {
+        let before =
+            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_MISSING_DECIMALS.load(Ordering::Relaxed);
+        let reserves = (1_000_000_000_000u64, 1_000_000_000u64);
+        let mut tracker = TokenArbTracker::new("TokenMint44444444444444444444444444444444");
+        tracker.upsert_pool(sample_pool("orca", "poolA", None, None));
+        tracker.upsert_pool(sample_pool("pump_amm", "poolB", None, None));
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert("poolA".to_string());
+        known_pools.insert("poolB".to_string());
+        let vault_balances = HashMap::from([
+            ("poolA".to_string(), vault(reserves.0, reserves.1)),
+            ("poolB".to_string(), vault(reserves.0, reserves.1)),
+        ]);
+
+        let forensics = ArbEligibilityForensics::new();
+        assert!(
+            check_with_forensics(&tracker, &known_pools, &vault_balances, &forensics).is_none()
+        );
+        assert!(
+            ironcrab::metrics::ARB_TWO_HOP_INSUFFICIENT_MISSING_DECIMALS.load(Ordering::Relaxed)
+                > before
+        );
+    }
+
+    #[test]
+    fn forensics_implausible_stablecoin_not_spread_too_large() {
+        let spread_before =
+            ironcrab::metrics::ARB_TWO_HOP_REJECTED_SPREAD_TOO_LARGE.load(Ordering::Relaxed);
+        let insufficient_before =
+            ironcrab::metrics::ARB_TWO_HOP_REJECTED_INSUFFICIENT_POOLS.load(Ordering::Relaxed);
+
+        let sol_in_base = 1_000_000_000u64;
+        let usdc_in_quote = 65_000_000u64;
+        let mut tracker = TokenArbTracker::new(USDC_MINT);
+        tracker.token_decimals = Some(6);
+        tracker.upsert_pool(sample_pool("orca", "orcaBad", None, None));
+        tracker.upsert_pool(sample_pool("meteora_dlmm", "dlmmBad", None, None));
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert("orcaBad".to_string());
+        known_pools.insert("dlmmBad".to_string());
+        let vault_balances = HashMap::from([
+            ("orcaBad".to_string(), vault(sol_in_base, usdc_in_quote)),
+            ("dlmmBad".to_string(), vault(sol_in_base, usdc_in_quote)),
+        ]);
+
+        let forensics = ArbEligibilityForensics::new();
+        assert!(
+            check_with_forensics(&tracker, &known_pools, &vault_balances, &forensics).is_none()
+        );
+        assert_eq!(
+            ironcrab::metrics::ARB_TWO_HOP_REJECTED_SPREAD_TOO_LARGE.load(Ordering::Relaxed),
+            spread_before
+        );
+        assert!(
+            ironcrab::metrics::ARB_TWO_HOP_REJECTED_INSUFFICIENT_POOLS.load(Ordering::Relaxed)
+                > insufficient_before
+        );
+    }
+
+    #[test]
+    fn determine_implausible_subreason_when_comparable_not_plausible() {
+        let breakdown = MintEligibilityBreakdown {
+            mint: USDC_MINT.to_string(),
+            candidate_pools_total: 2,
+            known_pools: 2,
+            fresh_price: 2,
+            has_reserve_data: 0,
+            has_trade_mid: 2,
+            has_decimals: 2,
+            comparable_price_present: 2,
+            comparable_price_plausible: 0,
+            eligible_pools: 2,
+            eligible_dexes: 2,
+            eligible_by_dex: HashMap::from([
+                ("orca".to_string(), 1),
+                ("meteora_dlmm".to_string(), 1),
+            ]),
+            reject_subreason: None,
+            pool_rows: vec![],
+        };
+        assert_eq!(
+            determine_insufficient_subreason(&breakdown),
+            ArbTwoHopInsufficientSubreason::ImplausiblePrice
+        );
+    }
+
+    #[test]
+    fn eligibility_snapshot_rate_limited_to_once_per_60s() {
+        let forensics = ArbEligibilityForensics::new();
+        let reserves = (1_000_000_000_000u64, 1_000_000_000u64);
+        let mut tracker = TokenArbTracker::new("TokenMint55555555555555555555555555555555");
+        tracker.token_decimals = Some(6);
+        tracker.upsert_pool(sample_pool("orca", "poolOnly", None, None));
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert("poolOnly".to_string());
+        let vault_balances =
+            HashMap::from([("poolOnly".to_string(), vault(reserves.0, reserves.1))]);
+
+        forensics.force_snapshot_ready();
+        let _ = check_with_forensics(&tracker, &known_pools, &vault_balances, &forensics);
+        assert!(forensics.maybe_emit_snapshot());
+        assert_eq!(forensics.snapshots_emitted_count(), 1);
+
+        let _ = check_with_forensics(&tracker, &known_pools, &vault_balances, &forensics);
+        assert!(!forensics.maybe_emit_snapshot());
+        assert_eq!(forensics.snapshots_emitted_count(), 1);
     }
 }
 
