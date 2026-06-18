@@ -2496,6 +2496,17 @@ pub fn arb_two_hop_tracker_seeded_pools_add(count: u64) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArbTwoHopInsufficientSubreason {
     NotKnownPool,
+    MissingReserves,
+    MissingTradePrice,
+    NoComparablePrice,
+    OnlyOneEligiblePool,
+    OnlyOneEligibleDex,
+}
+
+/// Diagnostic sub-reason for any 2-hop reject path (low-cardinality `reason` label).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbTwoHopRejectSubreason {
+    NotKnownPool,
     MissingDecimals,
     MissingReserves,
     MissingTradePrice,
@@ -2505,6 +2516,19 @@ pub enum ArbTwoHopInsufficientSubreason {
     ImplausiblePrice,
     OnlyOneEligiblePool,
     OnlyOneEligibleDex,
+}
+
+impl From<ArbTwoHopInsufficientSubreason> for ArbTwoHopRejectSubreason {
+    fn from(reason: ArbTwoHopInsufficientSubreason) -> Self {
+        match reason {
+            ArbTwoHopInsufficientSubreason::NotKnownPool => Self::NotKnownPool,
+            ArbTwoHopInsufficientSubreason::MissingReserves => Self::MissingReserves,
+            ArbTwoHopInsufficientSubreason::MissingTradePrice => Self::MissingTradePrice,
+            ArbTwoHopInsufficientSubreason::NoComparablePrice => Self::NoComparablePrice,
+            ArbTwoHopInsufficientSubreason::OnlyOneEligiblePool => Self::OnlyOneEligiblePool,
+            ArbTwoHopInsufficientSubreason::OnlyOneEligibleDex => Self::OnlyOneEligibleDex,
+        }
+    }
 }
 
 pub static ARB_TWO_HOP_INSUFFICIENT_NOT_KNOWN_POOL: Lazy<AtomicU64> =
@@ -2527,13 +2551,25 @@ pub static ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_POOL: Lazy<AtomicU64> =
 pub static ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_DEX: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
-/// Increment `arb_two_hop_insufficient_subreason_total{reason=...}` once per mint rejection.
+pub static ARB_TWO_HOP_REJECT_NOT_KNOWN_POOL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECT_MISSING_DECIMALS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECT_MISSING_RESERVES: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECT_MISSING_TRADE_PRICE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECT_NO_COMPARABLE_PRICE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECT_STALE_PRICE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECT_SAME_DEX_ONLY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECT_IMPLAUSIBLE_PRICE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECT_ONLY_ONE_ELIGIBLE_POOL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_REJECT_ONLY_ONE_ELIGIBLE_DEX: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Increment `arb_two_hop_insufficient_subreason_total{reason=...}` for insufficient_pools only.
 pub fn arb_two_hop_insufficient_subreason_inc(reason: ArbTwoHopInsufficientSubreason) {
     let counter = match reason {
         ArbTwoHopInsufficientSubreason::NotKnownPool => &*ARB_TWO_HOP_INSUFFICIENT_NOT_KNOWN_POOL,
-        ArbTwoHopInsufficientSubreason::MissingDecimals => {
-            &*ARB_TWO_HOP_INSUFFICIENT_MISSING_DECIMALS
-        }
         ArbTwoHopInsufficientSubreason::MissingReserves => {
             &*ARB_TWO_HOP_INSUFFICIENT_MISSING_RESERVES
         }
@@ -2543,17 +2579,32 @@ pub fn arb_two_hop_insufficient_subreason_inc(reason: ArbTwoHopInsufficientSubre
         ArbTwoHopInsufficientSubreason::NoComparablePrice => {
             &*ARB_TWO_HOP_INSUFFICIENT_NO_COMPARABLE_PRICE
         }
-        ArbTwoHopInsufficientSubreason::StalePrice => &*ARB_TWO_HOP_INSUFFICIENT_STALE_PRICE,
-        ArbTwoHopInsufficientSubreason::SameDexOnly => &*ARB_TWO_HOP_INSUFFICIENT_SAME_DEX_ONLY,
-        ArbTwoHopInsufficientSubreason::ImplausiblePrice => {
-            &*ARB_TWO_HOP_INSUFFICIENT_IMPLAUSIBLE_PRICE
-        }
         ArbTwoHopInsufficientSubreason::OnlyOneEligiblePool => {
             &*ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_POOL
         }
         ArbTwoHopInsufficientSubreason::OnlyOneEligibleDex => {
             &*ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_DEX
         }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    arb_two_hop_reject_subreason_inc(reason.into());
+}
+
+/// Increment `arb_two_hop_reject_subreason_total{reason=...}` for any documented reject subreason.
+pub fn arb_two_hop_reject_subreason_inc(reason: ArbTwoHopRejectSubreason) {
+    let counter = match reason {
+        ArbTwoHopRejectSubreason::NotKnownPool => &*ARB_TWO_HOP_REJECT_NOT_KNOWN_POOL,
+        ArbTwoHopRejectSubreason::MissingDecimals => &*ARB_TWO_HOP_REJECT_MISSING_DECIMALS,
+        ArbTwoHopRejectSubreason::MissingReserves => &*ARB_TWO_HOP_REJECT_MISSING_RESERVES,
+        ArbTwoHopRejectSubreason::MissingTradePrice => &*ARB_TWO_HOP_REJECT_MISSING_TRADE_PRICE,
+        ArbTwoHopRejectSubreason::NoComparablePrice => &*ARB_TWO_HOP_REJECT_NO_COMPARABLE_PRICE,
+        ArbTwoHopRejectSubreason::StalePrice => &*ARB_TWO_HOP_REJECT_STALE_PRICE,
+        ArbTwoHopRejectSubreason::SameDexOnly => &*ARB_TWO_HOP_REJECT_SAME_DEX_ONLY,
+        ArbTwoHopRejectSubreason::ImplausiblePrice => &*ARB_TWO_HOP_REJECT_IMPLAUSIBLE_PRICE,
+        ArbTwoHopRejectSubreason::OnlyOneEligiblePool => {
+            &*ARB_TWO_HOP_REJECT_ONLY_ONE_ELIGIBLE_POOL
+        }
+        ArbTwoHopRejectSubreason::OnlyOneEligibleDex => &*ARB_TWO_HOP_REJECT_ONLY_ONE_ELIGIBLE_DEX,
     };
     counter.fetch_add(1, Ordering::Relaxed);
 }
@@ -4763,6 +4814,76 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"only_one_eligible_dex\"} ");
     out.push_str(
         &ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_DEX
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"not_known_pool\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_NOT_KNOWN_POOL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"missing_decimals\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_MISSING_DECIMALS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"missing_reserves\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_MISSING_RESERVES
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"missing_trade_price\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_MISSING_TRADE_PRICE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"no_comparable_price\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_NO_COMPARABLE_PRICE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"stale_price\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_STALE_PRICE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"same_dex_only\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_SAME_DEX_ONLY
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"implausible_price\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_IMPLAUSIBLE_PRICE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"only_one_eligible_pool\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_ONLY_ONE_ELIGIBLE_POOL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_reject_subreason_total{reason=\"only_one_eligible_dex\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_REJECT_ONLY_ONE_ELIGIBLE_DEX
             .load(Ordering::Relaxed)
             .to_string(),
     );
