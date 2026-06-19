@@ -3372,6 +3372,79 @@ struct ArbCoveragePoolRecord {
     common_quote_mints: Vec<Pubkey>,
 }
 
+impl ArbCoverageIndex {
+    fn remove_pool_record(&mut self, pool: Pubkey, record: &ArbCoveragePoolRecord) {
+        for mint in &record.listed_mints {
+            if let Some(dex_map) = self.mint_dex_pools.get_mut(mint) {
+                if let Some(pools) = dex_map.get_mut(&record.dex) {
+                    pools.remove(&pool);
+                    if pools.is_empty() {
+                        dex_map.remove(record.dex);
+                    }
+                }
+                if dex_map.is_empty() {
+                    self.mint_dex_pools.remove(mint);
+                }
+            }
+        }
+        for mint in &record.common_quote_mints {
+            if let Some(pools) = self.mint_common_quote_pools.get_mut(mint) {
+                pools.remove(&pool);
+                if pools.is_empty() {
+                    self.mint_common_quote_pools.remove(mint);
+                }
+            }
+        }
+    }
+
+    fn insert_pool_record(&mut self, pool: Pubkey, record: ArbCoveragePoolRecord) {
+        for mint in &record.listed_mints {
+            self.mint_dex_pools
+                .entry(*mint)
+                .or_default()
+                .entry(record.dex)
+                .or_default()
+                .insert(pool);
+        }
+        for mint in &record.common_quote_mints {
+            self.mint_common_quote_pools
+                .entry(*mint)
+                .or_default()
+                .insert(pool);
+        }
+        self.by_pool.insert(pool, record);
+    }
+
+    /// Swap one pool's index row under a single write lock (remove old + insert new).
+    fn replace_pool_record(&mut self, pool: Pubkey, new_record: Option<ArbCoveragePoolRecord>) {
+        if let Some(old) = self.by_pool.remove(&pool) {
+            self.remove_pool_record(pool, &old);
+        }
+        if let Some(record) = new_record {
+            self.insert_pool_record(pool, record);
+        }
+    }
+}
+
+fn arb_coverage_pool_record_from_state(state: &CachedPoolState) -> Option<ArbCoveragePoolRecord> {
+    if matches!(state, CachedPoolState::PumpFun(_)) {
+        return None;
+    }
+    let (mint_a, mint_b) = pool_mints_for_geyser_explicit_tracking(state)?;
+    let dex = state.dex_name();
+    let listed_mints = vec![mint_a, mint_b];
+    let common_quote_mints = if cached_pool_has_arb_common_quote_leg(state) {
+        arb_candidate_mints_from_pair(mint_a, mint_b)
+    } else {
+        Vec::new()
+    };
+    Some(ArbCoveragePoolRecord {
+        dex,
+        listed_mints,
+        common_quote_mints,
+    })
+}
+
 const ARB_USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const ARB_USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 
@@ -3712,84 +3785,19 @@ impl MarketDataContext {
             .unwrap_or_default()
     }
 
-    fn remove_pool_from_arb_coverage_index(&self, pool: Pubkey) {
-        let mut index = self.arb_coverage_index.write();
-        let Some(record) = index.by_pool.remove(&pool) else {
-            return;
-        };
-        for mint in record.listed_mints {
-            if let Some(dex_map) = index.mint_dex_pools.get_mut(&mint) {
-                if let Some(pools) = dex_map.get_mut(&record.dex) {
-                    pools.remove(&pool);
-                    if pools.is_empty() {
-                        dex_map.remove(record.dex);
-                    }
-                }
-                if dex_map.is_empty() {
-                    index.mint_dex_pools.remove(&mint);
-                }
-            }
-        }
-        for mint in record.common_quote_mints {
-            if let Some(pools) = index.mint_common_quote_pools.get_mut(&mint) {
-                pools.remove(&pool);
-                if pools.is_empty() {
-                    index.mint_common_quote_pools.remove(&mint);
-                }
-            }
-        }
-    }
-
-    /// O(1) index refresh for one pool — called from md-state on upsert/register paths.
+    /// O(1) index refresh for one pool — single write lock for remove+insert (no transient gap).
     fn refresh_arb_coverage_index_for_pool(&self, pool: Pubkey) {
-        let Some(state) = self.live_pool_cache.get(&pool) else {
-            self.remove_pool_from_arb_coverage_index(pool);
-            return;
-        };
-        if matches!(state, CachedPoolState::PumpFun(_)) {
-            self.remove_pool_from_arb_coverage_index(pool);
-            return;
-        }
-        let Some((mint_a, mint_b)) = pool_mints_for_geyser_explicit_tracking(&state) else {
-            self.remove_pool_from_arb_coverage_index(pool);
-            return;
-        };
-
-        self.remove_pool_from_arb_coverage_index(pool);
-
-        let dex = state.dex_name();
-        let listed_mints = vec![mint_a, mint_b];
-        let common_quote_mints = if cached_pool_has_arb_common_quote_leg(&state) {
-            arb_candidate_mints_from_pair(mint_a, mint_b)
-        } else {
-            Vec::new()
-        };
-
-        let record = ArbCoveragePoolRecord {
-            dex,
-            listed_mints: listed_mints.clone(),
-            common_quote_mints: common_quote_mints.clone(),
-        };
-
+        let new_record = self
+            .live_pool_cache
+            .get(&pool)
+            .as_ref()
+            .and_then(arb_coverage_pool_record_from_state);
         let mut index = self.arb_coverage_index.write();
-        for mint in listed_mints {
-            index
-                .mint_dex_pools
-                .entry(mint)
-                .or_default()
-                .entry(dex)
-                .or_default()
-                .insert(pool);
+        let inserted = new_record.is_some();
+        index.replace_pool_record(pool, new_record);
+        if inserted {
+            inc_market_data_arb_coverage_index_updates_total();
         }
-        for mint in common_quote_mints {
-            index
-                .mint_common_quote_pools
-                .entry(mint)
-                .or_default()
-                .insert(pool);
-        }
-        index.by_pool.insert(pool, record);
-        inc_market_data_arb_coverage_index_updates_total();
     }
 
     /// Bounded backfill: register vault/bin rows for all SOL/common-quote pools of a multi-DEX mint.
@@ -17253,6 +17261,73 @@ mod pr_b_geyser_tracking_tests {
         let vs = ctx.tracked_vaults.read();
         assert!(vs.contains_key(&coin_vault));
         assert!(vs.contains_key(&pc_vault));
+    }
+
+    #[test]
+    fn arb_coverage_index_refresh_replaces_pool_on_mint_change() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let token_old = Pubkey::new_unique();
+        let token_new = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: token_old,
+                token_1_mint: quote,
+                token_0_vault: Pubkey::new_unique(),
+                token_1_vault: Pubkey::new_unique(),
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.refresh_arb_coverage_index_for_pool(pool);
+        assert!(ctx
+            .arb_common_quote_pools_for_mint_indexed(&token_old)
+            .contains(&pool));
+        assert!(!ctx
+            .arb_common_quote_pools_for_mint_indexed(&token_new)
+            .contains(&pool));
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: token_new,
+                token_1_mint: quote,
+                token_0_vault: Pubkey::new_unique(),
+                token_1_vault: Pubkey::new_unique(),
+                reserve_0: Some(3_000_000),
+                reserve_1: Some(4_000_000),
+            }),
+            2,
+        );
+        ctx.refresh_arb_coverage_index_for_pool(pool);
+
+        assert!(
+            !ctx.arb_common_quote_pools_for_mint_indexed(&token_old)
+                .contains(&pool),
+            "old mint must not retain pool after atomic refresh"
+        );
+        assert!(ctx
+            .arb_common_quote_pools_for_mint_indexed(&token_new)
+            .contains(&pool));
+        assert_eq!(ctx.arb_mint_distinct_dex_count(&token_old), 0);
+        assert_eq!(ctx.arb_mint_distinct_dex_count(&token_new), 1);
+        assert_eq!(
+            ctx.arb_coverage_index
+                .read()
+                .by_pool
+                .get(&pool)
+                .unwrap()
+                .listed_mints,
+            vec![token_new, quote]
+        );
     }
 
     #[test]
