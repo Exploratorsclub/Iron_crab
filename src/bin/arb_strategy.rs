@@ -3059,6 +3059,11 @@ impl ArbContext {
         base_mint: &str,
         quote_mint: &str,
     ) {
+        // USDC/USDT quote reserves must not land in vault_balances: eligibility treats
+        // reserve_quote as SOL lamports in reserve_mid_sol_per_token (I-15).
+        if base_mint != NATIVE_SOL_MINT && quote_mint != NATIVE_SOL_MINT {
+            return;
+        }
         let (reserve_base, reserve_quote) =
             sol_quoted_vault_reserves(base_mint, quote_mint, reserve_base, reserve_quote);
         let mut cache = self.vault_balances.write();
