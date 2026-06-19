@@ -516,10 +516,12 @@ fn md_state_dec_queue_depth(queue_depth: &AtomicUsize) {
 fn md_state_process_job(ctx: &Arc<MarketDataContext>, job: MdStateCommand) -> bool {
     match job {
         MdStateCommand::RegisterReservesAfterTrade(pool) => {
+            ctx.refresh_arb_coverage_index_for_pool(pool);
             let changed = ctx.register_geyser_reserves_after_trade(pool);
             changed | ctx.reconcile_arb_multi_dex_for_pool(pool)
         }
         MdStateCommand::RegisterPoolVaultsFromAccount { pool } => {
+            ctx.refresh_arb_coverage_index_for_pool(pool);
             let changed = ctx.register_pool_vaults_from_account(pool);
             changed | ctx.reconcile_arb_multi_dex_for_pool(pool)
         }
@@ -4591,7 +4593,6 @@ impl MarketDataContext {
     /// only when explicit pool assets are admitted (same rule as account-path).
     /// PR169a: returns whether tracked sets changed; caller schedules debounced Geyser sync.
     fn register_geyser_reserves_after_trade(self: &Arc<Self>, pool: Pubkey) -> bool {
-        self.refresh_arb_coverage_index_for_pool(pool);
         let Some(state) = self.live_pool_cache.get(&pool) else {
             return false;
         };
@@ -4783,7 +4784,6 @@ impl MarketDataContext {
 
     /// PR169a: register vault ATAs from MASTER cache after account-path pool upsert (no sync here).
     fn register_pool_vaults_from_account(&self, pool: Pubkey) -> bool {
-        self.refresh_arb_coverage_index_for_pool(pool);
         let Some(cached_state) = self.live_pool_cache.get(&pool) else {
             return false;
         };
@@ -17235,6 +17235,83 @@ mod pr_b_geyser_tracking_tests {
         let vs = ctx.tracked_vaults.read();
         assert!(vs.contains_key(&coin_vault));
         assert!(vs.contains_key(&pc_vault));
+    }
+
+    #[test]
+    fn trade_register_md_state_path_indexes_and_reconciles_sibling_pools() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let token_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool_cpmm = Pubkey::new_unique();
+        let pool_orca = Pubkey::new_unique();
+        let cpmm_coin = Pubkey::new_unique();
+        let cpmm_pc = Pubkey::new_unique();
+        let orca_a = Pubkey::new_unique();
+        let orca_b = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool_cpmm,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: token_mint,
+                token_1_mint: quote,
+                token_0_vault: cpmm_coin,
+                token_1_vault: cpmm_pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.live_pool_cache.upsert(
+            pool_orca,
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: token_mint,
+                token_mint_b: quote,
+                token_vault_a: orca_a,
+                token_vault_b: orca_b,
+                tick_current_index: 0,
+                sqrt_price: 1u128 << 64,
+                liquidity: 1,
+                fee_rate: 3000,
+                protocol_fee_rate: 300,
+                tick_spacing: 64,
+                vault_a_balance: Some(500_000),
+                vault_b_balance: Some(600_000),
+                token_a_program: None,
+                token_b_program: None,
+            }),
+            2,
+        );
+
+        assert!(
+            !md_state_process_job(&ctx, MdStateCommand::RegisterReservesAfterTrade(pool_cpmm)),
+            "single-dex trade register should not reconcile yet"
+        );
+        assert!(!ctx.arb_mint_is_multi_dex(&token_mint));
+        assert!(ctx.tracked_vaults.read().is_empty());
+
+        assert!(md_state_process_job(
+            &ctx,
+            MdStateCommand::RegisterReservesAfterTrade(pool_orca)
+        ));
+        assert!(ctx.arb_mint_is_multi_dex(&token_mint));
+
+        let vs = ctx.tracked_vaults.read();
+        assert!(vs.contains_key(&cpmm_coin));
+        assert!(vs.contains_key(&cpmm_pc));
+        assert!(vs.contains_key(&orca_a));
+        assert!(vs.contains_key(&orca_b));
+        assert_eq!(
+            vs.get(&cpmm_coin).unwrap().pin,
+            Some(GeyserPinReason::ArbMultiDex)
+        );
+        assert_eq!(
+            vs.get(&orca_a).unwrap().pin,
+            Some(GeyserPinReason::ArbMultiDex)
+        );
     }
 
     #[test]
