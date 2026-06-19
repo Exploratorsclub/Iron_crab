@@ -43,14 +43,18 @@ use ironcrab::ipc::{
     TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
-    arb_subscriber_high_processed_inc, arb_subscriber_high_queue_depth_set,
-    arb_subscriber_low_coalesced_inc, arb_subscriber_low_dropped_inc,
-    arb_subscriber_low_processed_inc, arb_subscriber_low_queue_depth_set,
-    arb_subscriber_pool_created_skipped_inc, arb_two_hop_eligible_dexes_add,
-    arb_two_hop_eligible_pools_by_dex_add, arb_two_hop_insufficient_subreason_inc,
-    arb_two_hop_opportunity_inc, arb_two_hop_pool_gate_add, arb_two_hop_reject_subreason_inc,
-    arb_two_hop_rejected_inc, arb_two_hop_tracker_seeded_pools_add, serve_metrics,
-    set_readiness_nats_connected, ArbTwoHopInsufficientSubreason, ArbTwoHopPoolGate,
+    arb_strategy_bootstrap_skip_inc, arb_strategy_bootstrap_warmup_set,
+    arb_strategy_pool_cache_update_seeded_inc, arb_strategy_pool_cache_update_seen_inc,
+    arb_strategy_pool_cache_update_skip_no_seed_inc,
+    arb_strategy_pool_cache_update_skip_non_arb_quote_inc, arb_subscriber_high_processed_inc,
+    arb_subscriber_high_queue_depth_set, arb_subscriber_low_coalesced_inc,
+    arb_subscriber_low_dropped_inc, arb_subscriber_low_processed_inc,
+    arb_subscriber_low_queue_depth_set, arb_subscriber_pool_created_skipped_inc,
+    arb_two_hop_eligible_dexes_add, arb_two_hop_eligible_pools_by_dex_add,
+    arb_two_hop_insufficient_subreason_inc, arb_two_hop_opportunity_inc, arb_two_hop_pool_gate_add,
+    arb_two_hop_reject_subreason_inc, arb_two_hop_rejected_inc,
+    arb_two_hop_tracker_seeded_pools_add, serve_metrics, set_readiness_nats_connected,
+    ArbStrategyWarmupSkipReason, ArbTwoHopInsufficientSubreason, ArbTwoHopPoolGate,
     ArbTwoHopRejectReason, ArbTwoHopRejectSubreason, MetricsComponent,
     ARB_REJECTED_MISSING_ACCOUNTS, ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL,
     MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
@@ -412,6 +416,30 @@ fn is_stablecoin_mint(mint: &str) -> bool {
     mint == USDC_MINT || mint == USDT_MINT
 }
 
+fn is_common_quote_mint(mint: &str) -> bool {
+    mint == NATIVE_SOL_MINT || mint == USDC_MINT || mint == USDT_MINT
+}
+
+/// Token mint tracked by `TokenArbTracker` for a pool pair with SOL/USDC/USDT on one side.
+fn arb_tracked_token_mint<'a>(base_mint: &'a str, quote_mint: &'a str) -> Option<&'a str> {
+    if is_common_quote_mint(base_mint) && is_common_quote_mint(quote_mint) {
+        return None;
+    }
+    if base_mint == NATIVE_SOL_MINT {
+        return Some(quote_mint);
+    }
+    if quote_mint == NATIVE_SOL_MINT {
+        return Some(base_mint);
+    }
+    if is_stablecoin_mint(quote_mint) {
+        return Some(base_mint);
+    }
+    if is_stablecoin_mint(base_mint) {
+        return Some(quote_mint);
+    }
+    None
+}
+
 /// Reject obviously wrong side/decimal comparable prices (stablecoins only).
 fn is_plausible_sol_per_token_price(mint: &str, price: Decimal) -> bool {
     if price <= Decimal::ZERO {
@@ -646,6 +674,255 @@ fn comparable_price_for_eligibility(
 /// SOL-quoted pool seed: (token_mint, reserve_base, reserve_quote_sol, active_id, bin_step).
 type SolQuotedPoolSeed = (String, u64, u64, Option<i32>, Option<u16>);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArbWarmupQuoteKind {
+    Sol,
+    Stablecoin,
+}
+
+#[derive(Debug, Clone)]
+struct ArbWarmupSeed {
+    token_mint: String,
+    reserve_base: u64,
+    reserve_quote: u64,
+    active_id: Option<i32>,
+    bin_step: Option<u16>,
+    quote_kind: ArbWarmupQuoteKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedPoolOutcome {
+    SeededNew,
+    UpdatedExisting,
+    Skipped(ArbStrategyWarmupSkipReason),
+}
+
+#[derive(Debug, Default, Clone)]
+struct ArbWarmupBootstrapStats {
+    tracker_seeded_pools: usize,
+    tracker_seed_candidates: usize,
+}
+
+fn pool_state_mints(state: &CachedPoolState) -> (String, String) {
+    match state {
+        CachedPoolState::Orca(s) => (s.token_mint_a.to_string(), s.token_mint_b.to_string()),
+        CachedPoolState::RaydiumAmm(s) => (s.base_mint.to_string(), s.quote_mint.to_string()),
+        CachedPoolState::RaydiumCpmm(s) => (s.token_0_mint.to_string(), s.token_1_mint.to_string()),
+        CachedPoolState::Meteora(s) => (s.token_x_mint.to_string(), s.token_y_mint.to_string()),
+        CachedPoolState::MeteoraCpmm(s) => (s.token_0_mint.to_string(), s.token_1_mint.to_string()),
+        CachedPoolState::PumpFun(s) => (s.token_mint.to_string(), NATIVE_SOL_MINT.to_string()),
+        CachedPoolState::PumpAmm(s) => (s.base_mint.to_string(), s.quote_mint.to_string()),
+    }
+}
+
+fn pool_state_has_arb_relevant_quote(state: &CachedPoolState) -> bool {
+    let (mint_a, mint_b) = pool_state_mints(state);
+    is_arb_relevant_pool_pair(&mint_a, &mint_b)
+}
+
+fn pool_state_has_any_reserves(state: &CachedPoolState) -> bool {
+    match state {
+        CachedPoolState::Orca(s) => s.vault_a_balance.is_some() || s.vault_b_balance.is_some(),
+        CachedPoolState::RaydiumAmm(s) => s.coin_reserve.is_some() || s.pc_reserve.is_some(),
+        CachedPoolState::RaydiumCpmm(s) => s.reserve_0.is_some() || s.reserve_1.is_some(),
+        CachedPoolState::Meteora(s) => {
+            s.reserve_x_balance.is_some() || s.reserve_y_balance.is_some()
+        }
+        CachedPoolState::MeteoraCpmm(_) => true,
+        CachedPoolState::PumpAmm(s) => s.base_reserve.is_some() || s.quote_reserve.is_some(),
+        CachedPoolState::PumpFun(s) => s.virtual_token_reserves > 0 || s.virtual_sol_reserves > 0,
+    }
+}
+
+fn classify_warmup_skip(state: &CachedPoolState) -> ArbStrategyWarmupSkipReason {
+    if !is_known_dex_label(state.dex_name()) {
+        return ArbStrategyWarmupSkipReason::UnknownDex;
+    }
+    if !pool_state_has_arb_relevant_quote(state) {
+        return ArbStrategyWarmupSkipReason::NonArbQuote;
+    }
+    if !pool_state_has_any_reserves(state) {
+        return ArbStrategyWarmupSkipReason::MissingReserves;
+    }
+    ArbStrategyWarmupSkipReason::ZeroReserves
+}
+
+fn orca_quote_vault_reserves(
+    token_mint_a: &str,
+    token_mint_b: &str,
+    vault_a_balance: u64,
+    vault_b_balance: u64,
+    quote_mint: &str,
+) -> Option<(String, u64, u64)> {
+    if token_mint_a == quote_mint {
+        Some((token_mint_b.to_string(), vault_b_balance, vault_a_balance))
+    } else if token_mint_b == quote_mint {
+        Some((token_mint_a.to_string(), vault_a_balance, vault_b_balance))
+    } else {
+        None
+    }
+}
+
+fn stablecoin_quoted_pool_seed(state: &CachedPoolState) -> Option<SolQuotedPoolSeed> {
+    for quote_mint in [USDC_MINT, USDT_MINT] {
+        if let Some(seed) = common_quote_pool_seed(state, quote_mint) {
+            return Some(seed);
+        }
+    }
+    None
+}
+
+fn common_quote_pool_seed(state: &CachedPoolState, quote_mint: &str) -> Option<SolQuotedPoolSeed> {
+    match state {
+        CachedPoolState::Orca(s) => {
+            let mint_a = s.token_mint_a.to_string();
+            let mint_b = s.token_mint_b.to_string();
+            let va = s.vault_a_balance?;
+            let vb = s.vault_b_balance?;
+            let (token_mint, reserve_base, reserve_quote) =
+                orca_quote_vault_reserves(&mint_a, &mint_b, va, vb, quote_mint)?;
+            Some((token_mint, reserve_base, reserve_quote, None, None))
+        }
+        CachedPoolState::RaydiumAmm(s) => {
+            let base = s.base_mint.to_string();
+            let quote = s.quote_mint.to_string();
+            let cr = s.coin_reserve?;
+            let pr = s.pc_reserve?;
+            if quote == quote_mint {
+                Some((base, cr, pr, None, None))
+            } else if base == quote_mint {
+                Some((quote, pr, cr, None, None))
+            } else {
+                None
+            }
+        }
+        CachedPoolState::RaydiumCpmm(s) => {
+            let t0 = s.token_0_mint.to_string();
+            let t1 = s.token_1_mint.to_string();
+            let r0 = s.reserve_0?;
+            let r1 = s.reserve_1?;
+            if t1 == quote_mint {
+                Some((t0, r0, r1, None, None))
+            } else if t0 == quote_mint {
+                Some((t1, r1, r0, None, None))
+            } else {
+                None
+            }
+        }
+        CachedPoolState::Meteora(s) => {
+            let x = s.token_x_mint.to_string();
+            let y = s.token_y_mint.to_string();
+            let rx = s.reserve_x_balance?;
+            let ry = s.reserve_y_balance?;
+            if y == quote_mint {
+                Some((x, rx, ry, Some(s.active_id), Some(s.bin_step)))
+            } else if x == quote_mint {
+                Some((y, ry, rx, Some(s.active_id), Some(s.bin_step)))
+            } else {
+                None
+            }
+        }
+        CachedPoolState::MeteoraCpmm(s) => {
+            let t0 = s.token_0_mint.to_string();
+            let t1 = s.token_1_mint.to_string();
+            if t1 == quote_mint {
+                Some((t0, s.reserve_0, s.reserve_1, None, None))
+            } else if t0 == quote_mint {
+                Some((t1, s.reserve_1, s.reserve_0, None, None))
+            } else {
+                None
+            }
+        }
+        CachedPoolState::PumpAmm(s) => {
+            let base = s.base_mint.to_string();
+            let quote = s.quote_mint.to_string();
+            let br = s.base_reserve?;
+            let qr = s.quote_reserve?;
+            if quote == quote_mint {
+                Some((base, br, qr, None, None))
+            } else if base == quote_mint {
+                Some((quote, qr, br, None, None))
+            } else {
+                None
+            }
+        }
+        CachedPoolState::PumpFun(_) => None,
+    }
+}
+
+fn arb_warmup_pool_seed(state: &CachedPoolState) -> Option<ArbWarmupSeed> {
+    if let Some((token_mint, reserve_base, reserve_quote, active_id, bin_step)) =
+        sol_quoted_pool_seed(state)
+    {
+        return Some(ArbWarmupSeed {
+            token_mint,
+            reserve_base,
+            reserve_quote,
+            active_id,
+            bin_step,
+            quote_kind: ArbWarmupQuoteKind::Sol,
+        });
+    }
+    let (token_mint, reserve_base, reserve_quote, active_id, bin_step) =
+        stablecoin_quoted_pool_seed(state)?;
+    Some(ArbWarmupSeed {
+        token_mint,
+        reserve_base,
+        reserve_quote,
+        active_id,
+        bin_step,
+        quote_kind: ArbWarmupQuoteKind::Stablecoin,
+    })
+}
+
+fn token_decimals_from_pool_state(state: &CachedPoolState, token_mint: &str) -> Option<u8> {
+    match state {
+        CachedPoolState::RaydiumAmm(s) => {
+            let base = s.base_mint.to_string();
+            let quote = s.quote_mint.to_string();
+            if token_mint == base && s.base_decimals > 0 {
+                Some(s.base_decimals)
+            } else if token_mint == quote && s.quote_decimals > 0 {
+                Some(s.quote_decimals)
+            } else {
+                None
+            }
+        }
+        CachedPoolState::MeteoraCpmm(s) => {
+            let t0 = s.token_0_mint.to_string();
+            let t1 = s.token_1_mint.to_string();
+            if token_mint == t0 && s.mint_0_decimals > 0 {
+                Some(s.mint_0_decimals)
+            } else if token_mint == t1 && s.mint_1_decimals > 0 {
+                Some(s.mint_1_decimals)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn apply_warmup_token_decimals(
+    tracker: &mut TokenArbTracker,
+    live_pool_cache: &LivePoolCache,
+    state: &CachedPoolState,
+    token_mint: &str,
+) {
+    if tracker.token_decimals.is_some() {
+        return;
+    }
+    if let Ok(pk) = Pubkey::from_str(token_mint) {
+        if let Some(d) = live_pool_cache.get_mint_decimals(&pk) {
+            tracker.token_decimals = Some(d);
+            return;
+        }
+    }
+    if let Some(d) = token_decimals_from_pool_state(state, token_mint) {
+        tracker.token_decimals = Some(d);
+    }
+}
+
 /// Extract SOL-quoted token reserves from SLAVE CachedPoolState (base=token, quote=SOL).
 fn sol_quoted_pool_seed(state: &CachedPoolState) -> Option<SolQuotedPoolSeed> {
     match state {
@@ -742,7 +1019,7 @@ fn sol_quoted_pool_seed(state: &CachedPoolState) -> Option<SolQuotedPoolSeed> {
     }
 }
 
-/// Upsert one pool into tracker + vault_balances from SLAVE cache. Returns true when newly added.
+/// Upsert one pool into tracker + vault_balances from SLAVE cache.
 fn seed_one_pool_from_live_cache(
     mint: &str,
     live_pool_cache: &LivePoolCache,
@@ -750,18 +1027,22 @@ fn seed_one_pool_from_live_cache(
     state: &CachedPoolState,
     trackers: &mut HashMap<String, TokenArbTracker>,
     vault_balances: &mut HashMap<String, VaultBalanceCache>,
-) -> bool {
+) -> SeedPoolOutcome {
     let dex = state.dex_name();
     if !is_known_dex_label(dex) {
-        return false;
+        return SeedPoolOutcome::Skipped(ArbStrategyWarmupSkipReason::UnknownDex);
     }
-    let Some((token_mint, reserve_base, reserve_quote, active_id, bin_step)) =
-        sol_quoted_pool_seed(state)
-    else {
-        return false;
+    let Some(warmup) = arb_warmup_pool_seed(state) else {
+        return SeedPoolOutcome::Skipped(classify_warmup_skip(state));
     };
-    if token_mint != mint || reserve_base == 0 || reserve_quote == 0 {
-        return false;
+    if warmup.token_mint != mint {
+        return SeedPoolOutcome::Skipped(ArbStrategyWarmupSkipReason::NonArbQuote);
+    }
+    if warmup.token_mint == NATIVE_SOL_MINT || is_stablecoin_mint(&warmup.token_mint) {
+        return SeedPoolOutcome::Skipped(ArbStrategyWarmupSkipReason::NativeTokenMint);
+    }
+    if warmup.reserve_base == 0 || warmup.reserve_quote == 0 {
+        return SeedPoolOutcome::Skipped(ArbStrategyWarmupSkipReason::ZeroReserves);
     }
 
     let pool_addr = pool_pk.to_string();
@@ -778,7 +1059,6 @@ fn seed_one_pool_from_live_cache(
     };
     let dlmm_sol_is_x = dlmm_token_x_mint.as_deref() == Some(NATIVE_SOL_MINT);
 
-    // Monotonic merge: lagging JetStream must not regress fresher Geyser PoolStateUpdate.
     let should_update_vault = match vault_balances.get(&pool_addr) {
         Some(existing) => slot >= existing.update_slot,
         None => true,
@@ -788,11 +1068,11 @@ fn seed_one_pool_from_live_cache(
         vault_balances.insert(
             pool_addr.clone(),
             VaultBalanceCache {
-                reserve_base,
-                reserve_quote,
+                reserve_base: warmup.reserve_base,
+                reserve_quote: warmup.reserve_quote,
                 update_slot: slot,
-                active_id,
-                bin_step,
+                active_id: warmup.active_id,
+                bin_step: warmup.bin_step,
                 updated_at: cache_updated_at,
                 dlmm_sol_is_x,
                 dlmm_token_x_mint,
@@ -810,19 +1090,30 @@ fn seed_one_pool_from_live_cache(
     let tracker = trackers
         .entry(mint.to_string())
         .or_insert_with(|| TokenArbTracker::new(mint));
-    let liquidity_sol = Decimal::from(eff_reserve_quote) / Decimal::from(1_000_000_000u64);
-    let reserve_price = tracker.token_decimals.and_then(|token_decimals| {
-        if reserves_plausible_for_comparable_price(
-            eff_reserve_base,
-            eff_reserve_quote,
-            token_decimals,
-            mint,
-        ) {
-            reserve_mid_sol_per_token(eff_reserve_base, eff_reserve_quote, token_decimals)
-        } else {
-            None
+    apply_warmup_token_decimals(tracker, live_pool_cache, state, mint);
+
+    let liquidity_sol = match warmup.quote_kind {
+        ArbWarmupQuoteKind::Sol => {
+            Decimal::from(eff_reserve_quote) / Decimal::from(1_000_000_000u64)
         }
-    });
+        ArbWarmupQuoteKind::Stablecoin => Decimal::ZERO,
+    };
+    let reserve_price = if warmup.quote_kind == ArbWarmupQuoteKind::Sol {
+        tracker.token_decimals.and_then(|token_decimals| {
+            if reserves_plausible_for_comparable_price(
+                eff_reserve_base,
+                eff_reserve_quote,
+                token_decimals,
+                mint,
+            ) {
+                reserve_mid_sol_per_token(eff_reserve_base, eff_reserve_quote, token_decimals)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
     let (trade_price_buy, trade_price_sell, trade_count, dex_accounts) = tracker
         .pools
         .get(&pool_addr)
@@ -851,18 +1142,22 @@ fn seed_one_pool_from_live_cache(
         trade_count,
         dex_accounts,
     };
-    let vault_entry = vault_balances.get(&pool_addr);
-    let dlmm_bins = None::<&HashMap<i64, BinArrayCache>>;
-    let last_price = comparable_price_sol_per_token(
-        &seed_pool,
-        Some((eff_reserve_base, eff_reserve_quote)),
-        tracker.token_decimals,
-        mint,
-        vault_entry,
-        dlmm_bins,
-        ComparablePriceSide::Buy,
-    )
-    .or(reserve_price);
+    let last_price = if warmup.quote_kind == ArbWarmupQuoteKind::Sol {
+        let vault_entry = vault_balances.get(&pool_addr);
+        let dlmm_bins = None::<&HashMap<i64, BinArrayCache>>;
+        comparable_price_sol_per_token(
+            &seed_pool,
+            Some((eff_reserve_base, eff_reserve_quote)),
+            tracker.token_decimals,
+            mint,
+            vault_entry,
+            dlmm_bins,
+            ComparablePriceSide::Buy,
+        )
+        .or(reserve_price)
+    } else {
+        seed_pool.last_price
+    };
 
     let is_new_pool = !tracker.pools.contains_key(&pool_addr);
     tracker.upsert_pool(PoolState {
@@ -877,7 +1172,11 @@ fn seed_one_pool_from_live_cache(
         trade_count: seed_pool.trade_count,
         dex_accounts: seed_pool.dex_accounts,
     });
-    is_new_pool
+    if is_new_pool {
+        SeedPoolOutcome::SeededNew
+    } else {
+        SeedPoolOutcome::UpdatedExisting
+    }
 }
 
 /// Seed TokenArbTracker pools for one mint from SLAVE LivePoolCache (Geyser-only, no RPC).
@@ -898,25 +1197,31 @@ fn seed_token_tracker_from_live_pool_cache(
         let Some((state, _, _)) = live_pool_cache.get_with_metadata(&pool_pk) else {
             return 0;
         };
-        if seed_one_pool_from_live_cache(
-            mint,
-            live_pool_cache,
-            pool_pk,
-            &state,
-            trackers,
-            vault_balances,
-        ) {
-            seeded = 1;
-        }
-    } else {
-        for (pool_pk, state) in live_pool_cache.iter() {
-            if seed_one_pool_from_live_cache(
+        if matches!(
+            seed_one_pool_from_live_cache(
                 mint,
                 live_pool_cache,
                 pool_pk,
                 &state,
                 trackers,
                 vault_balances,
+            ),
+            SeedPoolOutcome::SeededNew | SeedPoolOutcome::UpdatedExisting
+        ) {
+            seeded = 1;
+        }
+    } else {
+        for (pool_pk, state) in live_pool_cache.iter() {
+            if matches!(
+                seed_one_pool_from_live_cache(
+                    mint,
+                    live_pool_cache,
+                    pool_pk,
+                    &state,
+                    trackers,
+                    vault_balances,
+                ),
+                SeedPoolOutcome::SeededNew | SeedPoolOutcome::UpdatedExisting
             ) {
                 seeded += 1;
             }
@@ -929,38 +1234,49 @@ fn seed_token_tracker_from_live_pool_cache(
     seeded
 }
 
-/// Seed all mints that have at least one SOL-quoted pool in SLAVE LivePoolCache.
+/// Seed all arb-relevant pools from SLAVE LivePoolCache (cold-start full scan).
 fn seed_all_trackers_from_live_pool_cache(
     live_pool_cache: &LivePoolCache,
     trackers: &mut HashMap<String, TokenArbTracker>,
     vault_balances: &mut HashMap<String, VaultBalanceCache>,
-) -> usize {
-    let mut seeded = 0usize;
+) -> ArbWarmupBootstrapStats {
+    let mut stats = ArbWarmupBootstrapStats::default();
     for (pool_pk, state) in live_pool_cache.iter() {
         if !is_known_dex_label(state.dex_name()) {
+            arb_strategy_bootstrap_skip_inc(ArbStrategyWarmupSkipReason::UnknownDex);
             continue;
         }
-        let Some((token_mint, rb, rq, _, _)) = sol_quoted_pool_seed(&state) else {
+        stats.tracker_seed_candidates += 1;
+        let Some(warmup) = arb_warmup_pool_seed(&state) else {
+            arb_strategy_bootstrap_skip_inc(classify_warmup_skip(&state));
             continue;
         };
-        if rb == 0 || rq == 0 || token_mint == NATIVE_SOL_MINT {
+        if warmup.token_mint == NATIVE_SOL_MINT || is_stablecoin_mint(&warmup.token_mint) {
+            arb_strategy_bootstrap_skip_inc(ArbStrategyWarmupSkipReason::NativeTokenMint);
             continue;
         }
-        if seed_one_pool_from_live_cache(
-            &token_mint,
+        if warmup.reserve_base == 0 || warmup.reserve_quote == 0 {
+            arb_strategy_bootstrap_skip_inc(ArbStrategyWarmupSkipReason::ZeroReserves);
+            continue;
+        }
+        match seed_one_pool_from_live_cache(
+            &warmup.token_mint,
             live_pool_cache,
             pool_pk,
             &state,
             trackers,
             vault_balances,
         ) {
-            seeded += 1;
+            SeedPoolOutcome::SeededNew | SeedPoolOutcome::UpdatedExisting => {
+                stats.tracker_seeded_pools += 1;
+            }
+            SeedPoolOutcome::Skipped(reason) => arb_strategy_bootstrap_skip_inc(reason),
         }
     }
-    if seeded > 0 {
-        arb_two_hop_tracker_seeded_pools_add(seeded as u64);
+    if stats.tracker_seeded_pools > 0 {
+        arb_two_hop_tracker_seeded_pools_add(stats.tracker_seeded_pools as u64);
     }
-    seeded
+    stats
 }
 
 /// Tracks a pool's price/liquidity state
@@ -1812,10 +2128,6 @@ enum ArbEventPriority {
     Low,
 }
 
-fn is_common_quote_mint(mint: &str) -> bool {
-    mint == NATIVE_SOL_MINT || mint == USDC_MINT || mint == USDT_MINT
-}
-
 /// True when the pair may matter for 2-hop (SOL-quoted) or multi-hop (common quote on either side).
 fn is_arb_relevant_pool_pair(base_mint: &str, quote_mint: &str) -> bool {
     is_common_quote_mint(quote_mint) || is_common_quote_mint(base_mint)
@@ -2525,6 +2837,14 @@ impl ArbContext {
         }
     }
 
+    /// Sync `pools_tracked` counter and Prometheus gauge from tracker state.
+    fn sync_pools_tracked_gauge(&self) {
+        let trackers = self.trackers.read();
+        let total: usize = trackers.values().map(|t| t.pools.len()).sum();
+        self.pools_tracked.store(total as u64, Ordering::Relaxed);
+        POOLS_TRACKED_GAUGE.store(total as u64, Ordering::Relaxed);
+    }
+
     /// Update or create pool state from PoolCreated event
     fn handle_pool_created(
         &self,
@@ -2534,16 +2854,17 @@ impl ArbContext {
         dex: &str,
         liquidity_sol: Decimal,
     ) {
-        // Only track SOL pairs for now
-        const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
-        if quote_mint != SOL_MINT {
+        let Some(token_mint) = arb_tracked_token_mint(base_mint, quote_mint) else {
+            return;
+        };
+        if token_mint == NATIVE_SOL_MINT || is_stablecoin_mint(token_mint) {
             return;
         }
 
         let mut trackers = self.trackers.write();
         let tracker = trackers
-            .entry(base_mint.to_string())
-            .or_insert_with(|| TokenArbTracker::new(base_mint));
+            .entry(token_mint.to_string())
+            .or_insert_with(|| TokenArbTracker::new(token_mint));
 
         if tracker.pools.contains_key(pool_address) {
             return;
@@ -2562,20 +2883,16 @@ impl ArbContext {
             dex_accounts: None, // Will be filled by DexPoolAccounts event
         };
 
-        let is_new = !tracker.pools.contains_key(pool_address);
         tracker.upsert_pool(pool_state);
-
-        if is_new {
-            self.pools_tracked.fetch_add(1, Ordering::Relaxed);
-            debug!(
-                mint = %base_mint,
-                dex = %dex,
-                pool = %pool_address,
-                liquidity = %liquidity_sol,
-                pools = tracker.pools.len(),
-                "Pool added to arb tracker"
-            );
-        }
+        drop(trackers);
+        self.sync_pools_tracked_gauge();
+        debug!(
+            mint = %token_mint,
+            dex = %dex,
+            pool = %pool_address,
+            liquidity = %liquidity_sol,
+            "Pool added to arb tracker from PoolCreated"
+        );
     }
 
     /// Store DEX pool accounts from DexPoolAccounts event
@@ -2651,31 +2968,31 @@ impl ArbContext {
         }
     }
 
-    /// Seed all SOL-quoted mints after JetStream bootstrap.
-    fn seed_all_trackers_from_live_pool_cache(&self) -> usize {
+    /// Seed all arb-relevant pools after JetStream bootstrap.
+    fn seed_all_trackers_from_live_pool_cache(&self) -> ArbWarmupBootstrapStats {
         let mut trackers = self.trackers.write();
         let mut vault_balances = self.vault_balances.write();
-        seed_all_trackers_from_live_pool_cache(
+        let stats = seed_all_trackers_from_live_pool_cache(
             &self.live_pool_cache,
             &mut trackers,
             &mut vault_balances,
-        )
+        );
+        drop(trackers);
+        drop(vault_balances);
+        self.sync_pools_tracked_gauge();
+        stats
     }
 
     /// Incremental tracker seed when a pool is discovered or balances update.
-    fn seed_trackers_for_pool_cache_update(&self, update: &PoolCacheUpdate) {
+    fn seed_trackers_for_pool_cache_update(&self, update: &PoolCacheUpdate) -> bool {
         if matches!(update.update_type, PoolCacheUpdateType::PoolRemoved) {
-            return;
+            return false;
         }
-        let mint = if update.quote_mint == NATIVE_SOL_MINT {
-            &update.base_mint
-        } else if update.base_mint == NATIVE_SOL_MINT {
-            &update.quote_mint
-        } else {
-            return;
+        let Some(mint) = arb_tracked_token_mint(&update.base_mint, &update.quote_mint) else {
+            return false;
         };
-        if mint == NATIVE_SOL_MINT {
-            return;
+        if mint == NATIVE_SOL_MINT || is_stablecoin_mint(mint) {
+            return false;
         }
         let mut trackers = self.trackers.write();
         let mut vault_balances = self.vault_balances.write();
@@ -2686,13 +3003,19 @@ impl ArbContext {
             &mut vault_balances,
             Some(&update.pool_address),
         );
+        drop(trackers);
+        drop(vault_balances);
         if seeded > 0 {
+            self.sync_pools_tracked_gauge();
             debug!(
                 mint = %mint,
                 pools_seeded = seeded,
                 pool = %update.pool_address,
                 "Tracker seeded from SLAVE LivePoolCache"
             );
+            true
+        } else {
+            false
         }
     }
 
@@ -3558,18 +3881,27 @@ async fn main() -> Result<()> {
                     &ctx.known_pools,
                     &ctx.multi_hop,
                 );
-                let tracker_seeded = ctx.seed_all_trackers_from_live_pool_cache();
+                let warmup_stats = ctx.seed_all_trackers_from_live_pool_cache();
                 ctx.multi_hop.warmup_quotes_from_live_pool_cache();
                 let mh_stats = ctx.multi_hop.stats();
+                let live_rows = ctx.live_pool_cache.len() as u64;
+                arb_strategy_bootstrap_warmup_set(
+                    live_rows,
+                    known_count as u64,
+                    warmup_stats.tracker_seed_candidates as u64,
+                    warmup_stats.tracker_seeded_pools as u64,
+                );
                 info!(
                     pools_recovered,
                     known_pools = known_count,
-                    tracker_seeded_pools = tracker_seeded,
+                    live_pool_cache_rows = live_rows,
+                    tracker_seed_candidates = warmup_stats.tracker_seed_candidates,
+                    tracker_seeded_pools = warmup_stats.tracker_seeded_pools,
+                    pools_tracked = ctx.pools_tracked.load(Ordering::Relaxed),
                     multi_hop_pools = mh_stats.graph_pools,
                     multi_hop_vertices = mh_stats.graph_vertices,
                     "SLAVE CACHE: known_pools and multi-hop graph recovered from JetStream"
                 );
-                POOLS_TRACKED_GAUGE.store(known_count as u64, Ordering::Relaxed);
                 consumer
             }
             Err(e) => {
@@ -3859,6 +4191,18 @@ async fn main() -> Result<()> {
                                         NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
                                         match serde_json::from_slice::<PoolCacheUpdate>(&msg.payload) {
                                             Ok(update) => {
+                                                arb_strategy_pool_cache_update_seen_inc();
+                                                if !matches!(
+                                                    update.update_type,
+                                                    PoolCacheUpdateType::PoolRemoved
+                                                ) && arb_tracked_token_mint(
+                                                    &update.base_mint,
+                                                    &update.quote_mint,
+                                                )
+                                                .is_none()
+                                                {
+                                                    arb_strategy_pool_cache_update_skip_non_arb_quote_inc();
+                                                }
                                                 if sync_arb_slave_from_pool_cache_update(
                                                     &ctx.live_pool_cache,
                                                     &ctx.known_pools,
@@ -3867,7 +4211,12 @@ async fn main() -> Result<()> {
                                                 ) {
                                                     ctx.multi_hop
                                                         .touch_live_pool_quote_ready(&update.pool_address);
-                                                    ctx.seed_trackers_for_pool_cache_update(&update);
+                                                    if ctx.seed_trackers_for_pool_cache_update(&update)
+                                                    {
+                                                        arb_strategy_pool_cache_update_seeded_inc();
+                                                    } else {
+                                                        arb_strategy_pool_cache_update_skip_no_seed_inc();
+                                                    }
                                                     debug!(
                                                         pool = %update.pool_address,
                                                         dex = %update.dex,
@@ -3912,9 +4261,7 @@ async fn main() -> Result<()> {
                 let multi_hop_stats = ctx.multi_hop.stats();
                 ctx.multi_hop.refresh_quote_readiness_metrics();
                 ctx.eligibility_forensics.maybe_emit_snapshot();
-
-                // Prometheus: publish current gauges for this process
-                POOLS_TRACKED_GAUGE.store(ctx.pools_tracked.load(Ordering::Relaxed), Ordering::Relaxed);
+                ctx.sync_pools_tracked_gauge();
                 TOKENS_TRACKED_GAUGE.store(trackers.len() as u64, Ordering::Relaxed);
 
                 info!(
@@ -4782,6 +5129,158 @@ mod two_hop_price_tests {
             "expected spread_below_min or similar, not insufficient_pools"
         );
         assert_eq!(tracker.pools.len(), 2);
+    }
+
+    #[test]
+    fn bootstrap_warmup_seeds_two_dex_pools_into_one_tracker() {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+
+        let update_orca = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_a.to_string(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            1_000_000_000,
+            1,
+        );
+        let update_pump = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_b.to_string(),
+            "pump_amm".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            1_000_000_000,
+            2,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+        cache.set_mint_decimals(token_mint, 6);
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        let stats =
+            seed_all_trackers_from_live_pool_cache(&cache, &mut trackers, &mut vault_balances);
+        assert_eq!(stats.tracker_seeded_pools, 2);
+        assert_eq!(stats.tracker_seed_candidates, 2);
+        let tracker = trackers.get(&mint_str).expect("single token tracker");
+        assert_eq!(tracker.pools.len(), 2);
+        assert_eq!(tracker.pool_count_on_distinct_dexes(), 2);
+        assert_eq!(tracker.token_decimals, Some(6));
+    }
+
+    #[test]
+    fn usdc_quoted_pool_seeds_without_synthetic_sol_reserve_price() {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+
+        let update = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool.to_string(),
+            "raydium_cpmm".to_string(),
+            mint_str.clone(),
+            USDC_MINT.to_string(),
+            1_000_000_000_000,
+            1_000_000_000,
+            1,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update);
+        cache.set_mint_decimals(token_mint, 6);
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        let stats =
+            seed_all_trackers_from_live_pool_cache(&cache, &mut trackers, &mut vault_balances);
+        assert_eq!(stats.tracker_seeded_pools, 1);
+        let tracker = trackers.get(&mint_str).unwrap();
+        let pool_state = tracker.pools.get(&pool.to_string()).unwrap();
+        assert!(pool_state.has_reserve_data);
+        assert!(
+            pool_state.last_price.is_none(),
+            "USDC-quoted reserves must not synthesize SOL/token mid"
+        );
+    }
+
+    #[test]
+    fn incremental_balance_updated_seeds_without_full_scan() {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+        let pool_str = pool.to_string();
+
+        let update = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            1_000_000_000,
+            1,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update);
+        cache.set_mint_decimals(token_mint, 6);
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        let seeded = seed_token_tracker_from_live_pool_cache(
+            &mint_str,
+            &cache,
+            &mut trackers,
+            &mut vault_balances,
+            Some(&pool_str),
+        );
+        assert_eq!(seeded, 1);
+        assert_eq!(trackers.len(), 1);
+        assert_eq!(trackers.get(&mint_str).unwrap().pools.len(), 1);
+    }
+
+    #[test]
+    fn partial_pool_without_reserves_is_skipped_not_synthesized() {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+
+        let update = PoolCacheUpdate::new_pool_discovered(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool.to_string(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            0,
+            0,
+            None,
+            1,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update);
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        let stats =
+            seed_all_trackers_from_live_pool_cache(&cache, &mut trackers, &mut vault_balances);
+        assert_eq!(stats.tracker_seeded_pools, 0);
+        assert!(trackers.is_empty());
+        assert!(vault_balances.is_empty());
     }
 
     #[test]

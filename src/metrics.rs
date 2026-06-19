@@ -2501,6 +2501,32 @@ pub static ARB_TWO_HOP_OPPORTUNITIES: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::
 /// Pools seeded into TokenArbTracker from SLAVE LivePoolCache (reserve-mid, no Trade event).
 pub static ARB_TWO_HOP_TRACKER_SEEDED_POOLS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+// --- arb-strategy bootstrap / incremental warmup (low-cardinality) ---
+pub static ARB_STRATEGY_BOOTSTRAP_LIVE_POOL_CACHE_ROWS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_STRATEGY_BOOTSTRAP_KNOWN_POOLS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_STRATEGY_BOOTSTRAP_TRACKER_SEED_CANDIDATES: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_STRATEGY_BOOTSTRAP_TRACKER_SEEDED_POOLS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_STRATEGY_BOOTSTRAP_SKIP_UNKNOWN_DEX: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_STRATEGY_BOOTSTRAP_SKIP_NON_ARB_QUOTE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_STRATEGY_BOOTSTRAP_SKIP_MISSING_RESERVES: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_STRATEGY_BOOTSTRAP_SKIP_ZERO_RESERVES: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_STRATEGY_BOOTSTRAP_SKIP_NATIVE_TOKEN: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_STRATEGY_POOL_CACHE_UPDATES_SEEN: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_STRATEGY_POOL_CACHE_UPDATES_SEEDED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_STRATEGY_POOL_CACHE_UPDATE_SKIP_NON_ARB_QUOTE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_STRATEGY_POOL_CACHE_UPDATE_SKIP_NO_SEED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// 2-hop reject breakdown (arb-strategy `check_arbitrage`)
 pub static ARB_TWO_HOP_REJECTED_SPREAD_TOO_LARGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_REJECTED_SPREAD_BELOW_MIN: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -2555,6 +2581,60 @@ pub fn arb_two_hop_opportunity_inc() {
 /// Add to `arb_two_hop_tracker_seeded_pools_total` after SLAVE cache tracker seed.
 pub fn arb_two_hop_tracker_seeded_pools_add(count: u64) {
     ARB_TWO_HOP_TRACKER_SEEDED_POOLS.fetch_add(count, Ordering::Relaxed);
+}
+
+/// Bootstrap skip reason for arb-strategy tracker warmup (Prometheus label `reason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbStrategyWarmupSkipReason {
+    UnknownDex,
+    NonArbQuote,
+    MissingReserves,
+    ZeroReserves,
+    NativeTokenMint,
+}
+
+/// Record a bootstrap warmup skip (`arb_strategy_bootstrap_tracker_seed_skipped_total{reason=...}`).
+pub fn arb_strategy_bootstrap_skip_inc(reason: ArbStrategyWarmupSkipReason) {
+    let counter = match reason {
+        ArbStrategyWarmupSkipReason::UnknownDex => &*ARB_STRATEGY_BOOTSTRAP_SKIP_UNKNOWN_DEX,
+        ArbStrategyWarmupSkipReason::NonArbQuote => &*ARB_STRATEGY_BOOTSTRAP_SKIP_NON_ARB_QUOTE,
+        ArbStrategyWarmupSkipReason::MissingReserves => {
+            &*ARB_STRATEGY_BOOTSTRAP_SKIP_MISSING_RESERVES
+        }
+        ArbStrategyWarmupSkipReason::ZeroReserves => &*ARB_STRATEGY_BOOTSTRAP_SKIP_ZERO_RESERVES,
+        ArbStrategyWarmupSkipReason::NativeTokenMint => &*ARB_STRATEGY_BOOTSTRAP_SKIP_NATIVE_TOKEN,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Publish bootstrap warmup gauges after JetStream SLAVE recovery.
+pub fn arb_strategy_bootstrap_warmup_set(
+    live_pool_cache_rows: u64,
+    known_pools: u64,
+    tracker_seed_candidates: u64,
+    tracker_seeded_pools: u64,
+) {
+    ARB_STRATEGY_BOOTSTRAP_LIVE_POOL_CACHE_ROWS.store(live_pool_cache_rows, Ordering::Relaxed);
+    ARB_STRATEGY_BOOTSTRAP_KNOWN_POOLS.store(known_pools, Ordering::Relaxed);
+    ARB_STRATEGY_BOOTSTRAP_TRACKER_SEED_CANDIDATES
+        .store(tracker_seed_candidates, Ordering::Relaxed);
+    ARB_STRATEGY_BOOTSTRAP_TRACKER_SEEDED_POOLS.store(tracker_seeded_pools, Ordering::Relaxed);
+}
+
+pub fn arb_strategy_pool_cache_update_seen_inc() {
+    ARB_STRATEGY_POOL_CACHE_UPDATES_SEEN.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn arb_strategy_pool_cache_update_seeded_inc() {
+    ARB_STRATEGY_POOL_CACHE_UPDATES_SEEDED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn arb_strategy_pool_cache_update_skip_non_arb_quote_inc() {
+    ARB_STRATEGY_POOL_CACHE_UPDATE_SKIP_NON_ARB_QUOTE.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn arb_strategy_pool_cache_update_skip_no_seed_inc() {
+    ARB_STRATEGY_POOL_CACHE_UPDATE_SKIP_NO_SEED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Sub-reason when a mint hits the `insufficient_pools` gate (low-cardinality `reason` label).
@@ -4880,6 +4960,81 @@ async fn metrics_response() -> Response<Body> {
         "arb_two_hop_tracker_seeded_pools_total",
         ARB_TWO_HOP_TRACKER_SEEDED_POOLS.load(Ordering::Relaxed)
     );
+    line!(
+        "arb_strategy_bootstrap_live_pool_cache_rows",
+        ARB_STRATEGY_BOOTSTRAP_LIVE_POOL_CACHE_ROWS.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_strategy_bootstrap_known_pools_seeded",
+        ARB_STRATEGY_BOOTSTRAP_KNOWN_POOLS.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_strategy_bootstrap_tracker_seed_candidates",
+        ARB_STRATEGY_BOOTSTRAP_TRACKER_SEED_CANDIDATES.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_strategy_bootstrap_tracker_seeded_pools",
+        ARB_STRATEGY_BOOTSTRAP_TRACKER_SEEDED_POOLS.load(Ordering::Relaxed)
+    );
+    out.push_str("arb_strategy_bootstrap_tracker_seed_skipped_total{reason=\"unknown_dex\"} ");
+    out.push_str(
+        &ARB_STRATEGY_BOOTSTRAP_SKIP_UNKNOWN_DEX
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_strategy_bootstrap_tracker_seed_skipped_total{reason=\"non_arb_quote\"} ");
+    out.push_str(
+        &ARB_STRATEGY_BOOTSTRAP_SKIP_NON_ARB_QUOTE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_strategy_bootstrap_tracker_seed_skipped_total{reason=\"missing_reserves\"} ");
+    out.push_str(
+        &ARB_STRATEGY_BOOTSTRAP_SKIP_MISSING_RESERVES
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_strategy_bootstrap_tracker_seed_skipped_total{reason=\"zero_reserves\"} ");
+    out.push_str(
+        &ARB_STRATEGY_BOOTSTRAP_SKIP_ZERO_RESERVES
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        "arb_strategy_bootstrap_tracker_seed_skipped_total{reason=\"native_token_mint\"} ",
+    );
+    out.push_str(
+        &ARB_STRATEGY_BOOTSTRAP_SKIP_NATIVE_TOKEN
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "arb_strategy_pool_cache_updates_seen_total",
+        ARB_STRATEGY_POOL_CACHE_UPDATES_SEEN.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_strategy_pool_cache_updates_seeded_total",
+        ARB_STRATEGY_POOL_CACHE_UPDATES_SEEDED.load(Ordering::Relaxed)
+    );
+    out.push_str("arb_strategy_pool_cache_updates_skipped_total{reason=\"non_arb_quote\"} ");
+    out.push_str(
+        &ARB_STRATEGY_POOL_CACHE_UPDATE_SKIP_NON_ARB_QUOTE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_strategy_pool_cache_updates_skipped_total{reason=\"no_seed\"} ");
+    out.push_str(
+        &ARB_STRATEGY_POOL_CACHE_UPDATE_SKIP_NO_SEED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     line!(
         "arb_subscriber_high_queue_depth",
         ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH.load(Ordering::Relaxed)
