@@ -1064,56 +1064,11 @@ fn seed_one_pool_from_live_cache(
         None => true,
     };
 
-    if should_update_vault {
-        vault_balances.insert(
-            pool_addr.clone(),
-            VaultBalanceCache {
-                reserve_base: warmup.reserve_base,
-                reserve_quote: warmup.reserve_quote,
-                update_slot: slot,
-                active_id: warmup.active_id,
-                bin_step: warmup.bin_step,
-                updated_at: cache_updated_at,
-                dlmm_sol_is_x,
-                dlmm_token_x_mint,
-            },
-        );
-    }
-
-    let vault_ref = vault_balances
-        .get(&pool_addr)
-        .expect("vault_balances entry must exist after seed merge");
-    let eff_reserve_base = vault_ref.reserve_base;
-    let eff_reserve_quote = vault_ref.reserve_quote;
-    let eff_updated_at = vault_ref.updated_at;
-
     let tracker = trackers
         .entry(mint.to_string())
         .or_insert_with(|| TokenArbTracker::new(mint));
     apply_warmup_token_decimals(tracker, live_pool_cache, state, mint);
 
-    let liquidity_sol = match warmup.quote_kind {
-        ArbWarmupQuoteKind::Sol => {
-            Decimal::from(eff_reserve_quote) / Decimal::from(1_000_000_000u64)
-        }
-        ArbWarmupQuoteKind::Stablecoin => Decimal::ZERO,
-    };
-    let reserve_price = if warmup.quote_kind == ArbWarmupQuoteKind::Sol {
-        tracker.token_decimals.and_then(|token_decimals| {
-            if reserves_plausible_for_comparable_price(
-                eff_reserve_base,
-                eff_reserve_quote,
-                token_decimals,
-                mint,
-            ) {
-                reserve_mid_sol_per_token(eff_reserve_base, eff_reserve_quote, token_decimals)
-            } else {
-                None
-            }
-        })
-    } else {
-        None
-    };
     let (trade_price_buy, trade_price_sell, trade_count, dex_accounts) = tracker
         .pools
         .get(&pool_addr)
@@ -1126,9 +1081,84 @@ fn seed_one_pool_from_live_cache(
             )
         })
         .unwrap_or((None, None, 0, None));
+
+    let (
+        _eff_reserve_base,
+        _eff_reserve_quote,
+        eff_updated_at,
+        has_reserve_data,
+        liquidity_sol,
+        reserve_price,
+        vault_for_comparable,
+        vault_reserves_for_comparable,
+    ) = match warmup.quote_kind {
+        ArbWarmupQuoteKind::Sol => {
+            if should_update_vault {
+                vault_balances.insert(
+                    pool_addr.clone(),
+                    VaultBalanceCache {
+                        reserve_base: warmup.reserve_base,
+                        reserve_quote: warmup.reserve_quote,
+                        update_slot: slot,
+                        active_id: warmup.active_id,
+                        bin_step: warmup.bin_step,
+                        updated_at: cache_updated_at,
+                        dlmm_sol_is_x,
+                        dlmm_token_x_mint,
+                    },
+                );
+            }
+            let vault_ref = vault_balances
+                .get(&pool_addr)
+                .expect("vault_balances entry must exist after SOL-quoted seed merge");
+            let reserve_base = vault_ref.reserve_base;
+            let reserve_quote = vault_ref.reserve_quote;
+            let has_reserves = reserve_base > 0 && reserve_quote > 0;
+            let reserve_price = tracker.token_decimals.and_then(|token_decimals| {
+                if reserves_plausible_for_comparable_price(
+                    reserve_base,
+                    reserve_quote,
+                    token_decimals,
+                    mint,
+                ) {
+                    reserve_mid_sol_per_token(reserve_base, reserve_quote, token_decimals)
+                } else {
+                    None
+                }
+            });
+            (
+                reserve_base,
+                reserve_quote,
+                vault_ref.updated_at,
+                has_reserves,
+                Decimal::from(reserve_quote) / Decimal::from(1_000_000_000u64),
+                reserve_price,
+                vault_balances.get(&pool_addr),
+                Some((reserve_base, reserve_quote)),
+            )
+        }
+        ArbWarmupQuoteKind::Stablecoin => {
+            // USDC/USDT quote reserves must not land in vault_balances: eligibility treats
+            // reserve_quote as SOL lamports in reserve_mid_sol_per_token (I-15).
+            (
+                0,
+                0,
+                cache_updated_at,
+                false,
+                Decimal::ZERO,
+                None,
+                None,
+                None,
+            )
+        }
+    };
+
     let pool_last_update = match tracker.pools.get(&pool_addr) {
-        Some(p) if !should_update_vault => p.last_update.max(eff_updated_at),
-        _ => eff_updated_at,
+        Some(p) if warmup.quote_kind == ArbWarmupQuoteKind::Sol && !should_update_vault => {
+            p.last_update.max(eff_updated_at)
+        }
+        Some(p) => p.last_update.max(eff_updated_at),
+        None => eff_updated_at,
     };
     let seed_pool = PoolState {
         pool_address: pool_addr.clone(),
@@ -1137,27 +1167,22 @@ fn seed_one_pool_from_live_cache(
         trade_price_buy,
         trade_price_sell,
         liquidity_sol,
-        has_reserve_data: eff_reserve_base > 0 && eff_reserve_quote > 0,
+        has_reserve_data,
         last_update: pool_last_update,
         trade_count,
         dex_accounts,
     };
-    let last_price = if warmup.quote_kind == ArbWarmupQuoteKind::Sol {
-        let vault_entry = vault_balances.get(&pool_addr);
-        let dlmm_bins = None::<&HashMap<i64, BinArrayCache>>;
-        comparable_price_sol_per_token(
-            &seed_pool,
-            Some((eff_reserve_base, eff_reserve_quote)),
-            tracker.token_decimals,
-            mint,
-            vault_entry,
-            dlmm_bins,
-            ComparablePriceSide::Buy,
-        )
-        .or(reserve_price)
-    } else {
-        seed_pool.last_price
-    };
+    let dlmm_bins = None::<&HashMap<i64, BinArrayCache>>;
+    let last_price = comparable_price_sol_per_token(
+        &seed_pool,
+        vault_reserves_for_comparable,
+        tracker.token_decimals,
+        mint,
+        vault_for_comparable,
+        dlmm_bins,
+        ComparablePriceSide::Buy,
+    )
+    .or(reserve_price);
 
     let is_new_pool = !tracker.pools.contains_key(&pool_addr);
     tracker.upsert_pool(PoolState {
@@ -1167,7 +1192,7 @@ fn seed_one_pool_from_live_cache(
         trade_price_buy: seed_pool.trade_price_buy,
         trade_price_sell: seed_pool.trade_price_sell,
         liquidity_sol,
-        has_reserve_data: eff_reserve_base > 0 && eff_reserve_quote > 0,
+        has_reserve_data,
         last_update: pool_last_update,
         trade_count: seed_pool.trade_count,
         dex_accounts: seed_pool.dex_accounts,
@@ -5207,12 +5232,71 @@ mod two_hop_price_tests {
             seed_all_trackers_from_live_pool_cache(&cache, &mut trackers, &mut vault_balances);
         assert_eq!(stats.tracker_seeded_pools, 1);
         let tracker = trackers.get(&mint_str).unwrap();
-        let pool_state = tracker.pools.get(&pool.to_string()).unwrap();
-        assert!(pool_state.has_reserve_data);
+        let pool_str = pool.to_string();
+        let pool_state = tracker.pools.get(&pool_str).unwrap();
+        assert!(
+            !pool_state.has_reserve_data,
+            "USDC-quoted warmup must not mark SOL-style reserve data"
+        );
         assert!(
             pool_state.last_price.is_none(),
             "USDC-quoted reserves must not synthesize SOL/token mid"
         );
+        assert!(
+            !vault_balances.contains_key(&pool_str),
+            "USDC-quoted warmup must not write vault_balances (reserve_quote is not SOL)"
+        );
+    }
+
+    #[test]
+    fn usdc_quoted_pool_eligibility_has_no_synthetic_comparable_price() {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+        let pool_str = pool.to_string();
+
+        let update = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "raydium_cpmm".to_string(),
+            mint_str.clone(),
+            USDC_MINT.to_string(),
+            1_000_000_000_000,
+            1_000_000_000,
+            1,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update);
+        cache.set_mint_decimals(token_mint, 6);
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        let stats =
+            seed_all_trackers_from_live_pool_cache(&cache, &mut trackers, &mut vault_balances);
+        assert_eq!(stats.tracker_seeded_pools, 1);
+
+        let tracker = trackers.get(&mint_str).unwrap();
+        assert_eq!(tracker.token_decimals, Some(6));
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert(pool_str.clone());
+        let bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
+        let breakdown =
+            tracker.build_eligibility_breakdown(&known_pools, &vault_balances, &bin_arrays);
+
+        assert_eq!(breakdown.candidate_pools_total, 1);
+        assert_eq!(breakdown.known_pools, 1);
+        assert_eq!(
+            breakdown.comparable_price_present, 0,
+            "USDC vault reserves must not produce SOL/token comparable price"
+        );
+        assert_eq!(breakdown.comparable_price_plausible, 0);
+        let row = breakdown.pool_rows.first().expect("one pool row");
+        assert!(!row.comparable_price_present);
+        assert!(!row.comparable_price_plausible);
+        assert!(!row.has_reserve_data);
     }
 
     #[test]
