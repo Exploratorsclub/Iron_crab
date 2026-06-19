@@ -305,6 +305,24 @@ pub static MARKET_DATA_ARB_PIN_POOL_EVICTIONS_TOTAL: Lazy<AtomicU64> =
 /// Arb pin evictions due to pin-budget pressure (`reason=budget`).
 pub static MARKET_DATA_ARB_PIN_EVICTION_REASON_BUDGET: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Bounded arb-multi-dex coverage reconcile attempts (mint-level backfill).
+pub static MARKET_DATA_ARB_RECONCILE_ATTEMPTS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Pools registered/promoted during arb reconcile backfill.
+pub static MARKET_DATA_ARB_RECONCILE_POOLS_REGISTERED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ARB_RECONCILE_SKIPPED_NOT_MULTI_DEX_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ARB_RECONCILE_SKIPPED_PARTIAL_STATE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ARB_RECONCILE_SKIPPED_NO_COMMON_QUOTE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ARB_RECONCILE_SKIPPED_COOLDOWN_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ARB_RECONCILE_SKIPPED_BUDGET_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ARB_RECONCILE_SKIPPED_ALREADY_PINNED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 /// Geyser explicit-tracked subscription list syncs coalesced from the TX trade path (debounced flush).
 pub static MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -455,6 +473,46 @@ pub fn inc_market_data_arb_pin_pool_evictions_total() {
 #[inline]
 pub fn inc_market_data_arb_pin_eviction_reason_budget() {
     MARKET_DATA_ARB_PIN_EVICTION_REASON_BUDGET.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_reconcile_attempts_total() {
+    MARKET_DATA_ARB_RECONCILE_ATTEMPTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_reconcile_pools_registered_total() {
+    MARKET_DATA_ARB_RECONCILE_POOLS_REGISTERED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_reconcile_skipped_not_multi_dex_total() {
+    MARKET_DATA_ARB_RECONCILE_SKIPPED_NOT_MULTI_DEX_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_reconcile_skipped_partial_state_total() {
+    MARKET_DATA_ARB_RECONCILE_SKIPPED_PARTIAL_STATE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_reconcile_skipped_no_common_quote_total() {
+    MARKET_DATA_ARB_RECONCILE_SKIPPED_NO_COMMON_QUOTE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_reconcile_skipped_cooldown_total() {
+    MARKET_DATA_ARB_RECONCILE_SKIPPED_COOLDOWN_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_reconcile_skipped_budget_total() {
+    MARKET_DATA_ARB_RECONCILE_SKIPPED_BUDGET_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_reconcile_skipped_already_pinned_total() {
+    MARKET_DATA_ARB_RECONCILE_SKIPPED_ALREADY_PINNED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -3751,6 +3809,56 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("market_data_arb_pin_eviction_reason{reason=\"budget\"} ");
     out.push_str(
         &MARKET_DATA_ARB_PIN_EVICTION_REASON_BUDGET
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "market_data_arb_reconcile_attempts_total",
+        MARKET_DATA_ARB_RECONCILE_ATTEMPTS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_arb_reconcile_pools_registered_total",
+        MARKET_DATA_ARB_RECONCILE_POOLS_REGISTERED_TOTAL.load(Ordering::Relaxed)
+    );
+    out.push_str("market_data_arb_reconcile_skipped_total{reason=\"not_multi_dex\"} ");
+    out.push_str(
+        &MARKET_DATA_ARB_RECONCILE_SKIPPED_NOT_MULTI_DEX_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_arb_reconcile_skipped_total{reason=\"partial_state\"} ");
+    out.push_str(
+        &MARKET_DATA_ARB_RECONCILE_SKIPPED_PARTIAL_STATE_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_arb_reconcile_skipped_total{reason=\"no_common_quote\"} ");
+    out.push_str(
+        &MARKET_DATA_ARB_RECONCILE_SKIPPED_NO_COMMON_QUOTE_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_arb_reconcile_skipped_total{reason=\"cooldown\"} ");
+    out.push_str(
+        &MARKET_DATA_ARB_RECONCILE_SKIPPED_COOLDOWN_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_arb_reconcile_skipped_total{reason=\"budget\"} ");
+    out.push_str(
+        &MARKET_DATA_ARB_RECONCILE_SKIPPED_BUDGET_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_arb_reconcile_skipped_total{reason=\"already_pinned\"} ");
+    out.push_str(
+        &MARKET_DATA_ARB_RECONCILE_SKIPPED_ALREADY_PINNED_TOTAL
             .load(Ordering::Relaxed)
             .to_string(),
     );
