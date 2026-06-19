@@ -4785,7 +4785,7 @@ mod event_pipeline_tests {
 #[cfg(test)]
 mod two_hop_price_tests {
     use super::*;
-    use ironcrab::execution::live_pool_cache::create_shared_cache;
+    use ironcrab::execution::live_pool_cache::{create_shared_cache, SharedLivePoolCache};
     use ironcrab::ipc::PoolCacheUpdate;
     use rust_decimal::Decimal;
     use solana_sdk::pubkey::Pubkey;
@@ -4832,6 +4832,39 @@ mod two_hop_price_tests {
             updated_at: Instant::now(),
             dlmm_sol_is_x,
             dlmm_token_x_mint: dlmm_token_x_mint.map(str::to_string),
+        }
+    }
+
+    fn test_arb_context(live_pool_cache: SharedLivePoolCache) -> ArbContext {
+        let log_dir = std::env::temp_dir().join(format!("arb_ctx_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&log_dir).expect("test log dir");
+        let jsonl_writer =
+            JsonlWriter::new(JsonlWriterConfig::new("arb_test").with_log_dir(log_dir))
+                .expect("jsonl writer");
+        ArbContext {
+            run_id: "test-run".to_string(),
+            config: RwLock::new(ArbConfig::default()),
+            nats: None,
+            jsonl_writer,
+            trackers: RwLock::new(HashMap::new()),
+            events_received: AtomicU64::new(0),
+            pools_tracked: AtomicU64::new(0),
+            opportunities_found: AtomicU64::new(0),
+            intents_generated: AtomicU64::new(0),
+            intent_counter: AtomicU64::new(0),
+            zero_amount_trades: AtomicU64::new(0),
+            data_quality_rejects: AtomicU64::new(0),
+            last_market_event: RwLock::new(Instant::now()),
+            vault_balances: RwLock::new(HashMap::new()),
+            bin_arrays: RwLock::new(HashMap::new()),
+            live_pool_cache: live_pool_cache.clone(),
+            known_pools: RwLock::new(HashSet::new()),
+            multi_hop: Arc::new(MultiHopArbitrage::new(
+                MultiHopConfig::default(),
+                live_pool_cache,
+            )),
+            spread_too_large_warn_last: RwLock::new(HashMap::new()),
+            eligibility_forensics: ArbEligibilityForensics::new(),
         }
     }
 
@@ -5302,6 +5335,136 @@ mod two_hop_price_tests {
         assert!(!row.comparable_price_present);
         assert!(!row.comparable_price_plausible);
         assert!(!row.has_reserve_data);
+    }
+
+    #[test]
+    fn pool_state_update_usdc_quoted_does_not_write_vault_or_synthetic_price() {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+        let pool_str = pool.to_string();
+
+        let update = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "raydium_cpmm".to_string(),
+            mint_str.clone(),
+            USDC_MINT.to_string(),
+            1_000_000_000_000,
+            1_000_000_000,
+            1,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update);
+        cache.set_mint_decimals(token_mint, 6);
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        let stats =
+            seed_all_trackers_from_live_pool_cache(&cache, &mut trackers, &mut vault_balances);
+        assert_eq!(stats.tracker_seeded_pools, 1);
+        assert!(!vault_balances.contains_key(&pool_str));
+
+        let ctx = test_arb_context(cache);
+        *ctx.trackers.write() = trackers;
+        *ctx.vault_balances.write() = vault_balances;
+
+        ctx.handle_pool_state_update(
+            &pool_str,
+            "raydium_cpmm",
+            2_000_000_000_000,
+            2_000_000_000,
+            99,
+            None,
+            None,
+            &mint_str,
+            USDC_MINT,
+        );
+
+        assert!(
+            !ctx.vault_balances.read().contains_key(&pool_str),
+            "USDC PoolStateUpdate must not write vault_balances (reserve_quote is not SOL)"
+        );
+        let trackers = ctx.trackers.read();
+        let pool_state = trackers
+            .get(&mint_str)
+            .and_then(|t| t.pools.get(&pool_str))
+            .expect("tracked USDC pool");
+        assert!(
+            !pool_state.has_reserve_data,
+            "USDC PoolStateUpdate must not set SOL-style reserve flag"
+        );
+        assert!(
+            pool_state.last_price.is_none(),
+            "USDC PoolStateUpdate must not synthesize SOL/token last_price"
+        );
+    }
+
+    #[test]
+    fn pool_state_update_sol_quoted_updates_vault_and_reserve_data() {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+        let pool_str = pool.to_string();
+
+        let update = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            1_000_000_000,
+            1,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update);
+        cache.set_mint_decimals(token_mint, 6);
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        seed_all_trackers_from_live_pool_cache(&cache, &mut trackers, &mut vault_balances);
+
+        let ctx = test_arb_context(cache);
+        *ctx.trackers.write() = trackers;
+        *ctx.vault_balances.write() = vault_balances;
+
+        let new_token_reserve = 2_000_000_000_000u64;
+        let new_sol_reserve = 2_000_000_000u64;
+        ctx.handle_pool_state_update(
+            &pool_str,
+            "orca",
+            new_token_reserve,
+            new_sol_reserve,
+            99,
+            None,
+            None,
+            &mint_str,
+            NATIVE_SOL_MINT,
+        );
+
+        let vault_balances = ctx.vault_balances.read();
+        let vault = vault_balances
+            .get(&pool_str)
+            .expect("SOL PoolStateUpdate must cache vault balances");
+        assert_eq!(vault.reserve_base, new_token_reserve);
+        assert_eq!(vault.reserve_quote, new_sol_reserve);
+        assert_eq!(vault.update_slot, 99);
+
+        let trackers = ctx.trackers.read();
+        let pool_state = trackers
+            .get(&mint_str)
+            .and_then(|t| t.pools.get(&pool_str))
+            .expect("tracked SOL pool");
+        assert!(pool_state.has_reserve_data);
+        assert!(
+            pool_state.last_price.is_some(),
+            "SOL PoolStateUpdate with decimals should set reserve-based last_price"
+        );
     }
 
     #[test]
