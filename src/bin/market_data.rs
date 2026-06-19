@@ -5982,6 +5982,7 @@ async fn handle_wallet_bootstrap_raydium_cpmm_verify_for_mint(
 
         ctx.live_pool_cache
             .upsert(pool_addr, CachedPoolState::RaydiumCpmm(state.clone()), 0);
+        ctx.refresh_arb_coverage_index_for_pool(pool_addr);
 
         let readiness = raydium_cpmm_readiness_for_pool_cache_update(&state);
         ctx.live_pool_cache
@@ -6157,6 +6158,7 @@ async fn cold_path_rpc_refresh_meteora_cpmm_pool_row(
 
     ctx.live_pool_cache
         .upsert(pool_addr, CachedPoolState::MeteoraCpmm(state.clone()), 0);
+    ctx.refresh_arb_coverage_index_for_pool(pool_addr);
 
     let readiness = meteora_cpmm_readiness_for_pool_cache_update(&state);
     ctx.live_pool_cache
@@ -6407,6 +6409,7 @@ async fn cold_path_rpc_refresh_orca_whirlpool_pool_row(
 
     ctx.live_pool_cache
         .upsert(pool_addr, CachedPoolState::Orca(state.clone()), 0);
+    ctx.refresh_arb_coverage_index_for_pool(pool_addr);
 
     let readiness = orca_readiness_for_pool_cache_update(&state);
     ctx.live_pool_cache
@@ -6932,6 +6935,7 @@ async fn cold_path_rpc_refresh_meteora_dlmm_pool_row(
 
     ctx.live_pool_cache
         .upsert(pool_addr, CachedPoolState::Meteora(state.clone()), 0);
+    ctx.refresh_arb_coverage_index_for_pool(pool_addr);
 
     let readiness = meteora_dlmm_readiness_for_pool_cache_update(&state);
     ctx.live_pool_cache
@@ -7390,6 +7394,7 @@ async fn cold_path_rpc_refresh_raydium_amm_pool_row(
 
     ctx.live_pool_cache
         .upsert(pool_addr, CachedPoolState::RaydiumAmm(state.clone()), 0);
+    ctx.refresh_arb_coverage_index_for_pool(pool_addr);
 
     // Serum/OpenBook static accounts (same as FIX-29 one-shot path in Geyser handler).
     if state.market_id != Pubkey::default()
@@ -7894,6 +7899,7 @@ async fn cold_path_rpc_refresh_raydium_cpmm_pool_row(
 
     ctx.live_pool_cache
         .upsert(pool_addr, CachedPoolState::RaydiumCpmm(state.clone()), 0);
+    ctx.refresh_arb_coverage_index_for_pool(pool_addr);
 
     let readiness = raydium_cpmm_readiness_for_pool_cache_update(&state);
     ctx.live_pool_cache
