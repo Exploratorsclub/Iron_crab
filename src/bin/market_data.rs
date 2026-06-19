@@ -3370,32 +3370,6 @@ struct ArbCoveragePoolRecord {
     common_quote_mints: Vec<Pubkey>,
 }
 
-/// Whether `state` lists `mint` as a pool leg (test/diagnostic helper).
-#[allow(dead_code)]
-fn cached_pool_state_lists_mint(state: &CachedPoolState, mint: &Pubkey) -> bool {
-    match state {
-        CachedPoolState::RaydiumCpmm(s) => s.token_0_mint == *mint || s.token_1_mint == *mint,
-        CachedPoolState::MeteoraCpmm(s) => s.token_0_mint == *mint || s.token_1_mint == *mint,
-        CachedPoolState::Meteora(s) => s.token_x_mint == *mint || s.token_y_mint == *mint,
-        CachedPoolState::PumpAmm(s) => s.base_mint == *mint || s.quote_mint == *mint,
-        CachedPoolState::Orca(s) => s.token_mint_a == *mint || s.token_mint_b == *mint,
-        CachedPoolState::RaydiumAmm(s) => s.base_mint == *mint || s.quote_mint == *mint,
-        CachedPoolState::PumpFun(s) => s.token_mint == *mint,
-    }
-}
-
-/// Distinct DEX labels in MASTER cache that have at least one pool listing `token_mint`.
-#[allow(dead_code)]
-fn distinct_dex_count_for_token_mint(cache: &LivePoolCache, token_mint: &Pubkey) -> usize {
-    let mut dexes = HashSet::new();
-    for (_, state) in cache.iter() {
-        if cached_pool_state_lists_mint(&state, token_mint) {
-            dexes.insert(state.dex_name());
-        }
-    }
-    dexes.len()
-}
-
 const ARB_USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const ARB_USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 
@@ -3417,11 +3391,6 @@ fn arb_candidate_mints_from_pair(mint_a: Pubkey, mint_b: Pubkey) -> Vec<Pubkey> 
         (false, false) => vec![mint_a, mint_b],
         (true, true) => Vec::new(),
     }
-}
-
-#[allow(dead_code)]
-fn token_mint_is_multi_dex_in_cache(cache: &LivePoolCache, token_mint: &Pubkey) -> bool {
-    distinct_dex_count_for_token_mint(cache, token_mint) >= 2
 }
 
 /// True when the cached pool row has at least one non-zero reserve / vault balance.
@@ -3467,24 +3436,6 @@ fn cached_pool_has_arb_vault_layout(state: &CachedPoolState) -> bool {
 fn cached_pool_has_arb_common_quote_leg(state: &CachedPoolState) -> bool {
     pool_mints_for_geyser_explicit_tracking(state)
         .is_some_and(|(a, b)| is_arb_common_quote_mint(&a) || is_arb_common_quote_mint(&b))
-}
-
-/// SOL/USDC/USDT pools in MASTER cache that list `token_mint` as the non-quote leg.
-/// Test/diagnostic only — runtime reconcile uses [`ArbCoverageIndex`].
-#[cfg(test)]
-fn arb_common_quote_pools_for_mint(cache: &LivePoolCache, token_mint: &Pubkey) -> Vec<Pubkey> {
-    cache
-        .iter()
-        .filter_map(|(pool, state)| {
-            if cached_pool_state_lists_mint(&state, token_mint)
-                && cached_pool_has_arb_common_quote_leg(&state)
-            {
-                Some(pool)
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 fn try_enqueue_arb_multi_dex_reconcile(md_state: &MdStateSender, mint: Pubkey) {
@@ -16627,7 +16578,7 @@ mod pr_b_geyser_tracking_tests {
 
         ctx.refresh_arb_coverage_index_for_pool(pool_cpmm);
         ctx.refresh_arb_coverage_index_for_pool(pool_orca);
-        assert!(distinct_dex_count_for_token_mint(&ctx.live_pool_cache, &token_mint) >= 2);
+        assert!(ctx.arb_mint_is_multi_dex(&token_mint));
         MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool_cpmm);
 
         let vs = ctx.tracked_vaults.read();
@@ -16818,11 +16769,8 @@ mod pr_b_geyser_tracking_tests {
 
         ctx.refresh_arb_coverage_index_for_pool(pool_token_token);
         ctx.refresh_arb_coverage_index_for_pool(pool_b_orca);
-        assert_eq!(
-            distinct_dex_count_for_token_mint(&ctx.live_pool_cache, &token_a),
-            1
-        );
-        assert!(distinct_dex_count_for_token_mint(&ctx.live_pool_cache, &token_b) >= 2);
+        assert_eq!(ctx.arb_mint_distinct_dex_count(&token_a), 1);
+        assert!(ctx.arb_mint_is_multi_dex(&token_b));
         assert!(ctx.pool_admitted_for_arb_multi_dex(pool_token_token));
 
         MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool_token_token);
