@@ -844,6 +844,18 @@ impl MultiHopArbitrage {
         self.dirty_tokens.read().len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn search_from_tokens_for_test(
+        &self,
+        tokens: &[Pubkey],
+        config: &MultiHopConfig,
+        component: &str,
+        build: &str,
+        run_id: &str,
+    ) -> Vec<TradeIntent> {
+        self.search_from_tokens(tokens, config, component, build, run_id)
+    }
+
     /// Filter tokens that should be searched (cooldown + per-mint price change check)
     fn filter_tokens_for_search(
         &self,
@@ -946,6 +958,7 @@ impl MultiHopArbitrage {
             .fetch_add(cycles.len() as u64, Ordering::Relaxed);
 
         if cycles.is_empty() {
+            let mut search_lacked_quote_neighbors = false;
             for token in tokens {
                 let neighbors = self.graph.neighbors(token);
                 let quote_ready_neighbors = neighbors
@@ -957,8 +970,12 @@ impl MultiHopArbitrage {
                     })
                     .count();
                 if quote_ready_neighbors < 2 {
-                    multi_hop_search_no_quote_neighbors_inc();
+                    search_lacked_quote_neighbors = true;
+                    break;
                 }
+            }
+            if search_lacked_quote_neighbors {
+                multi_hop_search_no_quote_neighbors_inc();
             }
         }
 
@@ -1352,6 +1369,65 @@ mod tests {
 
         let out = result.unwrap();
         assert!(out > 9_700_000 && out < 9_900_000, "Got {out}");
+    }
+
+    #[test]
+    fn search_from_tokens_increments_no_quote_neighbors_once_per_search() {
+        use crate::metrics::MULTI_HOP_SEARCH_NO_QUOTE_NEIGHBORS_TOTAL;
+        use std::sync::atomic::Ordering;
+
+        let before = MULTI_HOP_SEARCH_NO_QUOTE_NEIGHBORS_TOTAL.load(Ordering::Relaxed);
+        let arb = MultiHopArbitrage::new(
+            MultiHopConfig {
+                enabled: true,
+                min_liquidity_usd: 0.0,
+                min_profit_bps: i32::MAX,
+                ..Default::default()
+            },
+            create_shared_cache(),
+        );
+
+        let token_a = Pubkey::new_unique();
+        let token_b = Pubkey::new_unique();
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+
+        arb.upsert_pool(
+            &pool_a.to_string(),
+            "raydium",
+            WSOL_MINT,
+            &token_a.to_string(),
+            100_000.0,
+            30,
+        );
+        arb.upsert_pool(
+            &pool_b.to_string(),
+            "raydium",
+            WSOL_MINT,
+            &token_b.to_string(),
+            100_000.0,
+            30,
+        );
+
+        let config = MultiHopConfig {
+            enabled: true,
+            min_liquidity_usd: 0.0,
+            min_profit_bps: i32::MAX,
+            ..Default::default()
+        };
+        let _ = arb.search_from_tokens_for_test(
+            &[token_a, token_b],
+            &config,
+            "test",
+            "0.1.0",
+            "test-run",
+        );
+
+        assert_eq!(
+            MULTI_HOP_SEARCH_NO_QUOTE_NEIGHBORS_TOTAL.load(Ordering::Relaxed),
+            before + 1,
+            "coalesced multi-token search should increment no-quote-neighbors once"
+        );
     }
 
     #[test]

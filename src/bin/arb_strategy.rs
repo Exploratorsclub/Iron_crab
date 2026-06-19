@@ -1228,6 +1228,9 @@ fn determine_insufficient_subreason(
         return ArbTwoHopInsufficientSubreason::NotKnownPool;
     }
     if breakdown.comparable_price_present == 0 {
+        if breakdown.has_reserve_data > 0 {
+            return ArbTwoHopInsufficientSubreason::NoComparablePrice;
+        }
         if breakdown.has_reserve_data == 0 && breakdown.has_trade_mid == 0 {
             return ArbTwoHopInsufficientSubreason::MissingReserves;
         }
@@ -5301,6 +5304,30 @@ mod two_hop_price_tests {
         assert!(
             ironcrab::metrics::ARB_TWO_HOP_REJECTED_INSUFFICIENT_POOLS.load(Ordering::Relaxed)
                 > insufficient_before
+        );
+    }
+
+    #[test]
+    fn determine_insufficient_subreason_reserve_data_without_trade_mid_is_no_comparable_price() {
+        let breakdown = MintEligibilityBreakdown {
+            mint: USDC_MINT.to_string(),
+            candidate_pools_total: 2,
+            known_pools: 2,
+            fresh_price: 2,
+            has_reserve_data: 2,
+            has_trade_mid: 0,
+            has_decimals: 2,
+            comparable_price_present: 0,
+            comparable_price_plausible: 0,
+            eligible_pools: 0,
+            eligible_dexes: 0,
+            eligible_by_dex: HashMap::new(),
+            reject_subreason: None,
+            pool_rows: vec![],
+        };
+        assert_eq!(
+            determine_insufficient_subreason(&breakdown),
+            ArbTwoHopInsufficientSubreason::NoComparablePrice
         );
     }
 
