@@ -24,8 +24,10 @@ use crate::ipc::{
 use crate::metrics::{
     multi_hop_cycle_rejected_sanity_inc, multi_hop_hop_missing_quote_inc,
     multi_hop_quote_from_cache_inc, multi_hop_quote_from_trade_cache_inc,
-    multi_hop_return_bps_saturated_inc, multi_hop_search_worker_queue_depth_set,
-    multi_hop_searches_coalesced_inc, multi_hop_shadow_logged_inc, MultiHopSanityRejectReason,
+    multi_hop_quote_ready_pools_set, multi_hop_quote_ready_wsol_edge_pools_set,
+    multi_hop_return_bps_saturated_inc, multi_hop_search_no_quote_neighbors_inc,
+    multi_hop_search_worker_queue_depth_set, multi_hop_searches_coalesced_inc,
+    multi_hop_shadow_logged_inc, MultiHopSanityRejectReason,
 };
 use parking_lot::RwLock;
 use solana_sdk::pubkey::Pubkey;
@@ -89,6 +91,10 @@ impl QuoteReadyIndex {
 
     pub fn is_empty(&self) -> bool {
         self.pools.read().is_empty()
+    }
+
+    pub fn snapshot_keys(&self) -> Vec<Pubkey> {
+        self.pools.read().iter().copied().collect()
     }
 }
 
@@ -439,6 +445,19 @@ impl CachedQuoteProvider {
         if should_run {
             self.cleanup();
         }
+    }
+
+    /// Read-only quote-ready probe for metrics/diagnostics (does not evict stale index entries).
+    pub fn probe_pool_quote_ready(&self, pool_address: &Pubkey) -> bool {
+        self.quote_ready.contains(pool_address) && self.pool_still_quote_ready(pool_address)
+    }
+
+    /// Count pools that remain quote-ready after freshness probe; evicts stale index entries.
+    pub fn count_fresh_quote_ready_pools(&self) -> u64 {
+        let keys = self.quote_ready.snapshot_keys();
+        keys.iter()
+            .filter(|pool| self.is_pool_quote_ready(pool))
+            .count() as u64
     }
 }
 
@@ -825,6 +844,18 @@ impl MultiHopArbitrage {
         self.dirty_tokens.read().len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn search_from_tokens_for_test(
+        &self,
+        tokens: &[Pubkey],
+        config: &MultiHopConfig,
+        component: &str,
+        build: &str,
+        run_id: &str,
+    ) -> Vec<TradeIntent> {
+        self.search_from_tokens(tokens, config, component, build, run_id)
+    }
+
     /// Filter tokens that should be searched (cooldown + per-mint price change check)
     fn filter_tokens_for_search(
         &self,
@@ -925,6 +956,28 @@ impl MultiHopArbitrage {
         let cycles = finder.find_cycles_through(&self.graph, tokens);
         self.cycles_found
             .fetch_add(cycles.len() as u64, Ordering::Relaxed);
+
+        if cycles.is_empty() {
+            let mut search_lacked_quote_neighbors = false;
+            for token in tokens {
+                let neighbors = self.graph.neighbors(token);
+                let quote_ready_neighbors = neighbors
+                    .iter()
+                    .flat_map(|(_, edges)| edges)
+                    .filter(|edge| {
+                        self.quote_provider
+                            .probe_pool_quote_ready(&edge.pool_address)
+                    })
+                    .count();
+                if quote_ready_neighbors < 2 {
+                    search_lacked_quote_neighbors = true;
+                    break;
+                }
+            }
+            if search_lacked_quote_neighbors {
+                multi_hop_search_no_quote_neighbors_inc();
+            }
+        }
 
         // Filter: trustworthy profit estimate + min threshold
         let profitable: Vec<_> = cycles
@@ -1129,6 +1182,27 @@ impl MultiHopArbitrage {
         self.quote_provider
             .warmup_from_live_pool_cache(QUOTE_WARMUP_TOP_N);
     }
+
+    /// Publish quote-readiness gauges for Prometheus (no algorithm change).
+    pub fn refresh_quote_readiness_metrics(&self) {
+        let ready_total = self.quote_provider.count_fresh_quote_ready_pools();
+        multi_hop_quote_ready_pools_set(ready_total);
+
+        let wsol = match Pubkey::from_str(WSOL_MINT) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+        let wsol_edge = self
+            .pool_mints
+            .read()
+            .iter()
+            .filter(|(pool, (mint_a, mint_b))| {
+                (*mint_a == wsol || *mint_b == wsol)
+                    && self.quote_provider.probe_pool_quote_ready(pool)
+            })
+            .count() as u64;
+        multi_hop_quote_ready_wsol_edge_pools_set(wsol_edge);
+    }
 }
 
 /// Stats for monitoring
@@ -1295,6 +1369,81 @@ mod tests {
 
         let out = result.unwrap();
         assert!(out > 9_700_000 && out < 9_900_000, "Got {out}");
+    }
+
+    #[test]
+    fn search_from_tokens_increments_no_quote_neighbors_once_per_search() {
+        use crate::metrics::MULTI_HOP_SEARCH_NO_QUOTE_NEIGHBORS_TOTAL;
+        use std::sync::atomic::Ordering;
+
+        let before = MULTI_HOP_SEARCH_NO_QUOTE_NEIGHBORS_TOTAL.load(Ordering::Relaxed);
+        let arb = MultiHopArbitrage::new(
+            MultiHopConfig {
+                enabled: true,
+                min_liquidity_usd: 0.0,
+                min_profit_bps: i32::MAX,
+                ..Default::default()
+            },
+            create_shared_cache(),
+        );
+
+        let token_a = Pubkey::new_unique();
+        let token_b = Pubkey::new_unique();
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+
+        arb.upsert_pool(
+            &pool_a.to_string(),
+            "raydium",
+            WSOL_MINT,
+            &token_a.to_string(),
+            100_000.0,
+            30,
+        );
+        arb.upsert_pool(
+            &pool_b.to_string(),
+            "raydium",
+            WSOL_MINT,
+            &token_b.to_string(),
+            100_000.0,
+            30,
+        );
+
+        let config = MultiHopConfig {
+            enabled: true,
+            min_liquidity_usd: 0.0,
+            min_profit_bps: i32::MAX,
+            ..Default::default()
+        };
+        let _ = arb.search_from_tokens_for_test(
+            &[token_a, token_b],
+            &config,
+            "test",
+            "0.1.0",
+            "test-run",
+        );
+
+        assert_eq!(
+            MULTI_HOP_SEARCH_NO_QUOTE_NEIGHBORS_TOTAL.load(Ordering::Relaxed),
+            before + 1,
+            "coalesced multi-token search should increment no-quote-neighbors once"
+        );
+    }
+
+    #[test]
+    fn count_fresh_quote_ready_pools_excludes_stale_index_entries() {
+        let provider = CachedQuoteProvider::new(Duration::from_secs(30), create_shared_cache());
+        let fresh_pool = Pubkey::new_unique();
+        let stale_pool = Pubkey::new_unique();
+        let input = Pubkey::new_unique();
+        let output = Pubkey::new_unique();
+
+        provider.update_quote(fresh_pool, input, output, 1_000_000, 980_000);
+        provider.quote_ready_index().mark_ready(stale_pool);
+
+        assert_eq!(provider.quote_ready_index().len(), 2);
+        assert_eq!(provider.count_fresh_quote_ready_pools(), 1);
+        assert_eq!(provider.quote_ready_index().len(), 1);
     }
 
     #[test]
