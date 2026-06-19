@@ -3812,9 +3812,6 @@ impl MarketDataContext {
                 }
             }
         }
-        self.arb_reconcile_mint_cooldown
-            .write()
-            .insert(mint, Instant::now());
 
         let pools = self.arb_common_quote_pools_for_mint_indexed(&mint);
         let mut changed = false;
@@ -3852,6 +3849,11 @@ impl MarketDataContext {
                 changed = true;
                 inc_market_data_arb_reconcile_pools_registered_total();
             }
+        }
+        if changed {
+            self.arb_reconcile_mint_cooldown
+                .write()
+                .insert(mint, Instant::now());
         }
         changed
     }
