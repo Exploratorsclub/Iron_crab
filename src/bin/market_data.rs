@@ -3650,6 +3650,16 @@ impl MarketDataContext {
             return false;
         }
         if self.active_pool_set.pool_has_any_pin(pool) {
+            let vaults = self.tracked_vaults.read();
+            if !vaults.values().any(|v| v.pool_address == pool) {
+                return false;
+            }
+            if matches!(&state, CachedPoolState::Meteora(_)) {
+                let bins = self.tracked_bin_arrays.read();
+                if !bins.values().any(|b| b.pool_address == pool) {
+                    return false;
+                }
+            }
             return true;
         }
         let vaults = self.tracked_vaults.read();
