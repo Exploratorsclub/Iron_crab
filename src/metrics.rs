@@ -323,6 +323,8 @@ pub static MARKET_DATA_ARB_RECONCILE_SKIPPED_BUDGET_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static MARKET_DATA_ARB_RECONCILE_SKIPPED_ALREADY_PINNED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ARB_COVERAGE_INDEX_UPDATES_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 /// Geyser explicit-tracked subscription list syncs coalesced from the TX trade path (debounced flush).
 pub static MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -513,6 +515,11 @@ pub fn inc_market_data_arb_reconcile_skipped_budget_total() {
 #[inline]
 pub fn inc_market_data_arb_reconcile_skipped_already_pinned_total() {
     MARKET_DATA_ARB_RECONCILE_SKIPPED_ALREADY_PINNED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_coverage_index_updates_total() {
+    MARKET_DATA_ARB_COVERAGE_INDEX_UPDATES_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -3863,6 +3870,10 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
+    line!(
+        "market_data_arb_coverage_index_updates_total",
+        MARKET_DATA_ARB_COVERAGE_INDEX_UPDATES_TOTAL.load(Ordering::Relaxed)
+    );
     line!(
         "market_data_geyser_sync_batch_total",
         MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed)
