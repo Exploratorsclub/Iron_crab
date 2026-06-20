@@ -3984,8 +3984,9 @@ impl MarketDataContext {
             score += 100;
         }
         if self.pool_has_full_arb_geyser_coverage(pool) {
-            score += 5;
-        } else if self.pool_has_partial_arb_geyser_tracking(pool) {
+            return 0;
+        }
+        if self.pool_has_partial_arb_geyser_tracking(pool) {
             score += 40;
         }
         if let Some((mint_a, mint_b)) = pool_mints_for_geyser_explicit_tracking(state) {
@@ -18326,9 +18327,10 @@ mod pr_b_geyser_tracking_tests {
         let already_before =
             MARKET_DATA_ARB_RECONCILE_SKIPPED_ALREADY_PINNED_TOTAL.load(Ordering::Relaxed);
         assert!(!ctx.reconcile_arb_multi_dex_for_mint(token_mint));
-        assert!(
-            MARKET_DATA_ARB_RECONCILE_SKIPPED_ALREADY_PINNED_TOTAL.load(Ordering::Relaxed)
-                > already_before
+        assert_eq!(
+            MARKET_DATA_ARB_RECONCILE_SKIPPED_ALREADY_PINNED_TOTAL.load(Ordering::Relaxed),
+            already_before,
+            "fully covered pools are excluded from ranked selection"
         );
     }
 
