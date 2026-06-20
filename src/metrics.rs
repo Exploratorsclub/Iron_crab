@@ -351,6 +351,21 @@ pub static MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// 1 while a debounced TX-path Geyser sync is scheduled and not yet flushed; 0 otherwise.
 pub static MARKET_DATA_GEYSER_SYNC_PENDING: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// md-state batch ended with tracked mutations but no net-new explicit subscription pubkeys.
+pub static MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// UnifiedHotPoolRegistry pool count (momentum-only hot pools).
+pub static MARKET_DATA_HOT_POOL_REGISTRY_POOLS_MOMENTUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// UnifiedHotPoolRegistry pool count (arb-only hot pools).
+pub static MARKET_DATA_HOT_POOL_REGISTRY_POOLS_ARB: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// UnifiedHotPoolRegistry pool count (momentum ∩ arb).
+pub static MARKET_DATA_HOT_POOL_REGISTRY_POOLS_BOTH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// BalanceUpdated published from MASTER cache without vault Geyser subscription.
+pub static MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 /// PR161: merge-task coalesced flush to `combined_tracked` (timer fired after `geyser_sync_batch_ms` quiet window).
 pub static MARKET_DATA_GEYSER_MERGE_COALESCED_TOTAL: Lazy<AtomicU64> =
@@ -590,6 +605,27 @@ pub fn record_market_data_geyser_sync_immediate_total() {
 #[inline]
 pub fn set_market_data_geyser_sync_pending(pending: u64) {
     MARKET_DATA_GEYSER_SYNC_PENDING.store(pending, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_geyser_sync_skipped_no_delta_total() {
+    MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_hot_pool_registry_pools_gauge(reason: &str, n: usize) {
+    let v = n as u64;
+    match reason {
+        "momentum" => MARKET_DATA_HOT_POOL_REGISTRY_POOLS_MOMENTUM.store(v, Ordering::Relaxed),
+        "arb" => MARKET_DATA_HOT_POOL_REGISTRY_POOLS_ARB.store(v, Ordering::Relaxed),
+        "both" => MARKET_DATA_HOT_POOL_REGISTRY_POOLS_BOTH.store(v, Ordering::Relaxed),
+        _ => {}
+    }
+}
+
+#[inline]
+pub fn inc_market_data_balance_updated_from_cache_total() {
+    MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -4060,6 +4096,35 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_geyser_sync_pending",
         MARKET_DATA_GEYSER_SYNC_PENDING.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_sync_skipped_no_delta_total",
+        MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL.load(Ordering::Relaxed)
+    );
+    out.push_str("market_data_hot_pool_registry_pools{reason=\"momentum\"} ");
+    out.push_str(
+        &MARKET_DATA_HOT_POOL_REGISTRY_POOLS_MOMENTUM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_hot_pool_registry_pools{reason=\"arb\"} ");
+    out.push_str(
+        &MARKET_DATA_HOT_POOL_REGISTRY_POOLS_ARB
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_hot_pool_registry_pools{reason=\"both\"} ");
+    out.push_str(
+        &MARKET_DATA_HOT_POOL_REGISTRY_POOLS_BOTH
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "market_data_balance_updated_from_cache_total",
+        MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_geyser_merge_coalesced_total",
