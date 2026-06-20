@@ -330,6 +330,9 @@ pub static MARKET_DATA_ARB_PIN_BUDGET_USED_GAUGE: Lazy<AtomicU64> = Lazy::new(||
 /// Pools selected for bounded arb reconcile after ranking (per mint pass).
 pub static MARKET_DATA_ARB_RECONCILE_SELECTED_POOLS_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Ranked reconcile candidates not selected because of `ARB_RECONCILE_MAX_POOLS_PER_MINT`.
+pub static MARKET_DATA_ARB_RECONCILE_UNSELECTED_POOLS_DUE_TO_CAP_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static MARKET_DATA_ARB_RECONCILE_SKIPPED_ACTIVE_BUDGET_PROTECTED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static MARKET_DATA_ARB_RECONCILE_SKIPPED_OVERSIZED_POOL_TOTAL: Lazy<AtomicU64> =
@@ -545,6 +548,13 @@ pub fn set_market_data_arb_pin_budget_used(n: usize) {
 #[inline]
 pub fn inc_market_data_arb_reconcile_selected_pools_total() {
     MARKET_DATA_ARB_RECONCILE_SELECTED_POOLS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn add_market_data_arb_reconcile_unselected_pools_due_to_cap_total(n: u64) {
+    if n > 0 {
+        MARKET_DATA_ARB_RECONCILE_UNSELECTED_POOLS_DUE_TO_CAP_TOTAL.fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 #[inline]
@@ -4016,6 +4026,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_arb_reconcile_selected_pools_total",
         MARKET_DATA_ARB_RECONCILE_SELECTED_POOLS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_arb_reconcile_unselected_pools_due_to_cap_total",
+        MARKET_DATA_ARB_RECONCILE_UNSELECTED_POOLS_DUE_TO_CAP_TOTAL.load(Ordering::Relaxed)
     );
     out.push_str("market_data_arb_reconcile_skipped_total{reason=\"active_budget_protected\"} ");
     out.push_str(

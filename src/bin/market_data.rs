@@ -51,6 +51,7 @@ use ironcrab::ipc::{
     POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use ironcrab::metrics::{
+    add_market_data_arb_reconcile_unselected_pools_due_to_cap_total,
     dec_market_data_account_high_priority_queue_depth,
     dec_market_data_account_low_priority_queue_depth, dec_market_data_account_publish_queue_depth,
     dec_market_data_account_worker_queue_depth, geyser_account_listener_account_updates_value,
@@ -3832,14 +3833,13 @@ impl MarketDataContext {
         }
 
         let now = Instant::now();
-        let selected = self.select_arb_reconcile_pools_for_mint(&mint);
-        let skipped_by_cap = self
-            .arb_common_quote_pools_for_mint_indexed(&mint)
-            .len()
-            .saturating_sub(selected.len());
-        for _ in 0..skipped_by_cap {
+        let (selected, ranked_len) = self.select_arb_reconcile_pools_for_mint(&mint);
+        if ranked_len > ARB_RECONCILE_MAX_POOLS_PER_MINT {
             inc_market_data_arb_reconcile_skipped_budget_total();
         }
+        add_market_data_arb_reconcile_unselected_pools_due_to_cap_total(
+            ranked_len.saturating_sub(selected.len()) as u64,
+        );
         for _pool in &selected {
             inc_market_data_arb_reconcile_selected_pools_total();
         }
@@ -3920,7 +3920,8 @@ impl MarketDataContext {
     }
 
     /// Ranked bounded pool selection for arb reconcile (coverage-ready, DEX-diverse, active-first).
-    fn select_arb_reconcile_pools_for_mint(&self, mint: &Pubkey) -> Vec<Pubkey> {
+    /// Returns `(selected, ranked_candidate_count)` where `ranked_candidate_count` is pre-cap.
+    fn select_arb_reconcile_pools_for_mint(&self, mint: &Pubkey) -> (Vec<Pubkey>, usize) {
         let pools = self.arb_common_quote_pools_for_mint_indexed(mint);
         let mut ranked: Vec<(Pubkey, u32, &'static str)> = Vec::with_capacity(pools.len());
         for pool in pools {
@@ -3956,7 +3957,13 @@ impl MarketDataContext {
                 selected.push(*pool);
             }
         }
-        selected
+        let ranked_len = ranked.len();
+        (selected, ranked_len)
+    }
+
+    /// True when pool arb LRU activity is inside the protection window (no lock).
+    fn arb_pool_activity_protected_at(last_activity: Instant, now: Instant) -> bool {
+        now.duration_since(last_activity) < ARB_PIN_ACTIVE_PROTECT_WINDOW
     }
 
     /// Higher score = reconcile sooner. Zero excludes pool from selection.
@@ -4079,13 +4086,6 @@ impl MarketDataContext {
         out
     }
 
-    fn arb_pool_is_activity_protected(&self, pool: Pubkey, now: Instant) -> bool {
-        self.arb_pool_lru
-            .read()
-            .get(&pool)
-            .is_some_and(|last| now.duration_since(*last) < ARB_PIN_ACTIVE_PROTECT_WINDOW)
-    }
-
     fn arb_pin_budget_can_fit_without_evicting_active(
         &self,
         slots_needed: usize,
@@ -4098,12 +4098,14 @@ impl MarketDataContext {
         let deficit = current
             .saturating_add(slots_needed)
             .saturating_sub(ARB_MULTI_DEX_PIN_ACCOUNT_BUDGET);
-        let mut evictable = 0usize;
-        let lru = self.arb_pool_lru.read();
-        let mut pools: Vec<(Pubkey, Instant)> = lru.iter().map(|(p, t)| (*p, *t)).collect();
+        let mut pools: Vec<(Pubkey, Instant)> = {
+            let lru = self.arb_pool_lru.read();
+            lru.iter().map(|(p, t)| (*p, *t)).collect()
+        };
         pools.sort_by_key(|(_, t)| *t);
-        for (pool, _) in pools {
-            if self.arb_pool_is_activity_protected(pool, now) {
+        let mut evictable = 0usize;
+        for (pool, last) in pools {
+            if Self::arb_pool_activity_protected_at(last, now) {
                 continue;
             }
             evictable = evictable.saturating_add(self.arb_pinned_pubkeys_for_pool(pool).len());
@@ -4154,11 +4156,14 @@ impl MarketDataContext {
 
     /// Pool with oldest arb pool LRU among non-activity-protected pools (eviction unit = whole pool).
     fn oldest_arb_pinned_pool_to_evict(&self, now: Instant) -> Option<Pubkey> {
-        self.arb_pool_lru
-            .read()
+        let pools: Vec<(Pubkey, Instant)> = {
+            let lru = self.arb_pool_lru.read();
+            lru.iter().map(|(p, t)| (*p, *t)).collect()
+        };
+        pools
             .iter()
-            .filter(|(pool, _)| !self.arb_pool_is_activity_protected(**pool, now))
-            .min_by_key(|(_, oldest)| *oldest)
+            .filter(|(_, last)| !Self::arb_pool_activity_protected_at(*last, now))
+            .min_by_key(|(_, last)| *last)
             .map(|(pool, _)| *pool)
     }
 
@@ -4193,7 +4198,11 @@ impl MarketDataContext {
     fn demote_arb_pins_for_pool(&self, pool: Pubkey, now: Instant) -> usize {
         let pubkeys = self.arb_pinned_pubkeys_for_pool(pool);
         let n = pubkeys.len();
-        let stale = !self.arb_pool_is_activity_protected(pool, now);
+        let stale = {
+            let lru = self.arb_pool_lru.read();
+            lru.get(&pool)
+                .is_none_or(|last| !Self::arb_pool_activity_protected_at(*last, now))
+        };
         for pk in pubkeys {
             self.demote_arb_pin_pubkey(pk);
         }
@@ -17534,7 +17543,7 @@ mod pr_b_geyser_tracking_tests {
         );
         ctx.refresh_arb_coverage_index_for_pool(pools[1]);
 
-        let selected = ctx.select_arb_reconcile_pools_for_mint(&token_mint);
+        let selected = ctx.select_arb_reconcile_pools_for_mint(&token_mint).0;
         assert_eq!(selected.len(), ARB_RECONCILE_MAX_POOLS_PER_MINT);
         assert!(
             selected.contains(&pools[1]),
