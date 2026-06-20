@@ -3889,8 +3889,10 @@ impl MarketDataContext {
                 _ => tracking_changed,
             };
             if registered {
-                changed = true;
                 inc_market_data_arb_reconcile_pools_registered_total();
+            }
+            if registered || tracking_changed {
+                changed = true;
             }
         }
         if changed {
