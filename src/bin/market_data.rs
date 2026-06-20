@@ -16305,13 +16305,6 @@ mod pr_b_geyser_tracking_tests {
         spawn_md_state_worker(Arc::clone(ctx), tokio::runtime::Handle::current())
     }
 
-    async fn test_drain_pending_geyser_sync_timers(ctx: &Arc<MarketDataContext>) {
-        if let Some(h) = ctx.geyser_sync_batch_timer.lock().take() {
-            h.abort();
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-
     fn test_spawn_md_sidefx(
         ctx: &Arc<MarketDataContext>,
         md_state: &MdStateSender,
