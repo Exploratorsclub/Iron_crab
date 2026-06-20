@@ -4097,9 +4097,6 @@ impl MarketDataContext {
             })
             .collect();
 
-        let _promoted = self
-            .hot_pool_registry
-            .promote_arb_pools(mint, eligible.clone());
         for pool in eligible {
             let follow_up = if self.hot_pool_registry.pool_has_momentum(pool) {
                 GeyserReserveRegisterFollowUp::MomentumUpgrade
@@ -5432,6 +5429,11 @@ impl MarketDataContext {
             enable_meteora_dlmm,
             true,
         );
+        if self.hot_pool_registry.pool_has_arb(pool)
+            && !self.hot_pool_registry.pool_has_momentum(pool)
+        {
+            self.apply_arb_multi_dex_pins_for_pool(pool, now, true);
+        }
         explicit_subscription_has_new_keys(
             &before_keys,
             &self.snapshot_explicit_subscription_pubkeys(),
