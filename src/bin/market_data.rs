@@ -3881,9 +3881,13 @@ impl MarketDataContext {
             } else {
                 GeyserReserveRegisterFollowUp::ArbMultiDexUpgrade
             };
-            let registered = self.register_geyser_reserves_impl(pool, follow_up)
-                || (matches!(follow_up, GeyserReserveRegisterFollowUp::ArbMultiDexUpgrade)
-                    && self.apply_arb_multi_dex_pins_for_pool(pool, now, false));
+            let tracking_changed = self.register_geyser_reserves_impl(pool, follow_up);
+            let registered = match follow_up {
+                GeyserReserveRegisterFollowUp::ArbMultiDexUpgrade => {
+                    self.pool_has_full_arb_geyser_coverage(pool)
+                }
+                _ => tracking_changed,
+            };
             if registered {
                 changed = true;
                 inc_market_data_arb_reconcile_pools_registered_total();
@@ -4040,9 +4044,11 @@ impl MarketDataContext {
                 out.push(*pk);
             }
         }
-        if out.is_empty() {
-            if let Some(state) = self.live_pool_cache.get(&pool) {
-                out = self.arb_pool_layout_pin_pubkeys_from_state(pool, &state);
+        if let Some(state) = self.live_pool_cache.get(&pool) {
+            for pk in self.arb_pool_layout_pin_pubkeys_from_state(pool, &state) {
+                if !out.contains(&pk) {
+                    out.push(pk);
+                }
             }
         }
         out
@@ -4066,7 +4072,17 @@ impl MarketDataContext {
             CachedPoolState::Meteora(s) => {
                 out.push(s.reserve_x);
                 out.push(s.reserve_y);
-                let _ = pool;
+                if self.config.read().enable_meteora_dlmm {
+                    let active_array_index =
+                        MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(s.active_id);
+                    for offset in -3i64..=3i64 {
+                        let index = active_array_index + offset;
+                        if let Ok(pda) = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&pool, index)
+                        {
+                            out.push(pda);
+                        }
+                    }
+                }
             }
             CachedPoolState::PumpAmm(s) => {
                 out.push(s.pool_base_token_account);
