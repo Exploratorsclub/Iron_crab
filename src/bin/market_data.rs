@@ -4379,6 +4379,19 @@ impl MarketDataContext {
 
     /// Cache-first JetStream BalanceUpdated for pools with fresh reserve basis (no vault Geyser sub required).
     fn try_publish_balance_updated_from_cache(&self, pool: Pubkey) {
+        let has_vault = self
+            .tracked_vaults
+            .read()
+            .values()
+            .any(|v| v.pool_address == pool);
+        let has_bin = self
+            .tracked_bin_arrays
+            .read()
+            .values()
+            .any(|b| b.pool_address == pool);
+        if has_vault || has_bin {
+            return;
+        }
         let Some(state) = self.live_pool_cache.get(&pool) else {
             return;
         };
@@ -4390,17 +4403,16 @@ impl MarketDataContext {
         else {
             return;
         };
-        inc_market_data_balance_updated_from_cache_total();
-        let nats = self
+        let Some(nats) = self
             .nats
             .as_ref()
-            .map(NatsClient::clone_for_spawned_publish);
+            .map(NatsClient::clone_for_spawned_publish)
+        else {
+            return;
+        };
         let run_id = self.run_id.clone();
         let pool_str = pool.to_string();
         let publish = async move {
-            let Some(nats) = nats else {
-                return;
-            };
             let mut balance_update = PoolCacheUpdate::new_balance_updated(
                 "market-data",
                 BUILD_VERSION,
@@ -4429,8 +4441,10 @@ impl MarketDataContext {
             let _ = nats.jetstream_publish(&subject, &balance_update).await;
         };
         if let Some(handle) = self.ingest_tokio_handle.read().clone() {
+            inc_market_data_balance_updated_from_cache_total();
             handle.spawn(publish);
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            inc_market_data_balance_updated_from_cache_total();
             handle.spawn(publish);
         }
     }
