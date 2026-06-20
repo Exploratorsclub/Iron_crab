@@ -601,12 +601,17 @@ fn md_state_worker_loop(
             }
         }
         let jobs = md_state_coalesce_jobs(jobs);
+        let schedule_sync_after_config = jobs
+            .iter()
+            .any(|job| matches!(job, MdStateCommand::ScheduleGeyserSyncAfterConfigChange));
         let before_keys = ctx.snapshot_explicit_subscription_pubkeys();
         for job in jobs {
             let _ = md_state_process_job(&ctx, job);
         }
         let after_keys = ctx.snapshot_explicit_subscription_pubkeys();
-        if explicit_subscription_has_new_keys(&before_keys, &after_keys) {
+        if explicit_subscription_has_new_keys(&before_keys, &after_keys)
+            || schedule_sync_after_config
+        {
             ctx.schedule_geyser_sync_batch_debounced();
         } else if before_keys != after_keys {
             inc_market_data_geyser_sync_skipped_no_delta_total();
@@ -13095,6 +13100,7 @@ async fn handle_geyser_transaction(
             md_state,
             MdStateCommand::RegisterReservesAfterTrade(*pool_address),
         );
+        try_enqueue_arb_reconcile_for_pool(md_state, ctx.live_pool_cache.as_ref(), *pool_address);
     }
 
     // Pump.fun: propagate creator/dev wallet so strategy can build deterministic intents.
