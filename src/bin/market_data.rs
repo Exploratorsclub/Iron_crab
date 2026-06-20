@@ -51,6 +51,7 @@ use ironcrab::ipc::{
     POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use ironcrab::metrics::{
+    add_market_data_arb_reconcile_unselected_pools_due_to_cap_total,
     dec_market_data_account_high_priority_queue_depth,
     dec_market_data_account_low_priority_queue_depth, dec_market_data_account_publish_queue_depth,
     dec_market_data_account_worker_queue_depth, geyser_account_listener_account_updates_value,
@@ -60,16 +61,21 @@ use ironcrab::metrics::{
     inc_market_data_account_publish_enqueue_dropped_total,
     inc_market_data_account_publish_queue_depth, inc_market_data_account_worker_queue_depth,
     inc_market_data_arb_coverage_index_updates_total,
-    inc_market_data_arb_pin_eviction_reason_budget, inc_market_data_arb_pin_evictions_total,
+    inc_market_data_arb_pin_eviction_reason_active_protected,
+    inc_market_data_arb_pin_eviction_reason_budget,
+    inc_market_data_arb_pin_eviction_reason_stale_budget, inc_market_data_arb_pin_evictions_total,
     inc_market_data_arb_pin_pool_evictions_total,
     inc_market_data_arb_pin_readd_cooldown_suppressed_total,
     inc_market_data_arb_reconcile_attempts_total,
     inc_market_data_arb_reconcile_pools_registered_total,
+    inc_market_data_arb_reconcile_selected_pools_total,
+    inc_market_data_arb_reconcile_skipped_active_budget_protected_total,
     inc_market_data_arb_reconcile_skipped_already_pinned_total,
     inc_market_data_arb_reconcile_skipped_budget_total,
     inc_market_data_arb_reconcile_skipped_cooldown_total,
     inc_market_data_arb_reconcile_skipped_no_common_quote_total,
     inc_market_data_arb_reconcile_skipped_not_multi_dex_total,
+    inc_market_data_arb_reconcile_skipped_oversized_pool_total,
     inc_market_data_arb_reconcile_skipped_partial_state_total,
     inc_market_data_arb_registered_vaults_total,
     inc_market_data_geyser_tracking_enqueue_dropped_total,
@@ -98,17 +104,18 @@ use ironcrab::metrics::{
     record_market_data_tx_channel_lag_ms, record_market_data_tx_handler_processed, serve_metrics,
     set_market_data_account_broadcast_queue_depth,
     set_market_data_account_publish_worker_last_success_unix_ms,
-    set_market_data_account_worker_count, set_market_data_arb_pinned_pools_gauge,
-    set_market_data_geyser_merge_pending, set_market_data_geyser_sync_pending,
-    set_market_data_geyser_tracking_queue_depth, set_market_data_md_sidefx_queue_depth,
-    set_market_data_md_state_queue_depth, set_market_data_momentum_active_pool_pins_gauge,
-    set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
-    set_readiness_nats_connected, touch_market_data_global_ingest_progress,
-    update_readiness_market_data_current, wall_clock_unix_ms_now, GeyserTrackedEvictKind,
-    MarketDataLatencySegment, MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
-    MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL,
-    MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
-    NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
+    set_market_data_account_worker_count, set_market_data_arb_pin_budget_used,
+    set_market_data_arb_pinned_pools_gauge, set_market_data_geyser_merge_pending,
+    set_market_data_geyser_sync_pending, set_market_data_geyser_tracking_queue_depth,
+    set_market_data_md_sidefx_queue_depth, set_market_data_md_state_queue_depth,
+    set_market_data_momentum_active_pool_pins_gauge, set_market_data_tx_broadcast_queue_depth,
+    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
+    touch_market_data_global_ingest_progress, update_readiness_market_data_current,
+    wall_clock_unix_ms_now, GeyserTrackedEvictKind, MarketDataLatencySegment, MetricsComponent,
+    MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS,
+    MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
+    MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
+    POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -2881,6 +2888,10 @@ const ARB_PIN_READD_COOLDOWN: Duration = Duration::from_secs(60);
 const ARB_RECONCILE_MINT_COOLDOWN: Duration = Duration::from_secs(30);
 /// Max SOL/common-quote pools registered per mint reconcile invocation.
 const ARB_RECONCILE_MAX_POOLS_PER_MINT: usize = 8;
+/// Pools with arb LRU activity inside this window are protected from budget eviction.
+const ARB_PIN_ACTIVE_PROTECT_WINDOW: Duration = Duration::from_secs(120);
+/// Skip reconcile/pin when a pool would require more new pubkey slots than this (Meteora DLMM etc.).
+const ARB_RECONCILE_OVERSIZED_POOL_MAX_NEW_PINS: usize = 12;
 
 #[derive(Debug, Clone)]
 struct MintTrackInfo {
@@ -3800,7 +3811,7 @@ impl MarketDataContext {
         }
     }
 
-    /// Bounded backfill: register vault/bin rows for all SOL/common-quote pools of a multi-DEX mint.
+    /// Bounded backfill: register vault/bin rows for ranked SOL/common-quote pools of a multi-DEX mint.
     fn reconcile_arb_multi_dex_for_mint(&self, mint: Pubkey) -> bool {
         inc_market_data_arb_reconcile_attempts_total();
         if is_arb_common_quote_mint(&mint) {
@@ -3821,14 +3832,20 @@ impl MarketDataContext {
             }
         }
 
-        let pools = self.arb_common_quote_pools_for_mint_indexed(&mint);
-        let mut changed = false;
-        for (processed, pool) in pools.into_iter().enumerate() {
-            if processed >= ARB_RECONCILE_MAX_POOLS_PER_MINT {
-                inc_market_data_arb_reconcile_skipped_budget_total();
-                break;
-            }
+        let now = Instant::now();
+        let (selected, ranked_len) = self.select_arb_reconcile_pools_for_mint(&mint);
+        if ranked_len > ARB_RECONCILE_MAX_POOLS_PER_MINT {
+            inc_market_data_arb_reconcile_skipped_budget_total();
+        }
+        add_market_data_arb_reconcile_unselected_pools_due_to_cap_total(
+            ranked_len.saturating_sub(selected.len()) as u64,
+        );
+        for _pool in &selected {
+            inc_market_data_arb_reconcile_selected_pools_total();
+        }
 
+        let mut changed = false;
+        for pool in selected {
             let Some(state) = self.live_pool_cache.get(&pool) else {
                 continue;
             };
@@ -3840,8 +3857,22 @@ impl MarketDataContext {
                 inc_market_data_arb_reconcile_skipped_partial_state_total();
                 continue;
             }
+            if !cached_pool_has_fresh_reserve_basis(&state) {
+                inc_market_data_arb_reconcile_skipped_partial_state_total();
+                continue;
+            }
             if self.pool_has_full_arb_geyser_coverage(pool) {
                 inc_market_data_arb_reconcile_skipped_already_pinned_total();
+                continue;
+            }
+
+            let new_pins = self.arb_pool_new_pin_slots_needed(pool);
+            if new_pins > ARB_RECONCILE_OVERSIZED_POOL_MAX_NEW_PINS {
+                inc_market_data_arb_reconcile_skipped_oversized_pool_total();
+                continue;
+            }
+            if new_pins > 0 && !self.arb_pin_budget_can_fit_without_evicting_active(new_pins, now) {
+                inc_market_data_arb_reconcile_skipped_active_budget_protected_total();
                 continue;
             }
 
@@ -3850,12 +3881,18 @@ impl MarketDataContext {
             } else {
                 GeyserReserveRegisterFollowUp::ArbMultiDexUpgrade
             };
-            let registered = self.register_geyser_reserves_impl(pool, follow_up)
-                || (matches!(follow_up, GeyserReserveRegisterFollowUp::ArbMultiDexUpgrade)
-                    && self.apply_arb_multi_dex_pins_for_pool(pool, Instant::now(), false));
+            let tracking_changed = self.register_geyser_reserves_impl(pool, follow_up);
+            let registered = match follow_up {
+                GeyserReserveRegisterFollowUp::ArbMultiDexUpgrade => {
+                    self.pool_has_full_arb_geyser_coverage(pool)
+                }
+                _ => tracking_changed,
+            };
             if registered {
-                changed = true;
                 inc_market_data_arb_reconcile_pools_registered_total();
+            }
+            if registered || tracking_changed {
+                changed = true;
             }
         }
         if changed {
@@ -3885,6 +3922,217 @@ impl MarketDataContext {
 
     fn refresh_arb_pin_gauges(&self) {
         set_market_data_arb_pinned_pools_gauge(self.arb_pool_lru.read().len());
+        set_market_data_arb_pin_budget_used(self.arb_pin_pubkey_budget_len());
+    }
+
+    /// Ranked bounded pool selection for arb reconcile (coverage-ready, DEX-diverse, active-first).
+    /// Returns `(selected, ranked_candidate_count)` where `ranked_candidate_count` is pre-cap.
+    fn select_arb_reconcile_pools_for_mint(&self, mint: &Pubkey) -> (Vec<Pubkey>, usize) {
+        let pools = self.arb_common_quote_pools_for_mint_indexed(mint);
+        let mut ranked: Vec<(Pubkey, u32, &'static str)> = Vec::with_capacity(pools.len());
+        for pool in pools {
+            let Some(state) = self.live_pool_cache.get(&pool) else {
+                continue;
+            };
+            if !cached_pool_has_arb_common_quote_leg(&state) {
+                continue;
+            }
+            let score = self.arb_reconcile_pool_rank_score(pool, &state);
+            if score == 0 {
+                continue;
+            }
+            ranked.push((pool, score, state.dex_name()));
+        }
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let mut selected = Vec::with_capacity(ARB_RECONCILE_MAX_POOLS_PER_MINT.min(ranked.len()));
+        let mut seen_dexes = HashSet::new();
+        for (pool, _, dex) in &ranked {
+            if selected.len() >= ARB_RECONCILE_MAX_POOLS_PER_MINT {
+                break;
+            }
+            if seen_dexes.insert(*dex) {
+                selected.push(*pool);
+            }
+        }
+        for (pool, _, _) in &ranked {
+            if selected.len() >= ARB_RECONCILE_MAX_POOLS_PER_MINT {
+                break;
+            }
+            if !selected.contains(pool) {
+                selected.push(*pool);
+            }
+        }
+        let ranked_len = ranked.len();
+        (selected, ranked_len)
+    }
+
+    /// True when pool arb LRU activity is inside the protection window (no lock).
+    fn arb_pool_activity_protected_at(last_activity: Instant, now: Instant) -> bool {
+        now.duration_since(last_activity) < ARB_PIN_ACTIVE_PROTECT_WINDOW
+    }
+
+    /// Higher score = reconcile sooner. Zero excludes pool from selection.
+    fn arb_reconcile_pool_rank_score(&self, pool: Pubkey, state: &CachedPoolState) -> u32 {
+        if !cached_pool_has_arb_common_quote_leg(state) {
+            return 0;
+        }
+        let mut score: u32 = 1;
+        if !cached_pool_has_arb_vault_layout(state) {
+            return score;
+        }
+        score = 10;
+        if cached_pool_has_fresh_reserve_basis(state) {
+            score += 100;
+        }
+        if self.pool_has_full_arb_geyser_coverage(pool) {
+            return 0;
+        }
+        if self.pool_has_partial_arb_geyser_tracking(pool) {
+            score += 40;
+        }
+        if let Some((mint_a, mint_b)) = pool_mints_for_geyser_explicit_tracking(state) {
+            let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+            if mint_a == sol || mint_b == sol {
+                score += 30;
+            } else if is_arb_common_quote_mint(&mint_a) || is_arb_common_quote_mint(&mint_b) {
+                score += 15;
+            }
+        }
+        if self.arb_pool_lru.read().contains_key(&pool) {
+            score += 20;
+        }
+        score
+    }
+
+    fn pool_has_partial_arb_geyser_tracking(&self, pool: Pubkey) -> bool {
+        let vaults = self.tracked_vaults.read();
+        let has_vault = vaults.values().any(|v| v.pool_address == pool);
+        if !has_vault {
+            return false;
+        }
+        let Some(state) = self.live_pool_cache.get(&pool) else {
+            return false;
+        };
+        if matches!(&state, CachedPoolState::Meteora(_)) {
+            let bins = self.tracked_bin_arrays.read();
+            return bins.values().any(|b| b.pool_address == pool);
+        }
+        true
+    }
+
+    fn arb_pool_new_pin_slots_needed(&self, pool: Pubkey) -> usize {
+        let pins = self.arb_pin_pubkeys.read();
+        self.arb_pool_candidate_pin_pubkeys(pool)
+            .into_iter()
+            .filter(|pk| !pins.contains(pk))
+            .count()
+    }
+
+    fn arb_pool_candidate_pin_pubkeys(&self, pool: Pubkey) -> Vec<Pubkey> {
+        let mut out = Vec::new();
+        for (pk, v) in self.tracked_vaults.read().iter() {
+            if v.pool_address == pool
+                && v.pin != Some(GeyserPinReason::Wallet)
+                && v.pin != Some(GeyserPinReason::MomentumActive)
+            {
+                out.push(*pk);
+            }
+        }
+        for (pk, b) in self.tracked_bin_arrays.read().iter() {
+            if b.pool_address == pool
+                && b.pin != Some(GeyserPinReason::Wallet)
+                && b.pin != Some(GeyserPinReason::MomentumActive)
+            {
+                out.push(*pk);
+            }
+        }
+        if let Some(state) = self.live_pool_cache.get(&pool) {
+            for pk in self.arb_pool_layout_pin_pubkeys_from_state(pool, &state) {
+                if !out.contains(&pk) {
+                    out.push(pk);
+                }
+            }
+        }
+        out
+    }
+
+    fn arb_pool_layout_pin_pubkeys_from_state(
+        &self,
+        pool: Pubkey,
+        state: &CachedPoolState,
+    ) -> Vec<Pubkey> {
+        let mut out = Vec::new();
+        match state {
+            CachedPoolState::RaydiumCpmm(s) => {
+                out.push(s.token_0_vault);
+                out.push(s.token_1_vault);
+            }
+            CachedPoolState::MeteoraCpmm(s) => {
+                out.push(s.token_0_vault);
+                out.push(s.token_1_vault);
+            }
+            CachedPoolState::Meteora(s) => {
+                out.push(s.reserve_x);
+                out.push(s.reserve_y);
+                if self.config.read().enable_meteora_dlmm {
+                    let active_array_index =
+                        MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(s.active_id);
+                    for offset in -3i64..=3i64 {
+                        let index = active_array_index + offset;
+                        if let Ok(pda) = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&pool, index)
+                        {
+                            out.push(pda);
+                        }
+                    }
+                }
+            }
+            CachedPoolState::PumpAmm(s) => {
+                out.push(s.pool_base_token_account);
+                out.push(s.pool_quote_token_account);
+            }
+            CachedPoolState::Orca(s) => {
+                out.push(s.token_vault_a);
+                out.push(s.token_vault_b);
+            }
+            CachedPoolState::RaydiumAmm(s) => {
+                out.push(s.coin_vault);
+                out.push(s.pc_vault);
+            }
+            CachedPoolState::PumpFun(_) => {}
+        }
+        out.retain(|pk| *pk != Pubkey::default());
+        out
+    }
+
+    fn arb_pin_budget_can_fit_without_evicting_active(
+        &self,
+        slots_needed: usize,
+        now: Instant,
+    ) -> bool {
+        let current = self.arb_pin_pubkey_budget_len();
+        if current.saturating_add(slots_needed) <= ARB_MULTI_DEX_PIN_ACCOUNT_BUDGET {
+            return true;
+        }
+        let deficit = current
+            .saturating_add(slots_needed)
+            .saturating_sub(ARB_MULTI_DEX_PIN_ACCOUNT_BUDGET);
+        let mut pools: Vec<(Pubkey, Instant)> = {
+            let lru = self.arb_pool_lru.read();
+            lru.iter().map(|(p, t)| (*p, *t)).collect()
+        };
+        pools.sort_by_key(|(_, t)| *t);
+        let mut evictable = 0usize;
+        for (pool, last) in pools {
+            if Self::arb_pool_activity_protected_at(last, now) {
+                continue;
+            }
+            evictable = evictable.saturating_add(self.arb_pinned_pubkeys_for_pool(pool).len());
+            if evictable >= deficit {
+                return true;
+            }
+        }
+        false
     }
 
     /// Refresh pool-level arb LRU on trade / vault tick / pool-state activity.
@@ -3900,13 +4148,13 @@ impl MarketDataContext {
     }
 
     fn arb_pin_readd_blocked_by_cooldown(&self, pool: Pubkey, fresh_activity: bool) -> bool {
-        if fresh_activity {
-            return false;
-        }
         let evicted = self.arb_pin_evicted_pools.read();
         let Some(evicted_at) = evicted.get(&pool) else {
             return false;
         };
+        if fresh_activity {
+            return false;
+        }
         evicted_at.elapsed() < ARB_PIN_READD_COOLDOWN
     }
 
@@ -3925,12 +4173,16 @@ impl MarketDataContext {
         out
     }
 
-    /// Pool with globally oldest arb pool LRU timestamp (eviction unit = whole pool).
-    fn oldest_arb_pinned_pool_to_evict(&self) -> Option<Pubkey> {
-        self.arb_pool_lru
-            .read()
+    /// Pool with oldest arb pool LRU among non-activity-protected pools (eviction unit = whole pool).
+    fn oldest_arb_pinned_pool_to_evict(&self, now: Instant) -> Option<Pubkey> {
+        let pools: Vec<(Pubkey, Instant)> = {
+            let lru = self.arb_pool_lru.read();
+            lru.iter().map(|(p, t)| (*p, *t)).collect()
+        };
+        pools
             .iter()
-            .min_by_key(|(_, oldest)| *oldest)
+            .filter(|(_, last)| !Self::arb_pool_activity_protected_at(*last, now))
+            .min_by_key(|(_, last)| *last)
             .map(|(pool, _)| *pool)
     }
 
@@ -3962,9 +4214,14 @@ impl MarketDataContext {
     }
 
     /// Demote all arb-multi-dex pins for one pool (vault legs + bin arrays atomically).
-    fn demote_arb_pins_for_pool(&self, pool: Pubkey) -> usize {
+    fn demote_arb_pins_for_pool(&self, pool: Pubkey, now: Instant) -> usize {
         let pubkeys = self.arb_pinned_pubkeys_for_pool(pool);
         let n = pubkeys.len();
+        let stale = {
+            let lru = self.arb_pool_lru.read();
+            lru.get(&pool)
+                .is_none_or(|last| !Self::arb_pool_activity_protected_at(*last, now))
+        };
         for pk in pubkeys {
             self.demote_arb_pin_pubkey(pk);
         }
@@ -3974,29 +4231,34 @@ impl MarketDataContext {
                 .write()
                 .insert(pool, Instant::now());
             inc_market_data_arb_pin_pool_evictions_total();
-            inc_market_data_arb_pin_eviction_reason_budget();
+            if stale {
+                inc_market_data_arb_pin_eviction_reason_stale_budget();
+            } else {
+                inc_market_data_arb_pin_eviction_reason_budget();
+            }
         }
         self.refresh_arb_pin_gauges();
         n
     }
 
-    /// Evict oldest arb-multi-dex pools until `slots_needed` new pins can fit under budget.
-    fn evict_oldest_arb_pins_for_budget(&self, slots_needed: usize) {
+    /// Evict oldest stale arb-multi-dex pools until `slots_needed` new pins can fit under budget.
+    /// Returns whether enough budget headroom exists after eviction attempts.
+    fn evict_oldest_arb_pins_for_budget(&self, slots_needed: usize, now: Instant) -> bool {
         loop {
             let need_evict = self
                 .arb_pin_pubkey_budget_len()
                 .saturating_add(slots_needed)
                 .saturating_sub(ARB_MULTI_DEX_PIN_ACCOUNT_BUDGET);
             if need_evict == 0 {
-                break;
+                return true;
             }
-            let Some(oldest_pool) = self.oldest_arb_pinned_pool_to_evict() else {
-                break;
+            let Some(oldest_pool) = self.oldest_arb_pinned_pool_to_evict(now) else {
+                return false;
             };
-            let freed = self.demote_arb_pins_for_pool(oldest_pool);
+            let freed = self.demote_arb_pins_for_pool(oldest_pool, now);
             if freed == 0 {
                 self.arb_pool_lru.write().remove(&oldest_pool);
-                break;
+                return false;
             }
             inc_market_data_arb_pin_evictions_total();
         }
@@ -4054,7 +4316,26 @@ impl MarketDataContext {
                 .count()
         };
         if slots_needed > 0 {
-            self.evict_oldest_arb_pins_for_budget(slots_needed);
+            if !self.evict_oldest_arb_pins_for_budget(slots_needed, now) {
+                inc_market_data_arb_pin_eviction_reason_active_protected();
+                return false;
+            }
+            let still_needed = {
+                let pins = self.arb_pin_pubkeys.read();
+                candidate_pubkeys
+                    .iter()
+                    .filter(|pk| !pins.contains(*pk))
+                    .count()
+            };
+            if still_needed > 0
+                && self
+                    .arb_pin_pubkey_budget_len()
+                    .saturating_add(still_needed)
+                    > ARB_MULTI_DEX_PIN_ACCOUNT_BUDGET
+            {
+                inc_market_data_arb_pin_eviction_reason_active_protected();
+                return false;
+            }
         }
 
         let mut changed = false;
@@ -16850,7 +17131,7 @@ mod pr_b_geyser_tracking_tests {
             lru.insert(pool, now);
         }
 
-        assert_eq!(ctx.demote_arb_pins_for_pool(pool), 2);
+        assert_eq!(ctx.demote_arb_pins_for_pool(pool, now), 2);
         let vs = ctx.tracked_vaults.read();
         assert!(!vs.get(&base_vault).unwrap().pinned);
         assert!(!vs.get(&quote_vault).unwrap().pinned);
@@ -16871,8 +17152,9 @@ mod pr_b_geyser_tracking_tests {
         let old_quote = Pubkey::new_unique();
         let new_base = Pubkey::new_unique();
         let new_quote = Pubkey::new_unique();
-        let old_at = Instant::now() - Duration::from_secs(120);
-        let new_at = Instant::now();
+        let old_at = Instant::now() - Duration::from_secs(300);
+        let new_at = Instant::now() - Duration::from_secs(150);
+        let now = Instant::now();
 
         let mk_vault = |pool: Pubkey, is_base: bool| VaultInfo {
             pool_address: pool,
@@ -16910,14 +17192,14 @@ mod pr_b_geyser_tracking_tests {
             }
         }
 
-        ctx.evict_oldest_arb_pins_for_budget(1);
+        ctx.evict_oldest_arb_pins_for_budget(1, now);
 
         let vs = ctx.tracked_vaults.read();
         assert!(!vs.get(&old_base).unwrap().pinned);
         assert!(!vs.get(&old_quote).unwrap().pinned);
         assert!(vs.get(&new_base).unwrap().pinned);
         assert!(vs.get(&new_quote).unwrap().pinned);
-        assert_eq!(ctx.oldest_arb_pinned_pool_to_evict(), Some(pool_new));
+        assert_eq!(ctx.oldest_arb_pinned_pool_to_evict(now), Some(pool_new));
     }
 
     #[test]
@@ -16971,10 +17253,11 @@ mod pr_b_geyser_tracking_tests {
             lru.insert(pool_stale, stale_at);
         }
 
-        ctx.touch_arb_pool_activity(pool_active, Instant::now());
-        assert_eq!(ctx.oldest_arb_pinned_pool_to_evict(), Some(pool_stale));
+        let now = Instant::now();
+        ctx.touch_arb_pool_activity(pool_active, now);
+        assert_eq!(ctx.oldest_arb_pinned_pool_to_evict(now), Some(pool_stale));
 
-        ctx.evict_oldest_arb_pins_for_budget(1);
+        ctx.evict_oldest_arb_pins_for_budget(1, now);
         let vs = ctx.tracked_vaults.read();
         assert!(vs.get(&active_base).unwrap().pinned);
         assert!(vs.get(&active_quote).unwrap().pinned);
@@ -17027,6 +17310,330 @@ mod pr_b_geyser_tracking_tests {
             vs.get(&base_vault).unwrap().pin,
             Some(GeyserPinReason::ArbMultiDex)
         );
+    }
+
+    #[test]
+    fn arb_pin_skips_new_pool_when_only_active_pools_fill_budget() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let now = Instant::now();
+        let mk_vault = |pool: Pubkey, is_base: bool, pinned: bool| VaultInfo {
+            pool_address: pool,
+            dex: "raydium_cpmm".to_string(),
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+            is_base_vault: is_base,
+            last_balance: std::sync::atomic::AtomicU64::new(0),
+            last_used_at: now,
+            pinned,
+            pin: pinned.then_some(GeyserPinReason::ArbMultiDex),
+            active_id: None,
+            bin_step: None,
+        };
+
+        let pool_active = Pubkey::new_unique();
+        let active_base = Pubkey::new_unique();
+        let active_quote = Pubkey::new_unique();
+
+        let mut pins = ctx.arb_pin_pubkeys.write();
+        for _ in 0..ARB_MULTI_DEX_PIN_ACCOUNT_BUDGET.saturating_sub(2) {
+            pins.insert(Pubkey::new_unique());
+        }
+        pins.insert(active_base);
+        pins.insert(active_quote);
+        drop(pins);
+
+        {
+            let mut vs = ctx.tracked_vaults.write();
+            vs.insert(active_base, mk_vault(pool_active, true, true));
+            vs.insert(active_quote, mk_vault(pool_active, false, true));
+        }
+        {
+            let mut lru = ctx.arb_pool_lru.write();
+            lru.insert(pool_active, now);
+        }
+        ctx.touch_arb_pool_activity(pool_active, now);
+
+        let pool_new = Pubkey::new_unique();
+        let new_base = Pubkey::new_unique();
+        let new_quote = Pubkey::new_unique();
+        {
+            let mut vs = ctx.tracked_vaults.write();
+            vs.insert(new_base, mk_vault(pool_new, true, false));
+            vs.insert(new_quote, mk_vault(pool_new, false, false));
+        }
+
+        assert!(!ctx.arb_pin_budget_can_fit_without_evicting_active(2, now));
+        assert!(!ctx.apply_arb_multi_dex_pins_for_pool(pool_new, now, false));
+        let vs = ctx.tracked_vaults.read();
+        assert!(vs.get(&active_base).unwrap().pinned);
+        assert_eq!(vs.get(&new_base).unwrap().pin, None);
+    }
+
+    #[test]
+    fn arb_reconcile_skips_oversized_pool_instead_of_evicting() {
+        use ironcrab::execution::live_pool_cache::MeteoraState;
+        use ironcrab::metrics::MARKET_DATA_ARB_RECONCILE_SKIPPED_OVERSIZED_POOL_TOTAL;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let token_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool_cpmm = Pubkey::new_unique();
+        let pool_orca = Pubkey::new_unique();
+        let pool_meteora = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+        let reserve_x = Pubkey::new_unique();
+        let reserve_y = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool_cpmm,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: token_mint,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.live_pool_cache.upsert(
+            pool_orca,
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: token_mint,
+                token_mint_b: quote,
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+                tick_current_index: 0,
+                sqrt_price: 1u128 << 64,
+                liquidity: 1,
+                fee_rate: 3000,
+                protocol_fee_rate: 300,
+                tick_spacing: 64,
+                vault_a_balance: Some(1),
+                vault_b_balance: Some(1),
+                token_a_program: None,
+                token_b_program: None,
+            }),
+            1,
+        );
+        ctx.live_pool_cache.upsert(
+            pool_meteora,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: token_mint,
+                token_y_mint: quote,
+                reserve_x,
+                reserve_y,
+                active_id: 0,
+                bin_step: 10,
+                reserve_x_balance: Some(1),
+                reserve_y_balance: Some(1),
+            }),
+            1,
+        );
+        ctx.refresh_arb_coverage_index_for_pool(pool_cpmm);
+        ctx.refresh_arb_coverage_index_for_pool(pool_orca);
+        ctx.refresh_arb_coverage_index_for_pool(pool_meteora);
+
+        {
+            let mut vs = ctx.tracked_vaults.write();
+            vs.insert(
+                reserve_x,
+                VaultInfo {
+                    pool_address: pool_meteora,
+                    dex: "meteora_dlmm".to_string(),
+                    base_mint: token_mint,
+                    quote_mint: quote,
+                    is_base_vault: true,
+                    last_balance: std::sync::atomic::AtomicU64::new(0),
+                    last_used_at: Instant::now(),
+                    pinned: false,
+                    pin: None,
+                    active_id: None,
+                    bin_step: None,
+                },
+            );
+            vs.insert(
+                reserve_y,
+                VaultInfo {
+                    pool_address: pool_meteora,
+                    dex: "meteora_dlmm".to_string(),
+                    base_mint: token_mint,
+                    quote_mint: quote,
+                    is_base_vault: false,
+                    last_balance: std::sync::atomic::AtomicU64::new(0),
+                    last_used_at: Instant::now(),
+                    pinned: false,
+                    pin: None,
+                    active_id: None,
+                    bin_step: None,
+                },
+            );
+        }
+        {
+            let mut bins = ctx.tracked_bin_arrays.write();
+            for i in 0..14 {
+                bins.insert(
+                    Pubkey::new_unique(),
+                    BinArrayInfo {
+                        pool_address: pool_meteora,
+                        bin_array_index: i,
+                        bin_step: 10,
+                        last_used_at: Instant::now(),
+                        pinned: false,
+                        pin: None,
+                    },
+                );
+            }
+        }
+
+        assert!(
+            ctx.arb_pool_new_pin_slots_needed(pool_meteora)
+                > ARB_RECONCILE_OVERSIZED_POOL_MAX_NEW_PINS
+        );
+
+        let oversized_before =
+            MARKET_DATA_ARB_RECONCILE_SKIPPED_OVERSIZED_POOL_TOTAL.load(Ordering::Relaxed);
+        assert!(ctx.reconcile_arb_multi_dex_for_mint(token_mint));
+        assert!(
+            MARKET_DATA_ARB_RECONCILE_SKIPPED_OVERSIZED_POOL_TOTAL.load(Ordering::Relaxed)
+                > oversized_before
+        );
+    }
+
+    #[test]
+    fn arb_reconcile_pool_selection_prioritizes_ready_sol_quote_pools() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let token_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let usdc = Pubkey::from_str(ARB_USDC_MINT).unwrap();
+        let mut pools = Vec::new();
+        for i in 0..12 {
+            let pool = Pubkey::new_unique();
+            pools.push(pool);
+            let quote_mint = if i % 3 == 0 { quote } else { usdc };
+            let has_reserves = i % 2 == 0;
+            ctx.live_pool_cache.upsert(
+                pool,
+                CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                    token_0_mint: token_mint,
+                    token_1_mint: quote_mint,
+                    token_0_vault: Pubkey::new_unique(),
+                    token_1_vault: Pubkey::new_unique(),
+                    reserve_0: has_reserves.then_some(1_000_000),
+                    reserve_1: has_reserves.then_some(2_000_000),
+                }),
+                1,
+            );
+            ctx.refresh_arb_coverage_index_for_pool(pool);
+        }
+
+        ctx.live_pool_cache.upsert(
+            pools[1],
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: token_mint,
+                token_mint_b: quote,
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+                tick_current_index: 0,
+                sqrt_price: 1u128 << 64,
+                liquidity: 1,
+                fee_rate: 3000,
+                protocol_fee_rate: 300,
+                tick_spacing: 64,
+                vault_a_balance: Some(1),
+                vault_b_balance: Some(1),
+                token_a_program: None,
+                token_b_program: None,
+            }),
+            2,
+        );
+        ctx.refresh_arb_coverage_index_for_pool(pools[1]);
+
+        let selected = ctx.select_arb_reconcile_pools_for_mint(&token_mint).0;
+        assert_eq!(selected.len(), ARB_RECONCILE_MAX_POOLS_PER_MINT);
+        assert!(
+            selected.contains(&pools[1]),
+            "SOL Orca pool should rank highly"
+        );
+        let min_selected_score = selected
+            .iter()
+            .map(|p| ctx.arb_reconcile_pool_rank_score(*p, &ctx.live_pool_cache.get(p).unwrap()))
+            .min()
+            .unwrap_or(0);
+        for pool in pools.iter().filter(|p| !selected.contains(p)) {
+            let score =
+                ctx.arb_reconcile_pool_rank_score(*pool, &ctx.live_pool_cache.get(pool).unwrap());
+            if score > 0 {
+                assert!(
+                    score <= min_selected_score,
+                    "unselected pool {pool} score {score} beats selected min {min_selected_score}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn arb_pin_readd_cooldown_ignores_fresh_activity_without_prior_eviction() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        let now = Instant::now();
+        {
+            let mut vs = ctx.tracked_vaults.write();
+            vs.insert(
+                base_vault,
+                VaultInfo {
+                    pool_address: pool,
+                    dex: "raydium_cpmm".to_string(),
+                    base_mint: Pubkey::new_unique(),
+                    quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                    is_base_vault: true,
+                    last_balance: std::sync::atomic::AtomicU64::new(0),
+                    last_used_at: now,
+                    pinned: false,
+                    pin: None,
+                    active_id: None,
+                    bin_step: None,
+                },
+            );
+            vs.insert(
+                quote_vault,
+                VaultInfo {
+                    pool_address: pool,
+                    dex: "raydium_cpmm".to_string(),
+                    base_mint: Pubkey::new_unique(),
+                    quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                    is_base_vault: false,
+                    last_balance: std::sync::atomic::AtomicU64::new(0),
+                    last_used_at: now,
+                    pinned: false,
+                    pin: None,
+                    active_id: None,
+                    bin_step: None,
+                },
+            );
+        }
+
+        assert!(ctx.apply_arb_multi_dex_pins_for_pool(pool, now, true));
+        assert!(!ctx.arb_pin_evicted_pools.read().contains_key(&pool));
     }
 
     #[test]
@@ -17722,9 +18329,10 @@ mod pr_b_geyser_tracking_tests {
         let already_before =
             MARKET_DATA_ARB_RECONCILE_SKIPPED_ALREADY_PINNED_TOTAL.load(Ordering::Relaxed);
         assert!(!ctx.reconcile_arb_multi_dex_for_mint(token_mint));
-        assert!(
-            MARKET_DATA_ARB_RECONCILE_SKIPPED_ALREADY_PINNED_TOTAL.load(Ordering::Relaxed)
-                > already_before
+        assert_eq!(
+            MARKET_DATA_ARB_RECONCILE_SKIPPED_ALREADY_PINNED_TOTAL.load(Ordering::Relaxed),
+            already_before,
+            "fully covered pools are excluded from ranked selection"
         );
     }
 

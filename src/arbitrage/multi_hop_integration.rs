@@ -1262,6 +1262,7 @@ mod tests {
     use crate::execution::live_pool_cache::{
         create_shared_cache, CachedPoolState, RaydiumAmmState,
     };
+    use serial_test::serial;
 
     #[test]
     fn test_multi_hop_config_default() {
@@ -1372,6 +1373,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn search_from_tokens_increments_no_quote_neighbors_once_per_search() {
         use crate::metrics::MULTI_HOP_SEARCH_NO_QUOTE_NEIGHBORS_TOTAL;
         use std::sync::atomic::Ordering;
@@ -1544,6 +1546,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn coalesced_dirty_tokens_produce_single_search() {
         let arb = MultiHopArbitrage::new(
             MultiHopConfig {

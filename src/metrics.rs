@@ -325,6 +325,24 @@ pub static MARKET_DATA_ARB_RECONCILE_SKIPPED_ALREADY_PINNED_TOTAL: Lazy<AtomicU6
     Lazy::new(|| AtomicU64::new(0));
 pub static MARKET_DATA_ARB_COVERAGE_INDEX_UPDATES_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Current arb-multi-dex pin pubkey budget usage (vault + bin-array legs).
+pub static MARKET_DATA_ARB_PIN_BUDGET_USED_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Pools selected for bounded arb reconcile after ranking (per mint pass).
+pub static MARKET_DATA_ARB_RECONCILE_SELECTED_POOLS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Ranked reconcile candidates not selected because of `ARB_RECONCILE_MAX_POOLS_PER_MINT`.
+pub static MARKET_DATA_ARB_RECONCILE_UNSELECTED_POOLS_DUE_TO_CAP_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ARB_RECONCILE_SKIPPED_ACTIVE_BUDGET_PROTECTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ARB_RECONCILE_SKIPPED_OVERSIZED_POOL_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Arb pin evictions of stale (inactive-window) pools under budget pressure.
+pub static MARKET_DATA_ARB_PIN_EVICTION_REASON_STALE_BUDGET: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Arb pin add skipped because only activity-protected pools would need eviction.
+pub static MARKET_DATA_ARB_PIN_EVICTION_REASON_ACTIVE_PROTECTED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 /// Geyser explicit-tracked subscription list syncs coalesced from the TX trade path (debounced flush).
 pub static MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -520,6 +538,43 @@ pub fn inc_market_data_arb_reconcile_skipped_already_pinned_total() {
 #[inline]
 pub fn inc_market_data_arb_coverage_index_updates_total() {
     MARKET_DATA_ARB_COVERAGE_INDEX_UPDATES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_arb_pin_budget_used(n: usize) {
+    MARKET_DATA_ARB_PIN_BUDGET_USED_GAUGE.store(n as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_reconcile_selected_pools_total() {
+    MARKET_DATA_ARB_RECONCILE_SELECTED_POOLS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn add_market_data_arb_reconcile_unselected_pools_due_to_cap_total(n: u64) {
+    if n > 0 {
+        MARKET_DATA_ARB_RECONCILE_UNSELECTED_POOLS_DUE_TO_CAP_TOTAL.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn inc_market_data_arb_reconcile_skipped_active_budget_protected_total() {
+    MARKET_DATA_ARB_RECONCILE_SKIPPED_ACTIVE_BUDGET_PROTECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_reconcile_skipped_oversized_pool_total() {
+    MARKET_DATA_ARB_RECONCILE_SKIPPED_OVERSIZED_POOL_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_pin_eviction_reason_stale_budget() {
+    MARKET_DATA_ARB_PIN_EVICTION_REASON_STALE_BUDGET.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_pin_eviction_reason_active_protected() {
+    MARKET_DATA_ARB_PIN_EVICTION_REASON_ACTIVE_PROTECTED.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -3900,6 +3955,24 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
+    out.push_str("market_data_arb_pin_eviction_reason{reason=\"stale_budget\"} ");
+    out.push_str(
+        &MARKET_DATA_ARB_PIN_EVICTION_REASON_STALE_BUDGET
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_arb_pin_eviction_reason{reason=\"active_protected\"} ");
+    out.push_str(
+        &MARKET_DATA_ARB_PIN_EVICTION_REASON_ACTIVE_PROTECTED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "market_data_arb_pin_budget_used",
+        MARKET_DATA_ARB_PIN_BUDGET_USED_GAUGE.load(Ordering::Relaxed)
+    );
     line!(
         "market_data_arb_reconcile_attempts_total",
         MARKET_DATA_ARB_RECONCILE_ATTEMPTS_TOTAL.load(Ordering::Relaxed)
@@ -3946,6 +4019,28 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("market_data_arb_reconcile_skipped_total{reason=\"already_pinned\"} ");
     out.push_str(
         &MARKET_DATA_ARB_RECONCILE_SKIPPED_ALREADY_PINNED_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "market_data_arb_reconcile_selected_pools_total",
+        MARKET_DATA_ARB_RECONCILE_SELECTED_POOLS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_arb_reconcile_unselected_pools_due_to_cap_total",
+        MARKET_DATA_ARB_RECONCILE_UNSELECTED_POOLS_DUE_TO_CAP_TOTAL.load(Ordering::Relaxed)
+    );
+    out.push_str("market_data_arb_reconcile_skipped_total{reason=\"active_budget_protected\"} ");
+    out.push_str(
+        &MARKET_DATA_ARB_RECONCILE_SKIPPED_ACTIVE_BUDGET_PROTECTED_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_arb_reconcile_skipped_total{reason=\"oversized_pool\"} ");
+    out.push_str(
+        &MARKET_DATA_ARB_RECONCILE_SKIPPED_OVERSIZED_POOL_TOTAL
             .load(Ordering::Relaxed)
             .to_string(),
     );
