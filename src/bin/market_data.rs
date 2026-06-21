@@ -11984,8 +11984,9 @@ fn account_geyser_update_might_be_relevant(
         return true;
     }
     if u.owner == PUMPFUN_PROGRAM_OWNER {
-        if let Some(CachedPoolState::PumpFun(s)) = ctx.live_pool_cache.get(&pool_pk) {
-            if ctx.wallet_tracks_mint_for_geyser(&s.token_mint) {
+        for mint in ctx.tracked_wallet_mint_decimals.read().keys() {
+            let (bonding_curve, _) = PumpFunDex::derive_bonding_curve_static(mint);
+            if bonding_curve == pool_pk {
                 return true;
             }
         }
