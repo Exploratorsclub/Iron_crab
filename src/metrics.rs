@@ -354,6 +354,9 @@ pub static MARKET_DATA_GEYSER_SYNC_PENDING: Lazy<AtomicU64> = Lazy::new(|| Atomi
 /// md-state batch ended with tracked mutations but no net-new explicit subscription pubkeys.
 pub static MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Debounced Geyser sync flush skipped due to per-second rate cap (startup burst protection).
+pub static MARKET_DATA_GEYSER_SYNC_SKIPPED_RATE_LIMIT_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// UnifiedHotPoolRegistry pool count (momentum-only hot pools).
 pub static MARKET_DATA_HOT_POOL_REGISTRY_POOLS_MOMENTUM: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -610,6 +613,11 @@ pub fn set_market_data_geyser_sync_pending(pending: u64) {
 #[inline]
 pub fn inc_market_data_geyser_sync_skipped_no_delta_total() {
     MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_geyser_sync_skipped_rate_limit_total() {
+    MARKET_DATA_GEYSER_SYNC_SKIPPED_RATE_LIMIT_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -4100,6 +4108,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_geyser_sync_skipped_no_delta_total",
         MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_sync_skipped_rate_limit_total",
+        MARKET_DATA_GEYSER_SYNC_SKIPPED_RATE_LIMIT_TOTAL.load(Ordering::Relaxed)
     );
     out.push_str("market_data_hot_pool_registry_pools{reason=\"momentum\"} ");
     out.push_str(

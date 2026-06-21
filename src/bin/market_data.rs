@@ -79,6 +79,7 @@ use ironcrab::metrics::{
     inc_market_data_arb_reconcile_skipped_partial_state_total,
     inc_market_data_arb_registered_vaults_total, inc_market_data_balance_updated_from_cache_total,
     inc_market_data_geyser_sync_skipped_no_delta_total,
+    inc_market_data_geyser_sync_skipped_rate_limit_total,
     inc_market_data_geyser_tracking_enqueue_dropped_total,
     inc_market_data_geyser_tracking_jobs_processed_total,
     inc_market_data_jsonl_enqueue_dropped_total, inc_market_data_md_sidefx_enqueue_dropped_total,
@@ -100,9 +101,10 @@ use ironcrab::metrics::{
     record_market_data_geyser_sync_immediate_total,
     record_market_data_geyser_to_publish_on_success, record_market_data_global_ingest_stall,
     record_market_data_momentum_active_pool_messages_total,
-    record_market_data_pool_mint_map_to_devwallet_ms, record_market_data_tokio_progress,
-    record_market_data_trade_after_bonding_publish_ms, record_market_data_tx_broadcast_lagged,
-    record_market_data_tx_channel_lag_ms, record_market_data_tx_handler_processed, serve_metrics,
+    record_market_data_pool_mint_map_to_devwallet_ms, record_market_data_tokio_liveness_stall,
+    record_market_data_tokio_progress, record_market_data_trade_after_bonding_publish_ms,
+    record_market_data_tx_broadcast_lagged, record_market_data_tx_channel_lag_ms,
+    record_market_data_tx_handler_processed, serve_metrics,
     set_market_data_account_broadcast_queue_depth,
     set_market_data_account_publish_worker_last_success_unix_ms,
     set_market_data_account_worker_count, set_market_data_arb_pin_budget_used,
@@ -180,6 +182,8 @@ const MARKET_DATA_MD_SIDEFX_BURST_MAX: usize = 128;
 /// PR167: minimum debounce for explicit pin updates during startup burst (seconds).
 const MARKET_DATA_GEYSER_SYNC_STARTUP_WINDOW: Duration = Duration::from_secs(120);
 const MARKET_DATA_GEYSER_SYNC_STARTUP_MIN_MS: u64 = 250;
+/// PR233: max debounced Geyser sync flushes per second during startup burst.
+const MARKET_DATA_GEYSER_SYNC_FLUSH_MAX_PER_SEC: usize = 4;
 /// PR169c: bounded channel for momentum updates before actor coalesce.
 const MARKET_DATA_MOMENTUM_COALESCE_CHANNEL_CAP: usize = 512;
 /// PR169c: chunk large momentum applies so the tracking actor yields to ingest tasks.
@@ -346,6 +350,8 @@ enum MdStateCommand {
     },
     /// PR169b: `max_tracked_accounts` cap change — debounced flush/eviction only.
     ScheduleGeyserSyncAfterConfigChange,
+    /// PR233: debounced explicit Geyser sync flush — executed only on `md-state` thread.
+    FlushGeyserSyncDebounced,
     /// Phase-R-R2: LRU touch only (no subscription change). Legacy singles coalesced into batch.
     #[allow(dead_code)]
     TouchVault(Pubkey),
@@ -551,6 +557,7 @@ fn md_state_process_job(ctx: &Arc<MarketDataContext>, job: MdStateCommand) -> bo
             ctx.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet))
         }
         MdStateCommand::ScheduleGeyserSyncAfterConfigChange => true,
+        MdStateCommand::FlushGeyserSyncDebounced => false,
         MdStateCommand::TouchVault(vault) => {
             ctx.touch_tracked_vault_pubkey(&vault);
             false
@@ -580,17 +587,19 @@ fn md_state_process_job(ctx: &Arc<MarketDataContext>, job: MdStateCommand) -> bo
     }
 }
 
-fn md_state_try_enqueue(sender: &MdStateSender, job: MdStateCommand) {
+fn md_state_try_enqueue(sender: &MdStateSender, job: MdStateCommand) -> bool {
     if sender.queue_depth.load(Ordering::Relaxed) >= sender.queue_capacity {
         inc_market_data_geyser_tracking_enqueue_dropped_total();
-        return;
+        return false;
     }
     if sender.tx.try_send(job).is_ok() {
         let depth = sender.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
         set_market_data_geyser_tracking_queue_depth(depth);
         set_market_data_md_state_queue_depth(depth);
+        true
     } else {
         inc_market_data_geyser_tracking_enqueue_dropped_total();
+        false
     }
 }
 
@@ -598,6 +607,7 @@ fn md_state_worker_loop(
     ctx: Arc<MarketDataContext>,
     rx: std_mpsc::Receiver<MdStateCommand>,
     queue_depth: Arc<AtomicUsize>,
+    md_state: MdStateSender,
 ) {
     loop {
         let Ok(first) = rx.recv() else {
@@ -618,18 +628,26 @@ fn md_state_worker_loop(
             }
         }
         let jobs = md_state_coalesce_jobs(jobs);
+        let flush_geyser_sync = jobs
+            .iter()
+            .any(|job| matches!(job, MdStateCommand::FlushGeyserSyncDebounced));
         let schedule_sync_after_config = jobs
             .iter()
             .any(|job| matches!(job, MdStateCommand::ScheduleGeyserSyncAfterConfigChange));
         let before_keys = ctx.snapshot_explicit_subscription_pubkeys();
         for job in jobs {
+            if matches!(job, MdStateCommand::FlushGeyserSyncDebounced) {
+                continue;
+            }
             let _ = md_state_process_job(&ctx, job);
         }
         let after_keys = ctx.snapshot_explicit_subscription_pubkeys();
-        if explicit_subscription_has_new_keys(&before_keys, &after_keys)
+        if flush_geyser_sync {
+            ctx.sync_geyser_tracked_accounts_batched_flush();
+        } else if explicit_subscription_has_new_keys(&before_keys, &after_keys)
             || schedule_sync_after_config
         {
-            ctx.schedule_geyser_sync_batch_debounced();
+            ctx.schedule_geyser_sync_batch_debounced(&md_state);
         } else if before_keys != after_keys {
             inc_market_data_geyser_sync_skipped_no_delta_total();
         }
@@ -647,15 +665,17 @@ fn spawn_md_state_worker(
     let queue_depth = Arc::new(AtomicUsize::new(0));
     let depth_worker = Arc::clone(&queue_depth);
     let ctx_worker = Arc::clone(&ctx);
+    let md_state_sender = MdStateSender {
+        tx: tx.clone(),
+        queue_depth: Arc::clone(&queue_depth),
+        queue_capacity,
+    };
+    let md_state_worker = md_state_sender.clone();
     let _join: JoinHandle<()> = std::thread::Builder::new()
         .name("md-state".into())
-        .spawn(move || md_state_worker_loop(ctx_worker, rx, depth_worker))
+        .spawn(move || md_state_worker_loop(ctx_worker, rx, depth_worker, md_state_worker))
         .expect("spawn md-state thread");
-    MdStateSender {
-        tx,
-        queue_depth,
-        queue_capacity,
-    }
+    md_state_sender
 }
 
 /// Phase-R-R4: deferred side-effects (pool_mint_map, heavy publish bursts, vault pairing reads).
@@ -3371,7 +3391,11 @@ struct MarketDataContext {
     helius_rpc: Option<Arc<SolanaRpc>>,
 
     /// Debounced flush of explicit Geyser subscription maps after TX-path reserve registration.
-    geyser_sync_batch_timer: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    geyser_sync_batch_timer: parking_lot::Mutex<Option<Arc<AtomicBool>>>,
+    /// PR233: sliding window for debounced Geyser sync flush rate cap.
+    geyser_sync_flush_timestamps: parking_lot::Mutex<Vec<Instant>>,
+    /// PR233: invalidates in-flight OS-thread debounce timers when rescheduled.
+    geyser_sync_debounce_epoch: AtomicU64,
     /// Tokio handle for debounced Geyser sync from the `md-state` OS thread (Phase-R-R2).
     ingest_tokio_handle: parking_lot::RwLock<Option<tokio::runtime::Handle>>,
 
@@ -3479,6 +3503,8 @@ struct VaultInfo {
     active_id: Option<i32>,
     /// Meteora DLMM: Bin step (price increment per bin in bps)
     bin_step: Option<u16>,
+    /// PR233: O(1) paired-vault LRU touch (opposite pool leg).
+    sibling_vault: Option<Pubkey>,
 }
 
 impl Clone for VaultInfo {
@@ -3497,6 +3523,7 @@ impl Clone for VaultInfo {
             pin: self.pin,
             active_id: self.active_id,
             bin_step: self.bin_step,
+            sibling_vault: self.sibling_vault,
         }
     }
 }
@@ -3898,8 +3925,12 @@ fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> {
     let mut seen_account_pools = HashSet::new();
     let mut lru_vaults = HashSet::new();
     let mut lru_bin_arrays = HashSet::new();
+    let mut pending_flush = false;
     for job in jobs {
         match job {
+            MdStateCommand::FlushGeyserSyncDebounced => {
+                pending_flush = true;
+            }
             MdStateCommand::ArbMultiDexReconcile { mint } => {
                 if seen_mints.insert(mint) {
                     out.push(MdStateCommand::ArbMultiDexReconcile { mint });
@@ -3938,6 +3969,9 @@ fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> {
             vaults: lru_vaults.into_iter().collect(),
             bin_arrays: lru_bin_arrays.into_iter().collect(),
         });
+    }
+    if pending_flush {
+        out.push(MdStateCommand::FlushGeyserSyncDebounced);
     }
     out
 }
@@ -4005,6 +4039,7 @@ fn insert_tracked_vault_pair(
             pin: None,
             active_id: spec.active_id,
             bin_step: spec.bin_step,
+            sibling_vault: Some(spec.quote_vault),
         }
     });
     vaults.entry(spec.quote_vault).or_insert_with(|| {
@@ -4021,8 +4056,15 @@ fn insert_tracked_vault_pair(
             pin: None,
             active_id: spec.active_id,
             bin_step: spec.bin_step,
+            sibling_vault: Some(spec.base_vault),
         }
     });
+    if let Some(base) = vaults.get_mut(&spec.base_vault) {
+        base.sibling_vault = Some(spec.quote_vault);
+    }
+    if let Some(quote) = vaults.get_mut(&spec.quote_vault) {
+        quote.sibling_vault = Some(spec.base_vault);
+    }
 }
 
 impl MarketDataContext {
@@ -4847,36 +4889,63 @@ impl MarketDataContext {
 
         let mut changed = false;
         let mut pool_has_arb_pins = false;
-        {
-            let mut pin_set = self.hot_pool_registry.arb_pin_pubkeys.write();
-            let mut vaults = self.tracked_vaults.write();
-            let mut bins = self.tracked_bin_arrays.write();
-            for pk in candidate_pubkeys {
-                if let Some(v) = vaults.get_mut(&pk) {
+        for pk in candidate_pubkeys {
+            let eligible = if let Some(v) = self.tracked_vaults.read().get(&pk) {
+                if v.pin == Some(GeyserPinReason::Wallet)
+                    || v.pin == Some(GeyserPinReason::MomentumActive)
+                {
+                    None
+                } else {
+                    Some((
+                        v.pool_address,
+                        true,
+                        v.pin == Some(GeyserPinReason::ArbMultiDex),
+                    ))
+                }
+            } else if let Some(b) = self.tracked_bin_arrays.read().get(&pk) {
+                if b.pin == Some(GeyserPinReason::Wallet)
+                    || b.pin == Some(GeyserPinReason::MomentumActive)
+                {
+                    None
+                } else {
+                    Some((
+                        b.pool_address,
+                        false,
+                        b.pin == Some(GeyserPinReason::ArbMultiDex),
+                    ))
+                }
+            } else {
+                None
+            };
+            let Some((_pool_addr, is_vault, was_arb)) = eligible else {
+                continue;
+            };
+            {
+                let mut pin_set = self.hot_pool_registry.arb_pin_pubkeys.write();
+                pin_set.insert(pk);
+            }
+            if is_vault {
+                if let Some(v) = self.tracked_vaults.write().get_mut(&pk) {
                     if v.pin == Some(GeyserPinReason::Wallet)
                         || v.pin == Some(GeyserPinReason::MomentumActive)
                     {
                         continue;
                     }
-                    let was_arb = v.pin == Some(GeyserPinReason::ArbMultiDex);
                     v.pinned = true;
                     v.pin = Some(GeyserPinReason::ArbMultiDex);
-                    pin_set.insert(pk);
-                    changed |= !was_arb;
-                    pool_has_arb_pins = true;
-                } else if let Some(b) = bins.get_mut(&pk) {
-                    if b.pin == Some(GeyserPinReason::Wallet)
-                        || b.pin == Some(GeyserPinReason::MomentumActive)
-                    {
-                        continue;
-                    }
-                    let was_arb = b.pin == Some(GeyserPinReason::ArbMultiDex);
-                    b.pinned = true;
-                    b.pin = Some(GeyserPinReason::ArbMultiDex);
-                    pin_set.insert(pk);
                     changed |= !was_arb;
                     pool_has_arb_pins = true;
                 }
+            } else if let Some(b) = self.tracked_bin_arrays.write().get_mut(&pk) {
+                if b.pin == Some(GeyserPinReason::Wallet)
+                    || b.pin == Some(GeyserPinReason::MomentumActive)
+                {
+                    continue;
+                }
+                b.pinned = true;
+                b.pin = Some(GeyserPinReason::ArbMultiDex);
+                changed |= !was_arb;
+                pool_has_arb_pins = true;
             }
         }
         if pool_has_arb_pins {
@@ -5172,28 +5241,72 @@ impl MarketDataContext {
         }
     }
 
-    fn schedule_geyser_sync_batch_debounced(self: &Arc<Self>) {
+    fn try_acquire_geyser_sync_flush_slot(&self) -> bool {
+        let mut window = self.geyser_sync_flush_timestamps.lock();
+        let now = Instant::now();
+        window.retain(|t| now.saturating_duration_since(*t) < Duration::from_secs(1));
+        if window.len() >= MARKET_DATA_GEYSER_SYNC_FLUSH_MAX_PER_SEC {
+            return false;
+        }
+        window.push(now);
+        true
+    }
+
+    fn release_geyser_sync_flush_slot(&self) {
+        self.geyser_sync_flush_timestamps.lock().pop();
+    }
+
+    fn schedule_geyser_sync_batch_debounced(self: &Arc<Self>, md_state: &MdStateSender) {
         let ms = self.geyser_sync_batch_debounce_ms();
         set_market_data_geyser_sync_pending(1);
+        let epoch = self
+            .geyser_sync_debounce_epoch
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         let mut guard = self.geyser_sync_batch_timer.lock();
-        if let Some(h) = guard.take() {
-            h.abort();
+        if let Some(abort) = guard.take() {
+            abort.store(true, Ordering::Relaxed);
         }
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_c = Arc::clone(&abort);
+        let md_state_thread = md_state.clone();
+        let md_state_fallback = md_state.clone();
         let ctx = self.clone();
-        let fut = async move {
-            tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
-            ctx.sync_geyser_tracked_accounts_batched_flush();
-        };
-        let h = if let Some(handle) = self.ingest_tokio_handle.read().clone() {
-            handle.spawn(fut)
-        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(fut)
-        } else {
-            warn!("schedule_geyser_sync_batch_debounced: no Tokio runtime handle");
-            set_market_data_geyser_sync_pending(0);
-            return;
-        };
-        *guard = Some(h);
+        match std::thread::Builder::new()
+            .name("md-geyser-sync-debounce".into())
+            .spawn(move || {
+                std::thread::sleep(Duration::from_millis(ms));
+                if abort_c.load(Ordering::Relaxed)
+                    || ctx.geyser_sync_debounce_epoch.load(Ordering::Relaxed) != epoch
+                {
+                    return;
+                }
+                if !ctx.try_acquire_geyser_sync_flush_slot() {
+                    inc_market_data_geyser_sync_skipped_rate_limit_total();
+                    ctx.schedule_geyser_sync_batch_debounced(&md_state_thread);
+                    return;
+                }
+                if !md_state_try_enqueue(&md_state_thread, MdStateCommand::FlushGeyserSyncDebounced)
+                {
+                    ctx.release_geyser_sync_flush_slot();
+                    ctx.schedule_geyser_sync_batch_debounced(&md_state_thread);
+                }
+            }) {
+            Ok(_) => *guard = Some(abort),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "md-geyser-sync-debounce thread spawn failed; enqueueing flush directly"
+                );
+                drop(guard);
+                if !md_state_try_enqueue(
+                    &md_state_fallback,
+                    MdStateCommand::FlushGeyserSyncDebounced,
+                ) {
+                    self.schedule_geyser_sync_batch_debounced(&md_state_fallback);
+                }
+            }
+        }
     }
 
     /// PR161: merge four explicit-track `watch` streams into `combined_tracked_tx` with the same
@@ -5339,17 +5452,16 @@ impl MarketDataContext {
     fn touch_tracked_vault_pubkey(&self, vault: &Pubkey) {
         let now = Instant::now();
         let mut vaults = self.tracked_vaults.write();
-        if let Some(v) = vaults.get_mut(vault) {
+        let sibling = if let Some(v) = vaults.get_mut(vault) {
             v.last_used_at = now;
-            let pool = v.pool_address;
-            let is_base = v.is_base_vault;
-            // Keep vault pairs aged together so LRU pair-eviction does not drop an active leg.
-            if let Some(sibling_pk) =
-                Self::geyser_unpinned_sibling_vault_pubkey(&vaults, pool, is_base)
-            {
-                if let Some(sv) = vaults.get_mut(&sibling_pk) {
-                    sv.last_used_at = now;
-                }
+            v.sibling_vault
+                .filter(|sibling_pk| vaults.get(sibling_pk).is_some_and(|sv| !sv.pinned))
+        } else {
+            None
+        };
+        if let Some(sibling_pk) = sibling {
+            if let Some(sv) = vaults.get_mut(&sibling_pk) {
+                sv.last_used_at = now;
             }
         }
     }
@@ -5722,6 +5834,7 @@ impl MarketDataContext {
                             pin: None,
                             active_id: None,
                             bin_step: None,
+                            sibling_vault: Some(s.pc_vault),
                         }
                     });
                     vaults.entry(s.pc_vault).or_insert_with(|| {
@@ -5738,8 +5851,15 @@ impl MarketDataContext {
                             pin: None,
                             active_id: None,
                             bin_step: None,
+                            sibling_vault: Some(s.coin_vault),
                         }
                     });
+                    if let Some(base) = vaults.get_mut(&s.coin_vault) {
+                        base.sibling_vault = Some(s.pc_vault);
+                    }
+                    if let Some(quote) = vaults.get_mut(&s.pc_vault) {
+                        quote.sibling_vault = Some(s.coin_vault);
+                    }
                 }
             }
             _ => {}
@@ -10710,6 +10830,8 @@ async fn main() -> Result<()> {
         pump_amm_dex: parking_lot::RwLock::new(None),
         helius_rpc,
         geyser_sync_batch_timer: parking_lot::Mutex::new(None),
+        geyser_sync_flush_timestamps: parking_lot::Mutex::new(Vec::new()),
+        geyser_sync_debounce_epoch: AtomicU64::new(0),
         ingest_tokio_handle: parking_lot::RwLock::new(None),
         pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
             std::collections::HashSet::new(),
@@ -12006,74 +12128,94 @@ fn spawn_market_data_metrics_runtime(addr: std::net::SocketAddr) {
 }
 
 /// PR167: detect global ingest stall (TX + account + head slot all frozen).
+/// PR233: OS thread — survives Tokio runtime freeze (same pattern as md-watchdog).
 fn spawn_market_data_global_ingest_liveness_task(process_started: Instant) {
-    tokio::spawn(async move {
-        const CHECK_INTERVAL: Duration = Duration::from_secs(10);
-        const STALL_WINDOW: Duration = Duration::from_secs(50);
-        const RECOVERY_WAIT: Duration = Duration::from_secs(60);
-        const STARTUP_GRACE: Duration = Duration::from_secs(120);
-        let mut last_tx = market_data_tx_handler_processed_value();
-        let mut last_account = geyser_account_listener_account_updates_value();
-        let mut last_head = market_data_geyser_head_slot_value();
-        let mut stalled_since: Option<Instant> = None;
-        let mut recovery_requested_at: Option<Instant> = None;
-        let mut interval = tokio::time::interval(CHECK_INTERVAL);
-        loop {
-            interval.tick().await;
-            if process_started.elapsed() < STARTUP_GRACE {
-                last_tx = market_data_tx_handler_processed_value();
-                last_account = geyser_account_listener_account_updates_value();
-                last_head = market_data_geyser_head_slot_value();
-                stalled_since = None;
-                recovery_requested_at = None;
-                continue;
-            }
-            let tx = market_data_tx_handler_processed_value();
-            let account = geyser_account_listener_account_updates_value();
-            let head = market_data_geyser_head_slot_value();
-            if market_data_global_ingest_stalled(
-                tx,
-                last_tx,
-                account,
-                last_account,
-                head,
-                last_head,
-            ) {
-                let since = *stalled_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= STALL_WINDOW {
-                    record_market_data_global_ingest_stall();
-                    if recovery_requested_at.is_none() {
-                        error!(
-                            stall_secs = STALL_WINDOW.as_secs(),
-                            tx_handler_processed = tx,
-                            account_updates = account,
-                            head_slot = head,
-                            "PR167: global ingest stalled — requesting Geyser TX + account session reconnect"
-                        );
-                        market_data_request_tx_session_reconnect();
-                        market_data_request_account_session_reconnect();
-                        recovery_requested_at = Some(Instant::now());
-                        stalled_since = None;
-                    } else if recovery_requested_at.is_some_and(|t| t.elapsed() >= RECOVERY_WAIT) {
-                        error!(
-                            stall_secs = RECOVERY_WAIT.as_secs(),
-                            "PR167: global ingest still stalled after reconnect — exiting for systemd restart"
-                        );
-                        #[cfg(unix)]
-                        MD_SYSTEMD_WATCHDOG_NOTIFY.store(false, Ordering::Relaxed);
-                        std::process::exit(1);
-                    }
+    use ironcrab::metrics::MARKET_DATA_INGEST_PROGRESS_TICK;
+
+    std::thread::Builder::new()
+        .name("md-ingest-liveness".into())
+        .spawn(move || {
+            const CHECK_INTERVAL: Duration = Duration::from_secs(10);
+            const STALL_WINDOW: Duration = Duration::from_secs(50);
+            const RECOVERY_WAIT: Duration = Duration::from_secs(60);
+            const STARTUP_GRACE: Duration = Duration::from_secs(120);
+            let mut last_tx = market_data_tx_handler_processed_value();
+            let mut last_account = geyser_account_listener_account_updates_value();
+            let mut last_head = market_data_geyser_head_slot_value();
+            let mut last_tokio_tick = MARKET_DATA_INGEST_PROGRESS_TICK.load(Ordering::Relaxed);
+            let mut stalled_since: Option<Instant> = None;
+            let mut tokio_stalled_since: Option<Instant> = None;
+            let mut recovery_requested_at: Option<Instant> = None;
+            loop {
+                std::thread::sleep(CHECK_INTERVAL);
+                if process_started.elapsed() < STARTUP_GRACE {
+                    last_tx = market_data_tx_handler_processed_value();
+                    last_account = geyser_account_listener_account_updates_value();
+                    last_head = market_data_geyser_head_slot_value();
+                    last_tokio_tick = MARKET_DATA_INGEST_PROGRESS_TICK.load(Ordering::Relaxed);
+                    stalled_since = None;
+                    tokio_stalled_since = None;
+                    recovery_requested_at = None;
+                    continue;
                 }
-            } else {
-                touch_market_data_global_ingest_progress();
-                stalled_since = None;
-                recovery_requested_at = None;
-                last_tx = tx;
-                last_account = account;
-                last_head = head;
+                let tx = market_data_tx_handler_processed_value();
+                let account = geyser_account_listener_account_updates_value();
+                let head = market_data_geyser_head_slot_value();
+                let tokio_tick = MARKET_DATA_INGEST_PROGRESS_TICK.load(Ordering::Relaxed);
+                if tokio_tick == last_tokio_tick {
+                    let since = *tokio_stalled_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= STALL_WINDOW {
+                        record_market_data_tokio_liveness_stall();
+                    }
+                } else {
+                    last_tokio_tick = tokio_tick;
+                    tokio_stalled_since = None;
+                }
+                if market_data_global_ingest_stalled(
+                    tx,
+                    last_tx,
+                    account,
+                    last_account,
+                    head,
+                    last_head,
+                ) {
+                    let since = *stalled_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= STALL_WINDOW {
+                        record_market_data_global_ingest_stall();
+                        if recovery_requested_at.is_none() {
+                            error!(
+                                stall_secs = STALL_WINDOW.as_secs(),
+                                tx_handler_processed = tx,
+                                account_updates = account,
+                                head_slot = head,
+                                "PR167: global ingest stalled — requesting Geyser TX + account session reconnect"
+                            );
+                            market_data_request_tx_session_reconnect();
+                            market_data_request_account_session_reconnect();
+                            recovery_requested_at = Some(Instant::now());
+                            stalled_since = None;
+                        } else if recovery_requested_at.is_some_and(|t| t.elapsed() >= RECOVERY_WAIT)
+                        {
+                            error!(
+                                stall_secs = RECOVERY_WAIT.as_secs(),
+                                "PR167: global ingest still stalled after reconnect — exiting for systemd restart"
+                            );
+                            #[cfg(unix)]
+                            MD_SYSTEMD_WATCHDOG_NOTIFY.store(false, Ordering::Relaxed);
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    touch_market_data_global_ingest_progress();
+                    stalled_since = None;
+                    recovery_requested_at = None;
+                    last_tx = tx;
+                    last_account = account;
+                    last_head = head;
+                }
             }
-        }
-    });
+        })
+        .expect("spawn md-ingest-liveness thread");
 }
 
 /// PR160: isolated publish thread + multi-worker Tokio (no NATS await on main Geyser runtime).
@@ -16216,6 +16358,8 @@ mod wallet_tx_meta_balance_tests {
             pump_amm_dex: parking_lot::RwLock::new(None),
             helius_rpc: None,
             geyser_sync_batch_timer: parking_lot::Mutex::new(None),
+            geyser_sync_flush_timestamps: parking_lot::Mutex::new(Vec::new()),
+            geyser_sync_debounce_epoch: AtomicU64::new(0),
             ingest_tokio_handle: parking_lot::RwLock::new(None),
             pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
                 std::collections::HashSet::new(),
@@ -16779,6 +16923,7 @@ mod pr_b_geyser_tracking_tests {
                     pin: None,
                     active_id: None,
                     bin_step: None,
+                    sibling_vault: Some(quote_vault),
                 },
             );
             vaults.insert(
@@ -16795,6 +16940,7 @@ mod pr_b_geyser_tracking_tests {
                     pin: None,
                     active_id: None,
                     bin_step: None,
+                    sibling_vault: Some(base_vault),
                 },
             );
         }
@@ -16826,6 +16972,7 @@ mod pr_b_geyser_tracking_tests {
                 pin: None,
                 active_id: None,
                 bin_step: None,
+                sibling_vault: None,
             },
         );
         map.insert(
@@ -16842,6 +16989,7 @@ mod pr_b_geyser_tracking_tests {
                 pin: None,
                 active_id: None,
                 bin_step: None,
+                sibling_vault: None,
             },
         );
         let oldest = map
@@ -16874,6 +17022,7 @@ mod pr_b_geyser_tracking_tests {
                 pin: Some(GeyserPinReason::Wallet),
                 active_id: None,
                 bin_step: None,
+                sibling_vault: None,
             },
         );
         map.insert(
@@ -16890,6 +17039,7 @@ mod pr_b_geyser_tracking_tests {
                 pin: None,
                 active_id: None,
                 bin_step: None,
+                sibling_vault: None,
             },
         );
         let oldest = map
@@ -16952,6 +17102,7 @@ mod pr_b_geyser_tracking_tests {
                 pin: None,
                 active_id: None,
                 bin_step: None,
+                sibling_vault: None,
             },
         );
         map.insert(
@@ -16968,6 +17119,7 @@ mod pr_b_geyser_tracking_tests {
                 pin: Some(GeyserPinReason::Wallet),
                 active_id: None,
                 bin_step: None,
+                sibling_vault: None,
             },
         );
         assert_eq!(
@@ -17000,6 +17152,7 @@ mod pr_b_geyser_tracking_tests {
                 pin: None,
                 active_id: None,
                 bin_step: None,
+                sibling_vault: None,
             },
         );
         map.insert(
@@ -17016,6 +17169,7 @@ mod pr_b_geyser_tracking_tests {
                 pin: None,
                 active_id: None,
                 bin_step: None,
+                sibling_vault: None,
             },
         );
         assert_eq!(
@@ -17077,6 +17231,8 @@ mod pr_b_geyser_tracking_tests {
             pump_amm_dex: parking_lot::RwLock::new(None),
             helius_rpc: None,
             geyser_sync_batch_timer: parking_lot::Mutex::new(None),
+            geyser_sync_flush_timestamps: parking_lot::Mutex::new(Vec::new()),
+            geyser_sync_debounce_epoch: AtomicU64::new(0),
             ingest_tokio_handle: parking_lot::RwLock::new(None),
             pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
                 std::collections::HashSet::new(),
@@ -17142,6 +17298,8 @@ mod pr_b_geyser_tracking_tests {
             pump_amm_dex: parking_lot::RwLock::new(None),
             helius_rpc: None,
             geyser_sync_batch_timer: parking_lot::Mutex::new(None),
+            geyser_sync_flush_timestamps: parking_lot::Mutex::new(Vec::new()),
+            geyser_sync_debounce_epoch: AtomicU64::new(0),
             ingest_tokio_handle: parking_lot::RwLock::new(None),
             pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
                 std::collections::HashSet::new(),
@@ -17649,6 +17807,7 @@ mod pr_b_geyser_tracking_tests {
                 pin: None,
                 active_id: None,
                 bin_step: None,
+                sibling_vault: None,
             },
         );
         let u = GeyserAccountUpdate {
@@ -17976,6 +18135,7 @@ mod pr_b_geyser_tracking_tests {
             pin: Some(GeyserPinReason::ArbMultiDex),
             active_id: None,
             bin_step: None,
+            sibling_vault: None,
         };
         {
             let mut vs = ctx.tracked_vaults.write();
@@ -18033,6 +18193,7 @@ mod pr_b_geyser_tracking_tests {
             pin: Some(GeyserPinReason::ArbMultiDex),
             active_id: None,
             bin_step: None,
+            sibling_vault: None,
         };
         {
             let mut vs = ctx.tracked_vaults.write();
@@ -18095,6 +18256,7 @@ mod pr_b_geyser_tracking_tests {
             pin: Some(GeyserPinReason::ArbMultiDex),
             active_id: None,
             bin_step: None,
+            sibling_vault: None,
         };
         {
             let mut vs = ctx.tracked_vaults.write();
@@ -18153,6 +18315,7 @@ mod pr_b_geyser_tracking_tests {
             pin: None,
             active_id: None,
             bin_step: None,
+            sibling_vault: None,
         };
         {
             let mut vs = ctx.tracked_vaults.write();
@@ -18198,6 +18361,7 @@ mod pr_b_geyser_tracking_tests {
             pin: pinned.then_some(GeyserPinReason::ArbMultiDex),
             active_id: None,
             bin_step: None,
+            sibling_vault: None,
         };
 
         let pool_active = Pubkey::new_unique();
@@ -18325,6 +18489,7 @@ mod pr_b_geyser_tracking_tests {
                     pin: None,
                     active_id: None,
                     bin_step: None,
+                    sibling_vault: None,
                 },
             );
             vs.insert(
@@ -18341,6 +18506,7 @@ mod pr_b_geyser_tracking_tests {
                     pin: None,
                     active_id: None,
                     bin_step: None,
+                    sibling_vault: None,
                 },
             );
         }
@@ -18478,6 +18644,7 @@ mod pr_b_geyser_tracking_tests {
                     pin: None,
                     active_id: None,
                     bin_step: None,
+                    sibling_vault: None,
                 },
             );
             vs.insert(
@@ -18494,6 +18661,7 @@ mod pr_b_geyser_tracking_tests {
                     pin: None,
                     active_id: None,
                     bin_step: None,
+                    sibling_vault: None,
                 },
             );
         }
@@ -20001,10 +20169,11 @@ mod pr_b_geyser_tracking_tests {
         );
         ctx.hot_pool_registry.pin_pool(base_mint, pool);
 
+        let md_state = test_spawn_md_state(&ctx);
+
         let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
         let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
 
-        let md_state = test_spawn_md_state(&ctx);
         md_state_try_enqueue(
             &md_state,
             MdStateCommand::RegisterPoolVaultsFromAccount { pool },
@@ -20025,12 +20194,8 @@ mod pr_b_geyser_tracking_tests {
         tokio::time::sleep(Duration::from_millis(350)).await;
         let batch_delta = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed) - batch0;
         assert!(
-            batch_delta <= 1,
-            "expected at most one debounced batch sync after hot-pool account vault registration (delta={batch_delta})"
-        );
-        assert!(
             batch_delta >= 1,
-            "expected debounced batch sync after actor vault registration"
+            "expected debounced batch sync after actor vault registration (delta={batch_delta})"
         );
     }
 
@@ -20585,5 +20750,91 @@ mod pr_b_geyser_tracking_tests {
             10_000,
             "total account queue backpressure budget ~10k"
         );
+    }
+
+    /// PR233: debounced Geyser sync must not call core flush from Tokio spawn in schedule path.
+    #[test]
+    fn pr233_schedule_geyser_sync_does_not_flush_on_tokio() {
+        let src = include_str!("market_data.rs");
+        let start = src
+            .find("fn schedule_geyser_sync_batch_debounced")
+            .expect("schedule_geyser_sync_batch_debounced");
+        let end = src
+            .find("/// PR161: merge four explicit-track")
+            .expect("after schedule_geyser_sync_batch_debounced");
+        let body = &src[start..end];
+        assert!(
+            !body.contains("sync_geyser_tracked_accounts_core"),
+            "schedule_geyser_sync_batch_debounced must not call sync_geyser_tracked_accounts_core on Tokio"
+        );
+        assert!(
+            !body.contains("sync_geyser_tracked_accounts_batched_flush"),
+            "schedule_geyser_sync_batch_debounced must enqueue FlushGeyserSyncDebounced instead of inline flush"
+        );
+        assert!(
+            body.contains("FlushGeyserSyncDebounced"),
+            "schedule path must enqueue md-state flush job"
+        );
+    }
+
+    /// PR233: coalesce multiple debounced flush jobs into one per burst.
+    #[test]
+    fn pr233_md_state_coalesce_merges_flush_geyser_sync_jobs() {
+        let jobs = vec![
+            MdStateCommand::FlushGeyserSyncDebounced,
+            MdStateCommand::FlushGeyserSyncDebounced,
+            MdStateCommand::TouchVault(Pubkey::new_unique()),
+        ];
+        let out = md_state_coalesce_jobs(jobs);
+        let flush_count = out
+            .iter()
+            .filter(|j| matches!(j, MdStateCommand::FlushGeyserSyncDebounced))
+            .count();
+        assert_eq!(flush_count, 1, "expected one coalesced flush job");
+    }
+
+    /// PR233: vault LRU touch updates only the touched vault and its O(1) sibling link.
+    #[test]
+    fn pr233_touch_tracked_vault_pubkey_is_o1_not_full_map_scan() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let base_a = Pubkey::new_unique();
+        let quote_a = Pubkey::new_unique();
+        let base_b = Pubkey::new_unique();
+        let quote_b = Pubkey::new_unique();
+        let old = Instant::now() - Duration::from_secs(120);
+        let mk = |pool: Pubkey, _pk: Pubkey, is_base: bool, sibling: Pubkey| VaultInfo {
+            pool_address: pool,
+            dex: "x".into(),
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            is_base_vault: is_base,
+            last_balance: std::sync::atomic::AtomicU64::new(0),
+            last_used_at: old,
+            pinned: false,
+            pin: None,
+            active_id: None,
+            bin_step: None,
+            sibling_vault: Some(sibling),
+        };
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            vaults.insert(base_a, mk(pool_a, base_a, true, quote_a));
+            vaults.insert(quote_a, mk(pool_a, quote_a, false, base_a));
+            vaults.insert(base_b, mk(pool_b, base_b, true, quote_b));
+            vaults.insert(quote_b, mk(pool_b, quote_b, false, base_b));
+        }
+
+        ctx.touch_tracked_vault_pubkey(&base_a);
+        let vaults = ctx.tracked_vaults.read();
+        assert!(vaults.get(&base_a).unwrap().last_used_at > old);
+        assert!(vaults.get(&quote_a).unwrap().last_used_at > old);
+        assert_eq!(vaults.get(&base_b).unwrap().last_used_at, old);
+        assert_eq!(vaults.get(&quote_b).unwrap().last_used_at, old);
     }
 }

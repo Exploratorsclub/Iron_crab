@@ -227,7 +227,30 @@ histogram_quantile(0.50, sum(rate(market_data_geyser_to_publish_ms_trade_bucket[
 market_data_geyser_sync_batch_total
 market_data_geyser_sync_immediate_total
 market_data_geyser_sync_pending
+market_data_geyser_sync_skipped_rate_limit_total
 geyser_tracked_accounts
+```
+
+**Prod-Soak PR233 (30 min, nach Deploy):** Kein Global-Freeze; Liveness-Counter steigen; Queues stabil. Script: `Iron_crab-eval/docs/supervisor/tmp_smoke_pr233_30min.sh`.
+
+```promql
+# Liveness (Delta > 0 über 20s)
+market_data_tx_handler_processed_total
+geyser_account_listener_account_updates_total
+market_data_geyser_head_slot
+market_data_geyser_tracking_jobs_processed_total
+# Stall-Detektoren (OS-Thread — überlebt Tokio-Freeze)
+market_data_global_ingest_stalls_total
+market_data_tokio_liveness_stalls_total
+# Queue-Backlogs (Delta T0→T30 ≈ 0)
+market_data_md_state_queue_depth
+market_data_md_sidefx_queue_depth
+market_data_account_worker_queue_depth
+geyser_tracking_enqueue_dropped_total
+# Latenz-Ziele (p99)
+histogram_quantile(0.99, sum(rate(market_data_tx_channel_lag_ms_bucket[5m])) by (le))
+histogram_quantile(0.99, sum(rate(market_data_account_channel_lag_ms_bucket[5m])) by (le))
+histogram_quantile(0.99, sum(rate(market_data_geyser_to_publish_ms_trade_bucket[5m])) by (le))
 ```
 
 **Prod-Gate (Account-Ingest-Fairness + Throughput P0, nach Deploy):** Ziel: `market_data_account_channel_lag_ms` **p50 < 20 ms**, **p95 < 100 ms**; `market_data_account_broadcast_queue_depth` **p50 ≈ 0**, **p99 < 10**; `market_data_account_worker_queue_depth` und `market_data_account_publish_queue_depth` dauerhaft niedrig (kein anhaltendes NATS-Await im Account-Handler). `market_data_account_broadcast_lagged_total == 0`. Tx-Metriken (`market_data_tx_channel_lag_ms`, `market_data_tx_broadcast_queue_depth`, `market_data_geyser_to_publish_ms_trade`) ohne Regression. Optional B★ (`market_data_trade_after_bonding_publish_ms`) und `market_data_bonding_to_trade_slot_delta_slots` beobachten.
