@@ -1506,3 +1506,15 @@ BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap 
 | **Betroffene Module** | `src/bin/momentum_bot.rs` |
 | **Regression-Pruefung** | `pool_scoped_entry_probe_targets_active_pool_not_legacy_pumpfun_row`, `pumpfun_complete_blocks_probe_while_pump_amm_remains_eligible`; `cargo fmt`, `cargo clippy --all-targets -D warnings`, `cargo test`. |
 | **Tags** | [momentum, entry, pumpfun, migration, multi-pool, i-13, i-16, i-7] |
+
+---
+
+## MD-STATE-DROP-ROOT-CAUSE: md-state Queue Cap-Stall nach PR231 (2026-06-21)
+
+| Symptom | Nach PR231 (`account_worker_queue_depth=0`, `early_drop` OK): `md_state_queue_depth` dauerhaft 8192, `geyser_tracking_jobs_processed_total` 0/s, `geyser_tracking_enqueue_dropped_total` ~1000/s. |
+|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | (RC-1) `apply_arb_multi_dex_pins_for_pool` lief bei jedem `RegisterPoolVaultsFromAccount` auch bei idempotentem Register. (RC-2) Triple-Enqueue pro Hot-Pool Account-Upsert (`UpdateArbCoverageIndex` + `Register` + `ArbMultiDexReconcile`). (RC-3) Jeder Vault-Balance-Tick enqueued `TouchVault` (O(pool) Scan). (RC-4) `TouchBinArray` direkt aus Account-Worker ohne Coalesce. (RC-5) `Register` auch wenn Vault-Rows bereits stabil. |
+| **Fix** | Reconcile/Pin-Promotion nur bei `vaults_changed`; redundante sidefx-Enqueues entfernt; `pool_needs_tracking_refresh_after_cache_upsert`-Guard; Vault/Bin LRU-Touches per md-sidefx-Burst coalesced → `TouchTrackedLruBatch`; `touch_tracked_vault_pubkey` O(1). **Keine** Queue-Cap-Erhöhung. |
+| **Betroffene Module** | `src/bin/market_data.rs` |
+| **Regression-Prüfung** | `cargo test --bin market-data`; Prod: `geyser_tracking_jobs_processed_total` > 0, Drops ≈ 0, `md_state_queue_depth` unter Cap. |
+| **Tags** | [market-data, md-state, geyser, hot-path, i-4b, i-16, pr230, pr231] |
