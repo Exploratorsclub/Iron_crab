@@ -5252,6 +5252,10 @@ impl MarketDataContext {
         true
     }
 
+    fn release_geyser_sync_flush_slot(&self) {
+        self.geyser_sync_flush_timestamps.lock().pop();
+    }
+
     fn schedule_geyser_sync_batch_debounced(self: &Arc<Self>, md_state: &MdStateSender) {
         let ms = self.geyser_sync_batch_debounce_ms();
         set_market_data_geyser_sync_pending(1);
@@ -5282,6 +5286,7 @@ impl MarketDataContext {
                     return;
                 }
                 if !md_state_try_enqueue(&md_state, MdStateCommand::FlushGeyserSyncDebounced) {
+                    ctx.release_geyser_sync_flush_slot();
                     ctx.schedule_geyser_sync_batch_debounced(&md_state);
                 }
             })
@@ -12188,7 +12193,6 @@ fn spawn_market_data_global_ingest_liveness_task(process_started: Instant) {
                 } else {
                     touch_market_data_global_ingest_progress();
                     stalled_since = None;
-                    tokio_stalled_since = None;
                     recovery_requested_at = None;
                     last_tx = tx;
                     last_account = account;
