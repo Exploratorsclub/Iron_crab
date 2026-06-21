@@ -5269,9 +5269,10 @@ impl MarketDataContext {
         }
         let abort = Arc::new(AtomicBool::new(false));
         let abort_c = Arc::clone(&abort);
-        let md_state = md_state.clone();
+        let md_state_thread = md_state.clone();
+        let md_state_fallback = md_state.clone();
         let ctx = self.clone();
-        std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("md-geyser-sync-debounce".into())
             .spawn(move || {
                 std::thread::sleep(Duration::from_millis(ms));
@@ -5282,16 +5283,30 @@ impl MarketDataContext {
                 }
                 if !ctx.try_acquire_geyser_sync_flush_slot() {
                     inc_market_data_geyser_sync_skipped_rate_limit_total();
-                    ctx.schedule_geyser_sync_batch_debounced(&md_state);
+                    ctx.schedule_geyser_sync_batch_debounced(&md_state_thread);
                     return;
                 }
-                if !md_state_try_enqueue(&md_state, MdStateCommand::FlushGeyserSyncDebounced) {
+                if !md_state_try_enqueue(&md_state_thread, MdStateCommand::FlushGeyserSyncDebounced)
+                {
                     ctx.release_geyser_sync_flush_slot();
-                    ctx.schedule_geyser_sync_batch_debounced(&md_state);
+                    ctx.schedule_geyser_sync_batch_debounced(&md_state_thread);
                 }
-            })
-            .ok();
-        *guard = Some(abort);
+            }) {
+            Ok(_) => *guard = Some(abort),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "md-geyser-sync-debounce thread spawn failed; enqueueing flush directly"
+                );
+                drop(guard);
+                if !md_state_try_enqueue(
+                    &md_state_fallback,
+                    MdStateCommand::FlushGeyserSyncDebounced,
+                ) {
+                    self.schedule_geyser_sync_batch_debounced(&md_state_fallback);
+                }
+            }
+        }
     }
 
     /// PR161: merge four explicit-track `watch` streams into `combined_tracked_tx` with the same
