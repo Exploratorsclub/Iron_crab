@@ -3870,6 +3870,11 @@ fn pool_needs_tracking_refresh_after_cache_upsert(
     if !ctx.hot_pool_registry.is_hot_pool(pool) {
         return false;
     }
+    // Raydium AMM vault rows are registered in register_geyser_reserves_impl; account upserts
+    // still need arb index refresh and balance publish via RegisterPoolVaultsFromAccount.
+    if matches!(cached_state, CachedPoolState::RaydiumAmm(_)) {
+        return true;
+    }
     let (enable_meteora_cpmm, enable_meteora_dlmm) = {
         let cfg = ctx.config.read();
         (cfg.enable_meteora_cpmm, cfg.enable_meteora_dlmm)
@@ -5333,8 +5338,19 @@ impl MarketDataContext {
 
     fn touch_tracked_vault_pubkey(&self, vault: &Pubkey) {
         let now = Instant::now();
-        if let Some(v) = self.tracked_vaults.write().get_mut(vault) {
+        let mut vaults = self.tracked_vaults.write();
+        if let Some(v) = vaults.get_mut(vault) {
             v.last_used_at = now;
+            let pool = v.pool_address;
+            let is_base = v.is_base_vault;
+            // Keep vault pairs aged together so LRU pair-eviction does not drop an active leg.
+            if let Some(sibling_pk) =
+                Self::geyser_unpinned_sibling_vault_pubkey(&vaults, pool, is_base)
+            {
+                if let Some(sv) = vaults.get_mut(&sibling_pk) {
+                    sv.last_used_at = now;
+                }
+            }
         }
     }
 
@@ -16736,7 +16752,7 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
-    fn touch_tracked_vault_pubkey_updates_only_target_vault() {
+    fn touch_tracked_vault_pubkey_updates_sibling_vault_for_lru_pair() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
@@ -16786,7 +16802,7 @@ mod pr_b_geyser_tracking_tests {
         ctx.touch_tracked_vault_pubkey(&base_vault);
         let vaults = ctx.tracked_vaults.read();
         assert!(vaults.get(&base_vault).unwrap().last_used_at > old_base);
-        assert_eq!(vaults.get(&quote_vault).unwrap().last_used_at, old_quote);
+        assert!(vaults.get(&quote_vault).unwrap().last_used_at > old_quote);
     }
 
     #[test]
