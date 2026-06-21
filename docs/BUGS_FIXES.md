@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PR233-TOKIO-FREEZE-SINGLE-WRITER: Global Ingest Freeze ~6min post PR232 (Dual Writer + Tokio Liveness Blind)
+**Datum**: 2026-06-21  
+**Problem** (Prod `bf79402`, PR232 merged): ~6 min nach Restart Global-Freeze — alle Counter flat, Geyser Recv-Q wächst (2+ MB), alle `tokio-runtime-w` + `md-state` auf `futex_wait_queue`. `global_ingest_stalls_total=0` weil Liveness-Task auf eingefrorener Tokio-Runtime. md-state depth=1, drops=0 — kein Queue-Flood, sondern Runtime-Deadlock durch parallele `tracked_*`-Mutation auf md-state **und** Tokio (`sync_geyser_tracked_accounts_batched_flush`).  
+**Root Cause**: (1) `schedule_geyser_sync_batch_debounced` spawnte Evict+Broadcast auf Ingest-Tokio während md-state parallel mutierte. (2) `apply_arb_multi_dex_pins_for_pool` hielt Write-Locks auf `arb_pin_pubkeys` + `tracked_vaults` + `tracked_bin_arrays` gleichzeitig. (3) `touch_tracked_vault_pubkey` O(n) Full-Map-Scan pro Vault. (4) PR167 Liveness via `tokio::spawn` — blind bei Runtime-Freeze.  
+**Fix**: (1) `MdStateCommand::FlushGeyserSyncDebounced` — Debounce auf OS-Thread, Sync nur auf md-state. (2) Arb-Pin-Promote: kurze Lock-Phasen, feste Order `arb_pin_pubkeys` → `tracked_vaults` → `tracked_bin_arrays`. (3) O(1) Vault-Touch via `sibling_vault`. (4) `md-ingest-liveness` OS-Thread + `market_data_tokio_liveness_stalls_total`. (5) Subscription-Burst: Full-Reconnect bei Jump >50 in 30s; Flush-Rate-Cap 4/s. **Invarianten**: I-4b, I-7, keine Cap-Erhöhung.  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `src/solana/geyser_listener.rs`, `docs/BUGS_FIXES.md`, `docs/RUNBOOK_PROD.md`
+
 ### ACCOUNT-WORKER-BACKLOG-PR230-FOLLOWUP: Account-Worker-Backlog + md-state Saturation (Post PR #230)
 **Datum**: 2026-06-21  
 **Problem** (Prod post-PR230 `6b0d5bd`, ~11h Killswitch): Global-Freeze behoben, aber struktureller Account-Worker-Backlog (`market_data_account_worker_queue_depth` ~34k, LOW-only) und md-state Drops (`geyser_tracking_enqueue_dropped_total` ~38M bei Queue-Cap 8192). Ingest ~457/s vs. Handler-Durchsatz ~245/s (2 Worker).  

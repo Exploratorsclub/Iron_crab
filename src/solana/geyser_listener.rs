@@ -1194,7 +1194,7 @@ impl GeyserAccountListener {
                                         && last_tracked_subscription_change
                                             .map(|t| {
                                                 now.saturating_duration_since(t)
-                                                    < Duration::from_secs(1)
+                                                    < Duration::from_secs(30)
                                             })
                                             .unwrap_or(true)
                                     {
