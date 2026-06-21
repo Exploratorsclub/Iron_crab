@@ -346,15 +346,23 @@ enum MdStateCommand {
     },
     /// PR169b: `max_tracked_accounts` cap change — debounced flush/eviction only.
     ScheduleGeyserSyncAfterConfigChange,
-    /// Phase-R-R2: LRU touch only (no subscription change).
+    /// Phase-R-R2: LRU touch only (no subscription change). Legacy singles coalesced into batch.
+    #[allow(dead_code)]
     TouchVault(Pubkey),
+    #[allow(dead_code)]
     TouchBinArray(Pubkey),
+    /// Batched LRU touches flushed once per md-sidefx burst (deduped vault/bin pubkeys).
+    TouchTrackedLruBatch {
+        vaults: Vec<Pubkey>,
+        bin_arrays: Vec<Pubkey>,
+    },
     TouchPool(Pubkey),
     /// Bounded arb-multi-dex vault/bin backfill when a mint becomes multi-DEX relevant.
     ArbMultiDexReconcile {
         mint: Pubkey,
     },
     /// Refresh incremental arb coverage index for one pool (O(1); no LivePoolCache scan).
+    #[allow(dead_code)]
     UpdateArbCoverageIndex {
         pool: Pubkey,
     },
@@ -551,6 +559,15 @@ fn md_state_process_job(ctx: &Arc<MarketDataContext>, job: MdStateCommand) -> bo
             ctx.touch_tracked_bin_array_pubkey(&pda);
             false
         }
+        MdStateCommand::TouchTrackedLruBatch { vaults, bin_arrays } => {
+            for vault in vaults {
+                ctx.touch_tracked_vault_pubkey(&vault);
+            }
+            for pda in bin_arrays {
+                ctx.touch_tracked_bin_array_pubkey(&pda);
+            }
+            false
+        }
         MdStateCommand::TouchPool(pool) => {
             ctx.touch_tracked_pool_vaults_and_bins_if_tracked(pool);
             false
@@ -713,6 +730,8 @@ enum MdSidefxCommand {
         slot: u64,
         grpc_recv_at: Instant,
     },
+    /// DLMM bin-array LRU touch off account ingest (coalesced in md-sidefx burst).
+    TouchBinArrayTick { pda: Pubkey },
     /// Phase-R-R4b: `parse_pool_account` + LivePoolCache writes + PoolCacheUpdate publish off account ingest.
     LivePoolCacheAccountUpdate {
         run_id: String,
@@ -738,6 +757,45 @@ struct MdSidefxWorkerCtx {
     ctx: Arc<MarketDataContext>,
     publish_tx: Option<mpsc::Sender<AccountPathNatsJob>>,
     md_state: MdStateSender,
+}
+
+/// Per-burst scratch: LRU touches coalesced before a single md-state enqueue.
+struct MdSidefxBurstScratch {
+    pending_vault_touches: HashSet<Pubkey>,
+    pending_bin_array_touches: HashSet<Pubkey>,
+}
+
+impl MdSidefxBurstScratch {
+    fn new() -> Self {
+        Self {
+            pending_vault_touches: HashSet::new(),
+            pending_bin_array_touches: HashSet::new(),
+        }
+    }
+
+    fn note_vault_touch(&mut self, vault: Pubkey) {
+        self.pending_vault_touches.insert(vault);
+    }
+
+    fn note_bin_array_touch(&mut self, pda: Pubkey) {
+        self.pending_bin_array_touches.insert(pda);
+    }
+}
+
+fn md_sidefx_flush_pending_lru_touches(
+    md_state: &MdStateSender,
+    scratch: &mut MdSidefxBurstScratch,
+) {
+    if scratch.pending_vault_touches.is_empty() && scratch.pending_bin_array_touches.is_empty() {
+        return;
+    }
+    md_state_try_enqueue(
+        md_state,
+        MdStateCommand::TouchTrackedLruBatch {
+            vaults: scratch.pending_vault_touches.drain().collect(),
+            bin_arrays: scratch.pending_bin_array_touches.drain().collect(),
+        },
+    );
 }
 
 fn md_sidefx_dec_queue_depth(queue_depth: &AtomicUsize) {
@@ -1725,19 +1783,11 @@ fn md_sidefx_process_live_pool_cache_account_update(w: &MdSidefxWorkerCtx, job: 
                 | CachedPoolState::Orca(_)
                 | CachedPoolState::RaydiumAmm(_)
         ) && w.ctx.hot_pool_registry.is_hot_pool(*pool_pubkey)
+            && pool_needs_tracking_refresh_after_cache_upsert(&w.ctx, *pool_pubkey, &cached_state)
         {
             md_state_try_enqueue(
                 &w.md_state,
-                MdStateCommand::UpdateArbCoverageIndex { pool: *pool_pubkey },
-            );
-            md_state_try_enqueue(
-                &w.md_state,
                 MdStateCommand::RegisterPoolVaultsFromAccount { pool: *pool_pubkey },
-            );
-            try_enqueue_arb_reconcile_for_pool(
-                &w.md_state,
-                w.ctx.live_pool_cache.as_ref(),
-                *pool_pubkey,
             );
         }
 
@@ -2113,7 +2163,11 @@ fn md_sidefx_process_live_pool_cache_account_update(w: &MdSidefxWorkerCtx, job: 
     }
 }
 
-fn md_sidefx_process_vault_balance_tick(w: &MdSidefxWorkerCtx, job: &MdSidefxCommand) {
+fn md_sidefx_process_vault_balance_tick(
+    w: &MdSidefxWorkerCtx,
+    job: &MdSidefxCommand,
+    scratch: &mut MdSidefxBurstScratch,
+) {
     let MdSidefxCommand::VaultBalanceTick {
         run_id,
         vault_pubkey,
@@ -2134,7 +2188,7 @@ fn md_sidefx_process_vault_balance_tick(w: &MdSidefxWorkerCtx, job: &MdSidefxCom
     if *balance == prev_balance {
         return;
     }
-    md_state_try_enqueue(&w.md_state, MdStateCommand::TouchVault(*vault_pubkey));
+    scratch.note_vault_touch(*vault_pubkey);
     let (reserve_base, reserve_quote) = if vault_info.is_base_vault {
         (*balance, 0u64)
     } else {
@@ -2315,7 +2369,22 @@ fn md_sidefx_process_vault_balance_tick(w: &MdSidefxWorkerCtx, job: &MdSidefxCom
     }
 }
 
-fn md_sidefx_process_job(w: &MdSidefxWorkerCtx, job: &MdSidefxCommand) {
+fn md_sidefx_process_touch_bin_array_tick(
+    _w: &MdSidefxWorkerCtx,
+    job: &MdSidefxCommand,
+    scratch: &mut MdSidefxBurstScratch,
+) {
+    let MdSidefxCommand::TouchBinArrayTick { pda } = job else {
+        return;
+    };
+    scratch.note_bin_array_touch(*pda);
+}
+
+fn md_sidefx_process_job(
+    w: &MdSidefxWorkerCtx,
+    job: &MdSidefxCommand,
+    scratch: &mut MdSidefxBurstScratch,
+) {
     match job {
         MdSidefxCommand::PumpFunPoolMintMapInsert { .. } => {
             md_sidefx_process_pump_fun_pool_mint_map(w, job)
@@ -2333,7 +2402,12 @@ fn md_sidefx_process_job(w: &MdSidefxWorkerCtx, job: &MdSidefxCommand) {
             md_sidefx_process_generic_dex_first_trade(w, job)
         }
         MdSidefxCommand::BondingCurveDevWallet { .. } => md_sidefx_process_bonding_curve(w, job),
-        MdSidefxCommand::VaultBalanceTick { .. } => md_sidefx_process_vault_balance_tick(w, job),
+        MdSidefxCommand::VaultBalanceTick { .. } => {
+            md_sidefx_process_vault_balance_tick(w, job, scratch)
+        }
+        MdSidefxCommand::TouchBinArrayTick { .. } => {
+            md_sidefx_process_touch_bin_array_tick(w, job, scratch)
+        }
         MdSidefxCommand::LivePoolCacheAccountUpdate { .. } => {
             md_sidefx_process_live_pool_cache_account_update(w, job)
         }
@@ -2349,6 +2423,8 @@ fn md_sidefx_coalesce_key(job: &MdSidefxCommand) -> Option<Pubkey> {
         MdSidefxCommand::PumpAmmTradeWithAccounts { pool_address, .. } => Some(*pool_address),
         MdSidefxCommand::PumpAmmCreatePoolObserved { pool_address, .. } => Some(*pool_address),
         MdSidefxCommand::LivePoolCacheAccountUpdate { pool_pubkey, .. } => Some(*pool_pubkey),
+        MdSidefxCommand::VaultBalanceTick { vault_pubkey, .. } => Some(*vault_pubkey),
+        MdSidefxCommand::TouchBinArrayTick { pda } => Some(*pda),
         _ => None,
     }
 }
@@ -2394,9 +2470,11 @@ fn md_sidefx_worker_loop(
                 Err(std_mpsc::TryRecvError::Disconnected) => break,
             }
         }
+        let mut scratch = MdSidefxBurstScratch::new();
         for job in md_sidefx_coalesce_burst(jobs) {
-            md_sidefx_process_job(&worker, &job);
+            md_sidefx_process_job(&worker, &job, &mut scratch);
         }
+        md_sidefx_flush_pending_lru_touches(&worker.md_state, &mut scratch);
     }
 }
 
@@ -3733,12 +3811,93 @@ fn try_enqueue_arb_reconcile_for_pool(
     }
 }
 
+/// Vault ATA pair from cache state (SOL-normalized) when hot-pool vault tracking applies.
+fn expected_pool_vault_pubkeys_from_cache(
+    cached_state: &CachedPoolState,
+    enable_meteora_cpmm: bool,
+    enable_meteora_dlmm: bool,
+) -> Option<(Pubkey, Pubkey)> {
+    match cached_state {
+        CachedPoolState::RaydiumCpmm(s) => {
+            let (_, _, base_vault, quote_vault) = cpmm_token_mints_and_vaults_sol_normalized(
+                s.token_0_mint,
+                s.token_1_mint,
+                s.token_0_vault,
+                s.token_1_vault,
+            );
+            Some((base_vault, quote_vault))
+        }
+        CachedPoolState::MeteoraCpmm(s) if enable_meteora_cpmm => {
+            let (_, _, base_vault, quote_vault) = cpmm_token_mints_and_vaults_sol_normalized(
+                s.token_0_mint,
+                s.token_1_mint,
+                s.token_0_vault,
+                s.token_1_vault,
+            );
+            Some((base_vault, quote_vault))
+        }
+        CachedPoolState::Meteora(s) if enable_meteora_dlmm => {
+            let (_, _, base_vault, quote_vault) = cpmm_token_mints_and_vaults_sol_normalized(
+                s.token_x_mint,
+                s.token_y_mint,
+                s.reserve_x,
+                s.reserve_y,
+            );
+            Some((base_vault, quote_vault))
+        }
+        CachedPoolState::Orca(s) => {
+            let (_, _, base_vault, quote_vault) = cpmm_token_mints_and_vaults_sol_normalized(
+                s.token_mint_a,
+                s.token_mint_b,
+                s.token_vault_a,
+                s.token_vault_b,
+            );
+            Some((base_vault, quote_vault))
+        }
+        CachedPoolState::PumpAmm(s) => {
+            Some((s.pool_base_token_account, s.pool_quote_token_account))
+        }
+        _ => None,
+    }
+}
+
+/// True when a hot-pool cache upsert still needs vault registration (missing vault rows).
+fn pool_needs_tracking_refresh_after_cache_upsert(
+    ctx: &MarketDataContext,
+    pool: Pubkey,
+    cached_state: &CachedPoolState,
+) -> bool {
+    if !ctx.hot_pool_registry.is_hot_pool(pool) {
+        return false;
+    }
+    // Raydium AMM vault rows are registered in register_geyser_reserves_impl; account upserts
+    // still need arb index refresh and balance publish via RegisterPoolVaultsFromAccount.
+    if matches!(cached_state, CachedPoolState::RaydiumAmm(_)) {
+        return true;
+    }
+    let (enable_meteora_cpmm, enable_meteora_dlmm) = {
+        let cfg = ctx.config.read();
+        (cfg.enable_meteora_cpmm, cfg.enable_meteora_dlmm)
+    };
+    let Some((base_vault, quote_vault)) = expected_pool_vault_pubkeys_from_cache(
+        cached_state,
+        enable_meteora_cpmm,
+        enable_meteora_dlmm,
+    ) else {
+        return false;
+    };
+    let vaults = ctx.tracked_vaults.read();
+    !vaults.contains_key(&base_vault) || !vaults.contains_key(&quote_vault)
+}
+
 fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> {
     let mut out = Vec::with_capacity(jobs.len());
     let mut seen_mints = HashSet::new();
     let mut seen_index_pools = HashSet::new();
     let mut seen_trade_pools = HashSet::new();
     let mut seen_account_pools = HashSet::new();
+    let mut lru_vaults = HashSet::new();
+    let mut lru_bin_arrays = HashSet::new();
     for job in jobs {
         match job {
             MdStateCommand::ArbMultiDexReconcile { mint } => {
@@ -3761,8 +3920,24 @@ fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> {
                     out.push(MdStateCommand::RegisterPoolVaultsFromAccount { pool });
                 }
             }
+            MdStateCommand::TouchVault(vault) => {
+                lru_vaults.insert(vault);
+            }
+            MdStateCommand::TouchBinArray(pda) => {
+                lru_bin_arrays.insert(pda);
+            }
+            MdStateCommand::TouchTrackedLruBatch { vaults, bin_arrays } => {
+                lru_vaults.extend(vaults);
+                lru_bin_arrays.extend(bin_arrays);
+            }
             other => out.push(other),
         }
+    }
+    if !lru_vaults.is_empty() || !lru_bin_arrays.is_empty() {
+        out.push(MdStateCommand::TouchTrackedLruBatch {
+            vaults: lru_vaults.into_iter().collect(),
+            bin_arrays: lru_bin_arrays.into_iter().collect(),
+        });
     }
     out
 }
@@ -5163,12 +5338,17 @@ impl MarketDataContext {
 
     fn touch_tracked_vault_pubkey(&self, vault: &Pubkey) {
         let now = Instant::now();
-        let mut vs = self.tracked_vaults.write();
-        let pool = vs.get(vault).map(|v| v.pool_address);
-        if let Some(pool) = pool {
-            for v in vs.values_mut() {
-                if v.pool_address == pool {
-                    v.last_used_at = now;
+        let mut vaults = self.tracked_vaults.write();
+        if let Some(v) = vaults.get_mut(vault) {
+            v.last_used_at = now;
+            let pool = v.pool_address;
+            let is_base = v.is_base_vault;
+            // Keep vault pairs aged together so LRU pair-eviction does not drop an active leg.
+            if let Some(sibling_pk) =
+                Self::geyser_unpinned_sibling_vault_pubkey(&vaults, pool, is_base)
+            {
+                if let Some(sv) = vaults.get_mut(&sibling_pk) {
+                    sv.last_used_at = now;
                 }
             }
         }
@@ -5441,7 +5621,7 @@ impl MarketDataContext {
         };
         let now = Instant::now();
         let before_keys = self.snapshot_explicit_subscription_pubkeys();
-        self.register_four_dex_pool_vaults_from_cached_state(
+        let vaults_changed = self.register_four_dex_pool_vaults_from_cached_state(
             pool,
             &cached_state,
             now,
@@ -5449,7 +5629,8 @@ impl MarketDataContext {
             enable_meteora_dlmm,
             true,
         );
-        if self.hot_pool_registry.pool_has_arb(pool)
+        if vaults_changed
+            && self.hot_pool_registry.pool_has_arb(pool)
             && !self.hot_pool_registry.pool_has_momentum(pool)
         {
             self.apply_arb_multi_dex_pins_for_pool(pool, now, true);
@@ -12520,7 +12701,7 @@ async fn handle_geyser_account(
     account_count: &AtomicU64,
     recv_at: Instant,
     publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
-    md_state: &MdStateSender,
+    _md_state: &MdStateSender,
     md_sidefx: &MdSidefxSender,
 ) {
     let account_geyser_recv_at = recv_at;
@@ -12828,9 +13009,11 @@ async fn handle_geyser_account(
             .get(&account_update.pubkey)
             .cloned();
         if let Some(bin_array_info) = bin_array_info_opt {
-            md_state_try_enqueue(
-                md_state,
-                MdStateCommand::TouchBinArray(account_update.pubkey),
+            md_sidefx_try_enqueue(
+                md_sidefx,
+                MdSidefxCommand::TouchBinArrayTick {
+                    pda: account_update.pubkey,
+                },
             );
             // Parse bin array to extract liquidity distribution
             match BinArray::parse(&account_update.data, bin_array_info.bin_step) {
@@ -16420,7 +16603,7 @@ mod pr_b_geyser_tracking_tests {
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
-        let (md_state, depth, _md_state_rx) = test_md_state_sender_no_worker();
+        let (md_state, depth, md_state_rx) = test_md_state_sender_no_worker();
         let worker = MdSidefxWorkerCtx {
             ctx: Arc::clone(&ctx),
             publish_tx: None,
@@ -16450,15 +16633,176 @@ mod pr_b_geyser_tracking_tests {
                 run_id: "test".into(),
                 pool_pubkey: pool,
                 owner: RAYDIUM_CPMM_OWNER,
-                account_data,
+                account_data: account_data.clone(),
                 slot: 2,
                 grpc_recv_at: Instant::now(),
             },
         );
-        assert!(
-            depth.load(Ordering::Relaxed) >= 2,
-            "hot pool must enqueue md-state tracking jobs"
+        assert_eq!(
+            depth.load(Ordering::Relaxed),
+            1,
+            "first hot upsert enqueues Register only (index refresh is inline)"
         );
+        let first_job = md_state_rx.recv().expect("Register job must be enqueued");
+        assert!(matches!(
+            first_job,
+            MdStateCommand::RegisterPoolVaultsFromAccount { .. }
+        ));
+        assert!(md_state_process_job(&ctx, first_job));
+
+        md_sidefx_process_live_pool_cache_account_update(
+            &worker,
+            &MdSidefxCommand::LivePoolCacheAccountUpdate {
+                run_id: "test".into(),
+                pool_pubkey: pool,
+                owner: RAYDIUM_CPMM_OWNER,
+                account_data,
+                slot: 3,
+                grpc_recv_at: Instant::now(),
+            },
+        );
+        assert_eq!(
+            depth.load(Ordering::Relaxed),
+            1,
+            "repeat hot upsert skips md-state when vault rows are stable"
+        );
+    }
+
+    #[test]
+    fn register_pool_vaults_from_account_skips_arb_pins_when_unchanged() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let token_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: token_mint,
+                token_1_mint: quote,
+                token_0_vault: coin_vault,
+                token_1_vault: pc_vault,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry
+            .promote_arb_pools(token_mint, vec![pool]);
+
+        assert!(md_state_process_job(
+            &ctx,
+            MdStateCommand::RegisterPoolVaultsFromAccount { pool }
+        ));
+        let pin_count_after_first = ctx.hot_pool_registry.arb_pin_pubkeys.read().len();
+
+        assert!(!md_state_process_job(
+            &ctx,
+            MdStateCommand::RegisterPoolVaultsFromAccount { pool }
+        ));
+        assert_eq!(
+            ctx.hot_pool_registry.arb_pin_pubkeys.read().len(),
+            pin_count_after_first,
+            "unchanged register must not re-run arb pin promotion"
+        );
+    }
+
+    #[test]
+    fn md_sidefx_coalesce_dedupes_vault_balance_ticks_per_vault() {
+        let vault = Pubkey::new_unique();
+        let jobs: Vec<_> = (0..10)
+            .map(|i| MdSidefxCommand::VaultBalanceTick {
+                run_id: "test".into(),
+                vault_pubkey: vault,
+                balance: i + 1,
+                slot: i + 1,
+                grpc_recv_at: Instant::now(),
+            })
+            .collect();
+        let out = md_sidefx_coalesce_burst(jobs);
+        assert_eq!(out.len(), 1);
+        let MdSidefxCommand::VaultBalanceTick { balance, .. } = &out[0] else {
+            panic!("expected VaultBalanceTick");
+        };
+        assert_eq!(*balance, 10);
+    }
+
+    #[test]
+    fn md_state_coalesce_batches_touch_vault_into_single_lru_job() {
+        let vault = Pubkey::new_unique();
+        let jobs: Vec<_> = (0..10).map(|_| MdStateCommand::TouchVault(vault)).collect();
+        let out = md_state_coalesce_jobs(jobs);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            out[0],
+            MdStateCommand::TouchTrackedLruBatch { .. }
+        ));
+        let MdStateCommand::TouchTrackedLruBatch { vaults, bin_arrays } = &out[0] else {
+            unreachable!();
+        };
+        assert_eq!(vaults.len(), 1);
+        assert_eq!(vaults[0], vault);
+        assert!(bin_arrays.is_empty());
+    }
+
+    #[test]
+    fn touch_tracked_vault_pubkey_updates_sibling_vault_for_lru_pair() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        let old_base = Instant::now() - Duration::from_secs(60);
+        let old_quote = Instant::now() - Duration::from_secs(30);
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            vaults.insert(
+                base_vault,
+                VaultInfo {
+                    pool_address: pool,
+                    dex: "x".into(),
+                    base_mint: Pubkey::new_unique(),
+                    quote_mint: Pubkey::new_unique(),
+                    is_base_vault: true,
+                    last_balance: std::sync::atomic::AtomicU64::new(0),
+                    last_used_at: old_base,
+                    pinned: false,
+                    pin: None,
+                    active_id: None,
+                    bin_step: None,
+                },
+            );
+            vaults.insert(
+                quote_vault,
+                VaultInfo {
+                    pool_address: pool,
+                    dex: "x".into(),
+                    base_mint: Pubkey::new_unique(),
+                    quote_mint: Pubkey::new_unique(),
+                    is_base_vault: false,
+                    last_balance: std::sync::atomic::AtomicU64::new(0),
+                    last_used_at: old_quote,
+                    pinned: false,
+                    pin: None,
+                    active_id: None,
+                    bin_step: None,
+                },
+            );
+        }
+
+        ctx.touch_tracked_vault_pubkey(&base_vault);
+        let vaults = ctx.tracked_vaults.read();
+        assert!(vaults.get(&base_vault).unwrap().last_used_at > old_base);
+        assert!(vaults.get(&quote_vault).unwrap().last_used_at > old_quote);
     }
 
     #[test]
