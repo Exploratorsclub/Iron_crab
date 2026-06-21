@@ -587,17 +587,19 @@ fn md_state_process_job(ctx: &Arc<MarketDataContext>, job: MdStateCommand) -> bo
     }
 }
 
-fn md_state_try_enqueue(sender: &MdStateSender, job: MdStateCommand) {
+fn md_state_try_enqueue(sender: &MdStateSender, job: MdStateCommand) -> bool {
     if sender.queue_depth.load(Ordering::Relaxed) >= sender.queue_capacity {
         inc_market_data_geyser_tracking_enqueue_dropped_total();
-        return;
+        return false;
     }
     if sender.tx.try_send(job).is_ok() {
         let depth = sender.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
         set_market_data_geyser_tracking_queue_depth(depth);
         set_market_data_md_state_queue_depth(depth);
+        true
     } else {
         inc_market_data_geyser_tracking_enqueue_dropped_total();
+        false
     }
 }
 
@@ -5276,10 +5278,12 @@ impl MarketDataContext {
                 }
                 if !ctx.try_acquire_geyser_sync_flush_slot() {
                     inc_market_data_geyser_sync_skipped_rate_limit_total();
-                    set_market_data_geyser_sync_pending(0);
+                    ctx.schedule_geyser_sync_batch_debounced(&md_state);
                     return;
                 }
-                md_state_try_enqueue(&md_state, MdStateCommand::FlushGeyserSyncDebounced);
+                if !md_state_try_enqueue(&md_state, MdStateCommand::FlushGeyserSyncDebounced) {
+                    ctx.schedule_geyser_sync_batch_debounced(&md_state);
+                }
             })
             .ok();
         *guard = Some(abort);
