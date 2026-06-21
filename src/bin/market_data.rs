@@ -3298,6 +3298,8 @@ struct MarketDataContext {
 
     /// PR164: dedupe `PoolCreated` NATS/JSONL for the same pool (account-path vault spam).
     pool_discovery_poolcreated_emitted: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
+    /// Explicit Geyser subscription pubkeys after last [`Self::sync_geyser_tracked_accounts_core`] flush.
+    last_synced_explicit_pubkeys: parking_lot::RwLock<HashSet<Pubkey>>,
 }
 
 #[derive(Debug, Default)]
@@ -3899,6 +3901,32 @@ impl MarketDataContext {
         set
     }
 
+    /// Vault + bin-array pubkeys tracked locally for one pool (explicit Geyser assets).
+    fn pool_explicit_vault_bin_pubkeys(&self, pool: Pubkey) -> Vec<Pubkey> {
+        let mut out = Vec::new();
+        for (pk, v) in self.tracked_vaults.read().iter() {
+            if v.pool_address == pool {
+                out.push(*pk);
+            }
+        }
+        for (pk, b) in self.tracked_bin_arrays.read().iter() {
+            if b.pool_address == pool {
+                out.push(*pk);
+            }
+        }
+        out
+    }
+
+    /// True when all vault/bin pubkeys for this pool were included in the last Geyser sync flush.
+    fn pool_has_live_vault_geyser_feed(&self, pool: Pubkey) -> bool {
+        let assets = self.pool_explicit_vault_bin_pubkeys(pool);
+        if assets.is_empty() {
+            return false;
+        }
+        let synced = self.last_synced_explicit_pubkeys.read();
+        assets.iter().all(|pk| synced.contains(pk))
+    }
+
     fn refresh_hot_pool_registry_gauges(&self) {
         let (momentum, arb, both) = self.hot_pool_registry.hot_pool_count_by_reason();
         set_market_data_hot_pool_registry_pools_gauge("momentum", momentum);
@@ -4376,17 +4404,7 @@ impl MarketDataContext {
 
     /// Cache-first JetStream BalanceUpdated for pools with fresh reserve basis (no vault Geyser sub required).
     fn try_publish_balance_updated_from_cache(&self, pool: Pubkey) {
-        let has_vault = self
-            .tracked_vaults
-            .read()
-            .values()
-            .any(|v| v.pool_address == pool);
-        let has_bin = self
-            .tracked_bin_arrays
-            .read()
-            .values()
-            .any(|b| b.pool_address == pool);
-        if has_vault || has_bin {
+        if self.pool_has_live_vault_geyser_feed(pool) {
             return;
         }
         let Some(state) = self.live_pool_cache.get(&pool) else {
@@ -4952,6 +4970,7 @@ impl MarketDataContext {
     fn sync_geyser_tracked_accounts_core(&self) {
         self.evict_geyser_unpinned_lru_to_cap();
         self.broadcast_tracked_geyser_explicit_to_merge();
+        *self.last_synced_explicit_pubkeys.write() = self.snapshot_explicit_subscription_pubkeys();
     }
 
     /// Immediate subscription-list sync (momentum pins, wallet tracks, config, account-path admission, …).
@@ -10513,6 +10532,7 @@ async fn main() -> Result<()> {
         pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
             std::collections::HashSet::new(),
         ),
+        last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -16009,6 +16029,7 @@ mod wallet_tx_meta_balance_tests {
             pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
                 std::collections::HashSet::new(),
             ),
+            last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
         })
     }
 
@@ -16631,6 +16652,7 @@ mod pr_b_geyser_tracking_tests {
             pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
                 std::collections::HashSet::new(),
             ),
+            last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
         })
     }
 
@@ -16695,6 +16717,7 @@ mod pr_b_geyser_tracking_tests {
             pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
                 std::collections::HashSet::new(),
             ),
+            last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
         });
         (
             ctx,
@@ -18777,6 +18800,102 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(
             MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed),
             imm0
+        );
+    }
+
+    #[test]
+    fn cache_publish_allowed_when_vault_rows_exist_before_geyser_sync_flush() {
+        use ironcrab::metrics::MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(base, pool);
+        assert!(md_state_process_job(
+            &ctx,
+            MdStateCommand::RegisterReservesAfterTrade(pool)
+        ));
+
+        assert!(!ctx.pool_explicit_vault_bin_pubkeys(pool).is_empty());
+        assert!(
+            !ctx.pool_has_live_vault_geyser_feed(pool),
+            "local vault rows before debounced Geyser flush must not count as live feed"
+        );
+
+        let counter_before = MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed);
+        ctx.try_publish_balance_updated_from_cache(pool);
+        assert_eq!(
+            MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed),
+            counter_before,
+            "without NATS the publish is a no-op, but pool_has_live=false proves no early skip"
+        );
+    }
+
+    #[test]
+    fn cache_publish_skipped_after_vault_pubkeys_in_last_synced_snapshot() {
+        use ironcrab::metrics::MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(base, pool);
+        assert!(md_state_process_job(
+            &ctx,
+            MdStateCommand::RegisterReservesAfterTrade(pool)
+        ));
+        ctx.sync_geyser_tracked_accounts();
+
+        assert!(
+            ctx.pool_has_live_vault_geyser_feed(pool),
+            "after sync flush vault pubkeys must be in last_synced_explicit_pubkeys"
+        );
+
+        let counter_before = MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed);
+        ctx.try_publish_balance_updated_from_cache(pool);
+        assert_eq!(
+            MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed),
+            counter_before,
+            "live vault Geyser feed must skip cache-first publish (slot-0 overwrite guard)"
         );
     }
 
