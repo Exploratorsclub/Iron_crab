@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### ACCOUNT-WORKER-BACKLOG-PR230-FOLLOWUP: Account-Worker-Backlog + md-state Saturation (Post PR #230)
+**Datum**: 2026-06-21  
+**Problem** (Prod post-PR230 `6b0d5bd`, ~11h Killswitch): Global-Freeze behoben, aber struktureller Account-Worker-Backlog (`market_data_account_worker_queue_depth` ~34k, LOW-only) und md-state Drops (`geyser_tracking_enqueue_dropped_total` ~38M bei Queue-Cap 8192). Ingest ~457/s vs. Handler-Durchsatz ~245/s (2 Worker).  
+**Root Cause**: (1) `account_geyser_update_might_be_relevant` gab für **jeden** DEX-Program-Owner `true` zurück — widerspricht PR230 Hot-Pool-Intent. (2) `md_sidefx_process_live_pool_cache_account_update` enqueued bei jedem Pool-Parse 3 md-state Jobs ohne Hot-Pool-Gate. (3) Worker-Queue-Gauge: `inc` vor `send().await` + `pending_low` ohne sofortiges `dec` bei HIGH-preempt-LOW.  
+**Fix**: (1) Relevance-Filter: DEX Pool-State nur bei `is_hot_pool` / `pool_mint_map` / `high_priority_bonding_curves` / wallet-tracked Pump.fun. (2) md-sidefx: md-state Enqueues nur für Hot Pools; Cache-upsert bleibt. (3) `account_geyser_dispatch_priority_high`: `is_hot_pool` (inkl. Arb-LRU). (4) Metrik: `inc` nach erfolgreichem `send`; `dec` beim `low.recv()` vor `pending_low`. **Nicht**: Worker 2→8, Cap-Erhöhung allein, RPC, Non-Hot Vault-Coverage. **Invarianten**: I-4b, I-7, PR230 UnifiedHotPoolRegistry.  
+**Dateien**: `src/bin/market_data.rs`, `docs/BUGS_FIXES.md`
+
 ### PHASE-UNIFIED-HOT-POOL-REGISTRY: Prod Global-Freeze ~5s nach Restart (Subscription-Sync-Sturm)
 **Datum**: 2026-06-20  
 **Problem** (Prod `architecture-rebuild` @ `70fb34f`): Nach Restart ~5s Global-Freeze — TX/Account/`head_slot` still, `geyser_*_session_connected=1`. Parallele Momentum-`ActivePoolSet` + Arb-LRU/Reconcile + `tracking_changed`-Sync (Commit `65cff8a`) erzeugten Subscription-Sync-Sturm gegen Caps/LRU.  
