@@ -1715,7 +1715,7 @@ fn md_sidefx_process_live_pool_cache_account_update(w: &MdSidefxWorkerCtx, job: 
             return;
         }
 
-        // PR169a: vault registration off hot path — single-writer tracking actor.
+        // PR169a + PR230: md-state tracking jobs only for execution-hot pools (bounded vault subs).
         if matches!(
             &cached_state,
             CachedPoolState::RaydiumCpmm(_)
@@ -1724,7 +1724,8 @@ fn md_sidefx_process_live_pool_cache_account_update(w: &MdSidefxWorkerCtx, job: 
                 | CachedPoolState::PumpAmm(_)
                 | CachedPoolState::Orca(_)
                 | CachedPoolState::RaydiumAmm(_)
-        ) {
+        ) && w.ctx.hot_pool_registry.is_hot_pool(*pool_pubkey)
+        {
             md_state_try_enqueue(
                 &w.md_state,
                 MdStateCommand::UpdateArbCoverageIndex { pool: *pool_pubkey },
@@ -11967,14 +11968,30 @@ fn account_geyser_update_might_be_relevant(
         return true;
     }
 
-    let o = u.owner;
-    o == RAYDIUM_AMM_V4_OWNER
-        || o == RAYDIUM_CPMM_OWNER
-        || o == ORCA_WHIRLPOOL_OWNER
-        || o == METEORA_CPMM_OWNER
-        || o == METEORA_DLMM_OWNER
-        || o == PUMPFUN_PROGRAM_OWNER
-        || o == PUMPFUN_AMM_PROGRAM_OWNER
+    if !account_geyser_update_is_dex_pool_owner(&u.owner) {
+        return false;
+    }
+
+    let pool_pk = u.pubkey;
+    if ctx.hot_pool_registry.is_hot_pool(pool_pk) {
+        return true;
+    }
+    let pool_str = pool_pk.to_string();
+    if ctx.pool_mint_map.read().contains_key(&pool_str) {
+        return true;
+    }
+    if ctx.high_priority_bonding_curves.read().contains(&pool_pk) {
+        return true;
+    }
+    if u.owner == PUMPFUN_PROGRAM_OWNER {
+        for mint in ctx.tracked_wallet_mint_decimals.read().keys() {
+            let (bonding_curve, _) = PumpFunDex::derive_bonding_curve_static(mint);
+            if bonding_curve == pool_pk {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Strategic HIGH admission for account worker sharding (ACCOUNT-PATH-TX-PARITY-CREATOR).
@@ -11994,7 +12011,7 @@ fn account_geyser_dispatch_priority_high(ctx: &MarketDataContext, u: &GeyserAcco
     if ctx.pool_mint_map.read().contains_key(&pool_str) {
         return true;
     }
-    if ctx.hot_pool_registry.pool_has_any_pin(pool_pk) {
+    if ctx.hot_pool_registry.is_hot_pool(pool_pk) {
         return true;
     }
     if ctx.wallet_tracks_mint_for_geyser(&pool_pk) {
@@ -12025,8 +12042,6 @@ async fn account_worker_recv_next(
             return Some(w);
         }
         if let Some(w) = pending_low.take() {
-            dec_market_data_account_low_priority_queue_depth();
-            dec_market_data_account_worker_queue_depth();
             return Some(w);
         }
         tokio::select! {
@@ -12044,8 +12059,6 @@ async fn account_worker_recv_next(
                         return Some(w);
                     }
                     if let Some(w) = pending_low.take() {
-                        dec_market_data_account_low_priority_queue_depth();
-                        dec_market_data_account_worker_queue_depth();
                         return Some(w);
                     }
                     if let Some(w) = low.recv().await {
@@ -12058,6 +12071,8 @@ async fn account_worker_recv_next(
             },
             l = low.recv() => match l {
                 Some(w) => {
+                    dec_market_data_account_low_priority_queue_depth();
+                    dec_market_data_account_worker_queue_depth();
                     pending_low = Some(w);
                     continue;
                 }
@@ -12068,8 +12083,6 @@ async fn account_worker_recv_next(
                         return Some(w);
                     }
                     if let Some(w) = pending_low.take() {
-                        dec_market_data_account_low_priority_queue_depth();
-                        dec_market_data_account_worker_queue_depth();
                         return Some(w);
                     }
                     return match high.recv().await {
@@ -13854,12 +13867,6 @@ async fn run_geyser_loop(
                     let shard = market_data_account_worker_shard(&account_update.pubkey);
                     let high =
                         account_geyser_dispatch_priority_high(&ctx_geyser_acc, &account_update);
-                    inc_market_data_account_worker_queue_depth();
-                    if high {
-                        inc_market_data_account_high_priority_queue_depth();
-                    } else {
-                        inc_market_data_account_low_priority_queue_depth();
-                    }
                     let send_res = if high {
                         worker_high_recv[shard]
                             .send(AccountWorkItem {
@@ -13875,13 +13882,14 @@ async fn run_geyser_loop(
                             })
                             .await
                     };
-                    if send_res.is_err() {
-                        dec_market_data_account_worker_queue_depth();
+                    if send_res.is_ok() {
+                        inc_market_data_account_worker_queue_depth();
                         if high {
-                            dec_market_data_account_high_priority_queue_depth();
+                            inc_market_data_account_high_priority_queue_depth();
                         } else {
-                            dec_market_data_account_low_priority_queue_depth();
+                            inc_market_data_account_low_priority_queue_depth();
                         }
+                    } else {
                         error!(
                             shard = shard,
                             "account worker queue closed; stopping Geyser account stream"
@@ -16376,6 +16384,83 @@ mod pr_b_geyser_tracking_tests {
         }
     }
 
+    fn test_md_state_sender_no_worker() -> (
+        MdStateSender,
+        Arc<AtomicUsize>,
+        std_mpsc::Receiver<MdStateCommand>,
+    ) {
+        let (tx, rx) = std_mpsc::sync_channel(MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP);
+        let queue_depth = Arc::new(AtomicUsize::new(0));
+        let sender = MdStateSender {
+            tx,
+            queue_depth: Arc::clone(&queue_depth),
+            queue_capacity: MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP,
+        };
+        (sender, queue_depth, rx)
+    }
+
+    fn test_raydium_cpmm_account_data(
+        token_0_mint: Pubkey,
+        token_1_mint: Pubkey,
+        token_0_vault: Pubkey,
+        token_1_vault: Pubkey,
+    ) -> Vec<u8> {
+        let mut data = vec![0u8; 1024];
+        data[8] = 1;
+        data[73..105].copy_from_slice(token_0_mint.as_ref());
+        data[105..137].copy_from_slice(token_1_mint.as_ref());
+        data[137..169].copy_from_slice(token_0_vault.as_ref());
+        data[169..201].copy_from_slice(token_1_vault.as_ref());
+        data
+    }
+
+    #[test]
+    fn md_sidefx_live_pool_cache_update_skips_md_state_for_non_hot_pool() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, depth, _md_state_rx) = test_md_state_sender_no_worker();
+        let worker = MdSidefxWorkerCtx {
+            ctx: Arc::clone(&ctx),
+            publish_tx: None,
+            md_state,
+        };
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let account_data =
+            test_raydium_cpmm_account_data(base, quote, Pubkey::new_unique(), Pubkey::new_unique());
+        let job = MdSidefxCommand::LivePoolCacheAccountUpdate {
+            run_id: "test".into(),
+            pool_pubkey: pool,
+            owner: RAYDIUM_CPMM_OWNER,
+            account_data: account_data.clone(),
+            slot: 1,
+            grpc_recv_at: Instant::now(),
+        };
+        md_sidefx_process_live_pool_cache_account_update(&worker, &job);
+        assert_eq!(depth.load(Ordering::Relaxed), 0);
+        assert!(ctx.live_pool_cache.get(&pool).is_some());
+
+        ctx.hot_pool_registry.pin_pool(base, pool);
+        md_sidefx_process_live_pool_cache_account_update(
+            &worker,
+            &MdSidefxCommand::LivePoolCacheAccountUpdate {
+                run_id: "test".into(),
+                pool_pubkey: pool,
+                owner: RAYDIUM_CPMM_OWNER,
+                account_data,
+                slot: 2,
+                grpc_recv_at: Instant::now(),
+            },
+        );
+        assert!(
+            depth.load(Ordering::Relaxed) >= 2,
+            "hot pool must enqueue md-state tracking jobs"
+        );
+    }
+
     #[test]
     fn lru_eviction_prefers_oldest_unpinned_vault() {
         let a = Pubkey::new_unique();
@@ -17111,6 +17196,68 @@ mod pr_b_geyser_tracking_tests {
             !account_path_enqueue_core_market_event(Some(&tx), None, &ctx, mk_event(2), None,)
                 .await
         );
+    }
+
+    #[test]
+    fn account_geyser_update_might_be_relevant_non_hot_dex_pool_false() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let u = GeyserAccountUpdate {
+            pubkey: pool,
+            slot: 1,
+            owner: RAYDIUM_CPMM_OWNER,
+            data: vec![],
+            lamports: 0,
+            grpc_recv_at: Instant::now(),
+        };
+        assert!(!account_geyser_update_might_be_relevant(&ctx, &u));
+        ctx.hot_pool_registry.pin_pool(base, pool);
+        assert!(account_geyser_update_might_be_relevant(&ctx, &u));
+    }
+
+    #[test]
+    fn account_geyser_update_might_be_relevant_pool_mint_map_without_hot_pin() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        ctx.pool_mint_map
+            .write()
+            .insert(pool.to_string(), Pubkey::new_unique().to_string());
+        let u = GeyserAccountUpdate {
+            pubkey: pool,
+            slot: 1,
+            owner: RAYDIUM_CPMM_OWNER,
+            data: vec![],
+            lamports: 0,
+            grpc_recv_at: Instant::now(),
+        };
+        assert!(account_geyser_update_might_be_relevant(&ctx, &u));
+    }
+
+    #[test]
+    fn account_geyser_dispatch_high_when_arb_hot_pool_without_momentum_pin() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        ctx.hot_pool_registry
+            .promote_arb_pools(Pubkey::new_unique(), vec![pool]);
+        let u = GeyserAccountUpdate {
+            pubkey: pool,
+            slot: 1,
+            owner: RAYDIUM_CPMM_OWNER,
+            data: vec![],
+            lamports: 0,
+            grpc_recv_at: Instant::now(),
+        };
+        assert!(account_geyser_dispatch_priority_high(&ctx, &u));
     }
 
     #[test]
@@ -18149,7 +18296,12 @@ mod pr_b_geyser_tracking_tests {
             inc_market_data_account_high_priority_queue_depth,
             inc_market_data_account_low_priority_queue_depth,
             inc_market_data_account_worker_queue_depth,
+            MARKET_DATA_ACCOUNT_HIGH_PRIORITY_QUEUE_DEPTH,
+            MARKET_DATA_ACCOUNT_LOW_PRIORITY_QUEUE_DEPTH, MARKET_DATA_ACCOUNT_WORKER_QUEUE_DEPTH,
         };
+        MARKET_DATA_ACCOUNT_WORKER_QUEUE_DEPTH.store(0, Ordering::Relaxed);
+        MARKET_DATA_ACCOUNT_HIGH_PRIORITY_QUEUE_DEPTH.store(0, Ordering::Relaxed);
+        MARKET_DATA_ACCOUNT_LOW_PRIORITY_QUEUE_DEPTH.store(0, Ordering::Relaxed);
         let (htx, mut hrx) = mpsc::channel(8);
         let (ltx, mut lrx) = mpsc::channel(8);
         let pool_h = Pubkey::new_unique();
@@ -18165,12 +18317,12 @@ mod pr_b_geyser_tracking_tests {
             },
             recv_at: Instant::now(),
         };
+        ltx.send(mk(pool_l)).await.unwrap();
         inc_market_data_account_low_priority_queue_depth();
         inc_market_data_account_worker_queue_depth();
-        ltx.send(mk(pool_l)).await.unwrap();
+        htx.send(mk(pool_h)).await.unwrap();
         inc_market_data_account_high_priority_queue_depth();
         inc_market_data_account_worker_queue_depth();
-        htx.send(mk(pool_h)).await.unwrap();
         drop(htx);
         drop(ltx);
         let w1 = account_worker_recv_next(&mut hrx, &mut lrx)
@@ -18182,6 +18334,18 @@ mod pr_b_geyser_tracking_tests {
             .expect("low item");
         assert_eq!(w2.update.pubkey, pool_l);
         assert!(account_worker_recv_next(&mut hrx, &mut lrx).await.is_none());
+        assert_eq!(
+            MARKET_DATA_ACCOUNT_WORKER_QUEUE_DEPTH.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            MARKET_DATA_ACCOUNT_HIGH_PRIORITY_QUEUE_DEPTH.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            MARKET_DATA_ACCOUNT_LOW_PRIORITY_QUEUE_DEPTH.load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
@@ -18997,6 +19161,20 @@ mod pr_b_geyser_tracking_tests {
         }
         let after = ctx.snapshot_explicit_subscription_pubkeys();
         assert!(!explicit_subscription_has_new_keys(&before, &after));
+    }
+
+    #[test]
+    fn md_state_coalesce_dedupes_ten_register_pool_vaults_from_account() {
+        let pool = Pubkey::new_unique();
+        let jobs: Vec<_> = (0..10)
+            .map(|_| MdStateCommand::RegisterPoolVaultsFromAccount { pool })
+            .collect();
+        let out = md_state_coalesce_jobs(jobs);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            out[0],
+            MdStateCommand::RegisterPoolVaultsFromAccount { .. }
+        ));
     }
 
     #[test]
