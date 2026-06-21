@@ -77,7 +77,8 @@ use ironcrab::metrics::{
     inc_market_data_arb_reconcile_skipped_not_multi_dex_total,
     inc_market_data_arb_reconcile_skipped_oversized_pool_total,
     inc_market_data_arb_reconcile_skipped_partial_state_total,
-    inc_market_data_arb_registered_vaults_total,
+    inc_market_data_arb_registered_vaults_total, inc_market_data_balance_updated_from_cache_total,
+    inc_market_data_geyser_sync_skipped_no_delta_total,
     inc_market_data_geyser_tracking_enqueue_dropped_total,
     inc_market_data_geyser_tracking_jobs_processed_total,
     inc_market_data_jsonl_enqueue_dropped_total, inc_market_data_md_sidefx_enqueue_dropped_total,
@@ -107,15 +108,15 @@ use ironcrab::metrics::{
     set_market_data_account_worker_count, set_market_data_arb_pin_budget_used,
     set_market_data_arb_pinned_pools_gauge, set_market_data_geyser_merge_pending,
     set_market_data_geyser_sync_pending, set_market_data_geyser_tracking_queue_depth,
-    set_market_data_md_sidefx_queue_depth, set_market_data_md_state_queue_depth,
-    set_market_data_momentum_active_pool_pins_gauge, set_market_data_tx_broadcast_queue_depth,
-    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
-    touch_market_data_global_ingest_progress, update_readiness_market_data_current,
-    wall_clock_unix_ms_now, GeyserTrackedEvictKind, MarketDataLatencySegment, MetricsComponent,
-    MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS,
-    MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
-    MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
-    POOLS_TRACKED_GAUGE,
+    set_market_data_hot_pool_registry_pools_gauge, set_market_data_md_sidefx_queue_depth,
+    set_market_data_md_state_queue_depth, set_market_data_momentum_active_pool_pins_gauge,
+    set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
+    set_readiness_nats_connected, touch_market_data_global_ingest_progress,
+    update_readiness_market_data_current, wall_clock_unix_ms_now, GeyserTrackedEvictKind,
+    MarketDataLatencySegment, MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
+    MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL,
+    MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
+    NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -499,7 +500,7 @@ fn apply_momentum_active_pools_in_md_state(
     if !batch_dirty {
         ctx.refresh_geyser_pins_gauge();
     }
-    set_market_data_momentum_active_pool_pins_gauge(ctx.active_pool_set.pair_count());
+    set_market_data_momentum_active_pool_pins_gauge(ctx.hot_pool_registry.pair_count());
     batch_dirty
 }
 
@@ -520,17 +521,19 @@ fn md_state_dec_queue_depth(queue_depth: &AtomicUsize) {
     set_market_data_md_state_queue_depth(0);
 }
 
+fn explicit_subscription_has_new_keys(before: &HashSet<Pubkey>, after: &HashSet<Pubkey>) -> bool {
+    after.iter().any(|k| !before.contains(k))
+}
+
 fn md_state_process_job(ctx: &Arc<MarketDataContext>, job: MdStateCommand) -> bool {
     match job {
         MdStateCommand::RegisterReservesAfterTrade(pool) => {
             ctx.refresh_arb_coverage_index_for_pool(pool);
-            let changed = ctx.register_geyser_reserves_after_trade(pool);
-            changed | ctx.reconcile_arb_multi_dex_for_pool(pool)
+            ctx.register_geyser_reserves_after_trade(pool)
         }
         MdStateCommand::RegisterPoolVaultsFromAccount { pool } => {
             ctx.refresh_arb_coverage_index_for_pool(pool);
-            let changed = ctx.register_pool_vaults_from_account(pool);
-            changed | ctx.reconcile_arb_multi_dex_for_pool(pool)
+            ctx.register_pool_vaults_from_account(pool)
         }
         MdStateCommand::TrackMint { mint, pin } => ctx.track_mint_for_geyser_metadata(mint, pin),
         MdStateCommand::ApplyMomentumActivePools(update) => {
@@ -598,15 +601,22 @@ fn md_state_worker_loop(
             }
         }
         let jobs = md_state_coalesce_jobs(jobs);
-        let mut schedule_sync = false;
+        let schedule_sync_after_config = jobs
+            .iter()
+            .any(|job| matches!(job, MdStateCommand::ScheduleGeyserSyncAfterConfigChange));
+        let before_keys = ctx.snapshot_explicit_subscription_pubkeys();
         for job in jobs {
-            if md_state_process_job(&ctx, job) {
-                schedule_sync = true;
-            }
+            let _ = md_state_process_job(&ctx, job);
         }
-        if schedule_sync {
+        let after_keys = ctx.snapshot_explicit_subscription_pubkeys();
+        if explicit_subscription_has_new_keys(&before_keys, &after_keys)
+            || schedule_sync_after_config
+        {
             ctx.schedule_geyser_sync_batch_debounced();
+        } else if before_keys != after_keys {
+            inc_market_data_geyser_sync_skipped_no_delta_total();
         }
+        ctx.refresh_hot_pool_registry_gauges();
     }
 }
 
@@ -2910,46 +2920,118 @@ impl Default for MintTrackInfo {
     }
 }
 
-/// PR-B: optional momentum active pool pins (PR-D NATS-driven).
+/// Unified hot-pool registry: momentum active ∪ arb top-k (deduplicated, budget-bounded).
 #[derive(Debug)]
-struct ActivePoolSet {
-    pairs: parking_lot::RwLock<std::collections::HashSet<(Pubkey, Pubkey)>>,
+struct UnifiedHotPoolRegistry {
+    momentum_pairs: parking_lot::RwLock<std::collections::HashSet<(Pubkey, Pubkey)>>,
+    /// Arb-multi-dex pool-level LRU (eviction unit = whole pool).
+    arb_pool_lru: parking_lot::RwLock<std::collections::HashMap<Pubkey, Instant>>,
+    /// Vault/bin pubkeys in arb-multi-dex pin tier (budget accounting).
+    arb_pin_pubkeys: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
+    /// Pools evicted from arb pin tier — re-add suppressed until cooldown or fresh activity.
+    arb_pin_evicted_pools: parking_lot::RwLock<std::collections::HashMap<Pubkey, Instant>>,
 }
 
-impl ActivePoolSet {
+#[allow(dead_code)]
+impl UnifiedHotPoolRegistry {
     fn new() -> Self {
         Self {
-            pairs: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            momentum_pairs: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            arb_pool_lru: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            arb_pin_pubkeys: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            arb_pin_evicted_pools: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
     fn pin_pool(&self, mint: Pubkey, pool: Pubkey) {
-        self.pairs.write().insert((mint, pool));
+        self.momentum_pairs.write().insert((mint, pool));
     }
 
     fn unpin_pool(&self, mint: Pubkey, pool: Pubkey) {
-        self.pairs.write().remove(&(mint, pool));
+        self.momentum_pairs.write().remove(&(mint, pool));
     }
 
+    #[allow(dead_code)]
     fn is_pinned(&self, mint: Pubkey, pool: Pubkey) -> bool {
-        self.pairs.read().contains(&(mint, pool))
+        self.momentum_pairs.read().contains(&(mint, pool))
     }
 
     fn pair_count(&self) -> usize {
-        self.pairs.read().len()
+        self.momentum_pairs.read().len()
     }
 
     fn mint_has_any_pinned_pool(&self, mint: Pubkey) -> bool {
-        self.pairs.read().iter().any(|(m, _)| *m == mint)
+        self.momentum_pairs.read().iter().any(|(m, _)| *m == mint)
     }
 
     /// True if any momentum active pin still references this pool (another `(mint, pool)` row).
     fn pool_has_any_pin(&self, pool: Pubkey) -> bool {
-        self.pairs.read().iter().any(|(_, p)| *p == pool)
+        self.momentum_pairs.read().iter().any(|(_, p)| *p == pool)
     }
 
     fn snapshot_pairs(&self) -> HashSet<(Pubkey, Pubkey)> {
-        self.pairs.read().clone()
+        self.momentum_pairs.read().clone()
+    }
+
+    /// Pool is in the execution hot set (momentum active or arb pin tier).
+    fn is_hot_pool(&self, pool: Pubkey) -> bool {
+        self.pool_has_any_pin(pool) || self.arb_pool_lru.read().contains_key(&pool)
+    }
+
+    fn pool_has_momentum(&self, pool: Pubkey) -> bool {
+        self.pool_has_any_pin(pool)
+    }
+
+    fn pool_has_arb(&self, pool: Pubkey) -> bool {
+        self.arb_pool_lru.read().contains_key(&pool)
+    }
+
+    /// Mark ranked arb pools as hot; returns pools newly added to the arb hot set.
+    fn promote_arb_pools(&self, _mint: Pubkey, pools: Vec<Pubkey>) -> Vec<Pubkey> {
+        let now = Instant::now();
+        let mut newly = Vec::new();
+        let mut lru = self.arb_pool_lru.write();
+        for pool in pools {
+            if lru.insert(pool, now).is_none() {
+                newly.push(pool);
+            }
+        }
+        newly
+    }
+
+    fn demote_arb_pool(&self, pool: Pubkey) {
+        self.arb_pool_lru.write().remove(&pool);
+    }
+
+    fn touch_arb_activity(&self, pool: Pubkey, now: Instant) {
+        if self.arb_pool_lru.read().contains_key(&pool) {
+            self.arb_pool_lru.write().insert(pool, now);
+        }
+    }
+
+    fn hot_pool_count_by_reason(&self) -> (usize, usize, usize) {
+        let momentum_only = self
+            .momentum_pairs
+            .read()
+            .iter()
+            .map(|(_, p)| *p)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter(|p| self.pool_has_any_pin(*p) && !self.pool_has_arb(*p))
+            .count();
+        let arb_only = self
+            .arb_pool_lru
+            .read()
+            .keys()
+            .filter(|p| !self.pool_has_any_pin(**p))
+            .count();
+        let both = self
+            .arb_pool_lru
+            .read()
+            .keys()
+            .filter(|p| self.pool_has_any_pin(**p))
+            .count();
+        (momentum_only, arb_only, both)
     }
 }
 
@@ -3118,15 +3200,8 @@ struct MarketDataContext {
     tracked_mints: parking_lot::RwLock<std::collections::HashMap<Pubkey, MintTrackInfo>>,
     tracked_mints_tx: watch::Sender<Vec<Pubkey>>,
 
-    /// PR-B: optional momentum active pool pins (empty until PR-D NATS wiring).
-    active_pool_set: Arc<ActivePoolSet>,
-
-    /// Arb-multi-dex pool-level LRU (eviction unit = whole pool).
-    arb_pool_lru: parking_lot::RwLock<std::collections::HashMap<Pubkey, Instant>>,
-    /// Vault/bin pubkeys in arb-multi-dex pin tier (budget accounting).
-    arb_pin_pubkeys: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
-    /// Pools evicted from arb pin tier — re-add suppressed until cooldown or fresh activity.
-    arb_pin_evicted_pools: parking_lot::RwLock<std::collections::HashMap<Pubkey, Instant>>,
+    /// Momentum active ∪ arb top-k hot pools (single writer: md-state thread).
+    hot_pool_registry: Arc<UnifiedHotPoolRegistry>,
     /// Per-mint cooldown for bounded arb coverage reconcile backfill.
     arb_reconcile_mint_cooldown: parking_lot::RwLock<std::collections::HashMap<Pubkey, Instant>>,
     /// Incremental mint→pool/dex index for bounded arb coverage (md-state maintained).
@@ -3223,6 +3298,8 @@ struct MarketDataContext {
 
     /// PR164: dedupe `PoolCreated` NATS/JSONL for the same pool (account-path vault spam).
     pool_discovery_poolcreated_emitted: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
+    /// Explicit Geyser subscription pubkeys after last [`Self::sync_geyser_tracked_accounts_core`] flush.
+    last_synced_explicit_pubkeys: parking_lot::RwLock<HashSet<Pubkey>>,
 }
 
 #[derive(Debug, Default)]
@@ -3360,7 +3437,6 @@ struct BinArrayInfo {
 
 #[derive(Clone, Copy)]
 enum GeyserReserveRegisterFollowUp {
-    None,
     /// PR-D: promote vault/bin rows for this pool to `MomentumActive` and track pool mints.
     MomentumUpgrade,
     /// Arb multi-dex: promote vault/bin rows for this pool to `ArbMultiDex` (budgeted pin tier).
@@ -3479,6 +3555,115 @@ fn arb_candidate_mints_from_pair(mint_a: Pubkey, mint_b: Pubkey) -> Vec<Pubkey> 
     }
 }
 
+/// Extract normalized balance fields from MASTER cache for JetStream BalanceUpdated.
+fn pool_cache_balance_fields_from_state(
+    state: &CachedPoolState,
+) -> Option<(Pubkey, Pubkey, u64, u64, &'static str)> {
+    let sol = Pubkey::from_str(NATIVE_SOL_MINT).ok()?;
+    match state {
+        CachedPoolState::RaydiumCpmm(s) => {
+            let (base_mint, quote_mint, base_r, quote_r) = if s.token_1_mint == sol {
+                (
+                    s.token_0_mint,
+                    s.token_1_mint,
+                    s.reserve_0.unwrap_or(0),
+                    s.reserve_1.unwrap_or(0),
+                )
+            } else if s.token_0_mint == sol {
+                (
+                    s.token_1_mint,
+                    s.token_0_mint,
+                    s.reserve_1.unwrap_or(0),
+                    s.reserve_0.unwrap_or(0),
+                )
+            } else {
+                (
+                    s.token_0_mint,
+                    s.token_1_mint,
+                    s.reserve_0.unwrap_or(0),
+                    s.reserve_1.unwrap_or(0),
+                )
+            };
+            Some((base_mint, quote_mint, base_r, quote_r, "raydium_cpmm"))
+        }
+        CachedPoolState::MeteoraCpmm(s) => {
+            let (base_mint, quote_mint, base_r, quote_r) = if s.token_1_mint == sol {
+                (s.token_0_mint, s.token_1_mint, s.reserve_0, s.reserve_1)
+            } else if s.token_0_mint == sol {
+                (s.token_1_mint, s.token_0_mint, s.reserve_1, s.reserve_0)
+            } else {
+                (s.token_0_mint, s.token_1_mint, s.reserve_0, s.reserve_1)
+            };
+            Some((base_mint, quote_mint, base_r, quote_r, "meteora_cpmm"))
+        }
+        CachedPoolState::Meteora(s) => {
+            let (base_mint, quote_mint, base_r, quote_r) = if s.token_y_mint == sol {
+                (
+                    s.token_x_mint,
+                    s.token_y_mint,
+                    s.reserve_x_balance.unwrap_or(0),
+                    s.reserve_y_balance.unwrap_or(0),
+                )
+            } else if s.token_x_mint == sol {
+                (
+                    s.token_y_mint,
+                    s.token_x_mint,
+                    s.reserve_y_balance.unwrap_or(0),
+                    s.reserve_x_balance.unwrap_or(0),
+                )
+            } else {
+                (
+                    s.token_x_mint,
+                    s.token_y_mint,
+                    s.reserve_x_balance.unwrap_or(0),
+                    s.reserve_y_balance.unwrap_or(0),
+                )
+            };
+            Some((base_mint, quote_mint, base_r, quote_r, "meteora_dlmm"))
+        }
+        CachedPoolState::PumpAmm(s) => Some((
+            s.base_mint,
+            s.quote_mint,
+            s.base_reserve.unwrap_or(0),
+            s.quote_reserve.unwrap_or(0),
+            "pump_amm",
+        )),
+        CachedPoolState::Orca(s) => {
+            let (base_mint, quote_mint, base_r, quote_r) = if s.token_mint_b == sol {
+                (
+                    s.token_mint_a,
+                    s.token_mint_b,
+                    s.vault_a_balance.unwrap_or(0),
+                    s.vault_b_balance.unwrap_or(0),
+                )
+            } else if s.token_mint_a == sol {
+                (
+                    s.token_mint_b,
+                    s.token_mint_a,
+                    s.vault_b_balance.unwrap_or(0),
+                    s.vault_a_balance.unwrap_or(0),
+                )
+            } else {
+                (
+                    s.token_mint_a,
+                    s.token_mint_b,
+                    s.vault_a_balance.unwrap_or(0),
+                    s.vault_b_balance.unwrap_or(0),
+                )
+            };
+            Some((base_mint, quote_mint, base_r, quote_r, "orca"))
+        }
+        CachedPoolState::RaydiumAmm(s) => Some((
+            s.base_mint,
+            s.quote_mint,
+            s.coin_reserve.unwrap_or(0),
+            s.pc_reserve.unwrap_or(0),
+            "raydium",
+        )),
+        CachedPoolState::PumpFun(_) => None,
+    }
+}
+
 /// True when the cached pool row has at least one non-zero reserve / vault balance.
 fn cached_pool_has_fresh_reserve_basis(state: &CachedPoolState) -> bool {
     let fresh = |opt: Option<u64>| opt.is_some_and(|v| v > 0);
@@ -3551,6 +3736,8 @@ fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> {
     let mut out = Vec::with_capacity(jobs.len());
     let mut seen_mints = HashSet::new();
     let mut seen_index_pools = HashSet::new();
+    let mut seen_trade_pools = HashSet::new();
+    let mut seen_account_pools = HashSet::new();
     for job in jobs {
         match job {
             MdStateCommand::ArbMultiDexReconcile { mint } => {
@@ -3561,6 +3748,16 @@ fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> {
             MdStateCommand::UpdateArbCoverageIndex { pool } => {
                 if seen_index_pools.insert(pool) {
                     out.push(MdStateCommand::UpdateArbCoverageIndex { pool });
+                }
+            }
+            MdStateCommand::RegisterReservesAfterTrade(pool) => {
+                if seen_trade_pools.insert(pool) {
+                    out.push(MdStateCommand::RegisterReservesAfterTrade(pool));
+                }
+            }
+            MdStateCommand::RegisterPoolVaultsFromAccount { pool } => {
+                if seen_account_pools.insert(pool) {
+                    out.push(MdStateCommand::RegisterPoolVaultsFromAccount { pool });
                 }
             }
             other => out.push(other),
@@ -3679,18 +3876,64 @@ impl MarketDataContext {
         self.tracked_wallet_mint_decimals.read().contains_key(mint)
     }
 
-    /// PR-B: explicit vault/bin-array/mint Geyser filters — not on cold-path pool-state alone.
+    /// PR-B: explicit vault/bin-array/mint Geyser filters — hot-set or wallet only.
     fn admit_geyser_explicit_pool_assets(
         &self,
         pool: Pubkey,
         base_mint: Pubkey,
         quote_mint: Pubkey,
     ) -> bool {
-        self.active_pool_set.is_pinned(base_mint, pool)
-            || self.active_pool_set.is_pinned(quote_mint, pool)
+        self.hot_pool_registry.is_hot_pool(pool)
             || self.wallet_tracks_mint_for_geyser(&base_mint)
             || self.wallet_tracks_mint_for_geyser(&quote_mint)
-            || self.pool_admitted_for_arb_multi_dex(pool)
+    }
+
+    fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
+        let mut set = HashSet::new();
+        set.extend(self.tracked_mints.read().keys().copied());
+        set.extend(self.tracked_vaults.read().keys().copied());
+        set.extend(self.tracked_bin_arrays.read().keys().copied());
+        if let Some(w) = &self.tracked_wallet {
+            set.insert(w.wallet);
+            set.insert(w.wsol_ata);
+        }
+        set.extend(self.tracked_wallet_token_accounts.read().iter().copied());
+        set
+    }
+
+    /// Vault + bin-array pubkeys tracked locally for one pool (explicit Geyser assets).
+    fn pool_explicit_vault_bin_pubkeys(&self, pool: Pubkey) -> Vec<Pubkey> {
+        let mut out = Vec::new();
+        for (pk, v) in self.tracked_vaults.read().iter() {
+            if v.pool_address == pool {
+                out.push(*pk);
+            }
+        }
+        for (pk, b) in self.tracked_bin_arrays.read().iter() {
+            if b.pool_address == pool {
+                out.push(*pk);
+            }
+        }
+        out
+    }
+
+    /// True when all vault/bin pubkeys for this pool were included in the last Geyser sync flush.
+    fn pool_has_live_vault_geyser_feed(&self, pool: Pubkey) -> bool {
+        let assets = self.pool_explicit_vault_bin_pubkeys(pool);
+        if assets.is_empty() {
+            return false;
+        }
+        let synced = self.last_synced_explicit_pubkeys.read();
+        assets.iter().all(|pk| synced.contains(pk))
+    }
+
+    fn refresh_hot_pool_registry_gauges(&self) {
+        let (momentum, arb, both) = self.hot_pool_registry.hot_pool_count_by_reason();
+        set_market_data_hot_pool_registry_pools_gauge("momentum", momentum);
+        set_market_data_hot_pool_registry_pools_gauge("arb", arb);
+        set_market_data_hot_pool_registry_pools_gauge("both", both);
+        set_market_data_momentum_active_pool_pins_gauge(self.hot_pool_registry.pair_count());
+        self.refresh_arb_pin_gauges();
     }
 
     /// True when pool passes arb-multi-dex admission (multi-dex relevance + reserve basis).
@@ -3733,7 +3976,7 @@ impl MarketDataContext {
         if !cached_pool_has_arb_vault_layout(&state) {
             return false;
         }
-        if self.active_pool_set.pool_has_any_pin(pool) {
+        if self.hot_pool_registry.pool_has_any_pin(pool) {
             let vaults = self.tracked_vaults.read();
             if !vaults.values().any(|v| v.pool_address == pool) {
                 return false;
@@ -3845,53 +4088,62 @@ impl MarketDataContext {
         }
 
         let mut changed = false;
-        for pool in selected {
-            let Some(state) = self.live_pool_cache.get(&pool) else {
-                continue;
-            };
-            if !cached_pool_has_arb_common_quote_leg(&state) {
-                inc_market_data_arb_reconcile_skipped_no_common_quote_total();
-                continue;
-            }
-            if !cached_pool_has_arb_vault_layout(&state) {
-                inc_market_data_arb_reconcile_skipped_partial_state_total();
-                continue;
-            }
-            if !cached_pool_has_fresh_reserve_basis(&state) {
-                inc_market_data_arb_reconcile_skipped_partial_state_total();
-                continue;
-            }
-            if self.pool_has_full_arb_geyser_coverage(pool) {
-                inc_market_data_arb_reconcile_skipped_already_pinned_total();
-                continue;
-            }
+        let eligible: Vec<Pubkey> = selected
+            .into_iter()
+            .filter(|pool| {
+                let Some(state) = self.live_pool_cache.get(pool) else {
+                    return false;
+                };
+                if !cached_pool_has_arb_common_quote_leg(&state) {
+                    inc_market_data_arb_reconcile_skipped_no_common_quote_total();
+                    return false;
+                }
+                if !cached_pool_has_arb_vault_layout(&state) {
+                    inc_market_data_arb_reconcile_skipped_partial_state_total();
+                    return false;
+                }
+                if !cached_pool_has_fresh_reserve_basis(&state) {
+                    inc_market_data_arb_reconcile_skipped_partial_state_total();
+                    return false;
+                }
+                if self.pool_has_full_arb_geyser_coverage(*pool) {
+                    inc_market_data_arb_reconcile_skipped_already_pinned_total();
+                    return false;
+                }
+                let new_pins = self.arb_pool_new_pin_slots_needed(*pool);
+                if new_pins > ARB_RECONCILE_OVERSIZED_POOL_MAX_NEW_PINS {
+                    inc_market_data_arb_reconcile_skipped_oversized_pool_total();
+                    return false;
+                }
+                if new_pins > 0
+                    && !self.arb_pin_budget_can_fit_without_evicting_active(new_pins, now)
+                {
+                    inc_market_data_arb_reconcile_skipped_active_budget_protected_total();
+                    return false;
+                }
+                true
+            })
+            .collect();
 
-            let new_pins = self.arb_pool_new_pin_slots_needed(pool);
-            if new_pins > ARB_RECONCILE_OVERSIZED_POOL_MAX_NEW_PINS {
-                inc_market_data_arb_reconcile_skipped_oversized_pool_total();
-                continue;
-            }
-            if new_pins > 0 && !self.arb_pin_budget_can_fit_without_evicting_active(new_pins, now) {
-                inc_market_data_arb_reconcile_skipped_active_budget_protected_total();
-                continue;
-            }
-
-            let follow_up = if self.active_pool_set.pool_has_any_pin(pool) {
+        for pool in eligible {
+            let follow_up = if self.hot_pool_registry.pool_has_momentum(pool) {
                 GeyserReserveRegisterFollowUp::MomentumUpgrade
             } else {
                 GeyserReserveRegisterFollowUp::ArbMultiDexUpgrade
             };
-            let tracking_changed = self.register_geyser_reserves_impl(pool, follow_up);
+            let before_keys = self.snapshot_explicit_subscription_pubkeys();
+            self.register_geyser_reserves_impl(pool, follow_up);
             let registered = match follow_up {
                 GeyserReserveRegisterFollowUp::ArbMultiDexUpgrade => {
                     self.pool_has_full_arb_geyser_coverage(pool)
                 }
-                _ => tracking_changed,
+                _ => explicit_subscription_has_new_keys(
+                    &before_keys,
+                    &self.snapshot_explicit_subscription_pubkeys(),
+                ),
             };
             if registered {
                 inc_market_data_arb_reconcile_pools_registered_total();
-            }
-            if registered || tracking_changed {
                 changed = true;
             }
         }
@@ -3903,7 +4155,8 @@ impl MarketDataContext {
         changed
     }
 
-    /// Inline reconcile trigger from md-state paths that already hold the actor lock.
+    /// Inline reconcile from trade/account md-state paths removed — reconcile only via coalesced job.
+    #[allow(dead_code)]
     fn reconcile_arb_multi_dex_for_pool(&self, pool: Pubkey) -> bool {
         let Some(state) = self.live_pool_cache.get(&pool) else {
             return false;
@@ -3921,7 +4174,7 @@ impl MarketDataContext {
     }
 
     fn refresh_arb_pin_gauges(&self) {
-        set_market_data_arb_pinned_pools_gauge(self.arb_pool_lru.read().len());
+        set_market_data_arb_pinned_pools_gauge(self.hot_pool_registry.arb_pool_lru.read().len());
         set_market_data_arb_pin_budget_used(self.arb_pin_pubkey_budget_len());
     }
 
@@ -3999,7 +4252,12 @@ impl MarketDataContext {
                 score += 15;
             }
         }
-        if self.arb_pool_lru.read().contains_key(&pool) {
+        if self
+            .hot_pool_registry
+            .arb_pool_lru
+            .read()
+            .contains_key(&pool)
+        {
             score += 20;
         }
         score
@@ -4022,7 +4280,7 @@ impl MarketDataContext {
     }
 
     fn arb_pool_new_pin_slots_needed(&self, pool: Pubkey) -> usize {
-        let pins = self.arb_pin_pubkeys.read();
+        let pins = self.hot_pool_registry.arb_pin_pubkeys.read();
         self.arb_pool_candidate_pin_pubkeys(pool)
             .into_iter()
             .filter(|pk| !pins.contains(pk))
@@ -4118,7 +4376,7 @@ impl MarketDataContext {
             .saturating_add(slots_needed)
             .saturating_sub(ARB_MULTI_DEX_PIN_ACCOUNT_BUDGET);
         let mut pools: Vec<(Pubkey, Instant)> = {
-            let lru = self.arb_pool_lru.read();
+            let lru = self.hot_pool_registry.arb_pool_lru.read();
             lru.iter().map(|(p, t)| (*p, *t)).collect()
         };
         pools.sort_by_key(|(_, t)| *t);
@@ -4137,18 +4395,81 @@ impl MarketDataContext {
 
     /// Refresh pool-level arb LRU on trade / vault tick / pool-state activity.
     fn touch_arb_pool_activity(&self, pool: Pubkey, now: Instant) {
-        if self.arb_pool_lru.read().contains_key(&pool) {
-            self.arb_pool_lru.write().insert(pool, now);
+        self.hot_pool_registry.touch_arb_activity(pool, now);
+        self.hot_pool_registry
+            .arb_pin_evicted_pools
+            .write()
+            .remove(&pool);
+    }
+
+    /// Cache-first JetStream BalanceUpdated for pools with fresh reserve basis (no vault Geyser sub required).
+    fn try_publish_balance_updated_from_cache(&self, pool: Pubkey) {
+        if self.pool_has_live_vault_geyser_feed(pool) {
+            return;
         }
-        self.arb_pin_evicted_pools.write().remove(&pool);
+        let Some(state) = self.live_pool_cache.get(&pool) else {
+            return;
+        };
+        if !cached_pool_has_fresh_reserve_basis(&state) {
+            return;
+        }
+        let Some((base_mint, quote_mint, base_reserve, quote_reserve, dex)) =
+            pool_cache_balance_fields_from_state(&state)
+        else {
+            return;
+        };
+        let Some(nats) = self
+            .nats
+            .as_ref()
+            .map(NatsClient::clone_for_spawned_publish)
+        else {
+            return;
+        };
+        let run_id = self.run_id.clone();
+        let pool_str = pool.to_string();
+        let publish = async move {
+            let mut balance_update = PoolCacheUpdate::new_balance_updated(
+                "market-data",
+                BUILD_VERSION,
+                &run_id,
+                pool_str.clone(),
+                dex.to_string(),
+                base_mint.to_string(),
+                quote_mint.to_string(),
+                base_reserve,
+                quote_reserve,
+                0,
+            );
+            if dex == "raydium_cpmm" {
+                if let CachedPoolState::RaydiumCpmm(ref s) = state {
+                    let mut meta = std::collections::HashMap::new();
+                    meta.insert(
+                        POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY.to_string(),
+                        raydium_cpmm_vaults_for_pool_cache_update(s),
+                    );
+                    balance_update.metadata = Some(meta);
+                    let readiness = raydium_cpmm_readiness_for_pool_cache_update(s);
+                    balance_update.set_dex_readiness_in_metadata(readiness);
+                }
+            }
+            let subject = pool_subject(&pool_str);
+            let _ = nats.jetstream_publish(&subject, &balance_update).await;
+        };
+        if let Some(handle) = self.ingest_tokio_handle.read().clone() {
+            inc_market_data_balance_updated_from_cache_total();
+            handle.spawn(publish);
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            inc_market_data_balance_updated_from_cache_total();
+            handle.spawn(publish);
+        }
     }
 
     fn arb_pin_pubkey_budget_len(&self) -> usize {
-        self.arb_pin_pubkeys.read().len()
+        self.hot_pool_registry.arb_pin_pubkeys.read().len()
     }
 
     fn arb_pin_readd_blocked_by_cooldown(&self, pool: Pubkey, fresh_activity: bool) -> bool {
-        let evicted = self.arb_pin_evicted_pools.read();
+        let evicted = self.hot_pool_registry.arb_pin_evicted_pools.read();
         let Some(evicted_at) = evicted.get(&pool) else {
             return false;
         };
@@ -4176,7 +4497,7 @@ impl MarketDataContext {
     /// Pool with oldest arb pool LRU among non-activity-protected pools (eviction unit = whole pool).
     fn oldest_arb_pinned_pool_to_evict(&self, now: Instant) -> Option<Pubkey> {
         let pools: Vec<(Pubkey, Instant)> = {
-            let lru = self.arb_pool_lru.read();
+            let lru = self.hot_pool_registry.arb_pool_lru.read();
             lru.iter().map(|(p, t)| (*p, *t)).collect()
         };
         pools
@@ -4195,7 +4516,10 @@ impl MarketDataContext {
                 .get(&pubkey)
                 .map(|b| b.pool_address)
         };
-        self.arb_pin_pubkeys.write().remove(&pubkey);
+        self.hot_pool_registry
+            .arb_pin_pubkeys
+            .write()
+            .remove(&pubkey);
         if let Some(v) = self.tracked_vaults.write().get_mut(&pubkey) {
             if v.pin == Some(GeyserPinReason::ArbMultiDex) {
                 v.pinned = false;
@@ -4218,16 +4542,17 @@ impl MarketDataContext {
         let pubkeys = self.arb_pinned_pubkeys_for_pool(pool);
         let n = pubkeys.len();
         let stale = {
-            let lru = self.arb_pool_lru.read();
+            let lru = self.hot_pool_registry.arb_pool_lru.read();
             lru.get(&pool)
                 .is_none_or(|last| !Self::arb_pool_activity_protected_at(*last, now))
         };
         for pk in pubkeys {
             self.demote_arb_pin_pubkey(pk);
         }
-        self.arb_pool_lru.write().remove(&pool);
+        self.hot_pool_registry.demote_arb_pool(pool);
         if n > 0 {
-            self.arb_pin_evicted_pools
+            self.hot_pool_registry
+                .arb_pin_evicted_pools
                 .write()
                 .insert(pool, Instant::now());
             inc_market_data_arb_pin_pool_evictions_total();
@@ -4257,7 +4582,10 @@ impl MarketDataContext {
             };
             let freed = self.demote_arb_pins_for_pool(oldest_pool, now);
             if freed == 0 {
-                self.arb_pool_lru.write().remove(&oldest_pool);
+                self.hot_pool_registry
+                    .arb_pool_lru
+                    .write()
+                    .remove(&oldest_pool);
                 return false;
             }
             inc_market_data_arb_pin_evictions_total();
@@ -4278,7 +4606,10 @@ impl MarketDataContext {
             return false;
         }
         if fresh_activity {
-            self.arb_pin_evicted_pools.write().remove(&pool);
+            self.hot_pool_registry
+                .arb_pin_evicted_pools
+                .write()
+                .remove(&pool);
         }
 
         let mut candidate_pubkeys: Vec<Pubkey> = Vec::new();
@@ -4309,7 +4640,7 @@ impl MarketDataContext {
         }
 
         let slots_needed = {
-            let pins = self.arb_pin_pubkeys.read();
+            let pins = self.hot_pool_registry.arb_pin_pubkeys.read();
             candidate_pubkeys
                 .iter()
                 .filter(|pk| !pins.contains(*pk))
@@ -4321,7 +4652,7 @@ impl MarketDataContext {
                 return false;
             }
             let still_needed = {
-                let pins = self.arb_pin_pubkeys.read();
+                let pins = self.hot_pool_registry.arb_pin_pubkeys.read();
                 candidate_pubkeys
                     .iter()
                     .filter(|pk| !pins.contains(*pk))
@@ -4341,7 +4672,7 @@ impl MarketDataContext {
         let mut changed = false;
         let mut pool_has_arb_pins = false;
         {
-            let mut pin_set = self.arb_pin_pubkeys.write();
+            let mut pin_set = self.hot_pool_registry.arb_pin_pubkeys.write();
             let mut vaults = self.tracked_vaults.write();
             let mut bins = self.tracked_bin_arrays.write();
             for pk in candidate_pubkeys {
@@ -4373,7 +4704,10 @@ impl MarketDataContext {
             }
         }
         if pool_has_arb_pins {
-            self.arb_pool_lru.write().insert(pool, now);
+            self.hot_pool_registry
+                .arb_pool_lru
+                .write()
+                .insert(pool, now);
         }
         if changed {
             self.refresh_arb_pin_gauges();
@@ -4383,7 +4717,7 @@ impl MarketDataContext {
 
     fn sync_arb_pool_lru_after_pubkey_demote(&self, pool: Pubkey) {
         if self.arb_pinned_pubkeys_for_pool(pool).is_empty() {
-            self.arb_pool_lru.write().remove(&pool);
+            self.hot_pool_registry.arb_pool_lru.write().remove(&pool);
             self.refresh_arb_pin_gauges();
         }
     }
@@ -4636,6 +4970,7 @@ impl MarketDataContext {
     fn sync_geyser_tracked_accounts_core(&self) {
         self.evict_geyser_unpinned_lru_to_cap();
         self.broadcast_tracked_geyser_explicit_to_merge();
+        *self.last_synced_explicit_pubkeys.write() = self.snapshot_explicit_subscription_pubkeys();
     }
 
     /// Immediate subscription-list sync (momentum pins, wallet tracks, config, account-path admission, …).
@@ -4890,10 +5225,15 @@ impl MarketDataContext {
         }
     }
 
-    /// PR-B: after a parsed swap trade, subscribe reserve vaults / DLMM bin arrays from MASTER cache
-    /// only when explicit pool assets are admitted (same rule as account-path).
-    /// PR169a: returns whether tracked sets changed; caller schedules debounced Geyser sync.
+    /// PR-B: after a parsed swap trade — cache-first BalanceUpdated; vault/bin registration only for hot pools.
     fn register_geyser_reserves_after_trade(self: &Arc<Self>, pool: Pubkey) -> bool {
+        self.try_publish_balance_updated_from_cache(pool);
+        let now = Instant::now();
+        self.hot_pool_registry.touch_arb_activity(pool, now);
+
+        if !self.hot_pool_registry.is_hot_pool(pool) {
+            return false;
+        }
         let Some(state) = self.live_pool_cache.get(&pool) else {
             return false;
         };
@@ -4903,17 +5243,19 @@ impl MarketDataContext {
         if !self.admit_geyser_explicit_pool_assets(pool, base_mint, quote_mint) {
             return false;
         }
-        let follow_up = if self.active_pool_set.pool_has_any_pin(pool) {
+        let follow_up = if self.hot_pool_registry.pool_has_momentum(pool) {
             GeyserReserveRegisterFollowUp::MomentumUpgrade
-        } else if self.pool_admitted_for_arb_multi_dex(pool) {
-            GeyserReserveRegisterFollowUp::ArbMultiDexUpgrade
         } else {
-            GeyserReserveRegisterFollowUp::None
+            GeyserReserveRegisterFollowUp::ArbMultiDexUpgrade
         };
         let vault_count_before = self.tracked_vaults.read().len();
-        let changed = self.register_geyser_reserves_impl(pool, follow_up);
-        self.touch_arb_pool_activity(pool, Instant::now());
-        if changed && matches!(follow_up, GeyserReserveRegisterFollowUp::ArbMultiDexUpgrade) {
+        let before_keys = self.snapshot_explicit_subscription_pubkeys();
+        self.register_geyser_reserves_impl(pool, follow_up);
+        let new_keys = explicit_subscription_has_new_keys(
+            &before_keys,
+            &self.snapshot_explicit_subscription_pubkeys(),
+        );
+        if new_keys && matches!(follow_up, GeyserReserveRegisterFollowUp::ArbMultiDexUpgrade) {
             let new_vaults = self
                 .tracked_vaults
                 .read()
@@ -4923,7 +5265,7 @@ impl MarketDataContext {
                 inc_market_data_arb_registered_vaults_total();
             }
         }
-        changed
+        new_keys
     }
 
     /// RaydiumCpmm / MeteoraCpmm / Meteora DLMM / PumpAmm vault rows from a MASTER cache entry.
@@ -5083,8 +5425,12 @@ impl MarketDataContext {
         vaults_changed
     }
 
-    /// PR169a: register vault ATAs from MASTER cache after account-path pool upsert (no sync here).
+    /// PR169a: register vault ATAs from MASTER cache after account-path pool upsert (hot pools only).
     fn register_pool_vaults_from_account(&self, pool: Pubkey) -> bool {
+        self.try_publish_balance_updated_from_cache(pool);
+        if !self.hot_pool_registry.is_hot_pool(pool) {
+            return false;
+        }
         let Some(cached_state) = self.live_pool_cache.get(&pool) else {
             return false;
         };
@@ -5093,7 +5439,8 @@ impl MarketDataContext {
             (cfg.enable_meteora_cpmm, cfg.enable_meteora_dlmm)
         };
         let now = Instant::now();
-        let changed = self.register_four_dex_pool_vaults_from_cached_state(
+        let before_keys = self.snapshot_explicit_subscription_pubkeys();
+        self.register_four_dex_pool_vaults_from_cached_state(
             pool,
             &cached_state,
             now,
@@ -5101,13 +5448,15 @@ impl MarketDataContext {
             enable_meteora_dlmm,
             true,
         );
-        // Mirror trade-path follow-up: momentum wins; else arb-multi-dex pin tier (no subscription churn).
-        if !self.active_pool_set.pool_has_any_pin(pool)
-            && self.pool_admitted_for_arb_multi_dex(pool)
+        if self.hot_pool_registry.pool_has_arb(pool)
+            && !self.hot_pool_registry.pool_has_momentum(pool)
         {
-            self.apply_arb_multi_dex_pins_for_pool(pool, now, false);
+            self.apply_arb_multi_dex_pins_for_pool(pool, now, true);
         }
-        changed
+        explicit_subscription_has_new_keys(
+            &before_keys,
+            &self.snapshot_explicit_subscription_pubkeys(),
+        )
     }
 
     /// PR-D: explicit vault/bin subscriptions for momentum active `(mint, pool)` when cache has layout.
@@ -5251,7 +5600,7 @@ impl MarketDataContext {
                     }
                 }
                 if !arb_pin_removals.is_empty() {
-                    let mut pins = self.arb_pin_pubkeys.write();
+                    let mut pins = self.hot_pool_registry.arb_pin_pubkeys.write();
                     for pk in arb_pin_removals {
                         pins.remove(&pk);
                     }
@@ -5271,7 +5620,6 @@ impl MarketDataContext {
             GeyserReserveRegisterFollowUp::ArbMultiDexUpgrade => {
                 self.apply_arb_multi_dex_pins_for_pool(pool, now, true);
             }
-            GeyserReserveRegisterFollowUp::None => {}
         }
 
         vaults_changed || bins_changed || mints_changed
@@ -5289,7 +5637,7 @@ impl MarketDataContext {
         if !batch_dirty {
             self.refresh_geyser_pins_gauge();
         }
-        set_market_data_momentum_active_pool_pins_gauge(self.active_pool_set.pair_count());
+        set_market_data_momentum_active_pool_pins_gauge(self.hot_pool_registry.pair_count());
         batch_dirty
     }
 
@@ -5308,7 +5656,7 @@ impl MarketDataContext {
             target.insert((mint_pk, pool_pk));
         }
         let mut batch_dirty = false;
-        let before = self.active_pool_set.snapshot_pairs();
+        let before = self.hot_pool_registry.snapshot_pairs();
         for (m, p) in before.difference(&target) {
             if self.clear_momentum_geyser_reserves_for_active_entry(*m, *p) {
                 batch_dirty = true;
@@ -5346,7 +5694,7 @@ impl MarketDataContext {
                 warn!(pool = %a.pool, "MomentumActivePoolsUpdate.active: invalid pool");
                 continue;
             };
-            self.active_pool_set.pin_pool(mint_pk, pool_pk);
+            self.hot_pool_registry.pin_pool(mint_pk, pool_pk);
             if self.register_geyser_reserves_for_momentum_active_pool(pool_pk) {
                 batch_dirty = true;
             }
@@ -5357,7 +5705,7 @@ impl MarketDataContext {
 
     /// PR-D: whether `mint` is still a base/quote leg for any pool that has a momentum active pin row.
     fn momentum_pool_leg_mint_still_required_by_other_pool(&self, mint: Pubkey) -> bool {
-        for (_, pool_pk) in self.active_pool_set.snapshot_pairs() {
+        for (_, pool_pk) in self.hot_pool_registry.snapshot_pairs() {
             match self.live_pool_cache.get(&pool_pk) {
                 Some(state) => {
                     if let Some((a, b)) = pool_mints_for_geyser_explicit_tracking(&state) {
@@ -5378,11 +5726,11 @@ impl MarketDataContext {
 
     /// Clear `MomentumActive` pins for one `(mint, pool)` side; never demotes [`GeyserPinReason::Wallet`].
     fn clear_momentum_geyser_reserves_for_active_entry(&self, mint: Pubkey, pool: Pubkey) -> bool {
-        self.active_pool_set.unpin_pool(mint, pool);
+        self.hot_pool_registry.unpin_pool(mint, pool);
         let mut changed = false;
         // Pool-level reserve pins are shared: only demote vaults/bin arrays when no `(m, pool)`
         // row remains after this unpin (PR #147 follow-up).
-        if !self.active_pool_set.pool_has_any_pin(pool) {
+        if !self.hot_pool_registry.pool_has_any_pin(pool) {
             {
                 let mut vaults = self.tracked_vaults.write();
                 for v in vaults.values_mut() {
@@ -5429,7 +5777,7 @@ impl MarketDataContext {
             }
         }
         if !self.wallet_tracks_mint_for_geyser(&mint)
-            && !self.active_pool_set.mint_has_any_pinned_pool(mint)
+            && !self.hot_pool_registry.mint_has_any_pinned_pool(mint)
         {
             let mut m = self.tracked_mints.write();
             if let Some(info) = m.get_mut(&mint) {
@@ -10152,10 +10500,7 @@ async fn main() -> Result<()> {
         priority_fee_tracker: Arc::new(PriorityFeeTracker::new()),
         tracked_mints: parking_lot::RwLock::new(std::collections::HashMap::new()),
         tracked_mints_tx,
-        active_pool_set: Arc::new(ActivePoolSet::new()),
-        arb_pool_lru: parking_lot::RwLock::new(std::collections::HashMap::new()),
-        arb_pin_pubkeys: parking_lot::RwLock::new(std::collections::HashSet::new()),
-        arb_pin_evicted_pools: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        hot_pool_registry: Arc::new(UnifiedHotPoolRegistry::new()),
         arb_reconcile_mint_cooldown: parking_lot::RwLock::new(std::collections::HashMap::new()),
         arb_coverage_index: parking_lot::RwLock::new(ArbCoverageIndex::default()),
         known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
@@ -10187,6 +10532,7 @@ async fn main() -> Result<()> {
         pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
             std::collections::HashSet::new(),
         ),
+        last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -11648,7 +11994,7 @@ fn account_geyser_dispatch_priority_high(ctx: &MarketDataContext, u: &GeyserAcco
     if ctx.pool_mint_map.read().contains_key(&pool_str) {
         return true;
     }
-    if ctx.active_pool_set.pool_has_any_pin(pool_pk) {
+    if ctx.hot_pool_registry.pool_has_any_pin(pool_pk) {
         return true;
     }
     if ctx.wallet_tracks_mint_for_geyser(&pool_pk) {
@@ -12790,6 +13136,7 @@ async fn handle_geyser_transaction(
             md_state,
             MdStateCommand::RegisterReservesAfterTrade(*pool_address),
         );
+        try_enqueue_arb_reconcile_for_pool(md_state, ctx.live_pool_cache.as_ref(), *pool_address);
     }
 
     // Pump.fun: propagate creator/dev wallet so strategy can build deterministic intents.
@@ -15648,10 +15995,7 @@ mod wallet_tx_meta_balance_tests {
             priority_fee_tracker: Arc::new(PriorityFeeTracker::new()),
             tracked_mints: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_mints_tx,
-            active_pool_set: Arc::new(ActivePoolSet::new()),
-            arb_pool_lru: parking_lot::RwLock::new(std::collections::HashMap::new()),
-            arb_pin_pubkeys: parking_lot::RwLock::new(std::collections::HashSet::new()),
-            arb_pin_evicted_pools: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            hot_pool_registry: Arc::new(UnifiedHotPoolRegistry::new()),
             arb_reconcile_mint_cooldown: parking_lot::RwLock::new(std::collections::HashMap::new()),
             arb_coverage_index: parking_lot::RwLock::new(ArbCoverageIndex::default()),
             known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
@@ -15685,6 +16029,7 @@ mod wallet_tx_meta_balance_tests {
             pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
                 std::collections::HashSet::new(),
             ),
+            last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
         })
     }
 
@@ -16128,8 +16473,8 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
-    fn active_pool_set_pin_api_roundtrip() {
-        let s = ActivePoolSet::new();
+    fn hot_pool_registry_pin_api_roundtrip() {
+        let s = UnifiedHotPoolRegistry::new();
         let mint = Pubkey::new_unique();
         let pool = Pubkey::new_unique();
         assert!(!s.is_pinned(mint, pool));
@@ -16140,8 +16485,8 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
-    fn active_pool_set_pool_has_any_pin() {
-        let s = ActivePoolSet::new();
+    fn hot_pool_registry_pool_has_any_pin() {
+        let s = UnifiedHotPoolRegistry::new();
         let m1 = Pubkey::new_unique();
         let m2 = Pubkey::new_unique();
         let pool = Pubkey::new_unique();
@@ -16273,10 +16618,7 @@ mod pr_b_geyser_tracking_tests {
             priority_fee_tracker: Arc::new(PriorityFeeTracker::new()),
             tracked_mints: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_mints_tx,
-            active_pool_set: Arc::new(ActivePoolSet::new()),
-            arb_pool_lru: parking_lot::RwLock::new(std::collections::HashMap::new()),
-            arb_pin_pubkeys: parking_lot::RwLock::new(std::collections::HashSet::new()),
-            arb_pin_evicted_pools: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            hot_pool_registry: Arc::new(UnifiedHotPoolRegistry::new()),
             arb_reconcile_mint_cooldown: parking_lot::RwLock::new(std::collections::HashMap::new()),
             arb_coverage_index: parking_lot::RwLock::new(ArbCoverageIndex::default()),
             known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
@@ -16310,6 +16652,7 @@ mod pr_b_geyser_tracking_tests {
             pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
                 std::collections::HashSet::new(),
             ),
+            last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
         })
     }
 
@@ -16340,10 +16683,7 @@ mod pr_b_geyser_tracking_tests {
             priority_fee_tracker: Arc::new(PriorityFeeTracker::new()),
             tracked_mints: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_mints_tx,
-            active_pool_set: Arc::new(ActivePoolSet::new()),
-            arb_pool_lru: parking_lot::RwLock::new(std::collections::HashMap::new()),
-            arb_pin_pubkeys: parking_lot::RwLock::new(std::collections::HashSet::new()),
-            arb_pin_evicted_pools: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            hot_pool_registry: Arc::new(UnifiedHotPoolRegistry::new()),
             arb_reconcile_mint_cooldown: parking_lot::RwLock::new(std::collections::HashMap::new()),
             arb_coverage_index: parking_lot::RwLock::new(ArbCoverageIndex::default()),
             known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
@@ -16377,6 +16717,7 @@ mod pr_b_geyser_tracking_tests {
             pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
                 std::collections::HashSet::new(),
             ),
+            last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
         });
         (
             ctx,
@@ -16571,7 +16912,7 @@ mod pr_b_geyser_tracking_tests {
         });
 
         assert!(
-            ctx.active_pool_set.is_pinned(other_tracker_mint, pool),
+            ctx.hot_pool_registry.is_pinned(other_tracker_mint, pool),
             "second pin row must survive"
         );
         let vs = ctx.tracked_vaults.read();
@@ -16659,7 +17000,7 @@ mod pr_b_geyser_tracking_tests {
         });
 
         assert!(
-            ctx.active_pool_set.is_pinned(other_tracker_mint, pool_b),
+            ctx.hot_pool_registry.is_pinned(other_tracker_mint, pool_b),
             "pool_b pin survives pool_a removal"
         );
         assert!(
@@ -16886,6 +17227,7 @@ mod pr_b_geyser_tracking_tests {
         ctx.refresh_arb_coverage_index_for_pool(pool_cpmm);
         ctx.refresh_arb_coverage_index_for_pool(pool_orca);
         assert!(ctx.arb_mint_is_multi_dex(&token_mint));
+        assert!(ctx.reconcile_arb_multi_dex_for_mint(token_mint));
         MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool_cpmm);
 
         let vs = ctx.tracked_vaults.read();
@@ -16899,9 +17241,21 @@ mod pr_b_geyser_tracking_tests {
             vs.get(&pc_vault).unwrap().pin,
             Some(GeyserPinReason::ArbMultiDex)
         );
-        assert!(ctx.arb_pin_pubkeys.read().contains(&coin_vault));
-        assert!(ctx.arb_pin_pubkeys.read().contains(&pc_vault));
-        assert!(ctx.arb_pool_lru.read().contains_key(&pool_cpmm));
+        assert!(ctx
+            .hot_pool_registry
+            .arb_pin_pubkeys
+            .read()
+            .contains(&coin_vault));
+        assert!(ctx
+            .hot_pool_registry
+            .arb_pin_pubkeys
+            .read()
+            .contains(&pc_vault));
+        assert!(ctx
+            .hot_pool_registry
+            .arb_pool_lru
+            .read()
+            .contains_key(&pool_cpmm));
     }
 
     #[test]
@@ -16953,7 +17307,7 @@ mod pr_b_geyser_tracking_tests {
 
         ctx.refresh_arb_coverage_index_for_pool(pool_cpmm);
         ctx.refresh_arb_coverage_index_for_pool(pool_orca);
-        assert!(ctx.register_pool_vaults_from_account(pool_cpmm));
+        assert!(ctx.reconcile_arb_multi_dex_for_mint(token_mint));
 
         let vs = ctx.tracked_vaults.read();
         assert_eq!(
@@ -17015,11 +17369,21 @@ mod pr_b_geyser_tracking_tests {
 
         ctx.refresh_arb_coverage_index_for_pool(pool);
         ctx.refresh_arb_coverage_index_for_pool(pool_orca);
-        MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool);
-        let first = *ctx.arb_pool_lru.read().get(&pool).unwrap();
+        assert!(ctx.reconcile_arb_multi_dex_for_mint(token_mint));
+        let first = *ctx
+            .hot_pool_registry
+            .arb_pool_lru
+            .read()
+            .get(&pool)
+            .unwrap();
         std::thread::sleep(Duration::from_millis(2));
         ctx.apply_arb_multi_dex_pins_for_pool(pool, Instant::now(), true);
-        let second = *ctx.arb_pool_lru.read().get(&pool).unwrap();
+        let second = *ctx
+            .hot_pool_registry
+            .arb_pool_lru
+            .read()
+            .get(&pool)
+            .unwrap();
         assert!(
             second > first,
             "arb pool LRU timestamp must refresh on reapply with fresh activity"
@@ -17066,8 +17430,8 @@ mod pr_b_geyser_tracking_tests {
                 fee_rate: 3000,
                 protocol_fee_rate: 300,
                 tick_spacing: 64,
-                vault_a_balance: None,
-                vault_b_balance: None,
+                vault_a_balance: Some(1_000_000),
+                vault_b_balance: Some(2_000_000),
                 token_a_program: None,
                 token_b_program: None,
             }),
@@ -17080,6 +17444,12 @@ mod pr_b_geyser_tracking_tests {
         assert!(ctx.arb_mint_is_multi_dex(&token_b));
         assert!(ctx.pool_admitted_for_arb_multi_dex(pool_token_token));
 
+        ctx.hot_pool_registry
+            .promote_arb_pools(token_b, vec![pool_token_token]);
+        ctx.register_geyser_reserves_impl(
+            pool_token_token,
+            GeyserReserveRegisterFollowUp::ArbMultiDexUpgrade,
+        );
         MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool_token_token);
         let vs = ctx.tracked_vaults.read();
         assert_eq!(
@@ -17122,12 +17492,12 @@ mod pr_b_geyser_tracking_tests {
             vs.insert(quote_vault, mk_vault(false));
         }
         {
-            let mut pins = ctx.arb_pin_pubkeys.write();
+            let mut pins = ctx.hot_pool_registry.arb_pin_pubkeys.write();
             pins.insert(base_vault);
             pins.insert(quote_vault);
         }
         {
-            let mut lru = ctx.arb_pool_lru.write();
+            let mut lru = ctx.hot_pool_registry.arb_pool_lru.write();
             lru.insert(pool, now);
         }
 
@@ -17135,8 +17505,12 @@ mod pr_b_geyser_tracking_tests {
         let vs = ctx.tracked_vaults.read();
         assert!(!vs.get(&base_vault).unwrap().pinned);
         assert!(!vs.get(&quote_vault).unwrap().pinned);
-        assert!(ctx.arb_pin_pubkeys.read().is_empty());
-        assert!(!ctx.arb_pool_lru.read().contains_key(&pool));
+        assert!(ctx.hot_pool_registry.arb_pin_pubkeys.read().is_empty());
+        assert!(!ctx
+            .hot_pool_registry
+            .arb_pool_lru
+            .read()
+            .contains_key(&pool));
     }
 
     #[test]
@@ -17177,12 +17551,12 @@ mod pr_b_geyser_tracking_tests {
             vs.insert(new_quote, mk_vault(pool_new, false));
         }
         {
-            let mut lru = ctx.arb_pool_lru.write();
+            let mut lru = ctx.hot_pool_registry.arb_pool_lru.write();
             lru.insert(pool_old, old_at);
             lru.insert(pool_new, new_at);
         }
         {
-            let mut pins = ctx.arb_pin_pubkeys.write();
+            let mut pins = ctx.hot_pool_registry.arb_pin_pubkeys.write();
             pins.insert(old_base);
             pins.insert(old_quote);
             pins.insert(new_base);
@@ -17239,7 +17613,7 @@ mod pr_b_geyser_tracking_tests {
             vs.insert(stale_quote, mk_vault(pool_stale, false));
         }
         {
-            let mut pins = ctx.arb_pin_pubkeys.write();
+            let mut pins = ctx.hot_pool_registry.arb_pin_pubkeys.write();
             for pk in [active_base, active_quote, stale_base, stale_quote] {
                 pins.insert(pk);
             }
@@ -17248,7 +17622,7 @@ mod pr_b_geyser_tracking_tests {
             }
         }
         {
-            let mut lru = ctx.arb_pool_lru.write();
+            let mut lru = ctx.hot_pool_registry.arb_pool_lru.write();
             lru.insert(pool_active, active_at);
             lru.insert(pool_stale, stale_at);
         }
@@ -17294,7 +17668,8 @@ mod pr_b_geyser_tracking_tests {
             vs.insert(base_vault, mk_vault(true));
             vs.insert(quote_vault, mk_vault(false));
         }
-        ctx.arb_pin_evicted_pools
+        ctx.hot_pool_registry
+            .arb_pin_evicted_pools
             .write()
             .insert(pool, Instant::now());
 
@@ -17338,7 +17713,7 @@ mod pr_b_geyser_tracking_tests {
         let active_base = Pubkey::new_unique();
         let active_quote = Pubkey::new_unique();
 
-        let mut pins = ctx.arb_pin_pubkeys.write();
+        let mut pins = ctx.hot_pool_registry.arb_pin_pubkeys.write();
         for _ in 0..ARB_MULTI_DEX_PIN_ACCOUNT_BUDGET.saturating_sub(2) {
             pins.insert(Pubkey::new_unique());
         }
@@ -17352,7 +17727,7 @@ mod pr_b_geyser_tracking_tests {
             vs.insert(active_quote, mk_vault(pool_active, false, true));
         }
         {
-            let mut lru = ctx.arb_pool_lru.write();
+            let mut lru = ctx.hot_pool_registry.arb_pool_lru.write();
             lru.insert(pool_active, now);
         }
         ctx.touch_arb_pool_activity(pool_active, now);
@@ -17633,7 +18008,11 @@ mod pr_b_geyser_tracking_tests {
         }
 
         assert!(ctx.apply_arb_multi_dex_pins_for_pool(pool, now, true));
-        assert!(!ctx.arb_pin_evicted_pools.read().contains_key(&pool));
+        assert!(!ctx
+            .hot_pool_registry
+            .arb_pin_evicted_pools
+            .read()
+            .contains_key(&pool));
     }
 
     #[test]
@@ -17861,7 +18240,7 @@ mod pr_b_geyser_tracking_tests {
             }),
             1,
         );
-        ctx.active_pool_set.pin_pool(base_mint, pool);
+        ctx.hot_pool_registry.pin_pool(base_mint, pool);
 
         MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool);
 
@@ -17988,16 +18367,23 @@ mod pr_b_geyser_tracking_tests {
 
         assert!(
             !md_state_process_job(&ctx, MdStateCommand::RegisterReservesAfterTrade(pool_cpmm)),
-            "single-dex trade register should not reconcile yet"
+            "single-dex trade register must not create vault rows without hot pool"
         );
         assert!(!ctx.arb_mint_is_multi_dex(&token_mint));
         assert!(ctx.tracked_vaults.read().is_empty());
 
+        ctx.refresh_arb_coverage_index_for_pool(pool_orca);
+        assert!(ctx.arb_mint_is_multi_dex(&token_mint));
+        assert!(
+            !md_state_process_job(&ctx, MdStateCommand::RegisterReservesAfterTrade(pool_orca)),
+            "trade path must not inline-reconcile or register vaults without hot pool"
+        );
+        assert!(ctx.tracked_vaults.read().is_empty());
+
         assert!(md_state_process_job(
             &ctx,
-            MdStateCommand::RegisterReservesAfterTrade(pool_orca)
+            MdStateCommand::ArbMultiDexReconcile { mint: token_mint }
         ));
-        assert!(ctx.arb_mint_is_multi_dex(&token_mint));
 
         let vs = ctx.tracked_vaults.read();
         assert!(vs.contains_key(&cpmm_coin));
@@ -18382,8 +18768,8 @@ mod pr_b_geyser_tracking_tests {
             }),
             1,
         );
-        ctx.active_pool_set.pin_pool(base_a, pool_a);
-        ctx.active_pool_set.pin_pool(base_b, pool_b);
+        ctx.hot_pool_registry.pin_pool(base_a, pool_a);
+        ctx.hot_pool_registry.pin_pool(base_b, pool_b);
 
         let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
         let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
@@ -18414,6 +18800,306 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(
             MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed),
             imm0
+        );
+    }
+
+    #[test]
+    fn cache_publish_allowed_when_vault_rows_exist_before_geyser_sync_flush() {
+        use ironcrab::metrics::MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(base, pool);
+        assert!(md_state_process_job(
+            &ctx,
+            MdStateCommand::RegisterReservesAfterTrade(pool)
+        ));
+
+        assert!(!ctx.pool_explicit_vault_bin_pubkeys(pool).is_empty());
+        assert!(
+            !ctx.pool_has_live_vault_geyser_feed(pool),
+            "local vault rows before debounced Geyser flush must not count as live feed"
+        );
+
+        let counter_before = MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed);
+        ctx.try_publish_balance_updated_from_cache(pool);
+        assert_eq!(
+            MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed),
+            counter_before,
+            "without NATS the publish is a no-op, but pool_has_live=false proves no early skip"
+        );
+    }
+
+    #[test]
+    fn cache_publish_skipped_after_vault_pubkeys_in_last_synced_snapshot() {
+        use ironcrab::metrics::MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(base, pool);
+        assert!(md_state_process_job(
+            &ctx,
+            MdStateCommand::RegisterReservesAfterTrade(pool)
+        ));
+        ctx.sync_geyser_tracked_accounts();
+
+        assert!(
+            ctx.pool_has_live_vault_geyser_feed(pool),
+            "after sync flush vault pubkeys must be in last_synced_explicit_pubkeys"
+        );
+
+        let counter_before = MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed);
+        ctx.try_publish_balance_updated_from_cache(pool);
+        assert_eq!(
+            MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed),
+            counter_before,
+            "live vault Geyser feed must skip cache-first publish (slot-0 overwrite guard)"
+        );
+    }
+
+    #[test]
+    fn pin_metadata_only_change_has_no_explicit_subscription_delta() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let token_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: token_mint,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        let orca_pool = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            orca_pool,
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: token_mint,
+                token_mint_b: quote,
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+                tick_current_index: 0,
+                sqrt_price: 1u128 << 64,
+                liquidity: 1,
+                fee_rate: 3000,
+                protocol_fee_rate: 300,
+                tick_spacing: 64,
+                vault_a_balance: Some(1),
+                vault_b_balance: Some(1),
+                token_a_program: None,
+                token_b_program: None,
+            }),
+            1,
+        );
+        ctx.refresh_arb_coverage_index_for_pool(pool);
+        ctx.refresh_arb_coverage_index_for_pool(orca_pool);
+        assert!(ctx.reconcile_arb_multi_dex_for_mint(token_mint));
+
+        let before = ctx.snapshot_explicit_subscription_pubkeys();
+        let _ = ctx.apply_arb_multi_dex_pins_for_pool(pool, Instant::now(), true);
+        let after = ctx.snapshot_explicit_subscription_pubkeys();
+        assert!(!explicit_subscription_has_new_keys(&before, &after));
+    }
+
+    #[test]
+    fn hot_pool_trade_flood_coalesced_no_new_subscription_keys() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(base, pool);
+        assert!(md_state_process_job(
+            &ctx,
+            MdStateCommand::RegisterReservesAfterTrade(pool)
+        ));
+
+        let before = ctx.snapshot_explicit_subscription_pubkeys();
+        let jobs: Vec<_> = (0..100)
+            .map(|_| MdStateCommand::RegisterReservesAfterTrade(pool))
+            .collect();
+        let coalesced = md_state_coalesce_jobs(jobs);
+        assert_eq!(coalesced.len(), 1);
+        for job in coalesced {
+            let _ = md_state_process_job(&ctx, job);
+        }
+        let after = ctx.snapshot_explicit_subscription_pubkeys();
+        assert!(!explicit_subscription_has_new_keys(&before, &after));
+    }
+
+    #[test]
+    fn md_state_coalesce_dedupes_trade_account_and_arb_reconcile_per_pool() {
+        let mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let jobs = vec![
+            MdStateCommand::ArbMultiDexReconcile { mint },
+            MdStateCommand::ArbMultiDexReconcile { mint },
+            MdStateCommand::RegisterReservesAfterTrade(pool),
+            MdStateCommand::RegisterReservesAfterTrade(pool),
+            MdStateCommand::RegisterPoolVaultsFromAccount { pool },
+            MdStateCommand::RegisterPoolVaultsFromAccount { pool },
+        ];
+        let out = md_state_coalesce_jobs(jobs);
+        assert_eq!(out.len(), 3);
+        assert!(matches!(
+            out[0],
+            MdStateCommand::ArbMultiDexReconcile { .. }
+        ));
+    }
+
+    #[test]
+    fn momentum_and_arb_same_pool_single_coalesced_worker_batch() {
+        use ironcrab::nats::{MomentumActivePinReason, MomentumActivePoolEntry};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let token_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+        let orca_pool = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: token_mint,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.live_pool_cache.upsert(
+            orca_pool,
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: token_mint,
+                token_mint_b: quote,
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+                tick_current_index: 0,
+                sqrt_price: 1u128 << 64,
+                liquidity: 1,
+                fee_rate: 3000,
+                protocol_fee_rate: 300,
+                tick_spacing: 64,
+                vault_a_balance: Some(1),
+                vault_b_balance: Some(1),
+                token_a_program: None,
+                token_b_program: None,
+            }),
+            1,
+        );
+        ctx.refresh_arb_coverage_index_for_pool(pool);
+        ctx.refresh_arb_coverage_index_for_pool(orca_pool);
+
+        let before_keys = ctx.snapshot_explicit_subscription_pubkeys();
+        let jobs = md_state_coalesce_jobs(vec![
+            MdStateCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
+                version: 1,
+                ts_unix_ms: 1,
+                active: vec![MomentumActivePoolEntry {
+                    mint: token_mint.to_string(),
+                    pool: pool.to_string(),
+                    pin_reason: MomentumActivePinReason::Tracker,
+                }],
+                removed: vec![],
+                full_active_snapshot: false,
+            }),
+            MdStateCommand::ArbMultiDexReconcile { mint: token_mint },
+        ]);
+        assert_eq!(jobs.len(), 2);
+        for job in jobs {
+            let _ = md_state_process_job(&ctx, job);
+        }
+        let after_keys = ctx.snapshot_explicit_subscription_pubkeys();
+        assert!(explicit_subscription_has_new_keys(
+            &before_keys,
+            &after_keys
+        ));
+        assert!(ctx.hot_pool_registry.is_hot_pool(pool));
+        assert!(ctx.hot_pool_registry.pool_has_momentum(pool));
+        let vs = ctx.tracked_vaults.read();
+        assert_eq!(
+            vs.get(&coin).unwrap().pin,
+            Some(GeyserPinReason::MomentumActive)
         );
     }
 
@@ -18791,7 +19477,7 @@ mod pr_b_geyser_tracking_tests {
             }),
             1,
         );
-        ctx.active_pool_set.pin_pool(base_mint, pool);
+        ctx.hot_pool_registry.pin_pool(base_mint, pool);
 
         let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
         let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
@@ -18815,9 +19501,13 @@ mod pr_b_geyser_tracking_tests {
         );
 
         tokio::time::sleep(Duration::from_millis(350)).await;
-        assert_eq!(
-            MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed),
-            batch0 + 1,
+        let batch_delta = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed) - batch0;
+        assert!(
+            batch_delta <= 1,
+            "expected at most one debounced batch sync after hot-pool account vault registration (delta={batch_delta})"
+        );
+        assert!(
+            batch_delta >= 1,
             "expected debounced batch sync after actor vault registration"
         );
     }
@@ -19000,7 +19690,7 @@ mod pr_b_geyser_tracking_tests {
             "expected 1–2 coalesced batches (delta={batches_delta})"
         );
         assert_eq!(
-            ctx.active_pool_set.pair_count(),
+            ctx.hot_pool_registry.pair_count(),
             99,
             "merged actor apply should pin every pool from the burst"
         );
@@ -19013,7 +19703,7 @@ mod pr_b_geyser_tracking_tests {
         };
 
         fn pin_count(ctx: &Arc<MarketDataContext>) -> usize {
-            ctx.active_pool_set.pair_count()
+            ctx.hot_pool_registry.pair_count()
         }
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -19093,8 +19783,8 @@ mod pr_b_geyser_tracking_tests {
 
         assert_eq!(pin_count(&ctx_seq), pin_count(&ctx_merged));
         assert_eq!(
-            ctx_seq.active_pool_set.snapshot_pairs(),
-            ctx_merged.active_pool_set.snapshot_pairs()
+            ctx_seq.hot_pool_registry.snapshot_pairs(),
+            ctx_merged.hot_pool_registry.snapshot_pairs()
         );
     }
 
@@ -19145,12 +19835,12 @@ mod pr_b_geyser_tracking_tests {
         );
 
         for _ in 0..200 {
-            if ctx.active_pool_set.pair_count() >= 48 {
+            if ctx.hot_pool_registry.pair_count() >= 48 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert_eq!(ctx.active_pool_set.pair_count(), 48);
+        assert_eq!(ctx.hot_pool_registry.pair_count(), 48);
     }
 
     /// Phase-R-R2: full md-state queue + held `tracked_vaults` write must not block TX handler.

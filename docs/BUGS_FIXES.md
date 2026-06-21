@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PHASE-UNIFIED-HOT-POOL-REGISTRY: Prod Global-Freeze ~5s nach Restart (Subscription-Sync-Sturm)
+**Datum**: 2026-06-20  
+**Problem** (Prod `architecture-rebuild` @ `70fb34f`): Nach Restart ~5s Global-Freeze — TX/Account/`head_slot` still, `geyser_*_session_connected=1`. Parallele Momentum-`ActivePoolSet` + Arb-LRU/Reconcile + `tracking_changed`-Sync (Commit `65cff8a`) erzeugten Subscription-Sync-Sturm gegen Caps/LRU.  
+**Root Cause**: Doppelte Hot-Set-Pfade (Momentum pins, Arb reconcile inline auf Trade/Account, Pin-Metadata löste debounced Geyser-Sync aus ohne netto neue Subscription-Pubkeys). Vault-Subscribe als Coverage-Mechanismus skalierte nicht.  
+**Fix** (PR2): (1) **`UnifiedHotPoolRegistry`** — Momentum ∪ Arb Top-K, dedupliziert, budget-bounded, Single-Writer `md-state`. (2) **Sync nur bei `new_explicit \ old_explicit` nicht leer** — kein `tracking_changed`→Sync. (3) Trade/Account: kein inline `reconcile_arb_multi_dex_for_pool`; Coalesce `RegisterReservesAfterTrade` / `RegisterPoolVaultsFromAccount`. (4) Vault-Rows nur für Hot Pools; **Cache-first `BalanceUpdated`** via JetStream ohne Vault-Geyser-Sub. (5) Metriken: `market_data_hot_pool_registry_pools`, `market_data_geyser_sync_skipped_no_delta_total`, `market_data_balance_updated_from_cache_total`. (6) Bugbot follow-up: `try_publish_balance_updated_from_cache` skip nur bei `pool_has_live_vault_geyser_feed` (Vault-Pubkeys in `last_synced_explicit_pubkeys`), nicht bei bloßer `tracked_vaults`-Row vor Sync-Flush. **Invarianten**: I-7, I-4b, I-16, keine Cap-Erhöhung, keine neuen NATS-Topics.  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### P172-TRADES-SERVER-TAIL-JSONL-SEGMENTS: Grafana Timeout on Large execution_results JSONL
 **Datum**: 2026-06-04  
 **Problem** (Prod `ironcrab-prod`): `trades-server` active but `:9899` timed out — single-threaded HTTP blocked on `/pnl_24h` full-file scan. `execution_results-20260604.jsonl` ~103k lines / 109 MB; `load_all_trades([0,1,2])` read every line of three days (~540k lines). Dashboard empty while WORLDCUP-Sell was in logs.  
