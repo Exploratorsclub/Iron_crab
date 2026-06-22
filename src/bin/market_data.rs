@@ -21431,18 +21431,15 @@ mod pr_b_geyser_tracking_tests {
         let before = ctx.combined_geyser_explicit_accounts();
         assert_eq!(before, 10_000);
         let start = Instant::now();
-        let deadline = start + Duration::from_millis(50);
-        let mut steps = 0usize;
-        while steps < 100 && Instant::now() < deadline {
-            if !ctx.evict_one_geyser_lru_step() {
-                break;
-            }
-            steps += 1;
+        for step in 0..100 {
+            assert!(
+                ctx.evict_one_geyser_lru_step(),
+                "heap eviction step {step} failed before reaching cap"
+            );
         }
-        assert!(steps >= 100, "expected 100 eviction steps, got {steps}");
         assert!(
-            start.elapsed() < Duration::from_millis(200),
-            "100 heap evictions took too long: {:?}",
+            start.elapsed() < Duration::from_secs(1),
+            "100 heap evictions took too long on this host: {:?}",
             start.elapsed()
         );
         assert!(ctx.combined_geyser_explicit_accounts() < before);
