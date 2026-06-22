@@ -78,20 +78,24 @@ use ironcrab::metrics::{
     inc_market_data_arb_reconcile_skipped_oversized_pool_total,
     inc_market_data_arb_reconcile_skipped_partial_state_total,
     inc_market_data_arb_registered_vaults_total, inc_market_data_balance_updated_from_cache_total,
-    inc_market_data_geyser_sync_skipped_no_delta_total,
+    inc_market_data_geyser_sync_partial_total, inc_market_data_geyser_sync_skipped_no_delta_total,
     inc_market_data_geyser_sync_skipped_rate_limit_total,
     inc_market_data_geyser_tracking_enqueue_dropped_total,
     inc_market_data_geyser_tracking_jobs_processed_total,
     inc_market_data_jsonl_enqueue_dropped_total, inc_market_data_md_sidefx_enqueue_dropped_total,
     inc_market_data_md_sidefx_jobs_processed_total,
-    inc_market_data_momentum_coalesced_batches_total,
+    inc_market_data_md_state_bursts_completed_total,
+    inc_market_data_md_state_evict_steps_budget_exhausted_total,
+    inc_market_data_md_state_evict_steps_total, inc_market_data_momentum_coalesced_batches_total,
     inc_market_data_momentum_coalesced_messages_total,
     inc_market_data_unparsed_account_dropped_total, inc_market_data_unparsed_tx_dropped_total,
     inc_market_data_vault_high_priority_dispatch_total, market_data_bump_geyser_head_slot,
-    market_data_geyser_head_slot_value, market_data_request_account_session_reconnect,
-    market_data_request_tx_session_reconnect, market_data_tx_handler_processed_value,
-    record_market_data_account_broadcast_lagged, record_market_data_account_channel_lag_ms,
-    record_market_data_account_early_drop_total, record_market_data_account_handler_duration_us,
+    market_data_geyser_head_slot_value, market_data_geyser_tracking_enqueue_dropped_value,
+    market_data_geyser_tracking_jobs_processed_value, market_data_md_state_bursts_completed_value,
+    market_data_request_account_session_reconnect, market_data_request_tx_session_reconnect,
+    market_data_tx_handler_processed_value, record_market_data_account_broadcast_lagged,
+    record_market_data_account_channel_lag_ms, record_market_data_account_early_drop_total,
+    record_market_data_account_handler_duration_us,
     record_market_data_account_publish_worker_job_duration_us,
     record_market_data_account_publish_worker_reconnect,
     record_market_data_account_publish_worker_stall,
@@ -100,6 +104,7 @@ use ironcrab::metrics::{
     record_market_data_geyser_merge_coalesced_total, record_market_data_geyser_sync_batch_total,
     record_market_data_geyser_sync_immediate_total,
     record_market_data_geyser_to_publish_on_success, record_market_data_global_ingest_stall,
+    record_market_data_md_state_stall, record_market_data_md_state_sync_flush_duration_us,
     record_market_data_momentum_active_pool_messages_total,
     record_market_data_pool_mint_map_to_devwallet_ms, record_market_data_tokio_liveness_stall,
     record_market_data_tokio_progress, record_market_data_trade_after_bonding_publish_ms,
@@ -111,14 +116,15 @@ use ironcrab::metrics::{
     set_market_data_arb_pinned_pools_gauge, set_market_data_geyser_merge_pending,
     set_market_data_geyser_sync_pending, set_market_data_geyser_tracking_queue_depth,
     set_market_data_hot_pool_registry_pools_gauge, set_market_data_md_sidefx_queue_depth,
-    set_market_data_md_state_queue_depth, set_market_data_momentum_active_pool_pins_gauge,
-    set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
-    set_readiness_nats_connected, touch_market_data_global_ingest_progress,
-    update_readiness_market_data_current, wall_clock_unix_ms_now, GeyserTrackedEvictKind,
-    MarketDataLatencySegment, MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
-    MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL,
-    MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
-    NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
+    set_market_data_md_state_evict_pending, set_market_data_md_state_queue_depth,
+    set_market_data_momentum_active_pool_pins_gauge, set_market_data_tx_broadcast_queue_depth,
+    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
+    touch_market_data_global_ingest_progress, update_readiness_market_data_current,
+    wall_clock_unix_ms_now, GeyserTrackedEvictKind, MarketDataLatencySegment, MetricsComponent,
+    MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS,
+    MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
+    MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
+    POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -184,6 +190,18 @@ const MARKET_DATA_GEYSER_SYNC_STARTUP_WINDOW: Duration = Duration::from_secs(120
 const MARKET_DATA_GEYSER_SYNC_STARTUP_MIN_MS: u64 = 250;
 /// PR233: max debounced Geyser sync flushes per second during startup burst.
 const MARKET_DATA_GEYSER_SYNC_FLUSH_MAX_PER_SEC: usize = 4;
+/// PR234: max wall time per md-state burst (job processing + sync/evict slice).
+const MARKET_DATA_MD_STATE_BURST_BUDGET_MS: u64 = 12;
+/// PR234: max LRU eviction steps per sync/evict slice on md-state.
+const MARKET_DATA_GEYSER_EVICT_MAX_STEPS_PER_FLUSH: usize = 16;
+/// PR234: md-state liveness poll interval (OS thread).
+const MARKET_DATA_MD_STATE_STALL_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+/// PR234: queue near-cap + flat progress before stall metric.
+const MARKET_DATA_MD_STATE_STALL_WINDOW: Duration = Duration::from_secs(60);
+/// PR234: exit for systemd restart after sustained md-state stall.
+const MARKET_DATA_MD_STATE_STALL_EXIT_AFTER: Duration = Duration::from_secs(120);
+/// PR234: queue depth fraction treated as saturation for md-state liveness.
+const MARKET_DATA_MD_STATE_STALL_QUEUE_FRAC: f64 = 0.95;
 /// PR169c: bounded channel for momentum updates before actor coalesce.
 const MARKET_DATA_MOMENTUM_COALESCE_CHANNEL_CAP: usize = 512;
 /// PR169c: chunk large momentum applies so the tracking actor yields to ingest tasks.
@@ -352,6 +370,8 @@ enum MdStateCommand {
     ScheduleGeyserSyncAfterConfigChange,
     /// PR233: debounced explicit Geyser sync flush — executed only on `md-state` thread.
     FlushGeyserSyncDebounced,
+    /// PR234: resume budgeted LRU eviction + partial sync after prior flush exhausted budget.
+    ContinueGeyserEvict,
     /// Phase-R-R2: LRU touch only (no subscription change). Legacy singles coalesced into batch.
     #[allow(dead_code)]
     TouchVault(Pubkey),
@@ -557,7 +577,7 @@ fn md_state_process_job(ctx: &Arc<MarketDataContext>, job: MdStateCommand) -> bo
             ctx.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet))
         }
         MdStateCommand::ScheduleGeyserSyncAfterConfigChange => true,
-        MdStateCommand::FlushGeyserSyncDebounced => false,
+        MdStateCommand::FlushGeyserSyncDebounced | MdStateCommand::ContinueGeyserEvict => false,
         MdStateCommand::TouchVault(vault) => {
             ctx.touch_tracked_vault_pubkey(&vault);
             false
@@ -609,41 +629,89 @@ fn md_state_worker_loop(
     queue_depth: Arc<AtomicUsize>,
     md_state: MdStateSender,
 ) {
+    let mut deferred_jobs: VecDeque<MdStateCommand> = VecDeque::new();
     loop {
-        let Ok(first) = rx.recv() else {
-            break;
-        };
-        md_state_dec_queue_depth(&queue_depth);
-        inc_market_data_geyser_tracking_jobs_processed_total();
-        let mut jobs = vec![first];
+        let burst_deadline =
+            Instant::now() + Duration::from_millis(MARKET_DATA_MD_STATE_BURST_BUDGET_MS);
+        let mut jobs = Vec::new();
         while jobs.len() < MARKET_DATA_MD_STATE_BURST_MAX {
-            match rx.try_recv() {
-                Ok(job) => {
-                    md_state_dec_queue_depth(&queue_depth);
-                    inc_market_data_geyser_tracking_jobs_processed_total();
-                    jobs.push(job);
+            if let Some(job) = deferred_jobs.pop_front() {
+                jobs.push(job);
+            } else if jobs.is_empty() {
+                let Ok(first) = rx.recv() else {
+                    break;
+                };
+                md_state_dec_queue_depth(&queue_depth);
+                inc_market_data_geyser_tracking_jobs_processed_total();
+                jobs.push(first);
+            } else {
+                match rx.try_recv() {
+                    Ok(job) => {
+                        md_state_dec_queue_depth(&queue_depth);
+                        inc_market_data_geyser_tracking_jobs_processed_total();
+                        jobs.push(job);
+                    }
+                    Err(std_mpsc::TryRecvError::Empty) => break,
+                    Err(std_mpsc::TryRecvError::Disconnected) => break,
                 }
-                Err(std_mpsc::TryRecvError::Empty) => break,
-                Err(std_mpsc::TryRecvError::Disconnected) => break,
             }
+        }
+        if jobs.is_empty() {
+            continue;
         }
         let jobs = md_state_coalesce_jobs(jobs);
         let flush_geyser_sync = jobs
             .iter()
             .any(|job| matches!(job, MdStateCommand::FlushGeyserSyncDebounced));
+        let continue_geyser_evict = jobs
+            .iter()
+            .any(|job| matches!(job, MdStateCommand::ContinueGeyserEvict));
         let schedule_sync_after_config = jobs
             .iter()
             .any(|job| matches!(job, MdStateCommand::ScheduleGeyserSyncAfterConfigChange));
         let before_keys = ctx.snapshot_explicit_subscription_pubkeys();
+        let mut deferred_this_burst = VecDeque::new();
         for job in jobs {
-            if matches!(job, MdStateCommand::FlushGeyserSyncDebounced) {
+            if Instant::now() >= burst_deadline {
+                deferred_this_burst.push_back(job);
                 continue;
             }
-            let _ = md_state_process_job(&ctx, job);
+            match job {
+                MdStateCommand::FlushGeyserSyncDebounced | MdStateCommand::ContinueGeyserEvict => {}
+                other => {
+                    let _ = md_state_process_job(&ctx, other);
+                }
+            }
+        }
+        while let Some(job) = deferred_this_burst.pop_front() {
+            deferred_jobs.push_back(job);
         }
         let after_keys = ctx.snapshot_explicit_subscription_pubkeys();
-        if flush_geyser_sync {
-            ctx.sync_geyser_tracked_accounts_batched_flush();
+        let evict_pending = ctx.pending_geyser_evict.load(Ordering::Relaxed);
+        if flush_geyser_sync || continue_geyser_evict || evict_pending {
+            if Instant::now() < burst_deadline {
+                let flush_start = Instant::now();
+                let sync_complete = if flush_geyser_sync {
+                    set_market_data_geyser_sync_pending(0);
+                    record_market_data_geyser_sync_batch_total();
+                    ctx.sync_geyser_tracked_accounts_core_with_deadline(burst_deadline)
+                } else {
+                    ctx.continue_geyser_evict_with_deadline(burst_deadline)
+                };
+                record_market_data_md_state_sync_flush_duration_us(
+                    flush_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                );
+                if flush_geyser_sync {
+                    ctx.release_geyser_sync_flush_slot();
+                }
+                if !sync_complete {
+                    deferred_jobs.push_front(MdStateCommand::ContinueGeyserEvict);
+                }
+            } else if flush_geyser_sync {
+                deferred_jobs.push_front(MdStateCommand::FlushGeyserSyncDebounced);
+            } else {
+                deferred_jobs.push_front(MdStateCommand::ContinueGeyserEvict);
+            }
         } else if explicit_subscription_has_new_keys(&before_keys, &after_keys)
             || schedule_sync_after_config
         {
@@ -652,6 +720,7 @@ fn md_state_worker_loop(
             inc_market_data_geyser_sync_skipped_no_delta_total();
         }
         ctx.refresh_hot_pool_registry_gauges();
+        inc_market_data_md_state_bursts_completed_total();
     }
 }
 
@@ -3403,6 +3472,8 @@ struct MarketDataContext {
     pool_discovery_poolcreated_emitted: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
     /// Explicit Geyser subscription pubkeys after last [`Self::sync_geyser_tracked_accounts_core`] flush.
     last_synced_explicit_pubkeys: parking_lot::RwLock<HashSet<Pubkey>>,
+    /// PR234: LRU eviction to cap incomplete — resume on next flush/`ContinueGeyserEvict`.
+    pending_geyser_evict: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -3926,10 +3997,14 @@ fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> {
     let mut lru_vaults = HashSet::new();
     let mut lru_bin_arrays = HashSet::new();
     let mut pending_flush = false;
+    let mut pending_evict_continue = false;
     for job in jobs {
         match job {
             MdStateCommand::FlushGeyserSyncDebounced => {
                 pending_flush = true;
+            }
+            MdStateCommand::ContinueGeyserEvict => {
+                pending_evict_continue = true;
             }
             MdStateCommand::ArbMultiDexReconcile { mint } => {
                 if seen_mints.insert(mint) {
@@ -3972,6 +4047,9 @@ fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> {
     }
     if pending_flush {
         out.push(MdStateCommand::FlushGeyserSyncDebounced);
+    }
+    if pending_evict_continue {
+        out.push(MdStateCommand::ContinueGeyserEvict);
     }
     out
 }
@@ -5035,167 +5113,185 @@ impl MarketDataContext {
         })
     }
 
-    /// PR-B: LRU eviction when explicit combined accounts exceed `max_tracked_accounts`.
-    /// Never evicts pinned rows; never evicts wallet subscription keys (they are not in these maps).
-    fn evict_geyser_unpinned_lru_to_cap(&self) {
+    /// PR-B / PR234: one LRU eviction step. Returns true if an account was removed.
+    fn evict_one_geyser_lru_step(&self) -> bool {
         let cap = self.config.read().max_tracked_accounts;
+        if self.combined_geyser_explicit_accounts() <= cap {
+            return false;
+        }
         let run_id = self.run_id.clone();
-        loop {
-            if self.combined_geyser_explicit_accounts() <= cap {
-                break;
-            }
 
-            #[derive(Clone, Copy)]
-            enum EvKind {
-                Vault,
-                Bin,
-                Mint,
-            }
-            let mut best: Option<(Instant, EvKind, Pubkey)> = None;
+        #[derive(Clone, Copy)]
+        enum EvKind {
+            Vault,
+            Bin,
+            Mint,
+        }
+        let mut best: Option<(Instant, EvKind, Pubkey)> = None;
 
-            for (pk, v) in self.tracked_vaults.read().iter() {
-                if v.pinned {
-                    continue;
+        for (pk, v) in self.tracked_vaults.read().iter() {
+            if v.pinned {
+                continue;
+            }
+            let cand = (v.last_used_at, EvKind::Vault, *pk);
+            best = Some(match best {
+                None => cand,
+                Some(b) if cand.0 < b.0 => cand,
+                Some(b) => b,
+            });
+        }
+        for (pk, b) in self.tracked_bin_arrays.read().iter() {
+            if b.pinned {
+                continue;
+            }
+            let cand = (b.last_used_at, EvKind::Bin, *pk);
+            best = Some(match best {
+                None => cand,
+                Some(x) if cand.0 < x.0 => cand,
+                Some(x) => x,
+            });
+        }
+        for (pk, m) in self.tracked_mints.read().iter() {
+            if m.pinned {
+                continue;
+            }
+            let cand = (m.last_used_at, EvKind::Mint, *pk);
+            best = Some(match best {
+                None => cand,
+                Some(x) if cand.0 < x.0 => cand,
+                Some(x) => x,
+            });
+        }
+
+        let Some((oldest_at, kind, pubkey)) = best else {
+            error!(
+                run_id = %run_id,
+                cap,
+                combined = self.combined_geyser_explicit_accounts(),
+                "geyser_evict: cannot reach cap — only pinned explicit accounts remain (no LRU candidates)"
+            );
+            self.pending_geyser_evict.store(false, Ordering::Relaxed);
+            set_market_data_md_state_evict_pending(false);
+            return false;
+        };
+
+        match kind {
+            EvKind::Vault => {
+                let mut vaults = self.tracked_vaults.write();
+                match vaults.get(&pubkey) {
+                    None => return false,
+                    Some(v) if v.pinned => return false,
+                    Some(_) => {}
                 }
-                let cand = (v.last_used_at, EvKind::Vault, *pk);
-                best = Some(match best {
-                    None => cand,
-                    Some(b) if cand.0 < b.0 => cand,
-                    Some(b) => b,
-                });
-            }
-            for (pk, b) in self.tracked_bin_arrays.read().iter() {
-                if b.pinned {
-                    continue;
-                }
-                let cand = (b.last_used_at, EvKind::Bin, *pk);
-                best = Some(match best {
-                    None => cand,
-                    Some(x) if cand.0 < x.0 => cand,
-                    Some(x) => x,
-                });
-            }
-            for (pk, m) in self.tracked_mints.read().iter() {
-                if m.pinned {
-                    continue;
-                }
-                let cand = (m.last_used_at, EvKind::Mint, *pk);
-                best = Some(match best {
-                    None => cand,
-                    Some(x) if cand.0 < x.0 => cand,
-                    Some(x) => x,
-                });
-            }
-
-            let Some((oldest_at, kind, pubkey)) = best else {
-                error!(
-                    run_id = %run_id,
-                    cap,
-                    combined = self.combined_geyser_explicit_accounts(),
-                    "geyser_evict: cannot reach cap — only pinned explicit accounts remain (no LRU candidates)"
-                );
-                break;
-            };
-
-            match kind {
-                EvKind::Vault => {
-                    let mut vaults = self.tracked_vaults.write();
-                    // Re-check under write lock: LRU candidate may have been pinned after the read-only scan (TOCTOU).
-                    match vaults.get(&pubkey) {
-                        None => continue,
-                        Some(v) if v.pinned => continue,
-                        Some(_) => {}
-                    }
-                    if let Some(v) = vaults.remove(&pubkey) {
-                        geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Vault);
-                        info!(
-                            run_id = %run_id,
-                            pool = %v.pool_address,
-                            mint = %v.base_mint,
-                            vault = %pubkey,
-                            reason = "lru_cap",
-                            oldest_age_ms = ?oldest_at.elapsed().as_millis(),
-                            "geyser_evicted"
-                        );
-                        // Evict the paired vault for the same pool when **both** legs are unpinned, so
-                        // LRU does not leave a misleading half-pair. Never remove a pinned sibling.
-                        let pool = v.pool_address;
-                        let this_is_base = v.is_base_vault;
-                        let sibling_pk =
-                            Self::geyser_unpinned_sibling_vault_pubkey(&vaults, pool, this_is_base);
-                        if let Some(spk) = sibling_pk {
-                            let remove_sibling =
-                                vaults.get(&spk).map(|sv| !sv.pinned).unwrap_or(false);
-                            if remove_sibling {
-                                if let Some(sv) = vaults.remove(&spk) {
-                                    geyser_metrics_inc_tracked_evicted(
-                                        GeyserTrackedEvictKind::Vault,
-                                    );
-                                    info!(
-                                        run_id = %run_id,
-                                        pool = %sv.pool_address,
-                                        mint = %sv.base_mint,
-                                        vault = %spk,
-                                        reason = "lru_cap_pair",
-                                        oldest_age_ms = ?oldest_at.elapsed().as_millis(),
-                                        "geyser_evicted"
-                                    );
-                                }
+                if let Some(v) = vaults.remove(&pubkey) {
+                    geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Vault);
+                    info!(
+                        run_id = %run_id,
+                        pool = %v.pool_address,
+                        mint = %v.base_mint,
+                        vault = %pubkey,
+                        reason = "lru_cap",
+                        oldest_age_ms = ?oldest_at.elapsed().as_millis(),
+                        "geyser_evicted"
+                    );
+                    let pool = v.pool_address;
+                    let this_is_base = v.is_base_vault;
+                    let sibling_pk =
+                        Self::geyser_unpinned_sibling_vault_pubkey(&vaults, pool, this_is_base);
+                    if let Some(spk) = sibling_pk {
+                        let remove_sibling = vaults.get(&spk).map(|sv| !sv.pinned).unwrap_or(false);
+                        if remove_sibling {
+                            if let Some(sv) = vaults.remove(&spk) {
+                                geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Vault);
+                                info!(
+                                    run_id = %run_id,
+                                    pool = %sv.pool_address,
+                                    mint = %sv.base_mint,
+                                    vault = %spk,
+                                    reason = "lru_cap_pair",
+                                    oldest_age_ms = ?oldest_at.elapsed().as_millis(),
+                                    "geyser_evicted"
+                                );
                             }
-                        } else if Self::geyser_pinned_sibling_vault_present(
-                            &vaults,
-                            pool,
-                            this_is_base,
-                        ) {
-                            // Single warn per eviction step: unpinned leg removed, pinned partner retained
-                            // (intentional — never evict pinned explicit accounts).
-                            warn!(
-                                run_id = %run_id,
-                                pool = %pool,
-                                evicted_vault = %pubkey,
-                                evicted_was_base_vault = this_is_base,
-                                "geyser_evict: removed unpinned vault but pinned sibling vault remains tracked (half-pair subscription)"
-                            );
                         }
-                    }
-                }
-                EvKind::Bin => {
-                    let mut bins = self.tracked_bin_arrays.write();
-                    match bins.get(&pubkey) {
-                        None => continue,
-                        Some(b) if b.pinned => continue,
-                        Some(_) => {}
-                    }
-                    if let Some(b) = bins.remove(&pubkey) {
-                        geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::BinArray);
-                        info!(
+                    } else if Self::geyser_pinned_sibling_vault_present(&vaults, pool, this_is_base)
+                    {
+                        warn!(
                             run_id = %run_id,
-                            pool = %b.pool_address,
-                            bin_array = %pubkey,
-                            reason = "lru_cap",
-                            "geyser_evicted"
+                            pool = %pool,
+                            evicted_vault = %pubkey,
+                            evicted_was_base_vault = this_is_base,
+                            "geyser_evict: removed unpinned vault but pinned sibling vault remains tracked (half-pair subscription)"
                         );
                     }
                 }
-                EvKind::Mint => {
-                    let mut mints = self.tracked_mints.write();
-                    match mints.get(&pubkey) {
-                        None => continue,
-                        Some(m) if m.pinned => continue,
-                        Some(_) => {}
-                    }
-                    if mints.remove(&pubkey).is_some() {
-                        geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Mint);
-                        info!(
-                            run_id = %run_id,
-                            mint = %pubkey,
-                            reason = "lru_cap",
-                            "geyser_evicted"
-                        );
-                    }
+            }
+            EvKind::Bin => {
+                let mut bins = self.tracked_bin_arrays.write();
+                match bins.get(&pubkey) {
+                    None => return false,
+                    Some(b) if b.pinned => return false,
+                    Some(_) => {}
+                }
+                if let Some(b) = bins.remove(&pubkey) {
+                    geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::BinArray);
+                    info!(
+                        run_id = %run_id,
+                        pool = %b.pool_address,
+                        bin_array = %pubkey,
+                        reason = "lru_cap",
+                        "geyser_evicted"
+                    );
+                }
+            }
+            EvKind::Mint => {
+                let mut mints = self.tracked_mints.write();
+                match mints.get(&pubkey) {
+                    None => return false,
+                    Some(m) if m.pinned => return false,
+                    Some(_) => {}
+                }
+                if mints.remove(&pubkey).is_some() {
+                    geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Mint);
+                    info!(
+                        run_id = %run_id,
+                        mint = %pubkey,
+                        reason = "lru_cap",
+                        "geyser_evicted"
+                    );
                 }
             }
         }
+        true
+    }
+
+    /// PR234: budgeted LRU eviction — max steps and wall deadline per md-state slice.
+    fn evict_geyser_unpinned_lru_budgeted(&self, deadline: Instant) -> bool {
+        let cap = self.config.read().max_tracked_accounts;
+        let mut steps = 0usize;
+        while self.combined_geyser_explicit_accounts() > cap
+            && steps < MARKET_DATA_GEYSER_EVICT_MAX_STEPS_PER_FLUSH
+            && Instant::now() < deadline
+        {
+            if !self.evict_one_geyser_lru_step() {
+                break;
+            }
+            steps += 1;
+            std::thread::yield_now();
+        }
+        if steps > 0 {
+            inc_market_data_md_state_evict_steps_total(steps as u64);
+        }
+        let cap_reached = self.combined_geyser_explicit_accounts() <= cap;
+        if cap_reached {
+            self.pending_geyser_evict.store(false, Ordering::Relaxed);
+            set_market_data_md_state_evict_pending(false);
+        } else {
+            self.pending_geyser_evict.store(true, Ordering::Relaxed);
+            set_market_data_md_state_evict_pending(true);
+            inc_market_data_md_state_evict_steps_budget_exhausted_total();
+        }
+        cap_reached
     }
 
     /// Push current explicit tracked keys to all merge-task channels after eviction.
@@ -5212,22 +5308,37 @@ impl MarketDataContext {
         self.refresh_geyser_pins_gauge();
     }
 
+    /// Returns true when eviction finished (cap OK or no LRU candidates) and broadcast/snapshot applied.
+    fn sync_geyser_tracked_accounts_core_with_deadline(&self, deadline: Instant) -> bool {
+        let cap_reached = self.evict_geyser_unpinned_lru_budgeted(deadline);
+        let evict_complete = cap_reached || !self.pending_geyser_evict.load(Ordering::Relaxed);
+        if evict_complete {
+            self.broadcast_tracked_geyser_explicit_to_merge();
+            *self.last_synced_explicit_pubkeys.write() =
+                self.snapshot_explicit_subscription_pubkeys();
+            true
+        } else {
+            inc_market_data_geyser_sync_partial_total();
+            false
+        }
+    }
+
+    fn continue_geyser_evict_with_deadline(&self, deadline: Instant) -> bool {
+        self.sync_geyser_tracked_accounts_core_with_deadline(deadline)
+    }
+
     fn sync_geyser_tracked_accounts_core(&self) {
-        self.evict_geyser_unpinned_lru_to_cap();
-        self.broadcast_tracked_geyser_explicit_to_merge();
-        *self.last_synced_explicit_pubkeys.write() = self.snapshot_explicit_subscription_pubkeys();
+        let deadline = Instant::now() + Duration::from_secs(300);
+        while !self.sync_geyser_tracked_accounts_core_with_deadline(deadline)
+            && self.pending_geyser_evict.load(Ordering::Relaxed)
+        {
+            std::thread::yield_now();
+        }
     }
 
     /// Immediate subscription-list sync (momentum pins, wallet tracks, config, account-path admission, …).
     fn sync_geyser_tracked_accounts(&self) {
         record_market_data_geyser_sync_immediate_total();
-        self.sync_geyser_tracked_accounts_core();
-    }
-
-    /// Debounced TX-path flush: one coalesced sync after the batch window.
-    fn sync_geyser_tracked_accounts_batched_flush(&self) {
-        set_market_data_geyser_sync_pending(0);
-        record_market_data_geyser_sync_batch_total();
         self.sync_geyser_tracked_accounts_core();
     }
 
@@ -10688,6 +10799,7 @@ async fn main() -> Result<()> {
     record_market_data_tokio_progress();
     let process_started = Instant::now();
     spawn_market_data_global_ingest_liveness_task(process_started);
+    spawn_market_data_md_state_liveness_task(process_started);
 
     // Setup NATS (optional in dry-run mode)
     let nats = if args.dry_run {
@@ -10837,6 +10949,7 @@ async fn main() -> Result<()> {
             std::collections::HashSet::new(),
         ),
         last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
+        pending_geyser_evict: AtomicBool::new(false),
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -12216,6 +12329,70 @@ fn spawn_market_data_global_ingest_liveness_task(process_started: Instant) {
             }
         })
         .expect("spawn md-ingest-liveness thread");
+}
+
+/// PR234: detect md-state stall (queue near cap + flat burst/job progress). OS thread — not Tokio.
+fn spawn_market_data_md_state_liveness_task(process_started: Instant) {
+    std::thread::Builder::new()
+        .name("md-state-liveness".into())
+        .spawn(move || {
+            const STARTUP_GRACE: Duration = Duration::from_secs(120);
+            let queue_saturation = ((MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP as f64)
+                * MARKET_DATA_MD_STATE_STALL_QUEUE_FRAC)
+                as usize;
+            let mut last_bursts = market_data_md_state_bursts_completed_value();
+            let mut last_jobs = market_data_geyser_tracking_jobs_processed_value();
+            let mut last_drops = market_data_geyser_tracking_enqueue_dropped_value();
+            let mut stalled_since: Option<Instant> = None;
+            loop {
+                std::thread::sleep(MARKET_DATA_MD_STATE_STALL_CHECK_INTERVAL);
+                if process_started.elapsed() < STARTUP_GRACE {
+                    last_bursts = market_data_md_state_bursts_completed_value();
+                    last_jobs = market_data_geyser_tracking_jobs_processed_value();
+                    last_drops = market_data_geyser_tracking_enqueue_dropped_value();
+                    stalled_since = None;
+                    continue;
+                }
+                let depth = ironcrab::metrics::MARKET_DATA_GEYSER_TRACKING_QUEUE_DEPTH
+                    .load(Ordering::Relaxed) as usize;
+                let bursts = market_data_md_state_bursts_completed_value();
+                let jobs = market_data_geyser_tracking_jobs_processed_value();
+                let drops = market_data_geyser_tracking_enqueue_dropped_value();
+                let progress_stalled = bursts == last_bursts && jobs == last_jobs;
+                let drops_rising = drops > last_drops;
+                if depth >= queue_saturation && (progress_stalled || drops_rising) {
+                    let since = *stalled_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= MARKET_DATA_MD_STATE_STALL_WINDOW {
+                        record_market_data_md_state_stall();
+                        warn!(
+                            stall_secs = MARKET_DATA_MD_STATE_STALL_WINDOW.as_secs(),
+                            queue_depth = depth,
+                            queue_cap = MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP,
+                            bursts_completed = bursts,
+                            jobs_dequeued = jobs,
+                            enqueue_dropped = drops,
+                            "PR234: md-state stalled near queue cap (check md-state thread wchan)"
+                        );
+                    }
+                    if since.elapsed() >= MARKET_DATA_MD_STATE_STALL_EXIT_AFTER {
+                        error!(
+                            stall_secs = MARKET_DATA_MD_STATE_STALL_EXIT_AFTER.as_secs(),
+                            queue_depth = depth,
+                            "PR234: md-state still stalled — exiting for systemd restart"
+                        );
+                        #[cfg(unix)]
+                        MD_SYSTEMD_WATCHDOG_NOTIFY.store(false, Ordering::Relaxed);
+                        std::process::exit(1);
+                    }
+                } else {
+                    stalled_since = None;
+                }
+                last_bursts = bursts;
+                last_jobs = jobs;
+                last_drops = drops;
+            }
+        })
+        .expect("spawn md-state-liveness thread");
 }
 
 /// PR160: isolated publish thread + multi-worker Tokio (no NATS await on main Geyser runtime).
@@ -16365,6 +16542,7 @@ mod wallet_tx_meta_balance_tests {
                 std::collections::HashSet::new(),
             ),
             last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
+            pending_geyser_evict: AtomicBool::new(false),
         })
     }
 
@@ -17238,6 +17416,7 @@ mod pr_b_geyser_tracking_tests {
                 std::collections::HashSet::new(),
             ),
             last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
+            pending_geyser_evict: AtomicBool::new(false),
         })
     }
 
@@ -17305,6 +17484,7 @@ mod pr_b_geyser_tracking_tests {
                 std::collections::HashSet::new(),
             ),
             last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
+            pending_geyser_evict: AtomicBool::new(false),
         });
         (
             ctx,
@@ -20836,5 +21016,114 @@ mod pr_b_geyser_tracking_tests {
         assert!(vaults.get(&quote_a).unwrap().last_used_at > old);
         assert_eq!(vaults.get(&base_b).unwrap().last_used_at, old);
         assert_eq!(vaults.get(&quote_b).unwrap().last_used_at, old);
+    }
+
+    /// PR234: budgeted eviction stops before cap and resumes on next slice.
+    #[test]
+    fn pr234_evict_budget_stops_and_sets_pending() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        {
+            let mut cfg = ctx.config.write();
+            cfg.max_tracked_accounts = 2;
+        }
+        let old = Instant::now() - Duration::from_secs(3600);
+        let mk_vault = |pool: Pubkey, is_base: bool| VaultInfo {
+            pool_address: pool,
+            dex: "x".into(),
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            is_base_vault: is_base,
+            last_balance: std::sync::atomic::AtomicU64::new(0),
+            last_used_at: old,
+            pinned: false,
+            pin: None,
+            active_id: None,
+            bin_step: None,
+            sibling_vault: None,
+        };
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            for _ in 0..25 {
+                let pool = Pubkey::new_unique();
+                vaults.insert(Pubkey::new_unique(), mk_vault(pool, true));
+            }
+        }
+        let combined_before = ctx.combined_geyser_explicit_accounts();
+        assert!(combined_before > 2);
+        let short_deadline = Instant::now() + Duration::from_secs(1);
+        let cap_reached = ctx.evict_geyser_unpinned_lru_budgeted(short_deadline);
+        assert!(!cap_reached);
+        assert!(ctx.pending_geyser_evict.load(Ordering::Relaxed));
+        assert!(ctx.combined_geyser_explicit_accounts() < combined_before);
+        assert!(ctx.combined_geyser_explicit_accounts() > 2);
+        let long_deadline = Instant::now() + Duration::from_secs(5);
+        while !ctx.evict_geyser_unpinned_lru_budgeted(long_deadline)
+            && ctx.pending_geyser_evict.load(Ordering::Relaxed)
+        {
+            std::thread::yield_now();
+        }
+        assert!(ctx.combined_geyser_explicit_accounts() <= 2);
+        assert!(!ctx.pending_geyser_evict.load(Ordering::Relaxed));
+    }
+
+    /// PR234: debounced flush slot is released after md-state flush attempt.
+    #[test]
+    fn pr234_geyser_sync_flush_slot_acquire_flush_release() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        assert!(ctx.try_acquire_geyser_sync_flush_slot());
+        let before = ctx.geyser_sync_flush_timestamps.lock().len();
+        assert_eq!(before, 1);
+        let _ = ctx.sync_geyser_tracked_accounts_core_with_deadline(
+            Instant::now() + Duration::from_secs(1),
+        );
+        ctx.release_geyser_sync_flush_slot();
+        assert_eq!(ctx.geyser_sync_flush_timestamps.lock().len(), 0);
+        for _ in 0..MARKET_DATA_GEYSER_SYNC_FLUSH_MAX_PER_SEC {
+            assert!(ctx.try_acquire_geyser_sync_flush_slot());
+        }
+        assert!(!ctx.try_acquire_geyser_sync_flush_slot());
+        ctx.release_geyser_sync_flush_slot();
+    }
+
+    /// PR234: `sync_geyser_tracked_accounts_core` stays off Tokio ingest handlers (extends PR233 guard).
+    #[test]
+    fn pr234_sync_core_not_called_from_tokio_ingest_handlers() {
+        let src = include_str!("market_data.rs");
+        let tx_start = src
+            .find("async fn handle_geyser_transaction")
+            .expect("tx handler");
+        let tx_end = src
+            .find("async fn run_geyser_loop")
+            .expect("after tx handler");
+        let acc_start = src
+            .find("async fn handle_geyser_account")
+            .expect("account handler");
+        let acc_end = src
+            .find("async fn handle_geyser_transaction")
+            .expect("after account handler");
+        let tx_body = &src[tx_start..tx_end];
+        let acc_body = &src[acc_start..acc_end];
+        assert!(
+            !tx_body.contains("sync_geyser_tracked_accounts_core"),
+            "TX handler must not call sync_geyser_tracked_accounts_core"
+        );
+        assert!(
+            !acc_body.contains("sync_geyser_tracked_accounts_core"),
+            "account handler must not call sync_geyser_tracked_accounts_core"
+        );
+        assert!(
+            !tx_body.contains("sync_geyser_tracked_accounts_batched_flush"),
+            "TX handler must not call sync_geyser_tracked_accounts_batched_flush"
+        );
+        assert!(
+            !acc_body.contains("sync_geyser_tracked_accounts_batched_flush"),
+            "account handler must not call sync_geyser_tracked_accounts_batched_flush"
+        );
     }
 }
