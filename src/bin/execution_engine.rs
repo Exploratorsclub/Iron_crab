@@ -3141,6 +3141,7 @@ impl ExecutionContext {
                     match resp.status {
                         ControlResponseStatus::Ok => DiscoveryRequestOutcome::Ok,
                         ControlResponseStatus::NotFound => DiscoveryRequestOutcome::NotFound,
+                        ControlResponseStatus::Busy => DiscoveryRequestOutcome::Timeout,
                         ControlResponseStatus::Error => DiscoveryRequestOutcome::Error(
                             resp.message.unwrap_or_else(|| "unknown error".to_string()),
                         ),
@@ -3248,6 +3249,7 @@ impl ExecutionContext {
                     match resp.status {
                         ControlResponseStatus::Ok => DiscoveryRequestOutcome::Ok,
                         ControlResponseStatus::NotFound => DiscoveryRequestOutcome::NotFound,
+                        ControlResponseStatus::Busy => DiscoveryRequestOutcome::Timeout,
                         ControlResponseStatus::Error => DiscoveryRequestOutcome::Error(
                             resp.message.unwrap_or_else(|| "unknown error".to_string()),
                         ),
@@ -3355,6 +3357,7 @@ impl ExecutionContext {
                     match resp.status {
                         ControlResponseStatus::Ok => DiscoveryRequestOutcome::Ok,
                         ControlResponseStatus::NotFound => DiscoveryRequestOutcome::NotFound,
+                        ControlResponseStatus::Busy => DiscoveryRequestOutcome::Timeout,
                         ControlResponseStatus::Error => DiscoveryRequestOutcome::Error(
                             resp.message.unwrap_or_else(|| "unknown error".to_string()),
                         ),
@@ -3462,6 +3465,7 @@ impl ExecutionContext {
                     match resp.status {
                         ControlResponseStatus::Ok => DiscoveryRequestOutcome::Ok,
                         ControlResponseStatus::NotFound => DiscoveryRequestOutcome::NotFound,
+                        ControlResponseStatus::Busy => DiscoveryRequestOutcome::Timeout,
                         ControlResponseStatus::Error => DiscoveryRequestOutcome::Error(
                             resp.message.unwrap_or_else(|| "unknown error".to_string()),
                         ),
@@ -3569,6 +3573,7 @@ impl ExecutionContext {
                     match resp.status {
                         ControlResponseStatus::Ok => DiscoveryRequestOutcome::Ok,
                         ControlResponseStatus::NotFound => DiscoveryRequestOutcome::NotFound,
+                        ControlResponseStatus::Busy => DiscoveryRequestOutcome::Timeout,
                         ControlResponseStatus::Error => DiscoveryRequestOutcome::Error(
                             resp.message.unwrap_or_else(|| "unknown error".to_string()),
                         ),
@@ -14271,6 +14276,7 @@ mod execution_engine_tests {
             let actual = match resp.status {
                 ControlResponseStatus::Ok => DiscoveryRequestOutcome::Ok,
                 ControlResponseStatus::NotFound => DiscoveryRequestOutcome::NotFound,
+                ControlResponseStatus::Busy => DiscoveryRequestOutcome::Timeout,
                 ControlResponseStatus::Error => DiscoveryRequestOutcome::Error(
                     resp.message.unwrap_or_else(|| "unknown".to_string()),
                 ),

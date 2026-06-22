@@ -5341,9 +5341,16 @@ impl PumpFunAmmDex {
         if local_gpa_error || local_gpa_zero_markets {
             if local_gpa_error {
                 if let Some(ref e) = discovery_err {
+                    let err_str = e.to_string();
+                    let is_timeout = err_str.contains("timeout") || err_str.contains("timed out");
                     warn!(
                         base_mint = %base_mint,
                         error = %e,
+                        rpc_timeout = is_timeout,
+                        rpc_inflight = crate::metrics::RPC_INFLIGHT_GAUGE
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        md_state_queue_depth = crate::metrics::MARKET_DATA_GEYSER_TRACKING_QUEUE_DEPTH
+                            .load(std::sync::atomic::Ordering::Relaxed),
                         "pump_amm: local getProgramAccounts failed or unusable; attempting bounded external pool-market discovery"
                     );
                 }
