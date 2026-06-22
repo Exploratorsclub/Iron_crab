@@ -239,9 +239,13 @@ market_data_tx_handler_processed_total
 geyser_account_listener_account_updates_total
 market_data_geyser_head_slot
 market_data_geyser_tracking_jobs_processed_total
+market_data_md_state_bursts_completed_total
 # Stall-Detektoren (OS-Thread — überlebt Tokio-Freeze)
 market_data_global_ingest_stalls_total
 market_data_tokio_liveness_stalls_total
+market_data_md_state_stalls_total
+market_data_md_state_evict_pending
+market_data_geyser_sync_partial_total
 # Queue-Backlogs (Delta T0→T30 ≈ 0)
 market_data_md_state_queue_depth
 market_data_md_sidefx_queue_depth

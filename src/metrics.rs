@@ -738,8 +738,39 @@ pub static MARKET_DATA_GEYSER_TRACKING_QUEUE_DEPTH: Lazy<AtomicU64> =
 /// PR169a: Geyser tracking actor queue full (`try_send` drop).
 pub static MARKET_DATA_GEYSER_TRACKING_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
-/// PR169a: jobs processed by the Geyser tracking actor.
+/// PR169a: jobs dequeued by the md-state worker (not completion — see `market_data_md_state_bursts_completed_total`).
 pub static MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// PR234: md-state worker burst iterations completed (one per loop pass with work).
+pub static MARKET_DATA_MD_STATE_BURSTS_COMPLETED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR234: md-state detected stalled while queue near cap (OS-thread liveness).
+pub static MARKET_DATA_MD_STATE_STALLS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// PR234: LRU eviction steps executed on md-state.
+pub static MARKET_DATA_MD_STATE_EVICT_STEPS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR234: eviction stopped before cap due to per-flush step/time budget.
+pub static MARKET_DATA_MD_STATE_EVICT_STEPS_BUDGET_EXHAUSTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR234: Geyser sync flush deferred because eviction still pending (no broadcast).
+pub static MARKET_DATA_GEYSER_SYNC_PARTIAL_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// PR234: 1 when LRU eviction to cap is incomplete and will resume on next flush.
+pub static MARKET_DATA_MD_STATE_EVICT_PENDING: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+const MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_BUCKETS: &[u64] = &[
+    100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000, 10_000_000,
+];
+static MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_COUNT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
 /// Phase-R-R4: deferred side-effects queue depth (`md-sidefx` OS thread).
@@ -862,6 +893,65 @@ pub fn inc_market_data_geyser_tracking_enqueue_dropped_total() {
 #[inline]
 pub fn inc_market_data_geyser_tracking_jobs_processed_total() {
     MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn market_data_geyser_tracking_jobs_processed_value() -> u64 {
+    MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn market_data_geyser_tracking_enqueue_dropped_value() -> u64 {
+    MARKET_DATA_GEYSER_TRACKING_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn market_data_md_state_bursts_completed_value() -> u64 {
+    MARKET_DATA_MD_STATE_BURSTS_COMPLETED_TOTAL.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn inc_market_data_md_state_bursts_completed_total() {
+    MARKET_DATA_MD_STATE_BURSTS_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_market_data_md_state_stall() {
+    MARKET_DATA_MD_STATE_STALLS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_md_state_evict_steps_total(n: u64) {
+    if n > 0 {
+        MARKET_DATA_MD_STATE_EVICT_STEPS_TOTAL.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn inc_market_data_md_state_evict_steps_budget_exhausted_total() {
+    MARKET_DATA_MD_STATE_EVICT_STEPS_BUDGET_EXHAUSTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_geyser_sync_partial_total() {
+    MARKET_DATA_GEYSER_SYNC_PARTIAL_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_md_state_evict_pending(pending: bool) {
+    MARKET_DATA_MD_STATE_EVICT_PENDING.store(u64::from(pending), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_market_data_md_state_sync_flush_duration_us(us: u64) {
+    record_histogram_u64_into(
+        MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_BUCKETS,
+        &MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_BUCKET_COUNTS,
+        &MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_SUM,
+        &MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_COUNT,
+        us,
+        u64::MAX,
+    );
 }
 
 #[inline]
@@ -3887,6 +3977,38 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_geyser_tracking_jobs_processed_total",
         MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_md_state_bursts_completed_total",
+        MARKET_DATA_MD_STATE_BURSTS_COMPLETED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_md_state_stalls_total",
+        MARKET_DATA_MD_STATE_STALLS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_md_state_evict_steps_total",
+        MARKET_DATA_MD_STATE_EVICT_STEPS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_md_state_evict_steps_budget_exhausted_total",
+        MARKET_DATA_MD_STATE_EVICT_STEPS_BUDGET_EXHAUSTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_sync_partial_total",
+        MARKET_DATA_GEYSER_SYNC_PARTIAL_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_md_state_evict_pending",
+        MARKET_DATA_MD_STATE_EVICT_PENDING.load(Ordering::Relaxed)
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_md_state_sync_flush_duration_us",
+        MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_BUCKETS,
+        &MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_BUCKET_COUNTS,
+        &MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_SUM,
+        &MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_COUNT,
     );
     line!(
         "market_data_md_sidefx_queue_depth",

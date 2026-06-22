@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PR234-MD-STATE-STALL: md-state Worker Stall post PR233 (Bounded Evict/Sync)
+**Datum**: 2026-06-22  
+**Problem** (Prod `3cf97b7`, PR233 merged): Tokio-Freeze behoben, aber md-state hängt in unbounded Evict+Sync — Queue am Cap 8192, ~466 Drops/s, `arb_reconcile_attempts_total` 0.  
+**Root Cause**: (1) Evict-Loop unbounded O(k×n) auf md-state. (2) Burst 256 Jobs + vollständiger Flush ohne ms-Budget. (3) Flush-Slot ohne Release nach md-state-Flush.  
+**Fix**: Budgetierte Evict/Sync, `ContinueGeyserEvict`, `release_geyser_sync_flush_slot`, `md-state-liveness` OS-Thread, neue Metriken. **Invarianten**: I-4b, PR233 Single-Writer, keine Cap-Erhöhung.  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`, `docs/RUNBOOK_PROD.md`
+
 ### PR233-TOKIO-FREEZE-SINGLE-WRITER: Global Ingest Freeze ~6min post PR232 (Dual Writer + Tokio Liveness Blind)
 **Datum**: 2026-06-21  
 **Problem** (Prod `bf79402`, PR232 merged): ~6 min nach Restart Global-Freeze — alle Counter flat, Geyser Recv-Q wächst (2+ MB), alle `tokio-runtime-w` + `md-state` auf `futex_wait_queue`. `global_ingest_stalls_total=0` weil Liveness-Task auf eingefrorener Tokio-Runtime. md-state depth=1, drops=0 — kein Queue-Flood, sondern Runtime-Deadlock durch parallele `tracked_*`-Mutation auf md-state **und** Tokio (`sync_geyser_tracked_accounts_batched_flush`).  
