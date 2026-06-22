@@ -692,9 +692,7 @@ fn md_state_worker_loop(
             if Instant::now() < burst_deadline {
                 let flush_start = Instant::now();
                 let sync_complete = if flush_geyser_sync {
-                    set_market_data_geyser_sync_pending(0);
-                    record_market_data_geyser_sync_batch_total();
-                    ctx.sync_geyser_tracked_accounts_core_with_deadline(burst_deadline)
+                    ctx.sync_geyser_tracked_accounts_batched_flush_with_deadline(burst_deadline)
                 } else {
                     ctx.continue_geyser_evict_with_deadline(burst_deadline)
                 };
@@ -5324,6 +5322,13 @@ impl MarketDataContext {
     }
 
     fn continue_geyser_evict_with_deadline(&self, deadline: Instant) -> bool {
+        self.sync_geyser_tracked_accounts_core_with_deadline(deadline)
+    }
+
+    /// Debounced TX-path flush on md-state: bounded eviction + broadcast when complete.
+    fn sync_geyser_tracked_accounts_batched_flush_with_deadline(&self, deadline: Instant) -> bool {
+        set_market_data_geyser_sync_pending(0);
+        record_market_data_geyser_sync_batch_total();
         self.sync_geyser_tracked_accounts_core_with_deadline(deadline)
     }
 
