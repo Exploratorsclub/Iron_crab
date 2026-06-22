@@ -12525,6 +12525,32 @@ fn spawn_market_data_global_ingest_liveness_task(process_started: Instant) {
         .expect("spawn md-ingest-liveness thread");
 }
 
+/// PR235: pure stall-duration policy for md-state liveness (testable without OS thread).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MdStateStallLivenessAction {
+    None,
+    RecordStall,
+    WarnStillStalled,
+    ExitForSystemd,
+}
+
+fn md_state_stall_liveness_action(
+    stalled_duration: Duration,
+    exit_enabled: bool,
+) -> MdStateStallLivenessAction {
+    if stalled_duration >= MARKET_DATA_MD_STATE_STALL_EXIT_AFTER {
+        if exit_enabled {
+            MdStateStallLivenessAction::ExitForSystemd
+        } else {
+            MdStateStallLivenessAction::WarnStillStalled
+        }
+    } else if stalled_duration >= MARKET_DATA_MD_STATE_STALL_WINDOW {
+        MdStateStallLivenessAction::RecordStall
+    } else {
+        MdStateStallLivenessAction::None
+    }
+}
+
 /// PR234: detect md-state stall (queue near cap + flat burst/job progress). OS thread — not Tokio.
 fn spawn_market_data_md_state_liveness_task(process_started: Instant) {
     std::thread::Builder::new()
@@ -12569,27 +12595,35 @@ fn spawn_market_data_md_state_liveness_task(process_started: Instant) {
                         );
                     }
                     if since.elapsed() >= MARKET_DATA_MD_STATE_STALL_EXIT_AFTER {
-                        if MARKET_DATA_MD_STATE_STALL_EXIT_ENABLED {
-                            error!(
-                                stall_secs = MARKET_DATA_MD_STATE_STALL_EXIT_AFTER.as_secs(),
-                                queue_depth = depth,
-                                "PR235: md-state still stalled — exiting for systemd restart"
-                            );
-                            #[cfg(unix)]
-                            MD_SYSTEMD_WATCHDOG_NOTIFY.store(false, Ordering::Relaxed);
-                            std::process::exit(1);
-                        } else {
-                            warn!(
-                                stall_secs = MARKET_DATA_MD_STATE_STALL_EXIT_AFTER.as_secs(),
-                                queue_depth = depth,
-                                bursts_completed = bursts,
-                                jobs_dequeued = jobs,
-                                enqueue_dropped = drops,
-                                evict_pending =
-                                    ironcrab::metrics::MARKET_DATA_MD_STATE_EVICT_PENDING
-                                        .load(Ordering::Relaxed),
-                                "PR235: md-state still stalled (exit disabled — metric recorded)"
-                            );
+                        match md_state_stall_liveness_action(
+                            since.elapsed(),
+                            MARKET_DATA_MD_STATE_STALL_EXIT_ENABLED,
+                        ) {
+                            MdStateStallLivenessAction::ExitForSystemd => {
+                                error!(
+                                    stall_secs = MARKET_DATA_MD_STATE_STALL_EXIT_AFTER.as_secs(),
+                                    queue_depth = depth,
+                                    "PR235: md-state still stalled — exiting for systemd restart"
+                                );
+                                #[cfg(unix)]
+                                MD_SYSTEMD_WATCHDOG_NOTIFY.store(false, Ordering::Relaxed);
+                                std::process::exit(1);
+                            }
+                            MdStateStallLivenessAction::WarnStillStalled => {
+                                warn!(
+                                    stall_secs = MARKET_DATA_MD_STATE_STALL_EXIT_AFTER.as_secs(),
+                                    queue_depth = depth,
+                                    bursts_completed = bursts,
+                                    jobs_dequeued = jobs,
+                                    enqueue_dropped = drops,
+                                    evict_pending =
+                                        ironcrab::metrics::MARKET_DATA_MD_STATE_EVICT_PENDING
+                                            .load(Ordering::Relaxed),
+                                    "PR235: md-state still stalled (exit disabled — metric recorded)"
+                                );
+                            }
+                            MdStateStallLivenessAction::None
+                            | MdStateStallLivenessAction::RecordStall => {}
                         }
                     }
                 } else {
@@ -21459,9 +21493,23 @@ mod pr_b_geyser_tracking_tests {
         ));
     }
 
-    /// PR235: systemd restart on md-state stall is disabled by default until soak validates fix.
+    /// PR235: default stall policy records metric and warns — no systemd exit until soak enables flag.
     #[test]
     fn pr235_md_state_stall_exit_disabled_by_default() {
-        assert!(!MARKET_DATA_MD_STATE_STALL_EXIT_ENABLED);
+        assert_eq!(
+            md_state_stall_liveness_action(MARKET_DATA_MD_STATE_STALL_EXIT_AFTER, false),
+            MdStateStallLivenessAction::WarnStillStalled,
+        );
+        assert_eq!(
+            md_state_stall_liveness_action(
+                MARKET_DATA_MD_STATE_STALL_EXIT_AFTER,
+                MARKET_DATA_MD_STATE_STALL_EXIT_ENABLED,
+            ),
+            MdStateStallLivenessAction::WarnStillStalled,
+        );
+        assert_eq!(
+            md_state_stall_liveness_action(MARKET_DATA_MD_STATE_STALL_EXIT_AFTER, true),
+            MdStateStallLivenessAction::ExitForSystemd,
+        );
     }
 }
