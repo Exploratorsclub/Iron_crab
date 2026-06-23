@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### PR237-MD-STATE-WRITER-STARVATION: md-state frozen mid-burst (Queue @8192, bursts_completed Δ=0)
+**Datum**: 2026-06-23  
+**Problem** (Prod post-PR235 `4696edc`, ~18 min Soak): `burst_in_progress=1` dauerhaft, `jobs_processed`/`bursts_completed` flat, `enqueue_dropped` +8547/30s, md-state `wchan=futex_wait_queue`.  
+**Root Cause**: Ingest Hot-Path (`account_geyser_update_might_be_relevant`, `account_geyser_dispatch_priority_high`) hielt kontinuierlich kurze Read-Locks auf `tracked_vaults`/`tracked_mints`/`tracked_bin_arrays`; md-state Writer (Register/Touch/Momentum) verhungerte mid-burst. Zusätzlich `TouchPool` Full-Map-Scan O(alle tracked).  
+**Fix**: (1) **Scope A**: `TrackedMembershipSnapshot` via `ArcSwap`, Refresh am Burst-Ende — Ingest ohne `tracked_*`.read(). (2) **Scope B**: `pool_tracked_legs` Reverse-Index, O(legs) Touch; Trade-Pfad `TradePoolLruTouch` → md-sidefx Scratch statt `TouchPool`. (3) **Scope C**: Metriken `md_state_writer_wait_us`, `tracked_membership_snapshot_age_ms`. **Invarianten**: I-4b, PR233 Single-Writer, keine Cap-Erhöhung, kein RPC Hot Path.  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `Cargo.toml`, `docs/BUGS_FIXES.md`
+
 ### PR234-MD-STATE-STALL: md-state Worker Stall post PR233 (Bounded Evict/Sync)
 **Datum**: 2026-06-22  
 **Problem** (Prod `3cf97b7`, PR233 merged): Tokio-Freeze behoben, aber md-state hängt in unbounded Evict+Sync — Queue am Cap 8192, ~466 Drops/s, `arb_reconcile_attempts_total` 0.  

@@ -18,6 +18,7 @@
 #![allow(clippy::await_holding_lock)]
 
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use clap::Parser;
 use serde::Serialize;
 use solana_sdk::pubkey::Pubkey;
@@ -83,6 +84,7 @@ use ironcrab::metrics::{
     inc_market_data_geyser_sync_skipped_rate_limit_total,
     inc_market_data_geyser_tracking_enqueue_dropped_total,
     inc_market_data_geyser_tracking_jobs_processed_total,
+    inc_market_data_ingest_membership_snapshot_hits_total,
     inc_market_data_jsonl_enqueue_dropped_total, inc_market_data_md_sidefx_enqueue_dropped_total,
     inc_market_data_md_sidefx_jobs_processed_total,
     inc_market_data_md_state_bursts_completed_total,
@@ -108,6 +110,7 @@ use ironcrab::metrics::{
     record_market_data_geyser_sync_immediate_total,
     record_market_data_geyser_to_publish_on_success, record_market_data_global_ingest_stall,
     record_market_data_md_state_stall, record_market_data_md_state_sync_flush_duration_us,
+    record_market_data_md_state_writer_wait_us,
     record_market_data_momentum_active_pool_messages_total,
     record_market_data_pool_mint_map_to_devwallet_ms, record_market_data_tokio_liveness_stall,
     record_market_data_tokio_progress, record_market_data_trade_after_bonding_publish_ms,
@@ -123,7 +126,8 @@ use ironcrab::metrics::{
     set_market_data_md_state_evict_pending, set_market_data_md_state_queue_depth,
     set_market_data_momentum_active_pool_pins_gauge, set_market_data_tx_broadcast_queue_depth,
     set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
-    touch_market_data_global_ingest_progress, update_readiness_market_data_current,
+    touch_market_data_global_ingest_progress,
+    touch_market_data_tracked_membership_snapshot_refresh, update_readiness_market_data_current,
     wall_clock_unix_ms_now, GeyserTrackedEvictKind, MarketDataLatencySegment, MetricsComponent,
     MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS,
     MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
@@ -394,6 +398,8 @@ enum MdStateCommand {
         vaults: Vec<Pubkey>,
         bin_arrays: Vec<Pubkey>,
     },
+    /// PR237: superseded by md-sidefx `TradePoolLruTouch` on trade path; kept for queued jobs.
+    #[allow(dead_code)]
     TouchPool(Pubkey),
     /// Bounded arb-multi-dex vault/bin backfill when a mint becomes multi-DEX relevant.
     ArbMultiDexReconcile {
@@ -740,6 +746,7 @@ fn md_state_worker_loop(
             inc_market_data_geyser_sync_skipped_no_delta_total();
         }
         ctx.refresh_hot_pool_registry_gauges();
+        ctx.refresh_tracked_membership_snapshot();
         if jobs_completed > 0 || did_flush_work {
             inc_market_data_md_state_bursts_completed_total();
         }
@@ -845,6 +852,8 @@ enum MdSidefxCommand {
     },
     /// DLMM bin-array LRU touch off account ingest (coalesced in md-sidefx burst).
     TouchBinArrayTick { pda: Pubkey },
+    /// PR237: trade-path vault/bin LRU touch via sidefx scratch (replaces md-state TouchPool).
+    TradePoolLruTouch { pool: Pubkey },
     /// Phase-R-R4b: `parse_pool_account` + LivePoolCache writes + PoolCacheUpdate publish off account ingest.
     LivePoolCacheAccountUpdate {
         run_id: String,
@@ -2513,6 +2522,17 @@ fn md_sidefx_process_touch_bin_array_tick(
     scratch.note_bin_array_touch(*pda);
 }
 
+fn md_sidefx_process_trade_pool_lru_touch(
+    w: &MdSidefxWorkerCtx,
+    job: &MdSidefxCommand,
+    scratch: &mut MdSidefxBurstScratch,
+) {
+    let MdSidefxCommand::TradePoolLruTouch { pool } = job else {
+        return;
+    };
+    note_trade_pool_lru_touches_from_cache(&w.ctx, *pool, scratch);
+}
+
 fn md_sidefx_process_job(
     w: &MdSidefxWorkerCtx,
     job: &MdSidefxCommand,
@@ -2541,6 +2561,9 @@ fn md_sidefx_process_job(
         MdSidefxCommand::TouchBinArrayTick { .. } => {
             md_sidefx_process_touch_bin_array_tick(w, job, scratch)
         }
+        MdSidefxCommand::TradePoolLruTouch { .. } => {
+            md_sidefx_process_trade_pool_lru_touch(w, job, scratch)
+        }
         MdSidefxCommand::LivePoolCacheAccountUpdate { .. } => {
             md_sidefx_process_live_pool_cache_account_update(w, job, scratch)
         }
@@ -2558,6 +2581,7 @@ fn md_sidefx_coalesce_key(job: &MdSidefxCommand) -> Option<Pubkey> {
         MdSidefxCommand::LivePoolCacheAccountUpdate { pool_pubkey, .. } => Some(*pool_pubkey),
         MdSidefxCommand::VaultBalanceTick { vault_pubkey, .. } => Some(*vault_pubkey),
         MdSidefxCommand::TouchBinArrayTick { pda } => Some(*pda),
+        MdSidefxCommand::TradePoolLruTouch { pool } => Some(*pool),
         _ => None,
     }
 }
@@ -3444,6 +3468,11 @@ struct MarketDataContext {
     /// Channel to notify GeyserAccountListener when tracked bin arrays change (triggers resubscribe).
     tracked_bin_arrays_tx: watch::Sender<Vec<Pubkey>>,
 
+    /// PR237: ingest hot-path membership (no `tracked_*` read locks).
+    tracked_membership: ArcSwap<TrackedMembershipSnapshot>,
+    /// PR237: pool → vault/bin pubkeys for O(legs) LRU touch (md-state writer only).
+    pool_tracked_legs: parking_lot::RwLock<HashMap<Pubkey, PoolTrackedLegs>>,
+
     /// MASTER LivePoolCache - Single Source of Truth for all pool state.
     /// Updated via Geyser events and propagated to execution-engine via NATS.
     live_pool_cache: Arc<LivePoolCache>,
@@ -3658,6 +3687,21 @@ struct BinArrayInfo {
     last_used_at: Instant,
     pinned: bool,
     pin: Option<GeyserPinReason>,
+}
+
+/// PR237: lock-free ingest membership view (refreshed by md-state at burst end).
+#[derive(Clone, Default)]
+struct TrackedMembershipSnapshot {
+    vaults: HashSet<Pubkey>,
+    mints: HashSet<Pubkey>,
+    bin_arrays: HashSet<Pubkey>,
+}
+
+/// PR237: reverse index pool → tracked vault/bin pubkeys (md-state writer only).
+#[derive(Clone, Debug, Default)]
+struct PoolTrackedLegs {
+    vaults: Vec<Pubkey>,
+    bin_arrays: Vec<Pubkey>,
 }
 
 #[derive(Clone, Copy)]
@@ -4130,6 +4174,51 @@ fn pool_needs_tracking_refresh_after_cache_upsert(
     true
 }
 
+/// PR237: cache-first vault/bin pubkeys for trade-path LRU touch (no full-map scan).
+fn note_trade_pool_lru_touches_from_cache(
+    ctx: &MarketDataContext,
+    pool: Pubkey,
+    scratch: &mut MdSidefxBurstScratch,
+) {
+    if !ctx.hot_pool_registry.is_hot_pool(pool) {
+        return;
+    }
+    let Some(state) = ctx.live_pool_cache.get(&pool) else {
+        return;
+    };
+    let (enable_meteora_cpmm, enable_meteora_dlmm) = {
+        let cfg = ctx.config.read();
+        (cfg.enable_meteora_cpmm, cfg.enable_meteora_dlmm)
+    };
+    if let Some((base_vault, quote_vault)) =
+        expected_pool_vault_pubkeys_from_cache(&state, enable_meteora_cpmm, enable_meteora_dlmm)
+    {
+        scratch.note_vault_touch(base_vault);
+        scratch.note_vault_touch(quote_vault);
+    }
+    if enable_meteora_dlmm {
+        if let CachedPoolState::Meteora(s) = &state {
+            let active_array_index = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(s.active_id);
+            for offset in -3i64..=3i64 {
+                let index = active_array_index + offset;
+                if let Ok(pda) = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&pool, index) {
+                    scratch.note_bin_array_touch(pda);
+                }
+            }
+        }
+    }
+}
+
+/// PR237: lock-free membership check for Geyser ingest filters.
+fn tracked_membership_contains_pubkey(ctx: &MarketDataContext, pk: &Pubkey) -> bool {
+    let snap = ctx.tracked_membership.load();
+    if snap.vaults.contains(pk) || snap.mints.contains(pk) || snap.bin_arrays.contains(pk) {
+        inc_market_data_ingest_membership_snapshot_hits_total();
+        return true;
+    }
+    false
+}
+
 fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> {
     let mut out = Vec::with_capacity(jobs.len());
     let mut seen_mints = HashSet::new();
@@ -4377,6 +4466,78 @@ impl MarketDataContext {
         set_market_data_hot_pool_registry_pools_gauge("both", both);
         set_market_data_momentum_active_pool_pins_gauge(self.hot_pool_registry.pair_count());
         self.refresh_arb_pin_gauges();
+    }
+
+    /// PR237: rebuild ingest membership snapshot from authoritative md-state maps.
+    fn refresh_tracked_membership_snapshot(&self) {
+        let vaults: HashSet<Pubkey> = self.tracked_vaults.read().keys().copied().collect();
+        let mints: HashSet<Pubkey> = self.tracked_mints.read().keys().copied().collect();
+        let bin_arrays: HashSet<Pubkey> = self.tracked_bin_arrays.read().keys().copied().collect();
+        self.tracked_membership
+            .store(Arc::new(TrackedMembershipSnapshot {
+                vaults,
+                mints,
+                bin_arrays,
+            }));
+        touch_market_data_tracked_membership_snapshot_refresh();
+    }
+
+    fn pool_tracked_legs_note_vault(&self, pool: Pubkey, vault: Pubkey) {
+        let mut legs = self.pool_tracked_legs.write();
+        let entry = legs.entry(pool).or_default();
+        if !entry.vaults.contains(&vault) {
+            entry.vaults.push(vault);
+        }
+    }
+
+    fn pool_tracked_legs_note_bin(&self, pool: Pubkey, pda: Pubkey) {
+        let mut legs = self.pool_tracked_legs.write();
+        let entry = legs.entry(pool).or_default();
+        if !entry.bin_arrays.contains(&pda) {
+            entry.bin_arrays.push(pda);
+        }
+    }
+
+    fn pool_tracked_legs_remove_vault(&self, pool: Pubkey, vault: Pubkey) {
+        let mut legs = self.pool_tracked_legs.write();
+        if let Some(entry) = legs.get_mut(&pool) {
+            entry.vaults.retain(|pk| *pk != vault);
+            if entry.vaults.is_empty() && entry.bin_arrays.is_empty() {
+                legs.remove(&pool);
+            }
+        }
+    }
+
+    fn pool_tracked_legs_remove_bin(&self, pool: Pubkey, pda: Pubkey) {
+        let mut legs = self.pool_tracked_legs.write();
+        if let Some(entry) = legs.get_mut(&pool) {
+            entry.bin_arrays.retain(|pk| *pk != pda);
+            if entry.vaults.is_empty() && entry.bin_arrays.is_empty() {
+                legs.remove(&pool);
+            }
+        }
+    }
+
+    fn tracked_vaults_write_timed(
+        &self,
+    ) -> parking_lot::RwLockWriteGuard<'_, HashMap<Pubkey, VaultInfo>> {
+        let wait_start = Instant::now();
+        let guard = self.tracked_vaults.write();
+        record_market_data_md_state_writer_wait_us(
+            wait_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+        );
+        guard
+    }
+
+    fn tracked_bin_arrays_write_timed(
+        &self,
+    ) -> parking_lot::RwLockWriteGuard<'_, HashMap<Pubkey, BinArrayInfo>> {
+        let wait_start = Instant::now();
+        let guard = self.tracked_bin_arrays.write();
+        record_market_data_md_state_writer_wait_us(
+            wait_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+        );
+        guard
     }
 
     /// True when pool passes arb-multi-dex admission (multi-dex relevance + reserve basis).
@@ -5312,6 +5473,7 @@ impl MarketDataContext {
                         "geyser_evicted"
                     );
                     let pool = v.pool_address;
+                    self.pool_tracked_legs_remove_vault(pool, entry.pubkey);
                     let this_is_base = v.is_base_vault;
                     let sibling_pk =
                         Self::geyser_unpinned_sibling_vault_pubkey(&vaults, pool, this_is_base);
@@ -5329,6 +5491,7 @@ impl MarketDataContext {
                                     oldest_age_ms = ?oldest_at.elapsed().as_millis(),
                                     "geyser_evicted"
                                 );
+                                self.pool_tracked_legs_remove_vault(sv.pool_address, spk);
                             }
                         }
                     } else if Self::geyser_pinned_sibling_vault_present(&vaults, pool, this_is_base)
@@ -5359,6 +5522,7 @@ impl MarketDataContext {
                         reason = "lru_cap",
                         "geyser_evicted"
                     );
+                    self.pool_tracked_legs_remove_bin(b.pool_address, entry.pubkey);
                 }
             }
             GeyserLruKind::Mint => {
@@ -5711,7 +5875,11 @@ impl MarketDataContext {
         spec: TrackedVaultPairInsert<'_>,
     ) {
         let now = spec.now;
+        let pool = spec.pool;
         let inserted = insert_tracked_vault_pair(vaults, vaults_changed, spec);
+        for pk in &inserted {
+            self.pool_tracked_legs_note_vault(pool, *pk);
+        }
         for pk in inserted {
             self.geyser_lru_note_vault(pk, now);
         }
@@ -5719,7 +5887,7 @@ impl MarketDataContext {
 
     fn touch_tracked_vault_pubkey(&self, vault: &Pubkey) {
         let now = Instant::now();
-        let mut vaults = self.tracked_vaults.write();
+        let mut vaults = self.tracked_vaults_write_timed();
         let sibling = if let Some(v) = vaults.get_mut(vault) {
             v.last_used_at = now;
             self.geyser_lru_note_vault(*vault, now);
@@ -5738,7 +5906,7 @@ impl MarketDataContext {
 
     fn touch_tracked_bin_array_pubkey(&self, pda: &Pubkey) {
         let now = Instant::now();
-        if let Some(b) = self.tracked_bin_arrays.write().get_mut(pda) {
+        if let Some(b) = self.tracked_bin_arrays_write_timed().get_mut(pda) {
             b.last_used_at = now;
             self.geyser_lru_note_bin(*pda, now);
         }
@@ -5754,37 +5922,19 @@ impl MarketDataContext {
 
     fn touch_tracked_pool_vaults_and_bins(&self, pool: Pubkey) {
         let now = Instant::now();
-        {
-            let mut vs = self.tracked_vaults.write();
-            for v in vs.values_mut() {
-                if v.pool_address == pool {
-                    v.last_used_at = now;
-                }
+        if let Some(legs) = self.pool_tracked_legs.read().get(&pool).cloned() {
+            for vault in legs.vaults {
+                self.touch_tracked_vault_pubkey(&vault);
             }
-        }
-        {
-            let mut bs = self.tracked_bin_arrays.write();
-            for b in bs.values_mut() {
-                if b.pool_address == pool {
-                    b.last_used_at = now;
-                }
+            for pda in legs.bin_arrays {
+                self.touch_tracked_bin_array_pubkey(&pda);
             }
         }
         self.touch_arb_pool_activity(pool, now);
     }
 
     fn touch_tracked_pool_vaults_and_bins_if_tracked(&self, pool: Pubkey) {
-        let has_vault = self
-            .tracked_vaults
-            .read()
-            .values()
-            .any(|v| v.pool_address == pool);
-        let has_bin = self
-            .tracked_bin_arrays
-            .read()
-            .values()
-            .any(|b| b.pool_address == pool);
-        if has_vault || has_bin {
+        if self.pool_tracked_legs.read().contains_key(&pool) {
             self.touch_tracked_pool_vaults_and_bins(pool);
         }
     }
@@ -6091,6 +6241,7 @@ impl MarketDataContext {
                     drop(bin_arrays);
                     for pda in new_bins {
                         self.geyser_lru_note_bin(pda, now);
+                        self.pool_tracked_legs_note_bin(pool, pda);
                     }
                 }
             }
@@ -11073,6 +11224,8 @@ async fn main() -> Result<()> {
         tracked_vaults_tx,
         tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
         tracked_bin_arrays_tx,
+        tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
+        pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
         live_pool_cache: Arc::new(LivePoolCache::new()),
         creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
         pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -12700,13 +12853,7 @@ fn account_geyser_update_might_be_relevant(
             return true;
         }
     }
-    if ctx.tracked_mints.read().contains_key(&u.pubkey) {
-        return true;
-    }
-    if ctx.tracked_vaults.read().contains_key(&u.pubkey) {
-        return true;
-    }
-    if ctx.tracked_bin_arrays.read().contains_key(&u.pubkey) {
+    if tracked_membership_contains_pubkey(ctx, &u.pubkey) {
         return true;
     }
 
@@ -12739,11 +12886,13 @@ fn account_geyser_update_might_be_relevant(
 /// Strategic HIGH admission for account worker sharding (ACCOUNT-PATH-TX-PARITY-CREATOR).
 fn account_geyser_dispatch_priority_high(ctx: &MarketDataContext, u: &GeyserAccountUpdate) -> bool {
     let pool_pk = u.pubkey;
-    if ctx.tracked_vaults.read().contains_key(&pool_pk) {
+    let snap = ctx.tracked_membership.load();
+    if snap.vaults.contains(&pool_pk) {
         inc_market_data_vault_high_priority_dispatch_total();
         return true;
     }
-    if ctx.tracked_bin_arrays.read().contains_key(&pool_pk) {
+    if snap.bin_arrays.contains(&pool_pk) {
+        inc_market_data_ingest_membership_snapshot_hits_total();
         return true;
     }
     let pool_str = pool_pk.to_string();
@@ -13886,9 +14035,14 @@ async fn handle_geyser_transaction(
         }
     }
 
-    // PR-B: qualifying swap trade — refresh LRU timestamps and register reserve vaults / DLMM bins.
+    // PR-B: qualifying swap trade — register reserve vaults / DLMM bins; LRU touch via md-sidefx.
     if let Some(ParsedDexEvent::Trade { pool_address, .. }) = parsed_event.as_ref() {
-        md_state_try_enqueue(md_state, MdStateCommand::TouchPool(*pool_address));
+        md_sidefx_try_enqueue(
+            md_sidefx,
+            MdSidefxCommand::TradePoolLruTouch {
+                pool: *pool_address,
+            },
+        );
         md_state_try_enqueue(
             md_state,
             MdStateCommand::RegisterReservesAfterTrade(*pool_address),
@@ -16765,6 +16919,8 @@ mod wallet_tx_meta_balance_tests {
             tracked_vaults_tx,
             tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_bin_arrays_tx,
+            tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
+            pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: Arc::new(LivePoolCache::new()),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -17648,6 +17804,8 @@ mod pr_b_geyser_tracking_tests {
             tracked_vaults_tx,
             tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_bin_arrays_tx,
+            tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
+            pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: Arc::new(LivePoolCache::new()),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -17718,6 +17876,8 @@ mod pr_b_geyser_tracking_tests {
             tracked_vaults_tx,
             tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_bin_arrays_tx,
+            tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
+            pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: Arc::new(LivePoolCache::new()),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -18251,6 +18411,7 @@ mod pr_b_geyser_tracking_tests {
                 sibling_vault: None,
             },
         );
+        ctx.refresh_tracked_membership_snapshot();
         let u = GeyserAccountUpdate {
             pubkey: vault,
             slot: 1,
@@ -21508,5 +21669,111 @@ mod pr_b_geyser_tracking_tests {
             md_state_stall_liveness_action(MARKET_DATA_MD_STATE_STALL_EXIT_AFTER, true),
             MdStateStallLivenessAction::ExitForSystemd,
         );
+    }
+
+    /// PR237: membership snapshot refreshed by md-state is visible to ingest filter without RwLock on maps.
+    #[test]
+    fn pr237_tracked_membership_snapshot_visible_to_ingest_filter() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let vault = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            vaults.insert(
+                vault,
+                VaultInfo {
+                    pool_address: pool,
+                    dex: "test".to_string(),
+                    base_mint: Pubkey::new_unique(),
+                    quote_mint: Pubkey::new_unique(),
+                    is_base_vault: true,
+                    last_balance: std::sync::atomic::AtomicU64::new(0),
+                    last_used_at: Instant::now(),
+                    pinned: false,
+                    pin: None,
+                    active_id: None,
+                    bin_step: None,
+                    sibling_vault: None,
+                },
+            );
+        }
+        ctx.refresh_tracked_membership_snapshot();
+        let u = GeyserAccountUpdate {
+            pubkey: vault,
+            slot: 1,
+            owner: Pubkey::new_unique(),
+            data: vec![],
+            lamports: 0,
+            grpc_recv_at: Instant::now(),
+        };
+        assert!(account_geyser_update_might_be_relevant(&ctx, &u));
+        assert!(account_geyser_dispatch_priority_high(&ctx, &u));
+    }
+
+    /// PR237: pool touch uses reverse index (O(legs)), not full-map scan.
+    #[test]
+    fn pr237_touch_pool_uses_pool_tracked_legs_only() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        let other_pool = Pubkey::new_unique();
+        let vault_a = Pubkey::new_unique();
+        let vault_b = Pubkey::new_unique();
+        let decoy_vault = Pubkey::new_unique();
+        let now_old = Instant::now() - Duration::from_secs(60);
+        let mk_vault = |pool_addr: Pubkey, is_base: bool| -> VaultInfo {
+            VaultInfo {
+                pool_address: pool_addr,
+                dex: "test".to_string(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                is_base_vault: is_base,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: now_old,
+                pinned: false,
+                pin: None,
+                active_id: None,
+                bin_step: None,
+                sibling_vault: None,
+            }
+        };
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            vaults.insert(vault_a, mk_vault(pool, true));
+            vaults.insert(vault_b, mk_vault(pool, false));
+            vaults.insert(decoy_vault, mk_vault(other_pool, true));
+        }
+        ctx.pool_tracked_legs_note_vault(pool, vault_a);
+        ctx.pool_tracked_legs_note_vault(pool, vault_b);
+        assert_eq!(
+            ctx.pool_tracked_legs
+                .read()
+                .get(&pool)
+                .unwrap()
+                .vaults
+                .len(),
+            2
+        );
+        ctx.touch_tracked_pool_vaults_and_bins(pool);
+        let vaults = ctx.tracked_vaults.read();
+        assert!(vaults.get(&vault_a).unwrap().last_used_at > now_old);
+        assert!(vaults.get(&vault_b).unwrap().last_used_at > now_old);
+        assert_eq!(vaults.get(&decoy_vault).unwrap().last_used_at, now_old);
+    }
+
+    /// PR237: trade hot path enqueues sidefx LRU touch, not md-state TouchPool.
+    #[test]
+    fn pr237_trade_path_uses_sidefx_not_md_state_touch_pool() {
+        let src = include_str!("market_data.rs");
+        let marker = "// PR-B: qualifying swap trade";
+        let start = src.find(marker).expect("trade block marker");
+        let block = &src[start..start.saturating_add(700)];
+        assert!(!block.contains("MdStateCommand::TouchPool"));
+        assert!(block.contains("TradePoolLruTouch"));
     }
 }
