@@ -89,8 +89,7 @@ use ironcrab::metrics::{
     inc_market_data_md_sidefx_jobs_processed_total,
     inc_market_data_md_state_bursts_completed_total,
     inc_market_data_md_state_evict_steps_budget_exhausted_total,
-    inc_market_data_md_state_evict_steps_total,
-    inc_market_data_momentum_coalesced_batches_total,
+    inc_market_data_md_state_evict_steps_total, inc_market_data_momentum_coalesced_batches_total,
     inc_market_data_momentum_coalesced_messages_total,
     inc_market_data_unparsed_account_dropped_total, inc_market_data_unparsed_tx_dropped_total,
     inc_market_data_vault_high_priority_dispatch_total, market_data_bump_geyser_head_slot,
@@ -372,9 +371,7 @@ enum MdStateCommand {
     RegisterReservesAfterTrade(Pubkey),
     /// Phase1: account sidefx no longer enqueue; handler kept for md-state direct jobs + tests.
     #[allow(dead_code)]
-    RegisterPoolVaultsFromAccount {
-        pool: Pubkey,
-    },
+    RegisterPoolVaultsFromAccount { pool: Pubkey },
     TrackMint {
         mint: Pubkey,
         pin: Option<GeyserPinReason>,
@@ -382,9 +379,7 @@ enum MdStateCommand {
     /// PR169b: momentum-bot active pool pin stream (serialized; debounced sync only).
     ApplyMomentumActivePools(MomentumActivePoolsUpdate),
     /// PR169b: wallet bootstrap / execution-results mint pin (no immediate sync).
-    TrackWalletMint {
-        mint: Pubkey,
-    },
+    TrackWalletMint { mint: Pubkey },
     /// PR169b: `max_tracked_accounts` cap change — debounced flush/eviction only.
     ScheduleGeyserSyncAfterConfigChange,
     /// PR233: debounced explicit Geyser sync flush — executed only on `md-state` thread.
@@ -406,14 +401,10 @@ enum MdStateCommand {
     TouchPool(Pubkey),
     /// Phase1: TX path no longer enqueues; handler kept until Phase 2 removes MD arb reconcile.
     #[allow(dead_code)]
-    ArbMultiDexReconcile {
-        mint: Pubkey,
-    },
+    ArbMultiDexReconcile { mint: Pubkey },
     /// Refresh incremental arb coverage index for one pool (O(1); no LivePoolCache scan).
     #[allow(dead_code)]
-    UpdateArbCoverageIndex {
-        pool: Pubkey,
-    },
+    UpdateArbCoverageIndex { pool: Pubkey },
 }
 
 /// Bounded enqueue handle for the `md-state` OS thread (non-Tokio).
