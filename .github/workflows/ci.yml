@@ -105,10 +105,12 @@ jobs:
         run: |
           set -euo pipefail
           EVAL="${{ github.workspace }}/Iron_crab-eval"
-          f="$EVAL/tests/request_reply_e2e_contract.rs"
-          test -f "$f"
-          perl -i -pe 's/(\| ControlResponseStatus::Error)( => return Ok\(\(\)\),)/$1\n                | ControlResponseStatus::Busy$2/' "$f"
-          perl -i -0777 -pe 's/(\| ControlResponseStatus::Error)(\s*\n\s*\);)/$1\n                | ControlResponseStatus::Busy$2/s' "$f"
+          for f in "$EVAL"/tests/*.rs; do
+            test -f "$f" || continue
+            grep -q 'ControlResponseStatus::Error' "$f" || continue
+            perl -i -pe 's/(\| ControlResponseStatus::Error)( => return Ok\(\(\)\),)/$1\n                | ControlResponseStatus::Busy$2/' "$f"
+            perl -i -0777 -pe 's/(\| ControlResponseStatus::Error)(\s*\n\s*\);)/$1\n                | ControlResponseStatus::Busy$2/s' "$f"
+          done
 
       - name: Patch eval git-dep to use PR checkout
         run: |
