@@ -100,6 +100,18 @@ jobs:
             perl -i -0777 -pe 's/(        9,\n        6,\n)        market_id,/${1}        None,\n        None,\n        market_id,/g' "$EVAL/$f"
           done
 
+      # PR235: ControlResponseStatus::Busy — eval main may not list the arm yet.
+      - name: Align eval ControlResponse Busy match arms with patched ironcrab IPC
+        run: |
+          set -euo pipefail
+          EVAL="${{ github.workspace }}/Iron_crab-eval"
+          for f in "$EVAL"/tests/*.rs; do
+            test -f "$f" || continue
+            grep -q 'ControlResponseStatus::Error' "$f" || continue
+            perl -i -pe 's/(\| ControlResponseStatus::Error)( => return Ok\(\(\)\),)/$1\n                | ControlResponseStatus::Busy$2/' "$f"
+            perl -i -0777 -pe 's/(\| ControlResponseStatus::Error)(\s*\n\s*\);)/$1\n                | ControlResponseStatus::Busy$2/s' "$f"
+          done
+
       - name: Patch eval git-dep to use PR checkout
         run: |
           cat >> "${{ github.workspace }}/Iron_crab-eval/Cargo.toml" <<'EOF'

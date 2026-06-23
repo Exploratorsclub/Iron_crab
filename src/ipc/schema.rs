@@ -1332,6 +1332,8 @@ pub enum ControlResponseStatus {
     NotFound,
     /// Error during processing.
     Error,
+    /// Transient backpressure (e.g. md-state queue saturated); caller may retry.
+    Busy,
 }
 
 /// Control response for request/reply correlation.

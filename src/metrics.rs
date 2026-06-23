@@ -757,6 +757,18 @@ pub static MARKET_DATA_MD_STATE_EVICT_STEPS_BUDGET_EXHAUSTED_TOTAL: Lazy<AtomicU
 pub static MARKET_DATA_GEYSER_SYNC_PARTIAL_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// PR234: 1 when LRU eviction to cap is incomplete and will resume on next flush.
 pub static MARKET_DATA_MD_STATE_EVICT_PENDING: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// PR235: md-state worker burst loop in progress (1 = busy).
+pub static MARKET_DATA_MD_STATE_BURST_IN_PROGRESS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR235: deferred md-state jobs waiting for next burst.
+pub static MARKET_DATA_MD_STATE_DEFERRED_JOBS_LEN: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR235: RegisterPoolVaultsFromAccount skipped — vaults already tracked for hot pool.
+pub static MARKET_DATA_MD_STATE_REGISTER_SKIPPED_IDEMPOTENT_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR235: cold-path discovery deferred while md-state queue under pressure.
+pub static MARKET_DATA_DISCOVERY_DEFERRED_MD_STATE_PRESSURE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 const MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_BUCKETS: &[u64] = &[
     100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000, 10_000_000,
@@ -940,6 +952,26 @@ pub fn inc_market_data_geyser_sync_partial_total() {
 #[inline]
 pub fn set_market_data_md_state_evict_pending(pending: bool) {
     MARKET_DATA_MD_STATE_EVICT_PENDING.store(u64::from(pending), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_md_state_burst_in_progress(in_progress: bool) {
+    MARKET_DATA_MD_STATE_BURST_IN_PROGRESS.store(u64::from(in_progress), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_md_state_deferred_jobs_len(len: usize) {
+    MARKET_DATA_MD_STATE_DEFERRED_JOBS_LEN.store(len as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_md_state_register_skipped_idempotent_total() {
+    MARKET_DATA_MD_STATE_REGISTER_SKIPPED_IDEMPOTENT_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_discovery_deferred_md_state_pressure_total() {
+    MARKET_DATA_DISCOVERY_DEFERRED_MD_STATE_PRESSURE_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -4001,6 +4033,22 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_md_state_evict_pending",
         MARKET_DATA_MD_STATE_EVICT_PENDING.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_md_state_burst_in_progress",
+        MARKET_DATA_MD_STATE_BURST_IN_PROGRESS.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_md_state_deferred_jobs_len",
+        MARKET_DATA_MD_STATE_DEFERRED_JOBS_LEN.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_md_state_register_skipped_idempotent_total",
+        MARKET_DATA_MD_STATE_REGISTER_SKIPPED_IDEMPOTENT_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_discovery_deferred_md_state_pressure_total",
+        MARKET_DATA_DISCOVERY_DEFERRED_MD_STATE_PRESSURE_TOTAL.load(Ordering::Relaxed)
     );
     append_momentum_latency_histogram_prometheus(
         &mut out,

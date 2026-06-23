@@ -3795,6 +3795,7 @@ impl MomentumContext {
         match recovery_kind {
             OpenPositionPoolRecoveryKind::PumpfunBonding => {
                 req.force_refresh_pumpfun = true;
+                req.pool_address_hint = Some(position_pool.to_string());
             }
             OpenPositionPoolRecoveryKind::PumpAmmAccounts => {
                 req.pool_address_hint = Some(position_pool.to_string());

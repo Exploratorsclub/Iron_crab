@@ -487,6 +487,24 @@ curl -s http://127.0.0.1:9803/metrics | grep arb_two_hop
 
 Logs: `journalctl -u arb-strategy | grep "Arb check rejected"`
 
+## md-state Stall vs. RPC healthy (PR235)
+
+**Symptom A — md-state Durchsatz-Defizit (kein RPC-Problem):**
+
+- `systemctl show ironcrab-market-data -p NRestarts` steigt alle paar Minuten
+- Logs: `PR235: md-state still stalled` oder `PR234: md-state stalled near queue cap`
+- Metriken: `market_data_md_state_queue_depth` nahe 8192, `market_data_geyser_tracking_enqueue_dropped_total` steigt
+- `bursts_completed` 60s Δ ≈ 0 trotz hohem `jobs_dequeued`
+- Lokaler RPC (`curl getHealth`, `getAccount`) bleibt schnell — **nicht** mit RPC-Umstellung „fixen“
+
+**Symptom B — echter RPC-Ausfall:**
+
+- `rpc_errors_total` / `rpc_timeouts_total` steigen dauerhaft
+- `getHealth` nicht `ok` oder `getAccount` > 100ms
+- Discovery-Fehler auch bei niedrigem `md_state_queue_depth`
+
+**PR235:** Watchdog `exit(1)` ist default **aus** (`MARKET_DATA_MD_STATE_STALL_EXIT_ENABLED=false`); Stalls werden als `market_data_md_state_stalls_total` + WARN geloggt. Restart-Loop durch md-state sollte nach Deploy verschwinden — bei anhaltenden Stalls Metriken `md_state_deferred_jobs_len`, `md_state_burst_in_progress`, `md_state_register_skipped_idempotent_total` prüfen.
+
 ## Siehe auch
 
 - [Iron_crab-eval/docs/spec/](https://github.com/Exploratorsclub/Iron_crab-eval) — Spezifikation (TARGET_ARCHITECTURE, ROLE_SEPARATION, DEFINITION_OF_DONE, STORAGE_CONVENTIONS)

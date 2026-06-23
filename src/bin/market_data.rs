@@ -22,7 +22,7 @@ use clap::Parser;
 use serde::Serialize;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -78,6 +78,7 @@ use ironcrab::metrics::{
     inc_market_data_arb_reconcile_skipped_oversized_pool_total,
     inc_market_data_arb_reconcile_skipped_partial_state_total,
     inc_market_data_arb_registered_vaults_total, inc_market_data_balance_updated_from_cache_total,
+    inc_market_data_discovery_deferred_md_state_pressure_total,
     inc_market_data_geyser_sync_partial_total, inc_market_data_geyser_sync_skipped_no_delta_total,
     inc_market_data_geyser_sync_skipped_rate_limit_total,
     inc_market_data_geyser_tracking_enqueue_dropped_total,
@@ -86,7 +87,9 @@ use ironcrab::metrics::{
     inc_market_data_md_sidefx_jobs_processed_total,
     inc_market_data_md_state_bursts_completed_total,
     inc_market_data_md_state_evict_steps_budget_exhausted_total,
-    inc_market_data_md_state_evict_steps_total, inc_market_data_momentum_coalesced_batches_total,
+    inc_market_data_md_state_evict_steps_total,
+    inc_market_data_md_state_register_skipped_idempotent_total,
+    inc_market_data_momentum_coalesced_batches_total,
     inc_market_data_momentum_coalesced_messages_total,
     inc_market_data_unparsed_account_dropped_total, inc_market_data_unparsed_tx_dropped_total,
     inc_market_data_vault_high_priority_dispatch_total, market_data_bump_geyser_head_slot,
@@ -116,6 +119,7 @@ use ironcrab::metrics::{
     set_market_data_arb_pinned_pools_gauge, set_market_data_geyser_merge_pending,
     set_market_data_geyser_sync_pending, set_market_data_geyser_tracking_queue_depth,
     set_market_data_hot_pool_registry_pools_gauge, set_market_data_md_sidefx_queue_depth,
+    set_market_data_md_state_burst_in_progress, set_market_data_md_state_deferred_jobs_len,
     set_market_data_md_state_evict_pending, set_market_data_md_state_queue_depth,
     set_market_data_momentum_active_pool_pins_gauge, set_market_data_tx_broadcast_queue_depth,
     set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
@@ -190,8 +194,12 @@ const MARKET_DATA_GEYSER_SYNC_STARTUP_WINDOW: Duration = Duration::from_secs(120
 const MARKET_DATA_GEYSER_SYNC_STARTUP_MIN_MS: u64 = 250;
 /// PR233: max debounced Geyser sync flushes per second during startup burst.
 const MARKET_DATA_GEYSER_SYNC_FLUSH_MAX_PER_SEC: usize = 4;
-/// PR234: max wall time per md-state burst (job processing + sync/evict slice).
-const MARKET_DATA_MD_STATE_BURST_BUDGET_MS: u64 = 12;
+/// PR235: wall time budget for job processing only (flush/evict uses separate budget).
+const MARKET_DATA_MD_STATE_JOB_BUDGET_MS: u64 = 16;
+/// PR235: minimum jobs completed per burst before time-budget defer (avoids re-defer loops).
+const MARKET_DATA_MD_STATE_MIN_JOBS_PER_BURST: usize = 32;
+/// PR235: wall time budget for sync/evict slice after job batch.
+const MARKET_DATA_MD_STATE_FLUSH_BUDGET_MS: u64 = 8;
 /// PR234: max LRU eviction steps per sync/evict slice on md-state.
 const MARKET_DATA_GEYSER_EVICT_MAX_STEPS_PER_FLUSH: usize = 16;
 /// PR234: md-state liveness poll interval (OS thread).
@@ -202,6 +210,10 @@ const MARKET_DATA_MD_STATE_STALL_WINDOW: Duration = Duration::from_secs(60);
 const MARKET_DATA_MD_STATE_STALL_EXIT_AFTER: Duration = Duration::from_secs(120);
 /// PR234: queue depth fraction treated as saturation for md-state liveness.
 const MARKET_DATA_MD_STATE_STALL_QUEUE_FRAC: f64 = 0.95;
+/// PR235: defer cold-path discovery when md-state queue exceeds this fraction of cap.
+const MARKET_DATA_MD_STATE_DISCOVERY_DEFER_QUEUE_FRAC: f64 = 0.75;
+/// PR235: when false, md-state liveness records stalls but does not exit(1) for systemd restart.
+const MARKET_DATA_MD_STATE_STALL_EXIT_ENABLED: bool = false;
 /// PR169c: bounded channel for momentum updates before actor coalesce.
 const MARKET_DATA_MOMENTUM_COALESCE_CHANNEL_CAP: usize = 512;
 /// PR169c: chunk large momentum applies so the tracking actor yields to ingest tasks.
@@ -631,14 +643,15 @@ fn md_state_worker_loop(
 ) {
     let mut deferred_jobs: VecDeque<MdStateCommand> = VecDeque::new();
     loop {
-        let burst_deadline =
-            Instant::now() + Duration::from_millis(MARKET_DATA_MD_STATE_BURST_BUDGET_MS);
+        set_market_data_md_state_burst_in_progress(true);
+        set_market_data_md_state_deferred_jobs_len(deferred_jobs.len());
         let mut jobs = Vec::new();
         while jobs.len() < MARKET_DATA_MD_STATE_BURST_MAX {
             if let Some(job) = deferred_jobs.pop_front() {
                 jobs.push(job);
             } else if jobs.is_empty() {
                 let Ok(first) = rx.recv() else {
+                    set_market_data_md_state_burst_in_progress(false);
                     break;
                 };
                 md_state_dec_queue_depth(&queue_depth);
@@ -652,11 +665,16 @@ fn md_state_worker_loop(
                         jobs.push(job);
                     }
                     Err(std_mpsc::TryRecvError::Empty) => break,
-                    Err(std_mpsc::TryRecvError::Disconnected) => break,
+                    Err(std_mpsc::TryRecvError::Disconnected) => {
+                        set_market_data_md_state_burst_in_progress(false);
+                        break;
+                    }
                 }
             }
         }
         if jobs.is_empty() {
+            set_market_data_md_state_burst_in_progress(false);
+            set_market_data_md_state_deferred_jobs_len(deferred_jobs.len());
             continue;
         }
         let jobs = md_state_coalesce_jobs(jobs);
@@ -670,9 +688,14 @@ fn md_state_worker_loop(
             .iter()
             .any(|job| matches!(job, MdStateCommand::ScheduleGeyserSyncAfterConfigChange));
         let before_keys = ctx.snapshot_explicit_subscription_pubkeys();
+        let job_deadline =
+            Instant::now() + Duration::from_millis(MARKET_DATA_MD_STATE_JOB_BUDGET_MS);
         let mut deferred_this_burst = VecDeque::new();
+        let mut jobs_completed = 0usize;
         for job in jobs {
-            if Instant::now() >= burst_deadline {
+            let at_budget = Instant::now() >= job_deadline;
+            let below_min = jobs_completed < MARKET_DATA_MD_STATE_MIN_JOBS_PER_BURST;
+            if at_budget && !below_min {
                 deferred_this_burst.push_back(job);
                 continue;
             }
@@ -680,6 +703,7 @@ fn md_state_worker_loop(
                 MdStateCommand::FlushGeyserSyncDebounced | MdStateCommand::ContinueGeyserEvict => {}
                 other => {
                     let _ = md_state_process_job(&ctx, other);
+                    jobs_completed += 1;
                 }
             }
         }
@@ -688,26 +712,24 @@ fn md_state_worker_loop(
         }
         let after_keys = ctx.snapshot_explicit_subscription_pubkeys();
         let evict_pending = ctx.pending_geyser_evict.load(Ordering::Relaxed);
+        let mut did_flush_work = false;
         if flush_geyser_sync || continue_geyser_evict || evict_pending {
-            if Instant::now() < burst_deadline {
-                let flush_start = Instant::now();
-                let sync_complete = if flush_geyser_sync {
-                    ctx.sync_geyser_tracked_accounts_batched_flush_with_deadline(burst_deadline)
-                } else {
-                    ctx.continue_geyser_evict_with_deadline(burst_deadline)
-                };
-                record_market_data_md_state_sync_flush_duration_us(
-                    flush_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-                );
-                if flush_geyser_sync {
-                    ctx.release_geyser_sync_flush_slot();
-                }
-                if !sync_complete {
-                    deferred_jobs.push_front(MdStateCommand::ContinueGeyserEvict);
-                }
-            } else if flush_geyser_sync {
-                deferred_jobs.push_front(MdStateCommand::FlushGeyserSyncDebounced);
+            let flush_deadline =
+                Instant::now() + Duration::from_millis(MARKET_DATA_MD_STATE_FLUSH_BUDGET_MS);
+            let flush_start = Instant::now();
+            let sync_complete = if flush_geyser_sync {
+                ctx.sync_geyser_tracked_accounts_batched_flush_with_deadline(flush_deadline)
             } else {
+                ctx.continue_geyser_evict_with_deadline(flush_deadline)
+            };
+            did_flush_work = true;
+            record_market_data_md_state_sync_flush_duration_us(
+                flush_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+            );
+            if flush_geyser_sync {
+                ctx.release_geyser_sync_flush_slot();
+            }
+            if !sync_complete {
                 deferred_jobs.push_front(MdStateCommand::ContinueGeyserEvict);
             }
         } else if explicit_subscription_has_new_keys(&before_keys, &after_keys)
@@ -718,7 +740,11 @@ fn md_state_worker_loop(
             inc_market_data_geyser_sync_skipped_no_delta_total();
         }
         ctx.refresh_hot_pool_registry_gauges();
-        inc_market_data_md_state_bursts_completed_total();
+        if jobs_completed > 0 || did_flush_work {
+            inc_market_data_md_state_bursts_completed_total();
+        }
+        set_market_data_md_state_burst_in_progress(false);
+        set_market_data_md_state_deferred_jobs_len(deferred_jobs.len());
     }
 }
 
@@ -846,10 +872,11 @@ struct MdSidefxWorkerCtx {
     md_state: MdStateSender,
 }
 
-/// Per-burst scratch: LRU touches coalesced before a single md-state enqueue.
+/// Per-burst scratch: LRU touches and register jobs coalesced before md-state enqueue.
 struct MdSidefxBurstScratch {
     pending_vault_touches: HashSet<Pubkey>,
     pending_bin_array_touches: HashSet<Pubkey>,
+    pending_register_pools: HashSet<Pubkey>,
 }
 
 impl MdSidefxBurstScratch {
@@ -857,6 +884,7 @@ impl MdSidefxBurstScratch {
         Self {
             pending_vault_touches: HashSet::new(),
             pending_bin_array_touches: HashSet::new(),
+            pending_register_pools: HashSet::new(),
         }
     }
 
@@ -867,6 +895,23 @@ impl MdSidefxBurstScratch {
     fn note_bin_array_touch(&mut self, pda: Pubkey) {
         self.pending_bin_array_touches.insert(pda);
     }
+
+    fn note_register_pool(&mut self, pool: Pubkey) {
+        self.pending_register_pools.insert(pool);
+    }
+}
+
+fn md_sidefx_flush_pending_md_state_jobs(
+    md_state: &MdStateSender,
+    scratch: &mut MdSidefxBurstScratch,
+) {
+    for pool in scratch.pending_register_pools.drain() {
+        md_state_try_enqueue(
+            md_state,
+            MdStateCommand::RegisterPoolVaultsFromAccount { pool },
+        );
+    }
+    md_sidefx_flush_pending_lru_touches(md_state, scratch);
 }
 
 fn md_sidefx_flush_pending_lru_touches(
@@ -1819,7 +1864,11 @@ fn md_sidefx_process_live_pool_cache_mint_decimals(w: &MdSidefxWorkerCtx, job: &
     w.ctx.live_pool_cache.set_mint_decimals(*mint, *decimals);
 }
 
-fn md_sidefx_process_live_pool_cache_account_update(w: &MdSidefxWorkerCtx, job: &MdSidefxCommand) {
+fn md_sidefx_process_live_pool_cache_account_update(
+    w: &MdSidefxWorkerCtx,
+    job: &MdSidefxCommand,
+    scratch: &mut MdSidefxBurstScratch,
+) {
     let MdSidefxCommand::LivePoolCacheAccountUpdate {
         run_id,
         pool_pubkey,
@@ -1872,10 +1921,7 @@ fn md_sidefx_process_live_pool_cache_account_update(w: &MdSidefxWorkerCtx, job: 
         ) && w.ctx.hot_pool_registry.is_hot_pool(*pool_pubkey)
             && pool_needs_tracking_refresh_after_cache_upsert(&w.ctx, *pool_pubkey, &cached_state)
         {
-            md_state_try_enqueue(
-                &w.md_state,
-                MdStateCommand::RegisterPoolVaultsFromAccount { pool: *pool_pubkey },
-            );
+            scratch.note_register_pool(*pool_pubkey);
         }
 
         // Extract mint and reserve info from cached_state for PoolCacheUpdate
@@ -2496,7 +2542,7 @@ fn md_sidefx_process_job(
             md_sidefx_process_touch_bin_array_tick(w, job, scratch)
         }
         MdSidefxCommand::LivePoolCacheAccountUpdate { .. } => {
-            md_sidefx_process_live_pool_cache_account_update(w, job)
+            md_sidefx_process_live_pool_cache_account_update(w, job, scratch)
         }
         MdSidefxCommand::LivePoolCacheMintDecimals { .. } => {
             md_sidefx_process_live_pool_cache_mint_decimals(w, job)
@@ -2561,7 +2607,7 @@ fn md_sidefx_worker_loop(
         for job in md_sidefx_coalesce_burst(jobs) {
             md_sidefx_process_job(&worker, &job, &mut scratch);
         }
-        md_sidefx_flush_pending_lru_touches(&worker.md_state, &mut scratch);
+        md_sidefx_flush_pending_md_state_jobs(&worker.md_state, &mut scratch);
     }
 }
 
@@ -3472,6 +3518,10 @@ struct MarketDataContext {
     last_synced_explicit_pubkeys: parking_lot::RwLock<HashSet<Pubkey>>,
     /// PR234: LRU eviction to cap incomplete — resume on next flush/`ContinueGeyserEvict`.
     pending_geyser_evict: AtomicBool,
+    /// PR235: min-heap LRU index for O(log n) eviction (vault/bin/mint).
+    geyser_lru_index: parking_lot::Mutex<GeyserLruIndex>,
+    /// PR235: skip redundant momentum snapshot reconcile when target set unchanged.
+    last_momentum_snapshot_target: parking_lot::RwLock<Option<HashSet<(Pubkey, Pubkey)>>>,
 }
 
 #[derive(Debug, Default)]
@@ -3616,6 +3666,86 @@ enum GeyserReserveRegisterFollowUp {
     MomentumUpgrade,
     /// Arb multi-dex: promote vault/bin rows for this pool to `ArbMultiDex` (budgeted pin tier).
     ArbMultiDexUpgrade,
+}
+
+/// PR235: O(log n) global LRU min-heap for Geyser explicit-account eviction (lazy stale pop).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum GeyserLruKind {
+    Vault,
+    Bin,
+    Mint,
+}
+
+#[derive(Clone, Copy)]
+struct GeyserLruHeapEntry {
+    last_used_at: Instant,
+    kind: GeyserLruKind,
+    pubkey: Pubkey,
+}
+
+impl PartialEq for GeyserLruHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.last_used_at == other.last_used_at
+            && self.kind == other.kind
+            && self.pubkey == other.pubkey
+    }
+}
+
+impl Eq for GeyserLruHeapEntry {}
+
+impl PartialOrd for GeyserLruHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for GeyserLruHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .last_used_at
+            .cmp(&self.last_used_at)
+            .then_with(|| self.pubkey.cmp(&other.pubkey))
+    }
+}
+
+#[derive(Default)]
+struct GeyserLruIndex {
+    heap: BinaryHeap<GeyserLruHeapEntry>,
+}
+
+impl GeyserLruIndex {
+    fn note(&mut self, kind: GeyserLruKind, pubkey: Pubkey, last_used_at: Instant) {
+        self.heap.push(GeyserLruHeapEntry {
+            last_used_at,
+            kind,
+            pubkey,
+        });
+    }
+
+    fn pop_lru_candidate(
+        &mut self,
+        vaults: &std::collections::HashMap<Pubkey, VaultInfo>,
+        bins: &std::collections::HashMap<Pubkey, BinArrayInfo>,
+        mints: &std::collections::HashMap<Pubkey, MintTrackInfo>,
+    ) -> Option<GeyserLruHeapEntry> {
+        while let Some(entry) = self.heap.pop() {
+            let still_lru = match entry.kind {
+                GeyserLruKind::Vault => vaults
+                    .get(&entry.pubkey)
+                    .is_some_and(|v| !v.pinned && v.last_used_at == entry.last_used_at),
+                GeyserLruKind::Bin => bins
+                    .get(&entry.pubkey)
+                    .is_some_and(|b| !b.pinned && b.last_used_at == entry.last_used_at),
+                GeyserLruKind::Mint => mints
+                    .get(&entry.pubkey)
+                    .is_some_and(|m| !m.pinned && m.last_used_at == entry.last_used_at),
+            };
+            if still_lru {
+                return Some(entry);
+            }
+        }
+        None
+    }
 }
 
 /// Incremental arb-coverage index: mint→dex/pool sets maintained on pool upsert (md-state).
@@ -3953,8 +4083,35 @@ fn expected_pool_vault_pubkeys_from_cache(
         CachedPoolState::PumpAmm(s) => {
             Some((s.pool_base_token_account, s.pool_quote_token_account))
         }
+        CachedPoolState::RaydiumAmm(s) => Some((s.coin_vault, s.pc_vault)),
         _ => None,
     }
+}
+
+/// True when expected vault rows for a hot pool are already registered with sibling links.
+fn pool_vaults_fully_tracked_for_cache(
+    ctx: &MarketDataContext,
+    pool: Pubkey,
+    cached_state: &CachedPoolState,
+) -> bool {
+    let (enable_meteora_cpmm, enable_meteora_dlmm) = {
+        let cfg = ctx.config.read();
+        (cfg.enable_meteora_cpmm, cfg.enable_meteora_dlmm)
+    };
+    let Some((base_vault, quote_vault)) = expected_pool_vault_pubkeys_from_cache(
+        cached_state,
+        enable_meteora_cpmm,
+        enable_meteora_dlmm,
+    ) else {
+        return true;
+    };
+    let vaults = ctx.tracked_vaults.read();
+    vaults
+        .get(&base_vault)
+        .is_some_and(|v| v.pool_address == pool && v.sibling_vault == Some(quote_vault))
+        && vaults
+            .get(&quote_vault)
+            .is_some_and(|v| v.pool_address == pool && v.sibling_vault == Some(base_vault))
 }
 
 /// True when a hot-pool cache upsert still needs vault registration (missing vault rows).
@@ -3966,24 +4123,11 @@ fn pool_needs_tracking_refresh_after_cache_upsert(
     if !ctx.hot_pool_registry.is_hot_pool(pool) {
         return false;
     }
-    // Raydium AMM vault rows are registered in register_geyser_reserves_impl; account upserts
-    // still need arb index refresh and balance publish via RegisterPoolVaultsFromAccount.
-    if matches!(cached_state, CachedPoolState::RaydiumAmm(_)) {
-        return true;
-    }
-    let (enable_meteora_cpmm, enable_meteora_dlmm) = {
-        let cfg = ctx.config.read();
-        (cfg.enable_meteora_cpmm, cfg.enable_meteora_dlmm)
-    };
-    let Some((base_vault, quote_vault)) = expected_pool_vault_pubkeys_from_cache(
-        cached_state,
-        enable_meteora_cpmm,
-        enable_meteora_dlmm,
-    ) else {
+    if pool_vaults_fully_tracked_for_cache(ctx, pool, cached_state) {
+        inc_market_data_md_state_register_skipped_idempotent_total();
         return false;
-    };
-    let vaults = ctx.tracked_vaults.read();
-    !vaults.contains_key(&base_vault) || !vaults.contains_key(&quote_vault)
+    }
+    true
 }
 
 fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> {
@@ -4099,11 +4243,12 @@ fn insert_tracked_vault_pair(
     vaults: &mut std::collections::HashMap<Pubkey, VaultInfo>,
     vaults_changed: &mut bool,
     spec: TrackedVaultPairInsert<'_>,
-) {
+) -> Vec<Pubkey> {
+    let mut inserted = Vec::new();
     let dex_str = spec.dex.to_string();
-    vaults.entry(spec.base_vault).or_insert_with(|| {
-        *vaults_changed = true;
-        VaultInfo {
+    use std::collections::hash_map::Entry;
+    if let Entry::Vacant(e) = vaults.entry(spec.base_vault) {
+        e.insert(VaultInfo {
             pool_address: spec.pool,
             dex: dex_str.clone(),
             base_mint: spec.base_mint,
@@ -4116,11 +4261,12 @@ fn insert_tracked_vault_pair(
             active_id: spec.active_id,
             bin_step: spec.bin_step,
             sibling_vault: Some(spec.quote_vault),
-        }
-    });
-    vaults.entry(spec.quote_vault).or_insert_with(|| {
+        });
+        inserted.push(spec.base_vault);
         *vaults_changed = true;
-        VaultInfo {
+    }
+    if let Entry::Vacant(e) = vaults.entry(spec.quote_vault) {
+        e.insert(VaultInfo {
             pool_address: spec.pool,
             dex: dex_str,
             base_mint: spec.base_mint,
@@ -4133,14 +4279,17 @@ fn insert_tracked_vault_pair(
             active_id: spec.active_id,
             bin_step: spec.bin_step,
             sibling_vault: Some(spec.base_vault),
-        }
-    });
+        });
+        inserted.push(spec.quote_vault);
+        *vaults_changed = true;
+    }
     if let Some(base) = vaults.get_mut(&spec.base_vault) {
         base.sibling_vault = Some(spec.quote_vault);
     }
     if let Some(quote) = vaults.get_mut(&spec.quote_vault) {
         quote.sibling_vault = Some(spec.base_vault);
     }
+    inserted
 }
 
 impl MarketDataContext {
@@ -5111,7 +5260,7 @@ impl MarketDataContext {
         })
     }
 
-    /// PR-B / PR234: one LRU eviction step. Returns true if an account was removed.
+    /// PR-B / PR234 / PR235: one LRU eviction step via min-heap (no full-map scan).
     fn evict_one_geyser_lru_step(&self) -> bool {
         let cap = self.config.read().max_tracked_accounts;
         if self.combined_geyser_explicit_accounts() <= cap {
@@ -5119,49 +5268,18 @@ impl MarketDataContext {
         }
         let run_id = self.run_id.clone();
 
-        #[derive(Clone, Copy)]
-        enum EvKind {
-            Vault,
-            Bin,
-            Mint,
-        }
-        let mut best: Option<(Instant, EvKind, Pubkey)> = None;
+        let vaults_read = self.tracked_vaults.read();
+        let bins_read = self.tracked_bin_arrays.read();
+        let mints_read = self.tracked_mints.read();
+        let candidate = {
+            let mut index = self.geyser_lru_index.lock();
+            index.pop_lru_candidate(&vaults_read, &bins_read, &mints_read)
+        };
+        drop(vaults_read);
+        drop(bins_read);
+        drop(mints_read);
 
-        for (pk, v) in self.tracked_vaults.read().iter() {
-            if v.pinned {
-                continue;
-            }
-            let cand = (v.last_used_at, EvKind::Vault, *pk);
-            best = Some(match best {
-                None => cand,
-                Some(b) if cand.0 < b.0 => cand,
-                Some(b) => b,
-            });
-        }
-        for (pk, b) in self.tracked_bin_arrays.read().iter() {
-            if b.pinned {
-                continue;
-            }
-            let cand = (b.last_used_at, EvKind::Bin, *pk);
-            best = Some(match best {
-                None => cand,
-                Some(x) if cand.0 < x.0 => cand,
-                Some(x) => x,
-            });
-        }
-        for (pk, m) in self.tracked_mints.read().iter() {
-            if m.pinned {
-                continue;
-            }
-            let cand = (m.last_used_at, EvKind::Mint, *pk);
-            best = Some(match best {
-                None => cand,
-                Some(x) if cand.0 < x.0 => cand,
-                Some(x) => x,
-            });
-        }
-
-        let Some((oldest_at, kind, pubkey)) = best else {
+        let Some(entry) = candidate else {
             error!(
                 run_id = %run_id,
                 cap,
@@ -5173,21 +5291,22 @@ impl MarketDataContext {
             return false;
         };
 
-        match kind {
-            EvKind::Vault => {
+        let oldest_at = entry.last_used_at;
+        match entry.kind {
+            GeyserLruKind::Vault => {
                 let mut vaults = self.tracked_vaults.write();
-                match vaults.get(&pubkey) {
+                match vaults.get(&entry.pubkey) {
                     None => return false,
                     Some(v) if v.pinned => return false,
                     Some(_) => {}
                 }
-                if let Some(v) = vaults.remove(&pubkey) {
+                if let Some(v) = vaults.remove(&entry.pubkey) {
                     geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Vault);
                     info!(
                         run_id = %run_id,
                         pool = %v.pool_address,
                         mint = %v.base_mint,
-                        vault = %pubkey,
+                        vault = %entry.pubkey,
                         reason = "lru_cap",
                         oldest_age_ms = ?oldest_at.elapsed().as_millis(),
                         "geyser_evicted"
@@ -5217,43 +5336,43 @@ impl MarketDataContext {
                         warn!(
                             run_id = %run_id,
                             pool = %pool,
-                            evicted_vault = %pubkey,
+                            evicted_vault = %entry.pubkey,
                             evicted_was_base_vault = this_is_base,
                             "geyser_evict: removed unpinned vault but pinned sibling vault remains tracked (half-pair subscription)"
                         );
                     }
                 }
             }
-            EvKind::Bin => {
+            GeyserLruKind::Bin => {
                 let mut bins = self.tracked_bin_arrays.write();
-                match bins.get(&pubkey) {
+                match bins.get(&entry.pubkey) {
                     None => return false,
                     Some(b) if b.pinned => return false,
                     Some(_) => {}
                 }
-                if let Some(b) = bins.remove(&pubkey) {
+                if let Some(b) = bins.remove(&entry.pubkey) {
                     geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::BinArray);
                     info!(
                         run_id = %run_id,
                         pool = %b.pool_address,
-                        bin_array = %pubkey,
+                        bin_array = %entry.pubkey,
                         reason = "lru_cap",
                         "geyser_evicted"
                     );
                 }
             }
-            EvKind::Mint => {
+            GeyserLruKind::Mint => {
                 let mut mints = self.tracked_mints.write();
-                match mints.get(&pubkey) {
+                match mints.get(&entry.pubkey) {
                     None => return false,
                     Some(m) if m.pinned => return false,
                     Some(_) => {}
                 }
-                if mints.remove(&pubkey).is_some() {
+                if mints.remove(&entry.pubkey).is_some() {
                     geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Mint);
                     info!(
                         run_id = %run_id,
-                        mint = %pubkey,
+                        mint = %entry.pubkey,
                         reason = "lru_cap",
                         "geyser_evicted"
                     );
@@ -5261,6 +5380,24 @@ impl MarketDataContext {
             }
         }
         true
+    }
+
+    fn geyser_lru_note_vault(&self, pubkey: Pubkey, last_used_at: Instant) {
+        self.geyser_lru_index
+            .lock()
+            .note(GeyserLruKind::Vault, pubkey, last_used_at);
+    }
+
+    fn geyser_lru_note_bin(&self, pubkey: Pubkey, last_used_at: Instant) {
+        self.geyser_lru_index
+            .lock()
+            .note(GeyserLruKind::Bin, pubkey, last_used_at);
+    }
+
+    fn geyser_lru_note_mint(&self, pubkey: Pubkey, last_used_at: Instant) {
+        self.geyser_lru_index
+            .lock()
+            .note(GeyserLruKind::Mint, pubkey, last_used_at);
     }
 
     /// PR234: budgeted LRU eviction — max steps and wall deadline per md-state slice.
@@ -5526,11 +5663,13 @@ impl MarketDataContext {
                     pinned,
                     pin,
                 });
+                self.geyser_lru_note_mint(mint, now);
                 true
             }
             Entry::Occupied(mut e) => {
                 let v = e.get_mut();
                 v.last_used_at = now;
+                self.geyser_lru_note_mint(mint, now);
                 match pin {
                     None => false,
                     Some(GeyserPinReason::Wallet) => {
@@ -5565,11 +5704,25 @@ impl MarketDataContext {
         }
     }
 
+    fn register_tracked_vault_pair_lru(
+        &self,
+        vaults: &mut std::collections::HashMap<Pubkey, VaultInfo>,
+        vaults_changed: &mut bool,
+        spec: TrackedVaultPairInsert<'_>,
+    ) {
+        let now = spec.now;
+        let inserted = insert_tracked_vault_pair(vaults, vaults_changed, spec);
+        for pk in inserted {
+            self.geyser_lru_note_vault(pk, now);
+        }
+    }
+
     fn touch_tracked_vault_pubkey(&self, vault: &Pubkey) {
         let now = Instant::now();
         let mut vaults = self.tracked_vaults.write();
         let sibling = if let Some(v) = vaults.get_mut(vault) {
             v.last_used_at = now;
+            self.geyser_lru_note_vault(*vault, now);
             v.sibling_vault
                 .filter(|sibling_pk| vaults.get(sibling_pk).is_some_and(|sv| !sv.pinned))
         } else {
@@ -5578,6 +5731,7 @@ impl MarketDataContext {
         if let Some(sibling_pk) = sibling {
             if let Some(sv) = vaults.get_mut(&sibling_pk) {
                 sv.last_used_at = now;
+                self.geyser_lru_note_vault(sibling_pk, now);
             }
         }
     }
@@ -5586,6 +5740,7 @@ impl MarketDataContext {
         let now = Instant::now();
         if let Some(b) = self.tracked_bin_arrays.write().get_mut(pda) {
             b.last_used_at = now;
+            self.geyser_lru_note_bin(*pda, now);
         }
     }
 
@@ -5704,7 +5859,7 @@ impl MarketDataContext {
                 );
             if admit(base_mint_v, quote_mint_v) {
                 let mut vaults = self.tracked_vaults.write();
-                insert_tracked_vault_pair(
+                self.register_tracked_vault_pair_lru(
                     &mut vaults,
                     &mut vaults_changed,
                     TrackedVaultPairInsert {
@@ -5733,7 +5888,7 @@ impl MarketDataContext {
                     );
                 if admit(base_mint_v, quote_mint_v) {
                     let mut vaults = self.tracked_vaults.write();
-                    insert_tracked_vault_pair(
+                    self.register_tracked_vault_pair_lru(
                         &mut vaults,
                         &mut vaults_changed,
                         TrackedVaultPairInsert {
@@ -5763,7 +5918,7 @@ impl MarketDataContext {
                     );
                 if admit(base_mint_v, quote_mint_v) {
                     let mut vaults = self.tracked_vaults.write();
-                    insert_tracked_vault_pair(
+                    self.register_tracked_vault_pair_lru(
                         &mut vaults,
                         &mut vaults_changed,
                         TrackedVaultPairInsert {
@@ -5792,7 +5947,7 @@ impl MarketDataContext {
                 );
             if admit(base_mint_v, quote_mint_v) {
                 let mut vaults = self.tracked_vaults.write();
-                insert_tracked_vault_pair(
+                self.register_tracked_vault_pair_lru(
                     &mut vaults,
                     &mut vaults_changed,
                     TrackedVaultPairInsert {
@@ -5813,7 +5968,7 @@ impl MarketDataContext {
         if let CachedPoolState::PumpAmm(s) = cached_state {
             if admit(s.base_mint, s.quote_mint) {
                 let mut vaults = self.tracked_vaults.write();
-                insert_tracked_vault_pair(
+                self.register_tracked_vault_pair_lru(
                     &mut vaults,
                     &mut vaults_changed,
                     TrackedVaultPairInsert {
@@ -5913,70 +6068,49 @@ impl MarketDataContext {
                 let bin_step = s.bin_step;
                 {
                     let mut bin_arrays = self.tracked_bin_arrays.write();
+                    let mut new_bins: Vec<Pubkey> = Vec::new();
                     for offset in -3i64..=3i64 {
                         let index = active_array_index + offset;
                         if let Ok(pda) = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&pool, index)
                         {
-                            bin_arrays.entry(pda).or_insert_with(|| {
-                                bins_changed = true;
-                                BinArrayInfo {
+                            use std::collections::hash_map::Entry;
+                            if let Entry::Vacant(e) = bin_arrays.entry(pda) {
+                                e.insert(BinArrayInfo {
                                     pool_address: pool,
                                     bin_array_index: index,
                                     bin_step,
                                     last_used_at: now,
                                     pinned: false,
                                     pin: None,
-                                }
-                            });
+                                });
+                                bins_changed = true;
+                                new_bins.push(pda);
+                            }
                         }
+                    }
+                    drop(bin_arrays);
+                    for pda in new_bins {
+                        self.geyser_lru_note_bin(pda, now);
                     }
                 }
             }
             CachedPoolState::RaydiumAmm(s) => {
-                let dex_str = "raydium".to_string();
-                {
-                    let mut vaults = self.tracked_vaults.write();
-                    vaults.entry(s.coin_vault).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: pool,
-                            dex: dex_str.clone(),
-                            base_mint: s.base_mint,
-                            quote_mint: s.quote_mint,
-                            is_base_vault: true,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: now,
-                            pinned: false,
-                            pin: None,
-                            active_id: None,
-                            bin_step: None,
-                            sibling_vault: Some(s.pc_vault),
-                        }
-                    });
-                    vaults.entry(s.pc_vault).or_insert_with(|| {
-                        vaults_changed = true;
-                        VaultInfo {
-                            pool_address: pool,
-                            dex: dex_str,
-                            base_mint: s.base_mint,
-                            quote_mint: s.quote_mint,
-                            is_base_vault: false,
-                            last_balance: std::sync::atomic::AtomicU64::new(0),
-                            last_used_at: now,
-                            pinned: false,
-                            pin: None,
-                            active_id: None,
-                            bin_step: None,
-                            sibling_vault: Some(s.coin_vault),
-                        }
-                    });
-                    if let Some(base) = vaults.get_mut(&s.coin_vault) {
-                        base.sibling_vault = Some(s.pc_vault);
-                    }
-                    if let Some(quote) = vaults.get_mut(&s.pc_vault) {
-                        quote.sibling_vault = Some(s.coin_vault);
-                    }
-                }
+                let mut vaults = self.tracked_vaults.write();
+                self.register_tracked_vault_pair_lru(
+                    &mut vaults,
+                    &mut vaults_changed,
+                    TrackedVaultPairInsert {
+                        pool,
+                        now,
+                        dex: "raydium",
+                        base_mint: s.base_mint,
+                        quote_mint: s.quote_mint,
+                        base_vault: s.coin_vault,
+                        quote_vault: s.pc_vault,
+                        active_id: None,
+                        bin_step: None,
+                    },
+                );
             }
             _ => {}
         }
@@ -6072,6 +6206,13 @@ impl MarketDataContext {
                 continue;
             };
             target.insert((mint_pk, pool_pk));
+        }
+        {
+            let mut last = self.last_momentum_snapshot_target.write();
+            if last.as_ref() == Some(&target) {
+                return false;
+            }
+            *last = Some(target.clone());
         }
         let mut batch_dirty = false;
         let before = self.hot_pool_registry.snapshot_pairs();
@@ -6852,6 +6993,7 @@ async fn run_bounded_wallet_dex_bootstrap_verify(
             run_id,
             &request_id_pf,
             &base_mint_str,
+            None,
             WALLET_BOOTSTRAP_ENSURE_PUMPFUN_FORCE_REFRESH,
         )
         .await;
@@ -10955,6 +11097,8 @@ async fn main() -> Result<()> {
         ),
         last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
         pending_geyser_evict: AtomicBool::new(false),
+        geyser_lru_index: parking_lot::Mutex::new(GeyserLruIndex::default()),
+        last_momentum_snapshot_target: parking_lot::RwLock::new(None),
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -11256,6 +11400,41 @@ fn log_pump_amm_scope49_force_refresh_sell_layout_failure(
     );
 }
 
+/// PR235: true when md-state queue is saturated enough to defer cold-path discovery RPC.
+fn market_data_md_state_queue_pressure_defer_discovery() -> bool {
+    let depth =
+        ironcrab::metrics::MARKET_DATA_GEYSER_TRACKING_QUEUE_DEPTH.load(Ordering::Relaxed) as f64;
+    depth
+        >= (MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP as f64)
+            * MARKET_DATA_MD_STATE_DISCOVERY_DEFER_QUEUE_FRAC
+}
+
+async fn defer_discovery_if_md_state_pressure(ctx: &MarketDataContext, request_id: &str) -> bool {
+    if !market_data_md_state_queue_pressure_defer_discovery() {
+        return false;
+    }
+    inc_market_data_discovery_deferred_md_state_pressure_total();
+    let depth = ironcrab::metrics::MARKET_DATA_GEYSER_TRACKING_QUEUE_DEPTH.load(Ordering::Relaxed);
+    warn!(
+        request_id = %request_id,
+        queue_depth = depth,
+        queue_cap = MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP,
+        "PR235: deferring cold-path discovery — md-state queue under pressure"
+    );
+    if let Some(ref nats) = ctx.nats {
+        publish_control_response(
+            nats,
+            &ctx.run_id,
+            request_id,
+            ControlResponseStatus::Busy,
+            None,
+            Some("md_state_queue_pressure".into()),
+        )
+        .await;
+    }
+    true
+}
+
 /// I-24d: Handle EnsurePumpAmmPoolAccounts Discovery Request.
 ///
 /// Performs RPC-based discovery (Cold Path), updates MASTER cache, publishes
@@ -11271,6 +11450,9 @@ async fn handle_ensure_pump_amm_pool_accounts(
     pool_address_hint: Option<&str>,
     force_refresh: bool,
 ) {
+    if defer_discovery_if_md_state_pressure(ctx, request_id).await {
+        return;
+    }
     let base_mint = match Pubkey::from_str(base_mint_str) {
         Ok(p) => p,
         Err(e) => {
@@ -11733,8 +11915,12 @@ async fn handle_ensure_pumpfun_bonding_curve(
     run_id: &str,
     request_id: &str,
     base_mint_str: &str,
+    pool_address_hint: Option<&str>,
     force_refresh: bool,
 ) {
+    if defer_discovery_if_md_state_pressure(ctx, request_id).await {
+        return;
+    }
     let base_mint = match Pubkey::from_str(base_mint_str) {
         Ok(p) => p,
         Err(e) => {
@@ -11774,6 +11960,9 @@ async fn handle_ensure_pumpfun_bonding_curve(
     };
 
     let (bonding_curve, _) = pumpfun.derive_bonding_curve(&base_mint);
+    let bonding_curve = pool_address_hint
+        .and_then(|s| Pubkey::from_str(s).ok())
+        .unwrap_or(bonding_curve);
     let bonding_curve_str = bonding_curve.to_string();
 
     if !force_refresh {
@@ -12336,6 +12525,32 @@ fn spawn_market_data_global_ingest_liveness_task(process_started: Instant) {
         .expect("spawn md-ingest-liveness thread");
 }
 
+/// PR235: pure stall-duration policy for md-state liveness (testable without OS thread).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MdStateStallLivenessAction {
+    None,
+    RecordStall,
+    WarnStillStalled,
+    ExitForSystemd,
+}
+
+fn md_state_stall_liveness_action(
+    stalled_duration: Duration,
+    exit_enabled: bool,
+) -> MdStateStallLivenessAction {
+    if stalled_duration >= MARKET_DATA_MD_STATE_STALL_EXIT_AFTER {
+        if exit_enabled {
+            MdStateStallLivenessAction::ExitForSystemd
+        } else {
+            MdStateStallLivenessAction::WarnStillStalled
+        }
+    } else if stalled_duration >= MARKET_DATA_MD_STATE_STALL_WINDOW {
+        MdStateStallLivenessAction::RecordStall
+    } else {
+        MdStateStallLivenessAction::None
+    }
+}
+
 /// PR234: detect md-state stall (queue near cap + flat burst/job progress). OS thread — not Tokio.
 fn spawn_market_data_md_state_liveness_task(process_started: Instant) {
     std::thread::Builder::new()
@@ -12380,14 +12595,36 @@ fn spawn_market_data_md_state_liveness_task(process_started: Instant) {
                         );
                     }
                     if since.elapsed() >= MARKET_DATA_MD_STATE_STALL_EXIT_AFTER {
-                        error!(
-                            stall_secs = MARKET_DATA_MD_STATE_STALL_EXIT_AFTER.as_secs(),
-                            queue_depth = depth,
-                            "PR234: md-state still stalled — exiting for systemd restart"
-                        );
-                        #[cfg(unix)]
-                        MD_SYSTEMD_WATCHDOG_NOTIFY.store(false, Ordering::Relaxed);
-                        std::process::exit(1);
+                        match md_state_stall_liveness_action(
+                            since.elapsed(),
+                            MARKET_DATA_MD_STATE_STALL_EXIT_ENABLED,
+                        ) {
+                            MdStateStallLivenessAction::ExitForSystemd => {
+                                error!(
+                                    stall_secs = MARKET_DATA_MD_STATE_STALL_EXIT_AFTER.as_secs(),
+                                    queue_depth = depth,
+                                    "PR235: md-state still stalled — exiting for systemd restart"
+                                );
+                                #[cfg(unix)]
+                                MD_SYSTEMD_WATCHDOG_NOTIFY.store(false, Ordering::Relaxed);
+                                std::process::exit(1);
+                            }
+                            MdStateStallLivenessAction::WarnStillStalled => {
+                                warn!(
+                                    stall_secs = MARKET_DATA_MD_STATE_STALL_EXIT_AFTER.as_secs(),
+                                    queue_depth = depth,
+                                    bursts_completed = bursts,
+                                    jobs_dequeued = jobs,
+                                    enqueue_dropped = drops,
+                                    evict_pending =
+                                        ironcrab::metrics::MARKET_DATA_MD_STATE_EVICT_PENDING
+                                            .load(Ordering::Relaxed),
+                                    "PR235: md-state still stalled (exit disabled — metric recorded)"
+                                );
+                            }
+                            MdStateStallLivenessAction::None
+                            | MdStateStallLivenessAction::RecordStall => {}
+                        }
                     }
                 } else {
                     stalled_since = None;
@@ -14482,10 +14719,12 @@ async fn run_geyser_loop(
                                     ControlRequestKind::EnsurePumpfunBondingCurve { base_mint } => {
                                         let run_id = ctx.run_id.clone();
                                         let request_id = req.request_id.clone();
+                                        let pool_hint = req.pool_address_hint.clone();
                                         let force_refresh = req.force_refresh_pumpfun;
                                         info!(
                                             request_id = %request_id,
                                             base_mint = %base_mint,
+                                            pool_address_hint = ?pool_hint,
                                             force_refresh_pumpfun = %force_refresh,
                                             "EnsurePumpfunBondingCurve received"
                                         );
@@ -14498,6 +14737,7 @@ async fn run_geyser_loop(
                                                 run_id.as_str(),
                                                 &request_id,
                                                 &base_mint,
+                                                pool_hint.as_deref(),
                                                 force_refresh,
                                             )
                                             .await;
@@ -15277,10 +15517,12 @@ async fn run_simulation_loop(
                                     ControlRequestKind::EnsurePumpfunBondingCurve { base_mint } => {
                                         let run_id = ctx.run_id.clone();
                                         let request_id = req.request_id.clone();
+                                        let pool_hint = req.pool_address_hint.clone();
                                         let force_refresh = req.force_refresh_pumpfun;
                                         info!(
                                             request_id = %request_id,
                                             base_mint = %base_mint,
+                                            pool_address_hint = ?pool_hint,
                                             force_refresh_pumpfun = %force_refresh,
                                             "EnsurePumpfunBondingCurve received (simulation)"
                                         );
@@ -15293,6 +15535,7 @@ async fn run_simulation_loop(
                                                 run_id.as_str(),
                                                 &request_id,
                                                 &base_mint,
+                                                pool_hint.as_deref(),
                                                 force_refresh,
                                             )
                                             .await;
@@ -16548,6 +16791,8 @@ mod wallet_tx_meta_balance_tests {
             ),
             last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
             pending_geyser_evict: AtomicBool::new(false),
+            geyser_lru_index: parking_lot::Mutex::new(GeyserLruIndex::default()),
+            last_momentum_snapshot_target: parking_lot::RwLock::new(None),
         })
     }
 
@@ -16934,7 +17179,7 @@ mod pr_b_geyser_tracking_tests {
         let worker = MdSidefxWorkerCtx {
             ctx: Arc::clone(&ctx),
             publish_tx: None,
-            md_state,
+            md_state: md_state.clone(),
         };
         let pool = Pubkey::new_unique();
         let base = Pubkey::new_unique();
@@ -16949,11 +17194,13 @@ mod pr_b_geyser_tracking_tests {
             slot: 1,
             grpc_recv_at: Instant::now(),
         };
-        md_sidefx_process_live_pool_cache_account_update(&worker, &job);
+        let mut scratch = MdSidefxBurstScratch::new();
+        md_sidefx_process_live_pool_cache_account_update(&worker, &job, &mut scratch);
         assert_eq!(depth.load(Ordering::Relaxed), 0);
         assert!(ctx.live_pool_cache.get(&pool).is_some());
 
         ctx.hot_pool_registry.pin_pool(base, pool);
+        let mut scratch = MdSidefxBurstScratch::new();
         md_sidefx_process_live_pool_cache_account_update(
             &worker,
             &MdSidefxCommand::LivePoolCacheAccountUpdate {
@@ -16964,7 +17211,9 @@ mod pr_b_geyser_tracking_tests {
                 slot: 2,
                 grpc_recv_at: Instant::now(),
             },
+            &mut scratch,
         );
+        md_sidefx_flush_pending_md_state_jobs(&md_state, &mut scratch);
         assert_eq!(
             depth.load(Ordering::Relaxed),
             1,
@@ -16977,6 +17226,7 @@ mod pr_b_geyser_tracking_tests {
         ));
         assert!(md_state_process_job(&ctx, first_job));
 
+        let mut scratch2 = MdSidefxBurstScratch::new();
         md_sidefx_process_live_pool_cache_account_update(
             &worker,
             &MdSidefxCommand::LivePoolCacheAccountUpdate {
@@ -16987,11 +17237,13 @@ mod pr_b_geyser_tracking_tests {
                 slot: 3,
                 grpc_recv_at: Instant::now(),
             },
+            &mut scratch2,
         );
+        md_sidefx_flush_pending_md_state_jobs(&md_state, &mut scratch2);
         assert_eq!(
             depth.load(Ordering::Relaxed),
             1,
-            "repeat hot upsert skips md-state when vault rows are stable"
+            "repeat hot upsert skips md-state when vault rows are stable (no second Register enqueue)"
         );
     }
 
@@ -17422,6 +17674,8 @@ mod pr_b_geyser_tracking_tests {
             ),
             last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
             pending_geyser_evict: AtomicBool::new(false),
+            geyser_lru_index: parking_lot::Mutex::new(GeyserLruIndex::default()),
+            last_momentum_snapshot_target: parking_lot::RwLock::new(None),
         })
     }
 
@@ -17490,6 +17744,8 @@ mod pr_b_geyser_tracking_tests {
             ),
             last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
             pending_geyser_evict: AtomicBool::new(false),
+            geyser_lru_index: parking_lot::Mutex::new(GeyserLruIndex::default()),
+            last_momentum_snapshot_target: parking_lot::RwLock::new(None),
         });
         (
             ctx,
@@ -21053,7 +21309,9 @@ mod pr_b_geyser_tracking_tests {
             let mut vaults = ctx.tracked_vaults.write();
             for _ in 0..25 {
                 let pool = Pubkey::new_unique();
-                vaults.insert(Pubkey::new_unique(), mk_vault(pool, true));
+                let pk = Pubkey::new_unique();
+                vaults.insert(pk, mk_vault(pool, true));
+                ctx.geyser_lru_note_vault(pk, old);
             }
         }
         let combined_before = ctx.combined_geyser_explicit_accounts();
@@ -21129,6 +21387,126 @@ mod pr_b_geyser_tracking_tests {
         assert!(
             !acc_body.contains("sync_geyser_tracked_accounts_batched_flush"),
             "account handler must not call sync_geyser_tracked_accounts_batched_flush"
+        );
+    }
+
+    /// PR235: LRU heap evicts 100 steps from 10k entries within ms budget (no full-map scan per step).
+    #[test]
+    fn pr235_lru_heap_evicts_10k_under_ms_budget() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        {
+            let mut cfg = ctx.config.write();
+            cfg.max_tracked_accounts = 100;
+        }
+        let base_time = Instant::now() - Duration::from_secs(7200);
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            for i in 0..10_000usize {
+                let pool = Pubkey::new_unique();
+                let pk = Pubkey::new_unique();
+                let at = base_time + Duration::from_millis(i as u64);
+                vaults.insert(
+                    pk,
+                    VaultInfo {
+                        pool_address: pool,
+                        dex: "x".into(),
+                        base_mint: Pubkey::new_unique(),
+                        quote_mint: Pubkey::new_unique(),
+                        is_base_vault: true,
+                        last_balance: std::sync::atomic::AtomicU64::new(0),
+                        last_used_at: at,
+                        pinned: false,
+                        pin: None,
+                        active_id: None,
+                        bin_step: None,
+                        sibling_vault: None,
+                    },
+                );
+                ctx.geyser_lru_note_vault(pk, at);
+            }
+        }
+        let before = ctx.combined_geyser_explicit_accounts();
+        assert_eq!(before, 10_000);
+        let start = Instant::now();
+        for step in 0..100 {
+            assert!(
+                ctx.evict_one_geyser_lru_step(),
+                "heap eviction step {step} failed before reaching cap"
+            );
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "100 heap evictions took too long on this host: {:?}",
+            start.elapsed()
+        );
+        assert!(ctx.combined_geyser_explicit_accounts() < before);
+    }
+
+    /// PR235: idempotent register guard skips when vault pair already tracked.
+    #[test]
+    fn pr235_pool_needs_tracking_skips_when_vaults_stable() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let token_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        let state = CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+            token_0_mint: token_mint,
+            token_1_mint: quote,
+            token_0_vault: base_vault,
+            token_1_vault: quote_vault,
+            reserve_0: Some(1),
+            reserve_1: Some(1),
+        });
+        ctx.hot_pool_registry.pin_pool(token_mint, pool);
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            let mut vaults_changed = false;
+            ctx.register_tracked_vault_pair_lru(
+                &mut vaults,
+                &mut vaults_changed,
+                TrackedVaultPairInsert {
+                    pool,
+                    now: Instant::now(),
+                    dex: "raydium_cpmm",
+                    base_mint: token_mint,
+                    quote_mint: quote,
+                    base_vault,
+                    quote_vault,
+                    active_id: None,
+                    bin_step: None,
+                },
+            );
+        }
+        assert!(!pool_needs_tracking_refresh_after_cache_upsert(
+            &ctx, pool, &state
+        ));
+    }
+
+    /// PR235: default stall policy records metric and warns — no systemd exit until soak enables flag.
+    #[test]
+    fn pr235_md_state_stall_exit_disabled_by_default() {
+        assert_eq!(
+            md_state_stall_liveness_action(MARKET_DATA_MD_STATE_STALL_EXIT_AFTER, false),
+            MdStateStallLivenessAction::WarnStillStalled,
+        );
+        assert_eq!(
+            md_state_stall_liveness_action(
+                MARKET_DATA_MD_STATE_STALL_EXIT_AFTER,
+                MARKET_DATA_MD_STATE_STALL_EXIT_ENABLED,
+            ),
+            MdStateStallLivenessAction::WarnStillStalled,
+        );
+        assert_eq!(
+            md_state_stall_liveness_action(MARKET_DATA_MD_STATE_STALL_EXIT_AFTER, true),
+            MdStateStallLivenessAction::ExitForSystemd,
         );
     }
 }
