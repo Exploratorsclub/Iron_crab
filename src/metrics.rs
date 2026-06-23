@@ -785,6 +785,28 @@ static MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_SUM: Lazy<AtomicU64> =
 static MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_COUNT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// PR237: md-state writer lock wait (tracked_vaults / tracked_bin_arrays / tracked_mints writes).
+const MARKET_DATA_MD_STATE_WRITER_WAIT_US_BUCKETS: &[u64] = &[
+    1, 10, 50, 100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
+    10_000_000,
+];
+static MARKET_DATA_MD_STATE_WRITER_WAIT_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    MARKET_DATA_MD_STATE_WRITER_WAIT_US_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+static MARKET_DATA_MD_STATE_WRITER_WAIT_US_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_MD_STATE_WRITER_WAIT_US_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// PR237: wall unix ms when ingest membership snapshot was last refreshed by md-state.
+static MARKET_DATA_TRACKED_MEMBERSHIP_SNAPSHOT_REFRESHED_UNIX_MS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// PR237: ingest hot-path membership snapshot hits (sanity).
+pub static MARKET_DATA_INGEST_MEMBERSHIP_SNAPSHOT_HITS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// Phase-R-R4: deferred side-effects queue depth (`md-sidefx` OS thread).
 pub static MARKET_DATA_MD_SIDEFX_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// Phase-R-R4: `md-sidefx` queue full (`try_send` drop).
@@ -984,6 +1006,39 @@ pub fn record_market_data_md_state_sync_flush_duration_us(us: u64) {
         us,
         u64::MAX,
     );
+}
+
+#[inline]
+pub fn record_market_data_md_state_writer_wait_us(us: u64) {
+    record_histogram_u64_into(
+        MARKET_DATA_MD_STATE_WRITER_WAIT_US_BUCKETS,
+        &MARKET_DATA_MD_STATE_WRITER_WAIT_US_BUCKET_COUNTS,
+        &MARKET_DATA_MD_STATE_WRITER_WAIT_US_SUM,
+        &MARKET_DATA_MD_STATE_WRITER_WAIT_US_COUNT,
+        us,
+        u64::MAX,
+    );
+}
+
+#[inline]
+pub fn touch_market_data_tracked_membership_snapshot_refresh() {
+    MARKET_DATA_TRACKED_MEMBERSHIP_SNAPSHOT_REFRESHED_UNIX_MS
+        .store(wall_clock_unix_ms_now(), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn market_data_tracked_membership_snapshot_age_ms() -> u64 {
+    let refreshed =
+        MARKET_DATA_TRACKED_MEMBERSHIP_SNAPSHOT_REFRESHED_UNIX_MS.load(Ordering::Relaxed);
+    if refreshed == 0 {
+        return 0;
+    }
+    wall_clock_unix_ms_now().saturating_sub(refreshed)
+}
+
+#[inline]
+pub fn inc_market_data_ingest_membership_snapshot_hits_total() {
+    MARKET_DATA_INGEST_MEMBERSHIP_SNAPSHOT_HITS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -4057,6 +4112,22 @@ async fn metrics_response() -> Response<Body> {
         &MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_BUCKET_COUNTS,
         &MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_SUM,
         &MARKET_DATA_MD_STATE_SYNC_FLUSH_DURATION_US_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_md_state_writer_wait_us",
+        MARKET_DATA_MD_STATE_WRITER_WAIT_US_BUCKETS,
+        &MARKET_DATA_MD_STATE_WRITER_WAIT_US_BUCKET_COUNTS,
+        &MARKET_DATA_MD_STATE_WRITER_WAIT_US_SUM,
+        &MARKET_DATA_MD_STATE_WRITER_WAIT_US_COUNT,
+    );
+    line!(
+        "market_data_tracked_membership_snapshot_age_ms",
+        market_data_tracked_membership_snapshot_age_ms()
+    );
+    line!(
+        "market_data_ingest_membership_snapshot_hits_total",
+        MARKET_DATA_INGEST_MEMBERSHIP_SNAPSHOT_HITS_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_md_sidefx_queue_depth",
