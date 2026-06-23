@@ -357,6 +357,14 @@ pub static MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL: Lazy<AtomicU64> =
 /// Debounced Geyser sync flush skipped due to per-second rate cap (startup burst protection).
 pub static MARKET_DATA_GEYSER_SYNC_SKIPPED_RATE_LIMIT_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Phase 2a: current explicit Geyser pubkey count in DesiredExplicitSet.
+pub static MARKET_DATA_GEYSER_EXPLICIT_SET_SIZE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Phase 2a: pubkey count in one delta-only Geyser subscribe push.
+pub static MARKET_DATA_GEYSER_SUBSCRIBE_DELTA_PUBKEYS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Phase 2a: track-worker coalesced Geyser push batches completed (500 ms window).
+pub static MARKET_DATA_TRACK_REQUEST_COALESCE_BATCHES_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// UnifiedHotPoolRegistry pool count (momentum-only hot pools).
 pub static MARKET_DATA_HOT_POOL_REGISTRY_POOLS_MOMENTUM: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -618,6 +626,26 @@ pub fn inc_market_data_geyser_sync_skipped_no_delta_total() {
 #[inline]
 pub fn inc_market_data_geyser_sync_skipped_rate_limit_total() {
     MARKET_DATA_GEYSER_SYNC_SKIPPED_RATE_LIMIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_geyser_explicit_set_size(n: usize) {
+    MARKET_DATA_GEYSER_EXPLICIT_SET_SIZE.store(n as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_market_data_geyser_subscribe_delta_pubkeys(n: u64) {
+    MARKET_DATA_GEYSER_SUBSCRIBE_DELTA_PUBKEYS.fetch_add(n, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_track_request_coalesce_batches_total() {
+    MARKET_DATA_TRACK_REQUEST_COALESCE_BATCHES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn market_data_geyser_explicit_set_size_value() -> u64 {
+    MARKET_DATA_GEYSER_EXPLICIT_SET_SIZE.load(Ordering::Relaxed)
 }
 
 #[inline]
@@ -4353,6 +4381,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_geyser_sync_skipped_rate_limit_total",
         MARKET_DATA_GEYSER_SYNC_SKIPPED_RATE_LIMIT_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_explicit_set_size",
+        MARKET_DATA_GEYSER_EXPLICIT_SET_SIZE.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_subscribe_delta_pubkeys",
+        MARKET_DATA_GEYSER_SUBSCRIBE_DELTA_PUBKEYS.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_track_request_coalesce_batches_total",
+        MARKET_DATA_TRACK_REQUEST_COALESCE_BATCHES_TOTAL.load(Ordering::Relaxed)
     );
     out.push_str("market_data_hot_pool_registry_pools{reason=\"momentum\"} ");
     out.push_str(

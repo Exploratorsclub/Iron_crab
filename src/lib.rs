@@ -3,6 +3,7 @@ pub mod audit;
 pub mod config;
 pub mod execution;
 pub mod ipc;
+pub mod market_data;
 pub mod metrics;
 pub mod momentum_bot;
 pub mod nats;
