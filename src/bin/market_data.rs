@@ -90,7 +90,6 @@ use ironcrab::metrics::{
     inc_market_data_md_state_bursts_completed_total,
     inc_market_data_md_state_evict_steps_budget_exhausted_total,
     inc_market_data_md_state_evict_steps_total,
-    inc_market_data_md_state_register_skipped_idempotent_total,
     inc_market_data_momentum_coalesced_batches_total,
     inc_market_data_momentum_coalesced_messages_total,
     inc_market_data_unparsed_account_dropped_total, inc_market_data_unparsed_tx_dropped_total,
@@ -368,7 +367,11 @@ fn market_data_global_ingest_stalled(
 
 /// Phase-R-R2: commands for the single-writer `md-state` thread (was Tokio Geyser tracking actor).
 enum MdStateCommand {
+    /// Phase1: TX/sidefx no longer enqueue; handler kept for in-flight jobs + Phase 2 track-worker.
+    #[allow(dead_code)]
     RegisterReservesAfterTrade(Pubkey),
+    /// Phase1: account sidefx no longer enqueue; handler kept for md-state direct jobs + tests.
+    #[allow(dead_code)]
     RegisterPoolVaultsFromAccount {
         pool: Pubkey,
     },
@@ -401,7 +404,8 @@ enum MdStateCommand {
     /// PR237: superseded by md-sidefx `TradePoolLruTouch` on trade path; kept for queued jobs.
     #[allow(dead_code)]
     TouchPool(Pubkey),
-    /// Bounded arb-multi-dex vault/bin backfill when a mint becomes multi-DEX relevant.
+    /// Phase1: TX path no longer enqueues; handler kept until Phase 2 removes MD arb reconcile.
+    #[allow(dead_code)]
     ArbMultiDexReconcile {
         mint: Pubkey,
     },
@@ -881,11 +885,10 @@ struct MdSidefxWorkerCtx {
     md_state: MdStateSender,
 }
 
-/// Per-burst scratch: LRU touches and register jobs coalesced before md-state enqueue.
+/// Per-burst scratch: LRU touches coalesced before md-state enqueue.
 struct MdSidefxBurstScratch {
     pending_vault_touches: HashSet<Pubkey>,
     pending_bin_array_touches: HashSet<Pubkey>,
-    pending_register_pools: HashSet<Pubkey>,
 }
 
 impl MdSidefxBurstScratch {
@@ -893,7 +896,6 @@ impl MdSidefxBurstScratch {
         Self {
             pending_vault_touches: HashSet::new(),
             pending_bin_array_touches: HashSet::new(),
-            pending_register_pools: HashSet::new(),
         }
     }
 
@@ -904,22 +906,12 @@ impl MdSidefxBurstScratch {
     fn note_bin_array_touch(&mut self, pda: Pubkey) {
         self.pending_bin_array_touches.insert(pda);
     }
-
-    fn note_register_pool(&mut self, pool: Pubkey) {
-        self.pending_register_pools.insert(pool);
-    }
 }
 
 fn md_sidefx_flush_pending_md_state_jobs(
     md_state: &MdStateSender,
     scratch: &mut MdSidefxBurstScratch,
 ) {
-    for pool in scratch.pending_register_pools.drain() {
-        md_state_try_enqueue(
-            md_state,
-            MdStateCommand::RegisterPoolVaultsFromAccount { pool },
-        );
-    }
     md_sidefx_flush_pending_lru_touches(md_state, scratch);
 }
 
@@ -1876,7 +1868,7 @@ fn md_sidefx_process_live_pool_cache_mint_decimals(w: &MdSidefxWorkerCtx, job: &
 fn md_sidefx_process_live_pool_cache_account_update(
     w: &MdSidefxWorkerCtx,
     job: &MdSidefxCommand,
-    scratch: &mut MdSidefxBurstScratch,
+    _scratch: &mut MdSidefxBurstScratch,
 ) {
     let MdSidefxCommand::LivePoolCacheAccountUpdate {
         run_id,
@@ -1918,20 +1910,8 @@ fn md_sidefx_process_live_pool_cache_account_update(
             return;
         }
 
-        // PR169a + PR230: md-state tracking jobs only for execution-hot pools (bounded vault subs).
-        if matches!(
-            &cached_state,
-            CachedPoolState::RaydiumCpmm(_)
-                | CachedPoolState::MeteoraCpmm(_)
-                | CachedPoolState::Meteora(_)
-                | CachedPoolState::PumpAmm(_)
-                | CachedPoolState::Orca(_)
-                | CachedPoolState::RaydiumAmm(_)
-        ) && w.ctx.hot_pool_registry.is_hot_pool(*pool_pubkey)
-            && pool_needs_tracking_refresh_after_cache_upsert(&w.ctx, *pool_pubkey, &cached_state)
-        {
-            scratch.note_register_pool(*pool_pubkey);
-        }
+        // Phase1: sidefx only updates MASTER cache + JetStream; vault registration stays in md-state.
+        // (No RegisterPoolVaultsFromAccount enqueue from account parse.)
 
         // Extract mint and reserve info from cached_state for PoolCacheUpdate
         let (base_mint, quote_mint, base_reserve, quote_reserve) = match &cached_state {
@@ -2320,44 +2300,34 @@ fn md_sidefx_process_vault_balance_tick(
     else {
         return;
     };
-    let vault_info_opt = w.ctx.tracked_vaults.read().get(vault_pubkey).cloned();
-    let Some(vault_info) = vault_info_opt else {
+    let snap = w.ctx.tracked_membership.load();
+    let Some(vault_view) = snap.vault_by_pubkey.get(vault_pubkey) else {
         return;
     };
-    let prev_balance = vault_info
+    let prev_balance = vault_view
         .last_balance
         .swap(*balance, std::sync::atomic::Ordering::Relaxed);
     if *balance == prev_balance {
         return;
     }
     scratch.note_vault_touch(*vault_pubkey);
-    let (reserve_base, reserve_quote) = if vault_info.is_base_vault {
-        (*balance, 0u64)
-    } else {
-        (0u64, *balance)
-    };
 
-    let complete_update = {
-        let vaults = w.ctx.tracked_vaults.read();
-        vaults
-            .values()
-            .find(|v| {
-                v.pool_address == vault_info.pool_address
-                    && v.is_base_vault != vault_info.is_base_vault
-            })
-            .map(|other| {
-                let other_balance = other
-                    .last_balance
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                if vault_info.is_base_vault {
-                    (*balance, other_balance)
-                } else {
-                    (other_balance, *balance)
+    let (mut final_base, mut final_quote) =
+        snapshot_vault_pair_balances(&snap, vault_pubkey, *balance).unwrap_or((*balance, 0));
+
+    // Prefer LivePoolCache MASTER when snapshot pair is incomplete.
+    if final_base == 0 || final_quote == 0 {
+        if let Some(state) = w.ctx.live_pool_cache.get(&vault_view.pool_address) {
+            if let Some((_, _, cache_base, cache_quote, _)) =
+                pool_cache_balance_fields_from_state(&state)
+            {
+                if cache_base > 0 && cache_quote > 0 {
+                    final_base = cache_base;
+                    final_quote = cache_quote;
                 }
-            })
-    };
-
-    let (final_base, final_quote) = complete_update.unwrap_or((reserve_base, reserve_quote));
+            }
+        }
+    }
 
     if final_base == 0 && final_quote == 0 {
         return;
@@ -2372,17 +2342,17 @@ fn md_sidefx_process_vault_balance_tick(
             "market-data",
             BUILD_VERSION,
             run_id,
-            vault_info.pool_address.to_string(),
-            vault_info.dex.clone(),
-            vault_info.base_mint.to_string(),
-            vault_info.quote_mint.to_string(),
+            vault_view.pool_address.to_string(),
+            vault_view.dex.clone(),
+            vault_view.base_mint.to_string(),
+            vault_view.quote_mint.to_string(),
             final_base,
             final_quote,
             *slot,
         );
-        if vault_info.dex == "raydium_cpmm" {
+        if vault_view.dex == "raydium_cpmm" {
             if let Some(CachedPoolState::RaydiumCpmm(ref s)) =
-                w.ctx.live_pool_cache.get(&vault_info.pool_address)
+                w.ctx.live_pool_cache.get(&vault_view.pool_address)
             {
                 let mut meta = std::collections::HashMap::new();
                 meta.insert(
@@ -2394,12 +2364,12 @@ fn md_sidefx_process_vault_balance_tick(
                 balance_update.set_dex_readiness_in_metadata(readiness);
                 w.ctx
                     .live_pool_cache
-                    .merge_raydium_cpmm_pool_readiness(vault_info.pool_address, readiness);
+                    .merge_raydium_cpmm_pool_readiness(vault_view.pool_address, readiness);
             }
         }
-        if vault_info.dex == "meteora_cpmm" {
+        if vault_view.dex == "meteora_cpmm" {
             if let Some(CachedPoolState::MeteoraCpmm(ref s)) =
-                w.ctx.live_pool_cache.get(&vault_info.pool_address)
+                w.ctx.live_pool_cache.get(&vault_view.pool_address)
             {
                 let mut meta = balance_update.metadata.take().unwrap_or_default();
                 meta.insert(
@@ -2415,23 +2385,23 @@ fn md_sidefx_process_vault_balance_tick(
                 balance_update.set_dex_readiness_in_metadata(readiness);
                 w.ctx
                     .live_pool_cache
-                    .merge_meteora_cpmm_pool_readiness(vault_info.pool_address, readiness);
+                    .merge_meteora_cpmm_pool_readiness(vault_view.pool_address, readiness);
             }
         }
-        if vault_info.dex == "raydium" {
+        if vault_view.dex == "raydium" {
             if let Some(CachedPoolState::RaydiumAmm(ref s)) =
-                w.ctx.live_pool_cache.get(&vault_info.pool_address)
+                w.ctx.live_pool_cache.get(&vault_view.pool_address)
             {
                 let readiness = raydium_amm_readiness_for_pool_cache_update(s);
                 balance_update.set_dex_readiness_in_metadata(readiness);
                 w.ctx
                     .live_pool_cache
-                    .merge_raydium_amm_pool_readiness(vault_info.pool_address, readiness);
+                    .merge_raydium_amm_pool_readiness(vault_view.pool_address, readiness);
             }
         }
-        if vault_info.dex == "orca" {
+        if vault_view.dex == "orca" {
             if let Some(CachedPoolState::Orca(ref s)) =
-                w.ctx.live_pool_cache.get(&vault_info.pool_address)
+                w.ctx.live_pool_cache.get(&vault_view.pool_address)
             {
                 let mut meta = balance_update.metadata.take().unwrap_or_default();
                 for (k, v) in orca_metadata_for_pool_cache_update(s) {
@@ -2442,12 +2412,12 @@ fn md_sidefx_process_vault_balance_tick(
                 balance_update.set_dex_readiness_in_metadata(readiness);
                 w.ctx
                     .live_pool_cache
-                    .merge_orca_pool_readiness(vault_info.pool_address, readiness);
+                    .merge_orca_pool_readiness(vault_view.pool_address, readiness);
             }
         }
-        if vault_info.dex == "meteora_dlmm" {
+        if vault_view.dex == "meteora_dlmm" {
             if let Some(CachedPoolState::Meteora(ref s)) =
-                w.ctx.live_pool_cache.get(&vault_info.pool_address)
+                w.ctx.live_pool_cache.get(&vault_view.pool_address)
             {
                 let mut meta = balance_update.metadata.take().unwrap_or_default();
                 for (k, v) in meteora_dlmm_metadata_for_pool_cache_update(s) {
@@ -2458,10 +2428,10 @@ fn md_sidefx_process_vault_balance_tick(
                 balance_update.set_dex_readiness_in_metadata(readiness);
                 w.ctx
                     .live_pool_cache
-                    .merge_meteora_dlmm_pool_readiness(vault_info.pool_address, readiness);
+                    .merge_meteora_dlmm_pool_readiness(vault_view.pool_address, readiness);
             }
         }
-        let subject = pool_subject(&vault_info.pool_address.to_string());
+        let subject = pool_subject(&vault_view.pool_address.to_string());
         sidefx_enqueue_jetstream(
             w.publish_tx.as_ref(),
             subject,
@@ -2470,7 +2440,7 @@ fn md_sidefx_process_vault_balance_tick(
             false,
         );
         info!(
-            pool = %vault_info.pool_address,
+            pool = %vault_view.pool_address,
             slot = slot,
             "MASTER CACHE: PoolCacheUpdate::BalanceUpdated enqueued for JetStream"
         );
@@ -2484,15 +2454,15 @@ fn md_sidefx_process_vault_balance_tick(
         "geyser_vault",
         Some(*slot),
         MarketEventKind::PoolStateUpdate {
-            pool_address: vault_info.pool_address.to_string(),
-            dex: vault_info.dex.clone(),
+            pool_address: vault_view.pool_address.to_string(),
+            dex: vault_view.dex.clone(),
             reserve_base: final_base,
             reserve_quote: final_quote,
-            base_mint: vault_info.base_mint.to_string(),
-            quote_mint: vault_info.quote_mint.to_string(),
+            base_mint: vault_view.base_mint.to_string(),
+            quote_mint: vault_view.quote_mint.to_string(),
             update_slot: *slot,
-            active_id: vault_info.active_id,
-            bin_step: vault_info.bin_step,
+            active_id: vault_view.active_id,
+            bin_step: vault_view.bin_step,
         },
     );
 
@@ -3689,12 +3659,37 @@ struct BinArrayInfo {
     pin: Option<GeyserPinReason>,
 }
 
-/// PR237: lock-free ingest membership view (refreshed by md-state at burst end).
+/// Phase1: lock-free vault metadata for ingest/sidefx (refreshed by md-state only).
+#[derive(Clone)]
+struct SnapshotVaultView {
+    pool_address: Pubkey,
+    dex: String,
+    base_mint: Pubkey,
+    quote_mint: Pubkey,
+    is_base_vault: bool,
+    sibling_vault: Option<Pubkey>,
+    active_id: Option<i32>,
+    bin_step: Option<u16>,
+    /// Sidefx may update; authoritative `VaultInfo.last_balance` refreshed on snapshot rebuild.
+    last_balance: Arc<AtomicU64>,
+}
+
+/// Phase1: lock-free bin-array metadata for ingest/sidefx.
+#[derive(Clone)]
+struct SnapshotBinArrayView {
+    pool_address: Pubkey,
+    bin_array_index: i64,
+    bin_step: u16,
+}
+
+/// PR237 + Phase1: lock-free ingest membership view (refreshed by md-state at burst end).
 #[derive(Clone, Default)]
 struct TrackedMembershipSnapshot {
     vaults: HashSet<Pubkey>,
     mints: HashSet<Pubkey>,
     bin_arrays: HashSet<Pubkey>,
+    vault_by_pubkey: HashMap<Pubkey, SnapshotVaultView>,
+    bin_array_by_pubkey: HashMap<Pubkey, SnapshotBinArrayView>,
 }
 
 /// PR237: reverse index pool → tracked vault/bin pubkeys (md-state writer only).
@@ -4058,29 +4053,6 @@ fn cached_pool_has_arb_common_quote_leg(state: &CachedPoolState) -> bool {
         .is_some_and(|(a, b)| is_arb_common_quote_mint(&a) || is_arb_common_quote_mint(&b))
 }
 
-fn try_enqueue_arb_multi_dex_reconcile(md_state: &MdStateSender, mint: Pubkey) {
-    if is_arb_common_quote_mint(&mint) {
-        return;
-    }
-    md_state_try_enqueue(md_state, MdStateCommand::ArbMultiDexReconcile { mint });
-}
-
-fn try_enqueue_arb_reconcile_for_pool(
-    md_state: &MdStateSender,
-    cache: &LivePoolCache,
-    pool: Pubkey,
-) {
-    let Some(state) = cache.get(&pool) else {
-        return;
-    };
-    let Some((mint_a, mint_b)) = pool_mints_for_geyser_explicit_tracking(&state) else {
-        return;
-    };
-    for mint in arb_candidate_mints_from_pair(mint_a, mint_b) {
-        try_enqueue_arb_multi_dex_reconcile(md_state, mint);
-    }
-}
-
 /// Vault ATA pair from cache state (SOL-normalized) when hot-pool vault tracking applies.
 fn expected_pool_vault_pubkeys_from_cache(
     cached_state: &CachedPoolState,
@@ -4133,6 +4105,7 @@ fn expected_pool_vault_pubkeys_from_cache(
 }
 
 /// True when expected vault rows for a hot pool are already registered with sibling links.
+#[cfg(test)]
 fn pool_vaults_fully_tracked_for_cache(
     ctx: &MarketDataContext,
     pool: Pubkey,
@@ -4159,6 +4132,7 @@ fn pool_vaults_fully_tracked_for_cache(
 }
 
 /// True when a hot-pool cache upsert still needs vault registration (missing vault rows).
+#[cfg(test)]
 fn pool_needs_tracking_refresh_after_cache_upsert(
     ctx: &MarketDataContext,
     pool: Pubkey,
@@ -4168,7 +4142,7 @@ fn pool_needs_tracking_refresh_after_cache_upsert(
         return false;
     }
     if pool_vaults_fully_tracked_for_cache(ctx, pool, cached_state) {
-        inc_market_data_md_state_register_skipped_idempotent_total();
+        ironcrab::metrics::inc_market_data_md_state_register_skipped_idempotent_total();
         return false;
     }
     true
@@ -4217,6 +4191,41 @@ fn tracked_membership_contains_pubkey(ctx: &MarketDataContext, pk: &Pubkey) -> b
         return true;
     }
     false
+}
+
+/// Phase1: pair reserve balances from snapshot vault views (no `tracked_vaults` map lock).
+fn snapshot_vault_pair_balances(
+    snap: &TrackedMembershipSnapshot,
+    vault_pubkey: &Pubkey,
+    new_balance: u64,
+) -> Option<(u64, u64)> {
+    let vault = snap.vault_by_pubkey.get(vault_pubkey)?;
+    let (base, quote) = if let Some(sibling_pk) = vault.sibling_vault {
+        snap.vault_by_pubkey
+            .get(&sibling_pk)
+            .map(|sibling| {
+                let sib_bal = sibling
+                    .last_balance
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if vault.is_base_vault {
+                    (new_balance, sib_bal)
+                } else {
+                    (sib_bal, new_balance)
+                }
+            })
+            .unwrap_or_else(|| {
+                if vault.is_base_vault {
+                    (new_balance, 0)
+                } else {
+                    (0, new_balance)
+                }
+            })
+    } else if vault.is_base_vault {
+        (new_balance, 0)
+    } else {
+        (0, new_balance)
+    };
+    Some((base, quote))
 }
 
 fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> {
@@ -4468,16 +4477,60 @@ impl MarketDataContext {
         self.refresh_arb_pin_gauges();
     }
 
-    /// PR237: rebuild ingest membership snapshot from authoritative md-state maps.
+    /// PR237 + Phase1: rebuild ingest/sidefx snapshot from authoritative md-state maps.
     fn refresh_tracked_membership_snapshot(&self) {
-        let vaults: HashSet<Pubkey> = self.tracked_vaults.read().keys().copied().collect();
+        let prior = self.tracked_membership.load();
+        let mut vault_by_pubkey = HashMap::new();
+        for (pk, v) in self.tracked_vaults.read().iter() {
+            let last_balance = prior
+                .vault_by_pubkey
+                .get(pk)
+                .map(|entry| Arc::clone(&entry.last_balance))
+                .unwrap_or_else(|| {
+                    Arc::new(AtomicU64::new(
+                        v.last_balance.load(std::sync::atomic::Ordering::Relaxed),
+                    ))
+                });
+            last_balance.store(
+                v.last_balance.load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            vault_by_pubkey.insert(
+                *pk,
+                SnapshotVaultView {
+                    pool_address: v.pool_address,
+                    dex: v.dex.clone(),
+                    base_mint: v.base_mint,
+                    quote_mint: v.quote_mint,
+                    is_base_vault: v.is_base_vault,
+                    sibling_vault: v.sibling_vault,
+                    active_id: v.active_id,
+                    bin_step: v.bin_step,
+                    last_balance,
+                },
+            );
+        }
+        let vaults: HashSet<Pubkey> = vault_by_pubkey.keys().copied().collect();
+        let mut bin_array_by_pubkey = HashMap::new();
+        for (pk, b) in self.tracked_bin_arrays.read().iter() {
+            bin_array_by_pubkey.insert(
+                *pk,
+                SnapshotBinArrayView {
+                    pool_address: b.pool_address,
+                    bin_array_index: b.bin_array_index,
+                    bin_step: b.bin_step,
+                },
+            );
+        }
+        let bin_arrays: HashSet<Pubkey> = bin_array_by_pubkey.keys().copied().collect();
         let mints: HashSet<Pubkey> = self.tracked_mints.read().keys().copied().collect();
-        let bin_arrays: HashSet<Pubkey> = self.tracked_bin_arrays.read().keys().copied().collect();
         self.tracked_membership
             .store(Arc::new(TrackedMembershipSnapshot {
                 vaults,
                 mints,
                 bin_arrays,
+                vault_by_pubkey,
+                bin_array_by_pubkey,
             }));
         touch_market_data_tracked_membership_snapshot_refresh();
     }
@@ -13610,9 +13663,10 @@ async fn handle_geyser_account(
     if (account_update.owner.to_bytes() == spl_token::ID.to_bytes()
         || account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes())
         && ctx
-            .tracked_mints
-            .read()
-            .contains_key(&account_update.pubkey)
+            .tracked_membership
+            .load()
+            .mints
+            .contains(&account_update.pubkey)
     {
         if let Some((decimals, supply, mint_authority, freeze_authority)) =
             try_parse_mint_account(&account_update.owner, &account_update.data)
@@ -13713,9 +13767,9 @@ async fn handle_geyser_account(
     let dlmm_program =
         Pubkey::from_str(METEORA_DLMM_PROGRAM).expect("Invalid METEORA_DLMM_PROGRAM constant");
     if account_update.owner == dlmm_program {
-        let bin_array_info_opt = ctx
-            .tracked_bin_arrays
-            .read()
+        let snap = ctx.tracked_membership.load();
+        let bin_array_info_opt = snap
+            .bin_array_by_pubkey
             .get(&account_update.pubkey)
             .cloned();
         if let Some(bin_array_info) = bin_array_info_opt {
@@ -14035,7 +14089,7 @@ async fn handle_geyser_transaction(
         }
     }
 
-    // PR-B: qualifying swap trade — register reserve vaults / DLMM bins; LRU touch via md-sidefx.
+    // Phase1: qualifying swap trade — LRU touch via md-sidefx only (no Register/Arb enqueue from TX).
     if let Some(ParsedDexEvent::Trade { pool_address, .. }) = parsed_event.as_ref() {
         md_sidefx_try_enqueue(
             md_sidefx,
@@ -14043,11 +14097,6 @@ async fn handle_geyser_transaction(
                 pool: *pool_address,
             },
         );
-        md_state_try_enqueue(
-            md_state,
-            MdStateCommand::RegisterReservesAfterTrade(*pool_address),
-        );
-        try_enqueue_arb_reconcile_for_pool(md_state, ctx.live_pool_cache.as_ref(), *pool_address);
     }
 
     // Pump.fun: propagate creator/dev wallet so strategy can build deterministic intents.
@@ -17372,15 +17421,10 @@ mod pr_b_geyser_tracking_tests {
         md_sidefx_flush_pending_md_state_jobs(&md_state, &mut scratch);
         assert_eq!(
             depth.load(Ordering::Relaxed),
-            1,
-            "first hot upsert enqueues Register only (index refresh is inline)"
+            0,
+            "phase1: hot pool account upsert must not enqueue RegisterPoolVaultsFromAccount from sidefx"
         );
-        let first_job = md_state_rx.recv().expect("Register job must be enqueued");
-        assert!(matches!(
-            first_job,
-            MdStateCommand::RegisterPoolVaultsFromAccount { .. }
-        ));
-        assert!(md_state_process_job(&ctx, first_job));
+        assert!(md_state_rx.try_recv().is_err());
 
         let mut scratch2 = MdSidefxBurstScratch::new();
         md_sidefx_process_live_pool_cache_account_update(
@@ -17398,8 +17442,8 @@ mod pr_b_geyser_tracking_tests {
         md_sidefx_flush_pending_md_state_jobs(&md_state, &mut scratch2);
         assert_eq!(
             depth.load(Ordering::Relaxed),
-            1,
-            "repeat hot upsert skips md-state when vault rows are stable (no second Register enqueue)"
+            0,
+            "phase1: repeat hot upsert still must not enqueue md-state register from sidefx"
         );
     }
 
@@ -21330,6 +21374,14 @@ mod pr_b_geyser_tracking_tests {
             "account handler must not read tracked_vaults (deferred to md-sidefx)"
         );
         assert!(
+            !acc_body.contains("tracked_mints.read()"),
+            "account handler must not read tracked_mints (use membership snapshot)"
+        );
+        assert!(
+            !acc_body.contains("tracked_bin_arrays.read()"),
+            "account handler must not read tracked_bin_arrays (use membership snapshot)"
+        );
+        assert!(
             !acc_body.contains("live_pool_cache.upsert"),
             "account handler must not upsert live_pool_cache (deferred to md-sidefx)"
         );
@@ -21766,14 +21818,198 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(vaults.get(&decoy_vault).unwrap().last_used_at, now_old);
     }
 
-    /// PR237: trade hot path enqueues sidefx LRU touch, not md-state TouchPool.
+    /// PR237: trade hot path enqueues sidefx LRU touch, not md-state TouchPool/Register.
     #[test]
     fn pr237_trade_path_uses_sidefx_not_md_state_touch_pool() {
         let src = include_str!("market_data.rs");
-        let marker = "// PR-B: qualifying swap trade";
+        let marker = "// Phase1: qualifying swap trade";
         let start = src.find(marker).expect("trade block marker");
-        let block = &src[start..start.saturating_add(700)];
+        let block = &src[start..start.saturating_add(500)];
         assert!(!block.contains("MdStateCommand::TouchPool"));
+        assert!(!block.contains("RegisterReservesAfterTrade"));
+        assert!(!block.contains("try_enqueue_arb_reconcile_for_pool"));
         assert!(block.contains("TradePoolLruTouch"));
+    }
+
+    /// Phase1: ingest + md-sidefx must not block on tracked_* map read locks.
+    #[test]
+    fn phase1_ingest_sidefx_no_tracked_map_reads() {
+        let src = include_str!("market_data.rs");
+        let tx_start = src
+            .find("async fn handle_geyser_transaction")
+            .expect("tx handler");
+        let tx_end = src
+            .find("async fn run_geyser_loop")
+            .expect("after tx handler");
+        let acc_start = src
+            .find("async fn handle_geyser_account")
+            .expect("account handler");
+        let acc_end = src
+            .find("async fn handle_geyser_transaction")
+            .expect("after account handler");
+        let sidefx_start = src
+            .find("fn md_sidefx_flush_pending_md_state_jobs")
+            .expect("sidefx region");
+        let sidefx_end = src
+            .find("fn spawn_md_sidefx_worker")
+            .expect("after sidefx region");
+        let tx_body = &src[tx_start..tx_end];
+        let acc_body = &src[acc_start..acc_end];
+        let sidefx_body = &src[sidefx_start..sidefx_end];
+        for body in [acc_body, tx_body, sidefx_body] {
+            assert!(
+                !body.contains("tracked_vaults.read()"),
+                "ingest/sidefx must not read tracked_vaults"
+            );
+            assert!(
+                !body.contains("tracked_mints.read()"),
+                "ingest/sidefx must not read tracked_mints"
+            );
+            assert!(
+                !body.contains("tracked_bin_arrays.read()"),
+                "ingest/sidefx must not read tracked_bin_arrays"
+            );
+        }
+    }
+
+    /// Phase1: trade handler must not enqueue RegisterReservesAfterTrade.
+    #[test]
+    fn phase1_trade_path_no_register_reserves_enqueue() {
+        let src = include_str!("market_data.rs");
+        let tx_start = src
+            .find("async fn handle_geyser_transaction")
+            .expect("tx handler");
+        let tx_end = src
+            .find("async fn run_geyser_loop")
+            .expect("after tx handler");
+        let tx_body = &src[tx_start..tx_end];
+        assert!(
+            !tx_body.contains("RegisterReservesAfterTrade"),
+            "TX handler must not enqueue RegisterReservesAfterTrade (phase1)"
+        );
+    }
+
+    /// Phase1: sidefx flush must not enqueue RegisterPoolVaultsFromAccount.
+    #[test]
+    fn phase1_sidefx_no_register_pool_vaults_enqueue() {
+        let src = include_str!("market_data.rs");
+        let start = src
+            .find("fn md_sidefx_flush_pending_md_state_jobs")
+            .expect("sidefx flush");
+        let end = src
+            .find("fn md_sidefx_dec_queue_depth")
+            .expect("after sidefx flush");
+        let body = &src[start..end];
+        assert!(
+            !body.contains("RegisterPoolVaultsFromAccount"),
+            "md_sidefx_flush must not enqueue RegisterPoolVaultsFromAccount"
+        );
+    }
+
+    /// Phase1: vault balance tick uses snapshot helper (no tracked_vaults map scan).
+    #[test]
+    fn phase1_sidefx_vault_tick_uses_snapshot() {
+        let src = include_str!("market_data.rs");
+        let start = src
+            .find("fn md_sidefx_process_vault_balance_tick")
+            .expect("vault tick handler");
+        let end = src
+            .find("fn md_sidefx_process_touch_bin_array_tick")
+            .expect("after vault tick handler");
+        let body = &src[start..end];
+        assert!(
+            body.contains("tracked_membership.load()"),
+            "vault tick must load membership snapshot"
+        );
+        assert!(
+            body.contains("snapshot_vault_pair_balances"),
+            "vault tick must assemble reserves via snapshot helper"
+        );
+        assert!(
+            !body.contains("tracked_vaults.read()"),
+            "vault tick must not read tracked_vaults map"
+        );
+    }
+
+    /// Phase1: snapshot-backed vault balance tick publishes paired reserves.
+    #[test]
+    fn phase1_vault_balance_tick_from_snapshot_publishes_pair() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, _depth, _rx) = test_md_state_sender_no_worker();
+        let worker = MdSidefxWorkerCtx {
+            ctx: Arc::clone(&ctx),
+            publish_tx: None,
+            md_state,
+        };
+
+        let pool = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            vaults.insert(
+                base_vault,
+                VaultInfo {
+                    pool_address: pool,
+                    dex: "raydium_cpmm".to_string(),
+                    base_mint: Pubkey::new_unique(),
+                    quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                    is_base_vault: true,
+                    last_balance: std::sync::atomic::AtomicU64::new(0),
+                    last_used_at: Instant::now(),
+                    pinned: false,
+                    pin: None,
+                    active_id: None,
+                    bin_step: None,
+                    sibling_vault: Some(quote_vault),
+                },
+            );
+            vaults.insert(
+                quote_vault,
+                VaultInfo {
+                    pool_address: pool,
+                    dex: "raydium_cpmm".to_string(),
+                    base_mint: Pubkey::new_unique(),
+                    quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                    is_base_vault: false,
+                    last_balance: std::sync::atomic::AtomicU64::new(5_000),
+                    last_used_at: Instant::now(),
+                    pinned: false,
+                    pin: None,
+                    active_id: None,
+                    bin_step: None,
+                    sibling_vault: Some(base_vault),
+                },
+            );
+        }
+        ctx.refresh_tracked_membership_snapshot();
+
+        let mut scratch = MdSidefxBurstScratch::new();
+        md_sidefx_process_vault_balance_tick(
+            &worker,
+            &MdSidefxCommand::VaultBalanceTick {
+                run_id: "test".into(),
+                vault_pubkey: base_vault,
+                balance: 10_000,
+                slot: 42,
+                grpc_recv_at: Instant::now(),
+            },
+            &mut scratch,
+        );
+        assert!(scratch.pending_vault_touches.contains(&base_vault));
+        let snap = ctx.tracked_membership.load();
+        let base_entry = snap.vault_by_pubkey.get(&base_vault).expect("base vault");
+        assert_eq!(
+            base_entry
+                .last_balance
+                .load(std::sync::atomic::Ordering::Relaxed),
+            10_000
+        );
+        let (base, quote) = snapshot_vault_pair_balances(&snap, &base_vault, 10_000).unwrap();
+        assert_eq!(base, 10_000);
+        assert_eq!(quote, 5_000);
     }
 }

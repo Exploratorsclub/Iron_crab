@@ -1539,3 +1539,15 @@ BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap 
 | **Betroffene Module** | `src/bin/market_data.rs` |
 | **Regression-Prüfung** | `cargo test --bin market-data`; Prod: `geyser_tracking_jobs_processed_total` > 0, Drops ≈ 0, `md_state_queue_depth` unter Cap. |
 | **Tags** | [market-data, md-state, geyser, hot-path, i-4b, i-16, pr230, pr231] |
+
+---
+
+## HYBRID-PHASE1: Ingest/Sidefx entkoppelt von tracked_* RwLocks + Register-Flood gestoppt (2026-06-23)
+
+| Symptom | Nach PR237 weiterhin `md_state_queue_depth` @8192, `burst_in_progress=1`, ~45× `tracked_vaults.read()` in Sidefx, massenhaft `RegisterReservesAfterTrade` / `RegisterPoolVaultsFromAccount` aus TX/Account-Parse. |
+|---------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | PR237 deckte nur zwei Ingest-Filter ab; Vault-Balance-Ticks, Bin-Array-Parse und Account-Cache-Upsert blockierten weiter auf `tracked_*` Maps; Trade- und Account-Sidefx enqueued Register-Jobs in md-state. |
+| **Fix** | (1) `TrackedMembershipSnapshot` um `SnapshotVaultView` / `SnapshotBinArrayView` mit `Arc<AtomicU64>` Balances erweitert; nur md-state refreshed Snapshot. (2) Alle Ingest/Sidefx-Pfade auf Snapshot umgestellt (0 `tracked_*.read()`). (3) `RegisterReservesAfterTrade` + Arb-Reconcile aus TX-Handler entfernt; `RegisterPoolVaultsFromAccount` aus Sidefx-Flush entfernt. Vault-Ticks nutzen `snapshot_vault_pair_balances` + LivePoolCache. |
+| **Betroffene Module** | `src/bin/market_data.rs` |
+| **Regression-Prüfung** | `phase1_*` source-body tests; `cargo fmt`, `cargo clippy`, `cargo test`; Eval Level 5. |
+| **Tags** | [market-data, hybrid-rollback, phase1, i-4b, ingest, md-sidefx, pr238] |
