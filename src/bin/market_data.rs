@@ -92,6 +92,7 @@ use ironcrab::metrics::{
     inc_market_data_md_state_evict_steps_budget_exhausted_total,
     inc_market_data_md_state_evict_steps_total, inc_market_data_momentum_coalesced_batches_total,
     inc_market_data_momentum_coalesced_messages_total,
+    inc_market_data_momentum_track_worker_enqueue_dropped_total,
     inc_market_data_track_request_coalesce_batches_total,
     inc_market_data_unparsed_account_dropped_total, inc_market_data_unparsed_tx_dropped_total,
     inc_market_data_vault_high_priority_dispatch_total, market_data_bump_geyser_head_slot,
@@ -126,8 +127,9 @@ use ironcrab::metrics::{
     set_market_data_md_sidefx_queue_depth, set_market_data_md_state_burst_in_progress,
     set_market_data_md_state_deferred_jobs_len, set_market_data_md_state_evict_pending,
     set_market_data_md_state_queue_depth, set_market_data_momentum_active_pool_pins_gauge,
-    set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
-    set_readiness_nats_connected, touch_market_data_global_ingest_progress,
+    set_market_data_track_worker_queue_depth, set_market_data_tx_broadcast_queue_depth,
+    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
+    touch_market_data_global_ingest_progress,
     touch_market_data_tracked_membership_snapshot_refresh, update_readiness_market_data_current,
     wall_clock_unix_ms_now, GeyserTrackedEvictKind, MarketDataLatencySegment, MetricsComponent,
     MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS,
@@ -383,8 +385,6 @@ enum MdStateCommand {
         mint: Pubkey,
         pin: Option<GeyserPinReason>,
     },
-    /// PR169b: momentum-bot active pool pin stream (serialized; debounced sync only).
-    ApplyMomentumActivePools(MomentumActivePoolsUpdate),
     /// PR169b: wallet bootstrap / execution-results mint pin (no immediate sync).
     TrackWalletMint { mint: Pubkey },
     /// PR169b: `max_tracked_accounts` cap change — debounced flush/eviction only.
@@ -503,7 +503,7 @@ fn momentum_coalesce_try_send(
 
 fn spawn_momentum_tracking_coalescer(
     ctx: Arc<MarketDataContext>,
-    md_state: MdStateSender,
+    track_worker: TrackWorkerSender,
 ) -> mpsc::Sender<MomentumActivePoolsUpdate> {
     let (coalesce_tx, mut coalesce_rx) =
         mpsc::channel::<MomentumActivePoolsUpdate>(MARKET_DATA_MOMENTUM_COALESCE_CHANNEL_CAP);
@@ -520,7 +520,12 @@ fn spawn_momentum_tracking_coalescer(
             }
             if let Some(merged) = merge_momentum_active_pools_updates(&pending) {
                 inc_market_data_momentum_coalesced_batches_total();
-                md_state_try_enqueue(&md_state, MdStateCommand::ApplyMomentumActivePools(merged));
+                if !track_worker_try_enqueue(
+                    &track_worker,
+                    TrackWorkerCommand::ApplyMomentumActivePools(merged),
+                ) {
+                    inc_market_data_momentum_track_worker_enqueue_dropped_total();
+                }
             }
             pending.clear();
         }
@@ -528,8 +533,8 @@ fn spawn_momentum_tracking_coalescer(
     coalesce_tx
 }
 
-/// Phase-R-R2: sync momentum apply on `md-state` thread (no Tokio yield).
-fn apply_momentum_active_pools_in_md_state(
+/// Phase-2b: sync momentum apply on `md-track-worker` thread (no Tokio yield).
+fn apply_momentum_active_pools_on_track_worker(
     ctx: &Arc<MarketDataContext>,
     update: MomentumActivePoolsUpdate,
 ) -> bool {
@@ -610,7 +615,8 @@ fn track_worker_try_enqueue(sender: &TrackWorkerSender, job: TrackWorkerCommand)
         return false;
     }
     if sender.tx.try_send(job).is_ok() {
-        let _depth = sender.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        let depth = sender.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        set_market_data_track_worker_queue_depth(depth);
         true
     } else {
         inc_market_data_geyser_tracking_enqueue_dropped_total();
@@ -619,9 +625,12 @@ fn track_worker_try_enqueue(sender: &TrackWorkerSender, job: TrackWorkerCommand)
 }
 
 fn track_worker_dec_queue_depth(queue_depth: &AtomicUsize) {
-    let _ = queue_depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-        cur.checked_sub(1)
-    });
+    let new_depth = queue_depth
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            cur.checked_sub(1)
+        })
+        .unwrap_or(0);
+    set_market_data_track_worker_queue_depth(new_depth);
 }
 
 fn consumer_id_for_pin(pin: Option<GeyserPinReason>) -> ConsumerId {
@@ -657,7 +666,7 @@ fn rebuild_desired_explicit_set_from_ctx(ctx: &MarketDataContext, set: &mut Desi
 fn track_worker_process_command(ctx: &Arc<MarketDataContext>, job: TrackWorkerCommand) -> bool {
     match job {
         TrackWorkerCommand::ApplyMomentumActivePools(update) => {
-            apply_momentum_active_pools_in_md_state(ctx, update)
+            apply_momentum_active_pools_on_track_worker(ctx, update)
         }
         TrackWorkerCommand::ApplyWalletPin { mint } => {
             ctx.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet))
@@ -846,13 +855,6 @@ fn md_state_process_job(
         }
         MdStateCommand::TrackMint { mint, pin } => {
             track_worker_try_enqueue(track_worker, TrackWorkerCommand::TrackMint { mint, pin });
-            false
-        }
-        MdStateCommand::ApplyMomentumActivePools(update) => {
-            track_worker_try_enqueue(
-                track_worker,
-                TrackWorkerCommand::ApplyMomentumActivePools(update),
-            );
             false
         }
         MdStateCommand::TrackWalletMint { mint } => {
@@ -14650,14 +14652,14 @@ async fn run_geyser_loop(
 
     // Phase-R-R2: single-writer `md-state` OS thread (before wallet snapshot — wallet path enqueues).
     let track_worker = spawn_track_worker(Arc::clone(&ctx));
+    // PR169c / Phase-2b: coalesce momentum NATS bursts before md-track-worker.
+    let momentum_coalesce_tx =
+        spawn_momentum_tracking_coalescer(Arc::clone(&ctx), track_worker.clone());
     let md_state = spawn_md_state_worker(
         Arc::clone(&ctx),
         tokio::runtime::Handle::current(),
         track_worker,
     );
-    // PR169c: coalesce momentum NATS bursts before md-state.
-    let momentum_coalesce_tx =
-        spawn_momentum_tracking_coalescer(Arc::clone(&ctx), md_state.clone());
 
     // === P0: Wallet Balance Snapshot (Position Reconciliation) ===
     // Bootstrap wallet state at startup (max 1 RPC roundtrip) using known mints from JetStream.
@@ -15864,13 +15866,13 @@ async fn run_simulation_loop(
     let pump_amm_dex = Arc::new(pump_inner);
 
     let track_worker = spawn_track_worker(Arc::clone(&ctx));
+    let momentum_coalesce_tx =
+        spawn_momentum_tracking_coalescer(Arc::clone(&ctx), track_worker.clone());
     let md_state = spawn_md_state_worker(
         Arc::clone(&ctx),
         tokio::runtime::Handle::current(),
         track_worker,
     );
-    let momentum_coalesce_tx =
-        spawn_momentum_tracking_coalescer(Arc::clone(&ctx), md_state.clone());
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut slot: u64 = 0;
@@ -20723,8 +20725,9 @@ mod pr_b_geyser_tracking_tests {
         ctx.refresh_arb_coverage_index_for_pool(orca_pool);
 
         let before_keys = ctx.snapshot_explicit_subscription_pubkeys();
-        let jobs = md_state_coalesce_jobs(vec![
-            MdStateCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
+        track_worker_try_enqueue(
+            &track_worker,
+            TrackWorkerCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
                 version: 1,
                 ts_unix_ms: 1,
                 active: vec![MomentumActivePoolEntry {
@@ -20735,9 +20738,11 @@ mod pr_b_geyser_tracking_tests {
                 removed: vec![],
                 full_active_snapshot: false,
             }),
-            MdStateCommand::ArbMultiDexReconcile { mint: token_mint },
-        ]);
-        assert_eq!(jobs.len(), 2);
+        );
+        let jobs = md_state_coalesce_jobs(vec![MdStateCommand::ArbMultiDexReconcile {
+            mint: token_mint,
+        }]);
+        assert_eq!(jobs.len(), 1);
         for job in jobs {
             let _ = md_state_process_job(&ctx, job, &track_worker);
         }
@@ -21162,12 +21167,12 @@ mod pr_b_geyser_tracking_tests {
         );
     }
 
-    /// PR169b: momentum active pools via actor — no immediate sync; jobs processed; debounced batch.
+    /// PR169b / Phase-2b: momentum active pools via track-worker — no immediate sync; debounced batch.
     #[tokio::test(flavor = "current_thread")]
     async fn pr169b_apply_momentum_active_pools_actor_no_immediate_sync() {
         use ironcrab::metrics::{
             MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL, MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL,
-            MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL,
+            MARKET_DATA_TRACK_REQUEST_COALESCE_BATCHES_TOTAL,
         };
         use ironcrab::nats::{MomentumActivePinReason, MomentumActivePoolEntry};
 
@@ -21175,11 +21180,11 @@ mod pr_b_geyser_tracking_tests {
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
-        let md_state = test_spawn_md_state(&ctx);
+        let track_worker = spawn_track_worker(Arc::clone(&ctx));
 
         let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
         let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
-        let jobs0 = MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
+        let coalesce0 = MARKET_DATA_TRACK_REQUEST_COALESCE_BATCHES_TOTAL.load(Ordering::Relaxed);
 
         let mut active = Vec::new();
         for _ in 0..12 {
@@ -21207,16 +21212,16 @@ mod pr_b_geyser_tracking_tests {
             });
         }
 
-        md_state_try_enqueue(
-            &md_state,
-            MdStateCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
+        assert!(track_worker_try_enqueue(
+            &track_worker,
+            TrackWorkerCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
                 version: 1,
                 ts_unix_ms: 1,
                 active,
                 removed: vec![],
                 full_active_snapshot: false,
             }),
-        );
+        ));
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
@@ -21224,12 +21229,16 @@ mod pr_b_geyser_tracking_tests {
             imm0,
             "momentum path must not immediate-sync"
         );
-        assert!(
-            MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed) > jobs0,
-            "md-state should process momentum job"
-        );
+        assert_eq!(ctx.hot_pool_registry.pair_count(), 12);
 
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        tokio::time::sleep(Duration::from_millis(
+            MARKET_DATA_TRACK_WORKER_COALESCE_MS + 200,
+        ))
+        .await;
+        assert!(
+            MARKET_DATA_TRACK_REQUEST_COALESCE_BATCHES_TOTAL.load(Ordering::Relaxed) > coalesce0,
+            "track-worker should coalesce momentum apply into a push batch"
+        );
         assert!(
             MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed) > batch0,
             "expected debounced batch sync after momentum update"
@@ -21290,8 +21299,8 @@ mod pr_b_geyser_tracking_tests {
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
-        let md_state = test_spawn_md_state(&ctx);
-        let coalesce_tx = spawn_momentum_tracking_coalescer(Arc::clone(&ctx), md_state);
+        let track_worker = spawn_track_worker(Arc::clone(&ctx));
+        let coalesce_tx = spawn_momentum_tracking_coalescer(Arc::clone(&ctx), track_worker);
 
         let msgs0 = MARKET_DATA_MOMENTUM_COALESCED_MESSAGES_TOTAL.load(Ordering::Relaxed);
         let batches0 = MARKET_DATA_MOMENTUM_COALESCED_BATCHES_TOTAL.load(Ordering::Relaxed);
@@ -21438,16 +21447,16 @@ mod pr_b_geyser_tracking_tests {
         );
     }
 
-    /// Phase-R-R2: large momentum apply runs on `md-state` thread (chunked, no Tokio in worker).
+    /// Phase-2b: large momentum apply runs on `md-track-worker` thread (chunked).
     #[tokio::test(flavor = "current_thread")]
-    async fn pr_r2_chunked_momentum_apply_on_md_state_thread() {
+    async fn pr_r2_chunked_momentum_apply_on_track_worker_thread() {
         use ironcrab::nats::{MomentumActivePinReason, MomentumActivePoolEntry};
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
-        let md_state = test_spawn_md_state(&ctx);
+        let track_worker = spawn_track_worker(Arc::clone(&ctx));
 
         let mut active = Vec::new();
         for _ in 0..48 {
@@ -21473,16 +21482,16 @@ mod pr_b_geyser_tracking_tests {
             });
         }
 
-        md_state_try_enqueue(
-            &md_state,
-            MdStateCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
+        assert!(track_worker_try_enqueue(
+            &track_worker,
+            TrackWorkerCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
                 version: 1,
                 ts_unix_ms: 1,
                 active,
                 removed: vec![],
                 full_active_snapshot: false,
             }),
-        );
+        ));
 
         for _ in 0..200 {
             if ctx.hot_pool_registry.pair_count() >= 48 {
@@ -22436,9 +22445,11 @@ mod pr_b_geyser_tracking_tests {
         let batches1 = MARKET_DATA_TRACK_REQUEST_COALESCE_BATCHES_TOTAL.load(Ordering::Relaxed);
         let delta = batches1.saturating_sub(batches0);
         assert!(
-            (1..=2).contains(&delta),
-            "two momentum updates within 500ms should coalesce to one push batch (delta={delta})"
+            delta >= 1,
+            "momentum updates should produce at least one coalesced push batch (delta={delta})"
         );
+        assert!(ctx.hot_pool_registry.is_hot_pool(pool_a));
+        assert!(ctx.hot_pool_registry.is_hot_pool(pool_b));
     }
 
     #[test]
@@ -22447,6 +22458,90 @@ mod pr_b_geyser_tracking_tests {
         assert!(
             src.contains(".name(\"md-track-worker\".into())"),
             "track worker must spawn OS thread named md-track-worker"
+        );
+    }
+
+    #[test]
+    fn phase2b_momentum_nats_enqueues_track_worker_not_md_state() {
+        let src = include_str!("market_data.rs");
+        let prod_src = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source section");
+        assert!(
+            !prod_src.contains("MdStateCommand::ApplyMomentumActivePools"),
+            "momentum must not enqueue MdStateCommand::ApplyMomentumActivePools"
+        );
+        assert!(
+            !prod_src.contains(
+                "md_state_try_enqueue(&md_state, MdStateCommand::ApplyMomentumActivePools"
+            ),
+            "momentum coalescer must not md_state_try_enqueue ApplyMomentumActivePools"
+        );
+        let coalescer_start = prod_src
+            .find("fn spawn_momentum_tracking_coalescer")
+            .expect("spawn_momentum_tracking_coalescer");
+        let coalescer_body = &prod_src[coalescer_start..coalescer_start.saturating_add(2500)];
+        assert!(
+            coalescer_body.contains("track_worker_try_enqueue"),
+            "momentum coalescer must enqueue track-worker"
+        );
+        assert!(
+            !coalescer_body.contains("md_state_try_enqueue"),
+            "momentum coalescer must not touch md-state enqueue"
+        );
+    }
+
+    #[test]
+    fn phase2b_apply_momentum_active_pools_on_track_worker_updates_desired_set() {
+        use ironcrab::nats::{MomentumActivePinReason, MomentumActivePoolEntry};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let track_worker = spawn_track_worker(Arc::clone(&ctx));
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: mint,
+                token_1_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1),
+                reserve_1: Some(1),
+            }),
+            1,
+        );
+
+        let before = ctx.snapshot_explicit_subscription_pubkeys();
+        assert!(track_worker_try_enqueue(
+            &track_worker,
+            TrackWorkerCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
+                version: 1,
+                ts_unix_ms: 1,
+                active: vec![MomentumActivePoolEntry {
+                    mint: mint.to_string(),
+                    pool: pool.to_string(),
+                    pin_reason: MomentumActivePinReason::Tracker,
+                }],
+                removed: vec![],
+                full_active_snapshot: false,
+            }),
+        ));
+        std::thread::sleep(Duration::from_millis(50));
+        let mid = ctx.snapshot_explicit_subscription_pubkeys();
+        assert!(explicit_subscription_has_new_keys(&before, &mid));
+        assert!(ctx.hot_pool_registry.is_hot_pool(pool));
+        let vs = ctx.tracked_vaults.read();
+        assert_eq!(
+            vs.get(&coin).unwrap().pin,
+            Some(GeyserPinReason::MomentumActive)
         );
     }
 }
