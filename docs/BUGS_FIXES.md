@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### Phase-2a-DESIRED-EXPLICIT-SET: md-track-worker + coalesced delta-only Geyser push
+**Datum**: 2026-06-23  
+**Problem**: Nach Phase 1 blieb md-state Dumpingground für Momentum `ApplyMomentumActivePools`, Wallet-Pins und Geyser-Sync-Bursts — Queue konnte weiter wachsen.  
+**Fix**: (1) **`DesiredExplicitSet`** (`src/market_data/track/desired_set.rs`) als SSOT für explizite Geyser-Pubkeys (Consumer-Refcount `Wallet`/`Momentum`/`Arb`, Pin-Priority-Eviction). (2) **`md-track-worker`** OS-Thread: Track-Commands + coalesced Push (500 ms, delta-only, skip bei leerem Delta). (3) md-state enqueued Track-Worker statt inline `sync_geyser_tracked_accounts_*`. (4) Metriken: `market_data_geyser_explicit_set_size`, `market_data_geyser_subscribe_delta_pubkeys`, `market_data_track_request_coalesce_batches_total`. **Invarianten**: I-4b, I-7, kein RPC Hot Path.  
+**Dateien**: `src/market_data/**`, `src/bin/market_data.rs`, `src/metrics.rs`, `src/lib.rs`
+
 ### PR237-MD-STATE-WRITER-STARVATION: md-state frozen mid-burst (Queue @8192, bursts_completed Δ=0)
 **Datum**: 2026-06-23  
 **Problem** (Prod post-PR235 `4696edc`, ~18 min Soak): `burst_in_progress=1` dauerhaft, `jobs_processed`/`bursts_completed` flat, `enqueue_dropped` +8547/30s, md-state `wchan=futex_wait_queue`.  
