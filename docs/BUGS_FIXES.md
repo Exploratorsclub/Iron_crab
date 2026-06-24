@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### Phase-2b-MOMENTUM-TRACK-WORKER: Momentum Active Pools bypass md-state
+**Datum**: 2026-06-24  
+**Problem**: Nach Phase 2a liefen Momentum NATS + `momentum_tracking_coalesce` weiterhin über `MdStateCommand::ApplyMomentumActivePools` auf die md-state-Queue (8192 cap) — reproduzierte Prod-Stall (Post-Deploy Phase 2a).  
+**Fix**: (1) **NATS-Subscriber + Coalescer** enqueuen nur noch `TrackWorkerCommand::ApplyMomentumActivePools` auf `md-track-worker` (bounded, Drop + Metrik bei voller Queue). (2) **`MdStateCommand::ApplyMomentumActivePools` entfernt** — md-state bearbeitet keine Momentum-Tracking-Arbeit mehr. (3) Pin/unpin + `DesiredExplicitSet` + coalesced Geyser push (500 ms, delta-only) bleiben im Track-Worker. (4) Metriken: `market_data_track_worker_queue_depth`, `market_data_momentum_track_worker_enqueue_dropped_total`. **Invarianten**: I-4b, I-7, kein RPC Hot Path.  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### Phase-2a-DESIRED-EXPLICIT-SET: md-track-worker + coalesced delta-only Geyser push
 **Datum**: 2026-06-23  
 **Problem**: Nach Phase 1 blieb md-state Dumpingground für Momentum `ApplyMomentumActivePools`, Wallet-Pins und Geyser-Sync-Bursts — Queue konnte weiter wachsen.  
