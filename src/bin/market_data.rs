@@ -867,7 +867,10 @@ fn md_state_process_job(
             false
         }
         MdStateCommand::FlushGeyserSyncDebounced => {
-            track_worker_try_enqueue(track_worker, TrackWorkerCommand::ScheduleGeyserPush);
+            track_worker_try_enqueue(
+                track_worker,
+                TrackWorkerCommand::ScheduleGeyserPushDebounced,
+            );
             false
         }
         MdStateCommand::ContinueGeyserEvict => {
@@ -923,7 +926,7 @@ fn md_state_worker_loop(
     ctx: Arc<MarketDataContext>,
     rx: std_mpsc::Receiver<MdStateCommand>,
     queue_depth: Arc<AtomicUsize>,
-    _md_state: MdStateSender,
+    md_state: MdStateSender,
     track_worker: TrackWorkerSender,
 ) {
     let mut deferred_jobs: VecDeque<MdStateCommand> = VecDeque::new();
@@ -988,7 +991,7 @@ fn md_state_worker_loop(
         if explicit_subscription_has_new_keys(&before_keys, &after_keys)
             || schedule_sync_after_config
         {
-            ctx.schedule_geyser_sync_batch_debounced(&track_worker);
+            ctx.schedule_geyser_sync_batch_debounced(&md_state);
         } else if before_keys != after_keys {
             inc_market_data_geyser_sync_skipped_no_delta_total();
         }
@@ -5979,7 +5982,7 @@ impl MarketDataContext {
         self.geyser_sync_flush_timestamps.lock().pop();
     }
 
-    fn schedule_geyser_sync_batch_debounced(self: &Arc<Self>, track_worker: &TrackWorkerSender) {
+    fn schedule_geyser_sync_batch_debounced(self: &Arc<Self>, md_state: &MdStateSender) {
         let ms = self.geyser_sync_batch_debounce_ms();
         set_market_data_geyser_sync_pending(1);
         let epoch = self
@@ -5992,8 +5995,8 @@ impl MarketDataContext {
         }
         let abort = Arc::new(AtomicBool::new(false));
         let abort_c = Arc::clone(&abort);
-        let track_worker_thread = track_worker.clone();
-        let track_worker_fallback = track_worker.clone();
+        let md_state_thread = md_state.clone();
+        let md_state_fallback = md_state.clone();
         let ctx = self.clone();
         match std::thread::Builder::new()
             .name("md-geyser-sync-debounce".into())
@@ -6006,15 +6009,13 @@ impl MarketDataContext {
                 }
                 if !ctx.try_acquire_geyser_sync_flush_slot() {
                     inc_market_data_geyser_sync_skipped_rate_limit_total();
-                    ctx.schedule_geyser_sync_batch_debounced(&track_worker_thread);
+                    ctx.schedule_geyser_sync_batch_debounced(&md_state_thread);
                     return;
                 }
-                if !track_worker_try_enqueue(
-                    &track_worker_thread,
-                    TrackWorkerCommand::ScheduleGeyserPushDebounced,
-                ) {
+                if !md_state_try_enqueue(&md_state_thread, MdStateCommand::FlushGeyserSyncDebounced)
+                {
                     ctx.release_geyser_sync_flush_slot();
-                    ctx.schedule_geyser_sync_batch_debounced(&track_worker_thread);
+                    ctx.schedule_geyser_sync_batch_debounced(&md_state_thread);
                 }
             }) {
             Ok(_) => *guard = Some(abort),
@@ -6024,11 +6025,11 @@ impl MarketDataContext {
                     "md-geyser-sync-debounce thread spawn failed; enqueueing flush directly"
                 );
                 drop(guard);
-                if !track_worker_try_enqueue(
-                    &track_worker_fallback,
-                    TrackWorkerCommand::ScheduleGeyserPushDebounced,
+                if !md_state_try_enqueue(
+                    &md_state_fallback,
+                    MdStateCommand::FlushGeyserSyncDebounced,
                 ) {
-                    self.schedule_geyser_sync_batch_debounced(&track_worker_fallback);
+                    self.schedule_geyser_sync_batch_debounced(&md_state_fallback);
                 }
             }
         }
@@ -21745,11 +21746,15 @@ mod pr_b_geyser_tracking_tests {
         );
         assert!(
             !body.contains("sync_geyser_tracked_accounts_batched_flush"),
-            "schedule_geyser_sync_batch_debounced must enqueue track-worker push instead of inline flush"
+            "schedule_geyser_sync_batch_debounced must enqueue FlushGeyserSyncDebounced instead of inline flush"
         );
         assert!(
-            body.contains("ScheduleGeyserPushDebounced"),
-            "schedule path must enqueue track-worker debounced push job"
+            body.contains("FlushGeyserSyncDebounced"),
+            "schedule path must enqueue md-state flush job"
+        );
+        assert!(
+            body.contains("md_state_try_enqueue"),
+            "schedule path must enqueue bounded md-state work"
         );
     }
 
