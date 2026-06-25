@@ -1587,3 +1587,15 @@ BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap 
 | **Betroffene Module** | `src/nats/arb_track_requests.rs`, `src/bin/market_data.rs`, `src/bin/arb_strategy.rs`, `src/metrics.rs` |
 | **Regression-Prüfung** | `cargo fmt`, `cargo clippy -D warnings`, `cargo test`, `phase3_*`; Eval Level 5. |
 | **Tags** | [arb-strategy, market-data, hybrid-rollback, phase3, i-4e, nats, track-worker, pr242] |
+
+---
+
+## HYBRID-PHASE4: Momentum Position/Wallet SSOT P1–P2–P4 (2026-06-25)
+
+| Symptom | Ghost positions / exit sizing drift when JetStream `WalletBalanceSnapshot` races with confirmed `ExecutionResult` fills. |
+|---------|-----------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | Dual-path balance authority: Scope 57 preferred wallet snapshot over `PositionTracker` for exit sizing; snapshot `balance=0` could auto-close Live positions before SELL confirm. |
+| **Fix** | (P1) Audit `docs/PHASE4_BALANCE_SOURCE_AUDIT.md`. (P2) Confirmed BUY/SELL mutates `token_amount` only via `ExecutionResult`; snapshot hint-only + guarded zero-close for `WalletSnapshot` entry source. (P4) `momentum_wallet_balance_divergence_lamports{mint}` + `momentum_wallet_balance_divergence_total`. |
+| **Betroffene Module** | `src/bin/momentum_bot.rs`, `src/metrics.rs`, `docs/PHASE4_BALANCE_SOURCE_AUDIT.md` |
+| **Regression-Prüfung** | `cargo fmt`, `cargo clippy -D warnings`, `cargo test`, `cargo test phase4_`; Eval Level 5. |
+| **Tags** | [momentum-bot, hybrid-rollback, phase4, wallet-ssot, i-13, ghost-positions, pr-phase4] |
