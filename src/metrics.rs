@@ -2,7 +2,7 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -2086,6 +2086,35 @@ pub fn record_momentum_orphan_scale_in_recovery_total() {
 #[inline]
 pub fn record_momentum_exit_amount_overlay_only_total() {
     MOMENTUM_EXIT_AMOUNT_OVERLAY_ONLY_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Per-mint signed divergence: `position.token_amount_raw - wallet_snapshot.balance_raw`.
+/// Cardinality bounded to open positions with non-zero drift (pruned on close / align).
+pub static MOMENTUM_WALLET_BALANCE_DIVERGENCE_BY_MINT: Lazy<RwLock<HashMap<String, i64>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+pub static MOMENTUM_WALLET_BALANCE_DIVERGENCE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn set_momentum_wallet_balance_divergence_lamports(mint: &str, signed_raw_delta: i64) {
+    let mut map = MOMENTUM_WALLET_BALANCE_DIVERGENCE_BY_MINT.write();
+    if signed_raw_delta == 0 {
+        map.remove(mint);
+    } else {
+        map.insert(mint.to_string(), signed_raw_delta);
+    }
+}
+
+#[inline]
+pub fn clear_momentum_wallet_balance_divergence_for_mint(mint: &str) {
+    MOMENTUM_WALLET_BALANCE_DIVERGENCE_BY_MINT
+        .write()
+        .remove(mint);
+}
+
+#[inline]
+pub fn record_momentum_wallet_balance_divergence_total() {
+    MOMENTUM_WALLET_BALANCE_DIVERGENCE_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Scale-in gate blocked reason (Prometheus label `reason`).
@@ -4864,6 +4893,17 @@ async fn metrics_response() -> Response<Body> {
         "momentum_exit_amount_overlay_only_total",
         MOMENTUM_EXIT_AMOUNT_OVERLAY_ONLY_TOTAL.load(Ordering::Relaxed)
     );
+    line!(
+        "momentum_wallet_balance_divergence_total",
+        MOMENTUM_WALLET_BALANCE_DIVERGENCE_TOTAL.load(Ordering::Relaxed)
+    );
+    for (mint, delta) in MOMENTUM_WALLET_BALANCE_DIVERGENCE_BY_MINT.read().iter() {
+        out.push_str("momentum_wallet_balance_divergence_lamports{mint=\"");
+        out.push_str(mint);
+        out.push_str("\"} ");
+        out.push_str(&delta.to_string());
+        out.push('\n');
+    }
     out.push_str("momentum_scale_in_gate_blocked_total{reason=\"missing_probe_state\"} ");
     out.push_str(
         &MOMENTUM_SCALE_IN_GATE_BLOCKED_MISSING_PROBE_STATE

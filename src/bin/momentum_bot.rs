@@ -3240,7 +3240,8 @@ struct MomentumContext {
     /// Scope 56: in-memory idempotency for duplicate JetStream / replayed ExecutionResults
     /// on the orphaned-BUY path (no durable store in this scope).
     orphaned_recovered_intent_ids: parking_lot::RwLock<BoundedIntentIdCache>,
-    /// Scope 57: latest JetStream `WalletBalanceSnapshot` per mint (authority hint for exit sizing; I-7 no RPC).
+    /// Phase 4 P2: latest JetStream `WalletBalanceSnapshot` per mint — **hint / plausibility only**
+    /// (I-7 no RPC). Confirmed position `token_amount` comes from `ExecutionResult`, not snapshot.
     latest_wallet_balance_raw_by_mint: parking_lot::RwLock<HashMap<String, u64>>,
     /// Stats — **unique mints** with at least one pool-scoped tracker row (not one increment per pool row).
     tokens_tracked: std::sync::atomic::AtomicU64,
@@ -5803,6 +5804,8 @@ impl MomentumContext {
             self.flush_momentum_active_pool_publish_queue();
         }
 
+        ironcrab::metrics::clear_momentum_wallet_balance_divergence_for_mint(mint);
+
         // Delete from KV asynchronously (fire-and-forget)
         let ctx = Arc::clone(self);
         tokio::spawn(async move {
@@ -6951,7 +6954,38 @@ impl MomentumContext {
             .insert(mint.to_string(), balance_raw);
     }
 
-    /// Scope 57 interim exit sizing (PA-5 follow-up): prefer JetStream wallet snapshot when overlay drifts.
+    fn has_pending_sell_for_mint(&self, mint: &str) -> bool {
+        self.pending_intents
+            .read()
+            .values()
+            .any(|p| p.mint == mint && matches!(p.side, TradeSide::Sell))
+    }
+
+    /// Phase 4 P4: record signed drift between confirmed position size and wallet snapshot hint.
+    fn record_wallet_balance_divergence_if_any(
+        &self,
+        mint: &str,
+        position_balance_raw: u64,
+        snapshot_balance_raw: u64,
+    ) {
+        if position_balance_raw == snapshot_balance_raw {
+            ironcrab::metrics::clear_momentum_wallet_balance_divergence_for_mint(mint);
+            return;
+        }
+        let signed = i64::try_from(position_balance_raw as i128 - snapshot_balance_raw as i128)
+            .unwrap_or(i64::MAX);
+        ironcrab::metrics::set_momentum_wallet_balance_divergence_lamports(mint, signed);
+        ironcrab::metrics::record_momentum_wallet_balance_divergence_total();
+        warn!(
+            mint = %mint,
+            position_balance_raw,
+            snapshot_balance_raw,
+            signed_delta_raw = signed,
+            "Wallet balance divergence: confirmed position size != JetStream snapshot hint"
+        );
+    }
+
+    /// Phase 4 P2: confirmed `PositionTracker.token_amount` is SSOT for exit sizing; snapshot is hint.
     fn resolve_exit_token_amount_raw(&self, mint: &str, hint_amount: u64) -> u64 {
         let overlay = self
             .positions
@@ -6961,18 +6995,26 @@ impl MomentumContext {
             .filter(|t| *t > 0)
             .unwrap_or(hint_amount);
 
-        match self
+        let snapshot = self
             .latest_wallet_balance_raw_by_mint
             .read()
             .get(mint)
             .copied()
-            .filter(|a| *a > 0)
-        {
-            Some(auth) => auth,
-            None => {
-                ironcrab::metrics::record_momentum_exit_amount_overlay_only_total();
-                overlay
+            .filter(|a| *a > 0);
+
+        if overlay > 0 {
+            if let Some(snap) = snapshot {
+                self.record_wallet_balance_divergence_if_any(mint, overlay, snap);
+            } else {
+                ironcrab::metrics::clear_momentum_wallet_balance_divergence_for_mint(mint);
             }
+            overlay
+        } else if let Some(snap) = snapshot {
+            ironcrab::metrics::record_momentum_exit_amount_overlay_only_total();
+            snap
+        } else {
+            ironcrab::metrics::record_momentum_exit_amount_overlay_only_total();
+            overlay
         }
     }
 
@@ -7572,6 +7614,7 @@ impl MomentumContext {
                             entry_confirmed_slot: entry_confirmed_slot_from_execution(result),
                             initial_bonding,
                         });
+                        self.cache_wallet_balance_snapshot_raw(&pending.mint, token_amount);
                         let ctx_exit = Arc::clone(self);
                         tokio::spawn(async move {
                             ctx_exit.process_exit_signals(None).await;
@@ -7679,6 +7722,9 @@ impl MomentumContext {
                                 realized_pnl_pct = format!("{:.2}%", realized_pnl_pct),
                                 "✅ SELL CONFIRMED - Closing position"
                             );
+                            self.latest_wallet_balance_raw_by_mint
+                                .write()
+                                .remove(&pending.mint);
                             self.close_position(&pending.mint);
                         }
                     }
@@ -18021,6 +18067,8 @@ mod tests {
     }
 
     /// Scope 57: exit sizing prefers JetStream wallet snapshot when overlay understates holdings.
+    /// Phase 4 P2 supersedes Scope 57: confirmed `PositionTracker.token_amount` is exit SSOT;
+    /// wallet snapshot is hint-only (divergence metric), not authority when overlay is smaller.
     #[tokio::test]
     async fn scope57_exit_amount_uses_wallet_authority_when_overlay_smaller() {
         let tmp = TempDir::new().expect("tempdir");
@@ -18068,8 +18116,8 @@ mod tests {
         let line = content.lines().last().expect("intent line");
         let intent: TradeIntent = serde_json::from_str(line).expect("parse TradeIntent");
         assert_eq!(
-            intent.required_capital.raw, wallet_total,
-            "exit must use wallet authority when overlay is probe-only"
+            intent.required_capital.raw, probe_only,
+            "Phase 4: exit must use confirmed position overlay, not wallet snapshot hint"
         );
     }
 
@@ -18807,6 +18855,155 @@ mod tests {
         assert_eq!(applied, 1);
         let pos = ctx.positions.read().get(mint).unwrap().clone();
         assert_eq!(pos.last_price_slot, 201);
+    }
+
+    fn wallet_balance_snapshot_event(mint: &str, balance_raw: u64, decimals: u8) -> MarketEvent {
+        MarketEvent {
+            header: RecordHeader::new("test", BUILD_VERSION, "run-test"),
+            event_id: format!("wbs-{mint}-{balance_raw}"),
+            source: "market-data".into(),
+            slot: Some(1),
+            kind: MarketEventKind::WalletBalanceSnapshot {
+                mint: mint.to_string(),
+                balance_raw,
+                decimals,
+                token_program: SPL_TOKEN_PROGRAM.to_string(),
+            },
+        }
+    }
+
+    /// Phase 4 P2: confirmed BUY fill_out is SSOT; a later Geyser snapshot must not resize the position.
+    #[tokio::test]
+    async fn phase4_confirmed_buy_size_from_execution_result_not_geyser_snapshot() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "Phase4BuyMintttttttttttttttttttttttttttttt";
+        let pool = "Phase4BuyPoolttttttttttttttttttttttttttttt";
+        ctx.register_pool(mint, pool, "raydium", 1);
+        ctx.register_buy_intent(
+            "buy-phase4-001",
+            mint,
+            pool,
+            "raydium",
+            1_000_000,
+            Some(EntryKind::Probe),
+        );
+
+        let confirmed_fill_raw = 5_432_100u64;
+        let stale_snapshot_raw = 9_999_999u64;
+        let result = ExecutionResult {
+            header: RecordHeader::new("test", BUILD_VERSION, "run-test"),
+            execution_id: "ex-phase4-buy".to_string(),
+            decision_id: "dec-phase4-buy".to_string(),
+            intent_id: "buy-phase4-001".to_string(),
+            source: "momentum-bot".to_string(),
+            token_mint: Some(mint.to_string()),
+            signature: Some("sig-phase4-buy".to_string()),
+            bundle_id: None,
+            status: ExecutionStatus::Confirmed,
+            fill_in: Some(ExplicitAmount::new(1_000_000, 9)),
+            fill_out: Some(ExplicitAmount::new(confirmed_fill_raw, 6)),
+            fill_status: Some(FillStatus::Complete),
+            fill_unavailable_reason: None,
+            confirmed_slot: Some(42),
+            block_time_unix_ms: None,
+            fees: None,
+            pnl: None,
+            wallet_sol_delta_lamports: Some(-1_000_000),
+            error_message: None,
+            error_code: None,
+            latency_ms: Some(1),
+            metadata: std::collections::HashMap::new(),
+        };
+
+        Arc::clone(&ctx).handle_execution_result(&result);
+        assert_eq!(
+            ctx.positions.read().get(mint).unwrap().token_amount,
+            confirmed_fill_raw
+        );
+
+        process_market_event(
+            &ctx,
+            &wallet_balance_snapshot_event(mint, stale_snapshot_raw, 6),
+            false,
+        )
+        .await
+        .expect("wallet snapshot");
+
+        assert_eq!(
+            ctx.positions.read().get(mint).unwrap().token_amount,
+            confirmed_fill_raw,
+            "stale JetStream snapshot must not overwrite confirmed BUY fill size"
+        );
+        assert_eq!(
+            ctx.resolve_exit_token_amount_raw(mint, confirmed_fill_raw),
+            confirmed_fill_raw,
+            "exit sizing must follow confirmed position, not snapshot hint"
+        );
+    }
+
+    /// Phase 4 P2: wallet snapshot is hint-only for existing Live positions (no clobber / no zero-close).
+    #[tokio::test]
+    async fn phase4_wallet_snapshot_does_not_clobber_confirmed_position_balance() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "Phase4ClobMintttttttttttttttttttttttttttttt";
+        let pool = "Phase4ClobPoolttttttttttttttttttttttttttttt";
+        let confirmed_raw = 2_000_000u64;
+        let drift_snapshot_raw = 9_000_000u64;
+
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool,
+            dex: "raydium",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: confirmed_raw,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 10,
+            initial_bonding: None,
+        });
+
+        process_market_event(
+            &ctx,
+            &wallet_balance_snapshot_event(mint, drift_snapshot_raw, 6),
+            false,
+        )
+        .await
+        .expect("wallet snapshot drift");
+
+        assert_eq!(
+            ctx.positions.read().get(mint).unwrap().token_amount,
+            confirmed_raw,
+            "snapshot must not overwrite confirmed position token_amount"
+        );
+        assert_eq!(
+            ctx.resolve_exit_token_amount_raw(mint, confirmed_raw),
+            confirmed_raw
+        );
+        assert!(
+            ctx.positions.read().contains_key(mint),
+            "Live position must remain open when snapshot drifts higher"
+        );
+
+        process_market_event(&ctx, &wallet_balance_snapshot_event(mint, 0, 6), false)
+            .await
+            .expect("wallet snapshot zero");
+
+        assert!(
+            ctx.positions.read().contains_key(mint),
+            "Live position must not auto-close on snapshot zero — close only via ExecutionResult"
+        );
+        assert_eq!(
+            ctx.positions.read().get(mint).unwrap().token_amount,
+            confirmed_raw
+        );
     }
 }
 
@@ -19710,19 +19907,48 @@ async fn process_market_event(
 
             if *balance_raw == 0 {
                 ctx.latest_wallet_balance_raw_by_mint.write().remove(mint);
-                // Remove ghost position if wallet balance is zero
-                let was_tracked = {
-                    let mut positions = ctx.positions.write();
-                    positions.remove(mint).is_some()
+                let close_decision = {
+                    let positions = ctx.positions.read();
+                    match positions.get(mint) {
+                        None => (false, false),
+                        Some(pos) => {
+                            let allow_snapshot_zero_close = pos.entry_source
+                                == PositionEntrySource::WalletSnapshot
+                                && !ctx.has_pending_sell_for_mint(mint);
+                            (true, allow_snapshot_zero_close)
+                        }
+                    }
                 };
-                // FIX-35: Also remove from orphaned_mints if it was waiting for reconciliation
-                ctx.orphaned_mints.write().remove(mint);
-                if was_tracked {
-                    info!(
-                        mint = %mint,
-                        "🧹 Position auto-closed: WalletBalanceSnapshot shows balance=0 (manual sale or external transfer)"
-                    );
-                    ctx.delete_position_from_kv(mint).await;
+                if close_decision.1 {
+                    let should_delete_kv = {
+                        let mut positions = ctx.positions.write();
+                        if positions.remove(mint).is_some() {
+                            info!(
+                                mint = %mint,
+                                "🧹 Position auto-closed: WalletBalanceSnapshot shows balance=0 (wallet-reconciled position)"
+                            );
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if should_delete_kv {
+                        ctx.orphaned_mints.write().remove(mint);
+                        ironcrab::metrics::clear_momentum_wallet_balance_divergence_for_mint(mint);
+                        ctx.delete_position_from_kv(mint).await;
+                    }
+                } else if close_decision.0 {
+                    if let Some(pos) = ctx.positions.read().get(mint) {
+                        if pos.token_amount > 0 {
+                            ctx.record_wallet_balance_divergence_if_any(mint, pos.token_amount, 0);
+                            debug!(
+                                mint = %mint,
+                                position_balance_raw = pos.token_amount,
+                                "WalletBalanceSnapshot balance=0 ignored for Live position — awaiting ExecutionResult close"
+                            );
+                        }
+                    }
+                    ctx.orphaned_mints.write().remove(mint);
                 } else {
                     debug!(
                         mint = %mint,
@@ -19733,10 +19959,17 @@ async fn process_market_event(
                 // Position exists in wallet - verify we're tracking it
                 let has_position = { ctx.positions.read().contains_key(mint) };
                 if has_position {
+                    if let Some(pos) = ctx.positions.read().get(mint) {
+                        ctx.record_wallet_balance_divergence_if_any(
+                            mint,
+                            pos.token_amount,
+                            *balance_raw,
+                        );
+                    }
                     debug!(
                         mint = %mint,
                         balance_raw = *balance_raw,
-                        "✅ WalletBalanceSnapshot: position verified in wallet"
+                        "✅ WalletBalanceSnapshot: position verified in wallet (hint only; no size overwrite)"
                     );
                 } else if let Some(reconciled) =
                     ctx.build_reconciled_position(mint, *balance_raw, *decimals)
