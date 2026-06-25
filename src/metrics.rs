@@ -286,6 +286,17 @@ pub static MARKET_DATA_MOMENTUM_COALESCED_MESSAGES_TOTAL: Lazy<AtomicU64> =
 /// Merged `ApplyMomentumActivePools` batches enqueued to the tracking actor (PR169c).
 pub static MARKET_DATA_MOMENTUM_COALESCED_BATCHES_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// arb-strategy published `ArbTrackRequestsUpdate` payloads (Phase 3).
+pub static ARB_TRACK_REQUESTS_MESSAGES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// market-data applied `ArbTrackRequestsUpdate` from core NATS (Phase 3).
+pub static MARKET_DATA_ARB_TRACK_REQUESTS_MESSAGES_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// NATS arb track updates absorbed by the pre-track-worker coalescer (Phase 3).
+pub static MARKET_DATA_ARB_TRACK_COALESCED_MESSAGES_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Merged `ApplyArbTrackRequests` batches enqueued to md-track-worker (Phase 3).
+pub static MARKET_DATA_ARB_TRACK_COALESCED_BATCHES_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// Vaults registered via arb multi-dex admission (no momentum pin).
 pub static MARKET_DATA_ARB_REGISTERED_VAULTS_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -484,6 +495,31 @@ pub fn inc_market_data_momentum_coalesced_messages_total() {
 #[inline]
 pub fn inc_market_data_momentum_coalesced_batches_total() {
     MARKET_DATA_MOMENTUM_COALESCED_BATCHES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_arb_track_requests_messages_total() {
+    ARB_TRACK_REQUESTS_MESSAGES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_market_data_arb_track_requests_messages_total() {
+    MARKET_DATA_ARB_TRACK_REQUESTS_MESSAGES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_track_coalesced_messages_total() {
+    MARKET_DATA_ARB_TRACK_COALESCED_MESSAGES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_track_coalesced_batches_total() {
+    MARKET_DATA_ARB_TRACK_COALESCED_BATCHES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_track_worker_enqueue_dropped_total() {
+    MARKET_DATA_ARB_TRACK_WORKER_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -764,6 +800,9 @@ pub static MARKET_DATA_TX_DEFERRED_DROPPED_TOTAL: Lazy<AtomicU64> = Lazy::new(||
 pub static MARKET_DATA_TRACK_WORKER_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// Phase-2b: momentum active pools enqueue dropped on full track-worker queue.
 pub static MARKET_DATA_MOMENTUM_TRACK_WORKER_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Phase 3: arb track requests enqueue dropped on full track-worker queue.
+pub static MARKET_DATA_ARB_TRACK_WORKER_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
 /// PR169a: single-writer Geyser tracking actor queue depth (gauge).
@@ -4260,6 +4299,22 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_momentum_coalesced_batches_total",
         MARKET_DATA_MOMENTUM_COALESCED_BATCHES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_track_requests_messages_total",
+        ARB_TRACK_REQUESTS_MESSAGES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_arb_track_requests_messages_total",
+        MARKET_DATA_ARB_TRACK_REQUESTS_MESSAGES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_arb_track_coalesced_messages_total",
+        MARKET_DATA_ARB_TRACK_COALESCED_MESSAGES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_arb_track_coalesced_batches_total",
+        MARKET_DATA_ARB_TRACK_COALESCED_BATCHES_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_arb_registered_vaults_total",

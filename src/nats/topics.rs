@@ -18,6 +18,9 @@ pub const TOPIC_MOMENTUM_MARKET_EVENTS: &str = "ironcrab.v1.market_events.moment
 /// Momentum active pool lifecycle (mint+pool pins for Geyser reserve subscription; PR-D).
 pub const TOPIC_MOMENTUM_ACTIVE_POOLS: &str = "ironcrab.v1.momentum.active_pools";
 
+/// Arb strategy-owned Geyser pool pins (pool-centric; Phase 3 hybrid rollback).
+pub const TOPIC_ARB_TRACK_REQUESTS: &str = "ironcrab.v1.arb.track_requests";
+
 /// Trade intents from strategy bots
 pub const TOPIC_TRADE_INTENTS: &str = "ironcrab.v1.trade_intents";
 
@@ -145,6 +148,14 @@ mod tests {
         assert!(TOPIC_MOMENTUM_ACTIVE_POOLS.contains(TOPIC_VERSION));
         assert!(TOPIC_MOMENTUM_ACTIVE_POOLS.contains("momentum"));
         assert!(TOPIC_MOMENTUM_ACTIVE_POOLS.contains("active_pools"));
+    }
+
+    #[test]
+    fn test_arb_track_requests_topic_versioned() {
+        assert!(TOPIC_ARB_TRACK_REQUESTS.starts_with(TOPIC_PREFIX));
+        assert!(TOPIC_ARB_TRACK_REQUESTS.contains(TOPIC_VERSION));
+        assert!(TOPIC_ARB_TRACK_REQUESTS.contains("arb"));
+        assert!(TOPIC_ARB_TRACK_REQUESTS.contains("track_requests"));
     }
 
     #[test]
