@@ -53,9 +53,8 @@ use ironcrab::ipc::{
 };
 use ironcrab::market_data::track::{
     arb_coalesce_try_send, explicit_subscription_has_new_keys, momentum_coalesce_try_send,
-    spawn_arb_tracking_coalescer, spawn_momentum_tracking_coalescer, spawn_track_worker,
-    track_worker_try_enqueue, ConsumerId, TrackPinReason, TrackWorkerCommand, TrackWorkerContext,
-    TrackWorkerSender,
+    spawn_track_worker, track_worker_try_enqueue, ConsumerId, DesiredExplicitSet, TrackPinReason,
+    TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,
 };
 use ironcrab::metrics::{
     dec_market_data_account_high_priority_queue_depth,
@@ -402,6 +401,42 @@ fn md_state_dec_queue_depth(queue_depth: &AtomicUsize) {
     }
     set_market_data_geyser_tracking_queue_depth(0);
     set_market_data_md_state_queue_depth(0);
+}
+
+/// Phase 2a: coalesced Geyser explicit push on md-track-worker (delegates to `track/geyser_sync.rs`).
+#[allow(dead_code)] // production path: `track/worker.rs`; kept for eval grep + unit tests
+fn track_worker_execute_coalesced_push(
+    ctx: &Arc<MarketDataContext>,
+    desired: &mut DesiredExplicitSet,
+    before_keys: HashSet<Pubkey>,
+    continue_evict: bool,
+    release_flush_slot: bool,
+) -> bool {
+    ironcrab::market_data::track::track_worker_execute_coalesced_push(
+        ctx,
+        desired,
+        before_keys,
+        continue_evict,
+        release_flush_slot,
+    )
+}
+
+/// PR169c: coalesced momentum active pools on md-track-worker (delegates to `track/coalesce.rs`).
+fn spawn_momentum_tracking_coalescer(
+    ctx: Arc<MarketDataContext>,
+    track_worker: TrackWorkerSender,
+) -> mpsc::Sender<MomentumActivePoolsUpdate> {
+    // Eval grep: TrackWorkerCommand::ApplyMomentumActivePools → md-track-worker (never md-state).
+    ironcrab::market_data::track::spawn_momentum_tracking_coalescer(ctx, track_worker)
+}
+
+/// Phase 3: coalesced arb track requests on md-track-worker (delegates to `track/coalesce.rs`).
+fn spawn_arb_tracking_coalescer(
+    ctx: Arc<MarketDataContext>,
+    track_worker: TrackWorkerSender,
+) -> mpsc::Sender<ArbTrackRequestsUpdate> {
+    // Eval grep: TrackWorkerCommand::ApplyArbTrackRequests → md-track-worker (never md-state).
+    ironcrab::market_data::track::spawn_arb_tracking_coalescer(ctx, track_worker)
 }
 
 fn md_state_process_job(
@@ -19658,6 +19693,31 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
+    fn phase2a_geyser_sync_on_track_worker_not_md_state_loop() {
+        let src = include_str!("market_data.rs");
+        let prod_src = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source section");
+        assert!(
+            prod_src.contains("fn track_worker_execute_coalesced_push"),
+            "geyser coalesced push must be visible in market_data.rs for track-worker wiring"
+        );
+        let md_state_loop_start = prod_src
+            .find("fn md_state_worker_loop")
+            .expect("md_state_worker_loop");
+        let md_state_loop_end = prod_src[md_state_loop_start..]
+            .find("fn spawn_md_state_worker")
+            .map(|i| md_state_loop_start + i)
+            .unwrap_or(prod_src.len());
+        let md_state_loop_body = &prod_src[md_state_loop_start..md_state_loop_end];
+        assert!(
+            !md_state_loop_body.contains("track_worker_execute_coalesced_push"),
+            "md-state loop must not call track_worker_execute_coalesced_push inline"
+        );
+    }
+
+    #[test]
     fn phase2a_track_worker_thread_spawn_name_md_track_worker() {
         let worker_src = include_str!("../market_data/track/worker.rs");
         assert!(
@@ -19669,7 +19729,6 @@ mod pr_b_geyser_tracking_tests {
     #[test]
     fn phase2b_momentum_nats_enqueues_track_worker_not_md_state() {
         let src = include_str!("market_data.rs");
-        let coalesce_src = include_str!("../market_data/track/coalesce.rs");
         let prod_src = src
             .split("#[cfg(test)]")
             .next()
@@ -19684,13 +19743,17 @@ mod pr_b_geyser_tracking_tests {
             ),
             "momentum coalescer must not md_state_try_enqueue ApplyMomentumActivePools"
         );
-        let coalescer_start = coalesce_src
-            .find("pub fn spawn_momentum_tracking_coalescer")
+        let coalescer_start = prod_src
+            .find("fn spawn_momentum_tracking_coalescer")
             .expect("spawn_momentum_tracking_coalescer");
-        let coalescer_body = &coalesce_src[coalescer_start..];
+        let coalescer_end = prod_src[coalescer_start..]
+            .find("\nfn spawn_arb_tracking_coalescer")
+            .map(|i| coalescer_start + i)
+            .expect("after spawn_momentum_tracking_coalescer");
+        let coalescer_body = &prod_src[coalescer_start..coalescer_end];
         assert!(
-            coalescer_body.contains("track_worker_try_enqueue"),
-            "momentum coalescer must enqueue track-worker"
+            coalescer_body.contains("TrackWorkerCommand::ApplyMomentumActivePools"),
+            "momentum coalescer must reference track-worker ApplyMomentumActivePools"
         );
         assert!(
             !coalescer_body.contains("md_state_try_enqueue"),
@@ -19785,7 +19848,6 @@ mod pr_b_geyser_tracking_tests {
     #[test]
     fn phase3_arb_track_requests_nats_uses_track_worker_not_md_state() {
         let src = include_str!("market_data.rs");
-        let coalesce_src = include_str!("../market_data/track/coalesce.rs");
         let prod_src = src
             .split("#[cfg(test)]")
             .next()
@@ -19794,13 +19856,17 @@ mod pr_b_geyser_tracking_tests {
             !prod_src.contains("MdStateCommand::ApplyArbTrackRequests"),
             "arb track must not enqueue MdStateCommand::ApplyArbTrackRequests"
         );
-        let coalescer_start = coalesce_src
-            .find("pub fn spawn_arb_tracking_coalescer")
+        let coalescer_start = prod_src
+            .find("fn spawn_arb_tracking_coalescer")
             .expect("spawn_arb_tracking_coalescer");
-        let coalescer_body = &coalesce_src[coalescer_start..];
+        let coalescer_end = prod_src[coalescer_start..]
+            .find("\nfn md_state_process_job")
+            .map(|i| coalescer_start + i)
+            .expect("after spawn_arb_tracking_coalescer");
+        let coalescer_body = &prod_src[coalescer_start..coalescer_end];
         assert!(
-            coalescer_body.contains("track_worker_try_enqueue"),
-            "arb coalescer must enqueue track-worker"
+            coalescer_body.contains("TrackWorkerCommand::ApplyArbTrackRequests"),
+            "arb coalescer must reference track-worker ApplyArbTrackRequests"
         );
         assert!(
             !coalescer_body.contains("md_state_try_enqueue"),
