@@ -1563,3 +1563,15 @@ BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap 
 | **Betroffene Module** | `src/bin/market_data.rs` |
 | **Regression-Prüfung** | `phase1_*` source-body tests; `cargo fmt`, `cargo clippy`, `cargo test`; Eval Level 5. |
 | **Tags** | [market-data, hybrid-rollback, phase1, i-4b, ingest, md-sidefx, pr238] |
+
+---
+
+## HYBRID-PHASE2C: ArbMultiDex-Reconcile aus md-state entfernt (2026-06-24)
+
+| Symptom | md-state-Queue weiterhin mit Arb-Entscheidungs-/Reconcile-Jobs belastet; Trade-Pfad und UnifiedHotPoolRegistry triggerten Arb-Pin-Heuristik in MD statt Strategy/Track-Worker. |
+|---------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | Phase 2b zog Momentum auf Track-Worker; verblieben: `ArbMultiDexReconcile`, `UpdateArbCoverageIndex`, `reconcile_arb_multi_dex_*`, Arb-Zweig in `UnifiedHotPoolRegistry`, Trade→Arb-Reconcile-Enqueues. |
+| **Fix** | (1) `MdStateCommand::ArbMultiDexReconcile` + `UpdateArbCoverageIndex` + Handler/Coalesce entfernt. (2) `ArbCoverageIndex`, reconcile/pin-Hilfsfunktionen und Arb-Registry-Felder gelöscht. (3) `register_geyser_reserves_after_trade` nur noch für Momentum-Hot-Pools. (4) `GeyserPinReason::ArbMultiDex` legacy-read-only. (5) `phase2c_*` Source-Body-Tests. Arb-Track-Requests = Phase 3. |
+| **Betroffene Module** | `src/bin/market_data.rs` |
+| **Regression-Prüfung** | `cargo fmt`, `cargo clippy -D warnings`, `cargo test`, `phase1_*`/`phase2a_*`/`phase2b_*`/`phase2c_*`; Eval Level 5 (separater Eval-PR für I-4c). |
+| **Tags** | [market-data, hybrid-rollback, phase2c, i-4c, md-state, arb, pr241] |
