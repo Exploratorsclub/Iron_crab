@@ -1575,3 +1575,15 @@ BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap 
 | **Betroffene Module** | `src/bin/market_data.rs` |
 | **Regression-Prüfung** | `cargo fmt`, `cargo clippy -D warnings`, `cargo test`, `phase1_*`/`phase2a_*`/`phase2b_*`/`phase2c_*`; Eval Level 5 (separater Eval-PR für I-4c). |
 | **Tags** | [market-data, hybrid-rollback, phase2c, i-4c, md-state, arb, pr241] |
+
+---
+
+## HYBRID-PHASE3: Arb track_requests NATS + MD track-worker consumer (2026-06-25)
+
+| Symptom | Nach Phase 2c fehlten Arb-Geyser-Pins; arb-strategy Metrics HTTP :9803 timeout unter Last (2-hop sync im MarketEvent-Worker). |
+|---------|--------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | Arb-Pinning war strategy-owned noch nicht wieder angebunden; `handle_trade` / `check_arbitrage` blockierte den priorisierten MarketEvent-Worker synchron. |
+| **Fix** | (1) Neues Topic `ironcrab.v1.arb.track_requests` — arb-strategy publiziert, market-data subscribed + `md-track-worker` (`ApplyArbTrackRequests`). (2) Pool-zentrische Pins mit `GeyserPinReason::ArbMultiDex`, Wallet/Momentum geschützt. (3) Baseline-Reconcile ~60 s + inkrementelle `multi_dex`/`trade_signal` publishes. (4) 2-hop Detection auf dedizierten `arb_two_hop_worker` Channel (Scope D). |
+| **Betroffene Module** | `src/nats/arb_track_requests.rs`, `src/bin/market_data.rs`, `src/bin/arb_strategy.rs`, `src/metrics.rs` |
+| **Regression-Prüfung** | `cargo fmt`, `cargo clippy -D warnings`, `cargo test`, `phase3_*`; Eval Level 5. |
+| **Tags** | [arb-strategy, market-data, hybrid-rollback, phase3, i-4e, nats, track-worker, pr242] |

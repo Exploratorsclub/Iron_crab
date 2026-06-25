@@ -53,19 +53,21 @@ use ironcrab::metrics::{
     arb_two_hop_eligible_dexes_add, arb_two_hop_eligible_pools_by_dex_add,
     arb_two_hop_insufficient_subreason_inc, arb_two_hop_opportunity_inc, arb_two_hop_pool_gate_add,
     arb_two_hop_reject_subreason_inc, arb_two_hop_rejected_inc,
-    arb_two_hop_tracker_seeded_pools_add, serve_metrics, set_readiness_nats_connected,
-    ArbStrategyWarmupSkipReason, ArbTwoHopInsufficientSubreason, ArbTwoHopPoolGate,
-    ArbTwoHopRejectReason, ArbTwoHopRejectSubreason, MetricsComponent,
-    ARB_REJECTED_MISSING_ACCOUNTS, ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL,
-    MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
-    POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
+    arb_two_hop_tracker_seeded_pools_add, record_arb_track_requests_messages_total, serve_metrics,
+    set_readiness_nats_connected, wall_clock_unix_ms_now, ArbStrategyWarmupSkipReason,
+    ArbTwoHopInsufficientSubreason, ArbTwoHopPoolGate, ArbTwoHopRejectReason,
+    ArbTwoHopRejectSubreason, MetricsComponent, ARB_REJECTED_MISSING_ACCOUNTS,
+    ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL,
+    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
+    TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, pool_cache_live_fallback_consumer_config,
-    CONFIG_STREAM_NAME, STREAM_NAME,
+    ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackRemovedEntry, ArbTrackRemovedReason,
+    ArbTrackRequestsUpdate, CONFIG_STREAM_NAME, STREAM_NAME,
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
-use ironcrab::nats::{TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
+use ironcrab::nats::{TOPIC_ARB_TRACK_REQUESTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
 use ironcrab::solana::dex::meteora_bin_walker::{dlmm_fee_bps, walker_from_bins};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 use solana_sdk::pubkey::Pubkey;
@@ -75,6 +77,16 @@ const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// NATS topic for config reload commands from control-plane (Core NATS fallback)
 const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
+
+/// Wire format version for `TOPIC_ARB_TRACK_REQUESTS`.
+const ARB_TRACK_REQUESTS_WIRE_VERSION: u32 = 1;
+/// Default cap for baseline reconcile `active[]` (configurable via `arb_track_baseline_max_pools`).
+const ARB_TRACK_BASELINE_MAX_POOLS_DEFAULT: usize = 500;
+/// Default baseline reconcile interval (configurable via `arb_track_reconcile_interval_secs`).
+const ARB_TRACK_RECONCILE_INTERVAL_SECS_DEFAULT: u64 = 60;
+
+/// Bounded queue for off-hot-loop 2-hop trade detection (Scope D).
+const ARB_TWO_HOP_WORKER_QUEUE_CAP: usize = 4096;
 
 // ============================================================================
 // Configuration
@@ -100,6 +112,10 @@ struct ArbConfig {
     intent_ttl_ms: u64,
     /// Enable 2-hop arbitrage (A→B on DEX1, B→A on DEX2). Default: true
     two_hop_enabled: bool,
+    /// Max pools in baseline reconcile snapshot. Default: 500.
+    arb_track_baseline_max_pools: usize,
+    /// Baseline reconcile publish interval in seconds. Default: 60.
+    arb_track_reconcile_interval_secs: u64,
 }
 
 impl Default for ArbConfig {
@@ -113,6 +129,8 @@ impl Default for ArbConfig {
             intent_cooldown_ms: 5000,             // 5s cooldown per pair
             intent_ttl_ms: 1000,                  // 1s TTL (Option C: fresh quotes in exec-engine)
             two_hop_enabled: true,                // 2-hop arb enabled by default
+            arb_track_baseline_max_pools: ARB_TRACK_BASELINE_MAX_POOLS_DEFAULT,
+            arb_track_reconcile_interval_secs: ARB_TRACK_RECONCILE_INTERVAL_SECS_DEFAULT,
         }
     }
 }
@@ -2296,6 +2314,63 @@ impl ArbLowEventCoalescer {
     }
 }
 
+/// Off-hot-loop 2-hop detection job (Scope D).
+#[derive(Debug, Clone)]
+struct ArbTwoHopTradeJob {
+    pool_address: String,
+    mint: String,
+    quote_mint: String,
+    sol_amount: u64,
+    token_amount: u64,
+    token_decimals: u8,
+    is_buy: bool,
+    dex: String,
+    slot: Option<u64>,
+    ts_unix_ms: u64,
+}
+
+fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoHopTradeJob>) {
+    tokio::spawn(async move {
+        while let Some(job) = rx.recv().await {
+            let two_hop_enabled = ctx.config.read().two_hop_enabled;
+            if !two_hop_enabled {
+                continue;
+            }
+            if let Some(opp) = ctx.handle_trade(
+                &job.pool_address,
+                &job.mint,
+                &job.quote_mint,
+                job.sol_amount,
+                job.token_amount,
+                job.token_decimals,
+                job.is_buy,
+                &job.dex,
+            ) {
+                ARB_TRIANGLE_OPPORTUNITIES.fetch_add(1, Ordering::Relaxed);
+                info!(
+                    mint = %opp.base_mint,
+                    buy_dex = %opp.buy_dex,
+                    sell_dex = %opp.sell_dex,
+                    spread_bps = opp.spread_bps,
+                    profit_lamports = opp.estimated_profit_lamports,
+                    "🔥 Arbitrage opportunity detected (two-hop worker)"
+                );
+                ctx.publish_arb_trade_signal_track_pins(&opp.buy_pool, &opp.sell_pool);
+                if let Some(mut intent) = create_arb_intent(&ctx, &opp) {
+                    if let Some(slot) = job.slot {
+                        intent.metadata.insert("slot".to_string(), slot.to_string());
+                    }
+                    intent
+                        .metadata
+                        .insert("slot_seen_at_ms".to_string(), job.ts_unix_ms.to_string());
+                    publish_arb_intent(&ctx, &intent).await;
+                }
+            }
+        }
+        info!("arb-strategy two-hop worker stopped");
+    });
+}
+
 async fn publish_arb_intent(ctx: &ArbContext, intent: &TradeIntent) {
     if let Err(e) = ctx.jsonl_writer.write(intent) {
         error!(error = %e, "Failed to write intent to JSONL");
@@ -2508,6 +2583,13 @@ struct ArbContext {
 
     /// Bounded 2-hop eligibility forensics (rate-limited snapshots).
     eligibility_forensics: ArbEligibilityForensics,
+
+    /// Phase 3: pools published as active via `TOPIC_ARB_TRACK_REQUESTS`.
+    arb_pinned_pools: RwLock<HashSet<String>>,
+    /// Phase 3: count of track_requests publishes (heartbeat).
+    arb_track_published: AtomicU64,
+    /// Scope D: enqueue-only sender for off-hot-loop 2-hop detection.
+    two_hop_tx: mpsc::Sender<ArbTwoHopTradeJob>,
 }
 
 /// Cached vault balances from PoolStateUpdate events
@@ -2667,6 +2749,32 @@ impl ArbContext {
                         info!(key = %key, new_value = %v, "Config updated");
                     } else {
                         rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "arb_track_baseline_max_pools" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 && v <= 10_000 {
+                            config.arb_track_baseline_max_pools = v as usize;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 1-10000".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "arb_track_reconcile_interval_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        if (10..=3_600).contains(&v) {
+                            config.arb_track_reconcile_interval_secs = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 10-3600".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
                 }
                 // Skip multi_hop_* keys here - they're handled in the second loop below
@@ -3546,6 +3654,152 @@ impl ArbContext {
         let trackers = self.trackers.read();
         trackers.get(mint).and_then(|t| t.token_program.clone())
     }
+
+    fn spawn_publish_arb_track_requests(
+        self: &Arc<Self>,
+        active: Vec<ArbTrackActiveEntry>,
+        removed: Vec<ArbTrackRemovedEntry>,
+        reconcile: bool,
+    ) {
+        if active.is_empty() && removed.is_empty() && !reconcile {
+            return;
+        }
+        let Some(nats_src) = self.nats.as_ref() else {
+            return;
+        };
+        let nats = nats_src.clone_for_spawned_publish();
+        let update = ArbTrackRequestsUpdate {
+            version: ARB_TRACK_REQUESTS_WIRE_VERSION,
+            ts_unix_ms: wall_clock_unix_ms_now(),
+            active,
+            removed,
+            reconcile,
+        };
+        record_arb_track_requests_messages_total();
+        self.arb_track_published.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            if let Err(e) = nats.publish(TOPIC_ARB_TRACK_REQUESTS, &update).await {
+                warn!(
+                    error = %e,
+                    topic = TOPIC_ARB_TRACK_REQUESTS,
+                    "ArbTrackRequests NATS publish failed"
+                );
+            }
+        });
+    }
+
+    fn collect_arb_track_baseline_active(&self) -> Vec<ArbTrackActiveEntry> {
+        let trackers = self.trackers.read();
+        let max_pools = self.config.read().arb_track_baseline_max_pools;
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for tracker in trackers.values() {
+            if tracker.pool_count_on_distinct_dexes() < 2 {
+                continue;
+            }
+            for pool in tracker.pools.keys() {
+                if seen.len() >= max_pools {
+                    return out;
+                }
+                if seen.insert(pool.clone()) {
+                    out.push(ArbTrackActiveEntry {
+                        pool: pool.clone(),
+                        reason: ArbTrackActiveReason::Baseline,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    fn reconcile_arb_track_baseline_publish(self: &Arc<Self>) {
+        if self.nats.is_none() {
+            return;
+        }
+        let active = self.collect_arb_track_baseline_active();
+        {
+            let mut pinned = self.arb_pinned_pools.write();
+            pinned.clear();
+            for a in &active {
+                pinned.insert(a.pool.clone());
+            }
+        }
+        self.spawn_publish_arb_track_requests(active, Vec::new(), true);
+    }
+
+    fn maybe_publish_arb_track_incremental_for_mint(self: &Arc<Self>, mint: &str) {
+        let trackers = self.trackers.read();
+        let Some(tracker) = trackers.get(mint) else {
+            return;
+        };
+        if tracker.pool_count_on_distinct_dexes() < 2 {
+            return;
+        }
+        let mut active = Vec::new();
+        let mut pinned = self.arb_pinned_pools.write();
+        for pool in tracker.pools.keys() {
+            if pinned.insert(pool.clone()) {
+                active.push(ArbTrackActiveEntry {
+                    pool: pool.clone(),
+                    reason: ArbTrackActiveReason::MultiDex,
+                });
+            }
+        }
+        drop(pinned);
+        drop(trackers);
+        if !active.is_empty() {
+            self.spawn_publish_arb_track_requests(active, Vec::new(), false);
+        }
+    }
+
+    fn publish_arb_trade_signal_track_pins(self: &Arc<Self>, buy_pool: &str, sell_pool: &str) {
+        if self.nats.is_none() {
+            return;
+        }
+        let mut active = Vec::new();
+        let mut pinned = self.arb_pinned_pools.write();
+        for pool in [buy_pool, sell_pool] {
+            if pinned.insert(pool.to_string()) {
+                active.push(ArbTrackActiveEntry {
+                    pool: pool.to_string(),
+                    reason: ArbTrackActiveReason::TradeSignal,
+                });
+            }
+        }
+        drop(pinned);
+        if !active.is_empty() {
+            self.spawn_publish_arb_track_requests(active, Vec::new(), false);
+        }
+    }
+
+    fn prune_arb_track_stale_pools(self: &Arc<Self>) {
+        if self.nats.is_none() {
+            return;
+        }
+        let trackers = self.trackers.read();
+        let mut still_active: HashSet<String> = HashSet::new();
+        for tracker in trackers.values() {
+            if tracker.pool_count_on_distinct_dexes() >= 2 {
+                still_active.extend(tracker.pools.keys().cloned());
+            }
+        }
+        drop(trackers);
+        let mut removed = Vec::new();
+        let mut pinned = self.arb_pinned_pools.write();
+        for pool in pinned.clone().into_iter() {
+            if !still_active.contains(&pool) {
+                pinned.remove(&pool);
+                removed.push(ArbTrackRemovedEntry {
+                    pool,
+                    reason: ArbTrackRemovedReason::Stale,
+                });
+            }
+        }
+        drop(pinned);
+        if !removed.is_empty() {
+            self.spawn_publish_arb_track_requests(Vec::new(), removed, false);
+        }
+    }
 }
 
 // ============================================================================
@@ -3878,6 +4132,8 @@ async fn main() -> Result<()> {
         run_id.clone(),
     );
 
+    let (two_hop_tx, two_hop_rx) = mpsc::channel::<ArbTwoHopTradeJob>(ARB_TWO_HOP_WORKER_QUEUE_CAP);
+
     let ctx = Arc::new(ArbContext {
         run_id: run_id.clone(),
         config: RwLock::new(initial_config),
@@ -3899,7 +4155,12 @@ async fn main() -> Result<()> {
         multi_hop,
         spread_too_large_warn_last: RwLock::new(HashMap::new()),
         eligibility_forensics: ArbEligibilityForensics::new(),
+        arb_pinned_pools: RwLock::new(HashSet::new()),
+        arb_track_published: AtomicU64::new(0),
+        two_hop_tx,
     });
+
+    spawn_arb_two_hop_worker(Arc::clone(&ctx), two_hop_rx);
 
     // Bootstrap SLAVE LivePoolCache from JetStream (same path as execution-engine).
     // Consumer is returned for reuse in the main loop (FIX-12 — no second LastPerSubject replay).
@@ -4132,6 +4393,10 @@ async fn main() -> Result<()> {
     let config_js_consumer_opt = config_js_consumer;
     let pool_cache_consumer_opt = pool_cache_consumer;
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(60));
+    let arb_reconcile_secs = ctx.config.read().arb_track_reconcile_interval_secs;
+    let mut arb_track_reconcile_interval =
+        tokio::time::interval(Duration::from_secs(arb_reconcile_secs.max(10)));
+    arb_track_reconcile_interval.tick().await;
 
     loop {
         tokio::select! {
@@ -4244,6 +4509,14 @@ async fn main() -> Result<()> {
                                                     if ctx.seed_trackers_for_pool_cache_update(&update)
                                                     {
                                                         arb_strategy_pool_cache_update_seeded_inc();
+                                                        if let Some(mint) = arb_tracked_token_mint(
+                                                            &update.base_mint,
+                                                            &update.quote_mint,
+                                                        ) {
+                                                            ctx.maybe_publish_arb_track_incremental_for_mint(
+                                                                mint,
+                                                            );
+                                                        }
                                                     } else {
                                                         arb_strategy_pool_cache_update_skip_no_seed_inc();
                                                     }
@@ -4292,6 +4565,7 @@ async fn main() -> Result<()> {
                 ctx.multi_hop.refresh_quote_readiness_metrics();
                 ctx.eligibility_forensics.maybe_emit_snapshot();
                 ctx.sync_pools_tracked_gauge();
+                ctx.prune_arb_track_stale_pools();
                 TOKENS_TRACKED_GAUGE.store(trackers.len() as u64, Ordering::Relaxed);
 
                 info!(
@@ -4304,17 +4578,22 @@ async fn main() -> Result<()> {
                     intents_generated = ctx.intents_generated.load(Ordering::Relaxed),
                     intents_written = records,
                     bytes_written = bytes,
-                    // Data quality metrics
                     zero_amount_trades = ctx.zero_amount_trades.load(Ordering::Relaxed),
                     data_quality_rejects = ctx.data_quality_rejects.load(Ordering::Relaxed),
-                    // Multi-hop stats
                     multi_hop_vertices = multi_hop_stats.graph_vertices,
                     multi_hop_pools = multi_hop_stats.graph_pools,
                     multi_hop_cycles_found = multi_hop_stats.cycles_found,
                     multi_hop_profitable = multi_hop_stats.cycles_profitable,
                     multi_hop_enabled = ctx.multi_hop.is_enabled(),
+                    arb_track_requests_published =
+                        ctx.arb_track_published.load(Ordering::Relaxed),
                     "arb-strategy heartbeat (SLAVE cache sync from market-data MASTER)"
                 );
+            }
+
+            // Phase 3: baseline arb track_requests reconcile (strategy-owned pins).
+            _ = arb_track_reconcile_interval.tick() => {
+                ctx.reconcile_arb_track_baseline_publish();
             }
 
             _ = &mut shutdown => {
@@ -4394,42 +4673,25 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
                 );
             }
 
-            // Existing 2-hop arbitrage detection
-            if let Some(opp) = ctx.handle_trade(
-                pool_address,
-                mint,
-                quote_mint,
-                *sol_amount,
-                *token_amount,
-                *token_decimals,
-                *is_buy,
-                dex,
-            ) {
-                // Prometheus: count arbitrage opportunities detected
-                ARB_TRIANGLE_OPPORTUNITIES.fetch_add(1, Ordering::Relaxed);
-                info!(
-                    mint = %opp.base_mint,
-                    buy_dex = %opp.buy_dex,
-                    sell_dex = %opp.sell_dex,
-                    spread_bps = opp.spread_bps,
-                    profit_lamports = opp.estimated_profit_lamports,
-                    "🔥 Arbitrage opportunity detected!"
-                );
-                // create_arb_intent returns None if pump_amm is used but DexPoolAccounts are missing
-                create_arb_intent(ctx, &opp).map(|mut intent| {
-                    // K Phase 1: Slot-to-Send Latency - propagate slot from event
-                    if let Some(slot) = event.slot {
-                        intent.metadata.insert("slot".to_string(), slot.to_string());
-                    }
-                    intent.metadata.insert(
-                        "slot_seen_at_ms".to_string(),
-                        event.header.ts_unix_ms.to_string(),
-                    );
-                    intent
-                })
-            } else {
-                None
+            // Scope D: 2-hop detection off the prioritized market-event worker.
+            if ctx.config.read().two_hop_enabled {
+                let job = ArbTwoHopTradeJob {
+                    pool_address: pool_address.clone(),
+                    mint: mint.clone(),
+                    quote_mint: quote_mint.clone(),
+                    sol_amount: *sol_amount,
+                    token_amount: *token_amount,
+                    token_decimals: *token_decimals,
+                    is_buy: *is_buy,
+                    dex: dex.clone(),
+                    slot: event.slot,
+                    ts_unix_ms: event.header.ts_unix_ms,
+                };
+                if ctx.two_hop_tx.try_send(job).is_err() {
+                    debug!("arb two-hop worker queue full; dropping trade detection job");
+                }
             }
+            None
         }
 
         // Handle DexPoolAccounts - cache for deterministic IX building (NO RPC in execution-engine)
@@ -4865,6 +5127,12 @@ mod two_hop_price_tests {
             )),
             spread_too_large_warn_last: RwLock::new(HashMap::new()),
             eligibility_forensics: ArbEligibilityForensics::new(),
+            arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_track_published: AtomicU64::new(0),
+            two_hop_tx: {
+                let (tx, _rx) = mpsc::channel(1);
+                tx
+            },
         }
     }
 
@@ -6231,6 +6499,25 @@ mod two_hop_price_tests {
         let _ = check_with_forensics(&tracker, &known_pools, &vault_balances, &forensics);
         assert!(!forensics.maybe_emit_snapshot());
         assert_eq!(forensics.snapshots_emitted_count(), 1);
+    }
+
+    #[test]
+    fn phase3_arb_track_requests_publish_serializes_reconcile_flag() {
+        let update = ArbTrackRequestsUpdate {
+            version: ARB_TRACK_REQUESTS_WIRE_VERSION,
+            ts_unix_ms: 1_700_000_000,
+            active: vec![ArbTrackActiveEntry {
+                pool: "Pool111111111111111111111111111111111111111".to_string(),
+                reason: ArbTrackActiveReason::Baseline,
+            }],
+            removed: vec![],
+            reconcile: true,
+        };
+        let json = serde_json::to_string(&update).expect("serialize");
+        assert!(json.contains("\"reconcile\":true"));
+        let back: ArbTrackRequestsUpdate = serde_json::from_str(&json).expect("deserialize");
+        assert!(back.reconcile);
+        assert_eq!(back.active.len(), 1);
     }
 }
 
