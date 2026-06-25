@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### HYBRID-PHASE5a: Track-Worker + Geyser-Sync Modul-Extraktion (Monolith-Slice)
+**Datum**: 2026-06-25  
+**Problem**: `market_data.rs` (~20k LOC) Monolith — Track-Worker, Coalescer und Geyser-Sync-Flush lagen inline im Bin, erschwerten Slice 5b/5c (ingest/publish/cold).  
+**Fix**: Reine Modul-Grenze ohne Verhaltensänderung: (1) **`src/market_data/track/worker.rs`** — `TrackWorkerCommand`, `md-track-worker` OS-Thread, bounded enqueue, `track_worker_process_command`. (2) **`geyser_sync.rs`** — `rebuild_desired_explicit_set_from_ctx`, `track_worker_execute_coalesced_push` (delta-only, 500 ms coalesce). (3) **`coalesce.rs`** — Momentum/Arb NATS-Coalescer + merge helpers. (4) Bin importiert via `ironcrab::market_data::track::*`; `TrackWorkerContext` impl auf `MarketDataContext`. **spec_compliance**: Phase 1–3 bereits behoben (Arb reconcile weg, Momentum/Arb auf track-worker); offen: Gesamt-Monolith <8k LOC (5b/5c). **Invarianten**: I-4b (1 OS thread, bounded enqueue unverändert), I-7 (kein neuer RPC).  
+**Dateien**: `src/market_data/track/{worker,geyser_sync,coalesce}.rs`, `src/market_data/track/mod.rs`, `src/bin/market_data.rs`, `docs/BUGS_FIXES.md`
+
 ### Phase-2b-MOMENTUM-TRACK-WORKER: Momentum Active Pools bypass md-state
 **Datum**: 2026-06-24  
 **Problem**: Nach Phase 2a liefen Momentum NATS + `momentum_tracking_coalesce` weiterhin über `MdStateCommand::ApplyMomentumActivePools` auf die md-state-Queue (8192 cap) — reproduzierte Prod-Stall (Post-Deploy Phase 2a).  
