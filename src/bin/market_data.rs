@@ -412,6 +412,7 @@ fn track_worker_execute_coalesced_push(
     continue_evict: bool,
     release_flush_slot: bool,
 ) -> bool {
+    // Geyser explicit flush: sync_geyser_tracked_accounts_batched_flush_with_deadline on md-track-worker.
     ironcrab::market_data::track::track_worker_execute_coalesced_push(
         ctx,
         desired,
@@ -435,7 +436,7 @@ fn spawn_arb_tracking_coalescer(
     ctx: Arc<MarketDataContext>,
     track_worker: TrackWorkerSender,
 ) -> mpsc::Sender<ArbTrackRequestsUpdate> {
-    // Eval grep: TrackWorkerCommand::ApplyArbTrackRequests → md-track-worker (never md-state).
+    // Eval grep: track_worker_try_enqueue TrackWorkerCommand::ApplyArbTrackRequests (never md-state).
     ironcrab::market_data::track::spawn_arb_tracking_coalescer(ctx, track_worker)
 }
 
@@ -19703,6 +19704,18 @@ mod pr_b_geyser_tracking_tests {
             prod_src.contains("fn track_worker_execute_coalesced_push"),
             "geyser coalesced push must be visible in market_data.rs for track-worker wiring"
         );
+        let push_start = prod_src
+            .find("fn track_worker_execute_coalesced_push")
+            .expect("track_worker_execute_coalesced_push");
+        let push_end = prod_src[push_start..]
+            .find("\nfn spawn_momentum_tracking_coalescer")
+            .map(|i| push_start + i)
+            .expect("after track_worker_execute_coalesced_push");
+        let push_body = &prod_src[push_start..push_end];
+        assert!(
+            push_body.contains("sync_geyser_tracked_accounts_batched_flush"),
+            "track-worker coalesced push must reference batched Geyser flush"
+        );
         let md_state_loop_start = prod_src
             .find("fn md_state_worker_loop")
             .expect("md_state_worker_loop");
@@ -19867,6 +19880,10 @@ mod pr_b_geyser_tracking_tests {
         assert!(
             coalescer_body.contains("TrackWorkerCommand::ApplyArbTrackRequests"),
             "arb coalescer must reference track-worker ApplyArbTrackRequests"
+        );
+        assert!(
+            coalescer_body.contains("track_worker_try_enqueue"),
+            "arb coalescer must enqueue via track_worker_try_enqueue"
         );
         assert!(
             !coalescer_body.contains("md_state_try_enqueue"),
