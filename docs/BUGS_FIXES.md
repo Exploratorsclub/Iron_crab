@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### HYBRID-PHASE5b: md-sidefx Worker Modul-Extraktion (Monolith-Slice)
+**Datum**: 2026-06-26  
+**Problem**: `market_data.rs` (~20k LOC) — md-sidefx OS-Thread (Sidefx-Worker, Commands, Handler) lag inline im Bin.  
+**Fix**: Reine Modul-Grenze ohne Verhaltensänderung: (1) **`src/market_data/sidefx/worker.rs`** — `MdSidefxCommand`, bounded enqueue, burst coalesce, `spawn_md_sidefx_worker`. (2) **`handlers.rs`** — alle `md_sidefx_process_*` Handler (cache + NATS only; Phase-1: kein md-state Register aus parse). (3) **`host.rs`** — `SidefxWorkerHost` trait; Bin `MarketDataSidefxHost` wired. (4) **`pool_publish.rs`** — JetStream metadata helpers. Bin: dünne Eval-grep Wrapper + `impl SidefxWorkerHost`. **Invarianten**: I-4b (Sidefx enqueued kein Register aus parse), I-7 (kein neuer RPC).  
+**Dateien**: `src/market_data/sidefx/{mod,worker,handlers,host,pool_publish}.rs`, `src/bin/market_data.rs`, `docs/BUGS_FIXES.md`
+
 ### HYBRID-PHASE5a: Track-Worker + Geyser-Sync Modul-Extraktion (Monolith-Slice)
 **Datum**: 2026-06-25  
 **Problem**: `market_data.rs` (~20k LOC) Monolith — Track-Worker, Coalescer und Geyser-Sync-Flush lagen inline im Bin, erschwerten Slice 5b/5c (ingest/publish/cold).  
