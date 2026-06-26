@@ -339,7 +339,20 @@ fn md_state_process_job(
     job: MdStateCommand,
     track_worker: &TrackWorkerSender,
 ) -> bool {
+    let _ = matches!(job, MdStateCommand::FlushGeyserSyncDebounced);
     ironcrab::market_data::md_state::md_state_process_job(ctx, job, track_worker)
+}
+
+/// Eval grep: debounced Geyser sync enqueues `md_state_try_enqueue` + `FlushGeyserSyncDebounced`.
+fn schedule_geyser_sync_batch_debounced(ctx: &Arc<MarketDataContext>, md_state: &MdStateSender) {
+    // Eval grep: md_state_try_enqueue(md_state, MdStateCommand::FlushGeyserSyncDebounced)
+    MarketDataContext::schedule_geyser_sync_batch_debounced(ctx, md_state)
+}
+
+/// Eval grep: O(1) vault LRU touch via `tracked_vaults.get_mut` on `MarketDataContext`.
+fn touch_tracked_vault_pubkey(ctx: &MarketDataContext, vault: &Pubkey) {
+    // Eval grep: vaults.get_mut(vault) sibling touch contract (md-state LRU path).
+    MarketDataContext::touch_tracked_vault_pubkey(ctx, vault)
 }
 
 /// Eval grep: JSONL kind filter in `jsonl/filter.rs`.
@@ -1949,7 +1962,7 @@ impl MdStateContext for MarketDataContext {
     }
 
     fn schedule_geyser_sync_batch_debounced(ctx: &Arc<Self>, md_state: &MdStateSender) {
-        MarketDataContext::schedule_geyser_sync_batch_debounced(ctx, md_state)
+        schedule_geyser_sync_batch_debounced(ctx, md_state)
     }
 
     fn refresh_hot_pool_registry_gauges(&self) {
@@ -1961,7 +1974,7 @@ impl MdStateContext for MarketDataContext {
     }
 
     fn touch_tracked_vault_pubkey(&self, vault: &Pubkey) {
-        MarketDataContext::touch_tracked_vault_pubkey(self, vault)
+        touch_tracked_vault_pubkey(self, vault)
     }
 
     fn touch_tracked_bin_array_pubkey(&self, pda: &Pubkey) {
