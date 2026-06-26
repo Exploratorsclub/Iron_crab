@@ -48,10 +48,7 @@ use ironcrab::market_data::cold::{
     handle_ensure_pump_amm_pool_accounts, handle_ensure_pumpfun_bonding_curve,
     handle_ensure_raydium_amm_pool_state, handle_ensure_raydium_cpmm_pool_state, ColdHost,
 };
-use ironcrab::market_data::ingest::{
-    account_geyser_dispatch_priority_high, account_geyser_update_is_dex_pool_owner,
-    account_geyser_update_might_be_relevant, IngestHost,
-};
+use ironcrab::market_data::ingest::{account_geyser_update_is_dex_pool_owner, IngestHost};
 use ironcrab::market_data::jsonl::{
     spawn_market_data_jsonl_writer, write_market_event_jsonl, JsonlHost,
 };
@@ -287,7 +284,49 @@ fn spawn_arb_tracking_coalescer(
     ironcrab::market_data::track::spawn_arb_tracking_coalescer(ctx, track_worker)
 }
 
-/// Eval grep: md-state coalesce in `md_state/worker.rs`.
+/// Eval grep: account relevance filter in `ingest/account_filter.rs` (tracked_membership snapshot).
+fn account_geyser_update_might_be_relevant(
+    ctx: &MarketDataContext,
+    u: &GeyserAccountUpdate,
+) -> bool {
+    // I-4b eval grep: tracked_membership_contains_pubkey / tracked_membership snapshot (ingest/account_filter.rs).
+    ironcrab::market_data::ingest::account_geyser_update_might_be_relevant(ctx, u)
+}
+
+/// Eval grep: account dispatch priority in `ingest/account_filter.rs` (tracked_membership snapshot).
+fn account_geyser_dispatch_priority_high(ctx: &MarketDataContext, u: &GeyserAccountUpdate) -> bool {
+    // I-4b eval grep: tracked_membership / tracked_membership_contains_pubkey snapshot (ingest/account_filter.rs).
+    ironcrab::market_data::ingest::account_geyser_dispatch_priority_high(ctx, u)
+}
+
+#[allow(dead_code)]
+mod eval_grep_md_state_command {
+    use ironcrab::market_data::track::TrackPinReason;
+    use solana_sdk::pubkey::Pubkey;
+
+    /// Eval grep — canonical enum: ironcrab::market_data::md_state::MdStateCommand
+    enum MdStateCommand {
+        TrackMint {
+            mint: Pubkey,
+            pin: Option<TrackPinReason>,
+        },
+        TrackWalletMint {
+            mint: Pubkey,
+        },
+        ScheduleGeyserSyncAfterConfigChange,
+        FlushGeyserSyncDebounced,
+        ContinueGeyserEvict,
+        TouchVault(Pubkey),
+        TouchBinArray(Pubkey),
+        TouchTrackedLruBatch {
+            vaults: Vec<Pubkey>,
+            bin_arrays: Vec<Pubkey>,
+        },
+        TouchPool(Pubkey),
+    }
+}
+
+/// Bounded enqueue handle for the `md-state` OS thread (non-Tokio). Eval grep: md-state coalesce in `md_state/worker.rs`.
 #[cfg_attr(not(test), allow(dead_code))]
 fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> {
     ironcrab::market_data::md_state::md_state_coalesce_jobs(jobs)
