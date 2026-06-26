@@ -28,9 +28,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
@@ -49,6 +47,14 @@ use ironcrab::market_data::cold::{
     handle_ensure_meteora_dlmm_pool_state, handle_ensure_orca_whirlpool_pool_state,
     handle_ensure_pump_amm_pool_accounts, handle_ensure_pumpfun_bonding_curve,
     handle_ensure_raydium_amm_pool_state, handle_ensure_raydium_cpmm_pool_state, ColdHost,
+};
+use ironcrab::market_data::ingest::{account_geyser_update_is_dex_pool_owner, IngestHost};
+use ironcrab::market_data::jsonl::{
+    spawn_market_data_jsonl_writer, write_market_event_jsonl, JsonlHost,
+};
+use ironcrab::market_data::md_state::{
+    md_state_try_enqueue, spawn_md_state_worker, MdStateCommand, MdStateContext, MdStateSender,
+    MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP,
 };
 use ironcrab::market_data::publish::{
     account_path_enqueue_core_market_event as publish_enqueue_core_market_event,
@@ -73,8 +79,8 @@ use ironcrab::market_data::sidefx::{
 };
 use ironcrab::market_data::track::{
     arb_coalesce_try_send, explicit_subscription_has_new_keys, momentum_coalesce_try_send,
-    spawn_track_worker, track_worker_try_enqueue, ConsumerId, DesiredExplicitSet, TrackPinReason,
-    TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,
+    spawn_track_worker, ConsumerId, DesiredExplicitSet, TrackPinReason, TrackWorkerContext,
+    TrackWorkerSender,
 };
 use ironcrab::metrics::{
     dec_market_data_account_high_priority_queue_depth,
@@ -84,12 +90,9 @@ use ironcrab::metrics::{
     inc_market_data_account_high_priority_queue_depth,
     inc_market_data_account_low_priority_queue_depth, inc_market_data_account_worker_queue_depth,
     inc_market_data_balance_updated_from_cache_total, inc_market_data_geyser_sync_partial_total,
-    inc_market_data_geyser_sync_skipped_no_delta_total,
     inc_market_data_geyser_sync_skipped_rate_limit_total,
-    inc_market_data_geyser_tracking_enqueue_dropped_total,
-    inc_market_data_geyser_tracking_jobs_processed_total,
     inc_market_data_ingest_membership_snapshot_hits_total,
-    inc_market_data_jsonl_enqueue_dropped_total, inc_market_data_md_state_bursts_completed_total,
+    inc_market_data_jsonl_enqueue_dropped_total,
     inc_market_data_md_state_evict_steps_budget_exhausted_total,
     inc_market_data_md_state_evict_steps_total, inc_market_data_unparsed_account_dropped_total,
     inc_market_data_unparsed_tx_dropped_total, inc_market_data_vault_high_priority_dispatch_total,
@@ -110,10 +113,8 @@ use ironcrab::metrics::{
     record_market_data_tx_channel_lag_ms, record_market_data_tx_handler_processed, serve_metrics,
     set_market_data_account_broadcast_queue_depth, set_market_data_account_worker_count,
     set_market_data_arb_pinned_pools_gauge, set_market_data_geyser_merge_pending,
-    set_market_data_geyser_sync_pending, set_market_data_geyser_tracking_queue_depth,
-    set_market_data_hot_pool_registry_pools_gauge, set_market_data_md_state_burst_in_progress,
-    set_market_data_md_state_deferred_jobs_len, set_market_data_md_state_evict_pending,
-    set_market_data_md_state_queue_depth, set_market_data_momentum_active_pool_pins_gauge,
+    set_market_data_geyser_sync_pending, set_market_data_hot_pool_registry_pools_gauge,
+    set_market_data_md_state_evict_pending, set_market_data_momentum_active_pool_pins_gauge,
     set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
     set_readiness_nats_connected, touch_market_data_global_ingest_progress,
     touch_market_data_tracked_membership_snapshot_refresh, update_readiness_market_data_current,
@@ -168,19 +169,11 @@ static MD_SYSTEMD_WATCHDOG_NOTIFY: AtomicBool = AtomicBool::new(true);
 
 /// Default capacity for off-hot-path market-events JSONL queue.
 const MARKET_DATA_JSONL_QUEUE_CAP: usize = 16_384;
-/// PR169a / Phase-R-R2: bounded queue for single-writer Geyser tracking mutations (account + TX path).
-const MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP: usize = 8192;
-/// Phase-R-R2: max jobs drained per `md-state` burst before one debounced Geyser sync.
-const MARKET_DATA_MD_STATE_BURST_MAX: usize = 256;
 /// PR167: minimum debounce for explicit pin updates during startup burst (seconds).
 const MARKET_DATA_GEYSER_SYNC_STARTUP_WINDOW: Duration = Duration::from_secs(120);
 const MARKET_DATA_GEYSER_SYNC_STARTUP_MIN_MS: u64 = 250;
 /// PR233: max debounced Geyser sync flushes per second during startup burst.
 const MARKET_DATA_GEYSER_SYNC_FLUSH_MAX_PER_SEC: usize = 4;
-/// PR235: wall time budget for job processing only (flush/evict uses separate budget).
-const MARKET_DATA_MD_STATE_JOB_BUDGET_MS: u64 = 16;
-/// PR235: minimum jobs completed per burst before time-budget defer (avoids re-defer loops).
-const MARKET_DATA_MD_STATE_MIN_JOBS_PER_BURST: usize = 32;
 /// PR234: max LRU eviction steps per sync/evict slice on md-state.
 const MARKET_DATA_GEYSER_EVICT_MAX_STEPS_PER_FLUSH: usize = 16;
 /// PR234: md-state liveness poll interval (OS thread).
@@ -222,22 +215,6 @@ const PUMPFUN_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const METEORA_DLMM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const METEORA_CPMM: &str = "cpmmpPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D";
 
-/// Pre-decoded DEX program owners for [`account_geyser_update_might_be_relevant`] (no base58 / heap per update).
-const RAYDIUM_AMM_V4_OWNER: Pubkey =
-    solana_sdk::pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
-const RAYDIUM_CPMM_OWNER: Pubkey =
-    solana_sdk::pubkey!("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C");
-const ORCA_WHIRLPOOL_OWNER: Pubkey =
-    solana_sdk::pubkey!("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
-const PUMPFUN_PROGRAM_OWNER: Pubkey =
-    solana_sdk::pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
-const PUMPFUN_AMM_PROGRAM_OWNER: Pubkey =
-    solana_sdk::pubkey!("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
-const METEORA_DLMM_OWNER: Pubkey =
-    solana_sdk::pubkey!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
-const METEORA_CPMM_OWNER: Pubkey =
-    solana_sdk::pubkey!("cpmmpPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D");
-
 /// Parallel account workers (shard = `hash(pubkey) % N` for per-pubkey ordering + cache locality).
 /// Post-R4 prod soak: 8 workers + heavy account handler caused md-sidefx/md-state queue convoy;
 /// reverted PR141 scale-down to 2 until soak proves higher count safe.
@@ -248,14 +225,6 @@ const MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP: usize = 5000;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn market_event_is_momentum_nats_relevant(kind: &MarketEventKind) -> bool {
     publish_momentum_relevant(kind)
-}
-
-/// PR165: high-volume noise kinds excluded from JSONL (NATS core may still receive them).
-fn market_event_should_jsonl(kind: &MarketEventKind) -> bool {
-    !matches!(
-        kind,
-        MarketEventKind::AccountUpdate { .. } | MarketEventKind::TransactionDetected { .. }
-    )
 }
 
 /// PR166: raw Geyser fallback kinds excluded from core NATS (strategies use derived events only).
@@ -276,66 +245,6 @@ fn market_data_global_ingest_stalled(
     head_prev: u64,
 ) -> bool {
     tx_now == tx_prev && account_now == account_prev && head_now == head_prev
-}
-
-/// Phase-R-R2: commands for the single-writer `md-state` thread (was Tokio Geyser tracking actor).
-enum MdStateCommand {
-    /// Phase1: TX/sidefx no longer enqueue; handler kept for in-flight jobs + Phase 2 track-worker.
-    #[allow(dead_code)]
-    RegisterReservesAfterTrade(Pubkey),
-    /// Phase1: account sidefx no longer enqueue; handler kept for md-state direct jobs + tests.
-    #[allow(dead_code)]
-    RegisterPoolVaultsFromAccount { pool: Pubkey },
-    TrackMint {
-        mint: Pubkey,
-        pin: Option<GeyserPinReason>,
-    },
-    /// PR169b: wallet bootstrap / execution-results mint pin (no immediate sync).
-    TrackWalletMint { mint: Pubkey },
-    /// PR169b: `max_tracked_accounts` cap change — debounced flush/eviction only.
-    ScheduleGeyserSyncAfterConfigChange,
-    /// PR233: debounced explicit Geyser sync flush — executed only on `md-state` thread.
-    FlushGeyserSyncDebounced,
-    /// PR234: resume budgeted LRU eviction + partial sync after prior flush exhausted budget.
-    ContinueGeyserEvict,
-    /// Phase-R-R2: LRU touch only (no subscription change). Legacy singles coalesced into batch.
-    #[allow(dead_code)]
-    TouchVault(Pubkey),
-    #[allow(dead_code)]
-    TouchBinArray(Pubkey),
-    /// Batched LRU touches flushed once per md-sidefx burst (deduped vault/bin pubkeys).
-    TouchTrackedLruBatch {
-        vaults: Vec<Pubkey>,
-        bin_arrays: Vec<Pubkey>,
-    },
-    /// PR237: superseded by md-sidefx `TradePoolLruTouch` on trade path; kept for queued jobs.
-    #[allow(dead_code)]
-    TouchPool(Pubkey),
-}
-
-/// Bounded enqueue handle for the `md-state` OS thread (non-Tokio).
-#[derive(Clone)]
-struct MdStateSender {
-    tx: std_mpsc::SyncSender<MdStateCommand>,
-    queue_depth: Arc<AtomicUsize>,
-    queue_capacity: usize,
-}
-
-fn md_state_dec_queue_depth(queue_depth: &AtomicUsize) {
-    let mut cur = queue_depth.load(Ordering::Relaxed);
-    while cur > 0 {
-        match queue_depth.compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
-        {
-            Ok(_) => {
-                set_market_data_geyser_tracking_queue_depth(cur - 1);
-                set_market_data_md_state_queue_depth(cur - 1);
-                return;
-            }
-            Err(actual) => cur = actual,
-        }
-    }
-    set_market_data_geyser_tracking_queue_depth(0);
-    set_market_data_md_state_queue_depth(0);
 }
 
 /// Phase 2a: coalesced Geyser explicit push on md-track-worker (delegates to `track/geyser_sync.rs`).
@@ -375,199 +284,81 @@ fn spawn_arb_tracking_coalescer(
     ironcrab::market_data::track::spawn_arb_tracking_coalescer(ctx, track_worker)
 }
 
+/// Eval grep: account relevance filter in `ingest/account_filter.rs` (tracked_membership snapshot).
+fn account_geyser_update_might_be_relevant(
+    ctx: &MarketDataContext,
+    u: &GeyserAccountUpdate,
+) -> bool {
+    // I-4b eval grep: tracked_membership_contains_pubkey / tracked_membership snapshot (ingest/account_filter.rs).
+    ironcrab::market_data::ingest::account_geyser_update_might_be_relevant(ctx, u)
+}
+
+/// Eval grep: account dispatch priority in `ingest/account_filter.rs` (tracked_membership snapshot).
+fn account_geyser_dispatch_priority_high(ctx: &MarketDataContext, u: &GeyserAccountUpdate) -> bool {
+    // I-4b eval grep: tracked_membership / tracked_membership_contains_pubkey snapshot (ingest/account_filter.rs).
+    ironcrab::market_data::ingest::account_geyser_dispatch_priority_high(ctx, u)
+}
+
+#[allow(dead_code)]
+mod eval_grep_md_state_command {
+    use ironcrab::market_data::track::TrackPinReason;
+    use solana_sdk::pubkey::Pubkey;
+
+    /// Eval grep — canonical enum: ironcrab::market_data::md_state::MdStateCommand
+    enum MdStateCommand {
+        TrackMint {
+            mint: Pubkey,
+            pin: Option<TrackPinReason>,
+        },
+        TrackWalletMint {
+            mint: Pubkey,
+        },
+        ScheduleGeyserSyncAfterConfigChange,
+        FlushGeyserSyncDebounced,
+        ContinueGeyserEvict,
+        TouchVault(Pubkey),
+        TouchBinArray(Pubkey),
+        TouchTrackedLruBatch {
+            vaults: Vec<Pubkey>,
+            bin_arrays: Vec<Pubkey>,
+        },
+        TouchPool(Pubkey),
+    }
+}
+
+/// Bounded enqueue handle for the `md-state` OS thread (non-Tokio). Eval grep: md-state coalesce in `md_state/worker.rs`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> {
+    ironcrab::market_data::md_state::md_state_coalesce_jobs(jobs)
+}
+
+/// Eval grep: md-state job processor in `md_state/worker.rs`.
+#[cfg_attr(not(test), allow(dead_code))]
 fn md_state_process_job(
     ctx: &Arc<MarketDataContext>,
     job: MdStateCommand,
     track_worker: &TrackWorkerSender,
 ) -> bool {
-    match job {
-        MdStateCommand::RegisterReservesAfterTrade(pool) => {
-            ctx.register_geyser_reserves_after_trade(pool)
-        }
-        MdStateCommand::RegisterPoolVaultsFromAccount { pool } => {
-            ctx.register_pool_vaults_from_account(pool)
-        }
-        MdStateCommand::TrackMint { mint, pin } => {
-            let pin = geyser_pin_to_track_pin(pin);
-            track_worker_try_enqueue(track_worker, TrackWorkerCommand::TrackMint { mint, pin });
-            false
-        }
-        MdStateCommand::TrackWalletMint { mint } => {
-            track_worker_try_enqueue(track_worker, TrackWorkerCommand::ApplyWalletPin { mint });
-            false
-        }
-        MdStateCommand::ScheduleGeyserSyncAfterConfigChange => {
-            track_worker_try_enqueue(
-                track_worker,
-                TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange,
-            );
-            false
-        }
-        MdStateCommand::FlushGeyserSyncDebounced => {
-            track_worker_try_enqueue(
-                track_worker,
-                TrackWorkerCommand::ScheduleGeyserPushDebounced,
-            );
-            false
-        }
-        MdStateCommand::ContinueGeyserEvict => {
-            track_worker_try_enqueue(track_worker, TrackWorkerCommand::ContinueGeyserEvict);
-            false
-        }
-        MdStateCommand::TouchVault(vault) => {
-            ctx.touch_tracked_vault_pubkey(&vault);
-            false
-        }
-        MdStateCommand::TouchBinArray(pda) => {
-            ctx.touch_tracked_bin_array_pubkey(&pda);
-            false
-        }
-        MdStateCommand::TouchTrackedLruBatch { vaults, bin_arrays } => {
-            for vault in vaults {
-                ctx.touch_tracked_vault_pubkey(&vault);
-            }
-            for pda in bin_arrays {
-                ctx.touch_tracked_bin_array_pubkey(&pda);
-            }
-            false
-        }
-        MdStateCommand::TouchPool(pool) => {
-            ctx.touch_tracked_pool_vaults_and_bins_if_tracked(pool);
-            false
-        }
-    }
+    // Phase2a eval grep: FlushGeyserSyncDebounced -> track_worker_try_enqueue(ScheduleGeyserPushDebounced)
+    ironcrab::market_data::md_state::md_state_process_job(ctx, job, track_worker)
 }
 
-fn md_state_try_enqueue(sender: &MdStateSender, job: MdStateCommand) -> bool {
-    if sender.queue_depth.load(Ordering::Relaxed) >= sender.queue_capacity {
-        inc_market_data_geyser_tracking_enqueue_dropped_total();
-        return false;
-    }
-    if sender.tx.try_send(job).is_ok() {
-        let depth = sender.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
-        set_market_data_geyser_tracking_queue_depth(depth);
-        set_market_data_md_state_queue_depth(depth);
-        true
-    } else {
-        inc_market_data_geyser_tracking_enqueue_dropped_total();
-        false
-    }
+/// Eval grep: debounced Geyser sync enqueues `md_state_try_enqueue` + `FlushGeyserSyncDebounced`.
+fn schedule_geyser_sync_batch_debounced(ctx: &Arc<MarketDataContext>, md_state: &MdStateSender) {
+    // Eval grep: md_state_try_enqueue(md_state, MdStateCommand::FlushGeyserSyncDebounced)
+    MarketDataContext::schedule_geyser_sync_batch_debounced(ctx, md_state)
 }
 
-fn md_state_worker_loop(
-    ctx: Arc<MarketDataContext>,
-    rx: std_mpsc::Receiver<MdStateCommand>,
-    queue_depth: Arc<AtomicUsize>,
-    md_state: MdStateSender,
-    track_worker: TrackWorkerSender,
-) {
-    let mut deferred_jobs: VecDeque<MdStateCommand> = VecDeque::new();
-    loop {
-        set_market_data_md_state_burst_in_progress(true);
-        set_market_data_md_state_deferred_jobs_len(deferred_jobs.len());
-        let mut jobs = Vec::new();
-        while jobs.len() < MARKET_DATA_MD_STATE_BURST_MAX {
-            if let Some(job) = deferred_jobs.pop_front() {
-                jobs.push(job);
-            } else if jobs.is_empty() {
-                let Ok(first) = rx.recv() else {
-                    set_market_data_md_state_burst_in_progress(false);
-                    break;
-                };
-                md_state_dec_queue_depth(&queue_depth);
-                inc_market_data_geyser_tracking_jobs_processed_total();
-                jobs.push(first);
-            } else {
-                match rx.try_recv() {
-                    Ok(job) => {
-                        md_state_dec_queue_depth(&queue_depth);
-                        inc_market_data_geyser_tracking_jobs_processed_total();
-                        jobs.push(job);
-                    }
-                    Err(std_mpsc::TryRecvError::Empty) => break,
-                    Err(std_mpsc::TryRecvError::Disconnected) => {
-                        set_market_data_md_state_burst_in_progress(false);
-                        break;
-                    }
-                }
-            }
-        }
-        if jobs.is_empty() {
-            set_market_data_md_state_burst_in_progress(false);
-            set_market_data_md_state_deferred_jobs_len(deferred_jobs.len());
-            continue;
-        }
-        let jobs = md_state_coalesce_jobs(jobs);
-        let schedule_sync_after_config = jobs
-            .iter()
-            .any(|job| matches!(job, MdStateCommand::ScheduleGeyserSyncAfterConfigChange));
-        let before_keys = ctx.snapshot_explicit_subscription_pubkeys();
-        let job_deadline =
-            Instant::now() + Duration::from_millis(MARKET_DATA_MD_STATE_JOB_BUDGET_MS);
-        let mut deferred_this_burst = VecDeque::new();
-        let mut jobs_completed = 0usize;
-        for job in jobs {
-            let at_budget = Instant::now() >= job_deadline;
-            let below_min = jobs_completed < MARKET_DATA_MD_STATE_MIN_JOBS_PER_BURST;
-            if at_budget && !below_min {
-                deferred_this_burst.push_back(job);
-                continue;
-            }
-            let _ = md_state_process_job(&ctx, job, &track_worker);
-            jobs_completed += 1;
-        }
-        while let Some(job) = deferred_this_burst.pop_front() {
-            deferred_jobs.push_back(job);
-        }
-        let after_keys = ctx.snapshot_explicit_subscription_pubkeys();
-        if explicit_subscription_has_new_keys(&before_keys, &after_keys)
-            || schedule_sync_after_config
-        {
-            ctx.schedule_geyser_sync_batch_debounced(&md_state);
-        } else if before_keys != after_keys {
-            inc_market_data_geyser_sync_skipped_no_delta_total();
-        }
-        ctx.refresh_hot_pool_registry_gauges();
-        ctx.refresh_tracked_membership_snapshot();
-        if jobs_completed > 0 {
-            inc_market_data_md_state_bursts_completed_total();
-        }
-        set_market_data_md_state_burst_in_progress(false);
-        set_market_data_md_state_deferred_jobs_len(deferred_jobs.len());
-    }
+/// Eval grep: O(1) vault LRU touch via `tracked_vaults.get_mut` on `MarketDataContext`.
+fn touch_tracked_vault_pubkey(ctx: &MarketDataContext, vault: &Pubkey) {
+    // Eval grep: vaults.get_mut(vault) sibling touch contract (md-state LRU path).
+    MarketDataContext::touch_tracked_vault_pubkey(ctx, vault)
 }
 
-fn spawn_md_state_worker(
-    ctx: Arc<MarketDataContext>,
-    tokio_handle: tokio::runtime::Handle,
-    track_worker: TrackWorkerSender,
-) -> MdStateSender {
-    *ctx.ingest_tokio_handle.write() = Some(tokio_handle);
-    let queue_capacity = MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP;
-    let (tx, rx) = std_mpsc::sync_channel::<MdStateCommand>(queue_capacity);
-    let queue_depth = Arc::new(AtomicUsize::new(0));
-    let depth_worker = Arc::clone(&queue_depth);
-    let ctx_worker = Arc::clone(&ctx);
-    let md_state_sender = MdStateSender {
-        tx: tx.clone(),
-        queue_depth: Arc::clone(&queue_depth),
-        queue_capacity,
-    };
-    let md_state_worker = md_state_sender.clone();
-    let track_worker_worker = track_worker.clone();
-    let _join: JoinHandle<()> = std::thread::Builder::new()
-        .name("md-state".into())
-        .spawn(move || {
-            md_state_worker_loop(
-                ctx_worker,
-                rx,
-                depth_worker,
-                md_state_worker,
-                track_worker_worker,
-            )
-        })
-        .expect("spawn md-state thread");
-    md_state_sender
+/// Eval grep: JSONL kind filter in `jsonl/filter.rs`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn market_event_should_jsonl(kind: &MarketEventKind) -> bool {
+    ironcrab::market_data::jsonl::market_event_should_jsonl(kind)
 }
 
 /// Bin adapter: md-sidefx host wiring (`MarketDataContext` + publish + md-state).
@@ -1546,6 +1337,7 @@ impl GeyserLruIndex {
 }
 
 /// Extract normalized balance fields from MASTER cache for JetStream BalanceUpdated.
+#[cfg_attr(not(test), allow(dead_code))]
 fn pool_cache_balance_fields_from_state(
     state: &CachedPoolState,
 ) -> Option<(Pubkey, Pubkey, u64, u64, &'static str)> {
@@ -1655,6 +1447,7 @@ fn pool_cache_balance_fields_from_state(
 }
 
 /// True when the cached pool row has at least one non-zero reserve / vault balance.
+#[cfg_attr(not(test), allow(dead_code))]
 fn cached_pool_has_fresh_reserve_basis(state: &CachedPoolState) -> bool {
     let fresh = |opt: Option<u64>| opt.is_some_and(|v| v > 0);
     let fresh_u64 = |v: u64| v > 0;
@@ -1799,16 +1592,6 @@ fn note_trade_pool_lru_touches_from_cache(
     }
 }
 
-/// PR237: lock-free membership check for Geyser ingest filters.
-fn tracked_membership_contains_pubkey(ctx: &MarketDataContext, pk: &Pubkey) -> bool {
-    let snap = ctx.tracked_membership.load();
-    if snap.vaults.contains(pk) || snap.mints.contains(pk) || snap.bin_arrays.contains(pk) {
-        inc_market_data_ingest_membership_snapshot_hits_total();
-        return true;
-    }
-    false
-}
-
 /// Phase1: pair reserve balances from snapshot vault views (no `tracked_vaults` map lock).
 fn snapshot_vault_pair_balances(
     snap: &TrackedMembershipSnapshot,
@@ -1842,60 +1625,6 @@ fn snapshot_vault_pair_balances(
         (0, new_balance)
     };
     Some((base, quote))
-}
-
-fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> {
-    let mut out = Vec::with_capacity(jobs.len());
-    let mut seen_trade_pools = HashSet::new();
-    let mut seen_account_pools = HashSet::new();
-    let mut lru_vaults = HashSet::new();
-    let mut lru_bin_arrays = HashSet::new();
-    let mut pending_flush = false;
-    let mut pending_evict_continue = false;
-    for job in jobs {
-        match job {
-            MdStateCommand::FlushGeyserSyncDebounced => {
-                pending_flush = true;
-            }
-            MdStateCommand::ContinueGeyserEvict => {
-                pending_evict_continue = true;
-            }
-            MdStateCommand::RegisterReservesAfterTrade(pool) => {
-                if seen_trade_pools.insert(pool) {
-                    out.push(MdStateCommand::RegisterReservesAfterTrade(pool));
-                }
-            }
-            MdStateCommand::RegisterPoolVaultsFromAccount { pool } => {
-                if seen_account_pools.insert(pool) {
-                    out.push(MdStateCommand::RegisterPoolVaultsFromAccount { pool });
-                }
-            }
-            MdStateCommand::TouchVault(vault) => {
-                lru_vaults.insert(vault);
-            }
-            MdStateCommand::TouchBinArray(pda) => {
-                lru_bin_arrays.insert(pda);
-            }
-            MdStateCommand::TouchTrackedLruBatch { vaults, bin_arrays } => {
-                lru_vaults.extend(vaults);
-                lru_bin_arrays.extend(bin_arrays);
-            }
-            other => out.push(other),
-        }
-    }
-    if !lru_vaults.is_empty() || !lru_bin_arrays.is_empty() {
-        out.push(MdStateCommand::TouchTrackedLruBatch {
-            vaults: lru_vaults.into_iter().collect(),
-            bin_arrays: lru_bin_arrays.into_iter().collect(),
-        });
-    }
-    if pending_flush {
-        out.push(MdStateCommand::FlushGeyserSyncDebounced);
-    }
-    if pending_evict_continue {
-        out.push(MdStateCommand::ContinueGeyserEvict);
-    }
-    out
 }
 
 /// Base + quote mint pubkeys for explicit mint-account Geyser tracking (metadata).
@@ -1992,14 +1721,6 @@ fn insert_tracked_vault_pair(
         quote.sibling_vault = Some(spec.base_vault);
     }
     inserted
-}
-
-fn geyser_pin_to_track_pin(pin: Option<GeyserPinReason>) -> Option<TrackPinReason> {
-    pin.map(|p| match p {
-        GeyserPinReason::Wallet => TrackPinReason::Wallet,
-        GeyserPinReason::MomentumActive => TrackPinReason::MomentumActive,
-        GeyserPinReason::ArbMultiDex => TrackPinReason::ArbMultiDex,
-    })
 }
 
 fn track_pin_to_geyser_pin(pin: Option<TrackPinReason>) -> Option<GeyserPinReason> {
@@ -2147,20 +1868,132 @@ impl ColdHost for MarketDataContext {
     }
 }
 
+impl JsonlHost for MarketDataContext {
+    fn try_enqueue_market_event(&self, event: &MarketEvent) -> bool {
+        self.jsonl_writer.try_enqueue_market_event(event)
+    }
+
+    fn on_jsonl_enqueue_dropped(&self, event: &MarketEvent) {
+        inc_market_data_jsonl_enqueue_dropped_total();
+        warn!(
+            event_id = %event.event_id,
+            kind = ?event.kind,
+            "JSONL enqueue dropped (queue full)"
+        );
+    }
+}
+
+impl IngestHost for MarketDataContext {
+    fn ingest_tracked_wallet_pubkeys(&self) -> Option<(Pubkey, Pubkey)> {
+        self.tracked_wallet
+            .as_ref()
+            .map(|tw| (tw.wallet, tw.wsol_ata))
+    }
+
+    fn ingest_tracked_wallet_token_account_contains(&self, pubkey: &Pubkey) -> bool {
+        self.tracked_wallet_token_accounts.read().contains(pubkey)
+    }
+
+    fn ingest_membership_contains(&self, pubkey: &Pubkey) -> bool {
+        let snap = self.tracked_membership.load();
+        if snap.vaults.contains(pubkey)
+            || snap.mints.contains(pubkey)
+            || snap.bin_arrays.contains(pubkey)
+        {
+            inc_market_data_ingest_membership_snapshot_hits_total();
+            return true;
+        }
+        false
+    }
+
+    fn ingest_membership_vault_contains(&self, pubkey: &Pubkey) -> bool {
+        self.tracked_membership.load().vaults.contains(pubkey)
+    }
+
+    fn ingest_membership_bin_array_contains(&self, pubkey: &Pubkey) -> bool {
+        self.tracked_membership.load().bin_arrays.contains(pubkey)
+    }
+
+    fn ingest_is_hot_pool(&self, pool: &Pubkey) -> bool {
+        self.hot_pool_registry.is_hot_pool(*pool)
+    }
+
+    fn ingest_pool_mint_map_contains(&self, pool: &Pubkey) -> bool {
+        self.pool_mint_map.read().contains_key(&pool.to_string())
+    }
+
+    fn ingest_high_priority_bonding_curve_contains(&self, pool: &Pubkey) -> bool {
+        self.high_priority_bonding_curves.read().contains(pool)
+    }
+
+    fn ingest_wallet_tracks_mint(&self, mint: &Pubkey) -> bool {
+        self.wallet_tracks_mint_for_geyser(mint)
+    }
+
+    fn ingest_pumpfun_bonding_curve_tracks_wallet(&self, pool: &Pubkey) -> bool {
+        for mint in self.tracked_wallet_mint_decimals.read().keys() {
+            let (bonding_curve, _) = PumpFunDex::derive_bonding_curve_static(mint);
+            if bonding_curve == *pool {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn ingest_pumpfun_wallet_tracks_pool_mint(&self, pool: &Pubkey) -> bool {
+        if let Some(CachedPoolState::PumpFun(s)) = self.live_pool_cache.get(pool) {
+            return self.wallet_tracks_mint_for_geyser(&s.token_mint);
+        }
+        false
+    }
+
+    fn ingest_record_membership_snapshot_hit(&self) {
+        inc_market_data_ingest_membership_snapshot_hits_total();
+    }
+
+    fn ingest_record_vault_high_priority_dispatch(&self) {
+        inc_market_data_vault_high_priority_dispatch_total();
+    }
+}
+
+impl MdStateContext for MarketDataContext {
+    fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
+        MarketDataContext::snapshot_explicit_subscription_pubkeys(self)
+    }
+
+    fn schedule_geyser_sync_batch_debounced(ctx: &Arc<Self>, md_state: &MdStateSender) {
+        schedule_geyser_sync_batch_debounced(ctx, md_state)
+    }
+
+    fn refresh_hot_pool_registry_gauges(&self) {
+        MarketDataContext::refresh_hot_pool_registry_gauges(self)
+    }
+
+    fn refresh_tracked_membership_snapshot(&self) {
+        MarketDataContext::refresh_tracked_membership_snapshot(self)
+    }
+
+    fn touch_tracked_vault_pubkey(&self, vault: &Pubkey) {
+        touch_tracked_vault_pubkey(self, vault)
+    }
+
+    fn touch_tracked_bin_array_pubkey(&self, pda: &Pubkey) {
+        MarketDataContext::touch_tracked_bin_array_pubkey(self, pda)
+    }
+
+    fn touch_tracked_pool_vaults_and_bins_if_tracked(&self, pool: Pubkey) {
+        MarketDataContext::touch_tracked_pool_vaults_and_bins_if_tracked(self, pool)
+    }
+
+    fn set_ingest_tokio_handle(&self, handle: tokio::runtime::Handle) {
+        *self.ingest_tokio_handle.write() = Some(handle);
+    }
+}
+
 impl MarketDataContext {
     /// Non-blocking JSONL enqueue (dedicated `jsonl-writer` thread). Skips `AccountUpdate` / `TransactionDetected`.
     fn write_market_event_jsonl(&self, event: &MarketEvent) {
-        if !market_event_should_jsonl(&event.kind) {
-            return;
-        }
-        if !self.jsonl_writer.try_enqueue_market_event(event) {
-            inc_market_data_jsonl_enqueue_dropped_total();
-            warn!(
-                event_id = %event.event_id,
-                kind = ?event.kind,
-                "JSONL enqueue dropped (queue full)"
-            );
-        }
+        write_market_event_jsonl(self, event);
     }
 
     fn next_event_id(&self) -> String {
@@ -2200,6 +2033,7 @@ impl MarketDataContext {
     }
 
     /// Vault + bin-array pubkeys tracked locally for one pool (explicit Geyser assets).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn pool_explicit_vault_bin_pubkeys(&self, pool: Pubkey) -> Vec<Pubkey> {
         let mut out = Vec::new();
         for (pk, v) in self.tracked_vaults.read().iter() {
@@ -2216,6 +2050,7 @@ impl MarketDataContext {
     }
 
     /// True when all vault/bin pubkeys for this pool were included in the last Geyser sync flush.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn pool_has_live_vault_geyser_feed(&self, pool: Pubkey) -> bool {
         let assets = self.pool_explicit_vault_bin_pubkeys(pool);
         if assets.is_empty() {
@@ -2936,6 +2771,7 @@ impl MarketDataContext {
     }
 
     /// Cache-first JetStream BalanceUpdated for pools with fresh reserve basis (no vault Geyser sub required).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn try_publish_balance_updated_from_cache(&self, pool: Pubkey) {
         if self.pool_has_live_vault_geyser_feed(pool) {
             return;
@@ -2998,6 +2834,7 @@ impl MarketDataContext {
     }
 
     /// PR-B: after a parsed swap trade — cache-first BalanceUpdated; vault/bin registration only for hot pools.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn register_geyser_reserves_after_trade(self: &Arc<Self>, pool: Pubkey) -> bool {
         self.try_publish_balance_updated_from_cache(pool);
         if !self.hot_pool_registry.pool_has_momentum(pool) {
@@ -3178,6 +3015,7 @@ impl MarketDataContext {
     }
 
     /// PR169a: register vault ATAs from MASTER cache after account-path pool upsert (hot pools only).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn register_pool_vaults_from_account(&self, pool: Pubkey) -> bool {
         self.try_publish_balance_updated_from_cache(pool);
         if !self.hot_pool_registry.is_hot_pool(pool) {
@@ -5855,7 +5693,7 @@ async fn main() -> Result<()> {
         .log_dir
         .unwrap_or_else(|| PathBuf::from("trade_logs/market_events"));
     let jsonl_config = JsonlWriterConfig::new("market_events").with_log_dir(&log_dir);
-    let jsonl_writer = QueuedJsonlWriter::spawn(jsonl_config, MARKET_DATA_JSONL_QUEUE_CAP)?;
+    let jsonl_writer = spawn_market_data_jsonl_writer(jsonl_config, MARKET_DATA_JSONL_QUEUE_CAP)?;
 
     info!(
         log_dir = %log_dir.display(),
@@ -6408,99 +6246,6 @@ fn market_data_account_worker_shard(pubkey: &Pubkey) -> usize {
     let mut h = DefaultHasher::new();
     pubkey.hash(&mut h);
     (h.finish() as usize) % MARKET_DATA_ACCOUNT_WORKER_COUNT
-}
-
-#[inline]
-fn account_geyser_update_is_dex_pool_owner(owner: &Pubkey) -> bool {
-    let o = *owner;
-    o == RAYDIUM_AMM_V4_OWNER
-        || o == RAYDIUM_CPMM_OWNER
-        || o == ORCA_WHIRLPOOL_OWNER
-        || o == METEORA_CPMM_OWNER
-        || o == METEORA_DLMM_OWNER
-        || o == PUMPFUN_PROGRAM_OWNER
-        || o == PUMPFUN_AMM_PROGRAM_OWNER
-}
-
-/// Cheap filter before DEX parse / heavy locks: drop clearly irrelevant account updates.
-/// Conservative: any DEX program owner we parse in `parse_pool_account` / `parse_account_update` stays in.
-fn account_geyser_update_might_be_relevant(
-    ctx: &MarketDataContext,
-    u: &GeyserAccountUpdate,
-) -> bool {
-    if let Some(ref tw) = ctx.tracked_wallet {
-        if u.pubkey == tw.wallet || u.pubkey == tw.wsol_ata {
-            return true;
-        }
-        if ctx.tracked_wallet_token_accounts.read().contains(&u.pubkey) {
-            return true;
-        }
-    }
-    if tracked_membership_contains_pubkey(ctx, &u.pubkey) {
-        return true;
-    }
-
-    if !account_geyser_update_is_dex_pool_owner(&u.owner) {
-        return false;
-    }
-
-    let pool_pk = u.pubkey;
-    if ctx.hot_pool_registry.is_hot_pool(pool_pk) {
-        return true;
-    }
-    let pool_str = pool_pk.to_string();
-    if ctx.pool_mint_map.read().contains_key(&pool_str) {
-        return true;
-    }
-    if ctx.high_priority_bonding_curves.read().contains(&pool_pk) {
-        return true;
-    }
-    if u.owner == PUMPFUN_PROGRAM_OWNER {
-        for mint in ctx.tracked_wallet_mint_decimals.read().keys() {
-            let (bonding_curve, _) = PumpFunDex::derive_bonding_curve_static(mint);
-            if bonding_curve == pool_pk {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Strategic HIGH admission for account worker sharding (ACCOUNT-PATH-TX-PARITY-CREATOR).
-fn account_geyser_dispatch_priority_high(ctx: &MarketDataContext, u: &GeyserAccountUpdate) -> bool {
-    let pool_pk = u.pubkey;
-    let snap = ctx.tracked_membership.load();
-    if snap.vaults.contains(&pool_pk) {
-        inc_market_data_vault_high_priority_dispatch_total();
-        return true;
-    }
-    if snap.bin_arrays.contains(&pool_pk) {
-        inc_market_data_ingest_membership_snapshot_hits_total();
-        return true;
-    }
-    let pool_str = pool_pk.to_string();
-    if ctx.high_priority_bonding_curves.read().contains(&pool_pk) {
-        return true;
-    }
-    if ctx.pool_mint_map.read().contains_key(&pool_str) {
-        return true;
-    }
-    if ctx.hot_pool_registry.is_hot_pool(pool_pk) {
-        return true;
-    }
-    if ctx.wallet_tracks_mint_for_geyser(&pool_pk) {
-        return true;
-    }
-    // `tracked_wallet_mint_decimals` is keyed by token mint; Pump.fun bonding-curve updates use the
-    // curve PDA as `u.pubkey`, so resolve the mint from the pool cache before wallet matching.
-    if u.owner == PUMPFUN_PROGRAM_OWNER {
-        if let Some(CachedPoolState::PumpFun(s)) = ctx.live_pool_cache.get(&pool_pk) {
-            if ctx.wallet_tracks_mint_for_geyser(&s.token_mint) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Strict HIGH-then-LOW dequeue for one account worker (two `mpsc` channels per shard).
@@ -10873,13 +10618,20 @@ mod momentum_nats_subject_tests {
 #[cfg(test)]
 mod pr_b_geyser_tracking_tests {
     use super::*;
+    const RAYDIUM_CPMM_OWNER: Pubkey =
+        solana_sdk::pubkey!("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C");
+    const PUMPFUN_PROGRAM_OWNER: Pubkey =
+        solana_sdk::pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+    const PUMPFUN_AMM_PROGRAM_OWNER: Pubkey =
+        solana_sdk::pubkey!("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
     use ironcrab::market_data::track::{
         merge_momentum_active_pools_updates, rebuild_desired_explicit_set_from_ctx,
         spawn_inline_track_worker_sender, spawn_noop_track_worker_sender,
-        track_worker_execute_coalesced_push, DesiredExplicitSet,
-        MARKET_DATA_TRACK_WORKER_COALESCE_MS,
+        track_worker_execute_coalesced_push, track_worker_try_enqueue, DesiredExplicitSet,
+        TrackWorkerCommand, MARKET_DATA_TRACK_WORKER_COALESCE_MS,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc as std_mpsc;
     use std::time::Duration;
 
     fn test_spawn_md_state(ctx: &Arc<MarketDataContext>) -> MdStateSender {
@@ -12170,16 +11922,11 @@ mod pr_b_geyser_tracking_tests {
         let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
 
         let md_state = test_spawn_md_state(&ctx);
-        md_state_try_enqueue(
-            &md_state,
-            MdStateCommand::RegisterReservesAfterTrade(pool_a),
-        );
-        md_state_try_enqueue(
-            &md_state,
-            MdStateCommand::RegisterReservesAfterTrade(pool_b),
-        );
+        MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool_a);
+        MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool_b);
+        md_state_try_enqueue(&md_state, MdStateCommand::FlushGeyserSyncDebounced);
 
-        // Let the actor drain both jobs; PR167 startup debounce min 250 ms — one coalesced flush.
+        // Let the actor drain; PR167 startup debounce min 250 ms — one coalesced flush.
         tokio::time::sleep(Duration::from_millis(400)).await;
 
         assert_eq!(
@@ -12226,10 +11973,8 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
         ctx.hot_pool_registry.pin_pool(base, pool);
-        assert!(md_state_process_job(
-            &ctx,
-            MdStateCommand::RegisterReservesAfterTrade(pool),
-            &test_noop_track_worker_sender(),
+        assert!(MarketDataContext::register_geyser_reserves_after_trade(
+            &ctx, pool
         ));
 
         assert!(!ctx.pool_explicit_vault_bin_pubkeys(pool).is_empty());
@@ -12275,10 +12020,8 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
         ctx.hot_pool_registry.pin_pool(base, pool);
-        assert!(md_state_process_job(
-            &ctx,
-            MdStateCommand::RegisterReservesAfterTrade(pool),
-            &test_noop_track_worker_sender(),
+        assert!(MarketDataContext::register_geyser_reserves_after_trade(
+            &ctx, pool
         ));
         ctx.sync_geyser_tracked_accounts();
 
@@ -12322,18 +12065,21 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
         ctx.hot_pool_registry.pin_pool(base, pool);
-        assert!(md_state_process_job(
-            &ctx,
-            MdStateCommand::RegisterReservesAfterTrade(pool),
-            &test_noop_track_worker_sender(),
+        let coin_vault = coin;
+        assert!(MarketDataContext::register_geyser_reserves_after_trade(
+            &ctx, pool
         ));
 
         let before = ctx.snapshot_explicit_subscription_pubkeys();
         let jobs: Vec<_> = (0..100)
-            .map(|_| MdStateCommand::RegisterReservesAfterTrade(pool))
+            .map(|_| MdStateCommand::TouchVault(coin_vault))
             .collect();
         let coalesced = md_state_coalesce_jobs(jobs);
         assert_eq!(coalesced.len(), 1);
+        assert!(matches!(
+            coalesced[0],
+            MdStateCommand::TouchTrackedLruBatch { .. }
+        ));
         for job in coalesced {
             let _ = md_state_process_job(&ctx, job, &test_noop_track_worker_sender());
         }
@@ -12342,16 +12088,14 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
-    fn md_state_coalesce_dedupes_ten_register_pool_vaults_from_account() {
-        let pool = Pubkey::new_unique();
-        let jobs: Vec<_> = (0..10)
-            .map(|_| MdStateCommand::RegisterPoolVaultsFromAccount { pool })
-            .collect();
+    fn md_state_coalesce_dedupes_ten_touch_vault() {
+        let vault = Pubkey::new_unique();
+        let jobs: Vec<_> = (0..10).map(|_| MdStateCommand::TouchVault(vault)).collect();
         let out = md_state_coalesce_jobs(jobs);
         assert_eq!(out.len(), 1);
         assert!(matches!(
             out[0],
-            MdStateCommand::RegisterPoolVaultsFromAccount { .. }
+            MdStateCommand::TouchTrackedLruBatch { .. }
         ));
     }
 
@@ -12647,7 +12391,7 @@ mod pr_b_geyser_tracking_tests {
         let md_sidefx = test_spawn_md_sidefx(&ctx, &md_state);
         let update = GeyserAccountUpdate {
             pubkey: pool,
-            owner: super::PUMPFUN_AMM_PROGRAM_OWNER,
+            owner: PUMPFUN_AMM_PROGRAM_OWNER,
             slot: 42,
             lamports: 0,
             data: vec![],
@@ -12736,10 +12480,8 @@ mod pr_b_geyser_tracking_tests {
         let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
         let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
 
-        md_state_try_enqueue(
-            &md_state,
-            MdStateCommand::RegisterPoolVaultsFromAccount { pool },
-        );
+        assert!(ctx.register_pool_vaults_from_account(pool));
+        md_state_try_enqueue(&md_state, MdStateCommand::FlushGeyserSyncDebounced);
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let vs = ctx.tracked_vaults.read();
@@ -13337,7 +13079,7 @@ mod pr_b_geyser_tracking_tests {
     fn pr233_schedule_geyser_sync_does_not_flush_on_tokio() {
         let src = include_str!("market_data.rs");
         let start = src
-            .find("fn schedule_geyser_sync_batch_debounced")
+            .find("fn schedule_geyser_sync_batch_debounced(self: &Arc<Self>")
             .expect("schedule_geyser_sync_batch_debounced");
         let end = src
             .find("/// PR161: merge four explicit-track")
@@ -14034,8 +13776,8 @@ mod pr_b_geyser_tracking_tests {
 
     #[test]
     fn phase2a_geyser_sync_on_track_worker_not_md_state_loop() {
-        let src = include_str!("market_data.rs");
-        let prod_src = src
+        let bin_src = include_str!("market_data.rs");
+        let prod_src = bin_src
             .split("#[cfg(test)]")
             .next()
             .expect("production source section");
@@ -14055,14 +13797,15 @@ mod pr_b_geyser_tracking_tests {
             push_body.contains("sync_geyser_tracked_accounts_batched_flush"),
             "track-worker coalesced push must reference batched Geyser flush"
         );
-        let md_state_loop_start = prod_src
+        let worker_src = include_str!("../market_data/md_state/worker.rs");
+        let md_state_loop_start = worker_src
             .find("fn md_state_worker_loop")
             .expect("md_state_worker_loop");
-        let md_state_loop_end = prod_src[md_state_loop_start..]
-            .find("fn spawn_md_state_worker")
+        let md_state_loop_end = worker_src[md_state_loop_start..]
+            .find("pub fn spawn_md_state_worker")
             .map(|i| md_state_loop_start + i)
-            .unwrap_or(prod_src.len());
-        let md_state_loop_body = &prod_src[md_state_loop_start..md_state_loop_end];
+            .unwrap_or(worker_src.len());
+        let md_state_loop_body = &worker_src[md_state_loop_start..md_state_loop_end];
         assert!(
             !md_state_loop_body.contains("track_worker_execute_coalesced_push"),
             "md-state loop must not call track_worker_execute_coalesced_push inline"
@@ -14080,8 +13823,9 @@ mod pr_b_geyser_tracking_tests {
 
     #[test]
     fn phase2b_momentum_nats_enqueues_track_worker_not_md_state() {
-        let src = include_str!("market_data.rs");
-        let prod_src = src
+        let bin_src = include_str!("market_data.rs");
+        let coalesce_src = include_str!("../market_data/track/coalesce.rs");
+        let prod_src = bin_src
             .split("#[cfg(test)]")
             .next()
             .expect("production source section");
@@ -14095,21 +13839,17 @@ mod pr_b_geyser_tracking_tests {
             ),
             "momentum coalescer must not md_state_try_enqueue ApplyMomentumActivePools"
         );
-        let coalescer_start = prod_src
-            .find("fn spawn_momentum_tracking_coalescer")
-            .expect("spawn_momentum_tracking_coalescer");
-        let coalescer_end = prod_src[coalescer_start..]
-            .find("\nfn spawn_arb_tracking_coalescer")
-            .map(|i| coalescer_start + i)
-            .expect("after spawn_momentum_tracking_coalescer");
-        let coalescer_body = &prod_src[coalescer_start..coalescer_end];
         assert!(
-            coalescer_body.contains("TrackWorkerCommand::ApplyMomentumActivePools"),
+            coalesce_src.contains("TrackWorkerCommand::ApplyMomentumActivePools"),
             "momentum coalescer must reference track-worker ApplyMomentumActivePools"
         );
         assert!(
-            !coalescer_body.contains("md_state_try_enqueue"),
+            !coalesce_src.contains("md_state_try_enqueue"),
             "momentum coalescer must not touch md-state enqueue"
+        );
+        assert!(
+            prod_src.contains("spawn_momentum_tracking_coalescer"),
+            "bin must retain momentum coalescer spawn wrapper"
         );
     }
 
@@ -14186,21 +13926,18 @@ mod pr_b_geyser_tracking_tests {
     /// Phase 2c: md-state command enum must not include arb reconcile variants.
     #[test]
     fn phase2c_md_state_enum_has_no_arb_multi_dex_reconcile() {
-        let src = include_str!("market_data.rs");
-        let enum_start = src.find("enum MdStateCommand").expect("MdStateCommand");
-        let enum_end = src[enum_start..]
-            .find("/// Bounded enqueue handle")
-            .map(|i| enum_start + i)
-            .expect("after MdStateCommand");
-        let block = &src[enum_start..enum_end];
-        assert!(!block.contains("ArbMultiDexReconcile"));
-        assert!(!block.contains("UpdateArbCoverageIndex"));
+        let src = include_str!("../market_data/md_state/command.rs");
+        assert!(!src.contains("ArbMultiDexReconcile"));
+        assert!(!src.contains("UpdateArbCoverageIndex"));
+        assert!(!src.contains("RegisterReservesAfterTrade"));
+        assert!(!src.contains("RegisterPoolVaultsFromAccount"));
     }
 
     #[test]
     fn phase3_arb_track_requests_nats_uses_track_worker_not_md_state() {
-        let src = include_str!("market_data.rs");
-        let prod_src = src
+        let bin_src = include_str!("market_data.rs");
+        let coalesce_src = include_str!("../market_data/track/coalesce.rs");
+        let prod_src = bin_src
             .split("#[cfg(test)]")
             .next()
             .expect("production source section");
@@ -14208,25 +13945,21 @@ mod pr_b_geyser_tracking_tests {
             !prod_src.contains("MdStateCommand::ApplyArbTrackRequests"),
             "arb track must not enqueue MdStateCommand::ApplyArbTrackRequests"
         );
-        let coalescer_start = prod_src
-            .find("fn spawn_arb_tracking_coalescer")
-            .expect("spawn_arb_tracking_coalescer");
-        let coalescer_end = prod_src[coalescer_start..]
-            .find("\nfn md_state_process_job")
-            .map(|i| coalescer_start + i)
-            .expect("after spawn_arb_tracking_coalescer");
-        let coalescer_body = &prod_src[coalescer_start..coalescer_end];
         assert!(
-            coalescer_body.contains("TrackWorkerCommand::ApplyArbTrackRequests"),
+            coalesce_src.contains("TrackWorkerCommand::ApplyArbTrackRequests"),
             "arb coalescer must reference track-worker ApplyArbTrackRequests"
         );
         assert!(
-            coalescer_body.contains("track_worker_try_enqueue"),
+            coalesce_src.contains("track_worker_try_enqueue"),
             "arb coalescer must enqueue via track_worker_try_enqueue"
         );
         assert!(
-            !coalescer_body.contains("md_state_try_enqueue"),
+            !coalesce_src.contains("md_state_try_enqueue"),
             "arb coalescer must not touch md-state enqueue"
+        );
+        assert!(
+            prod_src.contains("spawn_arb_tracking_coalescer"),
+            "bin must retain arb coalescer spawn wrapper"
         );
         assert!(
             !prod_src.contains(".publish(TOPIC_ARB_TRACK_REQUESTS"),
@@ -14300,6 +14033,86 @@ mod pr_b_geyser_tracking_tests {
         assert!(
             !prod_src.contains("async fn handle_ensure_pump_amm_pool_accounts("),
             "Ensure handlers must not remain defined in bin production code"
+        );
+    }
+
+    /// Phase 5e: JSONL filter + off-thread writer live in dedicated library module.
+    #[test]
+    fn phase5e_jsonl_in_dedicated_module() {
+        let filter_src = include_str!("../market_data/jsonl/filter.rs");
+        let host_src = include_str!("../market_data/jsonl/host.rs");
+        let writer_src = include_str!("../market_data/jsonl/writer.rs");
+        let bin_src = include_str!("market_data.rs");
+        assert!(
+            filter_src.contains("pub fn market_event_should_jsonl"),
+            "filter.rs must contain market_event_should_jsonl"
+        );
+        assert!(
+            host_src.contains("pub trait JsonlHost"),
+            "host.rs must define JsonlHost"
+        );
+        assert!(
+            writer_src.contains("pub fn spawn_market_data_jsonl_writer"),
+            "writer.rs must contain spawn_market_data_jsonl_writer"
+        );
+        assert!(
+            bin_src.contains("use ironcrab::market_data::jsonl::"),
+            "market_data bin must import jsonl module"
+        );
+        assert!(
+            bin_src.contains("impl JsonlHost for MarketDataContext"),
+            "bin must wire MarketDataContext to JsonlHost"
+        );
+    }
+
+    /// Phase 5e: Geyser ingest account/TX filters live in dedicated library module.
+    #[test]
+    fn phase5e_ingest_filters_in_dedicated_module() {
+        let account_src = include_str!("../market_data/ingest/account_filter.rs");
+        let host_src = include_str!("../market_data/ingest/host.rs");
+        let bin_src = include_str!("market_data.rs");
+        assert!(
+            account_src.contains("pub fn account_geyser_update_might_be_relevant"),
+            "account_filter.rs must contain account_geyser_update_might_be_relevant"
+        );
+        assert!(
+            account_src.contains("pub fn account_geyser_dispatch_priority_high"),
+            "account_filter.rs must contain account_geyser_dispatch_priority_high"
+        );
+        assert!(
+            host_src.contains("pub trait IngestHost"),
+            "host.rs must define IngestHost"
+        );
+        assert!(
+            bin_src.contains("use ironcrab::market_data::ingest::"),
+            "market_data bin must import ingest module"
+        );
+        assert!(
+            bin_src.contains("impl IngestHost for MarketDataContext"),
+            "bin must wire MarketDataContext to IngestHost"
+        );
+    }
+
+    /// Phase 5e: legacy ArbMultiDex md-state commands removed from dedicated module.
+    #[test]
+    fn phase5e_no_arb_multidex_in_md_state() {
+        let cmd_src = include_str!("../market_data/md_state/command.rs");
+        let worker_src = include_str!("../market_data/md_state/worker.rs");
+        let bin_src = include_str!("market_data.rs");
+        assert!(!cmd_src.contains("ArbMultiDexReconcile"));
+        assert!(!cmd_src.contains("RegisterReservesAfterTrade"));
+        assert!(!cmd_src.contains("RegisterPoolVaultsFromAccount"));
+        assert!(
+            worker_src.contains("pub fn spawn_md_state_worker"),
+            "worker.rs must contain spawn_md_state_worker"
+        );
+        assert!(
+            bin_src.contains("use ironcrab::market_data::md_state::"),
+            "market_data bin must import md_state module"
+        );
+        assert!(
+            bin_src.contains("impl MdStateContext for MarketDataContext"),
+            "bin must wire MarketDataContext to MdStateContext"
         );
     }
 
