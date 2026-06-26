@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### HYBRID-PHASE5c: md-account-publish Modul-Extraktion (Monolith-Slice)
+**Datum**: 2026-06-26  
+**Problem**: `market_data.rs` (~18k LOC) — dedizierter `md-publish` Tokio-Runtime-Thread, `AccountPathNatsJob` Queue, Worker-Loop/Dispatcher und Core-NATS-Helpers lagen inline im Bin.  
+**Fix**: Reine Modul-Grenze ohne Verhaltensänderung: (1) **`src/market_data/publish/account.rs`** — `AccountPathNatsJob`, bounded `try_send` enqueue, Worker-Pool, Dispatcher, `spawn_md_account_publish_runtime`. (2) **`core.rs`** — `publish_market_event_core_and_momentum_ex`, momentum fan-out classification. (3) **`host.rs`** — `PublishHost` trait; Bin `impl PublishHost for MarketDataContext`. Bin: dünne Wrapper + unveränderte Ingest-Enqueue-Semantik. **Invarianten**: I-4b (bounded try_send), I-7 (kein neuer RPC, nur NATS/JetStream).  
+**Dateien**: `src/market_data/publish/{mod,account,core,host}.rs`, `src/bin/market_data.rs`, `docs/BUGS_FIXES.md`
+
 ### HYBRID-PHASE5b: md-sidefx Worker Modul-Extraktion (Monolith-Slice)
 **Datum**: 2026-06-26  
 **Problem**: `market_data.rs` (~20k LOC) — md-sidefx OS-Thread (Sidefx-Worker, Commands, Handler) lag inline im Bin.  
