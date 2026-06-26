@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### HYBRID-PHASE5e: ingest/jsonl/md-state Modul-Extraktion + Legacy-Cleanup (Monolith-Slice)
+**Datum**: 2026-06-26  
+**Problem**: `market_data.rs` (~14.4k LOC nach 5d) — JSONL-Filter/Enqueue, Geyser-Account-Ingest-Filter und md-state Worker/Command-Enum lagen inline im Bin; verbotene `RegisterReservesAfterTrade` / `RegisterPoolVaultsFromAccount` md-state Commands noch im Enum.  
+**Fix**: Reine Modul-Grenze ohne Verhaltensänderung: (1) **`src/market_data/jsonl/`** — `market_event_should_jsonl`, `JsonlHost`, `spawn_market_data_jsonl_writer`. (2) **`src/market_data/ingest/`** — `IngestHost`, `account_geyser_*` Filter, `geyser_tx_involves_wallet` Re-Export. (3) **`src/market_data/md_state/`** — `MdStateCommand` (ohne Legacy-Register-Varianten), Worker-Loop, Coalesce, `spawn_md_state_worker`. Bin: `impl JsonlHost` / `IngestHost` / `MdStateContext` auf `MarketDataContext`; dünne JSONL-Enqueue-Wrapper. **Invarianten**: I-4b (bounded try_enqueue, keine tracked_*-Reads in ingest/), I-4c (kein reconcile_arb in ingest), I-7 (kein neuer RPC).  
+**Dateien**: `src/market_data/{jsonl,ingest,md_state}/*.rs`, `src/market_data/mod.rs`, `src/bin/market_data.rs`, `docs/BUGS_FIXES.md`
+
 ### HYBRID-PHASE5d: cold Ensure* Modul-Extraktion (Monolith-Slice, I-24d)
 **Datum**: 2026-06-26  
 **Problem**: `market_data.rs` (~14.5k LOC nach 5c) — I-24d Cold-Path `Ensure*` Handler, cache-scoped `cold_path_rpc_refresh_*`, PumpSwap SELL-layout Helpers und `defer_discovery_if_md_state_pressure` lagen inline im Bin.  
