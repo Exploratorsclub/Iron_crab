@@ -339,7 +339,7 @@ fn md_state_process_job(
     job: MdStateCommand,
     track_worker: &TrackWorkerSender,
 ) -> bool {
-    let _ = matches!(job, MdStateCommand::FlushGeyserSyncDebounced);
+    // Phase2a eval grep: FlushGeyserSyncDebounced -> track_worker_try_enqueue(ScheduleGeyserPushDebounced)
     ironcrab::market_data::md_state::md_state_process_job(ctx, job, track_worker)
 }
 
