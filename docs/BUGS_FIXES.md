@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### HYBRID-PHASE5d: cold Ensure* Modul-Extraktion (Monolith-Slice, I-24d)
+**Datum**: 2026-06-26  
+**Problem**: `market_data.rs` (~14.5k LOC nach 5c) — I-24d Cold-Path `Ensure*` Handler, cache-scoped `cold_path_rpc_refresh_*`, PumpSwap SELL-layout Helpers und `defer_discovery_if_md_state_pressure` lagen inline im Bin.  
+**Fix**: Reine Modul-Grenze ohne Verhaltensänderung: (1) **`src/market_data/cold/host.rs`** — `ColdHost` trait + `publish_control_response`. (2) **`rpc_refresh.rs`** — DEX-spezifische cache-scoped RPC refresh. (3) **`ensure_{pump,pumpfun,orca,meteora,raydium}.rs`** — öffentliche `handle_ensure_*` APIs. (4) **`defer.rs`**, **`pump_layout.rs`**. Bin: Control-Dispatch + wallet bootstrap rufen `ironcrab::market_data::cold::*`; `impl ColdHost for MarketDataContext`. **Invarianten**: I-24d (Discovery nur market-data), I-7 (kein neuer Hot-Path-RPC), I-4 (Cache/Geyser vor RPC short-circuit unverändert).  
+**Dateien**: `src/market_data/cold/*.rs`, `src/market_data/mod.rs`, `src/bin/market_data.rs`, `docs/BUGS_FIXES.md`
+
 ### HYBRID-PHASE5c: md-account-publish Modul-Extraktion (Monolith-Slice)
 **Datum**: 2026-06-26  
 **Problem**: `market_data.rs` (~18k LOC) — dedizierter `md-publish` Tokio-Runtime-Thread, `AccountPathNatsJob` Queue, Worker-Loop/Dispatcher und Core-NATS-Helpers lagen inline im Bin.  
