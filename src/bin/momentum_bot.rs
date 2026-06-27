@@ -9171,10 +9171,7 @@ fn wallet_hint_blocks_position_recovery(preload: &WalletHintPreload, mint: &str)
     if !preload.stream_loaded {
         return false;
     }
-    preload
-        .hints
-        .get(mint)
-        .is_none_or(|balance| *balance == 0)
+    preload.hints.get(mint).is_none_or(|balance| *balance == 0)
 }
 
 /// Preload latest per-mint wallet balances from JetStream (last-write-wins on `ts_unix_ms`).
