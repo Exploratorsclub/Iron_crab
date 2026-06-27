@@ -2914,6 +2914,12 @@ pub static ARB_STRATEGY_POOL_CACHE_UPDATE_SKIP_NON_ARB_QUOTE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_STRATEGY_POOL_CACHE_UPDATE_SKIP_NO_SEED: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+pub static ARB_POOL_CACHE_UPDATES_APPLIED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_POOL_CACHE_APPLY_BATCHES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_POOL_CACHE_APPLY_BATCH_SIZE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 /// 2-hop reject breakdown (arb-strategy `check_arbitrage`)
 pub static ARB_TWO_HOP_REJECTED_SPREAD_TOO_LARGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -3023,6 +3029,26 @@ pub fn arb_strategy_pool_cache_update_skip_non_arb_quote_inc() {
 
 pub fn arb_strategy_pool_cache_update_skip_no_seed_inc() {
     ARB_STRATEGY_POOL_CACHE_UPDATE_SKIP_NO_SEED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn arb_pool_cache_updates_applied_add(n: u64) {
+    ARB_POOL_CACHE_UPDATES_APPLIED_TOTAL.fetch_add(n, Ordering::Relaxed);
+}
+
+pub fn arb_pool_cache_apply_batches_inc() {
+    ARB_POOL_CACHE_APPLY_BATCHES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn set_arb_pool_cache_apply_batch_size_gauge(n: u64) {
+    ARB_POOL_CACHE_APPLY_BATCH_SIZE.store(n, Ordering::Relaxed);
+}
+
+pub fn inc_arb_tracker_write_enqueue_dropped_total() {
+    ARB_TRACKER_WRITE_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn set_arb_tracker_write_queue_depth(depth: u64) {
+    ARB_TRACKER_WRITE_QUEUE_DEPTH.store(depth, Ordering::Relaxed);
 }
 
 /// Sub-reason when a mint hits the `insufficient_pools` gate (low-cardinality `reason` label).
@@ -5628,6 +5654,26 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
+    line!(
+        "arb_pool_cache_updates_applied_total",
+        ARB_POOL_CACHE_UPDATES_APPLIED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_pool_cache_apply_batches_total",
+        ARB_POOL_CACHE_APPLY_BATCHES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_pool_cache_apply_batch_size",
+        ARB_POOL_CACHE_APPLY_BATCH_SIZE.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_tracker_write_enqueue_dropped_total",
+        ARB_TRACKER_WRITE_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_tracker_write_queue_depth",
+        ARB_TRACKER_WRITE_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
     line!(
         "arb_subscriber_high_queue_depth",
         ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH.load(Ordering::Relaxed)
