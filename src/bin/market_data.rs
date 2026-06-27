@@ -5593,6 +5593,16 @@ async fn publish_wallet_snapshot(
         "✅ Wallet snapshot bootstrap published (RPC: getMultipleAccounts + startup owner-scan)"
     );
 
+    if is_periodic {
+        ironcrab::metrics::market_data_wallet_snapshot_periodic_published_inc();
+        info!(
+            wallet = %wallet_str,
+            mints_in_wallet = mints_in_wallet.len(),
+            is_periodic = true,
+            "📸 Periodic wallet snapshot published"
+        );
+    }
+
     Ok(())
 }
 
@@ -7641,6 +7651,20 @@ async fn run_geyser_loop(
         return Ok(());
     }
 
+    let wallet_snapshot_periodic_secs = std::env::var("IRONCRAB_WALLET_SNAPSHOT_PERIODIC_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|secs| *secs >= 60)
+        .unwrap_or(600);
+    let mut wallet_snapshot_periodic_interval = tokio::time::interval(
+        std::time::Duration::from_secs(wallet_snapshot_periodic_secs),
+    );
+    wallet_snapshot_periodic_interval.tick().await;
+    info!(
+        interval_secs = wallet_snapshot_periodic_secs,
+        "Periodic wallet snapshot timer enabled (cold path)"
+    );
+
     // Mint metadata fetch pipeline:
     // - We add mints to `tracked_mints` when we see them via tx/pool discovery.
     // - Mint accounts often *never change*, so relying on a future Geyser account update
@@ -8750,6 +8774,30 @@ async fn run_geyser_loop(
                             warn!(error = %e, "Failed to deserialize ConfigUpdate");
                         }
                     }
+                }
+            }
+
+            // Periodic wallet snapshot (cold path) for momentum ghost reconciliation.
+            _ = wallet_snapshot_periodic_interval.tick() => {
+                if let Some(ref tracked_wallet) = ctx.tracked_wallet {
+                    let ctx_spawn = Arc::clone(&ctx);
+                    let rpc_spawn = Arc::clone(&rpc);
+                    let md_state_spawn = md_state.clone();
+                    let wallet = tracked_wallet.wallet;
+                    tokio::spawn(async move {
+                        if let Err(e) = publish_wallet_snapshot(
+                            &ctx_spawn,
+                            &rpc_spawn,
+                            &wallet,
+                            true,
+                            false,
+                            &md_state_spawn,
+                        )
+                        .await
+                        {
+                            warn!(error = %e, "Periodic wallet snapshot publish failed");
+                        }
+                    });
                 }
             }
 
