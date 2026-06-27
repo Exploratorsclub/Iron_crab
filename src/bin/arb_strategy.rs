@@ -43,7 +43,7 @@ use ironcrab::ipc::{
     TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
-    arb_event_worker_stall_inc, arb_strategy_bootstrap_skip_inc, arb_strategy_bootstrap_warmup_set,
+    arb_strategy_bootstrap_skip_inc, arb_strategy_bootstrap_warmup_set,
     arb_strategy_pool_cache_update_seeded_inc, arb_strategy_pool_cache_update_seen_inc,
     arb_strategy_pool_cache_update_skip_no_seed_inc,
     arb_strategy_pool_cache_update_skip_non_arb_quote_inc, arb_subscriber_high_dropped_inc,
@@ -218,8 +218,6 @@ const ARB_HIGH_EVENT_QUEUE_CAP: usize = 8192;
 const ARB_LOW_COALESCER_CAP: usize = 2048;
 /// Heartbeat warns when HIGH queue depth exceeds this fraction of capacity.
 const ARB_HIGH_QUEUE_WARN_PCT: u64 = 80;
-/// Max time a HIGH-priority market-event may block the worker before stall accounting.
-const ARB_EVENT_WORKER_HIGH_TIMEOUT: Duration = Duration::from_secs(5);
 
 static DLMM_MARGINAL_PRICE_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
@@ -2441,32 +2439,14 @@ async fn process_arb_market_event(
     event: MarketEvent,
     priority: ArbEventPriority,
 ) {
-    let process = async {
-        MARKET_EVENTS_CONSUMED_TOTAL.fetch_add(1, Ordering::Relaxed);
-        match priority {
-            ArbEventPriority::High => arb_subscriber_high_processed_inc(),
-            ArbEventPriority::Low => arb_subscriber_low_processed_inc(),
-        }
+    MARKET_EVENTS_CONSUMED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    match priority {
+        ArbEventPriority::High => arb_subscriber_high_processed_inc(),
+        ArbEventPriority::Low => arb_subscriber_low_processed_inc(),
+    }
 
-        if let Some(intent) = handle_market_event(ctx, &event).await {
-            publish_arb_intent(ctx, &intent).await;
-        }
-    };
-
-    if priority == ArbEventPriority::High {
-        match tokio::time::timeout(ARB_EVENT_WORKER_HIGH_TIMEOUT, process).await {
-            Ok(()) => {}
-            Err(_) => {
-                arb_event_worker_stall_inc();
-                warn!(
-                    timeout_secs = ARB_EVENT_WORKER_HIGH_TIMEOUT.as_secs(),
-                    event_id = %event.event_id,
-                    "arb HIGH market-event worker timed out (continuing pipeline)"
-                );
-            }
-        }
-    } else {
-        process.await;
+    if let Some(intent) = handle_market_event(ctx, &event).await {
+        publish_arb_intent(ctx, &intent).await;
     }
 }
 
@@ -3290,27 +3270,42 @@ impl ArbContext {
                 "Vault balances updated"
             );
         }
+        drop(cache);
 
         // Mirror SOL liquidity + reserve flag into per-mint pool trackers (Geyser-only, no RPC)
         let liquidity_sol = Decimal::from(reserve_quote) / Decimal::from(1_000_000_000u64);
+        let mints_with_pool: Vec<String> = self
+            .trackers
+            .read()
+            .iter()
+            .filter(|(_, tracker)| tracker.pools.contains_key(pool_address))
+            .map(|(mint, _)| mint.clone())
+            .collect();
+        if mints_with_pool.is_empty() {
+            return;
+        }
         let mut trackers = self.trackers.write();
-        for tracker in trackers.values_mut() {
-            if let Some(pool) = tracker.pools.get_mut(pool_address) {
-                pool.liquidity_sol = liquidity_sol;
-                pool.has_reserve_data = reserve_base > 0 && reserve_quote > 0;
-                pool.last_update = Instant::now();
-                if let Some(token_decimals) = tracker.token_decimals {
-                    if reserves_plausible_for_comparable_price(
-                        reserve_base,
-                        reserve_quote,
-                        token_decimals,
-                        &tracker.base_mint,
-                    ) {
-                        if let Some(mid) =
-                            reserve_mid_sol_per_token(reserve_base, reserve_quote, token_decimals)
-                        {
-                            pool.last_price = Some(mid);
-                        }
+        for mint in mints_with_pool {
+            let Some(tracker) = trackers.get_mut(&mint) else {
+                continue;
+            };
+            let Some(pool) = tracker.pools.get_mut(pool_address) else {
+                continue;
+            };
+            pool.liquidity_sol = liquidity_sol;
+            pool.has_reserve_data = reserve_base > 0 && reserve_quote > 0;
+            pool.last_update = Instant::now();
+            if let Some(token_decimals) = tracker.token_decimals {
+                if reserves_plausible_for_comparable_price(
+                    reserve_base,
+                    reserve_quote,
+                    token_decimals,
+                    &tracker.base_mint,
+                ) {
+                    if let Some(mid) =
+                        reserve_mid_sol_per_token(reserve_base, reserve_quote, token_decimals)
+                    {
+                        pool.last_price = Some(mid);
                     }
                 }
             }

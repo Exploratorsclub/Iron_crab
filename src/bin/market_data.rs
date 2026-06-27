@@ -4777,6 +4777,115 @@ mod execution_result_sell_close_tests {
 /// background task so the caller can reach the main loop and systemd watchdog pings before slow
 /// cold-path RPC completes. When true (`wallet_snapshot_only`), verification is awaited so the
 /// one-shot process exits with work finished.
+async fn publish_wallet_snapshot_stale_jetstream_cleanup(
+    ctx: &MarketDataContext,
+    nats: &NatsClient,
+    wallet_str: &str,
+    published_mint_set: &HashSet<String>,
+) {
+    use async_nats::jetstream;
+    use futures::StreamExt;
+
+    let js = jetstream::new(nats.client().clone());
+    let Ok(stream) = js.get_stream(WALLET_SNAPSHOT_STREAM_NAME).await else {
+        debug!(
+            stream = WALLET_SNAPSHOT_STREAM_NAME,
+            "Stale cleanup: WALLET_SNAPSHOT stream not found"
+        );
+        return;
+    };
+
+    let mut cleanup_consumer_config = wallet_snapshot_consumer_config();
+    cleanup_consumer_config.filter_subject = format!("ironcrab.wallet_snapshot.{}.*", wallet_str);
+    let Ok(consumer) = stream.create_consumer(cleanup_consumer_config).await else {
+        warn!("Stale cleanup: failed to create consumer");
+        return;
+    };
+
+    let mut stale_cleaned = 0usize;
+    let mut total_checked = 0usize;
+
+    loop {
+        let Ok(mut messages) = consumer.fetch().max_messages(500).messages().await else {
+            warn!("Stale cleanup: fetch failed");
+            break;
+        };
+
+        let mut batch_count = 0usize;
+
+        while let Some(msg) = messages.next().await {
+            let Ok(msg) = msg else {
+                warn!("Stale cleanup: error fetching message");
+                continue;
+            };
+
+            batch_count += 1;
+            total_checked += 1;
+
+            let Ok(event) = serde_json::from_slice::<MarketEvent>(&msg.payload) else {
+                let _ = msg.ack().await;
+                continue;
+            };
+
+            if let MarketEventKind::WalletBalanceSnapshot {
+                mint,
+                balance_raw,
+                decimals,
+                token_program: tp,
+            } = &event.kind
+            {
+                if mint != WSOL_MINT && *balance_raw > 0 && !published_mint_set.contains(mint) {
+                    let override_event = MarketEvent::new(
+                        "market-data",
+                        BUILD_VERSION,
+                        &ctx.run_id,
+                        format!("wallet_snapshot_stale_cleanup_{}", mint),
+                        "wallet_bootstrap_stale_cleanup",
+                        None,
+                        MarketEventKind::WalletBalanceSnapshot {
+                            mint: mint.clone(),
+                            balance_raw: 0,
+                            decimals: *decimals,
+                            token_program: tp.clone(),
+                        },
+                    );
+
+                    let subject = wallet_snapshot_subject(wallet_str, mint);
+                    if let Err(e) = nats.jetstream_publish(&subject, &override_event).await {
+                        warn!(error = %e, mint = %mint, "Stale cleanup: failed to publish zero-balance override to JetStream");
+                    }
+
+                    stale_cleaned += 1;
+                    info!(
+                        mint = %mint,
+                        old_balance = *balance_raw,
+                        "Stale cleanup: cleared ghost position (ATA no longer exists, balance → 0)"
+                    );
+                }
+            }
+
+            let _ = msg.ack().await;
+        }
+
+        if batch_count < 500 {
+            break;
+        }
+    }
+
+    if stale_cleaned > 0 {
+        info!(
+            stale_cleaned,
+            total_checked, "✅ Stale JetStream cleanup: cleared ghost positions from previous runs"
+        );
+    } else if total_checked > 0 {
+        debug!(
+            total_checked,
+            published = published_mint_set.len(),
+            "Stale cleanup: no ghost positions found (all entries are fresh)"
+        );
+    }
+}
+
 async fn publish_wallet_snapshot(
     ctx: &Arc<MarketDataContext>,
     rpc: &Arc<SolanaRpc>,
@@ -4906,20 +5015,19 @@ async fn publish_wallet_snapshot(
         // Token holdings will be learned event-driven (ExecutionResults + Geyser).
     }
 
-    // 1.5) Owner-Scan Discovery: getTokenAccountsByOwner (startup only)
+    // 1.5) Owner-Scan Discovery: getTokenAccountsByOwner (bootstrap + periodic cold path)
     //
     // JetStream only knows mints that were previously tracked. If the bot was offline and
     // tokens were bought externally (Phantom, Jupiter) or a previous run had broken ATA
     // tracking, those mints won't be in JetStream.
     //
     // This owner-scan discovers ALL token accounts in the wallet, merges them with known
-    // mints, and ensures the startup snapshot reflects the true on-chain wallet state.
-    // This is a legitimate startup-only RPC call (2 calls: SPL Token + Token-2022).
-    // It runs at every startup but NOT for periodic refreshes.
-    // Capture WSOL balance from owner-scan for JetStream bootstrap (set inside if !is_periodic)
+    // mints, and ensures the snapshot reflects the true on-chain wallet state.
+    // Cold-path RPC (2 calls: SPL Token + Token-2022) — allowed on startup and periodic timer.
+    // Capture WSOL balance from owner-scan for JetStream bootstrap (startup SOL/WSOL publish only).
     let mut bootstrap_wsol_balance: Option<u64> = None;
 
-    if !is_periodic {
+    {
         use solana_client::rpc_request::TokenAccountsFilter;
 
         let mut discovered_from_owner_scan: Vec<(Pubkey, u64, Pubkey)> = Vec::new(); // (mint, balance, token_program)
@@ -5225,139 +5333,21 @@ async fn publish_wallet_snapshot(
         ctx.write_market_event_jsonl(&event);
     }
 
-    // 2.5) Stale JetStream Cleanup: Override ghost entries not covered by bootstrap.
+    // 2.5) Stale JetStream Cleanup: Override ghost entries not covered by bootstrap/periodic scan.
     //
-    // MAX_BOOTSTRAP_MINTS limits how many mints are processed above.
     // JetStream may contain entries for mints that were sold/closed in previous runs,
-    // but never got their zero-balance override because they exceeded the cap.
-    // This step reads ALL remaining JetStream entries and publishes zero-balance
-    // overrides for any non-zero mints not already covered. No additional RPC calls.
-    if !is_periodic {
-        if let Some(ref nats) = ctx.nats {
-            let published_mint_set: HashSet<String> =
-                known_mints.iter().map(|m| m.to_string()).collect();
-
-            let js = jetstream::new(nats.client().clone());
-            match js.get_stream(WALLET_SNAPSHOT_STREAM_NAME).await {
-                Ok(stream) => {
-                    let mut cleanup_consumer_config = wallet_snapshot_consumer_config();
-                    cleanup_consumer_config.filter_subject =
-                        format!("ironcrab.wallet_snapshot.{}.*", wallet_str);
-                    match stream.create_consumer(cleanup_consumer_config).await {
-                        Ok(consumer) => {
-                            let mut stale_cleaned = 0usize;
-                            let mut total_checked = 0usize;
-
-                            loop {
-                                let mut messages =
-                                    match consumer.fetch().max_messages(500).messages().await {
-                                        Ok(m) => m,
-                                        Err(e) => {
-                                            warn!(error = %e, "Stale cleanup: fetch failed");
-                                            break;
-                                        }
-                                    };
-
-                                let mut batch_count = 0usize;
-
-                                while let Some(msg) = messages.next().await {
-                                    let msg = match msg {
-                                        Ok(m) => m,
-                                        Err(e) => {
-                                            warn!(error = %e, "Stale cleanup: error fetching message");
-                                            continue;
-                                        }
-                                    };
-
-                                    batch_count += 1;
-                                    total_checked += 1;
-
-                                    let event: MarketEvent =
-                                        match serde_json::from_slice(&msg.payload) {
-                                            Ok(e) => e,
-                                            Err(_) => {
-                                                let _ = msg.ack().await;
-                                                continue;
-                                            }
-                                        };
-
-                                    if let MarketEventKind::WalletBalanceSnapshot {
-                                        mint,
-                                        balance_raw,
-                                        decimals,
-                                        token_program: tp,
-                                    } = &event.kind
-                                    {
-                                        if mint != WSOL_MINT
-                                            && *balance_raw > 0
-                                            && !published_mint_set.contains(mint)
-                                        {
-                                            // Stale entry: publish zero-balance override
-                                            let override_event = MarketEvent::new(
-                                                "market-data",
-                                                BUILD_VERSION,
-                                                &ctx.run_id,
-                                                format!("wallet_snapshot_stale_cleanup_{}", mint),
-                                                "wallet_bootstrap_stale_cleanup",
-                                                None,
-                                                MarketEventKind::WalletBalanceSnapshot {
-                                                    mint: mint.clone(),
-                                                    balance_raw: 0,
-                                                    decimals: *decimals,
-                                                    token_program: tp.clone(),
-                                                },
-                                            );
-
-                                            let subject =
-                                                wallet_snapshot_subject(&wallet_str, mint);
-                                            if let Err(e) = nats
-                                                .jetstream_publish(&subject, &override_event)
-                                                .await
-                                            {
-                                                warn!(error = %e, mint = %mint, "Stale cleanup: failed to publish zero-balance override to JetStream");
-                                            }
-
-                                            stale_cleaned += 1;
-                                            info!(
-                                                mint = %mint,
-                                                old_balance = *balance_raw,
-                                                "Stale cleanup: cleared ghost position (ATA no longer exists, balance → 0)"
-                                            );
-                                        }
-                                    }
-
-                                    let _ = msg.ack().await;
-                                }
-
-                                if batch_count < 500 {
-                                    break;
-                                }
-                            }
-
-                            if stale_cleaned > 0 {
-                                info!(
-                                    stale_cleaned,
-                                    total_checked,
-                                    "✅ Stale JetStream cleanup: cleared ghost positions from previous runs"
-                                );
-                            } else if total_checked > 0 {
-                                debug!(
-                                    total_checked,
-                                    published = published_mint_set.len(),
-                                    "Stale cleanup: no ghost positions found (all entries are fresh)"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Stale cleanup: failed to create consumer");
-                        }
-                    }
-                }
-                Err(e) => {
-                    debug!(error = %e, "Stale cleanup: WALLET_SNAPSHOT stream not found");
-                }
-            }
-        }
+    // but never got their zero-balance override. Publish zero-balance overrides for any
+    // non-zero mints not already covered. No additional RPC calls.
+    if let Some(ref nats) = ctx.nats {
+        let published_mint_set: HashSet<String> =
+            known_mints.iter().map(|m| m.to_string()).collect();
+        publish_wallet_snapshot_stale_jetstream_cleanup(
+            ctx.as_ref(),
+            nats,
+            &wallet_str,
+            &published_mint_set,
+        )
+        .await;
     }
 
     // 3) Update tracked wallet accounts for Geyser subscription (wallet + WSOL + token ATAs).
