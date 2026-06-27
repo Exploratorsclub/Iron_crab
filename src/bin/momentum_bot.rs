@@ -9131,11 +9131,156 @@ async fn recover_positions_from_jsonl(
     Ok(positions)
 }
 
+fn record_wallet_snapshot_latest(
+    latest_by_mint: &mut HashMap<String, (u64, u64)>,
+    mint: &str,
+    balance_raw: u64,
+    ts_unix_ms: u64,
+) {
+    if is_non_tradeable_momentum_mint(mint) {
+        return;
+    }
+    latest_by_mint
+        .entry(mint.to_string())
+        .and_modify(|(bal, prev_ts)| {
+            if ts_unix_ms >= *prev_ts {
+                *bal = balance_raw;
+                *prev_ts = ts_unix_ms;
+            }
+        })
+        .or_insert((balance_raw, ts_unix_ms));
+}
+
+fn mint_has_positive_wallet_balance(
+    mint: &str,
+    latest_by_mint: &HashMap<String, (u64, u64)>,
+) -> bool {
+    latest_by_mint.get(mint).is_some_and(|(bal, _)| *bal > 0)
+}
+
+/// Result of JetStream wallet-hint preload for JSONL/KV recovery gating.
+#[derive(Debug, Clone)]
+struct WalletHintPreload {
+    hints: HashMap<String, u64>,
+    /// True when the wallet snapshot stream was read (even if no per-mint hints).
+    stream_loaded: bool,
+}
+
+/// When stream preload succeeded: block recovery unless latest hint balance > 0.
+fn wallet_hint_blocks_position_recovery(preload: &WalletHintPreload, mint: &str) -> bool {
+    if !preload.stream_loaded {
+        return false;
+    }
+    preload.hints.get(mint).is_none_or(|balance| *balance == 0)
+}
+
+/// Preload latest per-mint wallet balances from JetStream (last-write-wins on `ts_unix_ms`).
+async fn fetch_latest_wallet_balance_hints_from_jetstream(nats: &NatsClient) -> WalletHintPreload {
+    use async_nats::jetstream;
+    use futures::StreamExt;
+
+    let jetstream = jetstream::new(nats.client().clone());
+    let Ok(stream) = jetstream.get_stream(WALLET_SNAPSHOT_STREAM_NAME).await else {
+        return WalletHintPreload {
+            hints: HashMap::new(),
+            stream_loaded: false,
+        };
+    };
+    let Ok(consumer) = stream
+        .create_consumer(wallet_snapshot_consumer_config())
+        .await
+    else {
+        return WalletHintPreload {
+            hints: HashMap::new(),
+            stream_loaded: false,
+        };
+    };
+
+    let mut latest_by_mint: HashMap<String, (u64, u64)> = HashMap::new();
+    let batch_size = 1000;
+
+    loop {
+        let Ok(mut messages) = consumer.fetch().max_messages(batch_size).messages().await else {
+            break;
+        };
+        let mut batch_count = 0;
+
+        while let Some(msg) = messages.next().await {
+            let Ok(msg) = msg else { continue };
+            batch_count += 1;
+
+            let Ok(event) = serde_json::from_slice::<MarketEvent>(&msg.payload) else {
+                let _ = msg.ack().await;
+                continue;
+            };
+
+            if let MarketEventKind::WalletBalanceSnapshot {
+                mint, balance_raw, ..
+            } = &event.kind
+            {
+                record_wallet_snapshot_latest(
+                    &mut latest_by_mint,
+                    mint,
+                    *balance_raw,
+                    event.header.ts_unix_ms,
+                );
+            }
+
+            let _ = msg.ack().await;
+        }
+
+        if batch_count < batch_size {
+            break;
+        }
+    }
+
+    WalletHintPreload {
+        hints: latest_by_mint
+            .into_iter()
+            .map(|(mint, (balance, _))| (mint, balance))
+            .collect(),
+        stream_loaded: true,
+    }
+}
+
+async fn startup_wallet_ghost_reconciliation(ctx: &Arc<MomentumContext>) {
+    let mints_in_wallet: Vec<String> = ctx
+        .latest_wallet_balance_raw_by_mint
+        .read()
+        .iter()
+        .filter(|(mint, balance)| **balance > 0 && !is_non_tradeable_momentum_mint(mint))
+        .map(|(mint, _)| mint.clone())
+        .collect();
+
+    if ctx.latest_wallet_balance_raw_by_mint.read().is_empty() {
+        debug!("startup wallet reconciliation skipped: no JetStream wallet hints loaded");
+        return;
+    }
+
+    let wallet = std::env::var("IRONCRAB_WALLET_PUBKEY").unwrap_or_default();
+    let event = MarketEvent::new(
+        "momentum-bot",
+        BUILD_VERSION,
+        &ctx.run_id,
+        "wallet_snapshot_complete_startup".to_string(),
+        "startup_reconcile",
+        None,
+        MarketEventKind::WalletSnapshotComplete {
+            mints_in_wallet,
+            wallet,
+            is_periodic: false,
+        },
+    );
+
+    if let Err(e) = process_market_event(ctx, &event, false).await {
+        warn!(error = %e, "startup WalletSnapshotComplete reconciliation failed");
+    }
+}
+
 /// Bootstrap WalletBalanceSnapshot events from JetStream (race-free recovery)
 async fn bootstrap_wallet_snapshot_from_jetstream(ctx: &Arc<MomentumContext>) -> Result<usize> {
     use async_nats::jetstream;
     use futures::StreamExt;
-    use std::collections::HashSet;
 
     let Some(ref nats_client) = ctx.nats else {
         return Ok(0);
@@ -9158,7 +9303,7 @@ async fn bootstrap_wallet_snapshot_from_jetstream(ctx: &Arc<MomentumContext>) ->
         .create_consumer(wallet_snapshot_consumer_config())
         .await?;
     let mut recovered = 0usize;
-    let mut snapshot_mints: HashSet<String> = HashSet::new();
+    let mut latest_by_mint: HashMap<String, (u64, u64)> = HashMap::new();
     let batch_size = 1000;
 
     loop {
@@ -9187,8 +9332,16 @@ async fn bootstrap_wallet_snapshot_from_jetstream(ctx: &Arc<MomentumContext>) ->
                 }
             };
 
-            if let MarketEventKind::WalletBalanceSnapshot { mint, .. } = &event.kind {
-                snapshot_mints.insert(mint.clone());
+            if let MarketEventKind::WalletBalanceSnapshot {
+                mint, balance_raw, ..
+            } = &event.kind
+            {
+                record_wallet_snapshot_latest(
+                    &mut latest_by_mint,
+                    mint,
+                    *balance_raw,
+                    event.header.ts_unix_ms,
+                );
                 // JetStream bootstrap/replay: do not mix historical `ts_unix_ms` into
                 // `momentum_event_to_ingest_ms` (live Core NATS ingest SLO only).
                 let ingest_t0 = Instant::now();
@@ -9218,21 +9371,18 @@ async fn bootstrap_wallet_snapshot_from_jetstream(ctx: &Arc<MomentumContext>) ->
 
     if recovered > 0 {
         info!(recovered, "✅ Wallet snapshots recovered from JetStream");
+    }
 
+    if !latest_by_mint.is_empty() {
         let mut positions = ctx.positions.write();
-        let mut removed = 0usize;
-        positions.retain(|mint, _| {
-            let keep = snapshot_mints.contains(mint);
-            if !keep {
-                removed += 1;
-            }
-            keep
-        });
+        let before = positions.len();
+        positions.retain(|mint, _| mint_has_positive_wallet_balance(mint, &latest_by_mint));
+        let removed = before.saturating_sub(positions.len());
         if removed > 0 {
             info!(
                 removed,
                 remaining = positions.len(),
-                "🧹 Closed positions not present in wallet snapshot"
+                "🧹 Closed positions with latest JetStream wallet balance = 0"
             );
         }
     }
@@ -9383,6 +9533,21 @@ async fn main() -> Result<()> {
     // FIX: Probe + Scale must be aggregated. JSONL sums ALL BUY fills (probe+scale) from
     // execution_results. KV can be stale (saved after probe, before scale processed).
     // Merge: JSONL authoritative for token_amount when available; KV for rest.
+    let wallet_hint_preload = if let Some(ref nats_client) = nats {
+        fetch_latest_wallet_balance_hints_from_jetstream(nats_client).await
+    } else {
+        WalletHintPreload {
+            hints: HashMap::new(),
+            stream_loaded: false,
+        }
+    };
+    if wallet_hint_preload.stream_loaded {
+        info!(
+            count = wallet_hint_preload.hints.len(),
+            "Preloaded latest JetStream wallet balance hints for position recovery gate"
+        );
+    }
+
     let recovered_positions = {
         let mut kv_positions = HashMap::new();
         let mut jsonl_positions = HashMap::new();
@@ -9430,7 +9595,17 @@ async fn main() -> Result<()> {
         // Merge: JSONL authoritative (sums probe+scale from execution_results). KV for mints not in JSONL.
         let mut positions = HashMap::new();
         let mut merged_count = 0u32;
+        let mut jsonl_skipped_wallet_gate = 0u32;
         for (mint, jsonl_tracker) in &jsonl_positions {
+            if wallet_hint_blocks_position_recovery(&wallet_hint_preload, mint) {
+                jsonl_skipped_wallet_gate += 1;
+                info!(
+                    mint = %mint,
+                    hint_balance = ?wallet_hint_preload.hints.get(mint),
+                    "Skipping JSONL position recovery: JetStream wallet hint missing or zero"
+                );
+                continue;
+            }
             let mut tracker = jsonl_tracker.clone();
             if let Some(kv_tracker) = kv_positions.get(mint) {
                 // Both sources: prefer JSONL — it sums ALL BUY fills (probe+scale).
@@ -9455,7 +9630,16 @@ async fn main() -> Result<()> {
             }
             positions.insert(mint.clone(), tracker);
         }
+        if jsonl_skipped_wallet_gate > 0 {
+            info!(
+                skipped = jsonl_skipped_wallet_gate,
+                "JSONL ghost positions skipped via JetStream wallet-hint gate"
+            );
+        }
         for (mint, kv_tracker) in kv_positions {
+            if wallet_hint_blocks_position_recovery(&wallet_hint_preload, &mint) {
+                continue;
+            }
             positions.entry(mint).or_insert(kv_tracker);
         }
         if merged_count > 0 {
@@ -9548,6 +9732,8 @@ async fn main() -> Result<()> {
             debug!("No wallet snapshots recovered from JetStream");
         }
     }
+
+    startup_wallet_ghost_reconciliation(&ctx).await;
 
     // Open positions: request authoritative pool rows from market-data (bounded, deduped; no RPC here).
     ctx.schedule_open_position_pool_recoveries("startup").await;
@@ -12631,6 +12817,38 @@ mod tests {
         assert!(matches!(
             trackers.get(&sk).unwrap().state,
             TrackerState::PositionOpenProbe { .. }
+        ));
+    }
+
+    #[test]
+    fn wallet_hint_blocks_position_recovery_when_missing_or_zero() {
+        let loaded = WalletHintPreload {
+            stream_loaded: true,
+            hints: HashMap::from([
+                ("GhostMint1111111111111111111111111111111".to_string(), 0),
+                ("LiveMint11111111111111111111111111111111".to_string(), 42),
+            ]),
+        };
+        assert!(wallet_hint_blocks_position_recovery(
+            &loaded,
+            "GhostMint1111111111111111111111111111111"
+        ));
+        assert!(wallet_hint_blocks_position_recovery(
+            &loaded,
+            "MissingMint111111111111111111111111111111"
+        ));
+        assert!(!wallet_hint_blocks_position_recovery(
+            &loaded,
+            "LiveMint11111111111111111111111111111111"
+        ));
+
+        let unavailable = WalletHintPreload {
+            stream_loaded: false,
+            hints: HashMap::new(),
+        };
+        assert!(!wallet_hint_blocks_position_recovery(
+            &unavailable,
+            "AnyMint111111111111111111111111111111111"
         ));
     }
 

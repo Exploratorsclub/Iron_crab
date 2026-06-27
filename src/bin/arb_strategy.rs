@@ -46,20 +46,21 @@ use ironcrab::metrics::{
     arb_strategy_bootstrap_skip_inc, arb_strategy_bootstrap_warmup_set,
     arb_strategy_pool_cache_update_seeded_inc, arb_strategy_pool_cache_update_seen_inc,
     arb_strategy_pool_cache_update_skip_no_seed_inc,
-    arb_strategy_pool_cache_update_skip_non_arb_quote_inc, arb_subscriber_high_processed_inc,
-    arb_subscriber_high_queue_depth_set, arb_subscriber_low_coalesced_inc,
-    arb_subscriber_low_dropped_inc, arb_subscriber_low_processed_inc,
-    arb_subscriber_low_queue_depth_set, arb_subscriber_pool_created_skipped_inc,
-    arb_two_hop_eligible_dexes_add, arb_two_hop_eligible_pools_by_dex_add,
-    arb_two_hop_insufficient_subreason_inc, arb_two_hop_opportunity_inc, arb_two_hop_pool_gate_add,
-    arb_two_hop_reject_subreason_inc, arb_two_hop_rejected_inc,
-    arb_two_hop_tracker_seeded_pools_add, record_arb_track_requests_messages_total, serve_metrics,
-    set_readiness_nats_connected, wall_clock_unix_ms_now, ArbStrategyWarmupSkipReason,
-    ArbTwoHopInsufficientSubreason, ArbTwoHopPoolGate, ArbTwoHopRejectReason,
-    ArbTwoHopRejectSubreason, MetricsComponent, ARB_REJECTED_MISSING_ACCOUNTS,
-    ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL,
-    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
-    TOKENS_TRACKED_GAUGE,
+    arb_strategy_pool_cache_update_skip_non_arb_quote_inc, arb_subscriber_high_dropped_inc,
+    arb_subscriber_high_processed_inc, arb_subscriber_high_queue_depth_set,
+    arb_subscriber_low_coalesced_inc, arb_subscriber_low_dropped_inc,
+    arb_subscriber_low_processed_inc, arb_subscriber_low_queue_depth_set,
+    arb_subscriber_pool_created_skipped_inc, arb_two_hop_eligible_dexes_add,
+    arb_two_hop_eligible_pools_by_dex_add, arb_two_hop_insufficient_subreason_inc,
+    arb_two_hop_opportunity_inc, arb_two_hop_pool_gate_add, arb_two_hop_reject_subreason_inc,
+    arb_two_hop_rejected_inc, arb_two_hop_tracker_seeded_pools_add,
+    record_arb_track_requests_messages_total, serve_metrics, set_readiness_nats_connected,
+    wall_clock_unix_ms_now, ArbStrategyWarmupSkipReason, ArbTwoHopInsufficientSubreason,
+    ArbTwoHopPoolGate, ArbTwoHopRejectReason, ArbTwoHopRejectSubreason, MetricsComponent,
+    ARB_REJECTED_MISSING_ACCOUNTS, ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL,
+    ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH, ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL,
+    MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
+    POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, pool_cache_live_fallback_consumer_config,
@@ -215,6 +216,8 @@ const ELIGIBILITY_PENDING_CAP: usize = 256;
 const ARB_HIGH_EVENT_QUEUE_CAP: usize = 8192;
 /// Max distinct LOW-priority pool keys coalesced before latest-wins eviction.
 const ARB_LOW_COALESCER_CAP: usize = 2048;
+/// Heartbeat warns when HIGH queue depth exceeds this fraction of capacity.
+const ARB_HIGH_QUEUE_WARN_PCT: u64 = 80;
 
 static DLMM_MARGINAL_PRICE_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
@@ -1348,7 +1351,7 @@ struct PoolState {
 }
 
 /// Tracks same token across multiple DEXes
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TokenArbTracker {
     base_mint: String,
     /// Pool states keyed by pool_address (multiple pools per DEX allowed)
@@ -2314,6 +2317,44 @@ impl ArbLowEventCoalescer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HighEnqueueOutcome {
+    Enqueued,
+    DowngradedToLow,
+    Dropped,
+    ChannelClosed,
+}
+
+/// Non-blocking HIGH ingress: never block the NATS reader on a full queue.
+fn try_enqueue_high_priority(
+    high_tx: &mpsc::Sender<MarketEvent>,
+    low_coalescer: &parking_lot::Mutex<ArbLowEventCoalescer>,
+    low_notify: &tokio::sync::Notify,
+    event: MarketEvent,
+) -> HighEnqueueOutcome {
+    let depth = ARB_HIGH_EVENT_QUEUE_CAP.saturating_sub(high_tx.capacity());
+    arb_subscriber_high_queue_depth_set(depth as u64);
+
+    match high_tx.try_send(event) {
+        Ok(()) => HighEnqueueOutcome::Enqueued,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+            if market_event_pool_key(&event).is_some() {
+                let mut coalescer = low_coalescer.lock();
+                coalescer.insert(event, ARB_LOW_COALESCER_CAP);
+                arb_subscriber_low_queue_depth_set(coalescer.len() as u64);
+                drop(coalescer);
+                low_notify.notify_one();
+                arb_subscriber_high_dropped_inc();
+                HighEnqueueOutcome::DowngradedToLow
+            } else {
+                arb_subscriber_high_dropped_inc();
+                HighEnqueueOutcome::Dropped
+            }
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => HighEnqueueOutcome::ChannelClosed,
+    }
+}
+
 /// Off-hot-loop 2-hop detection job (Scope D).
 #[derive(Debug, Clone)]
 struct ArbTwoHopTradeJob {
@@ -2443,13 +2484,19 @@ fn spawn_arb_market_event_pipeline(
 
             match priority {
                 ArbEventPriority::High => {
-                    let depth = ARB_HIGH_EVENT_QUEUE_CAP.saturating_sub(high_tx.capacity());
-                    arb_subscriber_high_queue_depth_set(depth as u64);
-                    if high_tx.try_send(event.clone()).is_err()
-                        && high_tx.send(event).await.is_err()
-                    {
-                        warn!("arb-strategy HIGH event queue closed; stopping NATS reader");
-                        break;
+                    match try_enqueue_high_priority(
+                        &high_tx,
+                        &reader_coalescer,
+                        &reader_notify,
+                        event,
+                    ) {
+                        HighEnqueueOutcome::ChannelClosed => {
+                            warn!("arb-strategy HIGH event queue closed; stopping NATS reader");
+                            break;
+                        }
+                        HighEnqueueOutcome::Enqueued
+                        | HighEnqueueOutcome::DowngradedToLow
+                        | HighEnqueueOutcome::Dropped => {}
                     }
                     arb_subscriber_high_queue_depth_set(
                         ARB_HIGH_EVENT_QUEUE_CAP.saturating_sub(high_tx.capacity()) as u64,
@@ -3223,27 +3270,42 @@ impl ArbContext {
                 "Vault balances updated"
             );
         }
+        drop(cache);
 
         // Mirror SOL liquidity + reserve flag into per-mint pool trackers (Geyser-only, no RPC)
         let liquidity_sol = Decimal::from(reserve_quote) / Decimal::from(1_000_000_000u64);
+        let mints_with_pool: Vec<String> = self
+            .trackers
+            .read()
+            .iter()
+            .filter(|(_, tracker)| tracker.pools.contains_key(pool_address))
+            .map(|(mint, _)| mint.clone())
+            .collect();
+        if mints_with_pool.is_empty() {
+            return;
+        }
         let mut trackers = self.trackers.write();
-        for tracker in trackers.values_mut() {
-            if let Some(pool) = tracker.pools.get_mut(pool_address) {
-                pool.liquidity_sol = liquidity_sol;
-                pool.has_reserve_data = reserve_base > 0 && reserve_quote > 0;
-                pool.last_update = Instant::now();
-                if let Some(token_decimals) = tracker.token_decimals {
-                    if reserves_plausible_for_comparable_price(
-                        reserve_base,
-                        reserve_quote,
-                        token_decimals,
-                        &tracker.base_mint,
-                    ) {
-                        if let Some(mid) =
-                            reserve_mid_sol_per_token(reserve_base, reserve_quote, token_decimals)
-                        {
-                            pool.last_price = Some(mid);
-                        }
+        for mint in mints_with_pool {
+            let Some(tracker) = trackers.get_mut(&mint) else {
+                continue;
+            };
+            let Some(pool) = tracker.pools.get_mut(pool_address) else {
+                continue;
+            };
+            pool.liquidity_sol = liquidity_sol;
+            pool.has_reserve_data = reserve_base > 0 && reserve_quote > 0;
+            pool.last_update = Instant::now();
+            if let Some(token_decimals) = tracker.token_decimals {
+                if reserves_plausible_for_comparable_price(
+                    reserve_base,
+                    reserve_quote,
+                    token_decimals,
+                    &tracker.base_mint,
+                ) {
+                    if let Some(mid) =
+                        reserve_mid_sol_per_token(reserve_base, reserve_quote, token_decimals)
+                    {
+                        pool.last_price = Some(mid);
                     }
                 }
             }
@@ -3518,81 +3580,8 @@ impl ArbContext {
         );
 
         let config = self.config.read().clone();
-        let mut trackers = self.trackers.write();
-
-        // Get or create tracker for this mint
-        let tracker = trackers.entry(mint.to_string()).or_insert_with(|| {
-            info!(mint = %mint, "Creating tracker from Trade event (no PoolCreated)");
-            TokenArbTracker {
-                base_mint: mint.to_string(),
-                pools: HashMap::new(),
-                pool_accounts: HashMap::new(),
-                token_program: None,
-                token_decimals: None,
-                last_intent_time: None,
-            }
-        });
-
-        tracker.token_decimals = Some(token_decimals);
-
-        let effective_dex = if !dex.is_empty() && dex != "unknown" {
-            dex.to_string()
-        } else {
-            pool_address.to_string()
-        };
-
-        let pool = tracker
-            .pools
-            .entry(pool_address.to_string())
-            .or_insert_with(|| {
-                info!(pool = %pool_address, mint = %mint, dex = %effective_dex, "Creating pool from Trade event");
-                PoolState {
-                    pool_address: pool_address.to_string(),
-                    dex: effective_dex.clone(),
-                    liquidity_sol: Decimal::ZERO,
-                    has_reserve_data: false,
-                    last_price: None,
-                    trade_price_buy: None,
-                    trade_price_sell: None,
-                    trade_count: 0,
-                    last_update: Instant::now(),
-                    dex_accounts: None,
-                }
-            });
-
-        if is_buy {
-            pool.trade_price_buy = Some(price);
-        } else {
-            pool.trade_price_sell = Some(price);
-        }
-        let vault_reserves = self
-            .vault_balances
-            .read()
-            .get(pool_address)
-            .map(|c| (c.reserve_base, c.reserve_quote));
-        let vault_entry = self.vault_balances.read().get(pool_address).cloned();
-        let dlmm_bins = self.bin_arrays.read().get(pool_address).cloned();
-        pool.last_price = comparable_price_sol_per_token(
-            pool,
-            vault_reserves,
-            Some(token_decimals),
-            mint,
-            vault_entry.as_ref(),
-            dlmm_bins.as_ref(),
-            ComparablePriceSide::Buy,
-        );
-        pool.trade_count += 1;
-        pool.last_update = Instant::now();
-        trace!(
-            pool = %pool_address,
-            mint = %mint,
-            dex = %pool.dex,
-            comparable_price = ?pool.last_price,
-            "Pool comparable price updated"
-        );
 
         // Global Geyser connection health check (replaces per-pool staleness)
-        // If no MarketEvents received for 30s, connection is broken - don't trade
         if !self.is_geyser_connection_healthy() {
             warn!(
                 mint = %mint,
@@ -3602,11 +3591,87 @@ impl ArbContext {
             return None;
         }
 
-        // Check for arbitrage opportunity (with known_pools filter)
+        let vault_reserves = self
+            .vault_balances
+            .read()
+            .get(pool_address)
+            .map(|c| (c.reserve_base, c.reserve_quote));
+        let vault_entry = self.vault_balances.read().get(pool_address).cloned();
+        let dlmm_bins = self.bin_arrays.read().get(pool_address).cloned();
+
+        let tracker_snapshot = {
+            let mut trackers = self.trackers.write();
+
+            let tracker = trackers.entry(mint.to_string()).or_insert_with(|| {
+                info!(mint = %mint, "Creating tracker from Trade event (no PoolCreated)");
+                TokenArbTracker {
+                    base_mint: mint.to_string(),
+                    pools: HashMap::new(),
+                    pool_accounts: HashMap::new(),
+                    token_program: None,
+                    token_decimals: None,
+                    last_intent_time: None,
+                }
+            });
+
+            tracker.token_decimals = Some(token_decimals);
+
+            let effective_dex = if !dex.is_empty() && dex != "unknown" {
+                dex.to_string()
+            } else {
+                pool_address.to_string()
+            };
+
+            let pool = tracker
+                .pools
+                .entry(pool_address.to_string())
+                .or_insert_with(|| {
+                    info!(pool = %pool_address, mint = %mint, dex = %effective_dex, "Creating pool from Trade event");
+                    PoolState {
+                        pool_address: pool_address.to_string(),
+                        dex: effective_dex.clone(),
+                        liquidity_sol: Decimal::ZERO,
+                        has_reserve_data: false,
+                        last_price: None,
+                        trade_price_buy: None,
+                        trade_price_sell: None,
+                        trade_count: 0,
+                        last_update: Instant::now(),
+                        dex_accounts: None,
+                    }
+                });
+
+            if is_buy {
+                pool.trade_price_buy = Some(price);
+            } else {
+                pool.trade_price_sell = Some(price);
+            }
+            pool.last_price = comparable_price_sol_per_token(
+                pool,
+                vault_reserves,
+                Some(token_decimals),
+                mint,
+                vault_entry.as_ref(),
+                dlmm_bins.as_ref(),
+                ComparablePriceSide::Buy,
+            );
+            pool.trade_count += 1;
+            pool.last_update = Instant::now();
+            trace!(
+                pool = %pool_address,
+                mint = %mint,
+                dex = %pool.dex,
+                comparable_price = ?pool.last_price,
+                "Pool comparable price updated"
+            );
+
+            tracker.clone()
+        };
+
         let known_pools = self.known_pools.read();
         let vault_balances = self.vault_balances.read();
         let bin_arrays = self.bin_arrays.read();
-        if let Some(opp) = tracker.check_arbitrage(
+        let opp = tracker_snapshot.check_arbitrage(
             &config,
             &known_pools,
             &vault_balances,
@@ -3616,21 +3681,20 @@ impl ArbContext {
                 data_quality_rejects: &self.data_quality_rejects,
                 forensics: Some(&self.eligibility_forensics),
             },
-        ) {
-            // Check cooldown
-            let cooldown = Duration::from_millis(config.intent_cooldown_ms);
-            if let Some(last_time) = tracker.last_intent_time {
-                if last_time.elapsed() < cooldown {
-                    return None;
-                }
-            }
+        )?;
 
-            tracker.last_intent_time = Some(Instant::now());
-            self.opportunities_found.fetch_add(1, Ordering::Relaxed);
-            return Some(opp);
+        let cooldown = Duration::from_millis(config.intent_cooldown_ms);
+        let mut trackers = self.trackers.write();
+        let tracker = trackers.get_mut(mint)?;
+        if let Some(last_time) = tracker.last_intent_time {
+            if last_time.elapsed() < cooldown {
+                return None;
+            }
         }
 
-        None
+        tracker.last_intent_time = Some(Instant::now());
+        self.opportunities_found.fetch_add(1, Ordering::Relaxed);
+        Some(opp)
     }
 
     /// Get pool accounts for both buy and sell pools
@@ -4397,6 +4461,8 @@ async fn main() -> Result<()> {
     let mut arb_track_reconcile_interval =
         tokio::time::interval(Duration::from_secs(arb_reconcile_secs.max(10)));
     arb_track_reconcile_interval.tick().await;
+    let mut last_heartbeat_events_received = 0u64;
+    let mut last_heartbeat_high_processed = 0u64;
 
     loop {
         tokio::select! {
@@ -4568,8 +4634,37 @@ async fn main() -> Result<()> {
                 ctx.prune_arb_track_stale_pools();
                 TOKENS_TRACKED_GAUGE.store(trackers.len() as u64, Ordering::Relaxed);
 
+                let high_queue_depth = ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH.load(Ordering::Relaxed);
+                let high_processed = ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL.load(Ordering::Relaxed);
+                let events_received = ctx.events_received.load(Ordering::Relaxed);
+                let high_queue_cap = ARB_HIGH_EVENT_QUEUE_CAP as u64;
+                if high_queue_depth.saturating_mul(100) / high_queue_cap.max(1)
+                    >= ARB_HIGH_QUEUE_WARN_PCT
+                {
+                    warn!(
+                        high_queue_depth,
+                        high_queue_cap,
+                        high_processed,
+                        "arb HIGH event queue above 80% capacity"
+                    );
+                }
+                let events_delta = events_received.saturating_sub(last_heartbeat_events_received);
+                let high_processed_delta =
+                    high_processed.saturating_sub(last_heartbeat_high_processed);
+                if events_delta > 0 && high_processed_delta == 0 && high_queue_depth > high_queue_cap / 2
+                {
+                    warn!(
+                        events_delta,
+                        high_queue_depth,
+                        high_processed,
+                        "arb event pipeline may be stalled (events received but HIGH queue not draining)"
+                    );
+                }
+                last_heartbeat_events_received = events_received;
+                last_heartbeat_high_processed = high_processed;
+
                 info!(
-                    events_received = ctx.events_received.load(Ordering::Relaxed),
+                    events_received,
                     pools_tracked = ctx.pools_tracked.load(Ordering::Relaxed),
                     tokens_tracked = trackers.len(),
                     multi_dex_tokens = multi_dex_tokens,
@@ -4587,6 +4682,8 @@ async fn main() -> Result<()> {
                     multi_hop_enabled = ctx.multi_hop.is_enabled(),
                     arb_track_requests_published =
                         ctx.arb_track_published.load(Ordering::Relaxed),
+                    high_queue_depth,
+                    high_processed,
                     "arb-strategy heartbeat (SLAVE cache sync from market-data MASTER)"
                 );
             }
@@ -5041,6 +5138,65 @@ mod event_pipeline_tests {
         tx.try_send(event)
             .expect("HIGH trade must enqueue without drop");
         assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn high_priority_channel_drops_or_downgrades_when_full_instead_of_blocking() {
+        let (tx, _rx) = mpsc::channel::<MarketEvent>(2);
+        let coalescer = parking_lot::Mutex::new(ArbLowEventCoalescer::new());
+        let notify = tokio::sync::Notify::new();
+
+        let trade_a = sample_trade_event("pool-trade-a");
+        let trade_b = sample_trade_event("pool-trade-b");
+        let pool_state_event = MarketEvent::new(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            "evt-psu-full".to_string(),
+            "geyser",
+            Some(1),
+            MarketEventKind::PoolStateUpdate {
+                pool_address: "pool-known-full".to_string(),
+                dex: "orca".to_string(),
+                reserve_base: 1,
+                reserve_quote: 1,
+                update_slot: 1,
+                active_id: None,
+                bin_step: None,
+                base_mint: NATIVE_SOL_MINT.to_string(),
+                quote_mint: "TokenMint11111111111111111111111111111111".to_string(),
+            },
+        );
+
+        assert_eq!(
+            try_enqueue_high_priority(&tx, &coalescer, &notify, trade_a),
+            HighEnqueueOutcome::Enqueued
+        );
+        assert_eq!(
+            try_enqueue_high_priority(&tx, &coalescer, &notify, trade_b),
+            HighEnqueueOutcome::Enqueued
+        );
+        assert_eq!(tx.capacity(), 0, "HIGH channel must be full");
+
+        let before_dropped =
+            ironcrab::metrics::ARB_SUBSCRIBER_HIGH_DROPPED_TOTAL.load(Ordering::Relaxed);
+        assert_eq!(
+            try_enqueue_high_priority(&tx, &coalescer, &notify, pool_state_event),
+            HighEnqueueOutcome::DowngradedToLow
+        );
+        assert_eq!(tx.capacity(), 0);
+        assert_eq!(coalescer.lock().len(), 1);
+        assert!(
+            ironcrab::metrics::ARB_SUBSCRIBER_HIGH_DROPPED_TOTAL.load(Ordering::Relaxed)
+                > before_dropped
+        );
+
+        let trade_overflow = sample_trade_event("pool-trade-overflow");
+        assert_eq!(
+            try_enqueue_high_priority(&tx, &coalescer, &notify, trade_overflow),
+            HighEnqueueOutcome::DowngradedToLow
+        );
+        assert_eq!(coalescer.lock().len(), 2);
     }
 }
 
