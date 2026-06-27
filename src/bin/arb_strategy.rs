@@ -24,7 +24,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
@@ -43,6 +43,7 @@ use ironcrab::ipc::{
     TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
+    arb_pool_cache_apply_batches_inc, arb_pool_cache_updates_applied_add,
     arb_strategy_bootstrap_skip_inc, arb_strategy_bootstrap_warmup_set,
     arb_strategy_pool_cache_update_seeded_inc, arb_strategy_pool_cache_update_seen_inc,
     arb_strategy_pool_cache_update_skip_no_seed_inc,
@@ -54,13 +55,15 @@ use ironcrab::metrics::{
     arb_two_hop_eligible_pools_by_dex_add, arb_two_hop_insufficient_subreason_inc,
     arb_two_hop_opportunity_inc, arb_two_hop_pool_gate_add, arb_two_hop_reject_subreason_inc,
     arb_two_hop_rejected_inc, arb_two_hop_tracker_seeded_pools_add,
-    record_arb_track_requests_messages_total, serve_metrics, set_readiness_nats_connected,
-    wall_clock_unix_ms_now, ArbStrategyWarmupSkipReason, ArbTwoHopInsufficientSubreason,
-    ArbTwoHopPoolGate, ArbTwoHopRejectReason, ArbTwoHopRejectSubreason, MetricsComponent,
-    ARB_REJECTED_MISSING_ACCOUNTS, ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL,
-    ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH, ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL,
-    MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
-    POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
+    inc_arb_tracker_write_enqueue_dropped_total, record_arb_track_requests_messages_total,
+    serve_metrics, set_arb_pool_cache_apply_batch_size_gauge, set_arb_tracker_write_queue_depth,
+    set_readiness_nats_connected, wall_clock_unix_ms_now, ArbStrategyWarmupSkipReason,
+    ArbTwoHopInsufficientSubreason, ArbTwoHopPoolGate, ArbTwoHopRejectReason,
+    ArbTwoHopRejectSubreason, MetricsComponent, ARB_REJECTED_MISSING_ACCOUNTS,
+    ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL, ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH,
+    ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL,
+    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
+    TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, pool_cache_live_fallback_consumer_config,
@@ -72,6 +75,9 @@ use ironcrab::nats::{TOPIC_ARB_TRACK_REQUESTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_
 use ironcrab::solana::dex::meteora_bin_walker::{dlmm_fee_bps, walker_from_bins};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 use solana_sdk::pubkey::Pubkey;
+
+type JetStreamPullConsumer =
+    async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>;
 
 /// Build version for decision records
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -88,6 +94,10 @@ const ARB_TRACK_RECONCILE_INTERVAL_SECS_DEFAULT: u64 = 60;
 
 /// Bounded queue for off-hot-loop 2-hop trade detection (Scope D).
 const ARB_TWO_HOP_WORKER_QUEUE_CAP: usize = 4096;
+/// Max PoolCache updates applied per burst before yielding (main-loop decoupling).
+const ARB_POOL_CACHE_APPLY_BATCH_MAX: usize = 20;
+/// Single-writer queue for `trackers` / `vault_balances` mutations.
+const ARB_TRACKER_WRITE_QUEUE_CAP: usize = 8192;
 
 // ============================================================================
 // Configuration
@@ -2370,6 +2380,75 @@ struct ArbTwoHopTradeJob {
     ts_unix_ms: u64,
 }
 
+/// Serialized mutation jobs for `trackers` and `vault_balances` (single writer).
+enum ArbTrackerWriteJob {
+    SeedPoolCache {
+        update: PoolCacheUpdate,
+    },
+    HandleTrade {
+        job: ArbTwoHopTradeJob,
+        reply: oneshot::Sender<Option<ArbOpportunity>>,
+    },
+    PoolCreated {
+        pool_address: String,
+        base_mint: String,
+        quote_mint: String,
+        dex: String,
+        liquidity_sol: Decimal,
+    },
+    DexPoolAccounts {
+        pool_address: String,
+        base_mint: String,
+        quote_mint: String,
+        accounts: Vec<String>,
+    },
+    TokenMintInfo {
+        mint: String,
+        token_program: String,
+    },
+    PoolStateUpdate {
+        pool_address: String,
+        dex: String,
+        reserve_base: u64,
+        reserve_quote: u64,
+        update_slot: u64,
+        active_id: Option<i32>,
+        bin_step: Option<u16>,
+        base_mint: String,
+        quote_mint: String,
+    },
+}
+
+#[derive(Clone)]
+struct ArbTrackerWriteHandle {
+    tx: mpsc::Sender<ArbTrackerWriteJob>,
+    capacity: usize,
+}
+
+impl ArbTrackerWriteHandle {
+    fn record_queue_depth(&self) {
+        let depth = self.capacity.saturating_sub(self.tx.capacity());
+        set_arb_tracker_write_queue_depth(depth as u64);
+    }
+
+    fn try_enqueue(&self, job: ArbTrackerWriteJob) -> bool {
+        self.record_queue_depth();
+        if self.tx.try_send(job).is_err() {
+            inc_arb_tracker_write_enqueue_dropped_total();
+            false
+        } else {
+            true
+        }
+    }
+
+    async fn enqueue(&self, job: ArbTrackerWriteJob) {
+        self.record_queue_depth();
+        if self.tx.send(job).await.is_err() {
+            inc_arb_tracker_write_enqueue_dropped_total();
+        }
+    }
+}
+
 fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoHopTradeJob>) {
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
@@ -2377,16 +2456,18 @@ fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoH
             if !two_hop_enabled {
                 continue;
             }
-            if let Some(opp) = ctx.handle_trade(
-                &job.pool_address,
-                &job.mint,
-                &job.quote_mint,
-                job.sol_amount,
-                job.token_amount,
-                job.token_decimals,
-                job.is_buy,
-                &job.dex,
-            ) {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            ctx.tracker_write
+                .enqueue(ArbTrackerWriteJob::HandleTrade {
+                    job: job.clone(),
+                    reply: reply_tx,
+                })
+                .await;
+            let opp = match reply_rx.await {
+                Ok(opp) => opp,
+                Err(_) => continue,
+            };
+            if let Some(opp) = opp {
                 ARB_TRIANGLE_OPPORTUNITIES.fetch_add(1, Ordering::Relaxed);
                 info!(
                     mint = %opp.base_mint,
@@ -2637,6 +2718,8 @@ struct ArbContext {
     arb_track_published: AtomicU64,
     /// Scope D: enqueue-only sender for off-hot-loop 2-hop detection.
     two_hop_tx: mpsc::Sender<ArbTwoHopTradeJob>,
+    /// Single-writer channel for `trackers` / `vault_balances` mutations.
+    tracker_write: ArbTrackerWriteHandle,
 }
 
 /// Cached vault balances from PoolStateUpdate events
@@ -3518,7 +3601,7 @@ impl ArbContext {
     /// Only processes trades with SOL as quote_mint. Trades with non-SOL quotes
     /// (e.g., USDC) are skipped to avoid comparing prices in different units.
     #[allow(clippy::too_many_arguments)]
-    fn handle_trade(
+    fn apply_trade_to_tracker(
         &self,
         pool_address: &str,
         mint: &str,
@@ -3528,7 +3611,7 @@ impl ArbContext {
         token_decimals: u8,
         is_buy: bool,
         dex: &str,
-    ) -> Option<ArbOpportunity> {
+    ) -> Option<(TokenArbTracker, ArbConfig)> {
         // CRITICAL: Only track SOL-quoted pools for price comparison.
         // Comparing TOKEN/SOL prices with TOKEN/USDC prices is invalid!
         if quote_mint != NATIVE_SOL_MINT {
@@ -3668,6 +3751,52 @@ impl ArbContext {
             tracker.clone()
         };
 
+        Some((tracker_snapshot, config))
+    }
+
+    fn finalize_trade_opportunity(
+        &self,
+        mint: &str,
+        intent_cooldown_ms: u64,
+        opp: ArbOpportunity,
+    ) -> Option<ArbOpportunity> {
+        let cooldown = Duration::from_millis(intent_cooldown_ms);
+        let mut trackers = self.trackers.write();
+        let tracker = trackers.get_mut(mint)?;
+        if let Some(last_time) = tracker.last_intent_time {
+            if last_time.elapsed() < cooldown {
+                return None;
+            }
+        }
+
+        tracker.last_intent_time = Some(Instant::now());
+        self.opportunities_found.fetch_add(1, Ordering::Relaxed);
+        Some(opp)
+    }
+
+    #[allow(dead_code)] // sync path retained for unit tests (`apply_trade_to_tracker` + `check_arbitrage`)
+    #[allow(clippy::too_many_arguments)]
+    fn handle_trade(
+        &self,
+        pool_address: &str,
+        mint: &str,
+        quote_mint: &str,
+        sol_amount: u64,
+        token_amount: u64,
+        token_decimals: u8,
+        is_buy: bool,
+        dex: &str,
+    ) -> Option<ArbOpportunity> {
+        let (tracker_snapshot, config) = self.apply_trade_to_tracker(
+            pool_address,
+            mint,
+            quote_mint,
+            sol_amount,
+            token_amount,
+            token_decimals,
+            is_buy,
+            dex,
+        )?;
         let known_pools = self.known_pools.read();
         let vault_balances = self.vault_balances.read();
         let bin_arrays = self.bin_arrays.read();
@@ -3682,19 +3811,43 @@ impl ArbContext {
                 forensics: Some(&self.eligibility_forensics),
             },
         )?;
+        self.finalize_trade_opportunity(mint, config.intent_cooldown_ms, opp)
+    }
 
-        let cooldown = Duration::from_millis(config.intent_cooldown_ms);
-        let mut trackers = self.trackers.write();
-        let tracker = trackers.get_mut(mint)?;
-        if let Some(last_time) = tracker.last_intent_time {
-            if last_time.elapsed() < cooldown {
-                return None;
-            }
-        }
-
-        tracker.last_intent_time = Some(Instant::now());
-        self.opportunities_found.fetch_add(1, Ordering::Relaxed);
-        Some(opp)
+    async fn handle_trade_job(self: &Arc<Self>, job: &ArbTwoHopTradeJob) -> Option<ArbOpportunity> {
+        let (tracker_snapshot, config) = self.apply_trade_to_tracker(
+            &job.pool_address,
+            &job.mint,
+            &job.quote_mint,
+            job.sol_amount,
+            job.token_amount,
+            job.token_decimals,
+            job.is_buy,
+            &job.dex,
+        )?;
+        let ctx = Arc::clone(self);
+        let known_pools = self.known_pools.read().clone();
+        let vault_balances = self.vault_balances.read().clone();
+        let bin_arrays = self.bin_arrays.read().clone();
+        let cooldown_ms = config.intent_cooldown_ms;
+        let opp = tokio::task::spawn_blocking(move || {
+            tracker_snapshot.check_arbitrage(
+                &config,
+                &known_pools,
+                &vault_balances,
+                &bin_arrays,
+                &ArbCheckContext {
+                    spread_warn_last: &ctx.spread_too_large_warn_last,
+                    data_quality_rejects: &ctx.data_quality_rejects,
+                    forensics: Some(&ctx.eligibility_forensics),
+                },
+            )
+        })
+        .await
+        .ok()
+        .flatten();
+        let opp = opp?;
+        self.finalize_trade_opportunity(&job.mint, cooldown_ms, opp)
     }
 
     /// Get pool accounts for both buy and sell pools
@@ -4105,6 +4258,234 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
     Some(intent)
 }
 
+fn apply_pool_cache_jetstream_message(ctx: &ArbContext, update: PoolCacheUpdate) {
+    arb_strategy_pool_cache_update_seen_inc();
+    if !matches!(update.update_type, PoolCacheUpdateType::PoolRemoved)
+        && arb_tracked_token_mint(&update.base_mint, &update.quote_mint).is_none()
+    {
+        arb_strategy_pool_cache_update_skip_non_arb_quote_inc();
+    }
+    if sync_arb_slave_from_pool_cache_update(
+        &ctx.live_pool_cache,
+        &ctx.known_pools,
+        ctx.multi_hop.as_ref(),
+        &update,
+    ) {
+        ctx.multi_hop
+            .touch_live_pool_quote_ready(&update.pool_address);
+        if !ctx
+            .tracker_write
+            .try_enqueue(ArbTrackerWriteJob::SeedPoolCache {
+                update: update.clone(),
+            })
+        {
+            debug!(
+                pool = %update.pool_address,
+                "Dropped PoolCache tracker seed (single-writer queue full)"
+            );
+            arb_strategy_pool_cache_update_skip_no_seed_inc();
+            return;
+        }
+        debug!(
+            pool = %update.pool_address,
+            dex = %update.dex,
+            update_type = ?update.update_type,
+            "SLAVE CACHE: Pool cache update queued for tracker seed (JetStream)"
+        );
+    }
+}
+
+fn spawn_arb_tracker_write_worker(
+    ctx: Arc<ArbContext>,
+    mut rx: mpsc::Receiver<ArbTrackerWriteJob>,
+) {
+    tokio::spawn(async move {
+        while let Some(job) = rx.recv().await {
+            match job {
+                ArbTrackerWriteJob::SeedPoolCache { update } => {
+                    if ctx.seed_trackers_for_pool_cache_update(&update) {
+                        arb_strategy_pool_cache_update_seeded_inc();
+                        if let Some(mint) =
+                            arb_tracked_token_mint(&update.base_mint, &update.quote_mint)
+                        {
+                            ctx.maybe_publish_arb_track_incremental_for_mint(mint);
+                        }
+                    } else {
+                        arb_strategy_pool_cache_update_skip_no_seed_inc();
+                    }
+                }
+                ArbTrackerWriteJob::HandleTrade { job, reply } => {
+                    let opp = ctx.handle_trade_job(&job).await;
+                    let _ = reply.send(opp);
+                }
+                ArbTrackerWriteJob::PoolCreated {
+                    pool_address,
+                    base_mint,
+                    quote_mint,
+                    dex,
+                    liquidity_sol,
+                } => {
+                    ctx.handle_pool_created(
+                        &pool_address,
+                        &base_mint,
+                        &quote_mint,
+                        &dex,
+                        liquidity_sol,
+                    );
+                }
+                ArbTrackerWriteJob::DexPoolAccounts {
+                    pool_address,
+                    base_mint,
+                    quote_mint,
+                    accounts,
+                } => {
+                    ctx.handle_dex_pool_accounts(&pool_address, &base_mint, &quote_mint, accounts);
+                }
+                ArbTrackerWriteJob::TokenMintInfo {
+                    mint,
+                    token_program,
+                } => {
+                    ctx.handle_token_mint_info(&mint, &token_program);
+                }
+                ArbTrackerWriteJob::PoolStateUpdate {
+                    pool_address,
+                    dex,
+                    reserve_base,
+                    reserve_quote,
+                    update_slot,
+                    active_id,
+                    bin_step,
+                    base_mint,
+                    quote_mint,
+                } => {
+                    ctx.handle_pool_state_update(
+                        &pool_address,
+                        &dex,
+                        reserve_base,
+                        reserve_quote,
+                        update_slot,
+                        active_id,
+                        bin_step,
+                        &base_mint,
+                        &quote_mint,
+                    );
+                }
+            }
+            ctx.tracker_write.record_queue_depth();
+        }
+        info!("arb-strategy tracker write worker stopped");
+    });
+}
+
+fn spawn_arb_pool_cache_sync_worker(ctx: Arc<ArbContext>, consumer: JetStreamPullConsumer) {
+    tokio::spawn(async move {
+        loop {
+            use futures::StreamExt;
+            match consumer
+                .fetch()
+                .max_messages(100)
+                .expires(Duration::from_millis(100))
+                .messages()
+                .await
+            {
+                Ok(mut messages) => {
+                    let mut pending = Vec::new();
+                    while let Some(msg_result) = messages.next().await {
+                        match msg_result {
+                            Ok(msg) => pending.push(msg),
+                            Err(e) => {
+                                warn!(error = %e, "Error receiving JetStream PoolCache message");
+                            }
+                        }
+                    }
+                    if pending.is_empty() {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+
+                    set_arb_pool_cache_apply_batch_size_gauge(pending.len() as u64);
+                    arb_pool_cache_apply_batches_inc();
+
+                    while !pending.is_empty() {
+                        let chunk_len = ARB_POOL_CACHE_APPLY_BATCH_MAX.min(pending.len());
+                        let chunk: Vec<_> = pending.drain(..chunk_len).collect();
+                        for msg in chunk {
+                            NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            match serde_json::from_slice::<PoolCacheUpdate>(&msg.payload) {
+                                Ok(update) => {
+                                    apply_pool_cache_jetstream_message(&ctx, update);
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to deserialize PoolCacheUpdate from JetStream");
+                                }
+                            }
+                            if let Err(e) = msg.ack().await {
+                                warn!(error = %e, "Failed to ack JetStream PoolCache message");
+                            }
+                        }
+                        arb_pool_cache_updates_applied_add(chunk_len as u64);
+                        if !pending.is_empty() {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    trace!(error = %e, "JetStream PoolCache fetch returned (timeout or no messages)");
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_arb_config_js_worker(ctx: Arc<ArbContext>, consumer: JetStreamPullConsumer) {
+    tokio::spawn(async move {
+        loop {
+            use futures::StreamExt;
+            if let Ok(mut messages) = consumer.fetch().max_messages(1).messages().await {
+                while let Some(msg_result) = messages.next().await {
+                    if let Ok(msg) = msg_result {
+                        NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        match serde_json::from_slice::<ConfigUpdate>(&msg.payload) {
+                            Ok(update) => {
+                                if update.target_component == "arb-strategy" {
+                                    info!(
+                                        component = %update.target_component,
+                                        keys = ?update.config.keys(),
+                                        source = "jetstream",
+                                        "Applying config update"
+                                    );
+                                    let response = ctx.apply_config_update(&update);
+                                    match response.status {
+                                        ConfigUpdateStatus::Applied => info!(
+                                            applied = ?response.applied_keys,
+                                            "Config update applied"
+                                        ),
+                                        ConfigUpdateStatus::Rejected => warn!(
+                                            rejected = ?response.rejected_keys,
+                                            "Config update rejected"
+                                        ),
+                                        ConfigUpdateStatus::PartiallyApplied => warn!(
+                                            applied = ?response.applied_keys,
+                                            rejected = ?response.rejected_keys,
+                                            "Config update partially applied"
+                                        ),
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to deserialize ConfigUpdate from JetStream");
+                            }
+                        }
+                        let _ = msg.ack().await;
+                    }
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -4197,6 +4578,12 @@ async fn main() -> Result<()> {
     );
 
     let (two_hop_tx, two_hop_rx) = mpsc::channel::<ArbTwoHopTradeJob>(ARB_TWO_HOP_WORKER_QUEUE_CAP);
+    let (tracker_write_tx, tracker_write_rx) =
+        mpsc::channel::<ArbTrackerWriteJob>(ARB_TRACKER_WRITE_QUEUE_CAP);
+    let tracker_write = ArbTrackerWriteHandle {
+        tx: tracker_write_tx,
+        capacity: ARB_TRACKER_WRITE_QUEUE_CAP,
+    };
 
     let ctx = Arc::new(ArbContext {
         run_id: run_id.clone(),
@@ -4222,8 +4609,10 @@ async fn main() -> Result<()> {
         arb_pinned_pools: RwLock::new(HashSet::new()),
         arb_track_published: AtomicU64::new(0),
         two_hop_tx,
+        tracker_write,
     });
 
+    spawn_arb_tracker_write_worker(Arc::clone(&ctx), tracker_write_rx);
     spawn_arb_two_hop_worker(Arc::clone(&ctx), two_hop_rx);
 
     // Bootstrap SLAVE LivePoolCache from JetStream (same path as execution-engine).
@@ -4447,15 +4836,22 @@ async fn main() -> Result<()> {
         spawn_arb_market_event_pipeline(ctx.clone(), sub);
     }
 
-    // Main event loop (config, JetStream cache sync, heartbeat — MarketEvents handled by pipeline)
+    if let Some(consumer) = pool_cache_consumer {
+        info!("Starting dedicated PoolCache JetStream sync worker (decoupled from main loop)");
+        spawn_arb_pool_cache_sync_worker(ctx.clone(), consumer);
+    }
+    if let Some(consumer) = config_js_consumer {
+        info!("Starting dedicated JetStream config consumer worker (decoupled from main loop)");
+        spawn_arb_config_js_worker(ctx.clone(), consumer);
+    }
+
+    // Main event loop (Core NATS config fallback, heartbeat, reconcile — heavy JetStream offloaded)
     info!("Entering main event loop");
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
     let mut cfg_sub = config_subscription;
-    let config_js_consumer_opt = config_js_consumer;
-    let pool_cache_consumer_opt = pool_cache_consumer;
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(60));
     let arb_reconcile_secs = ctx.config.read().arb_track_reconcile_interval_secs;
     let mut arb_track_reconcile_interval =
@@ -4463,6 +4859,9 @@ async fn main() -> Result<()> {
     arb_track_reconcile_interval.tick().await;
     let mut last_heartbeat_events_received = 0u64;
     let mut last_heartbeat_high_processed = 0u64;
+    let mut last_heartbeat_market_events_consumed =
+        MARKET_EVENTS_CONSUMED_TOTAL.load(Ordering::Relaxed);
+    let mut consecutive_zero_consumed_heartbeats = 0u32;
 
     loop {
         tokio::select! {
@@ -4495,127 +4894,6 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-
-            // Config updates from JetStream (preferred, persisted)
-            _ = async {
-                use futures::StreamExt;
-                if let Some(ref consumer) = config_js_consumer_opt {
-                    match consumer.fetch().max_messages(1).messages().await {
-                        Ok(mut messages) => {
-                            while let Some(msg_result) = messages.next().await {
-                                if let Ok(msg) = msg_result {
-                                    NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                    match serde_json::from_slice::<ConfigUpdate>(&msg.payload) {
-                                        Ok(update) => {
-                                            if update.target_component == "arb-strategy" {
-                                                info!(component = %update.target_component, keys = ?update.config.keys(), source = "jetstream", "Applying config update");
-                                                let response = ctx.apply_config_update(&update);
-                                                match response.status {
-                                                    ConfigUpdateStatus::Applied => info!(applied = ?response.applied_keys, "Config update applied"),
-                                                    ConfigUpdateStatus::Rejected => warn!(rejected = ?response.rejected_keys, "Config update rejected"),
-                                                    ConfigUpdateStatus::PartiallyApplied => warn!(applied = ?response.applied_keys, rejected = ?response.rejected_keys, "Config update partially applied"),
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!(error = %e, "Failed to deserialize ConfigUpdate from JetStream");
-                                        }
-                                    }
-                                    let _ = msg.ack().await;
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            // No new messages, this is normal
-                        }
-                    }
-                } else {
-                    std::future::pending::<()>().await
-                }
-            } => {}
-
-            // PoolCacheUpdates from JetStream (SLAVE sync from market-data MASTER)
-            _ = async {
-                use futures::StreamExt;
-                if let Some(ref consumer) = pool_cache_consumer_opt {
-                    match consumer
-                        .fetch()
-                        .max_messages(100)
-                        .expires(Duration::from_millis(100))
-                        .messages()
-                        .await
-                    {
-                        Ok(mut messages) => {
-                            while let Some(msg_result) = messages.next().await {
-                                match msg_result {
-                                    Ok(msg) => {
-                                        NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                        match serde_json::from_slice::<PoolCacheUpdate>(&msg.payload) {
-                                            Ok(update) => {
-                                                arb_strategy_pool_cache_update_seen_inc();
-                                                if !matches!(
-                                                    update.update_type,
-                                                    PoolCacheUpdateType::PoolRemoved
-                                                ) && arb_tracked_token_mint(
-                                                    &update.base_mint,
-                                                    &update.quote_mint,
-                                                )
-                                                .is_none()
-                                                {
-                                                    arb_strategy_pool_cache_update_skip_non_arb_quote_inc();
-                                                }
-                                                if sync_arb_slave_from_pool_cache_update(
-                                                    &ctx.live_pool_cache,
-                                                    &ctx.known_pools,
-                                                    ctx.multi_hop.as_ref(),
-                                                    &update,
-                                                ) {
-                                                    ctx.multi_hop
-                                                        .touch_live_pool_quote_ready(&update.pool_address);
-                                                    if ctx.seed_trackers_for_pool_cache_update(&update)
-                                                    {
-                                                        arb_strategy_pool_cache_update_seeded_inc();
-                                                        if let Some(mint) = arb_tracked_token_mint(
-                                                            &update.base_mint,
-                                                            &update.quote_mint,
-                                                        ) {
-                                                            ctx.maybe_publish_arb_track_incremental_for_mint(
-                                                                mint,
-                                                            );
-                                                        }
-                                                    } else {
-                                                        arb_strategy_pool_cache_update_skip_no_seed_inc();
-                                                    }
-                                                    debug!(
-                                                        pool = %update.pool_address,
-                                                        dex = %update.dex,
-                                                        update_type = ?update.update_type,
-                                                        "SLAVE CACHE: Pool cache update applied (JetStream)"
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                warn!(error = %e, "Failed to deserialize PoolCacheUpdate from JetStream");
-                                            }
-                                        }
-                                        if let Err(e) = msg.ack().await {
-                                            warn!(error = %e, "Failed to ack JetStream message");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, "Error receiving JetStream message");
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            trace!(error = %e, "JetStream fetch returned (timeout or no messages)");
-                        }
-                    }
-                } else {
-                    std::future::pending::<()>().await
-                }
-            } => {}
 
             // Heartbeat
             _ = heartbeat_interval.tick() => {
@@ -4651,6 +4929,26 @@ async fn main() -> Result<()> {
                 let events_delta = events_received.saturating_sub(last_heartbeat_events_received);
                 let high_processed_delta =
                     high_processed.saturating_sub(last_heartbeat_high_processed);
+                let market_events_consumed =
+                    MARKET_EVENTS_CONSUMED_TOTAL.load(Ordering::Relaxed);
+                let consumed_delta = market_events_consumed
+                    .saturating_sub(last_heartbeat_market_events_consumed);
+                if consumed_delta == 0 && events_delta > 0 {
+                    consecutive_zero_consumed_heartbeats =
+                        consecutive_zero_consumed_heartbeats.saturating_add(1);
+                    if consecutive_zero_consumed_heartbeats >= 2 {
+                        warn!(
+                            consumed_delta,
+                            events_delta,
+                            market_events_consumed,
+                            events_received,
+                            high_queue_depth,
+                            "arb market event consumer stalled (MD events received but consumed delta=0 for 2+ heartbeats)"
+                        );
+                    }
+                } else {
+                    consecutive_zero_consumed_heartbeats = 0;
+                }
                 if events_delta > 0 && high_processed_delta == 0 && high_queue_depth > high_queue_cap / 2
                 {
                     warn!(
@@ -4662,9 +4960,12 @@ async fn main() -> Result<()> {
                 }
                 last_heartbeat_events_received = events_received;
                 last_heartbeat_high_processed = high_processed;
+                last_heartbeat_market_events_consumed = market_events_consumed;
 
                 info!(
                     events_received,
+                    market_events_consumed,
+                    market_events_consumed_delta = consumed_delta,
                     pools_tracked = ctx.pools_tracked.load(Ordering::Relaxed),
                     tokens_tracked = trackers.len(),
                     multi_dex_tokens = multi_dex_tokens,
@@ -4735,7 +5036,15 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             initial_liquidity_sol,
         } => {
             let liquidity = initial_liquidity_sol.unwrap_or(Decimal::ZERO);
-            ctx.handle_pool_created(pool_address, base_mint, quote_mint, dex, liquidity);
+            let _ = ctx
+                .tracker_write
+                .try_enqueue(ArbTrackerWriteJob::PoolCreated {
+                    pool_address: pool_address.clone(),
+                    base_mint: base_mint.clone(),
+                    quote_mint: quote_mint.clone(),
+                    dex: dex.clone(),
+                    liquidity_sol: liquidity,
+                });
             None
         }
 
@@ -4807,7 +5116,14 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
                 accounts_len = accounts.len(),
                 "Received DexPoolAccounts event"
             );
-            ctx.handle_dex_pool_accounts(pool_address, base_mint, quote_mint, accounts.clone());
+            let _ = ctx
+                .tracker_write
+                .try_enqueue(ArbTrackerWriteJob::DexPoolAccounts {
+                    pool_address: pool_address.clone(),
+                    base_mint: base_mint.clone(),
+                    quote_mint: quote_mint.clone(),
+                    accounts: accounts.clone(),
+                });
             None
         }
 
@@ -4824,17 +5140,19 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             quote_mint,
             ..
         } => {
-            ctx.handle_pool_state_update(
-                pool_address,
-                dex,
-                *reserve_base,
-                *reserve_quote,
-                *update_slot,
-                *active_id,
-                *bin_step,
-                base_mint,
-                quote_mint,
-            );
+            let _ = ctx
+                .tracker_write
+                .try_enqueue(ArbTrackerWriteJob::PoolStateUpdate {
+                    pool_address: pool_address.clone(),
+                    dex: dex.clone(),
+                    reserve_base: *reserve_base,
+                    reserve_quote: *reserve_quote,
+                    update_slot: *update_slot,
+                    active_id: *active_id,
+                    bin_step: *bin_step,
+                    base_mint: base_mint.clone(),
+                    quote_mint: quote_mint.clone(),
+                });
             None
         }
 
@@ -4855,7 +5173,12 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             token_program,
             ..
         } => {
-            ctx.handle_token_mint_info(mint, token_program);
+            let _ = ctx
+                .tracker_write
+                .try_enqueue(ArbTrackerWriteJob::TokenMintInfo {
+                    mint: mint.clone(),
+                    token_program: token_program.clone(),
+                });
             None
         }
 
@@ -5198,6 +5521,137 @@ mod event_pipeline_tests {
         );
         assert_eq!(coalescer.lock().len(), 2);
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn heartbeat_ticks_under_pool_cache_burst_and_parallel_trades() {
+        use ironcrab::execution::live_pool_cache::create_shared_cache;
+
+        let live_pool_cache = create_shared_cache();
+        let log_dir = std::env::temp_dir().join(format!("arb_burst_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&log_dir).expect("test log dir");
+        let jsonl_writer =
+            JsonlWriter::new(JsonlWriterConfig::new("arb_burst_test").with_log_dir(log_dir))
+                .expect("jsonl writer");
+        let (tracker_write_tx, tracker_write_rx) =
+            mpsc::channel::<ArbTrackerWriteJob>(ARB_TRACKER_WRITE_QUEUE_CAP);
+        let tracker_write = ArbTrackerWriteHandle {
+            tx: tracker_write_tx,
+            capacity: ARB_TRACKER_WRITE_QUEUE_CAP,
+        };
+        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopTradeJob>(1);
+
+        let ctx = Arc::new(ArbContext {
+            run_id: TEST_RUN.to_string(),
+            config: RwLock::new(ArbConfig::default()),
+            nats: None,
+            jsonl_writer,
+            trackers: RwLock::new(HashMap::new()),
+            events_received: AtomicU64::new(0),
+            pools_tracked: AtomicU64::new(0),
+            opportunities_found: AtomicU64::new(0),
+            intents_generated: AtomicU64::new(0),
+            intent_counter: AtomicU64::new(0),
+            zero_amount_trades: AtomicU64::new(0),
+            data_quality_rejects: AtomicU64::new(0),
+            last_market_event: RwLock::new(Instant::now()),
+            vault_balances: RwLock::new(HashMap::new()),
+            bin_arrays: RwLock::new(HashMap::new()),
+            live_pool_cache,
+            known_pools: RwLock::new(HashSet::new()),
+            multi_hop: Arc::new(MultiHopArbitrage::new(
+                MultiHopConfig::default(),
+                create_shared_cache(),
+            )),
+            spread_too_large_warn_last: RwLock::new(HashMap::new()),
+            eligibility_forensics: ArbEligibilityForensics::new(),
+            arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_track_published: AtomicU64::new(0),
+            two_hop_tx,
+            tracker_write,
+        });
+        spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
+
+        let token_mint = Pubkey::new_unique().to_string();
+        let trade_mint = token_mint.clone();
+        let heartbeat_ctx = ctx.clone();
+        let heartbeat = tokio::spawn(async move {
+            let mut ticks = 0u32;
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        ticks += 1;
+                        let _ = heartbeat_ctx.trackers.read().len();
+                    }
+                }
+            }
+            ticks
+        });
+
+        let burst_ctx = ctx.clone();
+        let burst = tokio::spawn(async move {
+            for i in 0..100usize {
+                let pool = Pubkey::new_unique();
+                let update = PoolCacheUpdate::new_balance_updated(
+                    TEST_COMPONENT,
+                    TEST_BUILD,
+                    TEST_RUN,
+                    pool.to_string(),
+                    "raydium".to_string(),
+                    token_mint.clone(),
+                    NATIVE_SOL_MINT.to_string(),
+                    1_000_000_000,
+                    1_000_000_000,
+                    i as u64 + 100,
+                );
+                apply_pool_cache_jetstream_message(&burst_ctx, update);
+                if (i + 1) % ARB_POOL_CACHE_APPLY_BATCH_MAX == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+
+        let trade_ctx = ctx.clone();
+        let trades = tokio::spawn(async move {
+            for i in 0..50usize {
+                let pool = format!("pool-trade-{i}");
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let job = ArbTwoHopTradeJob {
+                    pool_address: pool,
+                    mint: trade_mint.clone(),
+                    quote_mint: NATIVE_SOL_MINT.to_string(),
+                    sol_amount: 10_000_000,
+                    token_amount: 1_000_000,
+                    token_decimals: 6,
+                    is_buy: true,
+                    dex: "raydium".to_string(),
+                    slot: Some(1),
+                    ts_unix_ms: 1,
+                };
+                trade_ctx
+                    .tracker_write
+                    .enqueue(ArbTrackerWriteJob::HandleTrade {
+                        job,
+                        reply: reply_tx,
+                    })
+                    .await;
+                let _ = tokio::time::timeout(Duration::from_secs(1), reply_rx).await;
+            }
+        });
+
+        let ticks = tokio::time::timeout(Duration::from_secs(5), heartbeat)
+            .await
+            .expect("heartbeat task timed out")
+            .expect("heartbeat task panicked");
+        burst.await.expect("burst task panicked");
+        trades.await.expect("trades task panicked");
+        assert!(
+            ticks >= 5,
+            "expected heartbeat to tick under PoolCache burst + trade load, got {ticks}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5288,6 +5742,10 @@ mod two_hop_price_tests {
             two_hop_tx: {
                 let (tx, _rx) = mpsc::channel(1);
                 tx
+            },
+            tracker_write: {
+                let (tx, _rx) = mpsc::channel(1);
+                ArbTrackerWriteHandle { tx, capacity: 1 }
             },
         }
     }
