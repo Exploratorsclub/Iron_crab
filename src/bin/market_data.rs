@@ -133,6 +133,7 @@ use ironcrab::nats::{
     TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_MOMENTUM_ACTIVE_POOLS,
     TOPIC_PRIORITY_FEE_SAMPLES, WALLET_SNAPSHOT_STREAM_NAME,
 };
+use ironcrab::position_authority::is_sol_or_wsol_mint;
 use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
 use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
@@ -4756,6 +4757,18 @@ mod execution_result_sell_close_tests {
     }
 }
 
+/// True when stale JetStream bootstrap cleanup should publish a zero-balance override for `mint`.
+///
+/// Native SOL and WSOL sentinels are never ghost SPL ATAs and must be excluded (P0 PR #250 follow-up).
+#[inline]
+fn wallet_snapshot_stale_cleanup_targets_mint(
+    mint: &str,
+    balance_raw: u64,
+    published_mint_set: &HashSet<String>,
+) -> bool {
+    !is_sol_or_wsol_mint(mint) && balance_raw > 0 && !published_mint_set.contains(mint)
+}
+
 /// Publish wallet token balance snapshot for position reconciliation.
 ///
 /// Called at market-data startup to provide momentum-bot with current wallet state.
@@ -4834,7 +4847,11 @@ async fn publish_wallet_snapshot_stale_jetstream_cleanup(
                 token_program: tp,
             } = &event.kind
             {
-                if mint != WSOL_MINT && *balance_raw > 0 && !published_mint_set.contains(mint) {
+                if wallet_snapshot_stale_cleanup_targets_mint(
+                    mint,
+                    *balance_raw,
+                    published_mint_set,
+                ) {
                     let override_event = MarketEvent::new(
                         "market-data",
                         BUILD_VERSION,
@@ -5333,21 +5350,24 @@ async fn publish_wallet_snapshot(
         ctx.write_market_event_jsonl(&event);
     }
 
-    // 2.5) Stale JetStream Cleanup: Override ghost entries not covered by bootstrap/periodic scan.
+    // 2.5) Stale JetStream Cleanup: Override ghost entries not covered by bootstrap scan.
     //
     // JetStream may contain entries for mints that were sold/closed in previous runs,
     // but never got their zero-balance override. Publish zero-balance overrides for any
-    // non-zero mints not already covered. No additional RPC calls.
-    if let Some(ref nats) = ctx.nats {
-        let published_mint_set: HashSet<String> =
-            known_mints.iter().map(|m| m.to_string()).collect();
-        publish_wallet_snapshot_stale_jetstream_cleanup(
-            ctx.as_ref(),
-            nats,
-            &wallet_str,
-            &published_mint_set,
-        )
-        .await;
+    // non-zero SPL mints not already covered. No additional RPC calls.
+    // Startup only: periodic snapshots must not invalidate JetStream without a full owner scan.
+    if !is_periodic {
+        if let Some(ref nats) = ctx.nats {
+            let published_mint_set: HashSet<String> =
+                known_mints.iter().map(|m| m.to_string()).collect();
+            publish_wallet_snapshot_stale_jetstream_cleanup(
+                ctx.as_ref(),
+                nats,
+                &wallet_str,
+                &published_mint_set,
+            )
+            .await;
+        }
     }
 
     // 3) Update tracked wallet accounts for Geyser subscription (wallet + WSOL + token ATAs).
@@ -5584,6 +5604,31 @@ async fn publish_wallet_snapshot(
     );
 
     if is_periodic {
+        // Republish cached native SOL (bootstrap/Geyser-seeded) without RPC.
+        if let Some(ref tracked_wallet) = ctx.tracked_wallet {
+            if let Some(ref nats) = ctx.nats {
+                let sol_lamports = tracked_wallet.last_sol_balance.load(Ordering::Relaxed);
+                let sol_snapshot = MarketEvent::new(
+                    "market-data",
+                    BUILD_VERSION,
+                    &ctx.run_id,
+                    "wallet_snapshot_periodic_NATIVE_SOL".to_string(),
+                    "wallet_bootstrap",
+                    None,
+                    MarketEventKind::WalletBalanceSnapshot {
+                        mint: "NATIVE_SOL".to_string(),
+                        balance_raw: sol_lamports,
+                        decimals: 9,
+                        token_program: "system".to_string(),
+                    },
+                );
+                let sol_subject = wallet_snapshot_subject(&wallet_str, "NATIVE_SOL");
+                if let Err(e) = nats.jetstream_publish(&sol_subject, &sol_snapshot).await {
+                    warn!(error = %e, "Failed to republish native SOL WalletBalanceSnapshot (periodic)");
+                }
+            }
+        }
+
         ironcrab::metrics::market_data_wallet_snapshot_periodic_published_inc();
         info!(
             wallet = %wallet_str,
@@ -10261,6 +10306,251 @@ mod wallet_geyser_snapshot_decouple_tests {
             })
             .is_none()
         );
+    }
+}
+
+/// P0: stale JetStream cleanup must not zero NATIVE_SOL; SPL ghosts still cleared.
+#[cfg(test)]
+mod wallet_snapshot_stale_cleanup_tests {
+    use super::*;
+    use ironcrab::nats::{ensure_wallet_snapshot_stream, NatsClient, NatsConfig};
+    use std::collections::HashSet;
+    use std::process::{Child, Command, Stdio};
+
+    struct NatsTestServer {
+        _child: Child,
+        _store_dir: tempfile::TempDir,
+        url: String,
+    }
+
+    impl NatsTestServer {
+        fn start() -> Self {
+            let store_dir = tempfile::tempdir().expect("jetstream store tempdir");
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("bind ephemeral port")
+                .local_addr()
+                .expect("local addr")
+                .port();
+            let child = Command::new("nats-server")
+                .args([
+                    "-js",
+                    "-p",
+                    &port.to_string(),
+                    "-sd",
+                    store_dir.path().to_str().expect("tempdir path utf8"),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn nats-server");
+            let url = format!("nats://127.0.0.1:{port}");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            Self {
+                _child: child,
+                _store_dir: store_dir,
+                url,
+            }
+        }
+    }
+
+    impl Drop for NatsTestServer {
+        fn drop(&mut self) {
+            let _ = self._child.kill();
+            let _ = self._child.wait();
+        }
+    }
+
+    fn minimal_market_data_context_with_nats(nats: NatsClient) -> MarketDataContext {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let (tracked_wallet_tx, _) = watch::channel(Vec::<Pubkey>::new());
+        let (tracked_mints_tx, _tracked_mints_rx) = watch::channel(Vec::<Pubkey>::new());
+        let (tracked_vaults_tx, _tracked_vaults_rx) = watch::channel(Vec::<Pubkey>::new());
+        let (tracked_bin_arrays_tx, _tracked_bin_arrays_rx) = watch::channel(Vec::<Pubkey>::new());
+        MarketDataContext {
+            run_id: "run-stale-cleanup-test".to_string(),
+            config: parking_lot::RwLock::new(MarketDataConfig::default()),
+            geyser_full_reconnect_threshold_live: Arc::new(AtomicUsize::new(0)),
+            nats: Some(nats),
+            jsonl_writer: jsonl,
+            started_at: Instant::now(),
+            event_counter: std::sync::atomic::AtomicU64::new(0),
+            wallet_tracker: WalletTracker::new(WalletTrackerCfg::default()),
+            priority_fee_tracker: Arc::new(PriorityFeeTracker::new()),
+            tracked_mints: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tracked_mints_tx,
+            hot_pool_registry: Arc::new(UnifiedHotPoolRegistry::new()),
+            known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            known_trade_dex_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            pumpfun_pool_discovery_mint_info_emitted: parking_lot::RwLock::new(
+                std::collections::HashSet::new(),
+            ),
+            tracked_vaults: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tracked_vaults_tx,
+            tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tracked_bin_arrays_tx,
+            tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
+            pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
+            live_pool_cache: Arc::new(LivePoolCache::new()),
+            creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            high_priority_bonding_curves: parking_lot::RwLock::new(HashSet::new()),
+            raydium_serum_fetched: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            tracked_wallet: None,
+            tracked_wallet_tx,
+            tracked_wallet_token_accounts: parking_lot::RwLock::new(
+                std::collections::HashSet::new(),
+            ),
+            tracked_wallet_mint_decimals: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            execution_results_deduper: parking_lot::Mutex::new(ExecutionResultDeduper::default()),
+            last_emitted_curve_progress: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            bonding_curve_publish_times: parking_lot::Mutex::new(BondingCurvePublishTimes::new()),
+            pump_amm_dex: parking_lot::RwLock::new(None),
+            helius_rpc: None,
+            geyser_sync_batch_timer: parking_lot::Mutex::new(None),
+            geyser_sync_flush_timestamps: parking_lot::Mutex::new(Vec::new()),
+            geyser_sync_debounce_epoch: AtomicU64::new(0),
+            ingest_tokio_handle: parking_lot::RwLock::new(None),
+            pool_discovery_poolcreated_emitted: parking_lot::RwLock::new(
+                std::collections::HashSet::new(),
+            ),
+            last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
+            pending_geyser_evict: AtomicBool::new(false),
+            geyser_lru_index: parking_lot::Mutex::new(GeyserLruIndex::default()),
+            last_momentum_snapshot_target: parking_lot::RwLock::new(None),
+            last_arb_snapshot_target: parking_lot::RwLock::new(None),
+        }
+    }
+
+    fn wallet_balance_snapshot_event(mint: &str, balance_raw: u64) -> MarketEvent {
+        MarketEvent::new(
+            "market-data",
+            BUILD_VERSION,
+            "run-stale-cleanup-test",
+            format!("seed_{mint}"),
+            "wallet_bootstrap",
+            None,
+            MarketEventKind::WalletBalanceSnapshot {
+                mint: mint.to_string(),
+                balance_raw,
+                decimals: 9,
+                token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            },
+        )
+    }
+
+    async fn latest_wallet_snapshot_balance(
+        client: &async_nats::Client,
+        wallet: &str,
+        mint: &str,
+    ) -> Option<u64> {
+        use async_nats::jetstream;
+        use futures::StreamExt;
+
+        let js = jetstream::new(client.clone());
+        let stream = js.get_stream(WALLET_SNAPSHOT_STREAM_NAME).await.ok()?;
+        let mut consumer_config = wallet_snapshot_consumer_config();
+        consumer_config.filter_subject = wallet_snapshot_subject(wallet, mint);
+        let consumer = stream.create_consumer(consumer_config).await.ok()?;
+        let mut messages = consumer.fetch().max_messages(1).messages().await.ok()?;
+        let msg = messages.next().await?.ok()?;
+        let event: MarketEvent = serde_json::from_slice(&msg.payload).ok()?;
+        let _ = msg.ack().await;
+        match event.kind {
+            MarketEventKind::WalletBalanceSnapshot { balance_raw, .. } => Some(balance_raw),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn native_sol_and_wsol_never_stale_cleanup_targets() {
+        let published = HashSet::new();
+        assert!(!wallet_snapshot_stale_cleanup_targets_mint(
+            "NATIVE_SOL",
+            3_120_902_733,
+            &published
+        ));
+        assert!(!wallet_snapshot_stale_cleanup_targets_mint(
+            NATIVE_SOL_MINT,
+            1,
+            &published
+        ));
+        assert!(!wallet_snapshot_stale_cleanup_targets_mint(
+            WSOL_MINT, 1, &published
+        ));
+    }
+
+    #[test]
+    fn spl_ghost_mint_is_stale_cleanup_target_when_not_published() {
+        let ghost = "GhostMint1111111111111111111111111111111111";
+        let published = HashSet::new();
+        assert!(wallet_snapshot_stale_cleanup_targets_mint(
+            ghost, 42, &published
+        ));
+        let mut published_with_ghost = HashSet::new();
+        published_with_ghost.insert(ghost.to_string());
+        assert!(!wallet_snapshot_stale_cleanup_targets_mint(
+            ghost,
+            42,
+            &published_with_ghost
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stale_cleanup_zeros_spl_ghost_but_preserves_native_sol() {
+        let server = NatsTestServer::start();
+        let mut nats = NatsClient::new(NatsConfig::new(&server.url, "stale-cleanup-test"));
+        nats.connect().await.expect("connect nats");
+        ensure_wallet_snapshot_stream(nats.client())
+            .await
+            .expect("wallet snapshot stream");
+
+        let wallet = Pubkey::new_unique();
+        let wallet_str = wallet.to_string();
+        const NATIVE_BALANCE: u64 = 3_120_902_733;
+        const GHOST_MINT: &str = "GhostMint1111111111111111111111111111111111";
+        const GHOST_BALANCE: u64 = 999_000;
+
+        assert!(nats
+            .jetstream_publish(
+                &wallet_snapshot_subject(&wallet_str, "NATIVE_SOL"),
+                &wallet_balance_snapshot_event("NATIVE_SOL", NATIVE_BALANCE),
+            )
+            .await
+            .expect("publish native sol"));
+        assert!(nats
+            .jetstream_publish(
+                &wallet_snapshot_subject(&wallet_str, GHOST_MINT),
+                &wallet_balance_snapshot_event(GHOST_MINT, GHOST_BALANCE),
+            )
+            .await
+            .expect("publish ghost"));
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let ctx = minimal_market_data_context_with_nats(nats);
+        let published_mint_set = HashSet::new();
+        publish_wallet_snapshot_stale_jetstream_cleanup(
+            &ctx,
+            ctx.nats.as_ref().expect("nats"),
+            &wallet_str,
+            &published_mint_set,
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let client = ctx.nats.as_ref().expect("nats").client().clone();
+        let native_after = latest_wallet_snapshot_balance(&client, &wallet_str, "NATIVE_SOL")
+            .await
+            .expect("native sol snapshot");
+        let ghost_after = latest_wallet_snapshot_balance(&client, &wallet_str, GHOST_MINT)
+            .await
+            .expect("ghost snapshot");
+
+        assert_eq!(native_after, NATIVE_BALANCE);
+        assert_eq!(ghost_after, 0);
     }
 }
 
