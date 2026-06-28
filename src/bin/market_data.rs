@@ -133,6 +133,7 @@ use ironcrab::nats::{
     TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_MOMENTUM_ACTIVE_POOLS,
     TOPIC_PRIORITY_FEE_SAMPLES, WALLET_SNAPSHOT_STREAM_NAME,
 };
+use ironcrab::position_authority::is_sol_or_wsol_mint;
 use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
 use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
@@ -4756,6 +4757,16 @@ mod execution_result_sell_close_tests {
     }
 }
 
+/// True when stale JetStream cleanup should publish a zero-balance override for `mint`.
+#[inline]
+fn wallet_snapshot_stale_cleanup_targets_mint(
+    mint: &str,
+    balance_raw: u64,
+    published_mint_set: &HashSet<String>,
+) -> bool {
+    !is_sol_or_wsol_mint(mint) && balance_raw > 0 && !published_mint_set.contains(mint)
+}
+
 /// Publish wallet token balance snapshot for position reconciliation.
 ///
 /// Called at market-data startup to provide momentum-bot with current wallet state.
@@ -4834,7 +4845,11 @@ async fn publish_wallet_snapshot_stale_jetstream_cleanup(
                 token_program: tp,
             } = &event.kind
             {
-                if mint != WSOL_MINT && *balance_raw > 0 && !published_mint_set.contains(mint) {
+                if wallet_snapshot_stale_cleanup_targets_mint(
+                    mint,
+                    *balance_raw,
+                    published_mint_set,
+                ) {
                     let override_event = MarketEvent::new(
                         "market-data",
                         BUILD_VERSION,
@@ -4898,9 +4913,14 @@ async fn publish_wallet_snapshot(
     use futures::StreamExt;
     use std::collections::{HashMap, HashSet};
 
-    // Constraint: At most one RPC roundtrip on restart.
-    // In practice this also bounds the tracked accounts we add for wallet tracking.
+    // Constraint: At most one RPC roundtrip on restart (bootstrap).
+    // Periodic cold-path snapshots use owner-scan for full wallet coverage (no JetStream cap).
     const MAX_BOOTSTRAP_MINTS: usize = 30;
+    let max_jetstream_seed_mints = if is_periodic {
+        512usize
+    } else {
+        MAX_BOOTSTRAP_MINTS
+    };
 
     let token_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
         .expect("valid token program");
@@ -4933,7 +4953,7 @@ async fn publish_wallet_snapshot(
                         // If there are more, we cap to keep bootstrap to 1 RPC call.
                         let mut messages = consumer
                             .fetch()
-                            .max_messages(MAX_BOOTSTRAP_MINTS.saturating_mul(2))
+                            .max_messages(max_jetstream_seed_mints.saturating_mul(2))
                             .messages()
                             .await?;
 
@@ -4973,7 +4993,7 @@ async fn publish_wallet_snapshot(
                                 }
                             }
                             let _ = msg.ack().await;
-                            if known_mints.len() >= MAX_BOOTSTRAP_MINTS {
+                            if known_mints.len() >= max_jetstream_seed_mints {
                                 break;
                             }
                         }
@@ -5333,11 +5353,8 @@ async fn publish_wallet_snapshot(
         ctx.write_market_event_jsonl(&event);
     }
 
-    // 2.5) Stale JetStream Cleanup: Override ghost entries not covered by bootstrap/periodic scan.
-    //
-    // JetStream may contain entries for mints that were sold/closed in previous runs,
-    // but never got their zero-balance override. Publish zero-balance overrides for any
-    // non-zero mints not already covered. No additional RPC calls.
+    // 2.5) Stale JetStream Cleanup: Override ghost SPL entries not covered by scan.
+    // Bootstrap AND periodic cold-path snapshots run full owner-scan + this cleanup.
     if let Some(ref nats) = ctx.nats {
         let published_mint_set: HashSet<String> =
             known_mints.iter().map(|m| m.to_string()).collect();
@@ -5584,6 +5601,31 @@ async fn publish_wallet_snapshot(
     );
 
     if is_periodic {
+        // Republish cached native SOL (bootstrap/Geyser-seeded) without RPC.
+        if let Some(ref tracked_wallet) = ctx.tracked_wallet {
+            if let Some(ref nats) = ctx.nats {
+                let sol_lamports = tracked_wallet.last_sol_balance.load(Ordering::Relaxed);
+                let sol_snapshot = MarketEvent::new(
+                    "market-data",
+                    BUILD_VERSION,
+                    &ctx.run_id,
+                    "wallet_snapshot_periodic_NATIVE_SOL".to_string(),
+                    "wallet_bootstrap",
+                    None,
+                    MarketEventKind::WalletBalanceSnapshot {
+                        mint: "NATIVE_SOL".to_string(),
+                        balance_raw: sol_lamports,
+                        decimals: 9,
+                        token_program: "system".to_string(),
+                    },
+                );
+                let sol_subject = wallet_snapshot_subject(&wallet_str, "NATIVE_SOL");
+                if let Err(e) = nats.jetstream_publish(&sol_subject, &sol_snapshot).await {
+                    warn!(error = %e, "Failed to republish native SOL WalletBalanceSnapshot (periodic)");
+                }
+            }
+        }
+
         ironcrab::metrics::market_data_wallet_snapshot_periodic_published_inc();
         info!(
             wallet = %wallet_str,

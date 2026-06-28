@@ -9161,17 +9161,44 @@ fn mint_has_positive_wallet_balance(
 /// Result of JetStream wallet-hint preload for JSONL/KV recovery gating.
 #[derive(Debug, Clone)]
 struct WalletHintPreload {
-    hints: HashMap<String, u64>,
+    /// Latest balance per mint (balance_raw, ts_unix_ms) from JetStream LastPerSubject replay.
+    latest_by_mint: HashMap<String, (u64, u64)>,
     /// True when the wallet snapshot stream was read (even if no per-mint hints).
     stream_loaded: bool,
 }
 
-/// When stream preload succeeded: block recovery unless latest hint balance > 0.
-fn wallet_hint_blocks_position_recovery(preload: &WalletHintPreload, mint: &str) -> bool {
-    if !preload.stream_loaded {
-        return false;
+impl WalletHintPreload {
+    fn mints_in_wallet_from_hints(&self) -> HashSet<String> {
+        self.latest_by_mint
+            .iter()
+            .filter(|(mint, (balance, _))| *balance > 0 && !is_non_tradeable_momentum_mint(mint))
+            .map(|(mint, _)| mint.clone())
+            .collect()
     }
-    preload.hints.get(mint).is_none_or(|balance| *balance == 0)
+}
+
+/// Allow JSONL/KV position recovery only when wallet evidence shows the mint is held.
+///
+/// Safer default for empty-wallet prod: missing JetStream hint or zero balance → skip.
+fn jsonl_kv_position_recovery_allowed(
+    mint: &str,
+    preload: &WalletHintPreload,
+    mints_in_wallet: &HashSet<String>,
+) -> bool {
+    if mints_in_wallet.contains(mint) {
+        return true;
+    }
+    if mint_has_positive_wallet_balance(mint, &preload.latest_by_mint) {
+        return true;
+    }
+    if preload.stream_loaded {
+        debug!(
+            mint = %mint,
+            hint_balance = ?preload.latest_by_mint.get(mint).map(|(b, _)| *b),
+            "Skipping JSONL/KV position recovery: JetStream wallet hint missing or zero"
+        );
+    }
+    false
 }
 
 /// Preload latest per-mint wallet balances from JetStream (last-write-wins on `ts_unix_ms`).
@@ -9182,7 +9209,7 @@ async fn fetch_latest_wallet_balance_hints_from_jetstream(nats: &NatsClient) -> 
     let jetstream = jetstream::new(nats.client().clone());
     let Ok(stream) = jetstream.get_stream(WALLET_SNAPSHOT_STREAM_NAME).await else {
         return WalletHintPreload {
-            hints: HashMap::new(),
+            latest_by_mint: HashMap::new(),
             stream_loaded: false,
         };
     };
@@ -9191,7 +9218,7 @@ async fn fetch_latest_wallet_balance_hints_from_jetstream(nats: &NatsClient) -> 
         .await
     else {
         return WalletHintPreload {
-            hints: HashMap::new(),
+            latest_by_mint: HashMap::new(),
             stream_loaded: false,
         };
     };
@@ -9235,10 +9262,7 @@ async fn fetch_latest_wallet_balance_hints_from_jetstream(nats: &NatsClient) -> 
     }
 
     WalletHintPreload {
-        hints: latest_by_mint
-            .into_iter()
-            .map(|(mint, (balance, _))| (mint, balance))
-            .collect(),
+        latest_by_mint,
         stream_loaded: true,
     }
 }
@@ -9537,13 +9561,15 @@ async fn main() -> Result<()> {
         fetch_latest_wallet_balance_hints_from_jetstream(nats_client).await
     } else {
         WalletHintPreload {
-            hints: HashMap::new(),
+            latest_by_mint: HashMap::new(),
             stream_loaded: false,
         }
     };
+    let mints_in_wallet_for_recovery = wallet_hint_preload.mints_in_wallet_from_hints();
     if wallet_hint_preload.stream_loaded {
         info!(
-            count = wallet_hint_preload.hints.len(),
+            count = wallet_hint_preload.latest_by_mint.len(),
+            mints_in_wallet = mints_in_wallet_for_recovery.len(),
             "Preloaded latest JetStream wallet balance hints for position recovery gate"
         );
     }
@@ -9597,12 +9623,17 @@ async fn main() -> Result<()> {
         let mut merged_count = 0u32;
         let mut jsonl_skipped_wallet_gate = 0u32;
         for (mint, jsonl_tracker) in &jsonl_positions {
-            if wallet_hint_blocks_position_recovery(&wallet_hint_preload, mint) {
+            if !jsonl_kv_position_recovery_allowed(
+                mint,
+                &wallet_hint_preload,
+                &mints_in_wallet_for_recovery,
+            ) {
                 jsonl_skipped_wallet_gate += 1;
                 info!(
                     mint = %mint,
-                    hint_balance = ?wallet_hint_preload.hints.get(mint),
-                    "Skipping JSONL position recovery: JetStream wallet hint missing or zero"
+                    hint_balance = ?wallet_hint_preload.latest_by_mint.get(mint).map(|(b, _)| *b),
+                    in_wallet_snapshot = mints_in_wallet_for_recovery.contains(mint),
+                    "Skipping JSONL position recovery: no positive wallet evidence (hint missing or zero)"
                 );
                 continue;
             }
@@ -9637,7 +9668,11 @@ async fn main() -> Result<()> {
             );
         }
         for (mint, kv_tracker) in kv_positions {
-            if wallet_hint_blocks_position_recovery(&wallet_hint_preload, &mint) {
+            if !jsonl_kv_position_recovery_allowed(
+                &mint,
+                &wallet_hint_preload,
+                &mints_in_wallet_for_recovery,
+            ) {
                 continue;
             }
             positions.entry(mint).or_insert(kv_tracker);
@@ -12821,34 +12856,52 @@ mod tests {
     }
 
     #[test]
-    fn wallet_hint_blocks_position_recovery_when_missing_or_zero() {
-        let loaded = WalletHintPreload {
+    fn jsonl_kv_recovery_allowed_only_with_positive_wallet_evidence() {
+        let preload = WalletHintPreload {
             stream_loaded: true,
-            hints: HashMap::from([
-                ("GhostMint1111111111111111111111111111111".to_string(), 0),
-                ("LiveMint11111111111111111111111111111111".to_string(), 42),
+            latest_by_mint: HashMap::from([
+                (
+                    "GhostMint1111111111111111111111111111111".to_string(),
+                    (0, 1),
+                ),
+                (
+                    "LiveMint11111111111111111111111111111111".to_string(),
+                    (42, 2),
+                ),
             ]),
         };
-        assert!(wallet_hint_blocks_position_recovery(
-            &loaded,
-            "GhostMint1111111111111111111111111111111"
+        let mints_in_wallet =
+            HashSet::from(["LiveMint11111111111111111111111111111111".to_string()]);
+
+        assert!(!jsonl_kv_position_recovery_allowed(
+            "GhostMint1111111111111111111111111111111",
+            &preload,
+            &mints_in_wallet,
         ));
-        assert!(wallet_hint_blocks_position_recovery(
-            &loaded,
-            "MissingMint111111111111111111111111111111"
+        assert!(!jsonl_kv_position_recovery_allowed(
+            "MissingMint111111111111111111111111111111",
+            &preload,
+            &mints_in_wallet,
         ));
-        assert!(!wallet_hint_blocks_position_recovery(
-            &loaded,
-            "LiveMint11111111111111111111111111111111"
+        assert!(jsonl_kv_position_recovery_allowed(
+            "LiveMint11111111111111111111111111111111",
+            &preload,
+            &mints_in_wallet,
+        ));
+        assert!(jsonl_kv_position_recovery_allowed(
+            "LiveMint11111111111111111111111111111111",
+            &preload,
+            &HashSet::new(),
         ));
 
         let unavailable = WalletHintPreload {
             stream_loaded: false,
-            hints: HashMap::new(),
+            latest_by_mint: HashMap::new(),
         };
-        assert!(!wallet_hint_blocks_position_recovery(
+        assert!(!jsonl_kv_position_recovery_allowed(
+            "AnyMint111111111111111111111111111111111",
             &unavailable,
-            "AnyMint111111111111111111111111111111111"
+            &HashSet::new(),
         ));
     }
 

@@ -2377,35 +2377,58 @@ fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoH
             if !two_hop_enabled {
                 continue;
             }
-            if let Some(opp) = ctx.handle_trade(
-                &job.pool_address,
-                &job.mint,
-                &job.quote_mint,
-                job.sol_amount,
-                job.token_amount,
-                job.token_decimals,
-                job.is_buy,
-                &job.dex,
-            ) {
-                ARB_TRIANGLE_OPPORTUNITIES.fetch_add(1, Ordering::Relaxed);
-                info!(
-                    mint = %opp.base_mint,
-                    buy_dex = %opp.buy_dex,
-                    sell_dex = %opp.sell_dex,
-                    spread_bps = opp.spread_bps,
-                    profit_lamports = opp.estimated_profit_lamports,
-                    "🔥 Arbitrage opportunity detected (two-hop worker)"
-                );
-                ctx.publish_arb_trade_signal_track_pins(&opp.buy_pool, &opp.sell_pool);
-                if let Some(mut intent) = create_arb_intent(&ctx, &opp) {
-                    if let Some(slot) = job.slot {
-                        intent.metadata.insert("slot".to_string(), slot.to_string());
-                    }
-                    intent
-                        .metadata
-                        .insert("slot_seen_at_ms".to_string(), job.ts_unix_ms.to_string());
-                    publish_arb_intent(&ctx, &intent).await;
+
+            let ctx_blocking = Arc::clone(&ctx);
+            let detect_job = job.clone();
+            let opp = match tokio::task::spawn_blocking(move || {
+                ctx_blocking.detect_two_hop_arbitrage_from_trade(
+                    &detect_job.pool_address,
+                    &detect_job.mint,
+                    &detect_job.quote_mint,
+                    detect_job.sol_amount,
+                    detect_job.token_amount,
+                    detect_job.token_decimals,
+                    detect_job.is_buy,
+                    &detect_job.dex,
+                )
+            })
+            .await
+            {
+                Ok(opp) => opp,
+                Err(e) => {
+                    warn!(error = %e, mint = %job.mint, "two-hop spawn_blocking join failed");
+                    None
                 }
+            };
+
+            let Some(opp) = opp else {
+                continue;
+            };
+
+            if !ctx.try_record_arb_intent_cooldown(&opp.base_mint) {
+                debug!(mint = %opp.base_mint, "two-hop opportunity dropped: intent cooldown active");
+                continue;
+            }
+            ctx.opportunities_found.fetch_add(1, Ordering::Relaxed);
+
+            ARB_TRIANGLE_OPPORTUNITIES.fetch_add(1, Ordering::Relaxed);
+            info!(
+                mint = %opp.base_mint,
+                buy_dex = %opp.buy_dex,
+                sell_dex = %opp.sell_dex,
+                spread_bps = opp.spread_bps,
+                profit_lamports = opp.estimated_profit_lamports,
+                "🔥 Arbitrage opportunity detected (two-hop worker)"
+            );
+            ctx.publish_arb_trade_signal_track_pins(&opp.buy_pool, &opp.sell_pool);
+            if let Some(mut intent) = create_arb_intent(&ctx, &opp) {
+                if let Some(slot) = job.slot {
+                    intent.metadata.insert("slot".to_string(), slot.to_string());
+                }
+                intent
+                    .metadata
+                    .insert("slot_seen_at_ms".to_string(), job.ts_unix_ms.to_string());
+                publish_arb_intent(&ctx, &intent).await;
             }
         }
         info!("arb-strategy two-hop worker stopped");
@@ -3513,12 +3536,9 @@ impl ArbContext {
         })
     }
 
-    /// Update price from trade event
-    ///
-    /// Only processes trades with SOL as quote_mint. Trades with non-SOL quotes
-    /// (e.g., USDC) are skipped to avoid comparing prices in different units.
+    /// Sync 2-hop detection: update tracker + run check_arbitrage on clone (no cooldown writeback).
     #[allow(clippy::too_many_arguments)]
-    fn handle_trade(
+    fn detect_two_hop_arbitrage_from_trade(
         &self,
         pool_address: &str,
         mint: &str,
@@ -3529,8 +3549,6 @@ impl ArbContext {
         is_buy: bool,
         dex: &str,
     ) -> Option<ArbOpportunity> {
-        // CRITICAL: Only track SOL-quoted pools for price comparison.
-        // Comparing TOKEN/SOL prices with TOKEN/USDC prices is invalid!
         if quote_mint != NATIVE_SOL_MINT {
             debug!(
                 pool = %pool_address,
@@ -3542,7 +3560,6 @@ impl ArbContext {
             return None;
         }
 
-        // DATA QUALITY: Reject trades with zero amounts (parser failed to extract token balance)
         if token_amount == 0 || sol_amount == 0 {
             self.zero_amount_trades.fetch_add(1, Ordering::Relaxed);
             debug!(
@@ -3555,7 +3572,6 @@ impl ArbContext {
             return None;
         }
 
-        // DATA QUALITY: Filter dust trades (< 0.0001 SOL)
         if sol_amount < MIN_TRADE_VOLUME_LAMPORTS {
             debug!(
                 pool = %pool_address,
@@ -3581,7 +3597,6 @@ impl ArbContext {
 
         let config = self.config.read().clone();
 
-        // Global Geyser connection health check (replaces per-pool staleness)
         if !self.is_geyser_connection_healthy() {
             warn!(
                 mint = %mint,
@@ -3671,7 +3686,7 @@ impl ArbContext {
         let known_pools = self.known_pools.read();
         let vault_balances = self.vault_balances.read();
         let bin_arrays = self.bin_arrays.read();
-        let opp = tracker_snapshot.check_arbitrage(
+        tracker_snapshot.check_arbitrage(
             &config,
             &known_pools,
             &vault_balances,
@@ -3681,9 +3696,56 @@ impl ArbContext {
                 data_quality_rejects: &self.data_quality_rejects,
                 forensics: Some(&self.eligibility_forensics),
             },
+        )
+    }
+
+    /// Record intent cooldown on the live tracker after a confirmed opportunity.
+    fn try_record_arb_intent_cooldown(self: &Arc<Self>, mint: &str) -> bool {
+        let cooldown = Duration::from_millis(self.config.read().intent_cooldown_ms);
+        let mut trackers = self.trackers.write();
+        let Some(tracker) = trackers.get_mut(mint) else {
+            return false;
+        };
+        if let Some(last_time) = tracker.last_intent_time {
+            if last_time.elapsed() < cooldown {
+                return false;
+            }
+        }
+        tracker.last_intent_time = Some(Instant::now());
+        true
+    }
+
+    /// Update price from trade event
+    ///
+    /// Only processes trades with SOL as quote_mint. Trades with non-SOL quotes
+    /// (e.g., USDC) are skipped to avoid comparing prices in different units.
+    #[allow(clippy::too_many_arguments)]
+    /// Unit tests call this directly; production two-hop worker uses
+    /// [`Self::detect_two_hop_arbitrage_from_trade`] on a blocking thread.
+    #[allow(dead_code)]
+    fn handle_trade(
+        &self,
+        pool_address: &str,
+        mint: &str,
+        quote_mint: &str,
+        sol_amount: u64,
+        token_amount: u64,
+        token_decimals: u8,
+        is_buy: bool,
+        dex: &str,
+    ) -> Option<ArbOpportunity> {
+        let opp = self.detect_two_hop_arbitrage_from_trade(
+            pool_address,
+            mint,
+            quote_mint,
+            sol_amount,
+            token_amount,
+            token_decimals,
+            is_buy,
+            dex,
         )?;
 
-        let cooldown = Duration::from_millis(config.intent_cooldown_ms);
+        let cooldown = Duration::from_millis(self.config.read().intent_cooldown_ms);
         let mut trackers = self.trackers.write();
         let tracker = trackers.get_mut(mint)?;
         if let Some(last_time) = tracker.last_intent_time {
