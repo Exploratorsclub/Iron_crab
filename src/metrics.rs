@@ -2576,6 +2576,25 @@ fn reset_momentum_latency_metrics_for_test() {
     MOMENTUM_CORE_MARKET_EVENTS_PROCESSED_OTHER_TOTAL.store(0, Ordering::Relaxed);
 }
 
+#[cfg(test)]
+fn reset_execution_intent_delivery_segment_metrics_for_test() {
+    for c in EXECUTION_INTENT_JETSTREAM_TO_CHANNEL_MS_BUCKET_COUNTS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+    EXECUTION_INTENT_JETSTREAM_TO_CHANNEL_MS_SUM.store(0, Ordering::Relaxed);
+    EXECUTION_INTENT_JETSTREAM_TO_CHANNEL_MS_COUNT.store(0, Ordering::Relaxed);
+    for c in EXECUTION_INTENT_CHANNEL_WAIT_MS_BUCKET_COUNTS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+    EXECUTION_INTENT_CHANNEL_WAIT_MS_SUM.store(0, Ordering::Relaxed);
+    EXECUTION_INTENT_CHANNEL_WAIT_MS_COUNT.store(0, Ordering::Relaxed);
+    for c in EXECUTION_ENGINE_INTERVAL_TICK_DURATION_MS_BUCKET_COUNTS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+    EXECUTION_ENGINE_INTERVAL_TICK_DURATION_MS_SUM.store(0, Ordering::Relaxed);
+    EXECUTION_ENGINE_INTERVAL_TICK_DURATION_MS_COUNT.store(0, Ordering::Relaxed);
+}
+
 // --- execution-engine service metrics ---
 pub static INTENTS_RECEIVED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static INTENTS_EXECUTED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -2679,6 +2698,43 @@ pub static EXECUTION_INTENT_TO_CONFIRM_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = 
 });
 pub static EXECUTION_INTENT_TO_CONFIRM_MS_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static EXECUTION_INTENT_TO_CONFIRM_MS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// JetStream fetch task: TradeIntent deserialize → successful `intent_tx.send` (ms).
+pub static EXECUTION_INTENT_JETSTREAM_TO_CHANNEL_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+pub static EXECUTION_INTENT_JETSTREAM_TO_CHANNEL_MS_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static EXECUTION_INTENT_JETSTREAM_TO_CHANNEL_MS_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// `intent_tx.send` enqueue → main-loop `intent_rx.recv` (channel + select! wait, ms).
+pub static EXECUTION_INTENT_CHANNEL_WAIT_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+pub static EXECUTION_INTENT_CHANNEL_WAIT_MS_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static EXECUTION_INTENT_CHANNEL_WAIT_MS_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Wall time of PoolCache + WalletSnapshot JetStream batch block in `interval.tick` arm (ms).
+pub static EXECUTION_ENGINE_INTERVAL_TICK_DURATION_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+pub static EXECUTION_ENGINE_INTERVAL_TICK_DURATION_MS_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static EXECUTION_ENGINE_INTERVAL_TICK_DURATION_MS_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 pub static EXECUTION_PROCESS_INTENT_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
     EXECUTION_PROCESS_INTENT_US_BUCKETS
@@ -3992,6 +4048,45 @@ pub fn record_tx_slot_to_send_ms(ms: u64) {
             break;
         }
     }
+}
+
+/// JetStream fetch task: TradeIntent deserialize → successful channel enqueue (ms).
+#[inline]
+pub fn record_execution_intent_jetstream_to_channel_ms(ms: u64) {
+    record_histogram_u64_into(
+        EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS,
+        EXECUTION_INTENT_JETSTREAM_TO_CHANNEL_MS_BUCKET_COUNTS.as_slice(),
+        &EXECUTION_INTENT_JETSTREAM_TO_CHANNEL_MS_SUM,
+        &EXECUTION_INTENT_JETSTREAM_TO_CHANNEL_MS_COUNT,
+        ms,
+        MOMENTUM_LATENCY_MS_SUM_CAP,
+    );
+}
+
+/// Channel enqueue → main-loop `intent_rx.recv` before `process_intent` spawn (ms).
+#[inline]
+pub fn record_execution_intent_channel_wait_ms(ms: u64) {
+    record_histogram_u64_into(
+        EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS,
+        EXECUTION_INTENT_CHANNEL_WAIT_MS_BUCKET_COUNTS.as_slice(),
+        &EXECUTION_INTENT_CHANNEL_WAIT_MS_SUM,
+        &EXECUTION_INTENT_CHANNEL_WAIT_MS_COUNT,
+        ms,
+        MOMENTUM_LATENCY_MS_SUM_CAP,
+    );
+}
+
+/// PoolCache + WalletSnapshot JetStream batch work inside `interval.tick` (ms).
+#[inline]
+pub fn record_execution_engine_interval_tick_duration_ms(ms: u64) {
+    record_histogram_u64_into(
+        EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS,
+        EXECUTION_ENGINE_INTERVAL_TICK_DURATION_MS_BUCKET_COUNTS.as_slice(),
+        &EXECUTION_ENGINE_INTERVAL_TICK_DURATION_MS_SUM,
+        &EXECUTION_ENGINE_INTERVAL_TICK_DURATION_MS_COUNT,
+        ms,
+        MOMENTUM_LATENCY_MS_SUM_CAP,
+    );
 }
 
 /// `TradeIntent.header.ts_unix_ms` → first line of `process_intent` (JetStream / consumer skew).
@@ -5338,6 +5433,30 @@ async fn metrics_response() -> Response<Body> {
         &TX_REBROADCAST_DURING_CONFIRM_MS_BUCKET_COUNTS,
         &TX_REBROADCAST_DURING_CONFIRM_MS_SUM,
         &TX_REBROADCAST_DURING_CONFIRM_MS_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "execution_intent_jetstream_to_channel_ms",
+        EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS,
+        &EXECUTION_INTENT_JETSTREAM_TO_CHANNEL_MS_BUCKET_COUNTS,
+        &EXECUTION_INTENT_JETSTREAM_TO_CHANNEL_MS_SUM,
+        &EXECUTION_INTENT_JETSTREAM_TO_CHANNEL_MS_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "execution_intent_channel_wait_ms",
+        EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS,
+        &EXECUTION_INTENT_CHANNEL_WAIT_MS_BUCKET_COUNTS,
+        &EXECUTION_INTENT_CHANNEL_WAIT_MS_SUM,
+        &EXECUTION_INTENT_CHANNEL_WAIT_MS_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "execution_engine_interval_tick_duration_ms",
+        EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS,
+        &EXECUTION_ENGINE_INTERVAL_TICK_DURATION_MS_BUCKET_COUNTS,
+        &EXECUTION_ENGINE_INTERVAL_TICK_DURATION_MS_SUM,
+        &EXECUTION_ENGINE_INTERVAL_TICK_DURATION_MS_COUNT,
     );
     append_momentum_latency_histogram_prometheus(
         &mut out,
@@ -6748,6 +6867,44 @@ mod momentum_latency_metrics_tests {
         assert_eq!(
             MOMENTUM_CORE_MARKET_EVENTS_INGEST_CONSECUTIVE_CAP_HIT_STREAK.load(Ordering::Relaxed),
             0
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn execution_intent_delivery_segment_histograms_record_known_delta() {
+        reset_execution_intent_delivery_segment_metrics_for_test();
+        record_execution_intent_jetstream_to_channel_ms(42);
+        record_execution_intent_channel_wait_ms(1_500);
+        record_execution_engine_interval_tick_duration_ms(250);
+
+        assert_eq!(
+            EXECUTION_INTENT_JETSTREAM_TO_CHANNEL_MS_COUNT.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            EXECUTION_INTENT_JETSTREAM_TO_CHANNEL_MS_SUM.load(Ordering::Relaxed),
+            42
+        );
+        assert_eq!(
+            EXECUTION_INTENT_CHANNEL_WAIT_MS_COUNT.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            EXECUTION_INTENT_CHANNEL_WAIT_MS_SUM.load(Ordering::Relaxed),
+            1_500
+        );
+        assert_eq!(
+            EXECUTION_ENGINE_INTERVAL_TICK_DURATION_MS_COUNT.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            EXECUTION_ENGINE_INTERVAL_TICK_DURATION_MS_SUM.load(Ordering::Relaxed),
+            250
+        );
+        assert_eq!(
+            EXECUTION_INTENT_CHANNEL_WAIT_MS_BUCKET_COUNTS[9].load(Ordering::Relaxed),
+            1
         );
     }
 }

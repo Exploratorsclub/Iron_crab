@@ -285,6 +285,9 @@ histogram_quantile(0.50, sum(rate(market_data_geyser_to_publish_ms_trade_bucket[
 | D | `momentum_intent_header_to_publish_ms_*` | Intent-Header-Zeit bis JetStream-TradeIntent-Publish |
 | E | `momentum_publish_to_intent_ms_*` | Kausales Event-`ts_unix_ms` bis Intent-Header (Momentum-intern) |
 | F | `execution_intent_header_to_receive_ms_*` | Intent-Header bis erster Zeile `process_intent` |
+| F1 | `execution_intent_jetstream_to_channel_ms_*` | JetStream-Deserialisierung bis erfolgreicher `intent_tx.send` (Fetch-Task) |
+| F2 | `execution_intent_channel_wait_ms_*` | Channel-Enqueue bis `intent_rx.recv` im Main-Loop (Channel + `select!`-Wartezeit) |
+| F3 | `execution_engine_interval_tick_duration_ms_*` | Wall-Zeit des `interval.tick`-Arms nach Task-Drain (PoolCache + WalletSnapshot JetStream-Batches) |
 | G | `execution_process_intent_us_*` | Gesamtdauer `process_intent` (Mikrosekunden) |
 | H | `execution_intent_to_confirm_ms_*` | Intent-Header bis bestätigtes On-Chain-Outcome |
 | I | `execution_slot_lag_at_send_slots_*` | `cached_blockhash.slot` minus Intent-Metadaten-`slot` nach erfolgreichem Send |
@@ -295,6 +298,8 @@ Beispiel **rate()** über 5m (Namen an eueren `job`/Labels anpassen):
 histogram_quantile(0.99, sum(rate(momentum_intent_header_to_publish_ms_bucket[5m])) by (le))
 histogram_quantile(0.99, sum(rate(execution_process_intent_us_bucket[5m])) by (le)) / 1e6
 ```
+
+**Intent-Delivery-Segmentierung (execution-engine):** F1 + F2 + JetStream-Fetch-Latenz (nicht histogrammiert) erklaeren approx. den Gesamtweg bis F. Hohes F3 bei gleichzeitig hohem F2 deutet auf `interval.tick`-Starvation hin (Main-Loop blockiert durch PoolCache/WalletSnapshot-Batches). Hohes F1 bei niedrigem F2 deutet auf JetStream-Fetch-/Consumer-Verzoegerung hin.
 
 ### PumpSwap Async-Healing Metrics
 

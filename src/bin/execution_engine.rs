@@ -45,7 +45,7 @@ use solana_sdk::{
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding, UiTransactionTokenBalance,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -74,9 +74,11 @@ use ironcrab::ipc::{
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
-    record_execution_process_intent_us, record_execution_slot_lag_at_send_slots,
-    record_recent_trade, record_tx_confirmed_slot_delta_slots, record_tx_priority_fee_source,
-    record_tx_rebroadcast, record_tx_rebroadcast_during_confirm_ms, record_tx_rebroadcast_method,
+    record_execution_engine_interval_tick_duration_ms, record_execution_intent_channel_wait_ms,
+    record_execution_intent_jetstream_to_channel_ms, record_execution_process_intent_us,
+    record_execution_slot_lag_at_send_slots, record_recent_trade,
+    record_tx_confirmed_slot_delta_slots, record_tx_priority_fee_source, record_tx_rebroadcast,
+    record_tx_rebroadcast_during_confirm_ms, record_tx_rebroadcast_method,
     record_tx_send_to_confirm_ms, record_tx_slot_to_send_ms, serve_metrics,
     set_readiness_control_response_sub_active, set_readiness_control_sub_active,
     set_readiness_mode, set_readiness_nats_connected, set_readiness_state_paths_initialized,
@@ -6757,6 +6759,72 @@ async fn create_wallet_tx_confirm_live_consumer(
     }
 }
 
+const INTENT_CHANNEL_ENQUEUE_TRACKER_CAP: usize = 256;
+
+/// Sidecar map: channel enqueue wall time keyed by `intent_id` (not on-wire; cap 256, LRU evict).
+struct IntentChannelEnqueueTracker {
+    inner: std::sync::Mutex<IntentChannelEnqueueState>,
+}
+
+struct IntentChannelEnqueueState {
+    enqueue_ms_by_id: HashMap<String, u64>,
+    insertion_order: VecDeque<String>,
+}
+
+impl Default for IntentChannelEnqueueTracker {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(IntentChannelEnqueueState {
+                enqueue_ms_by_id: HashMap::new(),
+                insertion_order: VecDeque::new(),
+            }),
+        }
+    }
+}
+
+impl IntentChannelEnqueueTracker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn record_enqueue(&self, intent_id: String, enqueue_ms: u64) {
+        let mut state = self
+            .inner
+            .lock()
+            .expect("IntentChannelEnqueueTracker lock poisoned");
+        if let Some(entry) = state.enqueue_ms_by_id.get_mut(&intent_id) {
+            *entry = enqueue_ms;
+            return;
+        }
+        while state.enqueue_ms_by_id.len() >= INTENT_CHANNEL_ENQUEUE_TRACKER_CAP {
+            if let Some(oldest) = state.insertion_order.pop_front() {
+                state.enqueue_ms_by_id.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        state.insertion_order.push_back(intent_id.clone());
+        state.enqueue_ms_by_id.insert(intent_id, enqueue_ms);
+    }
+
+    fn take_and_record_channel_wait(&self, intent_id: &str, now_ms: u64) {
+        let enqueue_ms = {
+            let mut state = self
+                .inner
+                .lock()
+                .expect("IntentChannelEnqueueTracker lock poisoned");
+            let Some(enqueue_ms) = state.enqueue_ms_by_id.remove(intent_id) else {
+                return;
+            };
+            if let Some(pos) = state.insertion_order.iter().position(|id| id == intent_id) {
+                state.insertion_order.remove(pos);
+            }
+            enqueue_ms
+        };
+        record_execution_intent_channel_wait_ms(now_ms.saturating_sub(enqueue_ms));
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -7827,10 +7895,12 @@ async fn main() -> Result<()> {
     let (intent_tx, mut intent_rx) = tokio::sync::mpsc::channel::<TradeIntent>(100);
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<ControlRequest>(10);
     let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<ConfigUpdate>(10);
+    let intent_channel_enqueue_tracker = IntentChannelEnqueueTracker::new();
 
     // Spawn dedicated task for TradeIntents JetStream consumer
     if let Some(intent_consumer) = intent_js_consumer {
         let tx = intent_tx.clone();
+        let enqueue_tracker = Arc::clone(&intent_channel_enqueue_tracker);
         tokio::spawn(async move {
             use futures::StreamExt;
             loop {
@@ -7846,10 +7916,17 @@ async fn main() -> Result<()> {
                             if let Ok(msg) = msg_result {
                                 match serde_json::from_slice::<TradeIntent>(&msg.payload) {
                                     Ok(intent) => {
+                                        let deser_done_ms = wall_clock_unix_ms_now();
+                                        let intent_id = intent.intent_id.clone();
                                         if tx.send(intent).await.is_err() {
                                             warn!("TradeIntent channel closed, stopping JetStream consumer");
                                             return;
                                         }
+                                        let enqueue_ms = wall_clock_unix_ms_now();
+                                        record_execution_intent_jetstream_to_channel_ms(
+                                            enqueue_ms.saturating_sub(deser_done_ms),
+                                        );
+                                        enqueue_tracker.record_enqueue(intent_id, enqueue_ms);
                                         if let Err(e) = msg.ack().await {
                                             warn!(error = %e, "Failed to ack trade intent");
                                         }
@@ -8325,6 +8402,9 @@ async fn main() -> Result<()> {
         tokio::select! {
             // FIX-31: Spawn intent processing as a parallel task (was: blocking await)
             Some(intent) = intent_rx.recv() => {
+                let recv_ms = wall_clock_unix_ms_now();
+                intent_channel_enqueue_tracker
+                    .take_and_record_channel_wait(&intent.intent_id, recv_ms);
                 info!(intent_id = %intent.intent_id, source = %intent.source, "Received TradeIntent from NATS");
                 let ctx_clone = Arc::clone(&ctx);
                 let sem = Arc::clone(&ctx.intent_semaphore);
@@ -8550,6 +8630,8 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                let interval_tick_block_started_ms = wall_clock_unix_ms_now();
+
                 // Keep /ready fresh even when no intents flow.
                 ironcrab::metrics::record_activity();
 
@@ -8693,6 +8775,10 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+
+                record_execution_engine_interval_tick_duration_ms(
+                    wall_clock_unix_ms_now().saturating_sub(interval_tick_block_started_ms),
+                );
 
                 // MVP/dev convenience: simulate receiving a test intent once when running dry-run
                 // *without* NATS (so local dev still does something).
