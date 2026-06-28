@@ -10499,6 +10499,7 @@ mod wallet_snapshot_stale_cleanup_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires nats-server on PATH (local/dev only)"]
     #[serial_test::serial]
     async fn stale_cleanup_zeros_spl_ghost_but_preserves_native_sol() {
         let server = NatsTestServer::start();
