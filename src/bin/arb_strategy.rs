@@ -2518,11 +2518,15 @@ struct ArbTwoHopTradeJob {
 }
 
 /// Result of fast `apply_trade_to_tracker` in the single writer (check_arbitrage runs outside).
+/// `vault_balances` and `bin_arrays` are snapshotted in the writer immediately after apply
+/// so `check_arbitrage` sees a consistent view with `tracker_snapshot`.
 #[derive(Debug, Clone)]
 struct ApplyTradeResult {
     tracker_snapshot: TokenArbTracker,
     config: ArbConfig,
     mint: String,
+    vault_balances: HashMap<String, VaultBalanceCache>,
+    bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>>,
 }
 
 /// Serialized mutation jobs for `trackers` and `vault_balances` (single writer).
@@ -2609,6 +2613,9 @@ fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoH
                 continue;
             }
             let (reply_tx, reply_rx) = oneshot::channel();
+            // Flush coalesced PoolStateUpdates before ApplyTrade so writer applies fresh
+            // reserves (FIFO) before apply_trade_to_tracker / check_arbitrage snapshot.
+            ctx.flush_tracker_write_coalescer();
             if !ctx.tracker_write.try_enqueue(
                 ArbTrackerWriteJob::ApplyTrade {
                     job: job.clone(),
@@ -2627,14 +2634,12 @@ fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoH
             let mint = apply_result.mint.clone();
             let ctx_for_check = Arc::clone(&ctx);
             let known_pools = ctx.known_pools.read().clone();
-            let vault_balances = ctx.vault_balances.read().clone();
-            let bin_arrays = ctx.bin_arrays.read().clone();
             let opp = tokio::task::spawn_blocking(move || {
                 apply_result.tracker_snapshot.check_arbitrage(
                     &apply_result.config,
                     &known_pools,
-                    &vault_balances,
-                    &bin_arrays,
+                    &apply_result.vault_balances,
+                    &apply_result.bin_arrays,
                     &ArbCheckContext {
                         spread_warn_last: &ctx_for_check.spread_too_large_warn_last,
                         data_quality_rejects: &ctx_for_check.data_quality_rejects,
@@ -4547,6 +4552,8 @@ fn spawn_arb_tracker_write_worker(
                             tracker_snapshot,
                             config,
                             mint: job.mint.clone(),
+                            vault_balances: ctx.vault_balances.read().clone(),
+                            bin_arrays: ctx.bin_arrays.read().clone(),
                         });
                     let _ = reply.send(result);
                     arb_tracker_write_job_processed_inc(ArbTrackerWriteJobType::ApplyTrade);
@@ -5856,6 +5863,112 @@ mod event_pipeline_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coalesced_pool_state_in_apply_trade_snapshot_before_check() {
+        use ironcrab::execution::live_pool_cache::create_shared_cache;
+
+        let live_pool_cache = create_shared_cache();
+        let log_dir = std::env::temp_dir().join(format!("arb_coalesce_snap_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&log_dir).expect("test log dir");
+        let jsonl_writer =
+            JsonlWriter::new(JsonlWriterConfig::new("arb_coalesce_snap").with_log_dir(log_dir))
+                .expect("jsonl writer");
+        let (tracker_write_tx, tracker_write_rx) =
+            mpsc::channel::<ArbTrackerWriteJob>(ARB_TRACKER_WRITE_QUEUE_CAP);
+        let tracker_write = ArbTrackerWriteHandle {
+            tx: tracker_write_tx,
+            capacity: ARB_TRACKER_WRITE_QUEUE_CAP,
+        };
+        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopTradeJob>(1);
+
+        let ctx = Arc::new(ArbContext {
+            run_id: TEST_RUN.to_string(),
+            config: RwLock::new(ArbConfig::default()),
+            nats: None,
+            jsonl_writer,
+            trackers: RwLock::new(HashMap::new()),
+            events_received: AtomicU64::new(0),
+            pools_tracked: AtomicU64::new(0),
+            opportunities_found: AtomicU64::new(0),
+            intents_generated: AtomicU64::new(0),
+            intent_counter: AtomicU64::new(0),
+            zero_amount_trades: AtomicU64::new(0),
+            data_quality_rejects: AtomicU64::new(0),
+            last_market_event: RwLock::new(Instant::now()),
+            vault_balances: RwLock::new(HashMap::new()),
+            bin_arrays: RwLock::new(HashMap::new()),
+            live_pool_cache,
+            known_pools: RwLock::new(HashSet::new()),
+            multi_hop: Arc::new(MultiHopArbitrage::new(
+                MultiHopConfig::default(),
+                create_shared_cache(),
+            )),
+            spread_too_large_warn_last: RwLock::new(HashMap::new()),
+            eligibility_forensics: ArbEligibilityForensics::new(),
+            arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_track_published: AtomicU64::new(0),
+            two_hop_tx,
+            tracker_write,
+            tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
+        });
+        spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
+
+        let pool = "pool-coalesce-snap";
+        let mint = "TokenMint11111111111111111111111111111111";
+        ctx.handle_pool_created(pool, mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
+
+        const COALESCED_SLOT: u64 = 99;
+        ctx.coalesce_pool_state_update(
+            pool.to_string(),
+            "raydium".to_string(),
+            5_000_000,
+            10_000_000_000,
+            COALESCED_SLOT,
+            None,
+            None,
+            NATIVE_SOL_MINT.to_string(),
+            mint.to_string(),
+        );
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        ctx.flush_tracker_write_coalescer();
+        assert!(
+            ctx.tracker_write.try_enqueue(
+                ArbTrackerWriteJob::ApplyTrade {
+                    job: ArbTwoHopTradeJob {
+                        pool_address: pool.to_string(),
+                        mint: mint.to_string(),
+                        quote_mint: NATIVE_SOL_MINT.to_string(),
+                        sol_amount: 10_000_000,
+                        token_amount: 1_000_000,
+                        token_decimals: 6,
+                        is_buy: true,
+                        dex: "raydium".to_string(),
+                        slot: Some(1),
+                        ts_unix_ms: 1,
+                    },
+                    reply: reply_tx,
+                },
+                ArbTrackerWriteJobType::ApplyTrade,
+            ),
+            "ApplyTrade enqueue"
+        );
+
+        let apply_result = tokio::time::timeout(Duration::from_millis(500), reply_rx)
+            .await
+            .expect("ApplyTrade reply timed out")
+            .expect("ApplyTrade reply channel closed")
+            .expect("ApplyTrade must succeed");
+        let vault = apply_result
+            .vault_balances
+            .get(pool)
+            .expect("coalesced pool state must be in ApplyTrade snapshot");
+        assert_eq!(
+            vault.update_slot, COALESCED_SLOT,
+            "check_arbitrage snapshot must include flushed coalesced reserves"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_trade_does_not_block_writer_pool_state_updates() {
         use ironcrab::execution::live_pool_cache::create_shared_cache;
 
@@ -5909,7 +6022,20 @@ mod event_pipeline_tests {
         let mint = "TokenMint11111111111111111111111111111111";
         ctx.handle_pool_created(pool, mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
 
+        ctx.coalesce_pool_state_update(
+            pool.to_string(),
+            "raydium".to_string(),
+            5_000_000,
+            10_000_000_000,
+            42,
+            None,
+            None,
+            NATIVE_SOL_MINT.to_string(),
+            mint.to_string(),
+        );
+
         let (reply_tx, reply_rx) = oneshot::channel();
+        ctx.flush_tracker_write_coalescer();
         assert!(
             ctx.tracker_write.try_enqueue(
                 ArbTrackerWriteJob::ApplyTrade {
@@ -5932,46 +6058,17 @@ mod event_pipeline_tests {
             "ApplyTrade enqueue"
         );
 
-        ctx.coalesce_pool_state_update(
-            pool.to_string(),
-            "raydium".to_string(),
-            5_000_000,
-            10_000_000_000,
-            42,
-            None,
-            None,
-            NATIVE_SOL_MINT.to_string(),
-            mint.to_string(),
-        );
-        ctx.flush_tracker_write_coalescer();
-
-        let apply_ok = tokio::time::timeout(Duration::from_millis(500), reply_rx)
+        let apply_result = tokio::time::timeout(Duration::from_millis(500), reply_rx)
             .await
             .expect("ApplyTrade reply timed out")
             .expect("ApplyTrade reply channel closed")
-            .is_some();
+            .expect("ApplyTrade must succeed");
         assert!(
-            apply_ok,
-            "ApplyTrade must complete in writer without spawn_blocking"
-        );
-
-        let vault_deadline = Instant::now() + Duration::from_millis(500);
-        let mut vault_seen = false;
-        while Instant::now() < vault_deadline {
-            if ctx
+            apply_result
                 .vault_balances
-                .read()
                 .get(pool)
-                .is_some_and(|v| v.update_slot == 42)
-            {
-                vault_seen = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            vault_seen,
-            "PoolStateUpdate must be applied by writer while check_arbitrage runs outside"
+                .is_some_and(|v| v.update_slot == 42),
+            "ApplyTrade snapshot must include flushed coalesced reserves"
         );
     }
 
