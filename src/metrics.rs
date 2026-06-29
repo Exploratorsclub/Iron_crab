@@ -5,7 +5,7 @@ use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Recent trade record for dashboard display
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -3021,6 +3021,258 @@ pub enum ArbTrackerWriteJobType {
     FinalizeOpportunity,
 }
 
+impl ArbTrackerWriteJobType {
+    pub const COUNT: usize = 7;
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::PoolStateUpdate => 0,
+            Self::ApplyTrade => 1,
+            Self::PoolCreated => 2,
+            Self::DexPoolAccounts => 3,
+            Self::TokenMintInfo => 4,
+            Self::SeedPoolCache => 5,
+            Self::FinalizeOpportunity => 6,
+        }
+    }
+
+    pub fn as_numeric(self) -> u64 {
+        (self.index() + 1) as u64
+    }
+
+    pub fn prometheus_label(self) -> &'static str {
+        match self {
+            Self::PoolStateUpdate => "pool_state_update",
+            Self::ApplyTrade => "apply_trade",
+            Self::PoolCreated => "pool_created",
+            Self::DexPoolAccounts => "dex_pool_accounts",
+            Self::TokenMintInfo => "token_mint_info",
+            Self::SeedPoolCache => "seed_pool_cache",
+            Self::FinalizeOpportunity => "finalize_opportunity",
+        }
+    }
+
+    pub fn all() -> [Self; Self::COUNT] {
+        [
+            Self::PoolStateUpdate,
+            Self::ApplyTrade,
+            Self::PoolCreated,
+            Self::DexPoolAccounts,
+            Self::TokenMintInfo,
+            Self::SeedPoolCache,
+            Self::FinalizeOpportunity,
+        ]
+    }
+}
+
+/// Writer job duration histogram buckets (nanoseconds).
+const ARB_TRACKER_WRITE_JOB_DURATION_NS_BUCKETS: &[u64] = &[
+    1_000_000,
+    5_000_000,
+    10_000_000,
+    25_000_000,
+    50_000_000,
+    100_000_000,
+    250_000_000,
+    500_000_000,
+    1_000_000_000,
+    2_500_000_000,
+    5_000_000_000,
+    10_000_000_000,
+    30_000_000_000,
+    60_000_000_000,
+];
+
+struct ArbTrackerWriteJobDurationHist {
+    bucket_counts: Vec<AtomicU64>,
+    sum_ns: AtomicU64,
+    count: AtomicU64,
+}
+
+impl ArbTrackerWriteJobDurationHist {
+    fn new() -> Self {
+        Self {
+            bucket_counts: ARB_TRACKER_WRITE_JOB_DURATION_NS_BUCKETS
+                .iter()
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            sum_ns: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, duration_ns: u64) {
+        record_histogram_u64_into(
+            ARB_TRACKER_WRITE_JOB_DURATION_NS_BUCKETS,
+            &self.bucket_counts,
+            &self.sum_ns,
+            &self.count,
+            duration_ns,
+            u64::MAX,
+        );
+    }
+}
+
+fn new_arb_tracker_write_job_duration_hists(
+) -> [ArbTrackerWriteJobDurationHist; ArbTrackerWriteJobType::COUNT] {
+    std::array::from_fn(|_| ArbTrackerWriteJobDurationHist::new())
+}
+
+static ARB_TRACKER_WRITE_JOB_STARTED: Lazy<[AtomicU64; ArbTrackerWriteJobType::COUNT]> =
+    Lazy::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
+static ARB_TRACKER_WRITE_JOB_FINISHED: Lazy<[AtomicU64; ArbTrackerWriteJobType::COUNT]> =
+    Lazy::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
+static ARB_TRACKER_WRITE_JOB_DURATION: Lazy<
+    [ArbTrackerWriteJobDurationHist; ArbTrackerWriteJobType::COUNT],
+> = Lazy::new(new_arb_tracker_write_job_duration_hists);
+
+pub static ARB_TRACKER_WRITE_LAST_JOB_TYPE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_SECONDS_SINCE_LAST_FINISH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_CURRENT_JOB_TYPE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_CURRENT_JOB_STARTED_UNIX_MS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_LAST_FINISH_UNIX_MS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+static ARB_TRACKER_WRITE_COALESCER_FLUSH_LOST: Lazy<[AtomicU64; ArbTrackerWriteJobType::COUNT]> =
+    Lazy::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
+pub static ARB_TRACKER_WRITE_COALESCER_PENDING: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_BLOCKED_ON_APPLY_TRADE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_STALL_WATCHDOG_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Lock kinds observed during tracker-write jobs (Prometheus label `lock`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbWriterLockKind {
+    TrackersRead,
+    TrackersWrite,
+    VaultBalancesWrite,
+}
+
+impl ArbWriterLockKind {
+    fn index(self) -> usize {
+        match self {
+            Self::TrackersRead => 0,
+            Self::TrackersWrite => 1,
+            Self::VaultBalancesWrite => 2,
+        }
+    }
+
+    fn prometheus_label(self) -> &'static str {
+        match self {
+            Self::TrackersRead => "trackers_read",
+            Self::TrackersWrite => "trackers_write",
+            Self::VaultBalancesWrite => "vault_balances_write",
+        }
+    }
+
+    const COUNT: usize = 3;
+}
+
+struct ArbWriterLockWaitHist {
+    bucket_counts: Vec<AtomicU64>,
+    sum_ns: AtomicU64,
+    count: AtomicU64,
+}
+
+impl ArbWriterLockWaitHist {
+    fn new() -> Self {
+        Self {
+            bucket_counts: ARB_TRACKER_WRITE_JOB_DURATION_NS_BUCKETS
+                .iter()
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            sum_ns: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, wait_ns: u64) {
+        record_histogram_u64_into(
+            ARB_TRACKER_WRITE_JOB_DURATION_NS_BUCKETS,
+            &self.bucket_counts,
+            &self.sum_ns,
+            &self.count,
+            wait_ns,
+            u64::MAX,
+        );
+    }
+}
+
+static ARB_TRACKER_WRITE_LOCK_WAIT: Lazy<[ArbWriterLockWaitHist; ArbWriterLockKind::COUNT]> =
+    Lazy::new(|| std::array::from_fn(|_| ArbWriterLockWaitHist::new()));
+
+/// Heartbeat sub-phases for stall forensics (Prometheus label `phase`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbHeartbeatPhase {
+    TrackersRead,
+    MaybeEmit,
+    SyncPools,
+    Prune,
+    InfoLog,
+}
+
+impl ArbHeartbeatPhase {
+    fn index(self) -> usize {
+        match self {
+            Self::TrackersRead => 0,
+            Self::MaybeEmit => 1,
+            Self::SyncPools => 2,
+            Self::Prune => 3,
+            Self::InfoLog => 4,
+        }
+    }
+
+    fn prometheus_label(self) -> &'static str {
+        match self {
+            Self::TrackersRead => "trackers_read",
+            Self::MaybeEmit => "maybe_emit",
+            Self::SyncPools => "sync_pools",
+            Self::Prune => "prune",
+            Self::InfoLog => "info_log",
+        }
+    }
+
+    const COUNT: usize = 5;
+}
+
+struct ArbHeartbeatPhaseDurationHist {
+    bucket_counts: Vec<AtomicU64>,
+    sum_ns: AtomicU64,
+    count: AtomicU64,
+}
+
+impl ArbHeartbeatPhaseDurationHist {
+    fn new() -> Self {
+        Self {
+            bucket_counts: ARB_TRACKER_WRITE_JOB_DURATION_NS_BUCKETS
+                .iter()
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            sum_ns: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, duration_ns: u64) {
+        record_histogram_u64_into(
+            ARB_TRACKER_WRITE_JOB_DURATION_NS_BUCKETS,
+            &self.bucket_counts,
+            &self.sum_ns,
+            &self.count,
+            duration_ns,
+            u64::MAX,
+        );
+    }
+}
+
+static ARB_HEARTBEAT_PHASE_DURATION: Lazy<
+    [ArbHeartbeatPhaseDurationHist; ArbHeartbeatPhase::COUNT],
+> = Lazy::new(|| std::array::from_fn(|_| ArbHeartbeatPhaseDurationHist::new()));
+pub static ARB_HEARTBEAT_LAST_FINISH_UNIX_MS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// 2-hop reject breakdown (arb-strategy `check_arbitrage`)
 pub static ARB_TWO_HOP_REJECTED_SPREAD_TOO_LARGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_REJECTED_SPREAD_BELOW_MIN: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -3188,6 +3440,105 @@ pub fn arb_tracker_write_coalesced_flushed_inc() {
 
 pub fn set_arb_tracker_write_queue_depth(depth: u64) {
     ARB_TRACKER_WRITE_QUEUE_DEPTH.store(depth, Ordering::Relaxed);
+}
+
+pub fn arb_tracker_write_init_worker_state() {
+    let now = wall_clock_unix_ms_now();
+    ARB_TRACKER_WRITE_LAST_FINISH_UNIX_MS.store(now, Ordering::Relaxed);
+    ARB_TRACKER_WRITE_SECONDS_SINCE_LAST_FINISH.store(0, Ordering::Relaxed);
+}
+
+pub fn arb_tracker_write_job_started(job_type: ArbTrackerWriteJobType) {
+    ARB_TRACKER_WRITE_JOB_STARTED[job_type.index()].fetch_add(1, Ordering::Relaxed);
+    ARB_TRACKER_WRITE_LAST_JOB_TYPE.store(job_type.as_numeric(), Ordering::Relaxed);
+    ARB_TRACKER_WRITE_CURRENT_JOB_TYPE.store(job_type.as_numeric(), Ordering::Relaxed);
+    ARB_TRACKER_WRITE_CURRENT_JOB_STARTED_UNIX_MS
+        .store(wall_clock_unix_ms_now(), Ordering::Relaxed);
+}
+
+pub fn arb_tracker_write_job_finished(job_type: ArbTrackerWriteJobType, duration: Duration) {
+    let idx = job_type.index();
+    ARB_TRACKER_WRITE_JOB_FINISHED[idx].fetch_add(1, Ordering::Relaxed);
+    ARB_TRACKER_WRITE_JOB_DURATION[idx].record(duration.as_nanos() as u64);
+    let now = wall_clock_unix_ms_now();
+    ARB_TRACKER_WRITE_LAST_FINISH_UNIX_MS.store(now, Ordering::Relaxed);
+    ARB_TRACKER_WRITE_SECONDS_SINCE_LAST_FINISH.store(0, Ordering::Relaxed);
+    ARB_TRACKER_WRITE_CURRENT_JOB_TYPE.store(0, Ordering::Relaxed);
+    ARB_TRACKER_WRITE_CURRENT_JOB_STARTED_UNIX_MS.store(0, Ordering::Relaxed);
+}
+
+pub fn tick_arb_tracker_write_seconds_since_last_finish() {
+    let last = ARB_TRACKER_WRITE_LAST_FINISH_UNIX_MS.load(Ordering::Relaxed);
+    if last == 0 {
+        return;
+    }
+    let now = wall_clock_unix_ms_now();
+    let secs = now.saturating_sub(last) / 1000;
+    ARB_TRACKER_WRITE_SECONDS_SINCE_LAST_FINISH.store(secs, Ordering::Relaxed);
+}
+
+pub fn arb_tracker_write_job_started_total(job_type: ArbTrackerWriteJobType) -> u64 {
+    ARB_TRACKER_WRITE_JOB_STARTED[job_type.index()].load(Ordering::Relaxed)
+}
+
+pub fn arb_tracker_write_job_finished_total(job_type: ArbTrackerWriteJobType) -> u64 {
+    ARB_TRACKER_WRITE_JOB_FINISHED[job_type.index()].load(Ordering::Relaxed)
+}
+
+pub fn arb_tracker_write_job_duration_count(job_type: ArbTrackerWriteJobType) -> u64 {
+    ARB_TRACKER_WRITE_JOB_DURATION[job_type.index()]
+        .count
+        .load(Ordering::Relaxed)
+}
+
+pub fn arb_tracker_write_coalescer_flush_lost_inc(job_type: ArbTrackerWriteJobType) {
+    ARB_TRACKER_WRITE_COALESCER_FLUSH_LOST[job_type.index()].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn arb_tracker_write_coalescer_flush_lost_total(job_type: ArbTrackerWriteJobType) -> u64 {
+    ARB_TRACKER_WRITE_COALESCER_FLUSH_LOST[job_type.index()].load(Ordering::Relaxed)
+}
+
+pub fn set_arb_tracker_write_coalescer_pending(pending: u64) {
+    ARB_TRACKER_WRITE_COALESCER_PENDING.store(pending, Ordering::Relaxed);
+}
+
+pub fn set_arb_two_hop_blocked_on_apply_trade(blocked: bool) {
+    ARB_TWO_HOP_BLOCKED_ON_APPLY_TRADE.store(u64::from(blocked), Ordering::Relaxed);
+}
+
+pub fn arb_tracker_write_stall_watchdog_inc() {
+    ARB_TRACKER_WRITE_STALL_WATCHDOG_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_arb_writer_lock_wait(lock: ArbWriterLockKind, wait: Duration) {
+    ARB_TRACKER_WRITE_LOCK_WAIT[lock.index()].record(wait.as_nanos() as u64);
+}
+
+pub fn arb_writer_lock_wait_count(lock: ArbWriterLockKind) -> u64 {
+    ARB_TRACKER_WRITE_LOCK_WAIT[lock.index()]
+        .count
+        .load(Ordering::Relaxed)
+}
+
+pub fn record_arb_heartbeat_phase(phase: ArbHeartbeatPhase, duration: Duration) {
+    ARB_HEARTBEAT_PHASE_DURATION[phase.index()].record(duration.as_nanos() as u64);
+}
+
+pub fn arb_heartbeat_finished() {
+    let now = wall_clock_unix_ms_now();
+    ARB_HEARTBEAT_LAST_FINISH_UNIX_MS.store(now, Ordering::Relaxed);
+    ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH.store(0, Ordering::Relaxed);
+}
+
+pub fn tick_arb_heartbeat_seconds_since_last_finish() {
+    let last = ARB_HEARTBEAT_LAST_FINISH_UNIX_MS.load(Ordering::Relaxed);
+    if last == 0 {
+        return;
+    }
+    let now = wall_clock_unix_ms_now();
+    let secs = now.saturating_sub(last) / 1000;
+    ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH.store(secs, Ordering::Relaxed);
 }
 
 /// Sub-reason when a mint hits the `insufficient_pools` gate (low-cardinality `reason` label).
@@ -4258,6 +4609,39 @@ fn append_momentum_latency_histogram_prometheus(
     out.push_str(&format!("{}_bucket{{le=\"+Inf\"}} {}\n", metric, c));
     out.push_str(&format!("{}_sum {}\n", metric, s));
     out.push_str(&format!("{}_count {}\n", metric, c));
+}
+
+/// Append `_bucket{le=...}`, `_sum`, `_count` lines (same layout as `tx_slot_to_send_ms`).
+#[allow(clippy::too_many_arguments)]
+fn append_labeled_duration_seconds_histogram(
+    out: &mut String,
+    metric: &str,
+    label_key: &str,
+    label_value: &str,
+    buckets_ns: &[u64],
+    bucket_counts: &[AtomicU64],
+    sum: &AtomicU64,
+    count: &AtomicU64,
+) {
+    let c = count.load(Ordering::Relaxed);
+    let s = sum.load(Ordering::Relaxed);
+    for (i, b) in buckets_ns.iter().enumerate() {
+        let v = bucket_counts[i].load(Ordering::Relaxed);
+        out.push_str(&format!(
+            "{metric}_bucket{{{label_key}=\"{label_value}\",le=\"{}\"}} {v}\n",
+            (*b as f64) / 1e9
+        ));
+    }
+    out.push_str(&format!(
+        "{metric}_bucket{{{label_key}=\"{label_value}\",le=\"+Inf\"}} {c}\n"
+    ));
+    out.push_str(&format!(
+        "{metric}_sum{{{label_key}=\"{label_value}\"}} {}\n",
+        (s as f64) / 1e9
+    ));
+    out.push_str(&format!(
+        "{metric}_count{{{label_key}=\"{label_value}\"}} {c}\n"
+    ));
 }
 
 async fn metrics_response() -> Response<Body> {
@@ -5982,6 +6366,101 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
+    for job_type in ArbTrackerWriteJobType::all() {
+        out.push_str(&format!(
+            "arb_tracker_write_job_started_total{{job_type=\"{}\"}} {}\n",
+            job_type.prometheus_label(),
+            ARB_TRACKER_WRITE_JOB_STARTED[job_type.index()].load(Ordering::Relaxed)
+        ));
+    }
+    for job_type in ArbTrackerWriteJobType::all() {
+        out.push_str(&format!(
+            "arb_tracker_write_job_finished_total{{job_type=\"{}\"}} {}\n",
+            job_type.prometheus_label(),
+            ARB_TRACKER_WRITE_JOB_FINISHED[job_type.index()].load(Ordering::Relaxed)
+        ));
+    }
+    for job_type in ArbTrackerWriteJobType::all() {
+        append_labeled_duration_seconds_histogram(
+            &mut out,
+            "arb_tracker_write_job_duration_seconds",
+            "job_type",
+            job_type.prometheus_label(),
+            ARB_TRACKER_WRITE_JOB_DURATION_NS_BUCKETS,
+            &ARB_TRACKER_WRITE_JOB_DURATION[job_type.index()].bucket_counts,
+            &ARB_TRACKER_WRITE_JOB_DURATION[job_type.index()].sum_ns,
+            &ARB_TRACKER_WRITE_JOB_DURATION[job_type.index()].count,
+        );
+    }
+    line!(
+        "arb_tracker_write_last_job_type",
+        ARB_TRACKER_WRITE_LAST_JOB_TYPE.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_tracker_write_seconds_since_last_finish",
+        ARB_TRACKER_WRITE_SECONDS_SINCE_LAST_FINISH.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_tracker_write_current_job_type",
+        ARB_TRACKER_WRITE_CURRENT_JOB_TYPE.load(Ordering::Relaxed)
+    );
+    for job_type in ArbTrackerWriteJobType::all() {
+        out.push_str(&format!(
+            "arb_tracker_write_coalescer_flush_lost_total{{job_type=\"{}\"}} {}\n",
+            job_type.prometheus_label(),
+            ARB_TRACKER_WRITE_COALESCER_FLUSH_LOST[job_type.index()].load(Ordering::Relaxed)
+        ));
+    }
+    line!(
+        "arb_tracker_write_coalescer_pending",
+        ARB_TRACKER_WRITE_COALESCER_PENDING.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_two_hop_blocked_on_apply_trade",
+        ARB_TWO_HOP_BLOCKED_ON_APPLY_TRADE.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_tracker_write_stall_watchdog_total",
+        ARB_TRACKER_WRITE_STALL_WATCHDOG_TOTAL.load(Ordering::Relaxed)
+    );
+    for lock in [
+        ArbWriterLockKind::TrackersRead,
+        ArbWriterLockKind::TrackersWrite,
+        ArbWriterLockKind::VaultBalancesWrite,
+    ] {
+        append_labeled_duration_seconds_histogram(
+            &mut out,
+            "arb_tracker_write_lock_wait_seconds",
+            "lock",
+            lock.prometheus_label(),
+            ARB_TRACKER_WRITE_JOB_DURATION_NS_BUCKETS,
+            &ARB_TRACKER_WRITE_LOCK_WAIT[lock.index()].bucket_counts,
+            &ARB_TRACKER_WRITE_LOCK_WAIT[lock.index()].sum_ns,
+            &ARB_TRACKER_WRITE_LOCK_WAIT[lock.index()].count,
+        );
+    }
+    for phase in [
+        ArbHeartbeatPhase::TrackersRead,
+        ArbHeartbeatPhase::MaybeEmit,
+        ArbHeartbeatPhase::SyncPools,
+        ArbHeartbeatPhase::Prune,
+        ArbHeartbeatPhase::InfoLog,
+    ] {
+        append_labeled_duration_seconds_histogram(
+            &mut out,
+            "arb_heartbeat_phase_duration_seconds",
+            "phase",
+            phase.prometheus_label(),
+            ARB_TRACKER_WRITE_JOB_DURATION_NS_BUCKETS,
+            &ARB_HEARTBEAT_PHASE_DURATION[phase.index()].bucket_counts,
+            &ARB_HEARTBEAT_PHASE_DURATION[phase.index()].sum_ns,
+            &ARB_HEARTBEAT_PHASE_DURATION[phase.index()].count,
+        );
+    }
+    line!(
+        "arb_heartbeat_seconds_since_last_finish",
+        ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH.load(Ordering::Relaxed)
+    );
     line!(
         "arb_subscriber_high_queue_depth",
         ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH.load(Ordering::Relaxed)
