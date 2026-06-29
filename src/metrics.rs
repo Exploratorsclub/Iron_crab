@@ -2976,6 +2976,50 @@ pub static ARB_POOL_CACHE_APPLY_BATCH_SIZE: Lazy<AtomicU64> = Lazy::new(|| Atomi
 pub static ARB_TRACKER_WRITE_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACKER_WRITE_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_COALESCED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_COALESCED_FLUSHED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub static ARB_TRACKER_WRITE_DROPPED_POOL_STATE_UPDATE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_DROPPED_APPLY_TRADE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_DROPPED_POOL_CREATED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_DROPPED_DEX_POOL_ACCOUNTS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_DROPPED_TOKEN_MINT_INFO: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_DROPPED_SEED_POOL_CACHE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_DROPPED_FINALIZE_OPPORTUNITY: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub static ARB_TRACKER_WRITE_PROCESSED_POOL_STATE_UPDATE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_PROCESSED_APPLY_TRADE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_PROCESSED_POOL_CREATED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_PROCESSED_DEX_POOL_ACCOUNTS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_PROCESSED_TOKEN_MINT_INFO: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_PROCESSED_SEED_POOL_CACHE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACKER_WRITE_PROCESSED_FINALIZE_OPPORTUNITY: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Tracker-write job type for per-type drop/process metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbTrackerWriteJobType {
+    PoolStateUpdate,
+    ApplyTrade,
+    PoolCreated,
+    DexPoolAccounts,
+    TokenMintInfo,
+    SeedPoolCache,
+    FinalizeOpportunity,
+}
 
 /// 2-hop reject breakdown (arb-strategy `check_arbitrage`)
 pub static ARB_TWO_HOP_REJECTED_SPREAD_TOO_LARGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -3101,6 +3145,45 @@ pub fn set_arb_pool_cache_apply_batch_size_gauge(n: u64) {
 
 pub fn inc_arb_tracker_write_enqueue_dropped_total() {
     ARB_TRACKER_WRITE_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn arb_tracker_write_enqueue_dropped_inc(job_type: ArbTrackerWriteJobType) {
+    ARB_TRACKER_WRITE_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let counter = match job_type {
+        ArbTrackerWriteJobType::PoolStateUpdate => &*ARB_TRACKER_WRITE_DROPPED_POOL_STATE_UPDATE,
+        ArbTrackerWriteJobType::ApplyTrade => &*ARB_TRACKER_WRITE_DROPPED_APPLY_TRADE,
+        ArbTrackerWriteJobType::PoolCreated => &*ARB_TRACKER_WRITE_DROPPED_POOL_CREATED,
+        ArbTrackerWriteJobType::DexPoolAccounts => &*ARB_TRACKER_WRITE_DROPPED_DEX_POOL_ACCOUNTS,
+        ArbTrackerWriteJobType::TokenMintInfo => &*ARB_TRACKER_WRITE_DROPPED_TOKEN_MINT_INFO,
+        ArbTrackerWriteJobType::SeedPoolCache => &*ARB_TRACKER_WRITE_DROPPED_SEED_POOL_CACHE,
+        ArbTrackerWriteJobType::FinalizeOpportunity => {
+            &*ARB_TRACKER_WRITE_DROPPED_FINALIZE_OPPORTUNITY
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn arb_tracker_write_job_processed_inc(job_type: ArbTrackerWriteJobType) {
+    let counter = match job_type {
+        ArbTrackerWriteJobType::PoolStateUpdate => &*ARB_TRACKER_WRITE_PROCESSED_POOL_STATE_UPDATE,
+        ArbTrackerWriteJobType::ApplyTrade => &*ARB_TRACKER_WRITE_PROCESSED_APPLY_TRADE,
+        ArbTrackerWriteJobType::PoolCreated => &*ARB_TRACKER_WRITE_PROCESSED_POOL_CREATED,
+        ArbTrackerWriteJobType::DexPoolAccounts => &*ARB_TRACKER_WRITE_PROCESSED_DEX_POOL_ACCOUNTS,
+        ArbTrackerWriteJobType::TokenMintInfo => &*ARB_TRACKER_WRITE_PROCESSED_TOKEN_MINT_INFO,
+        ArbTrackerWriteJobType::SeedPoolCache => &*ARB_TRACKER_WRITE_PROCESSED_SEED_POOL_CACHE,
+        ArbTrackerWriteJobType::FinalizeOpportunity => {
+            &*ARB_TRACKER_WRITE_PROCESSED_FINALIZE_OPPORTUNITY
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn arb_tracker_write_coalesced_inc() {
+    ARB_TRACKER_WRITE_COALESCED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn arb_tracker_write_coalesced_flushed_inc() {
+    ARB_TRACKER_WRITE_COALESCED_FLUSHED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn set_arb_tracker_write_queue_depth(depth: u64) {
@@ -5793,6 +5876,112 @@ async fn metrics_response() -> Response<Body> {
         "arb_tracker_write_queue_depth",
         ARB_TRACKER_WRITE_QUEUE_DEPTH.load(Ordering::Relaxed)
     );
+    line!(
+        "arb_tracker_write_coalesced_total",
+        ARB_TRACKER_WRITE_COALESCED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_tracker_write_coalesced_flushed_total",
+        ARB_TRACKER_WRITE_COALESCED_FLUSHED_TOTAL.load(Ordering::Relaxed)
+    );
+    out.push_str("arb_tracker_write_enqueue_dropped_total{job_type=\"pool_state_update\"} ");
+    out.push_str(
+        &ARB_TRACKER_WRITE_DROPPED_POOL_STATE_UPDATE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_tracker_write_enqueue_dropped_total{job_type=\"apply_trade\"} ");
+    out.push_str(
+        &ARB_TRACKER_WRITE_DROPPED_APPLY_TRADE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_tracker_write_enqueue_dropped_total{job_type=\"pool_created\"} ");
+    out.push_str(
+        &ARB_TRACKER_WRITE_DROPPED_POOL_CREATED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_tracker_write_enqueue_dropped_total{job_type=\"dex_pool_accounts\"} ");
+    out.push_str(
+        &ARB_TRACKER_WRITE_DROPPED_DEX_POOL_ACCOUNTS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_tracker_write_enqueue_dropped_total{job_type=\"token_mint_info\"} ");
+    out.push_str(
+        &ARB_TRACKER_WRITE_DROPPED_TOKEN_MINT_INFO
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_tracker_write_enqueue_dropped_total{job_type=\"seed_pool_cache\"} ");
+    out.push_str(
+        &ARB_TRACKER_WRITE_DROPPED_SEED_POOL_CACHE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_tracker_write_enqueue_dropped_total{job_type=\"finalize_opportunity\"} ");
+    out.push_str(
+        &ARB_TRACKER_WRITE_DROPPED_FINALIZE_OPPORTUNITY
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_tracker_write_jobs_processed_total{job_type=\"pool_state_update\"} ");
+    out.push_str(
+        &ARB_TRACKER_WRITE_PROCESSED_POOL_STATE_UPDATE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_tracker_write_jobs_processed_total{job_type=\"apply_trade\"} ");
+    out.push_str(
+        &ARB_TRACKER_WRITE_PROCESSED_APPLY_TRADE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_tracker_write_jobs_processed_total{job_type=\"pool_created\"} ");
+    out.push_str(
+        &ARB_TRACKER_WRITE_PROCESSED_POOL_CREATED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_tracker_write_jobs_processed_total{job_type=\"dex_pool_accounts\"} ");
+    out.push_str(
+        &ARB_TRACKER_WRITE_PROCESSED_DEX_POOL_ACCOUNTS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_tracker_write_jobs_processed_total{job_type=\"token_mint_info\"} ");
+    out.push_str(
+        &ARB_TRACKER_WRITE_PROCESSED_TOKEN_MINT_INFO
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_tracker_write_jobs_processed_total{job_type=\"seed_pool_cache\"} ");
+    out.push_str(
+        &ARB_TRACKER_WRITE_PROCESSED_SEED_POOL_CACHE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_tracker_write_jobs_processed_total{job_type=\"finalize_opportunity\"} ");
+    out.push_str(
+        &ARB_TRACKER_WRITE_PROCESSED_FINALIZE_OPPORTUNITY
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     line!(
         "arb_subscriber_high_queue_depth",
         ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH.load(Ordering::Relaxed)
