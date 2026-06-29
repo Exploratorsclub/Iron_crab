@@ -4666,7 +4666,7 @@ fn maybe_arb_tracker_write_stall_watchdog_warn(queue_cap: usize) {
     let secs_since_finish = ARB_TRACKER_WRITE_SECONDS_SINCE_LAST_FINISH.load(Ordering::Relaxed);
     let queue_depth = ARB_TRACKER_WRITE_QUEUE_DEPTH.load(Ordering::Relaxed);
     let threshold = (queue_cap as u64 * 90) / 100;
-    if secs_since_finish <= 30 || queue_depth < threshold {
+    if queue_depth < threshold {
         return;
     }
 
@@ -4678,6 +4678,20 @@ fn maybe_arb_tracker_write_stall_watchdog_warn(queue_cap: usize) {
     } else {
         0
     };
+    let stuck_in_job = current_job_type > 0 && job_duration_secs > 30;
+    let not_finishing = secs_since_finish > 30;
+    if !stuck_in_job && !not_finishing {
+        return;
+    }
+
+    let stall_kind = if stuck_in_job && not_finishing {
+        "writer stuck in job and not finishing jobs"
+    } else if stuck_in_job {
+        "writer stuck in job"
+    } else {
+        "writer not finishing jobs"
+    };
+
     let coalescer_pending = ARB_TRACKER_WRITE_COALESCER_PENDING.load(Ordering::Relaxed);
     let flush_lost_pool_state =
         arb_tracker_write_coalescer_flush_lost_total(ArbTrackerWriteJobType::PoolStateUpdate);
@@ -4686,6 +4700,7 @@ fn maybe_arb_tracker_write_stall_watchdog_warn(queue_cap: usize) {
     let heartbeat_secs = ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH.load(Ordering::Relaxed);
 
     warn!(
+        stall_kind,
         current_job_type,
         job_duration_secs,
         queue_depth,
@@ -4695,7 +4710,7 @@ fn maybe_arb_tracker_write_stall_watchdog_warn(queue_cap: usize) {
         flush_lost_dex_accounts,
         secs_since_finish,
         heartbeat_secs_since_finish = heartbeat_secs,
-        "arb tracker write stall watchdog: writer idle while queue near capacity"
+        "arb tracker write stall watchdog"
     );
     arb_tracker_write_stall_watchdog_inc();
 }
@@ -5247,20 +5262,14 @@ async fn main() -> Result<()> {
             _ = heartbeat_interval.tick() => {
                 tick_arb_heartbeat_seconds_since_last_finish();
 
-                let phase_start = Instant::now();
                 let (records, bytes) = ctx.jsonl_writer.stats();
-                let (tokens_tracked, multi_dex_tokens) = {
-                    let trackers = ctx.trackers.read();
-                    let multi_dex_tokens = trackers
-                        .values()
-                        .filter(|t| t.pool_count_on_distinct_dexes() >= 2)
-                        .count();
-                    (trackers.len(), multi_dex_tokens)
-                };
-                record_arb_heartbeat_phase(
-                    ArbHeartbeatPhase::TrackersRead,
-                    phase_start.elapsed(),
-                );
+                // RCA parity with #253: hold trackers.read() across slow heartbeat steps.
+                let trackers_read_start = Instant::now();
+                let trackers = ctx.trackers.read();
+                let multi_dex_tokens = trackers
+                    .values()
+                    .filter(|t| t.pool_count_on_distinct_dexes() >= 2)
+                    .count();
 
                 let known_pools_count = ctx.known_pools.read().len();
                 let multi_hop_stats = ctx.multi_hop.stats();
@@ -5278,7 +5287,7 @@ async fn main() -> Result<()> {
                 ctx.prune_arb_track_stale_pools();
                 record_arb_heartbeat_phase(ArbHeartbeatPhase::Prune, phase_start.elapsed());
 
-                TOKENS_TRACKED_GAUGE.store(tokens_tracked as u64, Ordering::Relaxed);
+                TOKENS_TRACKED_GAUGE.store(trackers.len() as u64, Ordering::Relaxed);
 
                 let high_queue_depth = ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH.load(Ordering::Relaxed);
                 let high_processed = ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL.load(Ordering::Relaxed);
@@ -5336,7 +5345,7 @@ async fn main() -> Result<()> {
                     market_events_consumed,
                     market_events_consumed_delta = consumed_delta,
                     pools_tracked = ctx.pools_tracked.load(Ordering::Relaxed),
-                    tokens_tracked,
+                    tokens_tracked = trackers.len(),
                     multi_dex_tokens,
                     known_pools = known_pools_count,
                     opportunities_found = ctx.opportunities_found.load(Ordering::Relaxed),
@@ -5357,6 +5366,10 @@ async fn main() -> Result<()> {
                     "arb-strategy heartbeat (SLAVE cache sync from market-data MASTER)"
                 );
                 record_arb_heartbeat_phase(ArbHeartbeatPhase::InfoLog, phase_start.elapsed());
+                record_arb_heartbeat_phase(
+                    ArbHeartbeatPhase::TrackersRead,
+                    trackers_read_start.elapsed(),
+                );
                 arb_heartbeat_finished();
             }
 
