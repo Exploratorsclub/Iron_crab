@@ -43,7 +43,7 @@ use ironcrab::ipc::{
     TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
-    arb_pool_cache_apply_batches_inc, arb_pool_cache_updates_applied_add,
+    arb_heartbeat_finished, arb_pool_cache_apply_batches_inc, arb_pool_cache_updates_applied_add,
     arb_strategy_bootstrap_skip_inc, arb_strategy_bootstrap_warmup_set,
     arb_strategy_pool_cache_update_seeded_inc, arb_strategy_pool_cache_update_seen_inc,
     arb_strategy_pool_cache_update_skip_no_seed_inc,
@@ -52,20 +52,28 @@ use ironcrab::metrics::{
     arb_subscriber_low_coalesced_inc, arb_subscriber_low_dropped_inc,
     arb_subscriber_low_processed_inc, arb_subscriber_low_queue_depth_set,
     arb_subscriber_pool_created_skipped_inc, arb_tracker_write_coalesced_flushed_inc,
-    arb_tracker_write_coalesced_inc, arb_tracker_write_enqueue_dropped_inc,
-    arb_tracker_write_job_processed_inc, arb_two_hop_eligible_dexes_add,
+    arb_tracker_write_coalesced_inc, arb_tracker_write_coalescer_flush_lost_inc,
+    arb_tracker_write_coalescer_flush_lost_total, arb_tracker_write_enqueue_dropped_inc,
+    arb_tracker_write_init_worker_state, arb_tracker_write_job_finished,
+    arb_tracker_write_job_processed_inc, arb_tracker_write_job_started,
+    arb_tracker_write_stall_watchdog_inc, arb_two_hop_eligible_dexes_add,
     arb_two_hop_eligible_pools_by_dex_add, arb_two_hop_insufficient_subreason_inc,
     arb_two_hop_opportunity_inc, arb_two_hop_pool_gate_add, arb_two_hop_reject_subreason_inc,
-    arb_two_hop_rejected_inc, arb_two_hop_tracker_seeded_pools_add,
-    record_arb_track_requests_messages_total, serve_metrics,
-    set_arb_pool_cache_apply_batch_size_gauge, set_arb_tracker_write_queue_depth,
-    set_readiness_nats_connected, wall_clock_unix_ms_now, ArbStrategyWarmupSkipReason,
-    ArbTrackerWriteJobType, ArbTwoHopInsufficientSubreason, ArbTwoHopPoolGate,
-    ArbTwoHopRejectReason, ArbTwoHopRejectSubreason, MetricsComponent,
-    ARB_REJECTED_MISSING_ACCOUNTS, ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL,
-    ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH, ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL,
-    MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
-    POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
+    arb_two_hop_rejected_inc, arb_two_hop_tracker_seeded_pools_add, record_arb_heartbeat_phase,
+    record_arb_track_requests_messages_total, record_arb_writer_lock_wait, serve_metrics,
+    set_arb_pool_cache_apply_batch_size_gauge, set_arb_tracker_write_coalescer_pending,
+    set_arb_tracker_write_queue_depth, set_arb_two_hop_blocked_on_apply_trade,
+    set_readiness_nats_connected, tick_arb_heartbeat_seconds_since_last_finish,
+    tick_arb_tracker_write_seconds_since_last_finish, wall_clock_unix_ms_now, ArbHeartbeatPhase,
+    ArbStrategyWarmupSkipReason, ArbTrackerWriteJobType, ArbTwoHopInsufficientSubreason,
+    ArbTwoHopPoolGate, ArbTwoHopRejectReason, ArbTwoHopRejectSubreason, ArbWriterLockKind,
+    MetricsComponent, ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH, ARB_REJECTED_MISSING_ACCOUNTS,
+    ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL, ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH,
+    ARB_TRACKER_WRITE_COALESCER_PENDING, ARB_TRACKER_WRITE_CURRENT_JOB_STARTED_UNIX_MS,
+    ARB_TRACKER_WRITE_CURRENT_JOB_TYPE, ARB_TRACKER_WRITE_QUEUE_DEPTH,
+    ARB_TRACKER_WRITE_SECONDS_SINCE_LAST_FINISH, ARB_TRIANGLE_OPPORTUNITIES,
+    INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
+    NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, pool_cache_live_fallback_consumer_config,
@@ -2446,11 +2454,15 @@ impl ArbTrackerWriteCoalescer {
         for (_, job) in self.pool_state_updates.drain() {
             if handle.try_enqueue(job, ArbTrackerWriteJobType::PoolStateUpdate) {
                 arb_tracker_write_coalesced_flushed_inc();
+            } else {
+                arb_tracker_write_coalescer_flush_lost_inc(ArbTrackerWriteJobType::PoolStateUpdate);
             }
         }
         for (_, job) in self.dex_pool_accounts.drain() {
             if handle.try_enqueue(job, ArbTrackerWriteJobType::DexPoolAccounts) {
                 arb_tracker_write_coalesced_flushed_inc();
+            } else {
+                arb_tracker_write_coalescer_flush_lost_inc(ArbTrackerWriteJobType::DexPoolAccounts);
             }
         }
     }
@@ -2626,10 +2638,15 @@ fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoH
                 debug!("Dropped ApplyTrade (tracker-write queue full)");
                 continue;
             }
+            set_arb_two_hop_blocked_on_apply_trade(true);
             let apply_result = match reply_rx.await {
                 Ok(Some(result)) => result,
-                _ => continue,
+                _ => {
+                    set_arb_two_hop_blocked_on_apply_trade(false);
+                    continue;
+                }
             };
+            set_arb_two_hop_blocked_on_apply_trade(false);
             let intent_cooldown_ms = apply_result.config.intent_cooldown_ms;
             let mint = apply_result.mint.clone();
             let ctx_for_check = Arc::clone(&ctx);
@@ -2992,6 +3009,7 @@ impl ArbContext {
             quote_mint,
             ARB_TRACKER_WRITE_COALESCER_CAP,
         );
+        set_arb_tracker_write_coalescer_pending(coalescer.pending_len() as u64);
     }
 
     fn coalesce_dex_pool_accounts(
@@ -3009,11 +3027,13 @@ impl ArbContext {
             accounts,
             ARB_TRACKER_WRITE_COALESCER_CAP,
         );
+        set_arb_tracker_write_coalescer_pending(coalescer.pending_len() as u64);
     }
 
     fn flush_tracker_write_coalescer(&self) {
         let mut coalescer = self.tracker_write_coalescer.lock();
         coalescer.flush(&self.tracker_write);
+        set_arb_tracker_write_coalescer_pending(coalescer.pending_len() as u64);
     }
 
     /// Check if the Geyser connection is healthy.
@@ -3514,8 +3534,12 @@ impl ArbContext {
         if mint == NATIVE_SOL_MINT || is_stablecoin_mint(mint) {
             return false;
         }
+        let trackers_wait = Instant::now();
         let mut trackers = self.trackers.write();
+        record_arb_writer_lock_wait(ArbWriterLockKind::TrackersWrite, trackers_wait.elapsed());
+        let vault_wait = Instant::now();
         let mut vault_balances = self.vault_balances.write();
+        record_arb_writer_lock_wait(ArbWriterLockKind::VaultBalancesWrite, vault_wait.elapsed());
         let seeded = seed_token_tracker_from_live_pool_cache(
             mint,
             &self.live_pool_cache,
@@ -3561,7 +3585,9 @@ impl ArbContext {
         }
         let (reserve_base, reserve_quote) =
             sol_quoted_vault_reserves(base_mint, quote_mint, reserve_base, reserve_quote);
+        let vault_wait = Instant::now();
         let mut cache = self.vault_balances.write();
+        record_arb_writer_lock_wait(ArbWriterLockKind::VaultBalancesWrite, vault_wait.elapsed());
         let should_update_vault = match cache.get(pool_address) {
             Some(existing) => update_slot >= existing.update_slot,
             None => true,
@@ -3614,17 +3640,22 @@ impl ArbContext {
 
         // Mirror SOL liquidity + reserve flag into per-mint pool trackers (Geyser-only, no RPC)
         let liquidity_sol = Decimal::from(reserve_quote) / Decimal::from(1_000_000_000u64);
-        let mints_with_pool: Vec<String> = self
-            .trackers
-            .read()
-            .iter()
-            .filter(|(_, tracker)| tracker.pools.contains_key(pool_address))
-            .map(|(mint, _)| mint.clone())
-            .collect();
+        let read_wait = Instant::now();
+        let mints_with_pool: Vec<String> = {
+            let trackers = self.trackers.read();
+            record_arb_writer_lock_wait(ArbWriterLockKind::TrackersRead, read_wait.elapsed());
+            trackers
+                .iter()
+                .filter(|(_, tracker)| tracker.pools.contains_key(pool_address))
+                .map(|(mint, _)| mint.clone())
+                .collect()
+        };
         if mints_with_pool.is_empty() {
             return;
         }
+        let write_wait = Instant::now();
         let mut trackers = self.trackers.write();
+        record_arb_writer_lock_wait(ArbWriterLockKind::TrackersWrite, write_wait.elapsed());
         for mint in mints_with_pool {
             let Some(tracker) = trackers.get_mut(&mint) else {
                 continue;
@@ -4516,117 +4547,192 @@ fn apply_pool_cache_jetstream_message(ctx: &ArbContext, update: PoolCacheUpdate)
     }
 }
 
+fn arb_tracker_write_job_type(job: &ArbTrackerWriteJob) -> ArbTrackerWriteJobType {
+    match job {
+        ArbTrackerWriteJob::SeedPoolCache { .. } => ArbTrackerWriteJobType::SeedPoolCache,
+        ArbTrackerWriteJob::ApplyTrade { .. } => ArbTrackerWriteJobType::ApplyTrade,
+        ArbTrackerWriteJob::FinalizeOpportunity { .. } => {
+            ArbTrackerWriteJobType::FinalizeOpportunity
+        }
+        ArbTrackerWriteJob::PoolCreated { .. } => ArbTrackerWriteJobType::PoolCreated,
+        ArbTrackerWriteJob::DexPoolAccounts { .. } => ArbTrackerWriteJobType::DexPoolAccounts,
+        ArbTrackerWriteJob::TokenMintInfo { .. } => ArbTrackerWriteJobType::TokenMintInfo,
+        ArbTrackerWriteJob::PoolStateUpdate { .. } => ArbTrackerWriteJobType::PoolStateUpdate,
+    }
+}
+
+fn process_arb_tracker_write_job(ctx: Arc<ArbContext>, job: ArbTrackerWriteJob) {
+    let job_type = arb_tracker_write_job_type(&job);
+    arb_tracker_write_job_started(job_type);
+    let started = Instant::now();
+
+    match job {
+        ArbTrackerWriteJob::SeedPoolCache { update } => {
+            if ctx.seed_trackers_for_pool_cache_update(&update) {
+                arb_strategy_pool_cache_update_seeded_inc();
+                if let Some(mint) = arb_tracked_token_mint(&update.base_mint, &update.quote_mint) {
+                    ctx.maybe_publish_arb_track_incremental_for_mint(mint);
+                }
+            } else {
+                arb_strategy_pool_cache_update_skip_no_seed_inc();
+            }
+        }
+        ArbTrackerWriteJob::ApplyTrade { job, reply } => {
+            let result = ctx
+                .apply_trade_to_tracker(
+                    &job.pool_address,
+                    &job.mint,
+                    &job.quote_mint,
+                    job.sol_amount,
+                    job.token_amount,
+                    job.token_decimals,
+                    job.is_buy,
+                    &job.dex,
+                )
+                .map(|(tracker_snapshot, config)| ApplyTradeResult {
+                    tracker_snapshot,
+                    config,
+                    mint: job.mint.clone(),
+                    vault_balances: ctx.vault_balances.read().clone(),
+                    bin_arrays: ctx.bin_arrays.read().clone(),
+                });
+            let _ = reply.send(result);
+        }
+        ArbTrackerWriteJob::FinalizeOpportunity {
+            mint,
+            intent_cooldown_ms,
+            opp,
+            reply,
+        } => {
+            let finalized = ctx.finalize_trade_opportunity(&mint, intent_cooldown_ms, opp);
+            let _ = reply.send(finalized);
+        }
+        ArbTrackerWriteJob::PoolCreated {
+            pool_address,
+            base_mint,
+            quote_mint,
+            dex,
+            liquidity_sol,
+        } => {
+            ctx.handle_pool_created(&pool_address, &base_mint, &quote_mint, &dex, liquidity_sol);
+        }
+        ArbTrackerWriteJob::DexPoolAccounts {
+            pool_address,
+            base_mint,
+            quote_mint,
+            accounts,
+        } => {
+            ctx.handle_dex_pool_accounts(&pool_address, &base_mint, &quote_mint, accounts);
+        }
+        ArbTrackerWriteJob::TokenMintInfo {
+            mint,
+            token_program,
+        } => {
+            ctx.handle_token_mint_info(&mint, &token_program);
+        }
+        ArbTrackerWriteJob::PoolStateUpdate {
+            pool_address,
+            dex,
+            reserve_base,
+            reserve_quote,
+            update_slot,
+            active_id,
+            bin_step,
+            base_mint,
+            quote_mint,
+        } => {
+            ctx.handle_pool_state_update(
+                &pool_address,
+                &dex,
+                reserve_base,
+                reserve_quote,
+                update_slot,
+                active_id,
+                bin_step,
+                &base_mint,
+                &quote_mint,
+            );
+        }
+    }
+
+    arb_tracker_write_job_finished(job_type, started.elapsed());
+    arb_tracker_write_job_processed_inc(job_type);
+}
+
+fn maybe_arb_tracker_write_stall_watchdog_warn(queue_cap: usize) {
+    tick_arb_tracker_write_seconds_since_last_finish();
+    tick_arb_heartbeat_seconds_since_last_finish();
+
+    let secs_since_finish = ARB_TRACKER_WRITE_SECONDS_SINCE_LAST_FINISH.load(Ordering::Relaxed);
+    let queue_depth = ARB_TRACKER_WRITE_QUEUE_DEPTH.load(Ordering::Relaxed);
+    let threshold = (queue_cap as u64 * 90) / 100;
+    if queue_depth < threshold {
+        return;
+    }
+
+    let current_job_type = ARB_TRACKER_WRITE_CURRENT_JOB_TYPE.load(Ordering::Relaxed);
+    let job_started_ms = ARB_TRACKER_WRITE_CURRENT_JOB_STARTED_UNIX_MS.load(Ordering::Relaxed);
+    let now_ms = wall_clock_unix_ms_now();
+    let job_duration_secs = if job_started_ms > 0 {
+        now_ms.saturating_sub(job_started_ms) / 1000
+    } else {
+        0
+    };
+    let stuck_in_job = current_job_type > 0 && job_duration_secs > 30;
+    let not_finishing = secs_since_finish > 30;
+    if !stuck_in_job && !not_finishing {
+        return;
+    }
+
+    let stall_kind = if stuck_in_job && not_finishing {
+        "writer stuck in job and not finishing jobs"
+    } else if stuck_in_job {
+        "writer stuck in job"
+    } else {
+        "writer not finishing jobs"
+    };
+
+    let coalescer_pending = ARB_TRACKER_WRITE_COALESCER_PENDING.load(Ordering::Relaxed);
+    let flush_lost_pool_state =
+        arb_tracker_write_coalescer_flush_lost_total(ArbTrackerWriteJobType::PoolStateUpdate);
+    let flush_lost_dex_accounts =
+        arb_tracker_write_coalescer_flush_lost_total(ArbTrackerWriteJobType::DexPoolAccounts);
+    let heartbeat_secs = ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH.load(Ordering::Relaxed);
+
+    warn!(
+        stall_kind,
+        current_job_type,
+        job_duration_secs,
+        queue_depth,
+        queue_cap = queue_cap as u64,
+        coalescer_pending,
+        flush_lost_pool_state,
+        flush_lost_dex_accounts,
+        secs_since_finish,
+        heartbeat_secs_since_finish = heartbeat_secs,
+        "arb tracker write stall watchdog"
+    );
+    arb_tracker_write_stall_watchdog_inc();
+}
+
 fn spawn_arb_tracker_write_worker(
     ctx: Arc<ArbContext>,
     mut rx: mpsc::Receiver<ArbTrackerWriteJob>,
 ) {
+    arb_tracker_write_init_worker_state();
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            maybe_arb_tracker_write_stall_watchdog_warn(ARB_TRACKER_WRITE_QUEUE_CAP);
+        }
+    });
+
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
-            match job {
-                ArbTrackerWriteJob::SeedPoolCache { update } => {
-                    if ctx.seed_trackers_for_pool_cache_update(&update) {
-                        arb_strategy_pool_cache_update_seeded_inc();
-                        if let Some(mint) =
-                            arb_tracked_token_mint(&update.base_mint, &update.quote_mint)
-                        {
-                            ctx.maybe_publish_arb_track_incremental_for_mint(mint);
-                        }
-                    } else {
-                        arb_strategy_pool_cache_update_skip_no_seed_inc();
-                    }
-                    arb_tracker_write_job_processed_inc(ArbTrackerWriteJobType::SeedPoolCache);
-                }
-                ArbTrackerWriteJob::ApplyTrade { job, reply } => {
-                    let result = ctx
-                        .apply_trade_to_tracker(
-                            &job.pool_address,
-                            &job.mint,
-                            &job.quote_mint,
-                            job.sol_amount,
-                            job.token_amount,
-                            job.token_decimals,
-                            job.is_buy,
-                            &job.dex,
-                        )
-                        .map(|(tracker_snapshot, config)| ApplyTradeResult {
-                            tracker_snapshot,
-                            config,
-                            mint: job.mint.clone(),
-                            vault_balances: ctx.vault_balances.read().clone(),
-                            bin_arrays: ctx.bin_arrays.read().clone(),
-                        });
-                    let _ = reply.send(result);
-                    arb_tracker_write_job_processed_inc(ArbTrackerWriteJobType::ApplyTrade);
-                }
-                ArbTrackerWriteJob::FinalizeOpportunity {
-                    mint,
-                    intent_cooldown_ms,
-                    opp,
-                    reply,
-                } => {
-                    let finalized = ctx.finalize_trade_opportunity(&mint, intent_cooldown_ms, opp);
-                    let _ = reply.send(finalized);
-                    arb_tracker_write_job_processed_inc(
-                        ArbTrackerWriteJobType::FinalizeOpportunity,
-                    );
-                }
-                ArbTrackerWriteJob::PoolCreated {
-                    pool_address,
-                    base_mint,
-                    quote_mint,
-                    dex,
-                    liquidity_sol,
-                } => {
-                    ctx.handle_pool_created(
-                        &pool_address,
-                        &base_mint,
-                        &quote_mint,
-                        &dex,
-                        liquidity_sol,
-                    );
-                    arb_tracker_write_job_processed_inc(ArbTrackerWriteJobType::PoolCreated);
-                }
-                ArbTrackerWriteJob::DexPoolAccounts {
-                    pool_address,
-                    base_mint,
-                    quote_mint,
-                    accounts,
-                } => {
-                    ctx.handle_dex_pool_accounts(&pool_address, &base_mint, &quote_mint, accounts);
-                    arb_tracker_write_job_processed_inc(ArbTrackerWriteJobType::DexPoolAccounts);
-                }
-                ArbTrackerWriteJob::TokenMintInfo {
-                    mint,
-                    token_program,
-                } => {
-                    ctx.handle_token_mint_info(&mint, &token_program);
-                    arb_tracker_write_job_processed_inc(ArbTrackerWriteJobType::TokenMintInfo);
-                }
-                ArbTrackerWriteJob::PoolStateUpdate {
-                    pool_address,
-                    dex,
-                    reserve_base,
-                    reserve_quote,
-                    update_slot,
-                    active_id,
-                    bin_step,
-                    base_mint,
-                    quote_mint,
-                } => {
-                    ctx.handle_pool_state_update(
-                        &pool_address,
-                        &dex,
-                        reserve_base,
-                        reserve_quote,
-                        update_slot,
-                        active_id,
-                        bin_step,
-                        &base_mint,
-                        &quote_mint,
-                    );
-                    arb_tracker_write_job_processed_inc(ArbTrackerWriteJobType::PoolStateUpdate);
-                }
-            }
+            process_arb_tracker_write_job(Arc::clone(&ctx), job);
             ctx.tracker_write.record_queue_depth();
         }
         info!("arb-strategy tracker write worker stopped");
@@ -5154,7 +5260,11 @@ async fn main() -> Result<()> {
 
             // Heartbeat
             _ = heartbeat_interval.tick() => {
+                tick_arb_heartbeat_seconds_since_last_finish();
+
                 let (records, bytes) = ctx.jsonl_writer.stats();
+                // RCA parity with #253: hold trackers.read() across slow heartbeat steps.
+                let trackers_read_start = Instant::now();
                 let trackers = ctx.trackers.read();
                 let multi_dex_tokens = trackers
                     .values()
@@ -5164,9 +5274,19 @@ async fn main() -> Result<()> {
                 let known_pools_count = ctx.known_pools.read().len();
                 let multi_hop_stats = ctx.multi_hop.stats();
                 ctx.multi_hop.refresh_quote_readiness_metrics();
+
+                let phase_start = Instant::now();
                 ctx.eligibility_forensics.maybe_emit_snapshot();
+                record_arb_heartbeat_phase(ArbHeartbeatPhase::MaybeEmit, phase_start.elapsed());
+
+                let phase_start = Instant::now();
                 ctx.sync_pools_tracked_gauge();
+                record_arb_heartbeat_phase(ArbHeartbeatPhase::SyncPools, phase_start.elapsed());
+
+                let phase_start = Instant::now();
                 ctx.prune_arb_track_stale_pools();
+                record_arb_heartbeat_phase(ArbHeartbeatPhase::Prune, phase_start.elapsed());
+
                 TOKENS_TRACKED_GAUGE.store(trackers.len() as u64, Ordering::Relaxed);
 
                 let high_queue_depth = ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH.load(Ordering::Relaxed);
@@ -5219,13 +5339,14 @@ async fn main() -> Result<()> {
                 last_heartbeat_high_processed = high_processed;
                 last_heartbeat_market_events_consumed = market_events_consumed;
 
+                let phase_start = Instant::now();
                 info!(
                     events_received,
                     market_events_consumed,
                     market_events_consumed_delta = consumed_delta,
                     pools_tracked = ctx.pools_tracked.load(Ordering::Relaxed),
                     tokens_tracked = trackers.len(),
-                    multi_dex_tokens = multi_dex_tokens,
+                    multi_dex_tokens,
                     known_pools = known_pools_count,
                     opportunities_found = ctx.opportunities_found.load(Ordering::Relaxed),
                     intents_generated = ctx.intents_generated.load(Ordering::Relaxed),
@@ -5244,6 +5365,12 @@ async fn main() -> Result<()> {
                     high_processed,
                     "arb-strategy heartbeat (SLAVE cache sync from market-data MASTER)"
                 );
+                record_arb_heartbeat_phase(ArbHeartbeatPhase::InfoLog, phase_start.elapsed());
+                record_arb_heartbeat_phase(
+                    ArbHeartbeatPhase::TrackersRead,
+                    trackers_read_start.elapsed(),
+                );
+                arb_heartbeat_finished();
             }
 
             // Phase 3: baseline arb track_requests reconcile (strategy-owned pins).
@@ -6205,6 +6332,221 @@ mod event_pipeline_tests {
             ticks >= 5,
             "expected heartbeat to tick under PoolCache burst + trade load, got {ticks}"
         );
+    }
+
+    #[test]
+    fn tracker_write_coalescer_flush_increments_lost_when_queue_full() {
+        use ironcrab::metrics::{
+            arb_tracker_write_coalescer_flush_lost_total, ArbTrackerWriteJobType,
+        };
+
+        let (tx, _rx) = mpsc::channel::<ArbTrackerWriteJob>(1);
+        let handle = ArbTrackerWriteHandle { tx, capacity: 1 };
+        assert!(handle.try_enqueue(
+            ArbTrackerWriteJob::TokenMintInfo {
+                mint: "TokenMint11111111111111111111111111111111".to_string(),
+                token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            },
+            ArbTrackerWriteJobType::TokenMintInfo,
+        ));
+
+        let mut coalescer = ArbTrackerWriteCoalescer::new();
+        coalescer.insert_pool_state_update(
+            "pool-full".to_string(),
+            "raydium".to_string(),
+            1,
+            1,
+            1,
+            None,
+            None,
+            NATIVE_SOL_MINT.to_string(),
+            "TokenMint11111111111111111111111111111111".to_string(),
+            16,
+        );
+
+        let before =
+            arb_tracker_write_coalescer_flush_lost_total(ArbTrackerWriteJobType::PoolStateUpdate);
+        coalescer.flush(&handle);
+        let after =
+            arb_tracker_write_coalescer_flush_lost_total(ArbTrackerWriteJobType::PoolStateUpdate);
+        assert!(
+            after > before,
+            "coalescer flush on full queue must increment flush_lost counter"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_job_duration_histogram_recorded() {
+        use ironcrab::execution::live_pool_cache::create_shared_cache;
+        use ironcrab::metrics::{
+            arb_tracker_write_job_duration_count, arb_tracker_write_job_finished_total,
+            ArbTrackerWriteJobType,
+        };
+
+        let live_pool_cache = create_shared_cache();
+        let log_dir = std::env::temp_dir().join(format!("arb_job_hist_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&log_dir).expect("test log dir");
+        let jsonl_writer =
+            JsonlWriter::new(JsonlWriterConfig::new("arb_job_hist").with_log_dir(log_dir))
+                .expect("jsonl writer");
+        let (tracker_write_tx, tracker_write_rx) = mpsc::channel::<ArbTrackerWriteJob>(8);
+        let tracker_write = ArbTrackerWriteHandle {
+            tx: tracker_write_tx,
+            capacity: 8,
+        };
+        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopTradeJob>(1);
+
+        let ctx = Arc::new(ArbContext {
+            run_id: TEST_RUN.to_string(),
+            config: RwLock::new(ArbConfig::default()),
+            nats: None,
+            jsonl_writer,
+            trackers: RwLock::new(HashMap::new()),
+            events_received: AtomicU64::new(0),
+            pools_tracked: AtomicU64::new(0),
+            opportunities_found: AtomicU64::new(0),
+            intents_generated: AtomicU64::new(0),
+            intent_counter: AtomicU64::new(0),
+            zero_amount_trades: AtomicU64::new(0),
+            data_quality_rejects: AtomicU64::new(0),
+            last_market_event: RwLock::new(Instant::now()),
+            vault_balances: RwLock::new(HashMap::new()),
+            bin_arrays: RwLock::new(HashMap::new()),
+            live_pool_cache,
+            known_pools: RwLock::new(HashSet::new()),
+            multi_hop: Arc::new(MultiHopArbitrage::new(
+                MultiHopConfig::default(),
+                create_shared_cache(),
+            )),
+            spread_too_large_warn_last: RwLock::new(HashMap::new()),
+            eligibility_forensics: ArbEligibilityForensics::new(),
+            arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_track_published: AtomicU64::new(0),
+            two_hop_tx,
+            tracker_write,
+            tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
+        });
+        spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
+
+        ctx.tracker_write
+            .enqueue(
+                ArbTrackerWriteJob::TokenMintInfo {
+                    mint: "TokenMint11111111111111111111111111111111".to_string(),
+                    token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+                },
+                ArbTrackerWriteJobType::TokenMintInfo,
+            )
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if arb_tracker_write_job_finished_total(ArbTrackerWriteJobType::TokenMintInfo) > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer job did not finish in time");
+
+        assert!(
+            arb_tracker_write_job_duration_count(ArbTrackerWriteJobType::TokenMintInfo) > 0,
+            "writer job duration histogram must record finished jobs"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn heartbeat_read_lock_contention_blocks_writer_pool_state() {
+        use ironcrab::execution::live_pool_cache::create_shared_cache;
+        use ironcrab::metrics::{arb_writer_lock_wait_count, ArbWriterLockKind};
+
+        let live_pool_cache = create_shared_cache();
+        let log_dir = std::env::temp_dir().join(format!("arb_stall_repro_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&log_dir).expect("test log dir");
+        let jsonl_writer =
+            JsonlWriter::new(JsonlWriterConfig::new("arb_stall_repro").with_log_dir(log_dir))
+                .expect("jsonl writer");
+        let (tracker_write_tx, tracker_write_rx) = mpsc::channel::<ArbTrackerWriteJob>(8);
+        let tracker_write = ArbTrackerWriteHandle {
+            tx: tracker_write_tx,
+            capacity: 8,
+        };
+        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopTradeJob>(1);
+
+        let ctx = Arc::new(ArbContext {
+            run_id: TEST_RUN.to_string(),
+            config: RwLock::new(ArbConfig::default()),
+            nats: None,
+            jsonl_writer,
+            trackers: RwLock::new(HashMap::new()),
+            events_received: AtomicU64::new(0),
+            pools_tracked: AtomicU64::new(0),
+            opportunities_found: AtomicU64::new(0),
+            intents_generated: AtomicU64::new(0),
+            intent_counter: AtomicU64::new(0),
+            zero_amount_trades: AtomicU64::new(0),
+            data_quality_rejects: AtomicU64::new(0),
+            last_market_event: RwLock::new(Instant::now()),
+            vault_balances: RwLock::new(HashMap::new()),
+            bin_arrays: RwLock::new(HashMap::new()),
+            live_pool_cache,
+            known_pools: RwLock::new(HashSet::new()),
+            multi_hop: Arc::new(MultiHopArbitrage::new(
+                MultiHopConfig::default(),
+                create_shared_cache(),
+            )),
+            spread_too_large_warn_last: RwLock::new(HashMap::new()),
+            eligibility_forensics: ArbEligibilityForensics::new(),
+            arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_track_published: AtomicU64::new(0),
+            two_hop_tx,
+            tracker_write,
+            tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
+        });
+        spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
+
+        let pool = "pool-stall-repro";
+        let mint = "TokenMint11111111111111111111111111111111";
+        ctx.handle_pool_created(pool, mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
+
+        let contention_ctx = ctx.clone();
+        let contention = std::thread::spawn(move || {
+            let _read_guard = contention_ctx.trackers.read();
+            std::thread::sleep(Duration::from_millis(400));
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let write_ctx = ctx.clone();
+        let writer = tokio::spawn(async move {
+            write_ctx
+                .tracker_write
+                .enqueue(
+                    ArbTrackerWriteJob::PoolStateUpdate {
+                        pool_address: pool.to_string(),
+                        dex: "raydium".to_string(),
+                        reserve_base: 5_000_000,
+                        reserve_quote: 10_000_000_000,
+                        update_slot: 99,
+                        active_id: None,
+                        bin_step: None,
+                        base_mint: NATIVE_SOL_MINT.to_string(),
+                        quote_mint: mint.to_string(),
+                    },
+                    ArbTrackerWriteJobType::PoolStateUpdate,
+                )
+                .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            arb_writer_lock_wait_count(ArbWriterLockKind::TrackersWrite) > 0
+                || arb_writer_lock_wait_count(ArbWriterLockKind::TrackersRead) > 0,
+            "writer must observe lock wait while heartbeat-style read lock is held"
+        );
+
+        writer.await.expect("writer enqueue task panicked");
+        contention.join().expect("contention thread panicked");
     }
 }
 
