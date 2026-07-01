@@ -6,7 +6,7 @@ use crate::market_data::sidefx::host::{
     market_event_should_nats_core, MarketEventCorePublishTrace,
 };
 use crate::metrics::{
-    record_market_data_bonding_to_trade_slot_delta_slots,
+    market_data_pool_state_publish_inc, record_market_data_bonding_to_trade_slot_delta_slots,
     record_market_data_geyser_to_publish_on_success,
     record_market_data_trade_after_bonding_publish_ms, wall_clock_unix_ms_now,
     MARKET_DATA_LAST_TRADE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_MOMENTUM_FANOUT_PUBLISHED_TOTAL,
@@ -74,6 +74,9 @@ pub async fn publish_market_event_core_and_momentum_ex(
         Ok(true) => {
             NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
             MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            if let MarketEventKind::PoolStateUpdate { dex, .. } = &event.kind {
+                market_data_pool_state_publish_inc(dex);
+            }
             if let Some(t) = trace {
                 record_market_data_geyser_to_publish_on_success(
                     t.recv_at,

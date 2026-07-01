@@ -71,6 +71,12 @@ pub trait SidefxWorkerHost: Send + Sync {
     fn vault_membership_view(&self, vault: &Pubkey) -> Option<SidefxVaultMembershipView>;
     fn snapshot_vault_pair_balances(&self, vault: &Pubkey, new_balance: u64) -> Option<(u64, u64)>;
     fn note_trade_pool_lru_touches(&self, pool: Pubkey, scratch: &mut MdSidefxBurstScratch);
+
+    /// True when pool is in momentum/arb hot set (arb-pinned DLMM PoolStateUpdate gate).
+    fn is_hot_pool(&self, pool: &Pubkey) -> bool;
+
+    /// Re-register DLMM bin-array window when arb-pinned pool `active_id` drifts (Fix B).
+    fn maybe_refresh_arb_dlmm_bin_window(&self, pool: Pubkey, new_active_id: i32) -> bool;
 }
 
 #[inline]

@@ -7,7 +7,7 @@ use super::pool_publish::{
     pool_cache_balance_fields_from_state, pump_amm_sell_layout_publish_state,
     raydium_cpmm_readiness_for_pool_cache_update, raydium_cpmm_vaults_for_pool_cache_update,
 };
-use super::worker::{MdSidefxBurstScratch, MdSidefxCommand};
+use super::worker::{DlmmPoolStateSignal, MdSidefxBurstScratch, MdSidefxCommand};
 use crate::execution::live_pool_cache::{
     meteora_cpmm_readiness_for_pool_cache_update, meteora_dlmm_readiness_for_pool_cache_update,
     orca_readiness_for_pool_cache_update, parse_pool_account,
@@ -19,6 +19,7 @@ use crate::ipc::{
     POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use crate::metrics::{
+    inc_market_data_pool_state_publish_skipped_balance_unchanged_total,
     record_market_data_bonding_curve_grpc_to_devwallet_ms,
     record_market_data_pool_mint_map_to_devwallet_ms, MarketDataLatencySegment,
 };
@@ -53,6 +54,104 @@ fn sidefx_host_enqueue_jetstream<T: serde::Serialize>(
         log_fail,
         bump_market_events_published_total,
     );
+}
+
+/// Build PoolStateUpdate from MASTER LivePoolCache (Geyser-only; no RPC).
+fn md_sidefx_build_pool_state_update_from_cache(
+    host: &dyn SidefxWorkerHost,
+    run_id: &str,
+    pool_pubkey: &Pubkey,
+    slot: u64,
+) -> Option<MarketEvent> {
+    let state = host.live_pool_cache().get(pool_pubkey)?;
+    let (base_mint, quote_mint, reserve_base, reserve_quote, dex) =
+        pool_cache_balance_fields_from_state(&state)?;
+    let (active_id, bin_step) = match &state {
+        CachedPoolState::Meteora(s) => (Some(s.active_id), Some(s.bin_step)),
+        _ => (None, None),
+    };
+    Some(MarketEvent::new(
+        "market-data",
+        host.build_version(),
+        run_id,
+        host.next_event_id(),
+        "geyser_dlmm_cache",
+        Some(slot),
+        MarketEventKind::PoolStateUpdate {
+            pool_address: pool_pubkey.to_string(),
+            dex: dex.to_string(),
+            reserve_base,
+            reserve_quote,
+            base_mint: base_mint.to_string(),
+            quote_mint: quote_mint.to_string(),
+            update_slot: slot,
+            active_id,
+            bin_step,
+        },
+    ))
+}
+
+fn md_sidefx_publish_pool_state_update_from_cache(
+    host: &dyn SidefxWorkerHost,
+    run_id: &str,
+    pool_pubkey: &Pubkey,
+    slot: u64,
+    grpc_recv_at: Instant,
+) -> bool {
+    let Some(state_event) =
+        md_sidefx_build_pool_state_update_from_cache(host, run_id, pool_pubkey, slot)
+    else {
+        return false;
+    };
+    host.write_market_event_jsonl(&state_event);
+    if host.nats_enabled() {
+        host.enqueue_core_market_event(
+            state_event,
+            Some(MarketEventCorePublishTrace {
+                recv_at: grpc_recv_at,
+                cold_path: false,
+                segment: MarketDataLatencySegment::Other,
+            }),
+        )
+    } else {
+        false
+    }
+}
+
+pub fn md_sidefx_flush_pending_dlmm_pool_state_publishes(
+    host: &dyn SidefxWorkerHost,
+    scratch: &mut MdSidefxBurstScratch,
+) {
+    let signals: Vec<(Pubkey, DlmmPoolStateSignal)> = scratch.drain_dlmm_pool_state_signals();
+    for (pool, signal) in signals {
+        if !host.is_hot_pool(&pool) {
+            continue;
+        }
+        let _ = md_sidefx_publish_pool_state_update_from_cache(
+            host,
+            &signal.run_id,
+            &pool,
+            signal.slot,
+            signal.grpc_recv_at,
+        );
+    }
+}
+
+pub fn md_sidefx_process_dlmm_pool_state_publish_signal(
+    _host: &dyn SidefxWorkerHost,
+    job: &MdSidefxCommand,
+    scratch: &mut MdSidefxBurstScratch,
+) {
+    let MdSidefxCommand::DlmmPoolStatePublishSignal {
+        run_id,
+        pool_address,
+        slot,
+        grpc_recv_at,
+    } = job
+    else {
+        return;
+    };
+    scratch.note_dlmm_pool_state_signal(*pool_address, run_id, *slot, *grpc_recv_at);
 }
 
 pub fn sidefx_maybe_emit_dev_wallet_after_pool_mint_map(
@@ -873,7 +972,7 @@ pub fn md_sidefx_process_live_pool_cache_mint_decimals(
 pub fn md_sidefx_process_live_pool_cache_account_update(
     host: &dyn SidefxWorkerHost,
     job: &MdSidefxCommand,
-    _scratch: &mut MdSidefxBurstScratch,
+    scratch: &mut MdSidefxBurstScratch,
 ) {
     let MdSidefxCommand::LivePoolCacheAccountUpdate {
         run_id,
@@ -887,6 +986,13 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
         return;
     };
     if let Some(mut cached_state) = parse_pool_account(owner, account_data) {
+        let prev_meteora_meta = host.live_pool_cache().get(pool_pubkey).and_then(|s| {
+            if let CachedPoolState::Meteora(m) = s {
+                Some((m.active_id, m.bin_step))
+            } else {
+                None
+            }
+        });
         // P2#7: Enrich PumpFun token_mint from pool_mint_map when parse returns default
         if let CachedPoolState::PumpFun(ref mut s) = &mut cached_state {
             if s.token_mint == Pubkey::default() {
@@ -912,6 +1018,21 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
             // Stale Geyser snapshot (e.g. HIGH/LOW queue reorder for same pubkey): skip downstream
             // JetStream / MarketEvent side effects so trading state cannot regress.
             return;
+        }
+
+        if let CachedPoolState::Meteora(ref s) = cached_state {
+            let meta_changed = match prev_meteora_meta {
+                None => host.is_hot_pool(pool_pubkey),
+                Some((prev_id, prev_step)) => prev_id != s.active_id || prev_step != s.bin_step,
+            };
+            if meta_changed && host.is_hot_pool(pool_pubkey) {
+                scratch.note_dlmm_pool_state_signal(*pool_pubkey, run_id, *slot, *grpc_recv_at);
+            }
+            if let Some((prev_id, _)) = prev_meteora_meta {
+                if prev_id != s.active_id {
+                    let _ = host.maybe_refresh_arb_dlmm_bin_window(*pool_pubkey, s.active_id);
+                }
+            }
         }
 
         // Phase1: sidefx only updates MASTER cache + JetStream; vault registration stays in md-state.
@@ -1283,6 +1404,7 @@ pub fn md_sidefx_process_vault_balance_tick(
         .last_balance
         .swap(*balance, std::sync::atomic::Ordering::Relaxed);
     if *balance == prev_balance {
+        inc_market_data_pool_state_publish_skipped_balance_unchanged_total();
         return;
     }
     scratch.note_vault_touch(*vault_pubkey);
@@ -1499,6 +1621,9 @@ pub fn md_sidefx_process_job(
         }
         MdSidefxCommand::TouchBinArrayTick { .. } => {
             md_sidefx_process_touch_bin_array_tick(host, job, scratch)
+        }
+        MdSidefxCommand::DlmmPoolStatePublishSignal { .. } => {
+            md_sidefx_process_dlmm_pool_state_publish_signal(host, job, scratch)
         }
         MdSidefxCommand::TradePoolLruTouch { .. } => {
             md_sidefx_process_trade_pool_lru_touch(host, job, scratch)

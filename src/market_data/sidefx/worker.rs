@@ -93,6 +93,13 @@ pub enum MdSidefxCommand {
     },
     /// DLMM bin-array LRU touch off account ingest (coalesced in md-sidefx burst).
     TouchBinArrayTick { pda: Pubkey },
+    /// P0: coalesced PoolStateUpdate for hot Meteora DLMM pools (bin/state signal, no vault delta).
+    DlmmPoolStatePublishSignal {
+        run_id: String,
+        pool_address: Pubkey,
+        slot: u64,
+        grpc_recv_at: Instant,
+    },
     /// PR237: trade-path vault/bin LRU touch via sidefx scratch (replaces md-state TouchPool).
     TradePoolLruTouch { pool: Pubkey },
     /// Phase-R-R4b: `parse_pool_account` + LivePoolCache writes + PoolCacheUpdate publish off account ingest.
@@ -116,10 +123,19 @@ pub struct MdSidefxSender {
     pub queue_capacity: usize,
 }
 
+/// Per-burst coalesced DLMM pool-state publish signal (latest slot wins per pool).
+#[derive(Clone)]
+pub struct DlmmPoolStateSignal {
+    pub run_id: String,
+    pub slot: u64,
+    pub grpc_recv_at: Instant,
+}
+
 /// Per-burst scratch: LRU touches coalesced before md-state enqueue.
 pub struct MdSidefxBurstScratch {
     pending_vault_touches: HashSet<Pubkey>,
     pending_bin_array_touches: HashSet<Pubkey>,
+    pending_dlmm_pool_state_signals: HashMap<Pubkey, DlmmPoolStateSignal>,
 }
 
 impl Default for MdSidefxBurstScratch {
@@ -133,6 +149,7 @@ impl MdSidefxBurstScratch {
         Self {
             pending_vault_touches: HashSet::new(),
             pending_bin_array_touches: HashSet::new(),
+            pending_dlmm_pool_state_signals: HashMap::new(),
         }
     }
 
@@ -142,6 +159,32 @@ impl MdSidefxBurstScratch {
 
     pub fn note_bin_array_touch(&mut self, pda: Pubkey) {
         self.pending_bin_array_touches.insert(pda);
+    }
+
+    pub fn note_dlmm_pool_state_signal(
+        &mut self,
+        pool: Pubkey,
+        run_id: &str,
+        slot: u64,
+        grpc_recv_at: Instant,
+    ) {
+        match self.pending_dlmm_pool_state_signals.get(&pool) {
+            Some(existing) if existing.slot >= slot => {}
+            _ => {
+                self.pending_dlmm_pool_state_signals.insert(
+                    pool,
+                    DlmmPoolStateSignal {
+                        run_id: run_id.to_string(),
+                        slot,
+                        grpc_recv_at,
+                    },
+                );
+            }
+        }
+    }
+
+    pub fn drain_dlmm_pool_state_signals(&mut self) -> Vec<(Pubkey, DlmmPoolStateSignal)> {
+        self.pending_dlmm_pool_state_signals.drain().collect()
     }
 
     pub fn pending_vault_touches_contains(&self, vault: &Pubkey) -> bool {
@@ -164,6 +207,7 @@ pub fn md_sidefx_flush_pending_md_state_jobs(
     host: &dyn SidefxWorkerHost,
     scratch: &mut MdSidefxBurstScratch,
 ) {
+    super::handlers::md_sidefx_flush_pending_dlmm_pool_state_publishes(host, scratch);
     host.flush_lru_touches(scratch);
 }
 
@@ -203,6 +247,7 @@ pub fn md_sidefx_coalesce_key(job: &MdSidefxCommand) -> Option<Pubkey> {
         MdSidefxCommand::LivePoolCacheAccountUpdate { pool_pubkey, .. } => Some(*pool_pubkey),
         MdSidefxCommand::VaultBalanceTick { vault_pubkey, .. } => Some(*vault_pubkey),
         MdSidefxCommand::TouchBinArrayTick { pda } => Some(*pda),
+        MdSidefxCommand::DlmmPoolStatePublishSignal { pool_address, .. } => Some(*pool_address),
         MdSidefxCommand::TradePoolLruTouch { pool } => Some(*pool),
         _ => None,
     }

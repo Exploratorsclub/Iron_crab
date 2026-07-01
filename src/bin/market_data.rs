@@ -79,8 +79,8 @@ use ironcrab::market_data::sidefx::{
 };
 use ironcrab::market_data::track::{
     arb_coalesce_try_send, explicit_subscription_has_new_keys, momentum_coalesce_try_send,
-    spawn_track_worker, ConsumerId, DesiredExplicitSet, TrackPinReason, TrackWorkerContext,
-    TrackWorkerSender,
+    spawn_track_worker, track_worker_try_enqueue, ConsumerId, DesiredExplicitSet, TrackPinReason,
+    TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,
 };
 use ironcrab::metrics::{
     dec_market_data_account_high_priority_queue_depth,
@@ -367,6 +367,7 @@ struct MarketDataSidefxHost {
     ctx: Arc<MarketDataContext>,
     publish_tx: Option<mpsc::Sender<AccountPathNatsJob>>,
     md_state: MdStateSender,
+    track_worker: TrackWorkerSender,
 }
 
 impl SidefxWorkerHost for MarketDataSidefxHost {
@@ -538,6 +539,23 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
     fn note_trade_pool_lru_touches(&self, pool: Pubkey, scratch: &mut MdSidefxBurstScratch) {
         note_trade_pool_lru_touches_from_cache(&self.ctx, pool, scratch);
     }
+
+    fn is_hot_pool(&self, pool: &Pubkey) -> bool {
+        self.ctx.hot_pool_registry.is_hot_pool(*pool)
+    }
+
+    fn maybe_refresh_arb_dlmm_bin_window(&self, pool: Pubkey, new_active_id: i32) -> bool {
+        let changed = self
+            .ctx
+            .maybe_refresh_arb_dlmm_bin_window(pool, new_active_id);
+        if changed {
+            let _ = track_worker_try_enqueue(
+                &self.track_worker,
+                TrackWorkerCommand::ScheduleGeyserPushDebounced,
+            );
+        }
+        changed
+    }
 }
 
 /// Phase 5b: md-sidefx worker (delegates to `sidefx/worker.rs`).
@@ -545,11 +563,13 @@ fn spawn_md_sidefx_worker(
     ctx: Arc<MarketDataContext>,
     publish_tx: Option<mpsc::Sender<AccountPathNatsJob>>,
     md_state: MdStateSender,
+    track_worker: TrackWorkerSender,
 ) -> MdSidefxSender {
     let host = Arc::new(MarketDataSidefxHost {
         ctx,
         publish_tx,
         md_state,
+        track_worker,
     }) as Arc<dyn SidefxWorkerHost>;
     spawn_sidefx_worker(host, MARKET_DATA_MD_SIDEFX_QUEUE_CAP)
 }
@@ -1079,6 +1099,8 @@ struct MarketDataContext {
     last_momentum_snapshot_target: parking_lot::RwLock<Option<HashSet<(Pubkey, Pubkey)>>>,
     /// Phase 3: skip redundant arb snapshot reconcile when target pool set unchanged.
     last_arb_snapshot_target: parking_lot::RwLock<Option<HashSet<Pubkey>>>,
+    /// Last `active_id` used when registering DLMM bin-array window per pool (Fix B).
+    dlmm_registered_active_id: parking_lot::RwLock<HashMap<Pubkey, i32>>,
 }
 
 #[derive(Debug, Default)]
@@ -3068,6 +3090,85 @@ impl MarketDataContext {
         self.register_geyser_reserves_for_active_pool(pool, GeyserPinReason::ArbMultiDex)
     }
 
+    fn register_meteora_dlmm_bin_arrays(
+        &self,
+        pool: Pubkey,
+        active_id: i32,
+        bin_step: u16,
+        pin: GeyserPinReason,
+        now: Instant,
+    ) -> bool {
+        if !self.config.read().enable_meteora_dlmm {
+            return false;
+        }
+        let active_array_index = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(active_id);
+        let mut bins_changed = false;
+        let mut new_bins: Vec<Pubkey> = Vec::new();
+        {
+            let mut bin_arrays = self.tracked_bin_arrays.write();
+            for offset in -3i64..=3i64 {
+                let index = active_array_index + offset;
+                if let Ok(pda) = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&pool, index) {
+                    use std::collections::hash_map::Entry;
+                    match bin_arrays.entry(pda) {
+                        Entry::Vacant(e) => {
+                            e.insert(BinArrayInfo {
+                                pool_address: pool,
+                                bin_array_index: index,
+                                bin_step,
+                                last_used_at: now,
+                                pinned: false,
+                                pin: None,
+                            });
+                            bins_changed = true;
+                            new_bins.push(pda);
+                        }
+                        Entry::Occupied(mut e) => {
+                            let b = e.get_mut();
+                            if Self::geyser_pin_may_promote(b.pin, pin) {
+                                b.pinned = true;
+                                b.pin = Some(pin);
+                                b.bin_step = bin_step;
+                                bins_changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for pda in new_bins {
+            self.geyser_lru_note_bin(pda, now);
+            self.pool_tracked_legs_note_bin(pool, pda);
+        }
+        if bins_changed {
+            self.dlmm_registered_active_id
+                .write()
+                .insert(pool, active_id);
+        }
+        bins_changed
+    }
+
+    /// Fix B: when arb-pinned DLMM `active_id` drifts, register new bin-array PDAs + Geyser push.
+    fn maybe_refresh_arb_dlmm_bin_window(&self, pool: Pubkey, new_active_id: i32) -> bool {
+        if !self.hot_pool_registry.pool_has_arb(pool) {
+            return false;
+        }
+        let prev = self.dlmm_registered_active_id.read().get(&pool).copied();
+        if prev == Some(new_active_id) {
+            return false;
+        }
+        let Some(CachedPoolState::Meteora(s)) = self.live_pool_cache.get(&pool) else {
+            return false;
+        };
+        self.register_meteora_dlmm_bin_arrays(
+            pool,
+            new_active_id,
+            s.bin_step,
+            GeyserPinReason::ArbMultiDex,
+            Instant::now(),
+        )
+    }
+
     fn register_geyser_reserves_impl(&self, pool: Pubkey, pin: GeyserPinReason) -> bool {
         let now = Instant::now();
         let enable_dlmm = self.config.read().enable_meteora_dlmm;
@@ -3088,38 +3189,8 @@ impl MarketDataContext {
 
         match &state {
             CachedPoolState::Meteora(s) if enable_dlmm => {
-                let active_id = s.active_id;
-                let active_array_index =
-                    MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(active_id);
-                let bin_step = s.bin_step;
-                {
-                    let mut bin_arrays = self.tracked_bin_arrays.write();
-                    let mut new_bins: Vec<Pubkey> = Vec::new();
-                    for offset in -3i64..=3i64 {
-                        let index = active_array_index + offset;
-                        if let Ok(pda) = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&pool, index)
-                        {
-                            use std::collections::hash_map::Entry;
-                            if let Entry::Vacant(e) = bin_arrays.entry(pda) {
-                                e.insert(BinArrayInfo {
-                                    pool_address: pool,
-                                    bin_array_index: index,
-                                    bin_step,
-                                    last_used_at: now,
-                                    pinned: false,
-                                    pin: None,
-                                });
-                                bins_changed = true;
-                                new_bins.push(pda);
-                            }
-                        }
-                    }
-                    drop(bin_arrays);
-                    for pda in new_bins {
-                        self.geyser_lru_note_bin(pda, now);
-                        self.pool_tracked_legs_note_bin(pool, pda);
-                    }
-                }
+                bins_changed =
+                    self.register_meteora_dlmm_bin_arrays(pool, s.active_id, s.bin_step, pin, now);
             }
             CachedPoolState::RaydiumAmm(s) => {
                 let mut vaults = self.tracked_vaults.write();
@@ -5903,6 +5974,7 @@ async fn main() -> Result<()> {
         geyser_lru_index: parking_lot::Mutex::new(GeyserLruIndex::default()),
         last_momentum_snapshot_target: parking_lot::RwLock::new(None),
         last_arb_snapshot_target: parking_lot::RwLock::new(None),
+        dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -6483,14 +6555,8 @@ async fn account_path_enqueue_core_market_event(
     event: MarketEvent,
     trace: Option<MarketEventCorePublishTrace>,
 ) -> bool {
-    match &event.kind {
-        MarketEventKind::PoolStateUpdate { dex, .. } => {
-            ironcrab::metrics::market_data_pool_state_publish_inc(dex);
-        }
-        MarketEventKind::BinArrayUpdate { .. } => {
-            ironcrab::metrics::market_data_bin_array_publish_inc();
-        }
-        _ => {}
+    if matches!(&event.kind, MarketEventKind::BinArrayUpdate { .. }) {
+        ironcrab::metrics::market_data_bin_array_publish_inc();
     }
     publish_enqueue_core_market_event(publish_tx, nats, Some(ctx.as_ref()), event, trace).await
 }
@@ -7081,6 +7147,20 @@ async fn handle_geyser_account(
                             )
                             .await;
                         }
+                        if ctx
+                            .hot_pool_registry
+                            .is_hot_pool(bin_array_info.pool_address)
+                        {
+                            md_sidefx_try_enqueue(
+                                md_sidefx,
+                                MdSidefxCommand::DlmmPoolStatePublishSignal {
+                                    run_id: run_id.to_string(),
+                                    pool_address: bin_array_info.pool_address,
+                                    slot: account_update.slot,
+                                    grpc_recv_at: account_geyser_recv_at,
+                                },
+                            );
+                        }
                     }
                 }
                 Err(e) => {
@@ -7655,7 +7735,7 @@ async fn run_geyser_loop(
     let md_state = spawn_md_state_worker(
         Arc::clone(&ctx),
         tokio::runtime::Handle::current(),
-        track_worker,
+        track_worker.clone(),
     );
 
     // === P0: Wallet Balance Snapshot (Position Reconciliation) ===
@@ -7978,6 +8058,7 @@ async fn run_geyser_loop(
         Arc::clone(&ctx),
         account_publish_tx.clone(),
         md_state.clone(),
+        track_worker,
     );
 
     // Option A (MARKET-DATA-TX-INGEST-FAIRNESS): dedizierter Tokio-Task für Geyser-Txs.
@@ -8972,7 +9053,7 @@ async fn run_simulation_loop(
     let md_state = spawn_md_state_worker(
         Arc::clone(&ctx),
         tokio::runtime::Handle::current(),
-        track_worker,
+        track_worker.clone(),
     );
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -10430,6 +10511,7 @@ mod wallet_snapshot_stale_cleanup_tests {
             geyser_lru_index: parking_lot::Mutex::new(GeyserLruIndex::default()),
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
+            dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
@@ -10645,6 +10727,7 @@ mod wallet_tx_meta_balance_tests {
             geyser_lru_index: parking_lot::Mutex::new(GeyserLruIndex::default()),
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
+            dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
         })
     }
 
@@ -10992,19 +11075,22 @@ mod pr_b_geyser_tracking_tests {
     fn test_sidefx_host(
         ctx: &Arc<MarketDataContext>,
         md_state: MdStateSender,
+        track_worker: TrackWorkerSender,
     ) -> MarketDataSidefxHost {
         MarketDataSidefxHost {
             ctx: Arc::clone(ctx),
             publish_tx: None,
             md_state,
+            track_worker,
         }
     }
 
     fn test_spawn_md_sidefx(
         ctx: &Arc<MarketDataContext>,
         md_state: &MdStateSender,
+        track_worker: TrackWorkerSender,
     ) -> MdSidefxSender {
-        spawn_md_sidefx_worker(Arc::clone(ctx), None, md_state.clone())
+        spawn_md_sidefx_worker(Arc::clone(ctx), None, md_state.clone(), track_worker)
     }
 
     fn fill_md_state_queue(md_state: &MdStateSender) {
@@ -11065,7 +11151,7 @@ mod pr_b_geyser_tracking_tests {
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
         let (md_state, depth, md_state_rx) = test_md_state_sender_no_worker();
-        let worker = test_sidefx_host(&ctx, md_state.clone());
+        let worker = test_sidefx_host(&ctx, md_state.clone(), test_noop_track_worker_sender());
         let pool = Pubkey::new_unique();
         let base = Pubkey::new_unique();
         let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
@@ -11512,6 +11598,7 @@ mod pr_b_geyser_tracking_tests {
             geyser_lru_index: parking_lot::Mutex::new(GeyserLruIndex::default()),
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
+            dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
         })
     }
 
@@ -11583,6 +11670,7 @@ mod pr_b_geyser_tracking_tests {
             geyser_lru_index: parking_lot::Mutex::new(GeyserLruIndex::default()),
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
+            dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
         });
         (
             ctx,
@@ -12632,7 +12720,7 @@ mod pr_b_geyser_tracking_tests {
             grpc_recv_at: Instant::now(),
         };
         let md_state = test_spawn_md_state(&ctx);
-        let md_sidefx = test_spawn_md_sidefx(&ctx, &md_state);
+        let md_sidefx = test_spawn_md_sidefx(&ctx, &md_state, test_noop_track_worker_sender());
         let done = tokio::time::timeout(
             std::time::Duration::from_millis(150),
             handle_geyser_transaction(
@@ -12726,7 +12814,7 @@ mod pr_b_geyser_tracking_tests {
 
         let account_count = AtomicU64::new(0);
         let md_state = test_spawn_md_state(&ctx);
-        let md_sidefx = test_spawn_md_sidefx(&ctx, &md_state);
+        let md_sidefx = test_spawn_md_sidefx(&ctx, &md_state, test_noop_track_worker_sender());
         let update = GeyserAccountUpdate {
             pubkey: pool,
             owner: PUMPFUN_AMM_PROGRAM_OWNER,
@@ -13184,7 +13272,7 @@ mod pr_b_geyser_tracking_tests {
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
         let md_state = test_spawn_md_state(&ctx);
-        let md_sidefx = test_spawn_md_sidefx(&ctx, &md_state);
+        let md_sidefx = test_spawn_md_sidefx(&ctx, &md_state, test_noop_track_worker_sender());
         fill_md_state_queue(&md_state);
 
         let lock_ctx = Arc::clone(&ctx);
@@ -13269,7 +13357,7 @@ mod pr_b_geyser_tracking_tests {
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
         let md_state = test_spawn_md_state(&ctx);
-        let md_sidefx = test_spawn_md_sidefx(&ctx, &md_state);
+        let md_sidefx = test_spawn_md_sidefx(&ctx, &md_state, test_noop_track_worker_sender());
         fill_md_sidefx_queue(&md_sidefx);
 
         let lock_ctx = Arc::clone(&ctx);
@@ -13324,7 +13412,7 @@ mod pr_b_geyser_tracking_tests {
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
         let md_state = test_spawn_md_state(&ctx);
-        let md_sidefx = test_spawn_md_sidefx(&ctx, &md_state);
+        let md_sidefx = test_spawn_md_sidefx(&ctx, &md_state, test_noop_track_worker_sender());
 
         let pool = Pubkey::new_unique();
         let mint = "mint123".to_string();
@@ -13931,6 +14019,104 @@ mod pr_b_geyser_tracking_tests {
         );
     }
 
+    /// P0: coalesced DLMM PoolStateUpdate from bin/state signal uses MASTER cache.
+    #[test]
+    fn dlmm_pool_state_signal_coalesces_per_pool() {
+        use ironcrab::execution::live_pool_cache::{CachedPoolState, MeteoraState};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, _depth, _rx) = test_md_state_sender_no_worker();
+        let worker = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+
+        let pool = Pubkey::new_unique();
+        let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: Pubkey::new_unique(),
+                token_y_mint: sol,
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id: 7,
+                bin_step: 20,
+                reserve_x_balance: Some(500_000),
+                reserve_y_balance: Some(1_500_000_000),
+            }),
+            99,
+        );
+
+        let mut scratch = MdSidefxBurstScratch::new();
+        ironcrab::market_data::sidefx::handlers::md_sidefx_process_dlmm_pool_state_publish_signal(
+            &worker,
+            &MdSidefxCommand::DlmmPoolStatePublishSignal {
+                run_id: "run-test".into(),
+                pool_address: pool,
+                slot: 50,
+                grpc_recv_at: Instant::now(),
+            },
+            &mut scratch,
+        );
+        ironcrab::market_data::sidefx::handlers::md_sidefx_process_dlmm_pool_state_publish_signal(
+            &worker,
+            &MdSidefxCommand::DlmmPoolStatePublishSignal {
+                run_id: "run-test".into(),
+                pool_address: pool,
+                slot: 99,
+                grpc_recv_at: Instant::now(),
+            },
+            &mut scratch,
+        );
+        let signals = scratch.drain_dlmm_pool_state_signals();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].1.slot, 99, "latest slot must win coalesce");
+    }
+
+    /// Fix B: arb-pinned DLMM re-registers bin arrays when active_id drifts.
+    #[test]
+    fn arb_dlmm_bin_window_refreshes_on_active_id_drift() {
+        use ironcrab::execution::live_pool_cache::{CachedPoolState, MeteoraState};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: Pubkey::new_unique(),
+                token_y_mint: sol,
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id: 10,
+                bin_step: 15,
+                reserve_x_balance: Some(1),
+                reserve_y_balance: Some(1),
+            }),
+            1,
+        );
+        assert!(ctx.register_geyser_reserves_for_arb_active_pool(pool));
+        let before = ctx.tracked_bin_arrays.read().len();
+        assert!(
+            !ctx.maybe_refresh_arb_dlmm_bin_window(pool, 10),
+            "same active_id must be idempotent"
+        );
+        assert_eq!(ctx.tracked_bin_arrays.read().len(), before);
+
+        assert!(ctx.maybe_refresh_arb_dlmm_bin_window(pool, 500));
+        assert!(
+            ctx.tracked_bin_arrays.read().len() >= before,
+            "new active_id must register additional bin-array PDAs"
+        );
+        assert_eq!(ctx.dlmm_registered_active_id.read().get(&pool), Some(&500));
+    }
+
     /// Phase1: snapshot-backed vault balance tick publishes paired reserves.
     #[test]
     fn phase1_vault_balance_tick_from_snapshot_publishes_pair() {
@@ -13939,7 +14125,7 @@ mod pr_b_geyser_tracking_tests {
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
         let (md_state, _depth, _rx) = test_md_state_sender_no_worker();
-        let worker = test_sidefx_host(&ctx, md_state);
+        let worker = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
 
         let pool = Pubkey::new_unique();
         let base_vault = Pubkey::new_unique();

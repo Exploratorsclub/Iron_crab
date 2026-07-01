@@ -345,6 +345,59 @@ fn vault_dlmm_sol_is_x(vault: &VaultBalanceCache) -> bool {
         .unwrap_or(vault.dlmm_sol_is_x)
 }
 
+/// H3: seed missing DLMM vault row from SLAVE cache on BinArrayUpdate (Geyser-only).
+fn try_seed_dlmm_vault_on_bin_update(
+    pool_address: &str,
+    update_slot: u64,
+    live_pool_cache: &SharedLivePoolCache,
+    vault_cache: &mut HashMap<String, VaultBalanceCache>,
+) {
+    if vault_cache.contains_key(pool_address) {
+        return;
+    }
+    let Ok(pool_pk) = Pubkey::from_str(pool_address) else {
+        return;
+    };
+    let Some(state) = live_pool_cache.get(&pool_pk) else {
+        return;
+    };
+    let CachedPoolState::Meteora(s) = state else {
+        return;
+    };
+    let x = s.token_x_mint.to_string();
+    let y = s.token_y_mint.to_string();
+    let (reserve_base, reserve_quote, dlmm_sol_is_x, dlmm_token_x_mint) = if y == NATIVE_SOL_MINT {
+        (
+            s.reserve_x_balance.unwrap_or(0),
+            s.reserve_y_balance.unwrap_or(0),
+            false,
+            Some(x),
+        )
+    } else if x == NATIVE_SOL_MINT {
+        (
+            s.reserve_y_balance.unwrap_or(0),
+            s.reserve_x_balance.unwrap_or(0),
+            true,
+            Some(x),
+        )
+    } else {
+        return;
+    };
+    vault_cache.insert(
+        pool_address.to_string(),
+        VaultBalanceCache {
+            reserve_base,
+            reserve_quote,
+            update_slot,
+            active_id: Some(s.active_id),
+            bin_step: Some(s.bin_step),
+            updated_at: Instant::now(),
+            dlmm_sol_is_x,
+            dlmm_token_x_mint,
+        },
+    );
+}
+
 /// Resolve on-chain `token_x_mint` for DLMM PoolStateUpdate (normalized base/quote ≠ token_x/y).
 fn resolve_dlmm_token_x_mint_for_pool_update(
     pool_address: &str,
@@ -3784,6 +3837,12 @@ impl ArbContext {
         let now = Instant::now();
         {
             let mut vault_cache = self.vault_balances.write();
+            try_seed_dlmm_vault_on_bin_update(
+                pool_address,
+                update_slot,
+                &self.live_pool_cache,
+                &mut vault_cache,
+            );
             if let Some(v) = vault_cache.get_mut(pool_address) {
                 v.updated_at = now;
             }
@@ -6948,7 +7007,9 @@ mod event_pipeline_tests {
 #[cfg(test)]
 mod two_hop_price_tests {
     use super::*;
-    use ironcrab::execution::live_pool_cache::{create_shared_cache, SharedLivePoolCache};
+    use ironcrab::execution::live_pool_cache::{
+        create_shared_cache, CachedPoolState, MeteoraState, SharedLivePoolCache,
+    };
     use ironcrab::ipc::PoolCacheUpdate;
     use rust_decimal::Decimal;
     use solana_sdk::pubkey::Pubkey;
@@ -7310,6 +7371,48 @@ mod two_hop_price_tests {
         };
         let max_age = Duration::from_millis(MAX_PRICE_AGE_MS);
         assert!(is_pool_price_fresh(&pool, Some(&vault), max_age));
+    }
+
+    #[test]
+    fn bin_array_update_seeds_missing_vault_from_live_cache() {
+        let cache = create_shared_cache();
+        let pool_pk = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        cache.upsert(
+            pool_pk,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: token_mint,
+                token_y_mint: sol,
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id: 42,
+                bin_step: 25,
+                reserve_x_balance: Some(1_000_000),
+                reserve_y_balance: Some(2_000_000_000),
+            }),
+            10,
+        );
+        let ctx = test_arb_context(cache);
+        let pool_addr = pool_pk.to_string();
+        assert!(!ctx.vault_balances.read().contains_key(&pool_addr));
+
+        ctx.handle_bin_array_update(
+            &pool_addr,
+            0,
+            vec![BinData {
+                offset: 0,
+                amount_x: 1_000_000,
+                amount_y: 2_000_000_000,
+            }],
+            11,
+        );
+
+        let vaults = ctx.vault_balances.read();
+        let vault = vaults.get(&pool_addr).expect("vault must be seeded");
+        assert_eq!(vault.active_id, Some(42));
+        assert_eq!(vault.bin_step, Some(25));
+        assert!(vault.updated_at.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
