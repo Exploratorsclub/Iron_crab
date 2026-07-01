@@ -43,7 +43,8 @@ use ironcrab::ipc::{
     TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
-    arb_heartbeat_finished, arb_pool_cache_apply_batches_inc, arb_pool_cache_updates_applied_add,
+    arb_heartbeat_finished, arb_pool_cache_apply_batches_inc, arb_pool_cache_sync_fetch_empty_inc,
+    arb_pool_cache_sync_messages_add, arb_pool_cache_updates_applied_add,
     arb_strategy_bootstrap_skip_inc, arb_strategy_bootstrap_warmup_set,
     arb_strategy_pool_cache_update_seeded_inc, arb_strategy_pool_cache_update_seen_inc,
     arb_strategy_pool_cache_update_skip_no_seed_inc,
@@ -60,14 +61,15 @@ use ironcrab::metrics::{
     arb_two_hop_eligible_pools_by_dex_add, arb_two_hop_insufficient_subreason_inc,
     arb_two_hop_opportunity_inc, arb_two_hop_pool_gate_add, arb_two_hop_reject_subreason_inc,
     arb_two_hop_rejected_inc, arb_two_hop_tracker_seeded_pools_add, record_arb_heartbeat_phase,
-    record_arb_track_requests_messages_total, record_arb_writer_lock_wait, serve_metrics,
-    set_arb_pool_cache_apply_batch_size_gauge, set_arb_tracker_write_coalescer_pending,
-    set_arb_tracker_write_queue_depth, set_arb_two_hop_blocked_on_apply_trade,
-    set_readiness_nats_connected, tick_arb_heartbeat_seconds_since_last_finish,
-    tick_arb_tracker_write_seconds_since_last_finish, wall_clock_unix_ms_now, ArbHeartbeatPhase,
-    ArbStrategyWarmupSkipReason, ArbTrackerWriteJobType, ArbTwoHopInsufficientSubreason,
-    ArbTwoHopPoolGate, ArbTwoHopRejectReason, ArbTwoHopRejectSubreason, ArbWriterLockKind,
-    MetricsComponent, ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH, ARB_REJECTED_MISSING_ACCOUNTS,
+    record_arb_price_freshness_stale_age_ms, record_arb_track_requests_messages_total,
+    record_arb_writer_lock_wait, serve_metrics, set_arb_pool_cache_apply_batch_size_gauge,
+    set_arb_tracker_write_coalescer_pending, set_arb_tracker_write_queue_depth,
+    set_arb_two_hop_blocked_on_apply_trade, set_readiness_nats_connected,
+    tick_arb_heartbeat_seconds_since_last_finish, tick_arb_tracker_write_seconds_since_last_finish,
+    wall_clock_unix_ms_now, ArbHeartbeatPhase, ArbStrategyWarmupSkipReason, ArbTrackerWriteJobType,
+    ArbTwoHopInsufficientSubreason, ArbTwoHopPoolGate, ArbTwoHopRejectReason,
+    ArbTwoHopRejectSubreason, ArbWriterLockKind, MetricsComponent,
+    ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH, ARB_REJECTED_MISSING_ACCOUNTS,
     ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL, ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH,
     ARB_TRACKER_WRITE_COALESCER_PENDING, ARB_TRACKER_WRITE_CURRENT_JOB_STARTED_UNIX_MS,
     ARB_TRACKER_WRITE_CURRENT_JOB_TYPE, ARB_TRACKER_WRITE_QUEUE_DEPTH,
@@ -76,7 +78,7 @@ use ironcrab::metrics::{
     NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
-    config_consumer_config, config_subject, pool_cache_live_fallback_consumer_config,
+    arb_strategy_pool_cache_live_consumer_config, config_consumer_config, config_subject,
     ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackRemovedEntry, ArbTrackRemovedReason,
     ArbTrackRequestsUpdate, CONFIG_STREAM_NAME, STREAM_NAME,
 };
@@ -557,14 +559,51 @@ fn is_pool_price_fresh(
     if pool.last_update.elapsed() <= max_age {
         return true;
     }
-    if pool.has_reserve_data {
-        if let Some(v) = vault {
-            if v.reserve_base > 0 && v.reserve_quote > 0 && v.updated_at.elapsed() <= max_age {
-                return true;
-            }
+    if let Some(v) = vault {
+        if pool.dex == "meteora_dlmm"
+            && v.active_id.is_some()
+            && v.bin_step.is_some()
+            && v.updated_at.elapsed() <= max_age
+        {
+            return true;
+        }
+        if pool.has_reserve_data
+            && v.reserve_base > 0
+            && v.reserve_quote > 0
+            && v.updated_at.elapsed() <= max_age
+        {
+            return true;
         }
     }
     false
+}
+
+/// Age and dominant freshness source for stale-price metrics at 2-hop reject.
+fn stale_price_age_for_metrics(
+    pool: &PoolState,
+    vault: Option<&VaultBalanceCache>,
+) -> (u64, &'static str) {
+    let trade_age = pool.last_update.elapsed().as_millis() as u64;
+    if let Some(v) = vault {
+        if pool.dex == "meteora_dlmm" && v.active_id.is_some() && v.bin_step.is_some() {
+            let meta_age = v.updated_at.elapsed().as_millis() as u64;
+            if meta_age >= trade_age {
+                return (meta_age, "dlmm_meta");
+            }
+        }
+        if pool.has_reserve_data && v.reserve_base > 0 && v.reserve_quote > 0 {
+            let vault_age = v.updated_at.elapsed().as_millis() as u64;
+            if vault_age >= trade_age {
+                return (vault_age, "vault");
+            }
+        }
+    }
+    (trade_age, "trade")
+}
+
+fn record_stale_price_freshness_metrics(pool: &PoolState, vault: Option<&VaultBalanceCache>) {
+    let (age_ms, source) = stale_price_age_for_metrics(pool, vault);
+    record_arb_price_freshness_stale_age_ms(&pool.dex, source, age_ms);
 }
 
 /// Comparable SOL/token for spread: DLMM marginal (probe) > reserve mid > trade mid.
@@ -1988,6 +2027,12 @@ impl TokenArbTracker {
                 max_age_ms = MAX_PRICE_AGE_MS,
                 "Arb check rejected: stale comparable price"
             );
+            if !is_pool_price_fresh(buy_pool, buy_vault, max_age) {
+                record_stale_price_freshness_metrics(buy_pool, buy_vault);
+            }
+            if !is_pool_price_fresh(sell_pool, sell_vault, max_age) {
+                record_stale_price_freshness_metrics(sell_pool, sell_vault);
+            }
             breakdown.reject_subreason = Some(ArbTwoHopRejectSubreason::StalePrice);
             self.emit_eligibility_forensics(breakdown, forensics);
             arb_two_hop_rejected_inc(ArbTwoHopRejectReason::StalePrice);
@@ -3733,6 +3778,43 @@ impl ArbContext {
             return;
         }
         pool_cache.insert(bin_array_index, BinArrayCache { bins, update_slot });
+        drop(cache);
+
+        // Bin liquidity updates are a valid DLMM price signal (H3): refresh vault + pool timestamps.
+        let now = Instant::now();
+        {
+            let mut vault_cache = self.vault_balances.write();
+            if let Some(v) = vault_cache.get_mut(pool_address) {
+                v.updated_at = now;
+            }
+        }
+        let read_wait = Instant::now();
+        let mints_with_pool: Vec<String> = {
+            let trackers = self.trackers.read();
+            record_arb_writer_lock_wait(ArbWriterLockKind::TrackersRead, read_wait.elapsed());
+            trackers
+                .iter()
+                .filter(|(_, tracker)| tracker.pools.contains_key(pool_address))
+                .map(|(mint, _)| mint.clone())
+                .collect()
+        };
+        if !mints_with_pool.is_empty() {
+            let write_wait = Instant::now();
+            let mut trackers = self.trackers.write();
+            record_arb_writer_lock_wait(ArbWriterLockKind::TrackersWrite, write_wait.elapsed());
+            for mint in mints_with_pool {
+                let Some(tracker) = trackers.get_mut(&mint) else {
+                    continue;
+                };
+                let Some(pool) = tracker.pools.get_mut(pool_address) else {
+                    continue;
+                };
+                if pool.dex == "meteora_dlmm" {
+                    pool.last_update = now;
+                }
+            }
+        }
+
         debug!(
             pool = %pool_address,
             bin_array_index,
@@ -4833,10 +4915,12 @@ fn spawn_arb_pool_cache_sync_worker(ctx: Arc<ArbContext>, consumer: JetStreamPul
                         }
                     }
                     if pending.is_empty() {
+                        arb_pool_cache_sync_fetch_empty_inc();
                         tokio::task::yield_now().await;
                         continue;
                     }
 
+                    arb_pool_cache_sync_messages_add(pending.len() as u64);
                     set_arb_pool_cache_apply_batch_size_gauge(pending.len() as u64);
                     arb_pool_cache_apply_batches_inc();
 
@@ -5051,10 +5135,10 @@ async fn main() -> Result<()> {
     spawn_arb_two_hop_worker(Arc::clone(&ctx), two_hop_rx);
 
     // Bootstrap SLAVE LivePoolCache from JetStream (same path as execution-engine).
-    // Consumer is returned for reuse in the main loop (FIX-12 — no second LastPerSubject replay).
-    let bootstrap_consumer = if let Some(ref nats_client) = ctx.nats {
+    // Live sync uses a separate `DeliverPolicy::New` consumer (momentum-bot pattern).
+    if let Some(ref nats_client) = ctx.nats {
         match bootstrap_pool_cache_from_jetstream(nats_client, &ctx.live_pool_cache).await {
-            Ok((pools_recovered, consumer)) => {
+            Ok((pools_recovered, _consumer)) => {
                 let known_count = populate_arb_slave_from_live_pool_cache(
                     &ctx.live_pool_cache,
                     &ctx.known_pools,
@@ -5081,16 +5165,12 @@ async fn main() -> Result<()> {
                     multi_hop_vertices = mh_stats.graph_vertices,
                     "SLAVE CACHE: known_pools and multi-hop graph recovered from JetStream"
                 );
-                consumer
             }
             Err(e) => {
                 warn!(error = %e, "SLAVE CACHE: JetStream bootstrap failed (will rely on incremental updates)");
-                None
             }
         }
-    } else {
-        None
-    };
+    }
 
     // Subscribe to MarketEvents
     let market_subscription = if let Some(ref nats) = ctx.nats {
@@ -5187,31 +5267,28 @@ async fn main() -> Result<()> {
     };
 
     // Subscribe to PoolCacheUpdates from JetStream (SLAVE sync from market-data MASTER).
-    // CRITICAL: Reuse bootstrap consumer when available (FIX-12). Fallback: DeliverPolicy::New only.
-    let pool_cache_consumer = if let Some(consumer) = bootstrap_consumer {
-        info!(
-            stream = STREAM_NAME,
-            "Reusing bootstrap consumer for live PoolCacheUpdate sync (no duplicate LastPerSubject replay)"
-        );
-        Some(consumer)
-    } else if let Some(ref nats) = ctx.nats {
+    // Dedicated live consumer (`DeliverPolicy::New`) — bootstrap `LastPerSubject` does not
+    // deliver incremental updates after ack (same split as momentum-bot; H1).
+    let pool_cache_consumer = if let Some(ref nats) = ctx.nats {
         use async_nats::jetstream;
 
         let jetstream = jetstream::new(nats.client().clone());
 
         match jetstream.get_stream(STREAM_NAME).await {
             Ok(stream) => {
-                let config = pool_cache_live_fallback_consumer_config();
+                let config = arb_strategy_pool_cache_live_consumer_config();
                 match stream.create_consumer(config).await {
                     Ok(consumer) => {
                         info!(
                             stream = STREAM_NAME,
-                            "Created NEW JetStream consumer (no bootstrap, DeliverPolicy::New)"
+                            deliver_policy = "New",
+                            durable = "arb-strategy-pool-cache-live",
+                            "Arb PoolCache live consumer created (separate from bootstrap LastPerSubject)"
                         );
                         Some(consumer)
                     }
                     Err(e) => {
-                        warn!(error = %e, "Failed to create JetStream consumer for PoolCacheUpdates");
+                        warn!(error = %e, "Failed to create arb JetStream live PoolCache consumer");
                         None
                     }
                 }
@@ -7211,6 +7288,91 @@ mod two_hop_price_tests {
         let max_age = Duration::from_millis(MAX_PRICE_AGE_MS);
         assert!(!pool.last_update.elapsed().le(&max_age));
         assert!(is_pool_price_fresh(&pool, Some(&vault), max_age));
+    }
+
+    #[test]
+    fn dlmm_meta_fresh_without_reserves_passes_freshness_check() {
+        let stale_trade = Instant::now() - Duration::from_millis(MAX_PRICE_AGE_MS + 5_000);
+        let pool = PoolState {
+            has_reserve_data: false,
+            last_update: stale_trade,
+            ..sample_pool("meteora_dlmm", "dlmmMeta", None, None)
+        };
+        let vault = VaultBalanceCache {
+            reserve_base: 0,
+            reserve_quote: 0,
+            update_slot: 2,
+            active_id: Some(0),
+            bin_step: Some(10),
+            updated_at: Instant::now(),
+            dlmm_sol_is_x: true,
+            dlmm_token_x_mint: Some(NATIVE_SOL_MINT.to_string()),
+        };
+        let max_age = Duration::from_millis(MAX_PRICE_AGE_MS);
+        assert!(is_pool_price_fresh(&pool, Some(&vault), max_age));
+    }
+
+    #[test]
+    fn bin_array_update_refreshes_dlmm_pool_freshness() {
+        let cache = create_shared_cache();
+        let ctx = test_arb_context(cache);
+        let mint = "TokenMintBinArrayFresh1111111111111111111";
+        let pool_addr = "dlmmPoolBinFresh";
+
+        {
+            let mut trackers = ctx.trackers.write();
+            let tracker = TokenArbTracker::new(mint);
+            trackers.insert(mint.to_string(), tracker);
+        }
+        {
+            let mut trackers = ctx.trackers.write();
+            let tracker = trackers.get_mut(mint).unwrap();
+            tracker.upsert_pool(PoolState {
+                last_update: Instant::now() - Duration::from_millis(MAX_PRICE_AGE_MS + 10_000),
+                ..sample_pool("meteora_dlmm", pool_addr, None, None)
+            });
+        }
+        ctx.vault_balances.write().insert(
+            pool_addr.to_string(),
+            VaultBalanceCache {
+                reserve_base: 0,
+                reserve_quote: 0,
+                update_slot: 1,
+                active_id: Some(0),
+                bin_step: Some(10),
+                updated_at: Instant::now() - Duration::from_millis(MAX_PRICE_AGE_MS + 10_000),
+                dlmm_sol_is_x: true,
+                dlmm_token_x_mint: Some(NATIVE_SOL_MINT.to_string()),
+            },
+        );
+
+        let max_age = Duration::from_millis(MAX_PRICE_AGE_MS);
+        let pool_before = ctx.trackers.read().get(mint).unwrap().pools[pool_addr].clone();
+        let vault_before = ctx.vault_balances.read().get(pool_addr).unwrap().clone();
+        assert!(!is_pool_price_fresh(
+            &pool_before,
+            Some(&vault_before),
+            max_age
+        ));
+
+        ctx.handle_bin_array_update(
+            pool_addr,
+            0,
+            vec![BinData {
+                offset: 0,
+                amount_x: 1_000_000,
+                amount_y: 1_000_000_000,
+            }],
+            99,
+        );
+
+        let pool_after = ctx.trackers.read().get(mint).unwrap().pools[pool_addr].clone();
+        let vault_after = ctx.vault_balances.read().get(pool_addr).unwrap().clone();
+        assert!(is_pool_price_fresh(
+            &pool_after,
+            Some(&vault_after),
+            max_age
+        ));
     }
 
     #[test]

@@ -6483,6 +6483,15 @@ async fn account_path_enqueue_core_market_event(
     event: MarketEvent,
     trace: Option<MarketEventCorePublishTrace>,
 ) -> bool {
+    match &event.kind {
+        MarketEventKind::PoolStateUpdate { dex, .. } => {
+            ironcrab::metrics::market_data_pool_state_publish_inc(dex);
+        }
+        MarketEventKind::BinArrayUpdate { .. } => {
+            ironcrab::metrics::market_data_bin_array_publish_inc();
+        }
+        _ => {}
+    }
     publish_enqueue_core_market_event(publish_tx, nats, Some(ctx.as_ref()), event, trace).await
 }
 

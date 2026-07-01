@@ -432,6 +432,21 @@ pub fn pool_cache_live_consumer_config() -> jetstream::consumer::pull::Config {
     }
 }
 
+/// Live `POOL_CACHE` consumer for **arb-strategy** (`DeliverPolicy::New`).
+///
+/// Bootstrap uses [`slave_consumer_config`] (`LastPerSubject`) once at startup; this durable
+/// consumer receives only incremental updates after bootstrap (same split as momentum-bot).
+pub fn arb_strategy_pool_cache_live_consumer_config() -> jetstream::consumer::pull::Config {
+    jetstream::consumer::pull::Config {
+        deliver_policy: jetstream::consumer::DeliverPolicy::New,
+        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+        durable_name: Some("arb-strategy-pool-cache-live".to_string()),
+        max_ack_pending: 1000,
+        filter_subject: "ironcrab.pool_cache.>".to_string(),
+        ..Default::default()
+    }
+}
+
 /// Consumer config for wallet snapshot recovery (LastPerSubject)
 pub fn wallet_snapshot_consumer_config() -> jetstream::consumer::pull::Config {
     jetstream::consumer::pull::Config {
@@ -534,6 +549,20 @@ mod tests {
             Some("momentum-bot-pool-cache-live")
         );
         assert_eq!(live.filter_subject, "ironcrab.pool_cache.>");
+
+        let arb_live = arb_strategy_pool_cache_live_consumer_config();
+        assert!(matches!(
+            arb_live.deliver_policy,
+            jetstream::consumer::DeliverPolicy::New
+        ));
+        assert_eq!(
+            arb_live.durable_name.as_deref(),
+            Some("arb-strategy-pool-cache-live")
+        );
+        assert_ne!(
+            arb_live.durable_name, live.durable_name,
+            "arb and momentum must not share the same durable POOL_CACHE live consumer"
+        );
 
         let slave = slave_consumer_config();
         assert!(matches!(
