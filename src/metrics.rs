@@ -403,6 +403,9 @@ pub static MARKET_DATA_POOL_STATE_PUBLISH_METEORA_CPMM: Lazy<AtomicU64> =
 pub static MARKET_DATA_POOL_STATE_PUBLISH_PUMPFUN: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static MARKET_DATA_POOL_STATE_PUBLISH_OTHER: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// VaultBalanceTick skipped because on-chain balance unchanged (H1 evidence).
+pub static MARKET_DATA_POOL_STATE_PUBLISH_SKIPPED_BALANCE_UNCHANGED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// BinArrayUpdate published to Core NATS (Meteora DLMM only).
 pub static MARKET_DATA_BIN_ARRAY_PUBLISH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
@@ -730,6 +733,11 @@ pub fn market_data_pool_state_publish_inc(dex: &str) {
         _ => &*MARKET_DATA_POOL_STATE_PUBLISH_OTHER,
     };
     counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_pool_state_publish_skipped_balance_unchanged_total() {
+    MARKET_DATA_POOL_STATE_PUBLISH_SKIPPED_BALANCE_UNCHANGED.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn market_data_bin_array_publish_inc() {
@@ -5454,6 +5462,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_balance_updated_from_cache_total",
         MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_pool_state_publish_skipped_total{reason=\"balance_unchanged\"}",
+        MARKET_DATA_POOL_STATE_PUBLISH_SKIPPED_BALANCE_UNCHANGED.load(Ordering::Relaxed)
     );
     out.push_str("market_data_pool_state_publish_total{dex=\"orca\"} ");
     out.push_str(
