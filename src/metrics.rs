@@ -388,6 +388,23 @@ pub static MARKET_DATA_HOT_POOL_REGISTRY_POOLS_BOTH: Lazy<AtomicU64> =
 /// BalanceUpdated published from MASTER cache without vault Geyser subscription.
 pub static MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// PoolStateUpdate published to Core NATS (bounded `dex` label).
+pub static MARKET_DATA_POOL_STATE_PUBLISH_ORCA: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_POOL_STATE_PUBLISH_METEORA_DLMM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_POOL_STATE_PUBLISH_PUMP_AMM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_POOL_STATE_PUBLISH_RAYDIUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_POOL_STATE_PUBLISH_RAYDIUM_CPMM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_POOL_STATE_PUBLISH_METEORA_CPMM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_POOL_STATE_PUBLISH_PUMPFUN: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_POOL_STATE_PUBLISH_OTHER: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// BinArrayUpdate published to Core NATS (Meteora DLMM only).
+pub static MARKET_DATA_BIN_ARRAY_PUBLISH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 /// PR161: merge-task coalesced flush to `combined_tracked` (timer fired after `geyser_sync_batch_ms` quiet window).
 pub static MARKET_DATA_GEYSER_MERGE_COALESCED_TOTAL: Lazy<AtomicU64> =
@@ -698,6 +715,25 @@ pub fn set_market_data_hot_pool_registry_pools_gauge(reason: &str, n: usize) {
 #[inline]
 pub fn inc_market_data_balance_updated_from_cache_total() {
     MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment bounded `market_data_pool_state_publish_total{dex}`.
+pub fn market_data_pool_state_publish_inc(dex: &str) {
+    let counter = match dex {
+        "orca" => &*MARKET_DATA_POOL_STATE_PUBLISH_ORCA,
+        "meteora_dlmm" => &*MARKET_DATA_POOL_STATE_PUBLISH_METEORA_DLMM,
+        "pump_amm" => &*MARKET_DATA_POOL_STATE_PUBLISH_PUMP_AMM,
+        "raydium" => &*MARKET_DATA_POOL_STATE_PUBLISH_RAYDIUM,
+        "raydium_cpmm" => &*MARKET_DATA_POOL_STATE_PUBLISH_RAYDIUM_CPMM,
+        "meteora_cpmm" => &*MARKET_DATA_POOL_STATE_PUBLISH_METEORA_CPMM,
+        "pumpfun" => &*MARKET_DATA_POOL_STATE_PUBLISH_PUMPFUN,
+        _ => &*MARKET_DATA_POOL_STATE_PUBLISH_OTHER,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn market_data_bin_array_publish_inc() {
+    MARKET_DATA_BIN_ARRAY_PUBLISH_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -2973,6 +3009,10 @@ pub static ARB_STRATEGY_POOL_CACHE_UPDATE_SKIP_NO_SEED: Lazy<AtomicU64> =
 pub static ARB_POOL_CACHE_UPDATES_APPLIED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_POOL_CACHE_APPLY_BATCHES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_POOL_CACHE_APPLY_BATCH_SIZE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// JetStream fetch batches that returned zero messages (arb pool-cache live worker).
+pub static ARB_POOL_CACHE_SYNC_FETCH_EMPTY_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Messages pulled from JetStream before deserialize (arb pool-cache live worker).
+pub static ARB_POOL_CACHE_SYNC_MESSAGES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACKER_WRITE_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACKER_WRITE_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -3393,6 +3433,285 @@ pub fn arb_pool_cache_apply_batches_inc() {
 
 pub fn set_arb_pool_cache_apply_batch_size_gauge(n: u64) {
     ARB_POOL_CACHE_APPLY_BATCH_SIZE.store(n, Ordering::Relaxed);
+}
+
+pub fn arb_pool_cache_sync_messages_add(n: u64) {
+    ARB_POOL_CACHE_SYNC_MESSAGES_TOTAL.fetch_add(n, Ordering::Relaxed);
+}
+
+pub fn arb_pool_cache_sync_fetch_empty_inc() {
+    ARB_POOL_CACHE_SYNC_FETCH_EMPTY_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+const ARB_PRICE_FRESHNESS_AGE_MS_BUCKETS: &[u64] = &[
+    100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 60_000, 120_000,
+];
+const ARB_PRICE_FRESHNESS_AGE_MS_SUM_CAP: u64 = 600_000;
+const ARB_PRICE_FRESHNESS_BUCKET_LEN: usize = 10;
+
+fn arb_freshness_bucket_array() -> [AtomicU64; ARB_PRICE_FRESHNESS_BUCKET_LEN] {
+    std::array::from_fn(|_| AtomicU64::new(0))
+}
+
+pub static ARB_PRICE_FRESHNESS_ORCA_TRADE_BUCKET_COUNTS: Lazy<
+    [AtomicU64; ARB_PRICE_FRESHNESS_BUCKET_LEN],
+> = Lazy::new(arb_freshness_bucket_array);
+pub static ARB_PRICE_FRESHNESS_ORCA_TRADE_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PRICE_FRESHNESS_ORCA_TRADE_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PRICE_FRESHNESS_ORCA_VAULT_BUCKET_COUNTS: Lazy<
+    [AtomicU64; ARB_PRICE_FRESHNESS_BUCKET_LEN],
+> = Lazy::new(arb_freshness_bucket_array);
+pub static ARB_PRICE_FRESHNESS_ORCA_VAULT_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PRICE_FRESHNESS_ORCA_VAULT_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PRICE_FRESHNESS_METEORA_DLMM_TRADE_BUCKET_COUNTS: Lazy<
+    [AtomicU64; ARB_PRICE_FRESHNESS_BUCKET_LEN],
+> = Lazy::new(arb_freshness_bucket_array);
+pub static ARB_PRICE_FRESHNESS_METEORA_DLMM_TRADE_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PRICE_FRESHNESS_METEORA_DLMM_TRADE_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PRICE_FRESHNESS_METEORA_DLMM_VAULT_BUCKET_COUNTS: Lazy<
+    [AtomicU64; ARB_PRICE_FRESHNESS_BUCKET_LEN],
+> = Lazy::new(arb_freshness_bucket_array);
+pub static ARB_PRICE_FRESHNESS_METEORA_DLMM_VAULT_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PRICE_FRESHNESS_METEORA_DLMM_VAULT_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PRICE_FRESHNESS_METEORA_DLMM_DLMM_META_BUCKET_COUNTS: Lazy<
+    [AtomicU64; ARB_PRICE_FRESHNESS_BUCKET_LEN],
+> = Lazy::new(arb_freshness_bucket_array);
+pub static ARB_PRICE_FRESHNESS_METEORA_DLMM_DLMM_META_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PRICE_FRESHNESS_METEORA_DLMM_DLMM_META_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PRICE_FRESHNESS_PUMP_AMM_TRADE_BUCKET_COUNTS: Lazy<
+    [AtomicU64; ARB_PRICE_FRESHNESS_BUCKET_LEN],
+> = Lazy::new(arb_freshness_bucket_array);
+pub static ARB_PRICE_FRESHNESS_PUMP_AMM_TRADE_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PRICE_FRESHNESS_PUMP_AMM_TRADE_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PRICE_FRESHNESS_PUMP_AMM_VAULT_BUCKET_COUNTS: Lazy<
+    [AtomicU64; ARB_PRICE_FRESHNESS_BUCKET_LEN],
+> = Lazy::new(arb_freshness_bucket_array);
+pub static ARB_PRICE_FRESHNESS_PUMP_AMM_VAULT_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PRICE_FRESHNESS_PUMP_AMM_VAULT_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PRICE_FRESHNESS_OTHER_TRADE_BUCKET_COUNTS: Lazy<
+    [AtomicU64; ARB_PRICE_FRESHNESS_BUCKET_LEN],
+> = Lazy::new(arb_freshness_bucket_array);
+pub static ARB_PRICE_FRESHNESS_OTHER_TRADE_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PRICE_FRESHNESS_OTHER_TRADE_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PRICE_FRESHNESS_OTHER_VAULT_BUCKET_COUNTS: Lazy<
+    [AtomicU64; ARB_PRICE_FRESHNESS_BUCKET_LEN],
+> = Lazy::new(arb_freshness_bucket_array);
+pub static ARB_PRICE_FRESHNESS_OTHER_VAULT_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PRICE_FRESHNESS_OTHER_VAULT_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+fn arb_price_freshness_hist_parts(
+    dex: &str,
+    source: &str,
+) -> (
+    &'static [AtomicU64; ARB_PRICE_FRESHNESS_BUCKET_LEN],
+    &'static AtomicU64,
+    &'static AtomicU64,
+    &'static str,
+    &'static str,
+) {
+    let dex_label = match dex {
+        "orca" => "orca",
+        "meteora_dlmm" => "meteora_dlmm",
+        "pump_amm" => "pump_amm",
+        _ => "other",
+    };
+    let source_label = match source {
+        "vault" => "vault",
+        "dlmm_meta" => "dlmm_meta",
+        _ => "trade",
+    };
+    match (dex_label, source_label) {
+        ("orca", "trade") => (
+            &*ARB_PRICE_FRESHNESS_ORCA_TRADE_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_ORCA_TRADE_SUM,
+            &*ARB_PRICE_FRESHNESS_ORCA_TRADE_COUNT,
+            "orca",
+            "trade",
+        ),
+        ("orca", "vault") => (
+            &*ARB_PRICE_FRESHNESS_ORCA_VAULT_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_ORCA_VAULT_SUM,
+            &*ARB_PRICE_FRESHNESS_ORCA_VAULT_COUNT,
+            "orca",
+            "vault",
+        ),
+        ("meteora_dlmm", "trade") => (
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_TRADE_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_TRADE_SUM,
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_TRADE_COUNT,
+            "meteora_dlmm",
+            "trade",
+        ),
+        ("meteora_dlmm", "vault") => (
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_VAULT_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_VAULT_SUM,
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_VAULT_COUNT,
+            "meteora_dlmm",
+            "vault",
+        ),
+        ("meteora_dlmm", "dlmm_meta") => (
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_DLMM_META_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_DLMM_META_SUM,
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_DLMM_META_COUNT,
+            "meteora_dlmm",
+            "dlmm_meta",
+        ),
+        ("pump_amm", "trade") => (
+            &*ARB_PRICE_FRESHNESS_PUMP_AMM_TRADE_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_PUMP_AMM_TRADE_SUM,
+            &*ARB_PRICE_FRESHNESS_PUMP_AMM_TRADE_COUNT,
+            "pump_amm",
+            "trade",
+        ),
+        ("pump_amm", "vault") => (
+            &*ARB_PRICE_FRESHNESS_PUMP_AMM_VAULT_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_PUMP_AMM_VAULT_SUM,
+            &*ARB_PRICE_FRESHNESS_PUMP_AMM_VAULT_COUNT,
+            "pump_amm",
+            "vault",
+        ),
+        (_, "vault") => (
+            &*ARB_PRICE_FRESHNESS_OTHER_VAULT_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_OTHER_VAULT_SUM,
+            &*ARB_PRICE_FRESHNESS_OTHER_VAULT_COUNT,
+            "other",
+            "vault",
+        ),
+        _ => (
+            &*ARB_PRICE_FRESHNESS_OTHER_TRADE_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_OTHER_TRADE_SUM,
+            &*ARB_PRICE_FRESHNESS_OTHER_TRADE_COUNT,
+            "other",
+            "trade",
+        ),
+    }
+}
+
+/// Record stale-price age at 2-hop reject (`arb_price_freshness_age_ms_bucket{dex,freshness_source}`).
+pub fn record_arb_price_freshness_stale_age_ms(dex: &str, source: &str, age_ms: u64) {
+    let (bucket_counts, sum, count, _, _) = arb_price_freshness_hist_parts(dex, source);
+    record_histogram_u64_into(
+        ARB_PRICE_FRESHNESS_AGE_MS_BUCKETS,
+        bucket_counts,
+        sum,
+        count,
+        age_ms,
+        ARB_PRICE_FRESHNESS_AGE_MS_SUM_CAP,
+    );
+}
+
+fn append_arb_price_freshness_labeled_histogram(
+    out: &mut String,
+    dex: &str,
+    source: &str,
+    bucket_counts: &[AtomicU64; ARB_PRICE_FRESHNESS_BUCKET_LEN],
+    sum: &AtomicU64,
+    count: &AtomicU64,
+) {
+    let c = count.load(Ordering::Relaxed);
+    let s = sum.load(Ordering::Relaxed);
+    for (i, b) in ARB_PRICE_FRESHNESS_AGE_MS_BUCKETS.iter().enumerate() {
+        let v = bucket_counts[i].load(Ordering::Relaxed);
+        out.push_str(&format!(
+            "arb_price_freshness_age_ms_bucket{{dex=\"{dex}\",freshness_source=\"{source}\",le=\"{b}\"}} {v}\n"
+        ));
+    }
+    out.push_str(&format!(
+        "arb_price_freshness_age_ms_bucket{{dex=\"{dex}\",freshness_source=\"{source}\",le=\"+Inf\"}} {c}\n"
+    ));
+    out.push_str(&format!(
+        "arb_price_freshness_age_ms_sum{{dex=\"{dex}\",freshness_source=\"{source}\"}} {s}\n"
+    ));
+    out.push_str(&format!(
+        "arb_price_freshness_age_ms_count{{dex=\"{dex}\",freshness_source=\"{source}\"}} {c}\n"
+    ));
+}
+
+fn append_arb_price_freshness_histograms(out: &mut String) {
+    let series: [(
+        &str,
+        &str,
+        &[AtomicU64; ARB_PRICE_FRESHNESS_BUCKET_LEN],
+        &AtomicU64,
+        &AtomicU64,
+    ); 9] = [
+        (
+            "orca",
+            "trade",
+            &*ARB_PRICE_FRESHNESS_ORCA_TRADE_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_ORCA_TRADE_SUM,
+            &*ARB_PRICE_FRESHNESS_ORCA_TRADE_COUNT,
+        ),
+        (
+            "orca",
+            "vault",
+            &*ARB_PRICE_FRESHNESS_ORCA_VAULT_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_ORCA_VAULT_SUM,
+            &*ARB_PRICE_FRESHNESS_ORCA_VAULT_COUNT,
+        ),
+        (
+            "meteora_dlmm",
+            "trade",
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_TRADE_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_TRADE_SUM,
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_TRADE_COUNT,
+        ),
+        (
+            "meteora_dlmm",
+            "vault",
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_VAULT_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_VAULT_SUM,
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_VAULT_COUNT,
+        ),
+        (
+            "meteora_dlmm",
+            "dlmm_meta",
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_DLMM_META_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_DLMM_META_SUM,
+            &*ARB_PRICE_FRESHNESS_METEORA_DLMM_DLMM_META_COUNT,
+        ),
+        (
+            "pump_amm",
+            "trade",
+            &*ARB_PRICE_FRESHNESS_PUMP_AMM_TRADE_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_PUMP_AMM_TRADE_SUM,
+            &*ARB_PRICE_FRESHNESS_PUMP_AMM_TRADE_COUNT,
+        ),
+        (
+            "pump_amm",
+            "vault",
+            &*ARB_PRICE_FRESHNESS_PUMP_AMM_VAULT_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_PUMP_AMM_VAULT_SUM,
+            &*ARB_PRICE_FRESHNESS_PUMP_AMM_VAULT_COUNT,
+        ),
+        (
+            "other",
+            "trade",
+            &*ARB_PRICE_FRESHNESS_OTHER_TRADE_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_OTHER_TRADE_SUM,
+            &*ARB_PRICE_FRESHNESS_OTHER_TRADE_COUNT,
+        ),
+        (
+            "other",
+            "vault",
+            &*ARB_PRICE_FRESHNESS_OTHER_VAULT_BUCKET_COUNTS,
+            &*ARB_PRICE_FRESHNESS_OTHER_VAULT_SUM,
+            &*ARB_PRICE_FRESHNESS_OTHER_VAULT_COUNT,
+        ),
+    ];
+    for (dex, source, buckets, sum, count) in series {
+        append_arb_price_freshness_labeled_histogram(out, dex, source, buckets, sum, count);
+    }
 }
 
 pub fn inc_arb_tracker_write_enqueue_dropped_total() {
@@ -5136,6 +5455,66 @@ async fn metrics_response() -> Response<Body> {
         "market_data_balance_updated_from_cache_total",
         MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed)
     );
+    out.push_str("market_data_pool_state_publish_total{dex=\"orca\"} ");
+    out.push_str(
+        &MARKET_DATA_POOL_STATE_PUBLISH_ORCA
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_pool_state_publish_total{dex=\"meteora_dlmm\"} ");
+    out.push_str(
+        &MARKET_DATA_POOL_STATE_PUBLISH_METEORA_DLMM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_pool_state_publish_total{dex=\"pump_amm\"} ");
+    out.push_str(
+        &MARKET_DATA_POOL_STATE_PUBLISH_PUMP_AMM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_pool_state_publish_total{dex=\"raydium\"} ");
+    out.push_str(
+        &MARKET_DATA_POOL_STATE_PUBLISH_RAYDIUM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_pool_state_publish_total{dex=\"raydium_cpmm\"} ");
+    out.push_str(
+        &MARKET_DATA_POOL_STATE_PUBLISH_RAYDIUM_CPMM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_pool_state_publish_total{dex=\"meteora_cpmm\"} ");
+    out.push_str(
+        &MARKET_DATA_POOL_STATE_PUBLISH_METEORA_CPMM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_pool_state_publish_total{dex=\"pumpfun\"} ");
+    out.push_str(
+        &MARKET_DATA_POOL_STATE_PUBLISH_PUMPFUN
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_pool_state_publish_total{dex=\"other\"} ");
+    out.push_str(
+        &MARKET_DATA_POOL_STATE_PUBLISH_OTHER
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "market_data_bin_array_publish_total",
+        MARKET_DATA_BIN_ARRAY_PUBLISH_TOTAL.load(Ordering::Relaxed)
+    );
     line!(
         "market_data_geyser_merge_coalesced_total",
         MARKET_DATA_GEYSER_MERGE_COALESCED_TOTAL.load(Ordering::Relaxed)
@@ -6252,6 +6631,15 @@ async fn metrics_response() -> Response<Body> {
         "arb_pool_cache_apply_batch_size",
         ARB_POOL_CACHE_APPLY_BATCH_SIZE.load(Ordering::Relaxed)
     );
+    line!(
+        "arb_pool_cache_sync_messages_total",
+        ARB_POOL_CACHE_SYNC_MESSAGES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_pool_cache_sync_fetch_empty_total",
+        ARB_POOL_CACHE_SYNC_FETCH_EMPTY_TOTAL.load(Ordering::Relaxed)
+    );
+    append_arb_price_freshness_histograms(&mut out);
     line!(
         "arb_tracker_write_enqueue_dropped_total",
         ARB_TRACKER_WRITE_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
