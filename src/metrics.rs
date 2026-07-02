@@ -2989,6 +2989,22 @@ pub static ARB_TWO_HOP_OPPORTUNITIES: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::
 /// Pools seeded into TokenArbTracker from SLAVE LivePoolCache (reserve-mid, no Trade event).
 pub static ARB_TWO_HOP_TRACKER_SEEDED_POOLS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+// --- pool_quote shadow (M1, default off) ---
+pub static ARB_QUOTE_SHADOW_ROUND_TRIP_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_QUOTE_SHADOW_INCOMPATIBLE_KIND_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_QUOTE_SHADOW_ROUND_TRIP_PROFIT_SUM: Lazy<AtomicI64> =
+    Lazy::new(|| AtomicI64::new(0));
+pub static ARB_QUOTE_SHADOW_ROUND_TRIP_PROFIT_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_QUOTE_SHADOW_LEGACY_SPREAD_BPS: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
+pub static ARB_QUOTE_SHADOW_V2_PROFIT_LAMPORTS: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
+
+const ARB_QUOTE_SHADOW_PROFIT_BUCKETS: [i64; 5] =
+    [0, 1_000_000, 10_000_000, 100_000_000, 1_000_000_000];
+static ARB_QUOTE_SHADOW_PROFIT_BUCKET_COUNTS: Lazy<[AtomicU64; 5]> =
+    Lazy::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
+
 // --- arb-strategy bootstrap / incremental warmup (low-cardinality) ---
 pub static ARB_STRATEGY_BOOTSTRAP_LIVE_POOL_CACHE_ROWS: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -3370,6 +3386,34 @@ pub fn arb_two_hop_rejected_inc(reason: ArbTwoHopRejectReason) {
 /// Increment `arb_two_hop_opportunities_total`.
 pub fn arb_two_hop_opportunity_inc() {
     ARB_TWO_HOP_OPPORTUNITIES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record pool_quote shadow round-trip observation (legacy path unaffected).
+pub fn record_arb_quote_shadow_round_trip(
+    profit_lamports: i64,
+    legacy_spread_bps: Option<i64>,
+    incompatible_kind: bool,
+) {
+    ARB_QUOTE_SHADOW_ROUND_TRIP_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if incompatible_kind {
+        ARB_QUOTE_SHADOW_INCOMPATIBLE_KIND_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    ARB_QUOTE_SHADOW_ROUND_TRIP_PROFIT_SUM.fetch_add(profit_lamports, Ordering::Relaxed);
+    ARB_QUOTE_SHADOW_ROUND_TRIP_PROFIT_COUNT.fetch_add(1, Ordering::Relaxed);
+    ARB_QUOTE_SHADOW_V2_PROFIT_LAMPORTS.store(profit_lamports, Ordering::Relaxed);
+    if let Some(spread) = legacy_spread_bps {
+        ARB_QUOTE_SHADOW_LEGACY_SPREAD_BPS.store(spread, Ordering::Relaxed);
+    }
+    for (i, bucket) in ARB_QUOTE_SHADOW_PROFIT_BUCKETS.iter().enumerate() {
+        if profit_lamports <= *bucket {
+            ARB_QUOTE_SHADOW_PROFIT_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Update legacy spread gauge when shadow mode compares v1 vs v2.
+pub fn set_arb_quote_shadow_legacy_spread_bps(spread_bps: i64) {
+    ARB_QUOTE_SHADOW_LEGACY_SPREAD_BPS.store(spread_bps, Ordering::Relaxed);
 }
 
 /// Add to `arb_two_hop_tracker_seeded_pools_total` after SLAVE cache tracker seed.
@@ -6556,6 +6600,43 @@ async fn metrics_response() -> Response<Body> {
         "arb_two_hop_tracker_seeded_pools_total",
         ARB_TWO_HOP_TRACKER_SEEDED_POOLS.load(Ordering::Relaxed)
     );
+    line!(
+        "arb_quote_shadow_round_trip_total",
+        ARB_QUOTE_SHADOW_ROUND_TRIP_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_quote_shadow_incompatible_kind_total",
+        ARB_QUOTE_SHADOW_INCOMPATIBLE_KIND_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_quote_shadow_round_trip_profit_sum_lamports",
+        ARB_QUOTE_SHADOW_ROUND_TRIP_PROFIT_SUM.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_quote_shadow_round_trip_profit_count",
+        ARB_QUOTE_SHADOW_ROUND_TRIP_PROFIT_COUNT.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_quote_shadow_legacy_spread_bps",
+        ARB_QUOTE_SHADOW_LEGACY_SPREAD_BPS.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_quote_shadow_v2_profit_lamports",
+        ARB_QUOTE_SHADOW_V2_PROFIT_LAMPORTS.load(Ordering::Relaxed)
+    );
+    for (i, bucket) in ARB_QUOTE_SHADOW_PROFIT_BUCKETS.iter().enumerate() {
+        out.push_str(&format!(
+            "arb_quote_shadow_round_trip_profit_lamports_bucket{{le=\"{bucket}\"}} {}\n",
+            ARB_QUOTE_SHADOW_PROFIT_BUCKET_COUNTS[i].load(Ordering::Relaxed)
+        ));
+    }
+    out.push_str("arb_quote_shadow_round_trip_profit_lamports_bucket{le=\"+Inf\"} ");
+    out.push_str(
+        &ARB_QUOTE_SHADOW_ROUND_TRIP_PROFIT_COUNT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     line!(
         "arb_strategy_bootstrap_live_pool_cache_rows",
         ARB_STRATEGY_BOOTSTRAP_LIVE_POOL_CACHE_ROWS.load(Ordering::Relaxed)

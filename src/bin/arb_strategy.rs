@@ -29,8 +29,11 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use ironcrab::arbitrage::{
-    populate_arb_slave_from_live_pool_cache, sync_arb_slave_from_pool_cache_update,
-    MultiHopArbitrage, MultiHopConfig, MultiHopIntentBatch,
+    dlmm_marginal_price_plausible, dlmm_sol_output_from_bins, dlmm_token_output_from_bins,
+    populate_arb_slave_from_live_pool_cache, quote_exact_in, quotes_pairable,
+    round_trip_profit_lamports, sync_arb_slave_from_pool_cache_update, MultiHopArbitrage,
+    MultiHopConfig, MultiHopIntentBatch, QuotePoolInput, QuoteVaultInput, RoundTripLeg,
+    DLMM_PROBE_SOL_LAMPORTS,
 };
 use ironcrab::config::Config as AppConfig;
 use ironcrab::execution::live_pool_cache::{
@@ -61,8 +64,9 @@ use ironcrab::metrics::{
     arb_two_hop_eligible_pools_by_dex_add, arb_two_hop_insufficient_subreason_inc,
     arb_two_hop_opportunity_inc, arb_two_hop_pool_gate_add, arb_two_hop_reject_subreason_inc,
     arb_two_hop_rejected_inc, arb_two_hop_tracker_seeded_pools_add, record_arb_heartbeat_phase,
-    record_arb_price_freshness_stale_age_ms, record_arb_track_requests_messages_total,
-    record_arb_writer_lock_wait, serve_metrics, set_arb_pool_cache_apply_batch_size_gauge,
+    record_arb_price_freshness_stale_age_ms, record_arb_quote_shadow_round_trip,
+    record_arb_track_requests_messages_total, record_arb_writer_lock_wait, serve_metrics,
+    set_arb_pool_cache_apply_batch_size_gauge, set_arb_quote_shadow_legacy_spread_bps,
     set_arb_tracker_write_coalescer_pending, set_arb_tracker_write_queue_depth,
     set_arb_two_hop_blocked_on_apply_trade, set_readiness_nats_connected,
     tick_arb_heartbeat_seconds_since_last_finish, tick_arb_tracker_write_seconds_since_last_finish,
@@ -84,7 +88,6 @@ use ironcrab::nats::{
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_ARB_TRACK_REQUESTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
-use ironcrab::solana::dex::meteora_bin_walker::{dlmm_fee_bps, walker_from_bins};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 use solana_sdk::pubkey::Pubkey;
 
@@ -141,6 +144,8 @@ struct ArbConfig {
     arb_track_baseline_max_pools: usize,
     /// Baseline reconcile publish interval in seconds. Default: 60.
     arb_track_reconcile_interval_secs: u64,
+    /// Shadow pool_quote round-trip metrics (legacy path stays authoritative). Default: false.
+    arb_quote_shadow_mode: bool,
 }
 
 impl Default for ArbConfig {
@@ -156,6 +161,7 @@ impl Default for ArbConfig {
             two_hop_enabled: true,                // 2-hop arb enabled by default
             arb_track_baseline_max_pools: ARB_TRACK_BASELINE_MAX_POOLS_DEFAULT,
             arb_track_reconcile_interval_secs: ARB_TRACK_RECONCILE_INTERVAL_SECS_DEFAULT,
+            arb_quote_shadow_mode: false,
         }
     }
 }
@@ -224,11 +230,6 @@ const GEYSER_CONNECTION_TIMEOUT_SECS: u64 = 30;
 const MIN_TRADE_VOLUME_LAMPORTS: u64 = 100_000; // 0.0001 SOL minimum (filter dust)
 /// Max age for pool comparable prices used in 2-hop spread (aligns with Geyser health window).
 const MAX_PRICE_AGE_MS: u64 = 30_000;
-/// Small SOL probe for DLMM marginal price (0.01 SOL) — spread comparison only.
-const DLMM_PROBE_SOL_LAMPORTS: u64 = 10_000_000;
-/// Reject DLMM marginal price when it deviates more than this factor from reserve/trade mid.
-const DLMM_MARGINAL_MAX_DEVIATION_FACTOR: u64 = 100;
-/// Deduplicate per-mint "spread too large" WARN logs.
 const SPREAD_TOO_LARGE_WARN_COOLDOWN: Duration = Duration::from_secs(30);
 /// Rate limit for 2-hop eligibility diagnostic snapshots.
 const ELIGIBILITY_SNAPSHOT_COOLDOWN: Duration = Duration::from_secs(60);
@@ -320,23 +321,6 @@ fn trade_implied_sol_per_token(sol_amount: u64, token_amount: u64, token_decimal
     sol_dec / token_dec
 }
 
-fn flatten_bins_for_walker(bin_arrays: &HashMap<i64, Vec<BinData>>) -> Vec<(i32, u64, u64)> {
-    let mut all_bins: Vec<(i32, u64, u64)> = Vec::new();
-    for (array_idx, bins) in bin_arrays {
-        for bin in bins {
-            let bin_id = (*array_idx * 70 + bin.offset as i64) as i32;
-            all_bins.push((bin_id, bin.amount_x, bin.amount_y));
-        }
-    }
-    all_bins.sort_by_key(|(id, _, _)| *id);
-    all_bins
-}
-
-fn active_bin_present(active_id: i32, flat_bins: &[(i32, u64, u64)]) -> bool {
-    flat_bins.iter().any(|(id, _, _)| *id == active_id)
-}
-
-/// Derive whether on-chain token X is SOL (SSOT: Meteora `token_x_mint`).
 fn vault_dlmm_sol_is_x(vault: &VaultBalanceCache) -> bool {
     vault
         .dlmm_token_x_mint
@@ -428,86 +412,6 @@ fn trade_mid_sol_per_token(pool: &PoolState) -> Option<Decimal> {
         (Some(one), None) | (None, Some(one)) if one > Decimal::ZERO => Some(one),
         _ => None,
     }
-}
-
-fn dlmm_marginal_price_plausible(
-    marginal: Decimal,
-    reserve_mid: Option<Decimal>,
-    trade_mid: Option<Decimal>,
-) -> bool {
-    let reference = match reserve_mid.or(trade_mid) {
-        Some(mid) if mid > Decimal::ZERO => mid,
-        _ => return true,
-    };
-    if marginal <= Decimal::ZERO {
-        return false;
-    }
-    let ratio = if marginal > reference {
-        marginal / reference
-    } else {
-        reference / marginal
-    };
-    ratio <= Decimal::from(DLMM_MARGINAL_MAX_DEVIATION_FACTOR)
-}
-
-/// DLMM token output via BinWalker (shared by spread price + intent sizing).
-fn dlmm_token_output_from_bins(
-    active_id: i32,
-    bin_step: u16,
-    sol_in_lamports: u64,
-    bin_arrays: &HashMap<i64, Vec<BinData>>,
-    sol_is_x: bool,
-) -> Option<u64> {
-    if bin_arrays.is_empty() || sol_in_lamports == 0 {
-        return None;
-    }
-
-    let flat_bins = flatten_bins_for_walker(bin_arrays);
-    if !active_bin_present(active_id, &flat_bins) {
-        return None;
-    }
-
-    let walker = walker_from_bins(active_id, bin_step, &flat_bins);
-    let fee_bps = dlmm_fee_bps(bin_step);
-    let (amount_out, _, _) = if sol_is_x {
-        walker.quote_x_to_y(sol_in_lamports, fee_bps).ok()?
-    } else {
-        walker.quote_y_to_x(sol_in_lamports, fee_bps).ok()?
-    };
-    if amount_out == 0 {
-        return None;
-    }
-    Some(amount_out)
-}
-
-/// DLMM SOL output via BinWalker (token → SOL, sell-side marginal).
-fn dlmm_sol_output_from_bins(
-    active_id: i32,
-    bin_step: u16,
-    token_in: u64,
-    bin_arrays: &HashMap<i64, Vec<BinData>>,
-    sol_is_x: bool,
-) -> Option<u64> {
-    if bin_arrays.is_empty() || token_in == 0 {
-        return None;
-    }
-
-    let flat_bins = flatten_bins_for_walker(bin_arrays);
-    if !active_bin_present(active_id, &flat_bins) {
-        return None;
-    }
-
-    let walker = walker_from_bins(active_id, bin_step, &flat_bins);
-    let fee_bps = dlmm_fee_bps(bin_step);
-    let (amount_out, _, _) = if sol_is_x {
-        walker.quote_y_to_x(token_in, fee_bps).ok()?
-    } else {
-        walker.quote_x_to_y(token_in, fee_bps).ok()?
-    };
-    if amount_out == 0 {
-        return None;
-    }
-    Some(amount_out)
 }
 
 fn is_stablecoin_mint(mint: &str) -> bool {
@@ -1815,6 +1719,36 @@ struct ArbCheckContext<'a> {
     forensics: Option<&'a ArbEligibilityForensics>,
 }
 
+fn pool_state_to_quote_input(
+    pool: &PoolState,
+    token_mint: &str,
+    token_decimals: u8,
+) -> QuotePoolInput {
+    QuotePoolInput {
+        pool_address: pool.pool_address.clone(),
+        dex: pool.dex.clone(),
+        token_mint: token_mint.to_string(),
+        trade_price_buy: pool.trade_price_buy,
+        trade_price_sell: pool.trade_price_sell,
+        trade_updated_at: pool.last_update,
+        has_reserve_data: pool.has_reserve_data,
+        token_decimals,
+    }
+}
+
+fn vault_cache_to_quote_input(vault: &VaultBalanceCache) -> QuoteVaultInput {
+    QuoteVaultInput {
+        reserve_base: vault.reserve_base,
+        reserve_quote: vault.reserve_quote,
+        update_slot: vault.update_slot,
+        updated_at: vault.updated_at,
+        active_id: vault.active_id,
+        bin_step: vault.bin_step,
+        dlmm_sol_is_x: vault.dlmm_sol_is_x,
+        dlmm_token_x_mint: vault.dlmm_token_x_mint.clone(),
+    }
+}
+
 impl TokenArbTracker {
     fn new(base_mint: &str) -> Self {
         Self {
@@ -1947,6 +1881,112 @@ impl TokenArbTracker {
         }
     }
 
+    /// Shadow pool_quote round-trip (metrics only; does not affect legacy decisions).
+    fn run_arb_quote_shadow(
+        &self,
+        config: &ArbConfig,
+        known_pools: &HashSet<String>,
+        vault_balances: &HashMap<String, VaultBalanceCache>,
+        bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
+        legacy_spread_bps: Option<i64>,
+    ) {
+        if !config.arb_quote_shadow_mode {
+            return;
+        }
+        let Some(token_decimals) = self.token_decimals else {
+            return;
+        };
+        let max_age = Duration::from_millis(MAX_PRICE_AGE_MS);
+        let probe_sol = config.max_position_lamports;
+        let mut best_profit: Option<i64> = None;
+        let mut saw_incompatible_kind = false;
+
+        let candidate_pools: Vec<&PoolState> = self
+            .pools
+            .values()
+            .filter(|p| known_pools.contains(&p.pool_address))
+            .filter(|p| is_known_dex_label(&p.dex))
+            .filter(|p| p.dex != "pumpfun")
+            .collect();
+
+        for buy_pool in &candidate_pools {
+            let buy_vault = vault_balances.get(&buy_pool.pool_address);
+            if !is_pool_price_fresh(buy_pool, buy_vault, max_age) {
+                continue;
+            }
+            let buy_input = pool_state_to_quote_input(buy_pool, &self.base_mint, token_decimals);
+            let buy_vault_q = buy_vault.map(vault_cache_to_quote_input);
+            let buy_bins = bin_arrays
+                .get(&buy_pool.pool_address)
+                .map(flatten_bin_array_cache);
+
+            for sell_pool in &candidate_pools {
+                if sell_pool.pool_address == buy_pool.pool_address || sell_pool.dex == buy_pool.dex
+                {
+                    continue;
+                }
+                let sell_vault = vault_balances.get(&sell_pool.pool_address);
+                if !is_pool_price_fresh(sell_pool, sell_vault, max_age) {
+                    continue;
+                }
+                let sell_input =
+                    pool_state_to_quote_input(sell_pool, &self.base_mint, token_decimals);
+                let sell_vault_q = sell_vault.map(vault_cache_to_quote_input);
+                let sell_bins = bin_arrays
+                    .get(&sell_pool.pool_address)
+                    .map(flatten_bin_array_cache);
+
+                if let Some(profit) = round_trip_profit_lamports(
+                    &RoundTripLeg {
+                        pool: &buy_input,
+                        vault: buy_vault_q.as_ref(),
+                        dlmm_bins: buy_bins.as_ref(),
+                    },
+                    &RoundTripLeg {
+                        pool: &sell_input,
+                        vault: sell_vault_q.as_ref(),
+                        dlmm_bins: sell_bins.as_ref(),
+                    },
+                    probe_sol,
+                    config.est_tx_cost_lamports,
+                ) {
+                    best_profit = Some(best_profit.map_or(profit, |b| b.max(profit)));
+                    continue;
+                }
+
+                let Some(buy_quote) = quote_exact_in(
+                    &buy_input,
+                    buy_vault_q.as_ref(),
+                    buy_bins.as_ref(),
+                    NATIVE_SOL_MINT,
+                    &self.base_mint,
+                    probe_sol,
+                ) else {
+                    continue;
+                };
+                let Some(sell_quote) = quote_exact_in(
+                    &sell_input,
+                    sell_vault_q.as_ref(),
+                    sell_bins.as_ref(),
+                    &self.base_mint,
+                    NATIVE_SOL_MINT,
+                    buy_quote.amount_out,
+                ) else {
+                    continue;
+                };
+                if !quotes_pairable(&buy_quote, &sell_quote) {
+                    saw_incompatible_kind = true;
+                }
+            }
+        }
+
+        record_arb_quote_shadow_round_trip(
+            best_profit.unwrap_or(0),
+            legacy_spread_bps,
+            saw_incompatible_kind && best_profit.is_none(),
+        );
+    }
+
     /// Check for arbitrage opportunity between DEXes
     /// Returns: Option<(buy_dex, sell_dex, spread_bps, estimated_profit_lamports)>
     fn check_arbitrage(
@@ -1970,6 +2010,8 @@ impl TokenArbTracker {
 
         let mut breakdown =
             self.build_eligibility_breakdown(known_pools, vault_balances, bin_arrays);
+
+        self.run_arb_quote_shadow(config, known_pools, vault_balances, bin_arrays, None);
 
         let Some(_token_decimals) = self.token_decimals else {
             debug!(
@@ -2123,6 +2165,9 @@ impl TokenArbTracker {
 
         let spread = (sell_price - buy_price) / buy_price * Decimal::from(10000);
         let spread_bps = spread.round().to_i64().unwrap_or(i64::MAX);
+        if config.arb_quote_shadow_mode {
+            set_arb_quote_shadow_legacy_spread_bps(spread_bps);
+        }
 
         if self.base_mint == NATIVE_SOL_MINT {
             debug!(
@@ -3310,6 +3355,15 @@ impl ArbContext {
                         }
                     } else {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "arb_quote_shadow_mode" => {
+                    if let Some(v) = value.as_bool() {
+                        config.arb_quote_shadow_mode = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
                     }
                 }
                 // Skip multi_hop_* keys here - they're handled in the second loop below

@@ -31,6 +31,7 @@ pub mod arb_slave_sync;
 pub mod cycle_finder;
 pub mod multi_hop_integration;
 pub mod pool_graph;
+pub mod pool_quote;
 pub mod pool_ranker;
 pub mod types;
 
@@ -45,6 +46,12 @@ pub use multi_hop_integration::{
     QuoteReadyIndex, WSOL_MINT,
 };
 pub use pool_graph::{GraphStats, PoolGraph};
+pub use pool_quote::{
+    dlmm_marginal_price_plausible, dlmm_sol_output_from_bins, dlmm_token_output_from_bins,
+    flatten_bin_array_bins, quote_exact_in, quote_sol_per_token_for_screening, quotes_pairable,
+    round_trip_profit_lamports, DlmmBinArrays, PoolQuote, QuoteKind, QuotePoolInput, QuoteSide,
+    QuoteVaultInput, RoundTripLeg, DLMM_PROBE_SOL_LAMPORTS,
+};
 pub use pool_ranker::{PoolRanker, QuoteProvider, RankerConfig};
 pub use types::{
     clamp_edge_ratio, profit_to_return_bps, ArbCycle, DexType, ParseDexTypeError, PoolEdge,
