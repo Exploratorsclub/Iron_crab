@@ -12,18 +12,19 @@
 //! This is event-driven, NOT interval-based, to minimize latency.
 
 use crate::arbitrage::{
-    ArbCycle, BeamCycleFinder, CycleFinderConfig, DexType, PoolEdge, PoolGraph, PoolRanker,
-    QuoteProvider, RankerConfig, MAX_RETURN_BPS,
+    is_usable_quote_kind, quote_from_cached_pool, token_decimals_from_cached_state, ArbCycle,
+    BeamCycleFinder, CycleFinderConfig, DexType, DlmmBinArrays, PoolEdge, PoolGraph, PoolQuote,
+    PoolRanker, QuoteFreshnessConfig, QuoteKind, QuoteProvider, RankerConfig, MAX_RETURN_BPS,
 };
 use crate::execution::live_pool_cache::{CachedPoolState, SharedLivePoolCache};
-use crate::execution::quote_calculator;
+use crate::ipc::BinData;
 use crate::ipc::{
     ExplicitAmount, IntentOrigin, IntentTier, PoolAlternative, RecordHeader, SwapHop, TradeIntent,
     TradeResources, TradeSide, TradingRegime,
 };
 use crate::metrics::{
     multi_hop_cycle_rejected_sanity_inc, multi_hop_hop_missing_quote_inc,
-    multi_hop_quote_from_cache_inc, multi_hop_quote_from_trade_cache_inc,
+    multi_hop_quote_from_pool_quote_inc, multi_hop_quote_from_trade_cache_inc,
     multi_hop_quote_ready_pools_set, multi_hop_quote_ready_wsol_edge_pools_set,
     multi_hop_return_bps_saturated_inc, multi_hop_search_no_quote_neighbors_inc,
     multi_hop_search_worker_queue_depth_set, multi_hop_searches_coalesced_inc,
@@ -151,7 +152,7 @@ type QuoteCacheKey = (Pubkey, Pubkey, Pubkey);
 /// Cache value: (output_amount, timestamp)
 type QuoteCacheValue = (u64, Instant);
 
-/// Quote provider: trade-normalized cache, then LivePoolCache (Geyser). No synthetic fallback.
+/// Quote provider: trade-normalized cache, then LivePoolCache via `pool_quote` (Geyser). No synthetic fallback.
 pub struct CachedQuoteProvider {
     /// Cache: (pool, input_mint, output_mint) -> (output_amount, timestamp)
     cache: RwLock<HashMap<QuoteCacheKey, QuoteCacheValue>>,
@@ -161,6 +162,10 @@ pub struct CachedQuoteProvider {
     cache_ttl: Duration,
     /// SLAVE LivePoolCache (same SSOT as execution-engine) — no RPC on miss.
     live_pool_cache: SharedLivePoolCache,
+    /// Meteora DLMM bin arrays (Geyser); optional until wired from market events.
+    dlmm_bin_arrays: RwLock<HashMap<Pubkey, DlmmBinArrays>>,
+    /// Freshness TTLs aligned with 2-hop v2 defaults.
+    quote_freshness: QuoteFreshnessConfig,
     /// Pools with at least one quotable direction (beam expansion pruning).
     quote_ready: QuoteReadyIndex,
     last_cleanup: RwLock<Instant>,
@@ -173,30 +178,80 @@ impl CachedQuoteProvider {
             pool_mints: RwLock::new(HashMap::new()),
             cache_ttl,
             live_pool_cache,
+            dlmm_bin_arrays: RwLock::new(HashMap::new()),
+            quote_freshness: QuoteFreshnessConfig {
+                trade_ttl_ms: cache_ttl.as_millis() as u64,
+                ..QuoteFreshnessConfig::default()
+            },
             quote_ready: QuoteReadyIndex::default(),
             last_cleanup: RwLock::new(Instant::now()),
         }
+    }
+
+    /// Ingest Meteora DLMM bin array updates (Geyser). Enables ExecutableMarginal DLMM quotes.
+    pub fn update_dlmm_bin_array(&self, pool: Pubkey, array_index: i64, bins: Vec<BinData>) {
+        if bins.is_empty() {
+            return;
+        }
+        self.dlmm_bin_arrays
+            .write()
+            .entry(pool)
+            .or_default()
+            .insert(array_index, bins);
+    }
+
+    fn dlmm_bins_for_pool(&self, pool: &Pubkey) -> Option<DlmmBinArrays> {
+        let arrays = self.dlmm_bin_arrays.read();
+        let bins = arrays.get(pool)?;
+        (!bins.is_empty()).then(|| bins.clone())
+    }
+
+    fn resolve_token_decimals(&self, state: &CachedPoolState, token_mint: &Pubkey) -> u8 {
+        self.live_pool_cache
+            .get_mint_decimals(token_mint)
+            .unwrap_or_else(|| token_decimals_from_cached_state(state, token_mint))
     }
 
     pub fn quote_ready_index(&self) -> &QuoteReadyIndex {
         &self.quote_ready
     }
 
-    /// Mark pool ready when LivePoolCache gains reserves (incremental SSOT sync).
+    /// Mark pool ready when LivePoolCache yields ExecutableMarginal or fresh trade-cache quote.
     pub fn mark_ready_from_live_pool_cache(&self, pool_address: &Pubkey) {
         let Some(state) = self.live_pool_cache.get(pool_address) else {
             return;
         };
         let (mint_a, mint_b) = Self::mints_from_state(&state);
-        if self
-            .try_quote_from_live_pool_cache(pool_address, &mint_a, PROBE_LAMPORTS)
-            .is_some()
-            || self
-                .try_quote_from_live_pool_cache(pool_address, &mint_b, PROBE_LAMPORTS)
-                .is_some()
+        if self.direction_quotable(pool_address, &state, &mint_a, &mint_b)
+            || self.direction_quotable(pool_address, &state, &mint_b, &mint_a)
         {
             self.quote_ready.mark_ready(*pool_address);
         }
+    }
+
+    fn direction_quotable(
+        &self,
+        pool: &Pubkey,
+        state: &CachedPoolState,
+        mint_in: &Pubkey,
+        mint_out: &Pubkey,
+    ) -> bool {
+        if self.trade_direction_fresh_probe(*pool, *mint_in, *mint_out) {
+            return true;
+        }
+        self.try_pool_quote_from_live_pool_cache(pool, state, mint_in, mint_out, PROBE_LAMPORTS)
+            .is_some_and(|q| is_usable_quote_kind(q.kind))
+    }
+
+    fn trade_direction_fresh_probe(
+        &self,
+        pool: Pubkey,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+    ) -> bool {
+        let now = Instant::now();
+        let cache = self.cache.read();
+        self.trade_direction_fresh(&cache, pool, input_mint, output_mint, now)
     }
 
     fn resolve_pool_mints(&self, pool: &Pubkey) -> Option<(Pubkey, Pubkey)> {
@@ -235,11 +290,8 @@ impl CachedQuoteProvider {
             return false;
         };
         let (mint_a, mint_b) = Self::mints_from_state(&state);
-        self.try_quote_from_live_pool_cache(pool, &mint_a, PROBE_LAMPORTS)
-            .is_some()
-            || self
-                .try_quote_from_live_pool_cache(pool, &mint_b, PROBE_LAMPORTS)
-                .is_some()
+        self.direction_quotable(pool, &state, &mint_a, &mint_b)
+            || self.direction_quotable(pool, &state, &mint_b, &mint_a)
     }
 
     fn mints_from_state(state: &CachedPoolState) -> (Pubkey, Pubkey) {
@@ -281,26 +333,96 @@ impl CachedQuoteProvider {
         sol_side.max(10_000.0)
     }
 
-    fn try_quote_from_live_pool_cache(
+    fn try_pool_quote_from_live_pool_cache(
+        &self,
+        pool_address: &Pubkey,
+        state: &CachedPoolState,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+        amount_in: u64,
+    ) -> Option<PoolQuote> {
+        let (state, slot, age_ms) = self
+            .live_pool_cache
+            .get_with_metadata(pool_address)
+            .unwrap_or((state.clone(), 0, 0));
+        let updated_at = Instant::now()
+            .checked_sub(Duration::from_millis(age_ms))
+            .unwrap_or_else(Instant::now);
+        let wsol = Pubkey::from_str(WSOL_MINT).ok()?;
+        let token_mint = if *input_mint == wsol {
+            *output_mint
+        } else {
+            *input_mint
+        };
+        let token_decimals = self.resolve_token_decimals(&state, &token_mint);
+        let dlmm_bins = self.dlmm_bins_for_pool(pool_address);
+        let quote = quote_from_cached_pool(
+            &state,
+            &pool_address.to_string(),
+            &input_mint.to_string(),
+            &output_mint.to_string(),
+            amount_in,
+            dlmm_bins.as_ref(),
+            slot,
+            updated_at,
+            token_decimals,
+            &self.quote_freshness,
+        )?;
+        (quote.amount_out > 0).then_some(quote)
+    }
+
+    fn quote_output_from_live_pool_cache(
         &self,
         pool_address: &Pubkey,
         input_mint: &Pubkey,
+        output_mint: &Pubkey,
         amount_in: u64,
     ) -> Option<u64> {
         let state = self.live_pool_cache.get(pool_address)?;
-        let out = quote_calculator::quote_output_amount(&state, amount_in, input_mint).ok()?;
-        (out > 0).then_some(out)
+        let quote = self.try_pool_quote_from_live_pool_cache(
+            pool_address,
+            &state,
+            input_mint,
+            output_mint,
+            amount_in,
+        )?;
+        multi_hop_quote_from_pool_quote_inc();
+        Some(quote.amount_out)
     }
 
-    fn quote_from_live_pool_cache(
+    fn prefer_pool_quote_then_trade_cache(
         &self,
         pool_address: &Pubkey,
         input_mint: &Pubkey,
+        output_mint: &Pubkey,
         amount_in: u64,
     ) -> Option<u64> {
-        let out = self.try_quote_from_live_pool_cache(pool_address, input_mint, amount_in)?;
-        multi_hop_quote_from_cache_inc();
-        Some(out)
+        let pool_quote = self.live_pool_cache.get(pool_address).and_then(|state| {
+            self.try_pool_quote_from_live_pool_cache(
+                pool_address,
+                &state,
+                input_mint,
+                output_mint,
+                amount_in,
+            )
+        });
+        if let Some(ref q) = pool_quote {
+            if q.kind == QuoteKind::ExecutableMarginal {
+                multi_hop_quote_from_pool_quote_inc();
+                return Some(q.amount_out);
+            }
+        }
+        if let Some(out) = self.trade_cache_quote(pool_address, input_mint, output_mint, amount_in)
+        {
+            return Some(out);
+        }
+        if let Some(q) = pool_quote {
+            if is_usable_quote_kind(q.kind) {
+                multi_hop_quote_from_pool_quote_inc();
+                return Some(q.amount_out);
+            }
+        }
+        None
     }
 
     fn trade_cache_quote(
@@ -347,13 +469,15 @@ impl CachedQuoteProvider {
             let (mint_a, mint_b) = Self::mints_from_state(&state);
             let other = if mint_a == wsol { mint_b } else { mint_a };
 
-            if let Some(out) = self.try_quote_from_live_pool_cache(&pool_pk, &wsol, PROBE_LAMPORTS)
+            if let Some(out) =
+                self.quote_output_from_live_pool_cache(&pool_pk, &wsol, &other, PROBE_LAMPORTS)
             {
                 self.update_quote(pool_pk, wsol, other, PROBE_LAMPORTS, out);
                 self.quote_ready.mark_ready(pool_pk);
                 seeded += 1;
             }
-            if let Some(out) = self.try_quote_from_live_pool_cache(&pool_pk, &other, PROBE_LAMPORTS)
+            if let Some(out) =
+                self.quote_output_from_live_pool_cache(&pool_pk, &other, &wsol, PROBE_LAMPORTS)
             {
                 self.update_quote(pool_pk, other, wsol, PROBE_LAMPORTS, out);
                 self.quote_ready.mark_ready(pool_pk);
@@ -470,16 +594,18 @@ impl QuoteProvider for CachedQuoteProvider {
         output_mint: &Pubkey,
         amount_in: u64,
     ) -> Option<u64> {
-        if let Some(out) = self.trade_cache_quote(pool_address, input_mint, output_mint, amount_in)
-        {
+        if let Some(out) = self.prefer_pool_quote_then_trade_cache(
+            pool_address,
+            input_mint,
+            output_mint,
+            amount_in,
+        ) {
             return Some(out);
         }
 
-        if let Some(out) = self.quote_from_live_pool_cache(pool_address, input_mint, amount_in) {
-            return Some(out);
+        if self.quote_ready.contains(pool_address) {
+            multi_hop_hop_missing_quote_inc();
         }
-
-        multi_hop_hop_missing_quote_inc();
         None
     }
 
@@ -508,8 +634,17 @@ impl QuoteProvider for CachedQuoteProvider {
         {
             return true;
         }
-        self.try_quote_from_live_pool_cache(pool_address, input_mint, PROBE_LAMPORTS)
-            .is_some()
+        let Some(state) = self.live_pool_cache.get(pool_address) else {
+            return false;
+        };
+        self.try_pool_quote_from_live_pool_cache(
+            pool_address,
+            &state,
+            input_mint,
+            output_mint,
+            PROBE_LAMPORTS,
+        )
+        .is_some_and(|q| is_usable_quote_kind(q.kind))
     }
 
     fn get_cached_probe_quote(
@@ -520,12 +655,7 @@ impl QuoteProvider for CachedQuoteProvider {
         output_mint: &Pubkey,
         amount_in: u64,
     ) -> Option<u64> {
-        if let Some(out) = self.trade_cache_quote(pool_address, input_mint, output_mint, amount_in)
-        {
-            return Some(out);
-        }
-
-        self.quote_from_live_pool_cache(pool_address, input_mint, amount_in)
+        self.prefer_pool_quote_then_trade_cache(pool_address, input_mint, output_mint, amount_in)
     }
 }
 
@@ -1260,8 +1390,9 @@ impl QuoteProvider for Arc<CachedQuoteProvider> {
 mod tests {
     use super::*;
     use crate::execution::live_pool_cache::{
-        create_shared_cache, CachedPoolState, RaydiumAmmState,
+        create_shared_cache, CachedPoolState, MeteoraState, RaydiumAmmState,
     };
+    use crate::ipc::BinData;
     use serial_test::serial;
 
     #[test]
@@ -1330,8 +1461,66 @@ mod tests {
         let probe = PROBE_LAMPORTS;
         let out = provider
             .get_cached_probe_quote(&pool, DexType::RaydiumAmmV4, &wsol, &token, probe)
-            .expect("LivePoolCache quote expected");
+            .expect("pool_quote LivePoolCache quote expected");
         assert!(out > 0);
+        provider.mark_ready_from_live_pool_cache(&pool);
+        assert!(provider.is_pool_quote_ready(&pool));
+    }
+
+    #[test]
+    fn dlmm_multi_hop_uses_bin_walker_not_cp_approx() {
+        let cache = create_shared_cache();
+        let provider = CachedQuoteProvider::new(Duration::from_secs(30), cache.clone());
+
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let token = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let active_id = 0i32;
+        let bin_step = 100u16;
+        let token_amount = 500_000_000_000u64;
+        let sol_amount = 2_000_000_000u64;
+
+        cache.upsert(
+            pool,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: token,
+                token_y_mint: wsol,
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id,
+                bin_step,
+                reserve_x_balance: Some(1_000_000_000_000),
+                reserve_y_balance: Some(500_000_000),
+            }),
+            1,
+        );
+        provider.update_dlmm_bin_array(
+            pool,
+            active_id as i64 / 70,
+            vec![BinData {
+                offset: 0,
+                amount_x: token_amount,
+                amount_y: sol_amount,
+            }],
+        );
+
+        let out = provider
+            .get_cached_probe_quote(&pool, DexType::MeteoraDlmm, &wsol, &token, PROBE_LAMPORTS)
+            .expect("DLMM bin-walker quote expected");
+        let cp_approx = {
+            let fee_bps = 100u64;
+            let ri = sol_amount as u128;
+            let ro = token_amount as u128;
+            let a = PROBE_LAMPORTS as u128;
+            let after_fee = a * (10000 - fee_bps as u128) / 10000;
+            ((after_fee * ro) / (ri + after_fee)) as u64
+        };
+        assert_ne!(
+            out, cp_approx,
+            "bin walker must differ from reserve CP approx"
+        );
+        provider.mark_ready_from_live_pool_cache(&pool);
+        assert!(provider.is_pool_quote_ready(&pool));
     }
 
     #[test]
