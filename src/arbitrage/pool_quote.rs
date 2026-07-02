@@ -11,8 +11,10 @@ use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
+use crate::execution::live_pool_cache::{CachedPoolState, MeteoraState};
 use crate::ipc::BinData;
 use crate::solana::dex::meteora_bin_walker::{dlmm_fee_bps, walker_from_bins};
+use solana_sdk::pubkey::Pubkey;
 
 pub const NATIVE_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 /// Small SOL probe for DLMM marginal price / screening (0.01 SOL).
@@ -526,6 +528,450 @@ fn last_trade_mid_quote(
     })
 }
 
+/// SOL-quoted token reserves extracted from [`CachedPoolState`] (base = token, quote = SOL).
+#[derive(Debug, Clone)]
+pub struct SolQuotedPoolSeed {
+    pub token_mint: String,
+    pub reserve_base: u64,
+    pub reserve_quote: u64,
+    pub active_id: Option<i32>,
+    pub bin_step: Option<u16>,
+    pub dlmm_token_x_mint: Option<String>,
+}
+
+/// True when a quote may drive beam expansion / quote-ready index.
+pub fn is_usable_quote_kind(kind: QuoteKind) -> bool {
+    matches!(
+        kind,
+        QuoteKind::ExecutableMarginal | QuoteKind::LastTradeMid
+    )
+}
+
+fn orca_sol_quoted_vault_reserves(
+    mint_a: &str,
+    mint_b: &str,
+    vault_a: u64,
+    vault_b: u64,
+) -> Option<(u64, u64)> {
+    if mint_a == NATIVE_SOL_MINT {
+        Some((vault_b, vault_a))
+    } else if mint_b == NATIVE_SOL_MINT {
+        Some((vault_a, vault_b))
+    } else {
+        None
+    }
+}
+
+/// Map SLAVE [`CachedPoolState`] to SOL-quoted reserves for `quote_exact_in`.
+pub fn sol_quoted_seed_from_cached_state(state: &CachedPoolState) -> Option<SolQuotedPoolSeed> {
+    match state {
+        CachedPoolState::Orca(s) => {
+            let mint_a = s.token_mint_a.to_string();
+            let mint_b = s.token_mint_b.to_string();
+            let va = s.vault_a_balance?;
+            let vb = s.vault_b_balance?;
+            let (reserve_base, reserve_quote) =
+                orca_sol_quoted_vault_reserves(&mint_a, &mint_b, va, vb)?;
+            let token_mint = if mint_a == NATIVE_SOL_MINT {
+                mint_b
+            } else {
+                mint_a
+            };
+            Some(SolQuotedPoolSeed {
+                token_mint,
+                reserve_base,
+                reserve_quote,
+                active_id: None,
+                bin_step: None,
+                dlmm_token_x_mint: None,
+            })
+        }
+        CachedPoolState::RaydiumAmm(s) => {
+            let base = s.base_mint.to_string();
+            let quote = s.quote_mint.to_string();
+            let cr = s.coin_reserve?;
+            let pr = s.pc_reserve?;
+            if quote == NATIVE_SOL_MINT {
+                Some(SolQuotedPoolSeed {
+                    token_mint: base,
+                    reserve_base: cr,
+                    reserve_quote: pr,
+                    active_id: None,
+                    bin_step: None,
+                    dlmm_token_x_mint: None,
+                })
+            } else if base == NATIVE_SOL_MINT {
+                Some(SolQuotedPoolSeed {
+                    token_mint: quote,
+                    reserve_base: pr,
+                    reserve_quote: cr,
+                    active_id: None,
+                    bin_step: None,
+                    dlmm_token_x_mint: None,
+                })
+            } else {
+                None
+            }
+        }
+        CachedPoolState::RaydiumCpmm(s) => {
+            let t0 = s.token_0_mint.to_string();
+            let t1 = s.token_1_mint.to_string();
+            let r0 = s.reserve_0?;
+            let r1 = s.reserve_1?;
+            if t1 == NATIVE_SOL_MINT {
+                Some(SolQuotedPoolSeed {
+                    token_mint: t0,
+                    reserve_base: r0,
+                    reserve_quote: r1,
+                    active_id: None,
+                    bin_step: None,
+                    dlmm_token_x_mint: None,
+                })
+            } else if t0 == NATIVE_SOL_MINT {
+                Some(SolQuotedPoolSeed {
+                    token_mint: t1,
+                    reserve_base: r1,
+                    reserve_quote: r0,
+                    active_id: None,
+                    bin_step: None,
+                    dlmm_token_x_mint: None,
+                })
+            } else {
+                None
+            }
+        }
+        CachedPoolState::Meteora(s) => sol_quoted_seed_from_meteora_dlmm(s),
+        CachedPoolState::MeteoraCpmm(s) => {
+            let t0 = s.token_0_mint.to_string();
+            let t1 = s.token_1_mint.to_string();
+            if t1 == NATIVE_SOL_MINT {
+                Some(SolQuotedPoolSeed {
+                    token_mint: t0,
+                    reserve_base: s.reserve_0,
+                    reserve_quote: s.reserve_1,
+                    active_id: None,
+                    bin_step: None,
+                    dlmm_token_x_mint: None,
+                })
+            } else if t0 == NATIVE_SOL_MINT {
+                Some(SolQuotedPoolSeed {
+                    token_mint: t1,
+                    reserve_base: s.reserve_1,
+                    reserve_quote: s.reserve_0,
+                    active_id: None,
+                    bin_step: None,
+                    dlmm_token_x_mint: None,
+                })
+            } else {
+                None
+            }
+        }
+        CachedPoolState::PumpAmm(s) => {
+            let base = s.base_mint.to_string();
+            let quote = s.quote_mint.to_string();
+            let br = s.base_reserve?;
+            let qr = s.quote_reserve?;
+            if quote == NATIVE_SOL_MINT {
+                Some(SolQuotedPoolSeed {
+                    token_mint: base,
+                    reserve_base: br,
+                    reserve_quote: qr,
+                    active_id: None,
+                    bin_step: None,
+                    dlmm_token_x_mint: None,
+                })
+            } else if base == NATIVE_SOL_MINT {
+                Some(SolQuotedPoolSeed {
+                    token_mint: quote,
+                    reserve_base: qr,
+                    reserve_quote: br,
+                    active_id: None,
+                    bin_step: None,
+                    dlmm_token_x_mint: None,
+                })
+            } else {
+                None
+            }
+        }
+        CachedPoolState::PumpFun(s) => {
+            let mint = s.token_mint.to_string();
+            if mint == NATIVE_SOL_MINT {
+                return None;
+            }
+            let token_r = s.virtual_token_reserves;
+            let sol_r = s.virtual_sol_reserves;
+            (token_r > 0 && sol_r > 0).then_some(SolQuotedPoolSeed {
+                token_mint: mint,
+                reserve_base: token_r,
+                reserve_quote: sol_r,
+                active_id: None,
+                bin_step: None,
+                dlmm_token_x_mint: None,
+            })
+        }
+    }
+}
+
+fn sol_quoted_seed_from_meteora_dlmm(s: &MeteoraState) -> Option<SolQuotedPoolSeed> {
+    let x = s.token_x_mint.to_string();
+    let y = s.token_y_mint.to_string();
+    let rx = s.reserve_x_balance?;
+    let ry = s.reserve_y_balance?;
+    if y == NATIVE_SOL_MINT {
+        Some(SolQuotedPoolSeed {
+            token_mint: x.clone(),
+            reserve_base: rx,
+            reserve_quote: ry,
+            active_id: Some(s.active_id),
+            bin_step: Some(s.bin_step),
+            dlmm_token_x_mint: Some(x),
+        })
+    } else if x == NATIVE_SOL_MINT {
+        Some(SolQuotedPoolSeed {
+            token_mint: y.clone(),
+            reserve_base: ry,
+            reserve_quote: rx,
+            active_id: Some(s.active_id),
+            bin_step: Some(s.bin_step),
+            dlmm_token_x_mint: Some(x),
+        })
+    } else {
+        None
+    }
+}
+
+fn cached_pool_inputs(
+    state: &CachedPoolState,
+    pool_address: &str,
+    seed: &SolQuotedPoolSeed,
+    slot: u64,
+    updated_at: Instant,
+    token_decimals: u8,
+) -> (QuotePoolInput, QuoteVaultInput) {
+    let pool_input = QuotePoolInput {
+        pool_address: pool_address.to_string(),
+        dex: state.dex_name().to_string(),
+        token_mint: seed.token_mint.clone(),
+        trade_price_buy: None,
+        trade_price_sell: None,
+        trade_updated_at: updated_at,
+        has_reserve_data: seed.reserve_base > 0 && seed.reserve_quote > 0,
+        token_decimals,
+    };
+    let vault_input = QuoteVaultInput {
+        reserve_base: seed.reserve_base,
+        reserve_quote: seed.reserve_quote,
+        update_slot: slot,
+        updated_at,
+        active_id: seed.active_id,
+        bin_step: seed.bin_step,
+        dlmm_sol_is_x: seed.dlmm_token_x_mint.as_deref() == Some(NATIVE_SOL_MINT),
+        dlmm_token_x_mint: seed.dlmm_token_x_mint.clone(),
+    };
+    (pool_input, vault_input)
+}
+
+fn hop_mints_match_sol_seed(seed: &SolQuotedPoolSeed, mint_in: &str, mint_out: &str) -> bool {
+    (mint_in == NATIVE_SOL_MINT && mint_out == seed.token_mint)
+        || (mint_out == NATIVE_SOL_MINT && mint_in == seed.token_mint)
+}
+
+fn cpmm_hop_from_cached_state(
+    state: &CachedPoolState,
+    pool_address: &str,
+    mint_in: &str,
+    mint_out: &str,
+    amount_in: u64,
+    slot: u64,
+    updated_at: Instant,
+) -> Option<PoolQuote> {
+    if state.dex_name() == "meteora_dlmm" {
+        return None;
+    }
+    let (reserve_in, reserve_out, dex) = match state {
+        CachedPoolState::Orca(s) => {
+            let a = s.token_mint_a.to_string();
+            let b = s.token_mint_b.to_string();
+            let va = s.vault_a_balance?;
+            let vb = s.vault_b_balance?;
+            if mint_in == a && mint_out == b {
+                (va as u128, vb as u128, "orca")
+            } else if mint_in == b && mint_out == a {
+                (vb as u128, va as u128, "orca")
+            } else {
+                return None;
+            }
+        }
+        CachedPoolState::RaydiumAmm(s) => {
+            let base = s.base_mint.to_string();
+            let quote = s.quote_mint.to_string();
+            let cr = s.coin_reserve?;
+            let pr = s.pc_reserve?;
+            if mint_in == base && mint_out == quote {
+                (cr as u128, pr as u128, "raydium")
+            } else if mint_in == quote && mint_out == base {
+                (pr as u128, cr as u128, "raydium")
+            } else {
+                return None;
+            }
+        }
+        CachedPoolState::RaydiumCpmm(s) => {
+            let t0 = s.token_0_mint.to_string();
+            let t1 = s.token_1_mint.to_string();
+            let r0 = s.reserve_0?;
+            let r1 = s.reserve_1?;
+            if mint_in == t0 && mint_out == t1 {
+                (r0 as u128, r1 as u128, "raydium_cpmm")
+            } else if mint_in == t1 && mint_out == t0 {
+                (r1 as u128, r0 as u128, "raydium_cpmm")
+            } else {
+                return None;
+            }
+        }
+        CachedPoolState::MeteoraCpmm(s) => {
+            let t0 = s.token_0_mint.to_string();
+            let t1 = s.token_1_mint.to_string();
+            if mint_in == t0 && mint_out == t1 {
+                (s.reserve_0 as u128, s.reserve_1 as u128, "meteora_cpmm")
+            } else if mint_in == t1 && mint_out == t0 {
+                (s.reserve_1 as u128, s.reserve_0 as u128, "meteora_cpmm")
+            } else {
+                return None;
+            }
+        }
+        CachedPoolState::PumpAmm(s) => {
+            let base = s.base_mint.to_string();
+            let quote = s.quote_mint.to_string();
+            let br = s.base_reserve?;
+            let qr = s.quote_reserve?;
+            if mint_in == base && mint_out == quote {
+                (br as u128, qr as u128, "pump_amm")
+            } else if mint_in == quote && mint_out == base {
+                (qr as u128, br as u128, "pump_amm")
+            } else {
+                return None;
+            }
+        }
+        CachedPoolState::PumpFun(s) => {
+            let mint = s.token_mint.to_string();
+            if mint_in == NATIVE_SOL_MINT && mint_out == mint {
+                (
+                    s.virtual_sol_reserves as u128,
+                    s.virtual_token_reserves as u128,
+                    "pumpfun",
+                )
+            } else if mint_in == mint && mint_out == NATIVE_SOL_MINT {
+                (
+                    s.virtual_token_reserves as u128,
+                    s.virtual_sol_reserves as u128,
+                    "pumpfun",
+                )
+            } else {
+                return None;
+            }
+        }
+        CachedPoolState::Meteora(_) => return None,
+    };
+    if !supports_cpmm(dex) && dex != "pumpfun" {
+        return None;
+    }
+    let fee_bps = cpmm_fee_bps(dex);
+    let amount_out = cpmm_amount_out(reserve_in, reserve_out, amount_in, fee_bps)?;
+    Some(PoolQuote {
+        pool_address: pool_address.to_string(),
+        dex: dex.to_string(),
+        kind: QuoteKind::ExecutableMarginal,
+        side: quote_side_for_token_hop(mint_in, mint_out),
+        as_of_slot: slot,
+        as_of_ts: updated_at,
+        fresh: true,
+        state_fingerprint: 0,
+        amount_in,
+        amount_out,
+    })
+}
+
+fn quote_side_for_token_hop(_mint_in: &str, mint_out: &str) -> QuoteSide {
+    if mint_out == NATIVE_SOL_MINT {
+        QuoteSide::Sell
+    } else {
+        QuoteSide::Buy
+    }
+}
+
+/// Unified exact-in quote from SLAVE [`CachedPoolState`] (multi-hop + 2-hop SSOT).
+///
+/// SOL-quoted hops delegate to [`quote_exact_in_with_freshness`] (DLMM uses bin walker).
+/// Token-token hops on CPMM DEXes use reserve math from the same module (no `quote_calculator` CP DLMM).
+#[allow(clippy::too_many_arguments)]
+pub fn quote_from_cached_pool(
+    state: &CachedPoolState,
+    pool_address: &str,
+    mint_in: &str,
+    mint_out: &str,
+    amount_in: u64,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    slot: u64,
+    updated_at: Instant,
+    token_decimals: u8,
+    freshness: &QuoteFreshnessConfig,
+) -> Option<PoolQuote> {
+    if amount_in == 0 {
+        return None;
+    }
+    if mint_in == NATIVE_SOL_MINT || mint_out == NATIVE_SOL_MINT {
+        let seed = sol_quoted_seed_from_cached_state(state)?;
+        if !hop_mints_match_sol_seed(&seed, mint_in, mint_out) {
+            return None;
+        }
+        let (pool_input, vault_input) =
+            cached_pool_inputs(state, pool_address, &seed, slot, updated_at, token_decimals);
+        return quote_exact_in_with_freshness(
+            &pool_input,
+            Some(&vault_input),
+            dlmm_bins,
+            mint_in,
+            mint_out,
+            amount_in,
+            freshness,
+        );
+    }
+    cpmm_hop_from_cached_state(
+        state,
+        pool_address,
+        mint_in,
+        mint_out,
+        amount_in,
+        slot,
+        updated_at,
+    )
+}
+
+/// Token decimals from cache state when mint-decimals map has no entry.
+pub fn token_decimals_from_cached_state(state: &CachedPoolState, token_mint: &Pubkey) -> u8 {
+    match state {
+        CachedPoolState::RaydiumAmm(s) => {
+            if s.base_mint == *token_mint && s.base_decimals > 0 {
+                s.base_decimals
+            } else if s.quote_mint == *token_mint && s.quote_decimals > 0 {
+                s.quote_decimals
+            } else {
+                6
+            }
+        }
+        CachedPoolState::MeteoraCpmm(s) => {
+            if s.token_0_mint == *token_mint && s.mint_0_decimals > 0 {
+                s.mint_0_decimals
+            } else if s.token_1_mint == *token_mint && s.mint_1_decimals > 0 {
+                s.mint_1_decimals
+            } else {
+                6
+            }
+        }
+        _ => 6,
+    }
+}
+
 /// Exact-in quote for SOL-quoted pools. Priority: ExecutableMarginal, then LastTradeMid.
 pub fn quote_exact_in(
     pool: &QuotePoolInput,
@@ -1020,6 +1466,65 @@ mod tests {
             Some(&changed_vault),
             Instant::now()
         ));
+    }
+
+    #[test]
+    fn dlmm_cached_pool_quote_uses_bin_walker_not_reserve_ratio() {
+        let active_id = 0i32;
+        let bin_step = 100u16;
+        let token_amount = 500_000_000_000u64;
+        let sol_amount = 2_000_000_000u64;
+        let array_index = active_id as i64 / 70;
+        let mut bins: DlmmBinArrays = HashMap::new();
+        bins.insert(
+            array_index,
+            vec![BinData {
+                offset: 0,
+                amount_x: token_amount,
+                amount_y: sol_amount,
+            }],
+        );
+        let token_mint = Pubkey::new_unique();
+        let state = CachedPoolState::Meteora(MeteoraState {
+            token_x_mint: token_mint,
+            token_y_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+            reserve_x: Pubkey::new_unique(),
+            reserve_y: Pubkey::new_unique(),
+            active_id,
+            bin_step,
+            reserve_x_balance: Some(1_000_000_000_000),
+            reserve_y_balance: Some(500_000_000),
+        });
+        let sol_in = DLMM_PROBE_SOL_LAMPORTS;
+        let cp_out = cpmm_amount_out(
+            sol_amount as u128,
+            token_amount as u128,
+            sol_in,
+            cpmm_fee_bps("meteora_dlmm"),
+        )
+        .expect("cp approx");
+        let bin_out = dlmm_token_output_from_bins(active_id, bin_step, sol_in, &bins, false)
+            .expect("bin walker");
+        assert_ne!(
+            cp_out, bin_out,
+            "test requires bin walker and reserve CP to diverge"
+        );
+        let quote = quote_from_cached_pool(
+            &state,
+            "dlmmPool",
+            NATIVE_SOL_MINT,
+            &token_mint.to_string(),
+            sol_in,
+            Some(&bins),
+            1,
+            Instant::now(),
+            6,
+            &QuoteFreshnessConfig::default(),
+        )
+        .expect("dlmm pool quote");
+        assert_eq!(quote.kind, QuoteKind::ExecutableMarginal);
+        assert_eq!(quote.amount_out, bin_out);
+        assert_ne!(quote.amount_out, cp_out);
     }
 
     #[test]

@@ -141,6 +141,7 @@ impl<Q: QuoteProvider> PoolRanker<Q> {
             let mut ranked_pools = Vec::with_capacity(pools.len());
 
             for edge in pools {
+                // I-ARB-9: beam expansion skips pools outside quote-ready set.
                 if !self.quote_provider.is_pool_quote_ready(&edge.pool_address) {
                     continue;
                 }
@@ -192,6 +193,7 @@ impl<Q: QuoteProvider> PoolRanker<Q> {
             output_mint,
             self.config.probe_amount,
         ) else {
+            // Anomaly: pool was quote-ready but probe quote failed at expansion time.
             crate::metrics::multi_hop_hop_missing_quote_inc();
             return None;
         };
