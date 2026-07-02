@@ -7917,11 +7917,13 @@ mod two_hop_price_tests {
         assert_eq!(tracker.pools.len(), 2, "expected two seeded pools");
         assert_eq!(vault_balances.len(), 2, "expected two vault entries");
 
-        let mut config = ArbConfig::default();
-        config.arb_two_hop_v2_enabled = true;
-        config.min_spread_bps = 1;
-        config.min_profit_lamports = 1;
-        config.est_tx_cost_lamports = 1;
+        let config = ArbConfig {
+            arb_two_hop_v2_enabled: true,
+            min_spread_bps: 1,
+            min_profit_lamports: 1,
+            est_tx_cost_lamports: 1,
+            ..Default::default()
+        };
 
         let bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
         let spread_warn_last = RwLock::new(HashMap::new());
