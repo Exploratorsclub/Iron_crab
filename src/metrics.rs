@@ -3005,6 +3005,18 @@ const ARB_QUOTE_SHADOW_PROFIT_BUCKETS: [i64; 5] =
 static ARB_QUOTE_SHADOW_PROFIT_BUCKET_COUNTS: Lazy<[AtomicU64; 5]> =
     Lazy::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
 
+// --- 2-hop profit-first v2 (M2, default off) ---
+pub static ARB_TWO_HOP_V2_SCREEN_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_INCOMPATIBLE_KIND_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_UNPROFITABLE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_REJECTED_QUOTE_STALE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_REJECTED_INCOMPATIBLE_QUOTE_KIND: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_REJECTED_INSUFFICIENT_POOLS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 // --- arb-strategy bootstrap / incremental warmup (low-cardinality) ---
 pub static ARB_STRATEGY_BOOTSTRAP_LIVE_POOL_CACHE_ROWS: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -3414,6 +3426,40 @@ pub fn record_arb_quote_shadow_round_trip(
 /// Update legacy spread gauge when shadow mode compares v1 vs v2.
 pub fn set_arb_quote_shadow_legacy_spread_bps(spread_bps: i64) {
     ARB_QUOTE_SHADOW_LEGACY_SPREAD_BPS.store(spread_bps, Ordering::Relaxed);
+}
+
+/// Rejection reason for `arb_two_hop_v2_rejected_total{reason=...}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbTwoHopV2RejectReason {
+    RoundTripUnprofitable,
+    QuoteStale,
+    IncompatibleQuoteKind,
+    InsufficientPools,
+}
+
+/// Increment `arb_two_hop_v2_screen_total`.
+pub fn arb_two_hop_v2_screen_inc() {
+    ARB_TWO_HOP_V2_SCREEN_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_two_hop_v2_incompatible_kind_total`.
+pub fn arb_two_hop_v2_incompatible_kind_inc() {
+    ARB_TWO_HOP_V2_INCOMPATIBLE_KIND_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_two_hop_v2_rejected_total{reason=...}`.
+pub fn arb_two_hop_v2_rejected_inc(reason: ArbTwoHopV2RejectReason) {
+    let counter = match reason {
+        ArbTwoHopV2RejectReason::RoundTripUnprofitable => {
+            &*ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_UNPROFITABLE
+        }
+        ArbTwoHopV2RejectReason::QuoteStale => &*ARB_TWO_HOP_V2_REJECTED_QUOTE_STALE,
+        ArbTwoHopV2RejectReason::IncompatibleQuoteKind => {
+            &*ARB_TWO_HOP_V2_REJECTED_INCOMPATIBLE_QUOTE_KIND
+        }
+        ArbTwoHopV2RejectReason::InsufficientPools => &*ARB_TWO_HOP_V2_REJECTED_INSUFFICIENT_POOLS,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Add to `arb_two_hop_tracker_seeded_pools_total` after SLAVE cache tracker seed.
@@ -6633,6 +6679,42 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("arb_quote_shadow_round_trip_profit_lamports_bucket{le=\"+Inf\"} ");
     out.push_str(
         &ARB_QUOTE_SHADOW_ROUND_TRIP_PROFIT_COUNT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "arb_two_hop_v2_screen_total",
+        ARB_TWO_HOP_V2_SCREEN_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_two_hop_v2_incompatible_kind_total",
+        ARB_TWO_HOP_V2_INCOMPATIBLE_KIND_TOTAL.load(Ordering::Relaxed)
+    );
+    out.push_str("arb_two_hop_v2_rejected_total{reason=\"round_trip_unprofitable\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_UNPROFITABLE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_rejected_total{reason=\"quote_stale\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_REJECTED_QUOTE_STALE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_rejected_total{reason=\"incompatible_quote_kind\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_REJECTED_INCOMPATIBLE_QUOTE_KIND
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_rejected_total{reason=\"insufficient_pools\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_REJECTED_INSUFFICIENT_POOLS
             .load(Ordering::Relaxed)
             .to_string(),
     );
