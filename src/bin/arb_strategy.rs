@@ -31,8 +31,9 @@ use uuid::Uuid;
 use ironcrab::arbitrage::{
     dlmm_marginal_price_plausible, dlmm_sol_output_from_bins, dlmm_token_output_from_bins,
     populate_arb_slave_from_live_pool_cache, quote_exact_in, quotes_pairable,
-    round_trip_profit_lamports, sync_arb_slave_from_pool_cache_update, MultiHopArbitrage,
-    MultiHopConfig, MultiHopIntentBatch, QuotePoolInput, QuoteVaultInput, RoundTripLeg,
+    round_trip_profit_lamports, select_round_trip_pools, sync_arb_slave_from_pool_cache_update,
+    MultiHopArbitrage, MultiHopConfig, MultiHopIntentBatch, QuoteFreshnessConfig, QuotePoolInput,
+    QuoteVaultInput, RoundTripLeg, RoundTripPoolCandidate, RoundTripSelectFailure,
     DLMM_PROBE_SOL_LAMPORTS,
 };
 use ironcrab::config::Config as AppConfig;
@@ -63,23 +64,25 @@ use ironcrab::metrics::{
     arb_tracker_write_stall_watchdog_inc, arb_two_hop_eligible_dexes_add,
     arb_two_hop_eligible_pools_by_dex_add, arb_two_hop_insufficient_subreason_inc,
     arb_two_hop_opportunity_inc, arb_two_hop_pool_gate_add, arb_two_hop_reject_subreason_inc,
-    arb_two_hop_rejected_inc, arb_two_hop_tracker_seeded_pools_add, record_arb_heartbeat_phase,
-    record_arb_price_freshness_stale_age_ms, record_arb_quote_shadow_round_trip,
-    record_arb_track_requests_messages_total, record_arb_writer_lock_wait, serve_metrics,
-    set_arb_pool_cache_apply_batch_size_gauge, set_arb_quote_shadow_legacy_spread_bps,
-    set_arb_tracker_write_coalescer_pending, set_arb_tracker_write_queue_depth,
-    set_arb_two_hop_blocked_on_apply_trade, set_readiness_nats_connected,
-    tick_arb_heartbeat_seconds_since_last_finish, tick_arb_tracker_write_seconds_since_last_finish,
-    wall_clock_unix_ms_now, ArbHeartbeatPhase, ArbStrategyWarmupSkipReason, ArbTrackerWriteJobType,
-    ArbTwoHopInsufficientSubreason, ArbTwoHopPoolGate, ArbTwoHopRejectReason,
-    ArbTwoHopRejectSubreason, ArbWriterLockKind, MetricsComponent,
-    ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH, ARB_REJECTED_MISSING_ACCOUNTS,
-    ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL, ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH,
-    ARB_TRACKER_WRITE_COALESCER_PENDING, ARB_TRACKER_WRITE_CURRENT_JOB_STARTED_UNIX_MS,
-    ARB_TRACKER_WRITE_CURRENT_JOB_TYPE, ARB_TRACKER_WRITE_QUEUE_DEPTH,
-    ARB_TRACKER_WRITE_SECONDS_SINCE_LAST_FINISH, ARB_TRIANGLE_OPPORTUNITIES,
-    INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
-    NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
+    arb_two_hop_rejected_inc, arb_two_hop_tracker_seeded_pools_add,
+    arb_two_hop_v2_incompatible_kind_inc, arb_two_hop_v2_rejected_inc, arb_two_hop_v2_screen_inc,
+    record_arb_heartbeat_phase, record_arb_price_freshness_stale_age_ms,
+    record_arb_quote_shadow_round_trip, record_arb_track_requests_messages_total,
+    record_arb_writer_lock_wait, serve_metrics, set_arb_pool_cache_apply_batch_size_gauge,
+    set_arb_quote_shadow_legacy_spread_bps, set_arb_tracker_write_coalescer_pending,
+    set_arb_tracker_write_queue_depth, set_arb_two_hop_blocked_on_apply_trade,
+    set_readiness_nats_connected, tick_arb_heartbeat_seconds_since_last_finish,
+    tick_arb_tracker_write_seconds_since_last_finish, wall_clock_unix_ms_now, ArbHeartbeatPhase,
+    ArbStrategyWarmupSkipReason, ArbTrackerWriteJobType, ArbTwoHopInsufficientSubreason,
+    ArbTwoHopPoolGate, ArbTwoHopRejectReason, ArbTwoHopRejectSubreason, ArbTwoHopV2RejectReason,
+    ArbWriterLockKind, MetricsComponent, ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH,
+    ARB_REJECTED_MISSING_ACCOUNTS, ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL,
+    ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH, ARB_TRACKER_WRITE_COALESCER_PENDING,
+    ARB_TRACKER_WRITE_CURRENT_JOB_STARTED_UNIX_MS, ARB_TRACKER_WRITE_CURRENT_JOB_TYPE,
+    ARB_TRACKER_WRITE_QUEUE_DEPTH, ARB_TRACKER_WRITE_SECONDS_SINCE_LAST_FINISH,
+    ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL,
+    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
+    TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     arb_strategy_pool_cache_live_consumer_config, config_consumer_config, config_subject,
@@ -146,6 +149,14 @@ struct ArbConfig {
     arb_track_reconcile_interval_secs: u64,
     /// Shadow pool_quote round-trip metrics (legacy path stays authoritative). Default: false.
     arb_quote_shadow_mode: bool,
+    /// Profit-first 2-hop v2 (round-trip quotes). Default: false.
+    arb_two_hop_v2_enabled: bool,
+    /// SOL probe for v2 round-trip screening. Default: 10_000_000 (0.01 SOL).
+    arb_probe_lamports: u64,
+    /// LastTradeMid quote TTL for v2 freshness. Default: 30_000 ms.
+    arb_quote_trade_ttl_ms: u64,
+    /// ExecutableMarginal state TTL for v2 freshness. Default: 120_000 ms.
+    arb_quote_state_ttl_ms: u64,
 }
 
 impl Default for ArbConfig {
@@ -162,6 +173,10 @@ impl Default for ArbConfig {
             arb_track_baseline_max_pools: ARB_TRACK_BASELINE_MAX_POOLS_DEFAULT,
             arb_track_reconcile_interval_secs: ARB_TRACK_RECONCILE_INTERVAL_SECS_DEFAULT,
             arb_quote_shadow_mode: false,
+            arb_two_hop_v2_enabled: false,
+            arb_probe_lamports: DLMM_PROBE_SOL_LAMPORTS,
+            arb_quote_trade_ttl_ms: 30_000,
+            arb_quote_state_ttl_ms: 120_000,
         }
     }
 }
@@ -1368,6 +1383,14 @@ struct PoolState {
     dex_accounts: Option<Vec<String>>,
 }
 
+/// Owned pool inputs for v2 round-trip selection (avoids dangling refs to temporaries).
+type OwnedRoundTripCandidate = (
+    QuotePoolInput,
+    Option<QuoteVaultInput>,
+    Option<HashMap<i64, Vec<BinData>>>,
+    String,
+);
+
 /// Tracks same token across multiple DEXes
 #[derive(Debug, Clone)]
 struct TokenArbTracker {
@@ -1987,6 +2010,184 @@ impl TokenArbTracker {
         );
     }
 
+    fn quote_freshness_config(config: &ArbConfig) -> QuoteFreshnessConfig {
+        QuoteFreshnessConfig {
+            trade_ttl_ms: config.arb_quote_trade_ttl_ms,
+            state_ttl_ms: config.arb_quote_state_ttl_ms,
+        }
+    }
+
+    fn build_round_trip_candidates(
+        &self,
+        known_pools: &HashSet<String>,
+        vault_balances: &HashMap<String, VaultBalanceCache>,
+        bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
+        token_decimals: u8,
+    ) -> Vec<OwnedRoundTripCandidate> {
+        self.pools
+            .values()
+            .filter(|p| known_pools.contains(&p.pool_address))
+            .filter(|p| is_known_dex_label(&p.dex))
+            .filter(|p| p.dex != "pumpfun")
+            .map(|pool| {
+                let vault = vault_balances
+                    .get(&pool.pool_address)
+                    .map(vault_cache_to_quote_input);
+                let bins = bin_arrays
+                    .get(&pool.pool_address)
+                    .map(flatten_bin_array_cache);
+                (
+                    pool_state_to_quote_input(pool, &self.base_mint, token_decimals),
+                    vault,
+                    bins,
+                    pool.dex.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// I-ARB-6: profit-first 2-hop via round-trip quotes (no legacy mid-spread gates).
+    fn check_arbitrage_v2(
+        &self,
+        config: &ArbConfig,
+        known_pools: &HashSet<String>,
+        vault_balances: &HashMap<String, VaultBalanceCache>,
+        bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
+    ) -> Option<ArbOpportunity> {
+        arb_two_hop_v2_screen_inc();
+
+        if !config.two_hop_enabled {
+            return None;
+        }
+
+        let token_decimals = self.token_decimals?;
+
+        if self.base_mint == NATIVE_SOL_MINT {
+            arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::RoundTripUnprofitable);
+            return None;
+        }
+
+        let freshness = Self::quote_freshness_config(config);
+        let probe = config.arb_probe_lamports;
+        let owned_candidates = self.build_round_trip_candidates(
+            known_pools,
+            vault_balances,
+            bin_arrays,
+            token_decimals,
+        );
+        let candidates: Vec<RoundTripPoolCandidate<'_>> = owned_candidates
+            .iter()
+            .map(|(pool, vault, bins, dex)| RoundTripPoolCandidate {
+                pool,
+                vault: vault.as_ref(),
+                dlmm_bins: bins.as_ref(),
+                dex,
+            })
+            .collect();
+
+        let selection = match select_round_trip_pools(&candidates, probe, &freshness) {
+            Ok(selection) => selection,
+            Err(RoundTripSelectFailure::InsufficientPools) => {
+                arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::InsufficientPools);
+                return None;
+            }
+            Err(RoundTripSelectFailure::QuoteStale) => {
+                arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::QuoteStale);
+                return None;
+            }
+            Err(RoundTripSelectFailure::IncompatibleQuoteKind) => {
+                arb_two_hop_v2_incompatible_kind_inc();
+                arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::IncompatibleQuoteKind);
+                return None;
+            }
+        };
+
+        let buy_pool = self.pools.get(&selection.buy_pool_address)?;
+        let sell_pool = self.pools.get(&selection.sell_pool_address)?;
+
+        let max_trade_sol =
+            if buy_pool.liquidity_sol > Decimal::ZERO && sell_pool.liquidity_sol > Decimal::ZERO {
+                buy_pool.liquidity_sol.min(sell_pool.liquidity_sol).min(
+                    Decimal::from(config.max_position_lamports) / Decimal::from(1_000_000_000u64),
+                )
+            } else {
+                Decimal::from(config.max_position_lamports) / Decimal::from(1_000_000_000u64)
+            };
+        let trade_amount_lamports = (max_trade_sol * Decimal::from(1_000_000_000u64))
+            .to_string()
+            .parse::<u64>()
+            .unwrap_or(config.max_position_lamports)
+            .max(probe);
+
+        let profit_lamports = selection.sell_quote.amount_out as i64
+            - probe as i64
+            - config.est_tx_cost_lamports as i64;
+
+        let buy_liquidity_unknown =
+            !buy_pool.has_reserve_data && buy_pool.liquidity_sol <= Decimal::ZERO;
+        let sell_liquidity_unknown =
+            !sell_pool.has_reserve_data && sell_pool.liquidity_sol <= Decimal::ZERO;
+        let effective_min_profit = if buy_liquidity_unknown && sell_liquidity_unknown {
+            config.min_profit_lamports * 5
+        } else {
+            config.min_profit_lamports
+        };
+
+        let spread_bps = if probe > 0 {
+            let gross = selection.sell_quote.amount_out as i64 - probe as i64;
+            (gross * 10_000 / probe as i64).clamp(i64::MIN, i64::MAX) as i32
+        } else {
+            0
+        };
+
+        let max_spread = if self.base_mint == USDC_MINT || self.base_mint == USDT_MINT {
+            STABLECOIN_MAX_SPREAD_BPS
+        } else {
+            MAX_REASONABLE_SPREAD_BPS
+        };
+
+        if spread_bps as i64 > max_spread || spread_bps < config.min_spread_bps as i32 {
+            arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::RoundTripUnprofitable);
+            return None;
+        }
+
+        if profit_lamports < effective_min_profit as i64 {
+            arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::RoundTripUnprofitable);
+            return None;
+        }
+
+        let buy_price = Decimal::from(selection.buy_quote.amount_in)
+            / Decimal::from(1_000_000_000u64)
+            / (Decimal::from(selection.buy_quote.amount_out)
+                / Decimal::from(10u64.pow(token_decimals as u32)));
+        let sell_price = Decimal::from(selection.sell_quote.amount_out)
+            / Decimal::from(1_000_000_000u64)
+            / (Decimal::from(selection.sell_quote.amount_in)
+                / Decimal::from(10u64.pow(token_decimals as u32)));
+
+        arb_two_hop_opportunity_inc();
+
+        let scale = if probe > 0 {
+            trade_amount_lamports as i128 / probe as i128
+        } else {
+            1
+        };
+        let estimated_profit_lamports = (profit_lamports as i128 * scale).max(0) as u64;
+
+        Some(ArbOpportunity {
+            base_mint: self.base_mint.clone(),
+            buy_dex: selection.buy_dex,
+            buy_pool: selection.buy_pool_address,
+            buy_price,
+            sell_dex: selection.sell_dex,
+            sell_pool: selection.sell_pool_address,
+            sell_price,
+            spread_bps: spread_bps.max(0) as u32,
+            trade_amount_lamports,
+            estimated_profit_lamports,
+        })
+    }
+
     /// Check for arbitrage opportunity between DEXes
     /// Returns: Option<(buy_dex, sell_dex, spread_bps, estimated_profit_lamports)>
     fn check_arbitrage(
@@ -1997,6 +2198,10 @@ impl TokenArbTracker {
         bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
         check_ctx: &ArbCheckContext<'_>,
     ) -> Option<ArbOpportunity> {
+        if config.arb_two_hop_v2_enabled {
+            return self.check_arbitrage_v2(config, known_pools, vault_balances, bin_arrays);
+        }
+
         let spread_warn_last = check_ctx.spread_warn_last;
         let data_quality_rejects = check_ctx.data_quality_rejects;
         let forensics = check_ctx.forensics;
@@ -3364,6 +3569,54 @@ impl ArbContext {
                         info!(key = %key, new_value = %v, "Config updated");
                     } else {
                         rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "arb_two_hop_v2_enabled" => {
+                    if let Some(v) = value.as_bool() {
+                        config.arb_two_hop_v2_enabled = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "arb_probe_lamports" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.arb_probe_lamports = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "arb_quote_trade_ttl_ms" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.arb_quote_trade_ttl_ms = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "arb_quote_state_ttl_ms" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.arb_quote_state_ttl_ms = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
                 }
                 // Skip multi_hop_* keys here - they're handled in the second loop below
@@ -7608,6 +7861,87 @@ mod two_hop_price_tests {
             "expected spread_below_min or similar, not insufficient_pools"
         );
         assert_eq!(tracker.pools.len(), 2);
+    }
+
+    #[test]
+    fn check_arbitrage_v2_uses_round_trip_not_legacy_mids() {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+
+        let update_orca = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_a.to_string(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            980_000_000,
+            1,
+        );
+        let update_pump = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_b.to_string(),
+            "pump_amm".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            1_020_000_000,
+            2,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        seed_token_tracker_from_live_pool_cache(
+            &mint_str,
+            &cache,
+            &mut trackers,
+            &mut vault_balances,
+            None,
+        );
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert(pool_a.to_string());
+        known_pools.insert(pool_b.to_string());
+
+        let tracker = trackers.get_mut(&mint_str).unwrap();
+        tracker.token_decimals = Some(6);
+        assert_eq!(tracker.pools.len(), 2, "expected two seeded pools");
+        assert_eq!(vault_balances.len(), 2, "expected two vault entries");
+
+        let mut config = ArbConfig::default();
+        config.arb_two_hop_v2_enabled = true;
+        config.min_spread_bps = 1;
+        config.min_profit_lamports = 1;
+        config.est_tx_cost_lamports = 1;
+
+        let bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
+        let spread_warn_last = RwLock::new(HashMap::new());
+        let data_quality_rejects = AtomicU64::new(0);
+        let opp = tracker.check_arbitrage(
+            &config,
+            &known_pools,
+            &vault_balances,
+            &bin_arrays,
+            &ArbCheckContext {
+                spread_warn_last: &spread_warn_last,
+                data_quality_rejects: &data_quality_rejects,
+                forensics: None,
+            },
+        );
+        let opp = opp.expect("v2 round-trip should find cross-dex edge");
+        assert_eq!(opp.buy_pool, pool_a.to_string());
+        assert_eq!(opp.sell_pool, pool_b.to_string());
+        assert!(opp.spread_bps > 0);
+        assert!(opp.estimated_profit_lamports > 0);
     }
 
     #[test]
