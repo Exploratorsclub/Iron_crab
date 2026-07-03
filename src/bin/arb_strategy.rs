@@ -68,6 +68,7 @@ use ironcrab::metrics::{
     arb_two_hop_v2_incompatible_kind_inc, arb_two_hop_v2_rejected_inc, arb_two_hop_v2_screen_inc,
     record_arb_heartbeat_phase, record_arb_price_freshness_stale_age_ms,
     record_arb_quote_shadow_round_trip, record_arb_track_requests_messages_total,
+    record_arb_track_requests_publish_chunks_total, record_arb_track_requests_publish_failed_total,
     record_arb_writer_lock_wait, serve_metrics, set_arb_pool_cache_apply_batch_size_gauge,
     set_arb_quote_shadow_legacy_spread_bps, set_arb_tracker_write_coalescer_pending,
     set_arb_tracker_write_queue_depth, set_arb_two_hop_blocked_on_apply_trade,
@@ -85,9 +86,10 @@ use ironcrab::metrics::{
     TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
-    arb_strategy_pool_cache_live_consumer_config, config_consumer_config, config_subject,
+    arb_strategy_pool_cache_live_consumer_config, arb_track_payload_bytes, config_consumer_config,
+    config_subject, split_arb_track_requests_update, trim_reconcile_update_to_budget,
     ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackRemovedEntry, ArbTrackRemovedReason,
-    ArbTrackRequestsUpdate, CONFIG_STREAM_NAME, STREAM_NAME,
+    ArbTrackRequestsUpdate, ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES, CONFIG_STREAM_NAME, STREAM_NAME,
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_ARB_TRACK_REQUESTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
@@ -4653,15 +4655,58 @@ impl ArbContext {
             removed,
             reconcile,
         };
-        record_arb_track_requests_messages_total();
-        self.arb_track_published.fetch_add(1, Ordering::Relaxed);
-        tokio::spawn(async move {
-            if let Err(e) = nats.publish(TOPIC_ARB_TRACK_REQUESTS, &update).await {
+
+        let chunks = if reconcile {
+            if arb_track_payload_bytes(&update) > ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES {
                 warn!(
-                    error = %e,
-                    topic = TOPIC_ARB_TRACK_REQUESTS,
-                    "ArbTrackRequests NATS publish failed"
+                    payload_bytes = arb_track_payload_bytes(&update),
+                    max_bytes = ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES,
+                    active_len = update.active.len(),
+                    "ArbTrackRequests reconcile snapshot exceeds NATS publish budget; trimming active"
                 );
+                match trim_reconcile_update_to_budget(update) {
+                    Some(trimmed) => vec![trimmed],
+                    None => {
+                        warn!(
+                            max_bytes = ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES,
+                            "ArbTrackRequests reconcile snapshot still exceeds budget after trim; skipping publish"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                vec![update]
+            }
+        } else {
+            split_arb_track_requests_update(update)
+        };
+
+        if chunks.is_empty() {
+            return;
+        }
+
+        self.arb_track_published
+            .fetch_add(chunks.len() as u64, Ordering::Relaxed);
+        tokio::spawn(async move {
+            for chunk in chunks {
+                match nats.publish(TOPIC_ARB_TRACK_REQUESTS, &chunk).await {
+                    Ok(_) => {
+                        record_arb_track_requests_messages_total();
+                        record_arb_track_requests_publish_chunks_total();
+                    }
+                    Err(e) => {
+                        record_arb_track_requests_publish_failed_total();
+                        warn!(
+                            error = %e,
+                            topic = TOPIC_ARB_TRACK_REQUESTS,
+                            payload_bytes = arb_track_payload_bytes(&chunk),
+                            active_len = chunk.active.len(),
+                            removed_len = chunk.removed.len(),
+                            reconcile = chunk.reconcile,
+                            "ArbTrackRequests NATS publish failed"
+                        );
+                    }
+                }
             }
         });
     }

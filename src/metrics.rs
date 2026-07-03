@@ -288,6 +288,12 @@ pub static MARKET_DATA_MOMENTUM_COALESCED_BATCHES_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// arb-strategy published `ArbTrackRequestsUpdate` payloads (Phase 3).
 pub static ARB_TRACK_REQUESTS_MESSAGES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// arb-strategy NATS publish failures for `ArbTrackRequestsUpdate` chunks (Phase 3).
+pub static ARB_TRACK_REQUESTS_PUBLISH_FAILED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// arb-strategy successfully published `ArbTrackRequestsUpdate` NATS chunks (Phase 3).
+pub static ARB_TRACK_REQUESTS_PUBLISH_CHUNKS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// market-data applied `ArbTrackRequestsUpdate` from core NATS (Phase 3).
 pub static MARKET_DATA_ARB_TRACK_REQUESTS_MESSAGES_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -520,6 +526,16 @@ pub fn inc_market_data_momentum_coalesced_batches_total() {
 #[inline]
 pub fn record_arb_track_requests_messages_total() {
     ARB_TRACK_REQUESTS_MESSAGES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_arb_track_requests_publish_failed_total() {
+    ARB_TRACK_REQUESTS_PUBLISH_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_arb_track_requests_publish_chunks_total() {
+    ARB_TRACK_REQUESTS_PUBLISH_CHUNKS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -5363,6 +5379,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_track_requests_messages_total",
         ARB_TRACK_REQUESTS_MESSAGES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_track_requests_publish_failed_total",
+        ARB_TRACK_REQUESTS_PUBLISH_FAILED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_track_requests_publish_chunks_total",
+        ARB_TRACK_REQUESTS_PUBLISH_CHUNKS_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_arb_track_requests_messages_total",
