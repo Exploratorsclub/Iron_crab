@@ -47,15 +47,16 @@ pub use multi_hop_integration::{
 };
 pub use pool_graph::{GraphStats, PoolGraph};
 pub use pool_quote::{
-    dlmm_marginal_price_plausible, dlmm_sol_output_from_bins, dlmm_token_output_from_bins,
-    flatten_bin_array_bins, is_quote_fresh, is_usable_quote_kind, quote_exact_in,
-    quote_exact_in_with_freshness, quote_from_cached_pool, quote_sol_per_token_for_screening,
-    quotes_pairable, round_trip_profit_lamports, round_trip_profit_lamports_with_freshness,
-    select_round_trip_pools, sol_quoted_seed_from_cached_state, state_fingerprint,
-    token_decimals_from_cached_state, DlmmBinArrays, PoolQuote, QuoteFreshnessConfig, QuoteKind,
-    QuotePoolInput, QuoteSide, QuoteVaultInput, RoundTripInsufficientSubreason, RoundTripLeg,
-    RoundTripPoolCandidate, RoundTripPoolSelection, RoundTripSelectFailure, SolQuotedPoolSeed,
-    DLMM_PROBE_SOL_LAMPORTS, STATE_TTL_MS, TRADE_TTL_MS,
+    classify_cross_dex_sell_failure, dlmm_marginal_price_plausible, dlmm_sol_output_from_bins,
+    dlmm_token_output_from_bins, flatten_bin_array_bins, is_quote_fresh, is_usable_quote_kind,
+    quote_exact_in, quote_exact_in_with_freshness, quote_from_cached_pool,
+    quote_sol_per_token_for_screening, quotes_pairable, round_trip_profit_lamports,
+    round_trip_profit_lamports_with_freshness, select_round_trip_pools,
+    sol_quoted_seed_from_cached_state, state_fingerprint, token_decimals_from_cached_state,
+    DlmmBinArrays, NoCrossDexSellDetailReason, PoolQuote, QuoteFreshnessConfig, QuoteKind,
+    QuotePoolInput, QuoteSide, QuoteVaultInput, RoundTripInsufficient,
+    RoundTripInsufficientSubreason, RoundTripLeg, RoundTripPoolCandidate, RoundTripPoolSelection,
+    RoundTripSelectFailure, SolQuotedPoolSeed, DLMM_PROBE_SOL_LAMPORTS, STATE_TTL_MS, TRADE_TTL_MS,
 };
 pub use pool_ranker::{PoolRanker, QuoteProvider, RankerConfig};
 pub use types::{

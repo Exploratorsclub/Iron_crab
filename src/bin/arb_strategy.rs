@@ -29,13 +29,14 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use ironcrab::arbitrage::{
-    dlmm_marginal_price_plausible, dlmm_sol_output_from_bins, dlmm_token_output_from_bins,
-    is_quote_fresh, populate_arb_slave_from_live_pool_cache, quote_exact_in,
-    quote_exact_in_with_freshness, quotes_pairable, round_trip_profit_lamports,
+    classify_cross_dex_sell_failure, dlmm_marginal_price_plausible, dlmm_sol_output_from_bins,
+    dlmm_token_output_from_bins, is_quote_fresh, populate_arb_slave_from_live_pool_cache,
+    quote_exact_in, quote_exact_in_with_freshness, quotes_pairable, round_trip_profit_lamports,
     select_round_trip_pools, sync_arb_slave_from_pool_cache_update, MultiHopArbitrage,
-    MultiHopConfig, MultiHopIntentBatch, PoolQuote, QuoteFreshnessConfig, QuotePoolInput,
-    QuoteVaultInput, RoundTripInsufficientSubreason, RoundTripLeg, RoundTripPoolCandidate,
-    RoundTripSelectFailure, DLMM_PROBE_SOL_LAMPORTS,
+    MultiHopConfig, MultiHopIntentBatch, NoCrossDexSellDetailReason, PoolQuote,
+    QuoteFreshnessConfig, QuotePoolInput, QuoteVaultInput, RoundTripInsufficient,
+    RoundTripInsufficientSubreason, RoundTripLeg, RoundTripPoolCandidate, RoundTripSelectFailure,
+    DLMM_PROBE_SOL_LAMPORTS,
 };
 use ironcrab::config::Config as AppConfig;
 use ironcrab::execution::live_pool_cache::{
@@ -67,27 +68,29 @@ use ironcrab::metrics::{
     arb_two_hop_opportunity_inc, arb_two_hop_pool_gate_add, arb_two_hop_reject_subreason_inc,
     arb_two_hop_rejected_inc, arb_two_hop_tracker_seeded_pools_add,
     arb_two_hop_v2_incompatible_kind_inc, arb_two_hop_v2_insufficient_subreason_inc,
-    arb_two_hop_v2_rejected_inc, arb_two_hop_v2_screen_inc, arb_two_hop_v2_screen_multi_dex_inc,
-    record_arb_heartbeat_phase, record_arb_price_freshness_stale_age_ms,
-    record_arb_proactive_pin_first_publish, record_arb_proactive_track_publish_total,
-    record_arb_quote_pair_slot_delta, record_arb_quote_shadow_round_trip,
-    record_arb_track_requests_messages_total, record_arb_track_requests_publish_chunks_total,
-    record_arb_track_requests_publish_failed_total, record_arb_writer_lock_wait, serve_metrics,
-    set_arb_pool_cache_apply_batch_size_gauge, set_arb_quote_shadow_legacy_spread_bps,
-    set_arb_tracker_write_coalescer_pending, set_arb_tracker_write_queue_depth,
-    set_arb_two_hop_blocked_on_apply_trade, set_readiness_nats_connected,
-    tick_arb_heartbeat_seconds_since_last_finish, tick_arb_tracker_write_seconds_since_last_finish,
+    arb_two_hop_v2_no_cross_dex_sell_detail_inc, arb_two_hop_v2_rejected_inc,
+    arb_two_hop_v2_screen_inc, arb_two_hop_v2_screen_multi_dex_inc, record_arb_heartbeat_phase,
+    record_arb_price_freshness_stale_age_ms, record_arb_proactive_pin_first_publish,
+    record_arb_proactive_track_publish_total, record_arb_quote_pair_slot_delta,
+    record_arb_quote_shadow_round_trip, record_arb_track_requests_messages_total,
+    record_arb_track_requests_publish_chunks_total, record_arb_track_requests_publish_failed_total,
+    record_arb_writer_lock_wait, serve_metrics, set_arb_pool_cache_apply_batch_size_gauge,
+    set_arb_quote_shadow_legacy_spread_bps, set_arb_tracker_write_coalescer_pending,
+    set_arb_tracker_write_queue_depth, set_arb_two_hop_blocked_on_apply_trade,
+    set_readiness_nats_connected, tick_arb_heartbeat_seconds_since_last_finish,
+    tick_arb_tracker_write_seconds_since_last_finish,
     try_record_arb_track_pin_before_first_screen_ms, wall_clock_unix_ms_now, ArbHeartbeatPhase,
     ArbStrategyWarmupSkipReason, ArbTrackerWriteJobType, ArbTwoHopInsufficientSubreason,
     ArbTwoHopPoolGate, ArbTwoHopRejectReason, ArbTwoHopRejectSubreason,
-    ArbTwoHopV2InsufficientSubreason, ArbTwoHopV2RejectReason, ArbWriterLockKind, MetricsComponent,
-    ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH, ARB_REJECTED_MISSING_ACCOUNTS,
-    ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL, ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH,
-    ARB_TRACKER_WRITE_COALESCER_PENDING, ARB_TRACKER_WRITE_CURRENT_JOB_STARTED_UNIX_MS,
-    ARB_TRACKER_WRITE_CURRENT_JOB_TYPE, ARB_TRACKER_WRITE_QUEUE_DEPTH,
-    ARB_TRACKER_WRITE_SECONDS_SINCE_LAST_FINISH, ARB_TRIANGLE_OPPORTUNITIES,
-    INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
-    NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
+    ArbTwoHopV2InsufficientSubreason, ArbTwoHopV2NoCrossDexSellDetail, ArbTwoHopV2RejectReason,
+    ArbWriterLockKind, MetricsComponent, ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH,
+    ARB_REJECTED_MISSING_ACCOUNTS, ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL,
+    ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH, ARB_TRACKER_WRITE_COALESCER_PENDING,
+    ARB_TRACKER_WRITE_CURRENT_JOB_STARTED_UNIX_MS, ARB_TRACKER_WRITE_CURRENT_JOB_TYPE,
+    ARB_TRACKER_WRITE_QUEUE_DEPTH, ARB_TRACKER_WRITE_SECONDS_SINCE_LAST_FINISH,
+    ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL,
+    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
+    TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     arb_strategy_pool_cache_live_consumer_config, arb_track_payload_bytes, config_consumer_config,
@@ -1597,6 +1600,7 @@ struct PoolV2EligibilityRow {
     buy_quote_fresh: bool,
     sell_quote_ok: bool,
     sell_quote_fresh: bool,
+    sell_fail_reason: Option<String>,
 }
 
 /// Aggregated mint-level v2 eligibility breakdown for rate-limited snapshots.
@@ -1689,6 +1693,7 @@ impl ArbV2EligibilityForensics {
                         "buy_quote_fresh": row.buy_quote_fresh,
                         "sell_quote_ok": row.sell_quote_ok,
                         "sell_quote_fresh": row.sell_quote_fresh,
+                        "sell_fail_reason": row.sell_fail_reason,
                     })
                 })
                 .collect();
@@ -1750,8 +1755,29 @@ fn v2_insufficient_subreason_to_metric(
     }
 }
 
-fn record_v2_insufficient_subreason(subreason: RoundTripInsufficientSubreason) {
-    arb_two_hop_v2_insufficient_subreason_inc(v2_insufficient_subreason_to_metric(subreason));
+fn v2_no_cross_dex_sell_detail_to_metric(
+    detail: NoCrossDexSellDetailReason,
+) -> ArbTwoHopV2NoCrossDexSellDetail {
+    match detail {
+        NoCrossDexSellDetailReason::SellMissingVault => {
+            ArbTwoHopV2NoCrossDexSellDetail::SellMissingVault
+        }
+        NoCrossDexSellDetailReason::SellMissingDlmmBins => {
+            ArbTwoHopV2NoCrossDexSellDetail::SellMissingDlmmBins
+        }
+        NoCrossDexSellDetailReason::SellQuoteNone => ArbTwoHopV2NoCrossDexSellDetail::SellQuoteNone,
+        NoCrossDexSellDetailReason::SellNotFresh => ArbTwoHopV2NoCrossDexSellDetail::SellNotFresh,
+        NoCrossDexSellDetailReason::SellZeroOut => ArbTwoHopV2NoCrossDexSellDetail::SellZeroOut,
+    }
+}
+
+fn record_v2_insufficient_subreason(insufficient: RoundTripInsufficient) {
+    arb_two_hop_v2_insufficient_subreason_inc(v2_insufficient_subreason_to_metric(
+        insufficient.subreason,
+    ));
+    if let Some(detail) = insufficient.no_cross_dex_sell_detail {
+        arb_two_hop_v2_no_cross_dex_sell_detail_inc(v2_no_cross_dex_sell_detail_to_metric(detail));
+    }
 }
 
 fn record_eligibility_metrics(breakdown: &MintEligibilityBreakdown) {
@@ -2321,6 +2347,18 @@ impl TokenArbTracker {
                 (false, false)
             };
 
+            let sell_fail_reason = best_buy_amount_out.map(|token_amount| {
+                classify_cross_dex_sell_failure(
+                    candidate,
+                    token_amount,
+                    freshness,
+                    now,
+                    token_decimals,
+                )
+                .as_metric_label()
+                .to_string()
+            });
+
             pool_rows.push(PoolV2EligibilityRow {
                 pool_address: candidate.pool.pool_address.clone(),
                 dex: candidate.dex.to_string(),
@@ -2331,6 +2369,7 @@ impl TokenArbTracker {
                 buy_quote_fresh,
                 sell_quote_ok,
                 sell_quote_fresh,
+                sell_fail_reason,
             });
         }
 
@@ -2390,8 +2429,8 @@ impl TokenArbTracker {
 
         let selection = match select_round_trip_pools(&candidates, probe, &freshness) {
             Ok(selection) => selection,
-            Err(RoundTripSelectFailure::InsufficientPools(subreason)) => {
-                record_v2_insufficient_subreason(subreason);
+            Err(RoundTripSelectFailure::InsufficientPools(insufficient)) => {
+                record_v2_insufficient_subreason(insufficient);
                 arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::InsufficientPools);
                 if let Some(collector) = v2_forensics {
                     let breakdown = self.build_v2_eligibility_breakdown(
@@ -2401,7 +2440,7 @@ impl TokenArbTracker {
                         token_decimals,
                         probe,
                         &freshness,
-                        subreason,
+                        insufficient.subreason,
                     );
                     collector.record(breakdown);
                 }
