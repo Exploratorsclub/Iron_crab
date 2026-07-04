@@ -3053,6 +3053,24 @@ pub static ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_NOT_FRESH: Lazy<AtomicU6
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_ZERO_OUT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_STATE_STALE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_RESERVES_IMPLAUSIBLE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_DLMM_ACTIVE_BIN_MISSING: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_DLMM_WALKER_ZERO: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_DLMM_MARGINAL_REJECT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_CPMM_MATH_NONE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_UNSUPPORTED_DEX: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_TRADE_FALLBACK_NONE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_MINT_DIRECTION_INVALID: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static ARB_PROACTIVE_TRACK_PUBLISH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 const ARB_QUOTE_PAIR_SLOT_DELTA_BUCKETS: &[u64] = &[0, 1, 2, 3, 4, 5, 8, 16, 32];
@@ -3571,6 +3589,54 @@ pub fn arb_two_hop_v2_no_cross_dex_sell_detail_inc(reason: ArbTwoHopV2NoCrossDex
         }
         ArbTwoHopV2NoCrossDexSellDetail::SellZeroOut => {
             &*ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_ZERO_OUT
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Drill-down reason for `arb_two_hop_v2_sell_quote_none_detail_total{reason=...}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbTwoHopV2SellQuoteNoneDetail {
+    StateStale,
+    ReservesImplausible,
+    DlmmActiveBinMissing,
+    DlmmWalkerZero,
+    DlmmMarginalReject,
+    CpmmMathNone,
+    UnsupportedDex,
+    TradeFallbackNone,
+    MintDirectionInvalid,
+}
+
+/// Increment `arb_two_hop_v2_sell_quote_none_detail_total{reason=...}`.
+pub fn arb_two_hop_v2_sell_quote_none_detail_inc(reason: ArbTwoHopV2SellQuoteNoneDetail) {
+    let counter = match reason {
+        ArbTwoHopV2SellQuoteNoneDetail::StateStale => {
+            &*ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_STATE_STALE
+        }
+        ArbTwoHopV2SellQuoteNoneDetail::ReservesImplausible => {
+            &*ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_RESERVES_IMPLAUSIBLE
+        }
+        ArbTwoHopV2SellQuoteNoneDetail::DlmmActiveBinMissing => {
+            &*ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_DLMM_ACTIVE_BIN_MISSING
+        }
+        ArbTwoHopV2SellQuoteNoneDetail::DlmmWalkerZero => {
+            &*ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_DLMM_WALKER_ZERO
+        }
+        ArbTwoHopV2SellQuoteNoneDetail::DlmmMarginalReject => {
+            &*ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_DLMM_MARGINAL_REJECT
+        }
+        ArbTwoHopV2SellQuoteNoneDetail::CpmmMathNone => {
+            &*ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_CPMM_MATH_NONE
+        }
+        ArbTwoHopV2SellQuoteNoneDetail::UnsupportedDex => {
+            &*ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_UNSUPPORTED_DEX
+        }
+        ArbTwoHopV2SellQuoteNoneDetail::TradeFallbackNone => {
+            &*ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_TRADE_FALLBACK_NONE
+        }
+        ArbTwoHopV2SellQuoteNoneDetail::MintDirectionInvalid => {
+            &*ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_MINT_DIRECTION_INVALID
         }
     };
     counter.fetch_add(1, Ordering::Relaxed);
@@ -4355,6 +4421,74 @@ fn append_arb_two_hop_v2_no_cross_dex_sell_detail_total(out: &mut String) {
     out.push_str("arb_two_hop_v2_no_cross_dex_sell_detail_total{reason=\"sell_zero_out\"} ");
     out.push_str(
         &ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_ZERO_OUT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+}
+
+fn append_arb_two_hop_v2_sell_quote_none_detail_total(out: &mut String) {
+    out.push_str("arb_two_hop_v2_sell_quote_none_detail_total{reason=\"state_stale\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_STATE_STALE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_sell_quote_none_detail_total{reason=\"reserves_implausible\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_RESERVES_IMPLAUSIBLE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        "arb_two_hop_v2_sell_quote_none_detail_total{reason=\"dlmm_active_bin_missing\"} ",
+    );
+    out.push_str(
+        &ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_DLMM_ACTIVE_BIN_MISSING
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_sell_quote_none_detail_total{reason=\"dlmm_walker_zero\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_DLMM_WALKER_ZERO
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_sell_quote_none_detail_total{reason=\"dlmm_marginal_reject\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_DLMM_MARGINAL_REJECT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_sell_quote_none_detail_total{reason=\"cpmm_math_none\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_CPMM_MATH_NONE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_sell_quote_none_detail_total{reason=\"unsupported_dex\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_UNSUPPORTED_DEX
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_sell_quote_none_detail_total{reason=\"trade_fallback_none\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_TRADE_FALLBACK_NONE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_sell_quote_none_detail_total{reason=\"mint_direction_invalid\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_MINT_DIRECTION_INVALID
             .load(Ordering::Relaxed)
             .to_string(),
     );
@@ -7012,6 +7146,7 @@ async fn metrics_response() -> Response<Body> {
     );
     append_arb_two_hop_v2_insufficient_subreason_total(&mut out);
     append_arb_two_hop_v2_no_cross_dex_sell_detail_total(&mut out);
+    append_arb_two_hop_v2_sell_quote_none_detail_total(&mut out);
     append_momentum_latency_histogram_prometheus(
         &mut out,
         "arb_quote_pair_slot_delta",
@@ -8508,6 +8643,38 @@ mod arb_two_hop_subreason_metrics_tests {
             assert!(
                 out.contains(&format!("reason=\"{label}\"")),
                 "missing reject label {label}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod arb_two_hop_v2_sell_quote_none_detail_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn sell_quote_none_detail_inc_and_prometheus_labels() {
+        let before = ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_STATE_STALE.load(Ordering::Relaxed);
+        arb_two_hop_v2_sell_quote_none_detail_inc(ArbTwoHopV2SellQuoteNoneDetail::StateStale);
+        let after = ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_STATE_STALE.load(Ordering::Relaxed);
+        assert_eq!(after, before + 1);
+
+        let mut out = String::new();
+        append_arb_two_hop_v2_sell_quote_none_detail_total(&mut out);
+        for label in [
+            "state_stale",
+            "reserves_implausible",
+            "dlmm_active_bin_missing",
+            "dlmm_walker_zero",
+            "dlmm_marginal_reject",
+            "cpmm_math_none",
+            "unsupported_dex",
+            "trade_fallback_none",
+            "mint_direction_invalid",
+        ] {
+            assert!(
+                out.contains(&format!("reason=\"{label}\"")),
+                "missing sell_quote_none detail label {label}"
             );
         }
     }
