@@ -1,7 +1,7 @@
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server};
 use once_cell::sync::Lazy;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -3032,6 +3032,39 @@ pub static ARB_TWO_HOP_V2_REJECTED_INCOMPATIBLE_QUOTE_KIND: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_REJECTED_INSUFFICIENT_POOLS: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PROACTIVE_TRACK_PUBLISH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+const ARB_QUOTE_PAIR_SLOT_DELTA_BUCKETS: &[u64] = &[0, 1, 2, 3, 4, 5, 8, 16, 32];
+static ARB_QUOTE_PAIR_SLOT_DELTA_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    ARB_QUOTE_PAIR_SLOT_DELTA_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+pub static ARB_QUOTE_PAIR_SLOT_DELTA_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_QUOTE_PAIR_SLOT_DELTA_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+const ARB_TRACK_PIN_BEFORE_FIRST_SCREEN_MS_BUCKETS: &[u64] = &[
+    10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000,
+];
+static ARB_TRACK_PIN_BEFORE_FIRST_SCREEN_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    ARB_TRACK_PIN_BEFORE_FIRST_SCREEN_MS_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+pub static ARB_TRACK_PIN_BEFORE_FIRST_SCREEN_MS_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_PIN_BEFORE_FIRST_SCREEN_MS_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+const ARB_PROACTIVE_PIN_FIRST_PUBLISH_MAP_CAP: usize = 4096;
+static ARB_PROACTIVE_PIN_FIRST_PUBLISH_MS: Lazy<Mutex<HashMap<String, u64>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static ARB_PROACTIVE_PIN_FIRST_PUBLISH_ORDER: Lazy<Mutex<VecDeque<String>>> =
+    Lazy::new(|| Mutex::new(VecDeque::new()));
 
 // --- arb-strategy bootstrap / incremental warmup (low-cardinality) ---
 pub static ARB_STRATEGY_BOOTSTRAP_LIVE_POOL_CACHE_ROWS: Lazy<AtomicU64> =
@@ -3451,6 +3484,7 @@ pub enum ArbTwoHopV2RejectReason {
     QuoteStale,
     IncompatibleQuoteKind,
     InsufficientPools,
+    SlotDeltaExceeded,
 }
 
 /// Increment `arb_two_hop_v2_screen_total`.
@@ -3474,8 +3508,70 @@ pub fn arb_two_hop_v2_rejected_inc(reason: ArbTwoHopV2RejectReason) {
             &*ARB_TWO_HOP_V2_REJECTED_INCOMPATIBLE_QUOTE_KIND
         }
         ArbTwoHopV2RejectReason::InsufficientPools => &*ARB_TWO_HOP_V2_REJECTED_INSUFFICIENT_POOLS,
+        ArbTwoHopV2RejectReason::SlotDeltaExceeded => &*ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED,
     };
     counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record `|buy.as_of_slot - sell.as_of_slot|` for a v2 round-trip screen.
+pub fn record_arb_quote_pair_slot_delta(delta_slots: u64) {
+    record_histogram_u64_into(
+        ARB_QUOTE_PAIR_SLOT_DELTA_BUCKETS,
+        ARB_QUOTE_PAIR_SLOT_DELTA_BUCKET_COUNTS.as_slice(),
+        &ARB_QUOTE_PAIR_SLOT_DELTA_SUM,
+        &ARB_QUOTE_PAIR_SLOT_DELTA_COUNT,
+        delta_slots,
+        u64::MAX,
+    );
+}
+
+/// Record first proactive multi-DEX pin publish for pin-before-first-screen latency.
+pub fn record_arb_proactive_pin_first_publish(mint: &str) {
+    let now = wall_clock_unix_ms_now();
+    let mut map = ARB_PROACTIVE_PIN_FIRST_PUBLISH_MS.lock();
+    if map.contains_key(mint) {
+        return;
+    }
+    if map.len() >= ARB_PROACTIVE_PIN_FIRST_PUBLISH_MAP_CAP {
+        let mut order = ARB_PROACTIVE_PIN_FIRST_PUBLISH_ORDER.lock();
+        while map.len() >= ARB_PROACTIVE_PIN_FIRST_PUBLISH_MAP_CAP {
+            if let Some(old) = order.pop_front() {
+                map.remove(&old);
+            } else {
+                break;
+            }
+        }
+    }
+    map.insert(mint.to_string(), now);
+    ARB_PROACTIVE_PIN_FIRST_PUBLISH_ORDER
+        .lock()
+        .push_back(mint.to_string());
+}
+
+/// On first v2 screen for a mint, record ms since first proactive pin publish (if tracked).
+pub fn try_record_arb_track_pin_before_first_screen_ms(mint: &str) {
+    let publish_ms = ARB_PROACTIVE_PIN_FIRST_PUBLISH_MS.lock().remove(mint);
+    let Some(publish_ms) = publish_ms else {
+        return;
+    };
+    ARB_PROACTIVE_PIN_FIRST_PUBLISH_ORDER
+        .lock()
+        .retain(|m| m != mint);
+    let now = wall_clock_unix_ms_now();
+    let delta_ms = now.saturating_sub(publish_ms);
+    record_histogram_u64_into(
+        ARB_TRACK_PIN_BEFORE_FIRST_SCREEN_MS_BUCKETS,
+        ARB_TRACK_PIN_BEFORE_FIRST_SCREEN_MS_BUCKET_COUNTS.as_slice(),
+        &ARB_TRACK_PIN_BEFORE_FIRST_SCREEN_MS_SUM,
+        &ARB_TRACK_PIN_BEFORE_FIRST_SCREEN_MS_COUNT,
+        delta_ms,
+        3_600_000,
+    );
+}
+
+/// Increment `arb_proactive_track_publish_total`.
+pub fn record_arb_proactive_track_publish_total() {
+    ARB_PROACTIVE_TRACK_PUBLISH_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Add to `arb_two_hop_tracker_seeded_pools_total` after SLAVE cache tracker seed.
@@ -6748,6 +6844,33 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
+    out.push_str("arb_two_hop_v2_rejected_total{reason=\"slot_delta_exceeded\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "arb_quote_pair_slot_delta",
+        ARB_QUOTE_PAIR_SLOT_DELTA_BUCKETS,
+        ARB_QUOTE_PAIR_SLOT_DELTA_BUCKET_COUNTS.as_slice(),
+        &ARB_QUOTE_PAIR_SLOT_DELTA_SUM,
+        &ARB_QUOTE_PAIR_SLOT_DELTA_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "arb_track_pin_before_first_screen_ms",
+        ARB_TRACK_PIN_BEFORE_FIRST_SCREEN_MS_BUCKETS,
+        ARB_TRACK_PIN_BEFORE_FIRST_SCREEN_MS_BUCKET_COUNTS.as_slice(),
+        &ARB_TRACK_PIN_BEFORE_FIRST_SCREEN_MS_SUM,
+        &ARB_TRACK_PIN_BEFORE_FIRST_SCREEN_MS_COUNT,
+    );
+    line!(
+        "arb_proactive_track_publish_total",
+        ARB_PROACTIVE_TRACK_PUBLISH_TOTAL.load(Ordering::Relaxed)
+    );
     line!(
         "arb_strategy_bootstrap_live_pool_cache_rows",
         ARB_STRATEGY_BOOTSTRAP_LIVE_POOL_CACHE_ROWS.load(Ordering::Relaxed)
