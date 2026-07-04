@@ -442,9 +442,16 @@ fn executable_marginal_quote(
                 trade_implied_sol_per_token(amount_out, amount_in, pool.token_decimals)
             }
         };
-        if !dlmm_marginal_price_plausible(marginal_price, reserve_mid, trade_mid)
-            || !is_plausible_sol_per_token_price(&pool.token_mint, marginal_price)
-        {
+        // Buy screening uses a small SOL probe where marginal ≈ mid. Sell legs in round-trip
+        // pairing use the full buy token amount; slippage vs reserve mid is expected and must
+        // not reject an otherwise valid bin-walker quote (P2 sell_quote_none fix).
+        let marginal_ok = if side == QuoteSide::Sell {
+            is_plausible_sol_per_token_price(&pool.token_mint, marginal_price)
+        } else {
+            dlmm_marginal_price_plausible(marginal_price, reserve_mid, trade_mid)
+                && is_plausible_sol_per_token_price(&pool.token_mint, marginal_price)
+        };
+        if !marginal_ok {
             return None;
         }
         return Some(PoolQuote {
@@ -1155,6 +1162,286 @@ pub struct RoundTripPoolSelection {
     pub sell_quote: PoolQuote,
 }
 
+/// Drill-down when `quote_exact_in_with_freshness` returns `None` on a sell leg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SellQuoteNoneDetailReason {
+    StateStale,
+    ReservesImplausible,
+    DlmmActiveBinMissing,
+    DlmmWalkerZero,
+    DlmmMarginalReject,
+    CpmmMathNone,
+    UnsupportedDex,
+    TradeFallbackNone,
+    MintDirectionInvalid,
+}
+
+impl SellQuoteNoneDetailReason {
+    pub fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::StateStale => "state_stale",
+            Self::ReservesImplausible => "reserves_implausible",
+            Self::DlmmActiveBinMissing => "dlmm_active_bin_missing",
+            Self::DlmmWalkerZero => "dlmm_walker_zero",
+            Self::DlmmMarginalReject => "dlmm_marginal_reject",
+            Self::CpmmMathNone => "cpmm_math_none",
+            Self::UnsupportedDex => "unsupported_dex",
+            Self::TradeFallbackNone => "trade_fallback_none",
+            Self::MintDirectionInvalid => "mint_direction_invalid",
+        }
+    }
+}
+
+/// Outcome of classifying a cross-DEX sell leg (metrics / snapshots).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossDexSellFailure {
+    MissingDlmmBins,
+    MissingVault,
+    QuoteNone(SellQuoteNoneDetailReason),
+    NotFresh,
+    ZeroOut,
+}
+
+impl CrossDexSellFailure {
+    pub fn as_top_level_detail(self) -> NoCrossDexSellDetailReason {
+        match self {
+            Self::MissingDlmmBins => NoCrossDexSellDetailReason::SellMissingDlmmBins,
+            Self::MissingVault => NoCrossDexSellDetailReason::SellMissingVault,
+            Self::QuoteNone(SellQuoteNoneDetailReason::StateStale) => {
+                NoCrossDexSellDetailReason::SellNotFresh
+            }
+            Self::QuoteNone(_) => NoCrossDexSellDetailReason::SellQuoteNone,
+            Self::NotFresh => NoCrossDexSellDetailReason::SellNotFresh,
+            Self::ZeroOut => NoCrossDexSellDetailReason::SellZeroOut,
+        }
+    }
+
+    pub fn sell_quote_none_subreason(self) -> Option<SellQuoteNoneDetailReason> {
+        match self {
+            Self::QuoteNone(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+fn diagnose_executable_marginal_none(
+    pool: &QuotePoolInput,
+    vault: &QuoteVaultInput,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    amount_in: u64,
+    now: Instant,
+    freshness: &QuoteFreshnessConfig,
+) -> Option<SellQuoteNoneDetailReason> {
+    if !state_fresh(vault, now, freshness.state_ttl_ms) {
+        return Some(SellQuoteNoneDetailReason::StateStale);
+    }
+
+    if pool.dex == "meteora_dlmm" {
+        let active_id = vault.active_id?;
+        let bin_step = vault.bin_step?;
+        let bins = dlmm_bins?;
+        let sol_is_x = vault_dlmm_sol_is_x(vault);
+        let flat_bins = flatten_bins_for_walker(bins);
+        if !active_bin_present(active_id, &flat_bins) {
+            return Some(SellQuoteNoneDetailReason::DlmmActiveBinMissing);
+        }
+
+        let walker = walker_from_bins(active_id, bin_step, &flat_bins);
+        let fee_bps = dlmm_fee_bps(bin_step);
+        let amount_out = {
+            let (out, _, _) = if sol_is_x {
+                walker.quote_y_to_x(amount_in, fee_bps).ok()?
+            } else {
+                walker.quote_x_to_y(amount_in, fee_bps).ok()?
+            };
+            if out == 0 {
+                return Some(SellQuoteNoneDetailReason::DlmmWalkerZero);
+            }
+            out
+        };
+
+        let marginal_price =
+            trade_implied_sol_per_token(amount_out, amount_in, pool.token_decimals);
+        if !is_plausible_sol_per_token_price(&pool.token_mint, marginal_price) {
+            return Some(SellQuoteNoneDetailReason::DlmmMarginalReject);
+        }
+        return None;
+    }
+
+    if !supports_cpmm(&pool.dex) {
+        return Some(SellQuoteNoneDetailReason::UnsupportedDex);
+    }
+    if !reserves_plausible(
+        vault.reserve_base,
+        vault.reserve_quote,
+        pool.token_decimals,
+        &pool.token_mint,
+    ) {
+        return Some(SellQuoteNoneDetailReason::ReservesImplausible);
+    }
+
+    let (reserve_in, reserve_out) = (vault.reserve_base as u128, vault.reserve_quote as u128);
+    if cpmm_amount_out(reserve_in, reserve_out, amount_in, cpmm_fee_bps(&pool.dex)).is_none() {
+        return Some(SellQuoteNoneDetailReason::CpmmMathNone);
+    }
+    None
+}
+
+/// Diagnose why a token→SOL sell quote returned `None` (no RPC; existing inputs only).
+pub fn diagnose_sell_quote_none(
+    pool: &QuotePoolInput,
+    vault: Option<&QuoteVaultInput>,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    token_amount_in: u64,
+    freshness: &QuoteFreshnessConfig,
+    now: Instant,
+) -> SellQuoteNoneDetailReason {
+    if quote_side_from_mints(&pool.token_mint, &pool.token_mint, NATIVE_SOL_MINT).is_none() {
+        return SellQuoteNoneDetailReason::MintDirectionInvalid;
+    }
+    if token_amount_in == 0 {
+        return SellQuoteNoneDetailReason::CpmmMathNone;
+    }
+
+    if let Some(vault) = vault {
+        if let Some(reason) = diagnose_executable_marginal_none(
+            pool,
+            vault,
+            dlmm_bins,
+            token_amount_in,
+            now,
+            freshness,
+        ) {
+            return reason;
+        }
+    }
+
+    SellQuoteNoneDetailReason::TradeFallbackNone
+}
+
+/// Max token input sellable via DLMM bins (sum of token-side liquidity from active bin).
+fn dlmm_max_sell_token_in(
+    active_id: i32,
+    bin_step: u16,
+    bin_arrays: &DlmmBinArrays,
+    sol_is_x: bool,
+) -> u64 {
+    let flat_bins = flatten_bins_for_walker(bin_arrays);
+    if !active_bin_present(active_id, &flat_bins) {
+        return 0;
+    }
+    let walker = walker_from_bins(active_id, bin_step, &flat_bins);
+    let fee_bps = dlmm_fee_bps(bin_step);
+    let mut lo = 0u64;
+    let mut hi = flat_bins
+        .iter()
+        .map(|(_, x, y)| if sol_is_x { *y } else { *x })
+        .sum::<u64>()
+        .saturating_add(1);
+    if hi == 0 {
+        return 0;
+    }
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        let ok = if sol_is_x {
+            walker
+                .quote_y_to_x(mid, fee_bps)
+                .ok()
+                .map(|(out, _, _)| out)
+                .filter(|o| *o > 0)
+                .is_some()
+        } else {
+            walker
+                .quote_x_to_y(mid, fee_bps)
+                .ok()
+                .map(|(out, _, _)| out)
+                .filter(|o| *o > 0)
+                .is_some()
+        };
+        if ok {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
+/// Cap sell token input to what the pool can quote (DLMM bin depth / CPMM reserves).
+fn cap_sell_token_in(
+    pool: &QuotePoolInput,
+    vault: &QuoteVaultInput,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    token_amount_in: u64,
+) -> u64 {
+    if pool.dex == "meteora_dlmm" {
+        if let (Some(active_id), Some(bin_step), Some(bins)) =
+            (vault.active_id, vault.bin_step, dlmm_bins)
+        {
+            let max_in =
+                dlmm_max_sell_token_in(active_id, bin_step, bins, vault_dlmm_sol_is_x(vault));
+            if max_in > 0 && token_amount_in > max_in {
+                return max_in;
+            }
+        }
+    } else if supports_cpmm(&pool.dex)
+        && reserves_plausible(
+            vault.reserve_base,
+            vault.reserve_quote,
+            pool.token_decimals,
+            &pool.token_mint,
+        )
+    {
+        let fee_bps = cpmm_fee_bps(&pool.dex);
+        let reserve_in = vault.reserve_base as u128;
+        let reserve_out = vault.reserve_quote as u128;
+        let mut lo = 0u64;
+        let mut hi = token_amount_in;
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if cpmm_amount_out(reserve_in, reserve_out, mid, fee_bps).is_some() {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        if lo > 0 && lo < token_amount_in {
+            return lo;
+        }
+    }
+    token_amount_in
+}
+
+/// Token→SOL sell quote for round-trip pairing (caps input to pool realizable depth).
+pub fn quote_sell_round_trip(
+    pool: &QuotePoolInput,
+    vault: &QuoteVaultInput,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    token_amount_in: u64,
+    freshness: &QuoteFreshnessConfig,
+) -> Option<PoolQuote> {
+    quote_sell_exact_in_with_cap(pool, vault, dlmm_bins, token_amount_in, freshness)
+}
+
+fn quote_sell_exact_in_with_cap(
+    pool: &QuotePoolInput,
+    vault: &QuoteVaultInput,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    token_amount_in: u64,
+    freshness: &QuoteFreshnessConfig,
+) -> Option<PoolQuote> {
+    let capped = cap_sell_token_in(pool, vault, dlmm_bins, token_amount_in);
+    quote_exact_in_with_freshness(
+        pool,
+        Some(vault),
+        dlmm_bins,
+        &pool.token_mint,
+        NATIVE_SOL_MINT,
+        capped,
+        freshness,
+    )
+}
+
 /// Subreason when `select_round_trip_pools` cannot form a cross-DEX round trip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundTripInsufficientSubreason {
@@ -1187,10 +1474,11 @@ impl NoCrossDexSellDetailReason {
 }
 
 /// Insufficient-pool outcome with optional `NoCrossDexSell` drill-down.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoundTripInsufficient {
     pub subreason: RoundTripInsufficientSubreason,
     pub no_cross_dex_sell_detail: Option<NoCrossDexSellDetailReason>,
+    pub sell_quote_none_detail_counts: Option<HashMap<SellQuoteNoneDetailReason, usize>>,
 }
 
 impl RoundTripInsufficient {
@@ -1198,12 +1486,13 @@ impl RoundTripInsufficient {
         Self {
             subreason,
             no_cross_dex_sell_detail: None,
+            sell_quote_none_detail_counts: None,
         }
     }
 }
 
 /// Failure reason for `select_round_trip_pools`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoundTripSelectFailure {
     InsufficientPools(RoundTripInsufficient),
     IncompatibleQuoteKind,
@@ -1229,33 +1518,39 @@ pub fn classify_cross_dex_sell_failure(
     freshness: &QuoteFreshnessConfig,
     now: Instant,
     token_decimals: u8,
-) -> NoCrossDexSellDetailReason {
+) -> Option<CrossDexSellFailure> {
     if is_meteora_dlmm_dex(candidate.dex) && candidate.dlmm_bins.is_none() {
-        return NoCrossDexSellDetailReason::SellMissingDlmmBins;
+        return Some(CrossDexSellFailure::MissingDlmmBins);
     }
     if candidate.vault.is_none() {
-        return NoCrossDexSellDetailReason::SellMissingVault;
+        return Some(CrossDexSellFailure::MissingVault);
     }
-    let sell_quote = quote_exact_in_with_freshness(
+    let sell_quote = quote_sell_exact_in_with_cap(
         candidate.pool,
-        candidate.vault,
+        candidate.vault.expect("vault checked"),
         candidate.dlmm_bins,
-        &candidate.pool.token_mint,
-        NATIVE_SOL_MINT,
         token_amount_in,
         freshness,
     );
     let Some(sell_quote) = sell_quote else {
-        return NoCrossDexSellDetailReason::SellQuoteNone;
+        let sub = diagnose_sell_quote_none(
+            candidate.pool,
+            candidate.vault,
+            candidate.dlmm_bins,
+            token_amount_in,
+            freshness,
+            now,
+        );
+        return Some(CrossDexSellFailure::QuoteNone(sub));
     };
     if !is_quote_fresh(&sell_quote, freshness, candidate.vault, now) {
-        return NoCrossDexSellDetailReason::SellNotFresh;
+        return Some(CrossDexSellFailure::NotFresh);
     }
     let sol_per_token = sol_per_token_from_sell_quote(&sell_quote, token_decimals);
     if sol_per_token <= Decimal::ZERO {
-        return NoCrossDexSellDetailReason::SellZeroOut;
+        return Some(CrossDexSellFailure::ZeroOut);
     }
-    NoCrossDexSellDetailReason::SellQuoteNone
+    None
 }
 
 fn dominant_no_cross_dex_sell_detail(
@@ -1343,6 +1638,8 @@ pub fn select_round_trip_pools(
     let mut saw_incompatible_kind = false;
     let mut sell_fail_counts: std::collections::HashMap<NoCrossDexSellDetailReason, usize> =
         std::collections::HashMap::new();
+    let mut sell_quote_none_detail_counts: HashMap<SellQuoteNoneDetailReason, usize> =
+        HashMap::new();
 
     for buy in &valid_buys {
         for sell_candidate in candidates {
@@ -1356,26 +1653,36 @@ pub fn select_round_trip_pools(
                     .or_default() += 1;
                 continue;
             }
-            if sell_candidate.vault.is_none() {
+            let Some(sell_vault) = sell_candidate.vault else {
                 *sell_fail_counts
                     .entry(NoCrossDexSellDetailReason::SellMissingVault)
                     .or_default() += 1;
                 continue;
-            }
+            };
 
-            let sell_quote = quote_exact_in_with_freshness(
+            let sell_quote = quote_sell_exact_in_with_cap(
                 sell_candidate.pool,
-                sell_candidate.vault,
+                sell_vault,
                 sell_candidate.dlmm_bins,
-                &sell_candidate.pool.token_mint,
-                NATIVE_SOL_MINT,
                 buy.quote.amount_out,
                 freshness,
             );
             let Some(sell_quote) = sell_quote else {
-                *sell_fail_counts
-                    .entry(NoCrossDexSellDetailReason::SellQuoteNone)
-                    .or_default() += 1;
+                let sub = diagnose_sell_quote_none(
+                    sell_candidate.pool,
+                    sell_candidate.vault,
+                    sell_candidate.dlmm_bins,
+                    buy.quote.amount_out,
+                    freshness,
+                    now,
+                );
+                *sell_quote_none_detail_counts.entry(sub).or_default() += 1;
+                let top = if sub == SellQuoteNoneDetailReason::StateStale {
+                    NoCrossDexSellDetailReason::SellNotFresh
+                } else {
+                    NoCrossDexSellDetailReason::SellQuoteNone
+                };
+                *sell_fail_counts.entry(top).or_default() += 1;
                 continue;
             };
             if !is_quote_fresh(&sell_quote, freshness, sell_candidate.vault, now) {
@@ -1422,6 +1729,8 @@ pub fn select_round_trip_pools(
             RoundTripInsufficient {
                 subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
                 no_cross_dex_sell_detail: dominant_no_cross_dex_sell_detail(&sell_fail_counts),
+                sell_quote_none_detail_counts: (!sell_quote_none_detail_counts.is_empty())
+                    .then_some(sell_quote_none_detail_counts),
             },
         ));
     };
@@ -1787,13 +2096,23 @@ mod tests {
             &QuoteFreshnessConfig::default(),
         )
         .unwrap_err();
-        assert_eq!(
+        assert!(matches!(
             err,
             RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient {
                 subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
                 no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellQuoteNone),
+                ..
             })
-        );
+        ));
+        if let RoundTripSelectFailure::InsufficientPools(insufficient) = err {
+            let counts = insufficient
+                .sell_quote_none_detail_counts
+                .expect("sell quote none subcounts");
+            assert_eq!(
+                counts.get(&SellQuoteNoneDetailReason::ReservesImplausible),
+                Some(&1)
+            );
+        }
     }
 
     #[test]
@@ -1910,6 +2229,7 @@ mod tests {
             RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient {
                 subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
                 no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellMissingVault),
+                sell_quote_none_detail_counts: None,
             })
         );
     }
@@ -1945,6 +2265,7 @@ mod tests {
             RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient {
                 subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
                 no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellMissingDlmmBins),
+                sell_quote_none_detail_counts: None,
             })
         );
     }
@@ -1965,7 +2286,7 @@ mod tests {
             Instant::now(),
             6,
         );
-        assert_eq!(reason, NoCrossDexSellDetailReason::SellMissingVault);
+        assert_eq!(reason, Some(CrossDexSellFailure::MissingVault));
     }
 
     #[test]
@@ -2001,5 +2322,176 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, RoundTripSelectFailure::IncompatibleQuoteKind);
+    }
+
+    #[test]
+    fn diagnose_sell_quote_none_state_stale() {
+        let pool = sample_pool("orca", "stale");
+        let mut vault = sample_vault(1_000_000_000_000, 1_000_000_000);
+        vault.updated_at = Instant::now() - Duration::from_secs(300);
+        let reason = diagnose_sell_quote_none(
+            &pool,
+            Some(&vault),
+            None,
+            1_000_000,
+            &QuoteFreshnessConfig::default(),
+            Instant::now(),
+        );
+        assert_eq!(reason, SellQuoteNoneDetailReason::StateStale);
+    }
+
+    #[test]
+    fn diagnose_sell_quote_none_reserves_implausible() {
+        let pool = sample_pool("pump_amm", "bad");
+        let vault = sample_vault(0, 1_000_000_000);
+        let reason = diagnose_sell_quote_none(
+            &pool,
+            Some(&vault),
+            None,
+            1_000,
+            &QuoteFreshnessConfig::default(),
+            Instant::now(),
+        );
+        assert_eq!(reason, SellQuoteNoneDetailReason::ReservesImplausible);
+    }
+
+    #[test]
+    fn diagnose_sell_quote_none_trade_fallback_none() {
+        let pool = sample_pool("orca", "noTrade");
+        let reason = diagnose_sell_quote_none(
+            &pool,
+            None,
+            None,
+            1_000,
+            &QuoteFreshnessConfig::default(),
+            Instant::now(),
+        );
+        assert_eq!(reason, SellQuoteNoneDetailReason::TradeFallbackNone);
+    }
+
+    #[test]
+    fn diagnose_sell_quote_none_dlmm_active_bin_missing() {
+        let pool = sample_pool("meteora_dlmm", "dlmm");
+        let vault = QuoteVaultInput {
+            reserve_base: 1_000_000_000_000,
+            reserve_quote: 1_000_000_000,
+            update_slot: 1,
+            updated_at: Instant::now(),
+            active_id: Some(100),
+            bin_step: Some(100),
+            dlmm_sol_is_x: false,
+            dlmm_token_x_mint: Some(pool.token_mint.clone()),
+        };
+        let bins: DlmmBinArrays = HashMap::new();
+        let reason = diagnose_sell_quote_none(
+            &pool,
+            Some(&vault),
+            Some(&bins),
+            1_000_000,
+            &QuoteFreshnessConfig::default(),
+            Instant::now(),
+        );
+        assert_eq!(reason, SellQuoteNoneDetailReason::DlmmActiveBinMissing);
+    }
+
+    #[test]
+    fn classify_cross_dex_sell_failure_ok_returns_none() {
+        let pool = sample_pool("orca", "poolO");
+        let vault = sample_vault(1_000_000_000_000, 1_000_000_000);
+        let candidate = RoundTripPoolCandidate {
+            pool: &pool,
+            vault: Some(&vault),
+            dlmm_bins: None,
+            dex: "orca",
+        };
+        let failure = classify_cross_dex_sell_failure(
+            &candidate,
+            1_000_000,
+            &QuoteFreshnessConfig::default(),
+            Instant::now(),
+            6,
+        );
+        assert!(failure.is_none());
+    }
+
+    #[test]
+    fn dlmm_sell_large_token_amount_succeeds_without_marginal_probe_gate() {
+        let active_id = 0i32;
+        let bin_step = 100u16;
+        let token_amount = 1_000_000_000_000u64;
+        let sol_amount = 1_000_000_000u64;
+        let array_index = active_id as i64 / 70;
+        let mut bins: DlmmBinArrays = HashMap::new();
+        bins.insert(
+            array_index,
+            vec![BinData {
+                offset: 0,
+                amount_x: token_amount,
+                amount_y: sol_amount,
+            }],
+        );
+        let pool = sample_pool("meteora_dlmm", "dlmm");
+        let vault = QuoteVaultInput {
+            reserve_base: token_amount,
+            reserve_quote: sol_amount,
+            update_slot: 1,
+            updated_at: Instant::now(),
+            active_id: Some(active_id),
+            bin_step: Some(bin_step),
+            dlmm_sol_is_x: false,
+            dlmm_token_x_mint: Some(pool.token_mint.clone()),
+        };
+        let buy_quote = quote_exact_in(
+            &pool,
+            Some(&vault),
+            Some(&bins),
+            NATIVE_SOL_MINT,
+            &pool.token_mint,
+            DLMM_PROBE_SOL_LAMPORTS,
+        )
+        .expect("buy");
+        let sell_quote = quote_exact_in(
+            &pool,
+            Some(&vault),
+            Some(&bins),
+            &pool.token_mint,
+            NATIVE_SOL_MINT,
+            buy_quote.amount_out,
+        );
+        assert!(
+            sell_quote.is_some(),
+            "large DLMM sell must not fail marginal probe gate"
+        );
+    }
+
+    #[test]
+    fn select_round_trip_pools_cross_dex_sell_with_capped_token_amount() {
+        let pool_a = sample_pool("orca", "poolA");
+        let pool_b = sample_pool("pump_amm", "poolB");
+        let vault_a = sample_vault(1_000_000_000_000, 900_000_000);
+        let vault_b = sample_vault(1_000, 1_100_000_000);
+        let candidates = [
+            RoundTripPoolCandidate {
+                pool: &pool_a,
+                vault: Some(&vault_a),
+                dlmm_bins: None,
+                dex: "orca",
+            },
+            RoundTripPoolCandidate {
+                pool: &pool_b,
+                vault: Some(&vault_b),
+                dlmm_bins: None,
+                dex: "pump_amm",
+            },
+        ];
+        let selection = select_round_trip_pools(
+            &candidates,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+        )
+        .expect("capped sell should enable cross-dex pair");
+        assert_eq!(selection.buy_pool_address, "poolA");
+        assert_eq!(selection.sell_pool_address, "poolB");
+        assert!(selection.sell_quote.amount_out > 0);
     }
 }
