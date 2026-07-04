@@ -3023,6 +3023,7 @@ static ARB_QUOTE_SHADOW_PROFIT_BUCKET_COUNTS: Lazy<[AtomicU64; 5]> =
 
 // --- 2-hop profit-first v2 (M2, default off) ---
 pub static ARB_TWO_HOP_V2_SCREEN_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_SCREEN_MULTI_DEX_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_INCOMPATIBLE_KIND_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_UNPROFITABLE: Lazy<AtomicU64> =
@@ -3033,6 +3034,14 @@ pub static ARB_TWO_HOP_V2_REJECTED_INCOMPATIBLE_QUOTE_KIND: Lazy<AtomicU64> =
 pub static ARB_TWO_HOP_V2_REJECTED_INSUFFICIENT_POOLS: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_INSUFFICIENT_CANDIDATES_LT2: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_INSUFFICIENT_NO_FRESH_BUY_QUOTE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_INSUFFICIENT_NO_CROSS_DEX_SELL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_INSUFFICIENT_SINGLE_DEX_CANDIDATES: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_PROACTIVE_TRACK_PUBLISH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
@@ -3490,6 +3499,39 @@ pub enum ArbTwoHopV2RejectReason {
 /// Increment `arb_two_hop_v2_screen_total`.
 pub fn arb_two_hop_v2_screen_inc() {
     ARB_TWO_HOP_V2_SCREEN_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_two_hop_v2_screen_multi_dex_total`.
+pub fn arb_two_hop_v2_screen_multi_dex_inc() {
+    ARB_TWO_HOP_V2_SCREEN_MULTI_DEX_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Subreason for `arb_two_hop_v2_insufficient_subreason_total{reason=...}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbTwoHopV2InsufficientSubreason {
+    CandidatesLt2,
+    NoFreshBuyQuote,
+    NoCrossDexSell,
+    SingleDexCandidates,
+}
+
+/// Increment `arb_two_hop_v2_insufficient_subreason_total{reason=...}`.
+pub fn arb_two_hop_v2_insufficient_subreason_inc(reason: ArbTwoHopV2InsufficientSubreason) {
+    let counter = match reason {
+        ArbTwoHopV2InsufficientSubreason::CandidatesLt2 => {
+            &*ARB_TWO_HOP_V2_INSUFFICIENT_CANDIDATES_LT2
+        }
+        ArbTwoHopV2InsufficientSubreason::NoFreshBuyQuote => {
+            &*ARB_TWO_HOP_V2_INSUFFICIENT_NO_FRESH_BUY_QUOTE
+        }
+        ArbTwoHopV2InsufficientSubreason::NoCrossDexSell => {
+            &*ARB_TWO_HOP_V2_INSUFFICIENT_NO_CROSS_DEX_SELL
+        }
+        ArbTwoHopV2InsufficientSubreason::SingleDexCandidates => {
+            &*ARB_TWO_HOP_V2_INSUFFICIENT_SINGLE_DEX_CANDIDATES
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Increment `arb_two_hop_v2_incompatible_kind_total`.
@@ -4200,6 +4242,37 @@ fn append_arb_two_hop_insufficient_subreason_total(out: &mut String) {
     out.push_str("arb_two_hop_insufficient_subreason_total{reason=\"only_one_eligible_dex\"} ");
     out.push_str(
         &ARB_TWO_HOP_INSUFFICIENT_ONLY_ONE_ELIGIBLE_DEX
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+}
+
+fn append_arb_two_hop_v2_insufficient_subreason_total(out: &mut String) {
+    out.push_str("arb_two_hop_v2_insufficient_subreason_total{reason=\"candidates_lt_2\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_INSUFFICIENT_CANDIDATES_LT2
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_insufficient_subreason_total{reason=\"no_fresh_buy_quote\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_INSUFFICIENT_NO_FRESH_BUY_QUOTE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_insufficient_subreason_total{reason=\"no_cross_dex_sell\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_INSUFFICIENT_NO_CROSS_DEX_SELL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_insufficient_subreason_total{reason=\"single_dex_candidates\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_INSUFFICIENT_SINGLE_DEX_CANDIDATES
             .load(Ordering::Relaxed)
             .to_string(),
     );
@@ -6851,6 +6924,11 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
+    line!(
+        "arb_two_hop_v2_screen_multi_dex_total",
+        ARB_TWO_HOP_V2_SCREEN_MULTI_DEX_TOTAL.load(Ordering::Relaxed)
+    );
+    append_arb_two_hop_v2_insufficient_subreason_total(&mut out);
     append_momentum_latency_histogram_prometheus(
         &mut out,
         "arb_quote_pair_slot_delta",

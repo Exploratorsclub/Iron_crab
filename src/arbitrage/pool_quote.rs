@@ -1155,10 +1155,19 @@ pub struct RoundTripPoolSelection {
     pub sell_quote: PoolQuote,
 }
 
+/// Subreason when `select_round_trip_pools` cannot form a cross-DEX round trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundTripInsufficientSubreason {
+    CandidatesLt2,
+    NoFreshBuyQuote,
+    NoCrossDexSell,
+    SingleDexCandidates,
+}
+
 /// Failure reason for `select_round_trip_pools`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundTripSelectFailure {
-    InsufficientPools,
+    InsufficientPools(RoundTripInsufficientSubreason),
     IncompatibleQuoteKind,
     QuoteStale,
 }
@@ -1178,7 +1187,9 @@ pub fn select_round_trip_pools(
     freshness: &QuoteFreshnessConfig,
 ) -> Result<RoundTripPoolSelection, RoundTripSelectFailure> {
     if candidates.len() < 2 {
-        return Err(RoundTripSelectFailure::InsufficientPools);
+        return Err(RoundTripSelectFailure::InsufficientPools(
+            RoundTripInsufficientSubreason::CandidatesLt2,
+        ));
     }
 
     let now = Instant::now();
@@ -1228,8 +1239,18 @@ pub fn select_round_trip_pools(
     }
 
     let Some(best_buy) = best_buy else {
-        return Err(RoundTripSelectFailure::InsufficientPools);
+        return Err(RoundTripSelectFailure::InsufficientPools(
+            RoundTripInsufficientSubreason::NoFreshBuyQuote,
+        ));
     };
+
+    let distinct_dexes: std::collections::HashSet<&str> =
+        candidates.iter().map(|c| c.dex).collect();
+    if distinct_dexes.len() < 2 {
+        return Err(RoundTripSelectFailure::InsufficientPools(
+            RoundTripInsufficientSubreason::SingleDexCandidates,
+        ));
+    }
 
     let mut best_sell: Option<BuyCandidate<'_>> = None;
     let mut saw_incompatible_kind = false;
@@ -1278,7 +1299,9 @@ pub fn select_round_trip_pools(
         if saw_incompatible_kind {
             return Err(RoundTripSelectFailure::IncompatibleQuoteKind);
         }
-        return Err(RoundTripSelectFailure::InsufficientPools);
+        return Err(RoundTripSelectFailure::InsufficientPools(
+            RoundTripInsufficientSubreason::NoCrossDexSell,
+        ));
     };
 
     Ok(RoundTripPoolSelection {
@@ -1556,5 +1579,132 @@ mod tests {
         assert_eq!(selection.buy_pool_address, "poolA");
         assert_eq!(selection.sell_pool_address, "poolB");
         assert_eq!(selection.buy_quote.kind, selection.sell_quote.kind);
+    }
+
+    #[test]
+    fn select_round_trip_pools_one_candidate_is_candidates_lt_2() {
+        let pool = sample_pool("orca", "poolOnly");
+        let vault = sample_vault(1_000_000_000_000, 1_000_000_000);
+        let candidates = [RoundTripPoolCandidate {
+            pool: &pool,
+            vault: Some(&vault),
+            dlmm_bins: None,
+            dex: "orca",
+        }];
+        let err = select_round_trip_pools(
+            &candidates,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            RoundTripSelectFailure::InsufficientPools(
+                RoundTripInsufficientSubreason::CandidatesLt2
+            )
+        );
+    }
+
+    #[test]
+    fn select_round_trip_pools_same_dex_quotable_is_single_dex_candidates() {
+        let pool_a = sample_pool("orca", "poolA");
+        let pool_b = sample_pool("orca", "poolB");
+        let vault_a = sample_vault(1_000_000_000_000, 900_000_000);
+        let vault_b = sample_vault(1_000_000_000_000, 1_100_000_000);
+        let candidates = [
+            RoundTripPoolCandidate {
+                pool: &pool_a,
+                vault: Some(&vault_a),
+                dlmm_bins: None,
+                dex: "orca",
+            },
+            RoundTripPoolCandidate {
+                pool: &pool_b,
+                vault: Some(&vault_b),
+                dlmm_bins: None,
+                dex: "orca",
+            },
+        ];
+        let err = select_round_trip_pools(
+            &candidates,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            RoundTripSelectFailure::InsufficientPools(
+                RoundTripInsufficientSubreason::SingleDexCandidates
+            )
+        );
+    }
+
+    #[test]
+    fn select_round_trip_pools_cross_dex_missing_sell_is_no_cross_dex_sell() {
+        let pool_a = sample_pool("orca", "poolA");
+        let pool_b = sample_pool("pump_amm", "poolB");
+        let vault_a = sample_vault(1_000_000_000_000, 900_000_000);
+        let vault_b = sample_vault(0, 1_100_000_000);
+        let candidates = [
+            RoundTripPoolCandidate {
+                pool: &pool_a,
+                vault: Some(&vault_a),
+                dlmm_bins: None,
+                dex: "orca",
+            },
+            RoundTripPoolCandidate {
+                pool: &pool_b,
+                vault: Some(&vault_b),
+                dlmm_bins: None,
+                dex: "pump_amm",
+            },
+        ];
+        let err = select_round_trip_pools(
+            &candidates,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            RoundTripSelectFailure::InsufficientPools(
+                RoundTripInsufficientSubreason::NoCrossDexSell
+            )
+        );
+    }
+
+    #[test]
+    fn select_round_trip_pools_incompatible_kinds_only() {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        let pool_a = sample_pool("orca", "poolA");
+        let mut pool_b = sample_pool("pump_amm", "poolB");
+        let trade_price = Decimal::from_str("0.000001").unwrap();
+        pool_b.trade_price_buy = Some(trade_price);
+        pool_b.trade_price_sell = Some(trade_price);
+        pool_b.trade_updated_at = Instant::now();
+        let vault_a = sample_vault(1_000_000_000_000, 900_000_000);
+        let candidates = [
+            RoundTripPoolCandidate {
+                pool: &pool_a,
+                vault: Some(&vault_a),
+                dlmm_bins: None,
+                dex: "orca",
+            },
+            RoundTripPoolCandidate {
+                pool: &pool_b,
+                vault: None,
+                dlmm_bins: None,
+                dex: "pump_amm",
+            },
+        ];
+        let err = select_round_trip_pools(
+            &candidates,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, RoundTripSelectFailure::IncompatibleQuoteKind);
     }
 }
