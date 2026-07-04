@@ -67,13 +67,15 @@ use ironcrab::metrics::{
     arb_two_hop_rejected_inc, arb_two_hop_tracker_seeded_pools_add,
     arb_two_hop_v2_incompatible_kind_inc, arb_two_hop_v2_rejected_inc, arb_two_hop_v2_screen_inc,
     record_arb_heartbeat_phase, record_arb_price_freshness_stale_age_ms,
-    record_arb_quote_shadow_round_trip, record_arb_track_requests_messages_total,
-    record_arb_track_requests_publish_chunks_total, record_arb_track_requests_publish_failed_total,
-    record_arb_writer_lock_wait, serve_metrics, set_arb_pool_cache_apply_batch_size_gauge,
-    set_arb_quote_shadow_legacy_spread_bps, set_arb_tracker_write_coalescer_pending,
-    set_arb_tracker_write_queue_depth, set_arb_two_hop_blocked_on_apply_trade,
-    set_readiness_nats_connected, tick_arb_heartbeat_seconds_since_last_finish,
-    tick_arb_tracker_write_seconds_since_last_finish, wall_clock_unix_ms_now, ArbHeartbeatPhase,
+    record_arb_proactive_pin_first_publish, record_arb_proactive_track_publish_total,
+    record_arb_quote_pair_slot_delta, record_arb_quote_shadow_round_trip,
+    record_arb_track_requests_messages_total, record_arb_track_requests_publish_chunks_total,
+    record_arb_track_requests_publish_failed_total, record_arb_writer_lock_wait, serve_metrics,
+    set_arb_pool_cache_apply_batch_size_gauge, set_arb_quote_shadow_legacy_spread_bps,
+    set_arb_tracker_write_coalescer_pending, set_arb_tracker_write_queue_depth,
+    set_arb_two_hop_blocked_on_apply_trade, set_readiness_nats_connected,
+    tick_arb_heartbeat_seconds_since_last_finish, tick_arb_tracker_write_seconds_since_last_finish,
+    try_record_arb_track_pin_before_first_screen_ms, wall_clock_unix_ms_now, ArbHeartbeatPhase,
     ArbStrategyWarmupSkipReason, ArbTrackerWriteJobType, ArbTwoHopInsufficientSubreason,
     ArbTwoHopPoolGate, ArbTwoHopRejectReason, ArbTwoHopRejectSubreason, ArbTwoHopV2RejectReason,
     ArbWriterLockKind, MetricsComponent, ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH,
@@ -159,6 +161,8 @@ struct ArbConfig {
     arb_quote_trade_ttl_ms: u64,
     /// ExecutableMarginal state TTL for v2 freshness. Default: 120_000 ms.
     arb_quote_state_ttl_ms: u64,
+    /// Max allowed |buy.as_of_slot - sell.as_of_slot| for v2 round-trip (0 = gate off). Default: 2.
+    arb_max_leg_slot_delta: u64,
 }
 
 impl Default for ArbConfig {
@@ -179,6 +183,7 @@ impl Default for ArbConfig {
             arb_probe_lamports: DLMM_PROBE_SOL_LAMPORTS,
             arb_quote_trade_ttl_ms: 30_000,
             arb_quote_state_ttl_ms: 120_000,
+            arb_max_leg_slot_delta: 2,
         }
     }
 }
@@ -2057,6 +2062,7 @@ impl TokenArbTracker {
         bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
     ) -> Option<ArbOpportunity> {
         arb_two_hop_v2_screen_inc();
+        try_record_arb_track_pin_before_first_screen_ms(&self.base_mint);
 
         if !config.two_hop_enabled {
             return None;
@@ -2103,6 +2109,16 @@ impl TokenArbTracker {
                 return None;
             }
         };
+
+        let slot_delta = selection
+            .buy_quote
+            .as_of_slot
+            .abs_diff(selection.sell_quote.as_of_slot);
+        record_arb_quote_pair_slot_delta(slot_delta);
+        if config.arb_max_leg_slot_delta > 0 && slot_delta > config.arb_max_leg_slot_delta {
+            arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::SlotDeltaExceeded);
+            return None;
+        }
 
         let buy_pool = self.pools.get(&selection.buy_pool_address)?;
         let sell_pool = self.pools.get(&selection.sell_pool_address)?;
@@ -3621,6 +3637,20 @@ impl ArbContext {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
                 }
+                "arb_max_leg_slot_delta" => {
+                    if let Some(v) = value.as_u64() {
+                        if v <= 32 {
+                            config.arb_max_leg_slot_delta = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected
+                                .push((key.clone(), "Must be 0-32 (0 disables gate)".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
                 // Skip multi_hop_* keys here - they're handled in the second loop below
                 k if k.starts_with("multi_hop_") => {}
                 _ => rejected.push((key.clone(), format!("Unknown config key: {}", key))),
@@ -3822,7 +3852,8 @@ impl ArbContext {
         POOLS_TRACKED_GAUGE.store(total as u64, Ordering::Relaxed);
     }
 
-    /// Update or create pool state from PoolCreated event
+    /// Update or create pool state from PoolCreated event.
+    /// Returns the token mint when the tracker is multi-DEX after the update.
     fn handle_pool_created(
         &self,
         pool_address: &str,
@@ -3830,12 +3861,10 @@ impl ArbContext {
         quote_mint: &str,
         dex: &str,
         liquidity_sol: Decimal,
-    ) {
-        let Some(token_mint) = arb_tracked_token_mint(base_mint, quote_mint) else {
-            return;
-        };
+    ) -> Option<String> {
+        let token_mint = arb_tracked_token_mint(base_mint, quote_mint)?;
         if token_mint == NATIVE_SOL_MINT || is_stablecoin_mint(token_mint) {
-            return;
+            return None;
         }
 
         let mut trackers = self.trackers.write();
@@ -3844,7 +3873,7 @@ impl ArbContext {
             .or_insert_with(|| TokenArbTracker::new(token_mint));
 
         if tracker.pools.contains_key(pool_address) {
-            return;
+            return None;
         }
 
         let pool_state = PoolState {
@@ -3861,6 +3890,7 @@ impl ArbContext {
         };
 
         tracker.upsert_pool(pool_state);
+        let is_multi_dex = tracker.pool_count_on_distinct_dexes() >= 2;
         drop(trackers);
         self.sync_pools_tracked_gauge();
         debug!(
@@ -3870,6 +3900,11 @@ impl ArbContext {
             liquidity = %liquidity_sol,
             "Pool added to arb tracker from PoolCreated"
         );
+        if is_multi_dex {
+            Some(token_mint.to_string())
+        } else {
+            None
+        }
     }
 
     /// Store DEX pool accounts from DexPoolAccounts event
@@ -4750,7 +4785,11 @@ impl ArbContext {
         self.spawn_publish_arb_track_requests(active, Vec::new(), true);
     }
 
-    fn maybe_publish_arb_track_incremental_for_mint(self: &Arc<Self>, mint: &str) {
+    /// I-ARB-10: publish all tracker pools when mint is multi-DEX (proactive coverage).
+    fn publish_proactive_arb_track_for_mint(self: &Arc<Self>, mint: &str) {
+        if self.nats.is_none() {
+            return;
+        }
         let trackers = self.trackers.read();
         let Some(tracker) = trackers.get(mint) else {
             return;
@@ -4758,21 +4797,27 @@ impl ArbContext {
         if tracker.pool_count_on_distinct_dexes() < 2 {
             return;
         }
-        let mut active = Vec::new();
-        let mut pinned = self.arb_pinned_pools.write();
-        for pool in tracker.pools.keys() {
-            if pinned.insert(pool.clone()) {
-                active.push(ArbTrackActiveEntry {
-                    pool: pool.clone(),
-                    reason: ArbTrackActiveReason::MultiDex,
-                });
+        let active: Vec<ArbTrackActiveEntry> = tracker
+            .pools
+            .keys()
+            .map(|pool| ArbTrackActiveEntry {
+                pool: pool.clone(),
+                reason: ArbTrackActiveReason::MultiDex,
+            })
+            .collect();
+        drop(trackers);
+        if active.is_empty() {
+            return;
+        }
+        {
+            let mut pinned = self.arb_pinned_pools.write();
+            for entry in &active {
+                pinned.insert(entry.pool.clone());
             }
         }
-        drop(pinned);
-        drop(trackers);
-        if !active.is_empty() {
-            self.spawn_publish_arb_track_requests(active, Vec::new(), false);
-        }
+        record_arb_proactive_track_publish_total();
+        record_arb_proactive_pin_first_publish(mint);
+        self.spawn_publish_arb_track_requests(active, Vec::new(), false);
     }
 
     fn publish_arb_trade_signal_track_pins(self: &Arc<Self>, buy_pool: &str, sell_pool: &str) {
@@ -5125,7 +5170,7 @@ fn process_arb_tracker_write_job(ctx: Arc<ArbContext>, job: ArbTrackerWriteJob) 
             if ctx.seed_trackers_for_pool_cache_update(&update) {
                 arb_strategy_pool_cache_update_seeded_inc();
                 if let Some(mint) = arb_tracked_token_mint(&update.base_mint, &update.quote_mint) {
-                    ctx.maybe_publish_arb_track_incremental_for_mint(mint);
+                    ctx.publish_proactive_arb_track_for_mint(mint);
                 }
             } else {
                 arb_strategy_pool_cache_update_skip_no_seed_inc();
@@ -5144,6 +5189,9 @@ fn process_arb_tracker_write_job(ctx: Arc<ArbContext>, job: ArbTrackerWriteJob) 
                     &job.dex,
                 )
                 .map(|(tracker_snapshot, config)| {
+                    if tracker_snapshot.pool_count_on_distinct_dexes() >= 2 {
+                        ctx.publish_proactive_arb_track_for_mint(&job.mint);
+                    }
                     let (vault_balances, bin_arrays) =
                         ctx.snapshot_vault_bins_for_tracker(&tracker_snapshot);
                     ApplyTradeResult {
@@ -5172,7 +5220,11 @@ fn process_arb_tracker_write_job(ctx: Arc<ArbContext>, job: ArbTrackerWriteJob) 
             dex,
             liquidity_sol,
         } => {
-            ctx.handle_pool_created(&pool_address, &base_mint, &quote_mint, &dex, liquidity_sol);
+            if let Some(mint) =
+                ctx.handle_pool_created(&pool_address, &base_mint, &quote_mint, &dex, liquidity_sol)
+            {
+                ctx.publish_proactive_arb_track_for_mint(&mint);
+            }
         }
         ArbTrackerWriteJob::DexPoolAccounts {
             pool_address,
@@ -7989,6 +8041,105 @@ mod two_hop_price_tests {
         assert_eq!(opp.sell_pool, pool_b.to_string());
         assert!(opp.spread_bps > 0);
         assert!(opp.estimated_profit_lamports > 0);
+    }
+
+    #[test]
+    fn check_arbitrage_v2_rejects_excessive_slot_delta() {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+
+        let update_orca = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_a.to_string(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            980_000_000,
+            1,
+        );
+        let update_pump = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_b.to_string(),
+            "pump_amm".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            1_020_000_000,
+            100,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        seed_token_tracker_from_live_pool_cache(
+            &mint_str,
+            &cache,
+            &mut trackers,
+            &mut vault_balances,
+            None,
+        );
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert(pool_a.to_string());
+        known_pools.insert(pool_b.to_string());
+
+        let tracker = trackers.get_mut(&mint_str).unwrap();
+        tracker.token_decimals = Some(6);
+
+        let config = ArbConfig {
+            arb_two_hop_v2_enabled: true,
+            arb_max_leg_slot_delta: 2,
+            min_spread_bps: 1,
+            min_profit_lamports: 1,
+            est_tx_cost_lamports: 1,
+            ..Default::default()
+        };
+
+        let bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
+        let spread_warn_last = RwLock::new(HashMap::new());
+        let data_quality_rejects = AtomicU64::new(0);
+        let before =
+            ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED.load(Ordering::Relaxed);
+        let opp = tracker.check_arbitrage(
+            &config,
+            &known_pools,
+            &vault_balances,
+            &bin_arrays,
+            &ArbCheckContext {
+                spread_warn_last: &spread_warn_last,
+                data_quality_rejects: &data_quality_rejects,
+                forensics: None,
+            },
+        );
+        assert!(opp.is_none(), "slot delta 99 should exceed default gate");
+        assert!(
+            ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED.load(Ordering::Relaxed)
+                > before
+        );
+    }
+
+    #[test]
+    fn handle_pool_created_returns_mint_when_multi_dex() {
+        let cache = create_shared_cache();
+        let ctx = test_arb_context(cache);
+
+        let mint = "TokenMint11111111111111111111111111111111";
+        assert!(ctx
+            .handle_pool_created("poolA", mint, NATIVE_SOL_MINT, "orca", Decimal::ONE)
+            .is_none());
+        let multi = ctx
+            .handle_pool_created("poolB", mint, NATIVE_SOL_MINT, "pump_amm", Decimal::ONE)
+            .expect("second dex should make mint multi-dex");
+        assert_eq!(multi, mint);
     }
 
     #[test]
