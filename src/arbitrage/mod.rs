@@ -53,9 +53,9 @@ pub use pool_quote::{
     quotes_pairable, round_trip_profit_lamports, round_trip_profit_lamports_with_freshness,
     select_round_trip_pools, sol_quoted_seed_from_cached_state, state_fingerprint,
     token_decimals_from_cached_state, DlmmBinArrays, PoolQuote, QuoteFreshnessConfig, QuoteKind,
-    QuotePoolInput, QuoteSide, QuoteVaultInput, RoundTripLeg, RoundTripPoolCandidate,
-    RoundTripPoolSelection, RoundTripSelectFailure, SolQuotedPoolSeed, DLMM_PROBE_SOL_LAMPORTS,
-    STATE_TTL_MS, TRADE_TTL_MS,
+    QuotePoolInput, QuoteSide, QuoteVaultInput, RoundTripInsufficientSubreason, RoundTripLeg,
+    RoundTripPoolCandidate, RoundTripPoolSelection, RoundTripSelectFailure, SolQuotedPoolSeed,
+    DLMM_PROBE_SOL_LAMPORTS, STATE_TTL_MS, TRADE_TTL_MS,
 };
 pub use pool_ranker::{PoolRanker, QuoteProvider, RankerConfig};
 pub use types::{

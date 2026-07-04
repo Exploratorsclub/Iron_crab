@@ -30,11 +30,12 @@ use uuid::Uuid;
 
 use ironcrab::arbitrage::{
     dlmm_marginal_price_plausible, dlmm_sol_output_from_bins, dlmm_token_output_from_bins,
-    populate_arb_slave_from_live_pool_cache, quote_exact_in, quotes_pairable,
-    round_trip_profit_lamports, select_round_trip_pools, sync_arb_slave_from_pool_cache_update,
-    MultiHopArbitrage, MultiHopConfig, MultiHopIntentBatch, QuoteFreshnessConfig, QuotePoolInput,
-    QuoteVaultInput, RoundTripLeg, RoundTripPoolCandidate, RoundTripSelectFailure,
-    DLMM_PROBE_SOL_LAMPORTS,
+    is_quote_fresh, populate_arb_slave_from_live_pool_cache, quote_exact_in,
+    quote_exact_in_with_freshness, quotes_pairable, round_trip_profit_lamports,
+    select_round_trip_pools, sync_arb_slave_from_pool_cache_update, MultiHopArbitrage,
+    MultiHopConfig, MultiHopIntentBatch, PoolQuote, QuoteFreshnessConfig, QuotePoolInput,
+    QuoteVaultInput, RoundTripInsufficientSubreason, RoundTripLeg, RoundTripPoolCandidate,
+    RoundTripSelectFailure, DLMM_PROBE_SOL_LAMPORTS,
 };
 use ironcrab::config::Config as AppConfig;
 use ironcrab::execution::live_pool_cache::{
@@ -65,7 +66,8 @@ use ironcrab::metrics::{
     arb_two_hop_eligible_pools_by_dex_add, arb_two_hop_insufficient_subreason_inc,
     arb_two_hop_opportunity_inc, arb_two_hop_pool_gate_add, arb_two_hop_reject_subreason_inc,
     arb_two_hop_rejected_inc, arb_two_hop_tracker_seeded_pools_add,
-    arb_two_hop_v2_incompatible_kind_inc, arb_two_hop_v2_rejected_inc, arb_two_hop_v2_screen_inc,
+    arb_two_hop_v2_incompatible_kind_inc, arb_two_hop_v2_insufficient_subreason_inc,
+    arb_two_hop_v2_rejected_inc, arb_two_hop_v2_screen_inc, arb_two_hop_v2_screen_multi_dex_inc,
     record_arb_heartbeat_phase, record_arb_price_freshness_stale_age_ms,
     record_arb_proactive_pin_first_publish, record_arb_proactive_track_publish_total,
     record_arb_quote_pair_slot_delta, record_arb_quote_shadow_round_trip,
@@ -77,15 +79,15 @@ use ironcrab::metrics::{
     tick_arb_heartbeat_seconds_since_last_finish, tick_arb_tracker_write_seconds_since_last_finish,
     try_record_arb_track_pin_before_first_screen_ms, wall_clock_unix_ms_now, ArbHeartbeatPhase,
     ArbStrategyWarmupSkipReason, ArbTrackerWriteJobType, ArbTwoHopInsufficientSubreason,
-    ArbTwoHopPoolGate, ArbTwoHopRejectReason, ArbTwoHopRejectSubreason, ArbTwoHopV2RejectReason,
-    ArbWriterLockKind, MetricsComponent, ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH,
-    ARB_REJECTED_MISSING_ACCOUNTS, ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL,
-    ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH, ARB_TRACKER_WRITE_COALESCER_PENDING,
-    ARB_TRACKER_WRITE_CURRENT_JOB_STARTED_UNIX_MS, ARB_TRACKER_WRITE_CURRENT_JOB_TYPE,
-    ARB_TRACKER_WRITE_QUEUE_DEPTH, ARB_TRACKER_WRITE_SECONDS_SINCE_LAST_FINISH,
-    ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL,
-    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
-    TOKENS_TRACKED_GAUGE,
+    ArbTwoHopPoolGate, ArbTwoHopRejectReason, ArbTwoHopRejectSubreason,
+    ArbTwoHopV2InsufficientSubreason, ArbTwoHopV2RejectReason, ArbWriterLockKind, MetricsComponent,
+    ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH, ARB_REJECTED_MISSING_ACCOUNTS,
+    ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL, ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH,
+    ARB_TRACKER_WRITE_COALESCER_PENDING, ARB_TRACKER_WRITE_CURRENT_JOB_STARTED_UNIX_MS,
+    ARB_TRACKER_WRITE_CURRENT_JOB_TYPE, ARB_TRACKER_WRITE_QUEUE_DEPTH,
+    ARB_TRACKER_WRITE_SECONDS_SINCE_LAST_FINISH, ARB_TRIANGLE_OPPORTUNITIES,
+    INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
+    NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     arb_strategy_pool_cache_live_consumer_config, arb_track_payload_bytes, config_consumer_config,
@@ -1583,6 +1585,175 @@ impl ArbEligibilityForensics {
     }
 }
 
+/// Per-pool row for v2 round-trip eligibility forensics (bounded, journal only).
+#[derive(Debug, Clone)]
+struct PoolV2EligibilityRow {
+    pool_address: String,
+    dex: String,
+    known: bool,
+    has_vault: bool,
+    has_dlmm_bins: bool,
+    buy_quote_ok: bool,
+    buy_quote_fresh: bool,
+    sell_quote_ok: bool,
+    sell_quote_fresh: bool,
+}
+
+/// Aggregated mint-level v2 eligibility breakdown for rate-limited snapshots.
+#[derive(Debug, Clone)]
+struct MintV2EligibilityBreakdown {
+    mint: String,
+    candidate_pools_total: usize,
+    v2_candidate_pools: usize,
+    distinct_dexes: usize,
+    reject_subreason: RoundTripInsufficientSubreason,
+    pool_rows: Vec<PoolV2EligibilityRow>,
+}
+
+/// Rate-limited collector for v2 insufficient-pools forensics.
+struct ArbV2EligibilityForensics {
+    last_snapshot: RwLock<Instant>,
+    pending: RwLock<HashMap<String, MintV2EligibilityBreakdown>>,
+    snapshots_emitted: AtomicU64,
+}
+
+impl ArbV2EligibilityForensics {
+    fn new() -> Self {
+        Self {
+            last_snapshot: RwLock::new(Instant::now()),
+            pending: RwLock::new(HashMap::new()),
+            snapshots_emitted: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, breakdown: MintV2EligibilityBreakdown) {
+        if !matches!(
+            breakdown.reject_subreason,
+            RoundTripInsufficientSubreason::CandidatesLt2
+                | RoundTripInsufficientSubreason::NoFreshBuyQuote
+                | RoundTripInsufficientSubreason::NoCrossDexSell
+                | RoundTripInsufficientSubreason::SingleDexCandidates
+        ) {
+            return;
+        }
+
+        let mut pending = self.pending.write();
+        pending.insert(breakdown.mint.clone(), breakdown);
+        if pending.len() > ELIGIBILITY_PENDING_CAP {
+            let drop_key = pending
+                .keys()
+                .next()
+                .cloned()
+                .expect("pending non-empty after cap exceeded");
+            pending.remove(&drop_key);
+        }
+    }
+
+    fn maybe_emit_snapshot(&self) -> bool {
+        {
+            let last = self.last_snapshot.read();
+            if last.elapsed() < ELIGIBILITY_SNAPSHOT_COOLDOWN {
+                return false;
+            }
+        }
+
+        let mut pending = self.pending.write();
+        if pending.is_empty() {
+            return false;
+        }
+
+        let mut ranked: Vec<MintV2EligibilityBreakdown> = pending.values().cloned().collect();
+        ranked.sort_by(|a, b| {
+            b.v2_candidate_pools
+                .cmp(&a.v2_candidate_pools)
+                .then_with(|| a.candidate_pools_total.cmp(&b.candidate_pools_total))
+        });
+        let logged: Vec<MintV2EligibilityBreakdown> = ranked
+            .into_iter()
+            .take(ELIGIBILITY_SNAPSHOT_TOP_N)
+            .collect();
+
+        for entry in &logged {
+            let top_pools: Vec<_> = entry
+                .pool_rows
+                .iter()
+                .take(ELIGIBILITY_SNAPSHOT_POOL_ROWS)
+                .map(|row| {
+                    serde_json::json!({
+                        "pool": row.pool_address,
+                        "dex": row.dex,
+                        "known": row.known,
+                        "has_vault": row.has_vault,
+                        "has_dlmm_bins": row.has_dlmm_bins,
+                        "buy_quote_ok": row.buy_quote_ok,
+                        "buy_quote_fresh": row.buy_quote_fresh,
+                        "sell_quote_ok": row.sell_quote_ok,
+                        "sell_quote_fresh": row.sell_quote_fresh,
+                    })
+                })
+                .collect();
+
+            info!(
+                kind = "arb_two_hop_v2_eligibility_snapshot",
+                mint = %entry.mint,
+                candidate_pools_total = entry.candidate_pools_total,
+                v2_candidate_pools = entry.v2_candidate_pools,
+                distinct_dexes = entry.distinct_dexes,
+                reject_subreason = ?entry.reject_subreason,
+                top_pools = %serde_json::to_string(&top_pools).unwrap_or_else(|_| "[]".to_string()),
+                "2-hop v2 eligibility forensics snapshot"
+            );
+        }
+
+        for entry in &logged {
+            pending.remove(&entry.mint);
+        }
+
+        *self.last_snapshot.write() = Instant::now();
+        self.snapshots_emitted.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    #[cfg(test)]
+    fn pending_mint_count(&self) -> usize {
+        self.pending.read().len()
+    }
+
+    #[cfg(test)]
+    fn snapshots_emitted_count(&self) -> u64 {
+        self.snapshots_emitted.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn force_snapshot_ready(&self) {
+        *self.last_snapshot.write() =
+            Instant::now() - ELIGIBILITY_SNAPSHOT_COOLDOWN - Duration::from_secs(1);
+    }
+}
+
+fn v2_insufficient_subreason_to_metric(
+    subreason: RoundTripInsufficientSubreason,
+) -> ArbTwoHopV2InsufficientSubreason {
+    match subreason {
+        RoundTripInsufficientSubreason::CandidatesLt2 => {
+            ArbTwoHopV2InsufficientSubreason::CandidatesLt2
+        }
+        RoundTripInsufficientSubreason::NoFreshBuyQuote => {
+            ArbTwoHopV2InsufficientSubreason::NoFreshBuyQuote
+        }
+        RoundTripInsufficientSubreason::NoCrossDexSell => {
+            ArbTwoHopV2InsufficientSubreason::NoCrossDexSell
+        }
+        RoundTripInsufficientSubreason::SingleDexCandidates => {
+            ArbTwoHopV2InsufficientSubreason::SingleDexCandidates
+        }
+    }
+}
+
+fn record_v2_insufficient_subreason(subreason: RoundTripInsufficientSubreason) {
+    arb_two_hop_v2_insufficient_subreason_inc(v2_insufficient_subreason_to_metric(subreason));
+}
+
 fn record_eligibility_metrics(breakdown: &MintEligibilityBreakdown) {
     arb_two_hop_pool_gate_add(
         ArbTwoHopPoolGate::CandidatePools,
@@ -1747,6 +1918,7 @@ struct ArbCheckContext<'a> {
     spread_warn_last: &'a RwLock<HashMap<String, Instant>>,
     data_quality_rejects: &'a AtomicU64,
     forensics: Option<&'a ArbEligibilityForensics>,
+    v2_forensics: Option<&'a ArbV2EligibilityForensics>,
 }
 
 fn pool_state_to_quote_input(
@@ -2053,6 +2225,125 @@ impl TokenArbTracker {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn build_v2_eligibility_breakdown(
+        &self,
+        known_pools: &HashSet<String>,
+        vault_balances: &HashMap<String, VaultBalanceCache>,
+        bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
+        token_decimals: u8,
+        probe: u64,
+        freshness: &QuoteFreshnessConfig,
+        reject_subreason: RoundTripInsufficientSubreason,
+    ) -> MintV2EligibilityBreakdown {
+        let owned_candidates = self.build_round_trip_candidates(
+            known_pools,
+            vault_balances,
+            bin_arrays,
+            token_decimals,
+        );
+        let candidates: Vec<RoundTripPoolCandidate<'_>> = owned_candidates
+            .iter()
+            .map(|(pool, vault, bins, dex)| RoundTripPoolCandidate {
+                pool,
+                vault: vault.as_ref(),
+                dlmm_bins: bins.as_ref(),
+                dex,
+            })
+            .collect();
+
+        let distinct_dexes: HashSet<&str> = candidates.iter().map(|c| c.dex).collect();
+        let now = Instant::now();
+
+        let mut best_buy_amount_out: Option<u64> = None;
+        let mut best_buy_quote: Option<PoolQuote> = None;
+        for candidate in &candidates {
+            let buy_quote = quote_exact_in_with_freshness(
+                candidate.pool,
+                candidate.vault,
+                candidate.dlmm_bins,
+                NATIVE_SOL_MINT,
+                &candidate.pool.token_mint,
+                probe,
+                freshness,
+            );
+            let Some(buy_quote) = buy_quote else {
+                continue;
+            };
+            if !is_quote_fresh(&buy_quote, freshness, candidate.vault, now) {
+                continue;
+            }
+            let replace = match best_buy_amount_out {
+                None => true,
+                Some(current) => buy_quote.amount_out > current,
+            };
+            if replace {
+                best_buy_amount_out = Some(buy_quote.amount_out);
+                best_buy_quote = Some(buy_quote);
+            }
+        }
+
+        let mut pool_rows =
+            Vec::with_capacity(candidates.len().min(ELIGIBILITY_SNAPSHOT_POOL_ROWS));
+        for candidate in candidates.iter().take(ELIGIBILITY_SNAPSHOT_POOL_ROWS) {
+            let buy_quote = quote_exact_in_with_freshness(
+                candidate.pool,
+                candidate.vault,
+                candidate.dlmm_bins,
+                NATIVE_SOL_MINT,
+                &candidate.pool.token_mint,
+                probe,
+                freshness,
+            );
+            let buy_quote_ok = buy_quote.is_some();
+            let buy_quote_fresh = buy_quote
+                .as_ref()
+                .is_some_and(|q| is_quote_fresh(q, freshness, candidate.vault, now));
+
+            let (sell_quote_ok, sell_quote_fresh) = if let (Some(token_amount), Some(buy_q)) =
+                (best_buy_amount_out, best_buy_quote.as_ref())
+            {
+                let sell_quote = quote_exact_in_with_freshness(
+                    candidate.pool,
+                    candidate.vault,
+                    candidate.dlmm_bins,
+                    &candidate.pool.token_mint,
+                    NATIVE_SOL_MINT,
+                    token_amount,
+                    freshness,
+                );
+                let ok = sell_quote.is_some();
+                let fresh = sell_quote.as_ref().is_some_and(|q| {
+                    is_quote_fresh(q, freshness, candidate.vault, now) && quotes_pairable(buy_q, q)
+                });
+                (ok, fresh)
+            } else {
+                (false, false)
+            };
+
+            pool_rows.push(PoolV2EligibilityRow {
+                pool_address: candidate.pool.pool_address.clone(),
+                dex: candidate.dex.to_string(),
+                known: known_pools.contains(&candidate.pool.pool_address),
+                has_vault: candidate.vault.is_some(),
+                has_dlmm_bins: candidate.dlmm_bins.is_some(),
+                buy_quote_ok,
+                buy_quote_fresh,
+                sell_quote_ok,
+                sell_quote_fresh,
+            });
+        }
+
+        MintV2EligibilityBreakdown {
+            mint: self.base_mint.clone(),
+            candidate_pools_total: self.pools.len(),
+            v2_candidate_pools: owned_candidates.len(),
+            distinct_dexes: distinct_dexes.len(),
+            reject_subreason,
+            pool_rows,
+        }
+    }
+
     /// I-ARB-6: profit-first 2-hop via round-trip quotes (no legacy mid-spread gates).
     fn check_arbitrage_v2(
         &self,
@@ -2060,8 +2351,12 @@ impl TokenArbTracker {
         known_pools: &HashSet<String>,
         vault_balances: &HashMap<String, VaultBalanceCache>,
         bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
+        v2_forensics: Option<&ArbV2EligibilityForensics>,
     ) -> Option<ArbOpportunity> {
         arb_two_hop_v2_screen_inc();
+        if self.pool_count_on_distinct_dexes() >= 2 {
+            arb_two_hop_v2_screen_multi_dex_inc();
+        }
         try_record_arb_track_pin_before_first_screen_ms(&self.base_mint);
 
         if !config.two_hop_enabled {
@@ -2095,8 +2390,21 @@ impl TokenArbTracker {
 
         let selection = match select_round_trip_pools(&candidates, probe, &freshness) {
             Ok(selection) => selection,
-            Err(RoundTripSelectFailure::InsufficientPools) => {
+            Err(RoundTripSelectFailure::InsufficientPools(subreason)) => {
+                record_v2_insufficient_subreason(subreason);
                 arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::InsufficientPools);
+                if let Some(collector) = v2_forensics {
+                    let breakdown = self.build_v2_eligibility_breakdown(
+                        known_pools,
+                        vault_balances,
+                        bin_arrays,
+                        token_decimals,
+                        probe,
+                        &freshness,
+                        subreason,
+                    );
+                    collector.record(breakdown);
+                }
                 return None;
             }
             Err(RoundTripSelectFailure::QuoteStale) => {
@@ -2217,7 +2525,13 @@ impl TokenArbTracker {
         check_ctx: &ArbCheckContext<'_>,
     ) -> Option<ArbOpportunity> {
         if config.arb_two_hop_v2_enabled {
-            return self.check_arbitrage_v2(config, known_pools, vault_balances, bin_arrays);
+            return self.check_arbitrage_v2(
+                config,
+                known_pools,
+                vault_balances,
+                bin_arrays,
+                check_ctx.v2_forensics,
+            );
         }
 
         let spread_warn_last = check_ctx.spread_warn_last;
@@ -3057,6 +3371,7 @@ fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoH
                         spread_warn_last: &ctx_for_check.spread_too_large_warn_last,
                         data_quality_rejects: &ctx_for_check.data_quality_rejects,
                         forensics: Some(&ctx_for_check.eligibility_forensics),
+                        v2_forensics: Some(&ctx_for_check.v2_eligibility_forensics),
                     },
                 )
             })
@@ -3329,6 +3644,8 @@ struct ArbContext {
 
     /// Bounded 2-hop eligibility forensics (rate-limited snapshots).
     eligibility_forensics: ArbEligibilityForensics,
+    /// Bounded v2 round-trip eligibility forensics (rate-limited snapshots).
+    v2_eligibility_forensics: ArbV2EligibilityForensics,
 
     /// Phase 3: pools published as active via `TOPIC_ARB_TRACK_REQUESTS`.
     arb_pinned_pools: RwLock<HashSet<String>>,
@@ -4643,6 +4960,7 @@ impl ArbContext {
                 spread_warn_last: &self.spread_too_large_warn_last,
                 data_quality_rejects: &self.data_quality_rejects,
                 forensics: Some(&self.eligibility_forensics),
+                v2_forensics: Some(&self.v2_eligibility_forensics),
             },
         )?;
         self.finalize_trade_opportunity(mint, config.intent_cooldown_ms, opp)
@@ -5587,6 +5905,7 @@ async fn main() -> Result<()> {
         multi_hop,
         spread_too_large_warn_last: RwLock::new(HashMap::new()),
         eligibility_forensics: ArbEligibilityForensics::new(),
+        v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
         arb_pinned_pools: RwLock::new(HashSet::new()),
         arb_track_published: AtomicU64::new(0),
         two_hop_tx,
@@ -5896,6 +6215,7 @@ async fn main() -> Result<()> {
 
                 let phase_start = Instant::now();
                 ctx.eligibility_forensics.maybe_emit_snapshot();
+                ctx.v2_eligibility_forensics.maybe_emit_snapshot();
                 record_arb_heartbeat_phase(ArbHeartbeatPhase::MaybeEmit, phase_start.elapsed());
 
                 let phase_start = Instant::now();
@@ -6646,6 +6966,7 @@ mod event_pipeline_tests {
             )),
             spread_too_large_warn_last: RwLock::new(HashMap::new()),
             eligibility_forensics: ArbEligibilityForensics::new(),
+            v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
@@ -6752,6 +7073,7 @@ mod event_pipeline_tests {
             )),
             spread_too_large_warn_last: RwLock::new(HashMap::new()),
             eligibility_forensics: ArbEligibilityForensics::new(),
+            v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
@@ -6856,6 +7178,7 @@ mod event_pipeline_tests {
             )),
             spread_too_large_warn_last: RwLock::new(HashMap::new()),
             eligibility_forensics: ArbEligibilityForensics::new(),
+            v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
@@ -7070,6 +7393,7 @@ mod event_pipeline_tests {
             )),
             spread_too_large_warn_last: RwLock::new(HashMap::new()),
             eligibility_forensics: ArbEligibilityForensics::new(),
+            v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
@@ -7172,6 +7496,7 @@ mod event_pipeline_tests {
             )),
             spread_too_large_warn_last: RwLock::new(HashMap::new()),
             eligibility_forensics: ArbEligibilityForensics::new(),
+            v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
@@ -7278,6 +7603,7 @@ mod event_pipeline_tests {
             )),
             spread_too_large_warn_last: RwLock::new(HashMap::new()),
             eligibility_forensics: ArbEligibilityForensics::new(),
+            v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
@@ -7355,6 +7681,7 @@ mod event_pipeline_tests {
             )),
             spread_too_large_warn_last: RwLock::new(HashMap::new()),
             eligibility_forensics: ArbEligibilityForensics::new(),
+            v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
@@ -7493,6 +7820,7 @@ mod two_hop_price_tests {
             )),
             spread_too_large_warn_last: RwLock::new(HashMap::new()),
             eligibility_forensics: ArbEligibilityForensics::new(),
+            v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx: {
@@ -7950,6 +8278,7 @@ mod two_hop_price_tests {
                 spread_warn_last: &spread_warn_last,
                 data_quality_rejects: &data_quality_rejects,
                 forensics: None,
+                v2_forensics: None,
             },
         );
         // Same reserves → spread ~0, rejected by spread_below_min not insufficient_pools
@@ -8034,6 +8363,7 @@ mod two_hop_price_tests {
                 spread_warn_last: &spread_warn_last,
                 data_quality_rejects: &data_quality_rejects,
                 forensics: None,
+                v2_forensics: None,
             },
         );
         let opp = opp.expect("v2 round-trip should find cross-dex edge");
@@ -8118,6 +8448,7 @@ mod two_hop_price_tests {
                 spread_warn_last: &spread_warn_last,
                 data_quality_rejects: &data_quality_rejects,
                 forensics: None,
+                v2_forensics: None,
             },
         );
         assert!(opp.is_none(), "slot delta 99 should exceed default gate");
@@ -8766,6 +9097,7 @@ mod two_hop_price_tests {
                 spread_warn_last: &spread_warn_last,
                 data_quality_rejects: &data_quality_rejects,
                 forensics: None,
+                v2_forensics: None,
             },
         );
         assert!(opp.is_none());
@@ -8838,6 +9170,33 @@ mod two_hop_price_tests {
                 spread_warn_last: &spread_warn_last,
                 data_quality_rejects: &data_quality_rejects,
                 forensics: Some(forensics),
+                v2_forensics: None,
+            },
+        )
+    }
+
+    fn check_with_v2_forensics(
+        tracker: &TokenArbTracker,
+        known_pools: &HashSet<String>,
+        vault_balances: &HashMap<String, VaultBalanceCache>,
+        v2_forensics: &ArbV2EligibilityForensics,
+    ) -> Option<ArbOpportunity> {
+        let spread_warn_last = RwLock::new(HashMap::new());
+        let data_quality_rejects = AtomicU64::new(0);
+        let config = ArbConfig {
+            arb_two_hop_v2_enabled: true,
+            ..Default::default()
+        };
+        tracker.check_arbitrage(
+            &config,
+            known_pools,
+            vault_balances,
+            &HashMap::new(),
+            &ArbCheckContext {
+                spread_warn_last: &spread_warn_last,
+                data_quality_rejects: &data_quality_rejects,
+                forensics: None,
+                v2_forensics: Some(v2_forensics),
             },
         )
     }
@@ -9179,6 +9538,124 @@ mod two_hop_price_tests {
         let _ = check_with_forensics(&tracker, &known_pools, &vault_balances, &forensics);
         assert!(!forensics.maybe_emit_snapshot());
         assert_eq!(forensics.snapshots_emitted_count(), 1);
+    }
+
+    #[test]
+    fn v2_eligibility_snapshot_rate_limited_with_multiple_pending_mints() {
+        let v2_forensics = ArbV2EligibilityForensics::new();
+        let reserves = (1_000_000_000_000u64, 1_000_000_000u64);
+
+        for i in 0..2 {
+            let mint = format!("TokenMintV2{i:030}");
+            let pool = format!("poolV2{i}");
+            let mut tracker = TokenArbTracker::new(&mint);
+            tracker.token_decimals = Some(6);
+            tracker.upsert_pool(sample_pool("orca", &pool, None, None));
+            let mut known_pools = HashSet::new();
+            known_pools.insert(pool.clone());
+            let vault_balances = HashMap::from([(pool, vault(reserves.0, reserves.1))]);
+            let _ = check_with_v2_forensics(&tracker, &known_pools, &vault_balances, &v2_forensics);
+        }
+
+        assert_eq!(v2_forensics.pending_mint_count(), 2);
+        v2_forensics.force_snapshot_ready();
+        assert!(v2_forensics.maybe_emit_snapshot());
+        assert_eq!(v2_forensics.snapshots_emitted_count(), 1);
+        assert_eq!(v2_forensics.pending_mint_count(), 0);
+
+        let mint = "TokenMintV2Extra000000000000000000000";
+        let mut tracker = TokenArbTracker::new(mint);
+        tracker.token_decimals = Some(6);
+        tracker.upsert_pool(sample_pool("orca", "poolV2Extra", None, None));
+        let mut known_pools = HashSet::new();
+        known_pools.insert("poolV2Extra".to_string());
+        let vault_balances =
+            HashMap::from([("poolV2Extra".to_string(), vault(reserves.0, reserves.1))]);
+        let _ = check_with_v2_forensics(&tracker, &known_pools, &vault_balances, &v2_forensics);
+        assert!(!v2_forensics.maybe_emit_snapshot());
+        assert_eq!(v2_forensics.snapshots_emitted_count(), 1);
+    }
+
+    #[test]
+    fn check_arbitrage_v2_increments_multi_dex_screen_counter() {
+        let before_multi =
+            ironcrab::metrics::ARB_TWO_HOP_V2_SCREEN_MULTI_DEX_TOTAL.load(Ordering::Relaxed);
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+
+        let update_orca = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_a.to_string(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            980_000_000,
+            1,
+        );
+        let update_pump = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_b.to_string(),
+            "pump_amm".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            1_020_000_000,
+            2,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        seed_token_tracker_from_live_pool_cache(
+            &mint_str,
+            &cache,
+            &mut trackers,
+            &mut vault_balances,
+            None,
+        );
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert(pool_a.to_string());
+        known_pools.insert(pool_b.to_string());
+
+        let tracker = trackers.get_mut(&mint_str).unwrap();
+        tracker.token_decimals = Some(6);
+        assert_eq!(tracker.pool_count_on_distinct_dexes(), 2);
+
+        let config = ArbConfig {
+            arb_two_hop_v2_enabled: true,
+            min_spread_bps: 1,
+            min_profit_lamports: 1,
+            est_tx_cost_lamports: 1,
+            ..Default::default()
+        };
+        let spread_warn_last = RwLock::new(HashMap::new());
+        let data_quality_rejects = AtomicU64::new(0);
+        let _ = tracker.check_arbitrage(
+            &config,
+            &known_pools,
+            &vault_balances,
+            &HashMap::new(),
+            &ArbCheckContext {
+                spread_warn_last: &spread_warn_last,
+                data_quality_rejects: &data_quality_rejects,
+                forensics: None,
+                v2_forensics: None,
+            },
+        );
+        assert!(
+            ironcrab::metrics::ARB_TWO_HOP_V2_SCREEN_MULTI_DEX_TOTAL.load(Ordering::Relaxed)
+                > before_multi
+        );
     }
 
     #[test]
