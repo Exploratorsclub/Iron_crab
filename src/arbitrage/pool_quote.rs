@@ -1164,10 +1164,48 @@ pub enum RoundTripInsufficientSubreason {
     SingleDexCandidates,
 }
 
+/// Drill-down reason when every cross-DEX sell leg failed after at least one valid buy quote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NoCrossDexSellDetailReason {
+    SellMissingVault,
+    SellMissingDlmmBins,
+    SellQuoteNone,
+    SellNotFresh,
+    SellZeroOut,
+}
+
+impl NoCrossDexSellDetailReason {
+    pub fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::SellMissingVault => "sell_missing_vault",
+            Self::SellMissingDlmmBins => "sell_missing_dlmm_bins",
+            Self::SellQuoteNone => "sell_quote_none",
+            Self::SellNotFresh => "sell_not_fresh",
+            Self::SellZeroOut => "sell_zero_out",
+        }
+    }
+}
+
+/// Insufficient-pool outcome with optional `NoCrossDexSell` drill-down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundTripInsufficient {
+    pub subreason: RoundTripInsufficientSubreason,
+    pub no_cross_dex_sell_detail: Option<NoCrossDexSellDetailReason>,
+}
+
+impl RoundTripInsufficient {
+    pub fn new(subreason: RoundTripInsufficientSubreason) -> Self {
+        Self {
+            subreason,
+            no_cross_dex_sell_detail: None,
+        }
+    }
+}
+
 /// Failure reason for `select_round_trip_pools`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundTripSelectFailure {
-    InsufficientPools(RoundTripInsufficientSubreason),
+    InsufficientPools(RoundTripInsufficient),
     IncompatibleQuoteKind,
     QuoteStale,
 }
@@ -1180,7 +1218,56 @@ fn sol_per_token_from_sell_quote(quote: &PoolQuote, token_decimals: u8) -> Decim
     trade_implied_sol_per_token(quote.amount_out, quote.amount_in, token_decimals)
 }
 
-/// I-ARB-5: per-DEX best buy + cross-DEX best sell with matching QuoteKind.
+fn is_meteora_dlmm_dex(dex: &str) -> bool {
+    dex == "meteora_dlmm"
+}
+
+/// Classify why a cross-DEX sell leg failed for drill-down metrics / snapshots.
+pub fn classify_cross_dex_sell_failure(
+    candidate: &RoundTripPoolCandidate<'_>,
+    token_amount_in: u64,
+    freshness: &QuoteFreshnessConfig,
+    now: Instant,
+    token_decimals: u8,
+) -> NoCrossDexSellDetailReason {
+    if is_meteora_dlmm_dex(candidate.dex) && candidate.dlmm_bins.is_none() {
+        return NoCrossDexSellDetailReason::SellMissingDlmmBins;
+    }
+    if candidate.vault.is_none() {
+        return NoCrossDexSellDetailReason::SellMissingVault;
+    }
+    let sell_quote = quote_exact_in_with_freshness(
+        candidate.pool,
+        candidate.vault,
+        candidate.dlmm_bins,
+        &candidate.pool.token_mint,
+        NATIVE_SOL_MINT,
+        token_amount_in,
+        freshness,
+    );
+    let Some(sell_quote) = sell_quote else {
+        return NoCrossDexSellDetailReason::SellQuoteNone;
+    };
+    if !is_quote_fresh(&sell_quote, freshness, candidate.vault, now) {
+        return NoCrossDexSellDetailReason::SellNotFresh;
+    }
+    let sol_per_token = sol_per_token_from_sell_quote(&sell_quote, token_decimals);
+    if sol_per_token <= Decimal::ZERO {
+        return NoCrossDexSellDetailReason::SellZeroOut;
+    }
+    NoCrossDexSellDetailReason::SellQuoteNone
+}
+
+fn dominant_no_cross_dex_sell_detail(
+    counts: &std::collections::HashMap<NoCrossDexSellDetailReason, usize>,
+) -> Option<NoCrossDexSellDetailReason> {
+    counts
+        .iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(reason, _)| *reason)
+}
+
+/// I-ARB-5 evolution: enumerate valid cross-DEX (buy, sell) pairs and pick best round-trip.
 pub fn select_round_trip_pools(
     candidates: &[RoundTripPoolCandidate<'_>],
     probe_lamports: u64,
@@ -1188,7 +1275,7 @@ pub fn select_round_trip_pools(
 ) -> Result<RoundTripPoolSelection, RoundTripSelectFailure> {
     if candidates.len() < 2 {
         return Err(RoundTripSelectFailure::InsufficientPools(
-            RoundTripInsufficientSubreason::CandidatesLt2,
+            RoundTripInsufficient::new(RoundTripInsufficientSubreason::CandidatesLt2),
         ));
     }
 
@@ -1204,7 +1291,12 @@ pub fn select_round_trip_pools(
         sol_per_token: Decimal,
     }
 
-    let mut best_buy: Option<BuyCandidate<'_>> = None;
+    struct SellCandidate<'a> {
+        candidate: &'a RoundTripPoolCandidate<'a>,
+        quote: PoolQuote,
+    }
+
+    let mut valid_buys: Vec<BuyCandidate<'_>> = Vec::new();
     for candidate in candidates {
         let buy_quote = quote_exact_in_with_freshness(
             candidate.pool,
@@ -1225,82 +1317,112 @@ pub fn select_round_trip_pools(
         if sol_per_token <= Decimal::ZERO {
             continue;
         }
-        let replace = match &best_buy {
-            None => true,
-            Some(current) => sol_per_token < current.sol_per_token,
-        };
-        if replace {
-            best_buy = Some(BuyCandidate {
-                candidate,
-                quote: buy_quote,
-                sol_per_token,
-            });
-        }
+        valid_buys.push(BuyCandidate {
+            candidate,
+            quote: buy_quote,
+            sol_per_token,
+        });
     }
 
-    let Some(best_buy) = best_buy else {
+    if valid_buys.is_empty() {
         return Err(RoundTripSelectFailure::InsufficientPools(
-            RoundTripInsufficientSubreason::NoFreshBuyQuote,
+            RoundTripInsufficient::new(RoundTripInsufficientSubreason::NoFreshBuyQuote),
         ));
-    };
+    }
 
     let distinct_dexes: std::collections::HashSet<&str> =
         candidates.iter().map(|c| c.dex).collect();
     if distinct_dexes.len() < 2 {
         return Err(RoundTripSelectFailure::InsufficientPools(
-            RoundTripInsufficientSubreason::SingleDexCandidates,
+            RoundTripInsufficient::new(RoundTripInsufficientSubreason::SingleDexCandidates),
         ));
     }
 
-    let mut best_sell: Option<BuyCandidate<'_>> = None;
+    let mut best_pair: Option<(BuyCandidate<'_>, SellCandidate<'_>)> = None;
+    let mut best_round_trip_profit: i64 = i64::MIN;
     let mut saw_incompatible_kind = false;
+    let mut sell_fail_counts: std::collections::HashMap<NoCrossDexSellDetailReason, usize> =
+        std::collections::HashMap::new();
 
-    for candidate in candidates {
-        if candidate.dex == best_buy.candidate.dex {
-            continue;
-        }
-        let sell_quote = quote_exact_in_with_freshness(
-            candidate.pool,
-            candidate.vault,
-            candidate.dlmm_bins,
-            &candidate.pool.token_mint,
-            NATIVE_SOL_MINT,
-            best_buy.quote.amount_out,
-            freshness,
-        );
-        let Some(sell_quote) = sell_quote else {
-            continue;
-        };
-        if !is_quote_fresh(&sell_quote, freshness, candidate.vault, now) {
-            continue;
-        }
-        if !quotes_pairable(&best_buy.quote, &sell_quote) {
-            saw_incompatible_kind = true;
-            continue;
-        }
-        let sol_per_token = sol_per_token_from_sell_quote(&sell_quote, token_decimals);
-        if sol_per_token <= Decimal::ZERO {
-            continue;
-        }
-        let replace = match &best_sell {
-            None => true,
-            Some(current) => sol_per_token > current.sol_per_token,
-        };
-        if replace {
-            best_sell = Some(BuyCandidate {
-                candidate,
-                quote: sell_quote,
-                sol_per_token,
-            });
+    for buy in &valid_buys {
+        for sell_candidate in candidates {
+            if sell_candidate.dex == buy.candidate.dex {
+                continue;
+            }
+
+            if is_meteora_dlmm_dex(sell_candidate.dex) && sell_candidate.dlmm_bins.is_none() {
+                *sell_fail_counts
+                    .entry(NoCrossDexSellDetailReason::SellMissingDlmmBins)
+                    .or_default() += 1;
+                continue;
+            }
+            if sell_candidate.vault.is_none() {
+                *sell_fail_counts
+                    .entry(NoCrossDexSellDetailReason::SellMissingVault)
+                    .or_default() += 1;
+                continue;
+            }
+
+            let sell_quote = quote_exact_in_with_freshness(
+                sell_candidate.pool,
+                sell_candidate.vault,
+                sell_candidate.dlmm_bins,
+                &sell_candidate.pool.token_mint,
+                NATIVE_SOL_MINT,
+                buy.quote.amount_out,
+                freshness,
+            );
+            let Some(sell_quote) = sell_quote else {
+                *sell_fail_counts
+                    .entry(NoCrossDexSellDetailReason::SellQuoteNone)
+                    .or_default() += 1;
+                continue;
+            };
+            if !is_quote_fresh(&sell_quote, freshness, sell_candidate.vault, now) {
+                *sell_fail_counts
+                    .entry(NoCrossDexSellDetailReason::SellNotFresh)
+                    .or_default() += 1;
+                continue;
+            }
+            if !quotes_pairable(&buy.quote, &sell_quote) {
+                saw_incompatible_kind = true;
+                continue;
+            }
+            let sol_per_token = sol_per_token_from_sell_quote(&sell_quote, token_decimals);
+            if sol_per_token <= Decimal::ZERO {
+                *sell_fail_counts
+                    .entry(NoCrossDexSellDetailReason::SellZeroOut)
+                    .or_default() += 1;
+                continue;
+            }
+
+            let round_trip_profit = sell_quote.amount_out as i64 - probe_lamports as i64;
+            if round_trip_profit > best_round_trip_profit {
+                best_round_trip_profit = round_trip_profit;
+                best_pair = Some((
+                    BuyCandidate {
+                        candidate: buy.candidate,
+                        quote: buy.quote.clone(),
+                        sol_per_token: buy.sol_per_token,
+                    },
+                    SellCandidate {
+                        candidate: sell_candidate,
+                        quote: sell_quote,
+                    },
+                ));
+            }
         }
     }
 
-    let Some(best_sell) = best_sell else {
+    let Some((best_buy, best_sell)) = best_pair else {
         if saw_incompatible_kind {
             return Err(RoundTripSelectFailure::IncompatibleQuoteKind);
         }
         return Err(RoundTripSelectFailure::InsufficientPools(
-            RoundTripInsufficientSubreason::NoCrossDexSell,
+            RoundTripInsufficient {
+                subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
+                no_cross_dex_sell_detail: dominant_no_cross_dex_sell_detail(&sell_fail_counts),
+            },
         ));
     };
 
@@ -1599,9 +1721,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            RoundTripSelectFailure::InsufficientPools(
+            RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient::new(
                 RoundTripInsufficientSubreason::CandidatesLt2
-            )
+            ))
         );
     }
 
@@ -1633,9 +1755,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            RoundTripSelectFailure::InsufficientPools(
+            RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient::new(
                 RoundTripInsufficientSubreason::SingleDexCandidates
-            )
+            ))
         );
     }
 
@@ -1667,10 +1789,183 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            RoundTripSelectFailure::InsufficientPools(
-                RoundTripInsufficientSubreason::NoCrossDexSell
-            )
+            RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient {
+                subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
+                no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellQuoteNone),
+            })
         );
+    }
+
+    #[test]
+    fn select_round_trip_pools_pair_aware_matches_brute_force_best_round_trip() {
+        let pool_a = sample_pool("orca", "poolA");
+        let pool_b = sample_pool("pump_amm", "poolB");
+        let vault_a = sample_vault(1_000_000_000_000, 900_000_000);
+        let vault_b = sample_vault(1_000, 1_100_000_000);
+        let candidates = [
+            RoundTripPoolCandidate {
+                pool: &pool_a,
+                vault: Some(&vault_a),
+                dlmm_bins: None,
+                dex: "orca",
+            },
+            RoundTripPoolCandidate {
+                pool: &pool_b,
+                vault: Some(&vault_b),
+                dlmm_bins: None,
+                dex: "pump_amm",
+            },
+        ];
+        let freshness = QuoteFreshnessConfig::default();
+        let probe = DLMM_PROBE_SOL_LAMPORTS;
+        let now = Instant::now();
+
+        let mut brute_best_profit = i64::MIN;
+        let mut brute_best: Option<(String, String)> = None;
+        for buy in &candidates {
+            let buy_quote = quote_exact_in_with_freshness(
+                buy.pool,
+                buy.vault,
+                buy.dlmm_bins,
+                NATIVE_SOL_MINT,
+                &buy.pool.token_mint,
+                probe,
+                &freshness,
+            );
+            let Some(buy_quote) = buy_quote else { continue };
+            if !is_quote_fresh(&buy_quote, &freshness, buy.vault, now) {
+                continue;
+            }
+            for sell in &candidates {
+                if sell.dex == buy.dex {
+                    continue;
+                }
+                let sell_quote = quote_exact_in_with_freshness(
+                    sell.pool,
+                    sell.vault,
+                    sell.dlmm_bins,
+                    &sell.pool.token_mint,
+                    NATIVE_SOL_MINT,
+                    buy_quote.amount_out,
+                    &freshness,
+                );
+                let Some(sell_quote) = sell_quote else {
+                    continue;
+                };
+                if !is_quote_fresh(&sell_quote, &freshness, sell.vault, now) {
+                    continue;
+                }
+                if !quotes_pairable(&buy_quote, &sell_quote) {
+                    continue;
+                }
+                let profit = sell_quote.amount_out as i64 - probe as i64;
+                if profit > brute_best_profit {
+                    brute_best_profit = profit;
+                    brute_best = Some((
+                        buy.pool.pool_address.clone(),
+                        sell.pool.pool_address.clone(),
+                    ));
+                }
+            }
+        }
+
+        let selection =
+            select_round_trip_pools(&candidates, probe, &freshness).expect("pair-aware selection");
+        let expected = brute_best.expect("brute-force must find a pair");
+        assert_eq!(selection.buy_pool_address, expected.0);
+        assert_eq!(selection.sell_pool_address, expected.1);
+        assert!(
+            selection.sell_quote.amount_out as i64 - probe as i64 == brute_best_profit,
+            "selection must maximize round-trip profit"
+        );
+    }
+
+    #[test]
+    fn select_round_trip_pools_cross_dex_missing_vault_records_detail() {
+        let pool_a = sample_pool("orca", "poolA");
+        let pool_b = sample_pool("pump_amm", "poolB");
+        let vault_a = sample_vault(1_000_000_000_000, 900_000_000);
+        let candidates = [
+            RoundTripPoolCandidate {
+                pool: &pool_a,
+                vault: Some(&vault_a),
+                dlmm_bins: None,
+                dex: "orca",
+            },
+            RoundTripPoolCandidate {
+                pool: &pool_b,
+                vault: None,
+                dlmm_bins: None,
+                dex: "pump_amm",
+            },
+        ];
+        let err = select_round_trip_pools(
+            &candidates,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient {
+                subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
+                no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellMissingVault),
+            })
+        );
+    }
+
+    #[test]
+    fn select_round_trip_pools_dlmm_missing_bins_records_detail() {
+        let pool_a = sample_pool("pump_amm", "poolA");
+        let pool_b = sample_pool("meteora_dlmm", "poolB");
+        let vault_a = sample_vault(1_000_000_000_000, 900_000_000);
+        let vault_b = sample_vault(1_000_000_000_000, 1_100_000_000);
+        let candidates = [
+            RoundTripPoolCandidate {
+                pool: &pool_a,
+                vault: Some(&vault_a),
+                dlmm_bins: None,
+                dex: "pump_amm",
+            },
+            RoundTripPoolCandidate {
+                pool: &pool_b,
+                vault: Some(&vault_b),
+                dlmm_bins: None,
+                dex: "meteora_dlmm",
+            },
+        ];
+        let err = select_round_trip_pools(
+            &candidates,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient {
+                subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
+                no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellMissingDlmmBins),
+            })
+        );
+    }
+
+    #[test]
+    fn classify_cross_dex_sell_failure_missing_vault() {
+        let pool = sample_pool("orca", "poolO");
+        let candidate = RoundTripPoolCandidate {
+            pool: &pool,
+            vault: None,
+            dlmm_bins: None,
+            dex: "orca",
+        };
+        let reason = classify_cross_dex_sell_failure(
+            &candidate,
+            1_000,
+            &QuoteFreshnessConfig::default(),
+            Instant::now(),
+            6,
+        );
+        assert_eq!(reason, NoCrossDexSellDetailReason::SellMissingVault);
     }
 
     #[test]

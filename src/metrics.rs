@@ -3043,6 +3043,16 @@ pub static ARB_TWO_HOP_V2_INSUFFICIENT_NO_CROSS_DEX_SELL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_INSUFFICIENT_SINGLE_DEX_CANDIDATES: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_MISSING_VAULT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_MISSING_DLMM_BINS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_QUOTE_NONE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_NOT_FRESH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_ZERO_OUT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static ARB_PROACTIVE_TRACK_PUBLISH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 const ARB_QUOTE_PAIR_SLOT_DELTA_BUCKETS: &[u64] = &[0, 1, 2, 3, 4, 5, 8, 16, 32];
@@ -3529,6 +3539,38 @@ pub fn arb_two_hop_v2_insufficient_subreason_inc(reason: ArbTwoHopV2Insufficient
         }
         ArbTwoHopV2InsufficientSubreason::SingleDexCandidates => {
             &*ARB_TWO_HOP_V2_INSUFFICIENT_SINGLE_DEX_CANDIDATES
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Drill-down reason for `arb_two_hop_v2_no_cross_dex_sell_detail_total{reason=...}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbTwoHopV2NoCrossDexSellDetail {
+    SellMissingVault,
+    SellMissingDlmmBins,
+    SellQuoteNone,
+    SellNotFresh,
+    SellZeroOut,
+}
+
+/// Increment `arb_two_hop_v2_no_cross_dex_sell_detail_total{reason=...}`.
+pub fn arb_two_hop_v2_no_cross_dex_sell_detail_inc(reason: ArbTwoHopV2NoCrossDexSellDetail) {
+    let counter = match reason {
+        ArbTwoHopV2NoCrossDexSellDetail::SellMissingVault => {
+            &*ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_MISSING_VAULT
+        }
+        ArbTwoHopV2NoCrossDexSellDetail::SellMissingDlmmBins => {
+            &*ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_MISSING_DLMM_BINS
+        }
+        ArbTwoHopV2NoCrossDexSellDetail::SellQuoteNone => {
+            &*ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_QUOTE_NONE
+        }
+        ArbTwoHopV2NoCrossDexSellDetail::SellNotFresh => {
+            &*ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_NOT_FRESH
+        }
+        ArbTwoHopV2NoCrossDexSellDetail::SellZeroOut => {
+            &*ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_ZERO_OUT
         }
     };
     counter.fetch_add(1, Ordering::Relaxed);
@@ -4273,6 +4315,46 @@ fn append_arb_two_hop_v2_insufficient_subreason_total(out: &mut String) {
     out.push_str("arb_two_hop_v2_insufficient_subreason_total{reason=\"single_dex_candidates\"} ");
     out.push_str(
         &ARB_TWO_HOP_V2_INSUFFICIENT_SINGLE_DEX_CANDIDATES
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+}
+
+fn append_arb_two_hop_v2_no_cross_dex_sell_detail_total(out: &mut String) {
+    out.push_str("arb_two_hop_v2_no_cross_dex_sell_detail_total{reason=\"sell_missing_vault\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_MISSING_VAULT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        "arb_two_hop_v2_no_cross_dex_sell_detail_total{reason=\"sell_missing_dlmm_bins\"} ",
+    );
+    out.push_str(
+        &ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_MISSING_DLMM_BINS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_no_cross_dex_sell_detail_total{reason=\"sell_quote_none\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_QUOTE_NONE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_no_cross_dex_sell_detail_total{reason=\"sell_not_fresh\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_NOT_FRESH
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_no_cross_dex_sell_detail_total{reason=\"sell_zero_out\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_NO_CROSS_DEX_SELL_DETAIL_SELL_ZERO_OUT
             .load(Ordering::Relaxed)
             .to_string(),
     );
@@ -6929,6 +7011,7 @@ async fn metrics_response() -> Response<Body> {
         ARB_TWO_HOP_V2_SCREEN_MULTI_DEX_TOTAL.load(Ordering::Relaxed)
     );
     append_arb_two_hop_v2_insufficient_subreason_total(&mut out);
+    append_arb_two_hop_v2_no_cross_dex_sell_detail_total(&mut out);
     append_momentum_latency_histogram_prometheus(
         &mut out,
         "arb_quote_pair_slot_delta",
