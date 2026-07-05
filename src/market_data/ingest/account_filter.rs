@@ -1,6 +1,7 @@
 //! Geyser account update relevance + dispatch-priority filters.
 
 use super::host::IngestHost;
+use crate::metrics::inc_market_data_account_relevance_enrichment_hit_total;
 use crate::solana::geyser_listener::GeyserAccountUpdate;
 use solana_sdk::pubkey::Pubkey;
 
@@ -55,13 +56,8 @@ pub fn account_geyser_update_might_be_relevant<H: IngestHost>(
     }
 
     let pool_pk = u.pubkey;
-    if host.ingest_is_hot_pool(&pool_pk) {
-        return true;
-    }
-    if host.ingest_pool_mint_map_contains(&pool_pk) {
-        return true;
-    }
-    if host.ingest_high_priority_bonding_curve_contains(&pool_pk) {
+    if host.ingest_is_enrichment_member(&pool_pk) {
+        inc_market_data_account_relevance_enrichment_hit_total();
         return true;
     }
     if u.owner == PUMPFUN_PROGRAM_OWNER && host.ingest_pumpfun_bonding_curve_tracks_wallet(&pool_pk)
@@ -91,7 +87,7 @@ pub fn account_geyser_dispatch_priority_high<H: IngestHost>(
     if host.ingest_pool_mint_map_contains(&pool_pk) {
         return true;
     }
-    if host.ingest_is_hot_pool(&pool_pk) {
+    if host.ingest_is_enrichment_member(&pool_pk) {
         return true;
     }
     if host.ingest_wallet_tracks_mint(&pool_pk) {

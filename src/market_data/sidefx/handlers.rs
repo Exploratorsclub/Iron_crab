@@ -2,6 +2,7 @@
 
 use super::host::{MarketEventCorePublishTrace, SidefxWorkerHost};
 use super::pool_publish::{
+    cache_balance_fields_unchanged, cached_pool_has_fresh_reserve_basis,
     meteora_cpmm_onchain_mints_for_pool_cache_update, meteora_cpmm_vaults_for_pool_cache_update,
     meteora_dlmm_metadata_for_pool_cache_update, orca_metadata_for_pool_cache_update,
     pool_cache_balance_fields_from_state, pump_amm_sell_layout_publish_state,
@@ -20,6 +21,8 @@ use crate::ipc::{
 };
 use crate::metrics::{
     inc_market_data_devwallet_bonding_path_total, inc_market_data_devwallet_tx_published_total,
+    inc_market_data_enrichment_balance_updated_total,
+    inc_market_data_enrichment_pool_state_publish_total,
     inc_market_data_pool_state_publish_skipped_balance_unchanged_total,
     record_market_data_bonding_curve_grpc_to_devwallet_ms,
     record_market_data_pool_mint_map_to_devwallet_ms, MarketDataLatencySegment,
@@ -55,6 +58,133 @@ fn sidefx_host_enqueue_jetstream<T: serde::Serialize>(
         log_fail,
         bump_market_events_published_total,
     );
+}
+
+fn md_sidefx_build_balance_updated_from_cache(
+    host: &dyn SidefxWorkerHost,
+    run_id: &str,
+    pool_pubkey: &Pubkey,
+    slot: u64,
+) -> Option<PoolCacheUpdate> {
+    let state = host.live_pool_cache().get(pool_pubkey)?;
+    if !cached_pool_has_fresh_reserve_basis(&state) {
+        return None;
+    }
+    let (base_mint, quote_mint, base_reserve, quote_reserve, dex) =
+        pool_cache_balance_fields_from_state(&state)?;
+    let mut balance_update = PoolCacheUpdate::new_balance_updated(
+        "market-data",
+        host.build_version(),
+        run_id,
+        pool_pubkey.to_string(),
+        dex.to_string(),
+        base_mint.to_string(),
+        quote_mint.to_string(),
+        base_reserve,
+        quote_reserve,
+        slot,
+    );
+    match &state {
+        CachedPoolState::RaydiumCpmm(s) => {
+            let mut meta = std::collections::HashMap::new();
+            meta.insert(
+                POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY.to_string(),
+                raydium_cpmm_vaults_for_pool_cache_update(s),
+            );
+            balance_update.metadata = Some(meta);
+            let readiness = raydium_cpmm_readiness_for_pool_cache_update(s);
+            balance_update.set_dex_readiness_in_metadata(readiness);
+            host.live_pool_cache()
+                .merge_raydium_cpmm_pool_readiness(*pool_pubkey, readiness);
+        }
+        CachedPoolState::MeteoraCpmm(s) => {
+            let mut meta = std::collections::HashMap::new();
+            meta.insert(
+                POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY.to_string(),
+                meteora_cpmm_vaults_for_pool_cache_update(s),
+            );
+            meta.insert(
+                POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY.to_string(),
+                meteora_cpmm_onchain_mints_for_pool_cache_update(s),
+            );
+            balance_update.metadata = Some(meta);
+            let readiness = meteora_cpmm_readiness_for_pool_cache_update(s);
+            balance_update.set_dex_readiness_in_metadata(readiness);
+            host.live_pool_cache()
+                .merge_meteora_cpmm_pool_readiness(*pool_pubkey, readiness);
+        }
+        CachedPoolState::RaydiumAmm(s) => {
+            let readiness = raydium_amm_readiness_for_pool_cache_update(s);
+            balance_update.set_dex_readiness_in_metadata(readiness);
+            host.live_pool_cache()
+                .merge_raydium_amm_pool_readiness(*pool_pubkey, readiness);
+        }
+        CachedPoolState::Orca(s) => {
+            balance_update.metadata = Some(orca_metadata_for_pool_cache_update(s));
+            let readiness = orca_readiness_for_pool_cache_update(s);
+            balance_update.set_dex_readiness_in_metadata(readiness);
+            host.live_pool_cache()
+                .merge_orca_pool_readiness(*pool_pubkey, readiness);
+        }
+        CachedPoolState::Meteora(s) => {
+            balance_update.metadata = Some(meteora_dlmm_metadata_for_pool_cache_update(s));
+            let readiness = meteora_dlmm_readiness_for_pool_cache_update(s);
+            balance_update.set_dex_readiness_in_metadata(readiness);
+            host.live_pool_cache()
+                .merge_meteora_dlmm_pool_readiness(*pool_pubkey, readiness);
+        }
+        CachedPoolState::PumpAmm(_) | CachedPoolState::PumpFun(_) => {}
+    }
+    Some(balance_update)
+}
+
+/// P2: JetStream BalanceUpdated + Core PoolStateUpdate after MASTER cache upsert (I-MD-4).
+fn md_sidefx_publish_enrichment_from_cache_upsert(
+    host: &dyn SidefxWorkerHost,
+    run_id: &str,
+    pool_pubkey: &Pubkey,
+    cached_state: &CachedPoolState,
+    prev_state: Option<CachedPoolState>,
+    slot: u64,
+    grpc_recv_at: Instant,
+) {
+    if !host.is_enrichment_member(pool_pubkey) {
+        return;
+    }
+    if host.pool_has_live_vault_geyser_feed(*pool_pubkey) {
+        return;
+    }
+    if !cached_pool_has_fresh_reserve_basis(cached_state) {
+        return;
+    }
+    let balance_unchanged = prev_state
+        .as_ref()
+        .is_some_and(|prev| cache_balance_fields_unchanged(prev, cached_state));
+    if balance_unchanged {
+        inc_market_data_pool_state_publish_skipped_balance_unchanged_total();
+        return;
+    }
+
+    if host.nats_enabled() {
+        if let Some(balance_update) =
+            md_sidefx_build_balance_updated_from_cache(host, run_id, pool_pubkey, slot)
+        {
+            let subject = pool_subject(&pool_pubkey.to_string());
+            sidefx_host_enqueue_jetstream(
+                host,
+                subject,
+                &balance_update,
+                "PoolCacheUpdate::BalanceUpdated (enrichment cache upsert)",
+                false,
+            );
+            inc_market_data_enrichment_balance_updated_total();
+        }
+    }
+
+    if md_sidefx_publish_pool_state_update_from_cache(host, run_id, pool_pubkey, slot, grpc_recv_at)
+    {
+        inc_market_data_enrichment_pool_state_publish_total();
+    }
 }
 
 /// Build PoolStateUpdate from MASTER LivePoolCache (Geyser-only; no RPC).
@@ -1010,7 +1140,8 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
         return;
     };
     if let Some(mut cached_state) = parse_pool_account(owner, account_data) {
-        let prev_meteora_meta = host.live_pool_cache().get(pool_pubkey).and_then(|s| {
+        let prev_state = host.live_pool_cache().get(pool_pubkey);
+        let prev_meteora_meta = prev_state.as_ref().and_then(|s| {
             if let CachedPoolState::Meteora(m) = s {
                 Some((m.active_id, m.bin_step))
             } else {
@@ -1403,6 +1534,16 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                 false,
             );
         }
+
+        md_sidefx_publish_enrichment_from_cache_upsert(
+            host,
+            run_id,
+            pool_pubkey,
+            &cached_state,
+            prev_state,
+            *slot,
+            *grpc_recv_at,
+        );
     }
 }
 

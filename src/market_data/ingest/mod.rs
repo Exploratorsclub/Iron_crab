@@ -41,6 +41,10 @@ impl<T: IngestHost + ?Sized> IngestHost for Arc<T> {
         (**self).ingest_is_hot_pool(pool)
     }
 
+    fn ingest_is_enrichment_member(&self, pool: &solana_sdk::pubkey::Pubkey) -> bool {
+        (**self).ingest_is_enrichment_member(pool)
+    }
+
     fn ingest_pool_mint_map_contains(&self, pool: &solana_sdk::pubkey::Pubkey) -> bool {
         (**self).ingest_pool_mint_map_contains(pool)
     }
@@ -73,5 +77,9 @@ impl<T: IngestHost + ?Sized> IngestHost for Arc<T> {
 
     fn ingest_record_vault_high_priority_dispatch(&self) {
         (**self).ingest_record_vault_high_priority_dispatch()
+    }
+
+    fn ingest_record_enrichment_relevance_hit(&self) {
+        (**self).ingest_record_enrichment_relevance_hit()
     }
 }

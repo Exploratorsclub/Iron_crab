@@ -18,6 +18,9 @@ pub trait IngestHost: Send + Sync {
 
     fn ingest_is_hot_pool(&self, pool: &Pubkey) -> bool;
 
+    /// P2 EnrichmentRegistry: pool_mint_map ∪ bonding-curve priority ∪ hot-pool pins.
+    fn ingest_is_enrichment_member(&self, pool: &Pubkey) -> bool;
+
     fn ingest_pool_mint_map_contains(&self, pool: &Pubkey) -> bool;
 
     fn ingest_high_priority_bonding_curve_contains(&self, pool: &Pubkey) -> bool;
@@ -33,4 +36,6 @@ pub trait IngestHost: Send + Sync {
     fn ingest_record_membership_snapshot_hit(&self);
 
     fn ingest_record_vault_high_priority_dispatch(&self);
+
+    fn ingest_record_enrichment_relevance_hit(&self);
 }

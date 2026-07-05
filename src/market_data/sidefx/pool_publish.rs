@@ -297,3 +297,89 @@ pub fn pool_cache_balance_fields_from_state(
         CachedPoolState::PumpFun(_) => None,
     }
 }
+
+/// True when the cached pool row has at least one non-zero reserve / vault balance.
+pub fn cached_pool_has_fresh_reserve_basis(state: &CachedPoolState) -> bool {
+    let fresh = |opt: Option<u64>| opt.is_some_and(|v| v > 0);
+    let fresh_u64 = |v: u64| v > 0;
+    match state {
+        CachedPoolState::RaydiumCpmm(s) => fresh(s.reserve_0) || fresh(s.reserve_1),
+        CachedPoolState::MeteoraCpmm(s) => fresh_u64(s.reserve_0) || fresh_u64(s.reserve_1),
+        CachedPoolState::Meteora(s) => fresh(s.reserve_x_balance) || fresh(s.reserve_y_balance),
+        CachedPoolState::PumpAmm(s) => fresh(s.base_reserve) || fresh(s.quote_reserve),
+        CachedPoolState::Orca(s) => fresh(s.vault_a_balance) || fresh(s.vault_b_balance),
+        CachedPoolState::RaydiumAmm(s) => fresh(s.coin_reserve) || fresh(s.pc_reserve),
+        CachedPoolState::PumpFun(_) => false,
+    }
+}
+
+/// Compare normalized reserve fields between two cache rows.
+pub fn cache_balance_fields_unchanged(prev: &CachedPoolState, new: &CachedPoolState) -> bool {
+    match (
+        pool_cache_balance_fields_from_state(prev),
+        pool_cache_balance_fields_from_state(new),
+    ) {
+        (Some((_, _, pb, pq, _)), Some((_, _, nb, nq, _))) => pb == nb && pq == nq,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::live_pool_cache::RaydiumCpmmState;
+
+    #[test]
+    fn cached_pool_has_fresh_reserve_basis_requires_nonzero() {
+        let with = CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+            token_0_mint: Pubkey::new_unique(),
+            token_1_mint: Pubkey::new_unique(),
+            token_0_vault: Pubkey::new_unique(),
+            token_1_vault: Pubkey::new_unique(),
+            reserve_0: Some(1),
+            reserve_1: None,
+        });
+        let without = CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+            token_0_mint: Pubkey::new_unique(),
+            token_1_mint: Pubkey::new_unique(),
+            token_0_vault: Pubkey::new_unique(),
+            token_1_vault: Pubkey::new_unique(),
+            reserve_0: None,
+            reserve_1: None,
+        });
+        assert!(cached_pool_has_fresh_reserve_basis(&with));
+        assert!(!cached_pool_has_fresh_reserve_basis(&without));
+    }
+
+    #[test]
+    fn cache_balance_fields_unchanged_detects_equal_reserves() {
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let a = CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+            token_0_mint: mint_a,
+            token_1_mint: mint_b,
+            token_0_vault: Pubkey::new_unique(),
+            token_1_vault: Pubkey::new_unique(),
+            reserve_0: Some(100),
+            reserve_1: Some(200),
+        });
+        let b = CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+            token_0_mint: mint_a,
+            token_1_mint: mint_b,
+            token_0_vault: Pubkey::new_unique(),
+            token_1_vault: Pubkey::new_unique(),
+            reserve_0: Some(100),
+            reserve_1: Some(200),
+        });
+        let c = CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+            token_0_mint: mint_a,
+            token_1_mint: mint_b,
+            token_0_vault: Pubkey::new_unique(),
+            token_1_vault: Pubkey::new_unique(),
+            reserve_0: Some(101),
+            reserve_1: Some(200),
+        });
+        assert!(cache_balance_fields_unchanged(&a, &b));
+        assert!(!cache_balance_fields_unchanged(&a, &c));
+    }
+}

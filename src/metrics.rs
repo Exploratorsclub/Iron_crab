@@ -394,6 +394,18 @@ pub static MARKET_DATA_HOT_POOL_REGISTRY_POOLS_BOTH: Lazy<AtomicU64> =
 /// BalanceUpdated published from MASTER cache without vault Geyser subscription.
 pub static MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// P2: JetStream BalanceUpdated from enrichment cache upsert path.
+pub static MARKET_DATA_ENRICHMENT_BALANCE_UPDATED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// P2: Core NATS PoolStateUpdate from enrichment cache upsert path.
+pub static MARKET_DATA_ENRICHMENT_POOL_STATE_PUBLISH_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// P2: account relevance filter hit via EnrichmentRegistry membership.
+pub static MARKET_DATA_ACCOUNT_RELEVANCE_ENRICHMENT_HIT_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// P2: EnrichmentRegistry pool count gauge (deduplicated union).
+pub static MARKET_DATA_ENRICHMENT_REGISTRY_POOLS_GAUGE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// PoolStateUpdate published to Core NATS (bounded `dex` label).
 pub static MARKET_DATA_POOL_STATE_PUBLISH_ORCA: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MARKET_DATA_POOL_STATE_PUBLISH_METEORA_DLMM: Lazy<AtomicU64> =
@@ -734,6 +746,22 @@ pub fn set_market_data_hot_pool_registry_pools_gauge(reason: &str, n: usize) {
 #[inline]
 pub fn inc_market_data_balance_updated_from_cache_total() {
     MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_market_data_enrichment_balance_updated_total() {
+    MARKET_DATA_ENRICHMENT_BALANCE_UPDATED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_market_data_enrichment_pool_state_publish_total() {
+    MARKET_DATA_ENRICHMENT_POOL_STATE_PUBLISH_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_market_data_account_relevance_enrichment_hit_total() {
+    MARKET_DATA_ACCOUNT_RELEVANCE_ENRICHMENT_HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn set_market_data_enrichment_registry_pools_gauge(n: u64) {
+    MARKET_DATA_ENRICHMENT_REGISTRY_POOLS_GAUGE.store(n, Ordering::Relaxed);
 }
 
 /// Increment bounded `market_data_pool_state_publish_total{dex}`.
@@ -5990,6 +6018,22 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_balance_updated_from_cache_total",
         MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_enrichment_balance_updated_total",
+        MARKET_DATA_ENRICHMENT_BALANCE_UPDATED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_enrichment_pool_state_publish_total",
+        MARKET_DATA_ENRICHMENT_POOL_STATE_PUBLISH_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_relevance_enrichment_hit_total",
+        MARKET_DATA_ACCOUNT_RELEVANCE_ENRICHMENT_HIT_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_enrichment_registry_pools_gauge",
+        MARKET_DATA_ENRICHMENT_REGISTRY_POOLS_GAUGE.load(Ordering::Relaxed)
     );
     line!(
         "market_data_pool_state_publish_skipped_total{reason=\"balance_unchanged\"}",
