@@ -7631,7 +7631,7 @@ async fn handle_geyser_transaction(
             );
         }
 
-        // Phase-R-R4: pool_mint_map + DevWallet off hot path (`md-sidefx`).
+        // Phase-R-R4 / P1: pool_mint_map + DevWallet (creator_override) off hot path (`md-sidefx`).
         match parsed {
             ParsedDexEvent::PoolCreated {
                 pool_address,
@@ -7681,31 +7681,6 @@ async fn handle_geyser_transaction(
             md_sidefx,
             MdSidefxCommand::TradePoolLruTouch {
                 pool: *pool_address,
-            },
-        );
-    }
-
-    // Pump.fun: propagate creator/dev wallet so strategy can build deterministic intents.
-    // The PoolCreated MarketEventKind intentionally does not carry creator today, so emit
-    // a separate DevWalletIdentified event when available.
-    // Also cache the creator for later Trade events.
-    if let Some(ParsedDexEvent::PoolCreated {
-        pool_address,
-        base_mint,
-        dex: DexType::PumpFun,
-        creator: Some(creator),
-        ..
-    }) = parsed_event.as_ref()
-    {
-        md_sidefx_try_enqueue(
-            md_sidefx,
-            MdSidefxCommand::PumpFunDevWalletFromPoolCreated {
-                run_id: run_id.to_string(),
-                pool_address: *pool_address,
-                base_mint: *base_mint,
-                creator: *creator,
-                slot: tx_update.slot,
-                tx_geyser_recv_at,
             },
         );
     }
