@@ -89,7 +89,8 @@ use ironcrab::metrics::{
     geyser_metrics_set_subscription_accounts, geyser_metrics_set_tracked_pinned_accounts,
     inc_market_data_account_high_priority_queue_depth,
     inc_market_data_account_low_priority_queue_depth, inc_market_data_account_worker_queue_depth,
-    inc_market_data_balance_updated_from_cache_total, inc_market_data_geyser_sync_partial_total,
+    inc_market_data_balance_updated_from_cache_total, inc_market_data_devwallet_tx_published_total,
+    inc_market_data_geyser_sync_partial_total,
     inc_market_data_geyser_sync_skipped_rate_limit_total,
     inc_market_data_ingest_membership_snapshot_hits_total,
     inc_market_data_jsonl_enqueue_dropped_total,
@@ -6632,8 +6633,41 @@ async fn account_worker_recv_next(
     }
 }
 
-/// After `pool_mint_map` insert on the TX path: emit `DevWalletIdentified` if bonding-curve cache
-/// already holds authoritative creator (no Swap parsing; I-4 / BUG-D).
+/// Resolve PumpFun creator on TX ingest (P1): parse → mint cache → pool cache → LivePoolCache (no RPC).
+fn resolve_pumpfun_creator_tx_path(
+    ctx: &MarketDataContext,
+    pool_address: &str,
+    mint: &str,
+    pool_pubkey: &Pubkey,
+    parsed_creator: Option<&Pubkey>,
+) -> Option<String> {
+    if let Some(c) = parsed_creator {
+        return Some(c.to_string());
+    }
+    {
+        let cache = ctx.creator_cache.read();
+        if let Some(c) = cache.get(mint) {
+            if !c.is_empty() {
+                return Some(c.clone());
+            }
+        }
+    }
+    {
+        let pool_cache = ctx.pool_creator_cache.read();
+        if let Some(c) = pool_cache.get(pool_address) {
+            if !c.is_empty() {
+                return Some(c.clone());
+            }
+        }
+    }
+    ctx.live_pool_cache
+        .get_pumpfun_creator(pool_pubkey)
+        .filter(|pk| *pk != Pubkey::default())
+        .map(|pk| pk.to_string())
+}
+
+/// After `pool_mint_map` insert on the TX path: emit `DevWalletIdentified` when creator is known
+/// from TX parse, pool_creator_cache, or LivePoolCache (no Swap parsing; I-4 / BUG-D).
 ///
 /// NATS: when `publish_tx` is set (same channel as dedicated publish runtime), enqueue only —
 /// avoids blocking the TX ingest task on Core NATS backpressure (PR151 follow-up).
@@ -6649,12 +6683,28 @@ async fn maybe_emit_dev_wallet_after_pool_mint_map(
     tx_grpc_recv_at: Instant,
     publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
     nats: Option<&NatsClient>,
+    creator_override: Option<&str>,
 ) -> bool {
     let pool_str = pool.to_string();
-    let creator_str = match ctx.pool_creator_cache.read().get(&pool_str).cloned() {
-        Some(s) if !s.is_empty() => s,
-        _ => return false,
+    let creator_str = if let Some(c) = creator_override.filter(|s| !s.is_empty()) {
+        c.to_string()
+    } else if let Some(s) = ctx
+        .pool_creator_cache
+        .read()
+        .get(&pool_str)
+        .cloned()
+        .filter(|s| !s.is_empty())
+    {
+        s
+    } else {
+        match ctx.live_pool_cache.get_pumpfun_creator(pool) {
+            Some(pk) if pk != Pubkey::default() => pk.to_string(),
+            _ => return false,
+        }
     };
+    ctx.pool_creator_cache
+        .write()
+        .insert(pool_str.clone(), creator_str.clone());
     let existing = {
         let mut creator_cache = ctx.creator_cache.write();
         let existing = creator_cache.get(mint).cloned();
@@ -6680,12 +6730,14 @@ async fn maybe_emit_dev_wallet_after_pool_mint_map(
     }
     let publish_at = Instant::now();
     record_market_data_pool_mint_map_to_devwallet_ms(tx_grpc_recv_at, publish_at);
+    inc_market_data_devwallet_tx_published_total();
     info!(
         mint = %mint,
         pool = %pool_str,
         creator = %creator_str,
         corrected = existing.is_some(),
-        "DevWalletIdentified from TX path after pool_mint_map (creator from pool_creator_cache)"
+        had_override = creator_override.is_some(),
+        "DevWalletIdentified from TX path after pool_mint_map (P1 creator)"
     );
     let dev_event = MarketEvent::new(
         "market-data",
@@ -7579,11 +7631,12 @@ async fn handle_geyser_transaction(
             );
         }
 
-        // Phase-R-R4: pool_mint_map + DevWallet off hot path (`md-sidefx`).
+        // Phase-R-R4 / P1: pool_mint_map + DevWallet (creator_override) off hot path (`md-sidefx`).
         match parsed {
             ParsedDexEvent::PoolCreated {
                 pool_address,
                 base_mint,
+                creator,
                 dex: DexType::PumpFun,
                 ..
             } => {
@@ -7595,12 +7648,14 @@ async fn handle_geyser_transaction(
                         mint_str: base_mint.to_string(),
                         slot: Some(tx_update.slot),
                         tx_grpc_recv_at: tx_update.grpc_recv_at,
+                        creator_override: *creator,
                     },
                 );
             }
             ParsedDexEvent::Trade {
                 pool_address,
                 mint,
+                creator,
                 dex: DexType::PumpFun,
                 ..
             } => {
@@ -7612,6 +7667,7 @@ async fn handle_geyser_transaction(
                         mint_str: mint.to_string(),
                         slot: Some(tx_update.slot),
                         tx_grpc_recv_at: tx_update.grpc_recv_at,
+                        creator_override: *creator,
                     },
                 );
             }
@@ -7625,29 +7681,6 @@ async fn handle_geyser_transaction(
             md_sidefx,
             MdSidefxCommand::TradePoolLruTouch {
                 pool: *pool_address,
-            },
-        );
-    }
-
-    // Pump.fun: propagate creator/dev wallet so strategy can build deterministic intents.
-    // The PoolCreated MarketEventKind intentionally does not carry creator today, so emit
-    // a separate DevWalletIdentified event when available.
-    // Also cache the creator for later Trade events.
-    if let Some(ParsedDexEvent::PoolCreated {
-        base_mint,
-        dex: DexType::PumpFun,
-        creator: Some(creator),
-        ..
-    }) = parsed_event.as_ref()
-    {
-        md_sidefx_try_enqueue(
-            md_sidefx,
-            MdSidefxCommand::PumpFunDevWalletFromPoolCreated {
-                run_id: run_id.to_string(),
-                base_mint: *base_mint,
-                creator: *creator,
-                slot: tx_update.slot,
-                tx_geyser_recv_at,
             },
         );
     }
@@ -7819,6 +7852,15 @@ async fn handle_geyser_transaction(
         return;
     };
 
+    let pumpfun_trade_creator = match &parsed {
+        ParsedDexEvent::Trade {
+            dex: DexType::PumpFun,
+            creator,
+            ..
+        } => creator.as_ref(),
+        _ => None,
+    };
+
     info!(
         slot = tx_update.slot,
         sig = %tx_update.signature,
@@ -7826,7 +7868,7 @@ async fn handle_geyser_transaction(
     );
     let mut kind = parsed.to_market_event_kind();
 
-    // Enrich Trade events with creator from cache (P0: PumpFun intent building)
+    // Enrich Trade events with creator (P1 TX path: parse → caches → LivePoolCache; no RPC)
     if let MarketEventKind::Trade {
         ref pool_address,
         ref mint,
@@ -7836,25 +7878,34 @@ async fn handle_geyser_transaction(
     } = kind
     {
         if dex == "pumpfun" || dex == "pump_amm" {
-            let mut found_creator = None;
-            {
-                let cache = ctx.creator_cache.read();
-                if let Some(cached_creator) = cache.get(mint) {
-                    found_creator = Some(cached_creator.clone());
-                }
-            }
-            if found_creator.is_none() {
-                let pool_cache = ctx.pool_creator_cache.read();
-                if let Some(pool_creator) = pool_cache.get(pool_address) {
-                    found_creator = Some(pool_creator.clone());
-                    drop(pool_cache);
+            if let Ok(pool_pk) = Pubkey::from_str(pool_address) {
+                if let Some(cached_creator) = resolve_pumpfun_creator_tx_path(
+                    &ctx,
+                    pool_address,
+                    mint,
+                    &pool_pk,
+                    pumpfun_trade_creator,
+                ) {
+                    ctx.pool_creator_cache
+                        .write()
+                        .insert(pool_address.clone(), cached_creator.clone());
                     ctx.creator_cache
                         .write()
-                        .insert(mint.clone(), found_creator.clone().unwrap());
+                        .insert(mint.clone(), cached_creator.clone());
+                    *creator = Some(cached_creator.clone());
+                    let _ = maybe_emit_dev_wallet_after_pool_mint_map(
+                        &ctx,
+                        run_id,
+                        &pool_pk,
+                        mint,
+                        Some(tx_update.slot),
+                        tx_geyser_recv_at,
+                        account_publish_tx,
+                        ctx.nats.as_ref(),
+                        Some(cached_creator.as_str()),
+                    )
+                    .await;
                 }
-            }
-            if let Some(cached_creator) = found_creator {
-                *creator = Some(cached_creator.clone());
             }
         }
     }
@@ -11320,6 +11371,7 @@ mod pr_b_geyser_tracking_tests {
                     mint_str: "mint".into(),
                     slot: None,
                     tx_grpc_recv_at: Instant::now(),
+                    creator_override: None,
                 },
             );
         }
@@ -12208,6 +12260,7 @@ mod pr_b_geyser_tracking_tests {
                 grpc_at,
                 Some(&publish_tx),
                 None,
+                Some(creator.to_string().as_str()),
             )
             .await
         );
@@ -12234,6 +12287,7 @@ mod pr_b_geyser_tracking_tests {
                 grpc_at,
                 Some(&publish_tx),
                 None,
+                Some(creator.to_string().as_str()),
             )
             .await,
             "second call with same creator must not re-emit"
@@ -13644,6 +13698,7 @@ mod pr_b_geyser_tracking_tests {
                 mint_str: mint.clone(),
                 slot: Some(99),
                 tx_grpc_recv_at: Instant::now(),
+                creator_override: None,
             },
         );
 
@@ -13653,6 +13708,54 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(
             ctx.pool_mint_map.read().get(&pool.to_string()).cloned(),
             Some(mint)
+        );
+    }
+
+    /// Phase 1 P1: pool_mint_map + creator_override emits DevWallet without pre-filled pool_creator_cache.
+    #[tokio::test(flavor = "current_thread")]
+    async fn phase1_sidefx_pool_mint_map_emits_devwallet_with_creator_override() {
+        use ironcrab::metrics::MARKET_DATA_DEVWALLET_TX_PUBLISHED_TOTAL;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let md_state = test_spawn_md_state(&ctx);
+        let md_sidefx = test_spawn_md_sidefx(&ctx, &md_state, test_noop_track_worker_sender());
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique().to_string();
+        let creator = Pubkey::new_unique();
+        let tx0 = MARKET_DATA_DEVWALLET_TX_PUBLISHED_TOTAL.load(Ordering::Relaxed);
+        md_sidefx_try_enqueue(
+            &md_sidefx,
+            MdSidefxCommand::PumpFunPoolMintMapInsert {
+                run_id: "run-p1".into(),
+                pool_address: pool,
+                mint_str: mint.clone(),
+                slot: Some(42),
+                tx_grpc_recv_at: Instant::now(),
+                creator_override: Some(creator),
+            },
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            MARKET_DATA_DEVWALLET_TX_PUBLISHED_TOTAL.load(Ordering::Relaxed) > tx0,
+            "creator_override must publish DevWallet on TX path"
+        );
+        assert_eq!(
+            ctx.pool_creator_cache
+                .read()
+                .get(&pool.to_string())
+                .cloned(),
+            Some(creator.to_string()),
+            "pool_creator_cache must be filled from creator_override"
+        );
+        assert_eq!(
+            ctx.creator_cache.read().get(&mint).cloned(),
+            Some(creator.to_string()),
+            "creator_cache must be filled from creator_override"
         );
     }
 
