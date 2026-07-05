@@ -948,6 +948,12 @@ pub static MARKET_DATA_MD_SIDEFX_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
 /// Phase-R-R4: jobs processed by the `md-sidefx` worker.
 pub static MARKET_DATA_MD_SIDEFX_JOBS_PROCESSED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Phase 1 P1: `DevWalletIdentified` published from TX ingest (PoolCreated / trade fast-path).
+pub static MARKET_DATA_DEVWALLET_TX_PUBLISHED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Phase 1 P2: `DevWalletIdentified` published from bonding-curve account path.
+pub static MARKET_DATA_DEVWALLET_BONDING_PATH_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 #[inline]
 pub fn record_market_data_tx_handler_processed() {
@@ -1679,6 +1685,16 @@ pub fn inc_market_data_account_low_priority_queue_depth() {
 #[inline]
 pub fn dec_market_data_account_low_priority_queue_depth() {
     MARKET_DATA_ACCOUNT_LOW_PRIORITY_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_devwallet_tx_published_total() {
+    MARKET_DATA_DEVWALLET_TX_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_devwallet_bonding_path_total() {
+    MARKET_DATA_DEVWALLET_BONDING_PATH_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Wall ms from Geyser `grpc_recv_at` on the TX update to `DevWalletIdentified` publish (TX fast-path).
@@ -5688,6 +5704,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_md_sidefx_jobs_processed_total",
         MARKET_DATA_MD_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_devwallet_tx_published_total",
+        MARKET_DATA_DEVWALLET_TX_PUBLISHED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_devwallet_bonding_path_total",
+        MARKET_DATA_DEVWALLET_BONDING_PATH_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_unparsed_tx_dropped_total",

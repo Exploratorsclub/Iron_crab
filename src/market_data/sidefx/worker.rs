@@ -27,9 +27,12 @@ pub enum MdSidefxCommand {
         mint_str: String,
         slot: Option<u64>,
         tx_grpc_recv_at: Instant,
+        /// P1: creator from TX parse when known (avoids pool_creator_cache hen-and-egg).
+        creator_override: Option<Pubkey>,
     },
     PumpFunDevWalletFromPoolCreated {
         run_id: String,
+        pool_address: Pubkey,
         base_mint: Pubkey,
         creator: Pubkey,
         slot: u64,

@@ -19,6 +19,7 @@ use crate::ipc::{
     POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use crate::metrics::{
+    inc_market_data_devwallet_bonding_path_total, inc_market_data_devwallet_tx_published_total,
     inc_market_data_pool_state_publish_skipped_balance_unchanged_total,
     record_market_data_bonding_curve_grpc_to_devwallet_ms,
     record_market_data_pool_mint_map_to_devwallet_ms, MarketDataLatencySegment,
@@ -161,12 +162,23 @@ pub fn sidefx_maybe_emit_dev_wallet_after_pool_mint_map(
     mint: &str,
     slot: Option<u64>,
     tx_grpc_recv_at: Instant,
+    creator_override: Option<&str>,
 ) -> bool {
     let pool_str = pool.to_string();
-    let creator_str = match host.pool_creator_cache_get(&pool_str) {
-        Some(s) if !s.is_empty() => s,
-        _ => return false,
+    let creator_str = if let Some(c) = creator_override.filter(|s| !s.is_empty()) {
+        c.to_string()
+    } else if let Some(s) = host
+        .pool_creator_cache_get(&pool_str)
+        .filter(|s| !s.is_empty())
+    {
+        s
+    } else {
+        match host.live_pool_cache().get_pumpfun_creator(pool) {
+            Some(pk) if pk != Pubkey::default() => pk.to_string(),
+            _ => return false,
+        }
     };
+    host.pool_creator_cache_insert(pool_str.clone(), creator_str.clone());
     let existing = host.creator_cache_insert_returning_old(mint.to_string(), creator_str.clone());
     let should_emit = match &existing {
         None => true,
@@ -187,12 +199,14 @@ pub fn sidefx_maybe_emit_dev_wallet_after_pool_mint_map(
     }
     let publish_at = Instant::now();
     record_market_data_pool_mint_map_to_devwallet_ms(tx_grpc_recv_at, publish_at);
+    inc_market_data_devwallet_tx_published_total();
     info!(
         mint = %mint,
         pool = %pool_str,
         creator = %creator_str,
         corrected = existing.is_some(),
-        "DevWalletIdentified from TX path after pool_mint_map (creator from pool_creator_cache)"
+        had_override = creator_override.is_some(),
+        "DevWalletIdentified from TX path after pool_mint_map (P1 creator)"
     );
     let dev_event = MarketEvent::new(
         "market-data",
@@ -231,6 +245,7 @@ pub fn md_sidefx_process_pump_fun_pool_mint_map(
         mint_str,
         slot,
         tx_grpc_recv_at,
+        creator_override,
     } = job
     else {
         return;
@@ -239,6 +254,7 @@ pub fn md_sidefx_process_pump_fun_pool_mint_map(
         host.pool_mint_map_insert(pool_address.to_string(), mint_str.clone());
         host.high_priority_bonding_curves_insert(*pool_address);
     }
+    let override_str = creator_override.as_ref().map(|pk| pk.to_string());
     sidefx_maybe_emit_dev_wallet_after_pool_mint_map(
         host,
         run_id,
@@ -246,6 +262,7 @@ pub fn md_sidefx_process_pump_fun_pool_mint_map(
         mint_str,
         *slot,
         *tx_grpc_recv_at,
+        override_str.as_deref(),
     );
 }
 
@@ -255,6 +272,7 @@ pub fn md_sidefx_process_pump_fun_dev_wallet_from_pool_created(
 ) {
     let MdSidefxCommand::PumpFunDevWalletFromPoolCreated {
         run_id,
+        pool_address,
         base_mint,
         creator,
         slot,
@@ -263,12 +281,17 @@ pub fn md_sidefx_process_pump_fun_dev_wallet_from_pool_created(
     else {
         return;
     };
-    host.creator_cache_set(base_mint.to_string(), creator.to_string());
+    let pool_str = pool_address.to_string();
+    let creator_str = creator.to_string();
+    host.pool_creator_cache_insert(pool_str.clone(), creator_str.clone());
+    host.creator_cache_set(base_mint.to_string(), creator_str.clone());
     debug!(
         mint = %base_mint,
+        pool = %pool_str,
         creator = %creator,
-        "Cached PumpFun creator for Trade enrichment"
+        "Cached PumpFun creator for Trade enrichment (PoolCreated TX path)"
     );
+    inc_market_data_devwallet_tx_published_total();
     let dev_event = MarketEvent::new(
         "market-data",
         host.build_version(),
@@ -872,6 +895,7 @@ pub fn md_sidefx_process_bonding_curve(host: &dyn SidefxWorkerHost, job: &MdSide
                     }),
                 );
             }
+            inc_market_data_devwallet_bonding_path_total();
             record_market_data_bonding_curve_grpc_to_devwallet_ms(*grpc_recv_at, Instant::now());
         }
     }

@@ -911,6 +911,7 @@ fn parse_pumpfun_create(update: &GeyserTransactionUpdate) -> Option<ParsedDexEve
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_pumpfun_trade_event(
     update: &GeyserTransactionUpdate,
     bonding_curve: Pubkey,
@@ -919,9 +920,9 @@ fn build_pumpfun_trade_event(
     is_buy: bool,
     sol_amount: u64,
     token_amount: u64,
+    creator: Option<Pubkey>,
 ) -> ParsedDexEvent {
     let token_decimals = get_token_decimals(&update.post_token_balances, &mint);
-    let creator: Option<Pubkey> = None;
 
     let spl_token_str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
     let token_2022_str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
@@ -1056,6 +1057,7 @@ fn parse_pumpfun_buy_exact_sol_in(update: &GeyserTransactionUpdate) -> Option<Pa
         true,
         swap_sol_used,
         tokens_received,
+        None,
     ))
 }
 
@@ -1206,6 +1208,7 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
         is_buy,
         sol_amount,
         token_amount,
+        None,
     ))
 }
 
