@@ -1,5 +1,6 @@
 pub mod coalesce;
 pub mod desired_set;
+pub mod enrichment;
 pub mod geyser_sync;
 pub mod worker;
 
@@ -11,6 +12,9 @@ pub use coalesce::{
 pub use desired_set::{
     pin_priority_from_consumer, symmetric_diff, ConsumerId, DesiredExplicitSet, ExplicitEntry,
     PinPriority,
+};
+pub use enrichment::{
+    is_enrichment_member_from_inputs, pool_is_enrichment_member, EnrichmentMembershipInputs,
 };
 pub use geyser_sync::{
     consumer_id_for_track_pin, explicit_subscription_has_new_keys,

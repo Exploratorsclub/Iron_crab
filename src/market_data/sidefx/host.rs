@@ -75,6 +75,12 @@ pub trait SidefxWorkerHost: Send + Sync {
     /// True when pool is in momentum/arb hot set (arb-pinned DLMM PoolStateUpdate gate).
     fn is_hot_pool(&self, pool: &Pubkey) -> bool;
 
+    /// P2 EnrichmentRegistry membership (pool_mint_map ∪ pins ∪ bonding-curve priority).
+    fn is_enrichment_member(&self, pool: &Pubkey) -> bool;
+
+    /// True when vault/bin pubkeys for this pool were included in the last Geyser sync flush.
+    fn pool_has_live_vault_geyser_feed(&self, pool: Pubkey) -> bool;
+
     /// Re-register DLMM bin-array window when arb-pinned pool `active_id` drifts (Fix B).
     fn maybe_refresh_arb_dlmm_bin_window(&self, pool: Pubkey, new_active_id: i32) -> bool;
 }

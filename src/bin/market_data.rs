@@ -79,8 +79,8 @@ use ironcrab::market_data::sidefx::{
 };
 use ironcrab::market_data::track::{
     arb_coalesce_try_send, explicit_subscription_has_new_keys, momentum_coalesce_try_send,
-    spawn_track_worker, track_worker_try_enqueue, ConsumerId, DesiredExplicitSet, TrackPinReason,
-    TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,
+    pool_is_enrichment_member, spawn_track_worker, track_worker_try_enqueue, ConsumerId,
+    DesiredExplicitSet, TrackPinReason, TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,
 };
 use ironcrab::metrics::{
     dec_market_data_account_high_priority_queue_depth,
@@ -113,11 +113,12 @@ use ironcrab::metrics::{
     record_market_data_tokio_progress, record_market_data_tx_broadcast_lagged,
     record_market_data_tx_channel_lag_ms, record_market_data_tx_handler_processed, serve_metrics,
     set_market_data_account_broadcast_queue_depth, set_market_data_account_worker_count,
-    set_market_data_arb_pinned_pools_gauge, set_market_data_geyser_merge_pending,
-    set_market_data_geyser_sync_pending, set_market_data_hot_pool_registry_pools_gauge,
-    set_market_data_md_state_evict_pending, set_market_data_momentum_active_pool_pins_gauge,
-    set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
-    set_readiness_nats_connected, touch_market_data_global_ingest_progress,
+    set_market_data_arb_pinned_pools_gauge, set_market_data_enrichment_registry_pools_gauge,
+    set_market_data_geyser_merge_pending, set_market_data_geyser_sync_pending,
+    set_market_data_hot_pool_registry_pools_gauge, set_market_data_md_state_evict_pending,
+    set_market_data_momentum_active_pool_pins_gauge, set_market_data_tx_broadcast_queue_depth,
+    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
+    touch_market_data_global_ingest_progress,
     touch_market_data_tracked_membership_snapshot_refresh, update_readiness_market_data_current,
     GeyserTrackedEvictKind, MarketDataLatencySegment, MetricsComponent,
     MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_RECEIVED_TOTAL,
@@ -543,6 +544,14 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
 
     fn is_hot_pool(&self, pool: &Pubkey) -> bool {
         self.ctx.hot_pool_registry.is_hot_pool(*pool)
+    }
+
+    fn is_enrichment_member(&self, pool: &Pubkey) -> bool {
+        self.ctx.ingest_is_enrichment_member(pool)
+    }
+
+    fn pool_has_live_vault_geyser_feed(&self, pool: Pubkey) -> bool {
+        self.ctx.pool_has_live_vault_geyser_feed(pool)
     }
 
     fn maybe_refresh_arb_dlmm_bin_window(&self, pool: Pubkey, new_active_id: i32) -> bool {
@@ -1955,6 +1964,14 @@ impl IngestHost for MarketDataContext {
         self.hot_pool_registry.is_hot_pool(*pool)
     }
 
+    fn ingest_is_enrichment_member(&self, pool: &Pubkey) -> bool {
+        pool_is_enrichment_member(
+            self.pool_mint_map.read().contains_key(&pool.to_string()),
+            self.high_priority_bonding_curves.read().contains(pool),
+            self.hot_pool_registry.is_hot_pool(*pool),
+        )
+    }
+
     fn ingest_pool_mint_map_contains(&self, pool: &Pubkey) -> bool {
         self.pool_mint_map.read().contains_key(&pool.to_string())
     }
@@ -1990,6 +2007,10 @@ impl IngestHost for MarketDataContext {
 
     fn ingest_record_vault_high_priority_dispatch(&self) {
         inc_market_data_vault_high_priority_dispatch_total();
+    }
+
+    fn ingest_record_enrichment_relevance_hit(&self) {
+        ironcrab::metrics::inc_market_data_account_relevance_enrichment_hit_total();
     }
 }
 
@@ -2117,6 +2138,27 @@ impl MarketDataContext {
         set_market_data_hot_pool_registry_pools_gauge("both", 0);
         set_market_data_momentum_active_pool_pins_gauge(self.hot_pool_registry.pair_count());
         set_market_data_arb_pinned_pools_gauge(arb);
+        self.refresh_enrichment_registry_gauge();
+    }
+
+    fn refresh_enrichment_registry_gauge(&self) {
+        let mut pools: HashSet<Pubkey> = self
+            .hot_pool_registry
+            .snapshot_arb_pools()
+            .into_iter()
+            .collect();
+        for (_, pool) in self.hot_pool_registry.snapshot_pairs() {
+            pools.insert(pool);
+        }
+        for pool_str in self.pool_mint_map.read().keys() {
+            if let Ok(pk) = Pubkey::from_str(pool_str) {
+                pools.insert(pk);
+            }
+        }
+        for pool in self.high_priority_bonding_curves.read().iter() {
+            pools.insert(*pool);
+        }
+        set_market_data_enrichment_registry_pools_gauge(pools.len() as u64);
     }
 
     /// PR237 + Phase1: rebuild ingest/sidefx snapshot from authoritative md-state maps.
@@ -12379,6 +12421,50 @@ mod pr_b_geyser_tracking_tests {
             grpc_recv_at: Instant::now(),
         };
         assert!(account_geyser_update_might_be_relevant(&ctx, &u));
+        assert!(ctx.ingest_is_enrichment_member(&pool));
+    }
+
+    #[test]
+    fn account_geyser_update_might_be_relevant_arb_pinned_without_pool_mint_map() {
+        use ironcrab::metrics::MARKET_DATA_ACCOUNT_RELEVANCE_ENRICHMENT_HIT_TOTAL;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        assert!(!ctx.ingest_pool_mint_map_contains(&pool));
+        let before = MARKET_DATA_ACCOUNT_RELEVANCE_ENRICHMENT_HIT_TOTAL.load(Ordering::Relaxed);
+        let u = GeyserAccountUpdate {
+            pubkey: pool,
+            slot: 1,
+            owner: RAYDIUM_CPMM_OWNER,
+            data: vec![],
+            lamports: 0,
+            grpc_recv_at: Instant::now(),
+        };
+        assert!(account_geyser_update_might_be_relevant(&ctx, &u));
+        assert!(
+            MARKET_DATA_ACCOUNT_RELEVANCE_ENRICHMENT_HIT_TOTAL.load(Ordering::Relaxed) > before
+        );
+    }
+
+    #[test]
+    fn enrichment_sidefx_host_pool_mint_map_is_member_without_hot_pin() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, _depth, _md_state_rx) = test_md_state_sender_no_worker();
+        let worker = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+        let pool = Pubkey::new_unique();
+        ctx.pool_mint_map
+            .write()
+            .insert(pool.to_string(), Pubkey::new_unique().to_string());
+        assert!(worker.is_enrichment_member(&pool));
+        assert!(!worker.is_hot_pool(&pool));
+        assert!(!worker.pool_has_live_vault_geyser_feed(pool));
     }
 
     #[test]
