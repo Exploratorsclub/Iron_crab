@@ -1629,3 +1629,15 @@ BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap 
 | **Betroffene Module** | `src/bin/momentum_bot.rs`, `src/metrics.rs`, `docs/PHASE4_BALANCE_SOURCE_AUDIT.md` |
 | **Regression-Prüfung** | `cargo fmt`, `cargo clippy -D warnings`, `cargo test`, `cargo test phase4_`; Eval Level 5. |
 | **Tags** | [momentum-bot, hybrid-rollback, phase4, wallet-ssot, i-13, ghost-positions, pr-phase4] |
+
+---
+
+## MD-PHASE4-TX-INGEST: Geyser TX Handler nach `ingest/` extrahiert + systemd StateDirectory (2026-07-06)
+
+| Symptom | `market_data.rs` Monolith ~15.5k LOC; TX-Ingest-Logik im Bin schwer wartbar; Prod-Deploy #269 `exit 226/NAMESPACE` weil `/var/lib/ironcrab` ohne `StateDirectory` fehlte. |
+|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | Phase 1–3 Dual-Consumer prod-abgenommen, aber Monolith-Abbau (Plan Phase 4) noch offen; systemd `ReadWritePaths=/var/lib/ironcrab` ohne vorab erstelltes Verzeichnis. |
+| **Fix** | (1) `handle_geyser_transaction_update` + TX-only Parse/Emit-Hilfen nach `src/market_data/ingest/tx_handler.rs` / `tx_parse.rs`; `TxIngestHost`-Trait. (2) Bin: dünner `handle_geyser_transaction`-Wrapper. (3) `StateDirectory=ironcrab` in `docs/systemd/market-data.service`. Semantik P1/P2/P3 unverändert. |
+| **Betroffene Module** | `src/market_data/ingest/`, `src/bin/market_data.rs`, `docs/systemd/market-data.service` |
+| **Regression-Prüfung** | `cargo fmt`, `cargo clippy -D warnings`, `cargo test`, `cargo test phase4_`; Eval Level 5. |
+| **Tags** | [market-data, hybrid-rollback, phase4, tx-ingest, monolith-slice, systemd, i-md-1, pr-phase4-tx] |
