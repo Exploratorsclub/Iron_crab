@@ -36,10 +36,9 @@ use uuid::Uuid;
 
 use ironcrab::config::{Config, MarketDataGeyserCfg, WalletTrackerCfg};
 use ironcrab::ipc::{
-    BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ControlRequest,
-    ControlRequestKind, DexPoolReadiness, ExecutionResult, ExecutionStatus, IntentTier,
-    MarketEvent, MarketEventKind, PoolCacheUpdate, NATIVE_SOL_MINT,
-    POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
+    ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ControlRequest, ControlRequestKind,
+    DexPoolReadiness, ExecutionResult, ExecutionStatus, IntentTier, MarketEvent, MarketEventKind,
+    PoolCacheUpdate, NATIVE_SOL_MINT, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use ironcrab::market_data::cold::{
     cold_path_rpc_refresh_meteora_cpmm_pool_row, cold_path_rpc_refresh_meteora_dlmm_pool_row,
@@ -49,8 +48,9 @@ use ironcrab::market_data::cold::{
     handle_ensure_raydium_amm_pool_state, handle_ensure_raydium_cpmm_pool_state, ColdHost,
 };
 use ironcrab::market_data::ingest::{
-    account_geyser_update_is_dex_pool_owner, handle_geyser_transaction_update, IngestHost,
-    TxIngestHost, TxTrackedWalletView,
+    handle_geyser_account_update, handle_geyser_transaction_update, try_parse_mint_account,
+    try_parse_token_account_balance, AccountIngestHost, IngestHost, TxIngestHost,
+    TxTrackedWalletView,
 };
 use ironcrab::market_data::jsonl::{
     spawn_market_data_jsonl_writer, write_market_event_jsonl, JsonlHost,
@@ -99,9 +99,9 @@ use ironcrab::metrics::{
     inc_market_data_ingest_membership_snapshot_hits_total,
     inc_market_data_jsonl_enqueue_dropped_total,
     inc_market_data_md_state_evict_steps_budget_exhausted_total,
-    inc_market_data_md_state_evict_steps_total, inc_market_data_unparsed_account_dropped_total,
-    inc_market_data_vault_high_priority_dispatch_total, market_data_bump_geyser_head_slot,
-    market_data_geyser_head_slot_value, market_data_geyser_tracking_enqueue_dropped_value,
+    inc_market_data_md_state_evict_steps_total, inc_market_data_vault_high_priority_dispatch_total,
+    market_data_bump_geyser_head_slot, market_data_geyser_head_slot_value,
+    market_data_geyser_tracking_enqueue_dropped_value,
     market_data_geyser_tracking_jobs_processed_value, market_data_md_state_bursts_completed_value,
     market_data_request_account_session_reconnect, market_data_request_tx_session_reconnect,
     market_data_tx_handler_processed_value, record_market_data_account_broadcast_lagged,
@@ -139,12 +139,10 @@ use ironcrab::nats::{
     WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::position_authority::is_sol_or_wsol_mint;
-use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
-use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
 use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 use ironcrab::solana::dex::pumpfun::PumpFunDex;
 use ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex;
-use ironcrab::solana::dex_parser::{parse_account_update, OrcaPoolInfo, ParsedDexEvent};
+use ironcrab::solana::dex_parser::OrcaPoolInfo;
 use ironcrab::solana::geyser_pool_discovery::{
     DexType as PoolDexType, PoolDiscoveryEvent, PoolDiscoveryIngest,
 };
@@ -155,7 +153,6 @@ use ironcrab::solana::wallet_tracker::WalletTracker;
 use ironcrab::solana::wallet_tx_confirm_listener::{
     spawn_wallet_tx_confirm_listener, WalletTxConfirmUpdate,
 };
-use spl_token::solana_program::program_option::COption;
 use spl_token::solana_program::program_pack::Pack;
 use spl_token_2022::extension::StateWithExtensions;
 
@@ -586,6 +583,7 @@ fn spawn_md_sidefx_worker(
 }
 
 /// Eval grep: bounded md-sidefx enqueue (never blocks ingest).
+#[cfg_attr(not(test), allow(dead_code))]
 fn md_sidefx_try_enqueue(sender: &MdSidefxSender, job: MdSidefxCommand) {
     sidefx_try_enqueue(sender, job);
 }
@@ -2231,6 +2229,92 @@ impl TxIngestHost for MarketDataContext {
 
     fn tx_live_pool_cache(&self) -> &LivePoolCache {
         &self.live_pool_cache
+    }
+}
+
+impl AccountIngestHost for MarketDataContext {
+    fn account_build_version(&self) -> &'static str {
+        BUILD_VERSION
+    }
+
+    fn account_run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    fn account_next_event_id(&self) -> String {
+        self.next_event_id()
+    }
+
+    fn account_write_market_event_jsonl(&self, event: &MarketEvent) {
+        self.write_market_event_jsonl(event);
+    }
+
+    fn account_nats(&self) -> Option<&NatsClient> {
+        self.nats.as_ref()
+    }
+
+    fn account_publish_host(&self) -> Option<&dyn PublishHost> {
+        Some(self)
+    }
+
+    fn account_tracked_wallet_view(
+        &self,
+    ) -> Option<ironcrab::market_data::ingest::AccountTrackedWalletView> {
+        self.tracked_wallet.as_ref().map(|tw| {
+            ironcrab::market_data::ingest::AccountTrackedWalletView {
+                wallet: tw.wallet,
+                wsol_ata: tw.wsol_ata,
+            }
+        })
+    }
+
+    fn account_wallet_native_sol_swap(&self, lamports: u64) -> u64 {
+        self.tracked_wallet
+            .as_ref()
+            .map(|tw| tw.last_sol_balance.swap(lamports, Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    fn account_wallet_wsol_swap(&self, lamports: u64) -> u64 {
+        self.tracked_wallet
+            .as_ref()
+            .map(|tw| tw.last_wsol_balance.swap(lamports, Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    fn account_wallet_wsol_seen_set(&self) {
+        if let Some(tw) = self.tracked_wallet.as_ref() {
+            tw.wsol_seen.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn account_wallet_mint_decimals_get(&self, mint: &Pubkey) -> Option<u8> {
+        self.tracked_wallet_mint_decimals.read().get(mint).copied()
+    }
+
+    fn account_wallet_mint_decimals_insert(&self, mint: Pubkey, decimals: u8) {
+        self.tracked_wallet_mint_decimals
+            .write()
+            .insert(mint, decimals);
+    }
+
+    fn account_membership_mint_contains(&self, pubkey: &Pubkey) -> bool {
+        self.tracked_membership.load().mints.contains(pubkey)
+    }
+
+    fn account_membership_bin_array_info(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Option<ironcrab::market_data::ingest::AccountBinArrayView> {
+        self.tracked_membership
+            .load()
+            .bin_array_by_pubkey
+            .get(pubkey)
+            .map(|info| ironcrab::market_data::ingest::AccountBinArrayView {
+                pool_address: info.pool_address,
+                bin_array_index: info.bin_array_index,
+                bin_step: info.bin_step,
+            })
     }
 }
 
@@ -4286,102 +4370,6 @@ impl MarketDataContext {
             rejected_keys: rejected,
             new_snapshot_id: None,
         }
-    }
-}
-
-fn try_parse_mint_account(
-    owner: &Pubkey,
-    data: &[u8],
-) -> Option<(u8, u64, Option<String>, Option<String>)> {
-    if owner.to_bytes() == spl_token::ID.to_bytes() {
-        let mint = spl_token::state::Mint::unpack(data).ok()?;
-        let mint_authority = match mint.mint_authority {
-            COption::Some(p) => Some(p.to_string()),
-            COption::None => None,
-        };
-        let freeze_authority = match mint.freeze_authority {
-            COption::Some(p) => Some(p.to_string()),
-            COption::None => None,
-        };
-        Some((mint.decimals, mint.supply, mint_authority, freeze_authority))
-    } else if owner.to_bytes() == spl_token_2022::ID.to_bytes() {
-        let mint = StateWithExtensions::<spl_token_2022::state::Mint>::unpack(data).ok()?;
-        let base = mint.base;
-        let mint_authority = match base.mint_authority {
-            COption::Some(p) => Some(p.to_string()),
-            COption::None => None,
-        };
-        let freeze_authority = match base.freeze_authority {
-            COption::Some(p) => Some(p.to_string()),
-            COption::None => None,
-        };
-        Some((base.decimals, base.supply, mint_authority, freeze_authority))
-    } else {
-        None
-    }
-}
-
-/// Parse a Token Account to extract the balance (amount).
-/// Works with both spl-token and spl-token-2022 accounts.
-fn try_parse_token_account_balance(data: &[u8]) -> Option<u64> {
-    // SPL Token Account layout: 165 bytes
-    // Offset 64: amount (u64, little-endian)
-    if data.len() >= 72 {
-        // Standard spl-token Account layout
-        let amount_bytes: [u8; 8] = data[64..72].try_into().ok()?;
-        Some(u64::from_le_bytes(amount_bytes))
-    } else {
-        None
-    }
-}
-
-/// WSOL wrapped-SOL token account: balance from a Geyser account update, or `None` to skip.
-/// Empty `data` means the account no longer exists as a token account (e.g. ATA closed) → `Some(0)`.
-fn wsol_ata_balance_lamports_from_geyser_data(data: &[u8]) -> Option<u64> {
-    if data.is_empty() {
-        return Some(0);
-    }
-    try_parse_token_account_balance(data)
-}
-
-/// Which tracked-wallet Geyser account produced a balance update.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WalletGeyserUpdateSource {
-    NativeSol { lamports: u64, prev_lamports: u64 },
-    WsolAta { balance: u64, prev_balance: u64 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WalletGeyserSnapshotMint {
-    NativeSol,
-    Wsol,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WalletGeyserSnapshotToPublish {
-    mint: WalletGeyserSnapshotMint,
-    balance_raw: u64,
-}
-
-/// One Geyser account update → at most one wallet snapshot. Never cross-publish the other mint from cache.
-fn wallet_geyser_snapshots_to_publish(
-    source: WalletGeyserUpdateSource,
-) -> Option<WalletGeyserSnapshotToPublish> {
-    match source {
-        WalletGeyserUpdateSource::NativeSol {
-            lamports,
-            prev_lamports,
-        } => (lamports != prev_lamports).then_some(WalletGeyserSnapshotToPublish {
-            mint: WalletGeyserSnapshotMint::NativeSol,
-            balance_raw: lamports,
-        }),
-        WalletGeyserUpdateSource::WsolAta {
-            balance,
-            prev_balance,
-        } => (balance != prev_balance).then_some(WalletGeyserSnapshotToPublish {
-            mint: WalletGeyserSnapshotMint::Wsol,
-            balance_raw: balance,
-        }),
     }
 }
 
@@ -7138,6 +7126,7 @@ async fn handle_pool_discovery_market_event(
 /// Geyser account ingest (dedizierter Task-Fairness, siehe MARKET-DATA-ACCOUNT-INGEST-FAIRNESS).
 /// STOP-CHECK (PR165): **keine** RPC-Calls — weder direkt noch via `tokio::spawn` aus diesem Handler.
 #[allow(clippy::too_many_arguments)]
+/// Geyser account ingest — delegates to `ingest/account_handler.rs` (Phase 4b).
 async fn handle_geyser_account(
     ctx: Arc<MarketDataContext>,
     run_id: &str,
@@ -7145,486 +7134,22 @@ async fn handle_geyser_account(
     account_count: &AtomicU64,
     recv_at: Instant,
     publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
-    _md_state: &MdStateSender,
+    md_state: &MdStateSender,
     md_sidefx: &MdSidefxSender,
 ) {
-    let account_geyser_recv_at = recv_at;
-    account_count.fetch_add(1, Ordering::Relaxed);
-    record_market_data_tokio_progress();
-    ironcrab::metrics::record_activity();
-
-    // === WsolManager Support: Wallet Balance Updates ===
-    // Track SOL (native) and WSOL (ATA) balance changes for WsolManager
-    if let Some(ref tracked_wallet) = ctx.tracked_wallet {
-        let is_wallet_account = account_update.pubkey == tracked_wallet.wallet;
-        let is_wsol_ata = account_update.pubkey == tracked_wallet.wsol_ata;
-        let is_token_ata = ctx
-            .tracked_wallet_token_accounts
-            .read()
-            .contains(&account_update.pubkey);
-
-        if is_wallet_account {
-            // Native SOL account — balance is in lamports field. Publish NATIVE_SOL only.
-            let lamports = account_update.lamports;
-            let prev = tracked_wallet
-                .last_sol_balance
-                .swap(lamports, Ordering::Relaxed);
-            if let Some(snapshot) =
-                wallet_geyser_snapshots_to_publish(WalletGeyserUpdateSource::NativeSol {
-                    lamports,
-                    prev_lamports: prev,
-                })
-            {
-                if ctx.nats.is_some() {
-                    let wallet_str = tracked_wallet.wallet.to_string();
-                    let sol_snapshot = MarketEvent::new(
-                        "market-data",
-                        BUILD_VERSION,
-                        run_id,
-                        format!("geyser_wallet_sol_{}", account_update.slot),
-                        "geyser_wallet_update",
-                        Some(account_update.slot),
-                        MarketEventKind::WalletBalanceSnapshot {
-                            mint: "NATIVE_SOL".to_string(),
-                            balance_raw: snapshot.balance_raw,
-                            decimals: 9,
-                            token_program: "system".to_string(),
-                        },
-                    );
-                    let sol_subject = wallet_snapshot_subject(&wallet_str, "NATIVE_SOL");
-                    account_path_enqueue_jetstream(
-                        publish_tx,
-                        ctx.nats.as_ref(),
-                        sol_subject,
-                        &sol_snapshot,
-                        "native SOL WalletBalanceSnapshot",
-                        false,
-                    )
-                    .await;
-
-                    info!(
-                        wallet = %wallet_str,
-                        sol_lamports = snapshot.balance_raw,
-                        slot = account_update.slot,
-                        "WalletBalanceSnapshot (NATIVE_SOL) enqueued for JetStream"
-                    );
-                }
-            }
-        } else if is_wsol_ata {
-            // WSOL ATA — parse token account balance. Publish WSOL only.
-            // When the ATA is closed (unwrap), Geyser often delivers an update with
-            // `data` empty (account gone) — not parseable as SPL token state.
-            // That means WSOL=0. Previously we `continue`d and kept a stale balance
-            // with no zero WalletBalanceSnapshot to JetStream.
-            let Some(balance) = wsol_ata_balance_lamports_from_geyser_data(&account_update.data)
-            else {
-                return;
-            };
-            let prev = tracked_wallet
-                .last_wsol_balance
-                .swap(balance, Ordering::Relaxed);
-            tracked_wallet.wsol_seen.store(true, Ordering::Relaxed);
-            if let Some(snapshot) =
-                wallet_geyser_snapshots_to_publish(WalletGeyserUpdateSource::WsolAta {
-                    balance,
-                    prev_balance: prev,
-                })
-            {
-                if ctx.nats.is_some() {
-                    let wallet_str = tracked_wallet.wallet.to_string();
-                    let wsol_snapshot = MarketEvent::new(
-                        "market-data",
-                        BUILD_VERSION,
-                        run_id,
-                        format!("geyser_wallet_wsol_{}", account_update.slot),
-                        "geyser_wallet_update",
-                        Some(account_update.slot),
-                        MarketEventKind::WalletBalanceSnapshot {
-                            mint: WSOL_MINT.to_string(),
-                            balance_raw: snapshot.balance_raw,
-                            decimals: 9,
-                            token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-                                .to_string(),
-                        },
-                    );
-                    let wsol_subject = wallet_snapshot_subject(&wallet_str, WSOL_MINT);
-                    account_path_enqueue_jetstream(
-                        publish_tx,
-                        ctx.nats.as_ref(),
-                        wsol_subject,
-                        &wsol_snapshot,
-                        "WSOL WalletBalanceSnapshot",
-                        false,
-                    )
-                    .await;
-
-                    info!(
-                        wallet = %wallet_str,
-                        wsol_lamports = snapshot.balance_raw,
-                        slot = account_update.slot,
-                        "WalletBalanceSnapshot (WSOL) enqueued for JetStream"
-                    );
-                }
-            }
-        } else if is_token_ata
-            && (account_update.owner.to_bytes() == spl_token::ID.to_bytes()
-                || account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes())
-        {
-            let (mint, balance_raw) = if account_update.owner.to_bytes() == spl_token::ID.to_bytes()
-            {
-                match spl_token::state::Account::unpack(&account_update.data) {
-                    Ok(acc) => (Pubkey::new_from_array(acc.mint.to_bytes()), acc.amount),
-                    Err(_) => return,
-                }
-            } else {
-                // Token-2022 accounts may have extensions (data > 165 bytes).
-                // Use StateWithExtensions instead of Pack::unpack.
-                match StateWithExtensions::<spl_token_2022::state::Account>::unpack(
-                    &account_update.data,
-                ) {
-                    Ok(state) => (
-                        Pubkey::new_from_array(state.base.mint.to_bytes()),
-                        state.base.amount,
-                    ),
-                    Err(_) => return,
-                }
-            };
-
-            let decimals = ctx
-                .tracked_wallet_mint_decimals
-                .read()
-                .get(&mint)
-                .copied()
-                .unwrap_or_else(|| {
-                    // This should only happen for accounts created after initial scan.
-                    // Log a warning so we can track if this becomes a problem.
-                    warn!(
-                        mint = %mint,
-                        account = %account_update.pubkey,
-                        "Decimals not cached for token account, using default 6"
-                    );
-                    6
-                });
-
-            let mint_str = mint.to_string();
-            let event = MarketEvent::new(
-                "market-data",
-                BUILD_VERSION,
-                run_id,
-                ctx.next_event_id(),
-                "geyser_wallet_update",
-                Some(account_update.slot),
-                MarketEventKind::WalletBalanceSnapshot {
-                    mint: mint_str.clone(),
-                    balance_raw,
-                    decimals,
-                    token_program: account_update.owner.to_string(),
-                },
-            );
-
-            if ctx.nats.is_some() {
-                let subject =
-                    wallet_snapshot_subject(&tracked_wallet.wallet.to_string(), &mint_str);
-                account_path_enqueue_jetstream(
-                    publish_tx,
-                    ctx.nats.as_ref(),
-                    subject,
-                    &event,
-                    "WalletBalanceSnapshot JetStream",
-                    true,
-                )
-                .await;
-            }
-
-            ctx.write_market_event_jsonl(&event);
-        }
-    }
-
-    // Tracked mint updates (Token mint authority/freeze info)
-    if (account_update.owner.to_bytes() == spl_token::ID.to_bytes()
-        || account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes())
-        && ctx
-            .tracked_membership
-            .load()
-            .mints
-            .contains(&account_update.pubkey)
-    {
-        if let Some((decimals, supply, mint_authority, freeze_authority)) =
-            try_parse_mint_account(&account_update.owner, &account_update.data)
-        {
-            // Decimals-Policy: TokenMintInfo from Geyser is authoritative.
-            // Keep wallet decimals cache warm so WalletBalanceSnapshot never needs the 6-decimal fallback.
-            ctx.tracked_wallet_mint_decimals
-                .write()
-                .insert(account_update.pubkey, decimals);
-
-            // Phase-R-R4b: MASTER mint_decimals off account ingest (`md-sidefx`).
-            md_sidefx_try_enqueue(
-                md_sidefx,
-                MdSidefxCommand::LivePoolCacheMintDecimals {
-                    mint: account_update.pubkey,
-                    decimals,
-                },
-            );
-
-            let is_token_2022 = account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes();
-
-            let mint_event = MarketEvent::new(
-                "market-data",
-                BUILD_VERSION,
-                run_id,
-                ctx.next_event_id(),
-                "geyser",
-                Some(account_update.slot),
-                MarketEventKind::TokenMintInfo {
-                    mint: account_update.pubkey.to_string(),
-                    token_program: account_update.owner.to_string(),
-                    decimals,
-                    supply,
-                    mint_authority,
-                    freeze_authority,
-                },
-            );
-
-            // Log Token-2022 mints explicitly (debugging)
-            if is_token_2022 {
-                info!(
-                    mint = %account_update.pubkey,
-                    token_program = %account_update.owner,
-                    decimals,
-                    supply,
-                    "TokenMintInfo: Token-2022 mint detected via Geyser"
-                );
-            } else {
-                debug!(
-                    mint = %account_update.pubkey,
-                    token_program = %account_update.owner,
-                    decimals,
-                    "TokenMintInfo: SPL Token mint via Geyser"
-                );
-            }
-
-            ctx.write_market_event_jsonl(&mint_event);
-
-            if ctx.nats.is_some() {
-                account_path_enqueue_core_market_event(
-                    publish_tx,
-                    ctx.nats.as_ref(),
-                    &ctx,
-                    mint_event,
-                    Some(MarketEventCorePublishTrace {
-                        recv_at: account_geyser_recv_at,
-                        cold_path: false,
-                        segment: MarketDataLatencySegment::Other,
-                    }),
-                )
-                .await;
-            }
-        }
-    }
-
-    // Vault account updates → emit PoolStateUpdate (Geyser-based reserve balances)
-    // This eliminates the need for RPC calls to fetch vault balances.
-    if account_update.owner.to_bytes() == spl_token::ID.to_bytes()
-        || account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes()
-    {
-        // Phase-R-R4: vault pairing + publish off hot path (`md-sidefx`; no `tracked_vaults` read here).
-        if let Some(balance) = try_parse_token_account_balance(&account_update.data) {
-            md_sidefx_try_enqueue(
-                md_sidefx,
-                MdSidefxCommand::VaultBalanceTick {
-                    run_id: run_id.to_string(),
-                    vault_pubkey: account_update.pubkey,
-                    balance,
-                    slot: account_update.slot,
-                    grpc_recv_at: account_update.grpc_recv_at,
-                },
-            );
-        }
-    }
-
-    // Bin Array account updates → emit BinArrayUpdate (Geyser-based liquidity distribution)
-    // This eliminates the need for RPC calls to fetch Meteora DLMM bin arrays.
-    let dlmm_program =
-        Pubkey::from_str(METEORA_DLMM_PROGRAM).expect("Invalid METEORA_DLMM_PROGRAM constant");
-    if account_update.owner == dlmm_program {
-        let snap = ctx.tracked_membership.load();
-        let bin_array_info_opt = snap
-            .bin_array_by_pubkey
-            .get(&account_update.pubkey)
-            .cloned();
-        if let Some(bin_array_info) = bin_array_info_opt {
-            md_sidefx_try_enqueue(
-                md_sidefx,
-                MdSidefxCommand::TouchBinArrayTick {
-                    pda: account_update.pubkey,
-                },
-            );
-            // Parse bin array to extract liquidity distribution
-            match BinArray::parse(&account_update.data, bin_array_info.bin_step) {
-                Ok(parsed_array) => {
-                    // Convert to compact BinData (only bins with liquidity)
-                    let bins: Vec<BinData> = parsed_array
-                        .bins
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, bin)| bin.amount_x > 0 || bin.amount_y > 0)
-                        .map(|(offset, bin)| BinData {
-                            offset: offset as u8,
-                            amount_x: bin.amount_x,
-                            amount_y: bin.amount_y,
-                        })
-                        .collect();
-
-                    // Only emit if there's any liquidity
-                    if !bins.is_empty() {
-                        let bin_event = MarketEvent::new(
-                            "market-data",
-                            BUILD_VERSION,
-                            run_id,
-                            ctx.next_event_id(),
-                            "geyser_bin_array",
-                            Some(account_update.slot),
-                            MarketEventKind::BinArrayUpdate {
-                                pool_address: bin_array_info.pool_address.to_string(),
-                                bin_array_index: bin_array_info.bin_array_index,
-                                bins,
-                                update_slot: account_update.slot,
-                            },
-                        );
-
-                        ctx.write_market_event_jsonl(&bin_event);
-
-                        if ctx.nats.is_some() {
-                            account_path_enqueue_core_market_event(
-                                publish_tx,
-                                ctx.nats.as_ref(),
-                                &ctx,
-                                bin_event,
-                                Some(MarketEventCorePublishTrace {
-                                    recv_at: account_geyser_recv_at,
-                                    cold_path: false,
-                                    segment: MarketDataLatencySegment::Other,
-                                }),
-                            )
-                            .await;
-                        }
-                        if ctx
-                            .hot_pool_registry
-                            .is_hot_pool(bin_array_info.pool_address)
-                        {
-                            md_sidefx_try_enqueue(
-                                md_sidefx,
-                                MdSidefxCommand::DlmmPoolStatePublishSignal {
-                                    run_id: run_id.to_string(),
-                                    pool_address: bin_array_info.pool_address,
-                                    slot: account_update.slot,
-                                    grpc_recv_at: account_geyser_recv_at,
-                                },
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        error = %e,
-                        pubkey = %account_update.pubkey,
-                        "Failed to parse bin array account"
-                    );
-                }
-            }
-        }
-    }
-
-    // Phase-R-R4b: LivePoolCache populate + PoolCacheUpdate off account ingest (`md-sidefx`).
-    if account_geyser_update_is_dex_pool_owner(&account_update.owner) {
-        md_sidefx_try_enqueue(
-            md_sidefx,
-            MdSidefxCommand::LivePoolCacheAccountUpdate {
-                run_id: run_id.to_string(),
-                pool_pubkey: account_update.pubkey,
-                owner: account_update.owner,
-                account_data: account_update.data.clone(),
-                slot: account_update.slot,
-                grpc_recv_at: account_geyser_recv_at,
-            },
-        );
-    }
-
-    // Try to parse as DEX pool event (for MarketEvents - existing logic)
-    let parsed = parse_account_update(&account_update);
-
-    // Special handling for PumpFun BondingCurveUpdate: cache creator
-    if let Some(ParsedDexEvent::BondingCurveUpdate {
-        pool_address,
-        creator,
-        virtual_token_reserves,
-        virtual_sol_reserves,
-        real_token_reserves,
-        real_sol_reserves,
-        complete,
-        cashback_enabled,
-        slot,
-    }) = &parsed
-    {
-        md_sidefx_try_enqueue(
-            md_sidefx,
-            MdSidefxCommand::BondingCurveDevWallet {
-                run_id: run_id.to_string(),
-                pool_address: *pool_address,
-                creator: *creator,
-                slot: *slot,
-                grpc_recv_at: account_update.grpc_recv_at,
-                virtual_token_reserves: *virtual_token_reserves,
-                virtual_sol_reserves: *virtual_sol_reserves,
-                real_token_reserves: *real_token_reserves,
-                real_sol_reserves: *real_sol_reserves,
-                complete: *complete,
-                cashback_enabled: *cashback_enabled,
-            },
-        );
-        // Don't emit the BondingCurveUpdate as a MarketEvent - it's internal
-        return;
-    }
-
-    let Some(parsed) = parsed else {
-        inc_market_data_unparsed_account_dropped_total();
-        return;
-    };
-
-    debug!(slot = account_update.slot, "Parsed DEX account update");
-    let event_kind = parsed.to_market_event_kind();
-
-    let event = MarketEvent::new(
-        "market-data",
-        BUILD_VERSION,
+    handle_geyser_account_update(
+        ctx.as_ref(),
         run_id,
-        ctx.next_event_id(),
-        "geyser",
-        Some(account_update.slot),
-        event_kind,
-    );
-
-    // Write to JSONL
-    ctx.write_market_event_jsonl(&event);
-
-    // Publish to NATS
-    if ctx.nats.is_some() {
-        let seg = market_data_publish_segment(&event.kind);
-        account_path_enqueue_core_market_event(
-            publish_tx,
-            ctx.nats.as_ref(),
-            &ctx,
-            event,
-            Some(MarketEventCorePublishTrace {
-                recv_at: account_geyser_recv_at,
-                cold_path: false,
-                segment: seg,
-            }),
-        )
-        .await;
-    }
+        account_update,
+        account_count,
+        recv_at,
+        publish_tx,
+        md_state,
+        md_sidefx,
+    )
+    .await;
 }
+
 /// Geyser transaction ingest — delegates to `ingest/tx_handler.rs` (Phase 4).
 async fn handle_geyser_transaction(
     ctx: Arc<MarketDataContext>,
@@ -10295,7 +9820,7 @@ mod discovery_tests {
 /// WSOL ATA balance parsing from Geyser (Scope 55: zero after close)
 #[cfg(test)]
 mod wsol_ata_update_tests {
-    use super::wsol_ata_balance_lamports_from_geyser_data;
+    use ironcrab::market_data::ingest::wsol_ata_balance_lamports_from_geyser_data;
 
     #[test]
     fn empty_wsol_ata_data_means_zero_balance() {
@@ -10324,7 +9849,7 @@ mod wsol_ata_update_tests {
 /// Decoupled SOL/WSOL Geyser publish decisions (KNOWN_BUG_PATTERNS #23 fix).
 #[cfg(test)]
 mod wallet_geyser_snapshot_decouple_tests {
-    use super::{
+    use ironcrab::market_data::ingest::{
         wallet_geyser_snapshots_to_publish, WalletGeyserSnapshotMint, WalletGeyserUpdateSource,
     };
 
@@ -14817,6 +14342,69 @@ mod pr_b_geyser_tracking_tests {
             bin_src.contains("impl TxIngestHost for MarketDataContext"),
             "bin must wire MarketDataContext to TxIngestHost"
         );
+        assert!(
+            bin_src.contains("impl AccountIngestHost for MarketDataContext"),
+            "bin must wire MarketDataContext to AccountIngestHost"
+        );
+    }
+
+    /// Phase 4b: Geyser account handler lives in dedicated ingest module; bin retains thin wrapper.
+    #[test]
+    fn phase4b_account_handler_in_ingest_module() {
+        let account_handler_src = include_str!("../market_data/ingest/account_handler.rs");
+        let account_parse_src = include_str!("../market_data/ingest/account_parse.rs");
+        let bin_src = include_str!("market_data.rs");
+        let prod_src = bin_src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source section");
+        assert!(
+            account_handler_src.contains("pub async fn handle_geyser_account_update"),
+            "account_handler.rs must define handle_geyser_account_update"
+        );
+        assert!(
+            account_parse_src.contains("pub fn try_parse_mint_account"),
+            "account_parse.rs must contain account-only parse helpers"
+        );
+        assert!(
+            prod_src.contains("handle_geyser_account_update"),
+            "bin production code must delegate to ingest account handler"
+        );
+        assert!(
+            !prod_src.contains("Parsed DEX account update"),
+            "account handler body must not remain in bin production section"
+        );
+    }
+
+    /// Phase 4b: account ingest module must not read tracked_* maps or arb reconcile paths.
+    #[test]
+    fn phase4b_account_ingest_no_tracked_reads() {
+        let ingest_src = format!(
+            "{}\n{}\n{}",
+            include_str!("../market_data/ingest/account_handler.rs"),
+            include_str!("../market_data/ingest/account_parse.rs"),
+            include_str!("../market_data/ingest/account_host.rs"),
+        );
+        assert!(
+            !ingest_src.contains("tracked_vaults.read()"),
+            "account ingest must not read tracked_vaults"
+        );
+        assert!(
+            !ingest_src.contains("tracked_mints.read()"),
+            "account ingest must not read tracked_mints"
+        );
+        assert!(
+            !ingest_src.contains("tracked_bin_arrays.read()"),
+            "account ingest must not read tracked_bin_arrays"
+        );
+        assert!(
+            !ingest_src.contains("reconcile_arb"),
+            "account ingest must not call arb reconcile paths (I-4c)"
+        );
+        assert!(
+            !ingest_src.contains("sync_geyser_tracked_accounts_batched_flush"),
+            "account ingest must not call explicit Geyser flush inline"
+        );
     }
 
     /// Phase 4: Geyser TX handler lives in dedicated ingest module; bin retains thin wrapper.
@@ -14851,11 +14439,14 @@ mod pr_b_geyser_tracking_tests {
     #[test]
     fn phase4_ingest_no_tracked_reads() {
         let ingest_src = format!(
-            "{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             include_str!("../market_data/ingest/tx_handler.rs"),
             include_str!("../market_data/ingest/tx_parse.rs"),
             include_str!("../market_data/ingest/account_filter.rs"),
             include_str!("../market_data/ingest/tx_filter.rs"),
+            include_str!("../market_data/ingest/account_handler.rs"),
+            include_str!("../market_data/ingest/account_parse.rs"),
+            include_str!("../market_data/ingest/account_host.rs"),
         );
         assert!(
             !ingest_src.contains("tracked_vaults.read()"),
