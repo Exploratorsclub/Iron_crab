@@ -382,6 +382,18 @@ pub static MARKET_DATA_GEYSER_SUBSCRIBE_DELTA_PUBKEYS: Lazy<AtomicU64> =
 /// Phase 2a: track-worker coalesced Geyser push batches completed (500 ms window).
 pub static MARKET_DATA_TRACK_REQUEST_COALESCE_BATCHES_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Phase 3 P3: explicit-set snapshot writes completed.
+pub static MARKET_DATA_EXPLICIT_SET_SNAPSHOT_WRITE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Phase 3 P3: explicit-set snapshot write failures (graceful degrade).
+pub static MARKET_DATA_EXPLICIT_SET_SNAPSHOT_WRITE_ERRORS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Phase 3 P3: pubkeys restored from explicit-set snapshot on startup.
+pub static MARKET_DATA_EXPLICIT_SET_SNAPSHOT_RESTORE_PUBKEYS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Phase 3 P3: wall ms for explicit-set snapshot restore on startup.
+pub static MARKET_DATA_EXPLICIT_SET_SNAPSHOT_RESTORE_DURATION_MS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// UnifiedHotPoolRegistry pool count (momentum-only hot pools).
 pub static MARKET_DATA_HOT_POOL_REGISTRY_POOLS_MOMENTUM: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -725,6 +737,26 @@ pub fn record_market_data_geyser_subscribe_delta_pubkeys(n: u64) {
 #[inline]
 pub fn inc_market_data_track_request_coalesce_batches_total() {
     MARKET_DATA_TRACK_REQUEST_COALESCE_BATCHES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_explicit_set_snapshot_write_total() {
+    MARKET_DATA_EXPLICIT_SET_SNAPSHOT_WRITE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_explicit_set_snapshot_write_errors_total() {
+    MARKET_DATA_EXPLICIT_SET_SNAPSHOT_WRITE_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_explicit_set_snapshot_restore_pubkeys(n: u64) {
+    MARKET_DATA_EXPLICIT_SET_SNAPSHOT_RESTORE_PUBKEYS.store(n, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_explicit_set_snapshot_restore_duration_ms(ms: u64) {
+    MARKET_DATA_EXPLICIT_SET_SNAPSHOT_RESTORE_DURATION_MS.store(ms, Ordering::Relaxed);
 }
 
 #[inline]
@@ -5993,6 +6025,22 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_track_request_coalesce_batches_total",
         MARKET_DATA_TRACK_REQUEST_COALESCE_BATCHES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_explicit_set_snapshot_write_total",
+        MARKET_DATA_EXPLICIT_SET_SNAPSHOT_WRITE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_explicit_set_snapshot_write_errors_total",
+        MARKET_DATA_EXPLICIT_SET_SNAPSHOT_WRITE_ERRORS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_explicit_set_snapshot_restore_pubkeys",
+        MARKET_DATA_EXPLICIT_SET_SNAPSHOT_RESTORE_PUBKEYS.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_explicit_set_snapshot_restore_duration_ms",
+        MARKET_DATA_EXPLICIT_SET_SNAPSHOT_RESTORE_DURATION_MS.load(Ordering::Relaxed)
     );
     out.push_str("market_data_hot_pool_registry_pools{reason=\"momentum\"} ");
     out.push_str(

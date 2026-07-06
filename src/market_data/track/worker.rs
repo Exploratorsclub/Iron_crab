@@ -2,7 +2,13 @@
 
 use super::desired_set::DesiredExplicitSet;
 use super::geyser_sync::track_worker_execute_coalesced_push;
+use super::snapshot::{
+    explicit_set_snapshot_path, write_explicit_set_snapshot, ExplicitSetSnapshot,
+    MARKET_DATA_EXPLICIT_SET_SNAPSHOT_INTERVAL_SECS,
+};
 use crate::metrics::{
+    inc_market_data_explicit_set_snapshot_write_errors_total,
+    inc_market_data_explicit_set_snapshot_write_total,
     inc_market_data_geyser_tracking_enqueue_dropped_total,
     inc_market_data_track_request_coalesce_batches_total,
     record_market_data_arb_track_requests_messages_total,
@@ -66,6 +72,8 @@ pub trait TrackWorkerContext: Send + Sync {
     fn explicit_pubkey_rows_for_desired_set(
         &self,
     ) -> Vec<(Pubkey, super::ConsumerId, Option<Pubkey>)>;
+    fn build_explicit_set_snapshot(&self) -> ExplicitSetSnapshot;
+    fn apply_explicit_set_snapshot(&self, snapshot: &ExplicitSetSnapshot) -> usize;
 }
 
 /// Phase 2a: commands for the `md-track-worker` OS thread (DesiredExplicitSet + coalesced Geyser push).
@@ -84,6 +92,8 @@ pub enum TrackWorkerCommand {
     ScheduleGeyserPush,
     /// Debounced push after `try_acquire_geyser_sync_flush_slot` (rate-limited TX debounce thread).
     ScheduleGeyserPushDebounced,
+    /// Phase 3 P3: restore explicit set from on-disk snapshot (I-MD-6).
+    RestoreExplicitSnapshot(ExplicitSetSnapshot),
     ContinueGeyserEvict,
 }
 
@@ -196,6 +206,9 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
             ctx.track_mint_for_geyser_metadata(mint, pin)
         }
         TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange => true,
+        TrackWorkerCommand::RestoreExplicitSnapshot(snapshot) => {
+            ctx.apply_explicit_set_snapshot(&snapshot) > 0
+        }
         TrackWorkerCommand::ScheduleGeyserPush
         | TrackWorkerCommand::ScheduleGeyserPushDebounced
         | TrackWorkerCommand::ContinueGeyserEvict => false,
@@ -213,6 +226,11 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
     let mut push_before_keys: Option<HashSet<Pubkey>> = None;
     let mut pending_continue_evict = false;
     let mut pending_release_flush_slot = false;
+    let mut last_snapshot_write = Instant::now()
+        .checked_sub(Duration::from_secs(
+            MARKET_DATA_EXPLICIT_SET_SNAPSHOT_INTERVAL_SECS,
+        ))
+        .unwrap_or_else(Instant::now);
 
     loop {
         let timeout = match coalesce_deadline {
@@ -292,8 +310,35 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
             }
             inc_market_data_track_request_coalesce_batches_total();
             ctx.refresh_hot_pool_registry_gauges();
+            if last_snapshot_write.elapsed()
+                >= Duration::from_secs(MARKET_DATA_EXPLICIT_SET_SNAPSHOT_INTERVAL_SECS)
+            {
+                last_snapshot_write = Instant::now();
+                try_write_explicit_set_snapshot_from_ctx(ctx.as_ref());
+            }
         }
     }
+}
+
+fn try_write_explicit_set_snapshot_from_ctx<C: TrackWorkerContext>(ctx: &C) {
+    let path = explicit_set_snapshot_path();
+    let snapshot = ctx.build_explicit_set_snapshot();
+    match write_explicit_set_snapshot(&path, &snapshot) {
+        Ok(()) => inc_market_data_explicit_set_snapshot_write_total(),
+        Err(e) => {
+            inc_market_data_explicit_set_snapshot_write_errors_total();
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "explicit-set snapshot write failed (graceful degrade)"
+            );
+        }
+    }
+}
+
+/// Best-effort explicit-set snapshot flush (shutdown / external caller).
+pub fn flush_explicit_set_snapshot<C: TrackWorkerContext>(ctx: &C) {
+    try_write_explicit_set_snapshot_from_ctx(ctx);
 }
 
 pub fn spawn_track_worker<C: TrackWorkerContext + 'static>(ctx: Arc<C>) -> TrackWorkerSender {
