@@ -187,6 +187,24 @@ fn md_sidefx_publish_enrichment_from_cache_upsert(
     }
 }
 
+/// P2 SLO: count enrichment publishes only for EnrichmentRegistry members.
+fn md_sidefx_inc_enrichment_publish_metrics_if_member(
+    host: &dyn SidefxWorkerHost,
+    pool: &Pubkey,
+    balance_js: bool,
+    pool_state: bool,
+) {
+    if !host.is_enrichment_member(pool) {
+        return;
+    }
+    if balance_js {
+        inc_market_data_enrichment_balance_updated_total();
+    }
+    if pool_state {
+        inc_market_data_enrichment_pool_state_publish_total();
+    }
+}
+
 /// Build PoolStateUpdate from MASTER LivePoolCache (Geyser-only; no RPC).
 fn md_sidefx_build_pool_state_update_from_cache(
     host: &dyn SidefxWorkerHost,
@@ -1696,6 +1714,12 @@ pub fn md_sidefx_process_vault_balance_tick(
             "PoolCacheUpdate::BalanceUpdated",
             false,
         );
+        md_sidefx_inc_enrichment_publish_metrics_if_member(
+            host,
+            &vault_view.pool_address,
+            true,
+            false,
+        );
         info!(
             pool = %vault_view.pool_address,
             slot = slot,
@@ -1726,13 +1750,19 @@ pub fn md_sidefx_process_vault_balance_tick(
     host.write_market_event_jsonl(&state_event);
 
     if host.nats_enabled() {
-        host.enqueue_core_market_event(
+        let pool_state_enqueued = host.enqueue_core_market_event(
             state_event,
             Some(MarketEventCorePublishTrace {
                 recv_at: *grpc_recv_at,
                 cold_path: false,
                 segment: MarketDataLatencySegment::Other,
             }),
+        );
+        md_sidefx_inc_enrichment_publish_metrics_if_member(
+            host,
+            &vault_view.pool_address,
+            false,
+            pool_state_enqueued,
         );
     }
 }

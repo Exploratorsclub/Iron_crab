@@ -1546,8 +1546,28 @@ static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_SUM: Lazy<AtomicU64> =
 static MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_COUNT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// Early-drop reason for `market_data_account_early_drop_total{reason=...}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketDataAccountEarlyDropReason {
+    NonDexNonMembership,
+    DexPoolNotEnrichment,
+}
+
+impl MarketDataAccountEarlyDropReason {
+    #[inline]
+    pub fn as_prometheus_label(self) -> &'static str {
+        match self {
+            Self::NonDexNonMembership => "non_dex_non_membership",
+            Self::DexPoolNotEnrichment => "dex_pool_not_enrichment",
+        }
+    }
+}
+
 /// Account ingest: cheap relevance filter discarded the update before `handle_geyser_account` body.
-pub static MARKET_DATA_ACCOUNT_EARLY_DROP_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ACCOUNT_EARLY_DROP_NON_DEX_NON_MEMBERSHIP: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ACCOUNT_EARLY_DROP_DEX_POOL_NOT_ENRICHMENT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 /// Wall microseconds for `handle_geyser_account` body per worker (excludes queue wait).
 const MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_BUCKETS: &[u64] = &[
@@ -1842,8 +1862,16 @@ pub fn set_market_data_account_publish_worker_last_success_unix_ms(worker_id: us
 }
 
 #[inline]
-pub fn record_market_data_account_early_drop_total() {
-    MARKET_DATA_ACCOUNT_EARLY_DROP_TOTAL.fetch_add(1, Ordering::Relaxed);
+pub fn record_market_data_account_early_drop(reason: MarketDataAccountEarlyDropReason) {
+    let counter = match reason {
+        MarketDataAccountEarlyDropReason::NonDexNonMembership => {
+            &*MARKET_DATA_ACCOUNT_EARLY_DROP_NON_DEX_NON_MEMBERSHIP
+        }
+        MarketDataAccountEarlyDropReason::DexPoolNotEnrichment => {
+            &*MARKET_DATA_ACCOUNT_EARLY_DROP_DEX_POOL_NOT_ENRICHMENT
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Per-account-update handler wall time (worker), microseconds.
@@ -6390,10 +6418,20 @@ async fn metrics_response() -> Response<Body> {
         &MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_SUM,
         &MARKET_DATA_ACCOUNT_PUBLISH_WORKER_JOB_DURATION_US_COUNT,
     );
-    line!(
-        "market_data_account_early_drop_total",
-        MARKET_DATA_ACCOUNT_EARLY_DROP_TOTAL.load(Ordering::Relaxed)
+    out.push_str("market_data_account_early_drop_total{reason=\"non_dex_non_membership\"} ");
+    out.push_str(
+        &MARKET_DATA_ACCOUNT_EARLY_DROP_NON_DEX_NON_MEMBERSHIP
+            .load(Ordering::Relaxed)
+            .to_string(),
     );
+    out.push('\n');
+    out.push_str("market_data_account_early_drop_total{reason=\"dex_pool_not_enrichment\"} ");
+    out.push_str(
+        &MARKET_DATA_ACCOUNT_EARLY_DROP_DEX_POOL_NOT_ENRICHMENT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     append_momentum_latency_histogram_prometheus(
         &mut out,
         "market_data_account_handler_duration_us",
