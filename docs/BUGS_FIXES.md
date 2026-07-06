@@ -1641,3 +1641,15 @@ BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap 
 | **Betroffene Module** | `src/market_data/ingest/`, `src/bin/market_data.rs`, `docs/systemd/market-data.service` |
 | **Regression-Prüfung** | `cargo fmt`, `cargo clippy -D warnings`, `cargo test`, `cargo test phase4_`; Eval Level 5. |
 | **Tags** | [market-data, hybrid-rollback, phase4, tx-ingest, monolith-slice, systemd, i-md-1, pr-phase4-tx] |
+
+---
+
+## MD-PHASE4B-ACCOUNT-INGEST: Geyser Account Handler nach `ingest/` extrahiert (2026-07-06)
+
+| Symptom | `market_data.rs` Monolith ~15k LOC nach Slice 1; Account-Ingest-Logik (~500 LOC) noch im Bin. |
+|---------|--------------------------------------------------------------------------------------------------|
+| **Root Cause** | Phase 4 Slice 1 extrahierte nur TX-Pfad; Account-Pfad (`handle_geyser_account`) blieb im Monolith. |
+| **Fix** | (1) `handle_geyser_account_update` + Account-only Parse-Hilfen nach `src/market_data/ingest/account_handler.rs` / `account_parse.rs`; `AccountIngestHost`-Trait. (2) Bin: dünner `handle_geyser_account`-Wrapper. (3) `phase4b_*` grep-Tests. Semantik P2 enrichment / I-MD-4 unverändert. |
+| **Betroffene Module** | `src/market_data/ingest/`, `src/bin/market_data.rs` |
+| **Regression-Prüfung** | `cargo fmt`, `cargo clippy -D warnings`, `cargo test`, `cargo test phase4_`; Eval Level 5. |
+| **Tags** | [market-data, hybrid-rollback, phase4b, account-ingest, monolith-slice, i-md-2, i-md-4, pr-phase4b] |
