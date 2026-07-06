@@ -1,6 +1,9 @@
 pub mod account_filter;
 pub mod host;
 pub mod tx_filter;
+pub mod tx_handler;
+pub mod tx_host;
+pub mod tx_parse;
 
 pub use account_filter::{
     account_geyser_dispatch_priority_high, account_geyser_update_is_dex_pool_owner,
@@ -8,6 +11,13 @@ pub use account_filter::{
 };
 pub use host::IngestHost;
 pub use tx_filter::geyser_tx_involves_wallet;
+pub use tx_handler::handle_geyser_transaction_update;
+pub use tx_host::{TxIngestHost, TxTrackedWalletView};
+pub use tx_parse::{
+    maybe_emit_dev_wallet_after_pool_mint_map, process_wallet_balance_snapshots_from_tx_meta,
+    resolve_pumpfun_creator_tx_path, wallet_tx_meta_has_wsol_post_balance,
+    wallet_tx_meta_native_sol_post_lamports, wallet_tx_meta_pin_ata_from_balance,
+};
 
 use std::sync::Arc;
 
