@@ -12,6 +12,10 @@ use crate::metrics::{
     MarketDataLatencySegment,
 };
 use crate::nats::{wallet_snapshot_subject, NatsClient};
+use crate::solana::dex_parser::{
+    METEORA_DLMM, ORCA_WHIRLPOOL, PUMPFUN_AMM_PROGRAM, PUMPFUN_PROGRAM, RAYDIUM_AMM_V4,
+    RAYDIUM_CPMM,
+};
 use crate::solana::geyser_listener::{
     geyser_token_balance_account_pubkey, geyser_tx_involves_wallet,
     geyser_wallet_post_token_balances, GeyserTransactionUpdate, TokenBalance,
@@ -313,5 +317,57 @@ pub(crate) fn tx_publish_segment(kind: &MarketEventKind) -> MarketDataLatencySeg
         MarketEventKind::BondingCurveProgress { .. } => MarketDataLatencySegment::BondingCurve,
         MarketEventKind::PoolCreated { .. } => MarketDataLatencySegment::PoolCreated,
         _ => MarketDataLatencySegment::Other,
+    }
+}
+
+/// Whether any known DEX program id appears in the transaction account keys (no RPC).
+#[inline]
+pub fn tx_involves_known_dex_program(account_keys: &[Pubkey]) -> bool {
+    static PROGRAMS: &[&str] = &[
+        RAYDIUM_AMM_V4,
+        RAYDIUM_CPMM,
+        ORCA_WHIRLPOOL,
+        METEORA_DLMM,
+        PUMPFUN_PROGRAM,
+        PUMPFUN_AMM_PROGRAM,
+    ];
+    PROGRAMS.iter().any(|program_id| {
+        Pubkey::from_str(program_id)
+            .ok()
+            .is_some_and(|pk| account_keys.contains(&pk))
+    })
+}
+
+#[cfg(test)]
+mod tx_dex_detection_tests {
+    use super::*;
+    use crate::metrics::MarketDataUnparsedTxDropReason;
+
+    fn unparsed_tx_drop_reason(account_keys: &[Pubkey]) -> MarketDataUnparsedTxDropReason {
+        if tx_involves_known_dex_program(account_keys) {
+            MarketDataUnparsedTxDropReason::DexParseMiss
+        } else {
+            MarketDataUnparsedTxDropReason::NonDexTransaction
+        }
+    }
+
+    #[test]
+    fn tx_unparsed_drop_reason_non_dex_without_known_program() {
+        let keys = vec![Pubkey::new_unique(), Pubkey::new_unique()];
+        assert_eq!(
+            unparsed_tx_drop_reason(&keys),
+            MarketDataUnparsedTxDropReason::NonDexTransaction
+        );
+    }
+
+    #[test]
+    fn tx_unparsed_drop_reason_dex_parse_miss_when_raydium_present() {
+        let raydium = Pubkey::from_str(RAYDIUM_AMM_V4).unwrap();
+        let keys = vec![Pubkey::new_unique(), raydium];
+        assert!(tx_involves_known_dex_program(&keys));
+        assert_eq!(
+            unparsed_tx_drop_reason(&keys),
+            MarketDataUnparsedTxDropReason::DexParseMiss
+        );
     }
 }

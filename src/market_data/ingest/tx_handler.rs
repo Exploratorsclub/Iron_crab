@@ -4,7 +4,7 @@
 use super::tx_host::TxIngestHost;
 use super::tx_parse::{
     maybe_emit_dev_wallet_after_pool_mint_map, process_wallet_balance_snapshots_from_tx_meta,
-    resolve_pumpfun_creator_tx_path, tx_publish_segment,
+    resolve_pumpfun_creator_tx_path, tx_involves_known_dex_program, tx_publish_segment,
 };
 use crate::ipc::{IntentTier, MarketEvent, MarketEventKind, PriorityFeePercentiles};
 use crate::market_data::md_state::{md_state_try_enqueue, MdStateCommand, MdStateSender};
@@ -17,8 +17,9 @@ use crate::market_data::sidefx::{
     MdSidefxCommand, MdSidefxSender,
 };
 use crate::metrics::{
-    inc_market_data_unparsed_tx_dropped_total, market_data_bump_geyser_head_slot,
-    record_market_data_tx_channel_lag_ms, record_market_data_tx_handler_processed,
+    market_data_bump_geyser_head_slot, record_market_data_tx_channel_lag_ms,
+    record_market_data_tx_handler_processed, record_market_data_unparsed_tx_dropped,
+    MarketDataUnparsedTxDropReason,
 };
 use crate::nats::TOPIC_PRIORITY_FEE_SAMPLES;
 use crate::solana::dex_parser::{
@@ -320,7 +321,12 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
     }
 
     let Some(parsed) = parsed_event else {
-        inc_market_data_unparsed_tx_dropped_total();
+        let reason = if tx_involves_known_dex_program(&tx_update.account_keys) {
+            MarketDataUnparsedTxDropReason::DexParseMiss
+        } else {
+            MarketDataUnparsedTxDropReason::NonDexTransaction
+        };
+        record_market_data_unparsed_tx_dropped(reason);
         return;
     };
 

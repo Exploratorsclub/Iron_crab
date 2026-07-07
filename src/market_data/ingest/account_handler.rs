@@ -1,7 +1,9 @@
 //! Geyser account ingest handler (dedizierte worker pool, MARKET-DATA-ACCOUNT-THROUGHPUT-P0).
 //! STOP-CHECK: keine neuen RPC-Calls.
 
-use super::account_filter::account_geyser_update_is_dex_pool_owner;
+use super::account_filter::{
+    account_geyser_update_is_dex_pool_owner, account_geyser_update_is_sidefx_only_pool_owner,
+};
 use super::account_host::AccountIngestHost;
 use super::account_parse::{
     account_publish_segment, try_parse_mint_account, try_parse_token_account_balance,
@@ -17,7 +19,8 @@ use crate::market_data::sidefx::{
     md_sidefx_try_enqueue, MarketEventCorePublishTrace, MdSidefxCommand, MdSidefxSender,
 };
 use crate::metrics::{
-    inc_market_data_unparsed_account_dropped_total, record_market_data_tokio_progress,
+    record_market_data_tokio_progress, record_market_data_unparsed_account_dropped,
+    MarketDataUnparsedAccountDropReason,
 };
 use crate::nats::wallet_snapshot_subject;
 use crate::solana::dex::meteora_bin_array_layout::BinArray;
@@ -303,6 +306,7 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
                 )
                 .await;
             }
+            return;
         }
     }
 
@@ -323,6 +327,7 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
                     grpc_recv_at: account_update.grpc_recv_at,
                 },
             );
+            return;
         }
     }
 
@@ -410,6 +415,7 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
                     );
                 }
             }
+            return;
         }
     }
 
@@ -426,6 +432,9 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
                 grpc_recv_at: account_geyser_recv_at,
             },
         );
+        if account_geyser_update_is_sidefx_only_pool_owner(&account_update.owner) {
+            return;
+        }
     }
 
     // Try to parse as DEX pool event (for MarketEvents - existing logic)
@@ -465,7 +474,9 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
     }
 
     let Some(parsed) = parsed else {
-        inc_market_data_unparsed_account_dropped_total();
+        record_market_data_unparsed_account_dropped(
+            MarketDataUnparsedAccountDropReason::LegacyDexParseMiss,
+        );
         return;
     };
 

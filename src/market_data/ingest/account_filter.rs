@@ -35,6 +35,17 @@ pub fn account_geyser_update_is_dex_pool_owner(owner: &Pubkey) -> bool {
         || o == PUMPFUN_AMM_PROGRAM_OWNER
 }
 
+/// DEX pool owners handled exclusively via `md-sidefx` (`LivePoolCacheAccountUpdate`).
+/// Legacy `parse_account_update` remains for Raydium AMM v4, Orca, and PumpFun bonding.
+#[inline]
+pub fn account_geyser_update_is_sidefx_only_pool_owner(owner: &Pubkey) -> bool {
+    let o = *owner;
+    o == RAYDIUM_CPMM_OWNER
+        || o == METEORA_CPMM_OWNER
+        || o == METEORA_DLMM_OWNER
+        || o == PUMPFUN_AMM_PROGRAM_OWNER
+}
+
 /// Result of the cheap account relevance filter (before DEX parse / heavy locks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountGeyserRelevance {
