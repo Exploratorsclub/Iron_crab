@@ -889,6 +889,15 @@ pub static MARKET_DATA_TX_HANDLER_STALLS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| A
 pub static MARKET_DATA_UNPARSED_TX_DROPPED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MARKET_DATA_UNPARSED_ACCOUNT_DROPPED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Labeled: `market_data_unparsed_account_dropped_total{reason="legacy_dex_parse_miss"}`.
+pub static MARKET_DATA_UNPARSED_ACCOUNT_DROPPED_LEGACY_DEX_PARSE_MISS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Labeled: `market_data_unparsed_tx_dropped_total{reason="non_dex_transaction"}`.
+pub static MARKET_DATA_UNPARSED_TX_DROPPED_NON_DEX_TRANSACTION: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Labeled: `market_data_unparsed_tx_dropped_total{reason="dex_parse_miss"}`.
+pub static MARKET_DATA_UNPARSED_TX_DROPPED_DEX_PARSE_MISS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 static MARKET_DATA_TX_HANDLER_RECONNECT_REQUESTED: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 static MARKET_DATA_ACCOUNT_SESSION_RECONNECT_REQUESTED: Lazy<AtomicU64> =
@@ -1033,13 +1042,70 @@ pub fn record_market_data_tx_handler_stall() {
 }
 
 #[inline]
+#[allow(dead_code)]
 pub fn inc_market_data_unparsed_tx_dropped_total() {
     MARKET_DATA_UNPARSED_TX_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
+#[allow(dead_code)]
 pub fn inc_market_data_unparsed_account_dropped_total() {
     MARKET_DATA_UNPARSED_ACCOUNT_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Unparsed account drop reason for `market_data_unparsed_account_dropped_total{reason=...}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketDataUnparsedAccountDropReason {
+    LegacyDexParseMiss,
+}
+
+impl MarketDataUnparsedAccountDropReason {
+    #[inline]
+    pub fn as_prometheus_label(self) -> &'static str {
+        match self {
+            Self::LegacyDexParseMiss => "legacy_dex_parse_miss",
+        }
+    }
+}
+
+/// Unparsed TX drop reason for `market_data_unparsed_tx_dropped_total{reason=...}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketDataUnparsedTxDropReason {
+    NonDexTransaction,
+    DexParseMiss,
+}
+
+impl MarketDataUnparsedTxDropReason {
+    #[inline]
+    pub fn as_prometheus_label(self) -> &'static str {
+        match self {
+            Self::NonDexTransaction => "non_dex_transaction",
+            Self::DexParseMiss => "dex_parse_miss",
+        }
+    }
+}
+
+#[inline]
+pub fn record_market_data_unparsed_account_dropped(reason: MarketDataUnparsedAccountDropReason) {
+    let counter = match reason {
+        MarketDataUnparsedAccountDropReason::LegacyDexParseMiss => {
+            &*MARKET_DATA_UNPARSED_ACCOUNT_DROPPED_LEGACY_DEX_PARSE_MISS
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_market_data_unparsed_tx_dropped(reason: MarketDataUnparsedTxDropReason) {
+    let counter = match reason {
+        MarketDataUnparsedTxDropReason::NonDexTransaction => {
+            &*MARKET_DATA_UNPARSED_TX_DROPPED_NON_DEX_TRANSACTION
+        }
+        MarketDataUnparsedTxDropReason::DexParseMiss => {
+            &*MARKET_DATA_UNPARSED_TX_DROPPED_DEX_PARSE_MISS
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -5805,10 +5871,31 @@ async fn metrics_response() -> Response<Body> {
         "market_data_unparsed_tx_dropped_total",
         MARKET_DATA_UNPARSED_TX_DROPPED_TOTAL.load(Ordering::Relaxed)
     );
+    out.push_str("market_data_unparsed_tx_dropped_total{reason=\"non_dex_transaction\"} ");
+    out.push_str(
+        &MARKET_DATA_UNPARSED_TX_DROPPED_NON_DEX_TRANSACTION
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_unparsed_tx_dropped_total{reason=\"dex_parse_miss\"} ");
+    out.push_str(
+        &MARKET_DATA_UNPARSED_TX_DROPPED_DEX_PARSE_MISS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     line!(
         "market_data_unparsed_account_dropped_total",
         MARKET_DATA_UNPARSED_ACCOUNT_DROPPED_TOTAL.load(Ordering::Relaxed)
     );
+    out.push_str("market_data_unparsed_account_dropped_total{reason=\"legacy_dex_parse_miss\"} ");
+    out.push_str(
+        &MARKET_DATA_UNPARSED_ACCOUNT_DROPPED_LEGACY_DEX_PARSE_MISS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     line!(
         "geyser_account_listener_account_updates_total",
         GEYSER_ACCOUNT_LISTENER_ACCOUNT_UPDATES_TOTAL.load(Ordering::Relaxed)

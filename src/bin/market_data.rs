@@ -14490,6 +14490,55 @@ mod pr_b_geyser_tracking_tests {
         );
     }
 
+    /// P2 hardening: account handler early-returns after sidefx paths (no false unparsed drops).
+    #[test]
+    fn p2_account_handler_early_return_after_sidefx_paths() {
+        let account_handler_src = include_str!("../market_data/ingest/account_handler.rs");
+        assert!(
+            account_handler_src.contains("MdSidefxCommand::VaultBalanceTick"),
+            "account_handler must enqueue VaultBalanceTick"
+        );
+        let vault_tick_pos = account_handler_src
+            .find("MdSidefxCommand::VaultBalanceTick")
+            .expect("VaultBalanceTick");
+        let after_vault_tick = &account_handler_src[vault_tick_pos..];
+        assert!(
+            after_vault_tick.contains("return;"),
+            "account_handler must return after VaultBalanceTick enqueue"
+        );
+        assert!(
+            account_handler_src.contains("MdSidefxCommand::LivePoolCacheAccountUpdate"),
+            "account_handler must enqueue LivePoolCacheAccountUpdate"
+        );
+        assert!(
+            account_handler_src.contains("account_geyser_update_is_sidefx_only_pool_owner"),
+            "account_handler must gate sidefx-only pool owner early return"
+        );
+        assert!(
+            account_handler_src.contains("record_market_data_unparsed_account_dropped"),
+            "account_handler must use labeled unparsed account metric"
+        );
+    }
+
+    /// P2 hardening: TX handler uses labeled unparsed metric with DEX detection helper.
+    #[test]
+    fn p2_tx_handler_labeled_unparsed_drop_metric() {
+        let tx_handler_src = include_str!("../market_data/ingest/tx_handler.rs");
+        let tx_parse_src = include_str!("../market_data/ingest/tx_parse.rs");
+        assert!(
+            tx_handler_src.contains("record_market_data_unparsed_tx_dropped"),
+            "tx_handler must use labeled unparsed TX metric"
+        );
+        assert!(
+            tx_handler_src.contains("tx_involves_known_dex_program"),
+            "tx_handler must classify DEX vs non-DEX unparsed drops"
+        );
+        assert!(
+            tx_parse_src.contains("pub fn tx_involves_known_dex_program"),
+            "tx_parse must define DEX program detection helper"
+        );
+    }
+
     /// Phase 4b: account ingest module must not read tracked_* maps or arb reconcile paths.
     #[test]
     fn phase4b_account_ingest_no_tracked_reads() {
