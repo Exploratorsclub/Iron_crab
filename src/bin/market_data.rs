@@ -14530,12 +14530,16 @@ mod pr_b_geyser_tracking_tests {
             "tx_handler must use labeled unparsed TX metric"
         );
         assert!(
-            tx_handler_src.contains("tx_involves_known_dex_program"),
-            "tx_handler must classify DEX vs non-DEX unparsed drops"
+            tx_handler_src.contains("unparsed_tx_drop_reason"),
+            "tx_handler must classify DEX vs non-DEX unparsed drops via Geyser TX"
         );
         assert!(
-            tx_parse_src.contains("pub fn tx_involves_known_dex_program"),
-            "tx_parse must define DEX program detection helper"
+            tx_parse_src.contains("pub fn tx_geyser_had_extracted_dex_instruction"),
+            "tx_parse must define Geyser-extracted DEX instruction detection"
+        );
+        assert!(
+            tx_parse_src.contains("pub fn unparsed_tx_drop_reason"),
+            "tx_parse must define unparsed TX drop reason helper"
         );
     }
 
