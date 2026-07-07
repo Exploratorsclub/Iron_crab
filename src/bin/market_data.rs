@@ -105,7 +105,7 @@ use ironcrab::metrics::{
     market_data_geyser_tracking_jobs_processed_value, market_data_md_state_bursts_completed_value,
     market_data_request_account_session_reconnect, market_data_request_tx_session_reconnect,
     market_data_tx_handler_processed_value, record_market_data_account_broadcast_lagged,
-    record_market_data_account_channel_lag_ms, record_market_data_account_early_drop_total,
+    record_market_data_account_channel_lag_ms, record_market_data_account_early_drop,
     record_market_data_account_handler_duration_us,
     record_market_data_arb_track_requests_messages_total,
     record_market_data_geyser_merge_coalesced_total, record_market_data_geyser_sync_batch_total,
@@ -286,12 +286,21 @@ fn spawn_arb_tracking_coalescer(
 }
 
 /// Eval grep: account relevance filter in `ingest/account_filter.rs` (tracked_membership snapshot).
+#[cfg_attr(not(test), allow(dead_code))]
 fn account_geyser_update_might_be_relevant(
     ctx: &MarketDataContext,
     u: &GeyserAccountUpdate,
 ) -> bool {
     // I-4b eval grep: tracked_membership_contains_pubkey / tracked_membership snapshot (ingest/account_filter.rs).
     ironcrab::market_data::ingest::account_geyser_update_might_be_relevant(ctx, u)
+}
+
+/// Eval grep: account relevance filter with early-drop reason in `ingest/account_filter.rs`.
+fn account_geyser_update_relevance(
+    ctx: &MarketDataContext,
+    u: &GeyserAccountUpdate,
+) -> ironcrab::market_data::ingest::AccountGeyserRelevance {
+    ironcrab::market_data::ingest::account_geyser_update_relevance(ctx, u)
 }
 
 /// Eval grep: account dispatch priority in `ingest/account_filter.rs` (tracked_membership snapshot).
@@ -7692,9 +7701,14 @@ async fn run_geyser_loop(
                     set_market_data_account_broadcast_queue_depth(account_rx_geyser.len());
                     market_data_bump_geyser_head_slot(account_update.slot);
 
-                    if !account_geyser_update_might_be_relevant(&ctx_geyser_acc, &account_update) {
-                        record_market_data_account_early_drop_total();
-                        continue;
+                    match account_geyser_update_relevance(&ctx_geyser_acc, &account_update) {
+                        ironcrab::market_data::ingest::AccountGeyserRelevance::Relevant => {}
+                        ironcrab::market_data::ingest::AccountGeyserRelevance::EarlyDrop(
+                            reason,
+                        ) => {
+                            record_market_data_account_early_drop(reason);
+                            continue;
+                        }
                     }
 
                     let shard = market_data_account_worker_shard(&account_update.pubkey);
@@ -11672,6 +11686,98 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
+    fn account_geyser_update_relevance_non_enrichment_dex_pool_early_drop_reason() {
+        use ironcrab::market_data::ingest::AccountGeyserRelevance;
+        use ironcrab::metrics::MarketDataAccountEarlyDropReason;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        let u = GeyserAccountUpdate {
+            pubkey: pool,
+            slot: 1,
+            owner: RAYDIUM_CPMM_OWNER,
+            data: vec![],
+            lamports: 0,
+            grpc_recv_at: Instant::now(),
+        };
+        assert_eq!(
+            account_geyser_update_relevance(&ctx, &u),
+            AccountGeyserRelevance::EarlyDrop(
+                MarketDataAccountEarlyDropReason::DexPoolNotEnrichment
+            )
+        );
+    }
+
+    #[test]
+    fn account_geyser_update_relevance_random_non_dex_early_drop_reason() {
+        use ironcrab::market_data::ingest::AccountGeyserRelevance;
+        use ironcrab::metrics::MarketDataAccountEarlyDropReason;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let u = GeyserAccountUpdate {
+            pubkey: Pubkey::new_unique(),
+            slot: 1,
+            owner: Pubkey::new_unique(),
+            data: vec![],
+            lamports: 0,
+            grpc_recv_at: Instant::now(),
+        };
+        assert_eq!(
+            account_geyser_update_relevance(&ctx, &u),
+            AccountGeyserRelevance::EarlyDrop(
+                MarketDataAccountEarlyDropReason::NonDexNonMembership
+            )
+        );
+    }
+
+    #[test]
+    fn account_geyser_update_relevance_membership_explicit_vault_no_early_drop() {
+        use ironcrab::market_data::ingest::AccountGeyserRelevance;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let vault = Pubkey::new_unique();
+        ctx.tracked_vaults.write().insert(
+            vault,
+            VaultInfo {
+                pool_address: Pubkey::new_unique(),
+                dex: "raydium_cpmm".to_string(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                is_base_vault: true,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: Instant::now(),
+                pinned: false,
+                pin: None,
+                active_id: None,
+                bin_step: None,
+                sibling_vault: None,
+            },
+        );
+        ctx.refresh_tracked_membership_snapshot();
+        let u = GeyserAccountUpdate {
+            pubkey: vault,
+            slot: 1,
+            owner: Pubkey::new_unique(),
+            data: vec![],
+            lamports: 0,
+            grpc_recv_at: Instant::now(),
+        };
+        assert_eq!(
+            account_geyser_update_relevance(&ctx, &u),
+            AccountGeyserRelevance::Relevant
+        );
+    }
+
+    #[test]
     fn enrichment_sidefx_host_pool_mint_map_is_member_without_hot_pin() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
@@ -14327,6 +14433,14 @@ mod pr_b_geyser_tracking_tests {
             "account_filter.rs must contain account_geyser_update_might_be_relevant"
         );
         assert!(
+            account_src.contains("pub fn account_geyser_update_relevance"),
+            "account_filter.rs must contain account_geyser_update_relevance"
+        );
+        assert!(
+            bin_src.contains("record_market_data_account_early_drop"),
+            "bin must record labeled account early-drop metrics"
+        );
+        assert!(
             account_src.contains("pub fn account_geyser_dispatch_priority_high"),
             "account_filter.rs must contain account_geyser_dispatch_priority_high"
         );
@@ -14518,6 +14632,22 @@ mod pr_b_geyser_tracking_tests {
         assert!(
             bin_src.contains("fn md_sidefx_process_vault_balance_tick"),
             "bin must retain eval-grep wrapper for md_sidefx_process_vault_balance_tick"
+        );
+        assert!(
+            handlers_src.contains("fn md_sidefx_inc_enrichment_publish_metrics_if_member"),
+            "handlers.rs must count enrichment metrics on vault-tick publish path"
+        );
+        assert!(
+            handlers_src.contains("md_sidefx_inc_enrichment_publish_metrics_if_member"),
+            "md_sidefx_process_vault_balance_tick must call enrichment metric helper"
+        );
+        assert!(
+            handlers_src.contains("inc_market_data_enrichment_balance_updated_total"),
+            "vault-tick path must increment enrichment BalanceUpdated counter"
+        );
+        assert!(
+            handlers_src.contains("inc_market_data_enrichment_pool_state_publish_total"),
+            "vault-tick path must increment enrichment PoolState counter"
         );
     }
 
