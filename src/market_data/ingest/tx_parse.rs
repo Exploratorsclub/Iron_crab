@@ -9,7 +9,7 @@ use crate::market_data::publish::{
 use crate::market_data::sidefx::MarketEventCorePublishTrace;
 use crate::metrics::{
     inc_market_data_devwallet_tx_published_total, record_market_data_pool_mint_map_to_devwallet_ms,
-    MarketDataLatencySegment,
+    MarketDataLatencySegment, MarketDataUnparsedTxDropReason,
 };
 use crate::nats::{wallet_snapshot_subject, NatsClient};
 use crate::solana::dex_parser::{
@@ -320,54 +320,131 @@ pub(crate) fn tx_publish_segment(kind: &MarketEventKind) -> MarketDataLatencySeg
     }
 }
 
-/// Whether any known DEX program id appears in the transaction account keys (no RPC).
+const KNOWN_DEX_PROGRAM_IDS: &[&str] = &[
+    RAYDIUM_AMM_V4,
+    RAYDIUM_CPMM,
+    ORCA_WHIRLPOOL,
+    METEORA_DLMM,
+    PUMPFUN_PROGRAM,
+    PUMPFUN_AMM_PROGRAM,
+];
+
 #[inline]
-pub fn tx_involves_known_dex_program(account_keys: &[Pubkey]) -> bool {
-    static PROGRAMS: &[&str] = &[
-        RAYDIUM_AMM_V4,
-        RAYDIUM_CPMM,
-        ORCA_WHIRLPOOL,
-        METEORA_DLMM,
-        PUMPFUN_PROGRAM,
-        PUMPFUN_AMM_PROGRAM,
-    ];
-    PROGRAMS.iter().any(|program_id| {
+fn is_known_dex_program(pk: &Pubkey) -> bool {
+    KNOWN_DEX_PROGRAM_IDS.iter().any(|program_id| {
         Pubkey::from_str(program_id)
             .ok()
-            .is_some_and(|pk| account_keys.contains(&pk))
+            .is_some_and(|known| known == *pk)
     })
+}
+
+/// Whether the Geyser listener extracted a DEX instruction for parsing (no RPC).
+///
+/// SSOT: `geyser_listener.rs` sets `instruction_accounts` when a top-level or inner
+/// instruction invokes a subscribed DEX `program_id`. Fallback inspects `inner_instructions`
+/// when `instruction_accounts` is empty (safety parity with listener CPI extraction).
+#[inline]
+pub fn tx_geyser_had_extracted_dex_instruction(tx: &GeyserTransactionUpdate) -> bool {
+    if !tx.instruction_accounts.is_empty() {
+        return true;
+    }
+    tx.inner_instructions.iter().any(|inner| {
+        tx.account_keys
+            .get(inner.program_id_index as usize)
+            .is_some_and(is_known_dex_program)
+    })
+}
+
+/// Classify unparsed TX drops: actionable parse miss vs expected account_include noise.
+#[inline]
+pub fn unparsed_tx_drop_reason(tx: &GeyserTransactionUpdate) -> MarketDataUnparsedTxDropReason {
+    if tx_geyser_had_extracted_dex_instruction(tx) {
+        MarketDataUnparsedTxDropReason::DexParseMiss
+    } else {
+        MarketDataUnparsedTxDropReason::NonDexTransaction
+    }
 }
 
 #[cfg(test)]
 mod tx_dex_detection_tests {
     use super::*;
-    use crate::metrics::MarketDataUnparsedTxDropReason;
+    use crate::solana::geyser_listener::InnerInstruction;
+    use std::time::Instant;
 
-    fn unparsed_tx_drop_reason(account_keys: &[Pubkey]) -> MarketDataUnparsedTxDropReason {
-        if tx_involves_known_dex_program(account_keys) {
-            MarketDataUnparsedTxDropReason::DexParseMiss
-        } else {
-            MarketDataUnparsedTxDropReason::NonDexTransaction
+    fn minimal_tx(
+        account_keys: Vec<Pubkey>,
+        instruction_accounts: Vec<Pubkey>,
+        inner_instructions: Vec<InnerInstruction>,
+    ) -> GeyserTransactionUpdate {
+        GeyserTransactionUpdate {
+            signature: "test".into(),
+            slot: 1,
+            account_keys,
+            instruction_accounts,
+            instruction_data: vec![],
+            inner_instructions,
+            pre_token_balances: vec![],
+            post_token_balances: vec![],
+            pre_balances: vec![],
+            post_balances: vec![],
+            fee_lamports: 0,
+            compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
         }
     }
 
     #[test]
-    fn tx_unparsed_drop_reason_non_dex_without_known_program() {
-        let keys = vec![Pubkey::new_unique(), Pubkey::new_unique()];
+    fn tx_unparsed_drop_reason_non_dex_when_raydium_only_in_account_keys() {
+        let raydium = Pubkey::from_str(RAYDIUM_AMM_V4).unwrap();
+        let tx = minimal_tx(vec![Pubkey::new_unique(), raydium], vec![], vec![]);
+        assert!(!tx_geyser_had_extracted_dex_instruction(&tx));
         assert_eq!(
-            unparsed_tx_drop_reason(&keys),
+            unparsed_tx_drop_reason(&tx),
             MarketDataUnparsedTxDropReason::NonDexTransaction
         );
     }
 
     #[test]
-    fn tx_unparsed_drop_reason_dex_parse_miss_when_raydium_present() {
-        let raydium = Pubkey::from_str(RAYDIUM_AMM_V4).unwrap();
-        let keys = vec![Pubkey::new_unique(), raydium];
-        assert!(tx_involves_known_dex_program(&keys));
+    fn tx_unparsed_drop_reason_dex_parse_miss_when_instruction_accounts_populated() {
+        let pool = Pubkey::new_unique();
+        let tx = minimal_tx(vec![Pubkey::new_unique()], vec![pool], vec![]);
+        assert!(tx_geyser_had_extracted_dex_instruction(&tx));
         assert_eq!(
-            unparsed_tx_drop_reason(&keys),
+            unparsed_tx_drop_reason(&tx),
             MarketDataUnparsedTxDropReason::DexParseMiss
+        );
+    }
+
+    #[test]
+    fn tx_unparsed_drop_reason_dex_parse_miss_when_inner_raydium_cpi() {
+        let raydium = Pubkey::from_str(RAYDIUM_AMM_V4).unwrap();
+        let tx = minimal_tx(
+            vec![Pubkey::new_unique(), raydium],
+            vec![],
+            vec![InnerInstruction {
+                program_id_index: 1,
+                accounts: vec![0],
+                data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            }],
+        );
+        assert!(tx_geyser_had_extracted_dex_instruction(&tx));
+        assert_eq!(
+            unparsed_tx_drop_reason(&tx),
+            MarketDataUnparsedTxDropReason::DexParseMiss
+        );
+    }
+
+    #[test]
+    fn tx_unparsed_drop_reason_non_dex_without_extracted_ix_or_inner_dex() {
+        let tx = minimal_tx(
+            vec![Pubkey::new_unique(), Pubkey::new_unique()],
+            vec![],
+            vec![],
+        );
+        assert!(!tx_geyser_had_extracted_dex_instruction(&tx));
+        assert_eq!(
+            unparsed_tx_drop_reason(&tx),
+            MarketDataUnparsedTxDropReason::NonDexTransaction
         );
     }
 }
