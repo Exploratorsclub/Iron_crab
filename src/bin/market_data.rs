@@ -14169,7 +14169,8 @@ mod pr_b_geyser_tracking_tests {
             "arb-pin ensure debounce map must be removed"
         );
         assert!(
-            code_src.contains("Arb pin: Geyser reserve registration deferred (geyser-only, no RPC)"),
+            code_src
+                .contains("Arb pin: Geyser reserve registration deferred (geyser-only, no RPC)"),
             "apply_arb_active_entries must log deferred Geyser register without RPC"
         );
         let impl_marker = "Arb pin: Geyser reserve registration deferred (geyser-only, no RPC)";
