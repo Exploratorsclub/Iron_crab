@@ -1821,6 +1821,106 @@ fn record_v2_insufficient_subreason(insufficient: &RoundTripInsufficient) {
     }
 }
 
+const CROSS_DEX_PAIR_DEBUG_SAMPLE_MAX: usize = 3;
+
+fn insufficient_subreason_metric_label(subreason: RoundTripInsufficientSubreason) -> &'static str {
+    match subreason {
+        RoundTripInsufficientSubreason::CandidatesLt2 => "candidates_lt2",
+        RoundTripInsufficientSubreason::NoFreshBuyQuote => "no_fresh_buy_quote",
+        RoundTripInsufficientSubreason::NoCrossDexSell => "no_cross_dex_sell",
+        RoundTripInsufficientSubreason::SingleDexCandidates => "single_dex_candidates",
+    }
+}
+
+fn log_v2_round_trip_insufficient_pools(
+    mint: &str,
+    insufficient: &RoundTripInsufficient,
+    candidates: &[RoundTripPoolCandidate<'_>],
+    probe: u64,
+    freshness: &QuoteFreshnessConfig,
+    token_decimals: u8,
+) {
+    let subreason = insufficient.subreason;
+    let subreason_label = insufficient_subreason_metric_label(subreason);
+    if subreason == RoundTripInsufficientSubreason::NoCrossDexSell {
+        let dominant = insufficient
+            .no_cross_dex_sell_detail
+            .map(|d| d.as_metric_label())
+            .unwrap_or("unknown");
+        warn!(
+            mint = %mint,
+            subreason = subreason_label,
+            dominant_sell_fail_reason = dominant,
+            "arb v2 screen: insufficient pools (no cross-dex sell)"
+        );
+        log_v2_cross_dex_pair_failures_debug_sample(
+            mint,
+            candidates,
+            probe,
+            freshness,
+            token_decimals,
+        );
+    } else {
+        info!(
+            mint = %mint,
+            subreason = subreason_label,
+            "arb v2 screen: insufficient pools"
+        );
+    }
+}
+
+fn log_v2_cross_dex_pair_failures_debug_sample(
+    mint: &str,
+    candidates: &[RoundTripPoolCandidate<'_>],
+    probe: u64,
+    freshness: &QuoteFreshnessConfig,
+    token_decimals: u8,
+) {
+    let now = Instant::now();
+    let mut logged = 0usize;
+    'outer: for buy in candidates {
+        let Some(buy_quote) = quote_exact_in_with_freshness(
+            buy.pool,
+            buy.vault,
+            buy.dlmm_bins,
+            NATIVE_SOL_MINT,
+            &buy.pool.token_mint,
+            probe,
+            freshness,
+        ) else {
+            continue;
+        };
+        if !is_quote_fresh(&buy_quote, freshness, buy.vault, now) {
+            continue;
+        }
+        for sell in candidates {
+            if sell.dex == buy.dex {
+                continue;
+            }
+            let Some(failure) = classify_cross_dex_sell_failure(
+                sell,
+                buy_quote.amount_out,
+                freshness,
+                now,
+                token_decimals,
+            ) else {
+                continue;
+            };
+            debug!(
+                mint = %mint,
+                buy_dex = buy.dex,
+                sell_dex = sell.dex,
+                sell_fail_reason = failure.as_top_level_detail().as_metric_label(),
+                "arb v2 screen: cross-dex pair sell failure sample"
+            );
+            logged += 1;
+            if logged >= CROSS_DEX_PAIR_DEBUG_SAMPLE_MAX {
+                break 'outer;
+            }
+        }
+    }
+}
+
 fn record_eligibility_metrics(breakdown: &MintEligibilityBreakdown) {
     arb_two_hop_pool_gate_add(
         ArbTwoHopPoolGate::CandidatePools,
@@ -2496,6 +2596,14 @@ impl TokenArbTracker {
             Ok(selection) => selection,
             Err(RoundTripSelectFailure::InsufficientPools(insufficient)) => {
                 record_v2_insufficient_subreason(&insufficient);
+                log_v2_round_trip_insufficient_pools(
+                    &self.base_mint,
+                    &insufficient,
+                    &candidates,
+                    probe,
+                    &freshness,
+                    token_decimals,
+                );
                 arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::InsufficientPools);
                 if let Some(collector) = v2_forensics {
                     let breakdown = self.build_v2_eligibility_breakdown(
