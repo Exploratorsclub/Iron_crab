@@ -1822,6 +1822,96 @@ fn record_v2_insufficient_subreason(insufficient: &RoundTripInsufficient) {
 }
 
 const CROSS_DEX_PAIR_DEBUG_SAMPLE_MAX: usize = 3;
+const HOT_PATH_LOG_THROTTLE_SECS: u64 = 60;
+const HOT_PATH_LOG_THROTTLE_MAP_CAP: usize = 2048;
+
+mod bounded_log_throttle {
+    use std::collections::HashMap;
+    use std::hash::Hash;
+    use std::time::{Duration, Instant};
+
+    #[derive(Debug)]
+    pub(super) struct BoundedLogThrottle<K> {
+        entries: HashMap<K, Instant>,
+        cap: usize,
+        interval: Duration,
+    }
+
+    impl<K: Eq + Hash + Clone> BoundedLogThrottle<K> {
+        pub(super) fn new(cap: usize, interval: Duration) -> Self {
+            Self {
+                entries: HashMap::new(),
+                cap: cap.max(1),
+                interval,
+            }
+        }
+
+        /// Returns true when a diagnostic log may be emitted for `key` at `now`.
+        pub(super) fn should_emit(&mut self, key: K, now: Instant) -> bool {
+            if let Some(last) = self.entries.get(&key) {
+                if now.duration_since(*last) < self.interval {
+                    return false;
+                }
+            }
+            if self.entries.len() >= self.cap {
+                if let Some(oldest_key) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, ts)| *ts)
+                    .map(|(k, _)| k.clone())
+                {
+                    self.entries.remove(&oldest_key);
+                }
+            }
+            self.entries.insert(key, now);
+            true
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn repeated_key_suppressed_until_interval_elapses() {
+            let mut throttle = BoundedLogThrottle::new(8, Duration::from_secs(60));
+            let key = "mint-a:no_cross_dex_sell";
+            let t0 = Instant::now();
+            assert!(throttle.should_emit(key, t0));
+            assert!(!throttle.should_emit(key, t0 + Duration::from_secs(1)));
+            assert!(!throttle.should_emit(key, t0 + Duration::from_secs(59)));
+            assert!(throttle.should_emit(key, t0 + Duration::from_secs(60)));
+        }
+
+        #[test]
+        fn distinct_keys_emit_independently() {
+            let mut throttle = BoundedLogThrottle::new(8, Duration::from_secs(60));
+            let t0 = Instant::now();
+            assert!(throttle.should_emit("mint-a", t0));
+            assert!(throttle.should_emit("mint-b", t0));
+            assert!(!throttle.should_emit("mint-a", t0 + Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn map_capacity_is_bounded() {
+            let mut throttle = BoundedLogThrottle::new(2, Duration::from_secs(60));
+            let t0 = Instant::now();
+            assert!(throttle.should_emit("k1", t0));
+            assert!(throttle.should_emit("k2", t0 + Duration::from_secs(1)));
+            assert!(throttle.should_emit("k3", t0 + Duration::from_secs(2)));
+            assert_eq!(throttle.entries.len(), 2);
+        }
+    }
+}
+
+static ARB_V2_INSUFFICIENT_LOG_THROTTLE: std::sync::LazyLock<
+    parking_lot::Mutex<bounded_log_throttle::BoundedLogThrottle<String>>,
+> = std::sync::LazyLock::new(|| {
+    parking_lot::Mutex::new(bounded_log_throttle::BoundedLogThrottle::new(
+        HOT_PATH_LOG_THROTTLE_MAP_CAP,
+        Duration::from_secs(HOT_PATH_LOG_THROTTLE_SECS),
+    ))
+});
 
 fn insufficient_subreason_metric_label(subreason: RoundTripInsufficientSubreason) -> &'static str {
     match subreason {
@@ -1842,11 +1932,23 @@ fn log_v2_round_trip_insufficient_pools(
 ) {
     let subreason = insufficient.subreason;
     let subreason_label = insufficient_subreason_metric_label(subreason);
+    let dominant = insufficient
+        .no_cross_dex_sell_detail
+        .map(|d| d.as_metric_label())
+        .unwrap_or("unknown");
+    let throttle_key = if subreason == RoundTripInsufficientSubreason::NoCrossDexSell {
+        format!("no_cross_dex:{mint}:{dominant}")
+    } else {
+        format!("insufficient:{mint}:{subreason_label}")
+    };
+    let now = Instant::now();
+    if !ARB_V2_INSUFFICIENT_LOG_THROTTLE
+        .lock()
+        .should_emit(throttle_key, now)
+    {
+        return;
+    }
     if subreason == RoundTripInsufficientSubreason::NoCrossDexSell {
-        let dominant = insufficient
-            .no_cross_dex_sell_detail
-            .map(|d| d.as_metric_label())
-            .unwrap_or("unknown");
         warn!(
             mint = %mint,
             subreason = subreason_label,

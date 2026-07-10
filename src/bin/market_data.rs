@@ -1173,6 +1173,87 @@ const WALLET_BOOTSTRAP_DEX_VERIFY_MAX_MINTS: usize = 8;
 /// does not early-return on `CachedPoolState::PumpFun` without explicit Ready (merge + JetStream).
 const WALLET_BOOTSTRAP_ENSURE_PUMPFUN_FORCE_REFRESH: bool = true;
 
+const HOT_PATH_LOG_THROTTLE_SECS: u64 = 60;
+const HOT_PATH_LOG_THROTTLE_MAP_CAP: usize = 2048;
+
+mod bounded_log_throttle {
+    use std::collections::HashMap;
+    use std::hash::Hash;
+    use std::time::{Duration, Instant};
+
+    #[derive(Debug)]
+    pub(super) struct BoundedLogThrottle<K> {
+        entries: HashMap<K, Instant>,
+        cap: usize,
+        interval: Duration,
+    }
+
+    impl<K: Eq + Hash + Clone> BoundedLogThrottle<K> {
+        pub(super) fn new(cap: usize, interval: Duration) -> Self {
+            Self {
+                entries: HashMap::new(),
+                cap: cap.max(1),
+                interval,
+            }
+        }
+
+        pub(super) fn should_emit(&mut self, key: K, now: Instant) -> bool {
+            if let Some(last) = self.entries.get(&key) {
+                if now.duration_since(*last) < self.interval {
+                    return false;
+                }
+            }
+            if self.entries.len() >= self.cap {
+                if let Some(oldest_key) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, ts)| *ts)
+                    .map(|(k, _)| k.clone())
+                {
+                    self.entries.remove(&oldest_key);
+                }
+            }
+            self.entries.insert(key, now);
+            true
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn repeated_pool_reason_suppressed_until_interval_elapses() {
+            let mut throttle = BoundedLogThrottle::new(8, Duration::from_secs(60));
+            let key = "pool-a:live_pool_cache_miss";
+            let t0 = Instant::now();
+            assert!(throttle.should_emit(key, t0));
+            assert!(!throttle.should_emit(key, t0 + Duration::from_secs(5)));
+            assert!(throttle.should_emit(key, t0 + Duration::from_secs(60)));
+        }
+
+        #[test]
+        fn distinct_pool_reason_keys_emit_independently() {
+            let mut throttle = BoundedLogThrottle::new(8, Duration::from_secs(60));
+            let t0 = Instant::now();
+            assert!(throttle.should_emit("pool-a:live_pool_cache_miss", t0));
+            assert!(throttle.should_emit("pool-a:vault_register_no_change", t0));
+            assert!(
+                !throttle.should_emit("pool-a:live_pool_cache_miss", t0 + Duration::from_secs(1))
+            );
+        }
+    }
+}
+
+static ARB_PIN_DEFERRED_LOG_THROTTLE: std::sync::LazyLock<
+    parking_lot::Mutex<bounded_log_throttle::BoundedLogThrottle<String>>,
+> = std::sync::LazyLock::new(|| {
+    parking_lot::Mutex::new(bounded_log_throttle::BoundedLogThrottle::new(
+        HOT_PATH_LOG_THROTTLE_MAP_CAP,
+        Duration::from_secs(HOT_PATH_LOG_THROTTLE_SECS),
+    ))
+});
+
 /// Associated Token Program ID
 const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 
@@ -4046,14 +4127,21 @@ impl MarketDataContext {
                 } else {
                     "vault_register_no_change"
                 };
-                warn!(
-                    run_id = %self.run_id,
-                    pool = %pool_pk,
-                    pin = "ArbMultiDex",
-                    reason = reason,
-                    "Arb pin: Geyser reserve registration deferred (geyser-only, no RPC)"
-                );
                 inc_market_data_arb_pin_geyser_register_deferred_total(reason);
+                let throttle_key = format!("{pool_pk}:{reason}");
+                let now = Instant::now();
+                if ARB_PIN_DEFERRED_LOG_THROTTLE
+                    .lock()
+                    .should_emit(throttle_key, now)
+                {
+                    warn!(
+                        run_id = %self.run_id,
+                        pool = %pool_pk,
+                        pin = "ArbMultiDex",
+                        reason = reason,
+                        "Arb pin: Geyser reserve registration deferred (geyser-only, no RPC)"
+                    );
+                }
             }
             let _ = &a.reason;
         }
