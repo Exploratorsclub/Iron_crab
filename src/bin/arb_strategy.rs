@@ -1949,45 +1949,6 @@ static ARB_V2_INSUFFICIENT_LOG_THROTTLE: std::sync::LazyLock<
     ))
 });
 
-#[cfg(test)]
-mod v2_insufficient_log_throttle_tests {
-    use super::*;
-
-    #[test]
-    fn category_is_fixed_per_subreason_and_detail() {
-        let no_fresh = RoundTripInsufficient::new(RoundTripInsufficientSubreason::NoFreshBuyQuote);
-        assert_eq!(
-            v2_insufficient_log_category(&no_fresh),
-            V2InsufficientLogCategory::NoFreshBuyQuote
-        );
-        let cross_dex = RoundTripInsufficient {
-            subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
-            no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellMissingVault),
-            sell_quote_none_detail_counts: None,
-        };
-        assert_eq!(
-            v2_insufficient_log_category(&cross_dex),
-            V2InsufficientLogCategory::NoCrossDexSellMissingVault
-        );
-    }
-
-    #[test]
-    fn production_log_path_has_no_dynamic_string_keys() {
-        let src = include_str!("arb_strategy.rs");
-        let start = src
-            .find("fn log_v2_round_trip_insufficient_pools(")
-            .expect("log_v2_round_trip_insufficient_pools");
-        let end = src[start..]
-            .find("fn log_v2_cross_dex_pair_failures_debug_sample")
-            .expect("after log_v2_round_trip_insufficient_pools");
-        let fn_body = &src[start..start + end];
-        assert!(
-            !fn_body.contains("format!("),
-            "throttle decision must not allocate dynamic string keys"
-        );
-    }
-}
-
 fn insufficient_subreason_metric_label(subreason: RoundTripInsufficientSubreason) -> &'static str {
     match subreason {
         RoundTripInsufficientSubreason::CandidatesLt2 => "candidates_lt2",
@@ -10060,6 +10021,40 @@ mod two_hop_price_tests {
         let back: ArbTrackRequestsUpdate = serde_json::from_str(&json).expect("deserialize");
         assert!(back.reconcile);
         assert_eq!(back.active.len(), 1);
+    }
+
+    #[test]
+    fn v2_insufficient_log_category_is_fixed_per_subreason_and_detail() {
+        let no_fresh = RoundTripInsufficient::new(RoundTripInsufficientSubreason::NoFreshBuyQuote);
+        assert_eq!(
+            v2_insufficient_log_category(&no_fresh),
+            V2InsufficientLogCategory::NoFreshBuyQuote
+        );
+        let cross_dex = RoundTripInsufficient {
+            subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
+            no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellMissingVault),
+            sell_quote_none_detail_counts: None,
+        };
+        assert_eq!(
+            v2_insufficient_log_category(&cross_dex),
+            V2InsufficientLogCategory::NoCrossDexSellMissingVault
+        );
+    }
+
+    #[test]
+    fn v2_insufficient_log_path_has_no_dynamic_string_keys() {
+        let src = include_str!("arb_strategy.rs");
+        let start = src
+            .find("fn log_v2_round_trip_insufficient_pools(")
+            .expect("log_v2_round_trip_insufficient_pools");
+        let end = src[start..]
+            .find("fn log_v2_cross_dex_pair_failures_debug_sample")
+            .expect("after log_v2_round_trip_insufficient_pools");
+        let fn_body = &src[start..start + end];
+        assert!(
+            !fn_body.contains("format!("),
+            "throttle decision must not allocate dynamic string keys"
+        );
     }
 }
 
