@@ -1174,46 +1174,32 @@ const WALLET_BOOTSTRAP_DEX_VERIFY_MAX_MINTS: usize = 8;
 const WALLET_BOOTSTRAP_ENSURE_PUMPFUN_FORCE_REFRESH: bool = true;
 
 const HOT_PATH_LOG_THROTTLE_SECS: u64 = 60;
-const HOT_PATH_LOG_THROTTLE_MAP_CAP: usize = 2048;
 
-mod bounded_log_throttle {
-    use std::collections::HashMap;
-    use std::hash::Hash;
+mod fixed_category_log_throttle {
     use std::time::{Duration, Instant};
 
     #[derive(Debug)]
-    pub(super) struct BoundedLogThrottle<K> {
-        entries: HashMap<K, Instant>,
-        cap: usize,
+    pub(super) struct FixedCategoryLogThrottle<const N: usize> {
+        last_emit: [Option<Instant>; N],
         interval: Duration,
     }
 
-    impl<K: Eq + Hash + Clone> BoundedLogThrottle<K> {
-        pub(super) fn new(cap: usize, interval: Duration) -> Self {
+    impl<const N: usize> FixedCategoryLogThrottle<N> {
+        pub(super) fn new(interval: Duration) -> Self {
             Self {
-                entries: HashMap::new(),
-                cap: cap.max(1),
+                last_emit: [None; N],
                 interval,
             }
         }
 
-        pub(super) fn should_emit(&mut self, key: K, now: Instant) -> bool {
-            if let Some(last) = self.entries.get(&key) {
-                if now.duration_since(*last) < self.interval {
+        pub(super) fn should_emit(&mut self, category: usize, now: Instant) -> bool {
+            debug_assert!(category < N);
+            if let Some(last) = self.last_emit[category] {
+                if now.duration_since(last) < self.interval {
                     return false;
                 }
             }
-            if self.entries.len() >= self.cap {
-                if let Some(oldest_key) = self
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, ts)| *ts)
-                    .map(|(k, _)| k.clone())
-                {
-                    self.entries.remove(&oldest_key);
-                }
-            }
-            self.entries.insert(key, now);
+            self.last_emit[category] = Some(now);
             true
         }
     }
@@ -1223,33 +1209,42 @@ mod bounded_log_throttle {
         use super::*;
 
         #[test]
-        fn repeated_pool_reason_suppressed_until_interval_elapses() {
-            let mut throttle = BoundedLogThrottle::new(8, Duration::from_secs(60));
-            let key = "pool-a:live_pool_cache_miss";
+        fn many_distinct_pool_values_share_one_reason_category() {
+            let mut throttle = FixedCategoryLogThrottle::<2>::new(Duration::from_secs(60));
+            let category = 0usize;
             let t0 = Instant::now();
-            assert!(throttle.should_emit(key, t0));
-            assert!(!throttle.should_emit(key, t0 + Duration::from_secs(5)));
-            assert!(throttle.should_emit(key, t0 + Duration::from_secs(60)));
+            assert!(throttle.should_emit(category, t0));
+            for offset in 1..=1000u64 {
+                assert!(
+                    !throttle.should_emit(category, t0 + Duration::from_millis(offset)),
+                    "reason category must stay suppressed regardless of pool cardinality"
+                );
+            }
+            assert!(throttle.should_emit(category, t0 + Duration::from_secs(60)));
         }
 
         #[test]
-        fn distinct_pool_reason_keys_emit_independently() {
-            let mut throttle = BoundedLogThrottle::new(8, Duration::from_secs(60));
+        fn distinct_reason_categories_emit_independently() {
+            let mut throttle = FixedCategoryLogThrottle::<2>::new(Duration::from_secs(60));
             let t0 = Instant::now();
-            assert!(throttle.should_emit("pool-a:live_pool_cache_miss", t0));
-            assert!(throttle.should_emit("pool-a:vault_register_no_change", t0));
-            assert!(
-                !throttle.should_emit("pool-a:live_pool_cache_miss", t0 + Duration::from_secs(1))
-            );
+            assert!(throttle.should_emit(0, t0));
+            assert!(throttle.should_emit(1, t0));
+            assert!(!throttle.should_emit(0, t0 + Duration::from_secs(1)));
         }
     }
 }
 
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArbPinDeferredLogCategory {
+    LivePoolCacheMiss = 0,
+    VaultRegisterNoChange = 1,
+}
+
 static ARB_PIN_DEFERRED_LOG_THROTTLE: std::sync::LazyLock<
-    parking_lot::Mutex<bounded_log_throttle::BoundedLogThrottle<String>>,
+    parking_lot::Mutex<fixed_category_log_throttle::FixedCategoryLogThrottle<2>>,
 > = std::sync::LazyLock::new(|| {
-    parking_lot::Mutex::new(bounded_log_throttle::BoundedLogThrottle::new(
-        HOT_PATH_LOG_THROTTLE_MAP_CAP,
+    parking_lot::Mutex::new(fixed_category_log_throttle::FixedCategoryLogThrottle::new(
         Duration::from_secs(HOT_PATH_LOG_THROTTLE_SECS),
     ))
 });
@@ -4122,17 +4117,20 @@ impl MarketDataContext {
             if self.register_geyser_reserves_for_arb_active_pool(pool_pk) {
                 batch_dirty = true;
             } else {
-                let reason = if self.live_pool_cache.get(&pool_pk).is_none() {
-                    "live_pool_cache_miss"
+                let category = if self.live_pool_cache.get(&pool_pk).is_none() {
+                    ArbPinDeferredLogCategory::LivePoolCacheMiss
                 } else {
-                    "vault_register_no_change"
+                    ArbPinDeferredLogCategory::VaultRegisterNoChange
+                };
+                let reason: &'static str = match category {
+                    ArbPinDeferredLogCategory::LivePoolCacheMiss => "live_pool_cache_miss",
+                    ArbPinDeferredLogCategory::VaultRegisterNoChange => "vault_register_no_change",
                 };
                 inc_market_data_arb_pin_geyser_register_deferred_total(reason);
-                let throttle_key = format!("{pool_pk}:{reason}");
                 let now = Instant::now();
                 if ARB_PIN_DEFERRED_LOG_THROTTLE
                     .lock()
-                    .should_emit(throttle_key, now)
+                    .should_emit(category as usize, now)
                 {
                     warn!(
                         run_id = %self.run_id,
@@ -14273,6 +14271,26 @@ mod pr_b_geyser_tracking_tests {
         assert!(
             !impl_window.contains("cold_path_rpc_refresh"),
             "apply_arb_active_entries must not call cold_path_rpc_refresh"
+        );
+    }
+
+    /// Arb-pin deferred warn throttle must not build dynamic string keys.
+    #[test]
+    fn apply_arb_active_entries_throttle_has_no_dynamic_string_keys() {
+        let bin_src = include_str!("market_data.rs");
+        let anchor = bin_src
+            .find("ArbPinDeferredLogCategory::LivePoolCacheMiss")
+            .expect("apply_arb_active_entries deferred category");
+        let start = bin_src[..anchor]
+            .rfind("fn apply_arb_active_entries(")
+            .expect("apply_arb_active_entries");
+        let end = bin_src[anchor..]
+            .find("fn arb_pool_leg_mint_still_required")
+            .expect("after apply_arb_active_entries");
+        let fn_body = &bin_src[start..anchor + end];
+        assert!(
+            !fn_body.contains("format!("),
+            "throttle decision must not allocate dynamic string keys"
         );
     }
 

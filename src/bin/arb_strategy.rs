@@ -1823,47 +1823,33 @@ fn record_v2_insufficient_subreason(insufficient: &RoundTripInsufficient) {
 
 const CROSS_DEX_PAIR_DEBUG_SAMPLE_MAX: usize = 3;
 const HOT_PATH_LOG_THROTTLE_SECS: u64 = 60;
-const HOT_PATH_LOG_THROTTLE_MAP_CAP: usize = 2048;
+const V2_INSUFFICIENT_LOG_CATEGORY_COUNT: usize = 9;
 
-mod bounded_log_throttle {
-    use std::collections::HashMap;
-    use std::hash::Hash;
+mod fixed_category_log_throttle {
     use std::time::{Duration, Instant};
 
     #[derive(Debug)]
-    pub(super) struct BoundedLogThrottle<K> {
-        entries: HashMap<K, Instant>,
-        cap: usize,
+    pub(super) struct FixedCategoryLogThrottle<const N: usize> {
+        last_emit: [Option<Instant>; N],
         interval: Duration,
     }
 
-    impl<K: Eq + Hash + Clone> BoundedLogThrottle<K> {
-        pub(super) fn new(cap: usize, interval: Duration) -> Self {
+    impl<const N: usize> FixedCategoryLogThrottle<N> {
+        pub(super) fn new(interval: Duration) -> Self {
             Self {
-                entries: HashMap::new(),
-                cap: cap.max(1),
+                last_emit: [None; N],
                 interval,
             }
         }
 
-        /// Returns true when a diagnostic log may be emitted for `key` at `now`.
-        pub(super) fn should_emit(&mut self, key: K, now: Instant) -> bool {
-            if let Some(last) = self.entries.get(&key) {
-                if now.duration_since(*last) < self.interval {
+        pub(super) fn should_emit(&mut self, category: usize, now: Instant) -> bool {
+            debug_assert!(category < N);
+            if let Some(last) = self.last_emit[category] {
+                if now.duration_since(last) < self.interval {
                     return false;
                 }
             }
-            if self.entries.len() >= self.cap {
-                if let Some(oldest_key) = self
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, ts)| *ts)
-                    .map(|(k, _)| k.clone())
-                {
-                    self.entries.remove(&oldest_key);
-                }
-            }
-            self.entries.insert(key, now);
+            self.last_emit[category] = Some(now);
             true
         }
     }
@@ -1873,45 +1859,134 @@ mod bounded_log_throttle {
         use super::*;
 
         #[test]
-        fn repeated_key_suppressed_until_interval_elapses() {
-            let mut throttle = BoundedLogThrottle::new(8, Duration::from_secs(60));
-            let key = "mint-a:no_cross_dex_sell";
+        fn many_distinct_mint_values_share_one_category_slot() {
+            let mut throttle = FixedCategoryLogThrottle::<2>::new(Duration::from_secs(60));
+            let category = 0usize;
             let t0 = Instant::now();
-            assert!(throttle.should_emit(key, t0));
-            assert!(!throttle.should_emit(key, t0 + Duration::from_secs(1)));
-            assert!(!throttle.should_emit(key, t0 + Duration::from_secs(59)));
-            assert!(throttle.should_emit(key, t0 + Duration::from_secs(60)));
+            assert!(throttle.should_emit(category, t0));
+            for offset in 1..=1000u64 {
+                assert!(
+                    !throttle.should_emit(category, t0 + Duration::from_millis(offset)),
+                    "category must stay suppressed regardless of mint cardinality"
+                );
+            }
+            assert!(throttle.should_emit(category, t0 + Duration::from_secs(60)));
         }
 
         #[test]
-        fn distinct_keys_emit_independently() {
-            let mut throttle = BoundedLogThrottle::new(8, Duration::from_secs(60));
+        fn distinct_categories_emit_independently() {
+            let mut throttle = FixedCategoryLogThrottle::<3>::new(Duration::from_secs(60));
             let t0 = Instant::now();
-            assert!(throttle.should_emit("mint-a", t0));
-            assert!(throttle.should_emit("mint-b", t0));
-            assert!(!throttle.should_emit("mint-a", t0 + Duration::from_secs(1)));
+            assert!(throttle.should_emit(0, t0));
+            assert!(throttle.should_emit(1, t0));
+            assert!(!throttle.should_emit(0, t0 + Duration::from_secs(1)));
         }
 
         #[test]
-        fn map_capacity_is_bounded() {
-            let mut throttle = BoundedLogThrottle::new(2, Duration::from_secs(60));
+        fn category_reopens_after_interval() {
+            let mut throttle = FixedCategoryLogThrottle::<1>::new(Duration::from_secs(60));
             let t0 = Instant::now();
-            assert!(throttle.should_emit("k1", t0));
-            assert!(throttle.should_emit("k2", t0 + Duration::from_secs(1)));
-            assert!(throttle.should_emit("k3", t0 + Duration::from_secs(2)));
-            assert_eq!(throttle.entries.len(), 2);
+            assert!(throttle.should_emit(0, t0));
+            assert!(!throttle.should_emit(0, t0 + Duration::from_secs(59)));
+            assert!(throttle.should_emit(0, t0 + Duration::from_secs(60)));
+        }
+    }
+}
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V2InsufficientLogCategory {
+    CandidatesLt2 = 0,
+    NoFreshBuyQuote = 1,
+    SingleDexCandidates = 2,
+    NoCrossDexSellUnknown = 3,
+    NoCrossDexSellMissingVault = 4,
+    NoCrossDexSellMissingDlmmBins = 5,
+    NoCrossDexSellQuoteNone = 6,
+    NoCrossDexSellNotFresh = 7,
+    NoCrossDexSellZeroOut = 8,
+}
+
+fn v2_insufficient_log_category(insufficient: &RoundTripInsufficient) -> V2InsufficientLogCategory {
+    match insufficient.subreason {
+        RoundTripInsufficientSubreason::CandidatesLt2 => V2InsufficientLogCategory::CandidatesLt2,
+        RoundTripInsufficientSubreason::NoFreshBuyQuote => {
+            V2InsufficientLogCategory::NoFreshBuyQuote
+        }
+        RoundTripInsufficientSubreason::SingleDexCandidates => {
+            V2InsufficientLogCategory::SingleDexCandidates
+        }
+        RoundTripInsufficientSubreason::NoCrossDexSell => {
+            match insufficient.no_cross_dex_sell_detail {
+                Some(NoCrossDexSellDetailReason::SellMissingVault) => {
+                    V2InsufficientLogCategory::NoCrossDexSellMissingVault
+                }
+                Some(NoCrossDexSellDetailReason::SellMissingDlmmBins) => {
+                    V2InsufficientLogCategory::NoCrossDexSellMissingDlmmBins
+                }
+                Some(NoCrossDexSellDetailReason::SellQuoteNone) => {
+                    V2InsufficientLogCategory::NoCrossDexSellQuoteNone
+                }
+                Some(NoCrossDexSellDetailReason::SellNotFresh) => {
+                    V2InsufficientLogCategory::NoCrossDexSellNotFresh
+                }
+                Some(NoCrossDexSellDetailReason::SellZeroOut) => {
+                    V2InsufficientLogCategory::NoCrossDexSellZeroOut
+                }
+                None => V2InsufficientLogCategory::NoCrossDexSellUnknown,
+            }
         }
     }
 }
 
 static ARB_V2_INSUFFICIENT_LOG_THROTTLE: std::sync::LazyLock<
-    parking_lot::Mutex<bounded_log_throttle::BoundedLogThrottle<String>>,
+    parking_lot::Mutex<
+        fixed_category_log_throttle::FixedCategoryLogThrottle<V2_INSUFFICIENT_LOG_CATEGORY_COUNT>,
+    >,
 > = std::sync::LazyLock::new(|| {
-    parking_lot::Mutex::new(bounded_log_throttle::BoundedLogThrottle::new(
-        HOT_PATH_LOG_THROTTLE_MAP_CAP,
+    parking_lot::Mutex::new(fixed_category_log_throttle::FixedCategoryLogThrottle::new(
         Duration::from_secs(HOT_PATH_LOG_THROTTLE_SECS),
     ))
 });
+
+#[cfg(test)]
+mod v2_insufficient_log_throttle_tests {
+    use super::*;
+
+    #[test]
+    fn category_is_fixed_per_subreason_and_detail() {
+        let no_fresh = RoundTripInsufficient::new(RoundTripInsufficientSubreason::NoFreshBuyQuote);
+        assert_eq!(
+            v2_insufficient_log_category(&no_fresh),
+            V2InsufficientLogCategory::NoFreshBuyQuote
+        );
+        let cross_dex = RoundTripInsufficient {
+            subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
+            no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellMissingVault),
+            sell_quote_none_detail_counts: None,
+        };
+        assert_eq!(
+            v2_insufficient_log_category(&cross_dex),
+            V2InsufficientLogCategory::NoCrossDexSellMissingVault
+        );
+    }
+
+    #[test]
+    fn production_log_path_has_no_dynamic_string_keys() {
+        let src = include_str!("arb_strategy.rs");
+        let start = src
+            .find("fn log_v2_round_trip_insufficient_pools(")
+            .expect("log_v2_round_trip_insufficient_pools");
+        let end = src[start..]
+            .find("fn log_v2_cross_dex_pair_failures_debug_sample")
+            .expect("after log_v2_round_trip_insufficient_pools");
+        let fn_body = &src[start..start + end];
+        assert!(
+            !fn_body.contains("format!("),
+            "throttle decision must not allocate dynamic string keys"
+        );
+    }
+}
 
 fn insufficient_subreason_metric_label(subreason: RoundTripInsufficientSubreason) -> &'static str {
     match subreason {
@@ -1930,25 +2005,21 @@ fn log_v2_round_trip_insufficient_pools(
     freshness: &QuoteFreshnessConfig,
     token_decimals: u8,
 ) {
-    let subreason = insufficient.subreason;
-    let subreason_label = insufficient_subreason_metric_label(subreason);
-    let dominant = insufficient
-        .no_cross_dex_sell_detail
-        .map(|d| d.as_metric_label())
-        .unwrap_or("unknown");
-    let throttle_key = if subreason == RoundTripInsufficientSubreason::NoCrossDexSell {
-        format!("no_cross_dex:{mint}:{dominant}")
-    } else {
-        format!("insufficient:{mint}:{subreason_label}")
-    };
+    let category = v2_insufficient_log_category(insufficient);
     let now = Instant::now();
     if !ARB_V2_INSUFFICIENT_LOG_THROTTLE
         .lock()
-        .should_emit(throttle_key, now)
+        .should_emit(category as usize, now)
     {
         return;
     }
+    let subreason = insufficient.subreason;
+    let subreason_label = insufficient_subreason_metric_label(subreason);
     if subreason == RoundTripInsufficientSubreason::NoCrossDexSell {
+        let dominant = insufficient
+            .no_cross_dex_sell_detail
+            .map(|d| d.as_metric_label())
+            .unwrap_or("unknown");
         warn!(
             mint = %mint,
             subreason = subreason_label,
