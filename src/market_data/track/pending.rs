@@ -10,6 +10,59 @@ use solana_sdk::pubkey::Pubkey;
 use crate::market_data::track::desired_set::ConsumerId;
 use crate::market_data::track::worker_commands::{PoolExplicitSnapshot, TrackWorkerCommand};
 
+/// Monotonic per-(pool,consumer) revision sequencer for pool snapshot commands.
+#[derive(Debug, Default)]
+pub struct PoolSnapshotRevisionSequencer {
+    issued: Mutex<HashMap<(Pubkey, ConsumerId), u64>>,
+    last_applied: Mutex<HashMap<(Pubkey, ConsumerId), u64>>,
+}
+
+impl PoolSnapshotRevisionSequencer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn assign_next(&self, snapshot: &mut PoolExplicitSnapshot) -> u64 {
+        let key = (snapshot.pool, snapshot.consumer);
+        let mut issued = self.issued.lock().expect("pool revision issued lock");
+        let entry = issued.entry(key).or_insert(0);
+        *entry = entry.saturating_add(1);
+        snapshot.revision = *entry;
+        *entry
+    }
+
+    pub fn should_apply_and_record(&self, snapshot: &PoolExplicitSnapshot) -> bool {
+        let key = (snapshot.pool, snapshot.consumer);
+        let mut applied = self
+            .last_applied
+            .lock()
+            .expect("pool revision applied lock");
+        if snapshot.revision <= applied.get(&key).copied().unwrap_or(0) {
+            return false;
+        }
+        applied.insert(key, snapshot.revision);
+        true
+    }
+
+    pub fn current_issued(&self, pool: Pubkey, consumer: ConsumerId) -> u64 {
+        self.issued
+            .lock()
+            .expect("pool revision issued lock")
+            .get(&(pool, consumer))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn current_applied(&self, pool: Pubkey, consumer: ConsumerId) -> u64 {
+        self.last_applied
+            .lock()
+            .expect("pool revision applied lock")
+            .get(&(pool, consumer))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 /// Coalesced pool command awaiting worker replay after queue loss.
 #[derive(Debug, Clone)]
 pub enum PendingPoolCommand {
@@ -69,15 +122,6 @@ impl PendingPoolCommand {
                 new_active_id,
             },
         }
-    }
-}
-
-fn assign_revision(command: &mut PendingPoolCommand, revision: u64) {
-    match command {
-        PendingPoolCommand::RegisterReserves(s)
-        | PendingPoolCommand::VaultsFromAccount(s)
-        | PendingPoolCommand::AfterTrade(s) => s.revision = revision,
-        PendingPoolCommand::RefreshDlmm { snapshot, .. } => snapshot.revision = revision,
     }
 }
 
@@ -200,23 +244,39 @@ pub struct PendingPoolRegistrations {
     entries: Mutex<HashMap<(Pubkey, ConsumerId), CoalescedPoolPending>>,
     order: Mutex<VecDeque<(Pubkey, ConsumerId)>>,
     overflow: AtomicBool,
-    next_revision: AtomicU64,
+    revisions: std::sync::Arc<PoolSnapshotRevisionSequencer>,
 }
 
 impl PendingPoolRegistrations {
-    pub fn new(max_pools: usize) -> Self {
+    pub fn new(max_pools: usize, revisions: std::sync::Arc<PoolSnapshotRevisionSequencer>) -> Self {
         Self {
             max_pools: max_pools.max(1),
             entries: Mutex::new(HashMap::new()),
             order: Mutex::new(VecDeque::new()),
             overflow: AtomicBool::new(false),
-            next_revision: AtomicU64::new(0),
+            revisions,
         }
     }
 
     pub fn upsert(&self, mut command: PendingPoolCommand) -> PendingPoolUpsertResult {
-        let revision = self.next_revision.fetch_add(1, Ordering::AcqRel) + 1;
-        assign_revision(&mut command, revision);
+        let revision = match &mut command {
+            PendingPoolCommand::RegisterReserves(s)
+            | PendingPoolCommand::VaultsFromAccount(s)
+            | PendingPoolCommand::AfterTrade(s) => {
+                if s.revision == 0 {
+                    self.revisions.assign_next(s)
+                } else {
+                    s.revision
+                }
+            }
+            PendingPoolCommand::RefreshDlmm { snapshot, .. } => {
+                if snapshot.revision == 0 {
+                    self.revisions.assign_next(snapshot)
+                } else {
+                    snapshot.revision
+                }
+            }
+        };
         let key = (command.pool(), command.consumer());
         let mut entries = self.entries.lock().expect("pending pool lock");
         let mut order = self.order.lock().expect("pending pool order lock");
@@ -377,9 +437,19 @@ mod tests {
         }
     }
 
+    use std::sync::Arc;
+
+    fn mk_pending() -> (PendingPoolRegistrations, Arc<PoolSnapshotRevisionSequencer>) {
+        let revisions = Arc::new(PoolSnapshotRevisionSequencer::new());
+        (
+            PendingPoolRegistrations::new(8, Arc::clone(&revisions)),
+            revisions,
+        )
+    }
+
     #[test]
     fn pending_replays_latest_revision_not_kind_order() {
-        let pending = PendingPoolRegistrations::new(8);
+        let (pending, _revs) = mk_pending();
         let pool = Pubkey::new_unique();
         let old_vault = Pubkey::new_unique();
         let new_vault = Pubkey::new_unique();
@@ -408,7 +478,7 @@ mod tests {
 
     #[test]
     fn pending_stale_out_of_order_across_all_kinds_no_ops() {
-        let pending = PendingPoolRegistrations::new(8);
+        let (pending, _revs) = mk_pending();
         let pool = Pubkey::new_unique();
         let v2 = Pubkey::new_unique();
         let v3 = Pubkey::new_unique();
@@ -459,5 +529,22 @@ mod tests {
             }
             other => panic!("expected RefreshDlmm latest, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sequencer_rejects_stale_apply_after_newer() {
+        let revisions = PoolSnapshotRevisionSequencer::new();
+        let pool = Pubkey::new_unique();
+        let mut newer = mk_snapshot(pool, Pubkey::new_unique());
+        let mut older = mk_snapshot(pool, Pubkey::new_unique());
+        let rev_new = revisions.assign_next(&mut newer);
+        let rev_latest = revisions.assign_next(&mut older);
+        assert!(revisions.should_apply_and_record(&older));
+        assert!(!revisions.should_apply_and_record(&newer));
+        assert_eq!(
+            revisions.current_applied(pool, ConsumerId::Momentum),
+            rev_latest
+        );
+        assert!(rev_new < rev_latest);
     }
 }

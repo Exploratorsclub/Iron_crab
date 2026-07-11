@@ -26,7 +26,7 @@ pub use geyser_sync::{
 };
 pub use pending::{
     GeyserConnectBarrier, PendingPoolCommand, PendingPoolRegistrations, PendingPoolUpsertResult,
-    ProtectedOverflowDiagnostic, WalletExplicitPending,
+    PoolSnapshotRevisionSequencer, ProtectedOverflowDiagnostic, WalletExplicitPending,
 };
 pub use snapshot::{
     explicit_set_snapshot_path, load_explicit_set_snapshot, owner_key_to_snapshot,
