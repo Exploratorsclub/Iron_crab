@@ -27,6 +27,7 @@ pub enum TrackWorkerCommand {
     },
     SyncWalletExplicitDemand {
         demand: HashSet<Pubkey>,
+        token_accounts: HashSet<Pubkey>,
     },
     RegisterPoolGeyserReserves {
         pool: Pubkey,

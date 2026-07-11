@@ -96,7 +96,11 @@ pub trait TrackWorkerContext: Send + Sync {
         &self,
         desired: &mut DesiredExplicitSet,
         demand: HashSet<Pubkey>,
+        token_accounts: HashSet<Pubkey>,
     ) -> bool;
+    fn take_pending_explicit_cap(&self) -> Option<usize>;
+    fn take_track_worker_dirty(&self) -> bool;
+    fn apply_pending_track_worker_work(&self, desired: &mut DesiredExplicitSet);
     fn commit_register_pool_geyser_reserves(
         &self,
         desired: &mut DesiredExplicitSet,
@@ -163,21 +167,21 @@ pub trait TrackWorkerContext: Send + Sync {
 pub struct TrackWorkerSender {
     tx: std_mpsc::SyncSender<TrackWorkerCommand>,
     queue_depth: Arc<AtomicUsize>,
+    #[allow(dead_code)]
     queue_capacity: usize,
 }
 
 pub fn track_worker_try_enqueue(sender: &TrackWorkerSender, job: TrackWorkerCommand) -> bool {
-    if sender.queue_depth.load(Ordering::Relaxed) >= sender.queue_capacity {
-        inc_market_data_geyser_tracking_enqueue_dropped_total();
-        return false;
-    }
-    if sender.tx.try_send(job).is_ok() {
-        let depth = sender.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
-        set_market_data_track_worker_queue_depth(depth);
-        true
-    } else {
-        inc_market_data_geyser_tracking_enqueue_dropped_total();
-        false
+    match sender.tx.try_send(job) {
+        Ok(()) => {
+            let depth = sender.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+            set_market_data_track_worker_queue_depth(depth);
+            true
+        }
+        Err(_) => {
+            inc_market_data_geyser_tracking_enqueue_dropped_total();
+            false
+        }
     }
 }
 
@@ -270,9 +274,10 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
         TrackWorkerCommand::TrackMint { mint, pin } => {
             ctx.track_mint_for_geyser_metadata(desired, mint, pin)
         }
-        TrackWorkerCommand::SyncWalletExplicitDemand { demand } => {
-            ctx.sync_wallet_explicit_demand(desired, demand)
-        }
+        TrackWorkerCommand::SyncWalletExplicitDemand {
+            demand,
+            token_accounts,
+        } => ctx.sync_wallet_explicit_demand(desired, demand, token_accounts),
         TrackWorkerCommand::RegisterPoolGeyserReserves { pool, pin } => {
             ctx.commit_register_pool_geyser_reserves(desired, pool, pin)
         }
@@ -304,9 +309,21 @@ fn track_worker_apply_invalidation<C: TrackWorkerContext>(
     desired: &mut DesiredExplicitSet,
     admission_converged: &mut bool,
 ) {
+    if let Some(cap) = ctx.take_pending_explicit_cap() {
+        desired.set_max_explicit_pubkeys(cap);
+        *admission_converged = false;
+    }
     if ctx.take_explicit_admission_invalidate() {
         *admission_converged = false;
-        desired.set_max_explicit_pubkeys(ctx.max_tracked_accounts());
+    }
+}
+
+fn track_worker_apply_pending_dirty<C: TrackWorkerContext>(
+    ctx: &Arc<C>,
+    desired: &mut DesiredExplicitSet,
+) {
+    if ctx.take_track_worker_dirty() {
+        ctx.apply_pending_track_worker_work(desired);
     }
 }
 
@@ -387,6 +404,9 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
             Err(std_mpsc::RecvTimeoutError::Timeout) => {}
             Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
         }
+
+        track_worker_apply_pending_dirty(&ctx, &mut desired);
+        track_worker_apply_invalidation(&ctx, &mut desired, &mut admission_converged);
 
         let should_push =
             push_before_keys.is_some() && coalesce_deadline.is_some_and(|d| Instant::now() >= d);
