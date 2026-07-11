@@ -820,7 +820,6 @@ impl ArbTrackMintSnapshotCache {
 #[derive(Debug, Default)]
 struct ArbTrackSelectionCoalescer {
     dirty_mints: HashSet<String>,
-    pending_full: bool,
     dirty_overflow: bool,
 }
 
@@ -842,21 +841,15 @@ impl ArbTrackSelectionCoalescer {
         false
     }
 
-    fn note_full_reconcile(&mut self) {
-        self.pending_full = true;
-    }
-
     fn note_dirty_overflow(&mut self) {
         self.dirty_overflow = true;
     }
 
-    fn take_batch(&mut self) -> (Vec<String>, bool, bool) {
-        let full = self.pending_full;
+    fn take_batch(&mut self) -> (Vec<String>, bool) {
         let overflow = self.dirty_overflow;
-        self.pending_full = false;
         self.dirty_overflow = false;
         let dirty = self.dirty_mints.drain().collect();
-        (dirty, full, overflow)
+        (dirty, overflow)
     }
 }
 
@@ -6691,15 +6684,50 @@ fn maybe_arb_tracker_write_stall_watchdog_warn(queue_cap: usize) {
     arb_tracker_write_stall_watchdog_inc();
 }
 
+/// Authoritative batch-mode decision for the selection worker (unit-tested).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArbTrackBatchPlan {
+    Idle,
+    /// Full reconcile requested but rate-limited; no dirty mints to process incrementally.
+    DeferFullReconcile,
+    /// Process dirty mints only; `keep_pending_full` preserves deferred full reconcile.
+    Incremental {
+        keep_pending_full: bool,
+    },
+    FullReconcile,
+}
+
+fn resolve_arb_track_batch_plan(
+    wants_full_reconcile: bool,
+    has_dirty_mints: bool,
+    elapsed_since_full: Duration,
+    full_reconcile_min: Duration,
+) -> ArbTrackBatchPlan {
+    let full_allowed = wants_full_reconcile && elapsed_since_full >= full_reconcile_min;
+    if full_allowed {
+        return ArbTrackBatchPlan::FullReconcile;
+    }
+    if wants_full_reconcile && has_dirty_mints {
+        return ArbTrackBatchPlan::Incremental {
+            keep_pending_full: true,
+        };
+    }
+    if wants_full_reconcile {
+        return ArbTrackBatchPlan::DeferFullReconcile;
+    }
+    if has_dirty_mints {
+        return ArbTrackBatchPlan::Incremental {
+            keep_pending_full: false,
+        };
+    }
+    ArbTrackBatchPlan::Idle
+}
+
 fn run_arb_track_selection_batch(
     ctx: &Arc<ArbContext>,
     mut dirty_mints: Vec<String>,
-    mut full_reconcile: bool,
+    full_reconcile: bool,
 ) {
-    if ctx.arb_track_selection.take_pending_full() {
-        full_reconcile = true;
-    }
-
     let protected = ctx.mandatory_protected_snapshot_mints();
 
     if full_reconcile {
@@ -6742,9 +6770,6 @@ fn spawn_arb_track_selection_worker(ctx: Arc<ArbContext>, mut wake_rx: mpsc::Rec
             ctx.arb_track_selection.clear_wake_pending();
             ctx.arb_track_selection
                 .drain_ingress_to_coalescer(&mut coalescer);
-            if ctx.arb_track_selection.take_pending_full() {
-                coalescer.note_full_reconcile();
-            }
 
             let coalesce_deadline =
                 Instant::now() + Duration::from_millis(ARB_TRACK_SELECTION_COALESCE_MS);
@@ -6760,64 +6785,77 @@ fn spawn_arb_track_selection_worker(ctx: Arc<ArbContext>, mut wake_rx: mpsc::Rec
                 }
                 ctx.arb_track_selection
                     .drain_ingress_to_coalescer(&mut coalescer);
-                if ctx.arb_track_selection.take_pending_full() {
-                    coalescer.note_full_reconcile();
-                }
             }
 
-            let (dirty_mints, mut full_reconcile, dirty_overflow) = coalescer.take_batch();
+            let (dirty_mints, dirty_overflow) = coalescer.take_batch();
             if dirty_overflow {
                 ctx.arb_track_selection
                     .pending_full_reconcile
                     .store(true, Ordering::Release);
-                full_reconcile = true;
             }
-            if ctx.arb_track_selection.take_pending_full() {
-                full_reconcile = true;
-            }
+            let wants_full_reconcile = ctx
+                .arb_track_selection
+                .pending_full_reconcile
+                .load(Ordering::Acquire);
+            let plan = resolve_arb_track_batch_plan(
+                wants_full_reconcile,
+                !dirty_mints.is_empty(),
+                last_full_reconcile.elapsed(),
+                full_reconcile_min,
+            );
 
-            if full_reconcile && last_full_reconcile.elapsed() < full_reconcile_min {
-                ctx.arb_track_selection
-                    .pending_full_reconcile
-                    .store(true, Ordering::Release);
-                full_reconcile = false;
-            }
-
-            if dirty_mints.is_empty() && !full_reconcile {
-                if ctx
-                    .arb_track_selection
-                    .pending_full_reconcile
-                    .load(Ordering::Acquire)
-                {
+            match plan {
+                ArbTrackBatchPlan::Idle => {}
+                ArbTrackBatchPlan::DeferFullReconcile => {
+                    ctx.arb_track_selection
+                        .pending_full_reconcile
+                        .store(true, Ordering::Release);
                     let sleep = full_reconcile_min.saturating_sub(last_full_reconcile.elapsed());
                     if sleep > Duration::ZERO {
                         tokio::time::sleep(sleep).await;
                     }
                     ctx.arb_track_selection.schedule_worker_wake();
+                    continue;
                 }
-                continue;
-            }
-
-            if !full_reconcile {
-                let min_interval = Duration::from_millis(ARB_TRACK_INCREMENTAL_MIN_INTERVAL_MS);
-                let elapsed = last_incremental.elapsed();
-                if elapsed < min_interval {
-                    tokio::time::sleep(min_interval - elapsed).await;
+                ArbTrackBatchPlan::Incremental { keep_pending_full } => {
+                    if keep_pending_full {
+                        ctx.arb_track_selection
+                            .pending_full_reconcile
+                            .store(true, Ordering::Release);
+                    }
+                    let min_interval = Duration::from_millis(ARB_TRACK_INCREMENTAL_MIN_INTERVAL_MS);
+                    let elapsed = last_incremental.elapsed();
+                    if elapsed < min_interval {
+                        tokio::time::sleep(min_interval - elapsed).await;
+                    }
+                    let ctx_blocking = Arc::clone(&ctx);
+                    let dirty = dirty_mints;
+                    let blocking = tokio::task::spawn_blocking(move || {
+                        run_arb_track_selection_batch(&ctx_blocking, dirty, false);
+                    });
+                    if blocking.await.is_err() {
+                        warn!("arb track selection blocking batch join failed");
+                        ctx.arb_track_selection.record_blocking_join_failed();
+                    }
+                    last_incremental = Instant::now();
+                    if keep_pending_full {
+                        ctx.arb_track_selection.schedule_worker_wake();
+                    }
                 }
-            } else {
-                last_full_reconcile = Instant::now();
+                ArbTrackBatchPlan::FullReconcile => {
+                    let _ = ctx.arb_track_selection.take_pending_full();
+                    last_full_reconcile = Instant::now();
+                    let ctx_blocking = Arc::clone(&ctx);
+                    let blocking = tokio::task::spawn_blocking(move || {
+                        run_arb_track_selection_batch(&ctx_blocking, Vec::new(), true);
+                    });
+                    if blocking.await.is_err() {
+                        warn!("arb track selection blocking batch join failed");
+                        ctx.arb_track_selection.record_blocking_join_failed();
+                    }
+                    last_incremental = Instant::now();
+                }
             }
-
-            let ctx_blocking = Arc::clone(&ctx);
-            let dirty = dirty_mints;
-            let blocking = tokio::task::spawn_blocking(move || {
-                run_arb_track_selection_batch(&ctx_blocking, dirty, full_reconcile);
-            });
-            if blocking.await.is_err() {
-                warn!("arb track selection blocking batch join failed");
-                ctx.arb_track_selection.record_blocking_join_failed();
-            }
-            last_incremental = Instant::now();
 
             if ctx.arb_track_selection.ingress_has_work() {
                 ctx.arb_track_selection.schedule_worker_wake();
@@ -10965,13 +11003,11 @@ mod two_hop_price_tests {
         for i in 0..100 {
             coalescer.ingest_dirty(format!("mint_{i}"));
         }
-        let (dirty, full, overflow) = coalescer.take_batch();
-        assert!(!full);
+        let (dirty, overflow) = coalescer.take_batch();
         assert!(!overflow);
         assert_eq!(dirty.len(), 100);
-        let (dirty2, full2, overflow2) = coalescer.take_batch();
+        let (dirty2, overflow2) = coalescer.take_batch();
         assert!(dirty2.is_empty());
-        assert!(!full2);
         assert!(!overflow2);
     }
 
@@ -10982,8 +11018,7 @@ mod two_hop_price_tests {
             assert!(!coalescer.ingest_dirty(format!("mint_{i}")));
         }
         assert!(coalescer.ingest_dirty("overflow_mint".to_string()));
-        let (dirty, full, overflow) = coalescer.take_batch();
-        assert!(!full);
+        let (dirty, overflow) = coalescer.take_batch();
         assert!(
             overflow,
             "overflow must schedule authoritative full reconcile"
@@ -11006,7 +11041,7 @@ mod two_hop_price_tests {
             }
         }
         assert!(overflow_seen);
-        let (dirty, _, overflow) = coalescer.take_batch();
+        let (dirty, overflow) = coalescer.take_batch();
         assert!(overflow);
         assert_eq!(dirty.len(), cap);
     }
@@ -11019,9 +11054,62 @@ mod two_hop_price_tests {
             assert!(!coalescer.ingest_dirty(format!("mint_{i}")));
         }
         assert!(!coalescer.ingest_dirty("mint_0".to_string()));
-        let (dirty, _, overflow) = coalescer.take_batch();
+        let (dirty, overflow) = coalescer.take_batch();
         assert!(!overflow);
         assert_eq!(dirty.len(), cap);
+    }
+
+    #[test]
+    fn resolve_arb_track_batch_plan_defers_full_with_dirty_as_incremental() {
+        let min = Duration::from_secs(5);
+        let plan = resolve_arb_track_batch_plan(true, true, Duration::from_millis(100), min);
+        assert_eq!(
+            plan,
+            ArbTrackBatchPlan::Incremental {
+                keep_pending_full: true
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_arb_track_batch_plan_keeps_full_pending_until_interval_elapsed() {
+        let min = Duration::from_secs(5);
+        let deferred = resolve_arb_track_batch_plan(true, true, Duration::from_secs(1), min);
+        assert_eq!(
+            deferred,
+            ArbTrackBatchPlan::Incremental {
+                keep_pending_full: true
+            }
+        );
+        let eligible = resolve_arb_track_batch_plan(true, true, Duration::from_secs(5), min);
+        assert_eq!(eligible, ArbTrackBatchPlan::FullReconcile);
+    }
+
+    #[test]
+    fn resolve_arb_track_batch_plan_defers_full_without_dirty() {
+        let plan = resolve_arb_track_batch_plan(
+            true,
+            false,
+            Duration::from_millis(0),
+            Duration::from_secs(5),
+        );
+        assert_eq!(plan, ArbTrackBatchPlan::DeferFullReconcile);
+    }
+
+    #[test]
+    fn resolve_arb_track_batch_plan_incremental_without_pending_full_when_not_deferred() {
+        let plan = resolve_arb_track_batch_plan(
+            false,
+            true,
+            Duration::from_secs(0),
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            plan,
+            ArbTrackBatchPlan::Incremental {
+                keep_pending_full: false
+            }
+        );
     }
 
     #[test]
