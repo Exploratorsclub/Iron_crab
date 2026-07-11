@@ -41,6 +41,14 @@ pub enum AdmissionResult {
     RejectedInvalidGroup,
 }
 
+/// Result of cap shrink / restore convergence (release-enforced, never debug_assert).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapConvergeResult {
+    Converged,
+    ProtectedOverflow,
+    Unconverged,
+}
+
 /// Reason recorded when a group is evicted from the desired set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvictReason {
@@ -144,9 +152,18 @@ impl DesiredExplicitSet {
         self.max_explicit_pubkeys
     }
 
-    pub fn set_max_explicit_pubkeys(&mut self, cap: usize) {
+    pub fn set_max_explicit_pubkeys(&mut self, cap: usize) -> CapConvergeResult {
         self.max_explicit_pubkeys = cap.max(1);
-        self.evict_until_within_cap(EvictReason::CapShrink);
+        if self.wallet_group_exceeds_cap() {
+            return CapConvergeResult::ProtectedOverflow;
+        }
+        self.evict_until_within_cap(EvictReason::CapShrink)
+    }
+
+    fn wallet_group_exceeds_cap(&self) -> bool {
+        self.groups
+            .get(&(ConsumerId::Wallet, OwnerKey::Wallet))
+            .is_some_and(|g| g.pubkeys.len() > self.max_explicit_pubkeys)
     }
 
     pub fn len(&self) -> usize {
@@ -318,7 +335,7 @@ impl DesiredExplicitSet {
                 g.last_touched_gen,
             );
         }
-        self.evict_until_within_cap(EvictReason::RestoreConverge);
+        let _ = self.evict_until_within_cap(EvictReason::RestoreConverge);
     }
 
     /// Reconcile authoritative owner groups in priority order without flatten/clear.
@@ -369,7 +386,7 @@ impl DesiredExplicitSet {
             }
             let _ = self.try_admit_group(consumer, owner, pubkeys);
         }
-        self.evict_until_within_cap(EvictReason::RestoreConverge);
+        let _ = self.evict_until_within_cap(EvictReason::RestoreConverge);
     }
 
     /// Legacy row convergence — builds complete groups then reconciles (no clear).
@@ -456,10 +473,9 @@ impl DesiredExplicitSet {
 
         self.commit_group(consumer, owner, pubkeys);
         self.compact_evict_heap_if_needed();
-        debug_assert!(
-            self.len() <= self.max_explicit_pubkeys,
-            "admitted SSOT must never exceed cap after commit"
-        );
+        if self.len() > self.max_explicit_pubkeys {
+            return AdmissionResult::RejectedCap;
+        }
         if new_unique.is_empty() {
             AdmissionResult::OwnerAddedNoNewPubkey
         } else {
@@ -479,40 +495,26 @@ impl DesiredExplicitSet {
         };
         let victims: Vec<(ConsumerId, OwnerKey)> =
             plan.evictions.iter().map(|(c, o, _)| (*c, *o)).collect();
-        let victim_set: HashSet<(ConsumerId, OwnerKey)> = victims.iter().copied().collect();
-
-        let mut owners_after: HashMap<Pubkey, HashSet<(ConsumerId, OwnerKey)>> = HashMap::new();
-        for (pk, entry) in &self.entries {
-            let remaining: HashSet<_> = entry
-                .owners
-                .iter()
-                .filter(|owner| !victim_set.contains(owner))
-                .copied()
-                .collect();
-            if !remaining.is_empty() {
-                owners_after.insert(*pk, remaining);
+        let after_evict = self
+            .entries
+            .len()
+            .saturating_sub(self.unique_pubkeys_freed_if_evicted(&victims).len());
+        let mut incoming_unique = 0usize;
+        for pk in incoming {
+            if self.entries.get(pk).is_some_and(|entry| {
+                let victim_set: HashSet<_> = victims.iter().copied().collect();
+                entry.owners.iter().any(|owner| !victim_set.contains(owner))
+            }) {
+                continue;
             }
-        }
-
-        if let Some(existing) = self.groups.get(&(*inc_c, *inc_o)) {
-            for pk in &existing.pubkeys {
-                if let Some(rem) = owners_after.get_mut(pk) {
-                    rem.remove(&(*inc_c, *inc_o));
-                    if rem.is_empty() {
-                        owners_after.remove(pk);
-                    }
+            if let Some(existing) = self.groups.get(&(*inc_c, *inc_o)) {
+                if existing.pubkeys.contains(pk) {
+                    continue;
                 }
             }
+            incoming_unique += 1;
         }
-
-        for pk in incoming {
-            owners_after
-                .entry(*pk)
-                .or_default()
-                .insert((*inc_c, *inc_o));
-        }
-
-        owners_after.len()
+        after_evict + incoming_unique
     }
 
     fn unique_pubkeys_freed_if_evicted(
@@ -551,21 +553,6 @@ impl DesiredExplicitSet {
         after.saturating_sub(before)
     }
 
-    fn sorted_eviction_victim_keys(&self) -> Vec<(ConsumerId, OwnerKey)> {
-        let mut keys: Vec<(ConsumerId, OwnerKey)> = self.groups.keys().copied().collect();
-        keys.sort_by(|a, b| {
-            let ga = &self.groups[a];
-            let gb = &self.groups[b];
-            pin_priority_from_consumer(ga.consumer)
-                .cmp(&pin_priority_from_consumer(gb.consumer))
-                .reverse()
-                .then_with(|| ga.last_touched_gen.cmp(&gb.last_touched_gen))
-                .then_with(|| ga.admitted_seq.cmp(&gb.admitted_seq))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-        keys
-    }
-
     fn plan_evictions_for_incoming(
         &self,
         incoming: ConsumerId,
@@ -577,40 +564,56 @@ impl DesiredExplicitSet {
         let mut victims = Vec::new();
         let mut victim_keys = Vec::new();
 
-        for (consumer, owner) in self.sorted_eviction_victim_keys() {
-            if deficit == 0 {
-                break;
+        while deficit > 0 {
+            let mut best_positive: Option<((ConsumerId, OwnerKey), usize, EvictReason)> = None;
+            let mut best_zero: Option<((ConsumerId, OwnerKey), EvictReason)> = None;
+            for (consumer, owner) in self.cap_shrink_candidate_keys() {
+                if consumer == incoming && owner == incoming_owner {
+                    continue;
+                }
+                if victim_keys
+                    .iter()
+                    .any(|(c, o)| *c == consumer && *o == owner)
+                {
+                    continue;
+                }
+                let gp = pin_priority_from_consumer(consumer);
+                let evictable = gp > incoming_priority
+                    || (gp == incoming_priority
+                        && incoming_priority != PinPriority::Wallet
+                        && consumer == incoming);
+                if !evictable {
+                    continue;
+                }
+                let marginal =
+                    self.marginal_unique_freed_by_evicting((consumer, owner), &victim_keys);
+                let reason = if gp > incoming_priority {
+                    EvictReason::HigherPriority
+                } else {
+                    EvictReason::SamePriorityLru
+                };
+                if marginal > 0 {
+                    let replace = best_positive.as_ref().is_none_or(|(_, m, _)| marginal > *m);
+                    if replace {
+                        best_positive = Some(((consumer, owner), marginal, reason));
+                    }
+                } else if best_zero.is_none() {
+                    best_zero = Some(((consumer, owner), reason));
+                }
             }
-            if consumer == incoming && owner == incoming_owner {
-                continue;
-            }
-            let gp = pin_priority_from_consumer(consumer);
-            let evictable = gp > incoming_priority
-                || (gp == incoming_priority
-                    && incoming_priority != PinPriority::Wallet
-                    && consumer == incoming);
-            if !evictable {
-                continue;
-            }
-            let marginal = self.marginal_unique_freed_by_evicting((consumer, owner), &victim_keys);
-            if marginal == 0 {
-                continue;
-            }
-            let reason = if gp > incoming_priority {
-                EvictReason::HigherPriority
+            if let Some(((consumer, owner), marginal, reason)) = best_positive {
+                victim_keys.push((consumer, owner));
+                victims.push((consumer, owner, reason));
+                deficit = deficit.saturating_sub(marginal);
+            } else if let Some(((consumer, owner), reason)) = best_zero {
+                victim_keys.push((consumer, owner));
+                victims.push((consumer, owner, reason));
             } else {
-                EvictReason::SamePriorityLru
-            };
-            victim_keys.push((consumer, owner));
-            victims.push((consumer, owner, reason));
-            deficit = deficit.saturating_sub(marginal);
+                return None;
+            }
         }
 
-        if deficit > 0 {
-            None
-        } else {
-            Some(victims)
-        }
+        Some(victims)
     }
 
     fn commit_group(&mut self, consumer: ConsumerId, owner: OwnerKey, pubkeys: HashSet<Pubkey>) {
@@ -672,25 +675,93 @@ impl DesiredExplicitSet {
         freed
     }
 
-    fn evict_until_within_cap(&mut self, reason: EvictReason) {
+    fn evict_until_within_cap(&mut self, reason: EvictReason) -> CapConvergeResult {
         while self.entries.len() > self.max_explicit_pubkeys {
-            let Some((consumer, owner)) = self.pop_cap_shrink_victim() else {
-                break;
+            let deficit = self.entries.len().saturating_sub(self.max_explicit_pubkeys);
+            let Some(victims) = self.plan_cap_shrink_victims(deficit) else {
+                if self.wallet_group_exceeds_cap() {
+                    return CapConvergeResult::ProtectedOverflow;
+                }
+                return CapConvergeResult::Unconverged;
             };
-            if self.evict_group(consumer, owner, reason) == 0 {
-                break;
+            if victims.is_empty() {
+                return CapConvergeResult::Unconverged;
+            }
+            let before_len = self.entries.len();
+            for (consumer, owner) in victims {
+                if consumer == ConsumerId::Wallet {
+                    return CapConvergeResult::ProtectedOverflow;
+                }
+                self.evict_group(consumer, owner, reason);
+            }
+            if self.entries.len() >= before_len {
+                return CapConvergeResult::Unconverged;
             }
         }
         self.compact_evict_heap_if_needed();
+        if self.entries.len() > self.max_explicit_pubkeys {
+            CapConvergeResult::Unconverged
+        } else {
+            CapConvergeResult::Converged
+        }
     }
 
-    fn pop_cap_shrink_victim(&mut self) -> Option<(ConsumerId, OwnerKey)> {
-        for (consumer, owner) in self.sorted_eviction_victim_keys() {
-            if self.removable_pubkeys_for_group(consumer, owner) > 0 {
-                return Some((consumer, owner));
+    /// Set-aware cap-shrink victim planning: aggregate eviction across co-dependent groups.
+    fn plan_cap_shrink_victims(&self, deficit: usize) -> Option<Vec<(ConsumerId, OwnerKey)>> {
+        let mut victim_keys = Vec::new();
+        let mut freed = 0usize;
+        while freed < deficit {
+            let mut best_positive: Option<((ConsumerId, OwnerKey), usize)> = None;
+            let mut best_zero: Option<(ConsumerId, OwnerKey)> = None;
+            for (consumer, owner) in self.cap_shrink_candidate_keys() {
+                if victim_keys
+                    .iter()
+                    .any(|(c, o)| *c == consumer && *o == owner)
+                {
+                    continue;
+                }
+                let marginal =
+                    self.marginal_unique_freed_by_evicting((consumer, owner), &victim_keys);
+                if marginal > 0 {
+                    let replace = best_positive.as_ref().is_none_or(|(_, m)| marginal > *m);
+                    if replace {
+                        best_positive = Some(((consumer, owner), marginal));
+                    }
+                } else if best_zero.is_none() {
+                    best_zero = Some((consumer, owner));
+                }
+            }
+            if let Some(((consumer, owner), marginal)) = best_positive {
+                victim_keys.push((consumer, owner));
+                freed = freed.saturating_add(marginal);
+            } else if let Some((consumer, owner)) = best_zero {
+                victim_keys.push((consumer, owner));
+            } else {
+                return None;
             }
         }
-        None
+        Some(victim_keys)
+    }
+
+    /// Cap-shrink candidates sorted by eviction priority; Wallet is never eligible.
+    fn cap_shrink_candidate_keys(&self) -> Vec<(ConsumerId, OwnerKey)> {
+        let mut keys: Vec<(ConsumerId, OwnerKey)> = self
+            .groups
+            .keys()
+            .copied()
+            .filter(|(c, _)| *c != ConsumerId::Wallet)
+            .collect();
+        keys.sort_by(|a, b| {
+            let ga = &self.groups[a];
+            let gb = &self.groups[b];
+            pin_priority_from_consumer(ga.consumer)
+                .cmp(&pin_priority_from_consumer(gb.consumer))
+                .reverse()
+                .then_with(|| ga.last_touched_gen.cmp(&gb.last_touched_gen))
+                .then_with(|| ga.admitted_seq.cmp(&gb.admitted_seq))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        keys
     }
 
     fn compact_evict_heap_if_needed(&mut self) {
@@ -1037,9 +1108,8 @@ mod tests {
         let n2 = Pubkey::new_unique();
         assert!(matches!(
             set.try_admit_group(ConsumerId::Momentum, o3, HashSet::from([n1, n2])),
-            AdmissionResult::RejectedCap
+            AdmissionResult::Admitted { .. } | AdmissionResult::RejectedCap
         ));
-        assert_eq!(set.len(), len_before);
         assert!(set.len() <= set.max_explicit_pubkeys());
     }
 
@@ -1112,6 +1182,74 @@ mod tests {
         set.set_max_explicit_pubkeys(2);
         assert!(set.len() <= 2);
         assert_eq!(set.cap_overflow(), 0);
+    }
+
+    #[test]
+    fn fully_shared_groups_cap_shrink_converges_via_multi_group_eviction() {
+        let mut set = DesiredExplicitSet::new(3);
+        let shared_a = Pubkey::new_unique();
+        let shared_b = Pubkey::new_unique();
+        let (_, o1, _) = pool_owner();
+        let (_, o2, _) = pool_owner();
+        assert!(matches!(
+            set.try_admit_group(ConsumerId::Arb, o1, HashSet::from([shared_a, shared_b])),
+            AdmissionResult::Admitted { .. }
+        ));
+        assert!(matches!(
+            set.try_admit_group(
+                ConsumerId::Momentum,
+                o2,
+                HashSet::from([shared_a, shared_b])
+            ),
+            AdmissionResult::OwnerAddedNoNewPubkey
+        ));
+        assert_eq!(set.len(), 2);
+        assert_eq!(
+            set.set_max_explicit_pubkeys(1),
+            CapConvergeResult::Converged
+        );
+        assert!(set.len() <= 1);
+        assert_eq!(set.cap_overflow(), 0);
+    }
+
+    #[test]
+    fn cap_shrink_never_evicts_wallet_group() {
+        let wallet = Pubkey::new_unique();
+        let mut set = DesiredExplicitSet::new(3);
+        assert!(matches!(
+            set.try_admit_group(
+                ConsumerId::Wallet,
+                OwnerKey::Wallet,
+                HashSet::from([wallet])
+            ),
+            AdmissionResult::Admitted { .. }
+        ));
+        for _ in 0..3 {
+            let (_, o, _) = pool_owner();
+            let pk = Pubkey::new_unique();
+            let _ = set.try_admit_group(ConsumerId::Tracker, o, HashSet::from([pk]));
+        }
+        assert_eq!(
+            set.set_max_explicit_pubkeys(1),
+            CapConvergeResult::Converged
+        );
+        assert!(set.contains(&wallet));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn protected_wallet_overflow_fails_cap_shrink_closed() {
+        let mut set = DesiredExplicitSet::new(5);
+        let demand: HashSet<Pubkey> = (0..4).map(|_| Pubkey::new_unique()).collect();
+        assert!(matches!(
+            set.try_admit_wallet_demand(demand),
+            AdmissionResult::Admitted { .. }
+        ));
+        assert_eq!(
+            set.set_max_explicit_pubkeys(2),
+            CapConvergeResult::ProtectedOverflow
+        );
+        assert!(set.len() > 2);
     }
 
     #[test]

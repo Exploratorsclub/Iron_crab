@@ -52,10 +52,20 @@ pub fn track_worker_execute_coalesced_push<C: TrackWorkerContext>(
     set_market_data_geyser_explicit_set_size(desired.len());
 
     let after_keys = desired.snapshot_pubkeys();
-    debug_assert!(
-        after_keys.len() <= desired.max_explicit_pubkeys(),
-        "admitted SSOT must never exceed cap"
-    );
+    if desired.cap_overflow() > 0 {
+        set_market_data_geyser_explicit_cap_overflow(desired.cap_overflow());
+        if release_flush_slot {
+            ctx.release_geyser_sync_flush_slot();
+        }
+        return false;
+    }
+    if !ctx.geyser_explicit_readiness_ok() {
+        set_market_data_geyser_explicit_cap_overflow(0);
+        if release_flush_slot {
+            ctx.release_geyser_sync_flush_slot();
+        }
+        return false;
+    }
     let delta = symmetric_diff(&before_keys, &after_keys);
     if delta.is_empty() && !continue_evict && !ctx.pending_geyser_evict() {
         inc_market_data_geyser_sync_skipped_no_delta_total();

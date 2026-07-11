@@ -1,12 +1,12 @@
 //! Phase 5a: `md-track-worker` OS thread — bounded enqueue, command processing, coalesced Geyser push.
 
-use super::desired_set::DesiredExplicitSet;
+use super::desired_set::{CapConvergeResult, DesiredExplicitSet};
 use super::geyser_sync::track_worker_execute_coalesced_push;
 use super::snapshot::{
     explicit_set_snapshot_path, write_explicit_set_snapshot, ExplicitSetSnapshot,
     MARKET_DATA_EXPLICIT_SET_SNAPSHOT_INTERVAL_SECS,
 };
-use super::worker_commands::{GeyserPinReason, TrackWorkerCommand};
+use super::worker_commands::{GeyserPinReason, PoolExplicitSnapshot, TrackWorkerCommand};
 use crate::metrics::{
     inc_market_data_explicit_set_snapshot_write_errors_total,
     inc_market_data_explicit_set_snapshot_write_total,
@@ -92,35 +92,30 @@ pub trait TrackWorkerContext: Send + Sync {
         mint: Pubkey,
         pin: Option<TrackPinReason>,
     ) -> bool;
-    fn sync_wallet_explicit_demand(
-        &self,
-        desired: &mut DesiredExplicitSet,
-        demand: HashSet<Pubkey>,
-        token_accounts: HashSet<Pubkey>,
-    ) -> bool;
+    fn sync_wallet_explicit_demand(&self, desired: &mut DesiredExplicitSet, revision: u64) -> bool;
     fn take_pending_explicit_cap(&self) -> Option<usize>;
     fn take_track_worker_dirty(&self) -> bool;
     fn apply_pending_track_worker_work(&self, desired: &mut DesiredExplicitSet);
+    fn on_cap_converge_result(&self, desired: &DesiredExplicitSet, result: CapConvergeResult);
     fn commit_register_pool_geyser_reserves(
         &self,
         desired: &mut DesiredExplicitSet,
-        pool: Pubkey,
-        pin: TrackPinReason,
+        snapshot: &PoolExplicitSnapshot,
     ) -> bool;
     fn commit_register_pool_vaults_from_account(
         &self,
         desired: &mut DesiredExplicitSet,
-        pool: Pubkey,
+        snapshot: &PoolExplicitSnapshot,
     ) -> bool;
     fn commit_register_geyser_reserves_after_trade(
         &self,
         desired: &mut DesiredExplicitSet,
-        pool: Pubkey,
+        snapshot: &PoolExplicitSnapshot,
     ) -> bool;
     fn commit_refresh_dlmm_bin_window(
         &self,
         desired: &mut DesiredExplicitSet,
-        pool: Pubkey,
+        snapshot: &PoolExplicitSnapshot,
         new_active_id: i32,
     ) -> bool;
     fn refresh_geyser_pins_gauge(&self);
@@ -161,6 +156,7 @@ pub trait TrackWorkerContext: Send + Sync {
     fn invalidate_explicit_admission_convergence(&self);
     fn take_explicit_admission_invalidate(&self) -> bool;
     fn geyser_explicit_readiness_ok(&self) -> bool;
+    fn signal_restore_barrier(&self, ok: bool);
 }
 
 #[derive(Clone)]
@@ -171,14 +167,38 @@ pub struct TrackWorkerSender {
     queue_capacity: usize,
 }
 
+/// Test helper: bounded sender + receiver without a worker loop.
+pub fn track_worker_sender_for_test(
+    capacity: usize,
+) -> (
+    TrackWorkerSender,
+    std_mpsc::Receiver<TrackWorkerCommand>,
+    Arc<AtomicUsize>,
+) {
+    let (tx, rx) = std_mpsc::sync_channel::<TrackWorkerCommand>(capacity);
+    let queue_depth = Arc::new(AtomicUsize::new(0));
+    let sender = TrackWorkerSender {
+        tx,
+        queue_depth: Arc::clone(&queue_depth),
+        queue_capacity: capacity,
+    };
+    (sender, rx, queue_depth)
+}
+
 pub fn track_worker_try_enqueue(sender: &TrackWorkerSender, job: TrackWorkerCommand) -> bool {
+    let reserved = sender.queue_depth.fetch_add(1, Ordering::AcqRel) + 1;
+    if reserved > sender.queue_capacity {
+        sender.queue_depth.fetch_sub(1, Ordering::AcqRel);
+        inc_market_data_geyser_tracking_enqueue_dropped_total();
+        return false;
+    }
     match sender.tx.try_send(job) {
         Ok(()) => {
-            let depth = sender.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
-            set_market_data_track_worker_queue_depth(depth);
+            set_market_data_track_worker_queue_depth(reserved);
             true
         }
         Err(_) => {
+            sender.queue_depth.fetch_sub(1, Ordering::AcqRel);
             inc_market_data_geyser_tracking_enqueue_dropped_total();
             false
         }
@@ -274,23 +294,26 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
         TrackWorkerCommand::TrackMint { mint, pin } => {
             ctx.track_mint_for_geyser_metadata(desired, mint, pin)
         }
-        TrackWorkerCommand::SyncWalletExplicitDemand {
-            demand,
-            token_accounts,
-        } => ctx.sync_wallet_explicit_demand(desired, demand, token_accounts),
-        TrackWorkerCommand::RegisterPoolGeyserReserves { pool, pin } => {
-            ctx.commit_register_pool_geyser_reserves(desired, pool, pin)
+        TrackWorkerCommand::SyncWalletExplicitDemand { revision } => {
+            ctx.sync_wallet_explicit_demand(desired, revision)
         }
-        TrackWorkerCommand::RegisterPoolVaultsFromAccount { pool } => {
-            ctx.commit_register_pool_vaults_from_account(desired, pool)
+        TrackWorkerCommand::RegisterPoolGeyserReserves { snapshot } => {
+            ctx.commit_register_pool_geyser_reserves(desired, &snapshot)
         }
-        TrackWorkerCommand::RegisterGeyserReservesAfterTrade { pool } => {
-            ctx.commit_register_geyser_reserves_after_trade(desired, pool)
+        TrackWorkerCommand::RegisterPoolVaultsFromAccount { snapshot } => {
+            ctx.commit_register_pool_vaults_from_account(desired, &snapshot)
+        }
+        TrackWorkerCommand::RegisterGeyserReservesAfterTrade { snapshot } => {
+            ctx.commit_register_geyser_reserves_after_trade(desired, &snapshot)
         }
         TrackWorkerCommand::RefreshDlmmBinWindow {
-            pool,
+            snapshot,
             new_active_id,
-        } => ctx.commit_refresh_dlmm_bin_window(desired, pool, new_active_id),
+        } => ctx.commit_refresh_dlmm_bin_window(desired, &snapshot, new_active_id),
+        TrackWorkerCommand::RestoreBarrierComplete { ok } => {
+            ctx.signal_restore_barrier(ok);
+            false
+        }
         TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange => {
             ctx.invalidate_explicit_admission_convergence();
             true
@@ -310,7 +333,8 @@ fn track_worker_apply_invalidation<C: TrackWorkerContext>(
     admission_converged: &mut bool,
 ) {
     if let Some(cap) = ctx.take_pending_explicit_cap() {
-        desired.set_max_explicit_pubkeys(cap);
+        let result = desired.set_max_explicit_pubkeys(cap);
+        ctx.on_cap_converge_result(desired, result);
         *admission_converged = false;
     }
     if ctx.take_explicit_admission_invalidate() {
@@ -339,6 +363,7 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
     let mut pending_continue_evict = false;
     let mut pending_release_flush_slot = false;
     let mut admission_converged = false;
+    let mut pending_restore_barrier_ack = false;
     let mut last_snapshot_write = Instant::now()
         .checked_sub(Duration::from_secs(
             MARKET_DATA_EXPLICIT_SET_SNAPSHOT_INTERVAL_SECS,
@@ -374,6 +399,9 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
                 }
                 if matches!(job, TrackWorkerCommand::ScheduleGeyserPushDebounced) {
                     pending_release_flush_slot = true;
+                }
+                if matches!(job, TrackWorkerCommand::RestoreExplicitSnapshot(_)) {
+                    pending_restore_barrier_ack = true;
                 }
                 let cmd = match job {
                     TrackWorkerCommand::ScheduleGeyserPushDebounced => {
@@ -432,7 +460,15 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
                 release_flush_slot,
                 &mut admission_converged,
             ) {
-                track_worker_try_enqueue(&track_worker, TrackWorkerCommand::ContinueGeyserEvict);
+                if ctx.pending_geyser_evict() {
+                    track_worker_try_enqueue(
+                        &track_worker,
+                        TrackWorkerCommand::ContinueGeyserEvict,
+                    );
+                }
+            } else if pending_restore_barrier_ack {
+                ctx.signal_restore_barrier(true);
+                pending_restore_barrier_ack = false;
             }
             inc_market_data_track_request_coalesce_batches_total();
             ctx.refresh_hot_pool_registry_gauges();
@@ -517,5 +553,42 @@ pub fn spawn_inline_track_worker_sender<C: TrackWorkerContext + 'static>(
         tx,
         queue_depth: Arc::new(AtomicUsize::new(0)),
         queue_capacity: capacity,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn track_worker_queue_depth_reserve_never_underflows() {
+        let (tx, rx) = std_mpsc::sync_channel::<TrackWorkerCommand>(2);
+        let queue_depth = Arc::new(AtomicUsize::new(0));
+        let sender = TrackWorkerSender {
+            tx,
+            queue_depth: Arc::clone(&queue_depth),
+            queue_capacity: 2,
+        };
+        let depth_for_consumer = Arc::clone(&queue_depth);
+        let consumer = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let _ = rx.recv();
+                track_worker_dec_queue_depth(&depth_for_consumer);
+            }
+        });
+        assert!(track_worker_try_enqueue(
+            &sender,
+            TrackWorkerCommand::ScheduleGeyserPush
+        ));
+        assert!(track_worker_try_enqueue(
+            &sender,
+            TrackWorkerCommand::ScheduleGeyserPush
+        ));
+        assert!(!track_worker_try_enqueue(
+            &sender,
+            TrackWorkerCommand::ScheduleGeyserPush
+        ));
+        consumer.join().expect("consumer join");
+        assert_eq!(queue_depth.load(Ordering::Relaxed), 0);
     }
 }

@@ -2,6 +2,7 @@ pub mod coalesce;
 pub mod desired_set;
 pub mod enrichment;
 pub mod geyser_sync;
+pub mod pending;
 pub mod snapshot;
 pub mod worker;
 pub mod worker_commands;
@@ -12,8 +13,8 @@ pub use coalesce::{
     MARKET_DATA_ARB_COALESCE_CHANNEL_CAP, MARKET_DATA_MOMENTUM_COALESCE_CHANNEL_CAP,
 };
 pub use desired_set::{
-    pin_priority_from_consumer, symmetric_diff, AdmissionResult, ConsumerId, DesiredExplicitSet,
-    EvictReason, OwnerGroupSnapshot, OwnerKey, PinPriority,
+    pin_priority_from_consumer, symmetric_diff, AdmissionResult, CapConvergeResult, ConsumerId,
+    DesiredExplicitSet, EvictReason, OwnerGroupSnapshot, OwnerKey, PinPriority,
 };
 pub use enrichment::{
     is_enrichment_member_from_inputs, pool_is_enrichment_member, EnrichmentMembershipInputs,
@@ -22,6 +23,10 @@ pub use geyser_sync::{
     consumer_id_for_track_pin, explicit_subscription_has_new_keys,
     rebuild_desired_explicit_set_from_ctx, track_worker_execute_coalesced_push,
     MARKET_DATA_MD_STATE_FLUSH_BUDGET_MS,
+};
+pub use pending::{
+    GeyserConnectBarrier, PendingPoolCommand, PendingPoolKey, PendingPoolKind,
+    PendingPoolRegistrations, ProtectedOverflowDiagnostic, WalletExplicitPending,
 };
 pub use snapshot::{
     explicit_set_snapshot_path, load_explicit_set_snapshot, owner_key_to_snapshot,
@@ -33,10 +38,10 @@ pub use snapshot::{
 pub use worker::{
     apply_arb_track_requests_on_track_worker, apply_momentum_active_pools_on_track_worker,
     flush_explicit_set_snapshot, spawn_inline_track_worker_sender, spawn_noop_track_worker_sender,
-    spawn_track_worker, track_worker_process_command, track_worker_try_enqueue, TrackPinReason,
-    TrackWorkerContext, TrackWorkerSender, MARKET_DATA_ARB_APPLY_CHUNK_SIZE,
-    MARKET_DATA_ARB_APPLY_CHUNK_THRESHOLD, MARKET_DATA_MOMENTUM_APPLY_CHUNK_SIZE,
-    MARKET_DATA_MOMENTUM_APPLY_CHUNK_THRESHOLD, MARKET_DATA_TRACK_WORKER_COALESCE_MS,
-    MARKET_DATA_TRACK_WORKER_QUEUE_CAP,
+    spawn_track_worker, track_worker_process_command, track_worker_sender_for_test,
+    track_worker_try_enqueue, TrackPinReason, TrackWorkerContext, TrackWorkerSender,
+    MARKET_DATA_ARB_APPLY_CHUNK_SIZE, MARKET_DATA_ARB_APPLY_CHUNK_THRESHOLD,
+    MARKET_DATA_MOMENTUM_APPLY_CHUNK_SIZE, MARKET_DATA_MOMENTUM_APPLY_CHUNK_THRESHOLD,
+    MARKET_DATA_TRACK_WORKER_COALESCE_MS, MARKET_DATA_TRACK_WORKER_QUEUE_CAP,
 };
-pub use worker_commands::TrackWorkerCommand;
+pub use worker_commands::{GeyserPinReason, PoolExplicitSnapshot, TrackWorkerCommand};

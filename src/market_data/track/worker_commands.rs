@@ -3,6 +3,7 @@
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashSet;
 
+use super::desired_set::{ConsumerId, OwnerKey};
 use super::snapshot::ExplicitSetSnapshot;
 use crate::nats::{ArbTrackRequestsUpdate, MomentumActivePoolsUpdate};
 
@@ -12,6 +13,16 @@ pub enum GeyserPinReason {
     Wallet,
     MomentumActive,
     ArbMultiDex,
+}
+
+/// Immutable pool/account snapshot captured at enqueue time (admission + worker commit SSOT).
+#[derive(Debug, Clone)]
+pub struct PoolExplicitSnapshot {
+    pub pool: Pubkey,
+    pub pubkeys: HashSet<Pubkey>,
+    pub consumer: ConsumerId,
+    pub owner: OwnerKey,
+    pub pin: GeyserPinReason,
 }
 
 /// Phase 2a: commands for the `md-track-worker` OS thread (DesiredExplicitSet + coalesced Geyser push).
@@ -25,22 +36,21 @@ pub enum TrackWorkerCommand {
         mint: Pubkey,
         pin: Option<GeyserPinReason>,
     },
+    /// Worker reads authoritative [`super::pending::WalletExplicitPending`] by revision.
     SyncWalletExplicitDemand {
-        demand: HashSet<Pubkey>,
-        token_accounts: HashSet<Pubkey>,
+        revision: u64,
     },
     RegisterPoolGeyserReserves {
-        pool: Pubkey,
-        pin: GeyserPinReason,
+        snapshot: PoolExplicitSnapshot,
     },
     RegisterPoolVaultsFromAccount {
-        pool: Pubkey,
+        snapshot: PoolExplicitSnapshot,
     },
     RegisterGeyserReservesAfterTrade {
-        pool: Pubkey,
+        snapshot: PoolExplicitSnapshot,
     },
     RefreshDlmmBinWindow {
-        pool: Pubkey,
+        snapshot: PoolExplicitSnapshot,
         new_active_id: i32,
     },
     ScheduleGeyserSyncAfterConfigChange,
@@ -50,5 +60,9 @@ pub enum TrackWorkerCommand {
     ScheduleGeyserPushDebounced,
     /// Phase 3 P3: restore explicit set from on-disk snapshot (I-MD-6).
     RestoreExplicitSnapshot(ExplicitSetSnapshot),
+    /// Worker signals restore barrier completion (startup).
+    RestoreBarrierComplete {
+        ok: bool,
+    },
     ContinueGeyserEvict,
 }
