@@ -571,6 +571,19 @@ fn compute_snapshot_admit_set(
             }
         }
     }
+    let ranked_set: HashSet<&str> = ranked_mints.iter().map(String::as_str).collect();
+    let mut extra_protected: Vec<String> = protected
+        .iter()
+        .filter(|mint| !ranked_set.contains(mint.as_str()))
+        .cloned()
+        .collect();
+    extra_protected.sort();
+    for mint in extra_protected {
+        admit.insert(mint);
+        if admit.len() >= cap {
+            return admit;
+        }
+    }
     for mint in ranked_mints {
         if admit.len() >= cap {
             break;
@@ -5188,8 +5201,8 @@ impl ArbContext {
         let write_wait = Instant::now();
         let mut trackers = self.trackers.write();
         record_arb_writer_lock_wait(ArbWriterLockKind::TrackersWrite, write_wait.elapsed());
-        for mint in mints_with_pool {
-            let Some(tracker) = trackers.get_mut(&mint) else {
+        for mint in &mints_with_pool {
+            let Some(tracker) = trackers.get_mut(mint) else {
                 continue;
             };
             let Some(pool) = tracker.pools.get_mut(pool_address) else {
@@ -5212,6 +5225,10 @@ impl ArbContext {
                     }
                 }
             }
+        }
+        drop(trackers);
+        for mint in &mints_with_pool {
+            self.arb_track_selection.mark_dirty(mint);
         }
     }
 
@@ -5265,8 +5282,8 @@ impl ArbContext {
             let write_wait = Instant::now();
             let mut trackers = self.trackers.write();
             record_arb_writer_lock_wait(ArbWriterLockKind::TrackersWrite, write_wait.elapsed());
-            for mint in mints_with_pool {
-                let Some(tracker) = trackers.get_mut(&mint) else {
+            for mint in &mints_with_pool {
+                let Some(tracker) = trackers.get_mut(mint) else {
                     continue;
                 };
                 let Some(pool) = tracker.pools.get_mut(pool_address) else {
@@ -5275,6 +5292,10 @@ impl ArbContext {
                 if pool.dex == "meteora_dlmm" {
                     pool.last_update = now;
                 }
+            }
+            drop(trackers);
+            for mint in &mints_with_pool {
+                self.arb_track_selection.mark_dirty(mint);
             }
         }
 
