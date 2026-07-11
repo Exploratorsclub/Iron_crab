@@ -72,19 +72,22 @@ pub enum PoolCommandTerminal {
     InvalidRevision,
 }
 
+/// Phase returned by [`PoolSnapshotRevisionSequencer::begin_pool_command`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolCommandAcceptPhase {
+    Stale,
+    Ready,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RevisionRefCounts {
-    pub active_owners: usize,
     pub pending: u32,
     pub inflight: u32,
 }
 
 impl RevisionRefCounts {
-    #[allow(dead_code)]
-    fn total(self) -> u32 {
-        (self.active_owners as u32)
-            .saturating_add(self.pending)
-            .saturating_add(self.inflight)
+    pub fn total(self) -> u32 {
+        self.pending.saturating_add(self.inflight)
     }
 }
 
@@ -92,8 +95,7 @@ impl RevisionRefCounts {
 struct RevisionSlot {
     lifecycle_id: u32,
     issued_seq: u32,
-    applied_seq: u32,
-    active_owners: HashSet<RevisionActiveOwner>,
+    applied_revision: u64,
     pending: u32,
     inflight: u32,
     touch_stamp: u64,
@@ -101,7 +103,11 @@ struct RevisionSlot {
 
 impl RevisionSlot {
     fn recyclable(&self) -> bool {
-        self.active_owners.is_empty() && self.pending == 0 && self.inflight == 0
+        self.pending == 0 && self.inflight == 0
+    }
+
+    fn empty_slot(&self) -> bool {
+        self.recyclable() && self.applied_revision == 0
     }
 }
 
@@ -187,12 +193,15 @@ impl PoolSnapshotRevisionSequencer {
         RevisionSlot {
             lifecycle_id: self.fresh_lifecycle_id(),
             issued_seq: 0,
-            applied_seq: 0,
-            active_owners: HashSet::new(),
+            applied_revision: 0,
             pending: 0,
             inflight: 0,
             touch_stamp: self.next_touch_stamp(),
         }
+    }
+
+    pub fn revision_newer_than_applied(revision: u64, applied_revision: u64) -> bool {
+        revision != 0 && revision > applied_revision
     }
 
     fn ensure_slot(&self, key: (Pubkey, ConsumerId)) -> Result<(), RevisionAcquireResult> {
@@ -221,59 +230,36 @@ impl PoolSnapshotRevisionSequencer {
         slots: &mut HashMap<(Pubkey, ConsumerId), RevisionSlot>,
         key: (Pubkey, ConsumerId),
     ) {
-        if slots.get(&key).is_some_and(|slot| slot.recyclable()) {
+        if slots.get(&key).is_some_and(|slot| slot.empty_slot()) {
             slots.remove(&key);
         }
     }
 
-    /// Idempotent acquire of a logical active owner (duplicate acquire is a no-op).
+    /// Ensure a revision-registry key exists (ownership lives in bounded pin maps).
+    pub fn ensure_revision_key(&self, pool: Pubkey, consumer: ConsumerId) -> RevisionAcquireResult {
+        self.ensure_slot((pool, consumer))
+            .map(|()| RevisionAcquireResult::Acquired)
+            .unwrap_or(RevisionAcquireResult::RegistryFull)
+    }
+
+    #[deprecated(note = "ownership is tracked in hot_pool_registry pin maps")]
     pub fn acquire_active_owner(&self, owner: RevisionActiveOwner) -> RevisionAcquireResult {
-        let key = owner.registry_key();
-        if let Err(result) = self.ensure_slot(key) {
-            return result;
-        }
-        let mut slots = self.slots.lock().expect("pool revision slots lock");
-        let Some(slot) = slots.get_mut(&key) else {
-            return RevisionAcquireResult::RegistryFull;
-        };
-        slot.active_owners.insert(owner);
-        slot.touch_stamp = self.next_touch_stamp();
-        RevisionAcquireResult::Acquired
+        self.ensure_revision_key(owner.pool(), owner.consumer())
     }
 
-    /// Release one logical active owner; retires the slot when fully idle.
-    pub fn release_active_owner(&self, owner: RevisionActiveOwner) -> bool {
-        let key = owner.registry_key();
-        let mut slots = self.slots.lock().expect("pool revision slots lock");
-        let Some(slot) = slots.get_mut(&key) else {
-            return false;
-        };
-        slot.active_owners.remove(&owner);
-        let retired = slot.recyclable();
-        if retired {
-            slots.remove(&key);
-        }
-        retired
+    #[deprecated(note = "ownership is tracked in hot_pool_registry pin maps")]
+    pub fn release_active_owner(&self, _owner: RevisionActiveOwner) -> bool {
+        false
     }
 
-    #[deprecated(note = "use acquire_active_owner")]
+    #[deprecated(note = "use ensure_revision_key")]
     pub fn try_acquire_active(&self, pool: Pubkey, consumer: ConsumerId) -> RevisionAcquireResult {
-        let owner = match consumer {
-            ConsumerId::Momentum => RevisionActiveOwner::MomentumMintPool { mint: pool, pool },
-            ConsumerId::Arb => RevisionActiveOwner::ArbPool { pool },
-            _ => return RevisionAcquireResult::RegistryFull,
-        };
-        self.acquire_active_owner(owner)
+        self.ensure_revision_key(pool, consumer)
     }
 
-    #[deprecated(note = "use release_active_owner")]
-    pub fn release_active_if_idle(&self, pool: Pubkey, consumer: ConsumerId) -> bool {
-        let owner = match consumer {
-            ConsumerId::Momentum => RevisionActiveOwner::MomentumMintPool { mint: pool, pool },
-            ConsumerId::Arb => RevisionActiveOwner::ArbPool { pool },
-            _ => return false,
-        };
-        self.release_active_owner(owner)
+    #[deprecated(note = "ownership is tracked in hot_pool_registry pin maps")]
+    pub fn release_active_if_idle(&self, _pool: Pubkey, _consumer: ConsumerId) -> bool {
+        false
     }
 
     pub fn inc_pending_ref(&self, pool: Pubkey, consumer: ConsumerId) {
@@ -292,7 +278,6 @@ impl PoolSnapshotRevisionSequencer {
             return;
         };
         slot.pending = slot.pending.saturating_sub(1);
-        Self::maybe_remove_slot(&mut slots, key);
     }
 
     /// Reserve one in-flight command ref before queue send (ephemeral; no active owner).
@@ -342,7 +327,6 @@ impl PoolSnapshotRevisionSequencer {
             return;
         };
         slot.inflight = slot.inflight.saturating_sub(1);
-        Self::maybe_remove_slot(&mut slots, key);
     }
 
     #[deprecated(note = "use release_inflight_command")]
@@ -356,19 +340,15 @@ impl PoolSnapshotRevisionSequencer {
             .expect("pool revision slots lock")
             .get(&(pool, consumer))
             .map(|slot| RevisionRefCounts {
-                active_owners: slot.active_owners.len(),
                 pending: slot.pending,
                 inflight: slot.inflight,
             })
             .unwrap_or_default()
     }
 
-    pub fn has_active_owner(&self, owner: RevisionActiveOwner) -> bool {
-        self.slots
-            .lock()
-            .expect("pool revision slots lock")
-            .get(&owner.registry_key())
-            .is_some_and(|slot| slot.active_owners.contains(&owner))
+    #[deprecated(note = "ownership is tracked in hot_pool_registry pin maps")]
+    pub fn has_active_owner(&self, _owner: RevisionActiveOwner) -> bool {
+        false
     }
 
     pub fn assign_next(&self, snapshot: &mut PoolExplicitSnapshot) -> RevisionAssignResult {
@@ -388,54 +368,89 @@ impl PoolSnapshotRevisionSequencer {
     }
 
     pub fn revision_acceptable(&self, snapshot: &PoolExplicitSnapshot) -> bool {
+        matches!(
+            self.begin_pool_command(snapshot),
+            PoolCommandAcceptPhase::Ready
+        )
+    }
+
+    /// Begin processing under the registry lock — stale commands never advance watermark.
+    pub fn begin_pool_command(&self, snapshot: &PoolExplicitSnapshot) -> PoolCommandAcceptPhase {
         if snapshot.revision == 0 {
-            return false;
+            return PoolCommandAcceptPhase::Stale;
         }
-        let (lifecycle_id, seq) = Self::unpack_revision(snapshot.revision);
-        self.slots
+        let ready = self
+            .slots
             .lock()
             .expect("pool revision slots lock")
             .get(&(snapshot.pool, snapshot.consumer))
-            .is_some_and(|slot| lifecycle_id == slot.lifecycle_id && seq > slot.applied_seq)
+            .is_some_and(|slot| {
+                Self::revision_newer_than_applied(snapshot.revision, slot.applied_revision)
+            });
+        if ready {
+            PoolCommandAcceptPhase::Ready
+        } else {
+            PoolCommandAcceptPhase::Stale
+        }
     }
 
-    /// Finish a pool command on the worker — always releases exactly one in-flight ref.
+    /// Finish a pool command — releases exactly one in-flight ref when requested and may
+    /// advance the authoritative applied-revision watermark after demand validation.
     pub fn finish_pool_command(
         &self,
         snapshot: &PoolExplicitSnapshot,
         terminal: PoolCommandTerminal,
+        finish_inflight: bool,
+        record_watermark: bool,
     ) {
         if snapshot.revision == 0 {
-            self.release_inflight_command(snapshot.pool, snapshot.consumer);
+            if finish_inflight {
+                self.release_inflight_command(snapshot.pool, snapshot.consumer);
+            }
             return;
         }
-        let (lifecycle_id, seq) = Self::unpack_revision(snapshot.revision);
         let key = (snapshot.pool, snapshot.consumer);
         let mut slots = self.slots.lock().expect("pool revision slots lock");
         let Some(slot) = slots.get_mut(&key) else {
+            if finish_inflight {
+                drop(slots);
+                self.release_inflight_command(snapshot.pool, snapshot.consumer);
+            }
             return;
         };
-        if terminal == PoolCommandTerminal::Applied
-            && lifecycle_id == slot.lifecycle_id
-            && seq > slot.applied_seq
+        if record_watermark
+            && matches!(
+                terminal,
+                PoolCommandTerminal::Applied
+                    | PoolCommandTerminal::AdmissionRejected
+                    | PoolCommandTerminal::UnpinnedRejected
+            )
+            && Self::revision_newer_than_applied(snapshot.revision, slot.applied_revision)
         {
-            slot.applied_seq = seq;
+            slot.applied_revision = snapshot.revision;
         }
-        slot.inflight = slot.inflight.saturating_sub(1);
+        if finish_inflight {
+            slot.inflight = slot.inflight.saturating_sub(1);
+        }
         slot.touch_stamp = self.next_touch_stamp();
         Self::maybe_remove_slot(&mut slots, key);
     }
 
-    #[deprecated(note = "use revision_acceptable + finish_pool_command")]
+    #[deprecated(note = "use begin_pool_command + finish_pool_command")]
     pub fn should_apply_and_record(&self, snapshot: &PoolExplicitSnapshot) -> bool {
-        let acceptable = self.revision_acceptable(snapshot);
-        let terminal = if acceptable {
+        let phase = self.begin_pool_command(snapshot);
+        let terminal = if phase == PoolCommandAcceptPhase::Ready {
             PoolCommandTerminal::Applied
         } else {
             PoolCommandTerminal::StaleRevision
         };
-        self.finish_pool_command(snapshot, terminal);
-        acceptable
+        self.finish_pool_command(
+            snapshot,
+            terminal,
+            true,
+            phase == PoolCommandAcceptPhase::Ready,
+        );
+        phase == PoolCommandAcceptPhase::Ready
     }
 
     pub fn retire_key(&self, pool: Pubkey, consumer: ConsumerId) {
@@ -444,7 +459,7 @@ impl PoolSnapshotRevisionSequencer {
         let Some(slot) = slots.get(&key) else {
             return;
         };
-        if !slot.recyclable() {
+        if slot.inflight > 0 || slot.pending > 0 {
             return;
         }
         slots.remove(&key);
@@ -477,7 +492,7 @@ impl PoolSnapshotRevisionSequencer {
             .lock()
             .expect("pool revision slots lock")
             .get(&(pool, consumer))
-            .map(|slot| Self::pack_revision(slot.lifecycle_id, slot.applied_seq))
+            .map(|slot| slot.applied_revision)
             .unwrap_or(0)
     }
 
@@ -488,7 +503,7 @@ impl PoolSnapshotRevisionSequencer {
         consumer: ConsumerId,
         lifecycle_id: u32,
         issued_seq: u32,
-        applied_seq: u32,
+        applied_revision: u64,
     ) {
         let key = (pool, consumer);
         if let Err(RevisionAcquireResult::RegistryFull) = self.ensure_slot(key) {
@@ -498,7 +513,7 @@ impl PoolSnapshotRevisionSequencer {
         let slot = slots.get_mut(&key).expect("seeded revision slot");
         slot.lifecycle_id = lifecycle_id;
         slot.issued_seq = issued_seq;
-        slot.applied_seq = applied_seq;
+        slot.applied_revision = applied_revision;
         self.next_lifecycle_id
             .fetch_max(lifecycle_id.saturating_add(1), Ordering::AcqRel);
     }
@@ -668,6 +683,11 @@ impl WalletExplicitPending {
     }
 }
 
+enum PendingRefPolicy {
+    IncrementOnStore,
+    Defer,
+}
+
 /// Bounded per-pool coalesced pending (one entry per pool+consumer; overflow is fail-closed).
 #[derive(Debug)]
 pub struct PendingPoolRegistrations {
@@ -690,19 +710,44 @@ impl PendingPoolRegistrations {
     }
 
     pub fn upsert(&self, mut command: PendingPoolCommand) -> PendingPoolUpsertResult {
-        self.upsert_internal(&mut command, false)
+        self.upsert_internal(&mut command, PendingRefPolicy::IncrementOnStore)
     }
 
-    /// Upsert when the pending ref was already transferred from in-flight (enqueue loss).
-    pub fn upsert_transferred(&self, command: PendingPoolCommand) -> PendingPoolUpsertResult {
+    /// Transactional stash after queue send failure while holding one in-flight reservation.
+    pub fn upsert_after_inflight_send_failure(
+        &self,
+        pool: Pubkey,
+        consumer: ConsumerId,
+        command: PendingPoolCommand,
+    ) -> PendingPoolUpsertResult {
         let mut command = command;
-        self.upsert_internal(&mut command, true)
+        let result = self.upsert_internal(&mut command, PendingRefPolicy::Defer);
+        match result {
+            PendingPoolUpsertResult::Stored => {
+                if !self.revisions.transfer_inflight_to_pending(pool, consumer) {
+                    self.revisions.release_inflight_command(pool, consumer);
+                    self.overflow.store(true, Ordering::Release);
+                    return PendingPoolUpsertResult::Overflow;
+                }
+            }
+            PendingPoolUpsertResult::Coalesced
+            | PendingPoolUpsertResult::StaleNoOp
+            | PendingPoolUpsertResult::Overflow => {
+                self.revisions.release_inflight_command(pool, consumer);
+            }
+        }
+        result
+    }
+
+    #[deprecated(note = "use upsert_after_inflight_send_failure")]
+    pub fn upsert_transferred(&self, command: PendingPoolCommand) -> PendingPoolUpsertResult {
+        self.upsert(command)
     }
 
     fn upsert_internal(
         &self,
         command: &mut PendingPoolCommand,
-        pending_ref_transferred: bool,
+        ref_policy: PendingRefPolicy,
     ) -> PendingPoolUpsertResult {
         let revision = match command {
             PendingPoolCommand::RegisterReserves(s)
@@ -755,8 +800,11 @@ impl PendingPoolRegistrations {
             self.overflow.store(true, Ordering::Release);
             return PendingPoolUpsertResult::Overflow;
         }
-        if !pending_ref_transferred {
-            self.revisions.inc_pending_ref(key.0, key.1);
+        match ref_policy {
+            PendingRefPolicy::IncrementOnStore => {
+                self.revisions.inc_pending_ref(key.0, key.1);
+            }
+            PendingRefPolicy::Defer => {}
         }
         let coalesced = CoalescedPoolPending {
             pool: key.0,
@@ -937,10 +985,6 @@ mod tests {
         )
     }
 
-    fn momentum_owner(mint: Pubkey, pool: Pubkey) -> RevisionActiveOwner {
-        RevisionActiveOwner::MomentumMintPool { mint, pool }
-    }
-
     fn reserve_assign(
         revisions: &PoolSnapshotRevisionSequencer,
         pool: Pubkey,
@@ -957,26 +1001,20 @@ mod tests {
         }
     }
 
-    fn register_and_assign(
-        revisions: &PoolSnapshotRevisionSequencer,
-        owner: RevisionActiveOwner,
-    ) -> u64 {
+    fn ensure_key(revisions: &PoolSnapshotRevisionSequencer, pool: Pubkey, consumer: ConsumerId) {
         assert_eq!(
-            revisions.acquire_active_owner(owner),
+            revisions.ensure_revision_key(pool, consumer),
             RevisionAcquireResult::Acquired
         );
-        let pool = owner.pool();
-        reserve_assign(revisions, pool, owner.consumer())
     }
 
-    fn assert_acquired_owner(
+    fn register_and_assign(
         revisions: &PoolSnapshotRevisionSequencer,
-        owner: RevisionActiveOwner,
-    ) {
-        assert_eq!(
-            revisions.acquire_active_owner(owner),
-            RevisionAcquireResult::Acquired
-        );
+        pool: Pubkey,
+        consumer: ConsumerId,
+    ) -> u64 {
+        ensure_key(revisions, pool, consumer);
+        reserve_assign(revisions, pool, consumer)
     }
 
     fn assert_reserved_inflight(
@@ -991,69 +1029,36 @@ mod tests {
     }
 
     #[test]
-    fn active_owner_idempotent_duplicate_acquire() {
+    fn revision_key_ensure_is_idempotent() {
         let revisions = PoolSnapshotRevisionSequencer::with_max_keys(8);
         let pool = Pubkey::new_unique();
-        let mint = Pubkey::new_unique();
-        let owner = momentum_owner(mint, pool);
-        assert_eq!(
-            revisions.acquire_active_owner(owner),
-            RevisionAcquireResult::Acquired
-        );
-        assert_eq!(
-            revisions.acquire_active_owner(owner),
-            RevisionAcquireResult::Acquired
-        );
-        let refs = revisions.key_refs(pool, ConsumerId::Momentum);
-        assert_eq!(refs.active_owners, 1);
+        ensure_key(&revisions, pool, ConsumerId::Momentum);
+        ensure_key(&revisions, pool, ConsumerId::Momentum);
+        assert_eq!(revisions.active_key_count(), 1);
+        assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).total(), 0);
     }
 
     #[test]
-    fn two_momentum_mints_release_both_to_zero_active() {
+    fn revision_slot_retires_when_refs_return_to_zero() {
         let revisions = PoolSnapshotRevisionSequencer::with_max_keys(8);
         let pool = Pubkey::new_unique();
-        let mint_a = Pubkey::new_unique();
-        let mint_b = Pubkey::new_unique();
-        let owner_a = momentum_owner(mint_a, pool);
-        let owner_b = momentum_owner(mint_b, pool);
-        assert_eq!(
-            revisions.acquire_active_owner(owner_a),
-            RevisionAcquireResult::Acquired
-        );
-        assert_eq!(
-            revisions.acquire_active_owner(owner_b),
-            RevisionAcquireResult::Acquired
-        );
-        assert_eq!(
-            revisions.key_refs(pool, ConsumerId::Momentum).active_owners,
-            2
-        );
-        revisions.release_active_owner(owner_a);
-        assert_eq!(
-            revisions.key_refs(pool, ConsumerId::Momentum).active_owners,
-            1
-        );
-        revisions.release_active_owner(owner_b);
-        assert_eq!(
-            revisions.key_refs(pool, ConsumerId::Momentum).active_owners,
-            0
-        );
-        assert_eq!(revisions.active_key_count(), 0);
+        let rev = register_and_assign(&revisions, pool, ConsumerId::Momentum);
+        let mut snapshot = mk_snapshot(pool, Pubkey::new_unique());
+        snapshot.revision = rev;
+        revisions.finish_pool_command(&snapshot, PoolCommandTerminal::Applied, true, true);
+        assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).total(), 0);
+        assert!(revisions.current_applied(pool, ConsumerId::Momentum) > 0);
     }
 
     #[test]
     fn stale_noop_releases_inflight_without_apply() {
         let revisions = PoolSnapshotRevisionSequencer::with_max_keys(8);
         let pool = Pubkey::new_unique();
-        let owner = momentum_owner(Pubkey::new_unique(), pool);
-        assert_eq!(
-            revisions.acquire_active_owner(owner),
-            RevisionAcquireResult::Acquired
-        );
+        ensure_key(&revisions, pool, ConsumerId::Momentum);
         let rev = reserve_assign(&revisions, pool, ConsumerId::Momentum);
         let mut stale = mk_snapshot(pool, Pubkey::new_unique());
         stale.revision = rev;
-        revisions.finish_pool_command(&stale, PoolCommandTerminal::Applied);
+        revisions.finish_pool_command(&stale, PoolCommandTerminal::Applied, true, true);
         let mut older = mk_snapshot(pool, Pubkey::new_unique());
         older.revision = rev.saturating_sub(1);
         assert!(!revisions.revision_acceptable(&older));
@@ -1062,7 +1067,7 @@ mod tests {
             InflightReserveResult::Reserved
         );
         older.revision = rev;
-        revisions.finish_pool_command(&older, PoolCommandTerminal::StaleRevision);
+        revisions.finish_pool_command(&older, PoolCommandTerminal::StaleRevision, true, false);
         assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).inflight, 0);
     }
 
@@ -1070,8 +1075,7 @@ mod tests {
     fn inflight_transfer_to_pending_no_zero_ref_gap() {
         let revisions = PoolSnapshotRevisionSequencer::with_max_keys(8);
         let pool = Pubkey::new_unique();
-        let owner = momentum_owner(Pubkey::new_unique(), pool);
-        assert_acquired_owner(&revisions, owner);
+        ensure_key(&revisions, pool, ConsumerId::Momentum);
         let _rev = reserve_assign(&revisions, pool, ConsumerId::Momentum);
         let refs_before = revisions.key_refs(pool, ConsumerId::Momentum);
         assert_eq!(refs_before.inflight, 1);
@@ -1079,28 +1083,35 @@ mod tests {
         let refs_after = revisions.key_refs(pool, ConsumerId::Momentum);
         assert_eq!(refs_after.inflight, 0);
         assert_eq!(refs_after.pending, 1);
-        assert_eq!(refs_after.active_owners, 1);
+        assert_eq!(refs_after.total(), 1);
     }
 
     #[test]
     fn delayed_after_unpin_churn_keeps_registry_bounded() {
         let revisions = PoolSnapshotRevisionSequencer::with_max_keys(4);
         let pool = Pubkey::new_unique();
-        let mint = Pubkey::new_unique();
-        let owner = momentum_owner(mint, pool);
-        assert_acquired_owner(&revisions, owner);
+        ensure_key(&revisions, pool, ConsumerId::Momentum);
         let rev = reserve_assign(&revisions, pool, ConsumerId::Momentum);
-        revisions.release_active_owner(owner);
         let mut snapshot = mk_snapshot(pool, Pubkey::new_unique());
         snapshot.revision = rev;
-        revisions.finish_pool_command(&snapshot, PoolCommandTerminal::UnpinnedRejected);
+        revisions.finish_pool_command(
+            &snapshot,
+            PoolCommandTerminal::UnpinnedRejected,
+            true,
+            false,
+        );
         assert_eq!(revisions.active_key_count(), 0);
         for _ in 0..64 {
             let ephemeral_pool = Pubkey::new_unique();
             let rev = reserve_assign(&revisions, ephemeral_pool, ConsumerId::Momentum);
             let mut snap = mk_snapshot(ephemeral_pool, Pubkey::new_unique());
             snap.revision = rev;
-            revisions.finish_pool_command(&snap, PoolCommandTerminal::UnpinnedRejected);
+            revisions.finish_pool_command(
+                &snap,
+                PoolCommandTerminal::UnpinnedRejected,
+                true,
+                false,
+            );
         }
         assert!(revisions.active_key_count() <= 4);
     }
@@ -1109,9 +1120,14 @@ mod tests {
     fn revision_seq_near_wrap_allocates_new_lifecycle() {
         let revisions = PoolSnapshotRevisionSequencer::with_max_keys(8);
         let pool = Pubkey::new_unique();
-        let owner = momentum_owner(Pubkey::new_unique(), pool);
-        assert_acquired_owner(&revisions, owner);
-        revisions.test_seed_slot_revision_state(pool, ConsumerId::Momentum, 7, u32::MAX, 0);
+        ensure_key(&revisions, pool, ConsumerId::Momentum);
+        revisions.test_seed_slot_revision_state(
+            pool,
+            ConsumerId::Momentum,
+            7,
+            u32::MAX,
+            PoolSnapshotRevisionSequencer::pack_revision(7, u32::MAX - 1),
+        );
         let mut snap = mk_snapshot(pool, Pubkey::new_unique());
         let rev_wrap = match revisions.assign_next(&mut snap) {
             RevisionAssignResult::Assigned(rev) => rev,
@@ -1128,17 +1144,16 @@ mod tests {
         assert_reserved_inflight(&revisions, pool, ConsumerId::Momentum);
         let mut stale = mk_snapshot(pool, Pubkey::new_unique());
         stale.revision = PoolSnapshotRevisionSequencer::pack_revision(7, u32::MAX);
-        revisions.finish_pool_command(&stale, PoolCommandTerminal::StaleRevision);
+        revisions.finish_pool_command(&stale, PoolCommandTerminal::StaleRevision, true, false);
         assert_reserved_inflight(&revisions, pool, ConsumerId::Momentum);
-        revisions.finish_pool_command(&snap, PoolCommandTerminal::Applied);
+        revisions.finish_pool_command(&snap, PoolCommandTerminal::Applied, true, true);
     }
 
     #[test]
     fn pending_replays_latest_revision_not_kind_order() {
         let (pending, revisions) = mk_pending(8);
         let pool = Pubkey::new_unique();
-        let owner = momentum_owner(Pubkey::new_unique(), pool);
-        assert_acquired_owner(&revisions, owner);
+        ensure_key(&revisions, pool, ConsumerId::Momentum);
         let old_vault = Pubkey::new_unique();
         let new_vault = Pubkey::new_unique();
 
@@ -1170,8 +1185,7 @@ mod tests {
     fn pending_stale_out_of_order_across_all_kinds_no_ops() {
         let (pending, revisions) = mk_pending(8);
         let pool = Pubkey::new_unique();
-        let owner = momentum_owner(Pubkey::new_unique(), pool);
-        assert_acquired_owner(&revisions, owner);
+        ensure_key(&revisions, pool, ConsumerId::Momentum);
         let v2 = Pubkey::new_unique();
         let v3 = Pubkey::new_unique();
         let v4 = Pubkey::new_unique();
@@ -1225,8 +1239,7 @@ mod tests {
     fn sequencer_rejects_stale_apply_after_newer() {
         let revisions = PoolSnapshotRevisionSequencer::with_max_keys(8);
         let pool = Pubkey::new_unique();
-        let owner = momentum_owner(Pubkey::new_unique(), pool);
-        assert_acquired_owner(&revisions, owner);
+        ensure_key(&revisions, pool, ConsumerId::Momentum);
         let mut newer = mk_snapshot(pool, Pubkey::new_unique());
         let mut older = mk_snapshot(pool, Pubkey::new_unique());
         let rev_new = reserve_assign(&revisions, pool, ConsumerId::Momentum);
@@ -1238,10 +1251,10 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         };
-        revisions.finish_pool_command(&older, PoolCommandTerminal::Applied);
+        revisions.finish_pool_command(&older, PoolCommandTerminal::Applied, true, true);
         assert_reserved_inflight(&revisions, pool, ConsumerId::Momentum);
         newer.revision = rev_new;
-        revisions.finish_pool_command(&newer, PoolCommandTerminal::StaleRevision);
+        revisions.finish_pool_command(&newer, PoolCommandTerminal::StaleRevision, true, false);
         assert_eq!(
             revisions.current_applied(pool, ConsumerId::Momentum),
             rev_latest
@@ -1254,12 +1267,10 @@ mod tests {
         let revisions = PoolSnapshotRevisionSequencer::with_max_keys(8);
         for _ in 0..128 {
             let pool = Pubkey::new_unique();
-            let owner = momentum_owner(Pubkey::new_unique(), pool);
-            let revision = register_and_assign(&revisions, owner);
+            let revision = register_and_assign(&revisions, pool, ConsumerId::Momentum);
             let mut snapshot = mk_snapshot(pool, Pubkey::new_unique());
             snapshot.revision = revision;
-            revisions.finish_pool_command(&snapshot, PoolCommandTerminal::Applied);
-            revisions.release_active_owner(owner);
+            revisions.finish_pool_command(&snapshot, PoolCommandTerminal::Applied, true, true);
         }
         assert!(
             revisions.active_key_count() <= 8,
@@ -1271,41 +1282,33 @@ mod tests {
     #[test]
     fn active_keys_never_evicted_above_cap() {
         let revisions = PoolSnapshotRevisionSequencer::with_max_keys(4);
-        let pools: Vec<Pubkey> = (0..4).map(|_| Pubkey::new_unique()).collect();
-        for (i, pool) in pools[..4].iter().enumerate() {
-            let owner = momentum_owner(Pubkey::new_unique(), *pool);
-            assert_eq!(
-                revisions.acquire_active_owner(owner),
-                RevisionAcquireResult::Acquired
-            );
-            let _ = register_and_assign(&revisions, owner);
-            let _ = i;
+        let pools: Vec<Pubkey> = (0..5).map(|_| Pubkey::new_unique()).collect();
+        for pool in &pools[..4] {
+            let _ = register_and_assign(&revisions, *pool, ConsumerId::Momentum);
         }
         assert_eq!(revisions.active_key_count(), 4);
         assert_eq!(
-            revisions
-                .acquire_active_owner(momentum_owner(Pubkey::new_unique(), Pubkey::new_unique())),
+            revisions.ensure_revision_key(pools[4], ConsumerId::Momentum),
             RevisionAcquireResult::RegistryFull,
-            "must fail closed when all slots are active/in-flight"
+            "must fail closed when all slots are in use"
         );
         let refs = revisions.key_refs(pools[0], ConsumerId::Momentum);
-        assert_eq!(refs.active_owners, 1);
+        assert_eq!(refs.total(), 1);
     }
 
     #[test]
     fn retired_lifecycle_rejects_delayed_stale_command_after_repin() {
         let revisions = PoolSnapshotRevisionSequencer::with_max_keys(8);
         let pool = Pubkey::new_unique();
-        let owner = momentum_owner(Pubkey::new_unique(), pool);
-        assert_acquired_owner(&revisions, owner);
+        ensure_key(&revisions, pool, ConsumerId::Momentum);
         let mut stale = mk_snapshot(pool, Pubkey::new_unique());
         let stale_rev = reserve_assign(&revisions, pool, ConsumerId::Momentum);
         stale.revision = stale_rev;
-        revisions.finish_pool_command(&stale, PoolCommandTerminal::Applied);
-        revisions.release_active_owner(owner);
+        revisions.finish_pool_command(&stale, PoolCommandTerminal::Applied, true, true);
+        revisions.retire_key(pool, ConsumerId::Momentum);
+        assert_eq!(revisions.active_key_count(), 0);
 
-        let owner2 = momentum_owner(Pubkey::new_unique(), pool);
-        assert_acquired_owner(&revisions, owner2);
+        ensure_key(&revisions, pool, ConsumerId::Momentum);
         let mut fresh = mk_snapshot(pool, Pubkey::new_unique());
         let fresh_rev = reserve_assign(&revisions, pool, ConsumerId::Momentum);
         fresh.revision = fresh_rev;
@@ -1315,9 +1318,9 @@ mod tests {
         );
         assert_reserved_inflight(&revisions, pool, ConsumerId::Momentum);
         stale.revision = stale_rev;
-        revisions.finish_pool_command(&stale, PoolCommandTerminal::StaleRevision);
+        revisions.finish_pool_command(&stale, PoolCommandTerminal::StaleRevision, true, false);
         assert_reserved_inflight(&revisions, pool, ConsumerId::Momentum);
-        revisions.finish_pool_command(&fresh, PoolCommandTerminal::Applied);
+        revisions.finish_pool_command(&fresh, PoolCommandTerminal::Applied, true, true);
         assert_eq!(
             revisions.current_applied(pool, ConsumerId::Momentum),
             fresh_rev
@@ -1330,20 +1333,18 @@ mod tests {
         let mut issued: Vec<(Pubkey, u64)> = Vec::new();
         for _ in 0..256 {
             let pool = Pubkey::new_unique();
-            let owner = momentum_owner(Pubkey::new_unique(), pool);
-            let rev = register_and_assign(&revisions, owner);
+            let rev = register_and_assign(&revisions, pool, ConsumerId::Momentum);
             let mut snapshot = mk_snapshot(pool, Pubkey::new_unique());
             snapshot.revision = rev;
-            revisions.finish_pool_command(&snapshot, PoolCommandTerminal::Applied);
+            revisions.finish_pool_command(&snapshot, PoolCommandTerminal::Applied, true, true);
             issued.push((pool, rev));
-            revisions.release_active_owner(owner);
         }
         assert!(revisions.active_key_count() <= 16);
         for (pool, stale_rev) in issued.into_iter().take(32) {
             let mut stale = mk_snapshot(pool, Pubkey::new_unique());
             stale.revision = stale_rev;
             assert_reserved_inflight(&revisions, pool, ConsumerId::Momentum);
-            revisions.finish_pool_command(&stale, PoolCommandTerminal::StaleRevision);
+            revisions.finish_pool_command(&stale, PoolCommandTerminal::StaleRevision, true, false);
         }
     }
 
@@ -1354,8 +1355,7 @@ mod tests {
 
         let revisions = Arc::new(PoolSnapshotRevisionSequencer::with_max_keys(8));
         let pool = Pubkey::new_unique();
-        let owner = momentum_owner(Pubkey::new_unique(), pool);
-        assert_acquired_owner(&revisions, owner);
+        ensure_key(&revisions, pool, ConsumerId::Momentum);
         let revisions_a = Arc::clone(&revisions);
         let revisions_b = Arc::clone(&revisions);
         let handle = thread::spawn(move || {
@@ -1379,6 +1379,80 @@ mod tests {
         let refs = revisions.key_refs(pool, ConsumerId::Momentum);
         assert_eq!(refs.inflight, 0);
         assert_eq!(refs.pending, 0);
-        assert_eq!(refs.active_owners, 1);
+        assert_eq!(refs.total(), 0);
+    }
+
+    #[test]
+    fn upsert_after_send_failure_releases_inflight_on_coalesce_and_stale() {
+        let revisions = Arc::new(PoolSnapshotRevisionSequencer::with_max_keys(8));
+        let pending = PendingPoolRegistrations::new(8, Arc::clone(&revisions));
+        let pool = Pubkey::new_unique();
+        ensure_key(&revisions, pool, ConsumerId::Momentum);
+        let rev = register_and_assign(&revisions, pool, ConsumerId::Momentum);
+        revisions.release_inflight_command(pool, ConsumerId::Momentum);
+
+        let mut first = mk_snapshot(pool, Pubkey::new_unique());
+        first.revision = rev;
+        assert_reserved_inflight(&revisions, pool, ConsumerId::Momentum);
+        assert_eq!(
+            pending.upsert_after_inflight_send_failure(
+                pool,
+                ConsumerId::Momentum,
+                PendingPoolCommand::RegisterReserves(first),
+            ),
+            PendingPoolUpsertResult::Stored
+        );
+        assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).pending, 1);
+        assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).inflight, 0);
+
+        let mut newer = mk_snapshot(pool, Pubkey::new_unique());
+        newer.revision = rev.saturating_add(1);
+        assert_reserved_inflight(&revisions, pool, ConsumerId::Momentum);
+        assert_eq!(
+            pending.upsert_after_inflight_send_failure(
+                pool,
+                ConsumerId::Momentum,
+                PendingPoolCommand::AfterTrade(newer),
+            ),
+            PendingPoolUpsertResult::Coalesced
+        );
+        assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).pending, 1);
+        assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).inflight, 0);
+
+        let mut stale = mk_snapshot(pool, Pubkey::new_unique());
+        stale.revision = rev;
+        assert_reserved_inflight(&revisions, pool, ConsumerId::Momentum);
+        assert_eq!(
+            pending.upsert_after_inflight_send_failure(
+                pool,
+                ConsumerId::Momentum,
+                PendingPoolCommand::VaultsFromAccount(stale),
+            ),
+            PendingPoolUpsertResult::StaleNoOp
+        );
+        assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).total(), 1);
+
+        let drained = pending.drain_all();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).total(), 0);
+    }
+
+    #[test]
+    fn accepted_noop_advances_applied_revision_watermark() {
+        let revisions = PoolSnapshotRevisionSequencer::with_max_keys(8);
+        let pool = Pubkey::new_unique();
+        ensure_key(&revisions, pool, ConsumerId::Momentum);
+        let rev = register_and_assign(&revisions, pool, ConsumerId::Momentum);
+        let mut snapshot = mk_snapshot(pool, Pubkey::new_unique());
+        snapshot.revision = rev;
+        revisions.finish_pool_command(&snapshot, PoolCommandTerminal::Applied, true, true);
+        let mut stale = mk_snapshot(pool, Pubkey::new_unique());
+        stale.revision = rev.saturating_sub(1);
+        assert_eq!(
+            revisions.begin_pool_command(&stale),
+            PoolCommandAcceptPhase::Stale
+        );
+        revisions.finish_pool_command(&stale, PoolCommandTerminal::StaleRevision, true, false);
+        assert_eq!(revisions.current_applied(pool, ConsumerId::Momentum), rev);
     }
 }

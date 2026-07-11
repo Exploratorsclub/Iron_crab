@@ -1081,6 +1081,7 @@ struct EvictionPlanner<'a> {
     marginal: HashMap<(ConsumerId, OwnerKey), usize>,
     marginal_contributors: HashMap<(ConsumerId, OwnerKey), HashSet<Pubkey>>,
     pubkey_groups: HashMap<Pubkey, Vec<(ConsumerId, OwnerKey)>>,
+    projected_pubkey_refcount: HashMap<Pubkey, usize>,
 }
 
 impl<'a> EvictionPlanner<'a> {
@@ -1116,11 +1117,40 @@ impl<'a> EvictionPlanner<'a> {
             marginal,
             marginal_contributors,
             pubkey_groups,
+            projected_pubkey_refcount: HashMap::new(),
         };
+        for pk in &overlay.touched_pubkeys {
+            planner
+                .projected_pubkey_refcount
+                .insert(*pk, planner.projected_owner_count(pk));
+        }
         for key in planner.marginal.keys().copied().collect::<Vec<_>>() {
             planner.recompute_marginal_for_group(key, stats.as_deref_mut());
         }
         planner
+    }
+
+    fn projected_owner_count(&self, pk: &Pubkey) -> usize {
+        self.pubkey_groups
+            .get(pk)
+            .into_iter()
+            .flatten()
+            .filter(|owner| !self.suppressed.contains(owner) && !self.victims.contains(owner))
+            .count()
+    }
+
+    fn sole_projected_owner(&self, pk: &Pubkey) -> Option<(ConsumerId, OwnerKey)> {
+        let mut owners = self
+            .pubkey_groups
+            .get(pk)?
+            .iter()
+            .copied()
+            .filter(|owner| !self.suppressed.contains(owner) && !self.victims.contains(owner));
+        let first = owners.next()?;
+        if owners.next().is_some() {
+            return None;
+        }
+        Some(first)
     }
 
     fn index_pubkey(
@@ -1243,16 +1273,28 @@ impl<'a> EvictionPlanner<'a> {
         };
 
         for pk in &group.pubkeys {
-            let owners_after = self.effective_owners(pk);
-            if owners_after.len() == 1 {
-                let sole = owners_after[0];
-                if let Some(contributors) = self.marginal_contributors.get_mut(&sole) {
-                    if contributors.insert(*pk) {
-                        if let Some(m) = self.marginal.get_mut(&sole) {
-                            *m = m.saturating_add(1);
-                        }
-                        if let Some(stats) = stats.as_deref_mut() {
-                            stats.edge_updates = stats.edge_updates.saturating_add(1);
+            let before = self
+                .projected_pubkey_refcount
+                .get(pk)
+                .copied()
+                .unwrap_or_else(|| self.projected_owner_count(pk));
+            let after = before.saturating_sub(usize::from(
+                self.pubkey_groups
+                    .get(pk)
+                    .is_some_and(|sharing| sharing.contains(&victim))
+                    && before > 0,
+            ));
+            self.projected_pubkey_refcount.insert(*pk, after);
+            if before >= 2 && after == 1 {
+                if let Some(sole) = self.sole_projected_owner(pk) {
+                    if let Some(contributors) = self.marginal_contributors.get_mut(&sole) {
+                        if contributors.insert(*pk) {
+                            if let Some(m) = self.marginal.get_mut(&sole) {
+                                *m = m.saturating_add(1);
+                            }
+                            if let Some(stats) = stats.as_deref_mut() {
+                                stats.edge_updates = stats.edge_updates.saturating_add(1);
+                            }
                         }
                     }
                 }

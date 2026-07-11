@@ -27,7 +27,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
@@ -86,7 +86,7 @@ use ironcrab::market_data::track::{
     CapConvergeResult, ConsumerId, DesiredExplicitSet, ExplicitAccountKind, ExplicitSetSnapshot,
     ExplicitSnapshotRow, GeyserConnectBarrier, GeyserPinReason, InflightReserveResult,
     MintExplicitRow, OwnerGroupSnapshot, OwnerKey, PendingPoolCommand, PendingPoolRegistrations,
-    PendingPoolUpsertResult, PoolCommandTerminal, PoolExplicitSnapshot,
+    PendingPoolUpsertResult, PoolCommandAcceptPhase, PoolCommandTerminal, PoolExplicitSnapshot,
     PoolSnapshotRevisionSequencer, ProtectedOverflowDiagnostic, RevisionAcquireResult,
     RevisionActiveOwner, RevisionAssignResult, SnapshotConsumer, SnapshotOwnerGroup,
     TrackPinReason, TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender, VaultExplicitRow,
@@ -727,8 +727,24 @@ impl UnifiedHotPoolRegistry {
         }
     }
 
-    fn pin_pool(&self, mint: Pubkey, pool: Pubkey) {
-        self.momentum_pairs.write().insert((mint, pool));
+    fn pin_pool(&self, mint: Pubkey, pool: Pubkey) -> bool {
+        let mut pairs = self.momentum_pairs.write();
+        if pairs.contains(&(mint, pool)) {
+            return true;
+        }
+        if pairs.iter().filter(|(_, p)| *p == pool).count() >= MAX_MOMENTUM_MINTS_PER_POOL {
+            return false;
+        }
+        pairs.insert((mint, pool));
+        true
+    }
+
+    fn momentum_mint_count_for_pool(&self, pool: Pubkey) -> usize {
+        self.momentum_pairs
+            .read()
+            .iter()
+            .filter(|(_, p)| *p == pool)
+            .count()
     }
 
     fn unpin_pool(&self, mint: Pubkey, pool: Pubkey) {
@@ -1129,6 +1145,8 @@ struct MarketDataContext {
     /// Fail-closed when mandatory wallet demand exceeds explicit cap.
     geyser_explicit_ready: AtomicBool,
     geyser_explicit_config_error: parking_lot::RwLock<Option<String>>,
+    /// Independent latched fail-closed reasons (bitset of `GESYER_BLOCK_*`).
+    geyser_explicit_blockers: AtomicU8,
     /// Durable cap invalidation when config shrink enqueue fails (0 = none).
     pending_explicit_cap: AtomicUsize,
     /// Worker must drain pending wallet/cap work after enqueue loss.
@@ -1184,6 +1202,15 @@ struct TrackedWallet {
 
 /// WSOL Mint address constant
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+/// Maximum distinct momentum `(mint, pool)` rows per pool (fail-closed bound).
+const MAX_MOMENTUM_MINTS_PER_POOL: usize = 64;
+
+/// Independent fail-closed blocker flags for Geyser explicit readiness.
+const GESYER_BLOCK_PENDING_POOL_OVERFLOW: u8 = 1 << 0;
+const GESYER_BLOCK_REVISION_REGISTRY_FULL: u8 = 1 << 1;
+const GESYER_BLOCK_PROTECTED_CAP_OVERFLOW: u8 = 1 << 2;
+const GESYER_BLOCK_ADMISSION_UNCONVERGED: u8 = 1 << 3;
 
 /// Scope-8: After `WalletSnapshotComplete`, wait briefly for in-flight Geyser merges before
 /// cold-path RPC verification for wallet-only mints without explicit Ready (bounded).
@@ -1992,14 +2019,8 @@ fn stash_pending_pool_command(
     pool_meta: Option<(Pubkey, ConsumerId)>,
 ) {
     let stored = if let Some((pool, consumer)) = pool_meta {
-        if ctx
-            .pool_snapshot_revisions
-            .transfer_inflight_to_pending(pool, consumer)
-        {
-            ctx.pending_pool_commands.upsert_transferred(cmd)
-        } else {
-            PendingPoolUpsertResult::Overflow
-        }
+        ctx.pending_pool_commands
+            .upsert_after_inflight_send_failure(pool, consumer, cmd)
     } else {
         ctx.pending_pool_commands.upsert(cmd)
     };
@@ -2506,16 +2527,7 @@ impl TrackWorkerContext for MarketDataContext {
         snapshot: &PoolExplicitSnapshot,
     ) -> bool {
         self.apply_pool_snapshot_command(desired, snapshot, true, |desired| {
-            match desired.try_admit_group(snapshot.consumer, snapshot.owner, snapshot.all_pubkeys())
-            {
-                AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey => {
-                    self.register_tracked_assets_from_pool_snapshot(snapshot)
-                }
-                rejected => {
-                    record_admission_rejection(snapshot.consumer, rejected);
-                    false
-                }
-            }
+            self.apply_pool_admission(desired, snapshot)
         })
     }
 
@@ -2527,18 +2539,9 @@ impl TrackWorkerContext for MarketDataContext {
         self.apply_pool_snapshot_command(desired, snapshot, true, |desired| {
             self.try_publish_balance_updated_from_cache(snapshot.pool);
             if !self.hot_pool_registry.is_hot_pool(snapshot.pool) {
-                return false;
+                return (false, PoolCommandTerminal::Applied);
             }
-            match desired.try_admit_group(snapshot.consumer, snapshot.owner, snapshot.all_pubkeys())
-            {
-                AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey => {
-                    self.register_tracked_assets_from_pool_snapshot(snapshot)
-                }
-                rejected => {
-                    record_admission_rejection(snapshot.consumer, rejected);
-                    false
-                }
-            }
+            self.apply_pool_admission(desired, snapshot)
         })
     }
 
@@ -2550,18 +2553,9 @@ impl TrackWorkerContext for MarketDataContext {
         self.apply_pool_snapshot_command(desired, snapshot, true, |desired| {
             self.try_publish_balance_updated_from_cache(snapshot.pool);
             if !self.hot_pool_registry.pool_has_momentum(snapshot.pool) {
-                return false;
+                return (false, PoolCommandTerminal::UnpinnedRejected);
             }
-            match desired.try_admit_group(snapshot.consumer, snapshot.owner, snapshot.all_pubkeys())
-            {
-                AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey => {
-                    self.register_tracked_assets_from_pool_snapshot(snapshot)
-                }
-                rejected => {
-                    record_admission_rejection(snapshot.consumer, rejected);
-                    false
-                }
-            }
+            self.apply_pool_admission(desired, snapshot)
         })
     }
 
@@ -2573,7 +2567,7 @@ impl TrackWorkerContext for MarketDataContext {
     ) -> bool {
         self.apply_pool_snapshot_command(desired, snapshot, true, |desired| {
             if !self.hot_pool_registry.pool_has_arb(snapshot.pool) {
-                return false;
+                return (false, PoolCommandTerminal::UnpinnedRejected);
             }
             if self
                 .dlmm_registered_active_id
@@ -2582,24 +2576,15 @@ impl TrackWorkerContext for MarketDataContext {
                 .copied()
                 == Some(new_active_id)
             {
-                return false;
+                return (false, PoolCommandTerminal::Applied);
             }
-            match desired.try_admit_group(snapshot.consumer, snapshot.owner, snapshot.all_pubkeys())
-            {
-                AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey => {
-                    let changed = self.register_tracked_assets_from_pool_snapshot(snapshot);
-                    if changed {
-                        self.dlmm_registered_active_id
-                            .write()
-                            .insert(snapshot.pool, new_active_id);
-                    }
-                    changed
-                }
-                rejected => {
-                    record_admission_rejection(snapshot.consumer, rejected);
-                    false
-                }
+            let (changed, terminal) = self.apply_pool_admission(desired, snapshot);
+            if changed {
+                self.dlmm_registered_active_id
+                    .write()
+                    .insert(snapshot.pool, new_active_id);
             }
+            (changed, terminal)
         })
     }
 
@@ -3267,20 +3252,61 @@ impl MarketDataContext {
 
     fn fail_revision_registry_full(&self) {
         inc_market_data_revision_registry_full_total();
-        self.geyser_explicit_ready.store(false, Ordering::Release);
-        *self.geyser_explicit_config_error.write() =
-            Some("pool snapshot revision registry full (fail-closed)".into());
+        self.set_geyser_explicit_blocker(
+            GESYER_BLOCK_REVISION_REGISTRY_FULL,
+            Some("pool snapshot revision registry full (fail-closed)".into()),
+        );
         self.geyser_connect_barrier.mark_failed();
+    }
+
+    fn set_geyser_explicit_blocker(&self, flag: u8, msg: Option<String>) {
+        self.geyser_explicit_blockers
+            .fetch_or(flag, Ordering::AcqRel);
+        if let Some(msg) = msg {
+            *self.geyser_explicit_config_error.write() = Some(msg);
+        }
+        self.geyser_explicit_ready.store(false, Ordering::Release);
+    }
+
+    fn clear_geyser_explicit_blocker(&self, flag: u8) {
+        self.geyser_explicit_blockers
+            .fetch_and(!flag, Ordering::AcqRel);
+    }
+
+    fn refresh_geyser_explicit_readiness(&self, desired: &DesiredExplicitSet) {
+        let blockers = self.geyser_explicit_blockers.load(Ordering::Acquire);
+        let cap = self.config.read().max_tracked_accounts;
+        let wallet_ok = self.wallet_explicit_demand_pubkeys().len() <= cap;
+        let ready = blockers == 0 && desired.cap_overflow() == 0 && wallet_ok;
+        self.geyser_explicit_ready.store(ready, Ordering::Release);
+        if ready {
+            *self.geyser_explicit_config_error.write() = None;
+        }
     }
 
     fn pool_snapshot_consumer_demand_valid(&self, snapshot: &PoolExplicitSnapshot) -> bool {
         match snapshot.consumer {
-            ConsumerId::Momentum => {
-                self.hot_pool_registry.pool_has_momentum(snapshot.pool)
-                    || self.hot_pool_registry.pool_has_any_pin(snapshot.pool)
-            }
+            ConsumerId::Momentum => self.hot_pool_registry.pool_has_momentum(snapshot.pool),
             ConsumerId::Arb => self.hot_pool_registry.pool_has_arb(snapshot.pool),
-            _ => self.hot_pool_registry.is_hot_pool(snapshot.pool),
+            ConsumerId::Wallet => false,
+            ConsumerId::Tracker => self.hot_pool_registry.is_hot_pool(snapshot.pool),
+        }
+    }
+
+    fn apply_pool_admission(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        snapshot: &PoolExplicitSnapshot,
+    ) -> (bool, PoolCommandTerminal) {
+        match desired.try_admit_group(snapshot.consumer, snapshot.owner, snapshot.all_pubkeys()) {
+            AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey => {
+                let changed = self.register_tracked_assets_from_pool_snapshot(snapshot);
+                (changed, PoolCommandTerminal::Applied)
+            }
+            rejected => {
+                record_admission_rejection(snapshot.consumer, rejected);
+                (false, PoolCommandTerminal::AdmissionRejected)
+            }
         }
     }
 
@@ -3289,46 +3315,51 @@ impl MarketDataContext {
         desired: &mut DesiredExplicitSet,
         snapshot: &PoolExplicitSnapshot,
         finish_inflight: bool,
-        apply: impl FnOnce(&mut DesiredExplicitSet) -> bool,
+        apply: impl FnOnce(&mut DesiredExplicitSet) -> (bool, PoolCommandTerminal),
     ) -> bool {
-        if !self.pool_snapshot_revisions.revision_acceptable(snapshot) {
+        let phase = self.pool_snapshot_revisions.begin_pool_command(snapshot);
+        if phase == PoolCommandAcceptPhase::Stale {
             if finish_inflight {
-                self.pool_snapshot_revisions
-                    .finish_pool_command(snapshot, PoolCommandTerminal::StaleRevision);
+                self.pool_snapshot_revisions.finish_pool_command(
+                    snapshot,
+                    PoolCommandTerminal::StaleRevision,
+                    true,
+                    false,
+                );
             }
             return false;
         }
         if !self.pool_snapshot_consumer_demand_valid(snapshot) {
             if finish_inflight {
-                self.pool_snapshot_revisions
-                    .finish_pool_command(snapshot, PoolCommandTerminal::UnpinnedRejected);
+                self.pool_snapshot_revisions.finish_pool_command(
+                    snapshot,
+                    PoolCommandTerminal::UnpinnedRejected,
+                    true,
+                    true,
+                );
             }
             return false;
         }
-        let applied = apply(desired);
-        if finish_inflight {
-            let terminal = if applied {
-                PoolCommandTerminal::Applied
-            } else {
-                PoolCommandTerminal::AdmissionRejected
-            };
-            self.pool_snapshot_revisions
-                .finish_pool_command(snapshot, terminal);
-        }
-        applied
+        let (state_changed, terminal) = apply(desired);
+        self.pool_snapshot_revisions
+            .finish_pool_command(snapshot, terminal, finish_inflight, true);
+        state_changed
     }
 
     fn replay_pool_snapshot_command(
         &self,
         desired: &mut DesiredExplicitSet,
         snapshot: &PoolExplicitSnapshot,
-        apply: impl FnOnce(&mut DesiredExplicitSet) -> bool,
+        apply: impl FnOnce(&mut DesiredExplicitSet) -> (bool, PoolCommandTerminal),
     ) -> bool {
         self.apply_pool_snapshot_command(desired, snapshot, false, apply)
     }
 
-    fn acquire_revision_owner(&self, owner: RevisionActiveOwner) -> bool {
-        match self.pool_snapshot_revisions.acquire_active_owner(owner) {
+    fn ensure_pool_revision_key(&self, pool: Pubkey, consumer: ConsumerId) -> bool {
+        match self
+            .pool_snapshot_revisions
+            .ensure_revision_key(pool, consumer)
+        {
             RevisionAcquireResult::Acquired => true,
             RevisionAcquireResult::RegistryFull => {
                 self.fail_revision_registry_full();
@@ -3337,12 +3368,23 @@ impl MarketDataContext {
         }
     }
 
+    #[allow(dead_code)]
+    fn acquire_revision_owner(&self, owner: RevisionActiveOwner) -> bool {
+        self.ensure_pool_revision_key(owner.pool(), owner.consumer())
+    }
+
     fn acquire_momentum_revision_owner(&self, mint: Pubkey, pool: Pubkey) -> bool {
-        self.acquire_revision_owner(RevisionActiveOwner::MomentumMintPool { mint, pool })
+        if !self.hot_pool_registry.is_pinned(mint, pool) {
+            return false;
+        }
+        self.ensure_pool_revision_key(pool, ConsumerId::Momentum)
     }
 
     fn acquire_arb_revision_owner(&self, pool: Pubkey) -> bool {
-        self.acquire_revision_owner(RevisionActiveOwner::ArbPool { pool })
+        if !self.hot_pool_registry.pool_has_arb(pool) {
+            return false;
+        }
+        self.ensure_pool_revision_key(pool, ConsumerId::Arb)
     }
 
     #[allow(dead_code)]
@@ -3368,9 +3410,10 @@ impl MarketDataContext {
             return;
         }
         inc_market_data_track_pending_pool_overflow_total();
-        self.geyser_explicit_ready.store(false, Ordering::Release);
-        *self.geyser_explicit_config_error.write() =
-            Some("pending pool registration overflow (fail-closed)".into());
+        self.set_geyser_explicit_blocker(
+            GESYER_BLOCK_PENDING_POOL_OVERFLOW,
+            Some("pending pool registration overflow (fail-closed)".into()),
+        );
         self.geyser_connect_barrier.mark_failed();
         self.mark_track_worker_dirty();
     }
@@ -3383,8 +3426,7 @@ impl MarketDataContext {
             diag.wallet_demand_len, diag.configured_cap, diag.sample_wallet_pubkeys
         );
         record_admission_rejection(ConsumerId::Wallet, AdmissionResult::RejectedCap);
-        self.geyser_explicit_ready.store(false, Ordering::Release);
-        *self.geyser_explicit_config_error.write() = Some(msg);
+        self.set_geyser_explicit_blocker(GESYER_BLOCK_PROTECTED_CAP_OVERFLOW, Some(msg));
         self.geyser_connect_barrier.mark_failed();
     }
 
@@ -3395,62 +3437,23 @@ impl MarketDataContext {
     ) {
         match command {
             PendingPoolCommand::RegisterReserves(snapshot) => {
-                let _ =
-                    self.replay_pool_snapshot_command(desired, &snapshot, |desired| match desired
-                        .try_admit_group(snapshot.consumer, snapshot.owner, snapshot.all_pubkeys())
-                    {
-                        AdmissionResult::Admitted { .. }
-                        | AdmissionResult::OwnerAddedNoNewPubkey => {
-                            self.register_tracked_assets_from_pool_snapshot(&snapshot)
-                        }
-                        rejected => {
-                            record_admission_rejection(snapshot.consumer, rejected);
-                            false
-                        }
-                    });
+                let _ = self.replay_pool_snapshot_command(desired, &snapshot, |desired| {
+                    self.apply_pool_admission(desired, &snapshot)
+                });
             }
             PendingPoolCommand::VaultsFromAccount(snapshot) => {
                 let _ = self.replay_pool_snapshot_command(desired, &snapshot, |desired| {
                     self.try_publish_balance_updated_from_cache(snapshot.pool);
                     if !self.hot_pool_registry.is_hot_pool(snapshot.pool) {
-                        return false;
+                        return (false, PoolCommandTerminal::Applied);
                     }
-                    match desired.try_admit_group(
-                        snapshot.consumer,
-                        snapshot.owner,
-                        snapshot.all_pubkeys(),
-                    ) {
-                        AdmissionResult::Admitted { .. }
-                        | AdmissionResult::OwnerAddedNoNewPubkey => {
-                            self.register_tracked_assets_from_pool_snapshot(&snapshot)
-                        }
-                        rejected => {
-                            record_admission_rejection(snapshot.consumer, rejected);
-                            false
-                        }
-                    }
+                    self.apply_pool_admission(desired, &snapshot)
                 });
             }
             PendingPoolCommand::AfterTrade(snapshot) => {
                 let _ = self.replay_pool_snapshot_command(desired, &snapshot, |desired| {
                     self.try_publish_balance_updated_from_cache(snapshot.pool);
-                    if !self.hot_pool_registry.pool_has_momentum(snapshot.pool) {
-                        return false;
-                    }
-                    match desired.try_admit_group(
-                        snapshot.consumer,
-                        snapshot.owner,
-                        snapshot.all_pubkeys(),
-                    ) {
-                        AdmissionResult::Admitted { .. }
-                        | AdmissionResult::OwnerAddedNoNewPubkey => {
-                            self.register_tracked_assets_from_pool_snapshot(&snapshot)
-                        }
-                        rejected => {
-                            record_admission_rejection(snapshot.consumer, rejected);
-                            false
-                        }
-                    }
+                    self.apply_pool_admission(desired, &snapshot)
                 });
             }
             PendingPoolCommand::RefreshDlmm {
@@ -3458,9 +3461,6 @@ impl MarketDataContext {
                 new_active_id,
             } => {
                 let _ = self.replay_pool_snapshot_command(desired, &snapshot, |desired| {
-                    if !self.hot_pool_registry.pool_has_arb(snapshot.pool) {
-                        return false;
-                    }
                     if self
                         .dlmm_registered_active_id
                         .read()
@@ -3468,29 +3468,15 @@ impl MarketDataContext {
                         .copied()
                         == Some(new_active_id)
                     {
-                        return false;
+                        return (false, PoolCommandTerminal::Applied);
                     }
-                    match desired.try_admit_group(
-                        snapshot.consumer,
-                        snapshot.owner,
-                        snapshot.all_pubkeys(),
-                    ) {
-                        AdmissionResult::Admitted { .. }
-                        | AdmissionResult::OwnerAddedNoNewPubkey => {
-                            let changed =
-                                self.register_tracked_assets_from_pool_snapshot(&snapshot);
-                            if changed {
-                                self.dlmm_registered_active_id
-                                    .write()
-                                    .insert(snapshot.pool, new_active_id);
-                            }
-                            changed
-                        }
-                        rejected => {
-                            record_admission_rejection(snapshot.consumer, rejected);
-                            false
-                        }
+                    let (changed, terminal) = self.apply_pool_admission(desired, &snapshot);
+                    if changed {
+                        self.dlmm_registered_active_id
+                            .write()
+                            .insert(snapshot.pool, new_active_id);
                     }
+                    (changed, terminal)
                 });
             }
         }
@@ -3527,10 +3513,12 @@ impl MarketDataContext {
         if self.wallet_explicit_demand_pubkeys().len() > cap {
             return;
         }
-        *self.geyser_explicit_config_error.write() = None;
-        self.geyser_explicit_ready.store(true, Ordering::Release);
+        self.clear_geyser_explicit_blocker(GESYER_BLOCK_PENDING_POOL_OVERFLOW);
         self.clear_pending_pool_overflow_latch();
-        let _ = enqueue_track_worker(self, TrackWorkerCommand::ScheduleGeyserPushDebounced);
+        self.refresh_geyser_explicit_readiness(desired);
+        if self.geyser_explicit_readiness_ok() {
+            let _ = enqueue_track_worker(self, TrackWorkerCommand::ScheduleGeyserPushDebounced);
+        }
     }
 
     fn apply_pending_track_worker_work(&self, desired: &mut DesiredExplicitSet) {
@@ -3706,9 +3694,10 @@ impl MarketDataContext {
                 self.fail_geyser_explicit_protected_overflow(&demand);
             }
             CapConvergeResult::Unconverged => {
-                self.geyser_explicit_ready.store(false, Ordering::Release);
-                *self.geyser_explicit_config_error.write() =
-                    Some("explicit admission cap unconverged".into());
+                self.set_geyser_explicit_blocker(
+                    GESYER_BLOCK_ADMISSION_UNCONVERGED,
+                    Some("explicit admission cap unconverged".into()),
+                );
                 self.geyser_connect_barrier.mark_failed();
             }
         }
@@ -5646,8 +5635,15 @@ impl MarketDataContext {
                 warn!(pool = %a.pool, "MomentumActivePoolsUpdate.active: invalid pool");
                 continue;
             };
-            self.hot_pool_registry.pin_pool(mint_pk, pool_pk);
-            if !self.acquire_momentum_revision_owner(mint_pk, pool_pk) {
+            if !self.hot_pool_registry.pin_pool(mint_pk, pool_pk) {
+                warn!(
+                    mint = %mint_pk,
+                    pool = %pool_pk,
+                    "MomentumActivePoolsUpdate.active: per-pool mint pin bound exceeded"
+                );
+                continue;
+            }
+            if !self.ensure_pool_revision_key(pool_pk, ConsumerId::Momentum) {
                 continue;
             }
             if self.register_geyser_reserves_for_momentum_active_pool(desired, pool_pk) {
@@ -5687,8 +5683,6 @@ impl MarketDataContext {
         pool: Pubkey,
     ) -> bool {
         self.hot_pool_registry.unpin_pool(mint, pool);
-        self.pool_snapshot_revisions
-            .release_active_owner(RevisionActiveOwner::MomentumMintPool { mint, pool });
         let consumer = ConsumerId::Momentum;
         let refs = self.pool_snapshot_revisions.key_refs(pool, consumer);
         let has_pending = self.pending_pool_commands.has_pending(pool, consumer);
@@ -5899,8 +5893,6 @@ impl MarketDataContext {
         pool: Pubkey,
     ) -> bool {
         self.hot_pool_registry.unpin_arb_pool(pool);
-        self.pool_snapshot_revisions
-            .release_active_owner(RevisionActiveOwner::ArbPool { pool });
         let consumer = ConsumerId::Arb;
         let refs = self.pool_snapshot_revisions.key_refs(pool, consumer);
         let has_pending = self.pending_pool_commands.has_pending(pool, consumer);
@@ -8122,6 +8114,7 @@ async fn main() -> Result<()> {
         track_worker: parking_lot::RwLock::new(None),
         geyser_explicit_ready: AtomicBool::new(!wallet_configured),
         geyser_explicit_config_error: parking_lot::RwLock::new(None),
+        geyser_explicit_blockers: AtomicU8::new(0),
         pending_explicit_cap: AtomicUsize::new(0),
         track_worker_dirty: AtomicBool::new(false),
         wallet_explicit_pending,
@@ -11721,6 +11714,7 @@ mod wallet_snapshot_stale_cleanup_tests {
             track_worker: parking_lot::RwLock::new(None),
             geyser_explicit_ready: AtomicBool::new(true),
             geyser_explicit_config_error: parking_lot::RwLock::new(None),
+            geyser_explicit_blockers: AtomicU8::new(0),
             pending_explicit_cap: AtomicUsize::new(0),
             track_worker_dirty: AtomicBool::new(false),
             wallet_explicit_pending: Arc::new(WalletExplicitPending::default()),
@@ -11966,6 +11960,7 @@ mod wallet_tx_meta_balance_tests {
             track_worker: parking_lot::RwLock::new(None),
             geyser_explicit_ready: AtomicBool::new(true),
             geyser_explicit_config_error: parking_lot::RwLock::new(None),
+            geyser_explicit_blockers: AtomicU8::new(0),
             pending_explicit_cap: AtomicUsize::new(0),
             track_worker_dirty: AtomicBool::new(false),
             wallet_explicit_pending: Arc::new(WalletExplicitPending::default()),
@@ -12881,6 +12876,7 @@ mod pr_b_geyser_tracking_tests {
             track_worker: parking_lot::RwLock::new(None),
             geyser_explicit_ready: AtomicBool::new(true),
             geyser_explicit_config_error: parking_lot::RwLock::new(None),
+            geyser_explicit_blockers: AtomicU8::new(0),
             pending_explicit_cap: AtomicUsize::new(0),
             track_worker_dirty: AtomicBool::new(false),
             wallet_explicit_pending: Arc::new(WalletExplicitPending::default()),
@@ -12976,6 +12972,7 @@ mod pr_b_geyser_tracking_tests {
             track_worker: parking_lot::RwLock::new(None),
             geyser_explicit_ready: AtomicBool::new(true),
             geyser_explicit_config_error: parking_lot::RwLock::new(None),
+            geyser_explicit_blockers: AtomicU8::new(0),
             pending_explicit_cap: AtomicUsize::new(0),
             track_worker_dirty: AtomicBool::new(false),
             wallet_explicit_pending: Arc::new(WalletExplicitPending::default()),
@@ -17091,10 +17088,7 @@ mod pr_b_geyser_tracking_tests {
         let pool_a = Pubkey::new_unique();
         let pool_b = Pubkey::new_unique();
         assert_eq!(
-            revisions.acquire_active_owner(RevisionActiveOwner::MomentumMintPool {
-                mint: pool_a,
-                pool: pool_a,
-            }),
+            revisions.ensure_revision_key(pool_a, ConsumerId::Momentum),
             RevisionAcquireResult::Acquired
         );
         let mk_snapshot = |pool: Pubkey| PoolExplicitSnapshot {
@@ -17659,7 +17653,7 @@ mod pr_b_geyser_tracking_tests {
             .key_refs(pool, ConsumerId::Momentum);
         assert_eq!(refs.inflight, 0);
         assert_eq!(refs.pending, 0);
-        assert_eq!(refs.active_owners, 1);
+        assert!(ctx.hot_pool_registry.is_pinned(mint, pool));
     }
 
     #[test]
@@ -17822,5 +17816,249 @@ mod pr_b_geyser_tracking_tests {
         );
         assert!(desired.contains(&coin));
         assert!(desired.contains(&pc));
+    }
+
+    #[test]
+    fn arb_pin_does_not_authorize_momentum_pool_command() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1),
+                reserve_1: Some(1),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        assert!(!ctx.hot_pool_registry.pool_has_momentum(pool));
+        let snapshot = ctx
+            .build_pool_explicit_snapshot(pool, GeyserPinReason::MomentumActive)
+            .expect("snapshot");
+        let mut desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
+        assert!(!ctx.commit_register_pool_geyser_reserves(&mut desired, &snapshot));
+        assert!(
+            !desired
+                .snapshot_owner_groups()
+                .iter()
+                .any(|g| g.consumer == ConsumerId::Momentum),
+            "arb pin must not admit momentum consumer group"
+        );
+    }
+
+    #[test]
+    fn delayed_momentum_after_last_unpin_while_arb_remains_rejects() {
+        use ironcrab::execution::live_pool_cache::RaydiumCpmmState;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: mint,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1),
+                reserve_1: Some(1),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+
+        let mut desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
+        assert!(ctx.register_geyser_reserves_for_momentum_active_pool(&mut desired, pool));
+        ctx.clear_momentum_geyser_reserves_for_active_entry(&mut desired, mint, pool);
+        assert!(!ctx.hot_pool_registry.pool_has_momentum(pool));
+        assert!(ctx.hot_pool_registry.pool_has_arb(pool));
+
+        let Some(snapshot) =
+            ctx.build_pool_explicit_snapshot(pool, GeyserPinReason::MomentumActive)
+        else {
+            panic!("snapshot");
+        };
+        assert!(!ctx.commit_register_geyser_reserves_after_trade(&mut desired, &snapshot));
+        assert!(
+            !desired
+                .snapshot_owner_groups()
+                .iter()
+                .any(|g| g.consumer == ConsumerId::Momentum && g.owner == OwnerKey::Pool(pool)),
+            "delayed momentum command must not reintroduce group while only arb remains"
+        );
+        assert!(
+            desired
+                .snapshot_owner_groups()
+                .iter()
+                .any(|g| g.consumer == ConsumerId::Arb && g.owner == OwnerKey::Pool(pool))
+                || ctx.hot_pool_registry.pool_has_arb(pool),
+            "arb ownership must remain unaffected"
+        );
+    }
+
+    #[test]
+    fn pending_overflow_recovery_leaves_revision_registry_full_blocking() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+        assert!(ctx.ensure_pool_revision_key(pool, ConsumerId::Momentum));
+        let snapshot = PoolExplicitSnapshot {
+            pool,
+            vaults: vec![],
+            bin_arrays: vec![],
+            mints: vec![],
+            consumer: ConsumerId::Momentum,
+            owner: OwnerKey::Pool(pool),
+            pin: GeyserPinReason::MomentumActive,
+            revision: 0,
+        };
+        assert_eq!(
+            ctx.pending_pool_commands
+                .upsert(PendingPoolCommand::RegisterReserves(snapshot)),
+            PendingPoolUpsertResult::Stored
+        );
+        ctx.fail_pending_pool_overflow();
+        ctx.fail_revision_registry_full();
+        assert!(!ctx.geyser_explicit_readiness_ok());
+
+        let mut desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
+        ctx.apply_pending_track_worker_work(&mut desired);
+
+        assert!(
+            !ctx.pending_pool_overflow_latched.load(Ordering::Acquire),
+            "pending overflow latch should clear after drain"
+        );
+        assert!(
+            !ctx.geyser_explicit_readiness_ok(),
+            "revision registry full must remain latched after overflow-only recovery"
+        );
+    }
+
+    #[test]
+    fn momentum_mint_pin_bound_rejects_adversarial_many_mints_per_pool() {
+        let registry = UnifiedHotPoolRegistry::new();
+        let pool = Pubkey::new_unique();
+        for i in 0..MAX_MOMENTUM_MINTS_PER_POOL {
+            let mint = Pubkey::new_unique();
+            assert!(registry.pin_pool(mint, pool), "pin {i} should succeed");
+        }
+        let overflow_mint = Pubkey::new_unique();
+        assert!(
+            !registry.pin_pool(overflow_mint, pool),
+            "must fail closed before exceeding per-pool momentum mint bound"
+        );
+        assert_eq!(
+            registry.momentum_mint_count_for_pool(pool),
+            MAX_MOMENTUM_MINTS_PER_POOL
+        );
+    }
+
+    #[test]
+    fn integrated_pool_command_ref_lifecycle_all_terminal_outcomes() {
+        use ironcrab::execution::live_pool_cache::RaydiumCpmmState;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: mint,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1),
+                reserve_1: Some(1),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+
+        let mut desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
+        let mut snapshot = ctx
+            .build_pool_explicit_snapshot(pool, GeyserPinReason::MomentumActive)
+            .expect("snapshot");
+        let rev_applied = assign_pool_snapshot_for_test(
+            &ctx,
+            pool,
+            ConsumerId::Momentum,
+            &mut snapshot,
+            Some(mint),
+        );
+        snapshot.revision = rev_applied;
+        assert!(ctx.commit_register_pool_geyser_reserves(&mut desired, &snapshot));
+        let refs_after_apply = ctx
+            .pool_snapshot_revisions
+            .key_refs(pool, ConsumerId::Momentum);
+        assert_eq!(refs_after_apply.total(), 0);
+        assert_eq!(
+            ctx.pool_snapshot_revisions
+                .current_applied(pool, ConsumerId::Momentum),
+            rev_applied
+        );
+
+        let mut stale = snapshot.clone();
+        stale.revision = rev_applied.saturating_sub(1);
+        assert!(!ctx.commit_register_pool_geyser_reserves(&mut desired, &stale));
+        assert_eq!(
+            ctx.pool_snapshot_revisions
+                .current_applied(pool, ConsumerId::Momentum),
+            rev_applied
+        );
+
+        ctx.hot_pool_registry.unpin_pool(mint, pool);
+        let mut unpinned = snapshot.clone();
+        assert_eq!(
+            ctx.pool_snapshot_revisions
+                .reserve_inflight_command(pool, ConsumerId::Momentum),
+            InflightReserveResult::Reserved
+        );
+        let rev_unpinned = match ctx.pool_snapshot_revisions.assign_next(&mut unpinned) {
+            RevisionAssignResult::Assigned(rev) => rev,
+            other => panic!("assign failed: {other:?}"),
+        };
+        unpinned.revision = rev_unpinned;
+        assert!(!ctx.commit_register_geyser_reserves_after_trade(&mut desired, &unpinned));
+        let refs_after_unpin = ctx
+            .pool_snapshot_revisions
+            .key_refs(pool, ConsumerId::Momentum);
+        assert_eq!(refs_after_unpin.total(), 0);
+        assert!(
+            rev_unpinned > rev_applied,
+            "accepted unpinned rejection must still advance watermark"
+        );
+        assert_eq!(
+            ctx.pool_snapshot_revisions
+                .current_applied(pool, ConsumerId::Momentum),
+            rev_unpinned
+        );
     }
 }
