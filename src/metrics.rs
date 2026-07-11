@@ -3263,6 +3263,22 @@ pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_TRADE_FALLBACK_NONE: Lazy<Atomi
 pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_MINT_DIRECTION_INVALID: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_PROACTIVE_TRACK_PUBLISH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_SELECTED_POOLS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_SELECTED_MINTS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_CANDIDATE_POOLS_EXECUTABLE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_CANDIDATE_POOLS_QUOTE_READY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_CANDIDATE_POOLS_WARMABLE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_CANDIDATE_POOLS_REJECTED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_REMOVED_BUDGET_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_REMOVED_STALE_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_REMOVED_COOLDOWN_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_PUBLISH_SKIPPED_UNCHANGED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_SELECTION_RECOMPUTES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_SELECTION_QUEUE_OVERFLOW_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_SELECTION_BLOCKING_JOIN_FAILED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 const ARB_QUOTE_PAIR_SLOT_DELTA_BUCKETS: &[u64] = &[0, 1, 2, 3, 4, 5, 8, 16, 32];
 static ARB_QUOTE_PAIR_SLOT_DELTA_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
@@ -3913,6 +3929,56 @@ pub fn try_record_arb_track_pin_before_first_screen_ms(mint: &str) {
 /// Increment `arb_proactive_track_publish_total`.
 pub fn record_arb_proactive_track_publish_total() {
     ARB_PROACTIVE_TRACK_PUBLISH_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Update bounded Arb track selection gauges and candidate counters.
+pub fn set_arb_track_selection_metrics(
+    selected_pools: usize,
+    selected_mints: usize,
+    candidate_counts: &crate::arbitrage::TrackCandidateCounts,
+) {
+    ARB_TRACK_SELECTED_POOLS_GAUGE.store(selected_pools as u64, Ordering::Relaxed);
+    ARB_TRACK_SELECTED_MINTS_GAUGE.store(selected_mints as u64, Ordering::Relaxed);
+    ARB_TRACK_CANDIDATE_POOLS_EXECUTABLE.store(candidate_counts.executable, Ordering::Relaxed);
+    ARB_TRACK_CANDIDATE_POOLS_QUOTE_READY.store(candidate_counts.quote_ready, Ordering::Relaxed);
+    ARB_TRACK_CANDIDATE_POOLS_WARMABLE.store(candidate_counts.warmable, Ordering::Relaxed);
+    ARB_TRACK_CANDIDATE_POOLS_REJECTED.store(candidate_counts.rejected, Ordering::Relaxed);
+}
+
+/// Increment `arb_track_removed_total{reason=...}`.
+pub fn record_arb_track_removed_total(reason: crate::nats::ArbTrackRemovedReason) {
+    use crate::nats::ArbTrackRemovedReason;
+    match reason {
+        ArbTrackRemovedReason::Budget => {
+            ARB_TRACK_REMOVED_BUDGET_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        ArbTrackRemovedReason::Stale => {
+            ARB_TRACK_REMOVED_STALE_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        ArbTrackRemovedReason::Cooldown => {
+            ARB_TRACK_REMOVED_COOLDOWN_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Increment `arb_track_publish_skipped_unchanged_total`.
+pub fn record_arb_track_publish_skipped_unchanged_total() {
+    ARB_TRACK_PUBLISH_SKIPPED_UNCHANGED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_track_selection_recomputes_total`.
+pub fn record_arb_track_selection_recompute_total() {
+    ARB_TRACK_SELECTION_RECOMPUTES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_track_selection_queue_overflow_total`.
+pub fn record_arb_track_selection_queue_overflow_total() {
+    ARB_TRACK_SELECTION_QUEUE_OVERFLOW_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_track_selection_blocking_join_failed_total`.
+pub fn record_arb_track_selection_blocking_join_failed_total() {
+    ARB_TRACK_SELECTION_BLOCKING_JOIN_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Add to `arb_two_hop_tracker_seeded_pools_total` after SLAVE cache tracker seed.
@@ -7446,6 +7512,79 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_proactive_track_publish_total",
         ARB_PROACTIVE_TRACK_PUBLISH_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_track_selected_pools",
+        ARB_TRACK_SELECTED_POOLS_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_track_selected_mints",
+        ARB_TRACK_SELECTED_MINTS_GAUGE.load(Ordering::Relaxed)
+    );
+    out.push_str("arb_track_candidate_pools_total{readiness=\"executable\"} ");
+    out.push_str(
+        &ARB_TRACK_CANDIDATE_POOLS_EXECUTABLE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_track_candidate_pools_total{readiness=\"quote_ready\"} ");
+    out.push_str(
+        &ARB_TRACK_CANDIDATE_POOLS_QUOTE_READY
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_track_candidate_pools_total{readiness=\"warmable\"} ");
+    out.push_str(
+        &ARB_TRACK_CANDIDATE_POOLS_WARMABLE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_track_candidate_pools_total{readiness=\"rejected\"} ");
+    out.push_str(
+        &ARB_TRACK_CANDIDATE_POOLS_REJECTED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_track_removed_total{reason=\"budget\"} ");
+    out.push_str(
+        &ARB_TRACK_REMOVED_BUDGET_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_track_removed_total{reason=\"stale\"} ");
+    out.push_str(
+        &ARB_TRACK_REMOVED_STALE_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_track_removed_total{reason=\"cooldown\"} ");
+    out.push_str(
+        &ARB_TRACK_REMOVED_COOLDOWN_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "arb_track_publish_skipped_unchanged_total",
+        ARB_TRACK_PUBLISH_SKIPPED_UNCHANGED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_track_selection_recomputes_total",
+        ARB_TRACK_SELECTION_RECOMPUTES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_track_selection_queue_overflow_total",
+        ARB_TRACK_SELECTION_QUEUE_OVERFLOW_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_track_selection_blocking_join_failed_total",
+        ARB_TRACK_SELECTION_BLOCKING_JOIN_FAILED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "arb_strategy_bootstrap_live_pool_cache_rows",
