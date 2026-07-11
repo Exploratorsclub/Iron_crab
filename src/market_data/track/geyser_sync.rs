@@ -52,10 +52,15 @@ pub fn track_worker_execute_coalesced_push<C: TrackWorkerContext>(
     set_market_data_geyser_explicit_set_size(desired.len());
 
     let after_keys = desired.snapshot_pubkeys();
+    debug_assert!(
+        after_keys.len() <= desired.max_explicit_pubkeys(),
+        "admitted SSOT must never exceed cap"
+    );
     let delta = symmetric_diff(&before_keys, &after_keys);
     if delta.is_empty() && !continue_evict && !ctx.pending_geyser_evict() {
         inc_market_data_geyser_sync_skipped_no_delta_total();
         set_market_data_geyser_sync_pending(0);
+        ctx.publish_admitted_explicit_physical(desired);
         if release_flush_slot {
             ctx.release_geyser_sync_flush_slot();
         }
@@ -80,6 +85,7 @@ pub fn track_worker_execute_coalesced_push<C: TrackWorkerContext>(
         flush_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
     );
     ctx.prune_tracked_maps_to_desired(desired);
+    ctx.publish_admitted_explicit_physical(desired);
     ctx.refresh_tracked_membership_snapshot();
     *ctx.last_synced_explicit_pubkeys_write() = after_keys;
     if !sync_complete {

@@ -1,8 +1,7 @@
 //! Phase 5a: NATS burst coalescers for momentum and arb track-worker enqueue.
 
-use super::worker::{
-    track_worker_try_enqueue, TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,
-};
+use super::worker::{track_worker_try_enqueue, TrackWorkerContext, TrackWorkerSender};
+use super::worker_commands::TrackWorkerCommand;
 use crate::metrics::{
     inc_market_data_arb_track_coalesced_batches_total,
     inc_market_data_arb_track_coalesced_messages_total,
