@@ -11119,7 +11119,7 @@ mod two_hop_price_tests {
             handle.mark_dirty("mint_a");
         }
         assert_eq!(handle.ingress_dirty_len(), 1);
-        assert_eq!(wake_rx.try_recv().unwrap(), ());
+        assert!(wake_rx.try_recv().is_ok());
         assert!(wake_rx.try_recv().is_err());
     }
 
@@ -11143,7 +11143,7 @@ mod two_hop_price_tests {
         let (handle, mut wake_rx) = test_arb_track_selection_handle();
         handle.request_full_reconcile();
         assert!(handle.pending_full_reconcile.load(Ordering::Acquire));
-        assert_eq!(wake_rx.try_recv().unwrap(), ());
+        assert!(wake_rx.try_recv().is_ok());
     }
 
     #[test]
