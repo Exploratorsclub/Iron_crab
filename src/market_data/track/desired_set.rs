@@ -1264,31 +1264,33 @@ impl<'a> EvictionPlanner<'a> {
             }
         }
 
+        let contributor_pubkeys: Vec<Pubkey> = self
+            .marginal_contributors
+            .get(&victim)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         let freed = self.marginal_freed(victim);
         self.victims.insert(victim);
-        let Some(group) = self.set.groups.get(&victim) else {
-            self.marginal.insert(victim, 0);
-            self.marginal_contributors.insert(victim, HashSet::new());
-            return freed;
-        };
 
-        for pk in &group.pubkeys {
+        for pk in contributor_pubkeys {
             let before = self
                 .projected_pubkey_refcount
-                .get(pk)
+                .get(&pk)
                 .copied()
-                .unwrap_or_else(|| self.projected_owner_count(pk));
-            let after = before.saturating_sub(usize::from(
-                self.pubkey_groups
-                    .get(pk)
-                    .is_some_and(|sharing| sharing.contains(&victim))
-                    && before > 0,
-            ));
-            self.projected_pubkey_refcount.insert(*pk, after);
+                .unwrap_or_else(|| self.projected_owner_count(&pk));
+            let victim_was_sole = self
+                .pubkey_groups
+                .get(&pk)
+                .is_some_and(|sharing| sharing.contains(&victim))
+                && before > 0;
+            let after = before.saturating_sub(usize::from(victim_was_sole));
+            self.projected_pubkey_refcount.insert(pk, after);
             if before >= 2 && after == 1 {
-                if let Some(sole) = self.sole_projected_owner(pk) {
+                if let Some(sole) = self.sole_projected_owner(&pk) {
                     if let Some(contributors) = self.marginal_contributors.get_mut(&sole) {
-                        if contributors.insert(*pk) {
+                        if contributors.insert(pk) {
                             if let Some(m) = self.marginal.get_mut(&sole) {
                                 *m = m.saturating_add(1);
                             }

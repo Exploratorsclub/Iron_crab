@@ -765,9 +765,6 @@ impl PoolSnapshotRevisionSequencer {
             let Some(coalesced) = inner.pending_entries.remove(&k) else {
                 continue;
             };
-            if let Some(slot) = inner.slots.get_mut(&k) {
-                slot.pending = slot.pending.saturating_sub(1);
-            }
             drained.push(coalesced.into_command());
         }
         drained
@@ -1612,6 +1609,19 @@ mod tests {
 
         let drained = pending.drain_all();
         assert_eq!(drained.len(), 1);
+        assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).pending, 1);
+        let snapshot = match &drained[0] {
+            PendingPoolCommand::RegisterReserves(s)
+            | PendingPoolCommand::VaultsFromAccount(s)
+            | PendingPoolCommand::AfterTrade(s) => s,
+            PendingPoolCommand::RefreshDlmm { snapshot: s, .. } => s,
+        };
+        revisions.finish_pool_command(
+            snapshot,
+            PoolCommandTerminal::Applied,
+            Some(PoolCommandRefRelease::Pending),
+            true,
+        );
         assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).total(), 0);
     }
 
@@ -1726,6 +1736,19 @@ mod tests {
         revisions.test_set_drain_hold_before_remove(false);
         let drained = drainer.join().expect("drainer");
         assert_eq!(drained.len(), 1);
+        assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).pending, 1);
+        let snapshot = match &drained[0] {
+            PendingPoolCommand::RegisterReserves(s)
+            | PendingPoolCommand::VaultsFromAccount(s)
+            | PendingPoolCommand::AfterTrade(s) => s,
+            PendingPoolCommand::RefreshDlmm { snapshot: s, .. } => s,
+        };
+        revisions.finish_pool_command(
+            snapshot,
+            PoolCommandTerminal::Applied,
+            Some(PoolCommandRefRelease::Pending),
+            true,
+        );
         assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).pending, 0);
         assert!(!pending.has_pending(pool, ConsumerId::Momentum));
     }
