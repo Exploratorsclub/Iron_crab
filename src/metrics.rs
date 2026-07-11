@@ -3277,6 +3277,8 @@ pub static ARB_TRACK_PUBLISH_SKIPPED_UNCHANGED_TOTAL: Lazy<AtomicU64> =
 pub static ARB_TRACK_SELECTION_RECOMPUTES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACK_SELECTION_QUEUE_OVERFLOW_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_SELECTION_BLOCKING_JOIN_FAILED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 const ARB_QUOTE_PAIR_SLOT_DELTA_BUCKETS: &[u64] = &[0, 1, 2, 3, 4, 5, 8, 16, 32];
 static ARB_QUOTE_PAIR_SLOT_DELTA_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
@@ -3972,6 +3974,11 @@ pub fn record_arb_track_selection_recompute_total() {
 /// Increment `arb_track_selection_queue_overflow_total`.
 pub fn record_arb_track_selection_queue_overflow_total() {
     ARB_TRACK_SELECTION_QUEUE_OVERFLOW_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_track_selection_blocking_join_failed_total`.
+pub fn record_arb_track_selection_blocking_join_failed_total() {
+    ARB_TRACK_SELECTION_BLOCKING_JOIN_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Add to `arb_two_hop_tracker_seeded_pools_total` after SLAVE cache tracker seed.
@@ -7574,6 +7581,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_track_selection_queue_overflow_total",
         ARB_TRACK_SELECTION_QUEUE_OVERFLOW_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_track_selection_blocking_join_failed_total",
+        ARB_TRACK_SELECTION_BLOCKING_JOIN_FAILED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "arb_strategy_bootstrap_live_pool_cache_rows",

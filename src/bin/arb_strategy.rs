@@ -18,7 +18,8 @@ use clap::Parser;
 use parking_lot::RwLock;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -78,6 +79,7 @@ use ironcrab::metrics::{
     record_arb_quote_shadow_round_trip, record_arb_track_publish_skipped_unchanged_total,
     record_arb_track_removed_total, record_arb_track_requests_messages_total,
     record_arb_track_requests_publish_chunks_total, record_arb_track_requests_publish_failed_total,
+    record_arb_track_selection_blocking_join_failed_total,
     record_arb_track_selection_queue_overflow_total, record_arb_track_selection_recompute_total,
     record_arb_writer_lock_wait, serve_metrics, set_arb_pool_cache_apply_batch_size_gauge,
     set_arb_quote_shadow_legacy_spread_bps, set_arb_track_selection_metrics,
@@ -532,6 +534,11 @@ impl ArbTrackSelectionHandle {
         }
     }
 
+    fn record_blocking_join_failed(&self) {
+        record_arb_track_selection_blocking_join_failed_total();
+        self.pending_full_reconcile.store(true, Ordering::Release);
+    }
+
     fn take_pending_full(&self) -> bool {
         self.pending_full_reconcile.swap(false, Ordering::AcqRel)
     }
@@ -546,70 +553,169 @@ fn dummy_arb_track_selection_handle() -> ArbTrackSelectionHandle {
     }
 }
 
-/// Bounded LRU cache of per-mint selection snapshots.
+/// Deterministic top-K mint admission for bounded snapshot cache (unit-tested).
+fn compute_snapshot_admit_set(
+    ranked_mints: &[String],
+    protected: &HashSet<String>,
+    cap: usize,
+) -> HashSet<String> {
+    let mut admit = HashSet::new();
+    if cap == 0 {
+        return admit;
+    }
+    for mint in ranked_mints {
+        if protected.contains(mint) {
+            admit.insert(mint.clone());
+            if admit.len() >= cap {
+                return admit;
+            }
+        }
+    }
+    for mint in ranked_mints {
+        if admit.len() >= cap {
+            break;
+        }
+        admit.insert(mint.clone());
+    }
+    admit
+}
+
+#[derive(Debug, Clone)]
+struct MintSnapshotEntry {
+    input: TrackMintInput,
+    access_gen: u64,
+}
+
+/// Bounded mint snapshot cache with lazy min-heap eviction (O(log cap) touch).
 #[derive(Debug, Default)]
 struct ArbTrackMintSnapshotCache {
-    entries: HashMap<String, TrackMintInput>,
-    lru_order: VecDeque<String>,
+    entries: HashMap<String, MintSnapshotEntry>,
+    next_gen: u64,
+    eviction_heap: BinaryHeap<Reverse<(u64, String)>>,
 }
 
 impl ArbTrackMintSnapshotCache {
+    const HEAP_COMPACT_FACTOR: usize = 4;
+    const HEAP_COMPACT_MIN_EXTRA: usize = 64;
+
     #[allow(dead_code)] // used by unit tests (clippy does not count cfg(test) callers)
     fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[cfg(test)]
+    fn heap_len(&self) -> usize {
+        self.eviction_heap.len()
+    }
+
     fn values(&self) -> impl Iterator<Item = &TrackMintInput> {
-        self.entries.values()
+        self.entries.values().map(|entry| &entry.input)
     }
 
     fn remove(&mut self, mint: &str) {
         self.entries.remove(mint);
-        self.lru_order.retain(|m| m != mint);
     }
 
     fn retain(&mut self, mut keep: impl FnMut(&String) -> bool) {
         self.entries.retain(|mint, _| keep(mint));
-        self.lru_order.retain(|mint| keep(mint));
+        self.compact_heap_if_needed(true);
     }
 
-    fn touch_lru(&mut self, mint: &str) {
-        self.lru_order.retain(|m| m != mint);
-        self.lru_order.push_back(mint.to_string());
+    fn compact_heap_if_needed(&mut self, force: bool) {
+        let threshold = self
+            .entries
+            .len()
+            .saturating_mul(Self::HEAP_COMPACT_FACTOR)
+            .max(Self::HEAP_COMPACT_MIN_EXTRA);
+        if force || self.eviction_heap.len() > threshold {
+            self.eviction_heap = self
+                .entries
+                .iter()
+                .map(|(mint, entry)| Reverse((entry.access_gen, mint.clone())))
+                .collect();
+        }
     }
 
-    fn evict_one_unprotected(&mut self, protected: &HashSet<String>) -> bool {
-        let mut idx = 0;
-        while idx < self.lru_order.len() {
-            if let Some(mint) = self.lru_order.get(idx).cloned() {
-                if !protected.contains(&mint) {
-                    self.lru_order.remove(idx);
-                    self.entries.remove(&mint);
-                    return true;
-                }
-                idx += 1;
-            } else {
-                break;
+    fn touch_entry(&mut self, mint: &str) {
+        self.next_gen = self.next_gen.saturating_add(1);
+        let gen = self.next_gen;
+        if let Some(entry) = self.entries.get_mut(mint) {
+            entry.access_gen = gen;
+            self.eviction_heap.push(Reverse((gen, mint.to_string())));
+        }
+    }
+
+    fn pop_eviction_victim(
+        &mut self,
+        protected: &HashSet<String>,
+        unprotected_only: bool,
+    ) -> Option<String> {
+        let mut deferred = Vec::new();
+        let victim = loop {
+            let Some(Reverse((heap_gen, mint))) = self.eviction_heap.pop() else {
+                break None;
+            };
+            let Some(entry) = self.entries.get(&mint) else {
+                continue;
+            };
+            if entry.access_gen != heap_gen {
+                continue;
             }
+            if unprotected_only && protected.contains(&mint) {
+                deferred.push(Reverse((heap_gen, mint)));
+                continue;
+            }
+            break Some(mint);
+        };
+        for item in deferred {
+            self.eviction_heap.push(item);
+        }
+        victim
+    }
+
+    fn evict_one(&mut self, protected: &HashSet<String>) -> bool {
+        if let Some(victim) = self.pop_eviction_victim(protected, true) {
+            self.entries.remove(&victim);
+            return true;
+        }
+        if let Some(victim) = self.pop_eviction_victim(protected, false) {
+            self.entries.remove(&victim);
+            return true;
         }
         false
     }
 
+    /// Hard cap: protection only affects eviction preference, never bypasses capacity.
     fn insert_bounded(
         &mut self,
         mint: String,
         input: TrackMintInput,
         protected: &HashSet<String>,
     ) -> bool {
-        if !self.entries.contains_key(&mint)
-            && self.entries.len() >= ARB_TRACK_MINT_SNAPSHOTS_CAP
-            && !protected.contains(&mint)
-            && !self.evict_one_unprotected(protected)
-        {
-            return false;
+        if self.entries.contains_key(&mint) {
+            self.entries.get_mut(&mint).unwrap().input = input;
+            self.touch_entry(&mint);
+            self.compact_heap_if_needed(false);
+            return true;
         }
-        self.entries.insert(mint.clone(), input);
-        self.touch_lru(&mint);
+
+        while self.entries.len() >= ARB_TRACK_MINT_SNAPSHOTS_CAP {
+            if !self.evict_one(protected) {
+                return false;
+            }
+        }
+
+        self.next_gen = self.next_gen.saturating_add(1);
+        let gen = self.next_gen;
+        self.entries.insert(
+            mint.clone(),
+            MintSnapshotEntry {
+                input,
+                access_gen: gen,
+            },
+        );
+        self.eviction_heap.push(Reverse((gen, mint)));
+        self.compact_heap_if_needed(false);
         true
     }
 }
@@ -5717,15 +5823,16 @@ impl ArbContext {
         })
     }
 
-    fn protected_snapshot_mints(&self, refreshing: &HashSet<String>) -> HashSet<String> {
-        let mut protected = refreshing.clone();
+    fn mandatory_protected_snapshot_mints(&self) -> HashSet<String> {
+        let mut protected = HashSet::new();
         for mint in self.arb_trade_signal_pairs.read().keys() {
             protected.insert(mint.clone());
         }
         let pinned = self.arb_pinned_pools.read();
         let snapshots = self.arb_track_mint_snapshots.read();
-        for (mint, input) in &snapshots.entries {
-            if input
+        for (mint, entry) in &snapshots.entries {
+            if entry
+                .input
                 .pools
                 .iter()
                 .any(|pool| pinned.contains(&pool.pool_address))
@@ -5734,6 +5841,24 @@ impl ArbContext {
             }
         }
         protected
+    }
+
+    fn rank_multi_dex_mints_by_activity(&self, mints: &[String]) -> Vec<String> {
+        let trackers = self.trackers.read();
+        let vault_balances = self.vault_balances.read();
+        let mut ranked: Vec<(u64, String)> = mints
+            .iter()
+            .filter_map(|mint| {
+                let tracker = trackers.get(mint)?;
+                if tracker.pool_count_on_distinct_dexes() < 2 {
+                    return None;
+                }
+                let activity = tracker_mint_activity_unix_ms(tracker, &vault_balances);
+                Some((activity, mint.clone()))
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        ranked.into_iter().map(|(_, mint)| mint).collect()
     }
 
     fn commit_mint_snapshot(
@@ -6391,8 +6516,18 @@ fn run_arb_track_selection_batch(
         full_reconcile = true;
     }
 
-    let refresh_mints: HashSet<String> = if full_reconcile {
-        ctx.collect_multi_dex_mint_ids().into_iter().collect()
+    let protected = ctx.mandatory_protected_snapshot_mints();
+
+    if full_reconcile {
+        let all_mints = ctx.collect_multi_dex_mint_ids();
+        let ranked = ctx.rank_multi_dex_mints_by_activity(&all_mints);
+        let admit = compute_snapshot_admit_set(&ranked, &protected, ARB_TRACK_MINT_SNAPSHOTS_CAP);
+        for mint in &admit {
+            ctx.refresh_mint_snapshot(mint, &protected);
+        }
+        ctx.arb_track_mint_snapshots
+            .write()
+            .retain(|mint| admit.contains(mint));
     } else {
         dirty_mints.sort();
         dirty_mints.dedup();
@@ -6402,21 +6537,7 @@ fn run_arb_track_selection_batch(
                 .store(true, Ordering::Release);
             dirty_mints.truncate(ARB_TRACK_INCREMENTAL_MINTS_MAX);
         }
-        dirty_mints.into_iter().collect()
-    };
-
-    let protected = ctx.protected_snapshot_mints(&refresh_mints);
-
-    if full_reconcile {
-        for mint in &refresh_mints {
-            ctx.refresh_mint_snapshot(mint, &protected);
-        }
-        let retain: HashSet<String> = refresh_mints.clone();
-        ctx.arb_track_mint_snapshots
-            .write()
-            .retain(|mint| retain.contains(mint));
-    } else {
-        for mint in &refresh_mints {
+        for mint in &dirty_mints {
             ctx.refresh_mint_snapshot(mint, &protected);
         }
     }
@@ -6486,6 +6607,7 @@ fn spawn_arb_track_selection_worker(
             });
             if blocking.await.is_err() {
                 warn!("arb track selection blocking batch join failed");
+                ctx.arb_track_selection.record_blocking_join_failed();
             }
             last_incremental = Instant::now();
         }
@@ -10688,8 +10810,119 @@ mod two_hop_price_tests {
                 last_activity_unix_ms: i as u64,
             };
             let _ = cache.insert_bounded(mint, input, &protected);
+            assert!(cache.len() <= ARB_TRACK_MINT_SNAPSHOTS_CAP);
         }
-        assert!(cache.len() <= ARB_TRACK_MINT_SNAPSHOTS_CAP);
+    }
+
+    #[test]
+    fn arb_track_mint_snapshot_cache_never_exceeds_cap_when_incoming_protected() {
+        let mut cache = ArbTrackMintSnapshotCache::default();
+        let empty = HashSet::new();
+        for i in 0..ARB_TRACK_MINT_SNAPSHOTS_CAP {
+            let mint = format!("seed_{i:05}");
+            let input = TrackMintInput {
+                mint: mint.clone(),
+                pools: Vec::new(),
+                trade_signal_pools: None,
+                last_activity_unix_ms: i as u64,
+            };
+            assert!(cache.insert_bounded(mint, input, &empty));
+        }
+        assert_eq!(cache.len(), ARB_TRACK_MINT_SNAPSHOTS_CAP);
+
+        let mut all_incoming_protected: HashSet<String> = HashSet::new();
+        for i in 0..512 {
+            all_incoming_protected.insert(format!("incoming_{i:05}"));
+        }
+        for i in 0..512 {
+            let mint = format!("incoming_{i:05}");
+            let input = TrackMintInput {
+                mint: mint.clone(),
+                pools: Vec::new(),
+                trade_signal_pools: None,
+                last_activity_unix_ms: 10_000 + i as u64,
+            };
+            let _ = cache.insert_bounded(mint, input, &all_incoming_protected);
+            assert!(
+                cache.len() <= ARB_TRACK_MINT_SNAPSHOTS_CAP,
+                "protected incoming must not bypass hard cap"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_snapshot_admit_set_is_deterministic_top_k() {
+        let ranked: Vec<String> = (0..20).map(|i| format!("mint_{i:02}")).collect();
+        let mut protected = HashSet::new();
+        protected.insert("mint_19".to_string());
+        protected.insert("mint_00".to_string());
+
+        let admit_a = compute_snapshot_admit_set(&ranked, &protected, 5);
+        let admit_b = compute_snapshot_admit_set(&ranked, &protected, 5);
+        assert_eq!(admit_a, admit_b);
+        assert_eq!(admit_a.len(), 5);
+        assert!(admit_a.contains("mint_00"));
+        assert!(admit_a.contains("mint_19"));
+        assert!(admit_a.contains("mint_01"));
+        assert!(admit_a.contains("mint_02"));
+        assert!(admit_a.contains("mint_03"));
+    }
+
+    #[test]
+    fn snapshot_cache_hot_touch_keeps_heap_bounded() {
+        let mut cache = ArbTrackMintSnapshotCache::default();
+        let protected = HashSet::new();
+        for i in 0..ARB_TRACK_MINT_SNAPSHOTS_CAP {
+            let mint = format!("mint_{i:05}");
+            let input = TrackMintInput {
+                mint: mint.clone(),
+                pools: Vec::new(),
+                trade_signal_pools: None,
+                last_activity_unix_ms: i as u64,
+            };
+            cache.insert_bounded(mint, input, &protected);
+        }
+        let hot_mint = "mint_00000".to_string();
+        let hot_input = TrackMintInput {
+            mint: hot_mint.clone(),
+            pools: Vec::new(),
+            trade_signal_pools: None,
+            last_activity_unix_ms: u64::MAX,
+        };
+        for gen in 0..10_000 {
+            let input = TrackMintInput {
+                last_activity_unix_ms: gen,
+                ..hot_input.clone()
+            };
+            cache.insert_bounded(hot_mint.clone(), input, &protected);
+        }
+        let heap_bound = ARB_TRACK_MINT_SNAPSHOTS_CAP
+            .saturating_mul(ArbTrackMintSnapshotCache::HEAP_COMPACT_FACTOR)
+            .max(ArbTrackMintSnapshotCache::HEAP_COMPACT_MIN_EXTRA);
+        assert!(
+            cache.heap_len() <= heap_bound,
+            "heap must compact and stay bounded after hot touches"
+        );
+        assert_eq!(cache.len(), ARB_TRACK_MINT_SNAPSHOTS_CAP);
+    }
+
+    #[test]
+    fn arb_track_selection_blocking_join_failed_sets_pending_full() {
+        use ironcrab::metrics::ARB_TRACK_SELECTION_BLOCKING_JOIN_FAILED_TOTAL;
+
+        let (tx, _rx) = mpsc::channel::<ArbTrackSelectionJob>(1);
+        let pending = Arc::new(AtomicBool::new(false));
+        let handle = ArbTrackSelectionHandle {
+            tx,
+            pending_full_reconcile: Arc::clone(&pending),
+        };
+        let before = ARB_TRACK_SELECTION_BLOCKING_JOIN_FAILED_TOTAL.load(Ordering::Relaxed);
+        handle.record_blocking_join_failed();
+        assert!(pending.load(Ordering::Acquire));
+        assert_eq!(
+            ARB_TRACK_SELECTION_BLOCKING_JOIN_FAILED_TOTAL.load(Ordering::Relaxed),
+            before + 1
+        );
     }
 
     #[test]
