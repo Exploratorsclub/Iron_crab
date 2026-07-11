@@ -1131,6 +1131,9 @@ pub static MARKET_DATA_ARB_TRACK_WORKER_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
 /// Durable pending pool registration overflow (fail-closed; no silent eviction).
 pub static MARKET_DATA_TRACK_PENDING_POOL_OVERFLOW_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Pool snapshot revision registry full / key not registered (fail-closed before command issue).
+pub static MARKET_DATA_REVISION_REGISTRY_FULL_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 /// PR169a: single-writer Geyser tracking actor queue depth (gauge).
 pub static MARKET_DATA_GEYSER_TRACKING_QUEUE_DEPTH: Lazy<AtomicU64> =
@@ -1379,6 +1382,16 @@ pub fn set_market_data_track_worker_queue_depth(depth: usize) {
 #[inline]
 pub fn inc_market_data_track_pending_pool_overflow_total() {
     MARKET_DATA_TRACK_PENDING_POOL_OVERFLOW_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_revision_registry_full_total() {
+    MARKET_DATA_REVISION_REGISTRY_FULL_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn market_data_track_pending_pool_overflow_value() -> u64 {
+    MARKET_DATA_TRACK_PENDING_POOL_OVERFLOW_TOTAL.load(Ordering::Relaxed)
 }
 
 #[inline]

@@ -140,6 +140,52 @@ struct PlanningOverlay {
     suppressed_groups: HashSet<(ConsumerId, OwnerKey)>,
     incoming: Option<((ConsumerId, OwnerKey), HashSet<Pubkey>)>,
     projected_len: usize,
+    pk_projected: HashMap<Pubkey, bool>,
+}
+
+fn pk_projection_contribution(live: bool, proj: bool) -> i64 {
+    match (live, proj) {
+        (false, true) => 1,
+        (true, false) => -1,
+        _ => 0,
+    }
+}
+
+fn projected_len_delta(live: bool, old_proj: bool, new_proj: bool) -> i64 {
+    pk_projection_contribution(live, new_proj) - pk_projection_contribution(live, old_proj)
+}
+
+fn apply_projected_len_delta(projected_len: usize, delta: i64) -> usize {
+    (projected_len as i64 + delta).max(0) as usize
+}
+
+fn pk_would_exist_in_projection(
+    set: &DesiredExplicitSet,
+    pk: Pubkey,
+    suppressed: &HashSet<(ConsumerId, OwnerKey)>,
+    incoming: Option<((ConsumerId, OwnerKey), &HashSet<Pubkey>)>,
+    mut stats: Option<&mut PlanningStats>,
+) -> bool {
+    if let Some(entry) = set.entries.get(&pk) {
+        for owner in &entry.owners {
+            if let Some(s) = stats.as_mut() {
+                s.owner_edge_iterations = s.owner_edge_iterations.saturating_add(1);
+            }
+            if !suppressed.contains(owner) {
+                return true;
+            }
+        }
+    }
+    if let Some((key, pubs)) = incoming {
+        if pubs.contains(&pk) {
+            if let Some(s) = stats.as_mut() {
+                s.owner_edge_iterations = s.owner_edge_iterations.saturating_add(1);
+            }
+            let _ = key;
+            return true;
+        }
+    }
+    false
 }
 
 impl PlanningOverlay {
@@ -149,6 +195,7 @@ impl PlanningOverlay {
             suppressed_groups: HashSet::new(),
             incoming: None,
             projected_len: set.entries.len(),
+            pk_projected: HashMap::new(),
         }
     }
 
@@ -157,7 +204,7 @@ impl PlanningOverlay {
         consumer: ConsumerId,
         owner: OwnerKey,
         incoming: &HashSet<Pubkey>,
-        stats: Option<&mut PlanningStats>,
+        mut stats: Option<&mut PlanningStats>,
     ) -> Self {
         let key = (consumer, owner);
         let mut touched = incoming.clone();
@@ -166,13 +213,28 @@ impl PlanningOverlay {
         if let Some(existing) = set.groups.get(&key) {
             touched.extend(&existing.pubkeys);
         }
-        let projected_len =
-            compute_projected_len(set, &touched, &suppressed, Some((key, incoming)), stats);
+        let incoming_ref = Some((key, incoming));
+        let mut projected_len = set.entries.len();
+        let mut pk_projected = HashMap::with_capacity(touched.len());
+        for pk in &touched {
+            let live = set.entries.contains_key(pk);
+            let proj = pk_would_exist_in_projection(
+                set,
+                *pk,
+                &suppressed,
+                incoming_ref,
+                stats.as_deref_mut(),
+            );
+            pk_projected.insert(*pk, proj);
+            projected_len =
+                apply_projected_len_delta(projected_len, projected_len_delta(live, live, proj));
+        }
         Self {
             touched_pubkeys: touched,
             suppressed_groups: suppressed,
             incoming: Some((key, incoming.clone())),
             projected_len,
+            pk_projected,
         }
     }
 
@@ -182,69 +244,51 @@ impl PlanningOverlay {
         victim: (ConsumerId, OwnerKey),
         mut stats: Option<&mut PlanningStats>,
     ) {
+        if self.suppressed_groups.contains(&victim) {
+            return;
+        }
+        let pubkeys: Vec<Pubkey> = set
+            .groups
+            .get(&victim)
+            .map(|group| group.pubkeys.iter().copied().collect())
+            .unwrap_or_default();
+        for pk in &pubkeys {
+            self.touched_pubkeys.insert(*pk);
+        }
         if !self.suppressed_groups.insert(victim) {
             return;
         }
         if let Some(stats) = stats.as_deref_mut() {
             stats.victim_removals = stats.victim_removals.saturating_add(1);
         }
-        if let Some(group) = set.groups.get(&victim) {
-            self.touched_pubkeys.extend(&group.pubkeys);
-        }
-        self.projected_len = compute_projected_len(
-            set,
-            &self.touched_pubkeys,
-            &self.suppressed_groups,
-            self.incoming.as_ref().map(|(k, p)| (*k, p)),
-            stats,
-        );
-    }
-}
-
-fn pk_exists_in_projection(
-    set: &DesiredExplicitSet,
-    pk: Pubkey,
-    suppressed: &HashSet<(ConsumerId, OwnerKey)>,
-    incoming: Option<((ConsumerId, OwnerKey), &HashSet<Pubkey>)>,
-    mut stats: Option<&mut PlanningStats>,
-) -> bool {
-    if let Some(s) = stats.as_mut() {
-        s.owner_edge_iterations = s.owner_edge_iterations.saturating_add(1);
-    }
-    if let Some(entry) = set.entries.get(&pk) {
-        for owner in &entry.owners {
-            if !suppressed.contains(owner) {
-                return true;
-            }
+        let incoming_ref = self.incoming.as_ref().map(|(k, p)| (*k, p));
+        for pk in pubkeys {
+            let live = set.entries.contains_key(&pk);
+            let old_proj = if let Some(cached) = self.pk_projected.get(&pk) {
+                *cached
+            } else {
+                let mut without_victim = self.suppressed_groups.clone();
+                without_victim.remove(&victim);
+                pk_would_exist_in_projection(
+                    set,
+                    pk,
+                    &without_victim,
+                    incoming_ref,
+                    stats.as_deref_mut(),
+                )
+            };
+            let new_proj = pk_would_exist_in_projection(
+                set,
+                pk,
+                &self.suppressed_groups,
+                incoming_ref,
+                stats.as_deref_mut(),
+            );
+            self.pk_projected.insert(pk, new_proj);
+            let delta = projected_len_delta(live, old_proj, new_proj);
+            self.projected_len = apply_projected_len_delta(self.projected_len, delta);
         }
     }
-    if let Some((key, pubs)) = incoming {
-        if pubs.contains(&pk) {
-            return true;
-        }
-        let _ = key;
-    }
-    false
-}
-
-fn compute_projected_len(
-    set: &DesiredExplicitSet,
-    touched: &HashSet<Pubkey>,
-    suppressed: &HashSet<(ConsumerId, OwnerKey)>,
-    incoming: Option<((ConsumerId, OwnerKey), &HashSet<Pubkey>)>,
-    mut stats: Option<&mut PlanningStats>,
-) -> usize {
-    let mut delta = 0i64;
-    for pk in touched {
-        let live = set.entries.contains_key(pk);
-        let proj = pk_exists_in_projection(set, *pk, suppressed, incoming, stats.as_deref_mut());
-        delta += match (live, proj) {
-            (false, true) => 1,
-            (true, false) => -1,
-            _ => 0,
-        };
-    }
-    (set.entries.len() as i64 + delta).max(0) as usize
 }
 
 fn incoming_net_entry_delta(
@@ -1052,7 +1096,14 @@ impl<'a> EvictionPlanner<'a> {
         let mut pubkey_groups: HashMap<Pubkey, Vec<(ConsumerId, OwnerKey)>> = HashMap::new();
         let mut tracked_groups = HashSet::new();
         for pk in &overlay.touched_pubkeys {
-            Self::index_pubkey(set, overlay, *pk, &mut pubkey_groups, &mut tracked_groups);
+            Self::index_pubkey(
+                set,
+                overlay,
+                *pk,
+                &mut pubkey_groups,
+                &mut tracked_groups,
+                stats.as_deref_mut(),
+            );
         }
         for key in tracked_groups {
             marginal.insert(key, 0);
@@ -1078,11 +1129,15 @@ impl<'a> EvictionPlanner<'a> {
         pk: Pubkey,
         pubkey_groups: &mut HashMap<Pubkey, Vec<(ConsumerId, OwnerKey)>>,
         tracked_groups: &mut HashSet<(ConsumerId, OwnerKey)>,
+        mut stats: Option<&mut PlanningStats>,
     ) {
         if let Some(entry) = set.entries.get(&pk) {
             for owner in &entry.owners {
                 if overlay.suppressed_groups.contains(owner) {
                     continue;
+                }
+                if let Some(s) = stats.as_mut() {
+                    s.owner_edge_iterations = s.owner_edge_iterations.saturating_add(1);
                 }
                 tracked_groups.insert(*owner);
                 pubkey_groups.entry(pk).or_default().push(*owner);
@@ -1090,6 +1145,9 @@ impl<'a> EvictionPlanner<'a> {
         }
         if let Some((key, pubs)) = overlay.incoming.as_ref() {
             if pubs.contains(&pk) && !overlay.suppressed_groups.contains(key) {
+                if let Some(s) = stats.as_mut() {
+                    s.owner_edge_iterations = s.owner_edge_iterations.saturating_add(1);
+                }
                 tracked_groups.insert(*key);
                 pubkey_groups.entry(pk).or_default().push(*key);
             }
@@ -1170,6 +1228,7 @@ impl<'a> EvictionPlanner<'a> {
                         *pk,
                         &mut self.pubkey_groups,
                         &mut scratch,
+                        stats.as_deref_mut(),
                     );
                     for key in scratch {
                         self.marginal.entry(key).or_insert(0);
@@ -2027,15 +2086,14 @@ mod tests {
         let set = DesiredExplicitSet::new(10);
         let (_, owner, pk) = pool_owner();
         let mut stats = PlanningStats::default();
-        assert!(
-            set.test_plan_admit_group_with_stats(
+        assert!(set
+            .test_plan_admit_group_with_stats(
                 ConsumerId::Momentum,
                 owner,
                 HashSet::from([pk]),
                 Some(&mut stats),
             )
-            .is_ok()
-        );
+            .is_ok());
         assert_eq!(stats.projection_copies, 0);
         assert_eq!(stats.entries_copied, 0);
         assert_eq!(stats.owner_edge_iterations, 2);
