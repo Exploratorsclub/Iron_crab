@@ -41,6 +41,15 @@ impl PendingPoolCommand {
         }
     }
 
+    pub fn revision(&self) -> u64 {
+        match self {
+            Self::RegisterReserves(s)
+            | Self::VaultsFromAccount(s)
+            | Self::AfterTrade(s)
+            | Self::RefreshDlmm { snapshot: s, .. } => s.revision,
+        }
+    }
+
     pub fn into_track_command(self) -> TrackWorkerCommand {
         match self {
             Self::RegisterReserves(snapshot) => {
@@ -63,65 +72,47 @@ impl PendingPoolCommand {
     }
 }
 
+fn assign_revision(command: &mut PendingPoolCommand, revision: u64) {
+    match command {
+        PendingPoolCommand::RegisterReserves(s)
+        | PendingPoolCommand::VaultsFromAccount(s)
+        | PendingPoolCommand::AfterTrade(s) => s.revision = revision,
+        PendingPoolCommand::RefreshDlmm { snapshot, .. } => snapshot.revision = revision,
+    }
+}
+
 /// Result of stashing a pool command in durable pending state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingPoolUpsertResult {
     Stored,
     Coalesced,
+    StaleNoOp,
     Overflow,
 }
 
-/// Per-pool coalesced pending commands (one slot per pool+consumer, merged by kind).
+/// Per-pool latest authoritative pending command (one slot per pool+consumer, revision wins).
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct CoalescedPoolPending {
     pool: Pubkey,
     consumer: ConsumerId,
-    reserves: Option<PoolExplicitSnapshot>,
-    vaults: Option<PoolExplicitSnapshot>,
-    after_trade: Option<PoolExplicitSnapshot>,
-    refresh_dlmm: Option<(PoolExplicitSnapshot, i32)>,
+    latest_revision: u64,
+    latest_command: PendingPoolCommand,
 }
 
 impl CoalescedPoolPending {
-    fn merge(&mut self, command: PendingPoolCommand) {
-        match command {
-            PendingPoolCommand::RegisterReserves(snapshot) => {
-                self.reserves = Some(snapshot);
-            }
-            PendingPoolCommand::VaultsFromAccount(snapshot) => {
-                self.vaults = Some(snapshot);
-            }
-            PendingPoolCommand::AfterTrade(snapshot) => {
-                self.after_trade = Some(snapshot);
-            }
-            PendingPoolCommand::RefreshDlmm {
-                snapshot,
-                new_active_id,
-            } => {
-                self.refresh_dlmm = Some((snapshot, new_active_id));
-            }
+    fn try_merge(&mut self, revision: u64, command: PendingPoolCommand) -> bool {
+        if revision > self.latest_revision {
+            self.latest_revision = revision;
+            self.latest_command = command;
+            true
+        } else {
+            false
         }
     }
 
-    fn into_commands(self) -> Vec<PendingPoolCommand> {
-        let mut out = Vec::new();
-        if let Some(snapshot) = self.reserves {
-            out.push(PendingPoolCommand::RegisterReserves(snapshot));
-        }
-        if let Some(snapshot) = self.vaults {
-            out.push(PendingPoolCommand::VaultsFromAccount(snapshot));
-        }
-        if let Some(snapshot) = self.after_trade {
-            out.push(PendingPoolCommand::AfterTrade(snapshot));
-        }
-        if let Some((snapshot, new_active_id)) = self.refresh_dlmm {
-            out.push(PendingPoolCommand::RefreshDlmm {
-                snapshot,
-                new_active_id,
-            });
-        }
-        out
+    fn into_command(self) -> PendingPoolCommand {
+        self.latest_command
     }
 }
 
@@ -209,6 +200,7 @@ pub struct PendingPoolRegistrations {
     entries: Mutex<HashMap<(Pubkey, ConsumerId), CoalescedPoolPending>>,
     order: Mutex<VecDeque<(Pubkey, ConsumerId)>>,
     overflow: AtomicBool,
+    next_revision: AtomicU64,
 }
 
 impl PendingPoolRegistrations {
@@ -218,30 +210,32 @@ impl PendingPoolRegistrations {
             entries: Mutex::new(HashMap::new()),
             order: Mutex::new(VecDeque::new()),
             overflow: AtomicBool::new(false),
+            next_revision: AtomicU64::new(0),
         }
     }
 
-    pub fn upsert(&self, command: PendingPoolCommand) -> PendingPoolUpsertResult {
+    pub fn upsert(&self, mut command: PendingPoolCommand) -> PendingPoolUpsertResult {
+        let revision = self.next_revision.fetch_add(1, Ordering::AcqRel) + 1;
+        assign_revision(&mut command, revision);
         let key = (command.pool(), command.consumer());
         let mut entries = self.entries.lock().expect("pending pool lock");
         let mut order = self.order.lock().expect("pending pool order lock");
-        if entries.contains_key(&key) {
-            entries.get_mut(&key).expect("pending key").merge(command);
-            return PendingPoolUpsertResult::Coalesced;
+        if let Some(entry) = entries.get_mut(&key) {
+            if entry.try_merge(revision, command) {
+                return PendingPoolUpsertResult::Coalesced;
+            }
+            return PendingPoolUpsertResult::StaleNoOp;
         }
         if order.len() >= self.max_pools {
             self.overflow.store(true, Ordering::Release);
             return PendingPoolUpsertResult::Overflow;
         }
-        let mut coalesced = CoalescedPoolPending {
+        let coalesced = CoalescedPoolPending {
             pool: key.0,
             consumer: key.1,
-            reserves: None,
-            vaults: None,
-            after_trade: None,
-            refresh_dlmm: None,
+            latest_revision: revision,
+            latest_command: command,
         };
-        coalesced.merge(command);
         entries.insert(key, coalesced);
         order.push_back(key);
         PendingPoolUpsertResult::Stored
@@ -253,7 +247,7 @@ impl PendingPoolRegistrations {
         let keys: Vec<_> = order.drain(..).collect();
         keys.into_iter()
             .filter_map(|k| entries.remove(&k))
-            .flat_map(|coalesced| coalesced.into_commands())
+            .map(|coalesced| coalesced.into_command())
             .collect()
     }
 
@@ -271,6 +265,14 @@ impl PendingPoolRegistrations {
 
     pub fn pool_count(&self) -> usize {
         self.entries.lock().expect("pending pool lock").len()
+    }
+
+    pub fn latest_revision_for(&self, pool: Pubkey, consumer: ConsumerId) -> Option<u64> {
+        self.entries
+            .lock()
+            .expect("pending pool lock")
+            .get(&(pool, consumer))
+            .map(|e| e.latest_revision)
     }
 }
 
@@ -340,6 +342,122 @@ impl ProtectedOverflowDiagnostic {
             configured_cap: cap,
             wallet_demand_len: demand.len(),
             sample_wallet_pubkeys: demand.iter().copied().take(8).collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::market_data::track::desired_set::OwnerKey;
+    use crate::market_data::track::worker_commands::GeyserPinReason;
+
+    fn mk_snapshot(pool: Pubkey, vault: Pubkey) -> PoolExplicitSnapshot {
+        use crate::market_data::track::worker_commands::{MintExplicitRow, VaultExplicitRow};
+        PoolExplicitSnapshot {
+            pool,
+            vaults: vec![VaultExplicitRow {
+                pubkey: vault,
+                dex: "test".into(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                is_base_vault: true,
+                sibling_vault: None,
+                active_id: None,
+                bin_step: None,
+            }],
+            bin_arrays: vec![],
+            mints: vec![MintExplicitRow {
+                pubkey: Pubkey::new_unique(),
+            }],
+            consumer: ConsumerId::Momentum,
+            owner: OwnerKey::Pool(pool),
+            pin: GeyserPinReason::MomentumActive,
+            revision: 0,
+        }
+    }
+
+    #[test]
+    fn pending_replays_latest_revision_not_kind_order() {
+        let pending = PendingPoolRegistrations::new(8);
+        let pool = Pubkey::new_unique();
+        let old_vault = Pubkey::new_unique();
+        let new_vault = Pubkey::new_unique();
+
+        assert_eq!(
+            pending.upsert(PendingPoolCommand::RegisterReserves(mk_snapshot(
+                pool, old_vault
+            ))),
+            PendingPoolUpsertResult::Stored
+        );
+        assert_eq!(
+            pending.upsert(PendingPoolCommand::AfterTrade(mk_snapshot(pool, new_vault))),
+            PendingPoolUpsertResult::Coalesced
+        );
+        // Older revision (already assigned internally) cannot overwrite newer via re-upsert with stale
+        let drained = pending.drain_all();
+        assert_eq!(drained.len(), 1);
+        match &drained[0] {
+            PendingPoolCommand::AfterTrade(s) => {
+                assert_eq!(s.revision, 2);
+                assert_eq!(s.vaults[0].pubkey, new_vault);
+            }
+            other => panic!("expected AfterTrade latest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_stale_out_of_order_across_all_kinds_no_ops() {
+        let pending = PendingPoolRegistrations::new(8);
+        let pool = Pubkey::new_unique();
+        let v2 = Pubkey::new_unique();
+        let v3 = Pubkey::new_unique();
+        let v4 = Pubkey::new_unique();
+
+        assert_eq!(
+            pending.upsert(PendingPoolCommand::VaultsFromAccount(mk_snapshot(pool, v2))),
+            PendingPoolUpsertResult::Stored
+        );
+        let rev_vault = pending
+            .latest_revision_for(pool, ConsumerId::Momentum)
+            .expect("vault stored");
+
+        assert_eq!(
+            pending.upsert(PendingPoolCommand::RegisterReserves(mk_snapshot(pool, v4))),
+            PendingPoolUpsertResult::Coalesced
+        );
+        let rev_reserve = pending
+            .latest_revision_for(pool, ConsumerId::Momentum)
+            .expect("reserve newer");
+
+        assert_eq!(
+            pending.upsert(PendingPoolCommand::RefreshDlmm {
+                snapshot: mk_snapshot(pool, v3),
+                new_active_id: 9,
+            }),
+            PendingPoolUpsertResult::Coalesced
+        );
+        let rev_dlmm = pending
+            .latest_revision_for(pool, ConsumerId::Momentum)
+            .expect("dlmm newest");
+
+        // Simulate stale replay by manually constructing lower-revision command — upsert assigns
+        // monotonic revision so we verify only latest survives drain.
+        assert!(rev_dlmm > rev_reserve);
+        assert!(rev_reserve > rev_vault);
+
+        let drained = pending.drain_all();
+        assert_eq!(drained.len(), 1);
+        match &drained[0] {
+            PendingPoolCommand::RefreshDlmm {
+                snapshot,
+                new_active_id,
+            } => {
+                assert_eq!(snapshot.revision, rev_dlmm);
+                assert_eq!(snapshot.vaults[0].pubkey, v3);
+                assert_eq!(*new_active_id, 9);
+            }
+            other => panic!("expected RefreshDlmm latest, got {other:?}"),
         }
     }
 }

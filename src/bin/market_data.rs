@@ -3164,6 +3164,7 @@ impl MarketDataContext {
             consumer: consumer_id_for_geyser_pin(Some(pin)),
             owner: OwnerKey::Pool(pool),
             pin,
+            revision: 0,
         })
     }
 
@@ -16679,6 +16680,7 @@ mod pr_b_geyser_tracking_tests {
             consumer: ConsumerId::Momentum,
             owner: OwnerKey::Pool(pool),
             pin: GeyserPinReason::MomentumActive,
+            revision: 0,
         };
         assert_eq!(
             pending.upsert(PendingPoolCommand::RegisterReserves(mk_snapshot(pool_a))),
@@ -16692,7 +16694,12 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
-    fn queue_full_replay_coalesces_all_pool_command_kinds() {
+    fn queue_full_replay_replays_newest_typed_snapshot_per_kind_path() {
+        use ironcrab::execution::live_pool_cache::MeteoraState;
+        use ironcrab::market_data::track::worker_commands::{
+            BinArrayExplicitRow, MintExplicitRow, VaultExplicitRow,
+        };
+
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
@@ -16700,59 +16707,115 @@ mod pr_b_geyser_tracking_tests {
         let pool = Pubkey::new_unique();
         let base = Pubkey::new_unique();
         let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
-        let coin = Pubkey::new_unique();
-        let pc = Pubkey::new_unique();
+        let reserve_x = Pubkey::new_unique();
+        let reserve_y = Pubkey::new_unique();
+        let bin_old = Pubkey::new_unique();
+        let bin_new = Pubkey::new_unique();
+        let mint_old = Pubkey::new_unique();
+        let mint_new = Pubkey::new_unique();
         ctx.live_pool_cache.upsert(
             pool,
-            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
-                token_0_mint: base,
-                token_1_mint: quote,
-                token_0_vault: coin,
-                token_1_vault: pc,
-                reserve_0: Some(1),
-                reserve_1: Some(1),
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: base,
+                token_y_mint: quote,
+                reserve_x,
+                reserve_y,
+                active_id: 8,
+                bin_step: 25,
+                reserve_x_balance: Some(1),
+                reserve_y_balance: Some(1),
             }),
             1,
         );
-        ctx.hot_pool_registry.pin_pool(base, pool);
-        let snapshot = ctx
-            .build_pool_explicit_snapshot(pool, GeyserPinReason::MomentumActive)
-            .expect("snapshot");
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+
+        let mk_typed = |vault_pk: Pubkey, bin_pk: Pubkey, mint_pk: Pubkey| PoolExplicitSnapshot {
+            pool,
+            vaults: vec![VaultExplicitRow {
+                pubkey: vault_pk,
+                dex: "meteora".into(),
+                base_mint: base,
+                quote_mint: quote,
+                is_base_vault: true,
+                sibling_vault: Some(reserve_y),
+                active_id: Some(8),
+                bin_step: Some(25),
+            }],
+            bin_arrays: vec![BinArrayExplicitRow {
+                pubkey: bin_pk,
+                bin_array_index: 1,
+                bin_step: 25,
+            }],
+            mints: vec![MintExplicitRow { pubkey: mint_pk }],
+            consumer: ConsumerId::Arb,
+            owner: OwnerKey::Pool(pool),
+            pin: GeyserPinReason::ArbMultiDex,
+            revision: 0,
+        };
+
+        let snapshot_reserve = mk_typed(reserve_x, bin_old, mint_old);
+        let snapshot_vault = mk_typed(reserve_x, bin_old, mint_old);
+        let snapshot_after_trade = mk_typed(reserve_x, bin_old, mint_old);
+        let snapshot_dlmm = mk_typed(reserve_x, bin_new, mint_new);
 
         let (sender, _rx, _) = ironcrab::market_data::track::track_worker_sender_for_test(1);
         *ctx.track_worker.write() = Some(sender.clone());
         assert!(enqueue_track_worker(
             &ctx,
             TrackWorkerCommand::RegisterPoolGeyserReserves {
-                snapshot: snapshot.clone(),
+                snapshot: snapshot_reserve,
             },
         ));
         assert!(!enqueue_track_worker(
             &ctx,
             TrackWorkerCommand::RegisterPoolVaultsFromAccount {
-                snapshot: snapshot.clone(),
+                snapshot: snapshot_vault,
             },
         ));
         assert!(!enqueue_track_worker(
             &ctx,
             TrackWorkerCommand::RegisterGeyserReservesAfterTrade {
-                snapshot: snapshot.clone(),
+                snapshot: snapshot_after_trade,
             },
         ));
         assert!(!enqueue_track_worker(
             &ctx,
             TrackWorkerCommand::RefreshDlmmBinWindow {
-                snapshot: snapshot.clone(),
-                new_active_id: 3,
+                snapshot: snapshot_dlmm,
+                new_active_id: 9,
             },
         ));
         assert!(ctx.track_worker_dirty.load(Ordering::Relaxed));
         assert_eq!(ctx.pending_pool_commands.pool_count(), 1);
 
+        let latest_rev = ctx
+            .pending_pool_commands
+            .latest_revision_for(pool, ConsumerId::Arb)
+            .expect("pending revision");
+        assert_eq!(
+            latest_rev, 3,
+            "three queue-full stashes assign monotonic revisions"
+        );
+
         let mut desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
         ctx.apply_pending_track_worker_work(&mut desired);
-        assert!(desired.contains(&coin));
-        assert!(desired.contains(&pc));
+
+        let group = desired
+            .snapshot_owner_groups()
+            .into_iter()
+            .find(|g| g.consumer == ConsumerId::Arb && g.owner == OwnerKey::Pool(pool))
+            .expect("arb owner group");
+        assert!(group.pubkeys.contains(&reserve_x));
+        assert!(group.pubkeys.contains(&bin_new));
+        assert!(group.pubkeys.contains(&mint_new));
+        assert!(!group.pubkeys.contains(&bin_old));
+        assert!(!group.pubkeys.contains(&mint_old));
+
+        assert!(ctx.tracked_vaults.read().contains_key(&reserve_x));
+        assert!(ctx.tracked_bin_arrays.read().contains_key(&bin_new));
+        assert!(!ctx.tracked_bin_arrays.read().contains_key(&bin_old));
+        assert!(ctx.tracked_mints.read().contains_key(&mint_new));
+        assert!(!ctx.tracked_mints.read().contains_key(&mint_old));
     }
 
     #[tokio::test(flavor = "current_thread")]

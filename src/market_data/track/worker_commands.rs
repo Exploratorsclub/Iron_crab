@@ -52,6 +52,8 @@ pub struct PoolExplicitSnapshot {
     pub consumer: ConsumerId,
     pub owner: OwnerKey,
     pub pin: GeyserPinReason,
+    /// Monotonic sequence assigned at enqueue/pending-stash time (stale replay guard).
+    pub revision: u64,
 }
 
 impl PoolExplicitSnapshot {

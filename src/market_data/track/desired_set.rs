@@ -431,18 +431,13 @@ impl DesiredExplicitSet {
             }
         }
 
-        let new_unique: HashSet<Pubkey> = pubkeys
-            .iter()
-            .filter(|pk| !self.entries.contains_key(pk))
-            .copied()
-            .collect();
-        let need = new_unique.len();
-        let free = self.max_explicit_pubkeys.saturating_sub(self.entries.len());
+        let projected_without_evict =
+            self.projected_len_after_replace(consumer, owner, &pubkeys, &[]);
 
         let mut evictions = Vec::new();
-        if need > free {
-            let deficit = need - free;
-            match self.plan_evictions_for_incoming(consumer, owner, &new_unique, deficit) {
+        if projected_without_evict > self.max_explicit_pubkeys {
+            let deficit = projected_without_evict - self.max_explicit_pubkeys;
+            match self.plan_evictions_for_incoming(consumer, owner, deficit) {
                 Some(victims) => evictions = victims,
                 None => return Err(AdmissionResult::RejectedCap),
             }
@@ -456,6 +451,71 @@ impl DesiredExplicitSet {
             return Err(AdmissionResult::RejectedCap);
         }
         Ok(plan)
+    }
+
+    fn is_exclusive_to_owner(&self, pk: &Pubkey, consumer: ConsumerId, owner: OwnerKey) -> bool {
+        self.entries.get(pk).is_some_and(|entry| {
+            entry.owners.len() == 1 && entry.owners.contains(&(consumer, owner))
+        })
+    }
+
+    /// Projected `entries.len()` after evicting victims then replacing the incoming owner group.
+    fn projected_len_after_replace(
+        &self,
+        consumer: ConsumerId,
+        owner: OwnerKey,
+        incoming: &HashSet<Pubkey>,
+        victims: &[(ConsumerId, OwnerKey)],
+    ) -> usize {
+        let mut planner = EvictionPlanner::new(self);
+        let mut freed = 0usize;
+        for (vc, vo) in victims {
+            freed = freed.saturating_add(planner.add_victim((*vc, *vo)));
+        }
+        let len_after_evict = self.entries.len().saturating_sub(freed);
+        let replace_delta = self
+            .net_entry_delta_for_group_replace_after_victims(consumer, owner, incoming, victims);
+        ((len_after_evict as isize) + replace_delta).max(0) as usize
+    }
+
+    fn net_entry_delta_for_group_replace_after_victims(
+        &self,
+        consumer: ConsumerId,
+        owner: OwnerKey,
+        incoming: &HashSet<Pubkey>,
+        victims: &[(ConsumerId, OwnerKey)],
+    ) -> isize {
+        let victim_set: HashSet<(ConsumerId, OwnerKey)> = victims.iter().copied().collect();
+        let mut delta = 0isize;
+        if let Some(existing) = self.groups.get(&(consumer, owner)) {
+            for pk in &existing.pubkeys {
+                if !incoming.contains(pk) {
+                    let exclusive = if victim_set.is_empty() {
+                        self.is_exclusive_to_owner(pk, consumer, owner)
+                    } else {
+                        self.entries.get(pk).is_some_and(|entry| {
+                            entry
+                                .owners
+                                .iter()
+                                .all(|o| o == &(consumer, owner) || victim_set.contains(o))
+                        })
+                    };
+                    if exclusive {
+                        delta -= 1;
+                    }
+                }
+            }
+        }
+        for pk in incoming {
+            let remains_after_evict = self
+                .entries
+                .get(pk)
+                .is_some_and(|entry| entry.owners.iter().any(|o| !victim_set.contains(o)));
+            if !remains_after_evict {
+                delta += 1;
+            }
+        }
+        delta
     }
 
     fn apply_plan(&mut self, plan: AdmissionPlan) -> AdmissionResult {
@@ -497,75 +557,19 @@ impl DesiredExplicitSet {
         };
         let victims: Vec<(ConsumerId, OwnerKey)> =
             plan.evictions.iter().map(|(c, o, _)| (*c, *o)).collect();
-        let after_evict = self
-            .entries
-            .len()
-            .saturating_sub(self.unique_pubkeys_freed_if_evicted(&victims).len());
-        let mut incoming_unique = 0usize;
-        for pk in incoming {
-            if self.entries.get(pk).is_some_and(|entry| {
-                let victim_set: HashSet<_> = victims.iter().copied().collect();
-                entry.owners.iter().any(|owner| !victim_set.contains(owner))
-            }) {
-                continue;
-            }
-            if let Some(existing) = self.groups.get(&(*inc_c, *inc_o)) {
-                if existing.pubkeys.contains(pk) {
-                    continue;
-                }
-            }
-            incoming_unique += 1;
-        }
-        after_evict + incoming_unique
-    }
-
-    fn unique_pubkeys_freed_if_evicted(
-        &self,
-        victims: &[(ConsumerId, OwnerKey)],
-    ) -> HashSet<Pubkey> {
-        let victim_set: HashSet<(ConsumerId, OwnerKey)> = victims.iter().copied().collect();
-        let mut freed = HashSet::new();
-        for (vc, vo) in victims {
-            let Some(group) = self.groups.get(&(*vc, *vo)) else {
-                continue;
-            };
-            for pk in &group.pubkeys {
-                if freed.contains(pk) {
-                    continue;
-                }
-                if self.entries.get(pk).is_some_and(|entry| {
-                    entry.owners.iter().all(|owner| victim_set.contains(owner))
-                }) {
-                    freed.insert(*pk);
-                }
-            }
-        }
-        freed
-    }
-
-    fn marginal_unique_freed_by_evicting(
-        &self,
-        victim: (ConsumerId, OwnerKey),
-        already: &[(ConsumerId, OwnerKey)],
-    ) -> usize {
-        let mut extended = already.to_vec();
-        extended.push(victim);
-        let before = self.unique_pubkeys_freed_if_evicted(already).len();
-        let after = self.unique_pubkeys_freed_if_evicted(&extended).len();
-        after.saturating_sub(before)
+        self.projected_len_after_replace(*inc_c, *inc_o, incoming, &victims)
     }
 
     fn plan_evictions_for_incoming(
         &self,
         incoming: ConsumerId,
         incoming_owner: OwnerKey,
-        _new_unique: &HashSet<Pubkey>,
         mut deficit: usize,
     ) -> Option<Vec<(ConsumerId, OwnerKey, EvictReason)>> {
         let incoming_priority = pin_priority_from_consumer(incoming);
         let candidates = self.cap_shrink_candidate_keys();
+        let mut planner = EvictionPlanner::new(self);
         let mut victims = Vec::new();
-        let mut victim_keys = Vec::new();
 
         while deficit > 0 {
             let mut best_positive: Option<((ConsumerId, OwnerKey), usize, EvictReason)> = None;
@@ -574,10 +578,7 @@ impl DesiredExplicitSet {
                 if consumer == incoming && owner == incoming_owner {
                     continue;
                 }
-                if victim_keys
-                    .iter()
-                    .any(|(c, o)| *c == consumer && *o == owner)
-                {
+                if planner.is_victim(consumer, owner) {
                     continue;
                 }
                 let gp = pin_priority_from_consumer(consumer);
@@ -588,8 +589,7 @@ impl DesiredExplicitSet {
                 if !evictable {
                     continue;
                 }
-                let marginal =
-                    self.marginal_unique_freed_by_evicting((consumer, owner), &victim_keys);
+                let marginal = planner.marginal_freed((consumer, owner));
                 let reason = if gp > incoming_priority {
                     EvictReason::HigherPriority
                 } else {
@@ -605,11 +605,11 @@ impl DesiredExplicitSet {
                 }
             }
             if let Some(((consumer, owner), marginal, reason)) = best_positive {
-                victim_keys.push((consumer, owner));
+                planner.add_victim((consumer, owner));
                 victims.push((consumer, owner, reason));
                 deficit = deficit.saturating_sub(marginal);
             } else if let Some(((consumer, owner), reason)) = best_zero {
-                victim_keys.push((consumer, owner));
+                planner.add_victim((consumer, owner));
                 victims.push((consumer, owner, reason));
             } else {
                 return None;
@@ -712,20 +712,17 @@ impl DesiredExplicitSet {
     /// Set-aware cap-shrink victim planning: aggregate eviction across co-dependent groups.
     fn plan_cap_shrink_victims(&self, deficit: usize) -> Option<Vec<(ConsumerId, OwnerKey)>> {
         let candidates = self.cap_shrink_candidate_keys();
+        let mut planner = EvictionPlanner::new(self);
         let mut victim_keys = Vec::new();
         let mut freed = 0usize;
         while freed < deficit {
             let mut best_positive: Option<((ConsumerId, OwnerKey), usize)> = None;
             let mut best_zero: Option<(ConsumerId, OwnerKey)> = None;
             for &(consumer, owner) in &candidates {
-                if victim_keys
-                    .iter()
-                    .any(|(c, o)| *c == consumer && *o == owner)
-                {
+                if planner.is_victim(consumer, owner) {
                     continue;
                 }
-                let marginal =
-                    self.marginal_unique_freed_by_evicting((consumer, owner), &victim_keys);
+                let marginal = planner.marginal_freed((consumer, owner));
                 if marginal > 0 {
                     let replace = best_positive.as_ref().is_none_or(|(_, m)| marginal > *m);
                     if replace {
@@ -736,9 +733,11 @@ impl DesiredExplicitSet {
                 }
             }
             if let Some(((consumer, owner), marginal)) = best_positive {
+                planner.add_victim((consumer, owner));
                 victim_keys.push((consumer, owner));
                 freed = freed.saturating_add(marginal);
             } else if let Some((consumer, owner)) = best_zero {
+                planner.add_victim((consumer, owner));
                 victim_keys.push((consumer, owner));
             } else {
                 return None;
@@ -822,6 +821,147 @@ impl DesiredExplicitSet {
                 self.by_consumer.remove(&consumer);
             }
         }
+    }
+}
+
+/// Incremental marginal-free eviction planner (bounded edge updates, no G×G rescans).
+struct EvictionPlanner<'a> {
+    set: &'a DesiredExplicitSet,
+    victims: HashSet<(ConsumerId, OwnerKey)>,
+    marginal: HashMap<(ConsumerId, OwnerKey), usize>,
+    marginal_contributors: HashMap<(ConsumerId, OwnerKey), HashSet<Pubkey>>,
+    pubkey_groups: HashMap<Pubkey, Vec<(ConsumerId, OwnerKey)>>,
+    edge_updates: usize,
+}
+
+impl<'a> EvictionPlanner<'a> {
+    fn new(set: &'a DesiredExplicitSet) -> Self {
+        let mut marginal = HashMap::new();
+        let mut marginal_contributors: HashMap<(ConsumerId, OwnerKey), HashSet<Pubkey>> =
+            HashMap::new();
+        let mut pubkey_groups: HashMap<Pubkey, Vec<(ConsumerId, OwnerKey)>> = HashMap::new();
+        for (key, group) in &set.groups {
+            marginal.insert(*key, 0);
+            marginal_contributors.insert(*key, HashSet::new());
+            for pk in &group.pubkeys {
+                pubkey_groups.entry(*pk).or_default().push(*key);
+            }
+        }
+        let mut planner = Self {
+            set,
+            victims: HashSet::new(),
+            marginal,
+            marginal_contributors,
+            pubkey_groups,
+            edge_updates: 0,
+        };
+        for key in set.groups.keys().copied().collect::<Vec<_>>() {
+            planner.recompute_marginal_for_group(key);
+        }
+        planner
+    }
+
+    fn recompute_marginal_for_group(&mut self, group: (ConsumerId, OwnerKey)) {
+        if self.victims.contains(&group) {
+            self.marginal.insert(group, 0);
+            self.marginal_contributors.insert(group, HashSet::new());
+            return;
+        }
+        let Some(g) = self.set.groups.get(&group) else {
+            self.marginal.insert(group, 0);
+            self.marginal_contributors.insert(group, HashSet::new());
+            return;
+        };
+        let mut contributors = HashSet::new();
+        for pk in &g.pubkeys {
+            if self.pk_counts_toward_marginal(pk, group) {
+                contributors.insert(*pk);
+            }
+        }
+        self.marginal.insert(group, contributors.len());
+        self.marginal_contributors.insert(group, contributors);
+    }
+
+    fn pk_counts_toward_marginal(&self, pk: &Pubkey, group: (ConsumerId, OwnerKey)) -> bool {
+        self.set.entries.get(pk).is_some_and(|entry| {
+            entry
+                .owners
+                .iter()
+                .all(|owner| self.victims.contains(owner) || *owner == group)
+        })
+    }
+
+    fn is_victim(&self, consumer: ConsumerId, owner: OwnerKey) -> bool {
+        self.victims.contains(&(consumer, owner))
+    }
+
+    fn marginal_freed(&self, victim: (ConsumerId, OwnerKey)) -> usize {
+        self.marginal.get(&victim).copied().unwrap_or(0)
+    }
+
+    fn is_pubkey_freed(&self, pk: &Pubkey) -> bool {
+        self.set.entries.get(pk).is_some_and(|entry| {
+            entry
+                .owners
+                .iter()
+                .all(|owner| self.victims.contains(owner))
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn edge_updates(&self) -> usize {
+        self.edge_updates
+    }
+
+    fn add_victim(&mut self, victim: (ConsumerId, OwnerKey)) -> usize {
+        let freed = self.marginal_freed(victim);
+        self.victims.insert(victim);
+        let Some(group) = self.set.groups.get(&victim) else {
+            self.marginal.insert(victim, 0);
+            self.marginal_contributors.insert(victim, HashSet::new());
+            return freed;
+        };
+
+        let touched_groups: HashSet<(ConsumerId, OwnerKey)> = group
+            .pubkeys
+            .iter()
+            .flat_map(|pk| self.pubkey_groups.get(pk).into_iter().flatten().copied())
+            .collect();
+
+        for pk in &group.pubkeys {
+            if self.is_pubkey_freed(pk) {
+                if let Some(sharing) = self.pubkey_groups.get(pk) {
+                    for other in sharing {
+                        if *other != victim && !self.victims.contains(other) {
+                            if let Some(contributors) = self.marginal_contributors.get_mut(other) {
+                                if contributors.remove(pk) {
+                                    if let Some(m) = self.marginal.get_mut(other) {
+                                        *m = m.saturating_sub(1);
+                                    }
+                                    self.edge_updates = self.edge_updates.saturating_add(1);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.marginal.insert(victim, 0);
+        self.marginal_contributors.insert(victim, HashSet::new());
+
+        for other in touched_groups {
+            if other == victim || self.victims.contains(&other) {
+                continue;
+            }
+            let before = self.marginal_freed(other);
+            self.recompute_marginal_for_group(other);
+            if self.marginal_freed(other) != before {
+                self.edge_updates = self.edge_updates.saturating_add(1);
+            }
+        }
+
+        freed
     }
 }
 
@@ -1349,5 +1489,201 @@ mod tests {
         assert_eq!(delta.len(), 2);
         assert!(delta.contains(&added));
         assert!(delta.contains(&removed));
+    }
+
+    #[test]
+    fn exclusive_key_replacement_at_cap_succeeds_without_unrelated_eviction() {
+        let mut set = DesiredExplicitSet::new(3);
+        let wallet = Pubkey::new_unique();
+        assert!(matches!(
+            set.try_admit_group(
+                ConsumerId::Wallet,
+                OwnerKey::Wallet,
+                HashSet::from([wallet])
+            ),
+            AdmissionResult::Admitted { .. }
+        ));
+        let (_, arb_owner, _) = pool_owner();
+        let arb_pk = Pubkey::new_unique();
+        assert!(matches!(
+            set.try_admit_group(ConsumerId::Arb, arb_owner, HashSet::from([arb_pk])),
+            AdmissionResult::Admitted { .. }
+        ));
+        let pool = Pubkey::new_unique();
+        let owner = OwnerKey::Pool(pool);
+        let old = Pubkey::new_unique();
+        assert!(matches!(
+            set.try_admit_group(ConsumerId::Momentum, owner, HashSet::from([old])),
+            AdmissionResult::Admitted { .. }
+        ));
+        assert_eq!(set.len(), 3);
+
+        let new_pk = Pubkey::new_unique();
+        assert!(matches!(
+            set.try_admit_group(ConsumerId::Momentum, owner, HashSet::from([new_pk])),
+            AdmissionResult::Admitted { .. }
+        ));
+        assert!(set.contains(&arb_pk), "unrelated arb group must survive");
+        assert!(set.contains(&wallet));
+        assert!(!set.contains(&old));
+        assert!(set.contains(&new_pk));
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn shared_key_owner_group_replacement_at_cap_without_unrelated_eviction() {
+        let mut set = DesiredExplicitSet::new(3);
+        let shared = Pubkey::new_unique();
+        let (_, arb_owner, _) = pool_owner();
+        let arb_excl = Pubkey::new_unique();
+        assert!(matches!(
+            set.try_admit_group(
+                ConsumerId::Arb,
+                arb_owner,
+                HashSet::from([shared, arb_excl])
+            ),
+            AdmissionResult::Admitted { .. }
+        ));
+        let pool = Pubkey::new_unique();
+        let owner = OwnerKey::Pool(pool);
+        let mom_excl_old = Pubkey::new_unique();
+        assert!(matches!(
+            set.try_admit_group(
+                ConsumerId::Momentum,
+                owner,
+                HashSet::from([shared, mom_excl_old])
+            ),
+            AdmissionResult::Admitted { .. }
+        ));
+        assert_eq!(set.len(), 3);
+
+        let mom_excl_new = Pubkey::new_unique();
+        assert!(matches!(
+            set.try_admit_group(
+                ConsumerId::Momentum,
+                owner,
+                HashSet::from([shared, mom_excl_new])
+            ),
+            AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey
+        ));
+        assert!(set.contains(&arb_excl));
+        assert!(!set.contains(&mom_excl_old));
+        assert!(set.contains(&mom_excl_new));
+        assert!(set.contains(&shared));
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn dlmm_window_shift_equal_bins_at_cap_succeeds_without_eviction() {
+        let mut set = DesiredExplicitSet::new(4);
+        let wallet = Pubkey::new_unique();
+        let (_, arb_owner, _) = pool_owner();
+        let arb_pk = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let owner = OwnerKey::Pool(pool);
+        let b1 = Pubkey::new_unique();
+        let b2 = Pubkey::new_unique();
+        assert!(matches!(
+            set.try_admit_group(
+                ConsumerId::Wallet,
+                OwnerKey::Wallet,
+                HashSet::from([wallet])
+            ),
+            AdmissionResult::Admitted { .. }
+        ));
+        assert!(matches!(
+            set.try_admit_group(ConsumerId::Arb, arb_owner, HashSet::from([arb_pk])),
+            AdmissionResult::Admitted { .. }
+        ));
+        assert!(matches!(
+            set.try_admit_group(ConsumerId::Momentum, owner, HashSet::from([b1, b2])),
+            AdmissionResult::Admitted { .. }
+        ));
+        assert_eq!(set.len(), 4);
+
+        let b3 = Pubkey::new_unique();
+        let b4 = Pubkey::new_unique();
+        assert!(matches!(
+            set.try_admit_group(ConsumerId::Momentum, owner, HashSet::from([b3, b4])),
+            AdmissionResult::Admitted { .. }
+        ));
+        assert!(set.contains(&arb_pk));
+        assert!(set.contains(&wallet));
+        assert!(!set.contains(&b1));
+        assert!(!set.contains(&b2));
+        assert!(set.contains(&b3));
+        assert!(set.contains(&b4));
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn replacement_rejected_at_cap_leaves_state_unchanged() {
+        let mut set = DesiredExplicitSet::new(2);
+        let wallet = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let owner = OwnerKey::Pool(pool);
+        let k1 = Pubkey::new_unique();
+        let k2 = Pubkey::new_unique();
+        assert!(matches!(
+            set.try_admit_group(
+                ConsumerId::Wallet,
+                OwnerKey::Wallet,
+                HashSet::from([wallet])
+            ),
+            AdmissionResult::Admitted { .. }
+        ));
+        assert!(matches!(
+            set.try_admit_group(ConsumerId::Momentum, owner, HashSet::from([k1])),
+            AdmissionResult::Admitted { .. }
+        ));
+        let before = set.snapshot_pubkeys();
+        assert!(matches!(
+            set.try_admit_group(
+                ConsumerId::Momentum,
+                owner,
+                HashSet::from([k2, Pubkey::new_unique()])
+            ),
+            AdmissionResult::RejectedCap
+        ));
+        assert_eq!(set.snapshot_pubkeys(), before);
+    }
+
+    #[test]
+    fn eviction_planner_edge_updates_bounded_with_heavy_sharing() {
+        let mut set = DesiredExplicitSet::new(2);
+        let hub_a = Pubkey::new_unique();
+        let hub_b = Pubkey::new_unique();
+        for _ in 0..25 {
+            let (_, owner, _) = pool_owner();
+            let _ = set.try_admit_group(ConsumerId::Tracker, owner, HashSet::from([hub_a, hub_b]));
+        }
+        assert_eq!(set.len(), 2);
+
+        let candidates = set.cap_shrink_candidate_keys();
+        let mut planner = EvictionPlanner::new(&set);
+        let mut freed = 0usize;
+        while freed < 1 {
+            let best = candidates
+                .iter()
+                .filter(|(c, o)| !planner.is_victim(*c, *o))
+                .map(|key| (*key, planner.marginal_freed(*key)))
+                .max_by_key(|(_, m)| *m)
+                .map(|(key, _)| key);
+            let Some(victim) = best else {
+                break;
+            };
+            freed = freed.saturating_add(planner.add_victim(victim));
+        }
+        let edge_updates = planner.edge_updates();
+        let group_count = set.groups.len();
+        assert!(
+            edge_updates < group_count * group_count,
+            "edge updates {edge_updates} must stay sub-quadratic vs groups {group_count}"
+        );
+        assert!(
+            edge_updates > 0,
+            "co-dependent shared groups must drive incremental edge updates"
+        );
+        assert_eq!(freed, 2, "last shared victim frees both hub pubkeys");
     }
 }
