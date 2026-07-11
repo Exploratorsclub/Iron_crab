@@ -3274,6 +3274,7 @@ pub static ARB_TRACK_REMOVED_STALE_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU
 pub static ARB_TRACK_REMOVED_COOLDOWN_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACK_PUBLISH_SKIPPED_UNCHANGED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_SELECTION_RECOMPUTES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 const ARB_QUOTE_PAIR_SLOT_DELTA_BUCKETS: &[u64] = &[0, 1, 2, 3, 4, 5, 8, 16, 32];
 static ARB_QUOTE_PAIR_SLOT_DELTA_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
@@ -3959,6 +3960,11 @@ pub fn record_arb_track_removed_total(reason: crate::nats::ArbTrackRemovedReason
 /// Increment `arb_track_publish_skipped_unchanged_total`.
 pub fn record_arb_track_publish_skipped_unchanged_total() {
     ARB_TRACK_PUBLISH_SKIPPED_UNCHANGED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_track_selection_recomputes_total`.
+pub fn record_arb_track_selection_recompute_total() {
+    ARB_TRACK_SELECTION_RECOMPUTES_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Add to `arb_two_hop_tracker_seeded_pools_total` after SLAVE cache tracker seed.
@@ -7553,6 +7559,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_track_publish_skipped_unchanged_total",
         ARB_TRACK_PUBLISH_SKIPPED_UNCHANGED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_track_selection_recomputes_total",
+        ARB_TRACK_SELECTION_RECOMPUTES_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "arb_strategy_bootstrap_live_pool_cache_rows",

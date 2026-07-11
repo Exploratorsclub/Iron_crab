@@ -21,7 +21,7 @@ use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -73,11 +73,12 @@ use ironcrab::metrics::{
     arb_two_hop_v2_no_cross_dex_sell_detail_inc, arb_two_hop_v2_rejected_inc,
     arb_two_hop_v2_screen_inc, arb_two_hop_v2_screen_multi_dex_inc,
     arb_two_hop_v2_sell_quote_none_detail_inc, record_arb_heartbeat_phase,
-    record_arb_price_freshness_stale_age_ms, record_arb_proactive_track_publish_total,
-    record_arb_quote_pair_slot_delta, record_arb_quote_shadow_round_trip,
-    record_arb_track_publish_skipped_unchanged_total, record_arb_track_removed_total,
-    record_arb_track_requests_messages_total, record_arb_track_requests_publish_chunks_total,
-    record_arb_track_requests_publish_failed_total, record_arb_writer_lock_wait, serve_metrics,
+    record_arb_price_freshness_stale_age_ms, record_arb_proactive_pin_first_publish,
+    record_arb_proactive_track_publish_total, record_arb_quote_pair_slot_delta,
+    record_arb_quote_shadow_round_trip, record_arb_track_publish_skipped_unchanged_total,
+    record_arb_track_removed_total, record_arb_track_requests_messages_total,
+    record_arb_track_requests_publish_chunks_total, record_arb_track_requests_publish_failed_total,
+    record_arb_track_selection_recompute_total, record_arb_writer_lock_wait, serve_metrics,
     set_arb_pool_cache_apply_batch_size_gauge, set_arb_quote_shadow_legacy_spread_bps,
     set_arb_track_selection_metrics, set_arb_tracker_write_coalescer_pending,
     set_arb_tracker_write_queue_depth, set_arb_two_hop_blocked_on_apply_trade,
@@ -122,10 +123,16 @@ const ARB_TRACK_REQUESTS_WIRE_VERSION: u32 = 1;
 const ARB_TRACK_BASELINE_MAX_POOLS_DEFAULT: usize = 500;
 /// Default baseline reconcile interval (configurable via `arb_track_reconcile_interval_secs`).
 const ARB_TRACK_RECONCILE_INTERVAL_SECS_DEFAULT: u64 = 60;
-/// Max trade-signal pools remembered for pin priority (bounded).
-const ARB_TRADE_SIGNAL_POOLS_CAP: usize = 64;
-/// Coalesce window before recomputing Arb track selection after dirty marks.
-const ARB_TRACK_RECOMPUTE_COALESCE_MS: u64 = 50;
+/// Max trade-signal pairs remembered per mint (bounded LRU by recency).
+const ARB_TRADE_SIGNAL_PAIRS_CAP: usize = 64;
+/// Coalesce dirty-mint marks before an incremental global select.
+const ARB_TRACK_SELECTION_COALESCE_MS: u64 = 50;
+/// Minimum interval between incremental global selects (rate limit).
+const ARB_TRACK_INCREMENTAL_MIN_INTERVAL_MS: u64 = 1_000;
+/// Max dirty mints queued between incremental selects.
+const ARB_TRACK_SELECTION_DIRTY_MINTS_CAP: usize = 4_096;
+/// Yield between mint snapshot refreshes during full reconcile.
+const ARB_TRACK_FULL_RECONCILE_BATCH_YIELD: usize = 32;
 
 /// Bounded queue for off-hot-loop 2-hop trade detection (Scope D).
 const ARB_TWO_HOP_WORKER_QUEUE_CAP: usize = 4096;
@@ -477,27 +484,91 @@ fn arb_tracked_token_mint<'a>(base_mint: &'a str, quote_mint: &'a str) -> Option
     None
 }
 
-fn trade_signal_pair_for_mint(
-    tracker: &TokenArbTracker,
-    trade_signals: &HashSet<String>,
-) -> Option<(String, String)> {
-    let mut signal_pools: Vec<String> = tracker
-        .pools
-        .keys()
-        .filter(|pool| trade_signals.contains(*pool))
-        .cloned()
-        .collect();
-    signal_pools.sort();
-    for (i, buy) in signal_pools.iter().enumerate() {
-        let buy_dex = tracker.pools.get(buy)?.dex.as_str();
-        for sell in signal_pools.iter().skip(i + 1) {
-            let sell_dex = tracker.pools.get(sell)?.dex.as_str();
-            if buy_dex != sell_dex {
-                return Some((buy.clone(), sell.clone()));
+/// Bounded per-mint trade-signal buy/sell pair with recency.
+#[derive(Debug, Clone)]
+struct ArbTradeSignalPair {
+    buy_pool: String,
+    sell_pool: String,
+    #[allow(dead_code)]
+    seen_at_unix_ms: u64,
+}
+
+enum ArbTrackSelectionJob {
+    MarkDirty { mint: String },
+    FullReconcile,
+}
+
+struct ArbTrackSelectionHandle {
+    tx: mpsc::Sender<ArbTrackSelectionJob>,
+}
+
+impl ArbTrackSelectionHandle {
+    fn mark_dirty(&self, mint: &str) {
+        let _ = self.tx.try_send(ArbTrackSelectionJob::MarkDirty {
+            mint: mint.to_string(),
+        });
+    }
+
+    fn request_full_reconcile(&self) {
+        let _ = self.tx.try_send(ArbTrackSelectionJob::FullReconcile);
+    }
+}
+
+#[cfg(test)]
+fn dummy_arb_track_selection_handle() -> ArbTrackSelectionHandle {
+    let (tx, _rx) = mpsc::channel::<ArbTrackSelectionJob>(1);
+    ArbTrackSelectionHandle { tx }
+}
+
+/// Coalesces selection jobs for bounded worker scheduling (unit-tested).
+#[derive(Debug, Default)]
+struct ArbTrackSelectionCoalescer {
+    dirty_mints: HashSet<String>,
+    pending_full: bool,
+}
+
+impl ArbTrackSelectionCoalescer {
+    fn ingest(&mut self, job: ArbTrackSelectionJob) {
+        match job {
+            ArbTrackSelectionJob::MarkDirty { mint } => {
+                if self.dirty_mints.len() >= ARB_TRACK_SELECTION_DIRTY_MINTS_CAP {
+                    if let Some(old) = self.dirty_mints.iter().next().cloned() {
+                        self.dirty_mints.remove(&old);
+                    }
+                }
+                self.dirty_mints.insert(mint);
             }
+            ArbTrackSelectionJob::FullReconcile => self.pending_full = true,
         }
     }
-    None
+
+    fn take_batch(&mut self) -> (Vec<String>, bool) {
+        let full = self.pending_full;
+        self.pending_full = false;
+        let dirty = self.dirty_mints.drain().collect();
+        (dirty, full)
+    }
+}
+
+fn pool_activity_unix_ms(pool: &PoolState, vault: Option<&VaultBalanceCache>) -> u64 {
+    let pool_ms =
+        wall_clock_unix_ms_now().saturating_sub(pool.last_update.elapsed().as_millis() as u64);
+    vault
+        .map(|v| wall_clock_unix_ms_now().saturating_sub(v.updated_at.elapsed().as_millis() as u64))
+        .unwrap_or(pool_ms)
+        .max(pool_ms)
+}
+
+fn tracker_mint_activity_unix_ms(
+    tracker: &TokenArbTracker,
+    vault_balances: &HashMap<String, VaultBalanceCache>,
+) -> u64 {
+    tracker
+        .pools
+        .values()
+        .map(|pool| pool_activity_unix_ms(pool, vault_balances.get(&pool.pool_address)))
+        .max()
+        .unwrap_or_else(wall_clock_unix_ms_now)
 }
 
 /// Reject obviously wrong side/decimal comparable prices (stablecoins only).
@@ -3784,7 +3855,11 @@ fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoH
                     profit_lamports = opp.estimated_profit_lamports,
                     "🔥 Arbitrage opportunity detected (two-hop worker)"
                 );
-                ctx.publish_arb_trade_signal_track_pins(&opp.buy_pool, &opp.sell_pool);
+                ctx.publish_arb_trade_signal_track_pins(
+                    &opp.base_mint,
+                    &opp.buy_pool,
+                    &opp.sell_pool,
+                );
                 if let Some(mut intent) = create_arb_intent(&ctx, &opp) {
                     if let Some(slot) = job.slot {
                         intent.metadata.insert("slot".to_string(), slot.to_string());
@@ -4025,10 +4100,13 @@ struct ArbContext {
 
     /// Phase 3: pools published as active via `TOPIC_ARB_TRACK_REQUESTS`.
     arb_pinned_pools: RwLock<HashSet<String>>,
-    /// Trade-signal pools with elevated pin priority (bounded).
-    arb_trade_signal_pools: RwLock<HashSet<String>>,
-    /// Coalesce concurrent Arb track recomputes.
-    arb_track_recompute_scheduled: AtomicBool,
+    /// Bounded per-mint trade-signal pairs (mint -> buy/sell + recency).
+    arb_trade_signal_pairs: RwLock<HashMap<String, ArbTradeSignalPair>>,
+    /// LRU order for trade-signal pair eviction (oldest at front).
+    arb_trade_signal_pair_order: RwLock<Vec<String>>,
+    /// Cached per-mint selection snapshots (updated incrementally by selection worker).
+    arb_track_mint_snapshots: RwLock<HashMap<String, TrackMintInput>>,
+    arb_track_selection: ArbTrackSelectionHandle,
     /// Phase 3: count of track_requests publishes (heartbeat).
     arb_track_published: AtomicU64,
     /// Scope D: enqueue-only sender for off-hot-loop 2-hop detection.
@@ -5444,14 +5522,91 @@ impl ArbContext {
         });
     }
 
-    fn build_track_selection_input(&self) -> (Vec<TrackMintInput>, TrackSelectionConfig) {
+    fn collect_multi_dex_mint_ids(&self) -> Vec<String> {
         let trackers = self.trackers.read();
+        let mut mints: Vec<String> = trackers
+            .iter()
+            .filter(|(_, tracker)| {
+                tracker.pool_count_on_distinct_dexes() >= 2 && tracker.token_decimals.is_some()
+            })
+            .map(|(mint, _)| mint.clone())
+            .collect();
+        mints.sort();
+        mints
+    }
+
+    fn build_track_mint_input(&self, mint: &str) -> Option<TrackMintInput> {
+        let tracker = {
+            let trackers = self.trackers.read();
+            trackers.get(mint)?.clone()
+        };
+        if tracker.pool_count_on_distinct_dexes() < 2 {
+            return None;
+        }
+        let token_decimals = tracker.token_decimals?;
+
         let known_pools = self.known_pools.read();
         let vault_balances = self.vault_balances.read();
         let bin_arrays = self.bin_arrays.read();
-        let config = self.config.read();
-        let trade_signals = self.arb_trade_signal_pools.read();
+        let mint_activity = tracker_mint_activity_unix_ms(&tracker, &vault_balances);
+        let trade_signal_pools = self
+            .arb_trade_signal_pairs
+            .read()
+            .get(mint)
+            .map(|pair| (pair.buy_pool.clone(), pair.sell_pool.clone()));
 
+        let pools: Vec<TrackPoolInput> = tracker
+            .pools
+            .values()
+            .map(|pool| {
+                let vault = vault_balances.get(&pool.pool_address);
+                TrackPoolInput {
+                    pool_address: pool.pool_address.clone(),
+                    dex: pool.dex.clone(),
+                    known: known_pools.contains(&pool.pool_address),
+                    quote_pool: pool_state_to_quote_input(pool, mint, token_decimals),
+                    vault: vault.map(vault_cache_to_quote_input),
+                    dlmm_bins: bin_arrays
+                        .get(&pool.pool_address)
+                        .map(flatten_bin_array_cache),
+                    token_decimals,
+                    last_activity_unix_ms: pool_activity_unix_ms(pool, vault),
+                }
+            })
+            .collect();
+
+        Some(TrackMintInput {
+            mint: mint.to_string(),
+            pools,
+            trade_signal_pools,
+            last_activity_unix_ms: mint_activity,
+        })
+    }
+
+    fn refresh_mint_snapshot(&self, mint: &str) {
+        let mut snapshots = self.arb_track_mint_snapshots.write();
+        match self.build_track_mint_input(mint) {
+            Some(input) => {
+                snapshots.insert(mint.to_string(), input);
+            }
+            None => {
+                snapshots.remove(mint);
+            }
+        }
+    }
+
+    fn run_arb_track_selection_from_snapshots(self: &Arc<Self>, reconcile: bool) {
+        if self.nats.is_none() {
+            return;
+        }
+
+        let mint_inputs: Vec<TrackMintInput> = self
+            .arb_track_mint_snapshots
+            .read()
+            .values()
+            .cloned()
+            .collect();
+        let config = self.config.read();
         let selection_config = TrackSelectionConfig {
             max_pools: config.arb_track_baseline_max_pools,
             max_pools_per_mint: 3,
@@ -5461,57 +5616,9 @@ impl ArbContext {
                 state_ttl_ms: config.arb_quote_state_ttl_ms,
             },
         };
+        drop(config);
 
-        let mut mints = Vec::new();
-        for (mint, tracker) in trackers.iter() {
-            if tracker.pool_count_on_distinct_dexes() < 2 {
-                continue;
-            }
-            let Some(token_decimals) = tracker.token_decimals else {
-                continue;
-            };
-            let pools: Vec<TrackPoolInput> = tracker
-                .pools
-                .values()
-                .map(|pool| TrackPoolInput {
-                    pool_address: pool.pool_address.clone(),
-                    dex: pool.dex.clone(),
-                    known: known_pools.contains(&pool.pool_address),
-                    quote_pool: pool_state_to_quote_input(pool, mint, token_decimals),
-                    vault: vault_balances
-                        .get(&pool.pool_address)
-                        .map(vault_cache_to_quote_input),
-                    dlmm_bins: bin_arrays
-                        .get(&pool.pool_address)
-                        .map(flatten_bin_array_cache),
-                    token_decimals,
-                })
-                .collect();
-            let trade_signal_pools = trade_signal_pair_for_mint(tracker, &trade_signals);
-            mints.push(TrackMintInput {
-                mint: mint.clone(),
-                pools,
-                trade_signal_pools,
-            });
-        }
-
-        (mints, selection_config)
-    }
-
-    fn pool_still_tracker_valid(&self, pool: &str) -> bool {
-        let trackers = self.trackers.read();
-        trackers.values().any(|tracker| {
-            tracker.pool_count_on_distinct_dexes() >= 2 && tracker.pools.contains_key(pool)
-        })
-    }
-
-    fn recompute_arb_track_selection(self: &Arc<Self>, reconcile: bool) {
-        if self.nats.is_none() {
-            return;
-        }
-
-        let (mints, selection_config) = self.build_track_selection_input();
-        let result = select_arb_track_pools(&mints, &selection_config);
+        let result = select_arb_track_pools(&mint_inputs, &selection_config);
         set_arb_track_selection_metrics(
             result.selected.len(),
             result.selected_mints,
@@ -5559,11 +5666,7 @@ impl ArbContext {
                 .iter()
                 .filter(|pool| !new_pools.contains(*pool))
                 .map(|pool| {
-                    let reason = arb_track_removal_reason(
-                        pool,
-                        self.pool_still_tracker_valid(pool),
-                        &budget_displaced,
-                    );
+                    let reason = arb_track_removal_reason(pool, &budget_displaced);
                     record_arb_track_removed_total(reason);
                     ArbTrackRemovedEntry {
                         pool: pool.clone(),
@@ -5586,53 +5689,71 @@ impl ArbContext {
             if !active.is_empty() {
                 record_arb_proactive_track_publish_total();
             }
+            let newly_active_mints: HashSet<String> = result
+                .selected
+                .iter()
+                .filter(|p| !old_pools.contains(&p.pool))
+                .map(|p| p.mint.clone())
+                .collect();
+            for mint in newly_active_mints {
+                record_arb_proactive_pin_first_publish(&mint);
+            }
             self.spawn_publish_arb_track_requests(active, removed, false);
         }
     }
 
-    fn schedule_arb_track_recompute(self: &Arc<Self>) {
-        if self
-            .arb_track_recompute_scheduled
-            .swap(true, Ordering::AcqRel)
-        {
-            return;
-        }
-        let ctx = Arc::clone(self);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(ARB_TRACK_RECOMPUTE_COALESCE_MS)).await;
-            ctx.arb_track_recompute_scheduled
-                .store(false, Ordering::Release);
-            ctx.recompute_arb_track_selection(false);
-        });
+    fn mark_arb_track_mint_dirty(self: &Arc<Self>, mint: &str) {
+        self.arb_track_selection.mark_dirty(mint);
     }
 
     fn reconcile_arb_track_baseline_publish(self: &Arc<Self>) {
-        self.recompute_arb_track_selection(true);
+        self.arb_track_selection.request_full_reconcile();
     }
 
-    fn publish_proactive_arb_track_for_mint(self: &Arc<Self>, _mint: &str) {
-        self.schedule_arb_track_recompute();
+    fn publish_proactive_arb_track_for_mint(self: &Arc<Self>, mint: &str) {
+        self.mark_arb_track_mint_dirty(mint);
     }
 
-    fn publish_arb_trade_signal_track_pins(self: &Arc<Self>, buy_pool: &str, sell_pool: &str) {
-        {
-            let mut signals = self.arb_trade_signal_pools.write();
-            signals.insert(buy_pool.to_string());
-            signals.insert(sell_pool.to_string());
-            if signals.len() > ARB_TRADE_SIGNAL_POOLS_CAP {
-                let mut keys: Vec<_> = signals.iter().cloned().collect();
-                keys.sort();
-                let drain = signals.len() - ARB_TRADE_SIGNAL_POOLS_CAP;
-                for key in keys.into_iter().take(drain) {
-                    signals.remove(&key);
-                }
-            }
+    fn record_arb_trade_signal_pair(self: &Arc<Self>, mint: &str, buy_pool: &str, sell_pool: &str) {
+        let seen_at = wall_clock_unix_ms_now();
+        let mut pairs = self.arb_trade_signal_pairs.write();
+        let mut order = self.arb_trade_signal_pair_order.write();
+        if !pairs.contains_key(mint) {
+            order.push(mint.to_string());
         }
-        self.schedule_arb_track_recompute();
+        pairs.insert(
+            mint.to_string(),
+            ArbTradeSignalPair {
+                buy_pool: buy_pool.to_string(),
+                sell_pool: sell_pool.to_string(),
+                seen_at_unix_ms: seen_at,
+            },
+        );
+        if let Some(pos) = order.iter().position(|m| m == mint) {
+            order.remove(pos);
+        }
+        order.push(mint.to_string());
+        while pairs.len() > ARB_TRADE_SIGNAL_PAIRS_CAP {
+            let Some(evict_mint) = order.first().cloned() else {
+                break;
+            };
+            order.remove(0);
+            pairs.remove(&evict_mint);
+        }
+    }
+
+    fn publish_arb_trade_signal_track_pins(
+        self: &Arc<Self>,
+        mint: &str,
+        buy_pool: &str,
+        sell_pool: &str,
+    ) {
+        self.record_arb_trade_signal_pair(mint, buy_pool, sell_pool);
+        self.mark_arb_track_mint_dirty(mint);
     }
 
     fn prune_arb_track_stale_pools(self: &Arc<Self>) {
-        self.schedule_arb_track_recompute();
+        self.arb_track_selection.request_full_reconcile();
     }
 }
 
@@ -6098,6 +6219,71 @@ fn maybe_arb_tracker_write_stall_watchdog_warn(queue_cap: usize) {
     arb_tracker_write_stall_watchdog_inc();
 }
 
+fn spawn_arb_track_selection_worker(
+    ctx: Arc<ArbContext>,
+    mut rx: mpsc::Receiver<ArbTrackSelectionJob>,
+) {
+    tokio::spawn(async move {
+        let mut coalescer = ArbTrackSelectionCoalescer::default();
+        let mut last_incremental = Instant::now() - Duration::from_secs(3600);
+
+        while let Some(first) = rx.recv().await {
+            coalescer.ingest(first);
+            let coalesce_deadline =
+                Instant::now() + Duration::from_millis(ARB_TRACK_SELECTION_COALESCE_MS);
+            while Instant::now() < coalesce_deadline {
+                match rx.try_recv() {
+                    Ok(job) => coalescer.ingest(job),
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
+
+            let (dirty_mints, full_reconcile) = coalescer.take_batch();
+            if dirty_mints.is_empty() && !full_reconcile {
+                continue;
+            }
+
+            if !full_reconcile {
+                let min_interval = Duration::from_millis(ARB_TRACK_INCREMENTAL_MIN_INTERVAL_MS);
+                let elapsed = last_incremental.elapsed();
+                if elapsed < min_interval {
+                    tokio::time::sleep(min_interval - elapsed).await;
+                }
+            }
+
+            let refresh_mints: Vec<String> = if full_reconcile {
+                ctx.collect_multi_dex_mint_ids()
+            } else {
+                let mut mints = dirty_mints;
+                mints.sort();
+                mints.dedup();
+                mints
+            };
+
+            for (idx, mint) in refresh_mints.iter().enumerate() {
+                ctx.refresh_mint_snapshot(mint);
+                if full_reconcile && (idx + 1) % ARB_TRACK_FULL_RECONCILE_BATCH_YIELD == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            if full_reconcile {
+                let snapshot_mints: HashSet<String> = refresh_mints.into_iter().collect();
+                let mut snapshots = ctx.arb_track_mint_snapshots.write();
+                snapshots.retain(|mint, _| snapshot_mints.contains(mint));
+            }
+
+            ctx.run_arb_track_selection_from_snapshots(full_reconcile);
+            record_arb_track_selection_recompute_total();
+            last_incremental = Instant::now();
+        }
+        info!("arb-strategy track selection worker stopped");
+    });
+}
+
 fn spawn_arb_tracker_write_worker(
     ctx: Arc<ArbContext>,
     mut rx: mpsc::Receiver<ArbTrackerWriteJob>,
@@ -6331,6 +6517,11 @@ async fn main() -> Result<()> {
         tx: tracker_write_tx,
         capacity: ARB_TRACKER_WRITE_QUEUE_CAP,
     };
+    let (arb_track_selection_tx, arb_track_selection_rx) =
+        mpsc::channel::<ArbTrackSelectionJob>(ARB_TRACKER_WRITE_QUEUE_CAP);
+    let arb_track_selection = ArbTrackSelectionHandle {
+        tx: arb_track_selection_tx,
+    };
 
     let ctx = Arc::new(ArbContext {
         run_id: run_id.clone(),
@@ -6355,8 +6546,10 @@ async fn main() -> Result<()> {
         eligibility_forensics: ArbEligibilityForensics::new(),
         v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
         arb_pinned_pools: RwLock::new(HashSet::new()),
-        arb_trade_signal_pools: RwLock::new(HashSet::new()),
-        arb_track_recompute_scheduled: AtomicBool::new(false),
+        arb_trade_signal_pairs: RwLock::new(HashMap::new()),
+        arb_trade_signal_pair_order: RwLock::new(Vec::new()),
+        arb_track_mint_snapshots: RwLock::new(HashMap::new()),
+        arb_track_selection,
         arb_track_published: AtomicU64::new(0),
         two_hop_tx,
         tracker_write,
@@ -6364,6 +6557,7 @@ async fn main() -> Result<()> {
     });
 
     spawn_arb_tracker_write_worker(Arc::clone(&ctx), tracker_write_rx);
+    spawn_arb_track_selection_worker(Arc::clone(&ctx), arb_track_selection_rx);
     spawn_arb_two_hop_worker(Arc::clone(&ctx), two_hop_rx);
 
     // Bootstrap SLAVE LivePoolCache from JetStream (same path as execution-engine).
@@ -7418,8 +7612,10 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
-            arb_trade_signal_pools: RwLock::new(HashSet::new()),
-            arb_track_recompute_scheduled: AtomicBool::new(false),
+            arb_trade_signal_pairs: RwLock::new(HashMap::new()),
+            arb_trade_signal_pair_order: RwLock::new(Vec::new()),
+            arb_track_mint_snapshots: RwLock::new(HashMap::new()),
+            arb_track_selection: dummy_arb_track_selection_handle(),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
             tracker_write,
@@ -7527,8 +7723,10 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
-            arb_trade_signal_pools: RwLock::new(HashSet::new()),
-            arb_track_recompute_scheduled: AtomicBool::new(false),
+            arb_trade_signal_pairs: RwLock::new(HashMap::new()),
+            arb_trade_signal_pair_order: RwLock::new(Vec::new()),
+            arb_track_mint_snapshots: RwLock::new(HashMap::new()),
+            arb_track_selection: dummy_arb_track_selection_handle(),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
             tracker_write,
@@ -7634,8 +7832,10 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
-            arb_trade_signal_pools: RwLock::new(HashSet::new()),
-            arb_track_recompute_scheduled: AtomicBool::new(false),
+            arb_trade_signal_pairs: RwLock::new(HashMap::new()),
+            arb_trade_signal_pair_order: RwLock::new(Vec::new()),
+            arb_track_mint_snapshots: RwLock::new(HashMap::new()),
+            arb_track_selection: dummy_arb_track_selection_handle(),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
             tracker_write,
@@ -7851,8 +8051,10 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
-            arb_trade_signal_pools: RwLock::new(HashSet::new()),
-            arb_track_recompute_scheduled: AtomicBool::new(false),
+            arb_trade_signal_pairs: RwLock::new(HashMap::new()),
+            arb_trade_signal_pair_order: RwLock::new(Vec::new()),
+            arb_track_mint_snapshots: RwLock::new(HashMap::new()),
+            arb_track_selection: dummy_arb_track_selection_handle(),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
             tracker_write,
@@ -7956,8 +8158,10 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
-            arb_trade_signal_pools: RwLock::new(HashSet::new()),
-            arb_track_recompute_scheduled: AtomicBool::new(false),
+            arb_trade_signal_pairs: RwLock::new(HashMap::new()),
+            arb_trade_signal_pair_order: RwLock::new(Vec::new()),
+            arb_track_mint_snapshots: RwLock::new(HashMap::new()),
+            arb_track_selection: dummy_arb_track_selection_handle(),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
             tracker_write,
@@ -8065,8 +8269,10 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
-            arb_trade_signal_pools: RwLock::new(HashSet::new()),
-            arb_track_recompute_scheduled: AtomicBool::new(false),
+            arb_trade_signal_pairs: RwLock::new(HashMap::new()),
+            arb_trade_signal_pair_order: RwLock::new(Vec::new()),
+            arb_track_mint_snapshots: RwLock::new(HashMap::new()),
+            arb_track_selection: dummy_arb_track_selection_handle(),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
             tracker_write,
@@ -8145,8 +8351,10 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
-            arb_trade_signal_pools: RwLock::new(HashSet::new()),
-            arb_track_recompute_scheduled: AtomicBool::new(false),
+            arb_trade_signal_pairs: RwLock::new(HashMap::new()),
+            arb_trade_signal_pair_order: RwLock::new(Vec::new()),
+            arb_track_mint_snapshots: RwLock::new(HashMap::new()),
+            arb_track_selection: dummy_arb_track_selection_handle(),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
             tracker_write,
@@ -8286,8 +8494,10 @@ mod two_hop_price_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
-            arb_trade_signal_pools: RwLock::new(HashSet::new()),
-            arb_track_recompute_scheduled: AtomicBool::new(false),
+            arb_trade_signal_pairs: RwLock::new(HashMap::new()),
+            arb_trade_signal_pair_order: RwLock::new(Vec::new()),
+            arb_track_mint_snapshots: RwLock::new(HashMap::new()),
+            arb_track_selection: dummy_arb_track_selection_handle(),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx: {
                 let (tx, _rx) = mpsc::channel(1);
@@ -10155,6 +10365,7 @@ mod two_hop_price_tests {
                     }),
                     dlmm_bins: None,
                     token_decimals: 6,
+                    last_activity_unix_ms: 1,
                 },
                 TrackPoolInput {
                     pool_address: "pump_pool".to_string(),
@@ -10182,9 +10393,11 @@ mod two_hop_price_tests {
                     }),
                     dlmm_bins: None,
                     token_decimals: 6,
+                    last_activity_unix_ms: 2,
                 },
             ],
             trade_signal_pools: None,
+            last_activity_unix_ms: 2,
         };
         let config = TrackSelectionConfig {
             max_pools: 500,
@@ -10199,6 +10412,54 @@ mod two_hop_price_tests {
         let reconcile_pools: HashSet<_> =
             reconcile.selected.iter().map(|p| p.pool.clone()).collect();
         assert_eq!(proactive_pools, reconcile_pools);
+    }
+
+    #[test]
+    fn arb_track_selection_coalescer_bounds_burst_to_one_batch() {
+        let mut coalescer = ArbTrackSelectionCoalescer::default();
+        for i in 0..100 {
+            coalescer.ingest(ArbTrackSelectionJob::MarkDirty {
+                mint: format!("mint_{i}"),
+            });
+        }
+        let (dirty, full) = coalescer.take_batch();
+        assert!(!full);
+        assert_eq!(dirty.len(), 100);
+        let (dirty2, full2) = coalescer.take_batch();
+        assert!(dirty2.is_empty());
+        assert!(!full2);
+    }
+
+    #[test]
+    fn arb_trade_signal_pair_preserves_actual_buy_sell_mapping() {
+        let cache = create_shared_cache();
+        let ctx = Arc::new(test_arb_context(cache));
+        ctx.publish_arb_trade_signal_track_pins("mintA", "buy_pool", "sell_pool");
+        let pair = ctx
+            .arb_trade_signal_pairs
+            .read()
+            .get("mintA")
+            .cloned()
+            .unwrap();
+        assert_eq!(pair.buy_pool, "buy_pool");
+        assert_eq!(pair.sell_pool, "sell_pool");
+    }
+
+    #[test]
+    fn arb_trade_signal_pairs_evict_oldest_not_lexicographic() {
+        let cache = create_shared_cache();
+        let ctx = Arc::new(test_arb_context(cache));
+        for i in 0..=ARB_TRADE_SIGNAL_PAIRS_CAP {
+            ctx.publish_arb_trade_signal_track_pins(
+                &format!("mint_{i:03}"),
+                &format!("buy_{i}"),
+                &format!("sell_{i}"),
+            );
+        }
+        let pairs = ctx.arb_trade_signal_pairs.read();
+        assert_eq!(pairs.len(), ARB_TRADE_SIGNAL_PAIRS_CAP);
+        assert!(!pairs.contains_key("mint_000"));
+        assert!(pairs.contains_key(&format!("mint_{:03}", ARB_TRADE_SIGNAL_PAIRS_CAP)));
     }
 
     #[test]

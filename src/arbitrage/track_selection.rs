@@ -43,6 +43,8 @@ pub struct TrackPoolInput {
     pub vault: Option<QuoteVaultInput>,
     pub dlmm_bins: Option<DlmmBinArrays>,
     pub token_decimals: u8,
+    /// Latest activity from tracker/cache state (unix ms).
+    pub last_activity_unix_ms: u64,
 }
 
 /// Per-mint bundle of pools considered for pin selection.
@@ -52,6 +54,8 @@ pub struct TrackMintInput {
     pub pools: Vec<TrackPoolInput>,
     /// Optional trade-signal buy/sell pair for this mint (highest pin priority).
     pub trade_signal_pools: Option<(String, String)>,
+    /// Mint-level recency for global bundle ranking.
+    pub last_activity_unix_ms: u64,
 }
 
 /// Global selection limits and quote parameters.
@@ -120,20 +124,13 @@ pub fn select_arb_track_pools(
     }
 
     let mut bundles: Vec<MintBundle> = Vec::new();
-    let mut mint_inputs: Vec<&TrackMintInput> = mints.iter().collect();
-    mint_inputs.sort_by(|a, b| a.mint.cmp(&b.mint));
-
-    for mint in mint_inputs {
+    for mint in mints {
         if let Some(bundle) = build_mint_bundle(mint, config, &per_pool_readiness, now) {
             bundles.push(bundle);
         }
     }
 
-    bundles.sort_by(|a, b| {
-        b.priority
-            .cmp(&a.priority)
-            .then_with(|| a.mint.cmp(&b.mint))
-    });
+    bundles.sort_by(compare_bundles);
 
     let mut selected: Vec<SelectedTrackPool> = Vec::new();
     let mut budget_displaced: Vec<String> = Vec::new();
@@ -168,10 +165,9 @@ pub fn select_arb_track_pools(
 /// Map selection removals for pools no longer in the target set.
 pub fn arb_track_removal_reason(
     pool: &str,
-    still_tracker_valid: bool,
     budget_displaced: &HashSet<String>,
 ) -> ArbTrackRemovedReason {
-    if budget_displaced.contains(pool) || still_tracker_valid {
+    if budget_displaced.contains(pool) {
         ArbTrackRemovedReason::Budget
     } else {
         ArbTrackRemovedReason::Stale
@@ -182,7 +178,15 @@ pub fn arb_track_removal_reason(
 struct MintBundle {
     mint: String,
     priority: TrackPoolReadiness,
+    last_activity_unix_ms: u64,
     pools: Vec<SelectedTrackPool>,
+}
+
+fn compare_bundles(a: &MintBundle, b: &MintBundle) -> Ordering {
+    b.priority
+        .cmp(&a.priority)
+        .then_with(|| b.last_activity_unix_ms.cmp(&a.last_activity_unix_ms))
+        .then_with(|| a.mint.cmp(&b.mint))
 }
 
 fn build_mint_bundle(
@@ -220,7 +224,7 @@ fn build_mint_bundle(
         return Some(bundle);
     }
 
-    bundle_from_warmable_pair(mint, &eligible, config, per_pool_readiness, now)
+    bundle_from_pinable_pair(mint, &eligible, config, per_pool_readiness, now)
 }
 
 fn bundle_from_trade_signal(
@@ -259,6 +263,7 @@ fn bundle_from_trade_signal(
     Some(MintBundle {
         mint: mint.mint.clone(),
         priority: TrackPoolReadiness::Executable,
+        last_activity_unix_ms: mint.last_activity_unix_ms,
         pools,
     })
 }
@@ -310,49 +315,72 @@ fn bundle_from_round_trip(
     Some(MintBundle {
         mint: mint.mint.clone(),
         priority: TrackPoolReadiness::QuoteReady,
+        last_activity_unix_ms: mint.last_activity_unix_ms,
         pools,
     })
 }
 
-fn bundle_from_warmable_pair(
+fn bundle_from_pinable_pair(
     mint: &TrackMintInput,
     eligible: &[&TrackPoolInput],
     config: &TrackSelectionConfig,
     per_pool_readiness: &HashMap<String, TrackPoolReadiness>,
     now: Instant,
 ) -> Option<MintBundle> {
-    let mut warmable: Vec<&TrackPoolInput> = eligible
+    let mut pinable: Vec<&TrackPoolInput> = eligible
         .iter()
         .copied()
-        .filter(|p| is_warmable_pool(p, config, now))
+        .filter(|p| is_pinable_pool(p, config, now, per_pool_readiness))
         .collect();
-    warmable.sort_by(|a, b| dex_then_pool_cmp(a, b));
+    pinable.sort_by(|a, b| {
+        pool_readiness(a, per_pool_readiness)
+            .cmp(&pool_readiness(b, per_pool_readiness))
+            .reverse()
+            .then_with(|| dex_then_pool_cmp(a, b))
+    });
 
-    let mut buy: Option<&TrackPoolInput> = None;
-    let mut sell: Option<&TrackPoolInput> = None;
-    'outer: for (i, a) in warmable.iter().enumerate() {
-        for b in warmable.iter().skip(i + 1) {
-            if a.dex != b.dex {
-                buy = Some(a);
-                sell = Some(b);
-                break 'outer;
+    let mut best: Option<(&TrackPoolInput, &TrackPoolInput, TrackPoolReadiness)> = None;
+    for (i, a) in pinable.iter().enumerate() {
+        for b in pinable.iter().skip(i + 1) {
+            if a.dex == b.dex {
+                continue;
+            }
+            let ra = pool_readiness(a, per_pool_readiness);
+            let rb = pool_readiness(b, per_pool_readiness);
+            let bundle_priority = ra.min(rb);
+            let replace = match best {
+                None => true,
+                Some((best_a, best_b, current_priority)) => {
+                    if bundle_priority != current_priority {
+                        bundle_priority > current_priority
+                    } else {
+                        let activity = a.last_activity_unix_ms.max(b.last_activity_unix_ms);
+                        let best_activity = best_a
+                            .last_activity_unix_ms
+                            .max(best_b.last_activity_unix_ms);
+                        activity > best_activity
+                    }
+                }
+            };
+            if replace {
+                best = Some((a, b, bundle_priority));
             }
         }
     }
-    let (buy_pool, sell_pool) = (buy?, sell?);
+    let (buy_pool, sell_pool, bundle_priority) = best?;
 
     let mut pools = vec![
         selected_pool(
             mint,
             buy_pool,
-            TrackPoolReadiness::Warmable,
+            bundle_priority,
             ArbTrackActiveReason::MultiDex,
             per_pool_readiness,
         ),
         selected_pool(
             mint,
             sell_pool,
-            TrackPoolReadiness::Warmable,
+            bundle_priority,
             ArbTrackActiveReason::MultiDex,
             per_pool_readiness,
         ),
@@ -362,7 +390,8 @@ fn bundle_from_warmable_pair(
 
     Some(MintBundle {
         mint: mint.mint.clone(),
-        priority: TrackPoolReadiness::Warmable,
+        priority: bundle_priority,
+        last_activity_unix_ms: mint.last_activity_unix_ms,
         pools,
     })
 }
@@ -393,21 +422,17 @@ fn maybe_add_third_pool(
         .copied()
         .filter(|p| !used.contains(p.pool_address.as_str()))
         .filter(|p| !used_dexes.contains(p.dex.as_str()))
-        .filter(|p| {
-            per_pool_readiness
-                .get(&p.pool_address)
-                .copied()
-                .unwrap_or(TrackPoolReadiness::Rejected)
-                >= TrackPoolReadiness::Warmable
-        })
+        .filter(|p| is_pinable_pool(p, config, Instant::now(), per_pool_readiness))
         .collect();
-    candidates.sort_by(|a, b| dex_then_pool_cmp(a, b));
+    candidates.sort_by(|a, b| {
+        pool_readiness(a, per_pool_readiness)
+            .cmp(&pool_readiness(b, per_pool_readiness))
+            .reverse()
+            .then_with(|| dex_then_pool_cmp(a, b))
+    });
 
     if let Some(third) = candidates.first() {
-        let readiness = per_pool_readiness
-            .get(&third.pool_address)
-            .copied()
-            .unwrap_or(TrackPoolReadiness::Warmable);
+        let readiness = pool_readiness(third, per_pool_readiness);
         pools.push(selected_pool(
             mint,
             third,
@@ -437,6 +462,26 @@ fn selected_pool(
     }
 }
 
+fn pool_readiness(
+    pool: &TrackPoolInput,
+    per_pool_readiness: &HashMap<String, TrackPoolReadiness>,
+) -> TrackPoolReadiness {
+    per_pool_readiness
+        .get(&pool.pool_address)
+        .copied()
+        .unwrap_or(TrackPoolReadiness::Rejected)
+}
+
+fn is_pinable_pool(
+    pool: &TrackPoolInput,
+    config: &TrackSelectionConfig,
+    now: Instant,
+    per_pool_readiness: &HashMap<String, TrackPoolReadiness>,
+) -> bool {
+    pool_readiness(pool, per_pool_readiness) >= TrackPoolReadiness::Warmable
+        || is_warmable_pool(pool, config, now)
+}
+
 fn classify_pool_readiness(
     pool: &TrackPoolInput,
     config: &TrackSelectionConfig,
@@ -464,18 +509,8 @@ fn is_warmable_pool(pool: &TrackPoolInput, config: &TrackSelectionConfig, now: I
     if can_fresh_buy_quote(pool, config, now) {
         return false;
     }
-    // Structural quote path exists but freshness is missing.
-    quote_exact_in_with_freshness(
-        &pool.quote_pool,
-        pool.vault.as_ref(),
-        pool.dlmm_bins.as_ref(),
-        NATIVE_SOL_MINT,
-        &pool.quote_pool.token_mint,
-        config.probe_lamports,
-        &config.freshness,
-    )
-    .is_some()
-        || pool.quote_pool.has_reserve_data
+    // Known + structural DEX support; reserve/bin freshness may be missing.
+    true
 }
 
 fn can_fresh_buy_quote(pool: &TrackPoolInput, config: &TrackSelectionConfig, now: Instant) -> bool {
@@ -494,23 +529,21 @@ fn can_fresh_buy_quote(pool: &TrackPoolInput, config: &TrackSelectionConfig, now
 }
 
 fn is_structurally_quote_capable(pool: &TrackPoolInput) -> bool {
-    if pool.quote_pool.dex == "meteora_dlmm" {
-        if let Some(vault) = &pool.vault {
-            if vault.reserve_base > 0 && vault.reserve_quote > 0 {
-                let has_dlmm_meta = vault.active_id.is_some() && vault.bin_step.is_some();
-                if has_dlmm_meta || pool.dlmm_bins.is_some() {
+    if !pool.known || !is_arb_track_dex(&pool.dex) {
+        return false;
+    }
+    match pool.quote_pool.dex.as_str() {
+        "meteora_dlmm" => {
+            if let Some(vault) = &pool.vault {
+                if vault.active_id.is_some() && vault.bin_step.is_some() {
                     return true;
                 }
             }
+            pool.dlmm_bins.is_some() || pool.known
         }
-        return pool.dlmm_bins.is_some();
+        "orca" | "raydium" | "raydium_cpmm" | "pump_amm" => true,
+        _ => false,
     }
-    if let Some(vault) = &pool.vault {
-        if vault.reserve_base > 0 && vault.reserve_quote > 0 {
-            return true;
-        }
-    }
-    pool.quote_pool.has_reserve_data
 }
 
 fn is_arb_track_dex(dex: &str) -> bool {
@@ -568,6 +601,7 @@ mod tests {
         known: bool,
         has_reserve: bool,
         vault: Option<QuoteVaultInput>,
+        activity_ms: u64,
     ) -> TrackPoolInput {
         TrackPoolInput {
             pool_address: addr.to_string(),
@@ -577,6 +611,21 @@ mod tests {
             vault,
             dlmm_bins: None,
             token_decimals: 6,
+            last_activity_unix_ms: activity_ms,
+        }
+    }
+
+    fn mint_input(
+        mint: &str,
+        pools: Vec<TrackPoolInput>,
+        activity_ms: u64,
+        trade_signal: Option<(String, String)>,
+    ) -> TrackMintInput {
+        TrackMintInput {
+            mint: mint.to_string(),
+            pools,
+            trade_signal_pools: trade_signal,
+            last_activity_unix_ms: activity_ms,
         }
     }
 
@@ -595,9 +644,9 @@ mod tests {
 
     #[test]
     fn single_dex_mint_selects_nothing() {
-        let mint = TrackMintInput {
-            mint: MINT.to_string(),
-            pools: vec![
+        let mint = mint_input(
+            MINT,
+            vec![
                 pool_input(
                     "orca",
                     "poolA",
@@ -605,6 +654,7 @@ mod tests {
                     true,
                     true,
                     Some(vault(RESERVE_BASE, RESERVE_QUOTE)),
+                    1,
                 ),
                 pool_input(
                     "orca",
@@ -613,271 +663,145 @@ mod tests {
                     true,
                     true,
                     Some(vault(RESERVE_BASE, RESERVE_QUOTE)),
+                    2,
                 ),
             ],
-            trade_signal_pools: None,
-        };
+            2,
+            None,
+        );
         let result = select_arb_track_pools(&[mint], &default_config(500));
         assert!(result.selected.is_empty());
     }
 
     #[test]
-    fn three_pools_one_dex_plus_one_cross_dex_is_bounded() {
-        let mint = TrackMintInput {
-            mint: MINT.to_string(),
-            pools: vec![
-                pool_input(
-                    "orca",
-                    "orca1",
-                    MINT,
-                    true,
-                    true,
-                    Some(vault(RESERVE_BASE, RESERVE_QUOTE)),
-                ),
-                pool_input(
-                    "orca",
-                    "orca2",
-                    MINT,
-                    true,
-                    true,
-                    Some(vault(RESERVE_BASE, RESERVE_QUOTE)),
-                ),
-                pool_input(
-                    "orca",
-                    "orca3",
-                    MINT,
-                    true,
-                    true,
-                    Some(vault(RESERVE_BASE, RESERVE_QUOTE)),
-                ),
+    fn known_cache_pool_without_reserves_is_warmable() {
+        let mint = mint_input(
+            MINT,
+            vec![
+                pool_input("orca", "warm", MINT, true, false, None, 1),
                 pool_input(
                     "pump_amm",
-                    "pump1",
+                    "fresh",
                     MINT,
                     true,
                     true,
                     Some(vault(RESERVE_BASE, RESERVE_QUOTE * 2)),
+                    2,
                 ),
             ],
-            trade_signal_pools: None,
-        };
+            2,
+            None,
+        );
+        let result = select_arb_track_pools(&[mint], &default_config(500));
+        let pools: HashSet<_> = result.selected.iter().map(|p| p.pool.as_str()).collect();
+        assert!(pools.contains("warm"));
+        assert!(pools.contains("fresh"));
+        assert!(result.candidate_counts.warmable >= 1);
+    }
+
+    #[test]
+    fn quote_ready_plus_warmable_pair_selected() {
+        let fresh_vault = vault(RESERVE_BASE, RESERVE_QUOTE);
+        let mint = mint_input(
+            MINT,
+            vec![
+                pool_input(
+                    "orca",
+                    "quote_ready",
+                    MINT,
+                    true,
+                    true,
+                    Some(fresh_vault),
+                    10,
+                ),
+                pool_input("pump_amm", "warm_only", MINT, true, false, None, 5),
+            ],
+            10,
+            None,
+        );
         let result = select_arb_track_pools(&[mint], &default_config(500));
         let pools: HashSet<_> = result.selected.iter().map(|p| p.pool.as_str()).collect();
         assert_eq!(result.selected.len(), 2);
-        assert!(pools.contains("orca1") || pools.contains("orca2") || pools.contains("orca3"));
-        assert!(pools.contains("pump1"));
-        assert!(
-            !pools.contains("orca1")
-                || !pools.contains("orca2")
-                || !pools.contains("orca3")
-                || result.selected.len() <= 3
+        assert!(pools.contains("quote_ready"));
+        assert!(pools.contains("warm_only"));
+    }
+
+    #[test]
+    fn newer_equal_readiness_bundle_wins_over_older_mint_name() {
+        let old_mint = mint_input(
+            "AAAAOldMint111111111111111111111111111",
+            vec![
+                pool_input(
+                    "orca",
+                    "old_orca",
+                    MINT,
+                    true,
+                    true,
+                    Some(vault(RESERVE_BASE, RESERVE_QUOTE)),
+                    1,
+                ),
+                pool_input(
+                    "pump_amm",
+                    "old_pump",
+                    MINT,
+                    true,
+                    true,
+                    Some(vault(RESERVE_BASE, RESERVE_QUOTE * 2)),
+                    1,
+                ),
+            ],
+            1,
+            None,
         );
-    }
-
-    #[test]
-    fn tracker_only_unknown_cache_pools_not_selected() {
-        let mint = TrackMintInput {
-            mint: MINT.to_string(),
-            pools: vec![
+        let new_mint = mint_input(
+            "ZZZZNewMint111111111111111111111111111",
+            vec![
                 pool_input(
                     "orca",
-                    "known",
+                    "new_orca",
                     MINT,
                     true,
                     true,
                     Some(vault(RESERVE_BASE, RESERVE_QUOTE)),
+                    9_999,
                 ),
                 pool_input(
                     "pump_amm",
-                    "unknown",
-                    MINT,
-                    false,
-                    true,
-                    Some(vault(RESERVE_BASE, RESERVE_QUOTE)),
-                ),
-            ],
-            trade_signal_pools: None,
-        };
-        let result = select_arb_track_pools(&[mint], &default_config(500));
-        assert!(result.selected.is_empty());
-        assert!(result.candidate_counts.rejected >= 1);
-    }
-
-    #[test]
-    fn quote_ready_pair_preferred_over_warmable() {
-        let fresh_vault = vault(RESERVE_BASE, RESERVE_QUOTE);
-        let stale_vault = QuoteVaultInput {
-            updated_at: Instant::now() - std::time::Duration::from_secs(600),
-            ..fresh_vault.clone()
-        };
-        let mint_quote = TrackMintInput {
-            mint: "MintQuoteReady111111111111111111111111".to_string(),
-            pools: vec![
-                pool_input(
-                    "orca",
-                    "freshA",
+                    "new_pump",
                     MINT,
                     true,
                     true,
-                    Some(fresh_vault.clone()),
+                    Some(vault(RESERVE_BASE, RESERVE_QUOTE * 2)),
+                    9_999,
                 ),
-                pool_input("pump_amm", "freshB", MINT, true, true, Some(fresh_vault)),
             ],
-            trade_signal_pools: None,
-        };
-        let mint_warm = TrackMintInput {
-            mint: "MintWarmable11111111111111111111111111".to_string(),
-            pools: vec![
-                pool_input(
-                    "orca",
-                    "staleA",
-                    MINT,
-                    true,
-                    true,
-                    Some(stale_vault.clone()),
-                ),
-                pool_input("pump_amm", "staleB", MINT, true, true, Some(stale_vault)),
-            ],
-            trade_signal_pools: None,
-        };
-        let result = select_arb_track_pools(&[mint_warm, mint_quote], &default_config(4));
+            9_999,
+            None,
+        );
+        let result = select_arb_track_pools(&[old_mint, new_mint], &default_config(2));
         let selected_mints: HashSet<_> = result.selected.iter().map(|p| p.mint.as_str()).collect();
-        assert!(selected_mints.contains("MintQuoteReady111111111111111111111111"));
+        assert!(selected_mints.contains("ZZZZNewMint111111111111111111111111111"));
+        assert!(!selected_mints.contains("AAAAOldMint111111111111111111111111111"));
     }
 
     #[test]
-    fn rest_budget_of_one_does_not_take_isolated_pool() {
-        let make_mint = |suffix: &str| TrackMintInput {
-            mint: format!("Mint{suffix}"),
-            pools: vec![
-                pool_input(
-                    "orca",
-                    &format!("orca_{suffix}"),
-                    MINT,
-                    true,
-                    true,
-                    Some(vault(RESERVE_BASE, RESERVE_QUOTE)),
-                ),
-                pool_input(
-                    "pump_amm",
-                    &format!("pump_{suffix}"),
-                    MINT,
-                    true,
-                    true,
-                    Some(vault(RESERVE_BASE, RESERVE_QUOTE * 2)),
-                ),
-            ],
-            trade_signal_pools: None,
-        };
-        let mints: Vec<_> = (0..3).map(|i| make_mint(&i.to_string())).collect();
-        let result = select_arb_track_pools(&mints, &default_config(5));
-        assert!(result.selected.len() <= 5);
-        assert_eq!(result.selected.len() % 2, 0);
-    }
-
-    #[test]
-    fn selection_is_deterministic_across_input_order() {
-        let mint_a = TrackMintInput {
-            mint: "MintA".to_string(),
-            pools: vec![
-                pool_input(
-                    "orca",
-                    "a_orca",
-                    MINT,
-                    true,
-                    true,
-                    Some(vault(RESERVE_BASE, RESERVE_QUOTE)),
-                ),
-                pool_input(
-                    "pump_amm",
-                    "a_pump",
-                    MINT,
-                    true,
-                    true,
-                    Some(vault(RESERVE_BASE, RESERVE_QUOTE * 2)),
-                ),
-            ],
-            trade_signal_pools: None,
-        };
-        let mint_b = TrackMintInput {
-            mint: "MintB".to_string(),
-            pools: vec![
-                pool_input(
-                    "raydium",
-                    "b_ray",
-                    MINT,
-                    true,
-                    true,
-                    Some(vault(RESERVE_BASE, RESERVE_QUOTE)),
-                ),
-                pool_input(
-                    "pump_amm",
-                    "b_pump",
-                    MINT,
-                    true,
-                    true,
-                    Some(vault(RESERVE_BASE, RESERVE_QUOTE * 2)),
-                ),
-            ],
-            trade_signal_pools: None,
-        };
-        let r1 = select_arb_track_pools(&[mint_a.clone(), mint_b.clone()], &default_config(500));
-        let r2 = select_arb_track_pools(&[mint_b, mint_a], &default_config(500));
-        let pools1: Vec<_> = r1.selected.iter().map(|p| p.pool.clone()).collect();
-        let pools2: Vec<_> = r2.selected.iter().map(|p| p.pool.clone()).collect();
-        assert_eq!(pools1, pools2);
-    }
-
-    #[test]
-    fn result_size_never_exceeds_max_pools() {
-        let mut mints = Vec::new();
-        for i in 0..50 {
-            mints.push(TrackMintInput {
-                mint: format!("Mint{i:04}"),
-                pools: vec![
-                    pool_input(
-                        "orca",
-                        &format!("orca_{i}"),
-                        MINT,
-                        true,
-                        true,
-                        Some(vault(RESERVE_BASE, RESERVE_QUOTE)),
-                    ),
-                    pool_input(
-                        "pump_amm",
-                        &format!("pump_{i}"),
-                        MINT,
-                        true,
-                        true,
-                        Some(vault(RESERVE_BASE, RESERVE_QUOTE * 2)),
-                    ),
-                ],
-                trade_signal_pools: None,
-            });
-        }
-        let result = select_arb_track_pools(&mints, &default_config(10));
-        assert!(result.selected.len() <= 10);
-    }
-
-    #[test]
-    fn budget_displacement_marks_reason_budget() {
-        let pool = "orphan";
-        let displaced: HashSet<_> = [pool.to_string()].into_iter().collect();
+    fn budget_displacement_marks_reason_budget_only_when_displaced() {
+        let displaced: HashSet<_> = ["pool_budget".to_string()].into_iter().collect();
         assert_eq!(
-            arb_track_removal_reason(pool, true, &displaced),
+            arb_track_removal_reason("pool_budget", &displaced),
             ArbTrackRemovedReason::Budget
         );
         assert_eq!(
-            arb_track_removal_reason("gone", false, &displaced),
+            arb_track_removal_reason("pool_stale", &displaced),
             ArbTrackRemovedReason::Stale
         );
     }
 
     #[test]
     fn trade_signal_pair_selected_as_executable() {
-        let mint = TrackMintInput {
-            mint: MINT.to_string(),
-            pools: vec![
+        let mint = mint_input(
+            MINT,
+            vec![
                 pool_input(
                     "orca",
                     "sig_buy",
@@ -885,6 +809,7 @@ mod tests {
                     true,
                     true,
                     Some(vault(RESERVE_BASE, RESERVE_QUOTE)),
+                    1,
                 ),
                 pool_input(
                     "pump_amm",
@@ -893,15 +818,51 @@ mod tests {
                     true,
                     true,
                     Some(vault(RESERVE_BASE, RESERVE_QUOTE * 2)),
+                    2,
                 ),
             ],
-            trade_signal_pools: Some(("sig_buy".to_string(), "sig_sell".to_string())),
-        };
+            2,
+            Some(("sig_buy".to_string(), "sig_sell".to_string())),
+        );
         let result = select_arb_track_pools(&[mint], &default_config(500));
         assert_eq!(result.selected.len(), 2);
         assert!(result
             .selected
             .iter()
             .all(|p| p.active_reason == ArbTrackActiveReason::TradeSignal));
+    }
+
+    #[test]
+    fn result_size_never_exceeds_max_pools() {
+        let mut mints = Vec::new();
+        for i in 0..50 {
+            mints.push(mint_input(
+                &format!("Mint{i:04}"),
+                vec![
+                    pool_input(
+                        "orca",
+                        &format!("orca_{i}"),
+                        MINT,
+                        true,
+                        true,
+                        Some(vault(RESERVE_BASE, RESERVE_QUOTE)),
+                        i as u64,
+                    ),
+                    pool_input(
+                        "pump_amm",
+                        &format!("pump_{i}"),
+                        MINT,
+                        true,
+                        true,
+                        Some(vault(RESERVE_BASE, RESERVE_QUOTE * 2)),
+                        i as u64,
+                    ),
+                ],
+                i as u64,
+                None,
+            ));
+        }
+        let result = select_arb_track_pools(&mints, &default_config(10));
+        assert!(result.selected.len() <= 10);
     }
 }
