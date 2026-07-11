@@ -102,8 +102,8 @@ use ironcrab::metrics::{
 use ironcrab::nats::{
     arb_strategy_pool_cache_live_consumer_config, arb_track_payload_bytes, config_consumer_config,
     config_subject, split_arb_track_requests_update, trim_reconcile_update_to_budget,
-    ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackRemovedEntry, ArbTrackRemovedReason,
-    ArbTrackRequestsUpdate, ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES, CONFIG_STREAM_NAME, STREAM_NAME,
+    ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackRemovedEntry, ArbTrackRequestsUpdate,
+    ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES, CONFIG_STREAM_NAME, STREAM_NAME,
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_ARB_TRACK_REQUESTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
@@ -564,6 +564,8 @@ impl ArbTrackSelectionHandle {
             return;
         }
         if self.wake_tx.try_send(()).is_err() {
+            // Channel full: a wake token is already queued (capacity 1). Arm full
+            // reconcile so the in-flight worker pass performs authoritative recovery.
             record_arb_track_selection_queue_overflow_total();
             self.pending_full_reconcile.store(true, Ordering::Release);
         }
@@ -6218,33 +6220,10 @@ impl ArbContext {
         self.mark_arb_track_mint_dirty(mint);
     }
 
+    /// Heartbeat hook: schedule authoritative stale-pin cleanup via the selection worker.
+    /// No tracker scan, pinned-set mutation, or direct publish on the async path.
     fn prune_arb_track_stale_pools(self: &Arc<Self>) {
-        if self.nats.is_none() {
-            return;
-        }
-        let trackers = self.trackers.read();
-        let mut still_active: HashSet<String> = HashSet::new();
-        for tracker in trackers.values() {
-            if tracker.pool_count_on_distinct_dexes() >= 2 {
-                still_active.extend(tracker.pools.keys().cloned());
-            }
-        }
-        drop(trackers);
-        let mut removed = Vec::new();
-        let mut pinned = self.arb_pinned_pools.write();
-        for pool in pinned.clone().into_iter() {
-            if !still_active.contains(&pool) {
-                pinned.remove(&pool);
-                removed.push(ArbTrackRemovedEntry {
-                    pool,
-                    reason: ArbTrackRemovedReason::Stale,
-                });
-            }
-        }
-        drop(pinned);
-        if !removed.is_empty() {
-            self.spawn_publish_arb_track_requests(Vec::new(), removed, false);
-        }
+        self.arb_track_selection.request_full_reconcile();
     }
 }
 
@@ -11241,6 +11220,102 @@ mod two_hop_price_tests {
         assert!(admit_a.contains("mint_01"));
         assert!(admit_a.contains("mint_02"));
         assert!(admit_a.contains("mint_03"));
+    }
+
+    #[test]
+    fn prune_arb_track_stale_pools_only_schedules_full_reconcile() {
+        let cache = create_shared_cache();
+        let ctx = Arc::new(test_arb_context(cache));
+        let stale_pool = "stale_pool_addr";
+        ctx.arb_pinned_pools.write().insert(stale_pool.to_string());
+        assert!(!ctx
+            .arb_track_selection
+            .pending_full_reconcile
+            .load(Ordering::Acquire));
+        ctx.prune_arb_track_stale_pools();
+        assert!(
+            ctx.arb_track_selection
+                .pending_full_reconcile
+                .load(Ordering::Acquire),
+            "heartbeat prune must arm authoritative full reconcile only"
+        );
+        assert!(
+            ctx.arb_pinned_pools.read().contains(stale_pool),
+            "heartbeat prune must not mutate pinned set directly"
+        );
+    }
+
+    #[test]
+    fn full_reconcile_clears_stale_pinned_pool_via_authoritative_selection() {
+        let cache = create_shared_cache();
+        let ctx = Arc::new(test_arb_context(cache));
+        let stale_mint = "StalePinnedMint111111111111111111111111";
+        let stale_pool = "stale_pool_addr";
+        {
+            let mut snapshots = ctx.arb_track_mint_snapshots.write();
+            snapshots.insert_bounded(
+                stale_mint.to_string(),
+                TrackMintInput {
+                    mint: stale_mint.to_string(),
+                    pools: vec![
+                        TrackPoolInput {
+                            pool_address: stale_pool.to_string(),
+                            dex: "orca".to_string(),
+                            known: true,
+                            quote_pool: QuotePoolInput {
+                                pool_address: stale_pool.to_string(),
+                                dex: "orca".to_string(),
+                                token_mint: stale_mint.to_string(),
+                                trade_price_buy: None,
+                                trade_price_sell: None,
+                                trade_updated_at: Instant::now(),
+                                has_reserve_data: true,
+                                token_decimals: 6,
+                            },
+                            vault: None,
+                            dlmm_bins: None,
+                            token_decimals: 6,
+                            last_activity_unix_ms: 1,
+                        },
+                        TrackPoolInput {
+                            pool_address: "other_pool".to_string(),
+                            dex: "pump_amm".to_string(),
+                            known: true,
+                            quote_pool: QuotePoolInput {
+                                pool_address: "other_pool".to_string(),
+                                dex: "pump_amm".to_string(),
+                                token_mint: stale_mint.to_string(),
+                                trade_price_buy: None,
+                                trade_price_sell: None,
+                                trade_updated_at: Instant::now(),
+                                has_reserve_data: true,
+                                token_decimals: 6,
+                            },
+                            vault: None,
+                            dlmm_bins: None,
+                            token_decimals: 6,
+                            last_activity_unix_ms: 2,
+                        },
+                    ],
+                    trade_signal_pools: None,
+                    last_activity_unix_ms: 2,
+                },
+                &HashSet::new(),
+            );
+        }
+        ctx.arb_pinned_pools.write().insert(stale_pool.to_string());
+        run_arb_track_selection_batch(&ctx, Vec::new(), true);
+        assert!(
+            !ctx.arb_pinned_pools.read().contains(stale_pool),
+            "authoritative full reconcile must clear stale pins"
+        );
+        assert!(
+            !ctx.arb_track_mint_snapshots
+                .read()
+                .entries
+                .contains_key(stale_mint),
+            "stale snapshot must be rebuilt/removed from tracker truth"
+        );
     }
 
     #[test]
