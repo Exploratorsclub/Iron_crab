@@ -50,30 +50,88 @@ pub enum TrackPinReason {
 pub trait TrackWorkerContext: Send + Sync {
     fn geyser_sync_batch_debounce_ms(&self) -> u64;
     fn max_tracked_accounts(&self) -> usize;
-    fn apply_momentum_active_pools_update(&self, update: &MomentumActivePoolsUpdate) -> bool;
-    fn apply_momentum_snapshot_reconcile(&self, active: &[MomentumActivePoolEntry]) -> bool;
-    fn apply_momentum_removed_entries(&self, chunk: &[MomentumRemovedPoolEntry]) -> bool;
-    fn apply_momentum_active_entries(&self, chunk: &[MomentumActivePoolEntry]) -> bool;
-    fn apply_arb_track_requests_update(&self, update: &ArbTrackRequestsUpdate) -> bool;
-    fn apply_arb_snapshot_reconcile(&self, active: &[ArbTrackActiveEntry]) -> bool;
-    fn apply_arb_removed_entries(&self, chunk: &[ArbTrackRemovedEntry]) -> bool;
-    fn apply_arb_active_entries(&self, chunk: &[ArbTrackActiveEntry]) -> bool;
-    fn track_mint_for_geyser_metadata(&self, mint: Pubkey, pin: Option<TrackPinReason>) -> bool;
+    fn apply_momentum_active_pools_update(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        update: &MomentumActivePoolsUpdate,
+    ) -> bool;
+    fn apply_momentum_snapshot_reconcile(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        active: &[MomentumActivePoolEntry],
+    ) -> bool;
+    fn apply_momentum_removed_entries(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        chunk: &[MomentumRemovedPoolEntry],
+    ) -> bool;
+    fn apply_momentum_active_entries(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        chunk: &[MomentumActivePoolEntry],
+    ) -> bool;
+    fn apply_arb_track_requests_update(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        update: &ArbTrackRequestsUpdate,
+    ) -> bool;
+    fn apply_arb_snapshot_reconcile(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        active: &[ArbTrackActiveEntry],
+    ) -> bool;
+    fn apply_arb_removed_entries(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        chunk: &[ArbTrackRemovedEntry],
+    ) -> bool;
+    fn apply_arb_active_entries(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        chunk: &[ArbTrackActiveEntry],
+    ) -> bool;
+    fn track_mint_for_geyser_metadata(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        mint: Pubkey,
+        pin: Option<TrackPinReason>,
+    ) -> bool;
     fn refresh_geyser_pins_gauge(&self);
     fn hot_pool_registry_pair_count(&self) -> usize;
     fn hot_pool_registry_arb_pool_count(&self) -> usize;
     fn refresh_hot_pool_registry_gauges(&self);
     fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey>;
     fn pending_geyser_evict(&self) -> bool;
-    fn continue_geyser_evict_with_deadline(&self, deadline: Instant) -> bool;
-    fn sync_geyser_tracked_accounts_batched_flush_with_deadline(&self, deadline: Instant) -> bool;
+    fn clear_pending_geyser_evict(&self);
+    fn continue_geyser_evict_with_deadline(
+        &self,
+        deadline: Instant,
+        desired: &DesiredExplicitSet,
+    ) -> bool;
+    fn sync_geyser_tracked_accounts_batched_flush_with_deadline(
+        &self,
+        deadline: Instant,
+        desired: &DesiredExplicitSet,
+    ) -> bool;
     fn release_geyser_sync_flush_slot(&self);
     fn refresh_tracked_membership_snapshot(&self);
     fn explicit_pubkey_rows_for_desired_set(
         &self,
     ) -> Vec<(Pubkey, super::ConsumerId, Option<Pubkey>)>;
     fn build_explicit_set_snapshot(&self) -> ExplicitSetSnapshot;
-    fn apply_explicit_set_snapshot(&self, snapshot: &ExplicitSetSnapshot) -> usize;
+    fn apply_explicit_set_snapshot(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        snapshot: &ExplicitSetSnapshot,
+    ) -> usize;
+    fn converge_explicit_admission(&self, desired: &mut DesiredExplicitSet);
+    fn prune_tracked_maps_to_desired(&self, desired: &DesiredExplicitSet);
+    fn refresh_explicit_admission_metrics(&self, desired: &DesiredExplicitSet);
+    fn last_synced_explicit_pubkeys_write(
+        &self,
+    ) -> parking_lot::RwLockWriteGuard<'_, HashSet<Pubkey>>;
+    fn invalidate_explicit_admission_convergence(&self);
+    fn take_explicit_admission_invalidate(&self) -> bool;
 }
 
 /// Phase 2a: commands for the `md-track-worker` OS thread (DesiredExplicitSet + coalesced Geyser push).
@@ -131,24 +189,25 @@ fn track_worker_dec_queue_depth(queue_depth: &AtomicUsize) {
 /// Phase-2b: sync momentum apply on `md-track-worker` thread (no Tokio yield).
 pub fn apply_momentum_active_pools_on_track_worker<C: TrackWorkerContext>(
     ctx: &Arc<C>,
+    desired: &mut DesiredExplicitSet,
     update: MomentumActivePoolsUpdate,
 ) -> bool {
     let item_count = update.active.len() + update.removed.len();
     if item_count <= MARKET_DATA_MOMENTUM_APPLY_CHUNK_THRESHOLD {
-        return ctx.apply_momentum_active_pools_update(&update);
+        return ctx.apply_momentum_active_pools_update(desired, &update);
     }
     record_market_data_momentum_active_pool_messages_total();
     let mut batch_dirty = false;
     if update.full_active_snapshot {
-        batch_dirty |= ctx.apply_momentum_snapshot_reconcile(&update.active);
+        batch_dirty |= ctx.apply_momentum_snapshot_reconcile(desired, &update.active);
         std::thread::yield_now();
     }
     for chunk in update.removed.chunks(MARKET_DATA_MOMENTUM_APPLY_CHUNK_SIZE) {
-        batch_dirty |= ctx.apply_momentum_removed_entries(chunk);
+        batch_dirty |= ctx.apply_momentum_removed_entries(desired, chunk);
         std::thread::yield_now();
     }
     for chunk in update.active.chunks(MARKET_DATA_MOMENTUM_APPLY_CHUNK_SIZE) {
-        batch_dirty |= ctx.apply_momentum_active_entries(chunk);
+        batch_dirty |= ctx.apply_momentum_active_entries(desired, chunk);
         std::thread::yield_now();
     }
     if !batch_dirty {
@@ -161,24 +220,25 @@ pub fn apply_momentum_active_pools_on_track_worker<C: TrackWorkerContext>(
 /// Phase 3: sync arb track apply on `md-track-worker` thread (no Tokio yield).
 pub fn apply_arb_track_requests_on_track_worker<C: TrackWorkerContext>(
     ctx: &Arc<C>,
+    desired: &mut DesiredExplicitSet,
     update: ArbTrackRequestsUpdate,
 ) -> bool {
     let item_count = update.active.len() + update.removed.len();
     if item_count <= MARKET_DATA_ARB_APPLY_CHUNK_THRESHOLD {
-        return ctx.apply_arb_track_requests_update(&update);
+        return ctx.apply_arb_track_requests_update(desired, &update);
     }
     record_market_data_arb_track_requests_messages_total();
     let mut batch_dirty = false;
     if update.reconcile {
-        batch_dirty |= ctx.apply_arb_snapshot_reconcile(&update.active);
+        batch_dirty |= ctx.apply_arb_snapshot_reconcile(desired, &update.active);
         std::thread::yield_now();
     }
     for chunk in update.removed.chunks(MARKET_DATA_ARB_APPLY_CHUNK_SIZE) {
-        batch_dirty |= ctx.apply_arb_removed_entries(chunk);
+        batch_dirty |= ctx.apply_arb_removed_entries(desired, chunk);
         std::thread::yield_now();
     }
     for chunk in update.active.chunks(MARKET_DATA_ARB_APPLY_CHUNK_SIZE) {
-        batch_dirty |= ctx.apply_arb_active_entries(chunk);
+        batch_dirty |= ctx.apply_arb_active_entries(desired, chunk);
         std::thread::yield_now();
     }
     if !batch_dirty {
@@ -190,24 +250,28 @@ pub fn apply_arb_track_requests_on_track_worker<C: TrackWorkerContext>(
 
 pub fn track_worker_process_command<C: TrackWorkerContext>(
     ctx: &Arc<C>,
+    desired: &mut DesiredExplicitSet,
     job: TrackWorkerCommand,
 ) -> bool {
     match job {
         TrackWorkerCommand::ApplyMomentumActivePools(update) => {
-            apply_momentum_active_pools_on_track_worker(ctx, update)
+            apply_momentum_active_pools_on_track_worker(ctx, desired, update)
         }
         TrackWorkerCommand::ApplyArbTrackRequests(update) => {
-            apply_arb_track_requests_on_track_worker(ctx, update)
+            apply_arb_track_requests_on_track_worker(ctx, desired, update)
         }
         TrackWorkerCommand::ApplyWalletPin { mint } => {
-            ctx.track_mint_for_geyser_metadata(mint, Some(TrackPinReason::Wallet))
+            ctx.track_mint_for_geyser_metadata(desired, mint, Some(TrackPinReason::Wallet))
         }
         TrackWorkerCommand::TrackMint { mint, pin } => {
-            ctx.track_mint_for_geyser_metadata(mint, pin)
+            ctx.track_mint_for_geyser_metadata(desired, mint, pin)
         }
-        TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange => true,
+        TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange => {
+            ctx.invalidate_explicit_admission_convergence();
+            true
+        }
         TrackWorkerCommand::RestoreExplicitSnapshot(snapshot) => {
-            ctx.apply_explicit_set_snapshot(&snapshot) > 0
+            ctx.apply_explicit_set_snapshot(desired, &snapshot) > 0
         }
         TrackWorkerCommand::ScheduleGeyserPush
         | TrackWorkerCommand::ScheduleGeyserPushDebounced
@@ -226,6 +290,7 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
     let mut push_before_keys: Option<HashSet<Pubkey>> = None;
     let mut pending_continue_evict = false;
     let mut pending_release_flush_slot = false;
+    let mut admission_converged = false;
     let mut last_snapshot_write = Instant::now()
         .checked_sub(Duration::from_secs(
             MARKET_DATA_EXPLICIT_SET_SNAPSHOT_INTERVAL_SECS,
@@ -268,7 +333,10 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
                     }
                     other => other,
                 };
-                let _ = track_worker_process_command(&ctx, cmd);
+                let _ = track_worker_process_command(&ctx, &mut desired, cmd);
+                if ctx.take_explicit_admission_invalidate() {
+                    admission_converged = false;
+                }
                 while let Ok(more) = rx.try_recv() {
                     track_worker_dec_queue_depth(&queue_depth);
                     if matches!(more, TrackWorkerCommand::ContinueGeyserEvict) {
@@ -283,7 +351,7 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
                         }
                         other => other,
                     };
-                    let _ = track_worker_process_command(&ctx, cmd);
+                    let _ = track_worker_process_command(&ctx, &mut desired, cmd);
                 }
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {}
@@ -305,6 +373,7 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
                 before,
                 continue_evict,
                 release_flush_slot,
+                &mut admission_converged,
             ) {
                 track_worker_try_enqueue(&track_worker, TrackWorkerCommand::ContinueGeyserEvict);
             }
@@ -379,8 +448,9 @@ pub fn spawn_inline_track_worker_sender<C: TrackWorkerContext + 'static>(
     let (tx, rx) = std_mpsc::sync_channel::<TrackWorkerCommand>(capacity);
     let ctx_worker = Arc::clone(&ctx);
     std::thread::spawn(move || {
+        let mut desired = DesiredExplicitSet::new(ctx_worker.max_tracked_accounts());
         while let Ok(job) = rx.recv() {
-            let _ = track_worker_process_command(&ctx_worker, job);
+            let _ = track_worker_process_command(&ctx_worker, &mut desired, job);
         }
     });
     TrackWorkerSender {

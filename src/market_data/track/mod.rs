@@ -11,8 +11,8 @@ pub use coalesce::{
     MARKET_DATA_ARB_COALESCE_CHANNEL_CAP, MARKET_DATA_MOMENTUM_COALESCE_CHANNEL_CAP,
 };
 pub use desired_set::{
-    pin_priority_from_consumer, symmetric_diff, ConsumerId, DesiredExplicitSet, ExplicitEntry,
-    PinPriority,
+    pin_priority_from_consumer, symmetric_diff, AdmissionResult, ConsumerId, DesiredExplicitSet,
+    EvictReason, OwnerKey, PinPriority,
 };
 pub use enrichment::{
     is_enrichment_member_from_inputs, pool_is_enrichment_member, EnrichmentMembershipInputs,

@@ -19,6 +19,7 @@ pub enum SnapshotConsumer {
     Wallet,
     Momentum,
     Arb,
+    Tracker,
 }
 
 impl From<ConsumerId> for SnapshotConsumer {
@@ -27,6 +28,7 @@ impl From<ConsumerId> for SnapshotConsumer {
             ConsumerId::Wallet => SnapshotConsumer::Wallet,
             ConsumerId::Momentum => SnapshotConsumer::Momentum,
             ConsumerId::Arb => SnapshotConsumer::Arb,
+            ConsumerId::Tracker => SnapshotConsumer::Tracker,
         }
     }
 }

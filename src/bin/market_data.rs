@@ -82,10 +82,11 @@ use ironcrab::market_data::sidefx::{
 use ironcrab::market_data::track::{
     arb_coalesce_try_send, explicit_set_snapshot_path, explicit_subscription_has_new_keys,
     flush_explicit_set_snapshot, load_explicit_set_snapshot, momentum_coalesce_try_send,
-    pool_is_enrichment_member, spawn_track_worker, track_worker_try_enqueue, ConsumerId,
-    DesiredExplicitSet, ExplicitAccountKind, ExplicitSetSnapshot, ExplicitSnapshotRow,
-    SnapshotConsumer, TrackPinReason, TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,
-    EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP, MARKET_DATA_TRACK_WORKER_COALESCE_MS,
+    pool_is_enrichment_member, spawn_track_worker, track_worker_try_enqueue, AdmissionResult,
+    ConsumerId, DesiredExplicitSet, ExplicitAccountKind, ExplicitSetSnapshot, ExplicitSnapshotRow,
+    OwnerKey, SnapshotConsumer, TrackPinReason, TrackWorkerCommand, TrackWorkerContext,
+    TrackWorkerSender, EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
+    MARKET_DATA_TRACK_WORKER_COALESCE_MS,
 };
 use ironcrab::metrics::{
     dec_market_data_account_high_priority_queue_depth,
@@ -95,7 +96,9 @@ use ironcrab::metrics::{
     inc_market_data_account_high_priority_queue_depth,
     inc_market_data_account_low_priority_queue_depth, inc_market_data_account_worker_queue_depth,
     inc_market_data_arb_pin_geyser_register_deferred_total,
-    inc_market_data_balance_updated_from_cache_total, inc_market_data_geyser_sync_partial_total,
+    inc_market_data_balance_updated_from_cache_total,
+    inc_market_data_geyser_explicit_admission_rejected_total,
+    inc_market_data_geyser_sync_partial_total,
     inc_market_data_geyser_sync_skipped_rate_limit_total,
     inc_market_data_ingest_membership_snapshot_hits_total,
     inc_market_data_jsonl_enqueue_dropped_total,
@@ -118,11 +121,15 @@ use ironcrab::metrics::{
     set_market_data_account_broadcast_queue_depth, set_market_data_account_worker_count,
     set_market_data_arb_pinned_pools_gauge, set_market_data_enrichment_registry_pools_gauge,
     set_market_data_explicit_set_snapshot_restore_duration_ms,
-    set_market_data_explicit_set_snapshot_restore_pubkeys, set_market_data_geyser_merge_pending,
-    set_market_data_geyser_sync_pending, set_market_data_hot_pool_registry_pools_gauge,
-    set_market_data_md_state_evict_pending, set_market_data_momentum_active_pool_pins_gauge,
-    set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
-    set_readiness_nats_connected, touch_market_data_global_ingest_progress,
+    set_market_data_explicit_set_snapshot_restore_pubkeys,
+    set_market_data_geyser_explicit_admitted_accounts,
+    set_market_data_geyser_explicit_admitted_pools, set_market_data_geyser_explicit_cap_overflow,
+    set_market_data_geyser_explicit_requested_pools, set_market_data_geyser_explicit_set_size,
+    set_market_data_geyser_merge_pending, set_market_data_geyser_sync_pending,
+    set_market_data_hot_pool_registry_pools_gauge, set_market_data_md_state_evict_pending,
+    set_market_data_momentum_active_pool_pins_gauge, set_market_data_tx_broadcast_queue_depth,
+    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
+    touch_market_data_global_ingest_progress,
     touch_market_data_tracked_membership_snapshot_refresh, update_readiness_market_data_current,
     GeyserTrackedEvictKind, MarketDataLatencySegment, MetricsComponent,
     MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_RECEIVED_TOTAL,
@@ -257,6 +264,7 @@ fn track_worker_execute_coalesced_push(
     before_keys: HashSet<Pubkey>,
     continue_evict: bool,
     release_flush_slot: bool,
+    admission_converged: &mut bool,
 ) -> bool {
     // Geyser explicit flush: sync_geyser_tracked_accounts_batched_flush_with_deadline on md-track-worker.
     ironcrab::market_data::track::track_worker_execute_coalesced_push(
@@ -265,6 +273,7 @@ fn track_worker_execute_coalesced_push(
         before_keys,
         continue_evict,
         release_flush_slot,
+        admission_converged,
     )
 }
 
@@ -1120,6 +1129,8 @@ struct MarketDataContext {
     last_arb_snapshot_target: parking_lot::RwLock<Option<HashSet<Pubkey>>>,
     /// Last `active_id` used when registering DLMM bin-array window per pool (Fix B).
     dlmm_registered_active_id: parking_lot::RwLock<HashMap<Pubkey, i32>>,
+    /// Track-worker: force explicit-admission reconvergence (config reload / cap shrink).
+    explicit_admission_invalidate: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -1853,15 +1864,109 @@ fn consumer_id_for_geyser_pin(pin: Option<GeyserPinReason>) -> ConsumerId {
     match pin {
         Some(GeyserPinReason::Wallet) => ConsumerId::Wallet,
         Some(GeyserPinReason::MomentumActive) => ConsumerId::Momentum,
-        Some(GeyserPinReason::ArbMultiDex) | None => ConsumerId::Arb,
+        Some(GeyserPinReason::ArbMultiDex) => ConsumerId::Arb,
+        None => ConsumerId::Tracker,
     }
 }
 
-fn snapshot_consumer_to_geyser_pin(consumer: SnapshotConsumer) -> GeyserPinReason {
+fn consumer_id_label(consumer: ConsumerId) -> &'static str {
     match consumer {
-        SnapshotConsumer::Wallet => GeyserPinReason::Wallet,
-        SnapshotConsumer::Momentum => GeyserPinReason::MomentumActive,
-        SnapshotConsumer::Arb => GeyserPinReason::ArbMultiDex,
+        ConsumerId::Wallet => "wallet",
+        ConsumerId::Momentum => "momentum",
+        ConsumerId::Arb => "arb",
+        ConsumerId::Tracker => "tracker",
+    }
+}
+
+fn record_admission_rejection(consumer: ConsumerId, result: AdmissionResult) {
+    let (reason, label) = match result {
+        AdmissionResult::RejectedCap => ("cap", consumer_id_label(consumer)),
+        AdmissionResult::RejectedProtected => ("protected", consumer_id_label(consumer)),
+        AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey => return,
+    };
+    inc_market_data_geyser_explicit_admission_rejected_total(label, reason);
+}
+
+fn collect_pool_explicit_pubkeys_from_cached_state(
+    pool: Pubkey,
+    cached_state: &CachedPoolState,
+    enable_meteora_cpmm: bool,
+    enable_meteora_dlmm: bool,
+) -> HashSet<Pubkey> {
+    let mut out = HashSet::new();
+
+    if let CachedPoolState::RaydiumCpmm(s) = cached_state {
+        let (_, _, base_vault, quote_vault) = cpmm_token_mints_and_vaults_sol_normalized(
+            s.token_0_mint,
+            s.token_1_mint,
+            s.token_0_vault,
+            s.token_1_vault,
+        );
+        out.insert(base_vault);
+        out.insert(quote_vault);
+    }
+    if enable_meteora_cpmm {
+        if let CachedPoolState::MeteoraCpmm(s) = cached_state {
+            let (_, _, base_vault, quote_vault) = cpmm_token_mints_and_vaults_sol_normalized(
+                s.token_0_mint,
+                s.token_1_mint,
+                s.token_0_vault,
+                s.token_1_vault,
+            );
+            out.insert(base_vault);
+            out.insert(quote_vault);
+        }
+    }
+    if enable_meteora_dlmm {
+        if let CachedPoolState::Meteora(s) = cached_state {
+            let (_, _, base_vault, quote_vault) = cpmm_token_mints_and_vaults_sol_normalized(
+                s.token_x_mint,
+                s.token_y_mint,
+                s.reserve_x,
+                s.reserve_y,
+            );
+            out.insert(base_vault);
+            out.insert(quote_vault);
+            let active_array_index = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(s.active_id);
+            for offset in -3i64..=3i64 {
+                let index = active_array_index + offset;
+                if let Ok(pda) = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&pool, index) {
+                    out.insert(pda);
+                }
+            }
+        }
+    }
+    if let CachedPoolState::Orca(s) = cached_state {
+        let (_, _, base_vault, quote_vault) = cpmm_token_mints_and_vaults_sol_normalized(
+            s.token_mint_a,
+            s.token_mint_b,
+            s.token_vault_a,
+            s.token_vault_b,
+        );
+        out.insert(base_vault);
+        out.insert(quote_vault);
+    }
+    if let CachedPoolState::PumpAmm(s) = cached_state {
+        out.insert(s.pool_base_token_account);
+        out.insert(s.pool_quote_token_account);
+    }
+    if let CachedPoolState::RaydiumAmm(s) = cached_state {
+        out.insert(s.coin_vault);
+        out.insert(s.pc_vault);
+    }
+    if let Some((a, b)) = pool_mints_for_geyser_explicit_tracking(cached_state) {
+        out.insert(a);
+        out.insert(b);
+    }
+    out
+}
+
+fn snapshot_consumer_to_geyser_pin(consumer: SnapshotConsumer) -> Option<GeyserPinReason> {
+    match consumer {
+        SnapshotConsumer::Wallet => Some(GeyserPinReason::Wallet),
+        SnapshotConsumer::Momentum => Some(GeyserPinReason::MomentumActive),
+        SnapshotConsumer::Arb => Some(GeyserPinReason::ArbMultiDex),
+        SnapshotConsumer::Tracker => None,
     }
 }
 
@@ -1874,40 +1979,77 @@ impl TrackWorkerContext for MarketDataContext {
         self.config.read().max_tracked_accounts
     }
 
-    fn apply_momentum_active_pools_update(&self, update: &MomentumActivePoolsUpdate) -> bool {
-        self.apply_momentum_active_pools_update(update)
+    fn apply_momentum_active_pools_update(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        update: &MomentumActivePoolsUpdate,
+    ) -> bool {
+        self.apply_momentum_active_pools_update(desired, update)
     }
 
-    fn apply_momentum_snapshot_reconcile(&self, active: &[MomentumActivePoolEntry]) -> bool {
-        self.apply_momentum_snapshot_reconcile(active)
+    fn apply_momentum_snapshot_reconcile(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        active: &[MomentumActivePoolEntry],
+    ) -> bool {
+        self.apply_momentum_snapshot_reconcile(desired, active)
     }
 
-    fn apply_momentum_removed_entries(&self, chunk: &[MomentumRemovedPoolEntry]) -> bool {
-        self.apply_momentum_removed_entries(chunk)
+    fn apply_momentum_removed_entries(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        chunk: &[MomentumRemovedPoolEntry],
+    ) -> bool {
+        self.apply_momentum_removed_entries(desired, chunk)
     }
 
-    fn apply_momentum_active_entries(&self, chunk: &[MomentumActivePoolEntry]) -> bool {
-        self.apply_momentum_active_entries(chunk)
+    fn apply_momentum_active_entries(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        chunk: &[MomentumActivePoolEntry],
+    ) -> bool {
+        self.apply_momentum_active_entries(desired, chunk)
     }
 
-    fn apply_arb_track_requests_update(&self, update: &ArbTrackRequestsUpdate) -> bool {
-        self.apply_arb_track_requests_update(update)
+    fn apply_arb_track_requests_update(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        update: &ArbTrackRequestsUpdate,
+    ) -> bool {
+        self.apply_arb_track_requests_update(desired, update)
     }
 
-    fn apply_arb_snapshot_reconcile(&self, active: &[ArbTrackActiveEntry]) -> bool {
-        self.apply_arb_snapshot_reconcile(active)
+    fn apply_arb_snapshot_reconcile(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        active: &[ArbTrackActiveEntry],
+    ) -> bool {
+        self.apply_arb_snapshot_reconcile(desired, active)
     }
 
-    fn apply_arb_removed_entries(&self, chunk: &[ArbTrackRemovedEntry]) -> bool {
-        self.apply_arb_removed_entries(chunk)
+    fn apply_arb_removed_entries(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        chunk: &[ArbTrackRemovedEntry],
+    ) -> bool {
+        self.apply_arb_removed_entries(desired, chunk)
     }
 
-    fn apply_arb_active_entries(&self, chunk: &[ArbTrackActiveEntry]) -> bool {
-        self.apply_arb_active_entries(chunk)
+    fn apply_arb_active_entries(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        chunk: &[ArbTrackActiveEntry],
+    ) -> bool {
+        self.apply_arb_active_entries(desired, chunk)
     }
 
-    fn track_mint_for_geyser_metadata(&self, mint: Pubkey, pin: Option<TrackPinReason>) -> bool {
-        self.track_mint_for_geyser_metadata(mint, track_pin_to_geyser_pin(pin))
+    fn track_mint_for_geyser_metadata(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        mint: Pubkey,
+        pin: Option<TrackPinReason>,
+    ) -> bool {
+        self.track_mint_for_geyser_metadata_admitted(desired, mint, track_pin_to_geyser_pin(pin))
     }
 
     fn refresh_geyser_pins_gauge(&self) {
@@ -1934,12 +2076,27 @@ impl TrackWorkerContext for MarketDataContext {
         self.pending_geyser_evict.load(Ordering::Relaxed)
     }
 
-    fn continue_geyser_evict_with_deadline(&self, deadline: Instant) -> bool {
-        self.continue_geyser_evict_with_deadline(deadline)
+    fn clear_pending_geyser_evict(&self) {
+        self.pending_geyser_evict.store(false, Ordering::Relaxed);
+        set_market_data_md_state_evict_pending(false);
     }
 
-    fn sync_geyser_tracked_accounts_batched_flush_with_deadline(&self, deadline: Instant) -> bool {
-        self.sync_geyser_tracked_accounts_batched_flush_with_deadline(deadline)
+    fn continue_geyser_evict_with_deadline(
+        &self,
+        deadline: Instant,
+        desired: &DesiredExplicitSet,
+    ) -> bool {
+        self.sync_geyser_tracked_accounts_from_desired_with_deadline(deadline, desired)
+    }
+
+    fn sync_geyser_tracked_accounts_batched_flush_with_deadline(
+        &self,
+        deadline: Instant,
+        desired: &DesiredExplicitSet,
+    ) -> bool {
+        set_market_data_geyser_sync_pending(0);
+        record_market_data_geyser_sync_batch_total();
+        self.sync_geyser_tracked_accounts_from_desired_with_deadline(deadline, desired)
     }
 
     fn release_geyser_sync_flush_slot(&self) {
@@ -1951,24 +2108,7 @@ impl TrackWorkerContext for MarketDataContext {
     }
 
     fn explicit_pubkey_rows_for_desired_set(&self) -> Vec<(Pubkey, ConsumerId, Option<Pubkey>)> {
-        let mut rows = Vec::new();
-        for (pk, m) in self.tracked_mints.read().iter() {
-            rows.push((*pk, consumer_id_for_geyser_pin(m.pin), None));
-        }
-        for (pk, v) in self.tracked_vaults.read().iter() {
-            rows.push((*pk, consumer_id_for_geyser_pin(v.pin), Some(v.pool_address)));
-        }
-        for (pk, b) in self.tracked_bin_arrays.read().iter() {
-            rows.push((*pk, consumer_id_for_geyser_pin(b.pin), Some(b.pool_address)));
-        }
-        if let Some(w) = &self.tracked_wallet {
-            rows.push((w.wallet, ConsumerId::Wallet, None));
-            rows.push((w.wsol_ata, ConsumerId::Wallet, None));
-        }
-        for pk in self.tracked_wallet_token_accounts.read().iter() {
-            rows.push((*pk, ConsumerId::Wallet, None));
-        }
-        rows
+        self.collect_explicit_pubkey_rows_for_convergence()
     }
 
     fn build_explicit_set_snapshot(&self) -> ExplicitSetSnapshot {
@@ -1993,8 +2133,46 @@ impl TrackWorkerContext for MarketDataContext {
         snapshot
     }
 
-    fn apply_explicit_set_snapshot(&self, snapshot: &ExplicitSetSnapshot) -> usize {
-        self.apply_explicit_set_snapshot_impl(snapshot)
+    fn apply_explicit_set_snapshot(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        snapshot: &ExplicitSetSnapshot,
+    ) -> usize {
+        self.apply_explicit_set_snapshot_impl(desired, snapshot)
+    }
+
+    fn converge_explicit_admission(&self, desired: &mut DesiredExplicitSet) {
+        let rows = self.collect_explicit_pubkey_rows_for_convergence();
+        desired.set_max_explicit_pubkeys(self.config.read().max_tracked_accounts);
+        desired.converge_from_rows(&rows);
+        self.prune_tracked_maps_to_desired(desired);
+        self.pending_geyser_evict.store(false, Ordering::Relaxed);
+        set_market_data_md_state_evict_pending(false);
+        set_market_data_geyser_explicit_cap_overflow(desired.cap_overflow());
+    }
+
+    fn prune_tracked_maps_to_desired(&self, desired: &DesiredExplicitSet) {
+        MarketDataContext::prune_tracked_maps_to_desired(self, desired);
+    }
+
+    fn refresh_explicit_admission_metrics(&self, desired: &DesiredExplicitSet) {
+        MarketDataContext::refresh_explicit_admission_metrics(self, desired);
+    }
+
+    fn last_synced_explicit_pubkeys_write(
+        &self,
+    ) -> parking_lot::RwLockWriteGuard<'_, HashSet<Pubkey>> {
+        self.last_synced_explicit_pubkeys.write()
+    }
+
+    fn invalidate_explicit_admission_convergence(&self) {
+        self.explicit_admission_invalidate
+            .store(true, Ordering::Relaxed);
+    }
+
+    fn take_explicit_admission_invalidate(&self) -> bool {
+        self.explicit_admission_invalidate
+            .swap(false, Ordering::Relaxed)
     }
 }
 
@@ -2455,6 +2633,10 @@ impl MarketDataContext {
     }
 
     fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
+        let admitted = self.last_synced_explicit_pubkeys.read();
+        if !admitted.is_empty() {
+            return admitted.clone();
+        }
         let mut set = HashSet::new();
         set.extend(self.tracked_mints.read().keys().copied());
         set.extend(self.tracked_vaults.read().keys().copied());
@@ -2465,6 +2647,129 @@ impl MarketDataContext {
         }
         set.extend(self.tracked_wallet_token_accounts.read().iter().copied());
         set
+    }
+
+    fn collect_explicit_pubkey_rows_for_convergence(
+        &self,
+    ) -> Vec<(Pubkey, ConsumerId, Option<Pubkey>)> {
+        let mut rows = Vec::new();
+        for (pk, m) in self.tracked_mints.read().iter() {
+            rows.push((*pk, consumer_id_for_geyser_pin(m.pin), None));
+        }
+        for (pk, v) in self.tracked_vaults.read().iter() {
+            rows.push((*pk, consumer_id_for_geyser_pin(v.pin), Some(v.pool_address)));
+        }
+        for (pk, b) in self.tracked_bin_arrays.read().iter() {
+            rows.push((*pk, consumer_id_for_geyser_pin(b.pin), Some(b.pool_address)));
+        }
+        if let Some(w) = &self.tracked_wallet {
+            rows.push((w.wallet, ConsumerId::Wallet, None));
+            rows.push((w.wsol_ata, ConsumerId::Wallet, None));
+        }
+        for pk in self.tracked_wallet_token_accounts.read().iter() {
+            rows.push((*pk, ConsumerId::Wallet, None));
+        }
+        rows
+    }
+
+    fn prune_tracked_maps_to_desired(&self, desired: &DesiredExplicitSet) {
+        let admitted = desired.snapshot_pubkeys();
+        {
+            let mut mints = self.tracked_mints.write();
+            mints.retain(|pk, _| admitted.contains(pk));
+        }
+        {
+            let mut vaults = self.tracked_vaults.write();
+            let removed: Vec<(Pubkey, Pubkey)> = vaults
+                .iter()
+                .filter(|(pk, _)| !admitted.contains(pk))
+                .map(|(pk, v)| (*pk, v.pool_address))
+                .collect();
+            for (pk, pool) in removed {
+                vaults.remove(&pk);
+                self.pool_tracked_legs_remove_vault(pool, pk);
+            }
+        }
+        {
+            let mut bins = self.tracked_bin_arrays.write();
+            let removed: Vec<(Pubkey, Pubkey)> = bins
+                .iter()
+                .filter(|(pk, _)| !admitted.contains(pk))
+                .map(|(pk, b)| (*pk, b.pool_address))
+                .collect();
+            for (pk, pool) in removed {
+                bins.remove(&pk);
+                self.pool_tracked_legs_remove_bin(pool, pk);
+            }
+        }
+        self.tracked_wallet_token_accounts
+            .write()
+            .retain(|pk| admitted.contains(pk));
+        self.broadcast_tracked_geyser_explicit_to_merge();
+    }
+
+    fn refresh_explicit_admission_metrics(&self, desired: &DesiredExplicitSet) {
+        set_market_data_geyser_explicit_admitted_accounts(desired.len());
+        set_market_data_geyser_explicit_cap_overflow(desired.cap_overflow());
+        set_market_data_geyser_explicit_set_size(desired.len());
+        set_market_data_geyser_explicit_requested_pools(
+            "momentum",
+            self.hot_pool_registry.pair_count(),
+        );
+        set_market_data_geyser_explicit_requested_pools(
+            "arb",
+            self.hot_pool_registry.arb_pool_count(),
+        );
+        set_market_data_geyser_explicit_requested_pools("tracker", 0);
+        set_market_data_geyser_explicit_admitted_pools(
+            "momentum",
+            desired.admitted_pool_count(ConsumerId::Momentum),
+        );
+        set_market_data_geyser_explicit_admitted_pools(
+            "arb",
+            desired.admitted_pool_count(ConsumerId::Arb),
+        );
+        set_market_data_geyser_explicit_admitted_pools(
+            "tracker",
+            desired.admitted_pool_count(ConsumerId::Tracker),
+        );
+    }
+
+    fn sync_geyser_tracked_accounts_from_desired_with_deadline(
+        &self,
+        _deadline: Instant,
+        desired: &DesiredExplicitSet,
+    ) -> bool {
+        self.prune_tracked_maps_to_desired(desired);
+        self.broadcast_tracked_geyser_explicit_to_merge();
+        *self.last_synced_explicit_pubkeys.write() = desired.snapshot_pubkeys();
+        true
+    }
+
+    fn try_admit_pool_explicit_group(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        pool: Pubkey,
+        pin: GeyserPinReason,
+    ) -> AdmissionResult {
+        let Some(state) = self.live_pool_cache.get(&pool) else {
+            return AdmissionResult::RejectedProtected;
+        };
+        let (enable_meteora_cpmm, enable_meteora_dlmm) = {
+            let cfg = self.config.read();
+            (cfg.enable_meteora_cpmm, cfg.enable_meteora_dlmm)
+        };
+        let pubkeys = collect_pool_explicit_pubkeys_from_cached_state(
+            pool,
+            &state,
+            enable_meteora_cpmm,
+            enable_meteora_dlmm,
+        );
+        if pubkeys.is_empty() {
+            return AdmissionResult::RejectedProtected;
+        }
+        let consumer = consumer_id_for_geyser_pin(Some(pin));
+        desired.try_admit_group(consumer, OwnerKey::Pool(pool), pubkeys)
     }
 
     fn collect_explicit_snapshot_rows(&self) -> Vec<ExplicitSnapshotRow> {
@@ -2515,9 +2820,12 @@ impl MarketDataContext {
             .collect()
     }
 
-    fn apply_explicit_set_snapshot_impl(&self, snapshot: &ExplicitSetSnapshot) -> usize {
+    fn apply_explicit_set_snapshot_impl(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        snapshot: &ExplicitSetSnapshot,
+    ) -> usize {
         let now = Instant::now();
-        let mut restored = 0usize;
         for (pool, mint) in &snapshot.pool_mint_map {
             self.pool_mint_map
                 .write()
@@ -2537,15 +2845,38 @@ impl MarketDataContext {
                 self.hot_pool_registry.pin_arb_pool(pool);
             }
         }
+
+        let mut converge_rows = Vec::with_capacity(snapshot.rows.len());
         for row in &snapshot.rows {
             let Ok(pk) = Pubkey::from_str(&row.pubkey) else {
                 continue;
             };
+            let consumer = match row.consumer {
+                SnapshotConsumer::Wallet => ConsumerId::Wallet,
+                SnapshotConsumer::Momentum => ConsumerId::Momentum,
+                SnapshotConsumer::Arb => ConsumerId::Arb,
+                SnapshotConsumer::Tracker => ConsumerId::Tracker,
+            };
+            let pool = row.pool.as_deref().and_then(|s| Pubkey::from_str(s).ok());
+            converge_rows.push((pk, consumer, pool));
+        }
+        desired.set_max_explicit_pubkeys(self.config.read().max_tracked_accounts);
+        desired.converge_from_rows(&converge_rows);
+        let admitted = desired.snapshot_pubkeys();
+
+        let mut restored = 0usize;
+        for row in &snapshot.rows {
+            let Ok(pk) = Pubkey::from_str(&row.pubkey) else {
+                continue;
+            };
+            if !admitted.contains(&pk) {
+                continue;
+            }
             let pin = snapshot_consumer_to_geyser_pin(row.consumer);
             let pool = row.pool.as_deref().and_then(|s| Pubkey::from_str(s).ok());
             match row.kind {
                 ExplicitAccountKind::Mint => {
-                    let _ = self.track_mint_for_geyser_metadata(pk, Some(pin));
+                    let _ = self.track_mint_for_geyser_metadata(pk, pin);
                     if self.tracked_mints.read().contains_key(&pk) {
                         restored += 1;
                     }
@@ -2568,8 +2899,8 @@ impl MarketDataContext {
                                 is_base_vault: true,
                                 last_balance: std::sync::atomic::AtomicU64::new(0),
                                 last_used_at: now,
-                                pinned: true,
-                                pin: Some(pin),
+                                pinned: pin.is_some(),
+                                pin,
                                 active_id: None,
                                 bin_step: None,
                                 sibling_vault: None,
@@ -2583,9 +2914,12 @@ impl MarketDataContext {
                         Entry::Occupied(mut e) => {
                             let v = e.get_mut();
                             v.last_used_at = now;
-                            if Self::geyser_pin_may_promote(v.pin, pin) {
-                                v.pinned = true;
-                                v.pin = Some(pin);
+                            if pin
+                                .map(|p| Self::geyser_pin_may_promote(v.pin, p))
+                                .unwrap_or(v.pin.is_none())
+                            {
+                                v.pinned = pin.is_some();
+                                v.pin = pin;
                             }
                             restored += 1;
                         }
@@ -2602,8 +2936,8 @@ impl MarketDataContext {
                                 bin_array_index: 0,
                                 bin_step: 0,
                                 last_used_at: now,
-                                pinned: true,
-                                pin: Some(pin),
+                                pinned: pin.is_some(),
+                                pin,
                             });
                             drop(bins);
                             if pool_addr != Pubkey::default() {
@@ -2614,9 +2948,12 @@ impl MarketDataContext {
                         Entry::Occupied(mut e) => {
                             let b = e.get_mut();
                             b.last_used_at = now;
-                            if Self::geyser_pin_may_promote(b.pin, pin) {
-                                b.pinned = true;
-                                b.pin = Some(pin);
+                            if pin
+                                .map(|p| Self::geyser_pin_may_promote(b.pin, p))
+                                .unwrap_or(b.pin.is_none())
+                            {
+                                b.pinned = pin.is_some();
+                                b.pin = pin;
                             }
                             restored += 1;
                         }
@@ -2624,9 +2961,11 @@ impl MarketDataContext {
                 }
             }
         }
-        self.broadcast_tracked_geyser_explicit_to_merge();
+        self.prune_tracked_maps_to_desired(desired);
         self.refresh_tracked_membership_snapshot();
         self.refresh_hot_pool_registry_gauges();
+        self.explicit_admission_invalidate
+            .store(true, Ordering::Relaxed);
         restored
     }
 
@@ -3102,17 +3441,6 @@ impl MarketDataContext {
         }
     }
 
-    fn continue_geyser_evict_with_deadline(&self, deadline: Instant) -> bool {
-        self.sync_geyser_tracked_accounts_core_with_deadline(deadline)
-    }
-
-    /// Debounced TX-path flush on md-state: bounded eviction + broadcast when complete.
-    fn sync_geyser_tracked_accounts_batched_flush_with_deadline(&self, deadline: Instant) -> bool {
-        set_market_data_geyser_sync_pending(0);
-        record_market_data_geyser_sync_batch_total();
-        self.sync_geyser_tracked_accounts_core_with_deadline(deadline)
-    }
-
     fn sync_geyser_tracked_accounts_core(&self) {
         let deadline = Instant::now() + Duration::from_secs(300);
         while !self.sync_geyser_tracked_accounts_core_with_deadline(deadline)
@@ -3292,6 +3620,26 @@ impl MarketDataContext {
                 &wallet_rx,
             );
         }
+    }
+
+    /// Track mint pubkey for Geyser `TokenMintInfo` / metadata. Returns `true` if explicit pubkey set changed.
+    fn track_mint_for_geyser_metadata_admitted(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        mint: Pubkey,
+        pin: Option<GeyserPinReason>,
+    ) -> bool {
+        let consumer = consumer_id_for_geyser_pin(pin);
+        let owner = OwnerKey::Mint(mint);
+        let admission = desired.try_admit_group(consumer, owner, HashSet::from([mint]));
+        match admission {
+            AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey => {}
+            rejected => {
+                record_admission_rejection(consumer, rejected);
+                return false;
+            }
+        }
+        self.track_mint_for_geyser_metadata(mint, pin)
     }
 
     /// Track mint pubkey for Geyser `TokenMintInfo` / metadata. Returns `true` if explicit pubkey set changed.
@@ -3693,7 +4041,12 @@ impl MarketDataContext {
 
     /// PR-D / Phase 3: explicit vault/bin subscriptions when cache has layout.
     /// Returns whether any tracked set changed. Caller schedules debounced Geyser push.
-    fn register_geyser_reserves_for_active_pool(&self, pool: Pubkey, pin: GeyserPinReason) -> bool {
+    fn register_geyser_reserves_for_active_pool(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        pool: Pubkey,
+        pin: GeyserPinReason,
+    ) -> bool {
         if self.live_pool_cache.get(&pool).is_none() {
             debug!(
                 run_id = %self.run_id,
@@ -3703,15 +4056,36 @@ impl MarketDataContext {
             );
             return false;
         }
-        self.register_geyser_reserves_impl(pool, pin)
+        let admission = self.try_admit_pool_explicit_group(desired, pool, pin);
+        match admission {
+            AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey => {
+                self.register_geyser_reserves_impl(pool, pin)
+            }
+            rejected => {
+                record_admission_rejection(consumer_id_for_geyser_pin(Some(pin)), rejected);
+                false
+            }
+        }
     }
 
-    fn register_geyser_reserves_for_momentum_active_pool(&self, pool: Pubkey) -> bool {
-        self.register_geyser_reserves_for_active_pool(pool, GeyserPinReason::MomentumActive)
+    fn register_geyser_reserves_for_momentum_active_pool(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        pool: Pubkey,
+    ) -> bool {
+        self.register_geyser_reserves_for_active_pool(
+            desired,
+            pool,
+            GeyserPinReason::MomentumActive,
+        )
     }
 
-    fn register_geyser_reserves_for_arb_active_pool(&self, pool: Pubkey) -> bool {
-        self.register_geyser_reserves_for_active_pool(pool, GeyserPinReason::ArbMultiDex)
+    fn register_geyser_reserves_for_arb_active_pool(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        pool: Pubkey,
+    ) -> bool {
+        self.register_geyser_reserves_for_active_pool(desired, pool, GeyserPinReason::ArbMultiDex)
     }
 
     fn register_meteora_dlmm_bin_arrays(
@@ -3882,14 +4256,18 @@ impl MarketDataContext {
     }
 
     /// PR-D / PR169b: apply momentum-bot active pool pin updates (actor-only writer; caller schedules sync).
-    fn apply_momentum_active_pools_update(&self, update: &MomentumActivePoolsUpdate) -> bool {
+    fn apply_momentum_active_pools_update(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        update: &MomentumActivePoolsUpdate,
+    ) -> bool {
         record_market_data_momentum_active_pool_messages_total();
         let mut batch_dirty = false;
         if update.full_active_snapshot {
-            batch_dirty |= self.apply_momentum_snapshot_reconcile(&update.active);
+            batch_dirty |= self.apply_momentum_snapshot_reconcile(desired, &update.active);
         }
-        batch_dirty |= self.apply_momentum_removed_entries(&update.removed);
-        batch_dirty |= self.apply_momentum_active_entries(&update.active);
+        batch_dirty |= self.apply_momentum_removed_entries(desired, &update.removed);
+        batch_dirty |= self.apply_momentum_active_entries(desired, &update.active);
         if !batch_dirty {
             self.refresh_geyser_pins_gauge();
         }
@@ -3898,7 +4276,11 @@ impl MarketDataContext {
     }
 
     /// PR169c: snapshot reconcile only (`full_active_snapshot` target set).
-    fn apply_momentum_snapshot_reconcile(&self, active: &[MomentumActivePoolEntry]) -> bool {
+    fn apply_momentum_snapshot_reconcile(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        active: &[MomentumActivePoolEntry],
+    ) -> bool {
         let mut target: HashSet<(Pubkey, Pubkey)> = HashSet::new();
         for a in active {
             let Ok(mint_pk) = Pubkey::from_str(a.mint.trim()) else {
@@ -3921,14 +4303,18 @@ impl MarketDataContext {
         let mut batch_dirty = false;
         let before = self.hot_pool_registry.snapshot_pairs();
         for (m, p) in before.difference(&target) {
-            if self.clear_momentum_geyser_reserves_for_active_entry(*m, *p) {
+            if self.clear_momentum_geyser_reserves_for_active_entry(desired, *m, *p) {
                 batch_dirty = true;
             }
         }
         batch_dirty
     }
 
-    fn apply_momentum_removed_entries(&self, removed: &[MomentumRemovedPoolEntry]) -> bool {
+    fn apply_momentum_removed_entries(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        removed: &[MomentumRemovedPoolEntry],
+    ) -> bool {
         let mut batch_dirty = false;
         for r in removed {
             let Ok(mint_pk) = Pubkey::from_str(r.mint.trim()) else {
@@ -3939,14 +4325,18 @@ impl MarketDataContext {
                 warn!(pool = %r.pool, "MomentumActivePoolsUpdate.removed: invalid pool");
                 continue;
             };
-            if self.clear_momentum_geyser_reserves_for_active_entry(mint_pk, pool_pk) {
+            if self.clear_momentum_geyser_reserves_for_active_entry(desired, mint_pk, pool_pk) {
                 batch_dirty = true;
             }
         }
         batch_dirty
     }
 
-    fn apply_momentum_active_entries(&self, active: &[MomentumActivePoolEntry]) -> bool {
+    fn apply_momentum_active_entries(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        active: &[MomentumActivePoolEntry],
+    ) -> bool {
         let mut batch_dirty = false;
         for a in active {
             let Ok(mint_pk) = Pubkey::from_str(a.mint.trim()) else {
@@ -3958,7 +4348,7 @@ impl MarketDataContext {
                 continue;
             };
             self.hot_pool_registry.pin_pool(mint_pk, pool_pk);
-            if self.register_geyser_reserves_for_momentum_active_pool(pool_pk) {
+            if self.register_geyser_reserves_for_momentum_active_pool(desired, pool_pk) {
                 batch_dirty = true;
             }
             let _ = &a.pin_reason;
@@ -3988,8 +4378,14 @@ impl MarketDataContext {
     }
 
     /// Clear `MomentumActive` pins for one `(mint, pool)` side; never demotes [`GeyserPinReason::Wallet`].
-    fn clear_momentum_geyser_reserves_for_active_entry(&self, mint: Pubkey, pool: Pubkey) -> bool {
+    fn clear_momentum_geyser_reserves_for_active_entry(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        mint: Pubkey,
+        pool: Pubkey,
+    ) -> bool {
         self.hot_pool_registry.unpin_pool(mint, pool);
+        desired.remove_group(ConsumerId::Momentum, OwnerKey::Pool(pool));
         let mut changed = false;
         // Pool-level reserve pins are shared: only demote vaults/bin arrays when no `(m, pool)`
         // row remains after this unpin (PR #147 follow-up).
@@ -4051,14 +4447,18 @@ impl MarketDataContext {
     }
 
     /// Phase 3: apply arb-strategy track_requests pin updates (md-track-worker only).
-    fn apply_arb_track_requests_update(&self, update: &ArbTrackRequestsUpdate) -> bool {
+    fn apply_arb_track_requests_update(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        update: &ArbTrackRequestsUpdate,
+    ) -> bool {
         record_market_data_arb_track_requests_messages_total();
         let mut batch_dirty = false;
         if update.reconcile {
-            batch_dirty |= self.apply_arb_snapshot_reconcile(&update.active);
+            batch_dirty |= self.apply_arb_snapshot_reconcile(desired, &update.active);
         }
-        batch_dirty |= self.apply_arb_removed_entries(&update.removed);
-        batch_dirty |= self.apply_arb_active_entries(&update.active);
+        batch_dirty |= self.apply_arb_removed_entries(desired, &update.removed);
+        batch_dirty |= self.apply_arb_active_entries(desired, &update.active);
         if !batch_dirty {
             self.refresh_geyser_pins_gauge();
         }
@@ -4066,7 +4466,11 @@ impl MarketDataContext {
         batch_dirty
     }
 
-    fn apply_arb_snapshot_reconcile(&self, active: &[ArbTrackActiveEntry]) -> bool {
+    fn apply_arb_snapshot_reconcile(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        active: &[ArbTrackActiveEntry],
+    ) -> bool {
         let mut target: HashSet<Pubkey> = HashSet::new();
         for a in active {
             let Ok(pool_pk) = Pubkey::from_str(a.pool.trim()) else {
@@ -4085,28 +4489,36 @@ impl MarketDataContext {
         let mut batch_dirty = false;
         let before = self.hot_pool_registry.snapshot_arb_pools();
         for pool in before.difference(&target) {
-            if self.clear_arb_geyser_reserves_for_pool(*pool) {
+            if self.clear_arb_geyser_reserves_for_pool(desired, *pool) {
                 batch_dirty = true;
             }
         }
         batch_dirty
     }
 
-    fn apply_arb_removed_entries(&self, removed: &[ArbTrackRemovedEntry]) -> bool {
+    fn apply_arb_removed_entries(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        removed: &[ArbTrackRemovedEntry],
+    ) -> bool {
         let mut batch_dirty = false;
         for r in removed {
             let Ok(pool_pk) = Pubkey::from_str(r.pool.trim()) else {
                 warn!(pool = %r.pool, "ArbTrackRequestsUpdate.removed: invalid pool");
                 continue;
             };
-            if self.clear_arb_geyser_reserves_for_pool(pool_pk) {
+            if self.clear_arb_geyser_reserves_for_pool(desired, pool_pk) {
                 batch_dirty = true;
             }
         }
         batch_dirty
     }
 
-    fn apply_arb_active_entries(&self, active: &[ArbTrackActiveEntry]) -> bool {
+    fn apply_arb_active_entries(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        active: &[ArbTrackActiveEntry],
+    ) -> bool {
         let mut batch_dirty = false;
         for a in active {
             let Ok(pool_pk) = Pubkey::from_str(a.pool.trim()) else {
@@ -4114,7 +4526,7 @@ impl MarketDataContext {
                 continue;
             };
             self.hot_pool_registry.pin_arb_pool(pool_pk);
-            if self.register_geyser_reserves_for_arb_active_pool(pool_pk) {
+            if self.register_geyser_reserves_for_arb_active_pool(desired, pool_pk) {
                 batch_dirty = true;
             } else {
                 let category = if self.live_pool_cache.get(&pool_pk).is_none() {
@@ -4163,8 +4575,13 @@ impl MarketDataContext {
     }
 
     /// Clear Arb consumer pins for one pool; never demotes [`GeyserPinReason::Wallet`] or Momentum.
-    fn clear_arb_geyser_reserves_for_pool(&self, pool: Pubkey) -> bool {
+    fn clear_arb_geyser_reserves_for_pool(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        pool: Pubkey,
+    ) -> bool {
         self.hot_pool_registry.unpin_arb_pool(pool);
+        desired.remove_group(ConsumerId::Arb, OwnerKey::Pool(pool));
         let mut changed = false;
         if !self.hot_pool_registry.pool_has_arb(pool)
             && !self.hot_pool_registry.pool_has_any_pin(pool)
@@ -5077,6 +5494,22 @@ fn backfill_scope48_metadata_foreign_confirmed_sell(exec: &mut ExecutionResult) 
     );
     exec.metadata
         .insert("sell_untracked_ata".to_string(), "true".to_string());
+}
+
+#[cfg(test)]
+impl MarketDataContext {
+    fn apply_momentum_active_pools_update_for_test(
+        &self,
+        update: &MomentumActivePoolsUpdate,
+    ) -> bool {
+        let mut desired = DesiredExplicitSet::new(self.config.read().max_tracked_accounts);
+        self.apply_momentum_active_pools_update(&mut desired, update)
+    }
+
+    fn apply_arb_track_requests_update_for_test(&self, update: &ArbTrackRequestsUpdate) -> bool {
+        let mut desired = DesiredExplicitSet::new(self.config.read().max_tracked_accounts);
+        self.apply_arb_track_requests_update(&mut desired, update)
+    }
 }
 
 #[cfg(test)]
@@ -6331,6 +6764,7 @@ async fn main() -> Result<()> {
         last_momentum_snapshot_target: parking_lot::RwLock::new(None),
         last_arb_snapshot_target: parking_lot::RwLock::new(None),
         dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+        explicit_admission_invalidate: AtomicBool::new(false),
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -9936,6 +10370,7 @@ mod wallet_snapshot_stale_cleanup_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+            explicit_admission_invalidate: AtomicBool::new(false),
         }
     }
 
@@ -10156,6 +10591,7 @@ mod wallet_tx_meta_balance_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+            explicit_admission_invalidate: AtomicBool::new(false),
         })
     }
 
@@ -10495,6 +10931,10 @@ mod pr_b_geyser_tracking_tests {
 
     fn test_noop_track_worker_sender() -> TrackWorkerSender {
         spawn_noop_track_worker_sender(4096)
+    }
+
+    fn test_desired_set(ctx: &MarketDataContext) -> DesiredExplicitSet {
+        DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts)
     }
 
     fn test_inline_track_worker_sender(ctx: &Arc<MarketDataContext>) -> TrackWorkerSender {
@@ -11029,6 +11469,7 @@ mod pr_b_geyser_tracking_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+            explicit_admission_invalidate: AtomicBool::new(false),
         })
     }
 
@@ -11101,6 +11542,7 @@ mod pr_b_geyser_tracking_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+            explicit_admission_invalidate: AtomicBool::new(false),
         });
         (
             ctx,
@@ -11149,7 +11591,7 @@ mod pr_b_geyser_tracking_tests {
             removed: vec![],
             full_active_snapshot: false,
         };
-        ctx.apply_momentum_active_pools_update(&update);
+        ctx.apply_momentum_active_pools_update_for_test(&update);
 
         let vs = ctx.tracked_vaults.read();
         assert_eq!(
@@ -11191,7 +11633,7 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
 
-        ctx.apply_momentum_active_pools_update(&MomentumActivePoolsUpdate {
+        ctx.apply_momentum_active_pools_update_for_test(&MomentumActivePoolsUpdate {
             version: 1,
             ts_unix_ms: 1,
             active: vec![MomentumActivePoolEntry {
@@ -11211,7 +11653,7 @@ mod pr_b_geyser_tracking_tests {
             }
         }
 
-        ctx.apply_momentum_active_pools_update(&MomentumActivePoolsUpdate {
+        ctx.apply_momentum_active_pools_update_for_test(&MomentumActivePoolsUpdate {
             version: 1,
             ts_unix_ms: 2,
             active: vec![],
@@ -11263,7 +11705,7 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
 
-        ctx.apply_momentum_active_pools_update(&MomentumActivePoolsUpdate {
+        ctx.apply_momentum_active_pools_update_for_test(&MomentumActivePoolsUpdate {
             version: 1,
             ts_unix_ms: 1,
             active: vec![
@@ -11282,7 +11724,7 @@ mod pr_b_geyser_tracking_tests {
             full_active_snapshot: false,
         });
 
-        ctx.apply_momentum_active_pools_update(&MomentumActivePoolsUpdate {
+        ctx.apply_momentum_active_pools_update_for_test(&MomentumActivePoolsUpdate {
             version: 1,
             ts_unix_ms: 2,
             active: vec![],
@@ -11343,7 +11785,7 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
 
-        ctx.apply_momentum_active_pools_update(&MomentumActivePoolsUpdate {
+        ctx.apply_momentum_active_pools_update_for_test(&MomentumActivePoolsUpdate {
             version: 1,
             ts_unix_ms: 1,
             active: vec![
@@ -11370,7 +11812,7 @@ mod pr_b_geyser_tracking_tests {
             "setup: WSOL leg tracked for pool_a"
         );
 
-        ctx.apply_momentum_active_pools_update(&MomentumActivePoolsUpdate {
+        ctx.apply_momentum_active_pools_update_for_test(&MomentumActivePoolsUpdate {
             version: 1,
             ts_unix_ms: 2,
             active: vec![],
@@ -12765,10 +13207,10 @@ mod pr_b_geyser_tracking_tests {
         ];
 
         for u in &updates {
-            ctx_seq.apply_momentum_active_pools_update(u);
+            ctx_seq.apply_momentum_active_pools_update_for_test(u);
         }
         let merged = merge_momentum_active_pools_updates(&updates).expect("merged");
-        ctx_merged.apply_momentum_active_pools_update(&merged);
+        ctx_merged.apply_momentum_active_pools_update_for_test(&merged);
 
         assert_eq!(pin_count(&ctx_seq), pin_count(&ctx_merged));
         assert_eq!(
@@ -13708,7 +14150,10 @@ mod pr_b_geyser_tracking_tests {
             }),
             1,
         );
-        assert!(ctx.register_geyser_reserves_for_arb_active_pool(pool));
+        assert!(ctx.register_geyser_reserves_for_arb_active_pool(
+            &mut DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts),
+            pool,
+        ));
         let before = ctx.tracked_bin_arrays.read().len();
         assert!(
             !ctx.maybe_refresh_arb_dlmm_bin_window(pool, 10),
@@ -13812,12 +14257,14 @@ mod pr_b_geyser_tracking_tests {
         let before = ctx.snapshot_explicit_subscription_pubkeys();
         use ironcrab::metrics::MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL;
         let skip0 = MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL.load(Ordering::Relaxed);
+        let mut admission_converged = false;
         assert!(track_worker_execute_coalesced_push(
             &ctx,
             &mut desired,
             before,
             false,
             false,
+            &mut admission_converged,
         ));
         assert!(
             MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL.load(Ordering::Relaxed) > skip0,
@@ -14014,7 +14461,8 @@ mod pr_b_geyser_tracking_tests {
         );
         assert!(fresh.snapshot_explicit_subscription_pubkeys().is_empty());
 
-        let restored = fresh.apply_explicit_set_snapshot_impl(&snapshot);
+        let mut desired_restore = DesiredExplicitSet::new(fresh.config.read().max_tracked_accounts);
+        let restored = fresh.apply_explicit_set_snapshot_impl(&mut desired_restore, &snapshot);
         assert!(restored > 0);
         assert!(fresh
             .snapshot_explicit_subscription_pubkeys()
@@ -14054,12 +14502,14 @@ mod pr_b_geyser_tracking_tests {
         let keys = ctx.snapshot_explicit_subscription_pubkeys();
         use ironcrab::metrics::MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL;
         let skip0 = MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL.load(Ordering::Relaxed);
+        let mut admission_converged = false;
         assert!(track_worker_execute_coalesced_push(
             &ctx,
             &mut desired,
             keys,
             false,
             false,
+            &mut admission_converged,
         ));
         assert!(
             MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL.load(Ordering::Relaxed) > skip0,
@@ -14690,7 +15140,7 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
 
-        ctx.apply_arb_track_requests_update(&ArbTrackRequestsUpdate {
+        ctx.apply_arb_track_requests_update_for_test(&ArbTrackRequestsUpdate {
             version: 1,
             ts_unix_ms: 1,
             active: vec![ArbTrackActiveEntry {
@@ -14709,7 +15159,7 @@ mod pr_b_geyser_tracking_tests {
             }
         }
 
-        ctx.apply_arb_track_requests_update(&ArbTrackRequestsUpdate {
+        ctx.apply_arb_track_requests_update_for_test(&ArbTrackRequestsUpdate {
             version: 1,
             ts_unix_ms: 2,
             active: vec![],
