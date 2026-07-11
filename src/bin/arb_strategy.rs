@@ -718,6 +718,20 @@ impl ArbTrackMintSnapshotCache {
         self.compact_heap_if_needed(false);
         true
     }
+
+    #[cfg(test)]
+    fn test_access_generations_in_order(&self, mints: &[String]) -> Vec<u64> {
+        mints
+            .iter()
+            .filter_map(|mint| self.entries.get(mint).map(|entry| entry.access_gen))
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn test_eviction_victim(&mut self, protected: &HashSet<String>) -> Option<String> {
+        self.pop_eviction_victim(protected, true)
+            .or_else(|| self.pop_eviction_victim(protected, false))
+    }
 }
 
 /// Coalesces selection jobs for bounded worker scheduling (unit-tested).
@@ -758,12 +772,69 @@ impl ArbTrackSelectionCoalescer {
 }
 
 fn pool_activity_unix_ms(pool: &PoolState, vault: Option<&VaultBalanceCache>) -> u64 {
-    let pool_ms =
-        wall_clock_unix_ms_now().saturating_sub(pool.last_update.elapsed().as_millis() as u64);
+    let pool_ms = pool_last_update_activity_unix_ms(pool);
     vault
         .map(|v| wall_clock_unix_ms_now().saturating_sub(v.updated_at.elapsed().as_millis() as u64))
         .unwrap_or(pool_ms)
         .max(pool_ms)
+}
+
+/// Tracker-only coarse recency for top-K admission ranking (no vault lock).
+fn pool_last_update_activity_unix_ms(pool: &PoolState) -> u64 {
+    wall_clock_unix_ms_now().saturating_sub(pool.last_update.elapsed().as_millis() as u64)
+}
+
+fn tracker_coarse_activity_unix_ms(tracker: &TokenArbTracker) -> u64 {
+    tracker
+        .pools
+        .values()
+        .map(pool_last_update_activity_unix_ms)
+        .max()
+        .unwrap_or_else(wall_clock_unix_ms_now)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MintCoarseRankSnapshot {
+    mint: String,
+    activity_unix_ms: u64,
+}
+
+/// Clone minimal per-mint rank data while `trackers` read guard is held.
+fn build_multi_dex_coarse_rank_snapshot(
+    trackers: &HashMap<String, TokenArbTracker>,
+    mints: &[String],
+) -> Vec<MintCoarseRankSnapshot> {
+    mints
+        .iter()
+        .filter_map(|mint| {
+            let tracker = trackers.get(mint)?;
+            if tracker.pool_count_on_distinct_dexes() < 2 {
+                return None;
+            }
+            Some(MintCoarseRankSnapshot {
+                mint: mint.clone(),
+                activity_unix_ms: tracker_coarse_activity_unix_ms(tracker),
+            })
+        })
+        .collect()
+}
+
+fn rank_coarse_rank_snapshot(snapshot: &mut [MintCoarseRankSnapshot]) -> Vec<String> {
+    snapshot.sort_by(|a, b| {
+        b.activity_unix_ms
+            .cmp(&a.activity_unix_ms)
+            .then_with(|| a.mint.cmp(&b.mint))
+    });
+    snapshot.iter().map(|row| row.mint.clone()).collect()
+}
+
+/// Deterministic full-admit refresh order: ranked traversal, HashSet membership only.
+fn admit_refresh_order(ranked: &[String], admit: &HashSet<String>) -> Vec<String> {
+    ranked
+        .iter()
+        .filter(|mint| admit.contains(*mint))
+        .cloned()
+        .collect()
 }
 
 fn tracker_mint_activity_unix_ms(
@@ -5844,21 +5915,14 @@ impl ArbContext {
     }
 
     fn rank_multi_dex_mints_by_activity(&self, mints: &[String]) -> Vec<String> {
-        let trackers = self.trackers.read();
-        let vault_balances = self.vault_balances.read();
-        let mut ranked: Vec<(u64, String)> = mints
-            .iter()
-            .filter_map(|mint| {
-                let tracker = trackers.get(mint)?;
-                if tracker.pool_count_on_distinct_dexes() < 2 {
-                    return None;
-                }
-                let activity = tracker_mint_activity_unix_ms(tracker, &vault_balances);
-                Some((activity, mint.clone()))
-            })
-            .collect();
-        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        ranked.into_iter().map(|(_, mint)| mint).collect()
+        // Lock contract: `trackers` read guard only for cloning coarse rank rows.
+        // Vault balances are not read here; per-mint snapshot build uses separate
+        // short vault scopes in `build_track_mint_input`.
+        let mut snapshot = {
+            let trackers = self.trackers.read();
+            build_multi_dex_coarse_rank_snapshot(&trackers, mints)
+        };
+        rank_coarse_rank_snapshot(&mut snapshot)
     }
 
     fn commit_mint_snapshot(
@@ -6522,7 +6586,8 @@ fn run_arb_track_selection_batch(
         let all_mints = ctx.collect_multi_dex_mint_ids();
         let ranked = ctx.rank_multi_dex_mints_by_activity(&all_mints);
         let admit = compute_snapshot_admit_set(&ranked, &protected, ARB_TRACK_MINT_SNAPSHOTS_CAP);
-        for mint in &admit {
+        let refresh_order = admit_refresh_order(&ranked, &admit);
+        for mint in &refresh_order {
             ctx.refresh_mint_snapshot(mint, &protected);
         }
         ctx.arb_track_mint_snapshots
@@ -10866,6 +10931,50 @@ mod two_hop_price_tests {
         assert!(admit_a.contains("mint_01"));
         assert!(admit_a.contains("mint_02"));
         assert!(admit_a.contains("mint_03"));
+    }
+
+    #[test]
+    fn admit_refresh_order_preserves_rank_not_hashset_iteration() {
+        let ranked: Vec<String> = (0..8).map(|i| format!("mint_{i}")).collect();
+        let admit: HashSet<String> = ranked.iter().take(5).cloned().collect();
+        let ordered = admit_refresh_order(&ranked, &admit);
+        assert_eq!(ordered, ranked[..5]);
+    }
+
+    #[test]
+    fn full_admit_refresh_produces_identical_generations_and_eviction_victim() {
+        let ranked: Vec<String> = (0..8).map(|i| format!("mint_{i}")).collect();
+        let admit = compute_snapshot_admit_set(&ranked, &HashSet::new(), 5);
+        let refresh = admit_refresh_order(&ranked, &admit);
+
+        let run = || -> (Vec<u64>, Option<String>) {
+            let mut cache = ArbTrackMintSnapshotCache::default();
+            let protected = HashSet::new();
+            for mint in &refresh {
+                let input = TrackMintInput {
+                    mint: mint.clone(),
+                    pools: Vec::new(),
+                    trade_signal_pools: None,
+                    last_activity_unix_ms: 0,
+                };
+                assert!(cache.insert_bounded(mint.clone(), input, &protected));
+            }
+            let gens = cache.test_access_generations_in_order(&refresh);
+            let victim = cache.test_eviction_victim(&protected);
+            (gens, victim)
+        };
+
+        let (gens_a, victim_a) = run();
+        let (gens_b, victim_b) = run();
+        assert_eq!(
+            gens_a, gens_b,
+            "rank-ordered refresh must assign identical generations"
+        );
+        assert_eq!(
+            victim_a, victim_b,
+            "rank-ordered refresh must pick identical eviction victim"
+        );
+        assert_eq!(victim_a.as_deref(), Some("mint_0"));
     }
 
     #[test]
