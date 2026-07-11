@@ -102,8 +102,8 @@ use ironcrab::metrics::{
 use ironcrab::nats::{
     arb_strategy_pool_cache_live_consumer_config, arb_track_payload_bytes, config_consumer_config,
     config_subject, split_arb_track_requests_update, trim_reconcile_update_to_budget,
-    ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackRemovedEntry, ArbTrackRequestsUpdate,
-    ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES, CONFIG_STREAM_NAME, STREAM_NAME,
+    ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackRemovedEntry, ArbTrackRemovedReason,
+    ArbTrackRequestsUpdate, ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES, CONFIG_STREAM_NAME, STREAM_NAME,
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_ARB_TRACK_REQUESTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
@@ -565,6 +565,7 @@ impl ArbTrackSelectionHandle {
         }
         if self.wake_tx.try_send(()).is_err() {
             record_arb_track_selection_queue_overflow_total();
+            self.pending_full_reconcile.store(true, Ordering::Release);
         }
     }
 
@@ -6218,7 +6219,32 @@ impl ArbContext {
     }
 
     fn prune_arb_track_stale_pools(self: &Arc<Self>) {
-        self.arb_track_selection.request_full_reconcile();
+        if self.nats.is_none() {
+            return;
+        }
+        let trackers = self.trackers.read();
+        let mut still_active: HashSet<String> = HashSet::new();
+        for tracker in trackers.values() {
+            if tracker.pool_count_on_distinct_dexes() >= 2 {
+                still_active.extend(tracker.pools.keys().cloned());
+            }
+        }
+        drop(trackers);
+        let mut removed = Vec::new();
+        let mut pinned = self.arb_pinned_pools.write();
+        for pool in pinned.clone().into_iter() {
+            if !still_active.contains(&pool) {
+                pinned.remove(&pool);
+                removed.push(ArbTrackRemovedEntry {
+                    pool,
+                    reason: ArbTrackRemovedReason::Stale,
+                });
+            }
+        }
+        drop(pinned);
+        if !removed.is_empty() {
+            self.spawn_publish_arb_track_requests(Vec::new(), removed, false);
+        }
     }
 }
 
