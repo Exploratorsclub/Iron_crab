@@ -747,11 +747,11 @@ impl ArbTrackSelectionCoalescer {
     fn ingest(&mut self, job: ArbTrackSelectionJob) -> bool {
         match job {
             ArbTrackSelectionJob::MarkDirty { mint } => {
-                if self.dirty_mints.len() >= ARB_TRACK_SELECTION_DIRTY_MINTS_CAP {
+                self.dirty_mints.insert(mint);
+                if self.dirty_mints.len() > ARB_TRACK_SELECTION_DIRTY_MINTS_CAP {
                     self.dirty_overflow = true;
                     return true;
                 }
-                self.dirty_mints.insert(mint);
                 false
             }
             ArbTrackSelectionJob::FullReconcile => {
@@ -5930,19 +5930,32 @@ impl ArbContext {
         mint: &str,
         input: Option<TrackMintInput>,
         protected: &HashSet<String>,
-    ) {
+    ) -> bool {
         let mut snapshots = self.arb_track_mint_snapshots.write();
         match input {
             Some(input) => {
-                let _ = snapshots.insert_bounded(mint.to_string(), input, protected);
+                if snapshots.insert_bounded(mint.to_string(), input, protected) {
+                    true
+                } else {
+                    drop(snapshots);
+                    self.arb_track_selection
+                        .pending_full_reconcile
+                        .store(true, Ordering::Release);
+                    false
+                }
             }
-            None => snapshots.remove(mint),
+            None => {
+                snapshots.remove(mint);
+                true
+            }
         }
     }
 
     fn refresh_mint_snapshot(&self, mint: &str, protected: &HashSet<String>) {
         let input = self.build_track_mint_input(mint);
-        self.commit_mint_snapshot(mint, input, protected);
+        if !self.commit_mint_snapshot(mint, input, protected) {
+            self.arb_track_selection.mark_dirty(mint);
+        }
     }
 
     fn run_arb_track_selection_from_snapshots(self: &Arc<Self>, reconcile: bool) {
@@ -10843,7 +10856,8 @@ mod two_hop_price_tests {
         let (dirty, full, overflow) = coalescer.take_batch();
         assert!(!full);
         assert!(overflow);
-        assert_eq!(dirty.len(), ARB_TRACK_SELECTION_DIRTY_MINTS_CAP);
+        assert_eq!(dirty.len(), ARB_TRACK_SELECTION_DIRTY_MINTS_CAP + 1);
+        assert!(dirty.iter().any(|m| m == "overflow_mint"));
     }
 
     #[test]
