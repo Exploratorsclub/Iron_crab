@@ -1208,10 +1208,6 @@ impl<'a> EvictionPlanner<'a> {
         self.marginal.get(&victim).copied().unwrap_or(0)
     }
 
-    fn is_pubkey_freed(&self, pk: &Pubkey) -> bool {
-        self.effective_owners(pk).is_empty()
-    }
-
     fn add_victim(
         &mut self,
         victim: (ConsumerId, OwnerKey),
@@ -1246,27 +1242,17 @@ impl<'a> EvictionPlanner<'a> {
             return freed;
         };
 
-        let touched_groups: HashSet<(ConsumerId, OwnerKey)> = group
-            .pubkeys
-            .iter()
-            .flat_map(|pk| self.pubkey_groups.get(pk).into_iter().flatten().copied())
-            .collect();
-
         for pk in &group.pubkeys {
-            if self.is_pubkey_freed(pk) {
-                if let Some(sharing) = self.pubkey_groups.get(pk) {
-                    for other in sharing {
-                        if *other != victim && !self.victims.contains(other) {
-                            if let Some(contributors) = self.marginal_contributors.get_mut(other) {
-                                if contributors.remove(pk) {
-                                    if let Some(m) = self.marginal.get_mut(other) {
-                                        *m = m.saturating_sub(1);
-                                    }
-                                    if let Some(stats) = stats.as_deref_mut() {
-                                        stats.edge_updates = stats.edge_updates.saturating_add(1);
-                                    }
-                                }
-                            }
+            let owners_after = self.effective_owners(pk);
+            if owners_after.len() == 1 {
+                let sole = owners_after[0];
+                if let Some(contributors) = self.marginal_contributors.get_mut(&sole) {
+                    if contributors.insert(*pk) {
+                        if let Some(m) = self.marginal.get_mut(&sole) {
+                            *m = m.saturating_add(1);
+                        }
+                        if let Some(stats) = stats.as_deref_mut() {
+                            stats.edge_updates = stats.edge_updates.saturating_add(1);
                         }
                     }
                 }
@@ -1275,19 +1261,6 @@ impl<'a> EvictionPlanner<'a> {
 
         self.marginal.insert(victim, 0);
         self.marginal_contributors.insert(victim, HashSet::new());
-
-        for other in touched_groups {
-            if other == victim || self.victims.contains(&other) {
-                continue;
-            }
-            let before = self.marginal_freed(other);
-            self.recompute_marginal_for_group(other, stats.as_deref_mut());
-            if self.marginal_freed(other) != before {
-                if let Some(stats) = stats.as_deref_mut() {
-                    stats.edge_updates = stats.edge_updates.saturating_add(1);
-                }
-            }
-        }
 
         freed
     }
@@ -2133,7 +2106,12 @@ mod tests {
             stats.refcount_checks
                 <= edge_count.saturating_mul(stats.victim_removals.saturating_add(1))
         );
+        assert!(
+            stats.edge_updates
+                <= edge_count.saturating_mul(stats.victim_removals.saturating_add(1)),
+            "marginal edge updates must stay bounded under dense pubkey sharing"
+        );
         assert!(stats.candidate_pops > 0);
-        assert!(stats.refcount_checks > 0);
+        assert!(stats.victim_removals > 0);
     }
 }

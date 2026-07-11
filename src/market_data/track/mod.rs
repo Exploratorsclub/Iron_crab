@@ -25,9 +25,10 @@ pub use geyser_sync::{
     MARKET_DATA_MD_STATE_FLUSH_BUDGET_MS,
 };
 pub use pending::{
-    GeyserConnectBarrier, PendingPoolCommand, PendingPoolRegistrations, PendingPoolUpsertResult,
-    PoolSnapshotRevisionSequencer, ProtectedOverflowDiagnostic, RevisionAcquireResult,
-    RevisionAssignResult, RevisionRefCounts, WalletExplicitPending,
+    GeyserConnectBarrier, InflightReserveResult, PendingPoolCommand, PendingPoolRegistrations,
+    PendingPoolUpsertResult, PoolCommandTerminal, PoolSnapshotRevisionSequencer,
+    ProtectedOverflowDiagnostic, RevisionAcquireResult, RevisionActiveOwner, RevisionAssignResult,
+    RevisionRefCounts, WalletExplicitPending,
 };
 pub use snapshot::{
     explicit_set_snapshot_path, load_explicit_set_snapshot, owner_key_to_snapshot,

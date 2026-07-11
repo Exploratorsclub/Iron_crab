@@ -84,12 +84,13 @@ use ironcrab::market_data::track::{
     momentum_coalesce_try_send, owner_key_to_snapshot, pool_is_enrichment_member,
     spawn_track_worker, track_worker_try_enqueue, AdmissionResult, BinArrayExplicitRow,
     CapConvergeResult, ConsumerId, DesiredExplicitSet, ExplicitAccountKind, ExplicitSetSnapshot,
-    ExplicitSnapshotRow, GeyserConnectBarrier, GeyserPinReason, MintExplicitRow,
-    OwnerGroupSnapshot, OwnerKey, PendingPoolCommand, PendingPoolRegistrations,
-    PendingPoolUpsertResult, PoolExplicitSnapshot, PoolSnapshotRevisionSequencer,
-    ProtectedOverflowDiagnostic, RevisionAcquireResult, RevisionAssignResult, SnapshotConsumer,
-    SnapshotOwnerGroup, TrackPinReason, TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,
-    VaultExplicitRow, WalletExplicitPending, EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
+    ExplicitSnapshotRow, GeyserConnectBarrier, GeyserPinReason, InflightReserveResult,
+    MintExplicitRow, OwnerGroupSnapshot, OwnerKey, PendingPoolCommand, PendingPoolRegistrations,
+    PendingPoolUpsertResult, PoolCommandTerminal, PoolExplicitSnapshot,
+    PoolSnapshotRevisionSequencer, ProtectedOverflowDiagnostic, RevisionAcquireResult,
+    RevisionActiveOwner, RevisionAssignResult, SnapshotConsumer, SnapshotOwnerGroup,
+    TrackPinReason, TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender, VaultExplicitRow,
+    WalletExplicitPending, EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
 };
 use ironcrab::metrics::{
     dec_market_data_account_high_priority_queue_depth,
@@ -1933,82 +1934,102 @@ fn pending_pool_command_for_stash(job: &TrackWorkerCommand) -> Option<PendingPoo
     }
 }
 
-fn assign_pool_snapshot_revision(ctx: &MarketDataContext, job: &mut TrackWorkerCommand) -> bool {
-    let assign = |snapshot: &mut PoolExplicitSnapshot| match ctx
-        .pool_snapshot_revisions
-        .assign_next(snapshot)
-    {
-        RevisionAssignResult::Assigned(_) => true,
-        RevisionAssignResult::RegistryFull => {
-            ctx.fail_revision_registry_full();
-            false
-        }
-        RevisionAssignResult::KeyNotRegistered => {
-            match ctx
-                .pool_snapshot_revisions
-                .try_acquire_active(snapshot.pool, snapshot.consumer)
-            {
-                RevisionAcquireResult::Acquired => {
-                    match ctx.pool_snapshot_revisions.assign_next(snapshot) {
-                        RevisionAssignResult::Assigned(_) => true,
-                        RevisionAssignResult::RegistryFull => {
-                            ctx.fail_revision_registry_full();
-                            false
-                        }
-                        RevisionAssignResult::KeyNotRegistered => {
-                            ctx.fail_revision_registry_full();
-                            false
-                        }
-                    }
-                }
-                RevisionAcquireResult::RegistryFull => {
-                    ctx.fail_revision_registry_full();
-                    false
-                }
-            }
-        }
-    };
-    match job {
+fn prepare_pool_snapshot_for_enqueue(
+    ctx: &MarketDataContext,
+    job: &mut TrackWorkerCommand,
+) -> Option<(Pubkey, ConsumerId)> {
+    let (pool, consumer, snapshot) = match job {
         TrackWorkerCommand::RegisterPoolGeyserReserves { snapshot }
         | TrackWorkerCommand::RegisterPoolVaultsFromAccount { snapshot }
-        | TrackWorkerCommand::RegisterGeyserReservesAfterTrade { snapshot } => assign(snapshot),
-        TrackWorkerCommand::RefreshDlmmBinWindow { snapshot, .. } => assign(snapshot),
-        _ => true,
+        | TrackWorkerCommand::RegisterGeyserReservesAfterTrade { snapshot } => {
+            (snapshot.pool, snapshot.consumer, snapshot)
+        }
+        TrackWorkerCommand::RefreshDlmmBinWindow { snapshot, .. } => {
+            (snapshot.pool, snapshot.consumer, snapshot)
+        }
+        _ => return None,
+    };
+    match ctx
+        .pool_snapshot_revisions
+        .reserve_inflight_command(pool, consumer)
+    {
+        InflightReserveResult::Reserved => {}
+        InflightReserveResult::RegistryFull => {
+            ctx.fail_revision_registry_full();
+            return None;
+        }
+    }
+    match ctx.pool_snapshot_revisions.assign_next(snapshot) {
+        RevisionAssignResult::Assigned(_) => Some((pool, consumer)),
+        RevisionAssignResult::RegistryFull => {
+            ctx.pool_snapshot_revisions
+                .release_inflight_command(pool, consumer);
+            ctx.fail_revision_registry_full();
+            None
+        }
+        RevisionAssignResult::KeyNotRegistered => {
+            ctx.pool_snapshot_revisions
+                .release_inflight_command(pool, consumer);
+            ctx.fail_revision_registry_full();
+            None
+        }
     }
 }
 
-fn pool_command_meta(job: &TrackWorkerCommand) -> Option<(Pubkey, ConsumerId)> {
-    pending_pool_command_for_stash(job).map(|cmd| (cmd.pool(), cmd.consumer()))
+fn pool_snapshot_command_meta(job: &TrackWorkerCommand) -> bool {
+    matches!(
+        job,
+        TrackWorkerCommand::RegisterPoolGeyserReserves { .. }
+            | TrackWorkerCommand::RegisterPoolVaultsFromAccount { .. }
+            | TrackWorkerCommand::RegisterGeyserReservesAfterTrade { .. }
+            | TrackWorkerCommand::RefreshDlmmBinWindow { .. }
+    )
+}
+
+fn stash_pending_pool_command(
+    ctx: &MarketDataContext,
+    cmd: PendingPoolCommand,
+    pool_meta: Option<(Pubkey, ConsumerId)>,
+) {
+    let stored = if let Some((pool, consumer)) = pool_meta {
+        if ctx
+            .pool_snapshot_revisions
+            .transfer_inflight_to_pending(pool, consumer)
+        {
+            ctx.pending_pool_commands.upsert_transferred(cmd)
+        } else {
+            PendingPoolUpsertResult::Overflow
+        }
+    } else {
+        ctx.pending_pool_commands.upsert(cmd)
+    };
+    if stored == PendingPoolUpsertResult::Overflow {
+        ctx.fail_pending_pool_overflow();
+    }
 }
 
 fn enqueue_track_worker(ctx: &MarketDataContext, mut job: TrackWorkerCommand) -> bool {
     if ctx.pending_pool_overflow_latched.load(Ordering::Acquire) {
         return false;
     }
-    let pool_meta = pool_command_meta(&job);
-    if pool_meta.is_some() && !assign_pool_snapshot_revision(ctx, &mut job) {
+    let is_pool_snapshot = pool_snapshot_command_meta(&job);
+    let pool_meta = prepare_pool_snapshot_for_enqueue(ctx, &mut job);
+    if is_pool_snapshot && pool_meta.is_none() {
         return false;
     }
     let pending = pending_pool_command_for_stash(&job);
     let Some(sender) = ctx.track_worker.read().clone() else {
         if let Some(cmd) = pending {
-            if ctx.pending_pool_commands.upsert(cmd) == PendingPoolUpsertResult::Overflow {
-                ctx.fail_pending_pool_overflow();
-            }
+            stash_pending_pool_command(ctx, cmd, pool_meta);
         }
         ctx.mark_track_worker_dirty();
         return false;
     };
     if track_worker_try_enqueue(&sender, job) {
-        if let Some((pool, consumer)) = pool_meta {
-            ctx.pool_snapshot_revisions.inc_inflight_ref(pool, consumer);
-        }
         return true;
     }
     if let Some(cmd) = pending {
-        if ctx.pending_pool_commands.upsert(cmd) == PendingPoolUpsertResult::Overflow {
-            ctx.fail_pending_pool_overflow();
-        }
+        stash_pending_pool_command(ctx, cmd, pool_meta);
     }
     ctx.mark_track_worker_dirty();
     false
@@ -2484,21 +2505,18 @@ impl TrackWorkerContext for MarketDataContext {
         desired: &mut DesiredExplicitSet,
         snapshot: &PoolExplicitSnapshot,
     ) -> bool {
-        if !self
-            .pool_snapshot_revisions
-            .should_apply_and_record(snapshot)
-        {
-            return false;
-        }
-        match desired.try_admit_group(snapshot.consumer, snapshot.owner, snapshot.all_pubkeys()) {
-            AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey => {
-                self.register_tracked_assets_from_pool_snapshot(snapshot)
+        self.apply_pool_snapshot_command(desired, snapshot, true, |desired| {
+            match desired.try_admit_group(snapshot.consumer, snapshot.owner, snapshot.all_pubkeys())
+            {
+                AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey => {
+                    self.register_tracked_assets_from_pool_snapshot(snapshot)
+                }
+                rejected => {
+                    record_admission_rejection(snapshot.consumer, rejected);
+                    false
+                }
             }
-            rejected => {
-                record_admission_rejection(snapshot.consumer, rejected);
-                false
-            }
-        }
+        })
     }
 
     fn commit_register_pool_vaults_from_account(
@@ -2506,25 +2524,22 @@ impl TrackWorkerContext for MarketDataContext {
         desired: &mut DesiredExplicitSet,
         snapshot: &PoolExplicitSnapshot,
     ) -> bool {
-        if !self
-            .pool_snapshot_revisions
-            .should_apply_and_record(snapshot)
-        {
-            return false;
-        }
-        self.try_publish_balance_updated_from_cache(snapshot.pool);
-        if !self.hot_pool_registry.is_hot_pool(snapshot.pool) {
-            return false;
-        }
-        match desired.try_admit_group(snapshot.consumer, snapshot.owner, snapshot.all_pubkeys()) {
-            AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey => {
-                self.register_tracked_assets_from_pool_snapshot(snapshot)
+        self.apply_pool_snapshot_command(desired, snapshot, true, |desired| {
+            self.try_publish_balance_updated_from_cache(snapshot.pool);
+            if !self.hot_pool_registry.is_hot_pool(snapshot.pool) {
+                return false;
             }
-            rejected => {
-                record_admission_rejection(snapshot.consumer, rejected);
-                false
+            match desired.try_admit_group(snapshot.consumer, snapshot.owner, snapshot.all_pubkeys())
+            {
+                AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey => {
+                    self.register_tracked_assets_from_pool_snapshot(snapshot)
+                }
+                rejected => {
+                    record_admission_rejection(snapshot.consumer, rejected);
+                    false
+                }
             }
-        }
+        })
     }
 
     fn commit_register_geyser_reserves_after_trade(
@@ -2532,25 +2547,22 @@ impl TrackWorkerContext for MarketDataContext {
         desired: &mut DesiredExplicitSet,
         snapshot: &PoolExplicitSnapshot,
     ) -> bool {
-        if !self
-            .pool_snapshot_revisions
-            .should_apply_and_record(snapshot)
-        {
-            return false;
-        }
-        self.try_publish_balance_updated_from_cache(snapshot.pool);
-        if !self.hot_pool_registry.pool_has_momentum(snapshot.pool) {
-            return false;
-        }
-        match desired.try_admit_group(snapshot.consumer, snapshot.owner, snapshot.all_pubkeys()) {
-            AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey => {
-                self.register_tracked_assets_from_pool_snapshot(snapshot)
+        self.apply_pool_snapshot_command(desired, snapshot, true, |desired| {
+            self.try_publish_balance_updated_from_cache(snapshot.pool);
+            if !self.hot_pool_registry.pool_has_momentum(snapshot.pool) {
+                return false;
             }
-            rejected => {
-                record_admission_rejection(snapshot.consumer, rejected);
-                false
+            match desired.try_admit_group(snapshot.consumer, snapshot.owner, snapshot.all_pubkeys())
+            {
+                AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey => {
+                    self.register_tracked_assets_from_pool_snapshot(snapshot)
+                }
+                rejected => {
+                    record_admission_rejection(snapshot.consumer, rejected);
+                    false
+                }
             }
-        }
+        })
     }
 
     fn commit_refresh_dlmm_bin_window(
@@ -2559,39 +2571,36 @@ impl TrackWorkerContext for MarketDataContext {
         snapshot: &PoolExplicitSnapshot,
         new_active_id: i32,
     ) -> bool {
-        if !self
-            .pool_snapshot_revisions
-            .should_apply_and_record(snapshot)
-        {
-            return false;
-        }
-        if !self.hot_pool_registry.pool_has_arb(snapshot.pool) {
-            return false;
-        }
-        if self
-            .dlmm_registered_active_id
-            .read()
-            .get(&snapshot.pool)
-            .copied()
-            == Some(new_active_id)
-        {
-            return false;
-        }
-        match desired.try_admit_group(snapshot.consumer, snapshot.owner, snapshot.all_pubkeys()) {
-            AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey => {
-                let changed = self.register_tracked_assets_from_pool_snapshot(snapshot);
-                if changed {
-                    self.dlmm_registered_active_id
-                        .write()
-                        .insert(snapshot.pool, new_active_id);
+        self.apply_pool_snapshot_command(desired, snapshot, true, |desired| {
+            if !self.hot_pool_registry.pool_has_arb(snapshot.pool) {
+                return false;
+            }
+            if self
+                .dlmm_registered_active_id
+                .read()
+                .get(&snapshot.pool)
+                .copied()
+                == Some(new_active_id)
+            {
+                return false;
+            }
+            match desired.try_admit_group(snapshot.consumer, snapshot.owner, snapshot.all_pubkeys())
+            {
+                AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey => {
+                    let changed = self.register_tracked_assets_from_pool_snapshot(snapshot);
+                    if changed {
+                        self.dlmm_registered_active_id
+                            .write()
+                            .insert(snapshot.pool, new_active_id);
+                    }
+                    changed
                 }
-                changed
+                rejected => {
+                    record_admission_rejection(snapshot.consumer, rejected);
+                    false
+                }
             }
-            rejected => {
-                record_admission_rejection(snapshot.consumer, rejected);
-                false
-            }
-        }
+        })
     }
 
     fn publish_admitted_explicit_physical(&self, desired: &DesiredExplicitSet) {
@@ -3264,16 +3273,84 @@ impl MarketDataContext {
         self.geyser_connect_barrier.mark_failed();
     }
 
-    fn acquire_pool_revision_slot(&self, pool: Pubkey, consumer: ConsumerId) -> bool {
-        match self
-            .pool_snapshot_revisions
-            .try_acquire_active(pool, consumer)
-        {
+    fn pool_snapshot_consumer_demand_valid(&self, snapshot: &PoolExplicitSnapshot) -> bool {
+        match snapshot.consumer {
+            ConsumerId::Momentum => {
+                self.hot_pool_registry.pool_has_momentum(snapshot.pool)
+                    || self.hot_pool_registry.pool_has_any_pin(snapshot.pool)
+            }
+            ConsumerId::Arb => self.hot_pool_registry.pool_has_arb(snapshot.pool),
+            _ => self.hot_pool_registry.is_hot_pool(snapshot.pool),
+        }
+    }
+
+    fn apply_pool_snapshot_command(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        snapshot: &PoolExplicitSnapshot,
+        finish_inflight: bool,
+        apply: impl FnOnce(&mut DesiredExplicitSet) -> bool,
+    ) -> bool {
+        if !self.pool_snapshot_revisions.revision_acceptable(snapshot) {
+            if finish_inflight {
+                self.pool_snapshot_revisions
+                    .finish_pool_command(snapshot, PoolCommandTerminal::StaleRevision);
+            }
+            return false;
+        }
+        if !self.pool_snapshot_consumer_demand_valid(snapshot) {
+            if finish_inflight {
+                self.pool_snapshot_revisions
+                    .finish_pool_command(snapshot, PoolCommandTerminal::UnpinnedRejected);
+            }
+            return false;
+        }
+        let applied = apply(desired);
+        if finish_inflight {
+            let terminal = if applied {
+                PoolCommandTerminal::Applied
+            } else {
+                PoolCommandTerminal::AdmissionRejected
+            };
+            self.pool_snapshot_revisions
+                .finish_pool_command(snapshot, terminal);
+        }
+        applied
+    }
+
+    fn replay_pool_snapshot_command(
+        &self,
+        desired: &mut DesiredExplicitSet,
+        snapshot: &PoolExplicitSnapshot,
+        apply: impl FnOnce(&mut DesiredExplicitSet) -> bool,
+    ) -> bool {
+        self.apply_pool_snapshot_command(desired, snapshot, false, apply)
+    }
+
+    fn acquire_revision_owner(&self, owner: RevisionActiveOwner) -> bool {
+        match self.pool_snapshot_revisions.acquire_active_owner(owner) {
             RevisionAcquireResult::Acquired => true,
             RevisionAcquireResult::RegistryFull => {
                 self.fail_revision_registry_full();
                 false
             }
+        }
+    }
+
+    fn acquire_momentum_revision_owner(&self, mint: Pubkey, pool: Pubkey) -> bool {
+        self.acquire_revision_owner(RevisionActiveOwner::MomentumMintPool { mint, pool })
+    }
+
+    fn acquire_arb_revision_owner(&self, pool: Pubkey) -> bool {
+        self.acquire_revision_owner(RevisionActiveOwner::ArbPool { pool })
+    }
+
+    #[allow(dead_code)]
+    fn acquire_pool_revision_slot(&self, pool: Pubkey, consumer: ConsumerId) -> bool {
+        match consumer {
+            ConsumerId::Momentum => self.acquire_momentum_revision_owner(pool, pool),
+            ConsumerId::Arb => self.acquire_arb_revision_owner(pool),
+            _ => false,
         }
     }
 
@@ -3318,19 +3395,103 @@ impl MarketDataContext {
     ) {
         match command {
             PendingPoolCommand::RegisterReserves(snapshot) => {
-                let _ = self.commit_register_pool_geyser_reserves(desired, &snapshot);
+                let _ =
+                    self.replay_pool_snapshot_command(desired, &snapshot, |desired| match desired
+                        .try_admit_group(snapshot.consumer, snapshot.owner, snapshot.all_pubkeys())
+                    {
+                        AdmissionResult::Admitted { .. }
+                        | AdmissionResult::OwnerAddedNoNewPubkey => {
+                            self.register_tracked_assets_from_pool_snapshot(&snapshot)
+                        }
+                        rejected => {
+                            record_admission_rejection(snapshot.consumer, rejected);
+                            false
+                        }
+                    });
             }
             PendingPoolCommand::VaultsFromAccount(snapshot) => {
-                let _ = self.commit_register_pool_vaults_from_account(desired, &snapshot);
+                let _ = self.replay_pool_snapshot_command(desired, &snapshot, |desired| {
+                    self.try_publish_balance_updated_from_cache(snapshot.pool);
+                    if !self.hot_pool_registry.is_hot_pool(snapshot.pool) {
+                        return false;
+                    }
+                    match desired.try_admit_group(
+                        snapshot.consumer,
+                        snapshot.owner,
+                        snapshot.all_pubkeys(),
+                    ) {
+                        AdmissionResult::Admitted { .. }
+                        | AdmissionResult::OwnerAddedNoNewPubkey => {
+                            self.register_tracked_assets_from_pool_snapshot(&snapshot)
+                        }
+                        rejected => {
+                            record_admission_rejection(snapshot.consumer, rejected);
+                            false
+                        }
+                    }
+                });
             }
             PendingPoolCommand::AfterTrade(snapshot) => {
-                let _ = self.commit_register_geyser_reserves_after_trade(desired, &snapshot);
+                let _ = self.replay_pool_snapshot_command(desired, &snapshot, |desired| {
+                    self.try_publish_balance_updated_from_cache(snapshot.pool);
+                    if !self.hot_pool_registry.pool_has_momentum(snapshot.pool) {
+                        return false;
+                    }
+                    match desired.try_admit_group(
+                        snapshot.consumer,
+                        snapshot.owner,
+                        snapshot.all_pubkeys(),
+                    ) {
+                        AdmissionResult::Admitted { .. }
+                        | AdmissionResult::OwnerAddedNoNewPubkey => {
+                            self.register_tracked_assets_from_pool_snapshot(&snapshot)
+                        }
+                        rejected => {
+                            record_admission_rejection(snapshot.consumer, rejected);
+                            false
+                        }
+                    }
+                });
             }
             PendingPoolCommand::RefreshDlmm {
                 snapshot,
                 new_active_id,
             } => {
-                let _ = self.commit_refresh_dlmm_bin_window(desired, &snapshot, new_active_id);
+                let _ = self.replay_pool_snapshot_command(desired, &snapshot, |desired| {
+                    if !self.hot_pool_registry.pool_has_arb(snapshot.pool) {
+                        return false;
+                    }
+                    if self
+                        .dlmm_registered_active_id
+                        .read()
+                        .get(&snapshot.pool)
+                        .copied()
+                        == Some(new_active_id)
+                    {
+                        return false;
+                    }
+                    match desired.try_admit_group(
+                        snapshot.consumer,
+                        snapshot.owner,
+                        snapshot.all_pubkeys(),
+                    ) {
+                        AdmissionResult::Admitted { .. }
+                        | AdmissionResult::OwnerAddedNoNewPubkey => {
+                            let changed =
+                                self.register_tracked_assets_from_pool_snapshot(&snapshot);
+                            if changed {
+                                self.dlmm_registered_active_id
+                                    .write()
+                                    .insert(snapshot.pool, new_active_id);
+                            }
+                            changed
+                        }
+                        rejected => {
+                            record_admission_rejection(snapshot.consumer, rejected);
+                            false
+                        }
+                    }
+                });
             }
         }
     }
@@ -3350,13 +3511,33 @@ impl MarketDataContext {
         }
     }
 
-    fn apply_pending_track_worker_work(&self, desired: &mut DesiredExplicitSet) {
-        if self.pending_pool_overflow_latched.load(Ordering::Acquire) {
+    fn try_recover_pending_pool_overflow(&self, desired: &mut DesiredExplicitSet) {
+        if !self.pending_pool_overflow_latched.load(Ordering::Acquire) {
             return;
         }
-        if self.pending_pool_commands.overflowed() {
-            self.fail_pending_pool_overflow();
+        if !self.pending_pool_commands.is_empty() {
             return;
+        }
+        self.converge_explicit_admission(desired);
+        self.refresh_explicit_admission_metrics(desired);
+        if desired.cap_overflow() > 0 {
+            return;
+        }
+        let cap = self.config.read().max_tracked_accounts;
+        if self.wallet_explicit_demand_pubkeys().len() > cap {
+            return;
+        }
+        *self.geyser_explicit_config_error.write() = None;
+        self.geyser_explicit_ready.store(true, Ordering::Release);
+        self.clear_pending_pool_overflow_latch();
+        let _ = enqueue_track_worker(self, TrackWorkerCommand::ScheduleGeyserPushDebounced);
+    }
+
+    fn apply_pending_track_worker_work(&self, desired: &mut DesiredExplicitSet) {
+        if !self.pending_pool_overflow_latched.load(Ordering::Acquire)
+            && self.pending_pool_commands.overflowed()
+        {
+            self.fail_pending_pool_overflow();
         }
         let (demand, token_accounts, _) = self.wallet_explicit_pending.snapshot();
         if !demand.is_empty() || !token_accounts.is_empty() {
@@ -3364,6 +3545,10 @@ impl MarketDataContext {
         }
         for command in self.pending_pool_commands.drain_all() {
             self.replay_pending_pool_command(desired, command);
+        }
+        if self.pending_pool_overflow_latched.load(Ordering::Acquire) {
+            self.try_recover_pending_pool_overflow(desired);
+            return;
         }
         if self.pending_pool_commands.is_empty() {
             self.clear_pending_pool_overflow_latch();
@@ -5462,7 +5647,7 @@ impl MarketDataContext {
                 continue;
             };
             self.hot_pool_registry.pin_pool(mint_pk, pool_pk);
-            if !self.acquire_pool_revision_slot(pool_pk, ConsumerId::Momentum) {
+            if !self.acquire_momentum_revision_owner(mint_pk, pool_pk) {
                 continue;
             }
             if self.register_geyser_reserves_for_momentum_active_pool(desired, pool_pk) {
@@ -5502,6 +5687,8 @@ impl MarketDataContext {
         pool: Pubkey,
     ) -> bool {
         self.hot_pool_registry.unpin_pool(mint, pool);
+        self.pool_snapshot_revisions
+            .release_active_owner(RevisionActiveOwner::MomentumMintPool { mint, pool });
         let consumer = ConsumerId::Momentum;
         let refs = self.pool_snapshot_revisions.key_refs(pool, consumer);
         let has_pending = self.pending_pool_commands.has_pending(pool, consumer);
@@ -5513,8 +5700,6 @@ impl MarketDataContext {
             desired.remove_group(consumer, OwnerKey::Pool(pool));
             self.pool_snapshot_revisions
                 .maybe_retire_key(pool, consumer, false, false);
-            self.pool_snapshot_revisions
-                .release_active_if_idle(pool, consumer);
         }
         let mut changed = false;
         // Pool-level reserve pins are shared: only demote vaults/bin arrays when no `(m, pool)`
@@ -5656,7 +5841,7 @@ impl MarketDataContext {
                 continue;
             };
             self.hot_pool_registry.pin_arb_pool(pool_pk);
-            if !self.acquire_pool_revision_slot(pool_pk, ConsumerId::Arb) {
+            if !self.acquire_arb_revision_owner(pool_pk) {
                 continue;
             }
             if self.register_geyser_reserves_for_arb_active_pool(desired, pool_pk) {
@@ -5714,6 +5899,8 @@ impl MarketDataContext {
         pool: Pubkey,
     ) -> bool {
         self.hot_pool_registry.unpin_arb_pool(pool);
+        self.pool_snapshot_revisions
+            .release_active_owner(RevisionActiveOwner::ArbPool { pool });
         let consumer = ConsumerId::Arb;
         let refs = self.pool_snapshot_revisions.key_refs(pool, consumer);
         let has_pending = self.pending_pool_commands.has_pending(pool, consumer);
@@ -5726,8 +5913,6 @@ impl MarketDataContext {
             desired.remove_group(consumer, OwnerKey::Pool(pool));
             self.pool_snapshot_revisions
                 .maybe_retire_key(pool, consumer, false, false);
-            self.pool_snapshot_revisions
-                .release_active_if_idle(pool, consumer);
         }
         let mut changed = false;
         if !self.hot_pool_registry.pool_has_arb(pool)
@@ -16710,7 +16895,7 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
         ctx.hot_pool_registry.pin_pool(base, pool);
-        assert!(ctx.acquire_pool_revision_slot(pool, ConsumerId::Momentum));
+        assert!(ctx.acquire_momentum_revision_owner(base, pool));
         let snapshot = ctx
             .build_pool_explicit_snapshot(pool, GeyserPinReason::MomentumActive)
             .expect("snapshot");
@@ -16839,7 +17024,7 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
         ctx.hot_pool_registry.pin_arb_pool(pool);
-        assert!(ctx.acquire_pool_revision_slot(pool, ConsumerId::Arb));
+        assert!(ctx.acquire_arb_revision_owner(pool));
 
         let mut snapshot = ctx
             .build_pool_explicit_snapshot(pool, GeyserPinReason::ArbMultiDex)
@@ -16848,8 +17033,11 @@ mod pr_b_geyser_tracking_tests {
             RevisionAssignResult::Assigned(_) => {}
             other => panic!("assign failed: {other:?}"),
         }
-        ctx.pool_snapshot_revisions
-            .inc_inflight_ref(pool, ConsumerId::Arb);
+        assert_eq!(
+            ctx.pool_snapshot_revisions
+                .reserve_inflight_command(pool, ConsumerId::Arb),
+            InflightReserveResult::Reserved
+        );
         assert!(!snapshot.vaults.is_empty());
         assert!(!snapshot.bin_arrays.is_empty());
         assert!(!snapshot.mints.is_empty());
@@ -16875,14 +17063,25 @@ mod pr_b_geyser_tracking_tests {
         pool: Pubkey,
         consumer: ConsumerId,
         snapshot: &mut PoolExplicitSnapshot,
+        pin_mint: Option<Pubkey>,
     ) -> u64 {
-        assert!(ctx.acquire_pool_revision_slot(pool, consumer));
-        let rev = match ctx.pool_snapshot_revisions.assign_next(snapshot) {
+        match consumer {
+            ConsumerId::Momentum => {
+                let mint = pin_mint.unwrap_or(pool);
+                assert!(ctx.acquire_momentum_revision_owner(mint, pool));
+            }
+            ConsumerId::Arb => assert!(ctx.acquire_arb_revision_owner(pool)),
+            _ => panic!("unsupported consumer for test assign: {consumer:?}"),
+        }
+        assert_eq!(
+            ctx.pool_snapshot_revisions
+                .reserve_inflight_command(pool, consumer),
+            InflightReserveResult::Reserved
+        );
+        match ctx.pool_snapshot_revisions.assign_next(snapshot) {
             RevisionAssignResult::Assigned(rev) => rev,
             other => panic!("assign failed: {other:?}"),
-        };
-        ctx.pool_snapshot_revisions.inc_inflight_ref(pool, consumer);
-        rev
+        }
     }
 
     #[test]
@@ -16892,7 +17091,10 @@ mod pr_b_geyser_tracking_tests {
         let pool_a = Pubkey::new_unique();
         let pool_b = Pubkey::new_unique();
         assert_eq!(
-            revisions.try_acquire_active(pool_a, ConsumerId::Momentum),
+            revisions.acquire_active_owner(RevisionActiveOwner::MomentumMintPool {
+                mint: pool_a,
+                pool: pool_a,
+            }),
             RevisionAcquireResult::Acquired
         );
         let mk_snapshot = |pool: Pubkey| PoolExplicitSnapshot {
@@ -16951,7 +17153,7 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
         ctx.hot_pool_registry.pin_arb_pool(pool);
-        assert!(ctx.acquire_pool_revision_slot(pool, ConsumerId::Arb));
+        assert!(ctx.acquire_arb_revision_owner(pool));
 
         let mk_typed = |vault_pk: Pubkey, bin_pk: Pubkey, mint_pk: Pubkey| PoolExplicitSnapshot {
             pool,
@@ -17079,7 +17281,7 @@ mod pr_b_geyser_tracking_tests {
         );
         ctx.hot_pool_registry.pin_arb_pool(pool);
         ctx.hot_pool_registry.pin_pool(base, pool);
-        assert!(ctx.acquire_pool_revision_slot(pool, ConsumerId::Arb));
+        assert!(ctx.acquire_arb_revision_owner(pool));
 
         let mk_typed =
             move |bin_pk: Pubkey, mint_pk: Pubkey, extra_vault: Pubkey| PoolExplicitSnapshot {
@@ -17159,7 +17361,8 @@ mod pr_b_geyser_tracking_tests {
 
         let mut desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
         let mut snapshot_new = mk_typed(bin_new, mint_new, vault_new);
-        let rev_new = assign_pool_snapshot_for_test(&ctx, pool, ConsumerId::Arb, &mut snapshot_new);
+        let rev_new =
+            assign_pool_snapshot_for_test(&ctx, pool, ConsumerId::Arb, &mut snapshot_new, None);
         assert!(ctx.commit_register_pool_geyser_reserves(&mut desired, &snapshot_new));
         assert_eq!(
             ctx.pool_snapshot_revisions
@@ -17213,7 +17416,8 @@ mod pr_b_geyser_tracking_tests {
 
         let mut desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
         let mut snapshot_new = mk_typed(bin_new, mint_new, vault_new);
-        let rev_new = assign_pool_snapshot_for_test(&ctx, pool, ConsumerId::Arb, &mut snapshot_new);
+        let rev_new =
+            assign_pool_snapshot_for_test(&ctx, pool, ConsumerId::Arb, &mut snapshot_new, None);
         assert!(ctx.commit_register_pool_geyser_reserves(&mut desired, &snapshot_new));
 
         let mut snapshot_stale = mk_typed(bin_old, mint_old, vault_old);
@@ -17259,20 +17463,22 @@ mod pr_b_geyser_tracking_tests {
 
         let mut snap_reserves = mk_typed(bin_v1, mint_v1, vault_v1);
         let rev_reserves =
-            assign_pool_snapshot_for_test(&ctx, pool, ConsumerId::Arb, &mut snap_reserves);
+            assign_pool_snapshot_for_test(&ctx, pool, ConsumerId::Arb, &mut snap_reserves, None);
         assert!(ctx.commit_register_pool_geyser_reserves(&mut desired, &snap_reserves));
 
         let mut snap_vaults = mk_typed(bin_v2, mint_v2, vault_v2);
         let rev_vaults =
-            assign_pool_snapshot_for_test(&ctx, pool, ConsumerId::Arb, &mut snap_vaults);
+            assign_pool_snapshot_for_test(&ctx, pool, ConsumerId::Arb, &mut snap_vaults, None);
         assert!(ctx.commit_register_pool_vaults_from_account(&mut desired, &snap_vaults));
 
         let mut snap_trade = mk_typed(bin_v3, mint_v3, vault_v3);
-        let rev_trade = assign_pool_snapshot_for_test(&ctx, pool, ConsumerId::Arb, &mut snap_trade);
+        let rev_trade =
+            assign_pool_snapshot_for_test(&ctx, pool, ConsumerId::Arb, &mut snap_trade, None);
         assert!(ctx.commit_register_geyser_reserves_after_trade(&mut desired, &snap_trade));
 
         let mut snap_dlmm = mk_typed(bin_v4, mint_v4, vault_v4);
-        let rev_dlmm = assign_pool_snapshot_for_test(&ctx, pool, ConsumerId::Arb, &mut snap_dlmm);
+        let rev_dlmm =
+            assign_pool_snapshot_for_test(&ctx, pool, ConsumerId::Arb, &mut snap_dlmm, None);
         assert!(ctx.commit_refresh_dlmm_bin_window(&mut desired, &snap_dlmm, 9));
 
         assert!(rev_vaults > rev_reserves);
@@ -17400,6 +17606,63 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
+    fn pending_overflow_recovers_after_drain_without_restart() {
+        use ironcrab::execution::live_pool_cache::RaydiumCpmmState;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: mint,
+                token_1_mint: quote,
+                token_0_vault: base_vault,
+                token_1_vault: quote_vault,
+                reserve_0: Some(1),
+                reserve_1: Some(1),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+        assert!(ctx.acquire_momentum_revision_owner(mint, pool));
+        let snapshot = ctx
+            .build_pool_explicit_snapshot(pool, GeyserPinReason::MomentumActive)
+            .expect("snapshot");
+        assert_eq!(
+            ctx.pending_pool_commands
+                .upsert(PendingPoolCommand::RegisterReserves(snapshot)),
+            PendingPoolUpsertResult::Stored
+        );
+        ctx.fail_pending_pool_overflow();
+        assert!(ctx.pending_pool_overflow_latched.load(Ordering::Acquire));
+        assert!(!ctx.geyser_explicit_readiness_ok());
+
+        let mut desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
+        ctx.apply_pending_track_worker_work(&mut desired);
+
+        assert!(
+            !ctx.pending_pool_overflow_latched.load(Ordering::Acquire),
+            "overflow latch must clear after pending drain + convergence"
+        );
+        assert!(ctx.geyser_explicit_readiness_ok());
+        assert!(!ctx.pending_pool_commands.overflowed());
+        assert!(desired.contains(&base_vault));
+        let refs = ctx
+            .pool_snapshot_revisions
+            .key_refs(pool, ConsumerId::Momentum);
+        assert_eq!(refs.inflight, 0);
+        assert_eq!(refs.pending, 0);
+        assert_eq!(refs.active_owners, 1);
+    }
+
+    #[test]
     fn momentum_two_mint_same_pool_delayed_registration_retains_desired() {
         use ironcrab::execution::live_pool_cache::RaydiumCpmmState;
 
@@ -17428,9 +17691,10 @@ mod pr_b_geyser_tracking_tests {
 
         let mut desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
         ctx.hot_pool_registry.pin_pool(mint_a, pool);
-        assert!(ctx.acquire_pool_revision_slot(pool, ConsumerId::Momentum));
+        assert!(ctx.acquire_momentum_revision_owner(mint_a, pool));
         assert!(ctx.register_geyser_reserves_for_momentum_active_pool(&mut desired, pool));
         ctx.hot_pool_registry.pin_pool(mint_b, pool);
+        assert!(ctx.acquire_momentum_revision_owner(mint_b, pool));
         assert!(
             desired
                 .snapshot_owner_groups()
