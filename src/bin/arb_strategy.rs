@@ -744,14 +744,21 @@ struct ArbTrackSelectionCoalescer {
 
 impl ArbTrackSelectionCoalescer {
     /// Returns `true` when dirty overflow requires a full reconcile recovery.
+    ///
+    /// Lock-free bounded state: `dirty_mints` never exceeds
+    /// `ARB_TRACK_SELECTION_DIRTY_MINTS_CAP`. Overflow mints are not retained; full
+    /// reconcile scans current tracker truth and will include eligible mints.
     fn ingest(&mut self, job: ArbTrackSelectionJob) -> bool {
         match job {
             ArbTrackSelectionJob::MarkDirty { mint } => {
-                self.dirty_mints.insert(mint);
-                if self.dirty_mints.len() > ARB_TRACK_SELECTION_DIRTY_MINTS_CAP {
+                if self.dirty_mints.contains(&mint) {
+                    return false;
+                }
+                if self.dirty_mints.len() >= ARB_TRACK_SELECTION_DIRTY_MINTS_CAP {
                     self.dirty_overflow = true;
                     return true;
                 }
+                self.dirty_mints.insert(mint);
                 false
             }
             ArbTrackSelectionJob::FullReconcile => {
@@ -10855,9 +10862,50 @@ mod two_hop_price_tests {
         }));
         let (dirty, full, overflow) = coalescer.take_batch();
         assert!(!full);
+        assert!(
+            overflow,
+            "overflow must schedule authoritative full reconcile"
+        );
+        assert_eq!(dirty.len(), ARB_TRACK_SELECTION_DIRTY_MINTS_CAP);
+        assert!(
+            !dirty.iter().any(|m| m == "overflow_mint"),
+            "overflow mint is not retained; full reconcile recovers from tracker truth"
+        );
+    }
+
+    #[test]
+    fn arb_track_selection_coalescer_burst_never_exceeds_dirty_cap() {
+        let mut coalescer = ArbTrackSelectionCoalescer::default();
+        let cap = ARB_TRACK_SELECTION_DIRTY_MINTS_CAP;
+        let mut overflow_seen = false;
+        for i in 0..cap + 5_000 {
+            if coalescer.ingest(ArbTrackSelectionJob::MarkDirty {
+                mint: format!("burst_{i}"),
+            }) {
+                overflow_seen = true;
+            }
+        }
+        assert!(overflow_seen);
+        let (dirty, _, overflow) = coalescer.take_batch();
         assert!(overflow);
-        assert_eq!(dirty.len(), ARB_TRACK_SELECTION_DIRTY_MINTS_CAP + 1);
-        assert!(dirty.iter().any(|m| m == "overflow_mint"));
+        assert_eq!(dirty.len(), cap);
+    }
+
+    #[test]
+    fn arb_track_selection_coalescer_duplicate_dirty_at_cap_is_idempotent() {
+        let mut coalescer = ArbTrackSelectionCoalescer::default();
+        let cap = ARB_TRACK_SELECTION_DIRTY_MINTS_CAP;
+        for i in 0..cap {
+            assert!(!coalescer.ingest(ArbTrackSelectionJob::MarkDirty {
+                mint: format!("mint_{i}"),
+            }));
+        }
+        assert!(!coalescer.ingest(ArbTrackSelectionJob::MarkDirty {
+            mint: "mint_0".to_string(),
+        }));
+        let (dirty, _, overflow) = coalescer.take_batch();
+        assert!(!overflow);
+        assert_eq!(dirty.len(), cap);
     }
 
     #[test]
