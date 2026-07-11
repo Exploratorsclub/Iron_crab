@@ -11,54 +11,185 @@ use crate::market_data::track::desired_set::ConsumerId;
 use crate::market_data::track::worker_commands::{PoolExplicitSnapshot, TrackWorkerCommand};
 
 /// Monotonic per-(pool,consumer) revision sequencer for pool snapshot commands.
-#[derive(Debug, Default)]
+///
+/// Revisions pack `(generation << 32) | sequence`. Tombstoned generations reject delayed stale
+/// commands after registry cleanup/eviction.
+#[derive(Debug)]
 pub struct PoolSnapshotRevisionSequencer {
-    issued: Mutex<HashMap<(Pubkey, ConsumerId), u64>>,
-    last_applied: Mutex<HashMap<(Pubkey, ConsumerId), u64>>,
+    max_keys: usize,
+    slots: Mutex<HashMap<(Pubkey, ConsumerId), RevisionSlot>>,
+    tombstones: Mutex<HashMap<(Pubkey, ConsumerId), u32>>,
+    lru_stamp: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+struct RevisionSlot {
+    generation: u32,
+    issued_seq: u32,
+    applied_seq: u32,
+    lru_stamp: u64,
+}
+
+const REVISION_SEQ_MASK: u64 = 0xFFFF_FFFF;
+const REVISION_GEN_SHIFT: u32 = 32;
+const DEFAULT_MAX_REVISION_SLOTS: usize = 4096;
+
+impl Default for PoolSnapshotRevisionSequencer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PoolSnapshotRevisionSequencer {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_max_keys(DEFAULT_MAX_REVISION_SLOTS)
     }
 
-    pub fn assign_next(&self, snapshot: &mut PoolExplicitSnapshot) -> u64 {
-        let key = (snapshot.pool, snapshot.consumer);
-        let mut issued = self.issued.lock().expect("pool revision issued lock");
-        let entry = issued.entry(key).or_insert(0);
-        *entry = entry.saturating_add(1);
-        snapshot.revision = *entry;
-        *entry
-    }
-
-    pub fn should_apply_and_record(&self, snapshot: &PoolExplicitSnapshot) -> bool {
-        let key = (snapshot.pool, snapshot.consumer);
-        let mut applied = self
-            .last_applied
-            .lock()
-            .expect("pool revision applied lock");
-        if snapshot.revision <= applied.get(&key).copied().unwrap_or(0) {
-            return false;
+    pub fn with_max_keys(max_keys: usize) -> Self {
+        Self {
+            max_keys: max_keys.max(64),
+            slots: Mutex::new(HashMap::new()),
+            tombstones: Mutex::new(HashMap::new()),
+            lru_stamp: AtomicU64::new(0),
         }
-        applied.insert(key, snapshot.revision);
-        true
     }
 
-    pub fn current_issued(&self, pool: Pubkey, consumer: ConsumerId) -> u64 {
-        self.issued
+    pub fn pack_revision(generation: u32, sequence: u32) -> u64 {
+        ((generation as u64) << REVISION_GEN_SHIFT) | (sequence as u64)
+    }
+
+    pub fn unpack_revision(revision: u64) -> (u32, u32) {
+        (
+            (revision >> REVISION_GEN_SHIFT) as u32,
+            (revision & REVISION_SEQ_MASK) as u32,
+        )
+    }
+
+    pub fn revision_sequence(revision: u64) -> u32 {
+        Self::unpack_revision(revision).1
+    }
+
+    pub fn revision_generation(revision: u64) -> u32 {
+        Self::unpack_revision(revision).0
+    }
+
+    fn next_lru_stamp(&self) -> u64 {
+        self.lru_stamp
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1)
+    }
+
+    fn tombstone_generation(&self, key: (Pubkey, ConsumerId)) -> u32 {
+        self.tombstones
             .lock()
-            .expect("pool revision issued lock")
-            .get(&(pool, consumer))
+            .expect("pool revision tombstones lock")
+            .get(&key)
             .copied()
             .unwrap_or(0)
     }
 
-    pub fn current_applied(&self, pool: Pubkey, consumer: ConsumerId) -> u64 {
-        self.last_applied
+    fn record_tombstone(&self, key: (Pubkey, ConsumerId), generation: u32) {
+        let mut tombstones = self
+            .tombstones
             .lock()
-            .expect("pool revision applied lock")
+            .expect("pool revision tombstones lock");
+        let entry = tombstones.entry(key).or_insert(0);
+        *entry = (*entry).max(generation);
+    }
+
+    fn evict_lru_slot(&self, slots: &mut HashMap<(Pubkey, ConsumerId), RevisionSlot>) {
+        if slots.len() < self.max_keys {
+            return;
+        }
+        let Some((key, slot)) = slots
+            .iter()
+            .min_by_key(|(_, slot)| slot.lru_stamp)
+            .map(|(k, s)| (*k, s.clone()))
+        else {
+            return;
+        };
+        self.record_tombstone(key, slot.generation);
+        slots.remove(&key);
+    }
+
+    pub fn assign_next(&self, snapshot: &mut PoolExplicitSnapshot) -> u64 {
+        let key = (snapshot.pool, snapshot.consumer);
+        let mut slots = self.slots.lock().expect("pool revision issued lock");
+        if !slots.contains_key(&key) {
+            self.evict_lru_slot(&mut slots);
+        }
+        let floor_gen = self.tombstone_generation(key);
+        let slot = slots.entry(key).or_insert_with(|| RevisionSlot {
+            generation: floor_gen.saturating_add(1).max(1),
+            issued_seq: 0,
+            applied_seq: 0,
+            lru_stamp: self.next_lru_stamp(),
+        });
+        slot.issued_seq = slot.issued_seq.saturating_add(1);
+        if slot.issued_seq == 0 {
+            slot.generation = slot.generation.saturating_add(1);
+            slot.issued_seq = 1;
+        }
+        slot.lru_stamp = self.next_lru_stamp();
+        snapshot.revision = Self::pack_revision(slot.generation, slot.issued_seq);
+        snapshot.revision
+    }
+
+    pub fn should_apply_and_record(&self, snapshot: &PoolExplicitSnapshot) -> bool {
+        if snapshot.revision == 0 {
+            return false;
+        }
+        let (gen, seq) = Self::unpack_revision(snapshot.revision);
+        let key = (snapshot.pool, snapshot.consumer);
+        if gen <= self.tombstone_generation(key) {
+            return false;
+        }
+        let mut slots = self.slots.lock().expect("pool revision issued lock");
+        let Some(slot) = slots.get_mut(&key) else {
+            return false;
+        };
+        if gen != slot.generation || seq <= slot.applied_seq {
+            return false;
+        }
+        slot.applied_seq = seq;
+        slot.lru_stamp = self.next_lru_stamp();
+        true
+    }
+
+    pub fn retire_key(&self, pool: Pubkey, consumer: ConsumerId) {
+        let key = (pool, consumer);
+        let mut slots = self.slots.lock().expect("pool revision issued lock");
+        if let Some(slot) = slots.remove(&key) {
+            self.record_tombstone(key, slot.generation);
+        }
+    }
+
+    pub fn maybe_retire_key(&self, pool: Pubkey, consumer: ConsumerId, has_pending: bool) {
+        if has_pending {
+            return;
+        }
+        self.retire_key(pool, consumer);
+    }
+
+    pub fn active_key_count(&self) -> usize {
+        self.slots.lock().expect("pool revision issued lock").len()
+    }
+
+    pub fn current_issued(&self, pool: Pubkey, consumer: ConsumerId) -> u64 {
+        self.slots
+            .lock()
+            .expect("pool revision issued lock")
             .get(&(pool, consumer))
-            .copied()
+            .map(|slot| Self::pack_revision(slot.generation, slot.issued_seq))
+            .unwrap_or(0)
+    }
+
+    pub fn current_applied(&self, pool: Pubkey, consumer: ConsumerId) -> u64 {
+        self.slots
+            .lock()
+            .expect("pool revision issued lock")
+            .get(&(pool, consumer))
+            .map(|slot| Self::pack_revision(slot.generation, slot.applied_seq))
             .unwrap_or(0)
     }
 }
@@ -334,6 +465,13 @@ impl PendingPoolRegistrations {
             .get(&(pool, consumer))
             .map(|e| e.latest_revision)
     }
+
+    pub fn has_pending(&self, pool: Pubkey, consumer: ConsumerId) -> bool {
+        self.entries
+            .lock()
+            .expect("pending pool lock")
+            .contains_key(&(pool, consumer))
+    }
 }
 
 /// Startup Geyser connect barrier: worker signals ready/failed after restore+convergence.
@@ -469,7 +607,10 @@ mod tests {
         assert_eq!(drained.len(), 1);
         match &drained[0] {
             PendingPoolCommand::AfterTrade(s) => {
-                assert_eq!(s.revision, 2);
+                assert_eq!(
+                    PoolSnapshotRevisionSequencer::revision_sequence(s.revision),
+                    2
+                );
                 assert_eq!(s.vaults[0].pubkey, new_vault);
             }
             other => panic!("expected AfterTrade latest, got {other:?}"),
@@ -546,5 +687,48 @@ mod tests {
             rev_latest
         );
         assert!(rev_new < rev_latest);
+    }
+
+    #[test]
+    fn revision_registry_bounded_after_churn_beyond_cap() {
+        let revisions = PoolSnapshotRevisionSequencer::with_max_keys(8);
+        for _ in 0..128 {
+            let pool = Pubkey::new_unique();
+            let mut snapshot = mk_snapshot(pool, Pubkey::new_unique());
+            let revision = revisions.assign_next(&mut snapshot);
+            assert!(revisions.should_apply_and_record(&snapshot));
+            assert_eq!(
+                revisions.current_applied(pool, ConsumerId::Momentum),
+                revision
+            );
+            revisions.retire_key(pool, ConsumerId::Momentum);
+        }
+        assert!(
+            revisions.active_key_count() <= 8,
+            "revision registry must stay bounded"
+        );
+    }
+
+    #[test]
+    fn retired_generation_rejects_delayed_stale_command_after_repin() {
+        let revisions = PoolSnapshotRevisionSequencer::with_max_keys(8);
+        let pool = Pubkey::new_unique();
+        let mut stale = mk_snapshot(pool, Pubkey::new_unique());
+        let stale_rev = revisions.assign_next(&mut stale);
+        assert!(revisions.should_apply_and_record(&stale));
+        revisions.retire_key(pool, ConsumerId::Momentum);
+
+        let mut fresh = mk_snapshot(pool, Pubkey::new_unique());
+        let fresh_rev = revisions.assign_next(&mut fresh);
+        assert!(
+            PoolSnapshotRevisionSequencer::revision_generation(fresh_rev)
+                > PoolSnapshotRevisionSequencer::revision_generation(stale_rev)
+        );
+        assert!(!revisions.should_apply_and_record(&stale));
+        assert!(revisions.should_apply_and_record(&fresh));
+        assert_eq!(
+            revisions.current_applied(pool, ConsumerId::Momentum),
+            fresh_rev
+        );
     }
 }

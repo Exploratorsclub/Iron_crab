@@ -5417,6 +5417,12 @@ impl MarketDataContext {
     ) -> bool {
         self.hot_pool_registry.unpin_pool(mint, pool);
         desired.remove_group(ConsumerId::Momentum, OwnerKey::Pool(pool));
+        self.pool_snapshot_revisions.maybe_retire_key(
+            pool,
+            ConsumerId::Momentum,
+            self.pending_pool_commands
+                .has_pending(pool, ConsumerId::Momentum),
+        );
         let mut changed = false;
         // Pool-level reserve pins are shared: only demote vaults/bin arrays when no `(m, pool)`
         // row remains after this unpin (PR #147 follow-up).
@@ -5613,6 +5619,12 @@ impl MarketDataContext {
     ) -> bool {
         self.hot_pool_registry.unpin_arb_pool(pool);
         desired.remove_group(ConsumerId::Arb, OwnerKey::Pool(pool));
+        self.pool_snapshot_revisions.maybe_retire_key(
+            pool,
+            ConsumerId::Arb,
+            self.pending_pool_commands
+                .has_pending(pool, ConsumerId::Arb),
+        );
         let mut changed = false;
         if !self.hot_pool_registry.pool_has_arb(pool)
             && !self.hot_pool_registry.pool_has_any_pin(pool)
@@ -12021,6 +12033,11 @@ mod pr_b_geyser_tracking_tests {
         std::thread::sleep(Duration::from_millis(80));
     }
 
+    fn one_sequence_older_revision(revision: u64) -> u64 {
+        let (generation, sequence) = PoolSnapshotRevisionSequencer::unpack_revision(revision);
+        PoolSnapshotRevisionSequencer::pack_revision(generation, sequence.saturating_sub(1).max(1))
+    }
+
     #[allow(dead_code)]
     fn test_desired_set(ctx: &MarketDataContext) -> DesiredExplicitSet {
         DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts)
@@ -16708,8 +16725,7 @@ mod pr_b_geyser_tracking_tests {
         let mut snapshot = ctx
             .build_pool_explicit_snapshot(pool, GeyserPinReason::ArbMultiDex)
             .expect("dlmm snapshot");
-        ctx.pool_snapshot_revisions
-            .assign_next(&mut snapshot);
+        ctx.pool_snapshot_revisions.assign_next(&mut snapshot);
         assert!(!snapshot.vaults.is_empty());
         assert!(!snapshot.bin_arrays.is_empty());
         assert!(!snapshot.mints.is_empty());
@@ -16857,7 +16873,8 @@ mod pr_b_geyser_tracking_tests {
             .latest_revision_for(pool, ConsumerId::Arb)
             .expect("pending revision");
         assert_eq!(
-            latest_rev, 4,
+            PoolSnapshotRevisionSequencer::revision_sequence(latest_rev),
+            4,
             "one successful enqueue plus three queue-full stashes assign monotonic revisions"
         );
 
@@ -17006,7 +17023,7 @@ mod pr_b_geyser_tracking_tests {
         );
 
         let mut snapshot_old = mk_typed(bin_old, mint_old, vault_old);
-        snapshot_old.revision = rev_new.saturating_sub(1).max(1);
+        snapshot_old.revision = one_sequence_older_revision(rev_new);
         assert_eq!(
             ctx.pending_pool_commands
                 .upsert(PendingPoolCommand::RegisterReserves(snapshot_old)),
@@ -17055,7 +17072,7 @@ mod pr_b_geyser_tracking_tests {
         assert!(ctx.commit_register_pool_geyser_reserves(&mut desired, &snapshot_new));
 
         let mut snapshot_stale = mk_typed(bin_old, mint_old, vault_old);
-        snapshot_stale.revision = rev_new.saturating_sub(1).max(1);
+        snapshot_stale.revision = one_sequence_older_revision(rev_new);
         assert!(
             !ctx.commit_register_pool_geyser_reserves(&mut desired, &snapshot_stale),
             "stale direct commit must no-op"
@@ -17190,7 +17207,7 @@ mod pr_b_geyser_tracking_tests {
         assert!(rev_new > 0);
 
         let mut snapshot_stale = mk_typed(bin_stale, mint_stale, vault_stale);
-        snapshot_stale.revision = rev_new.saturating_sub(1).max(1);
+        snapshot_stale.revision = one_sequence_older_revision(rev_new);
         let mut desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
         assert!(
             !ctx.commit_register_pool_geyser_reserves(&mut desired, &snapshot_stale),
