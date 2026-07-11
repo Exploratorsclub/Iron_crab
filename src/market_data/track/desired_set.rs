@@ -34,11 +34,15 @@ pub enum OwnerKey {
 /// Result of attempting to admit an owner group atomically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionResult {
-    Admitted { new_pubkeys: usize },
+    Admitted {
+        new_pubkeys: usize,
+    },
     OwnerAddedNoNewPubkey,
     RejectedCap,
     RejectedProtected,
     RejectedInvalidGroup,
+    /// Plan validated but post-commit invariant failed (fail-closed; no metrics as RejectedCap).
+    RejectedInternal,
 }
 
 /// Result of cap shrink / restore convergence (release-enforced, never debug_assert).
@@ -455,9 +459,7 @@ impl DesiredExplicitSet {
     }
 
     fn apply_plan(&mut self, plan: AdmissionPlan) -> AdmissionResult {
-        if !self.validate_plan_fits_cap(&plan) {
-            return AdmissionResult::RejectedCap;
-        }
+        debug_assert!(self.validate_plan_fits_cap(&plan));
         let Some((consumer, owner, pubkeys)) = plan.incoming else {
             return AdmissionResult::RejectedInvalidGroup;
         };
@@ -474,7 +476,7 @@ impl DesiredExplicitSet {
         self.commit_group(consumer, owner, pubkeys);
         self.compact_evict_heap_if_needed();
         if self.len() > self.max_explicit_pubkeys {
-            return AdmissionResult::RejectedCap;
+            return AdmissionResult::RejectedInternal;
         }
         if new_unique.is_empty() {
             AdmissionResult::OwnerAddedNoNewPubkey
@@ -561,13 +563,14 @@ impl DesiredExplicitSet {
         mut deficit: usize,
     ) -> Option<Vec<(ConsumerId, OwnerKey, EvictReason)>> {
         let incoming_priority = pin_priority_from_consumer(incoming);
+        let candidates = self.cap_shrink_candidate_keys();
         let mut victims = Vec::new();
         let mut victim_keys = Vec::new();
 
         while deficit > 0 {
             let mut best_positive: Option<((ConsumerId, OwnerKey), usize, EvictReason)> = None;
             let mut best_zero: Option<((ConsumerId, OwnerKey), EvictReason)> = None;
-            for (consumer, owner) in self.cap_shrink_candidate_keys() {
+            for &(consumer, owner) in &candidates {
                 if consumer == incoming && owner == incoming_owner {
                     continue;
                 }
@@ -708,12 +711,13 @@ impl DesiredExplicitSet {
 
     /// Set-aware cap-shrink victim planning: aggregate eviction across co-dependent groups.
     fn plan_cap_shrink_victims(&self, deficit: usize) -> Option<Vec<(ConsumerId, OwnerKey)>> {
+        let candidates = self.cap_shrink_candidate_keys();
         let mut victim_keys = Vec::new();
         let mut freed = 0usize;
         while freed < deficit {
             let mut best_positive: Option<((ConsumerId, OwnerKey), usize)> = None;
             let mut best_zero: Option<(ConsumerId, OwnerKey)> = None;
-            for (consumer, owner) in self.cap_shrink_candidate_keys() {
+            for &(consumer, owner) in &candidates {
                 if victim_keys
                     .iter()
                     .any(|(c, o)| *c == consumer && *o == owner)
@@ -1305,6 +1309,30 @@ mod tests {
         assert!(set.len() <= 3);
         let wallet_row = rows[0].0;
         assert!(set.contains(&wallet_row));
+    }
+
+    #[test]
+    fn admission_rejected_cap_does_not_mutate_before_plan_apply() {
+        let mut set = DesiredExplicitSet::new(2);
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let k1 = Pubkey::new_unique();
+        let k2 = Pubkey::new_unique();
+        let k3 = Pubkey::new_unique();
+        assert!(matches!(
+            set.try_admit_group(
+                ConsumerId::Momentum,
+                OwnerKey::Pool(pool_a),
+                HashSet::from([k1, k2])
+            ),
+            AdmissionResult::Admitted { .. }
+        ));
+        let before = set.snapshot_pubkeys();
+        assert!(matches!(
+            set.try_admit_group(ConsumerId::Arb, OwnerKey::Pool(pool_b), HashSet::from([k3])),
+            AdmissionResult::RejectedCap
+        ));
+        assert_eq!(set.snapshot_pubkeys(), before);
     }
 
     #[test]

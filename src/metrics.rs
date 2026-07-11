@@ -1128,6 +1128,9 @@ pub static MARKET_DATA_MOMENTUM_TRACK_WORKER_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU
 /// Phase 3: arb track requests enqueue dropped on full track-worker queue.
 pub static MARKET_DATA_ARB_TRACK_WORKER_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Durable pending pool registration overflow (fail-closed; no silent eviction).
+pub static MARKET_DATA_TRACK_PENDING_POOL_OVERFLOW_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 /// PR169a: single-writer Geyser tracking actor queue depth (gauge).
 pub static MARKET_DATA_GEYSER_TRACKING_QUEUE_DEPTH: Lazy<AtomicU64> =
@@ -1371,6 +1374,11 @@ pub fn inc_market_data_tx_deferred_dropped_total() {
 #[inline]
 pub fn set_market_data_track_worker_queue_depth(depth: usize) {
     MARKET_DATA_TRACK_WORKER_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_track_pending_pool_overflow_total() {
+    MARKET_DATA_TRACK_PENDING_POOL_OVERFLOW_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]

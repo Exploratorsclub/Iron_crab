@@ -25,8 +25,8 @@ pub use geyser_sync::{
     MARKET_DATA_MD_STATE_FLUSH_BUDGET_MS,
 };
 pub use pending::{
-    GeyserConnectBarrier, PendingPoolCommand, PendingPoolKey, PendingPoolKind,
-    PendingPoolRegistrations, ProtectedOverflowDiagnostic, WalletExplicitPending,
+    GeyserConnectBarrier, PendingPoolCommand, PendingPoolRegistrations, PendingPoolUpsertResult,
+    ProtectedOverflowDiagnostic, WalletExplicitPending,
 };
 pub use snapshot::{
     explicit_set_snapshot_path, load_explicit_set_snapshot, owner_key_to_snapshot,
@@ -44,4 +44,7 @@ pub use worker::{
     MARKET_DATA_MOMENTUM_APPLY_CHUNK_SIZE, MARKET_DATA_MOMENTUM_APPLY_CHUNK_THRESHOLD,
     MARKET_DATA_TRACK_WORKER_COALESCE_MS, MARKET_DATA_TRACK_WORKER_QUEUE_CAP,
 };
-pub use worker_commands::{GeyserPinReason, PoolExplicitSnapshot, TrackWorkerCommand};
+pub use worker_commands::{
+    BinArrayExplicitRow, GeyserPinReason, MintExplicitRow, PoolExplicitSnapshot,
+    TrackWorkerCommand, VaultExplicitRow,
+};

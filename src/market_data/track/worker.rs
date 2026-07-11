@@ -321,6 +321,7 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
         TrackWorkerCommand::RestoreExplicitSnapshot(snapshot) => {
             ctx.apply_explicit_set_snapshot(desired, &snapshot) > 0
         }
+        TrackWorkerCommand::CompleteStartupBarrier => false,
         TrackWorkerCommand::ScheduleGeyserPush
         | TrackWorkerCommand::ScheduleGeyserPushDebounced
         | TrackWorkerCommand::ContinueGeyserEvict => false,
@@ -351,6 +352,47 @@ fn track_worker_apply_pending_dirty<C: TrackWorkerContext>(
     }
 }
 
+struct TrackWorkerJobFlags {
+    continue_evict: bool,
+    release_flush_slot: bool,
+    barrier_ack: bool,
+}
+
+impl TrackWorkerJobFlags {
+    fn note_job(&mut self, job: &TrackWorkerCommand) {
+        if matches!(job, TrackWorkerCommand::ContinueGeyserEvict) {
+            self.continue_evict = true;
+        }
+        if matches!(job, TrackWorkerCommand::ScheduleGeyserPushDebounced) {
+            self.release_flush_slot = true;
+        }
+        if matches!(
+            job,
+            TrackWorkerCommand::RestoreExplicitSnapshot(_)
+                | TrackWorkerCommand::CompleteStartupBarrier
+        ) {
+            self.barrier_ack = true;
+        }
+    }
+}
+
+fn track_worker_normalize_job(job: TrackWorkerCommand) -> TrackWorkerCommand {
+    match job {
+        TrackWorkerCommand::ScheduleGeyserPushDebounced => TrackWorkerCommand::ScheduleGeyserPush,
+        other => other,
+    }
+}
+
+fn track_worker_complete_barrier_ack<C: TrackWorkerContext>(
+    ctx: &Arc<C>,
+    desired: &DesiredExplicitSet,
+    push_ok: bool,
+) {
+    let cap_ok = desired.cap_overflow() == 0;
+    let ready = push_ok && cap_ok && ctx.geyser_explicit_readiness_ok();
+    ctx.signal_restore_barrier(ready);
+}
+
 fn track_worker_loop<C: TrackWorkerContext + 'static>(
     ctx: Arc<C>,
     rx: std_mpsc::Receiver<TrackWorkerCommand>,
@@ -363,7 +405,7 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
     let mut pending_continue_evict = false;
     let mut pending_release_flush_slot = false;
     let mut admission_converged = false;
-    let mut pending_restore_barrier_ack = false;
+    let mut pending_barrier_ack = false;
     let mut last_snapshot_write = Instant::now()
         .checked_sub(Duration::from_secs(
             MARKET_DATA_EXPLICIT_SET_SNAPSHOT_INTERVAL_SECS,
@@ -394,39 +436,24 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
                             + Duration::from_millis(MARKET_DATA_TRACK_WORKER_COALESCE_MS),
                     );
                 }
-                if matches!(job, TrackWorkerCommand::ContinueGeyserEvict) {
-                    pending_continue_evict = true;
-                }
-                if matches!(job, TrackWorkerCommand::ScheduleGeyserPushDebounced) {
-                    pending_release_flush_slot = true;
-                }
-                if matches!(job, TrackWorkerCommand::RestoreExplicitSnapshot(_)) {
-                    pending_restore_barrier_ack = true;
-                }
-                let cmd = match job {
-                    TrackWorkerCommand::ScheduleGeyserPushDebounced => {
-                        TrackWorkerCommand::ScheduleGeyserPush
-                    }
-                    other => other,
+                let mut flags = TrackWorkerJobFlags {
+                    continue_evict: pending_continue_evict,
+                    release_flush_slot: pending_release_flush_slot,
+                    barrier_ack: pending_barrier_ack,
                 };
+                flags.note_job(&job);
+                let cmd = track_worker_normalize_job(job);
                 let _ = track_worker_process_command(&ctx, &mut desired, cmd);
                 track_worker_apply_invalidation(&ctx, &mut desired, &mut admission_converged);
                 while let Ok(more) = rx.try_recv() {
                     track_worker_dec_queue_depth(&queue_depth);
-                    if matches!(more, TrackWorkerCommand::ContinueGeyserEvict) {
-                        pending_continue_evict = true;
-                    }
-                    if matches!(more, TrackWorkerCommand::ScheduleGeyserPushDebounced) {
-                        pending_release_flush_slot = true;
-                    }
-                    let cmd = match more {
-                        TrackWorkerCommand::ScheduleGeyserPushDebounced => {
-                            TrackWorkerCommand::ScheduleGeyserPush
-                        }
-                        other => other,
-                    };
+                    flags.note_job(&more);
+                    let cmd = track_worker_normalize_job(more);
                     let _ = track_worker_process_command(&ctx, &mut desired, cmd);
                 }
+                pending_continue_evict = flags.continue_evict;
+                pending_release_flush_slot = flags.release_flush_slot;
+                pending_barrier_ack = flags.barrier_ack;
                 track_worker_apply_invalidation(&ctx, &mut desired, &mut admission_converged);
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {}
@@ -440,6 +467,10 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
             push_before_keys.is_some() && coalesce_deadline.is_some_and(|d| Instant::now() >= d);
         if should_push {
             if !ctx.geyser_explicit_readiness_ok() {
+                if pending_barrier_ack {
+                    track_worker_complete_barrier_ack(&ctx, &desired, false);
+                    pending_barrier_ack = false;
+                }
                 push_before_keys = None;
                 coalesce_deadline = None;
                 pending_continue_evict = false;
@@ -452,23 +483,19 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
             pending_continue_evict = false;
             pending_release_flush_slot = false;
             coalesce_deadline = None;
-            if !track_worker_execute_coalesced_push(
+            let push_ok = track_worker_execute_coalesced_push(
                 &ctx,
                 &mut desired,
                 before,
                 continue_evict,
                 release_flush_slot,
                 &mut admission_converged,
-            ) {
-                if ctx.pending_geyser_evict() {
-                    track_worker_try_enqueue(
-                        &track_worker,
-                        TrackWorkerCommand::ContinueGeyserEvict,
-                    );
-                }
-            } else if pending_restore_barrier_ack {
-                ctx.signal_restore_barrier(true);
-                pending_restore_barrier_ack = false;
+            );
+            if pending_barrier_ack {
+                track_worker_complete_barrier_ack(&ctx, &desired, push_ok);
+                pending_barrier_ack = false;
+            } else if !push_ok && ctx.pending_geyser_evict() {
+                track_worker_try_enqueue(&track_worker, TrackWorkerCommand::ContinueGeyserEvict);
             }
             inc_market_data_track_request_coalesce_batches_total();
             ctx.refresh_hot_pool_registry_gauges();

@@ -1,7 +1,7 @@
 //! Bounded durable pending state for track-worker commands lost on full queue.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -60,6 +60,68 @@ impl PendingPoolCommand {
                 new_active_id,
             },
         }
+    }
+}
+
+/// Result of stashing a pool command in durable pending state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingPoolUpsertResult {
+    Stored,
+    Coalesced,
+    Overflow,
+}
+
+/// Per-pool coalesced pending commands (one slot per pool+consumer, merged by kind).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct CoalescedPoolPending {
+    pool: Pubkey,
+    consumer: ConsumerId,
+    reserves: Option<PoolExplicitSnapshot>,
+    vaults: Option<PoolExplicitSnapshot>,
+    after_trade: Option<PoolExplicitSnapshot>,
+    refresh_dlmm: Option<(PoolExplicitSnapshot, i32)>,
+}
+
+impl CoalescedPoolPending {
+    fn merge(&mut self, command: PendingPoolCommand) {
+        match command {
+            PendingPoolCommand::RegisterReserves(snapshot) => {
+                self.reserves = Some(snapshot);
+            }
+            PendingPoolCommand::VaultsFromAccount(snapshot) => {
+                self.vaults = Some(snapshot);
+            }
+            PendingPoolCommand::AfterTrade(snapshot) => {
+                self.after_trade = Some(snapshot);
+            }
+            PendingPoolCommand::RefreshDlmm {
+                snapshot,
+                new_active_id,
+            } => {
+                self.refresh_dlmm = Some((snapshot, new_active_id));
+            }
+        }
+    }
+
+    fn into_commands(self) -> Vec<PendingPoolCommand> {
+        let mut out = Vec::new();
+        if let Some(snapshot) = self.reserves {
+            out.push(PendingPoolCommand::RegisterReserves(snapshot));
+        }
+        if let Some(snapshot) = self.vaults {
+            out.push(PendingPoolCommand::VaultsFromAccount(snapshot));
+        }
+        if let Some(snapshot) = self.after_trade {
+            out.push(PendingPoolCommand::AfterTrade(snapshot));
+        }
+        if let Some((snapshot, new_active_id)) = self.refresh_dlmm {
+            out.push(PendingPoolCommand::RefreshDlmm {
+                snapshot,
+                new_active_id,
+            });
+        }
+        out
     }
 }
 
@@ -140,71 +202,75 @@ impl WalletExplicitPending {
     }
 }
 
-/// Bounded coalesced pool registration pending (keyed by pool+consumer+command kind).
+/// Bounded per-pool coalesced pending (one entry per pool+consumer; overflow is fail-closed).
 #[derive(Debug)]
 pub struct PendingPoolRegistrations {
-    cap: usize,
-    entries: Mutex<HashMap<PendingPoolKey, PendingPoolCommand>>,
-    order: Mutex<VecDeque<PendingPoolKey>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PendingPoolKey {
-    pub pool: Pubkey,
-    pub consumer: ConsumerId,
-    pub kind: PendingPoolKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PendingPoolKind {
-    Reserves,
-    Vaults,
-    AfterTrade,
-    RefreshDlmm,
+    max_pools: usize,
+    entries: Mutex<HashMap<(Pubkey, ConsumerId), CoalescedPoolPending>>,
+    order: Mutex<VecDeque<(Pubkey, ConsumerId)>>,
+    overflow: AtomicBool,
 }
 
 impl PendingPoolRegistrations {
-    pub fn new(cap: usize) -> Self {
+    pub fn new(max_pools: usize) -> Self {
         Self {
-            cap: cap.max(1),
+            max_pools: max_pools.max(1),
             entries: Mutex::new(HashMap::new()),
             order: Mutex::new(VecDeque::new()),
+            overflow: AtomicBool::new(false),
         }
     }
 
-    pub fn upsert(&self, command: PendingPoolCommand) {
-        let kind = match &command {
-            PendingPoolCommand::RegisterReserves(_) => PendingPoolKind::Reserves,
-            PendingPoolCommand::VaultsFromAccount(_) => PendingPoolKind::Vaults,
-            PendingPoolCommand::AfterTrade(_) => PendingPoolKind::AfterTrade,
-            PendingPoolCommand::RefreshDlmm { .. } => PendingPoolKind::RefreshDlmm,
-        };
-        let key = PendingPoolKey {
-            pool: command.pool(),
-            consumer: command.consumer(),
-            kind,
-        };
+    pub fn upsert(&self, command: PendingPoolCommand) -> PendingPoolUpsertResult {
+        let key = (command.pool(), command.consumer());
         let mut entries = self.entries.lock().expect("pending pool lock");
         let mut order = self.order.lock().expect("pending pool order lock");
-        if !entries.contains_key(&key) {
-            order.push_back(key);
-            while order.len() > self.cap {
-                if let Some(evict) = order.pop_front() {
-                    entries.remove(&evict);
-                }
-            }
+        if entries.contains_key(&key) {
+            entries.get_mut(&key).expect("pending key").merge(command);
+            return PendingPoolUpsertResult::Coalesced;
         }
-        entries.insert(key, command);
+        if order.len() >= self.max_pools {
+            self.overflow.store(true, Ordering::Release);
+            return PendingPoolUpsertResult::Overflow;
+        }
+        let mut coalesced = CoalescedPoolPending {
+            pool: key.0,
+            consumer: key.1,
+            reserves: None,
+            vaults: None,
+            after_trade: None,
+            refresh_dlmm: None,
+        };
+        coalesced.merge(command);
+        entries.insert(key, coalesced);
+        order.push_back(key);
+        PendingPoolUpsertResult::Stored
     }
 
     pub fn drain_all(&self) -> Vec<PendingPoolCommand> {
         let mut entries = self.entries.lock().expect("pending pool lock");
         let mut order = self.order.lock().expect("pending pool order lock");
-        order.drain(..).filter_map(|k| entries.remove(&k)).collect()
+        let keys: Vec<_> = order.drain(..).collect();
+        keys.into_iter()
+            .filter_map(|k| entries.remove(&k))
+            .flat_map(|coalesced| coalesced.into_commands())
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {
         self.entries.lock().expect("pending pool lock").is_empty()
+    }
+
+    pub fn overflowed(&self) -> bool {
+        self.overflow.load(Ordering::Acquire)
+    }
+
+    pub fn clear_overflow(&self) {
+        self.overflow.store(false, Ordering::Release);
+    }
+
+    pub fn pool_count(&self) -> usize {
+        self.entries.lock().expect("pending pool lock").len()
     }
 }
 
@@ -237,6 +303,10 @@ impl GeyserConnectBarrier {
 
     pub fn mark_failed(&self) {
         self.state.store(BARRIER_FAILED, Ordering::Release);
+    }
+
+    pub fn mark_pending(&self) {
+        self.state.store(BARRIER_PENDING, Ordering::Release);
     }
 
     pub fn is_ready(&self) -> bool {
