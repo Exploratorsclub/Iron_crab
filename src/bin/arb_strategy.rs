@@ -133,12 +133,16 @@ const ARB_TRACK_SELECTION_COALESCE_MS: u64 = 50;
 const ARB_TRACK_INCREMENTAL_MIN_INTERVAL_MS: u64 = 1_000;
 /// Max dirty mints queued between incremental selects.
 const ARB_TRACK_SELECTION_DIRTY_MINTS_CAP: usize = 4_096;
+/// Hot-path ingress dedup set cap (one slot per unique mint, not per Geyser update).
+const ARB_TRACK_SELECTION_INGRESS_DIRTY_CAP: usize = ARB_TRACK_SELECTION_DIRTY_MINTS_CAP;
+/// Single wake token queue: coalesces unlimited hot-path marks into one worker wakeup.
+const ARB_TRACK_SELECTION_WAKE_QUEUE_CAP: usize = 1;
+/// Minimum interval between global full-reconcile scans (prevents 50ms scan storms).
+const ARB_TRACK_FULL_RECONCILE_MIN_INTERVAL_MS: u64 = 5_000;
 /// Max mint snapshots retained for selection (bounded publish/readiness state).
 const ARB_TRACK_MINT_SNAPSHOTS_CAP: usize = 2_048;
 /// Max dirty mints processed per incremental batch; overflow schedules full reconcile.
 const ARB_TRACK_INCREMENTAL_MINTS_MAX: usize = 64;
-/// Selection worker job queue depth.
-const ARB_TRACK_SELECTION_QUEUE_CAP: usize = 4_096;
 
 /// Bounded queue for off-hot-loop 2-hop trade detection (Scope D).
 const ARB_TWO_HOP_WORKER_QUEUE_CAP: usize = 4096;
@@ -499,58 +503,123 @@ struct ArbTradeSignalPair {
     seen_at_unix_ms: u64,
 }
 
-enum ArbTrackSelectionJob {
-    MarkDirty { mint: String },
-    FullReconcile,
+#[derive(Debug, Default)]
+struct ArbTrackSelectionIngress {
+    dirty_mints: parking_lot::Mutex<HashSet<String>>,
+    dirty_overflow: AtomicBool,
+    wake_pending: AtomicBool,
 }
 
 struct ArbTrackSelectionHandle {
-    tx: mpsc::Sender<ArbTrackSelectionJob>,
+    ingress: ArbTrackSelectionIngress,
+    wake_tx: mpsc::Sender<()>,
     pending_full_reconcile: Arc<AtomicBool>,
 }
 
 impl ArbTrackSelectionHandle {
+    /// Hot path: bounded dedup ingress. Never allocates a queue slot per Geyser update.
     fn mark_dirty(&self, mint: &str) {
-        if self
-            .tx
-            .try_send(ArbTrackSelectionJob::MarkDirty {
-                mint: mint.to_string(),
-            })
-            .is_err()
-        {
-            record_arb_track_selection_queue_overflow_total();
-            self.pending_full_reconcile.store(true, Ordering::Release);
+        let schedule_wake = {
+            let mut dirty = self.ingress.dirty_mints.lock();
+            if dirty.contains(mint) {
+                return;
+            }
+            if dirty.len() >= ARB_TRACK_SELECTION_INGRESS_DIRTY_CAP {
+                self.ingress.dirty_overflow.store(true, Ordering::Release);
+                self.pending_full_reconcile.store(true, Ordering::Release);
+                true
+            } else {
+                dirty.insert(mint.to_string());
+                true
+            }
+        };
+        if schedule_wake {
+            self.schedule_worker_wake();
         }
     }
 
     fn request_full_reconcile(&self) {
         self.pending_full_reconcile.store(true, Ordering::Release);
-        if self
-            .tx
-            .try_send(ArbTrackSelectionJob::FullReconcile)
-            .is_err()
-        {
-            record_arb_track_selection_queue_overflow_total();
-        }
+        self.schedule_worker_wake();
     }
 
     fn record_blocking_join_failed(&self) {
         record_arb_track_selection_blocking_join_failed_total();
         self.pending_full_reconcile.store(true, Ordering::Release);
+        self.schedule_worker_wake();
     }
 
     fn take_pending_full(&self) -> bool {
         self.pending_full_reconcile.swap(false, Ordering::AcqRel)
     }
+
+    /// At most one wake token in flight; additional marks coalesce in the ingress set.
+    fn schedule_worker_wake(&self) {
+        if self
+            .ingress
+            .wake_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        if self.wake_tx.try_send(()).is_err() {
+            record_arb_track_selection_queue_overflow_total();
+        }
+    }
+
+    fn clear_wake_pending(&self) {
+        self.ingress.wake_pending.store(false, Ordering::Release);
+    }
+
+    fn drain_ingress_dirty(&self) -> (Vec<String>, bool) {
+        let mut dirty = self.ingress.dirty_mints.lock();
+        let overflow = self.ingress.dirty_overflow.swap(false, Ordering::AcqRel);
+        let mints: Vec<String> = dirty.drain().collect();
+        (mints, overflow)
+    }
+
+    fn drain_ingress_to_coalescer(&self, coalescer: &mut ArbTrackSelectionCoalescer) {
+        let (mints, overflow) = self.drain_ingress_dirty();
+        for mint in mints {
+            coalescer.ingest_dirty(mint);
+        }
+        if overflow {
+            coalescer.note_dirty_overflow();
+        }
+    }
+
+    fn ingress_has_work(&self) -> bool {
+        !self.ingress.dirty_mints.lock().is_empty()
+            || self.ingress.dirty_overflow.load(Ordering::Acquire)
+            || self.pending_full_reconcile.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn ingress_dirty_len(&self) -> usize {
+        self.ingress.dirty_mints.lock().len()
+    }
 }
 
 #[cfg(test)]
 fn dummy_arb_track_selection_handle() -> ArbTrackSelectionHandle {
-    let (tx, _rx) = mpsc::channel::<ArbTrackSelectionJob>(1);
+    let (wake_tx, _wake_rx) = mpsc::channel::<()>(ARB_TRACK_SELECTION_WAKE_QUEUE_CAP);
     ArbTrackSelectionHandle {
-        tx,
+        ingress: ArbTrackSelectionIngress::default(),
+        wake_tx,
         pending_full_reconcile: Arc::new(AtomicBool::new(false)),
     }
+}
+
+#[cfg(test)]
+fn test_arb_track_selection_handle() -> (ArbTrackSelectionHandle, mpsc::Receiver<()>) {
+    let (wake_tx, wake_rx) = mpsc::channel::<()>(ARB_TRACK_SELECTION_WAKE_QUEUE_CAP);
+    let handle = ArbTrackSelectionHandle {
+        ingress: ArbTrackSelectionIngress::default(),
+        wake_tx,
+        pending_full_reconcile: Arc::new(AtomicBool::new(false)),
+    };
+    (handle, wake_rx)
 }
 
 /// Deterministic top-K mint admission for bounded snapshot cache (unit-tested).
@@ -761,24 +830,24 @@ impl ArbTrackSelectionCoalescer {
     /// Lock-free bounded state: `dirty_mints` never exceeds
     /// `ARB_TRACK_SELECTION_DIRTY_MINTS_CAP`. Overflow mints are not retained; full
     /// reconcile scans current tracker truth and will include eligible mints.
-    fn ingest(&mut self, job: ArbTrackSelectionJob) -> bool {
-        match job {
-            ArbTrackSelectionJob::MarkDirty { mint } => {
-                if self.dirty_mints.contains(&mint) {
-                    return false;
-                }
-                if self.dirty_mints.len() >= ARB_TRACK_SELECTION_DIRTY_MINTS_CAP {
-                    self.dirty_overflow = true;
-                    return true;
-                }
-                self.dirty_mints.insert(mint);
-                false
-            }
-            ArbTrackSelectionJob::FullReconcile => {
-                self.pending_full = true;
-                false
-            }
+    fn ingest_dirty(&mut self, mint: String) -> bool {
+        if self.dirty_mints.contains(&mint) {
+            return false;
         }
+        if self.dirty_mints.len() >= ARB_TRACK_SELECTION_DIRTY_MINTS_CAP {
+            self.dirty_overflow = true;
+            return true;
+        }
+        self.dirty_mints.insert(mint);
+        false
+    }
+
+    fn note_full_reconcile(&mut self) {
+        self.pending_full = true;
+    }
+
+    fn note_dirty_overflow(&mut self) {
+        self.dirty_overflow = true;
     }
 
     fn take_batch(&mut self) -> (Vec<String>, bool, bool) {
@@ -848,13 +917,23 @@ fn rank_coarse_rank_snapshot(snapshot: &mut [MintCoarseRankSnapshot]) -> Vec<Str
     snapshot.iter().map(|row| row.mint.clone()).collect()
 }
 
-/// Deterministic full-admit refresh order: ranked traversal, HashSet membership only.
+/// Deterministic full-admit refresh order: ranked admitted mints first, then
+/// admitted-but-unranked mints in stable sorted order (HashSet membership only).
 fn admit_refresh_order(ranked: &[String], admit: &HashSet<String>) -> Vec<String> {
-    ranked
+    let ranked_set: HashSet<&str> = ranked.iter().map(String::as_str).collect();
+    let mut order: Vec<String> = ranked
         .iter()
         .filter(|mint| admit.contains(*mint))
         .cloned()
-        .collect()
+        .collect();
+    let mut unranked_admitted: Vec<String> = admit
+        .iter()
+        .filter(|mint| !ranked_set.contains(mint.as_str()))
+        .cloned()
+        .collect();
+    unranked_admitted.sort();
+    order.extend(unranked_admitted);
+    order
 }
 
 fn tracker_mint_activity_unix_ms(
@@ -6652,35 +6731,37 @@ fn run_arb_track_selection_batch(
     record_arb_track_selection_recompute_total();
 }
 
-fn spawn_arb_track_selection_worker(
-    ctx: Arc<ArbContext>,
-    mut rx: mpsc::Receiver<ArbTrackSelectionJob>,
-) {
+fn spawn_arb_track_selection_worker(ctx: Arc<ArbContext>, mut wake_rx: mpsc::Receiver<()>) {
     tokio::spawn(async move {
         let mut coalescer = ArbTrackSelectionCoalescer::default();
         let mut last_incremental = Instant::now() - Duration::from_secs(3600);
+        let mut last_full_reconcile = Instant::now() - Duration::from_secs(3600);
+        let full_reconcile_min = Duration::from_millis(ARB_TRACK_FULL_RECONCILE_MIN_INTERVAL_MS);
 
-        while let Some(first) = rx.recv().await {
-            if coalescer.ingest(first) {
-                ctx.arb_track_selection
-                    .pending_full_reconcile
-                    .store(true, Ordering::Release);
+        while wake_rx.recv().await.is_some() {
+            ctx.arb_track_selection.clear_wake_pending();
+            ctx.arb_track_selection
+                .drain_ingress_to_coalescer(&mut coalescer);
+            if ctx.arb_track_selection.take_pending_full() {
+                coalescer.note_full_reconcile();
             }
+
             let coalesce_deadline =
                 Instant::now() + Duration::from_millis(ARB_TRACK_SELECTION_COALESCE_MS);
             while Instant::now() < coalesce_deadline {
-                match rx.try_recv() {
-                    Ok(job) => {
-                        if coalescer.ingest(job) {
-                            ctx.arb_track_selection
-                                .pending_full_reconcile
-                                .store(true, Ordering::Release);
-                        }
+                match wake_rx.try_recv() {
+                    Ok(()) => {
+                        ctx.arb_track_selection.clear_wake_pending();
                     }
                     Err(mpsc::error::TryRecvError::Empty) => {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
-                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => return,
+                }
+                ctx.arb_track_selection
+                    .drain_ingress_to_coalescer(&mut coalescer);
+                if ctx.arb_track_selection.take_pending_full() {
+                    coalescer.note_full_reconcile();
                 }
             }
 
@@ -6694,7 +6775,26 @@ fn spawn_arb_track_selection_worker(
             if ctx.arb_track_selection.take_pending_full() {
                 full_reconcile = true;
             }
+
+            if full_reconcile && last_full_reconcile.elapsed() < full_reconcile_min {
+                ctx.arb_track_selection
+                    .pending_full_reconcile
+                    .store(true, Ordering::Release);
+                full_reconcile = false;
+            }
+
             if dirty_mints.is_empty() && !full_reconcile {
+                if ctx
+                    .arb_track_selection
+                    .pending_full_reconcile
+                    .load(Ordering::Acquire)
+                {
+                    let sleep = full_reconcile_min.saturating_sub(last_full_reconcile.elapsed());
+                    if sleep > Duration::ZERO {
+                        tokio::time::sleep(sleep).await;
+                    }
+                    ctx.arb_track_selection.schedule_worker_wake();
+                }
                 continue;
             }
 
@@ -6704,6 +6804,8 @@ fn spawn_arb_track_selection_worker(
                 if elapsed < min_interval {
                     tokio::time::sleep(min_interval - elapsed).await;
                 }
+            } else {
+                last_full_reconcile = Instant::now();
             }
 
             let ctx_blocking = Arc::clone(&ctx);
@@ -6716,6 +6818,10 @@ fn spawn_arb_track_selection_worker(
                 ctx.arb_track_selection.record_blocking_join_failed();
             }
             last_incremental = Instant::now();
+
+            if ctx.arb_track_selection.ingress_has_work() {
+                ctx.arb_track_selection.schedule_worker_wake();
+            }
         }
         info!("arb-strategy track selection worker stopped");
     });
@@ -6954,10 +7060,11 @@ async fn main() -> Result<()> {
         tx: tracker_write_tx,
         capacity: ARB_TRACKER_WRITE_QUEUE_CAP,
     };
-    let (arb_track_selection_tx, arb_track_selection_rx) =
-        mpsc::channel::<ArbTrackSelectionJob>(ARB_TRACK_SELECTION_QUEUE_CAP);
+    let (arb_track_selection_wake_tx, arb_track_selection_wake_rx) =
+        mpsc::channel::<()>(ARB_TRACK_SELECTION_WAKE_QUEUE_CAP);
     let arb_track_selection = ArbTrackSelectionHandle {
-        tx: arb_track_selection_tx,
+        ingress: ArbTrackSelectionIngress::default(),
+        wake_tx: arb_track_selection_wake_tx,
         pending_full_reconcile: Arc::new(AtomicBool::new(false)),
     };
 
@@ -6995,7 +7102,7 @@ async fn main() -> Result<()> {
     });
 
     spawn_arb_tracker_write_worker(Arc::clone(&ctx), tracker_write_rx);
-    spawn_arb_track_selection_worker(Arc::clone(&ctx), arb_track_selection_rx);
+    spawn_arb_track_selection_worker(Arc::clone(&ctx), arb_track_selection_wake_rx);
     spawn_arb_two_hop_worker(Arc::clone(&ctx), two_hop_rx);
 
     // Bootstrap SLAVE LivePoolCache from JetStream (same path as execution-engine).
@@ -10856,9 +10963,7 @@ mod two_hop_price_tests {
     fn arb_track_selection_coalescer_bounds_burst_to_one_batch() {
         let mut coalescer = ArbTrackSelectionCoalescer::default();
         for i in 0..100 {
-            coalescer.ingest(ArbTrackSelectionJob::MarkDirty {
-                mint: format!("mint_{i}"),
-            });
+            coalescer.ingest_dirty(format!("mint_{i}"));
         }
         let (dirty, full, overflow) = coalescer.take_batch();
         assert!(!full);
@@ -10874,13 +10979,9 @@ mod two_hop_price_tests {
     fn arb_track_selection_coalescer_dirty_overflow_requests_full_reconcile() {
         let mut coalescer = ArbTrackSelectionCoalescer::default();
         for i in 0..ARB_TRACK_SELECTION_DIRTY_MINTS_CAP {
-            assert!(!coalescer.ingest(ArbTrackSelectionJob::MarkDirty {
-                mint: format!("mint_{i}"),
-            }));
+            assert!(!coalescer.ingest_dirty(format!("mint_{i}")));
         }
-        assert!(coalescer.ingest(ArbTrackSelectionJob::MarkDirty {
-            mint: "overflow_mint".to_string(),
-        }));
+        assert!(coalescer.ingest_dirty("overflow_mint".to_string()));
         let (dirty, full, overflow) = coalescer.take_batch();
         assert!(!full);
         assert!(
@@ -10900,9 +11001,7 @@ mod two_hop_price_tests {
         let cap = ARB_TRACK_SELECTION_DIRTY_MINTS_CAP;
         let mut overflow_seen = false;
         for i in 0..cap + 5_000 {
-            if coalescer.ingest(ArbTrackSelectionJob::MarkDirty {
-                mint: format!("burst_{i}"),
-            }) {
+            if coalescer.ingest_dirty(format!("burst_{i}")) {
                 overflow_seen = true;
             }
         }
@@ -10917,32 +11016,46 @@ mod two_hop_price_tests {
         let mut coalescer = ArbTrackSelectionCoalescer::default();
         let cap = ARB_TRACK_SELECTION_DIRTY_MINTS_CAP;
         for i in 0..cap {
-            assert!(!coalescer.ingest(ArbTrackSelectionJob::MarkDirty {
-                mint: format!("mint_{i}"),
-            }));
+            assert!(!coalescer.ingest_dirty(format!("mint_{i}")));
         }
-        assert!(!coalescer.ingest(ArbTrackSelectionJob::MarkDirty {
-            mint: "mint_0".to_string(),
-        }));
+        assert!(!coalescer.ingest_dirty("mint_0".to_string()));
         let (dirty, _, overflow) = coalescer.take_batch();
         assert!(!overflow);
         assert_eq!(dirty.len(), cap);
     }
 
     #[test]
-    fn arb_track_selection_queue_overflow_sets_pending_full_reconcile() {
-        let (tx, _rx) = mpsc::channel::<ArbTrackSelectionJob>(1);
-        tx.try_send(ArbTrackSelectionJob::FullReconcile).unwrap();
-        let pending = Arc::new(AtomicBool::new(false));
-        let handle = ArbTrackSelectionHandle {
-            tx,
-            pending_full_reconcile: Arc::clone(&pending),
-        };
-        handle.mark_dirty("mint_overflow");
-        assert!(pending.load(Ordering::Acquire));
-        pending.store(false, Ordering::Release);
+    fn arb_track_selection_ingress_deduplicates_burst() {
+        let (handle, mut wake_rx) = test_arb_track_selection_handle();
+        for _ in 0..1_000 {
+            handle.mark_dirty("mint_a");
+        }
+        assert_eq!(handle.ingress_dirty_len(), 1);
+        assert_eq!(wake_rx.try_recv().unwrap(), ());
+        assert!(wake_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn arb_track_selection_ingress_hard_cap_sets_overflow() {
+        let (handle, _wake_rx) = test_arb_track_selection_handle();
+        let cap = ARB_TRACK_SELECTION_INGRESS_DIRTY_CAP;
+        for i in 0..cap {
+            handle.mark_dirty(&format!("mint_{i}"));
+        }
+        assert_eq!(handle.ingress_dirty_len(), cap);
+        handle.mark_dirty("overflow_mint");
+        assert_eq!(handle.ingress_dirty_len(), cap);
+        assert!(handle.pending_full_reconcile.load(Ordering::Acquire));
+        let (_, overflow) = handle.drain_ingress_dirty();
+        assert!(overflow);
+    }
+
+    #[test]
+    fn arb_track_selection_request_full_reconcile_sets_pending() {
+        let (handle, mut wake_rx) = test_arb_track_selection_handle();
         handle.request_full_reconcile();
-        assert!(pending.load(Ordering::Acquire));
+        assert!(handle.pending_full_reconcile.load(Ordering::Acquire));
+        assert_eq!(wake_rx.try_recv().unwrap(), ());
     }
 
     #[test]
@@ -11014,6 +11127,75 @@ mod two_hop_price_tests {
         assert!(admit_a.contains("mint_01"));
         assert!(admit_a.contains("mint_02"));
         assert!(admit_a.contains("mint_03"));
+    }
+
+    #[test]
+    fn admit_refresh_order_includes_unranked_protected_mints() {
+        let ranked = vec!["mint_a".to_string(), "mint_b".to_string()];
+        let mut admit = HashSet::new();
+        admit.insert("mint_a".to_string());
+        admit.insert("stale_pinned".to_string());
+        let order = admit_refresh_order(&ranked, &admit);
+        assert_eq!(order, vec!["mint_a", "stale_pinned"]);
+    }
+
+    #[test]
+    fn full_reconcile_refresh_removes_stale_unranked_protected_snapshot() {
+        let cache = create_shared_cache();
+        let ctx = Arc::new(test_arb_context(cache));
+        let stale_mint = "StalePinnedMint111111111111111111111111";
+        let stale_pool = "stale_pool_addr";
+        {
+            let mut snapshots = ctx.arb_track_mint_snapshots.write();
+            snapshots.insert_bounded(
+                stale_mint.to_string(),
+                TrackMintInput {
+                    mint: stale_mint.to_string(),
+                    pools: vec![TrackPoolInput {
+                        pool_address: stale_pool.to_string(),
+                        dex: "orca".to_string(),
+                        known: true,
+                        quote_pool: QuotePoolInput {
+                            pool_address: stale_pool.to_string(),
+                            dex: "orca".to_string(),
+                            token_mint: stale_mint.to_string(),
+                            trade_price_buy: None,
+                            trade_price_sell: None,
+                            trade_updated_at: Instant::now(),
+                            has_reserve_data: true,
+                            token_decimals: 6,
+                        },
+                        vault: None,
+                        dlmm_bins: None,
+                        token_decimals: 6,
+                        last_activity_unix_ms: 1,
+                    }],
+                    trade_signal_pools: None,
+                    last_activity_unix_ms: 1,
+                },
+                &HashSet::new(),
+            );
+        }
+        ctx.arb_pinned_pools.write().insert(stale_pool.to_string());
+        let ranked = vec!["active_mint".to_string()];
+        let protected = ctx.mandatory_protected_snapshot_mints();
+        assert!(protected.contains(stale_mint));
+        let admit = compute_snapshot_admit_set(&ranked, &protected, ARB_TRACK_MINT_SNAPSHOTS_CAP);
+        let refresh_order = admit_refresh_order(&ranked, &admit);
+        assert!(
+            refresh_order.iter().any(|m| m == stale_mint),
+            "unranked protected mint must be refreshed during full reconcile"
+        );
+        for mint in &refresh_order {
+            ctx.refresh_mint_snapshot(mint, &protected);
+        }
+        assert!(
+            !ctx.arb_track_mint_snapshots
+                .read()
+                .entries
+                .contains_key(stale_mint),
+            "stale protected snapshot must be removed when tracker truth is absent"
+        );
     }
 
     #[test]
@@ -11102,15 +11284,10 @@ mod two_hop_price_tests {
     fn arb_track_selection_blocking_join_failed_sets_pending_full() {
         use ironcrab::metrics::ARB_TRACK_SELECTION_BLOCKING_JOIN_FAILED_TOTAL;
 
-        let (tx, _rx) = mpsc::channel::<ArbTrackSelectionJob>(1);
-        let pending = Arc::new(AtomicBool::new(false));
-        let handle = ArbTrackSelectionHandle {
-            tx,
-            pending_full_reconcile: Arc::clone(&pending),
-        };
+        let (handle, _wake_rx) = test_arb_track_selection_handle();
         let before = ARB_TRACK_SELECTION_BLOCKING_JOIN_FAILED_TOTAL.load(Ordering::Relaxed);
         handle.record_blocking_join_failed();
-        assert!(pending.load(Ordering::Acquire));
+        assert!(handle.pending_full_reconcile.load(Ordering::Acquire));
         assert_eq!(
             ARB_TRACK_SELECTION_BLOCKING_JOIN_FAILED_TOTAL.load(Ordering::Relaxed),
             before + 1
