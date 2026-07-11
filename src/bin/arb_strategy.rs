@@ -21,7 +21,7 @@ use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -29,14 +29,16 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use ironcrab::arbitrage::{
-    classify_cross_dex_sell_failure, dlmm_marginal_price_plausible, dlmm_sol_output_from_bins,
-    dlmm_token_output_from_bins, is_quote_fresh, populate_arb_slave_from_live_pool_cache,
-    quote_exact_in, quote_exact_in_with_freshness, quote_sell_round_trip, quotes_pairable,
-    round_trip_profit_lamports, select_round_trip_pools, sync_arb_slave_from_pool_cache_update,
-    MultiHopArbitrage, MultiHopConfig, MultiHopIntentBatch, NoCrossDexSellDetailReason, PoolQuote,
+    arb_track_removal_reason, classify_cross_dex_sell_failure, dlmm_marginal_price_plausible,
+    dlmm_sol_output_from_bins, dlmm_token_output_from_bins, is_quote_fresh,
+    populate_arb_slave_from_live_pool_cache, quote_exact_in, quote_exact_in_with_freshness,
+    quote_sell_round_trip, quotes_pairable, round_trip_profit_lamports, select_arb_track_pools,
+    select_round_trip_pools, sync_arb_slave_from_pool_cache_update, MultiHopArbitrage,
+    MultiHopConfig, MultiHopIntentBatch, NoCrossDexSellDetailReason, PoolQuote,
     QuoteFreshnessConfig, QuoteKind, QuotePoolInput, QuoteVaultInput, RoundTripInsufficient,
     RoundTripInsufficientSubreason, RoundTripLeg, RoundTripPoolCandidate, RoundTripSelectFailure,
-    SellQuoteNoneDetailReason, DLMM_PROBE_SOL_LAMPORTS,
+    SellQuoteNoneDetailReason, TrackMintInput, TrackPoolInput, TrackSelectionConfig,
+    DLMM_PROBE_SOL_LAMPORTS,
 };
 use ironcrab::config::Config as AppConfig;
 use ironcrab::execution::live_pool_cache::{
@@ -71,12 +73,13 @@ use ironcrab::metrics::{
     arb_two_hop_v2_no_cross_dex_sell_detail_inc, arb_two_hop_v2_rejected_inc,
     arb_two_hop_v2_screen_inc, arb_two_hop_v2_screen_multi_dex_inc,
     arb_two_hop_v2_sell_quote_none_detail_inc, record_arb_heartbeat_phase,
-    record_arb_price_freshness_stale_age_ms, record_arb_proactive_pin_first_publish,
-    record_arb_proactive_track_publish_total, record_arb_quote_pair_slot_delta,
-    record_arb_quote_shadow_round_trip, record_arb_track_requests_messages_total,
-    record_arb_track_requests_publish_chunks_total, record_arb_track_requests_publish_failed_total,
-    record_arb_writer_lock_wait, serve_metrics, set_arb_pool_cache_apply_batch_size_gauge,
-    set_arb_quote_shadow_legacy_spread_bps, set_arb_tracker_write_coalescer_pending,
+    record_arb_price_freshness_stale_age_ms, record_arb_proactive_track_publish_total,
+    record_arb_quote_pair_slot_delta, record_arb_quote_shadow_round_trip,
+    record_arb_track_publish_skipped_unchanged_total, record_arb_track_removed_total,
+    record_arb_track_requests_messages_total, record_arb_track_requests_publish_chunks_total,
+    record_arb_track_requests_publish_failed_total, record_arb_writer_lock_wait, serve_metrics,
+    set_arb_pool_cache_apply_batch_size_gauge, set_arb_quote_shadow_legacy_spread_bps,
+    set_arb_track_selection_metrics, set_arb_tracker_write_coalescer_pending,
     set_arb_tracker_write_queue_depth, set_arb_two_hop_blocked_on_apply_trade,
     set_readiness_nats_connected, tick_arb_heartbeat_seconds_since_last_finish,
     tick_arb_tracker_write_seconds_since_last_finish,
@@ -96,8 +99,8 @@ use ironcrab::metrics::{
 use ironcrab::nats::{
     arb_strategy_pool_cache_live_consumer_config, arb_track_payload_bytes, config_consumer_config,
     config_subject, split_arb_track_requests_update, trim_reconcile_update_to_budget,
-    ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackRemovedEntry, ArbTrackRemovedReason,
-    ArbTrackRequestsUpdate, ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES, CONFIG_STREAM_NAME, STREAM_NAME,
+    ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackRemovedEntry, ArbTrackRequestsUpdate,
+    ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES, CONFIG_STREAM_NAME, STREAM_NAME,
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_ARB_TRACK_REQUESTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
@@ -119,6 +122,10 @@ const ARB_TRACK_REQUESTS_WIRE_VERSION: u32 = 1;
 const ARB_TRACK_BASELINE_MAX_POOLS_DEFAULT: usize = 500;
 /// Default baseline reconcile interval (configurable via `arb_track_reconcile_interval_secs`).
 const ARB_TRACK_RECONCILE_INTERVAL_SECS_DEFAULT: u64 = 60;
+/// Max trade-signal pools remembered for pin priority (bounded).
+const ARB_TRADE_SIGNAL_POOLS_CAP: usize = 64;
+/// Coalesce window before recomputing Arb track selection after dirty marks.
+const ARB_TRACK_RECOMPUTE_COALESCE_MS: u64 = 50;
 
 /// Bounded queue for off-hot-loop 2-hop trade detection (Scope D).
 const ARB_TWO_HOP_WORKER_QUEUE_CAP: usize = 4096;
@@ -466,6 +473,29 @@ fn arb_tracked_token_mint<'a>(base_mint: &'a str, quote_mint: &'a str) -> Option
     }
     if is_stablecoin_mint(base_mint) {
         return Some(quote_mint);
+    }
+    None
+}
+
+fn trade_signal_pair_for_mint(
+    tracker: &TokenArbTracker,
+    trade_signals: &HashSet<String>,
+) -> Option<(String, String)> {
+    let mut signal_pools: Vec<String> = tracker
+        .pools
+        .keys()
+        .filter(|pool| trade_signals.contains(*pool))
+        .cloned()
+        .collect();
+    signal_pools.sort();
+    for (i, buy) in signal_pools.iter().enumerate() {
+        let buy_dex = tracker.pools.get(buy)?.dex.as_str();
+        for sell in signal_pools.iter().skip(i + 1) {
+            let sell_dex = tracker.pools.get(sell)?.dex.as_str();
+            if buy_dex != sell_dex {
+                return Some((buy.clone(), sell.clone()));
+            }
+        }
     }
     None
 }
@@ -3995,6 +4025,10 @@ struct ArbContext {
 
     /// Phase 3: pools published as active via `TOPIC_ARB_TRACK_REQUESTS`.
     arb_pinned_pools: RwLock<HashSet<String>>,
+    /// Trade-signal pools with elevated pin priority (bounded).
+    arb_trade_signal_pools: RwLock<HashSet<String>>,
+    /// Coalesce concurrent Arb track recomputes.
+    arb_track_recompute_scheduled: AtomicBool,
     /// Phase 3: count of track_requests publishes (heartbeat).
     arb_track_published: AtomicU64,
     /// Scope D: enqueue-only sender for off-hot-loop 2-hop detection.
@@ -5410,127 +5444,195 @@ impl ArbContext {
         });
     }
 
-    fn collect_arb_track_baseline_active(&self) -> Vec<ArbTrackActiveEntry> {
+    fn build_track_selection_input(&self) -> (Vec<TrackMintInput>, TrackSelectionConfig) {
         let trackers = self.trackers.read();
-        let max_pools = self.config.read().arb_track_baseline_max_pools;
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for tracker in trackers.values() {
+        let known_pools = self.known_pools.read();
+        let vault_balances = self.vault_balances.read();
+        let bin_arrays = self.bin_arrays.read();
+        let config = self.config.read();
+        let trade_signals = self.arb_trade_signal_pools.read();
+
+        let selection_config = TrackSelectionConfig {
+            max_pools: config.arb_track_baseline_max_pools,
+            max_pools_per_mint: 3,
+            probe_lamports: config.arb_probe_lamports,
+            freshness: QuoteFreshnessConfig {
+                trade_ttl_ms: config.arb_quote_trade_ttl_ms,
+                state_ttl_ms: config.arb_quote_state_ttl_ms,
+            },
+        };
+
+        let mut mints = Vec::new();
+        for (mint, tracker) in trackers.iter() {
             if tracker.pool_count_on_distinct_dexes() < 2 {
                 continue;
             }
-            for pool in tracker.pools.keys() {
-                if seen.len() >= max_pools {
-                    return out;
-                }
-                if seen.insert(pool.clone()) {
-                    out.push(ArbTrackActiveEntry {
-                        pool: pool.clone(),
-                        reason: ArbTrackActiveReason::Baseline,
-                    });
-                }
-            }
+            let Some(token_decimals) = tracker.token_decimals else {
+                continue;
+            };
+            let pools: Vec<TrackPoolInput> = tracker
+                .pools
+                .values()
+                .map(|pool| TrackPoolInput {
+                    pool_address: pool.pool_address.clone(),
+                    dex: pool.dex.clone(),
+                    known: known_pools.contains(&pool.pool_address),
+                    quote_pool: pool_state_to_quote_input(pool, mint, token_decimals),
+                    vault: vault_balances
+                        .get(&pool.pool_address)
+                        .map(vault_cache_to_quote_input),
+                    dlmm_bins: bin_arrays
+                        .get(&pool.pool_address)
+                        .map(flatten_bin_array_cache),
+                    token_decimals,
+                })
+                .collect();
+            let trade_signal_pools = trade_signal_pair_for_mint(tracker, &trade_signals);
+            mints.push(TrackMintInput {
+                mint: mint.clone(),
+                pools,
+                trade_signal_pools,
+            });
         }
-        out
+
+        (mints, selection_config)
+    }
+
+    fn pool_still_tracker_valid(&self, pool: &str) -> bool {
+        let trackers = self.trackers.read();
+        trackers.values().any(|tracker| {
+            tracker.pool_count_on_distinct_dexes() >= 2 && tracker.pools.contains_key(pool)
+        })
+    }
+
+    fn recompute_arb_track_selection(self: &Arc<Self>, reconcile: bool) {
+        if self.nats.is_none() {
+            return;
+        }
+
+        let (mints, selection_config) = self.build_track_selection_input();
+        let result = select_arb_track_pools(&mints, &selection_config);
+        set_arb_track_selection_metrics(
+            result.selected.len(),
+            result.selected_mints,
+            &result.candidate_counts,
+        );
+
+        let budget_displaced: HashSet<String> = result.budget_displaced.into_iter().collect();
+        let new_pools: HashSet<String> = result.selected.iter().map(|p| p.pool.clone()).collect();
+        let old_pools = self.arb_pinned_pools.read().clone();
+
+        if !reconcile && old_pools == new_pools {
+            record_arb_track_publish_skipped_unchanged_total();
+            return;
+        }
+
+        let active = if reconcile {
+            result
+                .selected
+                .iter()
+                .map(|p| ArbTrackActiveEntry {
+                    pool: p.pool.clone(),
+                    reason: if p.active_reason == ArbTrackActiveReason::TradeSignal {
+                        ArbTrackActiveReason::TradeSignal
+                    } else {
+                        ArbTrackActiveReason::Baseline
+                    },
+                })
+                .collect()
+        } else {
+            result
+                .selected
+                .iter()
+                .filter(|p| !old_pools.contains(&p.pool))
+                .map(|p| ArbTrackActiveEntry {
+                    pool: p.pool.clone(),
+                    reason: p.active_reason,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let removed = if reconcile {
+            Vec::new()
+        } else {
+            old_pools
+                .iter()
+                .filter(|pool| !new_pools.contains(*pool))
+                .map(|pool| {
+                    let reason = arb_track_removal_reason(
+                        pool,
+                        self.pool_still_tracker_valid(pool),
+                        &budget_displaced,
+                    );
+                    record_arb_track_removed_total(reason);
+                    ArbTrackRemovedEntry {
+                        pool: pool.clone(),
+                        reason,
+                    }
+                })
+                .collect()
+        };
+
+        {
+            let mut pinned = self.arb_pinned_pools.write();
+            *pinned = new_pools;
+        }
+
+        if reconcile {
+            self.spawn_publish_arb_track_requests(active, Vec::new(), true);
+        } else if active.is_empty() && removed.is_empty() {
+            record_arb_track_publish_skipped_unchanged_total();
+        } else {
+            if !active.is_empty() {
+                record_arb_proactive_track_publish_total();
+            }
+            self.spawn_publish_arb_track_requests(active, removed, false);
+        }
+    }
+
+    fn schedule_arb_track_recompute(self: &Arc<Self>) {
+        if self
+            .arb_track_recompute_scheduled
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let ctx = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(ARB_TRACK_RECOMPUTE_COALESCE_MS)).await;
+            ctx.arb_track_recompute_scheduled
+                .store(false, Ordering::Release);
+            ctx.recompute_arb_track_selection(false);
+        });
     }
 
     fn reconcile_arb_track_baseline_publish(self: &Arc<Self>) {
-        if self.nats.is_none() {
-            return;
-        }
-        let active = self.collect_arb_track_baseline_active();
-        {
-            let mut pinned = self.arb_pinned_pools.write();
-            pinned.clear();
-            for a in &active {
-                pinned.insert(a.pool.clone());
-            }
-        }
-        self.spawn_publish_arb_track_requests(active, Vec::new(), true);
+        self.recompute_arb_track_selection(true);
     }
 
-    /// I-ARB-10: publish all tracker pools when mint is multi-DEX (proactive coverage).
-    fn publish_proactive_arb_track_for_mint(self: &Arc<Self>, mint: &str) {
-        if self.nats.is_none() {
-            return;
-        }
-        let trackers = self.trackers.read();
-        let Some(tracker) = trackers.get(mint) else {
-            return;
-        };
-        if tracker.pool_count_on_distinct_dexes() < 2 {
-            return;
-        }
-        let active: Vec<ArbTrackActiveEntry> = tracker
-            .pools
-            .keys()
-            .map(|pool| ArbTrackActiveEntry {
-                pool: pool.clone(),
-                reason: ArbTrackActiveReason::MultiDex,
-            })
-            .collect();
-        drop(trackers);
-        if active.is_empty() {
-            return;
-        }
-        {
-            let mut pinned = self.arb_pinned_pools.write();
-            for entry in &active {
-                pinned.insert(entry.pool.clone());
-            }
-        }
-        record_arb_proactive_track_publish_total();
-        record_arb_proactive_pin_first_publish(mint);
-        self.spawn_publish_arb_track_requests(active, Vec::new(), false);
+    fn publish_proactive_arb_track_for_mint(self: &Arc<Self>, _mint: &str) {
+        self.schedule_arb_track_recompute();
     }
 
     fn publish_arb_trade_signal_track_pins(self: &Arc<Self>, buy_pool: &str, sell_pool: &str) {
-        if self.nats.is_none() {
-            return;
-        }
-        let mut active = Vec::new();
-        let mut pinned = self.arb_pinned_pools.write();
-        for pool in [buy_pool, sell_pool] {
-            if pinned.insert(pool.to_string()) {
-                active.push(ArbTrackActiveEntry {
-                    pool: pool.to_string(),
-                    reason: ArbTrackActiveReason::TradeSignal,
-                });
+        {
+            let mut signals = self.arb_trade_signal_pools.write();
+            signals.insert(buy_pool.to_string());
+            signals.insert(sell_pool.to_string());
+            if signals.len() > ARB_TRADE_SIGNAL_POOLS_CAP {
+                let mut keys: Vec<_> = signals.iter().cloned().collect();
+                keys.sort();
+                let drain = signals.len() - ARB_TRADE_SIGNAL_POOLS_CAP;
+                for key in keys.into_iter().take(drain) {
+                    signals.remove(&key);
+                }
             }
         }
-        drop(pinned);
-        if !active.is_empty() {
-            self.spawn_publish_arb_track_requests(active, Vec::new(), false);
-        }
+        self.schedule_arb_track_recompute();
     }
 
     fn prune_arb_track_stale_pools(self: &Arc<Self>) {
-        if self.nats.is_none() {
-            return;
-        }
-        let trackers = self.trackers.read();
-        let mut still_active: HashSet<String> = HashSet::new();
-        for tracker in trackers.values() {
-            if tracker.pool_count_on_distinct_dexes() >= 2 {
-                still_active.extend(tracker.pools.keys().cloned());
-            }
-        }
-        drop(trackers);
-        let mut removed = Vec::new();
-        let mut pinned = self.arb_pinned_pools.write();
-        for pool in pinned.clone().into_iter() {
-            if !still_active.contains(&pool) {
-                pinned.remove(&pool);
-                removed.push(ArbTrackRemovedEntry {
-                    pool,
-                    reason: ArbTrackRemovedReason::Stale,
-                });
-            }
-        }
-        drop(pinned);
-        if !removed.is_empty() {
-            self.spawn_publish_arb_track_requests(Vec::new(), removed, false);
-        }
+        self.schedule_arb_track_recompute();
     }
 }
 
@@ -6253,6 +6355,8 @@ async fn main() -> Result<()> {
         eligibility_forensics: ArbEligibilityForensics::new(),
         v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
         arb_pinned_pools: RwLock::new(HashSet::new()),
+        arb_trade_signal_pools: RwLock::new(HashSet::new()),
+        arb_track_recompute_scheduled: AtomicBool::new(false),
         arb_track_published: AtomicU64::new(0),
         two_hop_tx,
         tracker_write,
@@ -7314,6 +7418,8 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_trade_signal_pools: RwLock::new(HashSet::new()),
+            arb_track_recompute_scheduled: AtomicBool::new(false),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
             tracker_write,
@@ -7421,6 +7527,8 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_trade_signal_pools: RwLock::new(HashSet::new()),
+            arb_track_recompute_scheduled: AtomicBool::new(false),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
             tracker_write,
@@ -7526,6 +7634,8 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_trade_signal_pools: RwLock::new(HashSet::new()),
+            arb_track_recompute_scheduled: AtomicBool::new(false),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
             tracker_write,
@@ -7741,6 +7851,8 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_trade_signal_pools: RwLock::new(HashSet::new()),
+            arb_track_recompute_scheduled: AtomicBool::new(false),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
             tracker_write,
@@ -7844,6 +7956,8 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_trade_signal_pools: RwLock::new(HashSet::new()),
+            arb_track_recompute_scheduled: AtomicBool::new(false),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
             tracker_write,
@@ -7951,6 +8065,8 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_trade_signal_pools: RwLock::new(HashSet::new()),
+            arb_track_recompute_scheduled: AtomicBool::new(false),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
             tracker_write,
@@ -8029,6 +8145,8 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_trade_signal_pools: RwLock::new(HashSet::new()),
+            arb_track_recompute_scheduled: AtomicBool::new(false),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx,
             tracker_write,
@@ -8168,6 +8286,8 @@ mod two_hop_price_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_trade_signal_pools: RwLock::new(HashSet::new()),
+            arb_track_recompute_scheduled: AtomicBool::new(false),
             arb_track_published: AtomicU64::new(0),
             two_hop_tx: {
                 let (tx, _rx) = mpsc::channel(1);
@@ -10002,6 +10122,83 @@ mod two_hop_price_tests {
             ironcrab::metrics::ARB_TWO_HOP_V2_SCREEN_MULTI_DEX_TOTAL.load(Ordering::Relaxed)
                 > before_multi
         );
+    }
+
+    #[test]
+    fn arb_track_reconcile_and_proactive_use_same_selection() {
+        let mint = TrackMintInput {
+            mint: "MintShared111111111111111111111111111".to_string(),
+            pools: vec![
+                TrackPoolInput {
+                    pool_address: "orca_pool".to_string(),
+                    dex: "orca".to_string(),
+                    known: true,
+                    quote_pool: QuotePoolInput {
+                        pool_address: "orca_pool".to_string(),
+                        dex: "orca".to_string(),
+                        token_mint: "MintShared111111111111111111111111111".to_string(),
+                        trade_price_buy: None,
+                        trade_price_sell: None,
+                        trade_updated_at: Instant::now(),
+                        has_reserve_data: true,
+                        token_decimals: 6,
+                    },
+                    vault: Some(QuoteVaultInput {
+                        reserve_base: 1_000_000_000_000,
+                        reserve_quote: 1_000_000_000,
+                        update_slot: 1,
+                        updated_at: Instant::now(),
+                        active_id: None,
+                        bin_step: None,
+                        dlmm_sol_is_x: false,
+                        dlmm_token_x_mint: None,
+                    }),
+                    dlmm_bins: None,
+                    token_decimals: 6,
+                },
+                TrackPoolInput {
+                    pool_address: "pump_pool".to_string(),
+                    dex: "pump_amm".to_string(),
+                    known: true,
+                    quote_pool: QuotePoolInput {
+                        pool_address: "pump_pool".to_string(),
+                        dex: "pump_amm".to_string(),
+                        token_mint: "MintShared111111111111111111111111111".to_string(),
+                        trade_price_buy: None,
+                        trade_price_sell: None,
+                        trade_updated_at: Instant::now(),
+                        has_reserve_data: true,
+                        token_decimals: 6,
+                    },
+                    vault: Some(QuoteVaultInput {
+                        reserve_base: 1_000_000_000_000,
+                        reserve_quote: 2_000_000_000,
+                        update_slot: 1,
+                        updated_at: Instant::now(),
+                        active_id: None,
+                        bin_step: None,
+                        dlmm_sol_is_x: false,
+                        dlmm_token_x_mint: None,
+                    }),
+                    dlmm_bins: None,
+                    token_decimals: 6,
+                },
+            ],
+            trade_signal_pools: None,
+        };
+        let config = TrackSelectionConfig {
+            max_pools: 500,
+            max_pools_per_mint: 3,
+            probe_lamports: 10_000_000,
+            freshness: QuoteFreshnessConfig::default(),
+        };
+        let proactive = select_arb_track_pools(std::slice::from_ref(&mint), &config);
+        let reconcile = select_arb_track_pools(std::slice::from_ref(&mint), &config);
+        let proactive_pools: HashSet<_> =
+            proactive.selected.iter().map(|p| p.pool.clone()).collect();
+        let reconcile_pools: HashSet<_> =
+            reconcile.selected.iter().map(|p| p.pool.clone()).collect();
+        assert_eq!(proactive_pools, reconcile_pools);
     }
 
     #[test]

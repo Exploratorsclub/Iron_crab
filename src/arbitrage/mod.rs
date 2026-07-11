@@ -33,6 +33,7 @@ pub mod multi_hop_integration;
 pub mod pool_graph;
 pub mod pool_quote;
 pub mod pool_ranker;
+pub mod track_selection;
 pub mod types;
 
 // Re-exports for convenient access
@@ -60,6 +61,10 @@ pub use pool_quote::{
     DLMM_PROBE_SOL_LAMPORTS, STATE_TTL_MS, TRADE_TTL_MS,
 };
 pub use pool_ranker::{PoolRanker, QuoteProvider, RankerConfig};
+pub use track_selection::{
+    arb_track_removal_reason, select_arb_track_pools, SelectedTrackPool, TrackCandidateCounts,
+    TrackMintInput, TrackPoolInput, TrackPoolReadiness, TrackSelectionConfig, TrackSelectionResult,
+};
 pub use types::{
     clamp_edge_ratio, profit_to_return_bps, ArbCycle, DexType, ParseDexTypeError, PoolEdge,
     RankedPool, SearchNode, MAX_CYCLE_PROFIT_MULTIPLIER, MAX_EDGE_RATIO, MAX_RETURN_BPS,
