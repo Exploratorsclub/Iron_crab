@@ -360,6 +360,12 @@ pub static MARKET_DATA_ARB_PIN_EVICTION_REASON_STALE_BUDGET: Lazy<AtomicU64> =
 /// Arb pin add skipped because only activity-protected pools would need eviction.
 pub static MARKET_DATA_ARB_PIN_EVICTION_REASON_ACTIVE_PROTECTED: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Arb pin: Geyser reserve registration deferred because LivePoolCache has no row yet.
+pub static MARKET_DATA_ARB_PIN_GEYSER_REGISTER_DEFERRED_LIVE_POOL_CACHE_MISS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Arb pin: Geyser reserve registration deferred because vault/bin register was a no-op.
+pub static MARKET_DATA_ARB_PIN_GEYSER_REGISTER_DEFERRED_VAULT_NO_CHANGE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 /// Geyser explicit-tracked subscription list syncs coalesced from the TX trade path (debounced flush).
 pub static MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -697,6 +703,21 @@ pub fn inc_market_data_arb_pin_eviction_reason_stale_budget() {
 #[inline]
 pub fn inc_market_data_arb_pin_eviction_reason_active_protected() {
     MARKET_DATA_ARB_PIN_EVICTION_REASON_ACTIVE_PROTECTED.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_pin_geyser_register_deferred_total(reason: &str) {
+    match reason {
+        "live_pool_cache_miss" => {
+            MARKET_DATA_ARB_PIN_GEYSER_REGISTER_DEFERRED_LIVE_POOL_CACHE_MISS
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        "vault_register_no_change" => {
+            MARKET_DATA_ARB_PIN_GEYSER_REGISTER_DEFERRED_VAULT_NO_CHANGE
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
 }
 
 #[inline]
@@ -6025,6 +6046,24 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("market_data_arb_pin_eviction_reason{reason=\"active_protected\"} ");
     out.push_str(
         &MARKET_DATA_ARB_PIN_EVICTION_REASON_ACTIVE_PROTECTED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        "market_data_arb_pin_geyser_register_deferred_total{reason=\"live_pool_cache_miss\"} ",
+    );
+    out.push_str(
+        &MARKET_DATA_ARB_PIN_GEYSER_REGISTER_DEFERRED_LIVE_POOL_CACHE_MISS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        "market_data_arb_pin_geyser_register_deferred_total{reason=\"vault_register_no_change\"} ",
+    );
+    out.push_str(
+        &MARKET_DATA_ARB_PIN_GEYSER_REGISTER_DEFERRED_VAULT_NO_CHANGE
             .load(Ordering::Relaxed)
             .to_string(),
     );

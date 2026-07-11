@@ -1821,6 +1821,240 @@ fn record_v2_insufficient_subreason(insufficient: &RoundTripInsufficient) {
     }
 }
 
+const CROSS_DEX_PAIR_DEBUG_SAMPLE_MAX: usize = 3;
+const HOT_PATH_LOG_THROTTLE_SECS: u64 = 60;
+const V2_INSUFFICIENT_LOG_CATEGORY_COUNT: usize = 9;
+
+mod fixed_category_log_throttle {
+    use std::time::{Duration, Instant};
+
+    #[derive(Debug)]
+    pub(super) struct FixedCategoryLogThrottle<const N: usize> {
+        last_emit: [Option<Instant>; N],
+        interval: Duration,
+    }
+
+    impl<const N: usize> FixedCategoryLogThrottle<N> {
+        pub(super) fn new(interval: Duration) -> Self {
+            Self {
+                last_emit: [None; N],
+                interval,
+            }
+        }
+
+        pub(super) fn should_emit(&mut self, category: usize, now: Instant) -> bool {
+            debug_assert!(category < N);
+            if let Some(last) = self.last_emit[category] {
+                if now.duration_since(last) < self.interval {
+                    return false;
+                }
+            }
+            self.last_emit[category] = Some(now);
+            true
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn many_distinct_mint_values_share_one_category_slot() {
+            let mut throttle = FixedCategoryLogThrottle::<2>::new(Duration::from_secs(60));
+            let category = 0usize;
+            let t0 = Instant::now();
+            assert!(throttle.should_emit(category, t0));
+            for offset in 1..=1000u64 {
+                assert!(
+                    !throttle.should_emit(category, t0 + Duration::from_millis(offset)),
+                    "category must stay suppressed regardless of mint cardinality"
+                );
+            }
+            assert!(throttle.should_emit(category, t0 + Duration::from_secs(60)));
+        }
+
+        #[test]
+        fn distinct_categories_emit_independently() {
+            let mut throttle = FixedCategoryLogThrottle::<3>::new(Duration::from_secs(60));
+            let t0 = Instant::now();
+            assert!(throttle.should_emit(0, t0));
+            assert!(throttle.should_emit(1, t0));
+            assert!(!throttle.should_emit(0, t0 + Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn category_reopens_after_interval() {
+            let mut throttle = FixedCategoryLogThrottle::<1>::new(Duration::from_secs(60));
+            let t0 = Instant::now();
+            assert!(throttle.should_emit(0, t0));
+            assert!(!throttle.should_emit(0, t0 + Duration::from_secs(59)));
+            assert!(throttle.should_emit(0, t0 + Duration::from_secs(60)));
+        }
+    }
+}
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V2InsufficientLogCategory {
+    CandidatesLt2 = 0,
+    NoFreshBuyQuote = 1,
+    SingleDexCandidates = 2,
+    NoCrossDexSellUnknown = 3,
+    NoCrossDexSellMissingVault = 4,
+    NoCrossDexSellMissingDlmmBins = 5,
+    NoCrossDexSellQuoteNone = 6,
+    NoCrossDexSellNotFresh = 7,
+    NoCrossDexSellZeroOut = 8,
+}
+
+fn v2_insufficient_log_category(insufficient: &RoundTripInsufficient) -> V2InsufficientLogCategory {
+    match insufficient.subreason {
+        RoundTripInsufficientSubreason::CandidatesLt2 => V2InsufficientLogCategory::CandidatesLt2,
+        RoundTripInsufficientSubreason::NoFreshBuyQuote => {
+            V2InsufficientLogCategory::NoFreshBuyQuote
+        }
+        RoundTripInsufficientSubreason::SingleDexCandidates => {
+            V2InsufficientLogCategory::SingleDexCandidates
+        }
+        RoundTripInsufficientSubreason::NoCrossDexSell => {
+            match insufficient.no_cross_dex_sell_detail {
+                Some(NoCrossDexSellDetailReason::SellMissingVault) => {
+                    V2InsufficientLogCategory::NoCrossDexSellMissingVault
+                }
+                Some(NoCrossDexSellDetailReason::SellMissingDlmmBins) => {
+                    V2InsufficientLogCategory::NoCrossDexSellMissingDlmmBins
+                }
+                Some(NoCrossDexSellDetailReason::SellQuoteNone) => {
+                    V2InsufficientLogCategory::NoCrossDexSellQuoteNone
+                }
+                Some(NoCrossDexSellDetailReason::SellNotFresh) => {
+                    V2InsufficientLogCategory::NoCrossDexSellNotFresh
+                }
+                Some(NoCrossDexSellDetailReason::SellZeroOut) => {
+                    V2InsufficientLogCategory::NoCrossDexSellZeroOut
+                }
+                None => V2InsufficientLogCategory::NoCrossDexSellUnknown,
+            }
+        }
+    }
+}
+
+static ARB_V2_INSUFFICIENT_LOG_THROTTLE: std::sync::LazyLock<
+    parking_lot::Mutex<
+        fixed_category_log_throttle::FixedCategoryLogThrottle<V2_INSUFFICIENT_LOG_CATEGORY_COUNT>,
+    >,
+> = std::sync::LazyLock::new(|| {
+    parking_lot::Mutex::new(fixed_category_log_throttle::FixedCategoryLogThrottle::new(
+        Duration::from_secs(HOT_PATH_LOG_THROTTLE_SECS),
+    ))
+});
+
+fn insufficient_subreason_metric_label(subreason: RoundTripInsufficientSubreason) -> &'static str {
+    match subreason {
+        RoundTripInsufficientSubreason::CandidatesLt2 => "candidates_lt2",
+        RoundTripInsufficientSubreason::NoFreshBuyQuote => "no_fresh_buy_quote",
+        RoundTripInsufficientSubreason::NoCrossDexSell => "no_cross_dex_sell",
+        RoundTripInsufficientSubreason::SingleDexCandidates => "single_dex_candidates",
+    }
+}
+
+fn log_v2_round_trip_insufficient_pools(
+    mint: &str,
+    insufficient: &RoundTripInsufficient,
+    candidates: &[RoundTripPoolCandidate<'_>],
+    probe: u64,
+    freshness: &QuoteFreshnessConfig,
+    token_decimals: u8,
+) {
+    let category = v2_insufficient_log_category(insufficient);
+    let now = Instant::now();
+    if !ARB_V2_INSUFFICIENT_LOG_THROTTLE
+        .lock()
+        .should_emit(category as usize, now)
+    {
+        return;
+    }
+    let subreason = insufficient.subreason;
+    let subreason_label = insufficient_subreason_metric_label(subreason);
+    if subreason == RoundTripInsufficientSubreason::NoCrossDexSell {
+        let dominant = insufficient
+            .no_cross_dex_sell_detail
+            .map(|d| d.as_metric_label())
+            .unwrap_or("unknown");
+        warn!(
+            mint = %mint,
+            subreason = subreason_label,
+            dominant_sell_fail_reason = dominant,
+            "arb v2 screen: insufficient pools (no cross-dex sell)"
+        );
+        log_v2_cross_dex_pair_failures_debug_sample(
+            mint,
+            candidates,
+            probe,
+            freshness,
+            token_decimals,
+        );
+    } else {
+        info!(
+            mint = %mint,
+            subreason = subreason_label,
+            "arb v2 screen: insufficient pools"
+        );
+    }
+}
+
+fn log_v2_cross_dex_pair_failures_debug_sample(
+    mint: &str,
+    candidates: &[RoundTripPoolCandidate<'_>],
+    probe: u64,
+    freshness: &QuoteFreshnessConfig,
+    token_decimals: u8,
+) {
+    let now = Instant::now();
+    let mut logged = 0usize;
+    'outer: for buy in candidates {
+        let Some(buy_quote) = quote_exact_in_with_freshness(
+            buy.pool,
+            buy.vault,
+            buy.dlmm_bins,
+            NATIVE_SOL_MINT,
+            &buy.pool.token_mint,
+            probe,
+            freshness,
+        ) else {
+            continue;
+        };
+        if !is_quote_fresh(&buy_quote, freshness, buy.vault, now) {
+            continue;
+        }
+        for sell in candidates {
+            if sell.dex == buy.dex {
+                continue;
+            }
+            let Some(failure) = classify_cross_dex_sell_failure(
+                sell,
+                buy_quote.amount_out,
+                freshness,
+                now,
+                token_decimals,
+            ) else {
+                continue;
+            };
+            debug!(
+                mint = %mint,
+                buy_dex = buy.dex,
+                sell_dex = sell.dex,
+                sell_fail_reason = failure.as_top_level_detail().as_metric_label(),
+                "arb v2 screen: cross-dex pair sell failure sample"
+            );
+            logged += 1;
+            if logged >= CROSS_DEX_PAIR_DEBUG_SAMPLE_MAX {
+                break 'outer;
+            }
+        }
+    }
+}
+
 fn record_eligibility_metrics(breakdown: &MintEligibilityBreakdown) {
     arb_two_hop_pool_gate_add(
         ArbTwoHopPoolGate::CandidatePools,
@@ -2496,6 +2730,14 @@ impl TokenArbTracker {
             Ok(selection) => selection,
             Err(RoundTripSelectFailure::InsufficientPools(insufficient)) => {
                 record_v2_insufficient_subreason(&insufficient);
+                log_v2_round_trip_insufficient_pools(
+                    &self.base_mint,
+                    &insufficient,
+                    &candidates,
+                    probe,
+                    &freshness,
+                    token_decimals,
+                );
                 arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::InsufficientPools);
                 if let Some(collector) = v2_forensics {
                     let breakdown = self.build_v2_eligibility_breakdown(
@@ -9779,6 +10021,40 @@ mod two_hop_price_tests {
         let back: ArbTrackRequestsUpdate = serde_json::from_str(&json).expect("deserialize");
         assert!(back.reconcile);
         assert_eq!(back.active.len(), 1);
+    }
+
+    #[test]
+    fn v2_insufficient_log_category_is_fixed_per_subreason_and_detail() {
+        let no_fresh = RoundTripInsufficient::new(RoundTripInsufficientSubreason::NoFreshBuyQuote);
+        assert_eq!(
+            v2_insufficient_log_category(&no_fresh),
+            V2InsufficientLogCategory::NoFreshBuyQuote
+        );
+        let cross_dex = RoundTripInsufficient {
+            subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
+            no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellMissingVault),
+            sell_quote_none_detail_counts: None,
+        };
+        assert_eq!(
+            v2_insufficient_log_category(&cross_dex),
+            V2InsufficientLogCategory::NoCrossDexSellMissingVault
+        );
+    }
+
+    #[test]
+    fn v2_insufficient_log_path_has_no_dynamic_string_keys() {
+        let src = include_str!("arb_strategy.rs");
+        let start = src
+            .find("fn log_v2_round_trip_insufficient_pools(")
+            .expect("log_v2_round_trip_insufficient_pools");
+        let end = src[start..]
+            .find("fn log_v2_cross_dex_pair_failures_debug_sample")
+            .expect("after log_v2_round_trip_insufficient_pools");
+        let fn_body = &src[start..start + end];
+        assert!(
+            !fn_body.contains("format!("),
+            "throttle decision must not allocate dynamic string keys"
+        );
     }
 }
 

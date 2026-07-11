@@ -94,6 +94,7 @@ use ironcrab::metrics::{
     geyser_metrics_set_subscription_accounts, geyser_metrics_set_tracked_pinned_accounts,
     inc_market_data_account_high_priority_queue_depth,
     inc_market_data_account_low_priority_queue_depth, inc_market_data_account_worker_queue_depth,
+    inc_market_data_arb_pin_geyser_register_deferred_total,
     inc_market_data_balance_updated_from_cache_total, inc_market_data_geyser_sync_partial_total,
     inc_market_data_geyser_sync_skipped_rate_limit_total,
     inc_market_data_ingest_membership_snapshot_hits_total,
@@ -1119,14 +1120,6 @@ struct MarketDataContext {
     last_arb_snapshot_target: parking_lot::RwLock<Option<HashSet<Pubkey>>>,
     /// Last `active_id` used when registering DLMM bin-array window per pool (Fix B).
     dlmm_registered_active_id: parking_lot::RwLock<HashMap<Pubkey, i32>>,
-    /// Cold-path RPC for arb-pin pool seed (set at Geyser loop start).
-    cold_path_rpc: parking_lot::RwLock<Option<Arc<SolanaRpc>>>,
-    /// Debounced arb-pin ensure enqueue (pool → last spawn time).
-    arb_pin_ensure_debounce: parking_lot::Mutex<HashMap<Pubkey, Instant>>,
-    /// Self `Arc` for cold-path spawns from `&self` md-state handlers.
-    self_arc: parking_lot::RwLock<Option<Arc<MarketDataContext>>>,
-    /// md-state sender for post-ensure Geyser sync scheduling.
-    md_state_sender: parking_lot::RwLock<Option<MdStateSender>>,
 }
 
 #[derive(Debug, Default)]
@@ -1176,14 +1169,85 @@ const WALLET_BOOTSTRAP_DEX_VERIFY_GRACE_MS: u64 = 400;
 /// Max wallet-held mints to run PumpSwap/PumpFun bootstrap verification for per startup (deduped).
 const WALLET_BOOTSTRAP_DEX_VERIFY_MAX_MINTS: usize = 8;
 
-/// Debounce arb-pin cold-path pool ensure per pool (seconds).
-const ARB_PIN_ENSURE_DEBOUNCE_SECS: u64 = 60;
-/// Cap debounce map for arb-pin ensure enqueue (LRU via oldest eviction).
-const ARB_PIN_ENSURE_DEBOUNCE_MAP_CAP: usize = 2048;
-
 /// Wallet bootstrap PumpFun step: must use `force_refresh` so `handle_ensure_pumpfun_bonding_curve`
 /// does not early-return on `CachedPoolState::PumpFun` without explicit Ready (merge + JetStream).
 const WALLET_BOOTSTRAP_ENSURE_PUMPFUN_FORCE_REFRESH: bool = true;
+
+const HOT_PATH_LOG_THROTTLE_SECS: u64 = 60;
+
+mod fixed_category_log_throttle {
+    use std::time::{Duration, Instant};
+
+    #[derive(Debug)]
+    pub(super) struct FixedCategoryLogThrottle<const N: usize> {
+        last_emit: [Option<Instant>; N],
+        interval: Duration,
+    }
+
+    impl<const N: usize> FixedCategoryLogThrottle<N> {
+        pub(super) fn new(interval: Duration) -> Self {
+            Self {
+                last_emit: [None; N],
+                interval,
+            }
+        }
+
+        pub(super) fn should_emit(&mut self, category: usize, now: Instant) -> bool {
+            debug_assert!(category < N);
+            if let Some(last) = self.last_emit[category] {
+                if now.duration_since(last) < self.interval {
+                    return false;
+                }
+            }
+            self.last_emit[category] = Some(now);
+            true
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn many_distinct_pool_values_share_one_reason_category() {
+            let mut throttle = FixedCategoryLogThrottle::<2>::new(Duration::from_secs(60));
+            let category = 0usize;
+            let t0 = Instant::now();
+            assert!(throttle.should_emit(category, t0));
+            for offset in 1..=1000u64 {
+                assert!(
+                    !throttle.should_emit(category, t0 + Duration::from_millis(offset)),
+                    "reason category must stay suppressed regardless of pool cardinality"
+                );
+            }
+            assert!(throttle.should_emit(category, t0 + Duration::from_secs(60)));
+        }
+
+        #[test]
+        fn distinct_reason_categories_emit_independently() {
+            let mut throttle = FixedCategoryLogThrottle::<2>::new(Duration::from_secs(60));
+            let t0 = Instant::now();
+            assert!(throttle.should_emit(0, t0));
+            assert!(throttle.should_emit(1, t0));
+            assert!(!throttle.should_emit(0, t0 + Duration::from_secs(1)));
+        }
+    }
+}
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArbPinDeferredLogCategory {
+    LivePoolCacheMiss = 0,
+    VaultRegisterNoChange = 1,
+}
+
+static ARB_PIN_DEFERRED_LOG_THROTTLE: std::sync::LazyLock<
+    parking_lot::Mutex<fixed_category_log_throttle::FixedCategoryLogThrottle<2>>,
+> = std::sync::LazyLock::new(|| {
+    parking_lot::Mutex::new(fixed_category_log_throttle::FixedCategoryLogThrottle::new(
+        Duration::from_secs(HOT_PATH_LOG_THROTTLE_SECS),
+    ))
+});
 
 /// Associated Token Program ID
 const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
@@ -2362,18 +2426,6 @@ impl MdStateContext for MarketDataContext {
 }
 
 impl MarketDataContext {
-    fn set_self_arc(&self, arc: Arc<MarketDataContext>) {
-        *self.self_arc.write() = Some(arc);
-    }
-
-    fn set_cold_path_rpc(&self, rpc: Arc<SolanaRpc>) {
-        *self.cold_path_rpc.write() = Some(rpc);
-    }
-
-    fn set_md_state_sender(&self, sender: MdStateSender) {
-        *self.md_state_sender.write() = Some(sender);
-    }
-
     /// Non-blocking JSONL enqueue (dedicated `jsonl-writer` thread). Skips `AccountUpdate` / `TransactionDetected`.
     fn write_market_event_jsonl(&self, event: &MarketEvent) {
         write_market_event_jsonl(self, event);
@@ -4054,72 +4106,6 @@ impl MarketDataContext {
         batch_dirty
     }
 
-    fn non_sol_mint_for_arb_pool_seed(state: &CachedPoolState) -> Option<Pubkey> {
-        let sol = Pubkey::from_str(NATIVE_SOL_MINT).ok()?;
-        match state {
-            CachedPoolState::Orca(s) => {
-                if s.token_mint_a == sol {
-                    Some(s.token_mint_b)
-                } else if s.token_mint_b == sol {
-                    Some(s.token_mint_a)
-                } else {
-                    None
-                }
-            }
-            CachedPoolState::Meteora(s) => {
-                if s.token_x_mint == sol {
-                    Some(s.token_y_mint)
-                } else if s.token_y_mint == sol {
-                    Some(s.token_x_mint)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn arb_pin_ensure_debounce_should_enqueue(&self, pool: Pubkey) -> bool {
-        let now = Instant::now();
-        let mut debounce = self.arb_pin_ensure_debounce.lock();
-        if let Some(last) = debounce.get(&pool) {
-            if last.elapsed() < Duration::from_secs(ARB_PIN_ENSURE_DEBOUNCE_SECS) {
-                return false;
-            }
-        }
-        if debounce.len() >= ARB_PIN_ENSURE_DEBOUNCE_MAP_CAP {
-            if let Some(oldest_pool) = debounce
-                .iter()
-                .min_by_key(|(_, ts)| *ts)
-                .map(|(pool, _)| *pool)
-            {
-                debounce.remove(&oldest_pool);
-            }
-        }
-        debounce.insert(pool, now);
-        true
-    }
-
-    fn maybe_enqueue_arb_pin_cold_path_ensure(&self, pool: Pubkey) {
-        if !self.arb_pin_ensure_debounce_should_enqueue(pool) {
-            return;
-        }
-        let Some(ctx) = self.self_arc.read().clone() else {
-            return;
-        };
-        let Some(rpc) = self.cold_path_rpc.read().clone() else {
-            return;
-        };
-        let Some(handle) = self.ingest_tokio_handle.read().clone() else {
-            return;
-        };
-        let md_state = self.md_state_sender.read().clone();
-
-        handle.spawn(async move {
-            arb_pin_cold_path_seed_pool_state(ctx, rpc, md_state, pool).await;
-        });
-    }
-
     fn apply_arb_active_entries(&self, active: &[ArbTrackActiveEntry]) -> bool {
         let mut batch_dirty = false;
         for a in active {
@@ -4130,13 +4116,30 @@ impl MarketDataContext {
             self.hot_pool_registry.pin_arb_pool(pool_pk);
             if self.register_geyser_reserves_for_arb_active_pool(pool_pk) {
                 batch_dirty = true;
-            } else if self.live_pool_cache.get(&pool_pk).is_none()
-                || matches!(
-                    self.live_pool_cache.get(&pool_pk),
-                    Some(CachedPoolState::Orca(_)) | Some(CachedPoolState::Meteora(_))
-                )
-            {
-                self.maybe_enqueue_arb_pin_cold_path_ensure(pool_pk);
+            } else {
+                let category = if self.live_pool_cache.get(&pool_pk).is_none() {
+                    ArbPinDeferredLogCategory::LivePoolCacheMiss
+                } else {
+                    ArbPinDeferredLogCategory::VaultRegisterNoChange
+                };
+                let reason: &'static str = match category {
+                    ArbPinDeferredLogCategory::LivePoolCacheMiss => "live_pool_cache_miss",
+                    ArbPinDeferredLogCategory::VaultRegisterNoChange => "vault_register_no_change",
+                };
+                inc_market_data_arb_pin_geyser_register_deferred_total(reason);
+                let now = Instant::now();
+                if ARB_PIN_DEFERRED_LOG_THROTTLE
+                    .lock()
+                    .should_emit(category as usize, now)
+                {
+                    warn!(
+                        run_id = %self.run_id,
+                        pool = %pool_pk,
+                        pin = "ArbMultiDex",
+                        reason = reason,
+                        "Arb pin: Geyser reserve registration deferred (geyser-only, no RPC)"
+                    );
+                }
             }
             let _ = &a.reason;
         }
@@ -5013,101 +5016,6 @@ async fn handle_wallet_bootstrap_meteora_dlmm_verify_for_mint(
             ctx, rpc, run_id, request_id, base_mint, pool_addr, state,
         )
         .await;
-    }
-}
-
-/// Cold-path only: debounced pool seed when arb pin hits LivePoolCache miss or Orca/DLMM rows
-/// need RPC refresh before vault/bin Geyser registration.
-async fn arb_pin_cold_path_seed_pool_state(
-    ctx: Arc<MarketDataContext>,
-    rpc: Arc<SolanaRpc>,
-    md_state: Option<MdStateSender>,
-    pool: Pubkey,
-) {
-    let run_id = ctx.run_id.clone();
-    let request_id = format!("arb-pin-ensure-{}", pool);
-
-    if let Some(state) = ctx.live_pool_cache.get(&pool) {
-        let Some(base_mint) = MarketDataContext::non_sol_mint_for_arb_pool_seed(&state) else {
-            return;
-        };
-        let base_mint_str = base_mint.to_string();
-        let pool_hint = pool.to_string();
-        match state {
-            CachedPoolState::Orca(_) => {
-                handle_ensure_orca_whirlpool_pool_state(
-                    ctx.as_ref(),
-                    &rpc,
-                    run_id.as_str(),
-                    &request_id,
-                    &base_mint_str,
-                    Some(pool_hint.as_str()),
-                    false,
-                )
-                .await;
-            }
-            CachedPoolState::Meteora(_) if ctx.config.read().enable_meteora_dlmm => {
-                handle_ensure_meteora_dlmm_pool_state(
-                    ctx.as_ref(),
-                    &rpc,
-                    run_id.as_str(),
-                    &request_id,
-                    &base_mint_str,
-                    Some(pool_hint.as_str()),
-                    false,
-                )
-                .await;
-            }
-            _ => return,
-        }
-    } else {
-        let pool_acc = match rpc.get_account_opt_retry(&pool).await {
-            Ok(Some(acc)) => acc,
-            Ok(None) | Err(_) => {
-                debug!(pool = %pool, "Arb pin cold seed: pool account fetch miss");
-                return;
-            }
-        };
-        let Some(parsed) = parse_pool_account(&pool_acc.owner, &pool_acc.data) else {
-            debug!(pool = %pool, "Arb pin cold seed: unsupported pool owner/layout");
-            return;
-        };
-        let Some(base_mint) = MarketDataContext::non_sol_mint_for_arb_pool_seed(&parsed) else {
-            return;
-        };
-        match parsed {
-            CachedPoolState::Orca(s) => {
-                cold_path_rpc_refresh_orca_whirlpool_pool_row(
-                    ctx.as_ref(),
-                    &rpc,
-                    run_id.as_str(),
-                    &request_id,
-                    &base_mint,
-                    pool,
-                    s,
-                )
-                .await;
-            }
-            CachedPoolState::Meteora(s) if ctx.config.read().enable_meteora_dlmm => {
-                cold_path_rpc_refresh_meteora_dlmm_pool_row(
-                    ctx.as_ref(),
-                    &rpc,
-                    run_id.as_str(),
-                    &request_id,
-                    &base_mint,
-                    pool,
-                    s,
-                )
-                .await;
-            }
-            _ => return,
-        }
-    }
-
-    if ctx.register_geyser_reserves_for_arb_active_pool(pool) {
-        if let Some(md_state) = md_state {
-            ctx.schedule_geyser_sync_batch_debounced(&md_state);
-        }
     }
 }
 
@@ -6423,10 +6331,6 @@ async fn main() -> Result<()> {
         last_momentum_snapshot_target: parking_lot::RwLock::new(None),
         last_arb_snapshot_target: parking_lot::RwLock::new(None),
         dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
-        cold_path_rpc: parking_lot::RwLock::new(None),
-        arb_pin_ensure_debounce: parking_lot::Mutex::new(HashMap::new()),
-        self_arc: parking_lot::RwLock::new(None),
-        md_state_sender: parking_lot::RwLock::new(None),
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -7225,9 +7129,6 @@ async fn run_geyser_loop(
         tokio::runtime::Handle::current(),
         track_worker.clone(),
     );
-    ctx.set_self_arc(Arc::clone(&ctx));
-    ctx.set_cold_path_rpc(Arc::clone(&rpc));
-    ctx.set_md_state_sender(md_state.clone());
 
     // === P0: Wallet Balance Snapshot (Position Reconciliation) ===
     // Bootstrap wallet state at startup (max 1 RPC roundtrip) using known mints from JetStream.
@@ -8578,9 +8479,6 @@ async fn run_simulation_loop(
         tokio::runtime::Handle::current(),
         track_worker.clone(),
     );
-    ctx.set_self_arc(Arc::clone(&ctx));
-    ctx.set_cold_path_rpc(Arc::clone(&rpc));
-    ctx.set_md_state_sender(md_state.clone());
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut slot: u64 = 0;
@@ -10038,10 +9936,6 @@ mod wallet_snapshot_stale_cleanup_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
-            cold_path_rpc: parking_lot::RwLock::new(None),
-            arb_pin_ensure_debounce: parking_lot::Mutex::new(HashMap::new()),
-            self_arc: parking_lot::RwLock::new(None),
-            md_state_sender: parking_lot::RwLock::new(None),
         }
     }
 
@@ -10262,10 +10156,6 @@ mod wallet_tx_meta_balance_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
-            cold_path_rpc: parking_lot::RwLock::new(None),
-            arb_pin_ensure_debounce: parking_lot::Mutex::new(HashMap::new()),
-            self_arc: parking_lot::RwLock::new(None),
-            md_state_sender: parking_lot::RwLock::new(None),
         })
     }
 
@@ -11139,10 +11029,6 @@ mod pr_b_geyser_tracking_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
-            cold_path_rpc: parking_lot::RwLock::new(None),
-            arb_pin_ensure_debounce: parking_lot::Mutex::new(HashMap::new()),
-            self_arc: parking_lot::RwLock::new(None),
-            md_state_sender: parking_lot::RwLock::new(None),
         })
     }
 
@@ -11215,10 +11101,6 @@ mod pr_b_geyser_tracking_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
-            cold_path_rpc: parking_lot::RwLock::new(None),
-            arb_pin_ensure_debounce: parking_lot::Mutex::new(HashMap::new()),
-            self_arc: parking_lot::RwLock::new(None),
-            md_state_sender: parking_lot::RwLock::new(None),
         });
         (
             ctx,
@@ -14353,6 +14235,62 @@ mod pr_b_geyser_tracking_tests {
         assert!(
             bin_src.contains("fn spawn_market_data_account_publish_runtime"),
             "bin must retain thin spawn wrapper for md-publish runtime"
+        );
+    }
+
+    /// Arb pin track path must remain Geyser-only (no cold-path RPC seed on pin).
+    #[test]
+    fn apply_arb_active_entries_geyser_only_no_cold_rpc() {
+        let bin_src = include_str!("market_data.rs");
+        let code_src = bin_src
+            .split("mod discovery_tests")
+            .next()
+            .expect("production + inline helpers before test modules");
+        assert!(
+            !code_src.contains("cold_path_rpc: parking_lot::RwLock"),
+            "MarketDataContext must not carry arb-pin cold_path_rpc"
+        );
+        assert!(
+            !code_src.contains("arb_pin_ensure_debounce"),
+            "arb-pin ensure debounce map must be removed"
+        );
+        assert!(
+            code_src
+                .contains("Arb pin: Geyser reserve registration deferred (geyser-only, no RPC)"),
+            "apply_arb_active_entries must log deferred Geyser register without RPC"
+        );
+        let impl_marker = "Arb pin: Geyser reserve registration deferred (geyser-only, no RPC)";
+        let impl_start = code_src
+            .find(impl_marker)
+            .expect("apply_arb_active_entries geyser-only path");
+        let impl_window = &code_src[impl_start.saturating_sub(800)..impl_start + 200];
+        assert!(
+            !impl_window.contains("handle_ensure_"),
+            "apply_arb_active_entries must not call handle_ensure_*"
+        );
+        assert!(
+            !impl_window.contains("cold_path_rpc_refresh"),
+            "apply_arb_active_entries must not call cold_path_rpc_refresh"
+        );
+    }
+
+    /// Arb-pin deferred warn throttle must not build dynamic string keys.
+    #[test]
+    fn apply_arb_active_entries_throttle_has_no_dynamic_string_keys() {
+        let bin_src = include_str!("market_data.rs");
+        let anchor = bin_src
+            .find("ArbPinDeferredLogCategory::LivePoolCacheMiss")
+            .expect("apply_arb_active_entries deferred category");
+        let start = bin_src[..anchor]
+            .rfind("fn apply_arb_active_entries(")
+            .expect("apply_arb_active_entries");
+        let end = bin_src[anchor..]
+            .find("fn arb_pool_leg_mint_still_required")
+            .expect("after apply_arb_active_entries");
+        let fn_body = &bin_src[start..anchor + end];
+        assert!(
+            !fn_body.contains("format!("),
+            "throttle decision must not allocate dynamic string keys"
         );
     }
 
