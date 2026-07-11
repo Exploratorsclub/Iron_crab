@@ -116,8 +116,21 @@ pub fn select_arb_track_pools(
     let mut per_pool_readiness: HashMap<String, TrackPoolReadiness> = HashMap::new();
 
     for mint in mints {
+        let signal_pools: HashSet<&str> = mint
+            .trade_signal_pools
+            .as_ref()
+            .map(|(buy, sell)| [buy.as_str(), sell.as_str()])
+            .into_iter()
+            .flatten()
+            .collect();
+
         for pool in &mint.pools {
-            let readiness = classify_pool_readiness(pool, config, now);
+            let mut readiness = classify_pool_readiness(pool, config, now);
+            if signal_pools.contains(pool.pool_address.as_str())
+                && readiness >= TrackPoolReadiness::Warmable
+            {
+                readiness = TrackPoolReadiness::Executable;
+            }
             candidate_counts.record(readiness);
             per_pool_readiness.insert(pool.pool_address.clone(), readiness);
         }
@@ -826,6 +839,7 @@ mod tests {
         );
         let result = select_arb_track_pools(&[mint], &default_config(500));
         assert_eq!(result.selected.len(), 2);
+        assert_eq!(result.candidate_counts.executable, 2);
         assert!(result
             .selected
             .iter()
