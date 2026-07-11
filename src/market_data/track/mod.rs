@@ -26,7 +26,7 @@ pub use geyser_sync::{
 };
 pub use pending::{
     GeyserConnectBarrier, InflightReserveResult, PendingPoolCommand, PendingPoolRegistrations,
-    PendingPoolUpsertResult, PoolCommandAcceptPhase, PoolCommandTerminal,
+    PendingPoolUpsertResult, PoolCommandAcceptPhase, PoolCommandRefRelease, PoolCommandTerminal,
     PoolSnapshotRevisionSequencer, ProtectedOverflowDiagnostic, RevisionAcquireResult,
     RevisionActiveOwner, RevisionAssignResult, RevisionRefCounts, WalletExplicitPending,
 };

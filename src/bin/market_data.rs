@@ -86,11 +86,11 @@ use ironcrab::market_data::track::{
     CapConvergeResult, ConsumerId, DesiredExplicitSet, ExplicitAccountKind, ExplicitSetSnapshot,
     ExplicitSnapshotRow, GeyserConnectBarrier, GeyserPinReason, InflightReserveResult,
     MintExplicitRow, OwnerGroupSnapshot, OwnerKey, PendingPoolCommand, PendingPoolRegistrations,
-    PendingPoolUpsertResult, PoolCommandAcceptPhase, PoolCommandTerminal, PoolExplicitSnapshot,
-    PoolSnapshotRevisionSequencer, ProtectedOverflowDiagnostic, RevisionAcquireResult,
-    RevisionActiveOwner, RevisionAssignResult, SnapshotConsumer, SnapshotOwnerGroup,
-    TrackPinReason, TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender, VaultExplicitRow,
-    WalletExplicitPending, EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
+    PendingPoolUpsertResult, PoolCommandAcceptPhase, PoolCommandRefRelease, PoolCommandTerminal,
+    PoolExplicitSnapshot, PoolSnapshotRevisionSequencer, ProtectedOverflowDiagnostic,
+    RevisionAcquireResult, RevisionActiveOwner, RevisionAssignResult, SnapshotConsumer,
+    SnapshotOwnerGroup, TrackPinReason, TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,
+    VaultExplicitRow, WalletExplicitPending, EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
 };
 use ironcrab::metrics::{
     dec_market_data_account_high_priority_queue_depth,
@@ -2526,9 +2526,12 @@ impl TrackWorkerContext for MarketDataContext {
         desired: &mut DesiredExplicitSet,
         snapshot: &PoolExplicitSnapshot,
     ) -> bool {
-        self.apply_pool_snapshot_command(desired, snapshot, true, |desired| {
-            self.apply_pool_admission(desired, snapshot)
-        })
+        self.apply_pool_snapshot_command(
+            desired,
+            snapshot,
+            Some(PoolCommandRefRelease::Inflight),
+            |desired| self.apply_pool_admission(desired, snapshot),
+        )
     }
 
     fn commit_register_pool_vaults_from_account(
@@ -2536,13 +2539,18 @@ impl TrackWorkerContext for MarketDataContext {
         desired: &mut DesiredExplicitSet,
         snapshot: &PoolExplicitSnapshot,
     ) -> bool {
-        self.apply_pool_snapshot_command(desired, snapshot, true, |desired| {
-            self.try_publish_balance_updated_from_cache(snapshot.pool);
-            if !self.hot_pool_registry.is_hot_pool(snapshot.pool) {
-                return (false, PoolCommandTerminal::Applied);
-            }
-            self.apply_pool_admission(desired, snapshot)
-        })
+        self.apply_pool_snapshot_command(
+            desired,
+            snapshot,
+            Some(PoolCommandRefRelease::Inflight),
+            |desired| {
+                self.try_publish_balance_updated_from_cache(snapshot.pool);
+                if !self.hot_pool_registry.is_hot_pool(snapshot.pool) {
+                    return (false, PoolCommandTerminal::Applied);
+                }
+                self.apply_pool_admission(desired, snapshot)
+            },
+        )
     }
 
     fn commit_register_geyser_reserves_after_trade(
@@ -2550,13 +2558,18 @@ impl TrackWorkerContext for MarketDataContext {
         desired: &mut DesiredExplicitSet,
         snapshot: &PoolExplicitSnapshot,
     ) -> bool {
-        self.apply_pool_snapshot_command(desired, snapshot, true, |desired| {
-            self.try_publish_balance_updated_from_cache(snapshot.pool);
-            if !self.hot_pool_registry.pool_has_momentum(snapshot.pool) {
-                return (false, PoolCommandTerminal::UnpinnedRejected);
-            }
-            self.apply_pool_admission(desired, snapshot)
-        })
+        self.apply_pool_snapshot_command(
+            desired,
+            snapshot,
+            Some(PoolCommandRefRelease::Inflight),
+            |desired| {
+                self.try_publish_balance_updated_from_cache(snapshot.pool);
+                if !self.hot_pool_registry.pool_has_momentum(snapshot.pool) {
+                    return (false, PoolCommandTerminal::UnpinnedRejected);
+                }
+                self.apply_pool_admission(desired, snapshot)
+            },
+        )
     }
 
     fn commit_refresh_dlmm_bin_window(
@@ -2565,27 +2578,32 @@ impl TrackWorkerContext for MarketDataContext {
         snapshot: &PoolExplicitSnapshot,
         new_active_id: i32,
     ) -> bool {
-        self.apply_pool_snapshot_command(desired, snapshot, true, |desired| {
-            if !self.hot_pool_registry.pool_has_arb(snapshot.pool) {
-                return (false, PoolCommandTerminal::UnpinnedRejected);
-            }
-            if self
-                .dlmm_registered_active_id
-                .read()
-                .get(&snapshot.pool)
-                .copied()
-                == Some(new_active_id)
-            {
-                return (false, PoolCommandTerminal::Applied);
-            }
-            let (changed, terminal) = self.apply_pool_admission(desired, snapshot);
-            if changed {
-                self.dlmm_registered_active_id
-                    .write()
-                    .insert(snapshot.pool, new_active_id);
-            }
-            (changed, terminal)
-        })
+        self.apply_pool_snapshot_command(
+            desired,
+            snapshot,
+            Some(PoolCommandRefRelease::Inflight),
+            |desired| {
+                if !self.hot_pool_registry.pool_has_arb(snapshot.pool) {
+                    return (false, PoolCommandTerminal::UnpinnedRejected);
+                }
+                if self
+                    .dlmm_registered_active_id
+                    .read()
+                    .get(&snapshot.pool)
+                    .copied()
+                    == Some(new_active_id)
+                {
+                    return (false, PoolCommandTerminal::Applied);
+                }
+                let (changed, terminal) = self.apply_pool_admission(desired, snapshot);
+                if changed {
+                    self.dlmm_registered_active_id
+                        .write()
+                        .insert(snapshot.pool, new_active_id);
+                }
+                (changed, terminal)
+            },
+        )
     }
 
     fn publish_admitted_explicit_physical(&self, desired: &DesiredExplicitSet) {
@@ -3314,27 +3332,27 @@ impl MarketDataContext {
         &self,
         desired: &mut DesiredExplicitSet,
         snapshot: &PoolExplicitSnapshot,
-        finish_inflight: bool,
+        release_ref: Option<PoolCommandRefRelease>,
         apply: impl FnOnce(&mut DesiredExplicitSet) -> (bool, PoolCommandTerminal),
     ) -> bool {
         let phase = self.pool_snapshot_revisions.begin_pool_command(snapshot);
         if phase == PoolCommandAcceptPhase::Stale {
-            if finish_inflight {
+            if let Some(release) = release_ref {
                 self.pool_snapshot_revisions.finish_pool_command(
                     snapshot,
                     PoolCommandTerminal::StaleRevision,
-                    true,
+                    Some(release),
                     false,
                 );
             }
             return false;
         }
         if !self.pool_snapshot_consumer_demand_valid(snapshot) {
-            if finish_inflight {
+            if let Some(release) = release_ref {
                 self.pool_snapshot_revisions.finish_pool_command(
                     snapshot,
                     PoolCommandTerminal::UnpinnedRejected,
-                    true,
+                    Some(release),
                     true,
                 );
             }
@@ -3342,7 +3360,7 @@ impl MarketDataContext {
         }
         let (state_changed, terminal) = apply(desired);
         self.pool_snapshot_revisions
-            .finish_pool_command(snapshot, terminal, finish_inflight, true);
+            .finish_pool_command(snapshot, terminal, release_ref, true);
         state_changed
     }
 
@@ -3352,7 +3370,12 @@ impl MarketDataContext {
         snapshot: &PoolExplicitSnapshot,
         apply: impl FnOnce(&mut DesiredExplicitSet) -> (bool, PoolCommandTerminal),
     ) -> bool {
-        self.apply_pool_snapshot_command(desired, snapshot, false, apply)
+        self.apply_pool_snapshot_command(
+            desired,
+            snapshot,
+            Some(PoolCommandRefRelease::Pending),
+            apply,
+        )
     }
 
     fn ensure_pool_revision_key(&self, pool: Pubkey, consumer: ConsumerId) -> bool {
@@ -12326,8 +12349,7 @@ mod pr_b_geyser_tracking_tests {
     }
 
     fn one_sequence_older_revision(revision: u64) -> u64 {
-        let (generation, sequence) = PoolSnapshotRevisionSequencer::unpack_revision(revision);
-        PoolSnapshotRevisionSequencer::pack_revision(generation, sequence.saturating_sub(1).max(1))
+        revision.saturating_sub(1).max(1)
     }
 
     #[allow(dead_code)]
@@ -17213,8 +17235,7 @@ mod pr_b_geyser_tracking_tests {
             .latest_revision_for(pool, ConsumerId::Arb)
             .expect("pending revision");
         assert_eq!(
-            PoolSnapshotRevisionSequencer::revision_sequence(latest_rev),
-            4,
+            latest_rev, 4,
             "one successful enqueue plus three queue-full stashes assign monotonic revisions"
         );
 
