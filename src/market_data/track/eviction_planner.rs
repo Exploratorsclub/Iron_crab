@@ -103,6 +103,71 @@ impl ConsumerProtectionRank {
     }
 }
 
+/// Cumulative eviction tier — explicit protection floor opened for feasibility.
+///
+/// `Tracker` is the least-protected tier; each higher variant cumulatively includes
+/// all less-protected consumers below it (never `Wallet`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EvictionTier {
+    Tracker,
+    Arb,
+    Momentum,
+}
+
+impl EvictionTier {
+    fn cumulative_consumers(self) -> &'static [ExplicitConsumer] {
+        match self {
+            Self::Tracker => &[ExplicitConsumer::Tracker],
+            Self::Arb => &[ExplicitConsumer::Tracker, ExplicitConsumer::Arb],
+            Self::Momentum => &[
+                ExplicitConsumer::Tracker,
+                ExplicitConsumer::Arb,
+                ExplicitConsumer::Momentum,
+            ],
+        }
+    }
+
+    fn allowed_for_incoming(consumer: ExplicitConsumer) -> &'static [EvictionTier] {
+        match consumer {
+            ExplicitConsumer::Tracker => &[Self::Tracker],
+            ExplicitConsumer::Arb => &[Self::Tracker, Self::Arb],
+            ExplicitConsumer::Momentum | ExplicitConsumer::Wallet => {
+                &[Self::Tracker, Self::Arb, Self::Momentum]
+            }
+        }
+    }
+}
+
+/// Inputs for pure tier-opening feasibility (no victim selection).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierFeasibilityRequest {
+    pub incoming_owner: ExplicitOwner,
+    pub incoming_pubkeys: Vec<Pubkey>,
+    pub cap: usize,
+}
+
+/// Outcome of tier-opening feasibility analysis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TierFeasibilityResult {
+    NoEvictionNeeded {
+        incoming_physical_added: usize,
+        projected_final_len: usize,
+    },
+    Feasible {
+        incoming_physical_added: usize,
+        required_to_free: usize,
+        opened_through: EvictionTier,
+        maximally_freeable_pubkeys: Vec<Pubkey>,
+    },
+    RejectedProtected {
+        incoming_physical_added: usize,
+        required_to_free: usize,
+        maximally_freeable_pubkeys: Vec<Pubkey>,
+    },
+    RejectedInvalidInput,
+    InternalInvariantViolation,
+}
+
 trait BuildStatsSink {
     fn record_owner_record(&mut self);
     fn record_group_key_edge(&mut self);
@@ -193,6 +258,29 @@ impl EvictionPlanningSnapshot {
 
     pub fn last_touch(&self, owner: &ExplicitOwner) -> Option<u64> {
         self.owner_record(owner).map(|record| record.last_touch)
+    }
+
+    /// Pure tier-opening feasibility — no victim selection or mutation.
+    pub fn analyze_tier_feasibility(
+        &self,
+        request: TierFeasibilityRequest,
+    ) -> TierFeasibilityResult {
+        analyze_tier_feasibility_inner(self, request)
+    }
+
+    #[cfg(test)]
+    fn test_only(
+        physical_len: usize,
+        owners: Vec<OwnerPlanningRecord>,
+        pubkey_index: Vec<PubkeyOwnerIndex>,
+    ) -> Self {
+        let physical_pubkeys: Vec<Pubkey> = pubkey_index.iter().map(|row| row.pubkey).collect();
+        Self {
+            physical_len,
+            physical_pubkeys,
+            owners,
+            pubkey_index,
+        }
     }
 }
 
@@ -326,6 +414,115 @@ fn validate_against_ownership<S: BuildStatsSink>(
     }
 
     Ok(())
+}
+
+fn analyze_tier_feasibility_inner(
+    snapshot: &EvictionPlanningSnapshot,
+    request: TierFeasibilityRequest,
+) -> TierFeasibilityResult {
+    let mut incoming_pubkeys = request.incoming_pubkeys;
+    incoming_pubkeys.sort();
+    incoming_pubkeys.dedup();
+
+    if incoming_pubkeys.is_empty() {
+        return TierFeasibilityResult::RejectedInvalidInput;
+    }
+
+    if snapshot.owner_record(&request.incoming_owner).is_some() {
+        return TierFeasibilityResult::RejectedInvalidInput;
+    }
+
+    let incoming_set: BTreeSet<Pubkey> = incoming_pubkeys.iter().copied().collect();
+    let incoming_physical_added = incoming_pubkeys
+        .iter()
+        .filter(|pubkey| snapshot.owner_refcount(pubkey) == 0)
+        .count();
+
+    let projected_final_len = match snapshot.physical_len().checked_add(incoming_physical_added) {
+        Some(len) => len,
+        None => return TierFeasibilityResult::InternalInvariantViolation,
+    };
+
+    if projected_final_len <= request.cap {
+        return TierFeasibilityResult::NoEvictionNeeded {
+            incoming_physical_added,
+            projected_final_len,
+        };
+    }
+    let required_to_free = match projected_final_len.checked_sub(request.cap) {
+        Some(needed) => needed,
+        None => return TierFeasibilityResult::InternalInvariantViolation,
+    };
+
+    let incoming_consumer = request.incoming_owner.consumer;
+    let allowed_tiers = EvictionTier::allowed_for_incoming(incoming_consumer);
+
+    let mut evictable_owners_by_tier: BTreeMap<EvictionTier, BTreeSet<ExplicitOwner>> =
+        BTreeMap::new();
+    for record in snapshot.owners() {
+        let consumer = record.owner.consumer;
+        if consumer == ExplicitConsumer::Wallet {
+            continue;
+        }
+        for tier in allowed_tiers {
+            if EvictionTier::cumulative_consumers(*tier).contains(&consumer) {
+                evictable_owners_by_tier
+                    .entry(*tier)
+                    .or_default()
+                    .insert(record.owner.clone());
+            }
+        }
+    }
+
+    let empty_evictable_owners = BTreeSet::new();
+    let mut freeable_by_tier: BTreeMap<EvictionTier, Vec<Pubkey>> = BTreeMap::new();
+    for row in snapshot.pubkey_index() {
+        if incoming_set.contains(&row.pubkey) {
+            continue;
+        }
+        for tier in allowed_tiers {
+            let evictable = evictable_owners_by_tier
+                .get(tier)
+                .unwrap_or(&empty_evictable_owners);
+            if row.owners.iter().all(|owner| evictable.contains(owner)) {
+                freeable_by_tier.entry(*tier).or_default().push(row.pubkey);
+            }
+        }
+    }
+
+    for pubkeys in freeable_by_tier.values_mut() {
+        pubkeys.sort();
+        pubkeys.dedup();
+    }
+
+    let mut opened_through = None;
+    for tier in allowed_tiers {
+        let freeable = freeable_by_tier.get(tier).map(Vec::as_slice).unwrap_or(&[]);
+        if freeable.len() >= required_to_free {
+            opened_through = Some(*tier);
+            break;
+        }
+    }
+
+    match opened_through {
+        Some(tier) => TierFeasibilityResult::Feasible {
+            incoming_physical_added,
+            required_to_free,
+            opened_through: tier,
+            maximally_freeable_pubkeys: freeable_by_tier.get(&tier).cloned().unwrap_or_default(),
+        },
+        None => {
+            let max_tier = *allowed_tiers.last().unwrap_or(&EvictionTier::Tracker);
+            TierFeasibilityResult::RejectedProtected {
+                incoming_physical_added,
+                required_to_free,
+                maximally_freeable_pubkeys: freeable_by_tier
+                    .get(&max_tier)
+                    .cloned()
+                    .unwrap_or_default(),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -712,5 +909,660 @@ mod tests {
             ConsumerProtectionRank::of(ExplicitConsumer::Momentum)
                 < ConsumerProtectionRank::of(ExplicitConsumer::Arb)
         );
+    }
+
+    fn snapshot_from_fixtures(fixtures: &[FixtureRow]) -> EvictionPlanningSnapshot {
+        let ownership = fixtures_to_ownership(fixtures);
+        EvictionPlanningSnapshot::from_ownership(&ownership, fixtures_to_lru(fixtures)).unwrap()
+    }
+
+    fn feasibility_request(
+        incoming_owner: ExplicitOwner,
+        incoming_pubkeys: Vec<Pubkey>,
+        cap: usize,
+    ) -> TierFeasibilityRequest {
+        TierFeasibilityRequest {
+            incoming_owner,
+            incoming_pubkeys,
+            cap,
+        }
+    }
+
+    fn assert_feasible(
+        result: &TierFeasibilityResult,
+        opened_through: EvictionTier,
+        required_to_free: usize,
+        incoming_physical_added: usize,
+        maximally_freeable: &[Pubkey],
+    ) {
+        match result {
+            TierFeasibilityResult::Feasible {
+                incoming_physical_added: added,
+                required_to_free: needed,
+                opened_through: tier,
+                maximally_freeable_pubkeys,
+            } => {
+                assert_eq!(*added, incoming_physical_added);
+                assert_eq!(*needed, required_to_free);
+                assert_eq!(*tier, opened_through);
+                assert_eq!(maximally_freeable_pubkeys.as_slice(), maximally_freeable);
+            }
+            other => panic!("expected Feasible, got {other:?}"),
+        }
+    }
+
+    /// Independent exhaustive oracle — hard-coded policy only; no production feasibility helpers.
+    struct TierFeasibilityOracle {
+        physical_len: usize,
+        pubkey_owner_sets: BTreeMap<Pubkey, BTreeSet<ExplicitOwner>>,
+        evictable_owners_by_tier: BTreeMap<OracleTier, BTreeSet<ExplicitOwner>>,
+    }
+
+    /// Test-only tier label — policy is duplicated here, not delegated to production helpers.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum OracleTier {
+        Tracker,
+        Arb,
+        Momentum,
+    }
+
+    impl OracleTier {
+        fn to_eviction_tier(self) -> EvictionTier {
+            match self {
+                Self::Tracker => EvictionTier::Tracker,
+                Self::Arb => EvictionTier::Arb,
+                Self::Momentum => EvictionTier::Momentum,
+            }
+        }
+    }
+
+    fn oracle_allowed_tiers(incoming: ExplicitConsumer) -> &'static [OracleTier] {
+        match incoming {
+            ExplicitConsumer::Tracker => &[OracleTier::Tracker],
+            ExplicitConsumer::Arb => &[OracleTier::Tracker, OracleTier::Arb],
+            ExplicitConsumer::Momentum | ExplicitConsumer::Wallet => {
+                &[OracleTier::Tracker, OracleTier::Arb, OracleTier::Momentum]
+            }
+        }
+    }
+
+    fn oracle_owner_in_cumulative_tier(owner: &ExplicitOwner, tier: OracleTier) -> bool {
+        match owner.consumer {
+            ExplicitConsumer::Wallet => false,
+            ExplicitConsumer::Tracker => true,
+            ExplicitConsumer::Arb => matches!(tier, OracleTier::Arb | OracleTier::Momentum),
+            ExplicitConsumer::Momentum => tier == OracleTier::Momentum,
+        }
+    }
+
+    impl TierFeasibilityOracle {
+        fn from_fixtures(fixtures: &[FixtureRow]) -> Self {
+            let mut pubkey_owner_sets: BTreeMap<Pubkey, BTreeSet<ExplicitOwner>> = BTreeMap::new();
+            let mut all_owners = BTreeSet::new();
+            for (owner, _, pubkeys) in fixtures {
+                all_owners.insert(owner.clone());
+                for pubkey in pubkeys {
+                    pubkey_owner_sets
+                        .entry(*pubkey)
+                        .or_default()
+                        .insert(owner.clone());
+                }
+            }
+
+            let mut evictable_owners_by_tier: BTreeMap<OracleTier, BTreeSet<ExplicitOwner>> =
+                BTreeMap::new();
+            for tier in [OracleTier::Tracker, OracleTier::Arb, OracleTier::Momentum] {
+                for owner in &all_owners {
+                    if oracle_owner_in_cumulative_tier(owner, tier) {
+                        evictable_owners_by_tier
+                            .entry(tier)
+                            .or_default()
+                            .insert(owner.clone());
+                    }
+                }
+            }
+
+            Self {
+                physical_len: pubkey_owner_sets.len(),
+                pubkey_owner_sets,
+                evictable_owners_by_tier,
+            }
+        }
+
+        fn incoming_physical_added(&self, incoming_pubkeys: &[Pubkey]) -> usize {
+            incoming_pubkeys
+                .iter()
+                .filter(|pk| !self.pubkey_owner_sets.contains_key(pk))
+                .count()
+        }
+
+        fn maximally_freeable_via_subset_enumeration(
+            &self,
+            tier: OracleTier,
+            incoming: &BTreeSet<Pubkey>,
+        ) -> BTreeSet<Pubkey> {
+            let empty = BTreeSet::new();
+            let evictable = self.evictable_owners_by_tier.get(&tier).unwrap_or(&empty);
+            let owners: Vec<&ExplicitOwner> = evictable.iter().collect();
+            let n = owners.len();
+            let mut best = BTreeSet::new();
+            let limit = 1usize << n;
+            for mask in 0..limit {
+                let subset: BTreeSet<&ExplicitOwner> = owners
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| mask & (1 << idx) != 0)
+                    .map(|(_, owner)| *owner)
+                    .collect();
+                let freeable: BTreeSet<Pubkey> = self
+                    .pubkey_owner_sets
+                    .iter()
+                    .filter(|(pubkey, owner_set)| {
+                        !incoming.contains(pubkey)
+                            && owner_set.iter().all(|owner| subset.contains(owner))
+                    })
+                    .map(|(pubkey, _)| *pubkey)
+                    .collect();
+                if freeable.len() > best.len() {
+                    best = freeable;
+                }
+            }
+            best
+        }
+
+        fn analyze(
+            &self,
+            incoming_owner: &ExplicitOwner,
+            incoming_pubkeys: &[Pubkey],
+            cap: usize,
+        ) -> TierFeasibilityResult {
+            let mut normalized: Vec<Pubkey> = incoming_pubkeys.to_vec();
+            normalized.sort();
+            normalized.dedup();
+            if normalized.is_empty() {
+                return TierFeasibilityResult::RejectedInvalidInput;
+            }
+            let incoming_set: BTreeSet<Pubkey> = normalized.iter().copied().collect();
+            let added = self.incoming_physical_added(&normalized);
+            let projected = match self.physical_len.checked_add(added) {
+                Some(v) => v,
+                None => return TierFeasibilityResult::InternalInvariantViolation,
+            };
+            if projected <= cap {
+                return TierFeasibilityResult::NoEvictionNeeded {
+                    incoming_physical_added: added,
+                    projected_final_len: projected,
+                };
+            }
+            let required = match projected.checked_sub(cap) {
+                Some(v) => v,
+                None => return TierFeasibilityResult::InternalInvariantViolation,
+            };
+            let allowed = oracle_allowed_tiers(incoming_owner.consumer);
+            let mut opened = None;
+            let mut freeable_at_opened = BTreeSet::new();
+            for tier in allowed {
+                let freeable = self.maximally_freeable_via_subset_enumeration(*tier, &incoming_set);
+                if freeable.len() >= required {
+                    opened = Some(*tier);
+                    freeable_at_opened = freeable;
+                    break;
+                }
+            }
+            let mut maximally_freeable: Vec<Pubkey> = match opened {
+                Some(_) => freeable_at_opened.into_iter().collect(),
+                None => {
+                    let max_tier = *allowed.last().unwrap_or(&OracleTier::Tracker);
+                    self.maximally_freeable_via_subset_enumeration(max_tier, &incoming_set)
+                        .into_iter()
+                        .collect()
+                }
+            };
+            maximally_freeable.sort();
+            match opened {
+                Some(tier) => TierFeasibilityResult::Feasible {
+                    incoming_physical_added: added,
+                    required_to_free: required,
+                    opened_through: tier.to_eviction_tier(),
+                    maximally_freeable_pubkeys: maximally_freeable,
+                },
+                None => TierFeasibilityResult::RejectedProtected {
+                    incoming_physical_added: added,
+                    required_to_free: required,
+                    maximally_freeable_pubkeys: maximally_freeable,
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn tier_feasibility_no_eviction_needed() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let fixtures = [(tracker.clone(), 1, vec![pk(1)])];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Tracker, 9);
+        let result =
+            snapshot.analyze_tier_feasibility(feasibility_request(incoming, vec![pk(2)], 5));
+        assert_eq!(
+            result,
+            TierFeasibilityResult::NoEvictionNeeded {
+                incoming_physical_added: 1,
+                projected_final_len: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn tier_feasibility_tracker_tier_alone_suffices() {
+        let t1 = pool_owner(ExplicitConsumer::Tracker, 1);
+        let t2 = pool_owner(ExplicitConsumer::Tracker, 2);
+        let fixtures = [(t1.clone(), 1, vec![pk(1)]), (t2.clone(), 2, vec![pk(2)])];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
+        let result = snapshot.analyze_tier_feasibility(feasibility_request(
+            incoming,
+            vec![pk(10), pk(11)],
+            2,
+        ));
+        assert_feasible(&result, EvictionTier::Tracker, 2, 2, &[pk(1), pk(2)]);
+    }
+
+    #[test]
+    fn tier_feasibility_jointly_shared_tracker_pubkeys_suffice() {
+        let shared = pk(50);
+        let t1 = pool_owner(ExplicitConsumer::Tracker, 1);
+        let t2 = pool_owner(ExplicitConsumer::Tracker, 2);
+        let fixtures = [
+            (t1.clone(), 1, vec![shared]),
+            (t2.clone(), 2, vec![shared, pk(2)]),
+        ];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
+        let result =
+            snapshot.analyze_tier_feasibility(feasibility_request(incoming, vec![pk(10)], 2));
+        assert_feasible(&result, EvictionTier::Tracker, 1, 1, &[pk(2), shared]);
+    }
+
+    #[test]
+    fn tier_feasibility_tracker_insufficient_arb_cumulative_suffices() {
+        let shared = pk(50);
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let arb = pool_owner(ExplicitConsumer::Arb, 2);
+        let fixtures = [
+            (tracker.clone(), 1, vec![pk(1), shared]),
+            (arb.clone(), 2, vec![shared, pk(3)]),
+        ];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
+        let result = snapshot.analyze_tier_feasibility(feasibility_request(
+            incoming,
+            vec![pk(10), pk(11)],
+            2,
+        ));
+        assert_feasible(&result, EvictionTier::Arb, 3, 2, &[pk(1), pk(3), shared]);
+    }
+
+    #[test]
+    fn tier_feasibility_incoming_tracker_cannot_open_arb_or_momentum() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let arb = pool_owner(ExplicitConsumer::Arb, 2);
+        let momentum = pool_owner(ExplicitConsumer::Momentum, 3);
+        let fixtures = [
+            (tracker.clone(), 1, vec![pk(1)]),
+            (arb.clone(), 2, vec![pk(2)]),
+            (momentum.clone(), 3, vec![pk(3)]),
+        ];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Tracker, 9);
+        let result = snapshot.analyze_tier_feasibility(feasibility_request(
+            incoming.clone(),
+            vec![pk(10), pk(11)],
+            2,
+        ));
+        match &result {
+            TierFeasibilityResult::RejectedProtected {
+                maximally_freeable_pubkeys,
+                ..
+            } => assert_eq!(maximally_freeable_pubkeys, &[pk(1)]),
+            other => panic!("expected RejectedProtected, got {other:?}"),
+        }
+        let feasible_only_tracker =
+            snapshot.analyze_tier_feasibility(feasibility_request(incoming, vec![pk(10)], 3));
+        assert_feasible(
+            &feasible_only_tracker,
+            EvictionTier::Tracker,
+            1,
+            1,
+            &[pk(1)],
+        );
+    }
+
+    #[test]
+    fn tier_feasibility_incoming_arb_cannot_open_momentum() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let arb = pool_owner(ExplicitConsumer::Arb, 2);
+        let momentum = pool_owner(ExplicitConsumer::Momentum, 3);
+        let fixtures = [
+            (tracker.clone(), 1, vec![pk(1)]),
+            (arb.clone(), 2, vec![pk(2)]),
+            (momentum.clone(), 3, vec![pk(3)]),
+        ];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Arb, 9);
+        let result = snapshot.analyze_tier_feasibility(feasibility_request(
+            incoming,
+            vec![pk(10), pk(11), pk(12)],
+            2,
+        ));
+        match &result {
+            TierFeasibilityResult::RejectedProtected {
+                maximally_freeable_pubkeys,
+                ..
+            } => assert_eq!(maximally_freeable_pubkeys, &[pk(1), pk(2)]),
+            other => panic!("expected RejectedProtected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tier_feasibility_wallet_never_maximally_freeable() {
+        let wallet = pool_owner(ExplicitConsumer::Wallet, 1);
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 2);
+        let shared = pk(50);
+        let fixtures = [
+            (wallet.clone(), 1, vec![shared, pk(1)]),
+            (tracker.clone(), 2, vec![pk(2)]),
+        ];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
+        let result =
+            snapshot.analyze_tier_feasibility(feasibility_request(incoming, vec![pk(10)], 3));
+        match &result {
+            TierFeasibilityResult::Feasible {
+                opened_through,
+                maximally_freeable_pubkeys,
+                required_to_free,
+                ..
+            } => {
+                assert_eq!(*opened_through, EvictionTier::Tracker);
+                assert_eq!(*required_to_free, 1);
+                assert_eq!(maximally_freeable_pubkeys, &[pk(2)]);
+                assert!(!maximally_freeable_pubkeys.contains(&shared));
+                assert!(!maximally_freeable_pubkeys.contains(&pk(1)));
+            }
+            other => panic!("expected Feasible, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tier_feasibility_mixed_tracker_arb_pubkey_freeable_only_at_arb_tier() {
+        let shared = pk(50);
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let arb = pool_owner(ExplicitConsumer::Arb, 2);
+        let fixtures = [
+            (tracker.clone(), 1, vec![shared, pk(1)]),
+            (arb.clone(), 2, vec![shared]),
+        ];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
+
+        let tracker_only = snapshot.analyze_tier_feasibility(feasibility_request(
+            incoming.clone(),
+            vec![pk(10)],
+            2,
+        ));
+        match &tracker_only {
+            TierFeasibilityResult::Feasible {
+                opened_through,
+                maximally_freeable_pubkeys,
+                ..
+            } => {
+                assert_eq!(*opened_through, EvictionTier::Tracker);
+                assert_eq!(maximally_freeable_pubkeys, &[pk(1)]);
+                assert!(!maximally_freeable_pubkeys.contains(&shared));
+            }
+            other => panic!("expected Feasible at Tracker, got {other:?}"),
+        }
+
+        let needs_arb = snapshot.analyze_tier_feasibility(feasibility_request(
+            incoming,
+            vec![pk(10), pk(11)],
+            2,
+        ));
+        assert_feasible(&needs_arb, EvictionTier::Arb, 2, 2, &[pk(1), shared]);
+    }
+
+    #[test]
+    fn tier_feasibility_incoming_overlap_never_counts_as_free() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let fixtures = [(tracker.clone(), 1, vec![pk(1), pk(2)])];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
+        let overlap = pk(1);
+        let result = snapshot.analyze_tier_feasibility(feasibility_request(
+            incoming,
+            vec![overlap, pk(10)],
+            2,
+        ));
+        match &result {
+            TierFeasibilityResult::Feasible {
+                maximally_freeable_pubkeys,
+                ..
+            } => {
+                assert!(!maximally_freeable_pubkeys.contains(&overlap));
+                assert_eq!(maximally_freeable_pubkeys, &[pk(2)]);
+            }
+            other => panic!("expected Feasible, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tier_feasibility_protected_rejection_reports_exact_maximal_pubkeys() {
+        let wallet = pool_owner(ExplicitConsumer::Wallet, 1);
+        let momentum = pool_owner(ExplicitConsumer::Momentum, 2);
+        let fixtures = [
+            (wallet.clone(), 1, vec![pk(1)]),
+            (momentum.clone(), 2, vec![pk(2), pk(3)]),
+        ];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
+        let result = snapshot.analyze_tier_feasibility(feasibility_request(
+            incoming,
+            vec![pk(10), pk(11)],
+            1,
+        ));
+        match &result {
+            TierFeasibilityResult::RejectedProtected {
+                required_to_free,
+                maximally_freeable_pubkeys,
+                ..
+            } => {
+                assert_eq!(*required_to_free, 4);
+                assert_eq!(maximally_freeable_pubkeys, &[pk(2), pk(3)]);
+            }
+            other => panic!("expected RejectedProtected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tier_feasibility_deterministic_under_permuted_incoming_order() {
+        let t1 = pool_owner(ExplicitConsumer::Tracker, 1);
+        let t2 = pool_owner(ExplicitConsumer::Tracker, 2);
+        let fixtures = [(t1.clone(), 1, vec![pk(1)]), (t2.clone(), 2, vec![pk(2)])];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
+        let a = snapshot.analyze_tier_feasibility(feasibility_request(
+            incoming.clone(),
+            vec![pk(10), pk(11), pk(12)],
+            1,
+        ));
+        let b = snapshot.analyze_tier_feasibility(feasibility_request(
+            incoming,
+            vec![pk(12), pk(10), pk(11)],
+            1,
+        ));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn tier_feasibility_rejects_duplicate_empty_and_existing_incoming() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let fixtures = [(tracker.clone(), 1, vec![pk(1)])];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
+
+        assert_eq!(
+            snapshot.analyze_tier_feasibility(feasibility_request(incoming.clone(), vec![], 5)),
+            TierFeasibilityResult::RejectedInvalidInput
+        );
+        assert_eq!(
+            snapshot.analyze_tier_feasibility(feasibility_request(tracker.clone(), vec![pk(2)], 5)),
+            TierFeasibilityResult::RejectedInvalidInput
+        );
+
+        let dup = snapshot.analyze_tier_feasibility(feasibility_request(
+            incoming.clone(),
+            vec![pk(2), pk(2)],
+            5,
+        ));
+        assert!(matches!(
+            dup,
+            TierFeasibilityResult::NoEvictionNeeded { .. }
+        ));
+    }
+
+    #[test]
+    fn tier_feasibility_usize_max_checked_fail_closed() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let snapshot = EvictionPlanningSnapshot::test_only(
+            usize::MAX,
+            vec![OwnerPlanningRecord {
+                owner: tracker.clone(),
+                last_touch: 1,
+                pubkeys: vec![pk(1)],
+            }],
+            vec![PubkeyOwnerIndex {
+                pubkey: pk(1),
+                refcount: 1,
+                owners: vec![tracker],
+            }],
+        );
+        let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
+        let result =
+            snapshot.analyze_tier_feasibility(feasibility_request(incoming, vec![pk(2)], 0));
+        assert_eq!(result, TierFeasibilityResult::InternalInvariantViolation);
+    }
+
+    #[test]
+    fn tier_feasibility_exhaustive_oracle_matches_small_fixture_graphs() {
+        let shared_tracker_arb = pk(11);
+        let shared_tracker_momentum = pk(50);
+        let wallet_only = pk(20);
+        let tracker_only = pk(1);
+
+        let graphs: Vec<Vec<FixtureRow>> = vec![
+            vec![
+                (
+                    pool_owner(ExplicitConsumer::Tracker, 1),
+                    1,
+                    vec![tracker_only],
+                ),
+                (pool_owner(ExplicitConsumer::Arb, 2), 2, vec![pk(2)]),
+            ],
+            vec![
+                (
+                    pool_owner(ExplicitConsumer::Tracker, 1),
+                    1,
+                    vec![pk(10), shared_tracker_arb],
+                ),
+                (
+                    pool_owner(ExplicitConsumer::Arb, 2),
+                    2,
+                    vec![shared_tracker_arb, pk(12)],
+                ),
+                (
+                    pool_owner(ExplicitConsumer::Momentum, 3),
+                    3,
+                    vec![pk(12), shared_tracker_momentum],
+                ),
+            ],
+            vec![
+                (
+                    pool_owner(ExplicitConsumer::Wallet, 1),
+                    1,
+                    vec![wallet_only, pk(21)],
+                ),
+                (
+                    pool_owner(ExplicitConsumer::Tracker, 2),
+                    2,
+                    vec![pk(21), shared_tracker_momentum],
+                ),
+                (
+                    pool_owner(ExplicitConsumer::Arb, 3),
+                    3,
+                    vec![shared_tracker_momentum, shared_tracker_arb],
+                ),
+            ],
+            vec![
+                (
+                    pool_owner(ExplicitConsumer::Tracker, 4),
+                    4,
+                    vec![shared_tracker_arb],
+                ),
+                (
+                    pool_owner(ExplicitConsumer::Arb, 5),
+                    5,
+                    vec![shared_tracker_arb, pk(30)],
+                ),
+                (
+                    pool_owner(ExplicitConsumer::Momentum, 6),
+                    6,
+                    vec![pk(30), pk(31)],
+                ),
+            ],
+        ];
+
+        let incoming_owners = [
+            pool_owner(ExplicitConsumer::Tracker, 50),
+            pool_owner(ExplicitConsumer::Arb, 51),
+            pool_owner(ExplicitConsumer::Momentum, 52),
+            pool_owner(ExplicitConsumer::Wallet, 53),
+        ];
+
+        let incoming_key_matrix = [
+            vec![pk(100)],
+            vec![pk(101), pk(102)],
+            vec![pk(103)],
+            vec![tracker_only],
+            vec![shared_tracker_arb],
+            vec![shared_tracker_momentum],
+            vec![wallet_only],
+            vec![pk(100), tracker_only],
+            vec![pk(101), shared_tracker_arb],
+            vec![pk(102), shared_tracker_momentum],
+            vec![pk(103), wallet_only],
+            vec![tracker_only, shared_tracker_arb, shared_tracker_momentum],
+        ];
+
+        for fixtures in graphs {
+            let snapshot = snapshot_from_fixtures(&fixtures);
+            let oracle = TierFeasibilityOracle::from_fixtures(&fixtures);
+            for incoming_owner in &incoming_owners {
+                if fixtures.iter().any(|(o, _, _)| o == incoming_owner) {
+                    continue;
+                }
+                for keys in &incoming_key_matrix {
+                    for cap in [0usize, 1, 2, 3, 5] {
+                        let request =
+                            feasibility_request(incoming_owner.clone(), keys.clone(), cap);
+                        let actual = snapshot.analyze_tier_feasibility(request);
+                        let expected = oracle.analyze(incoming_owner, keys, cap);
+                        assert_eq!(
+                            actual, expected,
+                            "fixtures={fixtures:?} incoming={incoming_owner:?} keys={keys:?} cap={cap}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
