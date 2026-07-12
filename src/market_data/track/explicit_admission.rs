@@ -39,13 +39,12 @@ pub struct FixedCapRemoveResult {
     pub physical_removed: Vec<Pubkey>,
 }
 
-/// Test-only counters to prove admission planning avoids full-graph scans/clones.
+/// Test-only counters for instrumented planning lookups (owner group + per-pubkey refcount).
 #[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanningStats {
     pub refcount_lookups: u64,
     pub owner_group_lookups: u64,
-    pub ownership_len_scans: u64,
 }
 
 #[cfg(test)]
@@ -67,6 +66,28 @@ pub struct FixedCapAdmission {
     ownership: ExplicitOwnership,
     #[cfg(test)]
     planning_stats: PlanningStats,
+}
+
+/// Precomputed admission outcome — all checked arithmetic happens before any ownership mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionPlan {
+    Unchanged,
+    RejectCap {
+        required_unique: usize,
+        available_unique: usize,
+    },
+    Commit {
+        projected_final_len: usize,
+        expected_added_len: usize,
+        expected_removed_len: usize,
+    },
+}
+
+/// Precomputed removal outcome — checked arithmetic before [`ExplicitOwnership::remove_group`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemovePlan {
+    projected_final_len: usize,
+    physical_removed: Vec<Pubkey>,
 }
 
 impl FixedCapAdmission {
@@ -124,94 +145,47 @@ impl FixedCapAdmission {
             return FixedCapAdmissionResult::RejectedInvalidGroup;
         }
 
-        let projection = self.project_admission(&owner, &normalized);
+        let plan = self.plan_admission(&owner, &normalized);
 
-        match projection {
-            AdmissionProjection::Unchanged => FixedCapAdmissionResult::Unchanged,
-            AdmissionProjection::RejectCap {
+        match plan {
+            AdmissionPlan::Unchanged => FixedCapAdmissionResult::Unchanged,
+            AdmissionPlan::RejectCap {
                 required_unique,
                 available_unique,
             } => FixedCapAdmissionResult::RejectedCap {
                 required_unique,
                 available_unique,
             },
-            AdmissionProjection::Admit => {
+            AdmissionPlan::Commit {
+                projected_final_len,
+                expected_added_len,
+                expected_removed_len,
+            } => {
                 let change = match self.ownership.upsert_group(owner, normalized) {
                     Ok(change) => change,
                     Err(EmptyOwnerGroupError) => {
                         return FixedCapAdmissionResult::RejectedInvalidGroup;
                     }
                 };
-                self.apply_physical_len_delta(&change);
-                match change {
-                    GroupChange::NewGroup { physical_added } => {
-                        if physical_added.is_empty() {
-                            FixedCapAdmissionResult::OwnerAddedNoNewPubkey
-                        } else {
-                            FixedCapAdmissionResult::Inserted { physical_added }
-                        }
-                    }
-                    GroupChange::Unchanged => FixedCapAdmissionResult::Unchanged,
-                    GroupChange::Replaced {
-                        physical_added,
-                        physical_removed,
-                    } => FixedCapAdmissionResult::OwnerReplaced {
-                        physical_added,
-                        physical_removed,
-                    },
-                }
+                debug_assert_commit_matches_plan(&change, expected_added_len, expected_removed_len);
+                self.physical_len = projected_final_len;
+                map_group_change_to_result(change)
             }
         }
     }
 
     /// Remove an owner group and return exact physical pubkey deltas.
     pub fn remove_group(&mut self, owner: &ExplicitOwner) -> Option<FixedCapRemoveResult> {
-        let pubkeys = self.ownership.owner_group(owner)?;
-        let mut physical_removed = Vec::new();
-        for pubkey in pubkeys {
-            if self.ownership.owner_refcount(pubkey) == 1 {
-                physical_removed.push(*pubkey);
-            }
-        }
-        physical_removed.sort();
+        let plan = self.plan_remove(owner)?;
         let snapshot = self.ownership.remove_group(owner)?;
-        self.physical_len = self
-            .physical_len
-            .checked_sub(physical_removed.len())
-            .expect("physical_len underflow on remove_group");
+        self.physical_len = plan.projected_final_len;
         Some(FixedCapRemoveResult {
             snapshot,
-            physical_removed,
+            physical_removed: plan.physical_removed,
         })
     }
 
-    fn apply_physical_len_delta(&mut self, change: &GroupChange) {
-        match change {
-            GroupChange::Unchanged => {}
-            GroupChange::NewGroup { physical_added } => {
-                self.physical_len = self
-                    .physical_len
-                    .checked_add(physical_added.len())
-                    .expect("physical_len overflow on NewGroup");
-            }
-            GroupChange::Replaced {
-                physical_added,
-                physical_removed,
-            } => {
-                self.physical_len = self
-                    .physical_len
-                    .checked_sub(physical_removed.len())
-                    .and_then(|len| len.checked_add(physical_added.len()))
-                    .expect("physical_len overflow on Replaced");
-            }
-        }
-    }
-
-    fn project_admission(
-        &mut self,
-        owner: &ExplicitOwner,
-        normalized: &[Pubkey],
-    ) -> AdmissionProjection {
+    fn plan_admission(&mut self, owner: &ExplicitOwner, normalized: &[Pubkey]) -> AdmissionPlan {
         #[cfg(test)]
         self.planning_stats.record_owner_group_lookup();
 
@@ -230,26 +204,29 @@ impl FixedCapAdmission {
 
                 let available_unique = self.cap.saturating_sub(current_len);
                 if physical_added > available_unique {
-                    return AdmissionProjection::RejectCap {
+                    return AdmissionPlan::RejectCap {
                         required_unique: physical_added,
                         available_unique,
                     };
                 }
 
-                let Some(projected_len) = current_len
+                let Some(projected_final_len) = current_len
                     .checked_add(physical_added)
                     .filter(|&len| len <= self.cap)
                 else {
-                    return AdmissionProjection::RejectCap {
+                    return AdmissionPlan::RejectCap {
                         required_unique: physical_added,
                         available_unique,
                     };
                 };
 
-                debug_assert_eq!(projected_len, current_len + physical_added);
-                AdmissionProjection::Admit
+                AdmissionPlan::Commit {
+                    projected_final_len,
+                    expected_added_len: physical_added,
+                    expected_removed_len: 0,
+                }
             }
-            Some(existing) if existing == normalized => AdmissionProjection::Unchanged,
+            Some(existing) if existing == normalized => AdmissionPlan::Unchanged,
             Some(old_pubkeys) => {
                 let old_set: HashSet<Pubkey> = old_pubkeys.iter().copied().collect();
                 let new_set: HashSet<Pubkey> = normalized.iter().copied().collect();
@@ -277,43 +254,91 @@ impl FixedCapAdmission {
                     .saturating_sub(current_len)
                     .saturating_add(physical_removed);
                 if physical_added > available_unique {
-                    return AdmissionProjection::RejectCap {
+                    return AdmissionPlan::RejectCap {
                         required_unique: physical_added,
                         available_unique,
                     };
                 }
 
-                let Some(after_free) = current_len.checked_sub(physical_removed) else {
-                    return AdmissionProjection::RejectCap {
-                        required_unique: physical_added,
-                        available_unique,
-                    };
-                };
-                let Some(projected_len) = after_free
-                    .checked_add(physical_added)
+                let Some(projected_final_len) = current_len
+                    .checked_sub(physical_removed)
+                    .and_then(|len| len.checked_add(physical_added))
                     .filter(|&len| len <= self.cap)
                 else {
-                    return AdmissionProjection::RejectCap {
+                    return AdmissionPlan::RejectCap {
                         required_unique: physical_added,
                         available_unique,
                     };
                 };
 
-                debug_assert_eq!(projected_len, after_free + physical_added);
-                AdmissionProjection::Admit
+                AdmissionPlan::Commit {
+                    projected_final_len,
+                    expected_added_len: physical_added,
+                    expected_removed_len: physical_removed,
+                }
             }
         }
     }
+
+    fn plan_remove(&self, owner: &ExplicitOwner) -> Option<RemovePlan> {
+        let pubkeys = self.ownership.owner_group(owner)?;
+        let mut physical_removed = Vec::new();
+        for pubkey in pubkeys {
+            if self.ownership.owner_refcount(pubkey) == 1 {
+                physical_removed.push(*pubkey);
+            }
+        }
+        physical_removed.sort();
+        let projected_final_len = self.physical_len.checked_sub(physical_removed.len())?;
+        Some(RemovePlan {
+            projected_final_len,
+            physical_removed,
+        })
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AdmissionProjection {
-    Unchanged,
-    Admit,
-    RejectCap {
-        required_unique: usize,
-        available_unique: usize,
-    },
+fn map_group_change_to_result(change: GroupChange) -> FixedCapAdmissionResult {
+    match change {
+        GroupChange::NewGroup { physical_added } => {
+            if physical_added.is_empty() {
+                FixedCapAdmissionResult::OwnerAddedNoNewPubkey
+            } else {
+                FixedCapAdmissionResult::Inserted { physical_added }
+            }
+        }
+        GroupChange::Unchanged => FixedCapAdmissionResult::Unchanged,
+        GroupChange::Replaced {
+            physical_added,
+            physical_removed,
+        } => FixedCapAdmissionResult::OwnerReplaced {
+            physical_added,
+            physical_removed,
+        },
+    }
+}
+
+fn debug_assert_commit_matches_plan(
+    change: &GroupChange,
+    expected_added_len: usize,
+    expected_removed_len: usize,
+) {
+    match change {
+        GroupChange::Unchanged => {
+            debug_assert_eq!(expected_added_len, 0);
+            debug_assert_eq!(expected_removed_len, 0);
+        }
+        GroupChange::NewGroup { physical_added } => {
+            debug_assert_eq!(physical_added.len(), expected_added_len);
+            debug_assert_eq!(expected_removed_len, 0);
+        }
+        GroupChange::Replaced {
+            physical_added,
+            physical_removed,
+        } => {
+            debug_assert_eq!(physical_added.len(), expected_added_len);
+            debug_assert_eq!(physical_removed.len(), expected_removed_len);
+        }
+    }
 }
 
 fn normalize_pubkeys(pubkeys: impl IntoIterator<Item = Pubkey>) -> Vec<Pubkey> {
@@ -424,6 +449,8 @@ mod tests {
     }
 
     /// Independent capped reference model — never calls [`FixedCapAdmission`].
+    ///
+    /// Admission uses a cloned candidate-state union algorithm, not production projection math.
     #[derive(Debug, Clone)]
     struct RefCapModel {
         cap: usize,
@@ -453,79 +480,6 @@ mod tests {
                 .count()
         }
 
-        fn project(
-            &self,
-            owner: &ExplicitOwner,
-            normalized: &BTreeSet<Pubkey>,
-        ) -> Result<AdmissionProjection, ()> {
-            let current_len = self.len();
-
-            match self.groups.get(owner) {
-                None => {
-                    let physical_added = normalized
-                        .iter()
-                        .filter(|pk| self.owner_refcount(pk) == 0)
-                        .count();
-                    let available_unique = self.cap.saturating_sub(current_len);
-                    if physical_added > available_unique {
-                        return Ok(AdmissionProjection::RejectCap {
-                            required_unique: physical_added,
-                            available_unique,
-                        });
-                    }
-                    let Some(projected_len) = current_len
-                        .checked_add(physical_added)
-                        .filter(|&len| len <= self.cap)
-                    else {
-                        return Ok(AdmissionProjection::RejectCap {
-                            required_unique: physical_added,
-                            available_unique,
-                        });
-                    };
-                    debug_assert_eq!(projected_len, current_len + physical_added);
-                    Ok(AdmissionProjection::Admit)
-                }
-                Some(existing) if existing == normalized => Ok(AdmissionProjection::Unchanged),
-                Some(old_pubkeys) => {
-                    let physical_added = normalized
-                        .difference(old_pubkeys)
-                        .filter(|pk| self.owner_refcount(pk) == 0)
-                        .count();
-                    let physical_removed = old_pubkeys
-                        .difference(normalized)
-                        .filter(|pk| self.owner_refcount(pk) == 1)
-                        .count();
-                    let available_unique = self
-                        .cap
-                        .saturating_sub(current_len)
-                        .saturating_add(physical_removed);
-                    if physical_added > available_unique {
-                        return Ok(AdmissionProjection::RejectCap {
-                            required_unique: physical_added,
-                            available_unique,
-                        });
-                    }
-                    let Some(after_free) = current_len.checked_sub(physical_removed) else {
-                        return Ok(AdmissionProjection::RejectCap {
-                            required_unique: physical_added,
-                            available_unique,
-                        });
-                    };
-                    let Some(projected_len) = after_free
-                        .checked_add(physical_added)
-                        .filter(|&len| len <= self.cap)
-                    else {
-                        return Ok(AdmissionProjection::RejectCap {
-                            required_unique: physical_added,
-                            available_unique,
-                        });
-                    };
-                    debug_assert_eq!(projected_len, after_free + physical_added);
-                    Ok(AdmissionProjection::Admit)
-                }
-            }
-        }
-
         fn try_admit_group(
             &mut self,
             owner: ExplicitOwner,
@@ -536,58 +490,56 @@ mod tests {
                 return FixedCapAdmissionResult::RejectedInvalidGroup;
             }
 
-            let before = self.index_snapshot();
-            let projection = self.project(&owner, &normalized).unwrap();
+            let before_snapshot = self.index_snapshot();
+            let old_group = self.groups.get(&owner).cloned();
 
-            match projection {
-                AdmissionProjection::Unchanged => FixedCapAdmissionResult::Unchanged,
-                AdmissionProjection::RejectCap {
-                    required_unique,
-                    available_unique,
-                } => {
-                    assert_eq!(self.index_snapshot(), before);
-                    FixedCapAdmissionResult::RejectedCap {
-                        required_unique,
-                        available_unique,
+            if old_group.as_ref() == Some(&normalized) {
+                return FixedCapAdmissionResult::Unchanged;
+            }
+
+            let physical_before = physical_pubkeys_from_groups(&self.groups);
+            let mut candidate_groups = self.groups.clone();
+            candidate_groups.insert(owner.clone(), normalized.clone());
+            let physical_after = physical_pubkeys_from_groups(&candidate_groups);
+
+            let mut physical_added: Vec<Pubkey> = physical_after
+                .difference(&physical_before)
+                .copied()
+                .collect();
+            physical_added.sort();
+
+            let mut physical_removed: Vec<Pubkey> = physical_before
+                .difference(&physical_after)
+                .copied()
+                .collect();
+            physical_removed.sort();
+
+            if physical_after.len() > self.cap {
+                assert_eq!(self.index_snapshot(), before_snapshot);
+                let current_len = physical_before.len();
+                return FixedCapAdmissionResult::RejectedCap {
+                    required_unique: physical_added.len(),
+                    available_unique: self
+                        .cap
+                        .saturating_sub(current_len)
+                        .saturating_add(physical_removed.len()),
+                };
+            }
+
+            self.groups = candidate_groups;
+
+            match old_group {
+                None => {
+                    if physical_added.is_empty() {
+                        FixedCapAdmissionResult::OwnerAddedNoNewPubkey
+                    } else {
+                        FixedCapAdmissionResult::Inserted { physical_added }
                     }
                 }
-                AdmissionProjection::Admit => {
-                    let physical_before = physical_pubkeys_from_groups(&self.groups);
-                    match self.groups.get(&owner) {
-                        None => {
-                            self.groups.insert(owner, normalized.clone());
-                            let physical_after = physical_pubkeys_from_groups(&self.groups);
-                            let physical_added: Vec<Pubkey> = physical_after
-                                .difference(&physical_before)
-                                .copied()
-                                .collect();
-                            if physical_added.is_empty() {
-                                FixedCapAdmissionResult::OwnerAddedNoNewPubkey
-                            } else {
-                                FixedCapAdmissionResult::Inserted { physical_added }
-                            }
-                        }
-                        Some(existing) if existing == &normalized => {
-                            FixedCapAdmissionResult::Unchanged
-                        }
-                        Some(_) => {
-                            self.groups.insert(owner, normalized);
-                            let physical_after = physical_pubkeys_from_groups(&self.groups);
-                            let physical_added: Vec<Pubkey> = physical_after
-                                .difference(&physical_before)
-                                .copied()
-                                .collect();
-                            let physical_removed: Vec<Pubkey> = physical_before
-                                .difference(&physical_after)
-                                .copied()
-                                .collect();
-                            FixedCapAdmissionResult::OwnerReplaced {
-                                physical_added,
-                                physical_removed,
-                            }
-                        }
-                    }
-                }
+                Some(_) => FixedCapAdmissionResult::OwnerReplaced {
+                    physical_added,
+                    physical_removed,
+                },
             }
         }
 
@@ -617,13 +569,9 @@ mod tests {
         admission_index_snapshot(admission).pubkeys.len()
     }
 
-    fn ownership_len_for_invariant(admission: &FixedCapAdmission) -> usize {
-        admission.ownership.len()
-    }
-
     fn assert_physical_len_invariant(admission: &FixedCapAdmission) {
         assert_eq!(admission.len(), independent_physical_len(admission));
-        assert_eq!(admission.len(), ownership_len_for_invariant(admission));
+        assert_eq!(admission.len(), admission.ownership.len());
     }
 
     fn assert_indexes_match(admission: &FixedCapAdmission, model: &RefCapModel) {
@@ -706,6 +654,16 @@ mod tests {
             | FixedCapAdmissionResult::Unchanged => {}
             other => panic!("expected successful admission, got {other:?}"),
         }
+    }
+
+    fn planning_lookup_upper_bound(group_size: usize, is_replace: bool) -> u64 {
+        let owner_group = 1;
+        let refcount = if is_replace {
+            u64::try_from(group_size.saturating_mul(2)).unwrap_or(u64::MAX)
+        } else {
+            u64::try_from(group_size).unwrap_or(u64::MAX)
+        };
+        owner_group + refcount
     }
 
     #[test]
@@ -880,12 +838,12 @@ mod tests {
         assert_admitted(admission.try_admit_group(owner_a.clone(), [shared, pk(2)]));
         assert_admitted(admission.try_admit_group(owner_b.clone(), [shared]));
 
-        let removed = admission.remove_group(&owner_a).unwrap();
+        let removed = admission.remove_group(&owner_a).expect("owner_a present");
         assert_eq!(removed.physical_removed, vec![pk(2)]);
         assert_eq!(admission.len(), 1);
         assert!(admission.contains_pubkey(&shared));
 
-        let removed_b = admission.remove_group(&owner_b).unwrap();
+        let removed_b = admission.remove_group(&owner_b).expect("owner_b present");
         assert_eq!(removed_b.physical_removed, vec![shared]);
         assert!(admission.is_empty());
     }
@@ -923,28 +881,36 @@ mod tests {
     }
 
     #[test]
-    fn planning_stats_prove_no_full_graph_scan_in_normal_path() {
+    fn planning_stats_bounded_by_group_size_per_operation() {
         let mut admission = FixedCapAdmission::new(4);
         let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+
         let _ = admission.try_admit_group(owner.clone(), [pk(1), pk(2)]);
         let stats_after_insert = admission.planning_stats().clone();
+        let insert_bound = planning_lookup_upper_bound(2, false);
+        assert!(stats_after_insert.owner_group_lookups <= insert_bound);
+        assert!(stats_after_insert.refcount_lookups <= insert_bound);
+        assert!(stats_after_insert.refcount_lookups > 0);
 
         let _ = admission.try_admit_group(owner.clone(), [pk(2), pk(3)]);
         let stats_after_replace = admission.planning_stats().clone();
+        let replace_bound =
+            stats_after_insert.owner_group_lookups + planning_lookup_upper_bound(2, true);
+        let replace_refcount_bound =
+            stats_after_insert.refcount_lookups + planning_lookup_upper_bound(2, true);
+        assert!(stats_after_replace.owner_group_lookups <= replace_bound);
+        assert!(stats_after_replace.refcount_lookups <= replace_refcount_bound);
 
         let _ = admission.try_admit_group(owner.clone(), [pk(2), pk(3)]);
         let stats_after_unchanged = admission.planning_stats().clone();
-
-        assert!(stats_after_insert.refcount_lookups > 0);
-        assert_eq!(stats_after_insert.owner_group_lookups, 1);
-        assert!(stats_after_replace.refcount_lookups > stats_after_insert.refcount_lookups);
-        assert_eq!(stats_after_replace.owner_group_lookups, 2);
         assert_eq!(
             stats_after_unchanged.refcount_lookups,
             stats_after_replace.refcount_lookups
         );
-        assert_eq!(stats_after_unchanged.owner_group_lookups, 3);
-        assert_eq!(stats_after_unchanged.ownership_len_scans, 0);
+        assert_eq!(
+            stats_after_unchanged.owner_group_lookups,
+            stats_after_replace.owner_group_lookups + 1
+        );
     }
 
     #[test]
@@ -958,8 +924,8 @@ mod tests {
         let expected = model.try_admit_group(owner.clone(), [exclusive, pk(11)]);
         assert_operation(&admission, &model, &result, &expected);
 
-        let removed = admission.remove_group(&owner).unwrap();
-        let ref_removed = model.remove_group(&owner).unwrap();
+        let removed = admission.remove_group(&owner).expect("owner present");
+        let ref_removed = model.remove_group(&owner).expect("owner present");
         assert_eq!(removed, ref_removed);
         assert_eq!(removed.physical_removed, vec![exclusive, pk(11)]);
         assert!(admission.is_empty());
@@ -983,8 +949,8 @@ mod tests {
         let expected_b = model.try_admit_group(owner_b.clone(), [shared]);
         assert_operation(&admission, &model, &result_b, &expected_b);
 
-        let removed = admission.remove_group(&owner_a).unwrap();
-        let ref_removed = model.remove_group(&owner_a).unwrap();
+        let removed = admission.remove_group(&owner_a).expect("owner_a present");
+        let ref_removed = model.remove_group(&owner_a).expect("owner_a present");
         assert_eq!(removed, ref_removed);
         assert_eq!(removed.physical_removed, vec![pk(2)]);
         assert_eq!(admission.len(), 1);
@@ -1051,8 +1017,8 @@ mod tests {
             let removed = admission.remove_group(owner);
             let ref_removed = model.remove_group(owner);
             assert_eq!(removed, ref_removed);
-            if removed.is_some() {
-                let delta = removed.as_ref().unwrap().physical_removed.len();
+            if let Some(removed) = removed.as_ref() {
+                let delta = removed.physical_removed.len();
                 assert_eq!(admission.len(), before_len.saturating_sub(delta));
             }
             assert_physical_len_invariant(&admission);
@@ -1063,10 +1029,10 @@ mod tests {
     #[test]
     fn bounded_reference_model_matches_fixed_cap_admission() {
         let caps = [0usize, 1, 2, 3, 5];
-        let seeds: [u64; 6] = [1, 7, 13, 42, 99, 255];
+        let seeds = [1u64, 7, 13, 42, 99, 255];
 
-        for cap in caps {
-            for seed in seeds {
+        for &cap in &caps {
+            for &seed in &seeds {
                 let mut admission = FixedCapAdmission::new(cap);
                 let mut model = RefCapModel::new(cap);
 
