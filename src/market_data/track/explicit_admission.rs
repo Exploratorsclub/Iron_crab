@@ -19,6 +19,15 @@ pub enum InvariantViolationRecovery {
     PreviousRestored,
     /// Restore validation failed: owner was fail-closed removed and `physical_len` reconciled.
     OwnerRemovedFailClosed,
+}
+
+/// Recovery path after an internal invariant violation during removal rollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixedCapRemoveRecovery {
+    /// Commit mismatch: previous owner group was atomically restored.
+    PreviousRestored,
+    /// Restore validation failed: owner was fail-closed removed and `physical_len` reconciled.
+    OwnerRemovedFailClosed,
     /// One-shot fail-closed removal did not leave the owner absent.
     RecoveryFailed,
 }
@@ -53,9 +62,7 @@ pub enum FixedCapRemoveResult {
     /// Pre-commit planning invariant failure; no mutation.
     PlanningInvariantViolation,
     /// Post-commit plan/rollback mismatch with a documented recovery path.
-    InternalInvariantViolation {
-        recovery: InvariantViolationRecovery,
-    },
+    InternalInvariantViolation { recovery: FixedCapRemoveRecovery },
 }
 
 /// Result of a fixed-cap owner-group replacement attempt.
@@ -118,6 +125,8 @@ pub struct FixedCapAdmission {
     test_force_restore_plan_mismatch: bool,
     #[cfg(test)]
     test_force_remove_planning_underflow: bool,
+    #[cfg(test)]
+    test_force_remove_planning_zero_refcount: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +192,8 @@ impl FixedCapAdmission {
             test_force_restore_plan_mismatch: false,
             #[cfg(test)]
             test_force_remove_planning_underflow: false,
+            #[cfg(test)]
+            test_force_remove_planning_zero_refcount: false,
         }
     }
 
@@ -232,6 +243,11 @@ impl FixedCapAdmission {
     #[cfg(test)]
     pub fn set_test_force_remove_planning_underflow(&mut self, enabled: bool) {
         self.test_force_remove_planning_underflow = enabled;
+    }
+
+    #[cfg(test)]
+    pub fn set_test_force_remove_planning_zero_refcount(&mut self, enabled: bool) {
+        self.test_force_remove_planning_zero_refcount = enabled;
     }
 
     /// Admit a new owner group when the owner is absent and projected physical pubkeys fit the cap.
@@ -562,6 +578,15 @@ impl FixedCapAdmission {
             #[cfg(test)]
             self.planning_stats.record_refcount_lookup();
             let refcount = self.ownership.owner_refcount(pubkey);
+            #[cfg(test)]
+            let refcount = if self.test_force_remove_planning_zero_refcount {
+                0
+            } else {
+                refcount
+            };
+            if refcount == 0 {
+                return RemovePlanOutcome::PlanningInvariantViolation;
+            }
             old_refcounts.push((*pubkey, refcount));
             if refcount == 1 {
                 physical_removed.push(*pubkey);
@@ -674,13 +699,13 @@ impl FixedCapAdmission {
         owner: &ExplicitOwner,
     ) -> FixedCapReplaceResult {
         let _ = self.ownership.remove_group(owner);
-        if self.ownership.owner_group(owner).is_some() {
-            self.reconcile_physical_len_cold();
-            return FixedCapReplaceResult::InternalInvariantViolation {
-                recovery: InvariantViolationRecovery::RecoveryFailed,
-            };
+        while self.ownership.owner_group(owner).is_some() {
+            if self.ownership.remove_group(owner).is_none() {
+                break;
+            }
         }
         self.reconcile_physical_len_cold();
+        debug_assert!(self.ownership.owner_group(owner).is_none());
         debug_assert!(self.physical_len <= self.cap);
         FixedCapReplaceResult::InternalInvariantViolation {
             recovery: InvariantViolationRecovery::OwnerRemovedFailClosed,
@@ -733,7 +758,7 @@ impl FixedCapAdmission {
                 self.reconcile_physical_len_cold();
             }
             FixedCapRemoveResult::InternalInvariantViolation {
-                recovery: InvariantViolationRecovery::PreviousRestored,
+                recovery: FixedCapRemoveRecovery::PreviousRestored,
             }
         } else {
             self.fail_closed_remove_owner_after_remove(owner)
@@ -748,13 +773,13 @@ impl FixedCapAdmission {
         if self.ownership.owner_group(owner).is_some() {
             self.reconcile_physical_len_cold();
             return FixedCapRemoveResult::InternalInvariantViolation {
-                recovery: InvariantViolationRecovery::RecoveryFailed,
+                recovery: FixedCapRemoveRecovery::RecoveryFailed,
             };
         }
         self.reconcile_physical_len_cold();
         debug_assert!(self.physical_len <= self.cap);
         FixedCapRemoveResult::InternalInvariantViolation {
-            recovery: InvariantViolationRecovery::OwnerRemovedFailClosed,
+            recovery: FixedCapRemoveRecovery::OwnerRemovedFailClosed,
         }
     }
 
@@ -859,7 +884,10 @@ fn removed_group_matches_plan(
 
     for &(pubkey, old_rc) in &plan.old_refcounts {
         let new_rc = ownership.owner_refcount(&pubkey);
-        if new_rc != old_rc - 1 {
+        let Some(expected_rc) = old_rc.checked_sub(1) else {
+            return false;
+        };
+        if new_rc != expected_rc {
             return false;
         }
     }
@@ -2058,6 +2086,27 @@ mod tests {
     }
 
     #[test]
+    fn remove_planning_zero_refcount_aborts_without_mutation() {
+        let mut admission = FixedCapAdmission::new(4);
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1), pk(2)]));
+        let before = capture_admission_snapshot(&admission);
+        let before_len = admission.len();
+
+        admission.set_test_force_remove_planning_zero_refcount(true);
+        assert_eq!(
+            admission.remove_group(owner.clone()),
+            FixedCapRemoveResult::PlanningInvariantViolation
+        );
+        assert_public_snapshots_equal(&capture_admission_snapshot(&admission), &before);
+        assert_eq!(admission.len(), before_len);
+        assert_eq!(
+            admission.owner_group(&owner),
+            Some([pk(1), pk(2)].as_slice())
+        );
+    }
+
+    #[test]
     fn remove_planning_stats_are_group_local_under_large_background() {
         let mut admission = FixedCapAdmission::new(100);
         for seed in 10u8..90 {
@@ -2163,7 +2212,7 @@ mod tests {
         assert_eq!(
             result,
             FixedCapRemoveResult::InternalInvariantViolation {
-                recovery: InvariantViolationRecovery::PreviousRestored,
+                recovery: FixedCapRemoveRecovery::PreviousRestored,
             }
         );
         let after = capture_admission_snapshot(&admission);
@@ -2190,7 +2239,7 @@ mod tests {
         assert_eq!(
             result,
             FixedCapRemoveResult::InternalInvariantViolation {
-                recovery: InvariantViolationRecovery::OwnerRemovedFailClosed,
+                recovery: FixedCapRemoveRecovery::OwnerRemovedFailClosed,
             }
         );
         assert!(admission.owner_group(&owner).is_none());
