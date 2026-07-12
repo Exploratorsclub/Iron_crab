@@ -1,6 +1,7 @@
 pub mod coalesce;
 pub mod desired_set;
 pub mod enrichment;
+pub mod eviction_planner;
 pub mod explicit_admission;
 pub mod explicit_ownership;
 pub mod geyser_sync;
@@ -18,6 +19,10 @@ pub use desired_set::{
 };
 pub use enrichment::{
     is_enrichment_member_from_inputs, pool_is_enrichment_member, EnrichmentMembershipInputs,
+};
+pub use eviction_planner::{
+    ConsumerProtectionRank, EvictionPlanningSnapshot, OwnerLruEntry, OwnerPlanningRecord,
+    PubkeyOwnerIndex, SnapshotBuildError,
 };
 pub use explicit_admission::{
     FixedCapAdmission, FixedCapAdmissionResult, FixedCapRemoveRecovery, FixedCapRemoveResult,
