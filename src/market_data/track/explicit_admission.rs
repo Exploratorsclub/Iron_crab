@@ -1,7 +1,8 @@
-//! Insert-only and owner-replacement fixed-cap admission over [`ExplicitOwnership`] (PR 1b1/1b2).
+//! Insert, replacement, and owner-removal fixed-cap admission over [`ExplicitOwnership`]
+//! (PR 1b1/1b2/1b3).
 //!
 //! Accepts only previously absent owners via insert. Replacement mutates only existing owners.
-//! No removal API, eviction, cap mutation, or runtime wiring.
+//! Removal is group-local and atomic. No eviction, cap mutation, or runtime wiring.
 //!
 //! Normal planning is O(group_size). [`FixedCapAdmission::reconcile_physical_len_cold`]
 //! may scan ownership only on exceptional invariant/rollback failure.
@@ -18,6 +19,17 @@ pub enum InvariantViolationRecovery {
     PreviousRestored,
     /// Restore validation failed: owner was fail-closed removed and `physical_len` reconciled.
     OwnerRemovedFailClosed,
+}
+
+/// Recovery path after an internal invariant violation during removal rollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixedCapRemoveRecovery {
+    /// Commit mismatch: previous owner group was atomically restored.
+    PreviousRestored,
+    /// Restore validation failed: owner was fail-closed removed and `physical_len` reconciled.
+    OwnerRemovedFailClosed,
+    /// One-shot fail-closed removal did not leave the owner absent.
+    RecoveryFailed,
 }
 
 /// Result of an insert-only admission attempt.
@@ -38,6 +50,19 @@ pub enum FixedCapAdmissionResult {
     RejectedExistingOwner,
     /// Plan/commit or rollback invariant failure (cold recovery may scan ownership).
     InternalInvariantViolation,
+}
+
+/// Result of a fixed-cap owner-group removal attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixedCapRemoveResult {
+    /// Owner removed; physical deltas from refcount 1→0 transitions.
+    Removed { physical_removed: Vec<Pubkey> },
+    /// Owner absent; fully mutation-free.
+    NotFound,
+    /// Pre-commit planning invariant failure; no mutation.
+    PlanningInvariantViolation,
+    /// Post-commit plan/rollback mismatch with a documented recovery path.
+    InternalInvariantViolation { recovery: FixedCapRemoveRecovery },
 }
 
 /// Result of a fixed-cap owner-group replacement attempt.
@@ -98,6 +123,10 @@ pub struct FixedCapAdmission {
     test_force_commit_plan_mismatch: bool,
     #[cfg(test)]
     test_force_restore_plan_mismatch: bool,
+    #[cfg(test)]
+    test_force_remove_planning_underflow: bool,
+    #[cfg(test)]
+    test_force_remove_planning_zero_refcount: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +143,20 @@ struct ReplacePlan {
     old_normalized: Vec<Pubkey>,
     physical_added: Vec<Pubkey>,
     physical_removed: Vec<Pubkey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemovePlan {
+    pre_len: usize,
+    projected_final_len: usize,
+    old_normalized: Vec<Pubkey>,
+    physical_removed: Vec<Pubkey>,
+    old_refcounts: Vec<(Pubkey, usize)>,
+}
+
+enum RemovePlanOutcome {
+    Ready(RemovePlan),
+    PlanningInvariantViolation,
 }
 
 enum InsertPlanOutcome {
@@ -147,6 +190,10 @@ impl FixedCapAdmission {
             test_force_commit_plan_mismatch: false,
             #[cfg(test)]
             test_force_restore_plan_mismatch: false,
+            #[cfg(test)]
+            test_force_remove_planning_underflow: false,
+            #[cfg(test)]
+            test_force_remove_planning_zero_refcount: false,
         }
     }
 
@@ -191,6 +238,16 @@ impl FixedCapAdmission {
     #[cfg(test)]
     pub fn set_test_force_restore_plan_mismatch(&mut self, enabled: bool) {
         self.test_force_restore_plan_mismatch = enabled;
+    }
+
+    #[cfg(test)]
+    pub fn set_test_force_remove_planning_underflow(&mut self, enabled: bool) {
+        self.test_force_remove_planning_underflow = enabled;
+    }
+
+    #[cfg(test)]
+    pub fn set_test_force_remove_planning_zero_refcount(&mut self, enabled: bool) {
+        self.test_force_remove_planning_zero_refcount = enabled;
     }
 
     /// Admit a new owner group when the owner is absent and projected physical pubkeys fit the cap.
@@ -342,6 +399,53 @@ impl FixedCapAdmission {
         }
     }
 
+    /// Remove an existing owner group atomically when projected physical pubkeys stay within the cap.
+    pub fn remove_group(&mut self, owner: ExplicitOwner) -> FixedCapRemoveResult {
+        #[cfg(test)]
+        self.planning_stats.record_owner_group_lookup();
+        let Some(old_group) = self.ownership.owner_group(&owner) else {
+            return FixedCapRemoveResult::NotFound;
+        };
+        let old_normalized = old_group.to_vec();
+
+        let plan = match self.plan_remove(&old_normalized) {
+            RemovePlanOutcome::PlanningInvariantViolation => {
+                return FixedCapRemoveResult::PlanningInvariantViolation;
+            }
+            RemovePlanOutcome::Ready(plan) => plan,
+        };
+
+        let force_commit_mismatch = {
+            #[cfg(test)]
+            {
+                self.test_force_commit_plan_mismatch
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        };
+        let expected_physical_removed =
+            expected_physical_removed_at_remove_commit(&plan, force_commit_mismatch);
+
+        let snapshot = self.ownership.remove_group(&owner);
+
+        if !removed_group_matches_plan(
+            &snapshot,
+            &owner,
+            &plan,
+            &expected_physical_removed,
+            &self.ownership,
+        ) {
+            return self.rollback_failed_remove(&owner, &plan);
+        }
+
+        self.physical_len = plan.projected_final_len;
+        FixedCapRemoveResult::Removed {
+            physical_removed: plan.physical_removed,
+        }
+    }
+
     fn plan_insert(&mut self, normalized: &[Pubkey]) -> InsertPlanOutcome {
         let pre_len = self.physical_len;
         let mut physical_added = Vec::new();
@@ -466,6 +570,55 @@ impl FixedCapAdmission {
         })
     }
 
+    fn plan_remove(&mut self, old_normalized: &[Pubkey]) -> RemovePlanOutcome {
+        let pre_len = self.physical_len;
+        let mut physical_removed = Vec::new();
+        let mut old_refcounts = Vec::with_capacity(old_normalized.len());
+        for pubkey in old_normalized {
+            #[cfg(test)]
+            self.planning_stats.record_refcount_lookup();
+            let refcount = self.ownership.owner_refcount(pubkey);
+            #[cfg(test)]
+            let refcount = if self.test_force_remove_planning_zero_refcount {
+                0
+            } else {
+                refcount
+            };
+            if refcount == 0 {
+                return RemovePlanOutcome::PlanningInvariantViolation;
+            }
+            old_refcounts.push((*pubkey, refcount));
+            if refcount == 1 {
+                physical_removed.push(*pubkey);
+            }
+        }
+
+        let removed_count = {
+            #[cfg(test)]
+            if self.test_force_remove_planning_underflow {
+                pre_len.saturating_add(1)
+            } else {
+                physical_removed.len()
+            }
+            #[cfg(not(test))]
+            {
+                physical_removed.len()
+            }
+        };
+
+        let Some(projected_final_len) = pre_len.checked_sub(removed_count) else {
+            return RemovePlanOutcome::PlanningInvariantViolation;
+        };
+
+        RemovePlanOutcome::Ready(RemovePlan {
+            pre_len,
+            projected_final_len,
+            old_normalized: old_normalized.to_vec(),
+            physical_removed,
+            old_refcounts,
+        })
+    }
+
     fn rollback_failed_insert(
         &mut self,
         owner: &ExplicitOwner,
@@ -559,6 +712,77 @@ impl FixedCapAdmission {
         }
     }
 
+    fn rollback_failed_remove(
+        &mut self,
+        owner: &ExplicitOwner,
+        plan: &RemovePlan,
+    ) -> FixedCapRemoveResult {
+        let force_restore_mismatch = {
+            #[cfg(test)]
+            {
+                self.test_force_restore_plan_mismatch
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        };
+        let restore_pubkeys = if force_restore_mismatch && !plan.old_normalized.is_empty() {
+            let mut corrupted = plan.old_normalized.clone();
+            corrupted.push(corrupted[0]);
+            corrupted
+        } else {
+            plan.old_normalized.clone()
+        };
+
+        let restore_change = match self
+            .ownership
+            .upsert_group(owner.clone(), restore_pubkeys.clone())
+        {
+            Ok(change) => change,
+            Err(EmptyOwnerGroupError) => {
+                return self.fail_closed_remove_owner_after_remove(owner);
+            }
+        };
+
+        let restored = match restore_change {
+            GroupChange::NewGroup { .. } => {
+                self.owner_group(owner) == Some(restore_pubkeys.as_slice())
+            }
+            GroupChange::Replaced { .. } | GroupChange::Unchanged => false,
+        };
+
+        if restored {
+            self.physical_len = plan.pre_len;
+            if self.ownership.owner_group(owner).is_none() {
+                self.reconcile_physical_len_cold();
+            }
+            FixedCapRemoveResult::InternalInvariantViolation {
+                recovery: FixedCapRemoveRecovery::PreviousRestored,
+            }
+        } else {
+            self.fail_closed_remove_owner_after_remove(owner)
+        }
+    }
+
+    fn fail_closed_remove_owner_after_remove(
+        &mut self,
+        owner: &ExplicitOwner,
+    ) -> FixedCapRemoveResult {
+        let _ = self.ownership.remove_group(owner);
+        if self.ownership.owner_group(owner).is_some() {
+            self.reconcile_physical_len_cold();
+            return FixedCapRemoveResult::InternalInvariantViolation {
+                recovery: FixedCapRemoveRecovery::RecoveryFailed,
+            };
+        }
+        self.reconcile_physical_len_cold();
+        debug_assert!(self.physical_len <= self.cap);
+        FixedCapRemoveResult::InternalInvariantViolation {
+            recovery: FixedCapRemoveRecovery::OwnerRemovedFailClosed,
+        }
+    }
+
     /// Cold fail-closed recovery: full scan of ownership to repair cached `physical_len`.
     fn reconcile_physical_len_cold(&mut self) {
         self.physical_len = self.ownership.len();
@@ -601,6 +825,19 @@ fn expected_physical_removed_at_replace_commit(
     }
 }
 
+fn expected_physical_removed_at_remove_commit(
+    plan: &RemovePlan,
+    force_mismatch: bool,
+) -> Vec<Pubkey> {
+    if force_mismatch && !plan.physical_removed.is_empty() {
+        let mut expected = plan.physical_removed.clone();
+        expected.push(expected[0]);
+        expected
+    } else {
+        plan.physical_removed.clone()
+    }
+}
+
 fn new_group_matches_plan(change: &GroupChange, expected_physical_added: &[Pubkey]) -> bool {
     match change {
         GroupChange::NewGroup { physical_added } => physical_added == expected_physical_added,
@@ -623,6 +860,48 @@ fn replaced_group_matches_plan(
         }
         GroupChange::NewGroup { .. } | GroupChange::Unchanged => false,
     }
+}
+
+fn removed_group_matches_plan(
+    snapshot: &Option<OwnerGroupSnapshot>,
+    owner: &ExplicitOwner,
+    plan: &RemovePlan,
+    expected_physical_removed: &[Pubkey],
+    ownership: &ExplicitOwnership,
+) -> bool {
+    let Some(snapshot) = snapshot else {
+        return false;
+    };
+    if snapshot.consumer != owner.consumer || snapshot.owner_key != owner.owner_key {
+        return false;
+    }
+    if snapshot.pubkeys != plan.old_normalized {
+        return false;
+    }
+    if ownership.owner_group(owner).is_some() {
+        return false;
+    }
+
+    for &(pubkey, old_rc) in &plan.old_refcounts {
+        let new_rc = ownership.owner_refcount(&pubkey);
+        let Some(expected_rc) = old_rc.checked_sub(1) else {
+            return false;
+        };
+        if new_rc != expected_rc {
+            return false;
+        }
+    }
+
+    let mut planned_physical_removed: Vec<Pubkey> = plan
+        .old_refcounts
+        .iter()
+        .filter(|(_, old_rc)| *old_rc == 1)
+        .map(|(pubkey, _)| *pubkey)
+        .collect();
+    planned_physical_removed.sort();
+    let mut expected = expected_physical_removed.to_vec();
+    expected.sort();
+    planned_physical_removed == expected
 }
 
 fn normalize_pubkeys(pubkeys: impl IntoIterator<Item = Pubkey>) -> Vec<Pubkey> {
@@ -811,6 +1090,34 @@ mod tests {
                 physical_removed,
             }
         }
+
+        fn remove_group(&mut self, owner: ExplicitOwner) -> FixedCapRemoveResult {
+            if !self.groups.contains_key(&owner) {
+                return FixedCapRemoveResult::NotFound;
+            }
+
+            let physical_before: BTreeSet<Pubkey> = self
+                .groups
+                .values()
+                .flat_map(|set| set.iter().copied())
+                .collect();
+            let mut candidate_groups = self.groups.clone();
+            candidate_groups.remove(&owner);
+            let physical_after: BTreeSet<Pubkey> = candidate_groups
+                .values()
+                .flat_map(|set| set.iter().copied())
+                .collect();
+
+            let physical_removed: Vec<Pubkey> = physical_before
+                .difference(&physical_after)
+                .copied()
+                .collect();
+
+            debug_assert!(physical_after.len() <= self.cap);
+
+            self.groups = candidate_groups;
+            FixedCapRemoveResult::Removed { physical_removed }
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -863,7 +1170,17 @@ mod tests {
     }
 
     fn capture_model_snapshot(model: &RefReplaceModel) -> AdmissionPublicSnapshot {
-        let owner_groups = model.groups.clone();
+        capture_groups_snapshot(&model.groups)
+    }
+
+    fn capture_remove_model_snapshot(model: &RefRemoveModel) -> AdmissionPublicSnapshot {
+        capture_groups_snapshot(&model.groups)
+    }
+
+    fn capture_groups_snapshot(
+        groups: &BTreeMap<ExplicitOwner, BTreeSet<Pubkey>>,
+    ) -> AdmissionPublicSnapshot {
+        let owner_groups = groups.clone();
         let mut pubkeys: Vec<Pubkey> = owner_groups
             .values()
             .flat_map(|set| set.iter().copied())
@@ -915,6 +1232,71 @@ mod tests {
     fn assert_replace_state_matches(admission: &FixedCapAdmission, model: &RefReplaceModel) {
         let actual = capture_admission_snapshot(admission);
         let expected = capture_model_snapshot(model);
+        assert_public_snapshots_equal(&actual, &expected);
+        assert_eq!(admission.len(), actual.pubkeys.len());
+        assert!(admission.len() <= admission.cap());
+        assert_no_extra_reverse_index_keys(admission);
+    }
+
+    /// Independent removal candidate-state model — never calls [`FixedCapAdmission`].
+    #[derive(Debug, Clone)]
+    struct RefRemoveModel {
+        cap: usize,
+        groups: BTreeMap<ExplicitOwner, BTreeSet<Pubkey>>,
+    }
+
+    impl RefRemoveModel {
+        fn new(cap: usize) -> Self {
+            Self {
+                cap,
+                groups: BTreeMap::new(),
+            }
+        }
+
+        fn admit_for_setup(
+            &mut self,
+            owner: ExplicitOwner,
+            pubkeys: impl IntoIterator<Item = Pubkey>,
+        ) {
+            let mut normalized: Vec<Pubkey> = pubkeys.into_iter().collect();
+            normalized.sort();
+            normalized.dedup();
+            assert!(!normalized.is_empty());
+            self.groups.insert(owner, normalized.into_iter().collect());
+        }
+
+        fn remove_group(&mut self, owner: ExplicitOwner) -> FixedCapRemoveResult {
+            if !self.groups.contains_key(&owner) {
+                return FixedCapRemoveResult::NotFound;
+            }
+
+            let physical_before: BTreeSet<Pubkey> = self
+                .groups
+                .values()
+                .flat_map(|set| set.iter().copied())
+                .collect();
+            let mut candidate_groups = self.groups.clone();
+            candidate_groups.remove(&owner);
+            let physical_after: BTreeSet<Pubkey> = candidate_groups
+                .values()
+                .flat_map(|set| set.iter().copied())
+                .collect();
+
+            let physical_removed: Vec<Pubkey> = physical_before
+                .difference(&physical_after)
+                .copied()
+                .collect();
+
+            debug_assert!(physical_after.len() <= self.cap);
+
+            self.groups = candidate_groups;
+            FixedCapRemoveResult::Removed { physical_removed }
+        }
+    }
+
+    fn assert_remove_state_matches(admission: &FixedCapAdmission, model: &RefRemoveModel) {
+        let actual = capture_admission_snapshot(admission);
+        let expected = capture_remove_model_snapshot(model);
         assert_public_snapshots_equal(&actual, &expected);
         assert_eq!(admission.len(), actual.pubkeys.len());
         assert!(admission.len() <= admission.cap());
@@ -1510,6 +1892,396 @@ mod tests {
         assert_no_extra_reverse_index_keys(&admission);
         assert!(admission.len() <= admission.cap());
         assert_eq!(admission.len(), admission.snapshot_pubkeys().len());
+    }
+
+    // --- Removal tests (PR 1b3) ---
+
+    #[test]
+    fn remove_exclusive_owner_removes_all_physical_keys() {
+        let mut admission = FixedCapAdmission::new(3);
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1), pk(2)]));
+        assert_eq!(admission.len(), 2);
+
+        let result = admission.remove_group(owner.clone());
+        assert_eq!(
+            result,
+            FixedCapRemoveResult::Removed {
+                physical_removed: vec![pk(1), pk(2)],
+            }
+        );
+        assert!(admission.is_empty());
+        assert!(admission.owner_group(&owner).is_none());
+    }
+
+    #[test]
+    fn remove_keeps_shared_key_and_removes_exclusive_key() {
+        let mut admission = FixedCapAdmission::new(4);
+        let shared = pk(1);
+        let owner_a = pool_owner(ExplicitConsumer::Momentum, 1);
+        let owner_b = pool_owner(ExplicitConsumer::Arb, 2);
+        assert_admitted(admission.try_admit_new_group(owner_a.clone(), [shared, pk(2)]));
+        assert_admitted(admission.try_admit_new_group(owner_b.clone(), [shared]));
+        let before_len = admission.len();
+
+        let result = admission.remove_group(owner_a.clone());
+        assert_eq!(
+            result,
+            FixedCapRemoveResult::Removed {
+                physical_removed: vec![pk(2)],
+            }
+        );
+        assert_eq!(admission.len(), before_len - 1);
+        assert!(admission.owner_refcount(&shared) > 0);
+        assert_eq!(admission.owner_refcount(&pk(2)), 0);
+        assert!(admission.owner_group(&owner_a).is_none());
+        assert_eq!(admission.owner_group(&owner_b), Some([shared].as_slice()));
+    }
+
+    #[test]
+    fn remove_fully_shared_owner_removes_no_physical_keys() {
+        let mut admission = FixedCapAdmission::new(2);
+        let shared = pk(1);
+        let owner_a = pool_owner(ExplicitConsumer::Momentum, 1);
+        let owner_b = pool_owner(ExplicitConsumer::Arb, 2);
+        assert_admitted(admission.try_admit_new_group(owner_a.clone(), [shared]));
+        assert_admitted(admission.try_admit_new_group(owner_b.clone(), [shared]));
+        let before_len = admission.len();
+
+        let result = admission.remove_group(owner_b.clone());
+        assert_eq!(
+            result,
+            FixedCapRemoveResult::Removed {
+                physical_removed: vec![],
+            }
+        );
+        assert_eq!(admission.len(), before_len);
+        assert_eq!(admission.owner_refcount(&shared), 1);
+        assert!(admission.owner_group(&owner_b).is_none());
+        assert_eq!(admission.owner_group(&owner_a), Some([shared].as_slice()));
+    }
+
+    #[test]
+    fn remove_unknown_owner_is_mutation_free() {
+        let mut admission = FixedCapAdmission::new(3);
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        let unknown = pool_owner(ExplicitConsumer::Arb, 9);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1)]));
+        let before = capture_admission_snapshot(&admission);
+
+        assert_eq!(
+            admission.remove_group(unknown),
+            FixedCapRemoveResult::NotFound
+        );
+        assert_public_snapshots_equal(&capture_admission_snapshot(&admission), &before);
+    }
+
+    #[test]
+    fn remove_cached_len_matches_snapshot_after_long_sequences() {
+        let mut admission = FixedCapAdmission::new(6);
+        let mut model = RefReplaceModel::new(6);
+        let owners = [
+            pool_owner(ExplicitConsumer::Momentum, 1),
+            pool_owner(ExplicitConsumer::Arb, 2),
+            pool_owner(ExplicitConsumer::Tracker, 3),
+        ];
+        let key_pool: Vec<Pubkey> = (1u8..=8).map(pk).collect();
+
+        for (step, owner) in owners.iter().enumerate() {
+            let keys: Vec<Pubkey> = key_pool
+                .iter()
+                .copied()
+                .filter(|k| (k.to_bytes()[0] as usize + step) % 2 == 0)
+                .take(2)
+                .collect();
+            assert_admitted(admission.try_admit_new_group(owner.clone(), keys.clone()));
+            model.admit_for_setup(owner.clone(), keys);
+            assert_replace_state_matches(&admission, &model);
+        }
+
+        for step in 0..16 {
+            let owner = owners[step % owners.len()].clone();
+            match step % 3 {
+                0 => {
+                    if !model.groups.contains_key(&owner) {
+                        continue;
+                    }
+                    let keys: Vec<Pubkey> = key_pool
+                        .iter()
+                        .copied()
+                        .filter(|k| (k.to_bytes()[0] as usize + step) % 3 != 0)
+                        .take(1 + step % 3)
+                        .collect();
+                    if keys.is_empty() {
+                        continue;
+                    }
+                    let result = admission.try_replace_group(owner.clone(), keys.clone());
+                    let expected = model.try_replace_group(owner.clone(), keys);
+                    assert_eq!(result, expected);
+                    assert_replace_state_matches(&admission, &model);
+                }
+                1 => {
+                    if admission.owner_group(&owner).is_none() {
+                        continue;
+                    }
+                    let result = admission.remove_group(owner.clone());
+                    let expected = model.remove_group(owner.clone());
+                    assert_eq!(result, expected);
+                    assert_replace_state_matches(&admission, &model);
+                }
+                _ => {
+                    if admission.owner_group(&owner).is_some() {
+                        continue;
+                    }
+                    let keys: Vec<Pubkey> = key_pool
+                        .iter()
+                        .copied()
+                        .filter(|k| (k.to_bytes()[0] as usize + step) % 4 == 0)
+                        .take(1 + step % 2)
+                        .collect();
+                    if keys.is_empty() {
+                        continue;
+                    }
+                    let before = capture_admission_snapshot(&admission);
+                    let admit = admission.try_admit_new_group(owner.clone(), keys.clone());
+                    if matches!(
+                        admit,
+                        FixedCapAdmissionResult::RejectedCap { .. }
+                            | FixedCapAdmissionResult::RejectedInvalidGroup
+                            | FixedCapAdmissionResult::RejectedExistingOwner
+                    ) {
+                        assert_public_snapshots_equal(
+                            &capture_admission_snapshot(&admission),
+                            &before,
+                        );
+                        continue;
+                    }
+                    assert_admitted(admit);
+                    model.admit_for_setup(owner.clone(), keys);
+                    assert_replace_state_matches(&admission, &model);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remove_planning_underflow_aborts_without_mutation() {
+        let mut admission = FixedCapAdmission::new(4);
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1), pk(2)]));
+        let before = capture_admission_snapshot(&admission);
+        let before_len = admission.len();
+
+        admission.set_test_force_remove_planning_underflow(true);
+        assert_eq!(
+            admission.remove_group(owner.clone()),
+            FixedCapRemoveResult::PlanningInvariantViolation
+        );
+        assert_public_snapshots_equal(&capture_admission_snapshot(&admission), &before);
+        assert_eq!(admission.len(), before_len);
+        assert_eq!(
+            admission.owner_group(&owner),
+            Some([pk(1), pk(2)].as_slice())
+        );
+    }
+
+    #[test]
+    fn remove_planning_zero_refcount_aborts_without_mutation() {
+        let mut admission = FixedCapAdmission::new(4);
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1), pk(2)]));
+        let before = capture_admission_snapshot(&admission);
+        let before_len = admission.len();
+
+        admission.set_test_force_remove_planning_zero_refcount(true);
+        assert_eq!(
+            admission.remove_group(owner.clone()),
+            FixedCapRemoveResult::PlanningInvariantViolation
+        );
+        assert_public_snapshots_equal(&capture_admission_snapshot(&admission), &before);
+        assert_eq!(admission.len(), before_len);
+        assert_eq!(
+            admission.owner_group(&owner),
+            Some([pk(1), pk(2)].as_slice())
+        );
+    }
+
+    #[test]
+    fn remove_planning_stats_are_group_local_under_large_background() {
+        let mut admission = FixedCapAdmission::new(100);
+        for seed in 10u8..90 {
+            let bg_owner = pool_owner(ExplicitConsumer::Tracker, seed);
+            assert_admitted(admission.try_admit_new_group(bg_owner, [pk(seed)]));
+        }
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        let target_keys = [pk(1), pk(2), pk(3)];
+        assert_admitted(admission.try_admit_new_group(owner.clone(), target_keys));
+        admission.planning_stats.refcount_lookups = 0;
+        admission.planning_stats.owner_group_lookups = 0;
+
+        let _ = admission.remove_group(owner);
+        assert_eq!(admission.planning_stats().owner_group_lookups, 1);
+        assert_eq!(admission.planning_stats().refcount_lookups, 3);
+    }
+
+    #[test]
+    fn remove_planning_stats_match_old_group_edges() {
+        let mut admission = FixedCapAdmission::new(8);
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        let keys = [pk(1), pk(2), pk(3), pk(4), pk(5)];
+        assert_admitted(admission.try_admit_new_group(owner.clone(), keys));
+        admission.planning_stats.refcount_lookups = 0;
+        admission.planning_stats.owner_group_lookups = 0;
+
+        let _ = admission.remove_group(owner);
+        assert_eq!(admission.planning_stats().owner_group_lookups, 1);
+        assert_eq!(admission.planning_stats().refcount_lookups, 5);
+    }
+
+    #[test]
+    fn bounded_reference_remove_model_matches_admission() {
+        let caps = [2usize, 3, 5, 8];
+        let seeds = [5u8, 13, 91];
+
+        caps.iter().copied().for_each(|cap| {
+            seeds.iter().copied().for_each(|seed| {
+                let mut admission = FixedCapAdmission::new(cap);
+                let mut model = RefRemoveModel::new(cap);
+                let owners = [
+                    pool_owner(ExplicitConsumer::Momentum, seed),
+                    pool_owner(ExplicitConsumer::Arb, seed.wrapping_add(1)),
+                    pool_owner(ExplicitConsumer::Tracker, seed.wrapping_add(2)),
+                ];
+                let key_pool: Vec<Pubkey> = (0u8..7).map(|b| pk(b.wrapping_add(seed))).collect();
+
+                for (step, owner) in owners.iter().enumerate() {
+                    let keys: Vec<Pubkey> = key_pool
+                        .iter()
+                        .copied()
+                        .filter(|k| (k.to_bytes()[0] as usize + step) % 2 == 0)
+                        .take(1 + step % 2)
+                        .collect();
+                    if keys.is_empty() {
+                        continue;
+                    }
+                    let admit_result = admission.try_admit_new_group(owner.clone(), keys.clone());
+                    if matches!(admit_result, FixedCapAdmissionResult::RejectedCap { .. }) {
+                        continue;
+                    }
+                    assert_admitted(admit_result);
+                    model.admit_for_setup(owner.clone(), keys);
+                    assert_remove_state_matches(&admission, &model);
+                }
+
+                for step in 0..10 {
+                    let owner = owners[step % owners.len()].clone();
+                    if !model.groups.contains_key(&owner) {
+                        let before = capture_admission_snapshot(&admission);
+                        assert_eq!(
+                            admission.remove_group(owner.clone()),
+                            FixedCapRemoveResult::NotFound
+                        );
+                        assert_public_snapshots_equal(
+                            &capture_admission_snapshot(&admission),
+                            &before,
+                        );
+                        continue;
+                    }
+                    let before = admission_groups(&admission);
+                    let result = admission.remove_group(owner.clone());
+                    let expected = model.remove_group(owner.clone());
+                    assert_eq!(result, expected);
+                    if matches!(result, FixedCapRemoveResult::NotFound) {
+                        assert_eq!(admission_groups(&admission), before);
+                    }
+                    assert_remove_state_matches(&admission, &model);
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn remove_forced_commit_mismatch_restores_previous_owner() {
+        let mut admission = FixedCapAdmission::new(4);
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1), pk(2)]));
+        let before = capture_admission_snapshot(&admission);
+
+        admission.set_test_force_commit_plan_mismatch(true);
+        let result = admission.remove_group(owner.clone());
+        assert_eq!(
+            result,
+            FixedCapRemoveResult::InternalInvariantViolation {
+                recovery: FixedCapRemoveRecovery::PreviousRestored,
+            }
+        );
+        let after = capture_admission_snapshot(&admission);
+        assert_public_snapshots_equal(&after, &before);
+        assert_no_extra_reverse_index_keys(&admission);
+        assert_eq!(
+            admission.owner_group(&owner),
+            Some([pk(1), pk(2)].as_slice())
+        );
+    }
+
+    #[test]
+    fn remove_forced_restore_mismatch_removes_owner_and_reconciles_len() {
+        let mut admission = FixedCapAdmission::new(4);
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        let other = pool_owner(ExplicitConsumer::Arb, 2);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1), pk(2)]));
+        assert_admitted(admission.try_admit_new_group(other.clone(), [pk(3)]));
+        let before = capture_admission_snapshot(&admission);
+
+        admission.set_test_force_commit_plan_mismatch(true);
+        admission.set_test_force_restore_plan_mismatch(true);
+        let result = admission.remove_group(owner.clone());
+        assert_eq!(
+            result,
+            FixedCapRemoveResult::InternalInvariantViolation {
+                recovery: FixedCapRemoveRecovery::OwnerRemovedFailClosed,
+            }
+        );
+        assert!(admission.owner_group(&owner).is_none());
+
+        let mut expected_groups = before.owner_groups.clone();
+        expected_groups.remove(&owner);
+        let expected_pubkeys: Vec<Pubkey> = expected_groups
+            .values()
+            .flat_map(|set| set.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let expected = AdmissionPublicSnapshot {
+            owner_groups: expected_groups.clone(),
+            pubkeys: expected_pubkeys,
+            pubkey_refcounts: pubkey_refcounts_from_groups(&expected_groups),
+        };
+        let after = capture_admission_snapshot(&admission);
+        assert_public_snapshots_equal(&after, &expected);
+        assert_no_extra_reverse_index_keys(&admission);
+        assert!(admission.len() <= admission.cap());
+        assert_eq!(admission.len(), admission.snapshot_pubkeys().len());
+    }
+
+    #[test]
+    fn remove_does_not_leave_stale_reverse_index_keys() {
+        let mut admission = FixedCapAdmission::new(4);
+        let shared = pk(1);
+        let owner_a = pool_owner(ExplicitConsumer::Momentum, 1);
+        let owner_b = pool_owner(ExplicitConsumer::Arb, 2);
+        assert_admitted(admission.try_admit_new_group(owner_a.clone(), [shared, pk(2)]));
+        assert_admitted(admission.try_admit_new_group(owner_b.clone(), [shared]));
+
+        assert_eq!(
+            admission.remove_group(owner_a),
+            FixedCapRemoveResult::Removed {
+                physical_removed: vec![pk(2)],
+            }
+        );
+        assert_no_extra_reverse_index_keys(&admission);
+        assert_eq!(admission.owner_refcount(&shared), 1);
+        assert_eq!(admission.owner_refcount(&pk(2)), 0);
     }
 
     fn assert_admitted(result: FixedCapAdmissionResult) {
