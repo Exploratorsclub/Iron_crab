@@ -181,21 +181,13 @@ impl ExplicitOwnership {
                 let old_pubkeys = old_pubkeys.clone();
                 let old_set: HashSet<Pubkey> = old_pubkeys.iter().copied().collect();
                 let new_set: HashSet<Pubkey> = normalized.iter().copied().collect();
-                self.detach_owner_pubkeys(&owner, &old_pubkeys);
-                let mut physical_removed = Vec::new();
-                for pubkey in old_set.difference(&new_set) {
-                    if self
-                        .pubkey_owners
-                        .get(pubkey)
-                        .is_some_and(|owners| owners.is_empty())
-                    {
-                        self.pubkey_owners.remove(pubkey);
-                        physical_removed.push(*pubkey);
-                    }
-                }
+                let physical_removed: Vec<Pubkey> = self
+                    .detach_owner_pubkeys(&owner, &old_pubkeys, None)
+                    .into_iter()
+                    .filter(|pubkey| !new_set.contains(pubkey))
+                    .collect();
                 let physical_added = self.attach_owner_pubkeys(&owner, &normalized, &old_set);
                 self.groups.insert(owner, normalized);
-                physical_removed.sort();
                 Ok(GroupChange::Replaced {
                     physical_added,
                     physical_removed,
@@ -208,8 +200,7 @@ impl ExplicitOwnership {
     pub fn remove_group(&mut self, owner: &ExplicitOwner) -> Option<OwnerGroupSnapshot> {
         let pubkeys = self.groups.remove(owner)?;
         let snapshot = OwnerGroupSnapshot::from_owner(owner, &pubkeys);
-        self.detach_owner_pubkeys(owner, &pubkeys);
-        self.prune_empty_pubkeys();
+        self.detach_owner_pubkeys(owner, &pubkeys, None);
         Some(snapshot)
     }
 
@@ -231,24 +222,32 @@ impl ExplicitOwnership {
         physical_added
     }
 
-    fn detach_owner_pubkeys(&mut self, owner: &ExplicitOwner, pubkeys: &[Pubkey]) {
+    /// Unlink `owner` from `pubkeys`, removing reverse-index keys on refcount 1→0.
+    ///
+    /// Visits exactly `pubkeys.len()` map keys (group-local). When `keys_visited` is
+    /// `Some`, increments it once per pubkey processed (test instrumentation).
+    fn detach_owner_pubkeys(
+        &mut self,
+        owner: &ExplicitOwner,
+        pubkeys: &[Pubkey],
+        mut keys_visited: Option<&mut usize>,
+    ) -> Vec<Pubkey> {
+        let mut physical_removed = Vec::new();
         for pubkey in pubkeys {
-            if let Some(owners) = self.pubkey_owners.get_mut(pubkey) {
+            if let Some(counter) = keys_visited.as_deref_mut() {
+                *counter += 1;
+            }
+            let became_empty = if let Some(owners) = self.pubkey_owners.get_mut(pubkey) {
                 owners.remove(owner);
+                owners.is_empty()
+            } else {
+                false
+            };
+            if became_empty {
+                self.pubkey_owners.remove(pubkey);
+                physical_removed.push(*pubkey);
             }
         }
-    }
-
-    fn prune_empty_pubkeys(&mut self) -> Vec<Pubkey> {
-        let mut physical_removed = Vec::new();
-        self.pubkey_owners.retain(|pubkey, owners| {
-            if owners.is_empty() {
-                physical_removed.push(*pubkey);
-                false
-            } else {
-                true
-            }
-        });
         physical_removed.sort();
         physical_removed
     }
@@ -269,6 +268,25 @@ mod tests {
 
     fn pk(seed: u8) -> Pubkey {
         Pubkey::new_from_array([seed; 32])
+    }
+
+    /// Counts pubkey visits inside [`ExplicitOwnership::detach_owner_pubkeys`].
+    #[derive(Debug, Default)]
+    struct UnlinkStats {
+        keys_visited: usize,
+    }
+
+    impl UnlinkStats {
+        fn detach(
+            ownership: &mut ExplicitOwnership,
+            owner: &ExplicitOwner,
+            pubkeys: &[Pubkey],
+        ) -> (Self, Vec<Pubkey>) {
+            let mut stats = Self::default();
+            let removed =
+                ownership.detach_owner_pubkeys(owner, pubkeys, Some(&mut stats.keys_visited));
+            (stats, removed)
+        }
     }
 
     fn pool_owner(consumer: ExplicitConsumer, seed: u8) -> ExplicitOwner {
@@ -901,5 +919,93 @@ mod tests {
             }
         );
         assert_eq!(ownership.owner_refcount(&shared), 2);
+    }
+
+    #[test]
+    fn exclusive_removal_clears_all_affected_reverse_index_keys() {
+        let mut ownership = ExplicitOwnership::new();
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        let k1 = pk(1);
+        let k2 = pk(2);
+        ownership.upsert_group(owner.clone(), [k1, k2]).unwrap();
+
+        ownership.remove_group(&owner);
+        assert_no_stale_empty_reverse_index_keys(&ownership);
+        assert!(ownership.pubkey_owners.is_empty());
+        assert!(!ownership.contains(&k1));
+        assert!(!ownership.contains(&k2));
+    }
+
+    #[test]
+    fn shared_removal_preserves_shared_reverse_index_keys() {
+        let mut ownership = ExplicitOwnership::new();
+        let shared = pk(1);
+        let exclusive = pk(2);
+        let owner_a = pool_owner(ExplicitConsumer::Momentum, 1);
+        let owner_b = pool_owner(ExplicitConsumer::Arb, 2);
+        ownership
+            .upsert_group(owner_a.clone(), [shared, exclusive])
+            .unwrap();
+        ownership.upsert_group(owner_b.clone(), [shared]).unwrap();
+
+        ownership.remove_group(&owner_a);
+        assert_no_stale_empty_reverse_index_keys(&ownership);
+        assert!(ownership.contains(&shared));
+        assert!(!ownership.contains(&exclusive));
+        assert_eq!(ownership.owner_refcount(&shared), 1);
+        assert_eq!(ownership.owner_group(&owner_b), Some([shared].as_slice()));
+    }
+
+    #[test]
+    fn unlink_visits_only_removed_group_keys_not_full_index() {
+        const BACKGROUND_KEYS: usize = 200;
+        const REMOVED_GROUP_KEYS: usize = 3;
+
+        let mut ownership = ExplicitOwnership::new();
+        let background_owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        let background_keys: Vec<Pubkey> =
+            (0..BACKGROUND_KEYS).map(|seed| pk(seed as u8)).collect();
+        ownership
+            .upsert_group(background_owner, background_keys)
+            .unwrap();
+        let total_physical = ownership.len();
+        assert!(
+            total_physical > REMOVED_GROUP_KEYS,
+            "background index must dwarf removed group for visit-count proof"
+        );
+
+        let removed_owner = pool_owner(ExplicitConsumer::Arb, 2);
+        let removed_keys: Vec<Pubkey> = (200..200 + REMOVED_GROUP_KEYS)
+            .map(|seed| pk(seed as u8))
+            .collect();
+        ownership
+            .upsert_group(removed_owner.clone(), removed_keys.clone())
+            .unwrap();
+
+        let (stats, physical_removed) =
+            UnlinkStats::detach(&mut ownership, &removed_owner, &removed_keys);
+        assert_eq!(
+            stats.keys_visited, REMOVED_GROUP_KEYS,
+            "unlink must visit exactly the old group's pubkeys"
+        );
+        assert!(
+            stats.keys_visited < total_physical,
+            "unlink must not scan the full reverse index (visited={}, total_physical={})",
+            stats.keys_visited,
+            total_physical
+        );
+        assert_eq!(physical_removed, removed_keys);
+
+        ownership.groups.remove(&removed_owner);
+        assert_no_stale_empty_reverse_index_keys(&ownership);
+        assert_eq!(ownership.len(), total_physical);
+
+        ownership
+            .upsert_group(removed_owner.clone(), removed_keys.clone())
+            .unwrap();
+        let snapshot = ownership.remove_group(&removed_owner).unwrap();
+        assert_eq!(snapshot.pubkeys, removed_keys);
+        assert_no_stale_empty_reverse_index_keys(&ownership);
+        assert_eq!(ownership.len(), total_physical);
     }
 }
