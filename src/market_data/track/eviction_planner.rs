@@ -474,6 +474,7 @@ fn analyze_tier_feasibility_inner(
         }
     }
 
+    let empty_evictable_owners = BTreeSet::new();
     let mut freeable_by_tier: BTreeMap<EvictionTier, Vec<Pubkey>> = BTreeMap::new();
     for row in snapshot.pubkey_index() {
         if incoming_set.contains(&row.pubkey) {
@@ -482,8 +483,7 @@ fn analyze_tier_feasibility_inner(
         for tier in allowed_tiers {
             let evictable = evictable_owners_by_tier
                 .get(tier)
-                .cloned()
-                .unwrap_or_default();
+                .unwrap_or(&empty_evictable_owners);
             if row.owners.iter().all(|owner| evictable.contains(owner)) {
                 freeable_by_tier.entry(*tier).or_default().push(row.pubkey);
             }
@@ -951,28 +951,69 @@ mod tests {
         }
     }
 
-    /// Independent exhaustive oracle — does not call production feasibility helpers.
+    /// Independent exhaustive oracle — hard-coded policy only; no production feasibility helpers.
     struct TierFeasibilityOracle {
         physical_len: usize,
         pubkey_owner_sets: BTreeMap<Pubkey, BTreeSet<ExplicitOwner>>,
-        evictable_owners_by_tier: BTreeMap<EvictionTier, BTreeSet<ExplicitOwner>>,
+        evictable_owners_by_tier: BTreeMap<OracleTier, BTreeSet<ExplicitOwner>>,
+    }
+
+    /// Test-only tier label — policy is duplicated here, not delegated to production helpers.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum OracleTier {
+        Tracker,
+        Arb,
+        Momentum,
+    }
+
+    impl OracleTier {
+        fn to_eviction_tier(self) -> EvictionTier {
+            match self {
+                Self::Tracker => EvictionTier::Tracker,
+                Self::Arb => EvictionTier::Arb,
+                Self::Momentum => EvictionTier::Momentum,
+            }
+        }
+    }
+
+    fn oracle_allowed_tiers(incoming: ExplicitConsumer) -> &'static [OracleTier] {
+        match incoming {
+            ExplicitConsumer::Tracker => &[OracleTier::Tracker],
+            ExplicitConsumer::Arb => &[OracleTier::Tracker, OracleTier::Arb],
+            ExplicitConsumer::Momentum | ExplicitConsumer::Wallet => {
+                &[OracleTier::Tracker, OracleTier::Arb, OracleTier::Momentum]
+            }
+        }
+    }
+
+    fn oracle_owner_in_cumulative_tier(owner: &ExplicitOwner, tier: OracleTier) -> bool {
+        match owner.consumer {
+            ExplicitConsumer::Wallet => false,
+            ExplicitConsumer::Tracker => true,
+            ExplicitConsumer::Arb => matches!(tier, OracleTier::Arb | OracleTier::Momentum),
+            ExplicitConsumer::Momentum => tier == OracleTier::Momentum,
+        }
     }
 
     impl TierFeasibilityOracle {
         fn from_fixtures(fixtures: &[FixtureRow]) -> Self {
-            let base = FixtureOracle::from_fixtures(fixtures);
-            let mut evictable_owners_by_tier: BTreeMap<EvictionTier, BTreeSet<ExplicitOwner>> =
-                BTreeMap::new();
-            for (owner, _, _) in fixtures {
-                if owner.consumer == ExplicitConsumer::Wallet {
-                    continue;
+            let mut pubkey_owner_sets: BTreeMap<Pubkey, BTreeSet<ExplicitOwner>> = BTreeMap::new();
+            let mut all_owners = BTreeSet::new();
+            for (owner, _, pubkeys) in fixtures {
+                all_owners.insert(owner.clone());
+                for pubkey in pubkeys {
+                    pubkey_owner_sets
+                        .entry(*pubkey)
+                        .or_default()
+                        .insert(owner.clone());
                 }
-                for tier in [
-                    EvictionTier::Tracker,
-                    EvictionTier::Arb,
-                    EvictionTier::Momentum,
-                ] {
-                    if EvictionTier::cumulative_consumers(tier).contains(&owner.consumer) {
+            }
+
+            let mut evictable_owners_by_tier: BTreeMap<OracleTier, BTreeSet<ExplicitOwner>> =
+                BTreeMap::new();
+            for tier in [OracleTier::Tracker, OracleTier::Arb, OracleTier::Momentum] {
+                for owner in &all_owners {
+                    if oracle_owner_in_cumulative_tier(owner, tier) {
                         evictable_owners_by_tier
                             .entry(tier)
                             .or_default()
@@ -980,9 +1021,10 @@ mod tests {
                     }
                 }
             }
+
             Self {
-                physical_len: base.physical_len(),
-                pubkey_owner_sets: base.pubkey_owner_sets,
+                physical_len: pubkey_owner_sets.len(),
+                pubkey_owner_sets,
                 evictable_owners_by_tier,
             }
         }
@@ -996,29 +1038,28 @@ mod tests {
 
         fn maximally_freeable_via_subset_enumeration(
             &self,
-            tier: EvictionTier,
+            tier: OracleTier,
             incoming: &BTreeSet<Pubkey>,
         ) -> BTreeSet<Pubkey> {
-            let evictable = self
-                .evictable_owners_by_tier
-                .get(&tier)
-                .cloned()
-                .unwrap_or_default();
-            let owners: Vec<ExplicitOwner> = evictable.into_iter().collect();
+            let empty = BTreeSet::new();
+            let evictable = self.evictable_owners_by_tier.get(&tier).unwrap_or(&empty);
+            let owners: Vec<&ExplicitOwner> = evictable.iter().collect();
             let n = owners.len();
             let mut best = BTreeSet::new();
             let limit = 1usize << n;
             for mask in 0..limit {
-                let subset: BTreeSet<ExplicitOwner> = owners
+                let subset: BTreeSet<&ExplicitOwner> = owners
                     .iter()
                     .enumerate()
-                    .filter_map(|(idx, owner)| (mask & (1 << idx) != 0).then(|| owner.clone()))
+                    .filter(|(idx, _)| mask & (1 << idx) != 0)
+                    .map(|(_, owner)| *owner)
                     .collect();
                 let freeable: BTreeSet<Pubkey> = self
                     .pubkey_owner_sets
                     .iter()
-                    .filter(|(pubkey, owners)| {
-                        !incoming.contains(pubkey) && owners.iter().all(|o| subset.contains(o))
+                    .filter(|(pubkey, owner_set)| {
+                        !incoming.contains(pubkey)
+                            && owner_set.iter().all(|owner| subset.contains(owner))
                     })
                     .map(|(pubkey, _)| *pubkey)
                     .collect();
@@ -1057,7 +1098,7 @@ mod tests {
                 Some(v) => v,
                 None => return TierFeasibilityResult::InternalInvariantViolation,
             };
-            let allowed = EvictionTier::allowed_for_incoming(incoming_owner.consumer);
+            let allowed = oracle_allowed_tiers(incoming_owner.consumer);
             let mut opened = None;
             let mut freeable_at_opened = BTreeSet::new();
             for tier in allowed {
@@ -1071,7 +1112,7 @@ mod tests {
             let mut maximally_freeable: Vec<Pubkey> = match opened {
                 Some(_) => freeable_at_opened.into_iter().collect(),
                 None => {
-                    let max_tier = *allowed.last().unwrap_or(&EvictionTier::Tracker);
+                    let max_tier = *allowed.last().unwrap_or(&OracleTier::Tracker);
                     self.maximally_freeable_via_subset_enumeration(max_tier, &incoming_set)
                         .into_iter()
                         .collect()
@@ -1082,7 +1123,7 @@ mod tests {
                 Some(tier) => TierFeasibilityResult::Feasible {
                     incoming_physical_added: added,
                     required_to_free: required,
-                    opened_through: tier,
+                    opened_through: tier.to_eviction_tier(),
                     maximally_freeable_pubkeys: maximally_freeable,
                 },
                 None => TierFeasibilityResult::RejectedProtected {
@@ -1413,27 +1454,70 @@ mod tests {
 
     #[test]
     fn tier_feasibility_exhaustive_oracle_matches_small_fixture_graphs() {
+        let shared_tracker_arb = pk(11);
+        let shared_tracker_momentum = pk(50);
+        let wallet_only = pk(20);
+        let tracker_only = pk(1);
+
         let graphs: Vec<Vec<FixtureRow>> = vec![
             vec![
-                (pool_owner(ExplicitConsumer::Tracker, 1), 1, vec![pk(1)]),
+                (
+                    pool_owner(ExplicitConsumer::Tracker, 1),
+                    1,
+                    vec![tracker_only],
+                ),
                 (pool_owner(ExplicitConsumer::Arb, 2), 2, vec![pk(2)]),
             ],
             vec![
                 (
                     pool_owner(ExplicitConsumer::Tracker, 1),
                     1,
-                    vec![pk(10), pk(11)],
+                    vec![pk(10), shared_tracker_arb],
                 ),
                 (
                     pool_owner(ExplicitConsumer::Arb, 2),
                     2,
-                    vec![pk(11), pk(12)],
+                    vec![shared_tracker_arb, pk(12)],
                 ),
-                (pool_owner(ExplicitConsumer::Momentum, 3), 3, vec![pk(12)]),
+                (
+                    pool_owner(ExplicitConsumer::Momentum, 3),
+                    3,
+                    vec![pk(12), shared_tracker_momentum],
+                ),
             ],
             vec![
-                (pool_owner(ExplicitConsumer::Wallet, 1), 1, vec![pk(20)]),
-                (pool_owner(ExplicitConsumer::Tracker, 2), 2, vec![pk(21)]),
+                (
+                    pool_owner(ExplicitConsumer::Wallet, 1),
+                    1,
+                    vec![wallet_only, pk(21)],
+                ),
+                (
+                    pool_owner(ExplicitConsumer::Tracker, 2),
+                    2,
+                    vec![pk(21), shared_tracker_momentum],
+                ),
+                (
+                    pool_owner(ExplicitConsumer::Arb, 3),
+                    3,
+                    vec![shared_tracker_momentum, shared_tracker_arb],
+                ),
+            ],
+            vec![
+                (
+                    pool_owner(ExplicitConsumer::Tracker, 4),
+                    4,
+                    vec![shared_tracker_arb],
+                ),
+                (
+                    pool_owner(ExplicitConsumer::Arb, 5),
+                    5,
+                    vec![shared_tracker_arb, pk(30)],
+                ),
+                (
+                    pool_owner(ExplicitConsumer::Momentum, 6),
+                    6,
+                    vec![pk(30), pk(31)],
+                ),
             ],
         ];
 
@@ -1443,7 +1527,21 @@ mod tests {
             pool_owner(ExplicitConsumer::Momentum, 52),
             pool_owner(ExplicitConsumer::Wallet, 53),
         ];
-        let incoming_keys = [vec![pk(100)], vec![pk(101), pk(102)], vec![pk(103)]];
+
+        let incoming_key_matrix = [
+            vec![pk(100)],
+            vec![pk(101), pk(102)],
+            vec![pk(103)],
+            vec![tracker_only],
+            vec![shared_tracker_arb],
+            vec![shared_tracker_momentum],
+            vec![wallet_only],
+            vec![pk(100), tracker_only],
+            vec![pk(101), shared_tracker_arb],
+            vec![pk(102), shared_tracker_momentum],
+            vec![pk(103), wallet_only],
+            vec![tracker_only, shared_tracker_arb, shared_tracker_momentum],
+        ];
 
         for fixtures in graphs {
             let snapshot = snapshot_from_fixtures(&fixtures);
@@ -1452,13 +1550,16 @@ mod tests {
                 if fixtures.iter().any(|(o, _, _)| o == incoming_owner) {
                     continue;
                 }
-                for keys in &incoming_keys {
-                    for cap in [0usize, 1, 2, 5] {
+                for keys in &incoming_key_matrix {
+                    for cap in [0usize, 1, 2, 3, 5] {
                         let request =
                             feasibility_request(incoming_owner.clone(), keys.clone(), cap);
                         let actual = snapshot.analyze_tier_feasibility(request);
                         let expected = oracle.analyze(incoming_owner, keys, cap);
-                        assert_eq!(actual, expected, "fixtures={fixtures:?}");
+                        assert_eq!(
+                            actual, expected,
+                            "fixtures={fixtures:?} incoming={incoming_owner:?} keys={keys:?} cap={cap}"
+                        );
                     }
                 }
             }
