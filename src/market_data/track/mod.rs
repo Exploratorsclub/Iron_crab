@@ -1,6 +1,7 @@
 pub mod coalesce;
 pub mod desired_set;
 pub mod enrichment;
+pub mod explicit_admission;
 pub mod explicit_ownership;
 pub mod geyser_sync;
 pub mod snapshot;
@@ -18,6 +19,7 @@ pub use desired_set::{
 pub use enrichment::{
     is_enrichment_member_from_inputs, pool_is_enrichment_member, EnrichmentMembershipInputs,
 };
+pub use explicit_admission::{FixedCapAdmission, FixedCapAdmissionResult};
 pub use explicit_ownership::{
     EmptyOwnerGroupError, ExplicitConsumer, ExplicitOwner, ExplicitOwnerKey, ExplicitOwnership,
     GroupChange, OwnerGroupSnapshot,
