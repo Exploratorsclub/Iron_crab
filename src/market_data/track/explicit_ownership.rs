@@ -367,9 +367,17 @@ mod tests {
         ownership
             .pubkey_owners
             .iter()
-            .filter(|(_, owners)| !owners.is_empty())
             .map(|(pubkey, owners)| (*pubkey, owners.iter().cloned().collect()))
             .collect()
+    }
+
+    fn assert_no_stale_empty_reverse_index_keys(ownership: &ExplicitOwnership) {
+        for (pubkey, owners) in &ownership.pubkey_owners {
+            assert!(
+                !owners.is_empty(),
+                "stale empty reverse-index entry for {pubkey:?}"
+            );
+        }
     }
 
     fn normalized_pubkey_owner_vec(
@@ -455,15 +463,13 @@ mod tests {
     }
 
     fn assert_indexes_match(ownership: &ExplicitOwnership, model: &RefModel) {
+        assert_no_stale_empty_reverse_index_keys(ownership);
+
         let sut_groups = sut_owner_groups(ownership);
         assert_eq!(sut_groups, model.groups);
 
         let sut_reverse = sut_pubkey_owner_sets(ownership);
         let model_reverse = pubkey_owner_sets_from_groups(&model.groups);
-        assert_eq!(
-            sut_reverse.keys().copied().collect::<Vec<_>>(),
-            model_reverse.keys().copied().collect::<Vec<_>>()
-        );
         assert_eq!(sut_reverse, model_reverse);
 
         let all_pubkeys: BTreeSet<Pubkey> = sut_reverse
@@ -842,6 +848,32 @@ mod tests {
         ownership.remove_group(&wo);
         model.remove_group(&wo);
         assert_indexes_match(&ownership, &model);
+    }
+
+    #[test]
+    fn removal_and_replacement_leave_no_empty_reverse_index_keys() {
+        let mut ownership = ExplicitOwnership::new();
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        let other = pool_owner(ExplicitConsumer::Arb, 2);
+        let shared = pk(1);
+        let k2 = pk(2);
+        let k3 = pk(3);
+
+        ownership.upsert_group(owner.clone(), [shared, k2]).unwrap();
+        assert_no_stale_empty_reverse_index_keys(&ownership);
+
+        ownership.upsert_group(other.clone(), [shared]).unwrap();
+        assert_no_stale_empty_reverse_index_keys(&ownership);
+
+        ownership.upsert_group(owner.clone(), [k2, k3]).unwrap();
+        assert_no_stale_empty_reverse_index_keys(&ownership);
+
+        ownership.remove_group(&other);
+        assert_no_stale_empty_reverse_index_keys(&ownership);
+
+        ownership.remove_group(&owner);
+        assert_no_stale_empty_reverse_index_keys(&ownership);
+        assert!(ownership.pubkey_owners.is_empty());
     }
 
     #[test]
