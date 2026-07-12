@@ -783,6 +783,16 @@ impl PoolSnapshotRevisionSequencer {
             .pending_entries
             .contains_key(&(pool, consumer))
     }
+
+    pub(crate) fn pending_revision_keys(&self) -> Vec<(Pubkey, ConsumerId)> {
+        self.inner
+            .lock()
+            .expect("revision registry lock")
+            .pending_entries
+            .keys()
+            .copied()
+            .collect()
+    }
 }
 
 /// Coalesced pool command awaiting worker replay after queue loss.
@@ -1040,6 +1050,10 @@ impl PendingPoolRegistrations {
 
     pub fn has_pending(&self, pool: Pubkey, consumer: ConsumerId) -> bool {
         self.revisions.pending_has_entry(pool, consumer)
+    }
+
+    pub fn pending_revision_keys(&self) -> Vec<(Pubkey, ConsumerId)> {
+        self.revisions.pending_revision_keys()
     }
 }
 

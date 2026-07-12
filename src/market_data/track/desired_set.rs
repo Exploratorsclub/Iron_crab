@@ -191,11 +191,14 @@ fn initial_projected_refcount(
 }
 
 impl PlanningOverlay {
-    fn for_cap_shrink(set: &DesiredExplicitSet) -> Self {
+    fn for_cap_shrink(set: &DesiredExplicitSet, mut stats: Option<&mut PlanningStats>) -> Self {
         let touched_pubkeys: HashSet<Pubkey> = set.entries.keys().copied().collect();
         let mut projected_pubkey_refcount = HashMap::with_capacity(touched_pubkeys.len());
         for pk in &touched_pubkeys {
             let count = set.entries.get(pk).map(|e| e.owners.len()).unwrap_or(0);
+            if let Some(s) = stats.as_mut() {
+                s.owner_edge_iterations = s.owner_edge_iterations.saturating_add(count);
+            }
             projected_pubkey_refcount.insert(*pk, count);
         }
         Self {
@@ -989,7 +992,7 @@ impl DesiredExplicitSet {
 
     /// Set-aware cap-shrink victim planning: aggregate eviction across co-dependent groups.
     fn plan_cap_shrink_victims(&self, _deficit: usize) -> Option<Vec<(ConsumerId, OwnerKey)>> {
-        let overlay = PlanningOverlay::for_cap_shrink(self);
+        let overlay = PlanningOverlay::for_cap_shrink(self, None);
         let victims_with_reason =
             self.plan_evictions_with_overlay(overlay, None, self.max_explicit_pubkeys, None)?;
         Some(
@@ -1067,7 +1070,7 @@ impl DesiredExplicitSet {
             Some((c, o, p)) => {
                 PlanningOverlay::for_incoming_admission(self, *c, *o, p, stats.as_deref_mut())
             }
-            None => PlanningOverlay::for_cap_shrink(self),
+            None => PlanningOverlay::for_cap_shrink(self, stats.as_deref_mut()),
         };
         let incoming_ref = incoming.as_ref().map(|(c, o, p)| (*c, *o, p));
         self.plan_evictions_with_overlay(overlay, incoming_ref, cap, stats)
@@ -1146,20 +1149,6 @@ impl<'a> EvictionPlanner<'a> {
                     .entry(*key)
                     .or_insert_with(|| group.pubkeys.iter().copied().collect());
             }
-        }
-        for pk in &overlay.touched_pubkeys {
-            planner
-                .projected_pubkey_refcount
-                .entry(*pk)
-                .or_insert_with(|| {
-                    initial_projected_refcount(
-                        set,
-                        *pk,
-                        &planner.suppressed,
-                        overlay.incoming.as_ref().map(|(k, p)| (*k, p)),
-                        stats.as_deref_mut(),
-                    )
-                });
         }
         for key in planner.marginal.keys().copied().collect::<Vec<_>>() {
             planner.recompute_marginal_for_group(key, stats.as_deref_mut());
@@ -2177,16 +2166,18 @@ mod tests {
         let log_g = (group_count + 1).ilog2() as usize + 1;
         assert!(stats.candidate_pops <= group_count.saturating_mul(log_g));
         assert!(stats.victim_removals <= group_count);
+        let owner_edge_budget = edge_count
+            .saturating_add(victim_edge_visits)
+            .saturating_add(stats.candidate_pops);
+        assert!(
+            stats.owner_edge_iterations <= owner_edge_budget,
+            "owner edge visits {}/{} must stay bounded by initial+touched edges + victim edges + heap pops",
+            stats.owner_edge_iterations,
+            owner_edge_budget
+        );
         assert_eq!(
             stats.victim_owner_edge_scans, 0,
             "victim removal must not rescan owner edges"
-        );
-        let owner_edge_budget = edge_count.saturating_add(stats.candidate_pops);
-        assert!(
-            stats.owner_edge_iterations <= owner_edge_budget,
-            "owner edge visits {}/{} must stay bounded by initial+touched edges + heap pops",
-            stats.owner_edge_iterations,
-            owner_edge_budget
         );
         assert!(
             stats.refcount_checks
