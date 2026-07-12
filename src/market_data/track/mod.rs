@@ -20,7 +20,7 @@ pub use enrichment::{
     is_enrichment_member_from_inputs, pool_is_enrichment_member, EnrichmentMembershipInputs,
 };
 pub use explicit_admission::{
-    FixedCapAdmission, FixedCapAdmissionResult, InvariantViolationRecovery,
+    FixedCapAdmission, FixedCapAdmissionResult, FixedCapReplaceResult, InvariantViolationRecovery,
 };
 pub use explicit_ownership::{
     EmptyOwnerGroupError, ExplicitConsumer, ExplicitOwner, ExplicitOwnerKey, ExplicitOwnership,
