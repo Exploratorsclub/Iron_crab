@@ -1,8 +1,6 @@
 //! Bounded durable pending state for track-worker commands lost on full queue.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -177,10 +175,6 @@ impl RevisionRegistryInner {
 pub struct PoolSnapshotRevisionSequencer {
     inner: Mutex<RevisionRegistryInner>,
     touch_seq: AtomicU64,
-    #[cfg(test)]
-    stash_hold_before_visible: AtomicBool,
-    #[cfg(test)]
-    drain_hold_before_remove: AtomicBool,
 }
 
 impl Default for PoolSnapshotRevisionSequencer {
@@ -198,10 +192,6 @@ impl PoolSnapshotRevisionSequencer {
         Self {
             inner: Mutex::new(RevisionRegistryInner::new(max_keys)),
             touch_seq: AtomicU64::new(0),
-            #[cfg(test)]
-            stash_hold_before_visible: AtomicBool::new(false),
-            #[cfg(test)]
-            drain_hold_before_remove: AtomicBool::new(false),
         }
     }
 
@@ -226,6 +216,24 @@ impl PoolSnapshotRevisionSequencer {
             .expect("revision registry lock")
             .slots
             .len()
+    }
+
+    /// Whether a new revision can be issued for `pool`+`consumer` (slot capacity + u64 headroom).
+    pub fn can_issue_revision(&self, pool: Pubkey, consumer: ConsumerId) -> bool {
+        let inner = self.inner.lock().expect("revision registry lock");
+        Self::can_issue_revision_locked(&inner, (pool, consumer))
+    }
+
+    fn can_issue_revision_locked(inner: &RevisionRegistryInner, key: (Pubkey, ConsumerId)) -> bool {
+        if let Some(slot) = inner.slots.get(&key) {
+            slot.last_issued
+                .checked_add(1)
+                .is_some_and(|next| next != 0)
+        } else if inner.slots.len() < inner.max_keys {
+            true
+        } else {
+            inner.slots.values().any(RevisionSlot::recyclable)
+        }
     }
 
     pub fn total_memory_slots(&self) -> usize {
@@ -563,7 +571,7 @@ impl PoolSnapshotRevisionSequencer {
             .unwrap_or(0)
     }
 
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn test_seed_slot_revision_state(
         &self,
         pool: Pubkey,
@@ -579,27 +587,6 @@ impl PoolSnapshotRevisionSequencer {
         let slot = inner.slots.get_mut(&key).expect("seeded revision slot");
         slot.last_issued = last_issued;
         slot.applied_revision = applied_revision;
-    }
-
-    #[cfg(test)]
-    pub fn test_set_stash_hold_before_visible(&self, hold: bool) {
-        self.stash_hold_before_visible
-            .store(hold, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub fn test_set_drain_hold_before_remove(&self, hold: bool) {
-        self.drain_hold_before_remove.store(hold, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    fn test_stash_hold_active(&self) -> bool {
-        self.stash_hold_before_visible.load(Ordering::Acquire)
-    }
-
-    #[cfg(test)]
-    fn test_drain_hold_active(&self) -> bool {
-        self.drain_hold_before_remove.load(Ordering::Acquire)
     }
 
     fn assign_revision_for_command(
@@ -637,24 +624,6 @@ impl PoolSnapshotRevisionSequencer {
         slot.touch_stamp = self.next_touch_stamp();
         snapshot.revision = next;
         Ok(next)
-    }
-
-    fn stash_hold_spin(&self) {
-        #[cfg(test)]
-        {
-            while self.stash_hold_before_visible.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-        }
-    }
-
-    fn drain_hold_spin(&self) {
-        #[cfg(test)]
-        {
-            while self.drain_hold_before_remove.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-        }
     }
 
     pub(crate) fn pending_upsert(
@@ -746,9 +715,6 @@ impl PoolSnapshotRevisionSequencer {
             latest_revision: revision,
             latest_command: command,
         };
-        drop(inner);
-        self.stash_hold_spin();
-        let mut inner = self.inner.lock().expect("revision registry lock");
         inner.pending_entries.insert(key, coalesced);
         inner.pending_order.push_back(key);
         PendingPoolUpsertResult::Stored
@@ -757,11 +723,8 @@ impl PoolSnapshotRevisionSequencer {
     pub(crate) fn pending_drain_all(&self) -> Vec<PendingPoolCommand> {
         let mut inner = self.inner.lock().expect("revision registry lock");
         let keys: Vec<_> = inner.pending_order.drain(..).collect();
-        drop(inner);
         let mut drained = Vec::with_capacity(keys.len());
         for k in keys {
-            self.drain_hold_spin();
-            let mut inner = self.inner.lock().expect("revision registry lock");
             let Some(coalesced) = inner.pending_entries.remove(&k) else {
                 continue;
             };
@@ -893,6 +856,29 @@ pub enum PendingPoolUpsertResult {
     Overflow,
 }
 
+/// Result of bumping the monotonic wallet explicit revision counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletRevisionBump {
+    Bumped(u64),
+    Exhausted,
+}
+
+impl WalletRevisionBump {
+    pub fn bumped_revision(self) -> Option<u64> {
+        match self {
+            Self::Bumped(rev) => Some(rev),
+            Self::Exhausted => None,
+        }
+    }
+
+    pub fn max(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Exhausted, _) | (_, Self::Exhausted) => Self::Exhausted,
+            (Self::Bumped(a), Self::Bumped(b)) => Self::Bumped(a.max(b)),
+        }
+    }
+}
+
 /// Authoritative wallet explicit demand merged under lock (no lost-update on burst ATA).
 #[derive(Debug, Default)]
 pub struct WalletExplicitPending {
@@ -907,21 +893,21 @@ struct WalletExplicitState {
 }
 
 impl WalletExplicitPending {
-    pub fn insert_ata(&self, ata: Pubkey) -> u64 {
+    pub fn insert_ata(&self, ata: Pubkey) -> WalletRevisionBump {
         let mut g = self.inner.lock().expect("wallet pending lock");
         g.demand.insert(ata);
         g.token_accounts.insert(ata);
         self.bump_revision()
     }
 
-    pub fn remove_ata(&self, ata: Pubkey) -> u64 {
+    pub fn remove_ata(&self, ata: Pubkey) -> WalletRevisionBump {
         let mut g = self.inner.lock().expect("wallet pending lock");
         g.demand.remove(&ata);
         g.token_accounts.remove(&ata);
         self.bump_revision()
     }
 
-    pub fn replace_token_accounts(&self, accounts: HashSet<Pubkey>) -> u64 {
+    pub fn replace_token_accounts(&self, accounts: HashSet<Pubkey>) -> WalletRevisionBump {
         let mut g = self.inner.lock().expect("wallet pending lock");
         g.token_accounts = accounts;
         self.bump_revision()
@@ -936,11 +922,20 @@ impl WalletExplicitPending {
         )
     }
 
-    pub fn ensure_wallet_base(&self, wallet: Pubkey, wsol_ata: Pubkey) -> u64 {
+    pub fn ensure_wallet_base(&self, wallet: Pubkey, wsol_ata: Pubkey) -> WalletRevisionBump {
         let mut g = self.inner.lock().expect("wallet pending lock");
         g.demand.insert(wallet);
         g.demand.insert(wsol_ata);
         self.bump_revision()
+    }
+
+    pub fn revision_exhausted(&self) -> bool {
+        self.revision.load(Ordering::Acquire) == u64::MAX
+    }
+
+    #[doc(hidden)]
+    pub fn test_seed_revision(&self, revision: u64) {
+        self.revision.store(revision, Ordering::Release);
     }
 
     pub fn current_revision(&self) -> u64 {
@@ -955,13 +950,35 @@ impl WalletExplicitPending {
             .contains(&pk)
     }
 
-    /// Monotonic wallet revision; returns `u64::MAX` fail-closed when exhausted.
-    #[allow(clippy::manual_saturating_arithmetic)]
-    fn bump_revision(&self) -> u64 {
-        self.revision
-            .fetch_add(1, Ordering::AcqRel)
-            .checked_add(1)
-            .unwrap_or(u64::MAX)
+    /// Monotonic wallet revision; permanently latches at `u64::MAX` when exhausted.
+    fn bump_revision(&self) -> WalletRevisionBump {
+        loop {
+            let current = self.revision.load(Ordering::Acquire);
+            if current == u64::MAX {
+                return WalletRevisionBump::Exhausted;
+            }
+            let next = match current.checked_add(1) {
+                None | Some(0) => u64::MAX,
+                Some(n) => n,
+            };
+            if next == u64::MAX {
+                if self
+                    .revision
+                    .compare_exchange(current, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return WalletRevisionBump::Exhausted;
+                }
+                continue;
+            }
+            if self
+                .revision
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return WalletRevisionBump::Bumped(next);
+            }
+        }
     }
 }
 
@@ -1669,7 +1686,6 @@ mod tests {
     #[test]
     fn atomic_stash_visible_only_with_pending_ref() {
         use std::sync::Arc;
-        use std::thread;
 
         let revisions = Arc::new(PoolSnapshotRevisionSequencer::with_max_keys(8));
         let pending = Arc::new(PendingPoolRegistrations::new(8, Arc::clone(&revisions)));
@@ -1678,63 +1694,21 @@ mod tests {
         let rev = register_and_assign(&revisions, pool, ConsumerId::Momentum);
         revisions.release_inflight_command(pool, ConsumerId::Momentum);
 
-        revisions.test_set_stash_hold_before_visible(true);
-
-        let revisions_producer = Arc::clone(&revisions);
-        let pending_producer = Arc::clone(&pending);
-        let producer = thread::spawn(move || {
-            let mut snap = mk_snapshot(pool, Pubkey::new_unique());
-            snap.revision = rev;
-            assert_reserved_inflight(&revisions_producer, pool, ConsumerId::Momentum);
-            pending_producer.upsert_after_inflight_send_failure(
+        let mut snap = mk_snapshot(pool, Pubkey::new_unique());
+        snap.revision = rev;
+        assert_reserved_inflight(&revisions, pool, ConsumerId::Momentum);
+        assert_eq!(
+            pending.upsert_after_inflight_send_failure(
                 pool,
                 ConsumerId::Momentum,
                 PendingPoolCommand::RegisterReserves(snap),
-            )
-        });
-
-        for _ in 0..200 {
-            let has_entry = pending.has_pending(pool, ConsumerId::Momentum);
-            let refs = revisions.key_refs(pool, ConsumerId::Momentum);
-            if has_entry {
-                assert!(
-                    refs.pending > 0,
-                    "visible pending entry must have pending ref"
-                );
-            }
-            if refs.pending > 0 && !has_entry {
-                assert!(
-                    revisions.test_stash_hold_active(),
-                    "pending ref without visible entry only during stash hold"
-                );
-            }
-            thread::yield_now();
-        }
-
-        revisions.test_set_stash_hold_before_visible(false);
-        assert_eq!(
-            producer.join().expect("producer"),
+            ),
             PendingPoolUpsertResult::Stored
         );
         assert!(pending.has_pending(pool, ConsumerId::Momentum));
         assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).pending, 1);
 
-        revisions.test_set_drain_hold_before_remove(true);
-        let pending_drain = Arc::clone(&pending);
-        let drainer = thread::spawn(move || pending_drain.drain_all());
-        for _ in 0..200 {
-            let has_entry = pending.has_pending(pool, ConsumerId::Momentum);
-            let refs = revisions.key_refs(pool, ConsumerId::Momentum);
-            if !has_entry && refs.pending > 0 {
-                assert!(
-                    revisions.test_drain_hold_active(),
-                    "pending ref after entry removed only during drain hold"
-                );
-            }
-            thread::yield_now();
-        }
-        revisions.test_set_drain_hold_before_remove(false);
-        let drained = drainer.join().expect("drainer");
+        let drained = pending.drain_all();
         assert_eq!(drained.len(), 1);
         assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).pending, 1);
         let snapshot = match &drained[0] {
@@ -1751,5 +1725,159 @@ mod tests {
         );
         assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).pending, 0);
         assert!(!pending.has_pending(pool, ConsumerId::Momentum));
+    }
+
+    #[test]
+    fn concurrent_stash_same_key_coalesces_to_single_entry_and_ref() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Barrier;
+        use std::thread;
+
+        let revisions = Arc::new(PoolSnapshotRevisionSequencer::with_max_keys(8));
+        let pending = Arc::new(PendingPoolRegistrations::new(8, Arc::clone(&revisions)));
+        let pool = Pubkey::new_unique();
+        ensure_key(&revisions, pool, ConsumerId::Momentum);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let stored_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for i in 0..2 {
+            let revisions_t = Arc::clone(&revisions);
+            let pending_t = Arc::clone(&pending);
+            let barrier_t = Arc::clone(&barrier);
+            let stored_t = Arc::clone(&stored_count);
+            handles.push(thread::spawn(move || {
+                barrier_t.wait();
+                assert_reserved_inflight(&revisions_t, pool, ConsumerId::Momentum);
+                let mut snap = mk_snapshot(pool, Pubkey::new_unique());
+                snap.revision = i as u64 + 1;
+                let result = pending_t.upsert_after_inflight_send_failure(
+                    pool,
+                    ConsumerId::Momentum,
+                    PendingPoolCommand::RegisterReserves(snap),
+                );
+                if result == PendingPoolUpsertResult::Stored {
+                    stored_t.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                result
+            }));
+        }
+
+        barrier.wait();
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.join().expect("producer"));
+        }
+        assert_eq!(stored_count.load(AtomicOrdering::SeqCst), 1);
+        assert!(
+            results
+                .iter()
+                .filter(|r| **r == PendingPoolUpsertResult::Coalesced)
+                .count()
+                <= 1
+        );
+        assert_eq!(pending.pool_count(), 1);
+        assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).pending, 1);
+        assert_eq!(revisions.key_refs(pool, ConsumerId::Momentum).inflight, 0);
+    }
+
+    #[test]
+    fn concurrent_stash_distinct_keys_respects_pending_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Barrier;
+        use std::thread;
+
+        const CAP: usize = 2;
+        let revisions = Arc::new(PoolSnapshotRevisionSequencer::with_max_keys(8));
+        let pending = Arc::new(PendingPoolRegistrations::new(CAP, Arc::clone(&revisions)));
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let pool_c = Pubkey::new_unique();
+        for pool in [pool_a, pool_b, pool_c] {
+            ensure_key(&revisions, pool, ConsumerId::Momentum);
+        }
+
+        let barrier = Arc::new(Barrier::new(4));
+        let stored_count = Arc::new(AtomicUsize::new(0));
+        let pools = [pool_a, pool_b, pool_c];
+        let mut handles = Vec::new();
+        for pool in pools {
+            let revisions_t = Arc::clone(&revisions);
+            let pending_t = Arc::clone(&pending);
+            let barrier_t = Arc::clone(&barrier);
+            let stored_t = Arc::clone(&stored_count);
+            handles.push(thread::spawn(move || {
+                barrier_t.wait();
+                assert_reserved_inflight(&revisions_t, pool, ConsumerId::Momentum);
+                let mut snap = mk_snapshot(pool, Pubkey::new_unique());
+                snap.revision = 1;
+                let result = pending_t.upsert_after_inflight_send_failure(
+                    pool,
+                    ConsumerId::Momentum,
+                    PendingPoolCommand::RegisterReserves(snap),
+                );
+                if result == PendingPoolUpsertResult::Stored {
+                    stored_t.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                result
+            }));
+        }
+
+        barrier.wait();
+        for handle in handles {
+            let _ = handle.join().expect("producer");
+        }
+        assert!(stored_count.load(AtomicOrdering::SeqCst) <= CAP);
+        assert!(pending.pool_count() <= CAP);
+        assert_eq!(
+            revisions.key_refs(pool_a, ConsumerId::Momentum).pending
+                + revisions.key_refs(pool_b, ConsumerId::Momentum).pending
+                + revisions.key_refs(pool_c, ConsumerId::Momentum).pending,
+            pending.pool_count() as u32
+        );
+    }
+
+    #[test]
+    fn can_issue_revision_recyclable_slot_without_active_key_headroom() {
+        let revisions = PoolSnapshotRevisionSequencer::with_max_keys(1);
+        let pool0 = Pubkey::new_unique();
+        let pool1 = Pubkey::new_unique();
+        ensure_key(&revisions, pool0, ConsumerId::Momentum);
+        revisions.inc_pending_ref(pool0, ConsumerId::Momentum);
+        assert!(!revisions.can_issue_revision(pool1, ConsumerId::Momentum));
+        revisions.dec_pending_ref(pool0, ConsumerId::Momentum);
+        revisions.retire_key(pool0, ConsumerId::Momentum);
+        assert!(revisions.can_issue_revision(pool1, ConsumerId::Momentum));
+    }
+
+    #[test]
+    fn can_issue_revision_false_when_u64_exhausted() {
+        let revisions = PoolSnapshotRevisionSequencer::with_max_keys(8);
+        let pool = Pubkey::new_unique();
+        ensure_key(&revisions, pool, ConsumerId::Momentum);
+        revisions.test_seed_slot_revision_state(pool, ConsumerId::Momentum, u64::MAX, u64::MAX - 1);
+        assert!(!revisions.can_issue_revision(pool, ConsumerId::Momentum));
+    }
+
+    #[test]
+    fn wallet_revision_exhaustion_latches_and_rejects_post_exhaustion_bumps() {
+        let pending = WalletExplicitPending::default();
+        pending.test_seed_revision(u64::MAX - 1);
+        assert_eq!(
+            pending.insert_ata(Pubkey::new_unique()),
+            WalletRevisionBump::Exhausted
+        );
+        assert!(pending.revision_exhausted());
+        assert_eq!(pending.current_revision(), u64::MAX);
+        assert_eq!(
+            pending.insert_ata(Pubkey::new_unique()),
+            WalletRevisionBump::Exhausted
+        );
+        let wallet = Pubkey::new_unique();
+        let wsol = Pubkey::new_unique();
+        assert_eq!(
+            pending.ensure_wallet_base(wallet, wsol),
+            WalletRevisionBump::Exhausted
+        );
     }
 }

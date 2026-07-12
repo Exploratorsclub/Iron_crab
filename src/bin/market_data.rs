@@ -90,7 +90,8 @@ use ironcrab::market_data::track::{
     PoolExplicitSnapshot, PoolSnapshotRevisionSequencer, ProtectedOverflowDiagnostic,
     RevisionAcquireResult, RevisionActiveOwner, RevisionAssignResult, SnapshotConsumer,
     SnapshotOwnerGroup, TrackPinReason, TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,
-    VaultExplicitRow, WalletExplicitPending, EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
+    VaultExplicitRow, WalletExplicitPending, WalletRevisionBump,
+    EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
 };
 use ironcrab::metrics::{
     dec_market_data_account_high_priority_queue_depth,
@@ -2947,11 +2948,13 @@ impl TxIngestHost for MarketDataContext {
             return false;
         };
         let was_present = self.wallet_explicit_pending.contains_demand(ata);
-        let revision = self
+        let bump_base = self
             .wallet_explicit_pending
             .ensure_wallet_base(tracked_wallet.wallet, tracked_wallet.wsol_ata);
-        let revision = self.wallet_explicit_pending.insert_ata(ata).max(revision);
-        let _ = self.enqueue_wallet_explicit_sync_revision(revision);
+        let bump_ata = self.wallet_explicit_pending.insert_ata(ata);
+        if let Some(revision) = self.finalize_wallet_revision_bumps([bump_base, bump_ata], None) {
+            let _ = self.enqueue_wallet_explicit_sync_revision(revision);
+        }
         !was_present
     }
 
@@ -2962,11 +2965,13 @@ impl TxIngestHost for MarketDataContext {
         if !self.wallet_explicit_pending.contains_demand(ata) {
             return false;
         }
-        let revision = self
+        let bump_base = self
             .wallet_explicit_pending
             .ensure_wallet_base(tracked_wallet.wallet, tracked_wallet.wsol_ata);
-        let revision = self.wallet_explicit_pending.remove_ata(ata).max(revision);
-        let _ = self.enqueue_wallet_explicit_sync_revision(revision);
+        let bump_ata = self.wallet_explicit_pending.remove_ata(ata);
+        if let Some(revision) = self.finalize_wallet_revision_bumps([bump_base, bump_ata], None) {
+            let _ = self.enqueue_wallet_explicit_sync_revision(revision);
+        }
         true
     }
 
@@ -2980,10 +2985,12 @@ impl TxIngestHost for MarketDataContext {
         let Some(tracked_wallet) = self.tracked_wallet.as_ref() else {
             return;
         };
-        let revision = self
+        let bump_base = self
             .wallet_explicit_pending
             .ensure_wallet_base(tracked_wallet.wallet, tracked_wallet.wsol_ata);
-        let _ = self.enqueue_wallet_explicit_sync_revision(revision);
+        if let Some(revision) = self.finalize_wallet_revision_bumps([bump_base], None) {
+            let _ = self.enqueue_wallet_explicit_sync_revision(revision);
+        }
         let _ = enqueue_track_worker(self, TrackWorkerCommand::ScheduleGeyserPushDebounced);
     }
 
@@ -3325,11 +3332,49 @@ impl MarketDataContext {
         }
     }
 
-    fn try_clear_revision_registry_full_blocker(&self, desired: &DesiredExplicitSet) {
-        if self.pool_snapshot_revisions.active_key_count() < self.pool_snapshot_revisions.max_keys()
+    fn try_clear_revision_registry_full_blocker(
+        &self,
+        pool: Pubkey,
+        consumer: ConsumerId,
+        desired: &DesiredExplicitSet,
+    ) {
+        if self
+            .pool_snapshot_revisions
+            .can_issue_revision(pool, consumer)
         {
             self.clear_geyser_explicit_blocker(GESYER_BLOCK_REVISION_REGISTRY_FULL);
             self.recompute_geyser_explicit_readiness(desired);
+        }
+    }
+
+    fn fail_wallet_revision_exhausted(&self, desired: Option<&DesiredExplicitSet>) {
+        self.set_geyser_explicit_blocker(
+            GESYER_BLOCK_WALLET_EXPLICIT,
+            Some("wallet explicit revision exhausted (fail-closed)".into()),
+        );
+        if let Some(desired) = desired {
+            self.recompute_geyser_explicit_readiness(desired);
+        }
+    }
+
+    fn finalize_wallet_revision_bumps(
+        &self,
+        bumps: impl IntoIterator<Item = WalletRevisionBump>,
+        desired: Option<&DesiredExplicitSet>,
+    ) -> Option<u64> {
+        let mut merged: Option<WalletRevisionBump> = None;
+        for bump in bumps {
+            merged = Some(match merged {
+                None => bump,
+                Some(prev) => prev.max(bump),
+            });
+        }
+        match merged? {
+            WalletRevisionBump::Exhausted => {
+                self.fail_wallet_revision_exhausted(desired);
+                None
+            }
+            WalletRevisionBump::Bumped(rev) => Some(rev),
         }
     }
 
@@ -3436,7 +3481,7 @@ impl MarketDataContext {
         {
             RevisionAcquireResult::Acquired => {
                 if let Some(desired) = desired {
-                    self.try_clear_revision_registry_full_blocker(desired);
+                    self.try_clear_revision_registry_full_blocker(pool, consumer, desired);
                 }
                 true
             }
@@ -3759,7 +3804,9 @@ impl MarketDataContext {
                 false
             }
             AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey => {
-                self.clear_geyser_explicit_blocker(GESYER_BLOCK_WALLET_EXPLICIT);
+                if !self.wallet_explicit_pending.revision_exhausted() {
+                    self.clear_geyser_explicit_blocker(GESYER_BLOCK_WALLET_EXPLICIT);
+                }
                 self.try_clear_protected_cap_blockers(desired);
                 self.recompute_geyser_explicit_readiness(desired);
                 true
@@ -3768,16 +3815,18 @@ impl MarketDataContext {
     }
 
     fn request_wallet_explicit_resync(&self) {
-        let revision = if let Some(tw) = &self.tracked_wallet {
+        let bump = if let Some(tw) = &self.tracked_wallet {
             let (demand, _, rev) = self.wallet_explicit_pending.snapshot();
             let token_accounts = Self::wallet_token_accounts_from_demand(&demand, tw);
             self.wallet_explicit_pending
                 .replace_token_accounts(token_accounts)
-                .max(rev)
+                .max(WalletRevisionBump::Bumped(rev))
         } else {
-            self.wallet_explicit_pending.current_revision()
+            WalletRevisionBump::Bumped(self.wallet_explicit_pending.current_revision())
         };
-        let _ = self.enqueue_wallet_explicit_sync_revision(revision);
+        if let Some(revision) = self.finalize_wallet_revision_bumps([bump], None) {
+            let _ = self.enqueue_wallet_explicit_sync_revision(revision);
+        }
         let _ = enqueue_track_worker(self, TrackWorkerCommand::ScheduleGeyserPushDebounced);
     }
 
@@ -7693,14 +7742,16 @@ async fn publish_wallet_snapshot(
 
     // 3) Update logical wallet explicit demand; physical publish goes through track-worker admission.
     if let Some(ref tracked_wallet) = ctx.tracked_wallet {
-        let revision = ctx
+        let bump_base = ctx
             .wallet_explicit_pending
             .ensure_wallet_base(tracked_wallet.wallet, tracked_wallet.wsol_ata);
-        let revision = ctx
+        let bump_replace = ctx
             .wallet_explicit_pending
-            .replace_token_accounts(wallet_token_accounts)
-            .max(revision);
-        let _ = ctx.enqueue_wallet_explicit_sync_revision(revision);
+            .replace_token_accounts(wallet_token_accounts);
+        if let Some(revision) = ctx.finalize_wallet_revision_bumps([bump_base, bump_replace], None)
+        {
+            let _ = ctx.enqueue_wallet_explicit_sync_revision(revision);
+        }
         let _ = enqueue_track_worker(ctx, TrackWorkerCommand::ScheduleGeyserPushDebounced);
     }
 
@@ -16919,10 +16970,13 @@ mod pr_b_geyser_tracking_tests {
         ctx.hot_pool_registry.pin_pool(base, pool);
 
         let wallet = Pubkey::new_unique();
-        let _ = ctx.enqueue_wallet_explicit_sync_revision(
-            ctx.wallet_explicit_pending
-                .replace_token_accounts(HashSet::from([wallet])),
-        );
+        if let Some(revision) = ctx.finalize_wallet_revision_bumps(
+            [ctx.wallet_explicit_pending
+                .replace_token_accounts(HashSet::from([wallet]))],
+            None,
+        ) {
+            let _ = ctx.enqueue_wallet_explicit_sync_revision(revision);
+        }
         test_wait_inline_track_worker();
 
         assert!(ctx.register_pool_vaults_from_account(pool));
@@ -18324,6 +18378,79 @@ mod pr_b_geyser_tracking_tests {
         registry.unpin_pool(mint1, pool1);
         assert!(!registry.is_pinned(mint1, pool1));
         assert_eq!(registry.pair_count(), 0);
+    }
+
+    #[test]
+    fn revision_registry_full_blocker_clears_after_successful_key_retry() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        ctx.fail_revision_registry_full();
+        let desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
+        ctx.recompute_geyser_explicit_readiness(&desired);
+        assert!(!ctx.geyser_explicit_readiness_ok());
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+        assert!(ctx.ensure_pool_revision_key(pool, ConsumerId::Momentum, Some(&desired)));
+        ctx.recompute_geyser_explicit_readiness(&desired);
+        assert!(ctx.geyser_explicit_readiness_ok());
+    }
+
+    #[test]
+    fn revision_registry_full_blocker_persists_when_u64_exhausted() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+        assert!(ctx.ensure_pool_revision_key_cold(pool, ConsumerId::Momentum));
+        ctx.pool_snapshot_revisions.test_seed_slot_revision_state(
+            pool,
+            ConsumerId::Momentum,
+            u64::MAX,
+            u64::MAX - 1,
+        );
+        ctx.fail_revision_registry_full();
+        let desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
+        ctx.recompute_geyser_explicit_readiness(&desired);
+        assert!(!ctx.geyser_explicit_readiness_ok());
+        assert!(ctx.ensure_pool_revision_key(pool, ConsumerId::Momentum, Some(&desired)));
+        ctx.recompute_geyser_explicit_readiness(&desired);
+        assert!(
+            !ctx.geyser_explicit_readiness_ok(),
+            "u64 exhaustion must keep registry-full blocker latched"
+        );
+    }
+
+    #[test]
+    fn wallet_revision_exhaustion_blocks_geyser_readiness() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
+        ctx.wallet_explicit_pending.test_seed_revision(u64::MAX - 1);
+        assert_eq!(
+            ctx.finalize_wallet_revision_bumps(
+                [ctx.wallet_explicit_pending.insert_ata(Pubkey::new_unique())],
+                Some(&desired),
+            ),
+            None
+        );
+        ctx.recompute_geyser_explicit_readiness(&desired);
+        assert!(!ctx.geyser_explicit_readiness_ok());
+        assert_eq!(
+            ctx.finalize_wallet_revision_bumps(
+                [ctx.wallet_explicit_pending.insert_ata(Pubkey::new_unique())],
+                Some(&desired),
+            ),
+            None,
+            "post-exhaustion bumps must stay fail-closed"
+        );
     }
 
     #[test]

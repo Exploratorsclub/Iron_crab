@@ -1080,6 +1080,7 @@ struct EvictionPlanner<'a> {
     victims: HashSet<(ConsumerId, OwnerKey)>,
     marginal: HashMap<(ConsumerId, OwnerKey), usize>,
     marginal_contributors: HashMap<(ConsumerId, OwnerKey), HashSet<Pubkey>>,
+    group_pubkeys: HashMap<(ConsumerId, OwnerKey), Vec<Pubkey>>,
     pubkey_groups: HashMap<Pubkey, Vec<(ConsumerId, OwnerKey)>>,
     projected_pubkey_refcount: HashMap<Pubkey, usize>,
 }
@@ -1106,9 +1107,15 @@ impl<'a> EvictionPlanner<'a> {
                 stats.as_deref_mut(),
             );
         }
-        for key in tracked_groups {
-            marginal.insert(key, 0);
-            marginal_contributors.insert(key, HashSet::new());
+        for key in &tracked_groups {
+            marginal.insert(*key, 0);
+            marginal_contributors.insert(*key, HashSet::new());
+        }
+        let mut group_pubkeys = HashMap::new();
+        for key in &tracked_groups {
+            if let Some(group) = set.groups.get(key) {
+                group_pubkeys.insert(*key, group.pubkeys.iter().copied().collect());
+            }
         }
         let mut planner = Self {
             set,
@@ -1116,6 +1123,7 @@ impl<'a> EvictionPlanner<'a> {
             victims: HashSet::new(),
             marginal,
             marginal_contributors,
+            group_pubkeys,
             pubkey_groups,
             projected_pubkey_refcount: HashMap::new(),
         };
@@ -1244,48 +1252,53 @@ impl<'a> EvictionPlanner<'a> {
         overlay: &PlanningOverlay,
         mut stats: Option<&mut PlanningStats>,
     ) -> usize {
-        if let Some(group) = self.set.groups.get(&victim) {
-            for pk in &group.pubkeys {
-                if !self.pubkey_groups.contains_key(pk) {
-                    let mut scratch = HashSet::new();
-                    Self::index_pubkey(
-                        self.set,
-                        overlay,
-                        *pk,
-                        &mut self.pubkey_groups,
-                        &mut scratch,
-                        stats.as_deref_mut(),
-                    );
-                    for key in scratch {
-                        self.marginal.entry(key).or_insert(0);
-                        self.marginal_contributors.entry(key).or_default();
+        let victim_pubkeys: Vec<Pubkey> = self
+            .set
+            .groups
+            .get(&victim)
+            .map(|group| group.pubkeys.iter().copied().collect())
+            .unwrap_or_default();
+        if !victim_pubkeys.is_empty() {
+            self.group_pubkeys.insert(victim, victim_pubkeys.clone());
+        }
+        for pk in &victim_pubkeys {
+            if !self.pubkey_groups.contains_key(pk) {
+                let mut scratch = HashSet::new();
+                Self::index_pubkey(
+                    self.set,
+                    overlay,
+                    *pk,
+                    &mut self.pubkey_groups,
+                    &mut scratch,
+                    stats.as_deref_mut(),
+                );
+                for key in scratch {
+                    self.marginal.entry(key).or_insert(0);
+                    self.marginal_contributors.entry(key).or_default();
+                    if let Some(group) = self.set.groups.get(&key) {
+                        self.group_pubkeys
+                            .entry(key)
+                            .or_insert_with(|| group.pubkeys.iter().copied().collect());
                     }
                 }
             }
         }
 
-        let contributor_pubkeys: Vec<Pubkey> = self
-            .marginal_contributors
-            .get(&victim)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
         let freed = self.marginal_freed(victim);
         self.victims.insert(victim);
 
-        for pk in contributor_pubkeys {
+        for pk in victim_pubkeys {
             let before = self
                 .projected_pubkey_refcount
                 .get(&pk)
                 .copied()
                 .unwrap_or_else(|| self.projected_owner_count(&pk));
-            let victim_was_sole = self
+            let victim_was_owner = self
                 .pubkey_groups
                 .get(&pk)
                 .is_some_and(|sharing| sharing.contains(&victim))
                 && before > 0;
-            let after = before.saturating_sub(usize::from(victim_was_sole));
+            let after = before.saturating_sub(usize::from(victim_was_owner));
             self.projected_pubkey_refcount.insert(pk, after);
             if before >= 2 && after == 1 {
                 if let Some(sole) = self.sole_projected_owner(&pk) {
@@ -2139,21 +2152,56 @@ mod tests {
         assert!(!victims.is_empty());
         assert_eq!(stats.projection_copies, 0);
         assert_eq!(stats.entries_copied, 0);
+        let victim_edge_visits: usize = victims
+            .iter()
+            .map(|(consumer, owner, _)| {
+                set.groups
+                    .get(&(*consumer, *owner))
+                    .map(|g| g.pubkeys.len())
+                    .unwrap_or(0)
+            })
+            .sum();
+        let victim_owner_edge_scans: usize = victims
+            .iter()
+            .map(|(consumer, owner, _)| {
+                set.groups
+                    .get(&(*consumer, *owner))
+                    .map(|g| {
+                        g.pubkeys
+                            .iter()
+                            .map(|pk| set.entries.get(pk).map(|e| e.owners.len()).unwrap_or(0))
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0)
+            })
+            .sum();
         let log_g = (group_count + 1).ilog2() as usize + 1;
         assert!(stats.candidate_pops <= group_count.saturating_mul(log_g));
         assert!(stats.victim_removals <= group_count);
+        let owner_edge_budget = edge_count
+            .saturating_add(victim_owner_edge_scans.saturating_mul(3))
+            .saturating_add(stats.candidate_pops);
         assert!(
-            stats.owner_edge_iterations
-                <= edge_count.saturating_mul(stats.victim_removals.saturating_add(1))
+            stats.owner_edge_iterations <= owner_edge_budget,
+            "owner edge visits {}/{} must stay bounded by initial edges + victim adjacency + heap pops",
+            stats.owner_edge_iterations,
+            owner_edge_budget
         );
         assert!(
             stats.refcount_checks
-                <= edge_count.saturating_mul(stats.victim_removals.saturating_add(1))
+                <= edge_count
+                    .saturating_add(victim_edge_visits)
+                    .saturating_add(stats.candidate_pops),
+            "refcount checks must stay bounded by initial edges + victim edges + heap pops"
         );
         assert!(
-            stats.edge_updates
-                <= edge_count.saturating_mul(stats.victim_removals.saturating_add(1)),
+            stats.edge_updates <= victim_edge_visits.saturating_add(stats.candidate_pops),
             "marginal edge updates must stay bounded under dense pubkey sharing"
+        );
+        assert!(
+            stats.owner_edge_iterations
+                < edge_count.saturating_mul(stats.victim_removals.saturating_add(1)),
+            "must not scale with edge_count * victims"
         );
         assert!(stats.candidate_pops > 0);
         assert!(stats.victim_removals > 0);

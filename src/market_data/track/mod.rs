@@ -29,6 +29,7 @@ pub use pending::{
     PendingPoolUpsertResult, PoolCommandAcceptPhase, PoolCommandRefRelease, PoolCommandTerminal,
     PoolSnapshotRevisionSequencer, ProtectedOverflowDiagnostic, RevisionAcquireResult,
     RevisionActiveOwner, RevisionAssignResult, RevisionRefCounts, WalletExplicitPending,
+    WalletRevisionBump,
 };
 pub use snapshot::{
     explicit_set_snapshot_path, load_explicit_set_snapshot, owner_key_to_snapshot,
