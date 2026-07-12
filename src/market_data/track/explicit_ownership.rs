@@ -351,26 +351,39 @@ mod tests {
         }
     }
 
+    fn sut_owner_groups(
+        ownership: &ExplicitOwnership,
+    ) -> BTreeMap<ExplicitOwner, BTreeSet<Pubkey>> {
+        ownership
+            .groups
+            .iter()
+            .map(|(owner, pubkeys)| (owner.clone(), pubkeys.iter().copied().collect()))
+            .collect()
+    }
+
+    fn sut_pubkey_owner_sets(
+        ownership: &ExplicitOwnership,
+    ) -> BTreeMap<Pubkey, BTreeSet<ExplicitOwner>> {
+        ownership
+            .pubkey_owners
+            .iter()
+            .filter(|(_, owners)| !owners.is_empty())
+            .map(|(pubkey, owners)| (*pubkey, owners.iter().cloned().collect()))
+            .collect()
+    }
+
+    fn normalized_pubkey_owner_vec(
+        map: &BTreeMap<Pubkey, BTreeSet<ExplicitOwner>>,
+    ) -> Vec<(Pubkey, Vec<ExplicitOwner>)> {
+        map.iter()
+            .map(|(pubkey, owners)| (*pubkey, owners.iter().cloned().collect()))
+            .collect()
+    }
+
     fn index_snapshot(ownership: &ExplicitOwnership) -> IndexSnapshot {
         let owner_groups = ownership.snapshot_owner_groups();
         let pubkeys = ownership.snapshot_pubkeys();
-        let mut pubkey_owner_sets = BTreeMap::new();
-        for group in &owner_groups {
-            let owner = ExplicitOwner {
-                consumer: group.consumer,
-                owner_key: group.owner_key.clone(),
-            };
-            for pubkey in &group.pubkeys {
-                pubkey_owner_sets
-                    .entry(*pubkey)
-                    .or_insert_with(BTreeSet::new)
-                    .insert(owner.clone());
-            }
-        }
-        let pubkey_owner_sets: Vec<(Pubkey, Vec<ExplicitOwner>)> = pubkey_owner_sets
-            .into_iter()
-            .map(|(pubkey, owners)| (pubkey, owners.into_iter().collect()))
-            .collect();
+        let pubkey_owner_sets = normalized_pubkey_owner_vec(&sut_pubkey_owner_sets(ownership));
         IndexSnapshot {
             owner_groups,
             pubkeys,
@@ -402,11 +415,9 @@ mod tests {
             match self.groups.get(&owner) {
                 Some(existing) if *existing == normalized => Ok(GroupChange::Unchanged),
                 Some(_) => {
-                    let mut without = self.groups.clone();
-                    without.remove(&owner);
-                    let physical_before = physical_pubkeys_from_groups(&without);
-                    without.insert(owner.clone(), normalized.clone());
-                    let physical_after = physical_pubkeys_from_groups(&without);
+                    let physical_before = physical_pubkeys_from_groups(&self.groups);
+                    self.groups.insert(owner.clone(), normalized.clone());
+                    let physical_after = physical_pubkeys_from_groups(&self.groups);
                     let physical_added: Vec<Pubkey> = physical_after
                         .difference(&physical_before)
                         .copied()
@@ -415,7 +426,6 @@ mod tests {
                         .difference(&physical_after)
                         .copied()
                         .collect();
-                    self.groups = without;
                     Ok(GroupChange::Replaced {
                         physical_added,
                         physical_removed,
@@ -445,22 +455,35 @@ mod tests {
     }
 
     fn assert_indexes_match(ownership: &ExplicitOwnership, model: &RefModel) {
+        let sut_groups = sut_owner_groups(ownership);
+        assert_eq!(sut_groups, model.groups);
+
+        let sut_reverse = sut_pubkey_owner_sets(ownership);
+        let model_reverse = pubkey_owner_sets_from_groups(&model.groups);
+        assert_eq!(
+            sut_reverse.keys().copied().collect::<Vec<_>>(),
+            model_reverse.keys().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(sut_reverse, model_reverse);
+
+        let all_pubkeys: BTreeSet<Pubkey> = sut_reverse
+            .keys()
+            .chain(model_reverse.keys())
+            .copied()
+            .collect();
+        for pubkey in all_pubkeys {
+            let sut_size = sut_reverse.get(&pubkey).map(BTreeSet::len).unwrap_or(0);
+            let model_size = model_reverse.get(&pubkey).map(BTreeSet::len).unwrap_or(0);
+            assert_eq!(ownership.owner_refcount(&pubkey), sut_size);
+            assert_eq!(ownership.owner_refcount(&pubkey), model_size);
+            assert_eq!(sut_size, model_size);
+        }
+
         let actual = index_snapshot(ownership);
         let expected = model.index_snapshot();
         assert_eq!(actual.owner_groups, expected.owner_groups);
         assert_eq!(actual.pubkeys, expected.pubkeys);
         assert_eq!(actual.pubkey_owner_sets, expected.pubkey_owner_sets);
-        for pubkey in &actual.pubkeys {
-            assert_eq!(
-                ownership.owner_refcount(pubkey),
-                expected
-                    .pubkey_owner_sets
-                    .iter()
-                    .find(|(pk, _)| pk == pubkey)
-                    .map(|(_, owners)| owners.len())
-                    .unwrap_or(0)
-            );
-        }
     }
 
     fn assert_operation(
@@ -561,6 +584,63 @@ mod tests {
             .unwrap();
         assert_eq!(change, GroupChange::Unchanged);
         assert_eq!(index_snapshot(&ownership), before);
+    }
+
+    #[test]
+    fn replacement_oracle_exclusive_case_matches_ref_model() {
+        let mut ownership = ExplicitOwnership::new();
+        let mut model = RefModel::default();
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        let k1 = pk(1);
+        let k2 = pk(2);
+        let k3 = pk(3);
+
+        ownership.upsert_group(owner.clone(), [k1, k2]).unwrap();
+        model.upsert_group(owner.clone(), [k1, k2]).unwrap();
+
+        let change = ownership.upsert_group(owner.clone(), [k2, k3]).unwrap();
+        let ref_change = model.upsert_group(owner.clone(), [k2, k3]).unwrap();
+        assert_eq!(
+            change,
+            GroupChange::Replaced {
+                physical_added: vec![k3],
+                physical_removed: vec![k1],
+            }
+        );
+        assert_eq!(change, ref_change);
+        assert_indexes_match(&ownership, &model);
+    }
+
+    #[test]
+    fn replacement_oracle_shared_key_case_matches_ref_model() {
+        let mut ownership = ExplicitOwnership::new();
+        let mut model = RefModel::default();
+        let shared = pk(1);
+        let owner_a = pool_owner(ExplicitConsumer::Momentum, 1);
+        let owner_b = pool_owner(ExplicitConsumer::Arb, 2);
+
+        ownership
+            .upsert_group(owner_a.clone(), [shared, pk(2)])
+            .unwrap();
+        model
+            .upsert_group(owner_a.clone(), [shared, pk(2)])
+            .unwrap();
+        ownership.upsert_group(owner_b.clone(), [shared]).unwrap();
+        model.upsert_group(owner_b.clone(), [shared]).unwrap();
+
+        let change = ownership.upsert_group(owner_a.clone(), [pk(3)]).unwrap();
+        let ref_change = model.upsert_group(owner_a.clone(), [pk(3)]).unwrap();
+        assert_eq!(
+            change,
+            GroupChange::Replaced {
+                physical_added: vec![pk(3)],
+                physical_removed: vec![pk(2)],
+            }
+        );
+        assert_eq!(change, ref_change);
+        assert_indexes_match(&ownership, &model);
+        assert!(ownership.contains(&shared));
+        assert_eq!(ownership.owner_refcount(&shared), 1);
     }
 
     #[test]
