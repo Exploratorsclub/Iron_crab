@@ -127,6 +127,7 @@ pub struct PlanningStats {
     pub projection_copies: usize,
     pub entries_copied: usize,
     pub owner_edge_iterations: usize,
+    pub victim_owner_edge_scans: usize,
     pub victim_removals: usize,
 }
 
@@ -140,7 +141,7 @@ struct PlanningOverlay {
     suppressed_groups: HashSet<(ConsumerId, OwnerKey)>,
     incoming: Option<((ConsumerId, OwnerKey), HashSet<Pubkey>)>,
     projected_len: usize,
-    pk_projected: HashMap<Pubkey, bool>,
+    projected_pubkey_refcount: HashMap<Pubkey, usize>,
 }
 
 fn pk_projection_contribution(live: bool, proj: bool) -> i64 {
@@ -159,20 +160,21 @@ fn apply_projected_len_delta(projected_len: usize, delta: i64) -> usize {
     (projected_len as i64 + delta).max(0) as usize
 }
 
-fn pk_would_exist_in_projection(
+fn initial_projected_refcount(
     set: &DesiredExplicitSet,
     pk: Pubkey,
     suppressed: &HashSet<(ConsumerId, OwnerKey)>,
     incoming: Option<((ConsumerId, OwnerKey), &HashSet<Pubkey>)>,
     mut stats: Option<&mut PlanningStats>,
-) -> bool {
+) -> usize {
+    let mut count = 0usize;
     if let Some(entry) = set.entries.get(&pk) {
         for owner in &entry.owners {
             if let Some(s) = stats.as_mut() {
                 s.owner_edge_iterations = s.owner_edge_iterations.saturating_add(1);
             }
             if !suppressed.contains(owner) {
-                return true;
+                count = count.saturating_add(1);
             }
         }
     }
@@ -182,20 +184,26 @@ fn pk_would_exist_in_projection(
                 s.owner_edge_iterations = s.owner_edge_iterations.saturating_add(1);
             }
             let _ = key;
-            return true;
+            count = count.saturating_add(1);
         }
     }
-    false
+    count
 }
 
 impl PlanningOverlay {
     fn for_cap_shrink(set: &DesiredExplicitSet) -> Self {
+        let touched_pubkeys: HashSet<Pubkey> = set.entries.keys().copied().collect();
+        let mut projected_pubkey_refcount = HashMap::with_capacity(touched_pubkeys.len());
+        for pk in &touched_pubkeys {
+            let count = set.entries.get(pk).map(|e| e.owners.len()).unwrap_or(0);
+            projected_pubkey_refcount.insert(*pk, count);
+        }
         Self {
-            touched_pubkeys: HashSet::new(),
+            touched_pubkeys,
             suppressed_groups: HashSet::new(),
             incoming: None,
             projected_len: set.entries.len(),
-            pk_projected: HashMap::new(),
+            projected_pubkey_refcount,
         }
     }
 
@@ -215,26 +223,29 @@ impl PlanningOverlay {
         }
         let incoming_ref = Some((key, incoming));
         let mut projected_len = set.entries.len();
-        let mut pk_projected = HashMap::with_capacity(touched.len());
+        let mut projected_pubkey_refcount = HashMap::with_capacity(touched.len());
         for pk in &touched {
             let live = set.entries.contains_key(pk);
-            let proj = pk_would_exist_in_projection(
+            let count = initial_projected_refcount(
                 set,
                 *pk,
                 &suppressed,
                 incoming_ref,
                 stats.as_deref_mut(),
             );
-            pk_projected.insert(*pk, proj);
-            projected_len =
-                apply_projected_len_delta(projected_len, projected_len_delta(live, live, proj));
+            projected_pubkey_refcount.insert(*pk, count);
+            let proj_exists = count > 0;
+            projected_len = apply_projected_len_delta(
+                projected_len,
+                projected_len_delta(live, live, proj_exists),
+            );
         }
         Self {
             touched_pubkeys: touched,
             suppressed_groups: suppressed,
             incoming: Some((key, incoming.clone())),
             projected_len,
-            pk_projected,
+            projected_pubkey_refcount,
         }
     }
 
@@ -255,37 +266,38 @@ impl PlanningOverlay {
         for pk in &pubkeys {
             self.touched_pubkeys.insert(*pk);
         }
+        let incoming_ref = self.incoming.as_ref().map(|(k, p)| (*k, p));
+        let before_counts: Vec<_> = pubkeys
+            .iter()
+            .map(|pk| {
+                (
+                    *pk,
+                    self.projected_pubkey_refcount
+                        .get(pk)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            initial_projected_refcount(
+                                set,
+                                *pk,
+                                &self.suppressed_groups,
+                                incoming_ref,
+                                None,
+                            )
+                        }),
+                )
+            })
+            .collect();
         if !self.suppressed_groups.insert(victim) {
             return;
         }
-        if let Some(stats) = stats.as_deref_mut() {
+        if let Some(stats) = stats.as_mut() {
             stats.victim_removals = stats.victim_removals.saturating_add(1);
         }
-        let incoming_ref = self.incoming.as_ref().map(|(k, p)| (*k, p));
-        for pk in pubkeys {
+        for (pk, before) in before_counts {
+            let after = before.saturating_sub(1);
+            self.projected_pubkey_refcount.insert(pk, after);
             let live = set.entries.contains_key(&pk);
-            let old_proj = if let Some(cached) = self.pk_projected.get(&pk) {
-                *cached
-            } else {
-                let mut without_victim = self.suppressed_groups.clone();
-                without_victim.remove(&victim);
-                pk_would_exist_in_projection(
-                    set,
-                    pk,
-                    &without_victim,
-                    incoming_ref,
-                    stats.as_deref_mut(),
-                )
-            };
-            let new_proj = pk_would_exist_in_projection(
-                set,
-                pk,
-                &self.suppressed_groups,
-                incoming_ref,
-                stats.as_deref_mut(),
-            );
-            self.pk_projected.insert(pk, new_proj);
-            let delta = projected_len_delta(live, old_proj, new_proj);
+            let delta = projected_len_delta(live, before > 0, after > 0);
             self.projected_len = apply_projected_len_delta(self.projected_len, delta);
         }
     }
@@ -1125,12 +1137,29 @@ impl<'a> EvictionPlanner<'a> {
             marginal_contributors,
             group_pubkeys,
             pubkey_groups,
-            projected_pubkey_refcount: HashMap::new(),
+            projected_pubkey_refcount: overlay.projected_pubkey_refcount.clone(),
         };
+        for key in &tracked_groups {
+            if let Some(group) = set.groups.get(key) {
+                planner
+                    .group_pubkeys
+                    .entry(*key)
+                    .or_insert_with(|| group.pubkeys.iter().copied().collect());
+            }
+        }
         for pk in &overlay.touched_pubkeys {
             planner
                 .projected_pubkey_refcount
-                .insert(*pk, planner.projected_owner_count(pk));
+                .entry(*pk)
+                .or_insert_with(|| {
+                    initial_projected_refcount(
+                        set,
+                        *pk,
+                        &planner.suppressed,
+                        overlay.incoming.as_ref().map(|(k, p)| (*k, p)),
+                        stats.as_deref_mut(),
+                    )
+                });
         }
         for key in planner.marginal.keys().copied().collect::<Vec<_>>() {
             planner.recompute_marginal_for_group(key, stats.as_deref_mut());
@@ -1138,27 +1167,17 @@ impl<'a> EvictionPlanner<'a> {
         planner
     }
 
-    fn projected_owner_count(&self, pk: &Pubkey) -> usize {
-        self.pubkey_groups
-            .get(pk)
-            .into_iter()
-            .flatten()
-            .filter(|owner| !self.suppressed.contains(owner) && !self.victims.contains(owner))
-            .count()
-    }
-
     fn sole_projected_owner(&self, pk: &Pubkey) -> Option<(ConsumerId, OwnerKey)> {
+        if self.projected_pubkey_refcount.get(pk).copied().unwrap_or(0) != 1 {
+            return None;
+        }
         let mut owners = self
             .pubkey_groups
             .get(pk)?
             .iter()
             .copied()
             .filter(|owner| !self.suppressed.contains(owner) && !self.victims.contains(owner));
-        let first = owners.next()?;
-        if owners.next().is_some() {
-            return None;
-        }
-        Some(first)
+        owners.next()
     }
 
     fn index_pubkey(
@@ -1220,22 +1239,9 @@ impl<'a> EvictionPlanner<'a> {
         self.marginal_contributors.insert(group, contributors);
     }
 
-    fn effective_owners(&self, pk: &Pubkey) -> Vec<(ConsumerId, OwnerKey)> {
-        let mut out = Vec::new();
-        if let Some(entry) = self.set.entries.get(pk) {
-            for owner in &entry.owners {
-                if self.suppressed.contains(owner) || self.victims.contains(owner) {
-                    continue;
-                }
-                out.push(*owner);
-            }
-        }
-        out
-    }
-
     fn pk_counts_toward_marginal(&self, pk: &Pubkey, group: (ConsumerId, OwnerKey)) -> bool {
-        let owners = self.effective_owners(pk);
-        owners.len() == 1 && owners[0] == group
+        self.projected_pubkey_refcount.get(pk).copied().unwrap_or(0) == 1
+            && self.sole_projected_owner(pk) == Some(group)
     }
 
     fn is_victim(&self, consumer: ConsumerId, owner: OwnerKey) -> bool {
@@ -1249,7 +1255,7 @@ impl<'a> EvictionPlanner<'a> {
     fn add_victim(
         &mut self,
         victim: (ConsumerId, OwnerKey),
-        overlay: &PlanningOverlay,
+        _overlay: &PlanningOverlay,
         mut stats: Option<&mut PlanningStats>,
     ) -> usize {
         let victim_pubkeys: Vec<Pubkey> = self
@@ -1263,42 +1269,49 @@ impl<'a> EvictionPlanner<'a> {
         }
         for pk in &victim_pubkeys {
             if !self.pubkey_groups.contains_key(pk) {
-                let mut scratch = HashSet::new();
-                Self::index_pubkey(
-                    self.set,
-                    overlay,
-                    *pk,
-                    &mut self.pubkey_groups,
-                    &mut scratch,
-                    stats.as_deref_mut(),
-                );
-                for key in scratch {
-                    self.marginal.entry(key).or_insert(0);
-                    self.marginal_contributors.entry(key).or_default();
-                    if let Some(group) = self.set.groups.get(&key) {
-                        self.group_pubkeys
-                            .entry(key)
-                            .or_insert_with(|| group.pubkeys.iter().copied().collect());
+                if let Some(entry) = self.set.entries.get(pk) {
+                    for owner in &entry.owners {
+                        if !self.suppressed.contains(owner) {
+                            self.pubkey_groups.entry(*pk).or_default().push(*owner);
+                        }
                     }
                 }
             }
         }
+        if !self.marginal.contains_key(&victim) {
+            self.recompute_marginal_for_group(victim, stats.as_deref_mut());
+        }
 
         let freed = self.marginal_freed(victim);
+        let before_counts: Vec<_> = victim_pubkeys
+            .iter()
+            .map(|pk| {
+                (
+                    *pk,
+                    self.projected_pubkey_refcount
+                        .get(pk)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            self.pubkey_groups
+                                .get(pk)
+                                .map(|owners| {
+                                    owners
+                                        .iter()
+                                        .filter(|owner| {
+                                            !self.suppressed.contains(owner)
+                                                && !self.victims.contains(owner)
+                                        })
+                                        .count()
+                                })
+                                .unwrap_or(0)
+                        }),
+                )
+            })
+            .collect();
         self.victims.insert(victim);
 
-        for pk in victim_pubkeys {
-            let before = self
-                .projected_pubkey_refcount
-                .get(&pk)
-                .copied()
-                .unwrap_or_else(|| self.projected_owner_count(&pk));
-            let victim_was_owner = self
-                .pubkey_groups
-                .get(&pk)
-                .is_some_and(|sharing| sharing.contains(&victim))
-                && before > 0;
-            let after = before.saturating_sub(usize::from(victim_was_owner));
+        for (pk, before) in before_counts {
+            let after = before.saturating_sub(1);
             self.projected_pubkey_refcount.insert(pk, after);
             if before >= 2 && after == 1 {
                 if let Some(sole) = self.sole_projected_owner(&pk) {
@@ -2161,29 +2174,17 @@ mod tests {
                     .unwrap_or(0)
             })
             .sum();
-        let victim_owner_edge_scans: usize = victims
-            .iter()
-            .map(|(consumer, owner, _)| {
-                set.groups
-                    .get(&(*consumer, *owner))
-                    .map(|g| {
-                        g.pubkeys
-                            .iter()
-                            .map(|pk| set.entries.get(pk).map(|e| e.owners.len()).unwrap_or(0))
-                            .sum::<usize>()
-                    })
-                    .unwrap_or(0)
-            })
-            .sum();
         let log_g = (group_count + 1).ilog2() as usize + 1;
         assert!(stats.candidate_pops <= group_count.saturating_mul(log_g));
         assert!(stats.victim_removals <= group_count);
-        let owner_edge_budget = edge_count
-            .saturating_add(victim_owner_edge_scans.saturating_mul(3))
-            .saturating_add(stats.candidate_pops);
+        assert_eq!(
+            stats.victim_owner_edge_scans, 0,
+            "victim removal must not rescan owner edges"
+        );
+        let owner_edge_budget = edge_count.saturating_add(stats.candidate_pops);
         assert!(
             stats.owner_edge_iterations <= owner_edge_budget,
-            "owner edge visits {}/{} must stay bounded by initial edges + victim adjacency + heap pops",
+            "owner edge visits {}/{} must stay bounded by initial+touched edges + heap pops",
             stats.owner_edge_iterations,
             owner_edge_budget
         );

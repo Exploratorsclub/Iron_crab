@@ -1181,6 +1181,8 @@ struct MarketDataContext {
     pending_pool_overflow_latched: AtomicBool,
     /// Startup restore + convergence barrier before Geyser connect.
     geyser_connect_barrier: Arc<GeyserConnectBarrier>,
+    /// Bounded ledger of revision-registry rejections (cleared per-key on retry/remove).
+    revision_registry_rejected: parking_lot::Mutex<HashSet<(Pubkey, ConsumerId)>>,
 }
 
 #[derive(Debug, Default)]
@@ -1236,6 +1238,7 @@ const GESYER_BLOCK_REVISION_REGISTRY_FULL: u8 = 1 << 1;
 const GESYER_BLOCK_PROTECTED_CAP_OVERFLOW: u8 = 1 << 2;
 const GESYER_BLOCK_ADMISSION_UNCONVERGED: u8 = 1 << 3;
 const GESYER_BLOCK_WALLET_EXPLICIT: u8 = 1 << 4;
+const GESYER_BLOCK_WALLET_REVISION_EXHAUSTED: u8 = 1 << 5;
 
 /// Scope-8: After `WalletSnapshotComplete`, wait briefly for in-flight Geyser merges before
 /// cold-path RPC verification for wallet-only mints without explicit Ready (bounded).
@@ -2007,7 +2010,7 @@ fn prepare_pool_snapshot_for_enqueue(
     {
         InflightReserveResult::Reserved => {}
         InflightReserveResult::RegistryFull => {
-            ctx.fail_revision_registry_full();
+            ctx.fail_revision_registry_full(pool, consumer);
             return None;
         }
     }
@@ -2016,13 +2019,13 @@ fn prepare_pool_snapshot_for_enqueue(
         RevisionAssignResult::RegistryFull => {
             ctx.pool_snapshot_revisions
                 .release_inflight_command(pool, consumer);
-            ctx.fail_revision_registry_full();
+            ctx.fail_revision_registry_full(pool, consumer);
             None
         }
         RevisionAssignResult::KeyNotRegistered => {
             ctx.pool_snapshot_revisions
                 .release_inflight_command(pool, consumer);
-            ctx.fail_revision_registry_full();
+            ctx.fail_revision_registry_full(pool, consumer);
             None
         }
     }
@@ -2636,7 +2639,7 @@ impl TrackWorkerContext for MarketDataContext {
     }
 
     fn geyser_explicit_readiness_ok(&self) -> bool {
-        self.geyser_explicit_ready.load(Ordering::Relaxed)
+        MarketDataContext::geyser_explicit_readiness_ok(self)
     }
 
     fn prune_tracked_maps_to_desired(&self, desired: &DesiredExplicitSet) {
@@ -2952,7 +2955,7 @@ impl TxIngestHost for MarketDataContext {
             .wallet_explicit_pending
             .ensure_wallet_base(tracked_wallet.wallet, tracked_wallet.wsol_ata);
         let bump_ata = self.wallet_explicit_pending.insert_ata(ata);
-        if let Some(revision) = self.finalize_wallet_revision_bumps([bump_base, bump_ata], None) {
+        if let Some(revision) = self.finalize_wallet_revision_bumps([bump_base, bump_ata]) {
             let _ = self.enqueue_wallet_explicit_sync_revision(revision);
         }
         !was_present
@@ -2969,7 +2972,7 @@ impl TxIngestHost for MarketDataContext {
             .wallet_explicit_pending
             .ensure_wallet_base(tracked_wallet.wallet, tracked_wallet.wsol_ata);
         let bump_ata = self.wallet_explicit_pending.remove_ata(ata);
-        if let Some(revision) = self.finalize_wallet_revision_bumps([bump_base, bump_ata], None) {
+        if let Some(revision) = self.finalize_wallet_revision_bumps([bump_base, bump_ata]) {
             let _ = self.enqueue_wallet_explicit_sync_revision(revision);
         }
         true
@@ -2988,7 +2991,7 @@ impl TxIngestHost for MarketDataContext {
         let bump_base = self
             .wallet_explicit_pending
             .ensure_wallet_base(tracked_wallet.wallet, tracked_wallet.wsol_ata);
-        if let Some(revision) = self.finalize_wallet_revision_bumps([bump_base], None) {
+        if let Some(revision) = self.finalize_wallet_revision_bumps([bump_base]) {
             let _ = self.enqueue_wallet_explicit_sync_revision(revision);
         }
         let _ = enqueue_track_worker(self, TrackWorkerCommand::ScheduleGeyserPushDebounced);
@@ -3120,6 +3123,15 @@ impl MdStateContext for MarketDataContext {
 }
 
 impl MarketDataContext {
+    fn geyser_explicit_blockers_active(&self) -> bool {
+        self.geyser_explicit_blockers.load(Ordering::Acquire) != 0
+    }
+
+    fn geyser_explicit_readiness_ok(&self) -> bool {
+        !self.geyser_explicit_blockers_active()
+            && self.geyser_explicit_ready.load(Ordering::Acquire)
+    }
+
     /// Non-blocking JSONL enqueue (dedicated `jsonl-writer` thread). Skips `AccountUpdate` / `TransactionDetected`.
     fn write_market_event_jsonl(&self, event: &MarketEvent) {
         write_market_event_jsonl(self, event);
@@ -3299,7 +3311,13 @@ impl MarketDataContext {
         })
     }
 
-    fn fail_revision_registry_full(&self) {
+    fn fail_revision_registry_full(&self, pool: Pubkey, consumer: ConsumerId) {
+        {
+            let mut rejected = self.revision_registry_rejected.lock();
+            if rejected.len() < self.pool_snapshot_revisions.max_keys() {
+                rejected.insert((pool, consumer));
+            }
+        }
         inc_market_data_revision_registry_full_total();
         self.set_geyser_explicit_blocker(
             GESYER_BLOCK_REVISION_REGISTRY_FULL,
@@ -3311,6 +3329,7 @@ impl MarketDataContext {
     fn set_geyser_explicit_blocker(&self, flag: u8, msg: Option<String>) {
         self.geyser_explicit_blockers
             .fetch_or(flag, Ordering::AcqRel);
+        self.geyser_explicit_ready.store(false, Ordering::Release);
         if let Some(msg) = msg {
             *self.geyser_explicit_config_error.write() = Some(msg);
         }
@@ -3332,35 +3351,66 @@ impl MarketDataContext {
         }
     }
 
+    fn maybe_clear_revision_registry_full_blocker(&self, desired: Option<&DesiredExplicitSet>) {
+        if !self.revision_registry_rejected.lock().is_empty() {
+            return;
+        }
+        self.clear_geyser_explicit_blocker(GESYER_BLOCK_REVISION_REGISTRY_FULL);
+        if let Some(desired) = desired {
+            self.recompute_geyser_explicit_readiness(desired);
+        }
+    }
+
+    fn resolve_revision_registry_rejection(
+        &self,
+        pool: Pubkey,
+        consumer: ConsumerId,
+        desired: Option<&DesiredExplicitSet>,
+    ) {
+        if !self
+            .pool_snapshot_revisions
+            .can_issue_revision(pool, consumer)
+        {
+            return;
+        }
+        self.revision_registry_rejected
+            .lock()
+            .remove(&(pool, consumer));
+        self.maybe_clear_revision_registry_full_blocker(desired);
+    }
+
+    fn drop_revision_registry_rejection(
+        &self,
+        pool: Pubkey,
+        consumer: ConsumerId,
+        desired: Option<&DesiredExplicitSet>,
+    ) {
+        self.revision_registry_rejected
+            .lock()
+            .remove(&(pool, consumer));
+        self.maybe_clear_revision_registry_full_blocker(desired);
+    }
+
     fn try_clear_revision_registry_full_blocker(
         &self,
         pool: Pubkey,
         consumer: ConsumerId,
         desired: &DesiredExplicitSet,
     ) {
-        if self
-            .pool_snapshot_revisions
-            .can_issue_revision(pool, consumer)
-        {
-            self.clear_geyser_explicit_blocker(GESYER_BLOCK_REVISION_REGISTRY_FULL);
-            self.recompute_geyser_explicit_readiness(desired);
-        }
+        self.resolve_revision_registry_rejection(pool, consumer, Some(desired));
     }
 
-    fn fail_wallet_revision_exhausted(&self, desired: Option<&DesiredExplicitSet>) {
+    fn fail_wallet_revision_exhausted(&self) {
         self.set_geyser_explicit_blocker(
-            GESYER_BLOCK_WALLET_EXPLICIT,
+            GESYER_BLOCK_WALLET_REVISION_EXHAUSTED,
             Some("wallet explicit revision exhausted (fail-closed)".into()),
         );
-        if let Some(desired) = desired {
-            self.recompute_geyser_explicit_readiness(desired);
-        }
+        self.geyser_connect_barrier.mark_failed();
     }
 
     fn finalize_wallet_revision_bumps(
         &self,
         bumps: impl IntoIterator<Item = WalletRevisionBump>,
-        desired: Option<&DesiredExplicitSet>,
     ) -> Option<u64> {
         let mut merged: Option<WalletRevisionBump> = None;
         for bump in bumps {
@@ -3371,7 +3421,7 @@ impl MarketDataContext {
         }
         match merged? {
             WalletRevisionBump::Exhausted => {
-                self.fail_wallet_revision_exhausted(desired);
+                self.fail_wallet_revision_exhausted();
                 None
             }
             WalletRevisionBump::Bumped(rev) => Some(rev),
@@ -3486,7 +3536,7 @@ impl MarketDataContext {
                 true
             }
             RevisionAcquireResult::RegistryFull => {
-                self.fail_revision_registry_full();
+                self.fail_revision_registry_full(pool, consumer);
                 false
             }
         }
@@ -3824,7 +3874,7 @@ impl MarketDataContext {
         } else {
             WalletRevisionBump::Bumped(self.wallet_explicit_pending.current_revision())
         };
-        if let Some(revision) = self.finalize_wallet_revision_bumps([bump], None) {
+        if let Some(revision) = self.finalize_wallet_revision_bumps([bump]) {
             let _ = self.enqueue_wallet_explicit_sync_revision(revision);
         }
         let _ = enqueue_track_worker(self, TrackWorkerCommand::ScheduleGeyserPushDebounced);
@@ -5858,6 +5908,7 @@ impl MarketDataContext {
         pool: Pubkey,
     ) -> bool {
         self.hot_pool_registry.unpin_pool(mint, pool);
+        self.drop_revision_registry_rejection(pool, ConsumerId::Momentum, Some(desired));
         let consumer = ConsumerId::Momentum;
         let refs = self.pool_snapshot_revisions.key_refs(pool, consumer);
         let has_pending = self.pending_pool_commands.has_pending(pool, consumer);
@@ -6071,6 +6122,7 @@ impl MarketDataContext {
         pool: Pubkey,
     ) -> bool {
         self.hot_pool_registry.unpin_arb_pool(pool);
+        self.drop_revision_registry_rejection(pool, ConsumerId::Arb, Some(desired));
         let consumer = ConsumerId::Arb;
         let refs = self.pool_snapshot_revisions.key_refs(pool, consumer);
         let has_pending = self.pending_pool_commands.has_pending(pool, consumer);
@@ -7748,8 +7800,7 @@ async fn publish_wallet_snapshot(
         let bump_replace = ctx
             .wallet_explicit_pending
             .replace_token_accounts(wallet_token_accounts);
-        if let Some(revision) = ctx.finalize_wallet_revision_bumps([bump_base, bump_replace], None)
-        {
+        if let Some(revision) = ctx.finalize_wallet_revision_bumps([bump_base, bump_replace]) {
             let _ = ctx.enqueue_wallet_explicit_sync_revision(revision);
         }
         let _ = enqueue_track_worker(ctx, TrackWorkerCommand::ScheduleGeyserPushDebounced);
@@ -8305,6 +8356,7 @@ async fn main() -> Result<()> {
         pool_snapshot_revisions,
         pending_pool_overflow_latched: AtomicBool::new(false),
         geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
+        revision_registry_rejected: parking_lot::Mutex::new(HashSet::new()),
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -11905,6 +11957,7 @@ mod wallet_snapshot_stale_cleanup_tests {
             pool_snapshot_revisions,
             pending_pool_overflow_latched: AtomicBool::new(false),
             geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
+            revision_registry_rejected: parking_lot::Mutex::new(HashSet::new()),
         }
     }
 
@@ -12151,6 +12204,7 @@ mod wallet_tx_meta_balance_tests {
             pool_snapshot_revisions,
             pending_pool_overflow_latched: AtomicBool::new(false),
             geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
+            revision_registry_rejected: parking_lot::Mutex::new(HashSet::new()),
         });
         let track_worker = spawn_inline_track_worker_sender(Arc::clone(&ctx), 4096);
         *ctx.track_worker.write() = Some(track_worker);
@@ -13066,6 +13120,7 @@ mod pr_b_geyser_tracking_tests {
             pool_snapshot_revisions,
             pending_pool_overflow_latched: AtomicBool::new(false),
             geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
+            revision_registry_rejected: parking_lot::Mutex::new(HashSet::new()),
         });
         let track_worker = spawn_inline_track_worker_sender(Arc::clone(&ctx), 4096);
         *ctx.track_worker.write() = Some(track_worker);
@@ -13162,6 +13217,7 @@ mod pr_b_geyser_tracking_tests {
             pool_snapshot_revisions,
             pending_pool_overflow_latched: AtomicBool::new(false),
             geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
+            revision_registry_rejected: parking_lot::Mutex::new(HashSet::new()),
         });
         (
             ctx,
@@ -16970,11 +17026,10 @@ mod pr_b_geyser_tracking_tests {
         ctx.hot_pool_registry.pin_pool(base, pool);
 
         let wallet = Pubkey::new_unique();
-        if let Some(revision) = ctx.finalize_wallet_revision_bumps(
-            [ctx.wallet_explicit_pending
-                .replace_token_accounts(HashSet::from([wallet]))],
-            None,
-        ) {
+        if let Some(revision) = ctx.finalize_wallet_revision_bumps([ctx
+            .wallet_explicit_pending
+            .replace_token_accounts(HashSet::from([wallet]))])
+        {
             let _ = ctx.enqueue_wallet_explicit_sync_revision(revision);
         }
         test_wait_inline_track_worker();
@@ -18123,7 +18178,7 @@ mod pr_b_geyser_tracking_tests {
             PendingPoolUpsertResult::Stored
         );
         ctx.fail_pending_pool_overflow();
-        ctx.fail_revision_registry_full();
+        ctx.fail_revision_registry_full(pool, ConsumerId::Momentum);
         let mut desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
         ctx.recompute_geyser_explicit_readiness(&desired);
         assert!(!ctx.geyser_explicit_readiness_ok());
@@ -18325,6 +18380,28 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
+    fn fail_closed_blocker_sets_ready_false_synchronously() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        ctx.geyser_explicit_ready.store(true, Ordering::Release);
+        assert!(ctx.geyser_explicit_readiness_ok());
+
+        ctx.fail_revision_registry_full(pool, ConsumerId::Momentum);
+        assert!(!ctx.geyser_explicit_ready.load(Ordering::Acquire));
+        assert!(ctx.geyser_explicit_blockers_active());
+        assert!(!ctx.geyser_explicit_readiness_ok());
+
+        ctx.geyser_explicit_ready.store(true, Ordering::Release);
+        ctx.fail_wallet_revision_exhausted();
+        assert!(!ctx.geyser_explicit_ready.load(Ordering::Acquire));
+        assert!(ctx.geyser_explicit_blockers_active());
+        assert!(!ctx.geyser_explicit_readiness_ok());
+    }
+
+    #[test]
     fn readiness_recompute_keeps_blockers_until_each_cleared() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
@@ -18336,6 +18413,7 @@ mod pr_b_geyser_tracking_tests {
             GESYER_BLOCK_REVISION_REGISTRY_FULL,
             Some("registry full".into()),
         );
+        assert!(!ctx.geyser_explicit_ready.load(Ordering::Acquire));
         ctx.set_geyser_explicit_blocker(
             GESYER_BLOCK_WALLET_EXPLICIT,
             Some("wallet blocked".into()),
@@ -18381,19 +18459,38 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
-    fn revision_registry_full_blocker_clears_after_successful_key_retry() {
+    fn revision_registry_full_blocker_clears_only_when_rejected_key_resolved() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
-        let pool = Pubkey::new_unique();
-        let mint = Pubkey::new_unique();
-        ctx.fail_revision_registry_full();
+        let pool_rejected = Pubkey::new_unique();
+        let pool_healthy = Pubkey::new_unique();
+        let mint_healthy = Pubkey::new_unique();
         let desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
-        ctx.recompute_geyser_explicit_readiness(&desired);
+
+        ctx.fail_revision_registry_full(pool_rejected, ConsumerId::Momentum);
         assert!(!ctx.geyser_explicit_readiness_ok());
-        ctx.hot_pool_registry.pin_pool(mint, pool);
-        assert!(ctx.ensure_pool_revision_key(pool, ConsumerId::Momentum, Some(&desired)));
+        assert!(ctx
+            .revision_registry_rejected
+            .lock()
+            .contains(&(pool_rejected, ConsumerId::Momentum)));
+
+        ctx.hot_pool_registry.pin_pool(mint_healthy, pool_healthy);
+        assert!(ctx.ensure_pool_revision_key(pool_healthy, ConsumerId::Momentum, Some(&desired)));
+        assert!(
+            !ctx.geyser_explicit_readiness_ok(),
+            "healthy key must not clear blocker while rejected key remains"
+        );
+        assert!(ctx
+            .revision_registry_rejected
+            .lock()
+            .contains(&(pool_rejected, ConsumerId::Momentum)));
+
+        let mint_rejected = Pubkey::new_unique();
+        ctx.hot_pool_registry.pin_pool(mint_rejected, pool_rejected);
+        assert!(ctx.ensure_pool_revision_key(pool_rejected, ConsumerId::Momentum, Some(&desired)));
+        assert!(ctx.revision_registry_rejected.lock().is_empty());
         ctx.recompute_geyser_explicit_readiness(&desired);
         assert!(ctx.geyser_explicit_readiness_ok());
     }
@@ -18414,9 +18511,8 @@ mod pr_b_geyser_tracking_tests {
             u64::MAX,
             u64::MAX - 1,
         );
-        ctx.fail_revision_registry_full();
+        ctx.fail_revision_registry_full(pool, ConsumerId::Momentum);
         let desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
-        ctx.recompute_geyser_explicit_readiness(&desired);
         assert!(!ctx.geyser_explicit_readiness_ok());
         assert!(ctx.ensure_pool_revision_key(pool, ConsumerId::Momentum, Some(&desired)));
         ctx.recompute_geyser_explicit_readiness(&desired);
@@ -18424,30 +18520,60 @@ mod pr_b_geyser_tracking_tests {
             !ctx.geyser_explicit_readiness_ok(),
             "u64 exhaustion must keep registry-full blocker latched"
         );
+        assert!(ctx
+            .revision_registry_rejected
+            .lock()
+            .contains(&(pool, ConsumerId::Momentum)));
     }
 
     #[test]
-    fn wallet_revision_exhaustion_blocks_geyser_readiness() {
+    fn wallet_revision_exhaustion_uses_distinct_blocker_and_survives_cap_recovery() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
-        let desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
+        let mut desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
         ctx.wallet_explicit_pending.test_seed_revision(u64::MAX - 1);
         assert_eq!(
-            ctx.finalize_wallet_revision_bumps(
-                [ctx.wallet_explicit_pending.insert_ata(Pubkey::new_unique())],
-                Some(&desired),
-            ),
+            ctx.finalize_wallet_revision_bumps([ctx
+                .wallet_explicit_pending
+                .insert_ata(Pubkey::new_unique())],),
             None
         );
-        ctx.recompute_geyser_explicit_readiness(&desired);
+        assert!(
+            ctx.geyser_explicit_blockers.load(Ordering::Acquire)
+                & GESYER_BLOCK_WALLET_REVISION_EXHAUSTED
+                != 0
+        );
         assert!(!ctx.geyser_explicit_readiness_ok());
+
+        ctx.set_geyser_explicit_blocker(
+            GESYER_BLOCK_WALLET_EXPLICIT,
+            Some("wallet cap overflow".into()),
+        );
+        ctx.clear_geyser_explicit_blocker(GESYER_BLOCK_WALLET_EXPLICIT);
+        ctx.try_clear_protected_cap_blockers(&desired);
+        assert!(
+            ctx.geyser_explicit_blockers.load(Ordering::Acquire)
+                & GESYER_BLOCK_WALLET_REVISION_EXHAUSTED
+                != 0,
+            "cap recovery must not clear wallet revision exhaustion"
+        );
+        assert!(!ctx.geyser_explicit_readiness_ok());
+
+        let wallet = Pubkey::new_unique();
+        let wsol = Pubkey::new_unique();
+        ctx.wallet_explicit_pending.ensure_wallet_base(wallet, wsol);
+        let (demand, token_accounts, _) = ctx.wallet_explicit_pending.snapshot();
+        assert!(ctx.commit_wallet_explicit_state(&mut desired, demand, token_accounts));
+        assert!(
+            !ctx.geyser_explicit_readiness_ok(),
+            "successful wallet admission must remain fail-closed after revision exhaustion"
+        );
         assert_eq!(
-            ctx.finalize_wallet_revision_bumps(
-                [ctx.wallet_explicit_pending.insert_ata(Pubkey::new_unique())],
-                Some(&desired),
-            ),
+            ctx.finalize_wallet_revision_bumps([ctx
+                .wallet_explicit_pending
+                .insert_ata(Pubkey::new_unique())],),
             None,
             "post-exhaustion bumps must stay fail-closed"
         );
