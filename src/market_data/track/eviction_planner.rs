@@ -2,6 +2,10 @@
 //!
 //! Side-effect-free read model over [`ExplicitOwnership`] public snapshot APIs.
 //! No victim selection, admission, cap-shrink, or runtime wiring.
+//!
+//! Construction is one pass over owner-group edges with `O(E log E)` deterministic
+//! ordering (`BTreeMap` / `BTreeSet` inserts and final sorts); no repeated whole-graph
+//! rebuild.
 
 use super::explicit_ownership::{
     ExplicitConsumer, ExplicitOwner, ExplicitOwnership, OwnerGroupSnapshot,
@@ -65,6 +69,16 @@ pub enum SnapshotBuildError {
     },
 }
 
+/// Test-only counters incremented inside the actual constructor loops.
+#[cfg(test)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BuildStats {
+    pub owner_records_built: u64,
+    pub group_key_edges: u64,
+    pub reverse_index_inserts: u64,
+    pub validation_reads: u64,
+}
+
 /// Total protection order: lower ordinal = higher protection (`Wallet` most protected).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ConsumerProtectionRank(u8);
@@ -89,78 +103,54 @@ impl ConsumerProtectionRank {
     }
 }
 
+trait BuildStatsSink {
+    fn record_owner_record(&mut self);
+    fn record_group_key_edge(&mut self);
+    fn record_reverse_index_insert(&mut self);
+    fn record_validation_read(&mut self);
+}
+
+struct NoopBuildStats;
+
+impl BuildStatsSink for NoopBuildStats {
+    fn record_owner_record(&mut self) {}
+    fn record_group_key_edge(&mut self) {}
+    fn record_reverse_index_insert(&mut self) {}
+    fn record_validation_read(&mut self) {}
+}
+
+#[cfg(test)]
+impl BuildStatsSink for BuildStats {
+    fn record_owner_record(&mut self) {
+        self.owner_records_built += 1;
+    }
+    fn record_group_key_edge(&mut self) {
+        self.group_key_edges += 1;
+    }
+    fn record_reverse_index_insert(&mut self) {
+        self.reverse_index_inserts += 1;
+    }
+    fn record_validation_read(&mut self) {
+        self.validation_reads += 1;
+    }
+}
+
 impl EvictionPlanningSnapshot {
     /// Build a validated snapshot from canonical ownership plus one LRU row per owner.
     pub fn from_ownership(
         ownership: &ExplicitOwnership,
         lru_entries: impl IntoIterator<Item = OwnerLruEntry>,
     ) -> Result<Self, SnapshotBuildError> {
-        let owner_groups = ownership.snapshot_owner_groups();
-        let owners_in_ownership = owner_set_from_groups(&owner_groups);
-
-        let mut lru_by_owner: BTreeMap<ExplicitOwner, u64> = BTreeMap::new();
-        for entry in lru_entries {
-            if lru_by_owner
-                .insert(entry.owner.clone(), entry.last_touch)
-                .is_some()
-            {
-                return Err(SnapshotBuildError::DuplicateLruOwner(entry.owner));
-            }
-            if !owners_in_ownership.contains(&entry.owner) {
-                return Err(SnapshotBuildError::UnknownLruOwner(entry.owner));
-            }
-        }
-
-        if ownership.is_empty() {
-            if lru_by_owner.is_empty() {
-                return Ok(Self::empty());
-            }
-            let unknown = lru_by_owner.into_keys().next().expect("non-empty lru map");
-            return Err(SnapshotBuildError::UnknownLruOwner(unknown));
-        }
-
-        for owner in &owners_in_ownership {
-            if !lru_by_owner.contains_key(owner) {
-                return Err(SnapshotBuildError::MissingLruEntry(owner.clone()));
-            }
-        }
-
-        let mut owners = Vec::with_capacity(owner_groups.len());
-        for group in owner_groups {
-            let owner = owner_from_group(&group);
-            let last_touch = lru_by_owner
-                .get(&owner)
-                .copied()
-                .expect("LRU validated above");
-            owners.push(OwnerPlanningRecord {
-                owner: owner.clone(),
-                last_touch,
-                pubkeys: group.pubkeys,
-            });
-        }
-        owners.sort_by(|a, b| a.owner.cmp(&b.owner));
-
-        let pubkey_index = build_pubkey_index(&owners)?;
-        validate_against_ownership(ownership, &pubkey_index)?;
-
-        let physical_pubkeys: Vec<Pubkey> = pubkey_index.iter().map(|row| row.pubkey).collect();
-        let physical_len = physical_pubkeys.len();
-
-        Ok(Self {
-            physical_len,
-            physical_pubkeys,
-            owners,
-            pubkey_index,
-        })
+        from_ownership_inner(ownership, lru_entries, &mut NoopBuildStats)
     }
 
-    fn empty() -> Self {
-        Self {
-            physical_len: 0,
-            physical_pubkeys: Vec::new(),
-            owners: Vec::new(),
-            pubkey_index: Vec::new(),
-        }
+    #[cfg(test)]
+    pub fn from_ownership_with_stats(
+        ownership: &ExplicitOwnership,
+        lru_entries: impl IntoIterator<Item = OwnerLruEntry>,
+        stats: &mut BuildStats,
+    ) -> Result<Self, SnapshotBuildError> {
+        from_ownership_inner(ownership, lru_entries, stats)
     }
 
     pub fn physical_len(&self) -> usize {
@@ -206,6 +196,66 @@ impl EvictionPlanningSnapshot {
     }
 }
 
+fn from_ownership_inner<S: BuildStatsSink>(
+    ownership: &ExplicitOwnership,
+    lru_entries: impl IntoIterator<Item = OwnerLruEntry>,
+    stats: &mut S,
+) -> Result<EvictionPlanningSnapshot, SnapshotBuildError> {
+    let owner_groups = ownership.snapshot_owner_groups();
+    let canonical_pubkeys = ownership.snapshot_pubkeys();
+    let owners_in_ownership = owner_set_from_groups(&owner_groups);
+
+    let mut lru_by_owner: BTreeMap<ExplicitOwner, u64> = BTreeMap::new();
+    for entry in lru_entries {
+        if lru_by_owner
+            .insert(entry.owner.clone(), entry.last_touch)
+            .is_some()
+        {
+            return Err(SnapshotBuildError::DuplicateLruOwner(entry.owner));
+        }
+        if !owners_in_ownership.contains(&entry.owner) {
+            return Err(SnapshotBuildError::UnknownLruOwner(entry.owner));
+        }
+    }
+
+    for owner in &owners_in_ownership {
+        if !lru_by_owner.contains_key(owner) {
+            return Err(SnapshotBuildError::MissingLruEntry(owner.clone()));
+        }
+    }
+
+    let mut owners = Vec::with_capacity(owner_groups.len());
+    for group in owner_groups {
+        let owner = owner_from_group(&group);
+        let Some(last_touch) = lru_by_owner.get(&owner).copied() else {
+            return Err(SnapshotBuildError::MissingLruEntry(owner));
+        };
+        stats.record_owner_record();
+        for _pubkey in &group.pubkeys {
+            stats.record_group_key_edge();
+        }
+        owners.push(OwnerPlanningRecord {
+            owner: owner.clone(),
+            last_touch,
+            pubkeys: group.pubkeys,
+        });
+    }
+    owners.sort_by(|a, b| a.owner.cmp(&b.owner));
+
+    let pubkey_index = build_pubkey_index(&owners, stats)?;
+    validate_against_ownership(ownership, &canonical_pubkeys, &pubkey_index, stats)?;
+
+    let physical_pubkeys: Vec<Pubkey> = pubkey_index.iter().map(|row| row.pubkey).collect();
+    let physical_len = physical_pubkeys.len();
+
+    Ok(EvictionPlanningSnapshot {
+        physical_len,
+        physical_pubkeys,
+        owners,
+        pubkey_index,
+    })
+}
+
 fn owner_from_group(group: &OwnerGroupSnapshot) -> ExplicitOwner {
     ExplicitOwner {
         consumer: group.consumer,
@@ -217,8 +267,9 @@ fn owner_set_from_groups(groups: &[OwnerGroupSnapshot]) -> BTreeSet<ExplicitOwne
     groups.iter().map(owner_from_group).collect()
 }
 
-fn build_pubkey_index(
+fn build_pubkey_index<S: BuildStatsSink>(
     owners: &[OwnerPlanningRecord],
+    stats: &mut S,
 ) -> Result<Vec<PubkeyOwnerIndex>, SnapshotBuildError> {
     let mut owners_by_pubkey: BTreeMap<Pubkey, BTreeSet<ExplicitOwner>> = BTreeMap::new();
     for record in owners {
@@ -227,6 +278,7 @@ fn build_pubkey_index(
                 .entry(*pubkey)
                 .or_default()
                 .insert(record.owner.clone());
+            stats.record_reverse_index_insert();
         }
     }
 
@@ -243,12 +295,14 @@ fn build_pubkey_index(
         .collect())
 }
 
-fn validate_against_ownership(
+fn validate_against_ownership<S: BuildStatsSink>(
     ownership: &ExplicitOwnership,
+    canonical_pubkeys: &[Pubkey],
     pubkey_index: &[PubkeyOwnerIndex],
+    stats: &mut S,
 ) -> Result<(), SnapshotBuildError> {
     let derived_pubkeys: Vec<Pubkey> = pubkey_index.iter().map(|row| row.pubkey).collect();
-    let canonical_pubkeys = ownership.snapshot_pubkeys();
+    stats.record_validation_read();
     if derived_pubkeys != canonical_pubkeys {
         if derived_pubkeys.len() != canonical_pubkeys.len() {
             return Err(SnapshotBuildError::PhysicalLenMismatch {
@@ -260,6 +314,7 @@ fn validate_against_ownership(
     }
 
     for row in pubkey_index {
+        stats.record_validation_read();
         let canonical = ownership.owner_refcount(&row.pubkey);
         if row.refcount != canonical {
             return Err(SnapshotBuildError::RefcountMismatch {
@@ -305,129 +360,153 @@ mod tests {
         ownership.upsert_group(owner, pubkeys).unwrap();
     }
 
-    #[derive(Debug, Default)]
-    struct BuildStats {
-        group_key_edges: usize,
-    }
+    /// Fixture row: owner identity, LRU stamp, and normalized group pubkeys.
+    type FixtureRow = (ExplicitOwner, u64, Vec<Pubkey>);
 
-    fn build_with_edge_count(
-        ownership: &ExplicitOwnership,
-        lru_entries: impl IntoIterator<Item = OwnerLruEntry>,
-    ) -> Result<(EvictionPlanningSnapshot, BuildStats), SnapshotBuildError> {
-        let groups = ownership.snapshot_owner_groups();
-        let mut stats = BuildStats::default();
-        for group in &groups {
-            stats.group_key_edges += group.pubkeys.len();
-        }
-        let snapshot = EvictionPlanningSnapshot::from_ownership(ownership, lru_entries)?;
-        Ok((snapshot, stats))
-    }
-
-    /// Independent oracle — uses only [`ExplicitOwnership`] public snapshot APIs.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct RefSnapshot {
+    /// Independent oracle — derives expected state solely from fixture rows before SUT.
+    #[derive(Debug, Clone)]
+    struct FixtureOracle {
+        owner_records: BTreeMap<ExplicitOwner, (u64, Vec<Pubkey>)>,
         physical_pubkeys: Vec<Pubkey>,
-        owner_groups: Vec<OwnerGroupSnapshot>,
-        pubkey_refcounts: BTreeMap<Pubkey, usize>,
+        pubkey_owner_sets: BTreeMap<Pubkey, BTreeSet<ExplicitOwner>>,
     }
 
-    impl RefSnapshot {
-        fn from_ownership(ownership: &ExplicitOwnership) -> Self {
-            let owner_groups = ownership.snapshot_owner_groups();
-            let physical_pubkeys = ownership.snapshot_pubkeys();
-            let mut pubkey_refcounts = BTreeMap::new();
-            for group in &owner_groups {
-                for pubkey in &group.pubkeys {
-                    *pubkey_refcounts.entry(*pubkey).or_default() += 1;
+    impl FixtureOracle {
+        fn from_fixtures(fixtures: &[FixtureRow]) -> Self {
+            let mut owner_records = BTreeMap::new();
+            let mut pubkey_owner_sets: BTreeMap<Pubkey, BTreeSet<ExplicitOwner>> = BTreeMap::new();
+
+            for (owner, touch, pubkeys) in fixtures {
+                let mut normalized = pubkeys.clone();
+                normalized.sort();
+                normalized.dedup();
+                owner_records.insert(owner.clone(), (*touch, normalized.clone()));
+                for pubkey in &normalized {
+                    pubkey_owner_sets
+                        .entry(*pubkey)
+                        .or_default()
+                        .insert(owner.clone());
                 }
             }
+
+            let physical_pubkeys: Vec<Pubkey> = pubkey_owner_sets.keys().copied().collect();
             Self {
+                owner_records,
                 physical_pubkeys,
-                owner_groups,
-                pubkey_refcounts,
+                pubkey_owner_sets,
             }
+        }
+
+        fn physical_len(&self) -> usize {
+            self.physical_pubkeys.len()
         }
 
         fn assert_matches(&self, snapshot: &EvictionPlanningSnapshot) {
-            assert_eq!(snapshot.physical_len(), self.physical_pubkeys.len());
+            assert_eq!(snapshot.physical_len(), self.physical_len());
             assert_eq!(
                 snapshot.physical_pubkeys(),
                 self.physical_pubkeys.as_slice()
             );
+            assert_eq!(snapshot.owners().len(), self.owner_records.len());
 
-            let expected_owners: BTreeMap<ExplicitOwner, (u64, Vec<Pubkey>)> = snapshot
-                .owners()
-                .iter()
-                .map(|record| {
-                    (
-                        record.owner.clone(),
-                        (record.last_touch, record.pubkeys.clone()),
-                    )
-                })
-                .collect();
-            assert_eq!(expected_owners.len(), self.owner_groups.len());
-
-            for group in &self.owner_groups {
-                let owner = owner_from_group(group);
-                let record = snapshot.owner_record(&owner).expect("missing owner record");
-                assert_eq!(record.pubkeys, group.pubkeys);
+            for (owner, (expected_touch, expected_pubkeys)) in &self.owner_records {
+                let record = snapshot
+                    .owner_record(owner)
+                    .unwrap_or_else(|| panic!("missing owner record for {owner:?}"));
+                assert_eq!(record.last_touch, *expected_touch);
+                assert_eq!(&record.pubkeys, expected_pubkeys);
             }
 
-            for (pubkey, expected_rc) in &self.pubkey_refcounts {
-                assert_eq!(snapshot.owner_refcount(pubkey), *expected_rc);
+            for (pubkey, expected_owners) in &self.pubkey_owner_sets {
+                let expected_refcount = expected_owners.len();
+                assert_eq!(snapshot.owner_refcount(pubkey), expected_refcount);
                 let owners = snapshot
                     .pubkey_owners(pubkey)
-                    .expect("missing pubkey index row");
-                assert_eq!(owners.len(), *expected_rc);
+                    .unwrap_or_else(|| panic!("missing pubkey index row for {pubkey:?}"));
+                assert_eq!(owners.len(), expected_refcount);
+                assert_eq!(
+                    owners.iter().cloned().collect::<BTreeSet<_>>(),
+                    *expected_owners
+                );
             }
         }
     }
 
-    fn capture_ownership(ownership: &ExplicitOwnership) -> RefSnapshot {
-        RefSnapshot::from_ownership(ownership)
+    fn fixtures_to_lru(fixtures: &[FixtureRow]) -> Vec<OwnerLruEntry> {
+        fixtures
+            .iter()
+            .map(|(owner, touch, _)| lru(owner.clone(), *touch))
+            .collect()
+    }
+
+    fn fixtures_to_ownership(fixtures: &[FixtureRow]) -> ExplicitOwnership {
+        let mut ownership = ExplicitOwnership::new();
+        for (owner, _, pubkeys) in fixtures {
+            upsert(&mut ownership, owner.clone(), pubkeys.iter().copied());
+        }
+        ownership
     }
 
     #[test]
     fn empty_ownership_accepts_empty_metadata() {
         let ownership = ExplicitOwnership::new();
+        let oracle = FixtureOracle::from_fixtures(&[]);
         let snapshot = EvictionPlanningSnapshot::from_ownership(&ownership, []).unwrap();
+        oracle.assert_matches(&snapshot);
         assert_eq!(snapshot.physical_len(), 0);
         assert!(snapshot.owners().is_empty());
         assert!(snapshot.pubkey_index().is_empty());
     }
 
     #[test]
-    fn single_and_multiple_owner_snapshots() {
+    fn nonempty_ownership_rejects_missing_metadata_without_short_circuit() {
         let mut ownership = ExplicitOwnership::new();
+        let owner = pool_owner(ExplicitConsumer::Tracker, 1);
+        upsert(&mut ownership, owner.clone(), [pk(1)]);
+
+        assert_eq!(
+            EvictionPlanningSnapshot::from_ownership(&ownership, []),
+            Err(SnapshotBuildError::MissingLruEntry(owner.clone()))
+        );
+    }
+
+    #[test]
+    fn single_and_multiple_owner_snapshots() {
         let a = pool_owner(ExplicitConsumer::Tracker, 1);
         let b = pool_owner(ExplicitConsumer::Arb, 2);
-        upsert(&mut ownership, a.clone(), [pk(10)]);
-        upsert(&mut ownership, b.clone(), [pk(11), pk(12)]);
+        let fixtures = [
+            (a.clone(), 100, vec![pk(10)]),
+            (b.clone(), 200, vec![pk(11), pk(12)]),
+        ];
+        let oracle = FixtureOracle::from_fixtures(&fixtures);
+        let ownership = fixtures_to_ownership(&fixtures);
 
-        let snapshot = EvictionPlanningSnapshot::from_ownership(
-            &ownership,
-            [lru(a.clone(), 100), lru(b.clone(), 200)],
-        )
-        .unwrap();
+        let snapshot =
+            EvictionPlanningSnapshot::from_ownership(&ownership, fixtures_to_lru(&fixtures))
+                .unwrap();
 
         assert_eq!(snapshot.physical_len(), 3);
         assert_eq!(snapshot.owners().len(), 2);
-        assert_eq!(snapshot.owner_record(&a).unwrap().last_touch, 100);
-        capture_ownership(&ownership).assert_matches(&snapshot);
+        oracle.assert_matches(&snapshot);
     }
 
     #[test]
     fn shared_keys_have_exact_refcounts_and_owner_sets() {
-        let mut ownership = ExplicitOwnership::new();
         let shared = pk(1);
         let a = pool_owner(ExplicitConsumer::Momentum, 1);
         let b = pool_owner(ExplicitConsumer::Arb, 2);
-        upsert(&mut ownership, a.clone(), [shared, pk(2)]);
-        upsert(&mut ownership, b.clone(), [shared]);
+        let fixtures = [
+            (a.clone(), 1, vec![shared, pk(2)]),
+            (b.clone(), 2, vec![shared]),
+        ];
+        let oracle = FixtureOracle::from_fixtures(&fixtures);
+        let ownership = fixtures_to_ownership(&fixtures);
 
         let snapshot =
-            EvictionPlanningSnapshot::from_ownership(&ownership, [lru(a, 1), lru(b, 2)]).unwrap();
+            EvictionPlanningSnapshot::from_ownership(&ownership, fixtures_to_lru(&fixtures))
+                .unwrap();
 
+        oracle.assert_matches(&snapshot);
         let row = snapshot
             .pubkey_index()
             .iter()
@@ -435,13 +514,10 @@ mod tests {
             .unwrap();
         assert_eq!(row.refcount, 2);
         assert_eq!(row.owners.len(), 2);
-        assert_eq!(snapshot.owner_refcount(&shared), 2);
-        capture_ownership(&ownership).assert_matches(&snapshot);
     }
 
     #[test]
     fn same_owner_key_across_consumers_remain_distinct() {
-        let mut ownership = ExplicitOwnership::new();
         let pool = pk(5);
         let momentum = ExplicitOwner {
             consumer: ExplicitConsumer::Momentum,
@@ -451,27 +527,26 @@ mod tests {
             consumer: ExplicitConsumer::Arb,
             owner_key: ExplicitOwnerKey::Pool(pool),
         };
-        upsert(&mut ownership, momentum.clone(), [pk(10)]);
-        upsert(&mut ownership, arb.clone(), [pk(11)]);
+        let fixtures = [
+            (momentum.clone(), 7, vec![pk(10)]),
+            (arb.clone(), 8, vec![pk(11)]),
+        ];
+        let oracle = FixtureOracle::from_fixtures(&fixtures);
+        let ownership = fixtures_to_ownership(&fixtures);
 
-        let snapshot = EvictionPlanningSnapshot::from_ownership(
-            &ownership,
-            [lru(momentum.clone(), 7), lru(arb.clone(), 8)],
-        )
-        .unwrap();
+        let snapshot =
+            EvictionPlanningSnapshot::from_ownership(&ownership, fixtures_to_lru(&fixtures))
+                .unwrap();
 
         assert_ne!(momentum, arb);
-        assert_eq!(snapshot.owners().len(), 2);
-        assert!(snapshot.owner_record(&momentum).is_some());
-        assert!(snapshot.owner_record(&arb).is_some());
-        capture_ownership(&ownership).assert_matches(&snapshot);
+        oracle.assert_matches(&snapshot);
     }
 
     #[test]
     fn missing_extra_and_duplicate_lru_are_rejected_without_mutation() {
-        let mut ownership = ExplicitOwnership::new();
         let owner = pool_owner(ExplicitConsumer::Tracker, 1);
-        upsert(&mut ownership, owner.clone(), [pk(1)]);
+        let fixtures = [(owner.clone(), 1, vec![pk(1)])];
+        let ownership = fixtures_to_ownership(&fixtures);
         let groups_before = ownership.snapshot_owner_groups();
         let pubkeys_before = ownership.snapshot_pubkeys();
 
@@ -504,23 +579,18 @@ mod tests {
 
     #[test]
     fn deterministic_under_permuted_metadata_order() {
-        let mut ownership = ExplicitOwnership::new();
         let o1 = pool_owner(ExplicitConsumer::Tracker, 1);
         let o2 = pool_owner(ExplicitConsumer::Arb, 2);
         let o3 = pool_owner(ExplicitConsumer::Momentum, 3);
-        upsert(&mut ownership, o1.clone(), [pk(1)]);
-        upsert(&mut ownership, o2.clone(), [pk(2)]);
-        upsert(&mut ownership, o3.clone(), [pk(3)]);
+        let fixtures = [
+            (o1.clone(), 10, vec![pk(1)]),
+            (o2.clone(), 20, vec![pk(2)]),
+            (o3.clone(), 30, vec![pk(3)]),
+        ];
+        let ownership = fixtures_to_ownership(&fixtures);
 
-        let s1 = EvictionPlanningSnapshot::from_ownership(
-            &ownership,
-            [
-                lru(o1.clone(), 10),
-                lru(o2.clone(), 20),
-                lru(o3.clone(), 30),
-            ],
-        )
-        .unwrap();
+        let s1 = EvictionPlanningSnapshot::from_ownership(&ownership, fixtures_to_lru(&fixtures))
+            .unwrap();
         let s2 = EvictionPlanningSnapshot::from_ownership(
             &ownership,
             [
@@ -534,27 +604,31 @@ mod tests {
     }
 
     #[test]
-    fn physical_len_matches_ownership_len() {
-        let mut ownership = ExplicitOwnership::new();
+    fn physical_len_matches_fixture_physical_set() {
         let shared = pk(1);
         let a = pool_owner(ExplicitConsumer::Tracker, 1);
         let b = pool_owner(ExplicitConsumer::Arb, 2);
-        upsert(&mut ownership, a.clone(), [shared, pk(2)]);
-        upsert(&mut ownership, b.clone(), [shared]);
+        let fixtures = [
+            (a.clone(), 1, vec![shared, pk(2)]),
+            (b.clone(), 2, vec![shared]),
+        ];
+        let oracle = FixtureOracle::from_fixtures(&fixtures);
+        let ownership = fixtures_to_ownership(&fixtures);
 
         let snapshot =
-            EvictionPlanningSnapshot::from_ownership(&ownership, [lru(a, 1), lru(b, 2)]).unwrap();
-        assert_eq!(snapshot.physical_len(), ownership.len());
+            EvictionPlanningSnapshot::from_ownership(&ownership, fixtures_to_lru(&fixtures))
+                .unwrap();
+        assert_eq!(snapshot.physical_len(), oracle.physical_len());
         assert_eq!(snapshot.physical_len(), 2);
+        oracle.assert_matches(&snapshot);
     }
 
     #[test]
-    fn large_graph_build_visits_owner_key_edges_linearly() {
+    fn large_graph_build_stats_match_constructor_work() {
         const OWNER_COUNT: usize = 400;
         const KEYS_PER_OWNER: usize = 3;
 
-        let mut ownership = ExplicitOwnership::new();
-        let mut lru_entries = Vec::with_capacity(OWNER_COUNT);
+        let mut fixtures = Vec::with_capacity(OWNER_COUNT);
         for seed in 0..OWNER_COUNT {
             let owner = ExplicitOwner {
                 consumer: ExplicitConsumer::Tracker,
@@ -563,33 +637,48 @@ mod tests {
             let pubkeys: Vec<Pubkey> = (0..KEYS_PER_OWNER)
                 .map(|k| pk(((seed * KEYS_PER_OWNER + k) % 250) as u8))
                 .collect();
-            upsert(&mut ownership, owner.clone(), pubkeys);
-            lru_entries.push(lru(owner, seed as u64));
+            fixtures.push((owner, seed as u64, pubkeys));
         }
 
-        let (snapshot, stats) = build_with_edge_count(&ownership, lru_entries).unwrap();
-        assert_eq!(stats.group_key_edges, OWNER_COUNT * KEYS_PER_OWNER);
+        let oracle = FixtureOracle::from_fixtures(&fixtures);
+        let ownership = fixtures_to_ownership(&fixtures);
+        let mut stats = BuildStats::default();
+        let snapshot = EvictionPlanningSnapshot::from_ownership_with_stats(
+            &ownership,
+            fixtures_to_lru(&fixtures),
+            &mut stats,
+        )
+        .unwrap();
+
+        let total_edges = OWNER_COUNT * KEYS_PER_OWNER;
+        assert_eq!(stats.owner_records_built, OWNER_COUNT as u64);
+        assert_eq!(stats.group_key_edges, total_edges as u64);
+        assert_eq!(stats.reverse_index_inserts, total_edges as u64);
+        assert_eq!(
+            stats.validation_reads,
+            1 + oracle.physical_len() as u64,
+            "one pubkey-list compare plus one refcount read per physical pubkey"
+        );
         assert_eq!(snapshot.owners().len(), OWNER_COUNT);
-        capture_ownership(&ownership).assert_matches(&snapshot);
+        oracle.assert_matches(&snapshot);
     }
 
     #[test]
     fn checked_stamps_accept_usize_max_without_counter_arithmetic() {
-        let mut ownership = ExplicitOwnership::new();
         let owner = pool_owner(ExplicitConsumer::Momentum, 1);
-        upsert(&mut ownership, owner.clone(), [pk(1)]);
+        let fixtures = [(owner.clone(), u64::MAX, vec![pk(1)])];
+        let oracle = FixtureOracle::from_fixtures(&fixtures);
+        let ownership = fixtures_to_ownership(&fixtures);
 
         let snapshot =
-            EvictionPlanningSnapshot::from_ownership(&ownership, [lru(owner, u64::MAX)]).unwrap();
-        assert_eq!(
-            snapshot.last_touch(&snapshot.owners()[0].owner),
-            Some(u64::MAX)
-        );
+            EvictionPlanningSnapshot::from_ownership(&ownership, fixtures_to_lru(&fixtures))
+                .unwrap();
+        oracle.assert_matches(&snapshot);
+        assert_eq!(snapshot.last_touch(&owner), Some(u64::MAX));
     }
 
     #[test]
-    fn independent_oracle_matches_owner_groups_pubkeys_and_refcounts() {
-        let mut ownership = ExplicitOwnership::new();
+    fn independent_oracle_derives_expected_state_before_sut() {
         let owners = [
             pool_owner(ExplicitConsumer::Wallet, 1),
             pool_owner(ExplicitConsumer::Momentum, 2),
@@ -597,19 +686,20 @@ mod tests {
             pool_owner(ExplicitConsumer::Tracker, 4),
         ];
         let shared = pk(50);
-        upsert(&mut ownership, owners[0].clone(), [pk(10)]);
-        upsert(&mut ownership, owners[1].clone(), [shared, pk(11)]);
-        upsert(&mut ownership, owners[2].clone(), [shared, pk(12)]);
-        upsert(&mut ownership, owners[3].clone(), [pk(13)]);
+        let fixtures = [
+            (owners[0].clone(), 1, vec![pk(10)]),
+            (owners[1].clone(), 2, vec![shared, pk(11)]),
+            (owners[2].clone(), 3, vec![shared, pk(12)]),
+            (owners[3].clone(), 4, vec![pk(13)]),
+        ];
 
-        let lru_entries = owners
-            .iter()
-            .enumerate()
-            .map(|(i, owner)| lru(owner.clone(), (i as u64) + 1))
-            .collect::<Vec<_>>();
+        let oracle = FixtureOracle::from_fixtures(&fixtures);
+        let ownership = fixtures_to_ownership(&fixtures);
+        let snapshot =
+            EvictionPlanningSnapshot::from_ownership(&ownership, fixtures_to_lru(&fixtures))
+                .unwrap();
 
-        let snapshot = EvictionPlanningSnapshot::from_ownership(&ownership, lru_entries).unwrap();
-        RefSnapshot::from_ownership(&ownership).assert_matches(&snapshot);
+        oracle.assert_matches(&snapshot);
     }
 
     #[test]
