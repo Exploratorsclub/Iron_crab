@@ -54,6 +54,8 @@ pub struct PoolExplicitSnapshot {
     pub pin: GeyserPinReason,
     /// Monotonic sequence assigned at enqueue/pending-stash time (stale replay guard).
     pub revision: u64,
+    /// When set, enqueue success may resolve exactly this ledger rejection (token + payload).
+    pub rejection_ledger_token: Option<u64>,
 }
 
 impl PoolExplicitSnapshot {

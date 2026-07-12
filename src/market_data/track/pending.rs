@@ -1163,6 +1163,7 @@ mod tests {
             owner: OwnerKey::Pool(pool),
             pin: GeyserPinReason::MomentumActive,
             revision: 0,
+            rejection_ledger_token: None,
         }
     }
 

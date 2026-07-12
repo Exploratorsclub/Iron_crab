@@ -1132,6 +1132,9 @@ pub static MARKET_DATA_ARB_TRACK_WORKER_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
 pub static MARKET_DATA_TRACK_PENDING_POOL_OVERFLOW_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// Pool snapshot revision registry full / key not registered (fail-closed before command issue).
+pub static MARKET_DATA_TRACKER_DEMAND_CAP_REJECTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 pub static MARKET_DATA_REVISION_REGISTRY_FULL_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
@@ -1382,6 +1385,11 @@ pub fn set_market_data_track_worker_queue_depth(depth: usize) {
 #[inline]
 pub fn inc_market_data_track_pending_pool_overflow_total() {
     MARKET_DATA_TRACK_PENDING_POOL_OVERFLOW_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tracker_demand_cap_rejected_total() {
+    MARKET_DATA_TRACKER_DEMAND_CAP_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
