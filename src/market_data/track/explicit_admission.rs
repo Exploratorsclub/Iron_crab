@@ -1,9 +1,9 @@
-//! Insert-only fixed-cap admission over [`ExplicitOwnership`] (PR 1b1).
+//! Insert-only and owner-replacement fixed-cap admission over [`ExplicitOwnership`] (PR 1b1/1b2).
 //!
-//! Accepts only previously absent owners. No replacement, removal API, eviction,
-//! cap mutation, or runtime wiring.
+//! Accepts only previously absent owners via insert. Replacement mutates only existing owners.
+//! No removal API, eviction, cap mutation, or runtime wiring.
 //!
-//! Normal planning is O(new_group_size). [`FixedCapAdmission::reconcile_physical_len_cold`]
+//! Normal planning is O(group_size). [`FixedCapAdmission::reconcile_physical_len_cold`]
 //! may scan ownership only on exceptional invariant/rollback failure.
 
 use super::explicit_ownership::{
@@ -11,13 +11,29 @@ use super::explicit_ownership::{
 };
 use solana_sdk::pubkey::Pubkey;
 
-/// Result of an insert-only admission attempt.
+/// Recovery path after an internal invariant violation during replacement rollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvariantViolationRecovery {
+    /// Commit mismatch: previous owner group was atomically restored.
+    PreviousRestored,
+    /// Restore validation failed: owner was fail-closed removed and `physical_len` reconciled.
+    OwnerRemovedFailClosed,
+}
+
+/// Result of a fixed-cap admission or replacement attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FixedCapAdmissionResult {
     /// First insert for this owner; pubkeys that transition refcount 0→1.
     Inserted { physical_added: Vec<Pubkey> },
     /// New owner group whose pubkeys were all already physically tracked.
     OwnerAddedNoNewPubkey,
+    /// Atomic replacement; physical deltas from refcount 0→1 / 1→0 transitions.
+    Replaced {
+        physical_added: Vec<Pubkey>,
+        physical_removed: Vec<Pubkey>,
+    },
+    /// Idempotent replacement with an identical normalized group.
+    Unchanged,
     /// Projected physical pubkey count would exceed the cap; no mutation.
     RejectedCap {
         required_unique: usize,
@@ -25,10 +41,14 @@ pub enum FixedCapAdmissionResult {
     },
     /// Empty owner groups are invalid and do not mutate state.
     RejectedInvalidGroup,
-    /// Owner already present; fully mutation-free even for an identical group.
+    /// Owner already present on insert; fully mutation-free even for an identical group.
     RejectedExistingOwner,
+    /// Owner absent on replacement; no insert fallback.
+    RejectedMissingOwner,
     /// Plan/commit or rollback invariant failure (cold recovery may scan ownership).
-    InternalInvariantViolation,
+    InternalInvariantViolation {
+        recovery: Option<InvariantViolationRecovery>,
+    },
 }
 
 /// Test-only counters for instrumented planning lookups.
@@ -60,6 +80,8 @@ pub struct FixedCapAdmission {
     planning_stats: PlanningStats,
     #[cfg(test)]
     test_force_commit_plan_mismatch: bool,
+    #[cfg(test)]
+    test_force_restore_plan_mismatch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,8 +91,27 @@ struct InsertPlan {
     physical_added: Vec<Pubkey>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplacePlan {
+    pre_len: usize,
+    projected_final_len: usize,
+    old_normalized: Vec<Pubkey>,
+    physical_added: Vec<Pubkey>,
+    physical_removed: Vec<Pubkey>,
+}
+
 enum InsertPlanOutcome {
     Ready(InsertPlan),
+    RejectCap {
+        required_unique: usize,
+        available_unique: usize,
+    },
+    InternalInvariantViolation,
+}
+
+enum ReplacePlanOutcome {
+    Ready(ReplacePlan),
+    Unchanged,
     RejectCap {
         required_unique: usize,
         available_unique: usize,
@@ -88,6 +129,8 @@ impl FixedCapAdmission {
             planning_stats: PlanningStats::default(),
             #[cfg(test)]
             test_force_commit_plan_mismatch: false,
+            #[cfg(test)]
+            test_force_restore_plan_mismatch: false,
         }
     }
 
@@ -129,6 +172,11 @@ impl FixedCapAdmission {
         self.test_force_commit_plan_mismatch = enabled;
     }
 
+    #[cfg(test)]
+    pub fn set_test_force_restore_plan_mismatch(&mut self, enabled: bool) {
+        self.test_force_restore_plan_mismatch = enabled;
+    }
+
     /// Admit a new owner group when the owner is absent and projected physical pubkeys fit the cap.
     pub fn try_admit_new_group(
         &mut self,
@@ -158,7 +206,7 @@ impl FixedCapAdmission {
                 };
             }
             InsertPlanOutcome::InternalInvariantViolation => {
-                return FixedCapAdmissionResult::InternalInvariantViolation;
+                return FixedCapAdmissionResult::InternalInvariantViolation { recovery: None };
             }
             InsertPlanOutcome::Ready(plan) => plan,
         };
@@ -199,6 +247,85 @@ impl FixedCapAdmission {
         }
     }
 
+    /// Replace an existing owner group atomically when projected physical pubkeys fit the cap.
+    pub fn try_replace_group(
+        &mut self,
+        existing_owner: ExplicitOwner,
+        replacement_pubkeys: impl IntoIterator<Item = Pubkey>,
+    ) -> FixedCapAdmissionResult {
+        let normalized = normalize_pubkeys(replacement_pubkeys);
+        if normalized.is_empty() {
+            return FixedCapAdmissionResult::RejectedInvalidGroup;
+        }
+
+        #[cfg(test)]
+        self.planning_stats.record_owner_group_lookup();
+        let Some(old_group) = self.ownership.owner_group(&existing_owner) else {
+            return FixedCapAdmissionResult::RejectedMissingOwner;
+        };
+        let old_normalized = old_group.to_vec();
+        if old_normalized == normalized {
+            return FixedCapAdmissionResult::Unchanged;
+        }
+
+        let plan_outcome = self.plan_replace(&old_normalized, &normalized);
+        let plan = match plan_outcome {
+            ReplacePlanOutcome::Unchanged => return FixedCapAdmissionResult::Unchanged,
+            ReplacePlanOutcome::RejectCap {
+                required_unique,
+                available_unique,
+            } => {
+                return FixedCapAdmissionResult::RejectedCap {
+                    required_unique,
+                    available_unique,
+                };
+            }
+            ReplacePlanOutcome::InternalInvariantViolation => {
+                return FixedCapAdmissionResult::InternalInvariantViolation { recovery: None };
+            }
+            ReplacePlanOutcome::Ready(plan) => plan,
+        };
+
+        let force_commit_mismatch = {
+            #[cfg(test)]
+            {
+                self.test_force_commit_plan_mismatch
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        };
+        let expected_physical_added =
+            expected_physical_added_at_replace_commit(&plan, force_commit_mismatch);
+        let expected_physical_removed =
+            expected_physical_removed_at_replace_commit(&plan, force_commit_mismatch);
+
+        let change = match self
+            .ownership
+            .upsert_group(existing_owner.clone(), normalized.clone())
+        {
+            Ok(change) => change,
+            Err(EmptyOwnerGroupError) => {
+                return FixedCapAdmissionResult::RejectedInvalidGroup;
+            }
+        };
+
+        if !replaced_group_matches_plan(
+            &change,
+            &expected_physical_added,
+            &expected_physical_removed,
+        ) {
+            return self.rollback_failed_replace(&existing_owner, &plan);
+        }
+
+        self.physical_len = plan.projected_final_len;
+        FixedCapAdmissionResult::Replaced {
+            physical_added: plan.physical_added,
+            physical_removed: plan.physical_removed,
+        }
+    }
+
     fn plan_insert(&mut self, normalized: &[Pubkey]) -> InsertPlanOutcome {
         let pre_len = self.physical_len;
         let mut physical_added = Vec::new();
@@ -233,6 +360,96 @@ impl FixedCapAdmission {
         })
     }
 
+    fn plan_replace(
+        &mut self,
+        old_normalized: &[Pubkey],
+        new_normalized: &[Pubkey],
+    ) -> ReplacePlanOutcome {
+        if old_normalized == new_normalized {
+            return ReplacePlanOutcome::Unchanged;
+        }
+
+        let pre_len = self.physical_len;
+        let mut physical_removed = Vec::new();
+        let mut physical_added = Vec::new();
+
+        let mut old_idx = 0usize;
+        let mut new_idx = 0usize;
+        while old_idx < old_normalized.len() || new_idx < new_normalized.len() {
+            let old_key = old_normalized.get(old_idx).copied();
+            let new_key = new_normalized.get(new_idx).copied();
+            match (old_key, new_key) {
+                (None, None) => break,
+                (Some(old), None) => {
+                    #[cfg(test)]
+                    self.planning_stats.record_refcount_lookup();
+                    if self.ownership.owner_refcount(&old) == 1 {
+                        physical_removed.push(old);
+                    }
+                    old_idx += 1;
+                }
+                (None, Some(new)) => {
+                    #[cfg(test)]
+                    self.planning_stats.record_refcount_lookup();
+                    if self.ownership.owner_refcount(&new) == 0 {
+                        physical_added.push(new);
+                    }
+                    new_idx += 1;
+                }
+                (Some(old), Some(new)) => {
+                    if old == new {
+                        old_idx += 1;
+                        new_idx += 1;
+                    } else if old < new {
+                        #[cfg(test)]
+                        self.planning_stats.record_refcount_lookup();
+                        if self.ownership.owner_refcount(&old) == 1 {
+                            physical_removed.push(old);
+                        }
+                        old_idx += 1;
+                    } else {
+                        #[cfg(test)]
+                        self.planning_stats.record_refcount_lookup();
+                        if self.ownership.owner_refcount(&new) == 0 {
+                            physical_added.push(new);
+                        }
+                        new_idx += 1;
+                    }
+                }
+            }
+        }
+
+        let required_unique = physical_added.len();
+        let available_unique = self
+            .cap
+            .saturating_sub(pre_len)
+            .saturating_add(physical_removed.len());
+        if required_unique > available_unique {
+            return ReplacePlanOutcome::RejectCap {
+                required_unique,
+                available_unique,
+            };
+        }
+
+        let Some(after_remove) = pre_len.checked_sub(physical_removed.len()) else {
+            return ReplacePlanOutcome::InternalInvariantViolation;
+        };
+        let Some(projected_final_len) = after_remove.checked_add(physical_added.len()) else {
+            return ReplacePlanOutcome::InternalInvariantViolation;
+        };
+        if projected_final_len > self.cap {
+            return ReplacePlanOutcome::InternalInvariantViolation;
+        }
+
+        ReplacePlanOutcome::Ready(ReplacePlan {
+            pre_len,
+            projected_final_len,
+            old_normalized: old_normalized.to_vec(),
+            physical_added,
+            physical_removed,
+        })
+    }
+
     fn rollback_failed_insert(
         &mut self,
         owner: &ExplicitOwner,
@@ -246,11 +463,71 @@ impl FixedCapAdmission {
                 if self.ownership.owner_group(owner).is_some() {
                     self.reconcile_physical_len_cold();
                 }
-                FixedCapAdmissionResult::InternalInvariantViolation
+                FixedCapAdmissionResult::InternalInvariantViolation { recovery: None }
             }
             _ => {
                 self.reconcile_physical_len_cold();
-                FixedCapAdmissionResult::InternalInvariantViolation
+                FixedCapAdmissionResult::InternalInvariantViolation { recovery: None }
+            }
+        }
+    }
+
+    fn rollback_failed_replace(
+        &mut self,
+        owner: &ExplicitOwner,
+        plan: &ReplacePlan,
+    ) -> FixedCapAdmissionResult {
+        let force_restore_mismatch = {
+            #[cfg(test)]
+            {
+                self.test_force_restore_plan_mismatch
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        };
+        let restore_pubkeys = if force_restore_mismatch && !plan.old_normalized.is_empty() {
+            let mut corrupted = plan.old_normalized.clone();
+            corrupted.push(corrupted[0]);
+            corrupted
+        } else {
+            plan.old_normalized.clone()
+        };
+
+        let restore_change = match self
+            .ownership
+            .upsert_group(owner.clone(), restore_pubkeys.clone())
+        {
+            Ok(change) => change,
+            Err(EmptyOwnerGroupError) => {
+                self.reconcile_physical_len_cold();
+                return FixedCapAdmissionResult::InternalInvariantViolation {
+                    recovery: Some(InvariantViolationRecovery::OwnerRemovedFailClosed),
+                };
+            }
+        };
+
+        let restored = match restore_change {
+            GroupChange::Replaced { .. } | GroupChange::Unchanged => {
+                self.owner_group(owner) == Some(restore_pubkeys.as_slice())
+            }
+            GroupChange::NewGroup { .. } => false,
+        };
+
+        if restored {
+            self.physical_len = plan.pre_len;
+            if self.ownership.owner_group(owner).is_none() {
+                self.reconcile_physical_len_cold();
+            }
+            FixedCapAdmissionResult::InternalInvariantViolation {
+                recovery: Some(InvariantViolationRecovery::PreviousRestored),
+            }
+        } else {
+            let _ = self.ownership.remove_group(owner);
+            self.reconcile_physical_len_cold();
+            FixedCapAdmissionResult::InternalInvariantViolation {
+                recovery: Some(InvariantViolationRecovery::OwnerRemovedFailClosed),
             }
         }
     }
@@ -271,10 +548,53 @@ fn expected_physical_added_at_commit(plan: &InsertPlan, force_mismatch: bool) ->
     }
 }
 
+fn expected_physical_added_at_replace_commit(
+    plan: &ReplacePlan,
+    force_mismatch: bool,
+) -> Vec<Pubkey> {
+    if force_mismatch && !plan.physical_added.is_empty() {
+        let mut expected = plan.physical_added.clone();
+        expected.push(expected[0]);
+        expected
+    } else {
+        plan.physical_added.clone()
+    }
+}
+
+fn expected_physical_removed_at_replace_commit(
+    plan: &ReplacePlan,
+    force_mismatch: bool,
+) -> Vec<Pubkey> {
+    if force_mismatch && !plan.physical_removed.is_empty() {
+        let mut expected = plan.physical_removed.clone();
+        expected.push(expected[0]);
+        expected
+    } else {
+        plan.physical_removed.clone()
+    }
+}
+
 fn new_group_matches_plan(change: &GroupChange, expected_physical_added: &[Pubkey]) -> bool {
     match change {
         GroupChange::NewGroup { physical_added } => physical_added == expected_physical_added,
         GroupChange::Unchanged | GroupChange::Replaced { .. } => false,
+    }
+}
+
+fn replaced_group_matches_plan(
+    change: &GroupChange,
+    expected_physical_added: &[Pubkey],
+    expected_physical_removed: &[Pubkey],
+) -> bool {
+    match change {
+        GroupChange::Replaced {
+            physical_added,
+            physical_removed,
+        } => {
+            physical_added == expected_physical_added
+                && physical_removed == expected_physical_removed
+        }
+        GroupChange::NewGroup { .. } | GroupChange::Unchanged => false,
     }
 }
 
@@ -389,10 +709,106 @@ mod tests {
         }
     }
 
+    /// Independent replacement candidate-state model — never calls [`FixedCapAdmission`].
+    #[derive(Debug, Clone)]
+    struct RefReplaceModel {
+        cap: usize,
+        groups: BTreeMap<ExplicitOwner, BTreeSet<Pubkey>>,
+    }
+
+    impl RefReplaceModel {
+        fn new(cap: usize) -> Self {
+            Self {
+                cap,
+                groups: BTreeMap::new(),
+            }
+        }
+
+        fn admit_for_setup(
+            &mut self,
+            owner: ExplicitOwner,
+            pubkeys: impl IntoIterator<Item = Pubkey>,
+        ) {
+            let mut normalized: Vec<Pubkey> = pubkeys.into_iter().collect();
+            normalized.sort();
+            normalized.dedup();
+            assert!(!normalized.is_empty());
+            self.groups.insert(owner, normalized.into_iter().collect());
+        }
+
+        fn try_replace_group(
+            &mut self,
+            owner: ExplicitOwner,
+            pubkeys: impl IntoIterator<Item = Pubkey>,
+        ) -> FixedCapAdmissionResult {
+            let mut normalized: Vec<Pubkey> = pubkeys.into_iter().collect();
+            normalized.sort();
+            normalized.dedup();
+            if normalized.is_empty() {
+                return FixedCapAdmissionResult::RejectedInvalidGroup;
+            }
+            let Some(old_group) = self.groups.get(&owner).cloned() else {
+                return FixedCapAdmissionResult::RejectedMissingOwner;
+            };
+            if old_group == normalized.iter().copied().collect::<BTreeSet<_>>() {
+                return FixedCapAdmissionResult::Unchanged;
+            }
+
+            let physical_before: BTreeSet<Pubkey> = self
+                .groups
+                .values()
+                .flat_map(|set| set.iter().copied())
+                .collect();
+            let mut candidate_groups = self.groups.clone();
+            candidate_groups.insert(owner.clone(), normalized.iter().copied().collect());
+            let physical_after: BTreeSet<Pubkey> = candidate_groups
+                .values()
+                .flat_map(|set| set.iter().copied())
+                .collect();
+
+            let physical_added: Vec<Pubkey> = physical_after
+                .difference(&physical_before)
+                .copied()
+                .collect();
+            let physical_removed: Vec<Pubkey> = physical_before
+                .difference(&physical_after)
+                .copied()
+                .collect();
+
+            if physical_after.len() > self.cap {
+                let available_unique = self
+                    .cap
+                    .saturating_sub(physical_before.len())
+                    .saturating_add(physical_removed.len());
+                return FixedCapAdmissionResult::RejectedCap {
+                    required_unique: physical_added.len(),
+                    available_unique,
+                };
+            }
+
+            self.groups = candidate_groups;
+            FixedCapAdmissionResult::Replaced {
+                physical_added,
+                physical_removed,
+            }
+        }
+    }
+
     fn assert_state_matches(admission: &FixedCapAdmission, model: &RefInsertModel) {
         assert_eq!(admission.len(), physical_len_from_groups(&model.groups));
         assert_eq!(admission.len(), admission.snapshot_pubkeys().len());
         assert_eq!(admission_groups(admission), model.groups);
+    }
+
+    fn assert_replace_state_matches(admission: &FixedCapAdmission, model: &RefReplaceModel) {
+        assert_eq!(admission.len(), physical_len_from_groups(&model.groups));
+        assert_eq!(admission.len(), admission.snapshot_pubkeys().len());
+        assert_eq!(
+            admission.len(),
+            admission.cap().min(physical_len_from_groups(&model.groups))
+        );
+        assert_eq!(admission_groups(admission), model.groups);
+        assert!(admission.len() <= admission.cap());
     }
 
     #[test]
@@ -599,12 +1015,378 @@ mod tests {
 
         admission.set_test_force_commit_plan_mismatch(true);
         let result = admission.try_admit_new_group(pool_owner(ExplicitConsumer::Arb, 2), [pk(2)]);
-        assert_eq!(result, FixedCapAdmissionResult::InternalInvariantViolation);
+        assert_eq!(
+            result,
+            FixedCapAdmissionResult::InternalInvariantViolation { recovery: None }
+        );
         assert_eq!(admission_groups(&admission), before_groups);
         assert_eq!(admission.len(), before_len);
         assert!(admission
             .owner_group(&pool_owner(ExplicitConsumer::Arb, 2))
             .is_none());
+    }
+
+    // --- Replacement tests (PR 1b2) ---
+
+    #[test]
+    fn replace_k1_k2_to_k2_k3_at_cap_reports_exact_deltas() {
+        let mut admission = FixedCapAdmission::new(2);
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        let k1 = pk(1);
+        let k2 = pk(2);
+        let k3 = pk(3);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [k1, k2]));
+        assert_eq!(admission.len(), 2);
+
+        let result = admission.try_replace_group(owner.clone(), [k2, k3]);
+        assert_eq!(
+            result,
+            FixedCapAdmissionResult::Replaced {
+                physical_added: vec![k3],
+                physical_removed: vec![k1],
+            }
+        );
+        assert_eq!(admission.len(), 2);
+        assert_eq!(admission.owner_group(&owner), Some([k2, k3].as_slice()));
+    }
+
+    #[test]
+    fn replace_does_not_remove_shared_outgoing_key() {
+        let mut admission = FixedCapAdmission::new(4);
+        let shared = pk(1);
+        let owner_a = pool_owner(ExplicitConsumer::Momentum, 1);
+        let owner_b = pool_owner(ExplicitConsumer::Arb, 2);
+        assert_admitted(admission.try_admit_new_group(owner_a.clone(), [shared, pk(2)]));
+        assert_admitted(admission.try_admit_new_group(owner_b.clone(), [shared]));
+        let before_len = admission.len();
+
+        let result = admission.try_replace_group(owner_a.clone(), [pk(3)]);
+        assert_eq!(
+            result,
+            FixedCapAdmissionResult::Replaced {
+                physical_added: vec![pk(3)],
+                physical_removed: vec![pk(2)],
+            }
+        );
+        assert!(admission.owner_refcount(&shared) > 0);
+        assert_eq!(admission.len(), before_len);
+    }
+
+    #[test]
+    fn replace_does_not_add_shared_incoming_key() {
+        let mut admission = FixedCapAdmission::new(4);
+        let shared = pk(1);
+        let owner_a = pool_owner(ExplicitConsumer::Momentum, 1);
+        let owner_b = pool_owner(ExplicitConsumer::Arb, 2);
+        assert_admitted(admission.try_admit_new_group(owner_a.clone(), [pk(2)]));
+        assert_admitted(admission.try_admit_new_group(owner_b.clone(), [shared]));
+        let before_len = admission.len();
+
+        let result = admission.try_replace_group(owner_a.clone(), [shared, pk(3)]);
+        assert_eq!(
+            result,
+            FixedCapAdmissionResult::Replaced {
+                physical_added: vec![pk(3)],
+                physical_removed: vec![pk(2)],
+            }
+        );
+        assert_eq!(admission.len(), before_len);
+        assert_eq!(admission.owner_refcount(&shared), 2);
+    }
+
+    #[test]
+    fn replace_grow_under_exact_and_over_cap() {
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        let k1 = pk(1);
+        let k2 = pk(2);
+        let k3 = pk(3);
+
+        let mut under = FixedCapAdmission::new(3);
+        assert_admitted(under.try_admit_new_group(owner.clone(), [k1]));
+        assert_eq!(
+            under.try_replace_group(owner.clone(), [k1, k2]),
+            FixedCapAdmissionResult::Replaced {
+                physical_added: vec![k2],
+                physical_removed: vec![],
+            }
+        );
+
+        let mut exact = FixedCapAdmission::new(2);
+        assert_admitted(exact.try_admit_new_group(owner.clone(), [k1]));
+        assert_eq!(
+            exact.try_replace_group(owner.clone(), [k1, k2]),
+            FixedCapAdmissionResult::Replaced {
+                physical_added: vec![k2],
+                physical_removed: vec![],
+            }
+        );
+        assert_eq!(exact.len(), 2);
+
+        let mut over = FixedCapAdmission::new(2);
+        assert_admitted(over.try_admit_new_group(owner.clone(), [k1, k2]));
+        let before = admission_groups(&over);
+        assert_eq!(
+            over.try_replace_group(owner.clone(), [k1, k2, k3]),
+            FixedCapAdmissionResult::RejectedCap {
+                required_unique: 1,
+                available_unique: 0,
+            }
+        );
+        assert_eq!(admission_groups(&over), before);
+    }
+
+    #[test]
+    fn replace_shrink_and_fully_shared_replacement() {
+        let mut admission = FixedCapAdmission::new(4);
+        let shared = pk(1);
+        let owner_a = pool_owner(ExplicitConsumer::Momentum, 1);
+        let owner_b = pool_owner(ExplicitConsumer::Arb, 2);
+        assert_admitted(admission.try_admit_new_group(owner_a.clone(), [shared, pk(2), pk(3)]));
+        assert_admitted(admission.try_admit_new_group(owner_b.clone(), [shared]));
+        let before_len = admission.len();
+
+        assert_eq!(
+            admission.try_replace_group(owner_a.clone(), [shared]),
+            FixedCapAdmissionResult::Replaced {
+                physical_added: vec![],
+                physical_removed: vec![pk(2), pk(3)],
+            }
+        );
+        assert_eq!(admission.len(), before_len - 2);
+        assert_eq!(admission.owner_refcount(&shared), 2);
+
+        let mut admission2 = FixedCapAdmission::new(2);
+        assert_admitted(admission2.try_admit_new_group(owner_a.clone(), [shared, pk(2)]));
+        assert_admitted(admission2.try_admit_new_group(owner_b.clone(), [shared]));
+        assert_eq!(
+            admission2.try_replace_group(owner_a.clone(), [shared]),
+            FixedCapAdmissionResult::Replaced {
+                physical_added: vec![],
+                physical_removed: vec![pk(2)],
+            }
+        );
+        assert_eq!(admission2.len(), 1);
+    }
+
+    #[test]
+    fn replace_identical_group_with_reordered_duplicates_is_unchanged() {
+        let mut admission = FixedCapAdmission::new(3);
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1), pk(2), pk(3)]));
+        let before = admission_groups(&admission);
+        let before_len = admission.len();
+
+        assert_eq!(
+            admission.try_replace_group(owner.clone(), [pk(3), pk(1), pk(2), pk(2)]),
+            FixedCapAdmissionResult::Unchanged
+        );
+        assert_eq!(admission_groups(&admission), before);
+        assert_eq!(admission.len(), before_len);
+    }
+
+    #[test]
+    fn replace_missing_invalid_and_cap_reject_are_mutation_free() {
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        let unknown = pool_owner(ExplicitConsumer::Arb, 9);
+
+        let mut missing = FixedCapAdmission::new(3);
+        let before = admission_groups(&missing);
+        assert_eq!(
+            missing.try_replace_group(unknown.clone(), [pk(1)]),
+            FixedCapAdmissionResult::RejectedMissingOwner
+        );
+        assert_eq!(admission_groups(&missing), before);
+
+        let mut invalid = FixedCapAdmission::new(3);
+        assert_admitted(invalid.try_admit_new_group(owner.clone(), [pk(1)]));
+        let before = admission_groups(&invalid);
+        assert_eq!(
+            invalid.try_replace_group(owner.clone(), []),
+            FixedCapAdmissionResult::RejectedInvalidGroup
+        );
+        assert_eq!(admission_groups(&invalid), before);
+
+        let mut cap_reject = FixedCapAdmission::new(2);
+        assert_admitted(cap_reject.try_admit_new_group(owner.clone(), [pk(1), pk(2)]));
+        let before = admission_groups(&cap_reject);
+        assert_eq!(
+            cap_reject.try_replace_group(owner.clone(), [pk(1), pk(3), pk(4)]),
+            FixedCapAdmissionResult::RejectedCap {
+                required_unique: 2,
+                available_unique: 1,
+            }
+        );
+        assert_eq!(admission_groups(&cap_reject), before);
+    }
+
+    #[test]
+    fn replace_cached_len_matches_snapshot_after_long_sequences() {
+        let mut admission = FixedCapAdmission::new(6);
+        let mut model = RefReplaceModel::new(6);
+        let owners = [
+            pool_owner(ExplicitConsumer::Momentum, 1),
+            pool_owner(ExplicitConsumer::Arb, 2),
+            pool_owner(ExplicitConsumer::Tracker, 3),
+        ];
+        let key_pool: Vec<Pubkey> = (1u8..=8).map(pk).collect();
+
+        for (step, owner) in owners.iter().enumerate() {
+            let keys: Vec<Pubkey> = key_pool
+                .iter()
+                .copied()
+                .filter(|k| (k.to_bytes()[0] as usize + step) % 2 == 0)
+                .take(2)
+                .collect();
+            assert_admitted(admission.try_admit_new_group(owner.clone(), keys.clone()));
+            model.admit_for_setup(owner.clone(), keys);
+            assert_replace_state_matches(&admission, &model);
+        }
+
+        for step in 0..12 {
+            let owner = owners[step % owners.len()].clone();
+            let keys: Vec<Pubkey> = key_pool
+                .iter()
+                .copied()
+                .filter(|k| (k.to_bytes()[0] as usize + step) % 3 != 0)
+                .take(1 + step % 3)
+                .collect();
+            if keys.is_empty() {
+                continue;
+            }
+            let result = admission.try_replace_group(owner.clone(), keys.clone());
+            let expected = model.try_replace_group(owner.clone(), keys);
+            assert_eq!(result, expected);
+            assert_replace_state_matches(&admission, &model);
+        }
+    }
+
+    #[test]
+    fn replace_planning_stats_match_asymmetric_group_lookups() {
+        let mut admission = FixedCapAdmission::new(8);
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        let old_keys = [pk(1), pk(2), pk(3), pk(4), pk(5)];
+        let new_keys = [pk(3), pk(4), pk(6), pk(7), pk(8), pk(9)];
+        assert_admitted(admission.try_admit_new_group(owner.clone(), old_keys));
+        admission.planning_stats.refcount_lookups = 0;
+        admission.planning_stats.owner_group_lookups = 0;
+
+        let _ = admission.try_replace_group(owner, new_keys);
+        assert_eq!(admission.planning_stats().owner_group_lookups, 1);
+        assert_eq!(admission.planning_stats().refcount_lookups, 7);
+    }
+
+    #[test]
+    fn bounded_reference_replace_model_matches_admission() {
+        let caps = [2usize, 3, 5, 8];
+        let seeds = [3u8, 11, 77];
+
+        caps.iter().copied().for_each(|cap| {
+            seeds.iter().copied().for_each(|seed| {
+                let mut admission = FixedCapAdmission::new(cap);
+                let mut model = RefReplaceModel::new(cap);
+                let owners = [
+                    pool_owner(ExplicitConsumer::Momentum, seed),
+                    pool_owner(ExplicitConsumer::Arb, seed.wrapping_add(1)),
+                ];
+                let key_pool: Vec<Pubkey> = (0u8..7).map(|b| pk(b.wrapping_add(seed))).collect();
+
+                for (step, owner) in owners.iter().enumerate() {
+                    let keys: Vec<Pubkey> = key_pool
+                        .iter()
+                        .copied()
+                        .filter(|k| (k.to_bytes()[0] as usize + step) % 2 == 0)
+                        .take(1)
+                        .collect();
+                    if keys.is_empty() {
+                        continue;
+                    }
+                    let admit_result = admission.try_admit_new_group(owner.clone(), keys.clone());
+                    if matches!(admit_result, FixedCapAdmissionResult::RejectedCap { .. }) {
+                        continue;
+                    }
+                    assert_admitted(admit_result);
+                    model.admit_for_setup(owner.clone(), keys);
+                    assert_replace_state_matches(&admission, &model);
+                }
+
+                for step in 0..10 {
+                    let owner = owners[step % owners.len()].clone();
+                    if !model.groups.contains_key(&owner) {
+                        continue;
+                    }
+                    let keys: Vec<Pubkey> = key_pool
+                        .iter()
+                        .copied()
+                        .filter(|k| (k.to_bytes()[0] as usize + step) % 3 != 1)
+                        .take(1 + step % 2)
+                        .collect();
+                    if keys.is_empty() {
+                        continue;
+                    }
+                    let before = admission_groups(&admission);
+                    let result = admission.try_replace_group(owner.clone(), keys.clone());
+                    let expected = model.try_replace_group(owner.clone(), keys);
+                    assert_eq!(result, expected);
+                    if matches!(
+                        result,
+                        FixedCapAdmissionResult::RejectedCap { .. }
+                            | FixedCapAdmissionResult::RejectedMissingOwner
+                            | FixedCapAdmissionResult::RejectedInvalidGroup
+                    ) {
+                        assert_eq!(admission_groups(&admission), before);
+                    }
+                    assert_replace_state_matches(&admission, &model);
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn replace_forced_commit_mismatch_restores_previous_owner() {
+        let mut admission = FixedCapAdmission::new(4);
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1), pk(2)]));
+        let before_groups = admission_groups(&admission);
+        let before_len = admission.len();
+
+        admission.set_test_force_commit_plan_mismatch(true);
+        let result = admission.try_replace_group(owner.clone(), [pk(2), pk(3)]);
+        assert_eq!(
+            result,
+            FixedCapAdmissionResult::InternalInvariantViolation {
+                recovery: Some(InvariantViolationRecovery::PreviousRestored),
+            }
+        );
+        assert_eq!(admission_groups(&admission), before_groups);
+        assert_eq!(admission.len(), before_len);
+        assert_eq!(
+            admission.owner_group(&owner),
+            Some([pk(1), pk(2)].as_slice())
+        );
+    }
+
+    #[test]
+    fn replace_forced_restore_mismatch_removes_owner_and_reconciles_len() {
+        let mut admission = FixedCapAdmission::new(4);
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        let other = pool_owner(ExplicitConsumer::Arb, 2);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1), pk(2)]));
+        assert_admitted(admission.try_admit_new_group(other.clone(), [pk(3)]));
+        let before_other = admission.owner_group(&other).map(|s| s.to_vec());
+
+        admission.set_test_force_commit_plan_mismatch(true);
+        admission.set_test_force_restore_plan_mismatch(true);
+        let result = admission.try_replace_group(owner.clone(), [pk(2), pk(4)]);
+        assert_eq!(
+            result,
+            FixedCapAdmissionResult::InternalInvariantViolation {
+                recovery: Some(InvariantViolationRecovery::OwnerRemovedFailClosed),
+            }
+        );
+        assert!(admission.owner_group(&owner).is_none());
+        assert_eq!(admission.owner_group(&other), before_other.as_deref());
+        assert!(admission.len() <= admission.cap());
+        assert_eq!(admission.len(), admission.snapshot_pubkeys().len());
     }
 
     fn assert_admitted(result: FixedCapAdmissionResult) {
