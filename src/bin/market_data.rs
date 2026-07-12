@@ -1247,61 +1247,68 @@ const GESYER_BLOCK_WALLET_REVISION_EXHAUSTED: u8 = 1 << 5;
 const GESYER_BLOCK_REJECTION_LEDGER_OVERFLOW: u8 = 1 << 6;
 
 /// Authoritative rejected logical demand awaiting bounded retry or explicit withdrawal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RejectedDemandKey {
+    Momentum { mint: Pubkey, pool: Pubkey },
+    Arb { pool: Pubkey },
+    Tracker { pool: Pubkey, owner: OwnerKey },
+}
+
+#[derive(Debug, Clone)]
 enum RejectedRevisionDemand {
     Momentum { mint: Pubkey, pool: Pubkey },
     Arb { pool: Pubkey },
-    Tracker { pool: Pubkey },
+    Tracker { snapshot: PoolExplicitSnapshot },
 }
 
 impl RejectedRevisionDemand {
-    fn pool(self) -> Pubkey {
+    fn demand_key(&self) -> RejectedDemandKey {
         match self {
-            Self::Momentum { pool, .. } | Self::Arb { pool } | Self::Tracker { pool } => pool,
+            Self::Momentum { mint, pool } => RejectedDemandKey::Momentum {
+                mint: *mint,
+                pool: *pool,
+            },
+            Self::Arb { pool } => RejectedDemandKey::Arb { pool: *pool },
+            Self::Tracker { snapshot } => RejectedDemandKey::Tracker {
+                pool: snapshot.pool,
+                owner: snapshot.owner,
+            },
         }
     }
 
-    fn consumer(self) -> ConsumerId {
-        match self {
-            Self::Momentum { .. } => ConsumerId::Momentum,
-            Self::Arb { .. } => ConsumerId::Arb,
-            Self::Tracker { .. } => ConsumerId::Tracker,
-        }
-    }
-
-    fn key(self) -> (Pubkey, ConsumerId) {
-        (self.pool(), self.consumer())
-    }
-
-    fn inferred(pool: Pubkey, consumer: ConsumerId, registry: &UnifiedHotPoolRegistry) -> Self {
-        match consumer {
-            ConsumerId::Momentum => {
-                let mint = registry
-                    .snapshot_pairs()
-                    .into_iter()
-                    .find_map(|(mint, p)| (p == pool).then_some(mint))
-                    .unwrap_or(pool);
-                Self::Momentum { mint, pool }
-            }
-            ConsumerId::Arb => Self::Arb { pool },
-            ConsumerId::Tracker | ConsumerId::Wallet => Self::Tracker { pool },
+    fn from_snapshot(snapshot: &PoolExplicitSnapshot) -> Option<Self> {
+        match snapshot.consumer {
+            ConsumerId::Momentum => match snapshot.owner {
+                OwnerKey::Mint(mint) => Some(Self::Momentum {
+                    mint,
+                    pool: snapshot.pool,
+                }),
+                OwnerKey::Pool(_) | OwnerKey::Wallet => None,
+            },
+            ConsumerId::Arb => Some(Self::Arb {
+                pool: snapshot.pool,
+            }),
+            ConsumerId::Tracker => Some(Self::Tracker {
+                snapshot: snapshot.clone(),
+            }),
+            ConsumerId::Wallet => None,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RevisionRejectionRecordResult {
-    AlreadyTracked,
+    UpdatedExisting,
     Stored,
     OverflowStored,
-    OverflowLost,
+    CapacityInvariantExceeded,
 }
 
 #[derive(Debug)]
 struct RevisionRegistryRejectionLedger {
-    entries: HashMap<(Pubkey, ConsumerId), RejectedRevisionDemand>,
-    overflow_entries: Vec<RejectedRevisionDemand>,
-    overflow_lost: usize,
+    entries: HashMap<RejectedDemandKey, RejectedRevisionDemand>,
+    overflow_entries: HashMap<RejectedDemandKey, RejectedRevisionDemand>,
+    capacity_invariant_exceeded: bool,
     generation: u64,
     capacity: usize,
 }
@@ -1310,73 +1317,68 @@ impl RevisionRegistryRejectionLedger {
     fn new(capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
-            overflow_entries: Vec::new(),
-            overflow_lost: 0,
+            overflow_entries: HashMap::new(),
+            capacity_invariant_exceeded: false,
             generation: 0,
             capacity: capacity.max(1),
         }
     }
 
+    #[cfg(test)]
+    fn contains_key(&self, key: &RejectedDemandKey) -> bool {
+        self.entries.contains_key(key) || self.overflow_entries.contains_key(key)
+    }
+
     fn record(&mut self, demand: RejectedRevisionDemand) -> RevisionRejectionRecordResult {
-        self.generation = self.generation.wrapping_add(1);
-        let key = demand.key();
-        if self.entries.contains_key(&key) {
-            return RevisionRejectionRecordResult::AlreadyTracked;
+        let key = demand.demand_key();
+        if let std::collections::hash_map::Entry::Occupied(mut slot) =
+            self.entries.entry(key.clone())
+        {
+            slot.insert(demand);
+            self.generation = self.generation.wrapping_add(1);
+            return RevisionRejectionRecordResult::UpdatedExisting;
+        }
+        if let std::collections::hash_map::Entry::Occupied(mut slot) =
+            self.overflow_entries.entry(key.clone())
+        {
+            slot.insert(demand);
+            self.generation = self.generation.wrapping_add(1);
+            return RevisionRejectionRecordResult::UpdatedExisting;
         }
         if self.entries.len() < self.capacity {
+            self.generation = self.generation.wrapping_add(1);
             self.entries.insert(key, demand);
             return RevisionRejectionRecordResult::Stored;
         }
         if self.overflow_entries.len() < self.capacity {
-            self.overflow_entries.push(demand);
+            self.generation = self.generation.wrapping_add(1);
+            self.overflow_entries.insert(key, demand);
             return RevisionRejectionRecordResult::OverflowStored;
         }
-        self.overflow_lost = self.overflow_lost.saturating_add(1);
-        RevisionRejectionRecordResult::OverflowLost
+        self.capacity_invariant_exceeded = true;
+        self.generation = self.generation.wrapping_add(1);
+        RevisionRejectionRecordResult::CapacityInvariantExceeded
     }
 
-    fn remove_demand(&mut self, demand: RejectedRevisionDemand) -> bool {
-        let key = demand.key();
-        if self.entries.remove(&key) == Some(demand) {
+    fn remove_demand(&mut self, demand: &RejectedRevisionDemand) -> bool {
+        let key = demand.demand_key();
+        if self.entries.remove(&key).is_some() || self.overflow_entries.remove(&key).is_some() {
             self.generation = self.generation.wrapping_add(1);
-            return true;
+            true
+        } else {
+            false
         }
-        if let Some(pos) = self
-            .overflow_entries
-            .iter()
-            .position(|stored| *stored == demand)
-        {
-            self.overflow_entries.remove(pos);
-            self.generation = self.generation.wrapping_add(1);
-            return true;
-        }
-        false
-    }
-
-    fn remove_key(&mut self, pool: Pubkey, consumer: ConsumerId) -> bool {
-        if self.entries.remove(&(pool, consumer)).is_some() {
-            self.generation = self.generation.wrapping_add(1);
-            return true;
-        }
-        if let Some(pos) = self
-            .overflow_entries
-            .iter()
-            .position(|stored| stored.key() == (pool, consumer))
-        {
-            self.overflow_entries.remove(pos);
-            self.generation = self.generation.wrapping_add(1);
-            return true;
-        }
-        false
     }
 
     fn has_unresolved(&self) -> bool {
-        !self.entries.is_empty() || !self.overflow_entries.is_empty() || self.overflow_lost > 0
+        !self.entries.is_empty()
+            || !self.overflow_entries.is_empty()
+            || self.capacity_invariant_exceeded
     }
 
     fn pending_demands(&self) -> Vec<RejectedRevisionDemand> {
-        let mut out: Vec<_> = self.entries.values().copied().collect();
-        out.extend(self.overflow_entries.iter().copied());
+        let mut out: Vec<_> = self.entries.values().cloned().collect();
+        out.extend(self.overflow_entries.values().cloned());
         out
     }
 }
@@ -2134,20 +2136,31 @@ fn pending_pool_registration_cap(_max_tracked_accounts: usize) -> usize {
     8_192
 }
 
-fn minimal_enqueue_pool_snapshot(pool: Pubkey, consumer: ConsumerId) -> PoolExplicitSnapshot {
-    PoolExplicitSnapshot {
-        pool,
-        vaults: vec![],
-        bin_arrays: vec![],
-        mints: vec![],
-        consumer,
-        owner: OwnerKey::Pool(pool),
-        pin: match consumer {
-            ConsumerId::Momentum => GeyserPinReason::MomentumActive,
-            ConsumerId::Arb => GeyserPinReason::ArbMultiDex,
-            ConsumerId::Tracker | ConsumerId::Wallet => GeyserPinReason::MomentumActive,
+fn rejected_demands_from_snapshot(
+    snapshot: &PoolExplicitSnapshot,
+    registry: &UnifiedHotPoolRegistry,
+) -> Vec<RejectedRevisionDemand> {
+    match snapshot.consumer {
+        ConsumerId::Momentum => match snapshot.owner {
+            OwnerKey::Mint(mint) => vec![RejectedRevisionDemand::Momentum {
+                mint,
+                pool: snapshot.pool,
+            }],
+            OwnerKey::Pool(pool) => registry
+                .snapshot_pairs()
+                .into_iter()
+                .filter(|(_, p)| *p == pool)
+                .map(|(mint, p)| RejectedRevisionDemand::Momentum { mint, pool: p })
+                .collect(),
+            OwnerKey::Wallet => vec![],
         },
-        revision: 0,
+        ConsumerId::Arb => vec![RejectedRevisionDemand::Arb {
+            pool: snapshot.pool,
+        }],
+        ConsumerId::Tracker => vec![RejectedRevisionDemand::Tracker {
+            snapshot: snapshot.clone(),
+        }],
+        ConsumerId::Wallet => vec![],
     }
 }
 
@@ -2199,25 +2212,25 @@ fn prepare_pool_snapshot_for_enqueue(
     {
         InflightReserveResult::Reserved => {}
         InflightReserveResult::RegistryFull => {
-            ctx.fail_revision_registry_full(pool, consumer);
+            ctx.fail_revision_registry_full_from_snapshot(snapshot);
             return None;
         }
     }
     match ctx.pool_snapshot_revisions.assign_next(snapshot) {
         RevisionAssignResult::Assigned(_) => {
-            ctx.record_revision_registry_enqueue_success(pool, consumer, None);
+            ctx.record_revision_registry_enqueue_success(snapshot, None);
             Some((pool, consumer))
         }
         RevisionAssignResult::RegistryFull => {
             ctx.pool_snapshot_revisions
                 .release_inflight_command(pool, consumer);
-            ctx.fail_revision_registry_full(pool, consumer);
+            ctx.fail_revision_registry_full_from_snapshot(snapshot);
             None
         }
         RevisionAssignResult::KeyNotRegistered => {
             ctx.pool_snapshot_revisions
                 .release_inflight_command(pool, consumer);
-            ctx.fail_revision_registry_full(pool, consumer);
+            ctx.fail_revision_registry_full_from_snapshot(snapshot);
             None
         }
     }
@@ -3508,11 +3521,11 @@ impl MarketDataContext {
             let mut ledger = self.revision_registry_rejection_ledger.lock();
             ledger.record(demand)
         };
-        if record_result == RevisionRejectionRecordResult::OverflowLost {
+        if record_result == RevisionRejectionRecordResult::CapacityInvariantExceeded {
             self.set_geyser_explicit_blocker(
                 GESYER_BLOCK_REJECTION_LEDGER_OVERFLOW,
                 Some(
-                    "revision registry rejection ledger overflow (fail-closed until reconcile)"
+                    "revision registry rejection ledger capacity invariant exceeded (fail-closed)"
                         .into(),
                 ),
             );
@@ -3533,10 +3546,15 @@ impl MarketDataContext {
         self.geyser_connect_barrier.mark_failed();
     }
 
-    fn fail_revision_registry_full(&self, pool: Pubkey, consumer: ConsumerId) {
-        let demand =
-            RejectedRevisionDemand::inferred(pool, consumer, self.hot_pool_registry.as_ref());
+    #[cfg(test)]
+    fn fail_revision_registry_full(&self, demand: RejectedRevisionDemand) {
         self.record_rejected_revision_demand(demand);
+    }
+
+    fn fail_revision_registry_full_from_snapshot(&self, snapshot: &PoolExplicitSnapshot) {
+        for demand in rejected_demands_from_snapshot(snapshot, self.hot_pool_registry.as_ref()) {
+            self.record_rejected_revision_demand(demand);
+        }
     }
 
     fn resolve_rejected_revision_demand(
@@ -3547,7 +3565,7 @@ impl MarketDataContext {
         let removed = self
             .revision_registry_rejection_ledger
             .lock()
-            .remove_demand(demand);
+            .remove_demand(&demand);
         if removed {
             self.maybe_clear_revision_registry_full_blocker(desired);
         }
@@ -3606,20 +3624,18 @@ impl MarketDataContext {
 
     fn record_revision_registry_enqueue_success(
         &self,
-        pool: Pubkey,
-        consumer: ConsumerId,
+        snapshot: &PoolExplicitSnapshot,
         desired: Option<&DesiredExplicitSet>,
     ) {
-        let demand =
-            RejectedRevisionDemand::inferred(pool, consumer, self.hot_pool_registry.as_ref());
+        let Some(demand) = RejectedRevisionDemand::from_snapshot(snapshot) else {
+            return;
+        };
         if self
             .revision_registry_rejection_ledger
             .lock()
-            .remove_key(pool, consumer)
+            .remove_demand(&demand)
         {
             self.maybe_clear_revision_registry_full_blocker(desired);
-        } else {
-            let _ = demand;
         }
     }
 
@@ -3672,17 +3688,29 @@ impl MarketDataContext {
                         true
                     }
                 }
-                RejectedRevisionDemand::Tracker { pool } => {
-                    if (!self.hot_pool_registry.is_hot_pool(pool)
-                        && !self.hot_pool_registry.try_pin_arb_pool(pool))
-                        || !self.ensure_pool_revision_key(pool, ConsumerId::Tracker, None)
-                    {
+                RejectedRevisionDemand::Tracker { ref snapshot } => {
+                    let demand = RejectedRevisionDemand::Tracker {
+                        snapshot: snapshot.clone(),
+                    };
+                    let still_wanted = desired
+                        .snapshot_owner_groups()
+                        .iter()
+                        .any(|g| g.consumer == ConsumerId::Tracker && g.owner == snapshot.owner);
+                    if !still_wanted {
+                        self.withdraw_rejected_revision_demand(demand, Some(desired));
+                        false
+                    } else if !self.ensure_pool_revision_key(
+                        snapshot.pool,
+                        ConsumerId::Tracker,
+                        None,
+                    ) {
                         false
                     } else {
-                        let snapshot = minimal_enqueue_pool_snapshot(pool, ConsumerId::Tracker);
                         enqueue_track_worker(
                             self,
-                            TrackWorkerCommand::RegisterPoolGeyserReserves { snapshot },
+                            TrackWorkerCommand::RegisterPoolGeyserReserves {
+                                snapshot: snapshot.clone(),
+                            },
                         )
                     }
                 }
@@ -3694,22 +3722,24 @@ impl MarketDataContext {
     }
 
     #[cfg(test)]
-    fn test_revision_rejection_has_key(&self, pool: Pubkey, consumer: ConsumerId) -> bool {
-        let ledger = self.revision_registry_rejection_ledger.lock();
-        ledger.entries.contains_key(&(pool, consumer))
-            || ledger
-                .overflow_entries
-                .iter()
-                .any(|stored| stored.key() == (pool, consumer))
+    fn test_revision_rejection_has_demand(&self, demand: &RejectedRevisionDemand) -> bool {
+        self.revision_registry_rejection_ledger
+            .lock()
+            .contains_key(&demand.demand_key())
     }
 
     #[cfg(test)]
-    fn test_revision_rejection_unresolved(&self) -> (usize, usize, usize, u64) {
+    fn test_revision_rejection_has_momentum(&self, mint: Pubkey, pool: Pubkey) -> bool {
+        self.test_revision_rejection_has_demand(&RejectedRevisionDemand::Momentum { mint, pool })
+    }
+
+    #[cfg(test)]
+    fn test_revision_rejection_unresolved(&self) -> (usize, usize, bool, u64) {
         let ledger = self.revision_registry_rejection_ledger.lock();
         (
             ledger.entries.len(),
             ledger.overflow_entries.len(),
-            ledger.overflow_lost,
+            ledger.capacity_invariant_exceeded,
             ledger.generation,
         )
     }
@@ -13475,8 +13505,29 @@ mod pr_b_geyser_tracking_tests {
         ctx
     }
 
-    fn mk_test_pool_snapshot(pool: Pubkey, consumer: ConsumerId) -> PoolExplicitSnapshot {
-        minimal_enqueue_pool_snapshot(pool, consumer)
+    fn mk_test_pool_snapshot(
+        pool: Pubkey,
+        consumer: ConsumerId,
+        momentum_mint: Option<Pubkey>,
+    ) -> PoolExplicitSnapshot {
+        let owner = match (consumer, momentum_mint) {
+            (ConsumerId::Momentum, Some(mint)) => OwnerKey::Mint(mint),
+            _ => OwnerKey::Pool(pool),
+        };
+        PoolExplicitSnapshot {
+            pool,
+            vaults: vec![],
+            bin_arrays: vec![],
+            mints: vec![],
+            consumer,
+            owner,
+            pin: match consumer {
+                ConsumerId::Momentum => GeyserPinReason::MomentumActive,
+                ConsumerId::Arb => GeyserPinReason::ArbMultiDex,
+                ConsumerId::Tracker | ConsumerId::Wallet => GeyserPinReason::MomentumActive,
+            },
+            revision: 0,
+        }
     }
 
     fn assert_revision_enqueue_retry_clears_rejection(
@@ -13485,16 +13536,90 @@ mod pr_b_geyser_tracking_tests {
         consumer: ConsumerId,
         setup: impl FnOnce(&Arc<MarketDataContext>, Pubkey),
     ) {
-        ctx.fail_revision_registry_full(pool, consumer);
-        assert!(!ctx.geyser_explicit_readiness_ok());
-        assert!(ctx.test_revision_rejection_has_key(pool, consumer));
         setup(ctx, pool);
-        let snapshot = mk_test_pool_snapshot(pool, consumer);
+        let demand = match consumer {
+            ConsumerId::Momentum => {
+                let mint = ctx
+                    .hot_pool_registry
+                    .snapshot_pairs()
+                    .into_iter()
+                    .find(|(_, p)| *p == pool)
+                    .map(|(m, _)| m)
+                    .expect("momentum mint pinned for pool");
+                RejectedRevisionDemand::Momentum { mint, pool }
+            }
+            ConsumerId::Arb => RejectedRevisionDemand::Arb { pool },
+            ConsumerId::Tracker => {
+                let snapshot = mk_test_pool_snapshot(pool, consumer, None);
+                RejectedRevisionDemand::Tracker { snapshot }
+            }
+            ConsumerId::Wallet => panic!("wallet consumer not supported in rejection retry test"),
+        };
+        ctx.fail_revision_registry_full(demand);
+        assert!(!ctx.geyser_explicit_readiness_ok());
+        match consumer {
+            ConsumerId::Momentum => {
+                let mint = ctx
+                    .hot_pool_registry
+                    .snapshot_pairs()
+                    .into_iter()
+                    .find(|(_, p)| *p == pool)
+                    .map(|(m, _)| m)
+                    .expect("momentum mint pinned");
+                assert!(ctx.test_revision_rejection_has_momentum(mint, pool));
+            }
+            ConsumerId::Arb => assert!(
+                ctx.test_revision_rejection_has_demand(&RejectedRevisionDemand::Arb { pool })
+            ),
+            ConsumerId::Tracker => {
+                let snapshot = mk_test_pool_snapshot(pool, consumer, None);
+                assert!(
+                    ctx.test_revision_rejection_has_demand(&RejectedRevisionDemand::Tracker {
+                        snapshot
+                    })
+                );
+            }
+            ConsumerId::Wallet => {}
+        }
+        let snapshot = match consumer {
+            ConsumerId::Momentum => {
+                let mint = ctx
+                    .hot_pool_registry
+                    .snapshot_pairs()
+                    .into_iter()
+                    .find(|(_, p)| *p == pool)
+                    .map(|(m, _)| m)
+                    .expect("momentum mint pinned");
+                mk_test_pool_snapshot(pool, consumer, Some(mint))
+            }
+            _ => mk_test_pool_snapshot(pool, consumer, None),
+        };
         assert!(enqueue_track_worker(
             ctx,
             TrackWorkerCommand::RegisterPoolGeyserReserves { snapshot },
         ));
-        assert!(!ctx.test_revision_rejection_has_key(pool, consumer));
+        match consumer {
+            ConsumerId::Momentum => {
+                let mint = ctx
+                    .hot_pool_registry
+                    .snapshot_pairs()
+                    .into_iter()
+                    .find(|(_, p)| *p == pool)
+                    .map(|(m, _)| m)
+                    .expect("momentum mint pinned");
+                assert!(!ctx.test_revision_rejection_has_momentum(mint, pool));
+            }
+            ConsumerId::Arb => assert!(
+                !ctx.test_revision_rejection_has_demand(&RejectedRevisionDemand::Arb { pool })
+            ),
+            ConsumerId::Tracker => {
+                let snapshot = mk_test_pool_snapshot(pool, consumer, None);
+                assert!(!ctx.test_revision_rejection_has_demand(
+                    &RejectedRevisionDemand::Tracker { snapshot }
+                ));
+            }
+            ConsumerId::Wallet => {}
+        }
     }
 
     /// PR161: same as [`minimal_market_data_context_for_pr_d_tests`], but returns merge `watch` receivers.
@@ -18550,8 +18675,9 @@ mod pr_b_geyser_tracking_tests {
                 .upsert(PendingPoolCommand::RegisterReserves(snapshot)),
             PendingPoolUpsertResult::Stored
         );
+        ctx.hot_pool_registry.pin_pool(mint, pool);
         ctx.fail_pending_pool_overflow();
-        ctx.fail_revision_registry_full(pool, ConsumerId::Momentum);
+        ctx.fail_revision_registry_full(RejectedRevisionDemand::Momentum { mint, pool });
         let mut desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
         ctx.recompute_geyser_explicit_readiness(&desired);
         assert!(!ctx.geyser_explicit_readiness_ok());
@@ -18759,10 +18885,11 @@ mod pr_b_geyser_tracking_tests {
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
         let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
         ctx.geyser_explicit_ready.store(true, Ordering::Release);
         assert!(ctx.geyser_explicit_readiness_ok());
 
-        ctx.fail_revision_registry_full(pool, ConsumerId::Momentum);
+        ctx.fail_revision_registry_full(RejectedRevisionDemand::Momentum { mint, pool });
         assert!(!ctx.geyser_explicit_ready.load(Ordering::Acquire));
         assert!(ctx.geyser_explicit_blockers_active());
         assert!(!ctx.geyser_explicit_readiness_ok());
@@ -18842,12 +18969,16 @@ mod pr_b_geyser_tracking_tests {
         let mint_healthy = Pubkey::new_unique();
         let mint_rejected = Pubkey::new_unique();
 
-        ctx.fail_revision_registry_full(pool_rejected, ConsumerId::Momentum);
+        ctx.fail_revision_registry_full(RejectedRevisionDemand::Momentum {
+            mint: mint_rejected,
+            pool: pool_rejected,
+        });
         assert!(!ctx.geyser_explicit_readiness_ok());
-        assert!(ctx.test_revision_rejection_has_key(pool_rejected, ConsumerId::Momentum));
+        assert!(ctx.test_revision_rejection_has_momentum(mint_rejected, pool_rejected));
 
         ctx.hot_pool_registry.pin_pool(mint_healthy, pool_healthy);
-        let healthy_snapshot = mk_test_pool_snapshot(pool_healthy, ConsumerId::Momentum);
+        let healthy_snapshot =
+            mk_test_pool_snapshot(pool_healthy, ConsumerId::Momentum, Some(mint_healthy));
         assert!(enqueue_track_worker(
             &ctx,
             TrackWorkerCommand::RegisterPoolGeyserReserves {
@@ -18858,10 +18989,11 @@ mod pr_b_geyser_tracking_tests {
             !ctx.geyser_explicit_readiness_ok(),
             "healthy enqueue retry must not clear blocker while rejected key remains"
         );
-        assert!(ctx.test_revision_rejection_has_key(pool_rejected, ConsumerId::Momentum));
+        assert!(ctx.test_revision_rejection_has_momentum(mint_rejected, pool_rejected));
 
         ctx.hot_pool_registry.pin_pool(mint_rejected, pool_rejected);
-        let snapshot = mk_test_pool_snapshot(pool_rejected, ConsumerId::Momentum);
+        let snapshot =
+            mk_test_pool_snapshot(pool_rejected, ConsumerId::Momentum, Some(mint_rejected));
         assert!(enqueue_track_worker(
             &ctx,
             TrackWorkerCommand::RegisterPoolGeyserReserves { snapshot },
@@ -18888,7 +19020,7 @@ mod pr_b_geyser_tracking_tests {
             u64::MAX,
             u64::MAX - 1,
         );
-        ctx.fail_revision_registry_full(pool, ConsumerId::Momentum);
+        ctx.fail_revision_registry_full(RejectedRevisionDemand::Momentum { mint, pool });
         let desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
         assert!(!ctx.geyser_explicit_readiness_ok());
         assert!(ctx.ensure_pool_revision_key(pool, ConsumerId::Momentum, Some(&desired)));
@@ -18897,7 +19029,7 @@ mod pr_b_geyser_tracking_tests {
             !ctx.geyser_explicit_readiness_ok(),
             "u64 exhaustion must keep registry-full blocker latched"
         );
-        assert!(ctx.test_revision_rejection_has_key(pool, ConsumerId::Momentum));
+        assert!(ctx.test_revision_rejection_has_momentum(mint, pool));
     }
 
     #[test]
@@ -18995,7 +19127,8 @@ mod pr_b_geyser_tracking_tests {
             pool,
             ConsumerId::Tracker,
             |ctx, pool| {
-                ctx.hot_pool_registry.pin_arb_pool(pool);
+                let mint = Pubkey::new_unique();
+                ctx.hot_pool_registry.pin_pool(mint, pool);
             },
         );
     }
@@ -19009,14 +19142,14 @@ mod pr_b_geyser_tracking_tests {
         *ctx.track_worker.write() = None;
         let pool = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        ctx.fail_revision_registry_full(pool, ConsumerId::Momentum);
+        ctx.fail_revision_registry_full(RejectedRevisionDemand::Momentum { mint, pool });
         ctx.hot_pool_registry.pin_pool(mint, pool);
-        let snapshot = mk_test_pool_snapshot(pool, ConsumerId::Momentum);
+        let snapshot = mk_test_pool_snapshot(pool, ConsumerId::Momentum, Some(mint));
         assert!(!enqueue_track_worker(
             &ctx,
             TrackWorkerCommand::RegisterPoolGeyserReserves { snapshot },
         ));
-        assert!(!ctx.test_revision_rejection_has_key(pool, ConsumerId::Momentum));
+        assert!(!ctx.test_revision_rejection_has_momentum(mint, pool));
         assert!(ctx
             .pending_pool_commands
             .has_pending(pool, ConsumerId::Momentum));
@@ -19045,12 +19178,12 @@ mod pr_b_geyser_tracking_tests {
 
         assert!(!ctx.try_pin_momentum_with_revision(mint, pool, &desired));
         assert!(!ctx.hot_pool_registry.is_pinned(mint, pool));
-        assert!(ctx.test_revision_rejection_has_key(pool, ConsumerId::Momentum));
+        assert!(ctx.test_revision_rejection_has_momentum(mint, pool));
         assert!(!ctx.geyser_explicit_readiness_ok());
 
         ctx.reconcile_revision_registry_rejections(Some(&desired));
         assert!(
-            ctx.test_revision_rejection_has_key(pool, ConsumerId::Momentum),
+            ctx.test_revision_rejection_has_momentum(mint, pool),
             "reconcile must not treat absent hot/pending pin as resolved demand"
         );
         assert!(!ctx.geyser_explicit_readiness_ok());
@@ -19076,7 +19209,7 @@ mod pr_b_geyser_tracking_tests {
             InflightReserveResult::Reserved,
         );
         assert!(!ctx.try_pin_momentum_with_revision(mint, pool, &desired));
-        assert!(ctx.test_revision_rejection_has_key(pool, ConsumerId::Momentum));
+        assert!(ctx.test_revision_rejection_has_momentum(mint, pool));
 
         ctx.pool_snapshot_revisions
             .release_inflight_command(occupant_pool, ConsumerId::Momentum);
@@ -19090,7 +19223,7 @@ mod pr_b_geyser_tracking_tests {
         );
 
         ctx.retry_bounded_rejected_revision_demands(&mut desired);
-        assert!(!ctx.test_revision_rejection_has_key(pool, ConsumerId::Momentum));
+        assert!(!ctx.test_revision_rejection_has_momentum(mint, pool));
         assert!(ctx.hot_pool_registry.is_pinned(mint, pool));
         ctx.reconcile_revision_registry_rejections(Some(&desired));
         ctx.recompute_geyser_explicit_readiness(&desired);
@@ -19120,7 +19253,7 @@ mod pr_b_geyser_tracking_tests {
         assert!(!ctx.hot_pool_registry.is_pinned(mint, pool));
 
         ctx.clear_momentum_geyser_reserves_for_active_entry(&mut desired, mint, pool);
-        assert!(!ctx.test_revision_rejection_has_key(pool, ConsumerId::Momentum));
+        assert!(!ctx.test_revision_rejection_has_momentum(mint, pool));
         ctx.reconcile_revision_registry_rejections(Some(&desired));
         ctx.recompute_geyser_explicit_readiness(&desired);
         assert!(ctx.geyser_explicit_readiness_ok());
@@ -19152,12 +19285,16 @@ mod pr_b_geyser_tracking_tests {
         });
         std::thread::sleep(std::time::Duration::from_millis(5));
         let overflow_pool = Pubkey::new_unique();
-        ctx.fail_revision_registry_full(overflow_pool, ConsumerId::Momentum);
-        let (entries, overflow_entries, overflow_lost, gen_after_fail) =
+        let overflow_mint = Pubkey::new_unique();
+        ctx.fail_revision_registry_full(RejectedRevisionDemand::Momentum {
+            mint: overflow_mint,
+            pool: overflow_pool,
+        });
+        let (entries, overflow_entries, capacity_exceeded, gen_after_fail) =
             ctx.test_revision_rejection_unresolved();
-        assert!(ctx.test_revision_rejection_has_key(overflow_pool, ConsumerId::Momentum));
+        assert!(ctx.test_revision_rejection_has_momentum(overflow_mint, overflow_pool));
         assert!(
-            gen_after_fail > gen_before || entries > 0 || overflow_entries > 0 || overflow_lost > 0
+            gen_after_fail > gen_before || entries > 0 || overflow_entries > 0 || capacity_exceeded
         );
 
         ctx.revision_reconcile_test_barrier
@@ -19165,13 +19302,159 @@ mod pr_b_geyser_tracking_tests {
             .store(true, Ordering::Release);
         worker.join().expect("reconcile thread");
 
-        assert!(ctx.test_revision_rejection_has_key(overflow_pool, ConsumerId::Momentum));
+        assert!(ctx.test_revision_rejection_has_momentum(overflow_mint, overflow_pool));
         assert!(!ctx.geyser_explicit_readiness_ok());
         assert!(
             ctx.geyser_explicit_blockers.load(Ordering::Acquire)
                 & GESYER_BLOCK_REVISION_REGISTRY_FULL
                 != 0
         );
+    }
+
+    #[test]
+    fn rejected_two_momentum_mints_same_pool_isolated() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests_with_revision_caps(jsonl, 1, 8);
+        let pool = Pubkey::new_unique();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let mut desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
+
+        let occupant_pool = Pubkey::new_unique();
+        let occupant_mint = Pubkey::new_unique();
+        ctx.hot_pool_registry.pin_pool(occupant_mint, occupant_pool);
+        assert!(ctx.ensure_pool_revision_key_cold(occupant_pool, ConsumerId::Momentum));
+        assert_eq!(
+            ctx.pool_snapshot_revisions
+                .reserve_inflight_command(occupant_pool, ConsumerId::Momentum),
+            InflightReserveResult::Reserved,
+        );
+
+        assert!(!ctx.try_pin_momentum_with_revision(mint_a, pool, &desired));
+        assert!(!ctx.try_pin_momentum_with_revision(mint_b, pool, &desired));
+        assert!(ctx.test_revision_rejection_has_momentum(mint_a, pool));
+        assert!(ctx.test_revision_rejection_has_momentum(mint_b, pool));
+
+        ctx.pool_snapshot_revisions
+            .release_inflight_command(occupant_pool, ConsumerId::Momentum);
+        ctx.hot_pool_registry
+            .unpin_pool(occupant_mint, occupant_pool);
+        ctx.pool_snapshot_revisions.maybe_retire_key(
+            occupant_pool,
+            ConsumerId::Momentum,
+            false,
+            false,
+        );
+
+        ctx.retry_bounded_rejected_revision_demands(&mut desired);
+        assert!(ctx.hot_pool_registry.is_pinned(mint_a, pool));
+        assert!(ctx.hot_pool_registry.is_pinned(mint_b, pool));
+        assert!(!ctx.test_revision_rejection_has_momentum(mint_a, pool));
+        assert!(!ctx.test_revision_rejection_has_momentum(mint_b, pool));
+
+        ctx.record_rejected_revision_demand(RejectedRevisionDemand::Momentum {
+            mint: mint_a,
+            pool,
+        });
+        ctx.record_rejected_revision_demand(RejectedRevisionDemand::Momentum {
+            mint: mint_b,
+            pool,
+        });
+        assert!(ctx.test_revision_rejection_has_momentum(mint_a, pool));
+        assert!(ctx.test_revision_rejection_has_momentum(mint_b, pool));
+
+        ctx.clear_momentum_geyser_reserves_for_active_entry(&mut desired, mint_a, pool);
+        assert!(!ctx.test_revision_rejection_has_momentum(mint_a, pool));
+        assert!(ctx.test_revision_rejection_has_momentum(mint_b, pool));
+        assert!(ctx.hot_pool_registry.is_pinned(mint_b, pool));
+
+        let snapshot_a = mk_test_pool_snapshot(pool, ConsumerId::Momentum, Some(mint_a));
+        ctx.record_rejected_revision_demand(RejectedRevisionDemand::Momentum {
+            mint: mint_a,
+            pool,
+        });
+        assert!(enqueue_track_worker(
+            &ctx,
+            TrackWorkerCommand::RegisterPoolGeyserReserves {
+                snapshot: snapshot_a,
+            },
+        ));
+        assert!(!ctx.test_revision_rejection_has_momentum(mint_a, pool));
+        assert!(ctx.test_revision_rejection_has_momentum(mint_b, pool));
+    }
+
+    #[test]
+    fn repeated_same_key_rejection_dedupes_and_eventually_clears() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests_with_revision_caps(jsonl, 8, 2);
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let demand = RejectedRevisionDemand::Momentum { mint, pool };
+
+        ctx.record_rejected_revision_demand(demand.clone());
+        ctx.record_rejected_revision_demand(demand.clone());
+        let (entries, overflow_entries, _, _) = ctx.test_revision_rejection_unresolved();
+        assert_eq!(
+            entries + overflow_entries,
+            1,
+            "repeated rejection of same demand must not consume extra bounded slots"
+        );
+
+        let mut desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+        ctx.retry_bounded_rejected_revision_demands(&mut desired);
+        assert!(!ctx.test_revision_rejection_has_momentum(mint, pool));
+        ctx.reconcile_revision_registry_rejections(Some(&desired));
+        ctx.recompute_geyser_explicit_readiness(&desired);
+        assert!(ctx.geyser_explicit_readiness_ok());
+    }
+
+    #[test]
+    fn tracker_retry_no_arb_pin_change_and_clears_orphan_demand() {
+        use std::collections::HashSet;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        let owner = OwnerKey::Pool(pool);
+        let snapshot = mk_test_pool_snapshot(pool, ConsumerId::Tracker, None);
+        let demand = RejectedRevisionDemand::Tracker {
+            snapshot: snapshot.clone(),
+        };
+        let mut desired = DesiredExplicitSet::new(ctx.config.read().max_tracked_accounts);
+        let hub = Pubkey::new_unique();
+        assert!(matches!(
+            desired.try_admit_group(ConsumerId::Tracker, owner, HashSet::from([hub])),
+            AdmissionResult::Admitted { .. } | AdmissionResult::OwnerAddedNoNewPubkey
+        ));
+
+        let arb_before = ctx.hot_pool_registry.arb_pool_count();
+        ctx.fail_revision_registry_full(demand.clone());
+        assert!(ctx.test_revision_rejection_has_demand(&demand));
+
+        ctx.retry_bounded_rejected_revision_demands(&mut desired);
+        assert_eq!(
+            ctx.hot_pool_registry.arb_pool_count(),
+            arb_before,
+            "tracker retry must not create arb ownership"
+        );
+        assert!(!ctx.test_revision_rejection_has_demand(&demand));
+
+        let orphan_snapshot = mk_test_pool_snapshot(pool, ConsumerId::Tracker, None);
+        let orphan_demand = RejectedRevisionDemand::Tracker {
+            snapshot: orphan_snapshot,
+        };
+        ctx.fail_revision_registry_full(orphan_demand.clone());
+        desired.remove_group(ConsumerId::Tracker, owner);
+        ctx.retry_bounded_rejected_revision_demands(&mut desired);
+        assert!(!ctx.test_revision_rejection_has_demand(&orphan_demand));
+        assert_eq!(ctx.hot_pool_registry.arb_pool_count(), arb_before);
     }
 
     #[test]
