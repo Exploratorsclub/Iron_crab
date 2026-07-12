@@ -19,7 +19,9 @@ pub use desired_set::{
 pub use enrichment::{
     is_enrichment_member_from_inputs, pool_is_enrichment_member, EnrichmentMembershipInputs,
 };
-pub use explicit_admission::{FixedCapAdmission, FixedCapAdmissionResult, FixedCapRemoveResult};
+pub use explicit_admission::{
+    FixedCapAdmission, FixedCapAdmissionResult, FixedCapRemoveOutcome, FixedCapRemoveResult,
+};
 pub use explicit_ownership::{
     EmptyOwnerGroupError, ExplicitConsumer, ExplicitOwner, ExplicitOwnerKey, ExplicitOwnership,
     GroupChange, OwnerGroupSnapshot,
