@@ -5916,7 +5916,7 @@ mod tests {
         }
     }
 
-    use super::super::eviction_planner::{select_cap_shrink_victims, CapShrinkSelectionResult};
+    use super::super::eviction_planner::select_cap_shrink_victims;
 
     fn assert_cap_shrink_converged(result: CapShrinkResult) -> (Vec<Pubkey>, Vec<ExplicitOwner>) {
         match result {
