@@ -277,7 +277,7 @@ impl FixedCapAdmission {
             Ok(plan) => plan,
             Err(_) => return TouchResult::InternalInvariantViolation,
         };
-        self.apply_stamp_plan(&stamp_plan);
+        self.apply_stamp_plan(stamp_plan);
         TouchResult::Touched
     }
 
@@ -444,7 +444,7 @@ impl FixedCapAdmission {
         }
 
         self.physical_len = plan.projected_final_len;
-        self.apply_stamp_plan(&stamp_plan);
+        self.apply_stamp_plan(stamp_plan);
         if plan.physical_added.is_empty() {
             FixedCapAdmissionResult::OwnerAddedNoNewPubkey
         } else {
@@ -470,6 +470,16 @@ impl FixedCapAdmission {
         let Some(old_group) = self.ownership.owner_group(&existing_owner) else {
             return FixedCapReplaceResult::RejectedMissingOwner;
         };
+        let pre_touch_stamp = match required_existing_stamp(&self.owner_lru, &existing_owner) {
+            Ok(stamp) => stamp,
+            Err(StampPlanError::MissingOwnerStamp) => {
+                self.fail_closed_remove_owner_stamp_mismatch(&existing_owner);
+                return FixedCapReplaceResult::InternalInvariantViolation {
+                    recovery: InvariantViolationRecovery::OwnerRemovedFailClosed,
+                };
+            }
+            Err(_) => return FixedCapReplaceResult::PlanningInvariantViolation,
+        };
         let old_normalized = old_group.to_vec();
         if old_normalized == normalized {
             return FixedCapReplaceResult::Unchanged;
@@ -491,17 +501,6 @@ impl FixedCapAdmission {
                 return FixedCapReplaceResult::PlanningInvariantViolation;
             }
             ReplacePlanOutcome::Ready(plan) => plan,
-        };
-
-        let pre_touch_stamp = match required_existing_stamp(&self.owner_lru, &existing_owner) {
-            Ok(stamp) => stamp,
-            Err(StampPlanError::MissingOwnerStamp) => {
-                self.fail_closed_remove_owner_stamp_mismatch(&existing_owner);
-                return FixedCapReplaceResult::InternalInvariantViolation {
-                    recovery: InvariantViolationRecovery::OwnerRemovedFailClosed,
-                };
-            }
-            Err(_) => return FixedCapReplaceResult::PlanningInvariantViolation,
         };
 
         let stamp_plan = match plan_stamp_assign(
@@ -548,7 +547,7 @@ impl FixedCapAdmission {
         }
 
         self.physical_len = plan.projected_final_len;
-        self.apply_stamp_plan(&stamp_plan);
+        self.apply_stamp_plan(stamp_plan);
         FixedCapReplaceResult::Replaced {
             physical_added: plan.physical_added,
             physical_removed: plan.physical_removed,
@@ -568,7 +567,9 @@ impl FixedCapAdmission {
             Ok(stamp) => stamp,
             Err(StampPlanError::MissingOwnerStamp) => {
                 self.fail_closed_remove_owner_stamp_mismatch(&owner);
-                return FixedCapRemoveResult::PlanningInvariantViolation;
+                return FixedCapRemoveResult::InternalInvariantViolation {
+                    recovery: FixedCapRemoveRecovery::OwnerRemovedFailClosed,
+                };
             }
             Err(_) => return FixedCapRemoveResult::PlanningInvariantViolation,
         };
@@ -608,7 +609,7 @@ impl FixedCapAdmission {
         }
 
         self.physical_len = plan.projected_final_len;
-        self.apply_stamp_plan(&stamp_plan);
+        self.apply_stamp_plan(stamp_plan);
         FixedCapRemoveResult::Removed {
             physical_removed: plan.physical_removed,
         }
@@ -970,8 +971,8 @@ impl FixedCapAdmission {
         self.reconcile_cold();
     }
 
-    fn apply_stamp_plan(&mut self, plan: &StampPlan) {
-        self.owner_lru = plan.owner_lru.clone();
+    fn apply_stamp_plan(&mut self, plan: StampPlan) {
+        self.owner_lru = plan.owner_lru;
         self.next_touch_stamp = plan.next_touch_stamp;
     }
 
@@ -2630,12 +2631,11 @@ mod tests {
             .expect("LRU snapshot must build eviction planning snapshot");
     }
 
-    /// Independent LRU stamp model — separate monotonic/event logic from production.
+    /// Independent LRU stamp model — separate monotonic logic from production.
     #[derive(Debug, Clone)]
     struct RefLruModel {
         stamps: BTreeMap<ExplicitOwner, u64>,
         next_stamp: u64,
-        events: Vec<(ExplicitOwner, u64)>,
     }
 
     impl RefLruModel {
@@ -2643,7 +2643,6 @@ mod tests {
             Self {
                 stamps: BTreeMap::new(),
                 next_stamp: 1,
-                events: Vec::new(),
             }
         }
 
@@ -2661,7 +2660,6 @@ mod tests {
 
         fn on_successful_remove(&mut self, owner: &ExplicitOwner) {
             self.stamps.remove(owner);
-            self.events.retain(|(o, _)| o != owner);
         }
 
         fn on_touch(&mut self, owner: &ExplicitOwner) {
@@ -2670,23 +2668,21 @@ mod tests {
 
         fn restore_stamp(&mut self, owner: &ExplicitOwner, stamp: u64) {
             self.stamps.insert(owner.clone(), stamp);
-            self.events.retain(|(o, _)| o != owner);
-            self.events.push((owner.clone(), stamp));
+            self.next_stamp = self.next_stamp.max(stamp.saturating_add(1));
         }
 
         fn assign_stamp(&mut self, owner: &ExplicitOwner) {
             if self.next_stamp == u64::MAX {
-                self.compact_from_event_order();
+                self.compact_from_stamp_order();
             }
             let stamp = self.next_stamp;
             self.next_stamp = self.next_stamp.saturating_add(1);
             self.stamps.insert(owner.clone(), stamp);
-            self.events.push((owner.clone(), stamp));
         }
 
-        fn compact_from_event_order(&mut self) {
+        fn compact_from_stamp_order(&mut self) {
             let mut ordered: Vec<(ExplicitOwner, u64)> = self
-                .events
+                .stamps
                 .iter()
                 .map(|(owner, stamp)| (owner.clone(), *stamp))
                 .collect();
@@ -2694,24 +2690,36 @@ mod tests {
                 stamp_a.cmp(stamp_b).then_with(|| owner_a.cmp(owner_b))
             });
             self.stamps.clear();
-            self.events.clear();
             for (idx, (owner, _)) in ordered.into_iter().enumerate() {
                 if let Ok(rank) = u64::try_from(idx) {
                     if let Some(stamp) = rank.checked_add(1) {
-                        self.stamps.insert(owner.clone(), stamp);
-                        self.events.push((owner, stamp));
+                        self.stamps.insert(owner, stamp);
                     }
                 }
             }
-            if let Ok(len) = u64::try_from(self.stamps.len()) {
-                if let Some(next) = len.checked_add(1) {
-                    self.next_stamp = next;
-                }
-            }
+            self.next_stamp = self
+                .stamps
+                .values()
+                .copied()
+                .max()
+                .and_then(|max| max.checked_add(1))
+                .unwrap_or(1);
         }
 
         fn snapshot(&self) -> BTreeMap<ExplicitOwner, u64> {
             self.stamps.clone()
+        }
+
+        fn ordered_owner_stamps(&self) -> Vec<(u64, ExplicitOwner)> {
+            let mut ordered: Vec<(u64, ExplicitOwner)> = self
+                .stamps
+                .iter()
+                .map(|(owner, stamp)| (*stamp, owner.clone()))
+                .collect();
+            ordered.sort_by(|(stamp_a, owner_a), (stamp_b, owner_b)| {
+                stamp_a.cmp(stamp_b).then_with(|| owner_a.cmp(owner_b))
+            });
+            ordered
         }
     }
 
@@ -2919,6 +2927,43 @@ mod tests {
     }
 
     #[test]
+    fn lru_replace_missing_stamp_before_unchanged_fail_closed() {
+        let mut admission = FixedCapAdmission::new(4);
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1), pk(2)]));
+        let stamp_before = admission.test_next_touch_stamp();
+        admission.owner_lru.remove(&owner);
+
+        assert_eq!(
+            admission.try_replace_group(owner.clone(), [pk(1), pk(2)]),
+            FixedCapReplaceResult::InternalInvariantViolation {
+                recovery: InvariantViolationRecovery::OwnerRemovedFailClosed,
+            }
+        );
+        assert!(admission.owner_group(&owner).is_none());
+        assert_eq!(admission.test_next_touch_stamp(), stamp_before);
+    }
+
+    #[test]
+    fn lru_replace_unchanged_with_valid_stamp_consumes_no_stamp() {
+        let mut admission = FixedCapAdmission::new(4);
+        let mut model = RefLruModel::new();
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1), pk(2)]));
+        model.on_successful_insert(&owner);
+        let stamp = admission.last_touch(&owner).unwrap();
+        let counter = admission.test_next_touch_stamp();
+
+        assert_eq!(
+            admission.try_replace_group(owner.clone(), [pk(2), pk(1)]),
+            FixedCapReplaceResult::Unchanged
+        );
+        assert_eq!(admission.last_touch(&owner).unwrap(), stamp);
+        assert_eq!(admission.test_next_touch_stamp(), counter);
+        assert_lru_matches_model(&admission, &model);
+    }
+
+    #[test]
     fn lru_missing_stamp_fail_closed_before_replace_remove_touch() {
         let mut admission = FixedCapAdmission::new(4);
         let owner = pool_owner(ExplicitConsumer::Momentum, 1);
@@ -2939,9 +2984,14 @@ mod tests {
         admission.owner_lru.remove(&owner);
         assert_eq!(
             admission.remove_group(owner.clone()),
-            FixedCapRemoveResult::PlanningInvariantViolation
+            FixedCapRemoveResult::InternalInvariantViolation {
+                recovery: FixedCapRemoveRecovery::OwnerRemovedFailClosed,
+            }
         );
         assert!(admission.owner_group(&owner).is_none());
+        assert!(admission.last_touch(&owner).is_none());
+        assert_eq!(admission.len(), 0);
+        assert!(admission.snapshot_lru_entries().is_empty());
         assert_lru_matches_ownership(&admission);
 
         assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1)]));
@@ -3162,6 +3212,7 @@ mod tests {
     #[test]
     fn lru_near_max_renormalization_preserves_stamp_owner_order() {
         let mut admission = FixedCapAdmission::new(16);
+        let mut model = RefLruModel::new();
         let owners: Vec<ExplicitOwner> = (0u8..4)
             .map(|seed| pool_owner(ExplicitConsumer::Momentum, seed))
             .collect();
@@ -3169,46 +3220,42 @@ mod tests {
             assert_admitted(
                 admission.try_admit_new_group(owner.clone(), [pk(owner_key_hash_seed(owner))]),
             );
+            model.on_successful_insert(owner);
         }
         admission.set_test_next_touch_stamp(u64::MAX - 1);
         admission.set_test_owner_stamp(owners[0].clone(), u64::MAX - 2);
         admission.set_test_owner_stamp(owners[1].clone(), u64::MAX - 2);
         admission.set_test_owner_stamp(owners[2].clone(), u64::MAX - 1);
         admission.set_test_owner_stamp(owners[3].clone(), u64::MAX - 1);
+        model.stamps = admission.test_owner_stamps();
+        model.next_stamp = admission.test_next_touch_stamp();
 
-        let mut before_sorted: Vec<(u64, ExplicitOwner)> = admission
-            .test_owner_stamps()
-            .into_iter()
-            .map(|(owner, stamp)| (stamp, owner))
-            .collect();
-        before_sorted.sort_by(|(stamp_a, owner_a), (stamp_b, owner_b)| {
-            stamp_a.cmp(stamp_b).then_with(|| owner_a.cmp(owner_b))
-        });
+        let before_sorted = model.ordered_owner_stamps();
 
         admission.test_renormalize_lru_stamps();
+        model.compact_from_stamp_order();
 
-        let mut after_sorted: Vec<(u64, ExplicitOwner)> = admission
-            .test_owner_stamps()
-            .into_iter()
-            .map(|(owner, stamp)| (stamp, owner))
-            .collect();
-        after_sorted.sort_by(|(stamp_a, owner_a), (stamp_b, owner_b)| {
-            stamp_a.cmp(stamp_b).then_with(|| owner_a.cmp(owner_b))
-        });
-
-        let before_owners: Vec<ExplicitOwner> = before_sorted.into_iter().map(|(_, o)| o).collect();
-        let after_owners: Vec<ExplicitOwner> = after_sorted.into_iter().map(|(_, o)| o).collect();
+        let after_sorted = model.ordered_owner_stamps();
+        let before_owners: Vec<ExplicitOwner> =
+            before_sorted.into_iter().map(|(_, owner)| owner).collect();
+        let after_owners: Vec<ExplicitOwner> =
+            after_sorted.into_iter().map(|(_, owner)| owner).collect();
         assert_eq!(before_owners, after_owners);
-        let mut compact_stamps: Vec<u64> =
-            admission.test_owner_stamps().values().copied().collect();
-        compact_stamps.sort();
-        assert_eq!(compact_stamps, vec![1, 2, 3, 4]);
-        admission.set_test_next_touch_stamp(5);
+        assert_lru_matches_model(&admission, &model);
+
         assert_eq!(
             admission.touch_group(owners[0].clone()),
             TouchResult::Touched
         );
-        assert_eq!(admission.last_touch(&owners[0]).unwrap(), 5);
+        model.on_touch(&owners[0]);
+        assert_lru_matches_model(&admission, &model);
+
+        assert_eq!(
+            admission.touch_group(owners[2].clone()),
+            TouchResult::Touched
+        );
+        model.on_touch(&owners[2]);
+        assert_lru_matches_model(&admission, &model);
     }
 
     #[test]
