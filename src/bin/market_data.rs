@@ -4704,6 +4704,21 @@ impl MarketDataContext {
                         );
                     }
                 }
+            } else if self.live_pool_cache.get(&pool_pk).is_none() {
+                inc_market_data_arb_pin_geyser_register_deferred_total("live_pool_cache_miss");
+                let now = Instant::now();
+                if ARB_PIN_DEFERRED_LOG_THROTTLE
+                    .lock()
+                    .should_emit(ArbPinDeferredLogCategory::LivePoolCacheMiss as usize, now)
+                {
+                    warn!(
+                        run_id = %self.run_id,
+                        pool = %pool_pk,
+                        pin = "ArbMultiDex",
+                        reason = "live_pool_cache_miss",
+                        "Arb pin: Geyser reserve registration deferred (geyser-only, no RPC)"
+                    );
+                }
             } else {
                 inc_market_data_arb_admission_rejected_total();
             }
