@@ -6774,7 +6774,8 @@ async fn main() -> Result<()> {
 
     if args.simulate {
         info!("Simulation mode: emitting fake slot events");
-        run_simulation_loop(ctx.clone(), &run_id, config_subscription).await?;
+        let track_worker = run_simulation_loop(ctx.clone(), &run_id, config_subscription).await?;
+        flush_explicit_set_snapshot(&track_worker);
     } else {
         info!(geyser_url = %args.geyser_url, "Starting Geyser integration");
         let wallet_tx_confirm_commitment = file_config
@@ -6783,7 +6784,7 @@ async fn main() -> Result<()> {
             .and_then(|e| e.confirm_commitment.clone())
             .unwrap_or_else(|| "confirmed".to_string());
 
-        run_geyser_loop(
+        let track_worker = run_geyser_loop(
             ctx.clone(),
             &run_id,
             &args.geyser_url,
@@ -6796,10 +6797,10 @@ async fn main() -> Result<()> {
             wallet_tx_confirm_commitment,
         )
         .await?;
+        flush_explicit_set_snapshot(&track_worker);
     }
 
-    // Flush explicit-set snapshot + JSONL on shutdown
-    flush_explicit_set_snapshot(ctx.as_ref());
+    // Flush JSONL on shutdown
     ctx.jsonl_writer.flush()?;
     info!(run_id = %run_id, "market-data shutdown complete");
 
@@ -7425,7 +7426,7 @@ async fn run_geyser_loop(
     tracked_wallet_rx: watch::Receiver<Vec<Pubkey>>,
     wallet_snapshot_only: bool,
     wallet_tx_confirm_commitment: String,
-) -> Result<()> {
+) -> Result<TrackWorkerSender> {
     // Initialize RPC client for fallback/metadata (prefer local RPC, fallback to Helius)
     let rpc_url =
         std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string()); // Local validator/private RPC preferred
@@ -7442,7 +7443,7 @@ async fn run_geyser_loop(
     let pump_amm_dex = Arc::new(pump_inner);
     *ctx.pump_amm_dex.write() = Some(Arc::clone(&pump_amm_dex));
 
-    // Phase-R-R2: single-writer `md-state` OS thread (before wallet snapshot — wallet path enqueues).
+    // Phase-R-R2: single-writer `md-track-worker` OS thread (before wallet snapshot — wallet path enqueues).
     let track_worker = spawn_track_worker(Arc::clone(&ctx));
     // Phase 3 P3 (I-MD-6): restore explicit Geyser set before first Geyser connect.
     MarketDataContext::restore_explicit_set_from_snapshot_on_startup(ctx.as_ref(), &track_worker);
@@ -7507,7 +7508,7 @@ async fn run_geyser_loop(
 
     if wallet_snapshot_only {
         info!("Wallet snapshot only mode enabled, exiting after snapshot");
-        return Ok(());
+        return Ok(track_worker);
     }
 
     let wallet_snapshot_periodic_secs = std::env::var("IRONCRAB_WALLET_SNAPSHOT_PERIODIC_SECS")
@@ -8718,7 +8719,7 @@ async fn run_geyser_loop(
 
             _ = &mut shutdown => {
                 info!("Shutdown signal received");
-                flush_explicit_set_snapshot(ctx.as_ref());
+                flush_explicit_set_snapshot(&track_worker);
                 tx_listener_handle.abort();
                 account_listener_handle.abort();
                 break;
@@ -8726,7 +8727,7 @@ async fn run_geyser_loop(
         }
     }
 
-    Ok(())
+    Ok(track_worker)
 }
 
 /// Run simulation loop (for testing without Geyser)
@@ -8734,7 +8735,7 @@ async fn run_simulation_loop(
     ctx: Arc<MarketDataContext>,
     run_id: &str,
     mut config_subscription: Option<ironcrab::nats::NatsSubscription>,
-) -> Result<()> {
+) -> Result<TrackWorkerSender> {
     // RPC client for EnsurePumpAmmPoolAccounts (Cold Path Discovery, same handler as Normalmodus)
     let rpc_url =
         std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string());
@@ -9192,7 +9193,7 @@ async fn run_simulation_loop(
         }
     }
 
-    Ok(())
+    Ok(track_worker)
 }
 
 // ============================================================================

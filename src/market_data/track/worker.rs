@@ -2,7 +2,7 @@
 
 use super::admission_wiring::{AdmissionConvergeResult, AdmissionRestoreResult};
 use super::explicit_admission::{CapShrinkResult, FixedCapAdmission};
-use super::geyser_sync::{converge_admission_from_ctx, track_worker_execute_coalesced_push};
+use super::geyser_sync::track_worker_execute_coalesced_push;
 use super::pending::{BoundedProtocolStore, StageResult};
 use super::snapshot::{
     explicit_set_snapshot_path, write_explicit_set_snapshot, ExplicitSetSnapshot,
@@ -258,6 +258,11 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
             false
         }
         TrackWorkerCommand::ContinueGeyserEvict => false,
+        TrackWorkerCommand::FlushExplicitSetSnapshot { done } => {
+            try_write_explicit_set_snapshot_from_ctx(ctx.as_ref(), admission);
+            let _ = done.send(());
+            false
+        }
     }
 }
 
@@ -453,20 +458,22 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
             pending_release_flush_slot = false;
             restore_barrier_pending = false;
             coalesce_deadline = None;
-            if !track_worker_execute_coalesced_push(
+            let push_ok = track_worker_execute_coalesced_push(
                 &ctx,
                 &mut admission,
                 before,
                 continue_evict,
                 release_flush_slot,
                 barrier_pending,
-            ) {
+            );
+            if !push_ok {
                 track_worker_try_enqueue(&track_worker, TrackWorkerCommand::ContinueGeyserEvict);
             }
             inc_market_data_track_request_coalesce_batches_total();
             ctx.refresh_hot_pool_registry_gauges();
-            if last_snapshot_write.elapsed()
-                >= Duration::from_secs(MARKET_DATA_EXPLICIT_SET_SNAPSHOT_INTERVAL_SECS)
+            if push_ok
+                && last_snapshot_write.elapsed()
+                    >= Duration::from_secs(MARKET_DATA_EXPLICIT_SET_SNAPSHOT_INTERVAL_SECS)
             {
                 last_snapshot_write = Instant::now();
                 try_write_explicit_set_snapshot_from_ctx(ctx.as_ref(), &admission);
@@ -494,11 +501,34 @@ fn try_write_explicit_set_snapshot_from_ctx<C: TrackWorkerContext>(
     }
 }
 
+fn track_worker_enqueue_blocking(sender: &TrackWorkerSender, job: TrackWorkerCommand) -> bool {
+    let immutable = {
+        let mut store = sender.protocol.lock().expect("track protocol store lock");
+        store.wrap_command(job)
+    };
+    match sender.tx.send(immutable) {
+        Ok(()) => {
+            let depth = sender.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+            set_market_data_track_worker_queue_depth(depth);
+            let mut store = sender.protocol.lock().expect("track protocol store lock");
+            store.begin_inflight();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Best-effort explicit-set snapshot flush (shutdown / external caller).
-pub fn flush_explicit_set_snapshot<C: TrackWorkerContext>(ctx: &C) {
-    let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
-    let _ = converge_admission_from_ctx(ctx, &mut admission);
-    try_write_explicit_set_snapshot_from_ctx(ctx, &admission);
+pub fn flush_explicit_set_snapshot(track_worker: &TrackWorkerSender) {
+    let (done_tx, done_rx) = std_mpsc::channel();
+    let job = TrackWorkerCommand::FlushExplicitSetSnapshot { done: done_tx };
+    if !track_worker_enqueue_blocking(track_worker, job) {
+        tracing::warn!("explicit-set snapshot flush enqueue failed (worker disconnected)");
+        return;
+    }
+    if done_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+        tracing::warn!("explicit-set snapshot flush timed out waiting for worker");
+    }
 }
 
 fn new_track_worker_sender(
