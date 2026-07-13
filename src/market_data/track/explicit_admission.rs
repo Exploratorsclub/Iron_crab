@@ -140,7 +140,18 @@ pub enum FixedCapReplaceResult {
     },
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EvictingStatsDelta {
+    owner_group_lookups: u64,
+    refcount_lookups: u64,
+    candidate_builds: u64,
+    candidate_group_edges: u64,
+}
+
 /// Test-only counters for instrumented planning lookups.
+///
+/// `eviction_candidate_builds` / `eviction_candidate_group_edges` count read-only
+/// candidate-graph rebuild work on the eviction commit path (one build per success).
 #[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanningStats {
@@ -158,6 +169,21 @@ impl PlanningStats {
 
     fn record_owner_group_lookup(&mut self) {
         self.owner_group_lookups += 1;
+    }
+
+    fn after_eviction_delta(&self, delta: EvictingStatsDelta) -> Option<Self> {
+        Some(Self {
+            owner_group_lookups: self
+                .owner_group_lookups
+                .checked_add(delta.owner_group_lookups)?,
+            refcount_lookups: self.refcount_lookups.checked_add(delta.refcount_lookups)?,
+            eviction_candidate_builds: self
+                .eviction_candidate_builds
+                .checked_add(delta.candidate_builds)?,
+            eviction_candidate_group_edges: self
+                .eviction_candidate_group_edges
+                .checked_add(delta.candidate_group_edges)?,
+        })
     }
 }
 
@@ -207,14 +233,6 @@ struct EvictingCandidateState {
     owner_lru: BTreeMap<ExplicitOwner, u64>,
     next_touch_stamp: u64,
     physical_len: usize,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct EvictingStatsDelta {
-    owner_group_lookups: u64,
-    refcount_lookups: u64,
-    candidate_builds: u64,
-    candidate_group_edges: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,14 +501,6 @@ impl FixedCapAdmission {
         self.test_force_evicting_corrupt_next_touch_stamp = enabled;
     }
 
-    #[cfg(test)]
-    fn apply_evicting_stats_delta(&mut self, delta: EvictingStatsDelta) {
-        self.planning_stats.owner_group_lookups += delta.owner_group_lookups;
-        self.planning_stats.refcount_lookups += delta.refcount_lookups;
-        self.planning_stats.eviction_candidate_builds += delta.candidate_builds;
-        self.planning_stats.eviction_candidate_group_edges += delta.candidate_group_edges;
-    }
-
     /// Plan eviction victims for a hypothetical new-owner admit using only internal state.
     ///
     /// Read-only: builds [`EvictionPlanningSnapshot`] from [`Self::ownership`] and
@@ -684,6 +694,14 @@ impl FixedCapAdmission {
             return EvictingAdmissionResult::InternalInvariantViolation;
         }
 
+        #[cfg(test)]
+        let post_stats = match self.planning_stats.after_eviction_delta(stats_delta) {
+            Some(stats) => stats,
+            None => return EvictingAdmissionResult::InternalInvariantViolation,
+        };
+        #[cfg(not(test))]
+        let _stats_delta = stats_delta;
+
         let result = EvictingAdmissionResult::InsertedWithEviction {
             physical_added,
             physical_removed: plan.physical_freed,
@@ -696,9 +714,9 @@ impl FixedCapAdmission {
         self.next_touch_stamp = candidate.next_touch_stamp;
         self.physical_len = candidate.physical_len;
         #[cfg(test)]
-        self.apply_evicting_stats_delta(stats_delta);
-        #[cfg(not(test))]
-        let _ = stats_delta;
+        {
+            self.planning_stats = post_stats;
+        }
 
         result
     }
@@ -708,7 +726,10 @@ impl FixedCapAdmission {
         owner: ExplicitOwner,
         normalized: Vec<Pubkey>,
     ) -> EvictingAdmissionResult {
-        match self.try_admit_new_group(owner, normalized) {
+        #[cfg(test)]
+        let stats_before = self.planning_stats.clone();
+
+        let mapped = match self.try_admit_new_group(owner, normalized) {
             FixedCapAdmissionResult::Inserted { physical_added } => {
                 EvictingAdmissionResult::InsertedNoEviction { physical_added }
             }
@@ -727,7 +748,14 @@ impl FixedCapAdmission {
             | FixedCapAdmissionResult::InternalInvariantViolation => {
                 EvictingAdmissionResult::InternalInvariantViolation
             }
+        };
+
+        #[cfg(test)]
+        if !matches!(mapped, EvictingAdmissionResult::InsertedNoEviction { .. }) {
+            self.planning_stats = stats_before;
         }
+
+        mapped
     }
 
     fn build_evicting_candidate(
@@ -824,7 +852,7 @@ impl FixedCapAdmission {
             owner_group_lookups: 0,
             refcount_lookups: 0,
             candidate_builds: 1,
-            candidate_group_edges: u64::try_from(group_edges).unwrap_or(u64::MAX),
+            candidate_group_edges: u64::try_from(group_edges).map_err(|_| ())?,
         };
 
         Ok((
@@ -5108,6 +5136,34 @@ mod tests {
         assert_eq!(admission.len(), 2);
         assert_eq!(admission.owner_group(&incoming), Some([pk(2)].as_slice()));
         assert_lru_matches_ownership(&admission);
+    }
+
+    #[test]
+    fn evicting_admit_fast_path_stamp_plan_failure_is_full_no_op() {
+        let mut admission = FixedCapAdmission::new(5);
+        let owner = pool_owner(ExplicitConsumer::Tracker, 1);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1)]));
+
+        admission.set_test_force_stamp_plan_failure(true);
+        let before = snapshot_admission_plan_state(&admission);
+        let result = admission
+            .try_admit_with_eviction(pool_owner(ExplicitConsumer::Tracker, 9), vec![pk(2)]);
+        assert_eq!(result, EvictingAdmissionResult::InternalInvariantViolation);
+        assert_admission_plan_state_unchanged(&admission, &before);
+    }
+
+    #[test]
+    fn evicting_admit_fast_path_commit_plan_mismatch_is_full_no_op() {
+        let mut admission = FixedCapAdmission::new(5);
+        let owner = pool_owner(ExplicitConsumer::Tracker, 1);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1)]));
+
+        admission.set_test_force_commit_plan_mismatch(true);
+        let before = snapshot_admission_plan_state(&admission);
+        let result = admission
+            .try_admit_with_eviction(pool_owner(ExplicitConsumer::Tracker, 9), vec![pk(2)]);
+        assert_eq!(result, EvictingAdmissionResult::InternalInvariantViolation);
+        assert_admission_plan_state_unchanged(&admission, &before);
     }
 
     #[test]
