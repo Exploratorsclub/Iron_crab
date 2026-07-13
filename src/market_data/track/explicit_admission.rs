@@ -142,6 +142,21 @@ pub struct FixedCapAdmission {
     test_force_remove_planning_underflow: bool,
     #[cfg(test)]
     test_force_remove_planning_zero_refcount: bool,
+    #[cfg(test)]
+    test_force_stamp_plan_failure: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StampPlan {
+    owner_lru: BTreeMap<ExplicitOwner, u64>,
+    next_touch_stamp: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StampPlanError {
+    Overflow,
+    MissingOwnerStamp,
+    ForcedFailure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +226,8 @@ impl FixedCapAdmission {
             test_force_remove_planning_underflow: false,
             #[cfg(test)]
             test_force_remove_planning_zero_refcount: false,
+            #[cfg(test)]
+            test_force_stamp_plan_failure: false,
         }
     }
 
@@ -247,10 +264,20 @@ impl FixedCapAdmission {
         if self.ownership.owner_group(&owner).is_none() {
             return TouchResult::NotFound;
         }
-        if !self.owner_lru.contains_key(&owner) {
+        let Some(_pre_stamp) = self.owner_lru.get(&owner).copied() else {
+            self.fail_closed_remove_owner_stamp_mismatch(&owner);
             return TouchResult::InternalInvariantViolation;
-        }
-        self.stamp_owner(&owner);
+        };
+        let stamp_plan = match plan_stamp_assign(
+            &self.owner_lru,
+            self.next_touch_stamp,
+            &owner,
+            self.stamp_plan_force_failure(),
+        ) {
+            Ok(plan) => plan,
+            Err(_) => return TouchResult::InternalInvariantViolation,
+        };
+        self.apply_stamp_plan(&stamp_plan);
         TouchResult::Touched
     }
 
@@ -296,6 +323,11 @@ impl FixedCapAdmission {
     }
 
     #[cfg(test)]
+    pub fn set_test_force_stamp_plan_failure(&mut self, enabled: bool) {
+        self.test_force_stamp_plan_failure = enabled;
+    }
+
+    #[cfg(test)]
     pub fn set_test_next_touch_stamp(&mut self, stamp: u64) {
         self.next_touch_stamp = stamp;
     }
@@ -324,8 +356,21 @@ impl FixedCapAdmission {
     }
 
     #[cfg(test)]
+    pub fn test_next_touch_stamp(&self) -> u64 {
+        self.next_touch_stamp
+    }
+
+    #[cfg(test)]
     pub fn test_renormalize_lru_stamps(&mut self) {
-        self.renormalize_lru_stamps();
+        if let Ok(map) = renormalize_stamps_fallible(&self.owner_lru) {
+            let len = map.len();
+            if let Ok(base) = u64::try_from(len) {
+                if let Some(next) = base.checked_add(1) {
+                    self.owner_lru = map;
+                    self.next_touch_stamp = next;
+                }
+            }
+        }
     }
 
     /// Admit a new owner group when the owner is absent and projected physical pubkeys fit the cap.
@@ -362,6 +407,16 @@ impl FixedCapAdmission {
             InsertPlanOutcome::Ready(plan) => plan,
         };
 
+        let stamp_plan = match plan_stamp_assign(
+            &self.owner_lru,
+            self.next_touch_stamp,
+            &owner,
+            self.stamp_plan_force_failure(),
+        ) {
+            Ok(plan) => plan,
+            Err(_) => return FixedCapAdmissionResult::InternalInvariantViolation,
+        };
+
         let force_mismatch = {
             #[cfg(test)]
             {
@@ -389,7 +444,7 @@ impl FixedCapAdmission {
         }
 
         self.physical_len = plan.projected_final_len;
-        self.stamp_owner(&owner);
+        self.apply_stamp_plan(&stamp_plan);
         if plan.physical_added.is_empty() {
             FixedCapAdmissionResult::OwnerAddedNoNewPubkey
         } else {
@@ -438,7 +493,26 @@ impl FixedCapAdmission {
             ReplacePlanOutcome::Ready(plan) => plan,
         };
 
-        let pre_touch_stamp = self.owner_lru.get(&existing_owner).copied();
+        let pre_touch_stamp = match required_existing_stamp(&self.owner_lru, &existing_owner) {
+            Ok(stamp) => stamp,
+            Err(StampPlanError::MissingOwnerStamp) => {
+                self.fail_closed_remove_owner_stamp_mismatch(&existing_owner);
+                return FixedCapReplaceResult::InternalInvariantViolation {
+                    recovery: InvariantViolationRecovery::OwnerRemovedFailClosed,
+                };
+            }
+            Err(_) => return FixedCapReplaceResult::PlanningInvariantViolation,
+        };
+
+        let stamp_plan = match plan_stamp_assign(
+            &self.owner_lru,
+            self.next_touch_stamp,
+            &existing_owner,
+            self.stamp_plan_force_failure(),
+        ) {
+            Ok(plan) => plan,
+            Err(_) => return FixedCapReplaceResult::PlanningInvariantViolation,
+        };
 
         let force_commit_mismatch = {
             #[cfg(test)]
@@ -474,7 +548,7 @@ impl FixedCapAdmission {
         }
 
         self.physical_len = plan.projected_final_len;
-        self.stamp_owner(&existing_owner);
+        self.apply_stamp_plan(&stamp_plan);
         FixedCapReplaceResult::Replaced {
             physical_added: plan.physical_added,
             physical_removed: plan.physical_removed,
@@ -490,7 +564,14 @@ impl FixedCapAdmission {
         };
         let old_normalized = old_group.to_vec();
 
-        let pre_touch_stamp = self.owner_lru.get(&owner).copied();
+        let pre_touch_stamp = match required_existing_stamp(&self.owner_lru, &owner) {
+            Ok(stamp) => stamp,
+            Err(StampPlanError::MissingOwnerStamp) => {
+                self.fail_closed_remove_owner_stamp_mismatch(&owner);
+                return FixedCapRemoveResult::PlanningInvariantViolation;
+            }
+            Err(_) => return FixedCapRemoveResult::PlanningInvariantViolation,
+        };
 
         let plan = match self.plan_remove(&old_normalized) {
             RemovePlanOutcome::PlanningInvariantViolation => {
@@ -498,6 +579,8 @@ impl FixedCapAdmission {
             }
             RemovePlanOutcome::Ready(plan) => plan,
         };
+
+        let stamp_plan = plan_stamp_remove(&self.owner_lru, self.next_touch_stamp, &owner);
 
         let force_commit_mismatch = {
             #[cfg(test)]
@@ -525,7 +608,7 @@ impl FixedCapAdmission {
         }
 
         self.physical_len = plan.projected_final_len;
-        self.owner_lru.remove(&owner);
+        self.apply_stamp_plan(&stamp_plan);
         FixedCapRemoveResult::Removed {
             physical_removed: plan.physical_removed,
         }
@@ -730,7 +813,7 @@ impl FixedCapAdmission {
         &mut self,
         owner: &ExplicitOwner,
         plan: &ReplacePlan,
-        pre_touch_stamp: Option<u64>,
+        pre_touch_stamp: u64,
     ) -> FixedCapReplaceResult {
         let force_restore_mismatch = {
             #[cfg(test)]
@@ -768,14 +851,16 @@ impl FixedCapAdmission {
         };
 
         if restored {
-            self.physical_len = plan.pre_len;
-            self.restore_owner_touch_stamp(owner, pre_touch_stamp);
-            if self.ownership.owner_group(owner).is_none() {
-                self.reconcile_physical_len_cold();
+            self.owner_lru.insert(owner.clone(), pre_touch_stamp);
+            if self.owner_group(owner) == Some(restore_pubkeys.as_slice())
+                && self.last_touch(owner) == Some(pre_touch_stamp)
+            {
+                self.physical_len = plan.pre_len;
+                return FixedCapReplaceResult::InternalInvariantViolation {
+                    recovery: InvariantViolationRecovery::PreviousRestored,
+                };
             }
-            FixedCapReplaceResult::InternalInvariantViolation {
-                recovery: InvariantViolationRecovery::PreviousRestored,
-            }
+            self.fail_closed_remove_owner_after_replace(owner)
         } else {
             self.fail_closed_remove_owner_after_replace(owner)
         }
@@ -792,9 +877,7 @@ impl FixedCapAdmission {
             }
         }
         self.owner_lru.remove(owner);
-        self.reconcile_physical_len_cold();
-        debug_assert!(self.ownership.owner_group(owner).is_none());
-        debug_assert!(self.physical_len <= self.cap);
+        self.reconcile_cold();
         FixedCapReplaceResult::InternalInvariantViolation {
             recovery: InvariantViolationRecovery::OwnerRemovedFailClosed,
         }
@@ -804,7 +887,7 @@ impl FixedCapAdmission {
         &mut self,
         owner: &ExplicitOwner,
         plan: &RemovePlan,
-        pre_touch_stamp: Option<u64>,
+        pre_touch_stamp: u64,
     ) -> FixedCapRemoveResult {
         let force_restore_mismatch = {
             #[cfg(test)]
@@ -842,14 +925,16 @@ impl FixedCapAdmission {
         };
 
         if restored {
-            self.physical_len = plan.pre_len;
-            self.restore_owner_touch_stamp(owner, pre_touch_stamp);
-            if self.ownership.owner_group(owner).is_none() {
-                self.reconcile_physical_len_cold();
+            self.owner_lru.insert(owner.clone(), pre_touch_stamp);
+            if self.owner_group(owner) == Some(restore_pubkeys.as_slice())
+                && self.last_touch(owner) == Some(pre_touch_stamp)
+            {
+                self.physical_len = plan.pre_len;
+                return FixedCapRemoveResult::InternalInvariantViolation {
+                    recovery: FixedCapRemoveRecovery::PreviousRestored,
+                };
             }
-            FixedCapRemoveResult::InternalInvariantViolation {
-                recovery: FixedCapRemoveRecovery::PreviousRestored,
-            }
+            self.fail_closed_remove_owner_after_remove(owner)
         } else {
             self.fail_closed_remove_owner_after_remove(owner)
         }
@@ -862,72 +947,53 @@ impl FixedCapAdmission {
         let _ = self.ownership.remove_group(owner);
         if self.ownership.owner_group(owner).is_some() {
             self.owner_lru.remove(owner);
-            self.reconcile_physical_len_cold();
+            self.reconcile_cold();
             return FixedCapRemoveResult::InternalInvariantViolation {
                 recovery: FixedCapRemoveRecovery::RecoveryFailed,
             };
         }
         self.owner_lru.remove(owner);
-        self.reconcile_physical_len_cold();
-        debug_assert!(self.physical_len <= self.cap);
+        self.reconcile_cold();
         FixedCapRemoveResult::InternalInvariantViolation {
             recovery: FixedCapRemoveRecovery::OwnerRemovedFailClosed,
         }
     }
 
-    fn stamp_owner(&mut self, owner: &ExplicitOwner) {
-        let stamp = self.allocate_touch_stamp();
-        self.owner_lru.insert(owner.clone(), stamp);
-    }
-
-    fn restore_owner_touch_stamp(&mut self, owner: &ExplicitOwner, stamp: Option<u64>) {
-        match stamp {
-            Some(stamp) => {
-                self.owner_lru.insert(owner.clone(), stamp);
-            }
-            None => {
-                self.owner_lru.remove(owner);
+    fn fail_closed_remove_owner_stamp_mismatch(&mut self, owner: &ExplicitOwner) {
+        let _ = self.ownership.remove_group(owner);
+        while self.ownership.owner_group(owner).is_some() {
+            if self.ownership.remove_group(owner).is_none() {
+                break;
             }
         }
+        self.owner_lru.remove(owner);
+        self.reconcile_cold();
     }
 
-    fn allocate_touch_stamp(&mut self) -> u64 {
-        if self.next_touch_stamp == u64::MAX {
-            self.renormalize_lru_stamps();
-        }
-        let stamp = self.next_touch_stamp;
-        self.next_touch_stamp = self.next_touch_stamp.saturating_add(1);
-        stamp
+    fn apply_stamp_plan(&mut self, plan: &StampPlan) {
+        self.owner_lru = plan.owner_lru.clone();
+        self.next_touch_stamp = plan.next_touch_stamp;
     }
 
-    fn renormalize_lru_stamps(&mut self) {
-        if self.owner_lru.is_empty() {
-            self.next_touch_stamp = 1;
-            return;
+    fn stamp_plan_force_failure(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.test_force_stamp_plan_failure
         }
-        let mut entries: Vec<(ExplicitOwner, u64)> = self
-            .owner_lru
-            .iter()
-            .map(|(owner, &stamp)| (owner.clone(), stamp))
-            .collect();
-        entries.sort_by(|(owner_a, stamp_a), (owner_b, stamp_b)| {
-            stamp_a.cmp(stamp_b).then_with(|| owner_a.cmp(owner_b))
-        });
-        self.owner_lru.clear();
-        for (idx, (owner, _)) in entries.into_iter().enumerate() {
-            self.owner_lru
-                .insert(owner, u64::try_from(idx).expect("owner count fits u64") + 1);
+        #[cfg(not(test))]
+        {
+            false
         }
-        self.next_touch_stamp = u64::try_from(self.owner_lru.len())
-            .expect("owner count fits u64")
-            .saturating_add(1);
     }
 
-    /// Cold fail-closed recovery: full scan of ownership to repair cached `physical_len`
-    /// and reconcile LRU metadata with ownership.
-    fn reconcile_physical_len_cold(&mut self) {
-        self.physical_len = self.ownership.len();
+    /// Cold fail-closed recovery: reconcile owner/stamp parity, then repair `physical_len`.
+    fn reconcile_cold(&mut self) {
         self.reconcile_lru_cold();
+        self.physical_len = self.ownership.len();
+    }
+
+    fn reconcile_physical_len_cold(&mut self) {
+        self.reconcile_cold();
     }
 
     fn reconcile_lru_cold(&mut self) {
@@ -958,6 +1024,86 @@ impl FixedCapAdmission {
                 }
             }
         }
+    }
+}
+
+fn required_existing_stamp(
+    owner_lru: &BTreeMap<ExplicitOwner, u64>,
+    owner: &ExplicitOwner,
+) -> Result<u64, StampPlanError> {
+    owner_lru
+        .get(owner)
+        .copied()
+        .ok_or(StampPlanError::MissingOwnerStamp)
+}
+
+fn renormalize_stamps_fallible(
+    owner_lru: &BTreeMap<ExplicitOwner, u64>,
+) -> Result<BTreeMap<ExplicitOwner, u64>, StampPlanError> {
+    if owner_lru.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut entries: Vec<(ExplicitOwner, u64)> = owner_lru
+        .iter()
+        .map(|(owner, &stamp)| (owner.clone(), stamp))
+        .collect();
+    entries.sort_by(|(owner_a, stamp_a), (owner_b, stamp_b)| {
+        stamp_a.cmp(stamp_b).then_with(|| owner_a.cmp(owner_b))
+    });
+    let mut renormalized = BTreeMap::new();
+    for (idx, (owner, _)) in entries.into_iter().enumerate() {
+        let rank = u64::try_from(idx).map_err(|_| StampPlanError::Overflow)?;
+        let stamp = rank.checked_add(1).ok_or(StampPlanError::Overflow)?;
+        renormalized.insert(owner, stamp);
+    }
+    Ok(renormalized)
+}
+
+fn prepare_stamp_base(
+    owner_lru: &BTreeMap<ExplicitOwner, u64>,
+    next_touch_stamp: u64,
+) -> Result<(BTreeMap<ExplicitOwner, u64>, u64), StampPlanError> {
+    if next_touch_stamp == u64::MAX {
+        let map = renormalize_stamps_fallible(owner_lru)?;
+        let len = map.len();
+        let base = u64::try_from(len).map_err(|_| StampPlanError::Overflow)?;
+        let assign = base.checked_add(1).ok_or(StampPlanError::Overflow)?;
+        Ok((map, assign))
+    } else {
+        Ok((owner_lru.clone(), next_touch_stamp))
+    }
+}
+
+fn plan_stamp_assign(
+    owner_lru: &BTreeMap<ExplicitOwner, u64>,
+    next_touch_stamp: u64,
+    owner: &ExplicitOwner,
+    force_failure: bool,
+) -> Result<StampPlan, StampPlanError> {
+    if force_failure {
+        return Err(StampPlanError::ForcedFailure);
+    }
+    let (mut map, assign_stamp) = prepare_stamp_base(owner_lru, next_touch_stamp)?;
+    let new_next = assign_stamp
+        .checked_add(1)
+        .ok_or(StampPlanError::Overflow)?;
+    map.insert(owner.clone(), assign_stamp);
+    Ok(StampPlan {
+        owner_lru: map,
+        next_touch_stamp: new_next,
+    })
+}
+
+fn plan_stamp_remove(
+    owner_lru: &BTreeMap<ExplicitOwner, u64>,
+    next_touch_stamp: u64,
+    owner: &ExplicitOwner,
+) -> StampPlan {
+    let mut map = owner_lru.clone();
+    map.remove(owner);
+    StampPlan {
+        owner_lru: map,
+        next_touch_stamp,
     }
 }
 
@@ -2484,11 +2630,12 @@ mod tests {
             .expect("LRU snapshot must build eviction planning snapshot");
     }
 
-    /// Independent LRU stamp model — never calls [`FixedCapAdmission`] LRU helpers directly.
+    /// Independent LRU stamp model — separate monotonic/event logic from production.
     #[derive(Debug, Clone)]
     struct RefLruModel {
         stamps: BTreeMap<ExplicitOwner, u64>,
         next_stamp: u64,
+        events: Vec<(ExplicitOwner, u64)>,
     }
 
     impl RefLruModel {
@@ -2496,71 +2643,71 @@ mod tests {
             Self {
                 stamps: BTreeMap::new(),
                 next_stamp: 1,
+                events: Vec::new(),
             }
         }
 
+        fn next_counter(&self) -> u64 {
+            self.next_stamp
+        }
+
         fn on_successful_insert(&mut self, owner: &ExplicitOwner) {
-            self.stamp_owner(owner);
+            self.assign_stamp(owner);
         }
 
         fn on_successful_replace(&mut self, owner: &ExplicitOwner) {
-            self.stamp_owner(owner);
+            self.assign_stamp(owner);
         }
 
         fn on_successful_remove(&mut self, owner: &ExplicitOwner) {
             self.stamps.remove(owner);
+            self.events.retain(|(o, _)| o != owner);
         }
 
         fn on_touch(&mut self, owner: &ExplicitOwner) {
-            self.stamp_owner(owner);
+            self.assign_stamp(owner);
         }
 
-        fn restore_stamp(&mut self, owner: &ExplicitOwner, stamp: Option<u64>) {
-            match stamp {
-                Some(stamp) => {
-                    self.stamps.insert(owner.clone(), stamp);
-                }
-                None => {
-                    self.stamps.remove(owner);
-                }
-            }
-        }
-
-        fn stamp_owner(&mut self, owner: &ExplicitOwner) {
-            let stamp = self.allocate_stamp();
+        fn restore_stamp(&mut self, owner: &ExplicitOwner, stamp: u64) {
             self.stamps.insert(owner.clone(), stamp);
+            self.events.retain(|(o, _)| o != owner);
+            self.events.push((owner.clone(), stamp));
         }
 
-        fn allocate_stamp(&mut self) -> u64 {
+        fn assign_stamp(&mut self, owner: &ExplicitOwner) {
             if self.next_stamp == u64::MAX {
-                self.renormalize();
+                self.compact_from_event_order();
             }
             let stamp = self.next_stamp;
-            self.next_stamp = self.next_stamp.checked_add(1).unwrap_or(u64::MAX);
-            stamp
+            self.next_stamp = self.next_stamp.saturating_add(1);
+            self.stamps.insert(owner.clone(), stamp);
+            self.events.push((owner.clone(), stamp));
         }
 
-        fn renormalize(&mut self) {
-            if self.stamps.is_empty() {
-                self.next_stamp = 1;
-                return;
-            }
-            let mut entries: Vec<(ExplicitOwner, u64)> = self
-                .stamps
+        fn compact_from_event_order(&mut self) {
+            let mut ordered: Vec<(ExplicitOwner, u64)> = self
+                .events
                 .iter()
-                .map(|(owner, &stamp)| (owner.clone(), stamp))
+                .map(|(owner, stamp)| (owner.clone(), *stamp))
                 .collect();
-            entries.sort_by(|(owner_a, stamp_a), (owner_b, stamp_b)| {
+            ordered.sort_by(|(owner_a, stamp_a), (owner_b, stamp_b)| {
                 stamp_a.cmp(stamp_b).then_with(|| owner_a.cmp(owner_b))
             });
             self.stamps.clear();
-            for (idx, (owner, _)) in entries.into_iter().enumerate() {
-                self.stamps
-                    .insert(owner, u64::try_from(idx).expect("owner count fits u64") + 1);
+            self.events.clear();
+            for (idx, (owner, _)) in ordered.into_iter().enumerate() {
+                if let Ok(rank) = u64::try_from(idx) {
+                    if let Some(stamp) = rank.checked_add(1) {
+                        self.stamps.insert(owner.clone(), stamp);
+                        self.events.push((owner, stamp));
+                    }
+                }
             }
-            self.next_stamp = u64::try_from(self.stamps.len())
-                .expect("owner count fits u64")
-                .saturating_add(1);
+            if let Ok(len) = u64::try_from(self.stamps.len()) {
+                if let Some(next) = len.checked_add(1) {
+                    self.next_stamp = next;
+                }
+            }
         }
 
         fn snapshot(&self) -> BTreeMap<ExplicitOwner, u64> {
@@ -2570,6 +2717,7 @@ mod tests {
 
     fn assert_lru_matches_model(admission: &FixedCapAdmission, model: &RefLruModel) {
         assert_eq!(admission.test_owner_stamps(), model.snapshot());
+        assert_eq!(admission.test_next_touch_stamp(), model.next_counter());
         assert_lru_matches_ownership(admission);
     }
 
@@ -2700,9 +2848,12 @@ mod tests {
     #[test]
     fn lru_reject_paths_consume_no_stamp() {
         let mut admission = FixedCapAdmission::new(2);
+        let mut model = RefLruModel::new();
         let owner = pool_owner(ExplicitConsumer::Momentum, 1);
         assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1)]));
+        model.on_successful_insert(&owner);
         let stamp_before = admission.last_touch(&owner).unwrap();
+        let counter_before = admission.test_next_touch_stamp();
 
         assert_eq!(
             admission.try_admit_new_group(owner.clone(), [pk(2)]),
@@ -2725,6 +2876,124 @@ mod tests {
         );
         assert_eq!(admission.last_touch(&owner).unwrap(), stamp_before);
         assert_eq!(admission.snapshot_lru_entries().len(), 1);
+        assert_eq!(admission.test_next_touch_stamp(), counter_before);
+
+        let other = pool_owner(ExplicitConsumer::Arb, 2);
+        assert_admitted(admission.try_admit_new_group(other.clone(), [pk(2)]));
+        model.on_successful_insert(&other);
+        assert_lru_matches_model(&admission, &model);
+
+        assert_eq!(admission.touch_group(owner.clone()), TouchResult::Touched);
+        model.on_touch(&owner);
+        assert_lru_matches_model(&admission, &model);
+    }
+
+    #[test]
+    fn lru_stamp_plan_failure_is_mutation_free() {
+        let mut admission = FixedCapAdmission::new(4);
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1)]));
+        let before = capture_admission_snapshot(&admission);
+        let counter_before = admission.test_next_touch_stamp();
+        let stamps_before = admission.test_owner_stamps();
+
+        admission.set_test_force_stamp_plan_failure(true);
+        assert_eq!(
+            admission.try_admit_new_group(pool_owner(ExplicitConsumer::Arb, 2), [pk(2)]),
+            FixedCapAdmissionResult::InternalInvariantViolation
+        );
+        assert_eq!(
+            admission.try_replace_group(owner.clone(), [pk(2)]),
+            FixedCapReplaceResult::PlanningInvariantViolation
+        );
+        assert_eq!(
+            admission.touch_group(owner.clone()),
+            TouchResult::InternalInvariantViolation
+        );
+        admission.set_test_force_stamp_plan_failure(false);
+
+        assert_public_snapshots_equal(&capture_admission_snapshot(&admission), &before);
+        assert_eq!(admission.test_owner_stamps(), stamps_before);
+        assert_eq!(admission.test_next_touch_stamp(), counter_before);
+        assert_lru_matches_ownership(&admission);
+    }
+
+    #[test]
+    fn lru_missing_stamp_fail_closed_before_replace_remove_touch() {
+        let mut admission = FixedCapAdmission::new(4);
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1), pk(2)]));
+        admission.owner_lru.remove(&owner);
+
+        assert_eq!(
+            admission.try_replace_group(owner.clone(), [pk(2), pk(3)]),
+            FixedCapReplaceResult::InternalInvariantViolation {
+                recovery: InvariantViolationRecovery::OwnerRemovedFailClosed,
+            }
+        );
+        assert!(admission.owner_group(&owner).is_none());
+        assert!(admission.last_touch(&owner).is_none());
+        assert_lru_matches_ownership(&admission);
+
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1)]));
+        admission.owner_lru.remove(&owner);
+        assert_eq!(
+            admission.remove_group(owner.clone()),
+            FixedCapRemoveResult::PlanningInvariantViolation
+        );
+        assert!(admission.owner_group(&owner).is_none());
+        assert_lru_matches_ownership(&admission);
+
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1)]));
+        admission.owner_lru.remove(&owner);
+        assert_eq!(
+            admission.touch_group(owner.clone()),
+            TouchResult::InternalInvariantViolation
+        );
+        assert!(admission.owner_group(&owner).is_none());
+        assert_lru_matches_ownership(&admission);
+    }
+
+    #[test]
+    fn lru_recovery_branches_build_eviction_snapshot() {
+        let mut admission = FixedCapAdmission::new(4);
+        let owner = pool_owner(ExplicitConsumer::Momentum, 1);
+        let other = pool_owner(ExplicitConsumer::Arb, 2);
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1), pk(2)]));
+        assert_admitted(admission.try_admit_new_group(other.clone(), [pk(3)]));
+
+        admission.set_test_force_commit_plan_mismatch(true);
+        assert_eq!(
+            admission.try_replace_group(owner.clone(), [pk(2), pk(4)]),
+            FixedCapReplaceResult::InternalInvariantViolation {
+                recovery: InvariantViolationRecovery::PreviousRestored,
+            }
+        );
+        assert_lru_matches_ownership(&admission);
+        admission.set_test_force_commit_plan_mismatch(false);
+
+        admission.set_test_force_commit_plan_mismatch(true);
+        admission.set_test_force_restore_plan_mismatch(true);
+        assert_eq!(
+            admission.try_replace_group(owner.clone(), [pk(2), pk(5)]),
+            FixedCapReplaceResult::InternalInvariantViolation {
+                recovery: InvariantViolationRecovery::OwnerRemovedFailClosed,
+            }
+        );
+        assert_lru_matches_ownership(&admission);
+        admission.set_test_force_commit_plan_mismatch(false);
+        admission.set_test_force_restore_plan_mismatch(false);
+
+        assert_admitted(admission.try_admit_new_group(owner.clone(), [pk(1)]));
+        admission.set_test_force_commit_plan_mismatch(true);
+        assert_eq!(
+            admission.remove_group(owner.clone()),
+            FixedCapRemoveResult::InternalInvariantViolation {
+                recovery: FixedCapRemoveRecovery::PreviousRestored,
+            }
+        );
+        assert_lru_matches_ownership(&admission);
+        admission.set_test_force_commit_plan_mismatch(false);
     }
 
     #[test]
@@ -2743,9 +3012,10 @@ mod tests {
                 recovery: InvariantViolationRecovery::PreviousRestored,
             }
         );
-        model.restore_stamp(&owner, Some(old_stamp));
+        model.restore_stamp(&owner, old_stamp);
         assert_eq!(admission.last_touch(&owner).unwrap(), old_stamp);
         assert_lru_matches_model(&admission, &model);
+        assert_lru_matches_ownership(&admission);
     }
 
     #[test]
@@ -2839,10 +3109,10 @@ mod tests {
                     }
                 }
                 2 => {
-                    if admission.owner_group(&owner).is_some() {
-                        if admission.touch_group(owner.clone()) == TouchResult::Touched {
-                            model.on_touch(&owner);
-                        }
+                    if admission.owner_group(&owner).is_some()
+                        && admission.touch_group(owner.clone()) == TouchResult::Touched
+                    {
+                        model.on_touch(&owner);
                     }
                 }
                 _ => {
