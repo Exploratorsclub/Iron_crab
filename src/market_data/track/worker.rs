@@ -232,15 +232,48 @@ fn track_worker_apply_protocol_command<C: TrackWorkerContext>(
     store.mark_applied(cmd.stream, cmd.revision);
 }
 
+fn track_worker_prepare_command_delivery<C: TrackWorkerContext>(
+    ctx: &Arc<C>,
+    payload: &TrackWorkerCommand,
+    coalesce_deadline: &mut Option<Instant>,
+    push_before_keys: &mut Option<HashSet<Pubkey>>,
+    pending_continue_evict: &mut bool,
+    pending_release_flush_slot: &mut bool,
+) {
+    if coalesce_deadline.is_none() {
+        *push_before_keys = Some(ctx.snapshot_explicit_subscription_pubkeys());
+        *coalesce_deadline =
+            Some(Instant::now() + Duration::from_millis(MARKET_DATA_TRACK_WORKER_COALESCE_MS));
+    }
+    if matches!(payload, TrackWorkerCommand::ContinueGeyserEvict) {
+        *pending_continue_evict = true;
+    }
+    if matches!(payload, TrackWorkerCommand::ScheduleGeyserPushDebounced) {
+        *pending_release_flush_slot = true;
+    }
+}
+
 fn track_worker_drain_pending_replay<C: TrackWorkerContext>(
     ctx: &Arc<C>,
     protocol: &Arc<Mutex<BoundedProtocolStore>>,
+    coalesce_deadline: &mut Option<Instant>,
+    push_before_keys: &mut Option<HashSet<Pubkey>>,
+    pending_continue_evict: &mut bool,
+    pending_release_flush_slot: &mut bool,
 ) {
     let pending_cmds = {
         let mut store = protocol.lock().expect("track protocol store lock");
         store.take_applicable_pending_sorted()
     };
     for cmd in pending_cmds {
+        track_worker_prepare_command_delivery(
+            ctx,
+            &cmd.payload,
+            coalesce_deadline,
+            push_before_keys,
+            pending_continue_evict,
+            pending_release_flush_slot,
+        );
         track_worker_apply_protocol_command(ctx, protocol, cmd);
     }
 }
@@ -280,31 +313,25 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
         match recv_result {
             Ok(job) => {
                 track_worker_dec_queue_depth(&queue_depth, &protocol);
-                if coalesce_deadline.is_none() {
-                    push_before_keys = Some(ctx.snapshot_explicit_subscription_pubkeys());
-                    coalesce_deadline = Some(
-                        Instant::now()
-                            + Duration::from_millis(MARKET_DATA_TRACK_WORKER_COALESCE_MS),
-                    );
-                }
-                if matches!(job.payload, TrackWorkerCommand::ContinueGeyserEvict) {
-                    pending_continue_evict = true;
-                }
-                if matches!(job.payload, TrackWorkerCommand::ScheduleGeyserPushDebounced) {
-                    pending_release_flush_slot = true;
-                }
+                track_worker_prepare_command_delivery(
+                    &ctx,
+                    &job.payload,
+                    &mut coalesce_deadline,
+                    &mut push_before_keys,
+                    &mut pending_continue_evict,
+                    &mut pending_release_flush_slot,
+                );
                 track_worker_apply_protocol_command(&ctx, &protocol, job);
                 while let Ok(more) = rx.try_recv() {
                     track_worker_dec_queue_depth(&queue_depth, &protocol);
-                    if matches!(more.payload, TrackWorkerCommand::ContinueGeyserEvict) {
-                        pending_continue_evict = true;
-                    }
-                    if matches!(
-                        more.payload,
-                        TrackWorkerCommand::ScheduleGeyserPushDebounced
-                    ) {
-                        pending_release_flush_slot = true;
-                    }
+                    track_worker_prepare_command_delivery(
+                        &ctx,
+                        &more.payload,
+                        &mut coalesce_deadline,
+                        &mut push_before_keys,
+                        &mut pending_continue_evict,
+                        &mut pending_release_flush_slot,
+                    );
                     track_worker_apply_protocol_command(&ctx, &protocol, more);
                 }
             }
@@ -312,7 +339,14 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
             Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
-        track_worker_drain_pending_replay(&ctx, &protocol);
+        track_worker_drain_pending_replay(
+            &ctx,
+            &protocol,
+            &mut coalesce_deadline,
+            &mut push_before_keys,
+            &mut pending_continue_evict,
+            &mut pending_release_flush_slot,
+        );
 
         let should_push =
             push_before_keys.is_some() && coalesce_deadline.is_some_and(|d| Instant::now() >= d);
