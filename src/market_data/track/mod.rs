@@ -21,9 +21,10 @@ pub use enrichment::{
     is_enrichment_member_from_inputs, pool_is_enrichment_member, EnrichmentMembershipInputs,
 };
 pub use eviction_planner::{
-    ConsumerProtectionRank, EvictionPlanningSnapshot, EvictionTier, OwnerLruEntry,
-    OwnerPlanningRecord, PubkeyOwnerIndex, SnapshotBuildError, TierFeasibilityRequest,
-    TierFeasibilityResult,
+    select_eviction_victims, ConsumerProtectionRank, EvictionPlanningSnapshot, EvictionTier,
+    OwnerLruEntry, OwnerPlanningRecord, PubkeyOwnerIndex, SnapshotBuildError,
+    TierFeasibilityRequest, TierFeasibilityResult, VictimSelectionPlan, VictimSelectionRequest,
+    VictimSelectionResult,
 };
 pub use explicit_admission::{
     FixedCapAdmission, FixedCapAdmissionResult, FixedCapRemoveRecovery, FixedCapRemoveResult,
