@@ -1,7 +1,10 @@
-//! Validated eviction planning snapshot (PR 1c1a).
+//! Validated eviction planning snapshot and pure eviction planning (PR 1c1a/1c1b).
 //!
-//! Side-effect-free read model over [`ExplicitOwnership`] public snapshot APIs.
-//! No victim selection, admission, cap-shrink, or runtime wiring.
+//! Side-effect-free read model over [`ExplicitOwnership`] public snapshot APIs:
+//! validated [`EvictionPlanningSnapshot`] construction, tier-opening
+//! [`EvictionPlanningSnapshot::analyze_tier_feasibility`], and priority/LRU
+//! [`select_eviction_victims`]. No admission, cap-shrink, touch-state mutation,
+//! or runtime wiring.
 //!
 //! Construction is one pass over owner-group edges with `O(E log E)` deterministic
 //! ordering (`BTreeMap` / `BTreeSet` inserts and final sorts); no repeated whole-graph
@@ -565,7 +568,7 @@ pub struct SelectorStats {
 }
 
 trait SelectorStatsSink {
-    fn record_initial_edge(&mut self);
+    fn record_initial_edges(&mut self, count: u64);
     fn record_candidate_evaluation(&mut self);
     fn record_refcount_update(&mut self);
     fn record_package_evaluation(&mut self);
@@ -574,7 +577,7 @@ trait SelectorStatsSink {
 struct NoopSelectorStats;
 
 impl SelectorStatsSink for NoopSelectorStats {
-    fn record_initial_edge(&mut self) {}
+    fn record_initial_edges(&mut self, _count: u64) {}
     fn record_candidate_evaluation(&mut self) {}
     fn record_refcount_update(&mut self) {}
     fn record_package_evaluation(&mut self) {}
@@ -582,8 +585,8 @@ impl SelectorStatsSink for NoopSelectorStats {
 
 #[cfg(test)]
 impl SelectorStatsSink for SelectorStats {
-    fn record_initial_edge(&mut self) {
-        self.initial_edges += 1;
+    fn record_initial_edges(&mut self, count: u64) {
+        self.initial_edges += count;
     }
     fn record_candidate_evaluation(&mut self) {
         self.candidate_evaluations += 1;
@@ -694,9 +697,8 @@ fn run_victim_selection<S: SelectorStatsSink>(
 
     let pubkey_index = snapshot.pubkey_index();
     let projected_refcounts: Vec<usize> = pubkey_index.iter().map(|row| row.refcount).collect();
-    for _ in &projected_refcounts {
-        stats.record_initial_edge();
-    }
+    let initial_edge_count: u64 = pubkey_index.iter().map(|row| row.owners.len() as u64).sum();
+    stats.record_initial_edges(initial_edge_count);
 
     let mut owner_pubkey_indices: BTreeMap<ExplicitOwner, Vec<usize>> = BTreeMap::new();
     for (idx, row) in pubkey_index.iter().enumerate() {
@@ -2223,19 +2225,116 @@ mod tests {
     }
 
     #[test]
-    fn victim_selection_deterministic_under_fixture_permutation() {
+    fn victim_selection_snapshot_invariant_under_fixture_permutations() {
+        let shared = pk(50);
         let t1 = pool_owner(ExplicitConsumer::Tracker, 1);
         let t2 = pool_owner(ExplicitConsumer::Tracker, 2);
-        let fixtures = [(t1.clone(), 1, vec![pk(1)]), (t2.clone(), 2, vec![pk(2)])];
-        let snapshot = snapshot_from_fixtures(&fixtures);
+        let arb = pool_owner(ExplicitConsumer::Arb, 3);
+        let fixtures = [
+            (t1.clone(), 10, vec![pk(1), shared]),
+            (t2.clone(), 20, vec![pk(2)]),
+            (arb.clone(), 30, vec![shared, pk(3)]),
+        ];
         let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
-        let a = select_eviction_victims(
-            &snapshot,
-            victim_request(incoming.clone(), vec![pk(10), pk(11)], 1),
-        );
-        let b =
-            select_eviction_victims(&snapshot, victim_request(incoming, vec![pk(11), pk(10)], 1));
-        assert_eq!(a, b);
+        let request = victim_request(incoming, vec![pk(10), pk(11)], 3);
+
+        let baseline_snapshot = snapshot_from_fixtures(&fixtures);
+        let baseline = select_eviction_victims(&baseline_snapshot, request.clone());
+
+        let row_perms = all_permutations(&(0..fixtures.len()).collect::<Vec<_>>());
+        for row_perm in &row_perms {
+            let perm_fixtures: Vec<FixtureRow> = row_perm
+                .iter()
+                .map(|&idx| {
+                    let (owner, touch, pubkeys) = &fixtures[idx];
+                    (owner.clone(), *touch, pubkeys.clone())
+                })
+                .collect();
+
+            let pubkey_orders: Vec<Vec<usize>> = perm_fixtures
+                .iter()
+                .map(|(_, _, pubkeys)| {
+                    let mut order: Vec<usize> = (0..pubkeys.len()).collect();
+                    order.reverse();
+                    order
+                })
+                .collect();
+            let permuted_pubkeys: Vec<FixtureRow> = perm_fixtures
+                .iter()
+                .enumerate()
+                .map(|(row_idx, (owner, touch, pubkeys))| {
+                    let ordered: Vec<Pubkey> = pubkey_orders[row_idx]
+                        .iter()
+                        .map(|&key_idx| pubkeys[key_idx])
+                        .collect();
+                    (owner.clone(), *touch, ordered)
+                })
+                .collect();
+
+            for lru_perm in all_permutations(&(0..permuted_pubkeys.len()).collect::<Vec<_>>()) {
+                let snapshot = snapshot_from_permuted(&permuted_pubkeys, &lru_perm).unwrap();
+                let actual = select_eviction_victims(&snapshot, request.clone());
+                assert_eq!(
+                    actual, baseline,
+                    "row_perm={row_perm:?} lru_perm={lru_perm:?}"
+                );
+            }
+        }
+    }
+
+    fn all_permutations(items: &[usize]) -> Vec<Vec<usize>> {
+        let n = items.len();
+        if n == 0 {
+            return vec![vec![]];
+        }
+        if n > 8 {
+            return vec![items.to_vec(), items.iter().rev().copied().collect()];
+        }
+        let mut out = Vec::new();
+        let mut used = vec![false; n];
+        let mut current = Vec::with_capacity(n);
+        permute_dfs(items, &mut used, &mut current, &mut out);
+        out
+    }
+
+    fn permute_dfs(
+        items: &[usize],
+        used: &mut [bool],
+        current: &mut Vec<usize>,
+        out: &mut Vec<Vec<usize>>,
+    ) {
+        if current.len() == items.len() {
+            out.push(current.clone());
+            return;
+        }
+        for (idx, &item) in items.iter().enumerate() {
+            if used[idx] {
+                continue;
+            }
+            used[idx] = true;
+            current.push(item);
+            permute_dfs(items, used, current, out);
+            current.pop();
+            used[idx] = false;
+        }
+    }
+
+    fn snapshot_from_permuted(
+        fixtures: &[FixtureRow],
+        lru_order: &[usize],
+    ) -> Result<EvictionPlanningSnapshot, SnapshotBuildError> {
+        let mut ownership = ExplicitOwnership::new();
+        for (owner, _, pubkeys) in fixtures {
+            upsert(&mut ownership, owner.clone(), pubkeys.iter().copied());
+        }
+        let lru_entries: Vec<OwnerLruEntry> = lru_order
+            .iter()
+            .map(|&idx| {
+                let (owner, touch, _) = &fixtures[idx];
+                lru(owner.clone(), *touch)
+            })
+            .collect();
+        EvictionPlanningSnapshot::from_ownership(&ownership, lru_entries)
     }
 
     #[test]
@@ -2310,21 +2409,14 @@ mod tests {
         let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
         let result =
             select_eviction_victims(&snapshot, victim_request(incoming, vec![pk(10), pk(11)], 3));
-        match &result {
-            VictimSelectionResult::Planned(plan) => {
-                assert!(plan.physical_freed.len() >= 2);
-                assert!(
-                    snapshot.physical_len() + plan.incoming_physical_added
-                        - plan.physical_freed.len()
-                        == plan.projected_final_len
-                );
-                assert!(plan.projected_final_len <= 3);
-                for victim in &plan.victims {
-                    assert_ne!(victim.consumer, ExplicitConsumer::Wallet);
-                }
-            }
-            other => panic!("expected Planned, got {other:?}"),
-        }
+        assert_planned(
+            &result,
+            &[a.clone(), b.clone(), c.clone()],
+            &[s1, s2, s3],
+            EvictionTier::Tracker,
+            2,
+            2,
+        );
     }
 
     #[test]
@@ -2341,43 +2433,69 @@ mod tests {
             victim_request(incoming, vec![pk(10)], 1),
             &mut stats,
         );
-        assert!(stats.initial_edges > 0);
+        assert_eq!(stats.initial_edges, 2, "one shared edge per owner");
         assert!(stats.candidate_evaluations > 0);
-        assert!(stats.incremental_refcount_updates > 0);
+        assert_eq!(stats.incremental_refcount_updates, 2);
         assert!(stats.package_evaluations > 0);
     }
 
-    /// Independent exhaustive victim oracle — hard-coded policy only.
-    struct VictimSelectionOracle {
+    /// Independent victim oracle — hard-coded policy + powerset (<=8 owners) + procedural replay.
+    /// Never calls production selection/tier/package/order helpers.
+    struct IndependentVictimOracle {
         physical_len: usize,
         owner_records: BTreeMap<ExplicitOwner, (u64, Vec<Pubkey>)>,
-        pubkey_owners: BTreeMap<Pubkey, BTreeSet<ExplicitOwner>>,
+        pubkey_holders: BTreeMap<Pubkey, BTreeSet<ExplicitOwner>>,
     }
 
-    impl VictimSelectionOracle {
-        fn from_fixtures(fixtures: &[FixtureRow]) -> Self {
-            let mut owner_records = BTreeMap::new();
-            let mut pubkey_owners: BTreeMap<Pubkey, BTreeSet<ExplicitOwner>> = BTreeMap::new();
-            for (owner, touch, pubkeys) in fixtures {
-                let mut normalized = pubkeys.clone();
-                normalized.sort();
-                normalized.dedup();
-                owner_records.insert(owner.clone(), (*touch, normalized.clone()));
-                for pubkey in &normalized {
-                    pubkey_owners
-                        .entry(*pubkey)
-                        .or_default()
-                        .insert(owner.clone());
-                }
-            }
-            Self {
-                physical_len: pubkey_owners.len(),
-                owner_records,
-                pubkey_owners,
+    /// Policy tier label duplicated for oracle isolation.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum PolicyTier {
+        Tracker,
+        Arb,
+        Momentum,
+    }
+
+    impl PolicyTier {
+        fn to_eviction_tier(self) -> EvictionTier {
+            match self {
+                Self::Tracker => EvictionTier::Tracker,
+                Self::Arb => EvictionTier::Arb,
+                Self::Momentum => EvictionTier::Momentum,
             }
         }
 
-        fn oracle_tier_priority(consumer: ExplicitConsumer) -> u8 {
+        fn allowed_for_incoming(consumer: ExplicitConsumer) -> &'static [PolicyTier] {
+            match consumer {
+                ExplicitConsumer::Tracker => &[Self::Tracker],
+                ExplicitConsumer::Arb => &[Self::Tracker, Self::Arb],
+                ExplicitConsumer::Momentum | ExplicitConsumer::Wallet => {
+                    &[Self::Tracker, Self::Arb, Self::Momentum]
+                }
+            }
+        }
+
+        fn cumulative_consumers(self) -> &'static [ExplicitConsumer] {
+            match self {
+                Self::Tracker => &[ExplicitConsumer::Tracker],
+                Self::Arb => &[ExplicitConsumer::Tracker, ExplicitConsumer::Arb],
+                Self::Momentum => &[
+                    ExplicitConsumer::Tracker,
+                    ExplicitConsumer::Arb,
+                    ExplicitConsumer::Momentum,
+                ],
+            }
+        }
+    }
+
+    struct VictimOracleCase {
+        fixtures: Vec<FixtureRow>,
+        incoming: ExplicitOwner,
+        keys: Vec<Pubkey>,
+        cap: usize,
+    }
+
+    impl IndependentVictimOracle {
+        fn eviction_rank(consumer: ExplicitConsumer) -> u8 {
             match consumer {
                 ExplicitConsumer::Tracker => 0,
                 ExplicitConsumer::Arb => 1,
@@ -2386,93 +2504,218 @@ mod tests {
             }
         }
 
-        fn oracle_cumulative_consumers(tier: OracleTier) -> &'static [ExplicitConsumer] {
-            match tier {
-                OracleTier::Tracker => &[ExplicitConsumer::Tracker],
-                OracleTier::Arb => &[ExplicitConsumer::Tracker, ExplicitConsumer::Arb],
-                OracleTier::Momentum => &[
-                    ExplicitConsumer::Tracker,
-                    ExplicitConsumer::Arb,
-                    ExplicitConsumer::Momentum,
-                ],
+        fn from_fixtures(fixtures: &[FixtureRow]) -> Self {
+            let mut owner_records = BTreeMap::new();
+            let mut pubkey_holders: BTreeMap<Pubkey, BTreeSet<ExplicitOwner>> = BTreeMap::new();
+            for (owner, touch, pubkeys) in fixtures {
+                let mut normalized = pubkeys.clone();
+                normalized.sort();
+                normalized.dedup();
+                owner_records.insert(owner.clone(), (*touch, normalized.clone()));
+                for pubkey in &normalized {
+                    pubkey_holders
+                        .entry(*pubkey)
+                        .or_default()
+                        .insert(owner.clone());
+                }
+            }
+            Self {
+                physical_len: pubkey_holders.len(),
+                owner_records,
+                pubkey_holders,
             }
         }
 
         fn incoming_physical_added(&self, incoming: &[Pubkey]) -> usize {
             incoming
                 .iter()
-                .filter(|pk| !self.pubkey_owners.contains_key(pk))
+                .filter(|pk| !self.pubkey_holders.contains_key(pk))
                 .count()
         }
 
-        fn simulate_selection(
+        fn eligible_owners_at_tier(&self, tier: PolicyTier) -> BTreeSet<ExplicitOwner> {
+            let cumulative = PolicyTier::cumulative_consumers(tier);
+            self.owner_records
+                .keys()
+                .filter(|owner| {
+                    owner.consumer != ExplicitConsumer::Wallet
+                        && cumulative.contains(&owner.consumer)
+                })
+                .cloned()
+                .collect()
+        }
+
+        fn freed_by_victim_subset(
+            &self,
+            victims: &BTreeSet<ExplicitOwner>,
+            incoming: &BTreeSet<Pubkey>,
+        ) -> BTreeSet<Pubkey> {
+            self.pubkey_holders
+                .iter()
+                .filter(|(pubkey, holders)| {
+                    !incoming.contains(pubkey)
+                        && holders.iter().all(|owner| victims.contains(owner))
+                })
+                .map(|(pubkey, _)| *pubkey)
+                .collect()
+        }
+
+        fn powerset_max_freeable(
+            &self,
+            allowed: &BTreeSet<ExplicitOwner>,
+            incoming: &BTreeSet<Pubkey>,
+        ) -> usize {
+            let owners: Vec<ExplicitOwner> = allowed.iter().cloned().collect();
+            assert!(owners.len() <= 8, "powerset oracle limited to <=8 owners");
+            let n = owners.len();
+            let mut best = 0usize;
+            for mask in 0..(1usize << n) {
+                let subset: BTreeSet<ExplicitOwner> = owners
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| mask & (1 << idx) != 0)
+                    .map(|(_, owner)| owner.clone())
+                    .collect();
+                best = best.max(self.freed_by_victim_subset(&subset, incoming).len());
+            }
+            best
+        }
+
+        fn powerset_any_subset_frees_enough(
+            &self,
+            allowed: &BTreeSet<ExplicitOwner>,
+            incoming: &BTreeSet<Pubkey>,
+            required: usize,
+        ) -> bool {
+            self.powerset_max_freeable(allowed, incoming) >= required
+        }
+
+        fn pubkey_freeable_count_at_tier(
+            &self,
+            tier: PolicyTier,
+            incoming: &BTreeSet<Pubkey>,
+        ) -> usize {
+            let eligible = self.eligible_owners_at_tier(tier);
+            self.pubkey_holders
+                .iter()
+                .filter(|(pubkey, holders)| {
+                    !incoming.contains(pubkey)
+                        && holders.iter().all(|owner| eligible.contains(owner))
+                })
+                .count()
+        }
+
+        fn sorted_candidates(&self, allowed: &BTreeSet<ExplicitOwner>) -> Vec<ExplicitOwner> {
+            let mut candidates: Vec<ExplicitOwner> = allowed.iter().cloned().collect();
+            candidates.sort_by(|a, b| {
+                let touch_a = self.owner_records.get(a).map(|(t, _)| *t).unwrap_or(0);
+                let touch_b = self.owner_records.get(b).map(|(t, _)| *t).unwrap_or(0);
+                Self::eviction_rank(a.consumer)
+                    .cmp(&Self::eviction_rank(b.consumer))
+                    .then(touch_a.cmp(&touch_b))
+                    .then(a.cmp(b))
+            });
+            candidates
+        }
+
+        fn owner_pubkeys_map(&self) -> BTreeMap<ExplicitOwner, Vec<Pubkey>> {
+            let mut map: BTreeMap<ExplicitOwner, Vec<Pubkey>> = BTreeMap::new();
+            for (pubkey, holders) in &self.pubkey_holders {
+                for owner in holders {
+                    map.entry(owner.clone()).or_default().push(*pubkey);
+                }
+            }
+            for pubkeys in map.values_mut() {
+                pubkeys.sort();
+                pubkeys.dedup();
+            }
+            map
+        }
+
+        fn package_rank_tuple(
+            &self,
+            package: &BTreeSet<ExplicitOwner>,
+        ) -> (u8, Vec<(u8, u64, ExplicitOwner)>, usize, Vec<ExplicitOwner>) {
+            let max_tier = package
+                .iter()
+                .map(|owner| Self::eviction_rank(owner.consumer))
+                .max()
+                .unwrap_or(0);
+            let mut member_keys: Vec<_> = package
+                .iter()
+                .map(|owner| {
+                    let touch = self.owner_records.get(owner).map(|(t, _)| *t).unwrap_or(0);
+                    (Self::eviction_rank(owner.consumer), touch, owner.clone())
+                })
+                .collect();
+            member_keys.sort();
+            let mut owners: Vec<_> = package.iter().cloned().collect();
+            owners.sort();
+            (max_tier, member_keys, package.len(), owners)
+        }
+
+        fn compare_packages(
+            &self,
+            a: &BTreeSet<ExplicitOwner>,
+            b: &BTreeSet<ExplicitOwner>,
+        ) -> std::cmp::Ordering {
+            self.package_rank_tuple(a).cmp(&self.package_rank_tuple(b))
+        }
+
+        fn procedural_selection(
             &self,
             allowed: &BTreeSet<ExplicitOwner>,
             incoming: &BTreeSet<Pubkey>,
             required: usize,
         ) -> Option<(Vec<ExplicitOwner>, BTreeSet<Pubkey>)> {
-            let mut candidates: Vec<ExplicitOwner> = allowed.iter().cloned().collect();
-            candidates.sort_by(|a, b| {
-                let touch_a = self.owner_records.get(a).map(|(t, _)| *t).unwrap_or(0);
-                let touch_b = self.owner_records.get(b).map(|(t, _)| *t).unwrap_or(0);
-                Self::oracle_tier_priority(a.consumer)
-                    .cmp(&Self::oracle_tier_priority(b.consumer))
-                    .then(touch_a.cmp(&touch_b))
-                    .then(a.cmp(b))
-            });
-
+            let candidates = self.sorted_candidates(allowed);
+            let owner_pubkeys = self.owner_pubkeys_map();
             let mut projected: BTreeMap<Pubkey, usize> = self
-                .pubkey_owners
+                .pubkey_holders
                 .iter()
-                .map(|(pk, owners)| (*pk, owners.len()))
+                .map(|(pubkey, holders)| (*pubkey, holders.len()))
                 .collect();
             let mut selected = BTreeSet::new();
             let mut victims = Vec::new();
             let mut freed = BTreeSet::new();
 
-            let owner_pubkeys: BTreeMap<ExplicitOwner, Vec<Pubkey>> = {
-                let mut map: BTreeMap<ExplicitOwner, Vec<Pubkey>> = BTreeMap::new();
-                for (pubkey, owners) in &self.pubkey_owners {
-                    for owner in owners {
-                        map.entry(owner.clone()).or_default().push(*pubkey);
-                    }
-                }
-                for keys in map.values_mut() {
-                    keys.sort();
-                    keys.dedup();
-                }
-                map
-            };
-
             while freed.len() < required {
-                let mut picked = false;
+                let mut picked_positive = false;
                 for owner in &candidates {
                     if selected.contains(owner) {
                         continue;
                     }
-                    let positive = owner_pubkeys.get(owner).into_iter().flatten().any(|pk| {
-                        !incoming.contains(pk) && projected.get(pk).copied().unwrap_or(0) == 1
-                    });
+                    let positive = owner_pubkeys
+                        .get(owner)
+                        .into_iter()
+                        .flatten()
+                        .any(|pubkey| {
+                            !incoming.contains(pubkey)
+                                && projected.get(pubkey).copied().unwrap_or(0) == 1
+                        });
                     if positive {
                         selected.insert(owner.clone());
                         victims.push(owner.clone());
-                        for pk in owner_pubkeys.get(owner).into_iter().flatten() {
-                            let prev = projected.get_mut(pk).unwrap();
+                        for pubkey in owner_pubkeys.get(owner).into_iter().flatten() {
+                            let prev = projected.get_mut(pubkey).unwrap();
+                            if *prev == 0 {
+                                continue;
+                            }
                             *prev -= 1;
-                            if *prev == 0 && !incoming.contains(pk) {
-                                freed.insert(*pk);
+                            if *prev == 0 && !incoming.contains(pubkey) {
+                                freed.insert(*pubkey);
                             }
                         }
-                        picked = true;
+                        picked_positive = true;
                         break;
                     }
                 }
-                if picked {
+                if picked_positive {
                     continue;
                 }
 
-                let mut packages: BTreeSet<BTreeSet<ExplicitOwner>> = BTreeSet::new();
-                for (pubkey, owners) in &self.pubkey_owners {
+                let mut packages = BTreeSet::new();
+                for (pubkey, holders) in &self.pubkey_holders {
                     if incoming.contains(pubkey) {
                         continue;
                     }
@@ -2480,9 +2723,9 @@ mod tests {
                     if count == 0 {
                         continue;
                     }
-                    let remaining: BTreeSet<ExplicitOwner> = owners
+                    let remaining: BTreeSet<ExplicitOwner> = holders
                         .iter()
-                        .filter(|o| allowed.contains(*o) && !selected.contains(*o))
+                        .filter(|owner| allowed.contains(*owner) && !selected.contains(*owner))
                         .cloned()
                         .collect();
                     if remaining.len() == count && !remaining.is_empty() {
@@ -2490,47 +2733,22 @@ mod tests {
                     }
                 }
 
-                let best = packages.into_iter().min_by(|a, b| {
-                    let max_a = a
-                        .iter()
-                        .map(|o| Self::oracle_tier_priority(o.consumer))
-                        .max()
-                        .unwrap_or(0);
-                    let max_b = b
-                        .iter()
-                        .map(|o| Self::oracle_tier_priority(o.consumer))
-                        .max()
-                        .unwrap_or(0);
-                    max_a.cmp(&max_b).then_with(|| {
-                        let mut ka: Vec<_> = a
-                            .iter()
-                            .map(|o| {
-                                let touch = self.owner_records.get(o).map(|(t, _)| *t).unwrap_or(0);
-                                (Self::oracle_tier_priority(o.consumer), touch, o.clone())
-                            })
-                            .collect();
-                        let mut kb: Vec<_> = b
-                            .iter()
-                            .map(|o| {
-                                let touch = self.owner_records.get(o).map(|(t, _)| *t).unwrap_or(0);
-                                (Self::oracle_tier_priority(o.consumer), touch, o.clone())
-                            })
-                            .collect();
-                        ka.sort();
-                        kb.sort();
-                        ka.cmp(&kb)
-                    })
-                })?;
+                let best = packages
+                    .into_iter()
+                    .min_by(|a, b| self.compare_packages(a, b))?;
 
                 for owner in &candidates {
                     if best.contains(owner) && !selected.contains(owner) {
                         selected.insert(owner.clone());
                         victims.push(owner.clone());
-                        for pk in owner_pubkeys.get(owner).into_iter().flatten() {
-                            let prev = projected.get_mut(pk).unwrap();
+                        for pubkey in owner_pubkeys.get(owner).into_iter().flatten() {
+                            let prev = projected.get_mut(pubkey).unwrap();
+                            if *prev == 0 {
+                                continue;
+                            }
                             *prev -= 1;
-                            if *prev == 0 && !incoming.contains(pk) {
-                                freed.insert(*pk);
+                            if *prev == 0 && !incoming.contains(pubkey) {
+                                freed.insert(*pubkey);
                             }
                         }
                     }
@@ -2555,128 +2773,229 @@ mod tests {
             if self.owner_records.contains_key(incoming_owner) {
                 return VictimSelectionResult::RejectedInvalidInput;
             }
+
             let incoming_set: BTreeSet<Pubkey> = normalized.iter().copied().collect();
-            let added = self.incoming_physical_added(&normalized);
-            let projected = match self.physical_len.checked_add(added) {
-                Some(v) => v,
+            let incoming_added = self.incoming_physical_added(&normalized);
+            let projected = match self.physical_len.checked_add(incoming_added) {
+                Some(value) => value,
                 None => return VictimSelectionResult::InternalInvariantViolation,
             };
             if projected <= cap {
                 return VictimSelectionResult::NoEvictionNeeded {
-                    incoming_physical_added: added,
+                    incoming_physical_added: incoming_added,
                     projected_final_len: projected,
                 };
             }
             let required = match projected.checked_sub(cap) {
-                Some(v) => v,
+                Some(value) => value,
                 None => return VictimSelectionResult::InternalInvariantViolation,
             };
 
-            let allowed_tiers = oracle_allowed_tiers(incoming_owner.consumer);
+            let allowed_tiers = PolicyTier::allowed_for_incoming(incoming_owner.consumer);
             let mut opened = None;
             for tier in allowed_tiers {
-                let cumulative = Self::oracle_cumulative_consumers(*tier);
-                let allowed: BTreeSet<ExplicitOwner> = self
-                    .owner_records
-                    .keys()
-                    .filter(|o| {
-                        o.consumer != ExplicitConsumer::Wallet && cumulative.contains(&o.consumer)
-                    })
-                    .cloned()
-                    .collect();
-                let max_freeable = self
-                    .pubkey_owners
-                    .iter()
-                    .filter(|(pk, owners)| {
-                        !incoming_set.contains(pk) && owners.iter().all(|o| allowed.contains(o))
-                    })
-                    .count();
-                if max_freeable >= required {
-                    opened = Some((*tier, allowed));
+                if self.pubkey_freeable_count_at_tier(*tier, &incoming_set) >= required {
+                    opened = Some((*tier, self.eligible_owners_at_tier(*tier)));
                     break;
                 }
             }
 
             let Some((tier, allowed)) = opened else {
+                let max_tier = *allowed_tiers.last().unwrap_or(&PolicyTier::Tracker);
+                let max_allowed = self.eligible_owners_at_tier(max_tier);
+                assert!(
+                    !self.powerset_any_subset_frees_enough(&max_allowed, &incoming_set, required),
+                    "RejectedProtected but powerset found feasible eligible subset"
+                );
                 return VictimSelectionResult::RejectedProtected {
-                    incoming_physical_added: added,
+                    incoming_physical_added: incoming_added,
                     required_to_free: required,
                 };
             };
 
-            let Some((victims, freed)) = self.simulate_selection(&allowed, &incoming_set, required)
+            assert!(
+                self.powerset_any_subset_frees_enough(&allowed, &incoming_set, required),
+                "opened tier but powerset found no feasible eligible subset"
+            );
+
+            let Some((victims, freed)) =
+                self.procedural_selection(&allowed, &incoming_set, required)
             else {
                 return VictimSelectionResult::InternalInvariantViolation;
             };
 
             let mut physical_freed: Vec<Pubkey> = freed.into_iter().collect();
             physical_freed.sort();
-            let projected_final = self
+            let projected_final_len = self
                 .physical_len
-                .checked_add(added)
-                .and_then(|v| v.checked_sub(physical_freed.len()))
+                .checked_add(incoming_added)
+                .and_then(|value| value.checked_sub(physical_freed.len()))
                 .unwrap_or(0);
 
             VictimSelectionResult::Planned(VictimSelectionPlan {
                 victims,
                 physical_freed,
-                incoming_physical_added: added,
-                projected_final_len: projected_final,
+                incoming_physical_added: incoming_added,
+                projected_final_len,
                 opened_through: tier.to_eviction_tier(),
             })
         }
     }
 
-    #[test]
-    fn victim_selection_exhaustive_oracle_matches_small_graphs() {
+    fn victim_oracle_test_cases() -> Vec<VictimOracleCase> {
         let shared = pk(50);
-        let graphs: Vec<Vec<FixtureRow>> = vec![
-            vec![
-                (pool_owner(ExplicitConsumer::Tracker, 1), 1, vec![pk(1)]),
-                (pool_owner(ExplicitConsumer::Arb, 2), 2, vec![pk(2)]),
-            ],
-            vec![
-                (pool_owner(ExplicitConsumer::Tracker, 1), 1, vec![shared]),
-                (
-                    pool_owner(ExplicitConsumer::Tracker, 2),
-                    2,
-                    vec![shared, pk(2)],
-                ),
-            ],
-            vec![
-                (pool_owner(ExplicitConsumer::Wallet, 1), 1, vec![pk(10)]),
-                (pool_owner(ExplicitConsumer::Tracker, 2), 2, vec![pk(11)]),
-            ],
-        ];
+        let shared_ab = pk(51);
+        let wallet = pool_owner(ExplicitConsumer::Wallet, 1);
+        let tracker_a = pool_owner(ExplicitConsumer::Tracker, 1);
+        let tracker_b = pool_owner(ExplicitConsumer::Tracker, 2);
+        let tracker_c = pool_owner(ExplicitConsumer::Tracker, 3);
+        let arb_a = pool_owner(ExplicitConsumer::Arb, 4);
+        let momentum_a = pool_owner(ExplicitConsumer::Momentum, 5);
+        let incoming_tracker = pool_owner(ExplicitConsumer::Tracker, 90);
+        let incoming_arb = pool_owner(ExplicitConsumer::Arb, 91);
+        let incoming_momentum = pool_owner(ExplicitConsumer::Momentum, 92);
 
-        let incoming_owners = [
-            pool_owner(ExplicitConsumer::Tracker, 50),
-            pool_owner(ExplicitConsumer::Arb, 51),
-            pool_owner(ExplicitConsumer::Momentum, 52),
-        ];
-        let key_sets = [vec![pk(100)], vec![pk(100), pk(101)], vec![shared, pk(102)]];
+        vec![
+            VictimOracleCase {
+                fixtures: vec![
+                    (tracker_a.clone(), 1, vec![pk(1)]),
+                    (arb_a.clone(), 2, vec![pk(2)]),
+                ],
+                incoming: incoming_momentum.clone(),
+                keys: vec![pk(100)],
+                cap: 5,
+            },
+            VictimOracleCase {
+                fixtures: vec![
+                    (tracker_a.clone(), 1, vec![pk(1)]),
+                    (arb_a.clone(), 2, vec![pk(2)]),
+                    (momentum_a.clone(), 3, vec![pk(3)]),
+                ],
+                incoming: incoming_momentum.clone(),
+                keys: vec![pk(100)],
+                cap: 2,
+            },
+            VictimOracleCase {
+                fixtures: vec![
+                    (tracker_a.clone(), 1, vec![shared]),
+                    (tracker_b.clone(), 2, vec![shared]),
+                ],
+                incoming: incoming_momentum.clone(),
+                keys: vec![pk(100)],
+                cap: 1,
+            },
+            VictimOracleCase {
+                fixtures: vec![
+                    (tracker_a.clone(), 1, vec![shared, pk(2)]),
+                    (arb_a.clone(), 3, vec![shared]),
+                ],
+                incoming: incoming_momentum.clone(),
+                keys: vec![pk(100), pk(101)],
+                cap: 2,
+            },
+            VictimOracleCase {
+                fixtures: vec![
+                    (wallet.clone(), 1, vec![pk(10)]),
+                    (tracker_a.clone(), 2, vec![pk(11)]),
+                ],
+                incoming: incoming_momentum.clone(),
+                keys: vec![pk(100)],
+                cap: 2,
+            },
+            VictimOracleCase {
+                fixtures: vec![(tracker_a.clone(), 1, vec![pk(1), pk(2)])],
+                incoming: incoming_momentum.clone(),
+                keys: vec![pk(1), pk(100)],
+                cap: 2,
+            },
+            VictimOracleCase {
+                fixtures: vec![
+                    (tracker_a.clone(), 1, vec![pk(1), shared_ab]),
+                    (arb_a.clone(), 2, vec![shared_ab]),
+                ],
+                incoming: incoming_momentum.clone(),
+                keys: vec![pk(100), pk(101)],
+                cap: 2,
+            },
+            VictimOracleCase {
+                fixtures: vec![
+                    (tracker_a.clone(), 1, vec![pk(1), pk(2)]),
+                    (tracker_b.clone(), 2, vec![pk(2), pk(3)]),
+                    (tracker_c.clone(), 3, vec![pk(1), pk(3)]),
+                ],
+                incoming: incoming_momentum.clone(),
+                keys: vec![pk(100), pk(101)],
+                cap: 3,
+            },
+            VictimOracleCase {
+                fixtures: vec![
+                    (tracker_a.clone(), 1, vec![shared]),
+                    (tracker_b.clone(), 2, vec![pk(2)]),
+                ],
+                incoming: incoming_momentum.clone(),
+                keys: vec![shared, pk(100)],
+                cap: 2,
+            },
+            VictimOracleCase {
+                fixtures: vec![
+                    (wallet.clone(), 1, vec![pk(1)]),
+                    (momentum_a.clone(), 2, vec![pk(2), pk(3)]),
+                ],
+                incoming: incoming_momentum.clone(),
+                keys: vec![pk(10), pk(11)],
+                cap: 1,
+            },
+            VictimOracleCase {
+                fixtures: vec![
+                    (tracker_a.clone(), 1, vec![pk(1)]),
+                    (arb_a.clone(), 2, vec![pk(2)]),
+                    (momentum_a.clone(), 3, vec![pk(3)]),
+                ],
+                incoming: incoming_tracker.clone(),
+                keys: vec![pk(100), pk(101)],
+                cap: 2,
+            },
+            VictimOracleCase {
+                fixtures: vec![
+                    (tracker_a.clone(), 1, vec![pk(1)]),
+                    (arb_a.clone(), 2, vec![pk(2)]),
+                    (momentum_a.clone(), 3, vec![pk(3)]),
+                ],
+                incoming: incoming_arb.clone(),
+                keys: vec![pk(100), pk(101), pk(102)],
+                cap: 2,
+            },
+            VictimOracleCase {
+                fixtures: vec![
+                    (tracker_a.clone(), 10, vec![pk(60)]),
+                    (tracker_b.clone(), 20, vec![pk(60)]),
+                    (tracker_c.clone(), 30, vec![pk(61)]),
+                    (pool_owner(ExplicitConsumer::Tracker, 6), 40, vec![pk(61)]),
+                ],
+                incoming: incoming_momentum.clone(),
+                keys: vec![pk(100), pk(101)],
+                cap: 3,
+            },
+        ]
+    }
 
-        for fixtures in graphs {
-            let snapshot = snapshot_from_fixtures(&fixtures);
-            let oracle = VictimSelectionOracle::from_fixtures(&fixtures);
-            for incoming_owner in &incoming_owners {
-                if fixtures.iter().any(|(o, _, _)| o == incoming_owner) {
-                    continue;
-                }
-                for keys in &key_sets {
-                    for cap in [0usize, 1, 2, 3] {
-                        let actual = select_eviction_victims(
-                            &snapshot,
-                            victim_request(incoming_owner.clone(), keys.clone(), cap),
-                        );
-                        let expected = oracle.analyze(incoming_owner, keys, cap);
-                        assert_eq!(
-                            actual, expected,
-                            "fixtures={fixtures:?} incoming={incoming_owner:?} keys={keys:?} cap={cap}"
-                        );
-                    }
-                }
-            }
+    #[test]
+    fn victim_selection_powerset_oracle_matches_production_on_deterministic_graphs() {
+        for case in victim_oracle_test_cases() {
+            assert!(
+                case.fixtures.len() <= 8,
+                "powerset oracle requires <=8 owners"
+            );
+            let snapshot = snapshot_from_fixtures(&case.fixtures);
+            let oracle = IndependentVictimOracle::from_fixtures(&case.fixtures);
+            let request = victim_request(case.incoming.clone(), case.keys.clone(), case.cap);
+            let actual = select_eviction_victims(&snapshot, request);
+            let expected = oracle.analyze(&case.incoming, &case.keys, case.cap);
+            assert_eq!(
+                actual, expected,
+                "fixtures={:?} incoming={:?} keys={:?} cap={}",
+                case.fixtures, case.incoming, case.keys, case.cap
+            );
         }
     }
 }
