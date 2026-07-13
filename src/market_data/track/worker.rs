@@ -265,6 +265,32 @@ fn track_worker_prepare_command_delivery<C: TrackWorkerContext>(
     }
 }
 
+fn track_worker_receive_protocol_command<C: TrackWorkerContext>(
+    ctx: &Arc<C>,
+    protocol: &Arc<Mutex<BoundedProtocolStore>>,
+    cmd: ImmutableTrackCommand,
+    coalesce_deadline: &mut Option<Instant>,
+    push_before_keys: &mut Option<HashSet<Pubkey>>,
+    pending_continue_evict: &mut bool,
+    pending_release_flush_slot: &mut bool,
+) {
+    let applicable = {
+        let store = protocol.lock().expect("track protocol store lock");
+        store.is_applicable(cmd.stream, cmd.revision)
+    };
+    if applicable {
+        track_worker_prepare_command_delivery(
+            ctx,
+            &cmd.payload,
+            coalesce_deadline,
+            push_before_keys,
+            pending_continue_evict,
+            pending_release_flush_slot,
+        );
+    }
+    track_worker_apply_protocol_command(ctx, protocol, cmd);
+}
+
 fn track_worker_drain_pending_replay<C: TrackWorkerContext>(
     ctx: &Arc<C>,
     protocol: &Arc<Mutex<BoundedProtocolStore>>,
@@ -325,26 +351,26 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
         match recv_result {
             Ok(job) => {
                 track_worker_dec_queue_depth(&queue_depth, &protocol);
-                track_worker_prepare_command_delivery(
+                track_worker_receive_protocol_command(
                     &ctx,
-                    &job.payload,
+                    &protocol,
+                    job,
                     &mut coalesce_deadline,
                     &mut push_before_keys,
                     &mut pending_continue_evict,
                     &mut pending_release_flush_slot,
                 );
-                track_worker_apply_protocol_command(&ctx, &protocol, job);
                 while let Ok(more) = rx.try_recv() {
                     track_worker_dec_queue_depth(&queue_depth, &protocol);
-                    track_worker_prepare_command_delivery(
+                    track_worker_receive_protocol_command(
                         &ctx,
-                        &more.payload,
+                        &protocol,
+                        more,
                         &mut coalesce_deadline,
                         &mut push_before_keys,
                         &mut pending_continue_evict,
                         &mut pending_release_flush_slot,
                     );
-                    track_worker_apply_protocol_command(&ctx, &protocol, more);
                 }
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {}
