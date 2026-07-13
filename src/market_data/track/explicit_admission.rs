@@ -947,8 +947,7 @@ impl FixedCapAdmission {
     ) -> FixedCapRemoveResult {
         let _ = self.ownership.remove_group(owner);
         if self.ownership.owner_group(owner).is_some() {
-            self.owner_lru.remove(owner);
-            self.reconcile_cold();
+            self.physical_len = self.ownership.len();
             return FixedCapRemoveResult::InternalInvariantViolation {
                 recovery: FixedCapRemoveRecovery::RecoveryFailed,
             };
