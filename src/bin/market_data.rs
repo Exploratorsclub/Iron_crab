@@ -2701,6 +2701,33 @@ impl MarketDataContext {
         set
     }
 
+    fn configured_max_tracked_accounts(&self) -> usize {
+        self.config.read().max_tracked_accounts
+    }
+
+    fn admission_exceeds_configured_cap(&self, admission: &FixedCapAdmission) -> bool {
+        ironcrab::market_data::track::admission_exceeds_configured_cap(
+            admission,
+            self.configured_max_tracked_accounts(),
+        )
+    }
+
+    fn mark_explicit_admission_config_cap_desync(
+        &self,
+        admission: &FixedCapAdmission,
+        detail: &str,
+    ) {
+        let configured = self.configured_max_tracked_accounts();
+        self.geyser_explicit_ready.store(false, Ordering::Release);
+        *self.geyser_explicit_config_error.write() = Some(format!(
+            "configured max_tracked_accounts ({configured}) below admission cap ({}); admitted={}; {detail}",
+            admission.cap(),
+            admission.len(),
+        ));
+        self.geyser_connect_barrier.mark_failed();
+        set_market_data_geyser_explicit_cap_overflow(1);
+    }
+
     fn on_admission_converge_result(
         &self,
         admission: &FixedCapAdmission,
@@ -2720,9 +2747,25 @@ impl MarketDataContext {
             AdmissionConvergeResult::Converged => {
                 set_market_data_geyser_explicit_admitted_accounts(admission.len());
                 set_market_data_geyser_explicit_set_size(admission.len());
-                if !admission.wallet_demand_exceeds_cap(admission.cap()) {
+                let configured = self.configured_max_tracked_accounts();
+                if self.admission_exceeds_configured_cap(admission) {
+                    self.mark_explicit_admission_config_cap_desync(
+                        admission,
+                        "converge succeeded but admission exceeds configured cap",
+                    );
+                } else if admission.wallet_demand_exceeds_cap(configured) {
+                    let wallet_len = self.wallet_explicit_demand_pubkeys().len();
+                    let msg = format!(
+                        "wallet protected explicit demand ({wallet_len} pubkeys) exceeds max_tracked_accounts cap ({configured})"
+                    );
+                    self.geyser_explicit_ready.store(false, Ordering::Release);
+                    *self.geyser_explicit_config_error.write() = Some(msg);
+                    self.geyser_connect_barrier.mark_failed();
+                    set_market_data_geyser_explicit_cap_overflow(1);
+                } else {
                     self.geyser_explicit_ready.store(true, Ordering::Release);
                     *self.geyser_explicit_config_error.write() = None;
+                    set_market_data_geyser_explicit_cap_overflow(0);
                 }
             }
             AdmissionConvergeResult::ProtectedOverflow => {
@@ -2794,6 +2837,13 @@ impl MarketDataContext {
     }
 
     fn publish_admitted_explicit_physical(&self, admission: &FixedCapAdmission) {
+        if self.admission_exceeds_configured_cap(admission) {
+            self.mark_explicit_admission_config_cap_desync(
+                admission,
+                "publish blocked: admission exceeds configured cap",
+            );
+            return;
+        }
         let admitted: HashSet<Pubkey> = admission.snapshot_pubkeys().into_iter().collect();
         let mint_keys: HashSet<Pubkey> = self.tracked_mints.read().keys().copied().collect();
         let vault_keys: HashSet<Pubkey> = self.tracked_vaults.read().keys().copied().collect();
@@ -2851,8 +2901,26 @@ impl MarketDataContext {
         let result = restore_admission_from_owner_groups(admission, &groups);
         match result {
             AdmissionRestoreResult::Restored => {
-                self.geyser_explicit_ready.store(true, Ordering::Release);
-                *self.geyser_explicit_config_error.write() = None;
+                if self.admission_exceeds_configured_cap(admission) {
+                    self.mark_explicit_admission_config_cap_desync(
+                        admission,
+                        "restore succeeded but admission exceeds configured cap",
+                    );
+                } else if admission
+                    .wallet_demand_exceeds_cap(self.configured_max_tracked_accounts())
+                {
+                    let cap = self.configured_max_tracked_accounts();
+                    let msg = format!(
+                        "wallet-only explicit demand exceeds max_tracked_accounts cap ({cap}) on restore"
+                    );
+                    self.geyser_explicit_ready.store(false, Ordering::Release);
+                    *self.geyser_explicit_config_error.write() = Some(msg);
+                    self.geyser_connect_barrier.mark_failed();
+                } else {
+                    self.geyser_explicit_ready.store(true, Ordering::Release);
+                    *self.geyser_explicit_config_error.write() = None;
+                    set_market_data_geyser_explicit_cap_overflow(0);
+                }
             }
             AdmissionRestoreResult::ProtectedOverflow => {
                 let cap = admission.cap();
@@ -2892,12 +2960,29 @@ impl MarketDataContext {
             };
         }
         let result = admission.try_shrink_cap(new_cap);
-        if matches!(result, CapShrinkResult::ProtectedOverflow { .. }) {
-            self.geyser_explicit_ready.store(false, Ordering::Release);
-            *self.geyser_explicit_config_error.write() = Some(format!(
-                "max_tracked_accounts shrink to {new_cap} rejected: wallet protected overflow"
-            ));
-            self.geyser_connect_barrier.mark_failed();
+        match result {
+            CapShrinkResult::Converged { .. } | CapShrinkResult::NoOpAlreadyWithinCap { .. } => {
+                if self.admission_exceeds_configured_cap(admission) {
+                    self.mark_explicit_admission_config_cap_desync(
+                        admission,
+                        "cap shrink did not align admission with configured cap",
+                    );
+                } else {
+                    self.geyser_explicit_ready.store(true, Ordering::Release);
+                    *self.geyser_explicit_config_error.write() = None;
+                    set_market_data_geyser_explicit_cap_overflow(0);
+                }
+            }
+            CapShrinkResult::ProtectedOverflow { .. } => {
+                self.mark_explicit_admission_config_cap_desync(
+                    admission,
+                    "max_tracked_accounts shrink rejected: wallet protected overflow",
+                );
+            }
+            CapShrinkResult::RejectedInvalidInput | CapShrinkResult::InternalInvariantViolation => {
+                self.mark_explicit_admission_config_cap_desync(admission, "cap shrink failed");
+            }
+            CapShrinkResult::RejectedCapIncrease { .. } => {}
         }
         result
     }

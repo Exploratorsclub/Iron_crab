@@ -248,6 +248,14 @@ pub fn admitted_pubkey_set(admission: &FixedCapAdmission) -> HashSet<Pubkey> {
     admission.snapshot_pubkeys().into_iter().collect()
 }
 
+/// True when admission hard cap or physical len exceeds the configured `max_tracked_accounts`.
+pub fn admission_exceeds_configured_cap(
+    admission: &FixedCapAdmission,
+    configured_cap: usize,
+) -> bool {
+    admission.cap() > configured_cap || admission.len() > configured_cap
+}
+
 /// Partition admitted pubkeys into merge-task channels so their union equals `admitted`.
 ///
 /// Tracked-map membership classifies known kinds; any admitted pubkey without a map row
@@ -354,6 +362,21 @@ mod tests {
             AdmissionConvergeResult::Converged
         );
         assert_eq!(admission.len(), 1);
+    }
+
+    #[test]
+    fn admission_exceeds_configured_cap_when_hard_cap_desynced() {
+        let mut admission = FixedCapAdmission::new(10_000);
+        assert!(!admission_exceeds_configured_cap(&admission, 10_000));
+        assert!(admission_exceeds_configured_cap(&admission, 5_000));
+        let owner = pool_owner(ExplicitConsumer::Momentum, Pubkey::new_unique());
+        assert!(admit_or_replace(
+            &mut admission,
+            owner,
+            vec![Pubkey::new_unique()]
+        ));
+        assert!(!admission_exceeds_configured_cap(&admission, 10_000));
+        assert!(admission_exceeds_configured_cap(&admission, 0));
     }
 
     #[test]
