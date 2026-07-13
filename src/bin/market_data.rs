@@ -4531,12 +4531,12 @@ impl MarketDataContext {
         mint: Pubkey,
         pool: Pubkey,
     ) -> bool {
-        self.release_pool_consumer_group(admission, pool, ExplicitConsumer::Momentum);
         self.hot_pool_registry.unpin_pool(mint, pool);
         let mut changed = false;
         // Pool-level reserve pins are shared: only demote vaults/bin arrays when no `(m, pool)`
         // row remains after this unpin (PR #147 follow-up).
         if !self.hot_pool_registry.pool_has_any_pin(pool) {
+            self.release_pool_consumer_group(admission, pool, ExplicitConsumer::Momentum);
             {
                 let mut vaults = self.tracked_vaults.write();
                 for v in vaults.values_mut() {
