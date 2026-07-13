@@ -2897,7 +2897,11 @@ impl MarketDataContext {
         admission: &mut FixedCapAdmission,
         new_cap: usize,
     ) -> CapShrinkResult {
-        let result = admission.try_shrink_cap(new_cap);
+        let result = if new_cap > admission.cap() {
+            admission.raise_cap(new_cap)
+        } else {
+            admission.try_shrink_cap(new_cap)
+        };
         if matches!(result, CapShrinkResult::ProtectedOverflow { .. }) {
             self.geyser_explicit_ready.store(false, Ordering::Release);
             *self.geyser_explicit_config_error.write() = Some(format!(
