@@ -2795,42 +2795,23 @@ impl MarketDataContext {
 
     fn publish_admitted_explicit_physical(&self, admission: &FixedCapAdmission) {
         let admitted: HashSet<Pubkey> = admission.snapshot_pubkeys().into_iter().collect();
-        let mut sorted: Vec<Pubkey> = admitted.iter().copied().collect();
-        sorted.sort();
-        sorted.dedup();
-        let n = sorted.len();
-        let mints: Vec<Pubkey> = self
-            .tracked_mints
-            .read()
-            .keys()
-            .filter(|pk| admitted.contains(pk))
-            .copied()
-            .collect();
-        let vaults: Vec<Pubkey> = self
-            .tracked_vaults
-            .read()
-            .keys()
-            .filter(|pk| admitted.contains(pk))
-            .copied()
-            .collect();
-        let bins: Vec<Pubkey> = self
-            .tracked_bin_arrays
-            .read()
-            .keys()
-            .filter(|pk| admitted.contains(pk))
-            .copied()
-            .collect();
+        let mint_keys: HashSet<Pubkey> = self.tracked_mints.read().keys().copied().collect();
+        let vault_keys: HashSet<Pubkey> = self.tracked_vaults.read().keys().copied().collect();
+        let bin_keys: HashSet<Pubkey> = self.tracked_bin_arrays.read().keys().copied().collect();
+        let wallet_keys = self.wallet_explicit_demand_pubkeys();
+        let (mints, vaults, bins, wallets) =
+            ironcrab::market_data::track::partition_admitted_pubkeys_for_geyser_channels(
+                &admitted,
+                &mint_keys,
+                &vault_keys,
+                &bin_keys,
+                &wallet_keys,
+            );
         let _ = self.tracked_mints_tx.send(mints);
         let _ = self.tracked_vaults_tx.send(vaults);
         let _ = self.tracked_bin_arrays_tx.send(bins);
-        let mut wallets: Vec<Pubkey> = self
-            .wallet_explicit_demand_pubkeys()
-            .into_iter()
-            .filter(|pk| admitted.contains(pk))
-            .collect();
-        wallets.sort();
         let _ = self.tracked_wallet_tx.send(wallets);
-        geyser_metrics_set_subscription_accounts(n);
+        geyser_metrics_set_subscription_accounts(admitted.len());
         self.refresh_geyser_pins_gauge();
     }
 

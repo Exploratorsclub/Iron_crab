@@ -248,6 +248,69 @@ pub fn admitted_pubkey_set(admission: &FixedCapAdmission) -> HashSet<Pubkey> {
     admission.snapshot_pubkeys().into_iter().collect()
 }
 
+/// Partition admitted pubkeys into merge-task channels so their union equals `admitted`.
+///
+/// Tracked-map membership classifies known kinds; any admitted pubkey without a map row
+/// (e.g. restored Tracker admission) is routed to `mints` so Geyser still receives it.
+pub fn partition_admitted_pubkeys_for_geyser_channels(
+    admitted: &HashSet<Pubkey>,
+    mint_keys: &HashSet<Pubkey>,
+    vault_keys: &HashSet<Pubkey>,
+    bin_keys: &HashSet<Pubkey>,
+    wallet_keys: &HashSet<Pubkey>,
+) -> (Vec<Pubkey>, Vec<Pubkey>, Vec<Pubkey>, Vec<Pubkey>) {
+    let mut mints = Vec::new();
+    let mut vaults = Vec::new();
+    let mut bins = Vec::new();
+    let mut wallets = Vec::new();
+    let mut classified = HashSet::new();
+
+    for pk in admitted {
+        if wallet_keys.contains(pk) {
+            wallets.push(*pk);
+            classified.insert(*pk);
+        }
+    }
+    for pk in admitted {
+        if classified.contains(pk) {
+            continue;
+        }
+        if vault_keys.contains(pk) {
+            vaults.push(*pk);
+            classified.insert(*pk);
+        }
+    }
+    for pk in admitted {
+        if classified.contains(pk) {
+            continue;
+        }
+        if bin_keys.contains(pk) {
+            bins.push(*pk);
+            classified.insert(*pk);
+        }
+    }
+    for pk in admitted {
+        if classified.contains(pk) {
+            continue;
+        }
+        if mint_keys.contains(pk) {
+            mints.push(*pk);
+            classified.insert(*pk);
+        }
+    }
+    for pk in admitted {
+        if !classified.contains(pk) {
+            mints.push(*pk);
+        }
+    }
+
+    mints.sort();
+    vaults.sort();
+    bins.sort();
+    wallets.sort();
+    (mints, vaults, bins, wallets)
+}
+
 pub fn apply_cap_shrink(admission: &mut FixedCapAdmission, new_cap: usize) -> CapShrinkResult {
     admission.try_shrink_cap(new_cap)
 }
@@ -291,6 +354,38 @@ mod tests {
             AdmissionConvergeResult::Converged
         );
         assert_eq!(admission.len(), 1);
+    }
+
+    #[test]
+    fn partition_admitted_includes_keys_without_tracked_map_rows() {
+        let admitted: HashSet<Pubkey> = [
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ]
+        .into_iter()
+        .collect();
+        let vault_pk = *admitted.iter().next().unwrap();
+        let wallet_pk = admitted.iter().nth(1).copied().unwrap();
+        let orphan_pk = admitted.iter().nth(2).copied().unwrap();
+        let (mints, vaults, bins, wallets) = partition_admitted_pubkeys_for_geyser_channels(
+            &admitted,
+            &HashSet::new(),
+            &HashSet::from([vault_pk]),
+            &HashSet::new(),
+            &HashSet::from([wallet_pk]),
+        );
+        assert_eq!(wallets, vec![wallet_pk]);
+        assert_eq!(vaults, vec![vault_pk]);
+        assert_eq!(bins, Vec::<Pubkey>::new());
+        assert_eq!(mints, vec![orphan_pk]);
+        let combined: HashSet<Pubkey> = mints
+            .into_iter()
+            .chain(vaults)
+            .chain(bins)
+            .chain(wallets)
+            .collect();
+        assert_eq!(combined, admitted);
     }
 
     #[test]
