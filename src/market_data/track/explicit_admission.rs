@@ -7,7 +7,10 @@
 //! Normal planning is O(group_size). [`FixedCapAdmission::reconcile_physical_len_cold`]
 //! may scan ownership only on exceptional invariant/rollback failure.
 
-use super::eviction_planner::OwnerLruEntry;
+use super::eviction_planner::{
+    select_eviction_victims, EvictionPlanningSnapshot, OwnerLruEntry, VictimSelectionRequest,
+    VictimSelectionResult,
+};
 use super::explicit_ownership::{
     EmptyOwnerGroupError, ExplicitOwner, ExplicitOwnership, GroupChange, OwnerGroupSnapshot,
 };
@@ -66,6 +69,12 @@ pub enum FixedCapRemoveResult {
     /// Post-commit plan/rollback mismatch with a documented recovery path.
     InternalInvariantViolation { recovery: FixedCapRemoveRecovery },
 }
+
+/// Read-only eviction plan for a hypothetical new-owner admit (PR 1c2b1).
+///
+/// Alias of [`VictimSelectionResult`]: identical cap/delta semantics from the pure selector
+/// over an internally built [`EvictionPlanningSnapshot`]. Not a commit token.
+pub type AdmissionEvictionPlanResult = VictimSelectionResult;
 
 /// Result of an explicit owner-group LRU touch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +153,8 @@ pub struct FixedCapAdmission {
     test_force_remove_planning_zero_refcount: bool,
     #[cfg(test)]
     test_force_stamp_plan_failure: bool,
+    #[cfg(test)]
+    test_eviction_plan_extra_lru: Vec<OwnerLruEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +239,8 @@ impl FixedCapAdmission {
             test_force_remove_planning_zero_refcount: false,
             #[cfg(test)]
             test_force_stamp_plan_failure: false,
+            #[cfg(test)]
+            test_eviction_plan_extra_lru: Vec::new(),
         }
     }
 
@@ -371,6 +384,50 @@ impl FixedCapAdmission {
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    pub fn set_test_eviction_plan_extra_lru(&mut self, entries: Vec<OwnerLruEntry>) {
+        self.test_eviction_plan_extra_lru = entries;
+    }
+
+    /// Plan eviction victims for a hypothetical new-owner admit using only internal state.
+    ///
+    /// Read-only: builds [`EvictionPlanningSnapshot`] from [`Self::ownership`] and
+    /// [`Self::snapshot_lru_entries`], then delegates to [`select_eviction_victims`].
+    /// No ownership/LRU mutation, stamp consumption, victim removal, or incoming commit.
+    /// Snapshot construction failures map to [`VictimSelectionResult::InternalInvariantViolation`].
+    pub fn plan_admit_with_eviction(
+        &self,
+        incoming_owner: ExplicitOwner,
+        incoming_pubkeys: impl IntoIterator<Item = Pubkey>,
+    ) -> AdmissionEvictionPlanResult {
+        let incoming_pubkeys = normalize_pubkeys(incoming_pubkeys);
+        let snapshot = match EvictionPlanningSnapshot::from_ownership(
+            &self.ownership,
+            self.eviction_planning_lru_entries(),
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return VictimSelectionResult::InternalInvariantViolation,
+        };
+        select_eviction_victims(
+            &snapshot,
+            VictimSelectionRequest {
+                incoming_owner,
+                incoming_pubkeys,
+                cap: self.cap,
+            },
+        )
+    }
+
+    fn eviction_planning_lru_entries(&self) -> Vec<OwnerLruEntry> {
+        #[cfg(test)]
+        if !self.test_eviction_plan_extra_lru.is_empty() {
+            let mut entries = self.snapshot_lru_entries();
+            entries.extend(self.test_eviction_plan_extra_lru.iter().cloned());
+            return entries;
+        }
+        self.snapshot_lru_entries()
     }
 
     /// Admit a new owner group when the owner is absent and projected physical pubkeys fit the cap.
@@ -3291,5 +3348,441 @@ mod tests {
             FixedCapRemoveResult::Removed { .. } => {}
             other => panic!("expected successful removal, got {other:?}"),
         }
+    }
+
+    use super::super::eviction_planner::{
+        select_eviction_victims, EvictionTier, TierFeasibilityRequest, TierFeasibilityResult,
+        VictimSelectionPlan, VictimSelectionRequest,
+    };
+
+    type EvictionFixtureRow = (ExplicitOwner, u64, Vec<Pubkey>);
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ReverseIndexRow {
+        refcount: usize,
+        owners: BTreeSet<ExplicitOwner>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AdmissionPlanStateSnapshot {
+        cap: usize,
+        physical_len: usize,
+        next_touch_stamp: u64,
+        owner_lru: BTreeMap<ExplicitOwner, u64>,
+        ownership_groups: BTreeMap<ExplicitOwner, BTreeSet<Pubkey>>,
+        snapshot_pubkeys: Vec<Pubkey>,
+        reverse_index: BTreeMap<Pubkey, ReverseIndexRow>,
+        planning_stats: PlanningStats,
+        test_force_commit_plan_mismatch: bool,
+        test_force_restore_plan_mismatch: bool,
+        test_force_remove_planning_underflow: bool,
+        test_force_remove_planning_zero_refcount: bool,
+        test_force_stamp_plan_failure: bool,
+        test_eviction_plan_extra_lru: Vec<OwnerLruEntry>,
+    }
+
+    fn reverse_index_from_groups(
+        groups: &BTreeMap<ExplicitOwner, BTreeSet<Pubkey>>,
+    ) -> BTreeMap<Pubkey, ReverseIndexRow> {
+        let mut by_pubkey: BTreeMap<Pubkey, BTreeSet<ExplicitOwner>> = BTreeMap::new();
+        for (owner, pubkeys) in groups {
+            for pubkey in pubkeys {
+                by_pubkey.entry(*pubkey).or_default().insert(owner.clone());
+            }
+        }
+        by_pubkey
+            .into_iter()
+            .map(|(pubkey, owners)| {
+                let refcount = owners.len();
+                (pubkey, ReverseIndexRow { refcount, owners })
+            })
+            .collect()
+    }
+
+    fn snapshot_admission_plan_state(admission: &FixedCapAdmission) -> AdmissionPlanStateSnapshot {
+        let ownership_groups = admission_groups(admission);
+        let snapshot_pubkeys = admission.snapshot_pubkeys();
+        let reverse_index = reverse_index_from_groups(&ownership_groups);
+        for (pubkey, row) in &reverse_index {
+            assert_eq!(row.refcount, admission.owner_refcount(pubkey));
+        }
+        assert_eq!(admission.physical_len, snapshot_pubkeys.len());
+        AdmissionPlanStateSnapshot {
+            cap: admission.cap,
+            physical_len: admission.physical_len,
+            next_touch_stamp: admission.next_touch_stamp,
+            owner_lru: admission.owner_lru.clone(),
+            ownership_groups,
+            snapshot_pubkeys,
+            reverse_index,
+            planning_stats: admission.planning_stats.clone(),
+            test_force_commit_plan_mismatch: admission.test_force_commit_plan_mismatch,
+            test_force_restore_plan_mismatch: admission.test_force_restore_plan_mismatch,
+            test_force_remove_planning_underflow: admission.test_force_remove_planning_underflow,
+            test_force_remove_planning_zero_refcount: admission
+                .test_force_remove_planning_zero_refcount,
+            test_force_stamp_plan_failure: admission.test_force_stamp_plan_failure,
+            test_eviction_plan_extra_lru: admission.test_eviction_plan_extra_lru.clone(),
+        }
+    }
+
+    fn assert_admission_plan_state_unchanged(
+        admission: &FixedCapAdmission,
+        before: &AdmissionPlanStateSnapshot,
+    ) {
+        assert_eq!(snapshot_admission_plan_state(admission), *before);
+    }
+
+    fn plan_and_assert_state_unchanged(
+        admission: &FixedCapAdmission,
+        before: &AdmissionPlanStateSnapshot,
+        incoming_owner: ExplicitOwner,
+        incoming_pubkeys: Vec<Pubkey>,
+    ) -> AdmissionEvictionPlanResult {
+        let result = admission.plan_admit_with_eviction(incoming_owner, incoming_pubkeys);
+        assert_admission_plan_state_unchanged(admission, before);
+        result
+    }
+
+    fn admission_from_eviction_fixtures(
+        cap: usize,
+        fixtures: &[EvictionFixtureRow],
+    ) -> FixedCapAdmission {
+        let mut admission = FixedCapAdmission::new(cap);
+        for (owner, _stamp, pubkeys) in fixtures {
+            assert_admitted(admission.try_admit_new_group(owner.clone(), pubkeys.clone()));
+        }
+        for (owner, stamp, _) in fixtures {
+            admission.set_test_owner_stamp(owner.clone(), *stamp);
+        }
+        if let Some(max_stamp) = fixtures.iter().map(|(_, stamp, _)| *stamp).max() {
+            admission.set_test_next_touch_stamp(max_stamp.saturating_add(1));
+        }
+        admission
+    }
+
+    fn victim_request(
+        incoming_owner: ExplicitOwner,
+        incoming_pubkeys: Vec<Pubkey>,
+        cap: usize,
+    ) -> VictimSelectionRequest {
+        VictimSelectionRequest {
+            incoming_owner,
+            incoming_pubkeys,
+            cap,
+        }
+    }
+
+    fn tier_request(
+        incoming_owner: ExplicitOwner,
+        incoming_pubkeys: Vec<Pubkey>,
+        cap: usize,
+    ) -> TierFeasibilityRequest {
+        TierFeasibilityRequest {
+            incoming_owner,
+            incoming_pubkeys,
+            cap,
+        }
+    }
+
+    fn assert_facade_matches_direct_selector(
+        admission: &FixedCapAdmission,
+        incoming_owner: ExplicitOwner,
+        incoming_pubkeys: Vec<Pubkey>,
+    ) {
+        let snapshot = admission
+            .test_build_eviction_snapshot()
+            .expect("fixture admission must build eviction snapshot");
+        let expected = select_eviction_victims(
+            &snapshot,
+            victim_request(
+                incoming_owner.clone(),
+                incoming_pubkeys.clone(),
+                admission.cap(),
+            ),
+        );
+        let before = snapshot_admission_plan_state(admission);
+        let actual =
+            plan_and_assert_state_unchanged(admission, &before, incoming_owner, incoming_pubkeys);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn eviction_plan_facade_result_no_eviction_needed_exact() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let fixtures = [(tracker.clone(), 1, vec![pk(1)])];
+        let admission = admission_from_eviction_fixtures(5, &fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Tracker, 9);
+        let before = snapshot_admission_plan_state(&admission);
+        let result =
+            plan_and_assert_state_unchanged(&admission, &before, incoming.clone(), vec![pk(2)]);
+        assert_eq!(
+            result,
+            VictimSelectionResult::NoEvictionNeeded {
+                incoming_physical_added: 1,
+                projected_final_len: 2,
+            }
+        );
+        assert_facade_matches_direct_selector(&admission, incoming, vec![pk(2)]);
+    }
+
+    #[test]
+    fn eviction_plan_facade_result_planned_exact() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let arb = pool_owner(ExplicitConsumer::Arb, 2);
+        let momentum = pool_owner(ExplicitConsumer::Momentum, 3);
+        let fixtures = [
+            (momentum.clone(), 30, vec![pk(3)]),
+            (arb.clone(), 20, vec![pk(2)]),
+            (tracker.clone(), 10, vec![pk(1)]),
+        ];
+        let admission = admission_from_eviction_fixtures(3, &fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
+        let before = snapshot_admission_plan_state(&admission);
+        let result =
+            plan_and_assert_state_unchanged(&admission, &before, incoming.clone(), vec![pk(10)]);
+        assert_eq!(
+            result,
+            VictimSelectionResult::Planned(VictimSelectionPlan {
+                victims: vec![tracker.clone()],
+                physical_freed: vec![pk(1)],
+                incoming_physical_added: 1,
+                projected_final_len: 3,
+                opened_through: EvictionTier::Tracker,
+            })
+        );
+        assert_facade_matches_direct_selector(&admission, incoming, vec![pk(10)]);
+    }
+
+    #[test]
+    fn eviction_plan_facade_result_planned_wallet_never_victim() {
+        let wallet = pool_owner(ExplicitConsumer::Wallet, 1);
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 2);
+        let shared = pk(50);
+        let fixtures = [
+            (wallet.clone(), 1, vec![shared, pk(1)]),
+            (tracker.clone(), 2, vec![pk(2)]),
+        ];
+        let admission = admission_from_eviction_fixtures(3, &fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
+        let before = snapshot_admission_plan_state(&admission);
+        let result =
+            plan_and_assert_state_unchanged(&admission, &before, incoming.clone(), vec![pk(10)]);
+        assert_eq!(
+            result,
+            VictimSelectionResult::Planned(VictimSelectionPlan {
+                victims: vec![tracker.clone()],
+                physical_freed: vec![pk(2)],
+                incoming_physical_added: 1,
+                projected_final_len: 3,
+                opened_through: EvictionTier::Tracker,
+            })
+        );
+        let planned = match &result {
+            VictimSelectionResult::Planned(plan) => plan,
+            other => panic!("expected Planned, got {other:?}"),
+        };
+        assert!(!planned.victims.contains(&wallet));
+        assert_facade_matches_direct_selector(&admission, incoming, vec![pk(10)]);
+    }
+
+    #[test]
+    fn eviction_plan_facade_result_planned_joint_shared() {
+        let shared = pk(50);
+        let a = pool_owner(ExplicitConsumer::Tracker, 1);
+        let b = pool_owner(ExplicitConsumer::Tracker, 2);
+        let fixtures = [(a.clone(), 1, vec![shared]), (b.clone(), 2, vec![shared])];
+        let admission = admission_from_eviction_fixtures(1, &fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
+        let before = snapshot_admission_plan_state(&admission);
+        let result =
+            plan_and_assert_state_unchanged(&admission, &before, incoming.clone(), vec![pk(10)]);
+        assert_eq!(
+            result,
+            VictimSelectionResult::Planned(VictimSelectionPlan {
+                victims: vec![a.clone(), b.clone()],
+                physical_freed: vec![shared],
+                incoming_physical_added: 1,
+                projected_final_len: 1,
+                opened_through: EvictionTier::Tracker,
+            })
+        );
+        assert_facade_matches_direct_selector(&admission, incoming, vec![pk(10)]);
+    }
+
+    #[test]
+    fn eviction_plan_facade_result_rejected_protected_exact() {
+        let wallet = pool_owner(ExplicitConsumer::Wallet, 1);
+        let momentum = pool_owner(ExplicitConsumer::Momentum, 2);
+        let fixtures = [
+            (wallet.clone(), 1, vec![pk(1)]),
+            (momentum.clone(), 2, vec![pk(2)]),
+        ];
+        let admission = admission_from_eviction_fixtures(2, &fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
+        let incoming_pubkeys = vec![pk(10), pk(11)];
+        let before = snapshot_admission_plan_state(&admission);
+        let result = plan_and_assert_state_unchanged(
+            &admission,
+            &before,
+            incoming.clone(),
+            incoming_pubkeys.clone(),
+        );
+        assert_eq!(
+            result,
+            VictimSelectionResult::RejectedProtected {
+                incoming_physical_added: 2,
+                required_to_free: 2,
+            }
+        );
+        let snapshot = admission
+            .test_build_eviction_snapshot()
+            .expect("fixture admission must build eviction snapshot");
+        assert_eq!(
+            snapshot.analyze_tier_feasibility(tier_request(
+                incoming,
+                incoming_pubkeys,
+                admission.cap(),
+            )),
+            TierFeasibilityResult::RejectedProtected {
+                incoming_physical_added: 2,
+                required_to_free: 2,
+                maximally_freeable_pubkeys: vec![pk(2)],
+            }
+        );
+        assert_facade_matches_direct_selector(
+            &admission,
+            pool_owner(ExplicitConsumer::Momentum, 9),
+            vec![pk(10), pk(11)],
+        );
+    }
+
+    #[test]
+    fn eviction_plan_facade_result_rejected_invalid_input_exact() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let fixtures = [(tracker.clone(), 1, vec![pk(1)])];
+        let admission = admission_from_eviction_fixtures(5, &fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
+        let before = snapshot_admission_plan_state(&admission);
+        let result = plan_and_assert_state_unchanged(&admission, &before, incoming.clone(), vec![]);
+        assert_eq!(result, VictimSelectionResult::RejectedInvalidInput);
+        assert_facade_matches_direct_selector(&admission, incoming, vec![]);
+    }
+
+    #[test]
+    fn eviction_plan_facade_result_internal_invariant_violation_exact() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let fixtures = [(tracker.clone(), 1, vec![pk(1)])];
+        let mut admission = admission_from_eviction_fixtures(5, &fixtures);
+        let ghost = pool_owner(ExplicitConsumer::Tracker, 99);
+        let overlay = vec![OwnerLruEntry {
+            owner: ghost,
+            last_touch: 999,
+        }];
+        admission.set_test_eviction_plan_extra_lru(overlay.clone());
+        let before = snapshot_admission_plan_state(&admission);
+        assert_eq!(before.test_eviction_plan_extra_lru, overlay);
+        let result = plan_and_assert_state_unchanged(
+            &admission,
+            &before,
+            pool_owner(ExplicitConsumer::Momentum, 9),
+            vec![pk(2)],
+        );
+        assert_eq!(result, VictimSelectionResult::InternalInvariantViolation);
+        assert_eq!(
+            snapshot_admission_plan_state(&admission).test_eviction_plan_extra_lru,
+            overlay
+        );
+    }
+
+    #[test]
+    fn eviction_plan_facade_touch_changes_plan_lru_deterministically() {
+        let t1 = pool_owner(ExplicitConsumer::Tracker, 1);
+        let t2 = pool_owner(ExplicitConsumer::Tracker, 2);
+        let fixtures = [
+            (t1.clone(), 100, vec![pk(1)]),
+            (t2.clone(), 200, vec![pk(2)]),
+        ];
+        let mut admission = admission_from_eviction_fixtures(2, &fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
+        let before_touch = snapshot_admission_plan_state(&admission);
+        let before_plan = plan_and_assert_state_unchanged(
+            &admission,
+            &before_touch,
+            incoming.clone(),
+            vec![pk(10)],
+        );
+        assert_eq!(
+            before_plan,
+            VictimSelectionResult::Planned(VictimSelectionPlan {
+                victims: vec![t1.clone()],
+                physical_freed: vec![pk(1)],
+                incoming_physical_added: 1,
+                projected_final_len: 2,
+                opened_through: EvictionTier::Tracker,
+            })
+        );
+
+        assert_eq!(admission.touch_group(t1.clone()), TouchResult::Touched);
+        let after_touch_state = snapshot_admission_plan_state(&admission);
+        assert_ne!(after_touch_state.owner_lru, before_touch.owner_lru);
+        let after_plan =
+            plan_and_assert_state_unchanged(&admission, &after_touch_state, incoming, vec![pk(10)]);
+        assert_eq!(
+            after_plan,
+            VictimSelectionResult::Planned(VictimSelectionPlan {
+                victims: vec![t2.clone()],
+                physical_freed: vec![pk(2)],
+                incoming_physical_added: 1,
+                projected_final_len: 2,
+                opened_through: EvictionTier::Tracker,
+            })
+        );
+    }
+
+    #[test]
+    fn eviction_plan_facade_matches_direct_selector_on_fixtures() {
+        let shared = pk(50);
+        let a = pool_owner(ExplicitConsumer::Tracker, 1);
+        let b = pool_owner(ExplicitConsumer::Tracker, 2);
+        let fixtures = [
+            (a.clone(), 1, vec![shared]),
+            (b.clone(), 2, vec![pk(2)]),
+            (pool_owner(ExplicitConsumer::Arb, 3), 3, vec![pk(3)]),
+        ];
+        let admission = admission_from_eviction_fixtures(3, &fixtures);
+        assert_facade_matches_direct_selector(
+            &admission,
+            pool_owner(ExplicitConsumer::Momentum, 9),
+            vec![shared, pk(10)],
+        );
+        assert_facade_matches_direct_selector(
+            &admission,
+            pool_owner(ExplicitConsumer::Momentum, 9),
+            vec![pk(10), pk(11)],
+        );
+    }
+
+    #[test]
+    fn eviction_plan_facade_repeated_planning_is_identical_and_stamp_free() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let arb = pool_owner(ExplicitConsumer::Arb, 2);
+        let fixtures = [
+            (tracker.clone(), 10, vec![pk(1)]),
+            (arb.clone(), 20, vec![pk(2)]),
+        ];
+        let admission = admission_from_eviction_fixtures(2, &fixtures);
+        let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
+        let incoming_pubkeys = vec![pk(10)];
+        let before = snapshot_admission_plan_state(&admission);
+        let first = plan_and_assert_state_unchanged(
+            &admission,
+            &before,
+            incoming.clone(),
+            incoming_pubkeys.clone(),
+        );
+        let second =
+            plan_and_assert_state_unchanged(&admission, &before, incoming, incoming_pubkeys);
+        assert_eq!(first, second);
     }
 }
