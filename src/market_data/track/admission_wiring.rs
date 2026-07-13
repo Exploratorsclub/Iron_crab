@@ -69,6 +69,32 @@ pub fn rows_to_owner_groups(
         .collect()
 }
 
+/// Until PR 4b emits live Tracker demand via ctx rows, preserve Tracker-labelled owner
+/// groups already in admission (e.g. cold restore) as authoritative demand during converge.
+pub fn merge_admission_tracker_owner_groups(
+    admission: &FixedCapAdmission,
+    authoritative: &mut Vec<(ExplicitOwner, Vec<Pubkey>)>,
+) {
+    let mut present: BTreeSet<(ExplicitConsumer, ExplicitOwnerKey)> = authoritative
+        .iter()
+        .map(|(owner, _)| owner_group_key(owner))
+        .collect();
+
+    for group in admission.snapshot_owner_groups() {
+        if group.consumer != ExplicitConsumer::Tracker {
+            continue;
+        }
+        let owner = ExplicitOwner {
+            consumer: group.consumer,
+            owner_key: group.owner_key.clone(),
+        };
+        let key = owner_group_key(&owner);
+        if present.insert(key) {
+            authoritative.push((owner, group.pubkeys.clone()));
+        }
+    }
+}
+
 fn owner_group_key(owner: &ExplicitOwner) -> (ExplicitConsumer, ExplicitOwnerKey) {
     (owner.consumer, owner.owner_key.clone())
 }
@@ -265,6 +291,31 @@ mod tests {
             AdmissionConvergeResult::Converged
         );
         assert_eq!(admission.len(), 1);
+    }
+
+    #[test]
+    fn converge_preserves_restored_tracker_when_ctx_has_arb_same_pool() {
+        let mut admission = FixedCapAdmission::new(20);
+        let pool = Pubkey::new_unique();
+        let tracker_pk = Pubkey::new_unique();
+        let arb_pk = Pubkey::new_unique();
+        let tracker_owner = pool_owner(ExplicitConsumer::Tracker, pool);
+        assert!(admit_or_replace(
+            &mut admission,
+            tracker_owner.clone(),
+            vec![tracker_pk]
+        ));
+
+        let arb_owner = pool_owner(ExplicitConsumer::Arb, pool);
+        let mut authoritative = vec![(arb_owner, vec![arb_pk])];
+        merge_admission_tracker_owner_groups(&admission, &mut authoritative);
+        assert_eq!(
+            converge_admission_from_groups(&mut admission, &authoritative),
+            AdmissionConvergeResult::Converged
+        );
+        assert!(admission.owner_group(&tracker_owner).is_some());
+        assert!(admission.contains(&tracker_pk));
+        assert!(admission.contains(&arb_pk));
     }
 
     #[test]

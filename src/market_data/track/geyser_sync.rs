@@ -1,8 +1,8 @@
 //! Phase 5a: track-worker Geyser explicit-set rebuild + coalesced delta-only push.
 
 use super::admission_wiring::{
-    admitted_pubkey_set, converge_admission_from_groups, rows_to_owner_groups,
-    AdmissionConvergeResult,
+    admitted_pubkey_set, converge_admission_from_groups, merge_admission_tracker_owner_groups,
+    rows_to_owner_groups, AdmissionConvergeResult,
 };
 use super::desired_set::symmetric_diff;
 use super::explicit_admission::FixedCapAdmission;
@@ -35,7 +35,8 @@ pub fn converge_admission_from_ctx<C: TrackWorkerContext>(
     admission: &mut FixedCapAdmission,
 ) -> AdmissionConvergeResult {
     let rows = ctx.explicit_pubkey_rows_for_desired_set();
-    let groups = rows_to_owner_groups(&rows);
+    let mut groups = rows_to_owner_groups(&rows);
+    merge_admission_tracker_owner_groups(admission, &mut groups);
     let result = converge_admission_from_groups(admission, &groups);
     set_market_data_geyser_explicit_admitted_accounts(admission.len());
     set_market_data_geyser_explicit_set_size(admission.len());

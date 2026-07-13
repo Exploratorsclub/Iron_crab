@@ -14,8 +14,8 @@ pub mod worker_commands;
 
 pub use admission_wiring::{
     admitted_pubkey_set, apply_cap_shrink, converge_admission_from_groups,
-    restore_admission_from_owner_groups, rows_to_owner_groups, AdmissionConvergeResult,
-    AdmissionRestoreResult,
+    merge_admission_tracker_owner_groups, restore_admission_from_owner_groups,
+    rows_to_owner_groups, AdmissionConvergeResult, AdmissionRestoreResult,
 };
 pub use barrier::GeyserConnectBarrier;
 pub use coalesce::{
