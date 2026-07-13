@@ -96,6 +96,7 @@ pub trait TrackWorkerContext: Send + Sync {
     ) -> parking_lot::RwLockWriteGuard<'_, HashSet<Pubkey>>;
     fn clear_pending_geyser_evict(&self);
     fn geyser_explicit_readiness_ok(&self) -> bool;
+    fn geyser_connect_barrier_pending(&self) -> bool;
     fn signal_restore_barrier(&self, ok: bool);
     fn apply_explicit_cap_shrink(
         &self,
@@ -250,8 +251,13 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
             legacy > 0 || matches!(restore, AdmissionRestoreResult::Restored)
         }
         TrackWorkerCommand::ScheduleGeyserPush
-        | TrackWorkerCommand::ScheduleGeyserPushDebounced
-        | TrackWorkerCommand::ContinueGeyserEvict => false,
+        | TrackWorkerCommand::ScheduleGeyserPushDebounced => {
+            if ctx.geyser_connect_barrier_pending() {
+                *restore_barrier_pending = true;
+            }
+            false
+        }
+        TrackWorkerCommand::ContinueGeyserEvict => false,
     }
 }
 

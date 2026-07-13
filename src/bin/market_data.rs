@@ -2021,6 +2021,10 @@ impl TrackWorkerContext for MarketDataContext {
         self.geyser_explicit_ready.load(Ordering::Relaxed)
     }
 
+    fn geyser_connect_barrier_pending(&self) -> bool {
+        !self.geyser_connect_barrier.is_ready()
+    }
+
     fn signal_restore_barrier(&self, ok: bool) {
         MarketDataContext::signal_restore_barrier(self, ok);
     }
@@ -2819,6 +2823,13 @@ impl MarketDataContext {
         let _ = self.tracked_mints_tx.send(mints);
         let _ = self.tracked_vaults_tx.send(vaults);
         let _ = self.tracked_bin_arrays_tx.send(bins);
+        let mut wallets: Vec<Pubkey> = self
+            .wallet_explicit_demand_pubkeys()
+            .into_iter()
+            .filter(|pk| admitted.contains(pk))
+            .collect();
+        wallets.sort();
+        let _ = self.tracked_wallet_tx.send(wallets);
         geyser_metrics_set_subscription_accounts(n);
         self.refresh_geyser_pins_gauge();
     }
@@ -2918,7 +2929,15 @@ impl MarketDataContext {
     ) {
         let path = explicit_set_snapshot_path();
         let Some(snapshot) = load_explicit_set_snapshot(&path) else {
-            ctx.geyser_connect_barrier.mark_ready();
+            let _ = track_worker_try_enqueue(track_worker, TrackWorkerCommand::ScheduleGeyserPush);
+            if ctx
+                .geyser_connect_barrier
+                .wait_ready(Duration::from_secs(30))
+                .is_err()
+            {
+                warn!("explicit Geyser startup barrier failed or timed out (no snapshot, fail-closed)");
+                ctx.geyser_explicit_ready.store(false, Ordering::Release);
+            }
             return;
         };
         let start = Instant::now();
