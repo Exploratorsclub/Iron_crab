@@ -1082,9 +1082,6 @@ impl FixedCapAdmission {
         if candidate.physical_len != plan.projected_final_len {
             return false;
         }
-        if candidate.physical_len != new_cap {
-            return false;
-        }
         if candidate.physical_len > new_cap {
             return false;
         }
