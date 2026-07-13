@@ -214,6 +214,15 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
     }
 }
 
+fn track_worker_command_advances_revision(payload: &TrackWorkerCommand) -> bool {
+    !matches!(
+        payload,
+        TrackWorkerCommand::ScheduleGeyserPush
+            | TrackWorkerCommand::ScheduleGeyserPushDebounced
+            | TrackWorkerCommand::ContinueGeyserEvict
+    )
+}
+
 fn track_worker_apply_protocol_command<C: TrackWorkerContext>(
     ctx: &Arc<C>,
     protocol: &Arc<Mutex<BoundedProtocolStore>>,
@@ -227,9 +236,12 @@ fn track_worker_apply_protocol_command<C: TrackWorkerContext>(
         inc_market_data_track_protocol_superseded_revisions_total();
         return;
     }
+    let advances_revision = track_worker_command_advances_revision(&cmd.payload);
     let _ = track_worker_process_command(ctx, cmd.payload);
-    let mut store = protocol.lock().expect("track protocol store lock");
-    store.mark_applied(cmd.stream, cmd.revision);
+    if advances_revision {
+        let mut store = protocol.lock().expect("track protocol store lock");
+        store.mark_applied(cmd.stream, cmd.revision);
+    }
 }
 
 fn track_worker_prepare_command_delivery<C: TrackWorkerContext>(

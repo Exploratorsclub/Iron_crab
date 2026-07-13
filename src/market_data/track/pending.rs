@@ -117,23 +117,32 @@ impl BoundedProtocolStore {
         StageResult::Staged
     }
 
-    /// Extract applicable pending commands sorted by (stream, revision).
+    /// Extract applicable pending commands in staging order (per-stream revision order).
     pub fn take_applicable_pending_sorted(&mut self) -> Vec<ImmutableTrackCommand> {
         if self.pending.is_empty() {
             return Vec::new();
         }
-        self.pending.sort_by(|a, b| {
-            a.stream
-                .cmp(&b.stream)
-                .then_with(|| a.revision.cmp(&b.revision))
-        });
         let drained: Vec<ImmutableTrackCommand> = self.pending.drain(..).collect();
+        let mut stream_order = Vec::new();
+        for cmd in &drained {
+            if !stream_order.contains(&cmd.stream) {
+                stream_order.push(cmd.stream);
+            }
+        }
         let mut applicable = Vec::new();
-        for cmd in drained {
-            if self.is_applicable(cmd.stream, cmd.revision) {
-                applicable.push(cmd);
-            } else {
-                inc_market_data_track_protocol_superseded_revisions_total();
+        for stream in stream_order {
+            let mut stream_cmds: Vec<ImmutableTrackCommand> = drained
+                .iter()
+                .filter(|cmd| cmd.stream == stream)
+                .cloned()
+                .collect();
+            stream_cmds.sort_by_key(|cmd| cmd.revision);
+            for cmd in stream_cmds {
+                if self.is_applicable(cmd.stream, cmd.revision) {
+                    applicable.push(cmd);
+                } else {
+                    inc_market_data_track_protocol_superseded_revisions_total();
+                }
             }
         }
         self.refresh_pending_depth_metric();
