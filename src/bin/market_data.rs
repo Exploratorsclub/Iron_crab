@@ -4489,8 +4489,8 @@ impl MarketDataContext {
                 warn!(pool = %a.pool, "MomentumActivePoolsUpdate.active: invalid pool");
                 continue;
             };
-            self.hot_pool_registry.pin_pool(mint_pk, pool_pk);
             if self.try_admit_pool_consumer_group(admission, pool_pk, ExplicitConsumer::Momentum) {
+                self.hot_pool_registry.pin_pool(mint_pk, pool_pk);
                 inc_market_data_momentum_admission_admitted_total();
                 if self.register_geyser_reserves_for_momentum_active_pool(pool_pk) {
                     batch_dirty = true;
@@ -4672,8 +4672,8 @@ impl MarketDataContext {
                 warn!(pool = %a.pool, "ArbTrackRequestsUpdate.active: invalid pool");
                 continue;
             };
-            self.hot_pool_registry.pin_arb_pool(pool_pk);
             if self.try_admit_pool_consumer_group(admission, pool_pk, ExplicitConsumer::Arb) {
+                self.hot_pool_registry.pin_arb_pool(pool_pk);
                 inc_market_data_arb_admission_admitted_total();
                 if self.register_geyser_reserves_for_arb_active_pool(pool_pk) {
                     batch_dirty = true;
@@ -14849,7 +14849,7 @@ mod pr_b_geyser_tracking_tests {
         );
         assert_eq!(ctx.tracked_vaults.read().len(), vaults_before);
         assert_eq!(ctx.tracked_mints.read().len(), mints_before);
-        assert!(ctx.hot_pool_registry.is_hot_pool(pool));
+        assert!(!ctx.hot_pool_registry.is_hot_pool(pool));
     }
 
     /// Phase 2c: trade handler must not reference arb reconcile enqueue helpers.
