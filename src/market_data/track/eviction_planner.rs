@@ -2035,7 +2035,7 @@ mod tests {
         let result = select_eviction_victims(&snapshot, victim_request(incoming, vec![pk(10)], 3));
         assert_planned(
             &result,
-            &[tracker.clone()],
+            std::slice::from_ref(&tracker),
             &[pk(1)],
             EvictionTier::Tracker,
             1,
@@ -2056,7 +2056,7 @@ mod tests {
         let result = select_eviction_victims(&snapshot, victim_request(incoming, vec![pk(10)], 2));
         assert_planned(
             &result,
-            &[t1.clone()],
+            std::slice::from_ref(&t1),
             &[pk(1)],
             EvictionTier::Tracker,
             1,
@@ -2095,7 +2095,14 @@ mod tests {
         let incoming = pool_owner(ExplicitConsumer::Momentum, 9);
         let result =
             select_eviction_victims(&snapshot, victim_request(incoming, vec![shared, pk(10)], 2));
-        assert_planned(&result, &[b.clone()], &[pk(2)], EvictionTier::Tracker, 1, 2);
+        assert_planned(
+            &result,
+            std::slice::from_ref(&b),
+            &[pk(2)],
+            EvictionTier::Tracker,
+            1,
+            2,
+        );
         assert!(!matches!(&result, VictimSelectionResult::Planned(p) if p.victims.contains(&a)));
     }
 
@@ -2439,6 +2446,18 @@ mod tests {
         assert!(stats.package_evaluations > 0);
     }
 
+    /// Hard-coded per-owner rank within a joint package (oracle only).
+    type PolicyOwnerRankKey = (u8, u64, ExplicitOwner);
+
+    /// Canonical joint-package tie-break key (oracle only).
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct PolicyPackageRankKey {
+        max_tier: u8,
+        member_keys: Vec<PolicyOwnerRankKey>,
+        package_len: usize,
+        owners: Vec<ExplicitOwner>,
+    }
+
     /// Independent victim oracle — hard-coded policy + powerset (<=8 owners) + procedural replay.
     /// Never calls production selection/tier/package/order helpers.
     struct IndependentVictimOracle {
@@ -2632,16 +2651,13 @@ mod tests {
             map
         }
 
-        fn package_rank_tuple(
-            &self,
-            package: &BTreeSet<ExplicitOwner>,
-        ) -> (u8, Vec<(u8, u64, ExplicitOwner)>, usize, Vec<ExplicitOwner>) {
+        fn package_rank_tuple(&self, package: &BTreeSet<ExplicitOwner>) -> PolicyPackageRankKey {
             let max_tier = package
                 .iter()
                 .map(|owner| Self::eviction_rank(owner.consumer))
                 .max()
                 .unwrap_or(0);
-            let mut member_keys: Vec<_> = package
+            let mut member_keys: Vec<PolicyOwnerRankKey> = package
                 .iter()
                 .map(|owner| {
                     let touch = self.owner_records.get(owner).map(|(t, _)| *t).unwrap_or(0);
@@ -2651,7 +2667,12 @@ mod tests {
             member_keys.sort();
             let mut owners: Vec<_> = package.iter().cloned().collect();
             owners.sort();
-            (max_tier, member_keys, package.len(), owners)
+            PolicyPackageRankKey {
+                max_tier,
+                member_keys,
+                package_len: package.len(),
+                owners,
+            }
         }
 
         fn compare_packages(
