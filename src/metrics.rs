@@ -382,6 +382,76 @@ pub static MARKET_DATA_GEYSER_SYNC_SKIPPED_RATE_LIMIT_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// Phase 2a: current explicit Geyser pubkey count in DesiredExplicitSet.
 pub static MARKET_DATA_GEYSER_EXPLICIT_SET_SIZE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// I-MD-7: deduplicated admitted explicit pubkey count (DesiredExplicitSet SSOT).
+pub static MARKET_DATA_GEYSER_EXPLICIT_ADMITTED_ACCOUNTS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// I-MD-7: oversubscription gauge; 0 after convergence.
+pub static MARKET_DATA_GEYSER_EXPLICIT_CAP_OVERFLOW: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// I-MD-8: requested pool groups by consumer (logical demand, not admitted).
+pub static MARKET_DATA_GEYSER_EXPLICIT_REQUESTED_POOLS_MOMENTUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_REQUESTED_POOLS_ARB: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_REQUESTED_POOLS_TRACKER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// I-MD-8: admitted pool groups by consumer.
+pub static MARKET_DATA_GEYSER_EXPLICIT_ADMITTED_POOLS_MOMENTUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_ADMITTED_POOLS_ARB: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_ADMITTED_POOLS_TRACKER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// I-MD-7: admission rejections {consumer, reason}.
+pub static MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_CAP_WALLET: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_CAP_MOMENTUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_CAP_ARB: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_CAP_TRACKER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_PROTECTED_WALLET: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_PROTECTED_MOMENTUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_PROTECTED_ARB: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_PROTECTED_TRACKER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_INVALID_GROUP_WALLET: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_INVALID_GROUP_MOMENTUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_INVALID_GROUP_ARB: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_INVALID_GROUP_TRACKER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// I-MD-8: group evictions {consumer, reason}.
+pub static MARKET_DATA_GEYSER_EXPLICIT_EVICTED_HIGHER_PRIORITY_MOMENTUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_EVICTED_HIGHER_PRIORITY_ARB: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_EVICTED_HIGHER_PRIORITY_TRACKER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_EVICTED_SAME_PRIORITY_LRU_MOMENTUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_EVICTED_SAME_PRIORITY_LRU_ARB: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_EVICTED_SAME_PRIORITY_LRU_TRACKER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_EVICTED_CAP_SHRINK_MOMENTUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_EVICTED_CAP_SHRINK_ARB: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_EVICTED_CAP_SHRINK_TRACKER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_EVICTED_RESTORE_CONVERGE_MOMENTUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_EVICTED_RESTORE_CONVERGE_ARB: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_GEYSER_EXPLICIT_EVICTED_RESTORE_CONVERGE_TRACKER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// Phase 2a: pubkey count in one delta-only Geyser subscribe push.
 pub static MARKET_DATA_GEYSER_SUBSCRIBE_DELTA_PUBKEYS: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -786,6 +856,110 @@ pub fn market_data_geyser_explicit_set_size_value() -> u64 {
 }
 
 #[inline]
+pub fn set_market_data_geyser_explicit_admitted_accounts(n: usize) {
+    MARKET_DATA_GEYSER_EXPLICIT_ADMITTED_ACCOUNTS.store(n as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_geyser_explicit_cap_overflow(n: usize) {
+    MARKET_DATA_GEYSER_EXPLICIT_CAP_OVERFLOW.store(n as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_geyser_explicit_requested_pools(consumer: &str, n: usize) {
+    let v = n as u64;
+    match consumer {
+        "momentum" => {
+            MARKET_DATA_GEYSER_EXPLICIT_REQUESTED_POOLS_MOMENTUM.store(v, Ordering::Relaxed)
+        }
+        "arb" => MARKET_DATA_GEYSER_EXPLICIT_REQUESTED_POOLS_ARB.store(v, Ordering::Relaxed),
+        "tracker" => {
+            MARKET_DATA_GEYSER_EXPLICIT_REQUESTED_POOLS_TRACKER.store(v, Ordering::Relaxed)
+        }
+        _ => {}
+    }
+}
+
+#[inline]
+pub fn set_market_data_geyser_explicit_admitted_pools(consumer: &str, n: usize) {
+    let v = n as u64;
+    match consumer {
+        "momentum" => {
+            MARKET_DATA_GEYSER_EXPLICIT_ADMITTED_POOLS_MOMENTUM.store(v, Ordering::Relaxed)
+        }
+        "arb" => MARKET_DATA_GEYSER_EXPLICIT_ADMITTED_POOLS_ARB.store(v, Ordering::Relaxed),
+        "tracker" => MARKET_DATA_GEYSER_EXPLICIT_ADMITTED_POOLS_TRACKER.store(v, Ordering::Relaxed),
+        _ => {}
+    }
+}
+
+#[inline]
+pub fn inc_market_data_geyser_explicit_admission_rejected_total(consumer: &str, reason: &str) {
+    let counter = match (consumer, reason) {
+        ("wallet", "cap") => &*MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_CAP_WALLET,
+        ("momentum", "cap") => &*MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_CAP_MOMENTUM,
+        ("arb", "cap") => &*MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_CAP_ARB,
+        ("tracker", "cap") => &*MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_CAP_TRACKER,
+        ("wallet", "protected") => {
+            &*MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_PROTECTED_WALLET
+        }
+        ("momentum", "protected") => {
+            &*MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_PROTECTED_MOMENTUM
+        }
+        ("arb", "protected") => &*MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_PROTECTED_ARB,
+        ("tracker", "protected") => {
+            &*MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_PROTECTED_TRACKER
+        }
+        ("wallet", "invalid_group") => {
+            &*MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_INVALID_GROUP_WALLET
+        }
+        ("momentum", "invalid_group") => {
+            &*MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_INVALID_GROUP_MOMENTUM
+        }
+        ("arb", "invalid_group") => {
+            &*MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_INVALID_GROUP_ARB
+        }
+        ("tracker", "invalid_group") => {
+            &*MARKET_DATA_GEYSER_EXPLICIT_ADMISSION_REJECTED_INVALID_GROUP_TRACKER
+        }
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_geyser_explicit_evicted_total(consumer: &str, reason: &str) {
+    let counter = match (consumer, reason) {
+        ("momentum", "higher_priority") => {
+            &*MARKET_DATA_GEYSER_EXPLICIT_EVICTED_HIGHER_PRIORITY_MOMENTUM
+        }
+        ("arb", "higher_priority") => &*MARKET_DATA_GEYSER_EXPLICIT_EVICTED_HIGHER_PRIORITY_ARB,
+        ("tracker", "higher_priority") => {
+            &*MARKET_DATA_GEYSER_EXPLICIT_EVICTED_HIGHER_PRIORITY_TRACKER
+        }
+        ("momentum", "same_priority_lru") => {
+            &*MARKET_DATA_GEYSER_EXPLICIT_EVICTED_SAME_PRIORITY_LRU_MOMENTUM
+        }
+        ("arb", "same_priority_lru") => &*MARKET_DATA_GEYSER_EXPLICIT_EVICTED_SAME_PRIORITY_LRU_ARB,
+        ("tracker", "same_priority_lru") => {
+            &*MARKET_DATA_GEYSER_EXPLICIT_EVICTED_SAME_PRIORITY_LRU_TRACKER
+        }
+        ("momentum", "cap_shrink") => &*MARKET_DATA_GEYSER_EXPLICIT_EVICTED_CAP_SHRINK_MOMENTUM,
+        ("arb", "cap_shrink") => &*MARKET_DATA_GEYSER_EXPLICIT_EVICTED_CAP_SHRINK_ARB,
+        ("tracker", "cap_shrink") => &*MARKET_DATA_GEYSER_EXPLICIT_EVICTED_CAP_SHRINK_TRACKER,
+        ("momentum", "restore_converge") => {
+            &*MARKET_DATA_GEYSER_EXPLICIT_EVICTED_RESTORE_CONVERGE_MOMENTUM
+        }
+        ("arb", "restore_converge") => &*MARKET_DATA_GEYSER_EXPLICIT_EVICTED_RESTORE_CONVERGE_ARB,
+        ("tracker", "restore_converge") => {
+            &*MARKET_DATA_GEYSER_EXPLICIT_EVICTED_RESTORE_CONVERGE_TRACKER
+        }
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
 pub fn set_market_data_hot_pool_registry_pools_gauge(reason: &str, n: usize) {
     let v = n as u64;
     match reason {
@@ -953,6 +1127,15 @@ pub static MARKET_DATA_MOMENTUM_TRACK_WORKER_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU
     Lazy::new(|| AtomicU64::new(0));
 /// Phase 3: arb track requests enqueue dropped on full track-worker queue.
 pub static MARKET_DATA_ARB_TRACK_WORKER_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Durable pending pool registration overflow (fail-closed; no silent eviction).
+pub static MARKET_DATA_TRACK_PENDING_POOL_OVERFLOW_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Pool snapshot revision registry full / key not registered (fail-closed before command issue).
+pub static MARKET_DATA_TRACKER_DEMAND_CAP_REJECTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub static MARKET_DATA_REVISION_REGISTRY_FULL_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
 /// PR169a: single-writer Geyser tracking actor queue depth (gauge).
@@ -1197,6 +1380,26 @@ pub fn inc_market_data_tx_deferred_dropped_total() {
 #[inline]
 pub fn set_market_data_track_worker_queue_depth(depth: usize) {
     MARKET_DATA_TRACK_WORKER_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_track_pending_pool_overflow_total() {
+    MARKET_DATA_TRACK_PENDING_POOL_OVERFLOW_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tracker_demand_cap_rejected_total() {
+    MARKET_DATA_TRACKER_DEMAND_CAP_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_revision_registry_full_total() {
+    MARKET_DATA_REVISION_REGISTRY_FULL_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn market_data_track_pending_pool_overflow_value() -> u64 {
+    MARKET_DATA_TRACK_PENDING_POOL_OVERFLOW_TOTAL.load(Ordering::Relaxed)
 }
 
 #[inline]
@@ -6237,6 +6440,38 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_geyser_explicit_set_size",
         MARKET_DATA_GEYSER_EXPLICIT_SET_SIZE.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_explicit_admitted_accounts",
+        MARKET_DATA_GEYSER_EXPLICIT_ADMITTED_ACCOUNTS.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_explicit_cap_overflow",
+        MARKET_DATA_GEYSER_EXPLICIT_CAP_OVERFLOW.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_explicit_requested_pools{consumer=\"momentum\"}",
+        MARKET_DATA_GEYSER_EXPLICIT_REQUESTED_POOLS_MOMENTUM.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_explicit_requested_pools{consumer=\"arb\"}",
+        MARKET_DATA_GEYSER_EXPLICIT_REQUESTED_POOLS_ARB.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_explicit_requested_pools{consumer=\"tracker\"}",
+        MARKET_DATA_GEYSER_EXPLICIT_REQUESTED_POOLS_TRACKER.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_explicit_admitted_pools{consumer=\"momentum\"}",
+        MARKET_DATA_GEYSER_EXPLICIT_ADMITTED_POOLS_MOMENTUM.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_explicit_admitted_pools{consumer=\"arb\"}",
+        MARKET_DATA_GEYSER_EXPLICIT_ADMITTED_POOLS_ARB.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_explicit_admitted_pools{consumer=\"tracker\"}",
+        MARKET_DATA_GEYSER_EXPLICIT_ADMITTED_POOLS_TRACKER.load(Ordering::Relaxed)
     );
     line!(
         "market_data_geyser_subscribe_delta_pubkeys",

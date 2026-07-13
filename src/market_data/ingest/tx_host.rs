@@ -68,6 +68,7 @@ pub trait TxIngestHost: IngestHost + Send + Sync {
     /// True when wallet-scoped mint should be enqueued via `TrackWalletMint` (no `tracked_mints` read in ingest).
     fn tx_wallet_mint_needs_track(&self, mint: &Pubkey) -> bool;
     fn tx_wallet_token_account_insert(&self, ata: Pubkey) -> bool;
+    fn tx_wallet_token_account_remove(&self, ata: Pubkey) -> bool;
     fn tx_wallet_mint_decimals_insert(&self, mint: Pubkey, decimals: u8);
     /// Refresh Geyser wallet subscribe list after ATA pin (wallet + WSOL ATA + tracked token ATAs).
     fn tx_wallet_notify_geyser_subscribe_accounts_changed(&self);
@@ -200,6 +201,10 @@ impl<T: TxIngestHost + ?Sized> TxIngestHost for std::sync::Arc<T> {
 
     fn tx_wallet_token_account_insert(&self, ata: Pubkey) -> bool {
         (**self).tx_wallet_token_account_insert(ata)
+    }
+
+    fn tx_wallet_token_account_remove(&self, ata: Pubkey) -> bool {
+        (**self).tx_wallet_token_account_remove(ata)
     }
 
     fn tx_wallet_mint_decimals_insert(&self, mint: Pubkey, decimals: u8) {
