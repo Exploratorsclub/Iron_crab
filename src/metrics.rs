@@ -955,6 +955,22 @@ pub static MARKET_DATA_MOMENTUM_TRACK_WORKER_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU
 pub static MARKET_DATA_ARB_TRACK_WORKER_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// Bounded track-worker protocol: pending slot depth (gauge).
+pub static MARKET_DATA_TRACK_PROTOCOL_PENDING_DEPTH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Bounded track-worker protocol: in-flight command depth (gauge).
+pub static MARKET_DATA_TRACK_PROTOCOL_INFLIGHT_DEPTH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Queue-full overflow staged into pending for replay (I-MD-5).
+pub static MARKET_DATA_TRACK_PROTOCOL_REPLAY_TRIGGERS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Stale or duplicate revision ignored during drain (idempotent).
+pub static MARKET_DATA_TRACK_PROTOCOL_SUPERSEDED_REVISIONS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Oldest pending slot evicted when pending cap is full (bounded store).
+pub static MARKET_DATA_TRACK_PROTOCOL_PENDING_EVICTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// PR169a: single-writer Geyser tracking actor queue depth (gauge).
 pub static MARKET_DATA_GEYSER_TRACKING_QUEUE_DEPTH: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -1202,6 +1218,31 @@ pub fn set_market_data_track_worker_queue_depth(depth: usize) {
 #[inline]
 pub fn inc_market_data_momentum_track_worker_enqueue_dropped_total() {
     MARKET_DATA_MOMENTUM_TRACK_WORKER_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_track_protocol_pending_depth(depth: usize) {
+    MARKET_DATA_TRACK_PROTOCOL_PENDING_DEPTH.store(depth as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_track_protocol_inflight_depth(depth: usize) {
+    MARKET_DATA_TRACK_PROTOCOL_INFLIGHT_DEPTH.store(depth as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_track_protocol_replay_triggers_total() {
+    MARKET_DATA_TRACK_PROTOCOL_REPLAY_TRIGGERS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_track_protocol_superseded_revisions_total() {
+    MARKET_DATA_TRACK_PROTOCOL_SUPERSEDED_REVISIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_track_protocol_pending_evicted_total() {
+    MARKET_DATA_TRACK_PROTOCOL_PENDING_EVICTED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -5853,6 +5894,26 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_momentum_track_worker_enqueue_dropped_total",
         MARKET_DATA_MOMENTUM_TRACK_WORKER_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_track_protocol_pending_depth",
+        MARKET_DATA_TRACK_PROTOCOL_PENDING_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_track_protocol_inflight_depth",
+        MARKET_DATA_TRACK_PROTOCOL_INFLIGHT_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_track_protocol_replay_triggers_total",
+        MARKET_DATA_TRACK_PROTOCOL_REPLAY_TRIGGERS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_track_protocol_superseded_revisions_total",
+        MARKET_DATA_TRACK_PROTOCOL_SUPERSEDED_REVISIONS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_track_protocol_pending_evicted_total",
+        MARKET_DATA_TRACK_PROTOCOL_PENDING_EVICTED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_geyser_tracking_queue_depth",
