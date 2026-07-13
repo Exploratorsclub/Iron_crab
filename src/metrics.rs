@@ -382,6 +382,12 @@ pub static MARKET_DATA_GEYSER_SYNC_SKIPPED_RATE_LIMIT_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// Phase 2a: current explicit Geyser pubkey count in DesiredExplicitSet.
 pub static MARKET_DATA_GEYSER_EXPLICIT_SET_SIZE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// PR3: physically admitted explicit pubkey count (FixedCapAdmission SSOT).
+pub static MARKET_DATA_GEYSER_EXPLICIT_ADMITTED_ACCOUNTS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR3: 1 when admitted set exceeds cap or convergence failed (fail-closed signal).
+pub static MARKET_DATA_GEYSER_EXPLICIT_CAP_OVERFLOW: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// Phase 2a: pubkey count in one delta-only Geyser subscribe push.
 pub static MARKET_DATA_GEYSER_SUBSCRIBE_DELTA_PUBKEYS: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -748,6 +754,16 @@ pub fn inc_market_data_geyser_sync_skipped_rate_limit_total() {
 #[inline]
 pub fn set_market_data_geyser_explicit_set_size(n: usize) {
     MARKET_DATA_GEYSER_EXPLICIT_SET_SIZE.store(n as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_geyser_explicit_admitted_accounts(n: usize) {
+    MARKET_DATA_GEYSER_EXPLICIT_ADMITTED_ACCOUNTS.store(n as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_geyser_explicit_cap_overflow(n: usize) {
+    MARKET_DATA_GEYSER_EXPLICIT_CAP_OVERFLOW.store(n as u64, Ordering::Relaxed);
 }
 
 #[inline]
@@ -6298,6 +6314,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_geyser_explicit_set_size",
         MARKET_DATA_GEYSER_EXPLICIT_SET_SIZE.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_explicit_admitted_accounts",
+        MARKET_DATA_GEYSER_EXPLICIT_ADMITTED_ACCOUNTS.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_geyser_explicit_cap_overflow",
+        MARKET_DATA_GEYSER_EXPLICIT_CAP_OVERFLOW.load(Ordering::Relaxed)
     );
     line!(
         "market_data_geyser_subscribe_delta_pubkeys",
