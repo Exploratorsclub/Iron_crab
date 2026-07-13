@@ -1,4 +1,5 @@
 //! Phase 5a: NATS burst coalescers for momentum and arb track-worker enqueue.
+//! Queue-full paths preserve demand via bounded pending replay (I-MD-5).
 
 use super::worker::{
     track_worker_try_enqueue, TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,

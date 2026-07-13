@@ -5,8 +5,10 @@ pub mod eviction_planner;
 pub mod explicit_admission;
 pub mod explicit_ownership;
 pub mod geyser_sync;
+pub mod pending;
 pub mod snapshot;
 pub mod worker;
+pub mod worker_commands;
 
 pub use coalesce::{
     arb_coalesce_try_send, merge_arb_track_requests_updates, merge_momentum_active_pools_updates,
@@ -41,6 +43,10 @@ pub use geyser_sync::{
     rebuild_desired_explicit_set_from_ctx, track_worker_execute_coalesced_push,
     MARKET_DATA_MD_STATE_FLUSH_BUDGET_MS,
 };
+pub use pending::{
+    BoundedProtocolStore, StageResult, MARKET_DATA_TRACK_INFLIGHT_CAP,
+    MARKET_DATA_TRACK_PENDING_CAP,
+};
 pub use snapshot::{
     explicit_set_snapshot_path, load_explicit_set_snapshot, write_explicit_set_snapshot,
     ExplicitAccountKind, ExplicitSetSnapshot, ExplicitSnapshotRow, SnapshotConsumer,
@@ -55,4 +61,7 @@ pub use worker::{
     MARKET_DATA_ARB_APPLY_CHUNK_THRESHOLD, MARKET_DATA_MOMENTUM_APPLY_CHUNK_SIZE,
     MARKET_DATA_MOMENTUM_APPLY_CHUNK_THRESHOLD, MARKET_DATA_TRACK_WORKER_COALESCE_MS,
     MARKET_DATA_TRACK_WORKER_QUEUE_CAP,
+};
+pub use worker_commands::{
+    stream_for_command, ImmutableTrackCommand, RevisionAssigner, TrackCommandStream,
 };

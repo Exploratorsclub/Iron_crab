@@ -2,14 +2,18 @@
 
 use super::desired_set::DesiredExplicitSet;
 use super::geyser_sync::track_worker_execute_coalesced_push;
+use super::pending::{BoundedProtocolStore, StageResult};
 use super::snapshot::{
     explicit_set_snapshot_path, write_explicit_set_snapshot, ExplicitSetSnapshot,
     MARKET_DATA_EXPLICIT_SET_SNAPSHOT_INTERVAL_SECS,
 };
+use super::worker_commands::ImmutableTrackCommand;
+pub use super::worker_commands::{TrackPinReason, TrackWorkerCommand};
 use crate::metrics::{
     inc_market_data_explicit_set_snapshot_write_errors_total,
     inc_market_data_explicit_set_snapshot_write_total,
     inc_market_data_geyser_tracking_enqueue_dropped_total,
+    inc_market_data_track_protocol_superseded_revisions_total,
     inc_market_data_track_request_coalesce_batches_total,
     record_market_data_arb_track_requests_messages_total,
     record_market_data_momentum_active_pool_messages_total, set_market_data_arb_pinned_pools_gauge,
@@ -23,7 +27,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -37,14 +41,6 @@ pub const MARKET_DATA_MOMENTUM_APPLY_CHUNK_SIZE: usize = 16;
 /// Phase 3: chunk large arb track applies on md-track-worker.
 pub const MARKET_DATA_ARB_APPLY_CHUNK_THRESHOLD: usize = 32;
 pub const MARKET_DATA_ARB_APPLY_CHUNK_SIZE: usize = 16;
-
-/// Pin reason for explicit Geyser tracking (maps to [`super::ConsumerId`] in rebuild).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrackPinReason {
-    Wallet,
-    MomentumActive,
-    ArbMultiDex,
-}
 
 /// Context surface required by the track-worker loop and apply helpers.
 pub trait TrackWorkerContext: Send + Sync {
@@ -76,56 +72,59 @@ pub trait TrackWorkerContext: Send + Sync {
     fn apply_explicit_set_snapshot(&self, snapshot: &ExplicitSetSnapshot) -> usize;
 }
 
-/// Phase 2a: commands for the `md-track-worker` OS thread (DesiredExplicitSet + coalesced Geyser push).
-pub enum TrackWorkerCommand {
-    ApplyMomentumActivePools(MomentumActivePoolsUpdate),
-    ApplyArbTrackRequests(ArbTrackRequestsUpdate),
-    ApplyWalletPin {
-        mint: Pubkey,
-    },
-    TrackMint {
-        mint: Pubkey,
-        pin: Option<TrackPinReason>,
-    },
-    ScheduleGeyserSyncAfterConfigChange,
-    /// Coalesced explicit Geyser push (md-state burst / trade path).
-    ScheduleGeyserPush,
-    /// Debounced push after `try_acquire_geyser_sync_flush_slot` (rate-limited TX debounce thread).
-    ScheduleGeyserPushDebounced,
-    /// Phase 3 P3: restore explicit set from on-disk snapshot (I-MD-6).
-    RestoreExplicitSnapshot(ExplicitSetSnapshot),
-    ContinueGeyserEvict,
-}
-
 #[derive(Clone)]
 pub struct TrackWorkerSender {
-    tx: std_mpsc::SyncSender<TrackWorkerCommand>,
+    tx: std_mpsc::SyncSender<ImmutableTrackCommand>,
     queue_depth: Arc<AtomicUsize>,
     queue_capacity: usize,
+    protocol: Arc<Mutex<BoundedProtocolStore>>,
+}
+
+fn track_worker_stage_on_queue_full(
+    protocol: &Arc<Mutex<BoundedProtocolStore>>,
+    cmd: ImmutableTrackCommand,
+) -> bool {
+    let mut store = protocol.lock().expect("track protocol store lock");
+    match store.stage_on_queue_full(cmd) {
+        StageResult::Staged => true,
+        StageResult::Lost => {
+            inc_market_data_geyser_tracking_enqueue_dropped_total();
+            false
+        }
+    }
 }
 
 pub fn track_worker_try_enqueue(sender: &TrackWorkerSender, job: TrackWorkerCommand) -> bool {
+    let immutable = {
+        let mut store = sender.protocol.lock().expect("track protocol store lock");
+        store.wrap_command(job)
+    };
     if sender.queue_depth.load(Ordering::Relaxed) >= sender.queue_capacity {
-        inc_market_data_geyser_tracking_enqueue_dropped_total();
-        return false;
+        return track_worker_stage_on_queue_full(&sender.protocol, immutable);
     }
-    if sender.tx.try_send(job).is_ok() {
+    if sender.tx.try_send(immutable.clone()).is_ok() {
         let depth = sender.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
         set_market_data_track_worker_queue_depth(depth);
+        let mut store = sender.protocol.lock().expect("track protocol store lock");
+        store.begin_inflight();
         true
     } else {
-        inc_market_data_geyser_tracking_enqueue_dropped_total();
-        false
+        track_worker_stage_on_queue_full(&sender.protocol, immutable)
     }
 }
 
-fn track_worker_dec_queue_depth(queue_depth: &AtomicUsize) {
+fn track_worker_dec_queue_depth(
+    queue_depth: &AtomicUsize,
+    protocol: &Arc<Mutex<BoundedProtocolStore>>,
+) {
     let new_depth = queue_depth
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             cur.checked_sub(1)
         })
         .unwrap_or(0);
     set_market_data_track_worker_queue_depth(new_depth);
+    let mut store = protocol.lock().expect("track protocol store lock");
+    store.end_inflight();
 }
 
 /// Phase-2b: sync momentum apply on `md-track-worker` thread (no Tokio yield).
@@ -215,11 +214,108 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
     }
 }
 
+fn track_worker_apply_protocol_command<C: TrackWorkerContext>(
+    ctx: &Arc<C>,
+    protocol: &Arc<Mutex<BoundedProtocolStore>>,
+    cmd: ImmutableTrackCommand,
+) {
+    let applicable = {
+        let store = protocol.lock().expect("track protocol store lock");
+        store.is_applicable(cmd.stream, cmd.revision)
+    };
+    if !applicable {
+        inc_market_data_track_protocol_superseded_revisions_total();
+        return;
+    }
+    let _ = track_worker_process_command(ctx, cmd.payload);
+    let mut store = protocol.lock().expect("track protocol store lock");
+    store.mark_applied(cmd.stream, cmd.revision);
+}
+
+fn track_worker_prepare_command_delivery<C: TrackWorkerContext>(
+    ctx: &Arc<C>,
+    payload: &TrackWorkerCommand,
+    coalesce_deadline: &mut Option<Instant>,
+    push_before_keys: &mut Option<HashSet<Pubkey>>,
+    pending_continue_evict: &mut bool,
+    pending_release_flush_slot: &mut bool,
+) {
+    if coalesce_deadline.is_none() {
+        *push_before_keys = Some(ctx.snapshot_explicit_subscription_pubkeys());
+        *coalesce_deadline =
+            Some(Instant::now() + Duration::from_millis(MARKET_DATA_TRACK_WORKER_COALESCE_MS));
+    }
+    if matches!(payload, TrackWorkerCommand::ContinueGeyserEvict) {
+        *pending_continue_evict = true;
+    }
+    if matches!(payload, TrackWorkerCommand::ScheduleGeyserPushDebounced) {
+        *pending_release_flush_slot = true;
+    }
+}
+
+fn track_worker_receive_protocol_command<C: TrackWorkerContext>(
+    ctx: &Arc<C>,
+    protocol: &Arc<Mutex<BoundedProtocolStore>>,
+    cmd: ImmutableTrackCommand,
+    coalesce_deadline: &mut Option<Instant>,
+    push_before_keys: &mut Option<HashSet<Pubkey>>,
+    pending_continue_evict: &mut bool,
+    pending_release_flush_slot: &mut bool,
+) {
+    let applicable = {
+        let store = protocol.lock().expect("track protocol store lock");
+        store.is_applicable(cmd.stream, cmd.revision)
+    };
+    if applicable {
+        track_worker_prepare_command_delivery(
+            ctx,
+            &cmd.payload,
+            coalesce_deadline,
+            push_before_keys,
+            pending_continue_evict,
+            pending_release_flush_slot,
+        );
+    }
+    track_worker_apply_protocol_command(ctx, protocol, cmd);
+}
+
+fn track_worker_drain_pending_replay<C: TrackWorkerContext>(
+    ctx: &Arc<C>,
+    protocol: &Arc<Mutex<BoundedProtocolStore>>,
+    coalesce_deadline: &mut Option<Instant>,
+    push_before_keys: &mut Option<HashSet<Pubkey>>,
+    pending_continue_evict: &mut bool,
+    pending_release_flush_slot: &mut bool,
+) {
+    let pending_cmds = {
+        let mut store = protocol.lock().expect("track protocol store lock");
+        store.take_applicable_pending_sorted()
+    };
+    for cmd in pending_cmds {
+        let applicable = {
+            let store = protocol.lock().expect("track protocol store lock");
+            store.is_applicable(cmd.stream, cmd.revision)
+        };
+        if applicable {
+            track_worker_prepare_command_delivery(
+                ctx,
+                &cmd.payload,
+                coalesce_deadline,
+                push_before_keys,
+                pending_continue_evict,
+                pending_release_flush_slot,
+            );
+        }
+        track_worker_apply_protocol_command(ctx, protocol, cmd);
+    }
+}
+
 fn track_worker_loop<C: TrackWorkerContext + 'static>(
     ctx: Arc<C>,
-    rx: std_mpsc::Receiver<TrackWorkerCommand>,
+    rx: std_mpsc::Receiver<ImmutableTrackCommand>,
     queue_depth: Arc<AtomicUsize>,
     track_worker: TrackWorkerSender,
+    protocol: Arc<Mutex<BoundedProtocolStore>>,
 ) {
     let mut desired = DesiredExplicitSet::new(ctx.max_tracked_accounts());
     let mut coalesce_deadline: Option<Instant> = None;
@@ -248,47 +344,41 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
 
         match recv_result {
             Ok(job) => {
-                track_worker_dec_queue_depth(&queue_depth);
-                if coalesce_deadline.is_none() {
-                    push_before_keys = Some(ctx.snapshot_explicit_subscription_pubkeys());
-                    coalesce_deadline = Some(
-                        Instant::now()
-                            + Duration::from_millis(MARKET_DATA_TRACK_WORKER_COALESCE_MS),
-                    );
-                }
-                if matches!(job, TrackWorkerCommand::ContinueGeyserEvict) {
-                    pending_continue_evict = true;
-                }
-                if matches!(job, TrackWorkerCommand::ScheduleGeyserPushDebounced) {
-                    pending_release_flush_slot = true;
-                }
-                let cmd = match job {
-                    TrackWorkerCommand::ScheduleGeyserPushDebounced => {
-                        TrackWorkerCommand::ScheduleGeyserPush
-                    }
-                    other => other,
-                };
-                let _ = track_worker_process_command(&ctx, cmd);
+                track_worker_dec_queue_depth(&queue_depth, &protocol);
+                track_worker_receive_protocol_command(
+                    &ctx,
+                    &protocol,
+                    job,
+                    &mut coalesce_deadline,
+                    &mut push_before_keys,
+                    &mut pending_continue_evict,
+                    &mut pending_release_flush_slot,
+                );
                 while let Ok(more) = rx.try_recv() {
-                    track_worker_dec_queue_depth(&queue_depth);
-                    if matches!(more, TrackWorkerCommand::ContinueGeyserEvict) {
-                        pending_continue_evict = true;
-                    }
-                    if matches!(more, TrackWorkerCommand::ScheduleGeyserPushDebounced) {
-                        pending_release_flush_slot = true;
-                    }
-                    let cmd = match more {
-                        TrackWorkerCommand::ScheduleGeyserPushDebounced => {
-                            TrackWorkerCommand::ScheduleGeyserPush
-                        }
-                        other => other,
-                    };
-                    let _ = track_worker_process_command(&ctx, cmd);
+                    track_worker_dec_queue_depth(&queue_depth, &protocol);
+                    track_worker_receive_protocol_command(
+                        &ctx,
+                        &protocol,
+                        more,
+                        &mut coalesce_deadline,
+                        &mut push_before_keys,
+                        &mut pending_continue_evict,
+                        &mut pending_release_flush_slot,
+                    );
                 }
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {}
             Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
         }
+
+        track_worker_drain_pending_replay(
+            &ctx,
+            &protocol,
+            &mut coalesce_deadline,
+            &mut push_before_keys,
+            &mut pending_continue_evict,
+            &mut pending_release_flush_slot,
+        );
 
         let should_push =
             push_before_keys.is_some() && coalesce_deadline.is_some_and(|d| Instant::now() >= d);
@@ -341,9 +431,21 @@ pub fn flush_explicit_set_snapshot<C: TrackWorkerContext>(ctx: &C) {
     try_write_explicit_set_snapshot_from_ctx(ctx);
 }
 
+fn new_track_worker_sender(
+    tx: std_mpsc::SyncSender<ImmutableTrackCommand>,
+    queue_capacity: usize,
+) -> TrackWorkerSender {
+    TrackWorkerSender {
+        tx,
+        queue_depth: Arc::new(AtomicUsize::new(0)),
+        queue_capacity,
+        protocol: Arc::new(Mutex::new(BoundedProtocolStore::default_caps())),
+    }
+}
+
 pub fn spawn_track_worker<C: TrackWorkerContext + 'static>(ctx: Arc<C>) -> TrackWorkerSender {
     let queue_capacity = MARKET_DATA_TRACK_WORKER_QUEUE_CAP;
-    let (tx, rx) = std_mpsc::sync_channel::<TrackWorkerCommand>(queue_capacity);
+    let (tx, rx) = std_mpsc::sync_channel::<ImmutableTrackCommand>(queue_capacity);
     let queue_depth = Arc::new(AtomicUsize::new(0));
     let depth_worker = Arc::clone(&queue_depth);
     let ctx_worker = Arc::clone(&ctx);
@@ -351,24 +453,22 @@ pub fn spawn_track_worker<C: TrackWorkerContext + 'static>(ctx: Arc<C>) -> Track
         tx: tx.clone(),
         queue_depth: Arc::clone(&queue_depth),
         queue_capacity,
+        protocol: Arc::new(Mutex::new(BoundedProtocolStore::default_caps())),
     };
     let track_worker = sender.clone();
+    let protocol = Arc::clone(&sender.protocol);
     let _join: JoinHandle<()> = std::thread::Builder::new()
         .name("md-track-worker".into())
-        .spawn(move || track_worker_loop(ctx_worker, rx, depth_worker, track_worker))
+        .spawn(move || track_worker_loop(ctx_worker, rx, depth_worker, track_worker, protocol))
         .expect("spawn md-track-worker thread");
     sender
 }
 
 /// Test helper: enqueue handle that drains jobs without processing (md-state unit tests).
 pub fn spawn_noop_track_worker_sender(capacity: usize) -> TrackWorkerSender {
-    let (tx, rx) = std_mpsc::sync_channel::<TrackWorkerCommand>(capacity);
+    let (tx, rx) = std_mpsc::sync_channel::<ImmutableTrackCommand>(capacity);
     std::thread::spawn(move || while let Ok(_job) = rx.recv() {});
-    TrackWorkerSender {
-        tx,
-        queue_depth: Arc::new(AtomicUsize::new(0)),
-        queue_capacity: capacity,
-    }
+    new_track_worker_sender(tx, capacity)
 }
 
 /// Test helper: inline command processor without Geyser push coalesce loop.
@@ -376,16 +476,100 @@ pub fn spawn_inline_track_worker_sender<C: TrackWorkerContext + 'static>(
     ctx: Arc<C>,
     capacity: usize,
 ) -> TrackWorkerSender {
-    let (tx, rx) = std_mpsc::sync_channel::<TrackWorkerCommand>(capacity);
+    let (tx, rx) = std_mpsc::sync_channel::<ImmutableTrackCommand>(capacity);
     let ctx_worker = Arc::clone(&ctx);
+    let protocol = Arc::new(Mutex::new(BoundedProtocolStore::default_caps()));
+    let protocol_worker = Arc::clone(&protocol);
     std::thread::spawn(move || {
         while let Ok(job) = rx.recv() {
-            let _ = track_worker_process_command(&ctx_worker, job);
+            track_worker_apply_protocol_command(&ctx_worker, &protocol_worker, job);
         }
     });
     TrackWorkerSender {
         tx,
         queue_depth: Arc::new(AtomicUsize::new(0)),
         queue_capacity: capacity,
+        protocol,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::pending::BoundedProtocolStore;
+    use super::super::worker_commands::TrackCommandStream;
+    use super::*;
+    use crate::nats::MomentumActivePoolsUpdate;
+
+    #[test]
+    fn queue_full_preserves_demand_in_pending() {
+        let sender = spawn_noop_track_worker_sender(0);
+        let ok = track_worker_try_enqueue(
+            &sender,
+            TrackWorkerCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
+                version: 1,
+                ts_unix_ms: 0,
+                active: vec![],
+                removed: vec![],
+                full_active_snapshot: false,
+            }),
+        );
+        assert!(ok, "queue-full must stage to pending, not drop");
+        let store = sender.protocol.lock().expect("lock");
+        assert_eq!(store.pending_len(), 1);
+    }
+
+    #[test]
+    fn superseded_revision_skipped_on_apply() {
+        let sender = spawn_noop_track_worker_sender(1);
+        let cmd = {
+            let mut store = sender.protocol.lock().expect("lock");
+            let c = store.wrap_command(TrackWorkerCommand::ApplyMomentumActivePools(
+                MomentumActivePoolsUpdate {
+                    version: 1,
+                    ts_unix_ms: 0,
+                    active: vec![],
+                    removed: vec![],
+                    full_active_snapshot: false,
+                },
+            ));
+            store.mark_applied(TrackCommandStream::Momentum, c.revision);
+            c
+        };
+        assert!(sender.tx.try_send(cmd.clone()).is_ok());
+        // inline apply path not running; verify applicability directly
+        let store = sender.protocol.lock().expect("lock");
+        assert!(!store.is_applicable(cmd.stream, cmd.revision));
+    }
+
+    #[test]
+    fn control_push_advances_revision_superseding_older_pending_push() {
+        let mut store = BoundedProtocolStore::default_caps();
+        let push_old = store.wrap_command(TrackWorkerCommand::ScheduleGeyserPush);
+        store.stage_on_queue_full(push_old.clone());
+        let push_new = store.wrap_command(TrackWorkerCommand::ScheduleGeyserPush);
+        store.mark_applied(push_new.stream, push_new.revision);
+        assert!(!store.is_applicable(push_old.stream, push_old.revision));
+        let applicable = store.take_applicable_pending_sorted();
+        assert!(
+            applicable.is_empty(),
+            "older pending push must be superseded after newer push advances watermark"
+        );
+    }
+
+    #[test]
+    fn control_push_evict_variants_advance_revision() {
+        let mut store = BoundedProtocolStore::default_caps();
+        for payload in [
+            TrackWorkerCommand::ScheduleGeyserPush,
+            TrackWorkerCommand::ScheduleGeyserPushDebounced,
+            TrackWorkerCommand::ContinueGeyserEvict,
+        ] {
+            let cmd = store.wrap_command(payload);
+            store.mark_applied(cmd.stream, cmd.revision);
+            assert!(
+                !store.is_applicable(cmd.stream, cmd.revision),
+                "applied revision must not remain applicable"
+            );
+        }
     }
 }
