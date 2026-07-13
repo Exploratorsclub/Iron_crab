@@ -214,15 +214,6 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
     }
 }
 
-fn track_worker_command_advances_revision(payload: &TrackWorkerCommand) -> bool {
-    !matches!(
-        payload,
-        TrackWorkerCommand::ScheduleGeyserPush
-            | TrackWorkerCommand::ScheduleGeyserPushDebounced
-            | TrackWorkerCommand::ContinueGeyserEvict
-    )
-}
-
 fn track_worker_apply_protocol_command<C: TrackWorkerContext>(
     ctx: &Arc<C>,
     protocol: &Arc<Mutex<BoundedProtocolStore>>,
@@ -236,12 +227,9 @@ fn track_worker_apply_protocol_command<C: TrackWorkerContext>(
         inc_market_data_track_protocol_superseded_revisions_total();
         return;
     }
-    let advances_revision = track_worker_command_advances_revision(&cmd.payload);
     let _ = track_worker_process_command(ctx, cmd.payload);
-    if advances_revision {
-        let mut store = protocol.lock().expect("track protocol store lock");
-        store.mark_applied(cmd.stream, cmd.revision);
-    }
+    let mut store = protocol.lock().expect("track protocol store lock");
+    store.mark_applied(cmd.stream, cmd.revision);
 }
 
 fn track_worker_prepare_command_delivery<C: TrackWorkerContext>(
@@ -304,14 +292,20 @@ fn track_worker_drain_pending_replay<C: TrackWorkerContext>(
         store.take_applicable_pending_sorted()
     };
     for cmd in pending_cmds {
-        track_worker_prepare_command_delivery(
-            ctx,
-            &cmd.payload,
-            coalesce_deadline,
-            push_before_keys,
-            pending_continue_evict,
-            pending_release_flush_slot,
-        );
+        let applicable = {
+            let store = protocol.lock().expect("track protocol store lock");
+            store.is_applicable(cmd.stream, cmd.revision)
+        };
+        if applicable {
+            track_worker_prepare_command_delivery(
+                ctx,
+                &cmd.payload,
+                coalesce_deadline,
+                push_before_keys,
+                pending_continue_evict,
+                pending_release_flush_slot,
+            );
+        }
         track_worker_apply_protocol_command(ctx, protocol, cmd);
     }
 }
@@ -501,6 +495,7 @@ pub fn spawn_inline_track_worker_sender<C: TrackWorkerContext + 'static>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::pending::BoundedProtocolStore;
     use super::super::worker_commands::TrackCommandStream;
     use super::*;
     use crate::nats::MomentumActivePoolsUpdate;
@@ -544,5 +539,37 @@ mod tests {
         // inline apply path not running; verify applicability directly
         let store = sender.protocol.lock().expect("lock");
         assert!(!store.is_applicable(cmd.stream, cmd.revision));
+    }
+
+    #[test]
+    fn control_push_advances_revision_superseding_older_pending_push() {
+        let mut store = BoundedProtocolStore::default_caps();
+        let push_old = store.wrap_command(TrackWorkerCommand::ScheduleGeyserPush);
+        store.stage_on_queue_full(push_old.clone());
+        let push_new = store.wrap_command(TrackWorkerCommand::ScheduleGeyserPush);
+        store.mark_applied(push_new.stream, push_new.revision);
+        assert!(!store.is_applicable(push_old.stream, push_old.revision));
+        let applicable = store.take_applicable_pending_sorted();
+        assert!(
+            applicable.is_empty(),
+            "older pending push must be superseded after newer push advances watermark"
+        );
+    }
+
+    #[test]
+    fn control_push_evict_variants_advance_revision() {
+        let mut store = BoundedProtocolStore::default_caps();
+        for payload in [
+            TrackWorkerCommand::ScheduleGeyserPush,
+            TrackWorkerCommand::ScheduleGeyserPushDebounced,
+            TrackWorkerCommand::ContinueGeyserEvict,
+        ] {
+            let cmd = store.wrap_command(payload);
+            store.mark_applied(cmd.stream, cmd.revision);
+            assert!(
+                !store.is_applicable(cmd.stream, cmd.revision),
+                "applied revision must not remain applicable"
+            );
+        }
     }
 }
