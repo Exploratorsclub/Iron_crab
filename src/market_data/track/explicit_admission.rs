@@ -827,16 +827,6 @@ impl FixedCapAdmission {
         select_cap_shrink_victims(&snapshot, target_cap)
     }
 
-    /// Raise the hard cap without eviction. No-op when `new_cap <= self.cap`.
-    pub fn raise_cap(&mut self, new_cap: usize) -> CapShrinkResult {
-        let old_cap = self.cap;
-        if new_cap <= old_cap {
-            return CapShrinkResult::NoOpAlreadyWithinCap { old_cap, new_cap };
-        }
-        self.cap = new_cap;
-        CapShrinkResult::NoOpAlreadyWithinCap { old_cap, new_cap }
-    }
-
     /// Lower the hard cap, evicting victims when `physical_len` exceeds the new cap.
     ///
     /// Cap increases are rejected without mutation. When `physical_len <= new_cap`, only the cap

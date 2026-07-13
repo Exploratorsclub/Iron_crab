@@ -2897,11 +2897,20 @@ impl MarketDataContext {
         admission: &mut FixedCapAdmission,
         new_cap: usize,
     ) -> CapShrinkResult {
-        let result = if new_cap > admission.cap() {
-            admission.raise_cap(new_cap)
-        } else {
-            admission.try_shrink_cap(new_cap)
-        };
+        // Runtime cap increases are not supported: config may update, but admission cap is
+        // fixed at worker startup until process restart (I-MD-7 / PR3 scope).
+        if new_cap > admission.cap() {
+            warn!(
+                configured_cap = new_cap,
+                admission_cap = admission.cap(),
+                "Runtime max_tracked_accounts cap increase ignored; restart required"
+            );
+            return CapShrinkResult::RejectedCapIncrease {
+                old_cap: admission.cap(),
+                requested_cap: new_cap,
+            };
+        }
+        let result = admission.try_shrink_cap(new_cap);
         if matches!(result, CapShrinkResult::ProtectedOverflow { .. }) {
             self.geyser_explicit_ready.store(false, Ordering::Release);
             *self.geyser_explicit_config_error.write() = Some(format!(
