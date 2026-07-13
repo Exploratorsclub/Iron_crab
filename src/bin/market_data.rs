@@ -82,10 +82,11 @@ use ironcrab::market_data::sidefx::{
 use ironcrab::market_data::track::{
     arb_coalesce_try_send, explicit_set_snapshot_path, explicit_subscription_has_new_keys,
     flush_explicit_set_snapshot, load_explicit_set_snapshot, momentum_coalesce_try_send,
-    pool_is_enrichment_member, spawn_track_worker, track_worker_try_enqueue, ConsumerId,
-    DesiredExplicitSet, ExplicitAccountKind, ExplicitSetSnapshot, ExplicitSnapshotRow,
-    SnapshotConsumer, TrackPinReason, TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,
-    EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP, MARKET_DATA_TRACK_WORKER_COALESCE_MS,
+    owner_group_snapshot_to_disk, pool_is_enrichment_member, restore_admission_from_owner_groups,
+    spawn_track_worker, track_worker_try_enqueue, AdmissionConvergeResult, AdmissionRestoreResult,
+    CapShrinkResult, ConsumerId, ExplicitAccountKind, ExplicitSetSnapshot, ExplicitSnapshotRow,
+    FixedCapAdmission, GeyserConnectBarrier, SnapshotConsumer, TrackPinReason, TrackWorkerCommand,
+    TrackWorkerContext, TrackWorkerSender, EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
 };
 use ironcrab::metrics::{
     dec_market_data_account_high_priority_queue_depth,
@@ -118,11 +119,14 @@ use ironcrab::metrics::{
     set_market_data_account_broadcast_queue_depth, set_market_data_account_worker_count,
     set_market_data_arb_pinned_pools_gauge, set_market_data_enrichment_registry_pools_gauge,
     set_market_data_explicit_set_snapshot_restore_duration_ms,
-    set_market_data_explicit_set_snapshot_restore_pubkeys, set_market_data_geyser_merge_pending,
-    set_market_data_geyser_sync_pending, set_market_data_hot_pool_registry_pools_gauge,
-    set_market_data_md_state_evict_pending, set_market_data_momentum_active_pool_pins_gauge,
-    set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
-    set_readiness_nats_connected, touch_market_data_global_ingest_progress,
+    set_market_data_explicit_set_snapshot_restore_pubkeys,
+    set_market_data_geyser_explicit_admitted_accounts,
+    set_market_data_geyser_explicit_cap_overflow, set_market_data_geyser_explicit_set_size,
+    set_market_data_geyser_merge_pending, set_market_data_geyser_sync_pending,
+    set_market_data_hot_pool_registry_pools_gauge, set_market_data_md_state_evict_pending,
+    set_market_data_momentum_active_pool_pins_gauge, set_market_data_tx_broadcast_queue_depth,
+    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
+    touch_market_data_global_ingest_progress,
     touch_market_data_tracked_membership_snapshot_refresh, update_readiness_market_data_current,
     GeyserTrackedEvictKind, MarketDataLatencySegment, MetricsComponent,
     MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_RECEIVED_TOTAL,
@@ -253,18 +257,20 @@ fn market_data_global_ingest_stalled(
 #[allow(dead_code)] // production path: `track/worker.rs`; kept for eval grep + unit tests
 fn track_worker_execute_coalesced_push(
     ctx: &Arc<MarketDataContext>,
-    desired: &mut DesiredExplicitSet,
+    admission: &mut FixedCapAdmission,
     before_keys: HashSet<Pubkey>,
     continue_evict: bool,
     release_flush_slot: bool,
+    restore_barrier_pending: bool,
 ) -> bool {
-    // Geyser explicit flush: sync_geyser_tracked_accounts_batched_flush_with_deadline on md-track-worker.
+    // Eval grep: `sync_geyser_tracked_accounts_batched_flush_with_deadline` on track-worker path.
     ironcrab::market_data::track::track_worker_execute_coalesced_push(
         ctx,
-        desired,
+        admission,
         before_keys,
         continue_evict,
         release_flush_slot,
+        restore_barrier_pending,
     )
 }
 
@@ -1120,6 +1126,11 @@ struct MarketDataContext {
     last_arb_snapshot_target: parking_lot::RwLock<Option<HashSet<Pubkey>>>,
     /// Last `active_id` used when registering DLMM bin-array window per pool (Fix B).
     dlmm_registered_active_id: parking_lot::RwLock<HashMap<Pubkey, i32>>,
+    /// PR3: startup restore / first physical publish barrier before Geyser connect.
+    geyser_connect_barrier: Arc<GeyserConnectBarrier>,
+    /// PR3: explicit admission readiness (wallet-over-cap fail-closed).
+    geyser_explicit_ready: AtomicBool,
+    geyser_explicit_config_error: parking_lot::RwLock<Option<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -1861,7 +1872,7 @@ fn snapshot_consumer_to_geyser_pin(consumer: SnapshotConsumer) -> GeyserPinReaso
     match consumer {
         SnapshotConsumer::Wallet => GeyserPinReason::Wallet,
         SnapshotConsumer::Momentum => GeyserPinReason::MomentumActive,
-        SnapshotConsumer::Arb => GeyserPinReason::ArbMultiDex,
+        SnapshotConsumer::Arb | SnapshotConsumer::Tracker => GeyserPinReason::ArbMultiDex,
     }
 }
 
@@ -1934,12 +1945,21 @@ impl TrackWorkerContext for MarketDataContext {
         self.pending_geyser_evict.load(Ordering::Relaxed)
     }
 
-    fn continue_geyser_evict_with_deadline(&self, deadline: Instant) -> bool {
-        self.continue_geyser_evict_with_deadline(deadline)
+    fn continue_geyser_evict_with_deadline(
+        &self,
+        deadline: Instant,
+        admission: &FixedCapAdmission,
+    ) -> bool {
+        self.sync_geyser_tracked_accounts_from_admission_with_deadline(deadline, admission)
     }
 
-    fn sync_geyser_tracked_accounts_batched_flush_with_deadline(&self, deadline: Instant) -> bool {
-        self.sync_geyser_tracked_accounts_batched_flush_with_deadline(deadline)
+    fn sync_geyser_tracked_accounts_batched_flush_with_deadline(
+        &self,
+        deadline: Instant,
+        admission: &FixedCapAdmission,
+    ) -> bool {
+        let _ = deadline;
+        self.sync_geyser_tracked_accounts_from_admission_with_deadline(deadline, admission)
     }
 
     fn release_geyser_sync_flush_slot(&self) {
@@ -1951,50 +1971,70 @@ impl TrackWorkerContext for MarketDataContext {
     }
 
     fn explicit_pubkey_rows_for_desired_set(&self) -> Vec<(Pubkey, ConsumerId, Option<Pubkey>)> {
-        let mut rows = Vec::new();
-        for (pk, m) in self.tracked_mints.read().iter() {
-            rows.push((*pk, consumer_id_for_geyser_pin(m.pin), None));
-        }
-        for (pk, v) in self.tracked_vaults.read().iter() {
-            rows.push((*pk, consumer_id_for_geyser_pin(v.pin), Some(v.pool_address)));
-        }
-        for (pk, b) in self.tracked_bin_arrays.read().iter() {
-            rows.push((*pk, consumer_id_for_geyser_pin(b.pin), Some(b.pool_address)));
-        }
-        if let Some(w) = &self.tracked_wallet {
-            rows.push((w.wallet, ConsumerId::Wallet, None));
-            rows.push((w.wsol_ata, ConsumerId::Wallet, None));
-        }
-        for pk in self.tracked_wallet_token_accounts.read().iter() {
-            rows.push((*pk, ConsumerId::Wallet, None));
-        }
-        rows
+        MarketDataContext::explicit_pubkey_rows_for_desired_set(self)
     }
 
-    fn build_explicit_set_snapshot(&self) -> ExplicitSetSnapshot {
-        let mut snapshot = ExplicitSetSnapshot::new(Some(self.run_id.clone()));
-        snapshot.rows = self.collect_explicit_snapshot_rows();
-        snapshot.pool_mint_map =
-            self.collect_pool_mint_map_tier1(EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP);
-        snapshot.momentum_pools = self
-            .hot_pool_registry
-            .snapshot_pairs()
-            .into_iter()
-            .map(|(_, pool)| pool.to_string())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        snapshot.arb_pools = self
-            .hot_pool_registry
-            .snapshot_arb_pools()
-            .into_iter()
-            .map(|p| p.to_string())
-            .collect();
-        snapshot
+    fn build_explicit_set_snapshot(&self, admission: &FixedCapAdmission) -> ExplicitSetSnapshot {
+        MarketDataContext::build_explicit_set_snapshot(self, admission)
     }
 
-    fn apply_explicit_set_snapshot(&self, snapshot: &ExplicitSetSnapshot) -> usize {
+    fn apply_explicit_set_snapshot_legacy(&self, snapshot: &ExplicitSetSnapshot) -> usize {
         self.apply_explicit_set_snapshot_impl(snapshot)
+    }
+
+    fn apply_explicit_set_snapshot(
+        &self,
+        admission: &mut FixedCapAdmission,
+        snapshot: &ExplicitSetSnapshot,
+    ) -> AdmissionRestoreResult {
+        MarketDataContext::restore_explicit_admission_from_snapshot(self, admission, snapshot)
+    }
+
+    fn on_admission_converge_result(
+        &self,
+        admission: &FixedCapAdmission,
+        result: AdmissionConvergeResult,
+    ) {
+        MarketDataContext::on_admission_converge_result(self, admission, result);
+    }
+
+    fn prune_tracked_maps_to_admitted(&self, admission: &FixedCapAdmission) {
+        MarketDataContext::prune_tracked_maps_to_admitted(self, admission);
+    }
+
+    fn publish_admitted_explicit_physical(&self, admission: &FixedCapAdmission) {
+        MarketDataContext::publish_admitted_explicit_physical(self, admission);
+    }
+
+    fn last_synced_explicit_pubkeys_write(
+        &self,
+    ) -> parking_lot::RwLockWriteGuard<'_, HashSet<Pubkey>> {
+        self.last_synced_explicit_pubkeys.write()
+    }
+
+    fn clear_pending_geyser_evict(&self) {
+        self.pending_geyser_evict.store(false, Ordering::Relaxed);
+        set_market_data_md_state_evict_pending(false);
+    }
+
+    fn geyser_explicit_readiness_ok(&self) -> bool {
+        self.geyser_explicit_ready.load(Ordering::Relaxed)
+    }
+
+    fn geyser_connect_barrier_pending(&self) -> bool {
+        !self.geyser_connect_barrier.is_ready()
+    }
+
+    fn signal_restore_barrier(&self, ok: bool) {
+        MarketDataContext::signal_restore_barrier(self, ok);
+    }
+
+    fn apply_explicit_cap_shrink(
+        &self,
+        admission: &mut FixedCapAdmission,
+        new_cap: usize,
+    ) -> CapShrinkResult {
+        MarketDataContext::apply_explicit_cap_shrink(self, admission, new_cap)
     }
 }
 
@@ -2630,10 +2670,353 @@ impl MarketDataContext {
         restored
     }
 
+    fn explicit_pubkey_rows_for_desired_set(&self) -> Vec<(Pubkey, ConsumerId, Option<Pubkey>)> {
+        let mut rows = Vec::new();
+        for (pk, m) in self.tracked_mints.read().iter() {
+            rows.push((*pk, consumer_id_for_geyser_pin(m.pin), None));
+        }
+        for (pk, v) in self.tracked_vaults.read().iter() {
+            rows.push((*pk, consumer_id_for_geyser_pin(v.pin), Some(v.pool_address)));
+        }
+        for (pk, b) in self.tracked_bin_arrays.read().iter() {
+            rows.push((*pk, consumer_id_for_geyser_pin(b.pin), Some(b.pool_address)));
+        }
+        if let Some(w) = &self.tracked_wallet {
+            rows.push((w.wallet, ConsumerId::Wallet, None));
+            rows.push((w.wsol_ata, ConsumerId::Wallet, None));
+        }
+        for pk in self.tracked_wallet_token_accounts.read().iter() {
+            rows.push((*pk, ConsumerId::Wallet, None));
+        }
+        rows
+    }
+
+    fn wallet_explicit_demand_pubkeys(&self) -> HashSet<Pubkey> {
+        let mut set = HashSet::new();
+        if let Some(w) = &self.tracked_wallet {
+            set.insert(w.wallet);
+            set.insert(w.wsol_ata);
+        }
+        set.extend(self.tracked_wallet_token_accounts.read().iter().copied());
+        set
+    }
+
+    fn configured_max_tracked_accounts(&self) -> usize {
+        self.config.read().max_tracked_accounts
+    }
+
+    fn admission_exceeds_configured_cap(&self, admission: &FixedCapAdmission) -> bool {
+        ironcrab::market_data::track::admission_exceeds_configured_cap(
+            admission,
+            self.configured_max_tracked_accounts(),
+        )
+    }
+
+    fn mark_explicit_admission_config_cap_desync(
+        &self,
+        admission: &FixedCapAdmission,
+        detail: &str,
+    ) {
+        let configured = self.configured_max_tracked_accounts();
+        self.geyser_explicit_ready.store(false, Ordering::Release);
+        *self.geyser_explicit_config_error.write() = Some(format!(
+            "configured max_tracked_accounts ({configured}) below admission cap ({}); admitted={}; {detail}",
+            admission.cap(),
+            admission.len(),
+        ));
+        self.geyser_connect_barrier.mark_failed();
+        set_market_data_geyser_explicit_cap_overflow(1);
+    }
+
+    fn on_admission_converge_result(
+        &self,
+        admission: &FixedCapAdmission,
+        result: AdmissionConvergeResult,
+    ) {
+        set_market_data_geyser_explicit_cap_overflow(
+            if matches!(
+                result,
+                AdmissionConvergeResult::ProtectedOverflow | AdmissionConvergeResult::Unconverged
+            ) {
+                1
+            } else {
+                0
+            },
+        );
+        match result {
+            AdmissionConvergeResult::Converged => {
+                set_market_data_geyser_explicit_admitted_accounts(admission.len());
+                set_market_data_geyser_explicit_set_size(admission.len());
+                let configured = self.configured_max_tracked_accounts();
+                if self.admission_exceeds_configured_cap(admission) {
+                    self.mark_explicit_admission_config_cap_desync(
+                        admission,
+                        "converge succeeded but admission exceeds configured cap",
+                    );
+                } else if admission.wallet_demand_exceeds_cap(configured) {
+                    let wallet_len = self.wallet_explicit_demand_pubkeys().len();
+                    let msg = format!(
+                        "wallet protected explicit demand ({wallet_len} pubkeys) exceeds max_tracked_accounts cap ({configured})"
+                    );
+                    self.geyser_explicit_ready.store(false, Ordering::Release);
+                    *self.geyser_explicit_config_error.write() = Some(msg);
+                    self.geyser_connect_barrier.mark_failed();
+                    set_market_data_geyser_explicit_cap_overflow(1);
+                } else {
+                    self.geyser_explicit_ready.store(true, Ordering::Release);
+                    *self.geyser_explicit_config_error.write() = None;
+                    set_market_data_geyser_explicit_cap_overflow(0);
+                }
+            }
+            AdmissionConvergeResult::ProtectedOverflow => {
+                let cap = admission.cap();
+                let wallet_len = self.wallet_explicit_demand_pubkeys().len();
+                let msg = format!(
+                    "wallet protected explicit demand ({wallet_len} pubkeys) exceeds max_tracked_accounts cap ({cap})"
+                );
+                self.geyser_explicit_ready.store(false, Ordering::Release);
+                *self.geyser_explicit_config_error.write() = Some(msg);
+                self.geyser_connect_barrier.mark_failed();
+            }
+            AdmissionConvergeResult::Unconverged => {
+                self.geyser_explicit_ready.store(false, Ordering::Release);
+                *self.geyser_explicit_config_error.write() =
+                    Some("explicit admission cap unconverged".into());
+                self.geyser_connect_barrier.mark_failed();
+            }
+        }
+    }
+
+    fn signal_restore_barrier(&self, ok: bool) {
+        let wallet_fits =
+            self.wallet_explicit_demand_pubkeys().len() <= self.config.read().max_tracked_accounts;
+        if ok && self.geyser_explicit_readiness_ok() && wallet_fits {
+            self.geyser_connect_barrier.mark_ready();
+        } else {
+            self.geyser_connect_barrier.mark_failed();
+        }
+    }
+
+    fn geyser_explicit_readiness_ok(&self) -> bool {
+        self.geyser_explicit_ready.load(Ordering::Relaxed)
+    }
+
+    fn prune_tracked_maps_to_admitted(&self, admission: &FixedCapAdmission) {
+        let admitted: HashSet<Pubkey> = admission.snapshot_pubkeys().into_iter().collect();
+        {
+            let mut mints = self.tracked_mints.write();
+            mints.retain(|pk, _| admitted.contains(pk));
+        }
+        {
+            let mut vaults = self.tracked_vaults.write();
+            let removed: Vec<(Pubkey, Pubkey)> = vaults
+                .iter()
+                .filter(|(pk, _)| !admitted.contains(pk))
+                .map(|(pk, v)| (*pk, v.pool_address))
+                .collect();
+            for (pk, pool) in removed {
+                vaults.remove(&pk);
+                self.pool_tracked_legs_remove_vault(pool, pk);
+            }
+        }
+        {
+            let mut bins = self.tracked_bin_arrays.write();
+            let removed: Vec<(Pubkey, Pubkey)> = bins
+                .iter()
+                .filter(|(pk, _)| !admitted.contains(pk))
+                .map(|(pk, b)| (*pk, b.pool_address))
+                .collect();
+            for (pk, pool) in removed {
+                bins.remove(&pk);
+                self.pool_tracked_legs_remove_bin(pool, pk);
+            }
+        }
+        self.tracked_wallet_token_accounts
+            .write()
+            .retain(|pk| admitted.contains(pk));
+    }
+
+    fn publish_admitted_explicit_physical(&self, admission: &FixedCapAdmission) {
+        if self.admission_exceeds_configured_cap(admission) {
+            self.mark_explicit_admission_config_cap_desync(
+                admission,
+                "publish blocked: admission exceeds configured cap",
+            );
+            return;
+        }
+        let admitted: HashSet<Pubkey> = admission.snapshot_pubkeys().into_iter().collect();
+        let mint_keys: HashSet<Pubkey> = self.tracked_mints.read().keys().copied().collect();
+        let vault_keys: HashSet<Pubkey> = self.tracked_vaults.read().keys().copied().collect();
+        let bin_keys: HashSet<Pubkey> = self.tracked_bin_arrays.read().keys().copied().collect();
+        let wallet_keys = self.wallet_explicit_demand_pubkeys();
+        let (mints, vaults, bins, wallets) =
+            ironcrab::market_data::track::partition_admitted_pubkeys_for_geyser_channels(
+                &admitted,
+                &mint_keys,
+                &vault_keys,
+                &bin_keys,
+                &wallet_keys,
+            );
+        let _ = self.tracked_mints_tx.send(mints);
+        let _ = self.tracked_vaults_tx.send(vaults);
+        let _ = self.tracked_bin_arrays_tx.send(bins);
+        let _ = self.tracked_wallet_tx.send(wallets);
+        geyser_metrics_set_subscription_accounts(admitted.len());
+        self.refresh_geyser_pins_gauge();
+    }
+
+    fn build_explicit_set_snapshot(&self, admission: &FixedCapAdmission) -> ExplicitSetSnapshot {
+        let mut snapshot = ExplicitSetSnapshot::new(Some(self.run_id.clone()));
+        snapshot.rows = self.collect_explicit_snapshot_rows();
+        snapshot.owner_groups = admission
+            .snapshot_owner_groups()
+            .iter()
+            .map(owner_group_snapshot_to_disk)
+            .collect();
+        snapshot.pool_mint_map =
+            self.collect_pool_mint_map_tier1(EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP);
+        snapshot.momentum_pools = self
+            .hot_pool_registry
+            .snapshot_pairs()
+            .into_iter()
+            .map(|(_, pool)| pool.to_string())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        snapshot.arb_pools = self
+            .hot_pool_registry
+            .snapshot_arb_pools()
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect();
+        snapshot
+    }
+
+    fn restore_explicit_admission_from_snapshot(
+        &self,
+        admission: &mut FixedCapAdmission,
+        snapshot: &ExplicitSetSnapshot,
+    ) -> AdmissionRestoreResult {
+        let groups = snapshot.to_owner_group_snapshots();
+        let result = restore_admission_from_owner_groups(admission, &groups);
+        match result {
+            AdmissionRestoreResult::Restored => {
+                if self.admission_exceeds_configured_cap(admission) {
+                    self.mark_explicit_admission_config_cap_desync(
+                        admission,
+                        "restore succeeded but admission exceeds configured cap",
+                    );
+                } else if admission
+                    .wallet_demand_exceeds_cap(self.configured_max_tracked_accounts())
+                {
+                    let cap = self.configured_max_tracked_accounts();
+                    let msg = format!(
+                        "wallet-only explicit demand exceeds max_tracked_accounts cap ({cap}) on restore"
+                    );
+                    self.geyser_explicit_ready.store(false, Ordering::Release);
+                    *self.geyser_explicit_config_error.write() = Some(msg);
+                    self.geyser_connect_barrier.mark_failed();
+                } else {
+                    self.geyser_explicit_ready.store(true, Ordering::Release);
+                    *self.geyser_explicit_config_error.write() = None;
+                    set_market_data_geyser_explicit_cap_overflow(0);
+                }
+            }
+            AdmissionRestoreResult::ProtectedOverflow => {
+                let cap = admission.cap();
+                let msg = format!(
+                    "wallet-only explicit demand exceeds max_tracked_accounts cap ({cap}) on restore"
+                );
+                self.geyser_explicit_ready.store(false, Ordering::Release);
+                *self.geyser_explicit_config_error.write() = Some(msg);
+                self.geyser_connect_barrier.mark_failed();
+            }
+            AdmissionRestoreResult::Unconverged => {
+                self.geyser_explicit_ready.store(false, Ordering::Release);
+                *self.geyser_explicit_config_error.write() =
+                    Some("explicit admission restore unconverged".into());
+                self.geyser_connect_barrier.mark_failed();
+            }
+        }
+        result
+    }
+
+    fn apply_explicit_cap_shrink(
+        &self,
+        admission: &mut FixedCapAdmission,
+        new_cap: usize,
+    ) -> CapShrinkResult {
+        // Runtime cap increases are not supported: config may update, but admission cap is
+        // fixed at worker startup until process restart (I-MD-7 / PR3 scope).
+        if new_cap > admission.cap() {
+            warn!(
+                configured_cap = new_cap,
+                admission_cap = admission.cap(),
+                "Runtime max_tracked_accounts cap increase ignored; restart required"
+            );
+            return CapShrinkResult::RejectedCapIncrease {
+                old_cap: admission.cap(),
+                requested_cap: new_cap,
+            };
+        }
+        let result = admission.try_shrink_cap(new_cap);
+        match result {
+            CapShrinkResult::Converged { .. } | CapShrinkResult::NoOpAlreadyWithinCap { .. } => {
+                if self.admission_exceeds_configured_cap(admission) {
+                    self.mark_explicit_admission_config_cap_desync(
+                        admission,
+                        "cap shrink did not align admission with configured cap",
+                    );
+                } else {
+                    self.geyser_explicit_ready.store(true, Ordering::Release);
+                    *self.geyser_explicit_config_error.write() = None;
+                    set_market_data_geyser_explicit_cap_overflow(0);
+                }
+            }
+            CapShrinkResult::ProtectedOverflow { .. } => {
+                self.mark_explicit_admission_config_cap_desync(
+                    admission,
+                    "max_tracked_accounts shrink rejected: wallet protected overflow",
+                );
+            }
+            CapShrinkResult::RejectedInvalidInput | CapShrinkResult::InternalInvariantViolation => {
+                self.mark_explicit_admission_config_cap_desync(admission, "cap shrink failed");
+            }
+            CapShrinkResult::RejectedCapIncrease { .. } => {}
+        }
+        result
+    }
+
+    fn sync_geyser_tracked_accounts_from_admission_with_deadline(
+        &self,
+        _deadline: Instant,
+        admission: &FixedCapAdmission,
+    ) -> bool {
+        set_market_data_geyser_sync_pending(0);
+        record_market_data_geyser_sync_batch_total();
+        self.prune_tracked_maps_to_admitted(admission);
+        self.publish_admitted_explicit_physical(admission);
+        *self.last_synced_explicit_pubkeys.write() =
+            admission.snapshot_pubkeys().into_iter().collect();
+        true
+    }
+
     /// Phase 3 P3: restore explicit set from disk before first Geyser connect (I-MD-6).
-    fn restore_explicit_set_from_snapshot_on_startup(track_worker: &TrackWorkerSender) {
+    fn restore_explicit_set_from_snapshot_on_startup(
+        ctx: &MarketDataContext,
+        track_worker: &TrackWorkerSender,
+    ) {
         let path = explicit_set_snapshot_path();
         let Some(snapshot) = load_explicit_set_snapshot(&path) else {
+            let _ = track_worker_try_enqueue(track_worker, TrackWorkerCommand::ScheduleGeyserPush);
+            if ctx
+                .geyser_connect_barrier
+                .wait_ready(Duration::from_secs(30))
+                .is_err()
+            {
+                warn!("explicit Geyser startup barrier failed or timed out (no snapshot, fail-closed)");
+                ctx.geyser_explicit_ready.store(false, Ordering::Release);
+            }
             return;
         };
         let start = Instant::now();
@@ -2642,6 +3025,7 @@ impl MarketDataContext {
             path = %path.display(),
             pubkeys = pubkey_count,
             pool_mint_map = snapshot.pool_mint_map.len(),
+            owner_groups = snapshot.owner_groups.len(),
             "Restoring explicit Geyser set from snapshot (I-MD-6)"
         );
         let _ = track_worker_try_enqueue(
@@ -2649,9 +3033,14 @@ impl MarketDataContext {
             TrackWorkerCommand::RestoreExplicitSnapshot(snapshot),
         );
         let _ = track_worker_try_enqueue(track_worker, TrackWorkerCommand::ScheduleGeyserPush);
-        std::thread::sleep(Duration::from_millis(
-            MARKET_DATA_TRACK_WORKER_COALESCE_MS + 300,
-        ));
+        if ctx
+            .geyser_connect_barrier
+            .wait_ready(Duration::from_secs(30))
+            .is_err()
+        {
+            warn!("explicit Geyser restore barrier failed or timed out (fail-closed)");
+            ctx.geyser_explicit_ready.store(false, Ordering::Release);
+        }
         set_market_data_explicit_set_snapshot_restore_pubkeys(pubkey_count);
         set_market_data_explicit_set_snapshot_restore_duration_ms(
             start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
@@ -3102,17 +3491,20 @@ impl MarketDataContext {
         }
     }
 
+    #[allow(dead_code)] // legacy LRU path; track-worker uses admission flush via TrackWorkerContext
     fn continue_geyser_evict_with_deadline(&self, deadline: Instant) -> bool {
         self.sync_geyser_tracked_accounts_core_with_deadline(deadline)
     }
 
     /// Debounced TX-path flush on md-state: bounded eviction + broadcast when complete.
+    #[allow(dead_code)] // legacy LRU path; track-worker uses admission flush via TrackWorkerContext
     fn sync_geyser_tracked_accounts_batched_flush_with_deadline(&self, deadline: Instant) -> bool {
         set_market_data_geyser_sync_pending(0);
         record_market_data_geyser_sync_batch_total();
         self.sync_geyser_tracked_accounts_core_with_deadline(deadline)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn sync_geyser_tracked_accounts_core(&self) {
         let deadline = Instant::now() + Duration::from_secs(300);
         while !self.sync_geyser_tracked_accounts_core_with_deadline(deadline)
@@ -3123,6 +3515,7 @@ impl MarketDataContext {
     }
 
     /// Immediate subscription-list sync (momentum pins, wallet tracks, config, account-path admission, …).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn sync_geyser_tracked_accounts(&self) {
         record_market_data_geyser_sync_immediate_total();
         self.sync_geyser_tracked_accounts_core();
@@ -4221,6 +4614,7 @@ impl MarketDataContext {
         &self,
         update: &ConfigUpdate,
         md_state: Option<&MdStateSender>,
+        track_worker: Option<&TrackWorkerSender>,
     ) -> ConfigUpdateResponse {
         let mut applied = Vec::new();
         let mut rejected = Vec::new();
@@ -4362,9 +4756,13 @@ impl MarketDataContext {
                     md_state,
                     MdStateCommand::ScheduleGeyserSyncAfterConfigChange,
                 );
-            } else {
-                // Bootstrap before md-state worker exists: one-shot cold-path flush.
-                self.sync_geyser_tracked_accounts();
+            } else if let Some(track_worker) = track_worker {
+                let _ = track_worker_try_enqueue(
+                    track_worker,
+                    TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange,
+                );
+                let _ =
+                    track_worker_try_enqueue(track_worker, TrackWorkerCommand::ScheduleGeyserPush);
             }
         }
 
@@ -6331,6 +6729,9 @@ async fn main() -> Result<()> {
         last_momentum_snapshot_target: parking_lot::RwLock::new(None),
         last_arb_snapshot_target: parking_lot::RwLock::new(None),
         dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+        geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
+        geyser_explicit_ready: AtomicBool::new(true),
+        geyser_explicit_config_error: parking_lot::RwLock::new(None),
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -6413,7 +6814,8 @@ async fn main() -> Result<()> {
                                                 keys = ?update.config.keys().collect::<Vec<_>>(),
                                                 "Bootstrap: Applying config from JetStream"
                                             );
-                                            let response = ctx.apply_config_update(&update, None);
+                                            let response =
+                                                ctx.apply_config_update(&update, None, None);
                                             info!(
                                                 status = ?response.status,
                                                 applied = ?response.applied_keys,
@@ -6447,7 +6849,8 @@ async fn main() -> Result<()> {
 
     if args.simulate {
         info!("Simulation mode: emitting fake slot events");
-        run_simulation_loop(ctx.clone(), &run_id, config_subscription).await?;
+        let track_worker = run_simulation_loop(ctx.clone(), &run_id, config_subscription).await?;
+        flush_explicit_set_snapshot(&track_worker);
     } else {
         info!(geyser_url = %args.geyser_url, "Starting Geyser integration");
         let wallet_tx_confirm_commitment = file_config
@@ -6456,7 +6859,7 @@ async fn main() -> Result<()> {
             .and_then(|e| e.confirm_commitment.clone())
             .unwrap_or_else(|| "confirmed".to_string());
 
-        run_geyser_loop(
+        let track_worker = run_geyser_loop(
             ctx.clone(),
             &run_id,
             &args.geyser_url,
@@ -6469,10 +6872,10 @@ async fn main() -> Result<()> {
             wallet_tx_confirm_commitment,
         )
         .await?;
+        flush_explicit_set_snapshot(&track_worker);
     }
 
-    // Flush explicit-set snapshot + JSONL on shutdown
-    flush_explicit_set_snapshot(ctx.as_ref());
+    // Flush JSONL on shutdown
     ctx.jsonl_writer.flush()?;
     info!(run_id = %run_id, "market-data shutdown complete");
 
@@ -7098,7 +7501,7 @@ async fn run_geyser_loop(
     tracked_wallet_rx: watch::Receiver<Vec<Pubkey>>,
     wallet_snapshot_only: bool,
     wallet_tx_confirm_commitment: String,
-) -> Result<()> {
+) -> Result<TrackWorkerSender> {
     // Initialize RPC client for fallback/metadata (prefer local RPC, fallback to Helius)
     let rpc_url =
         std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string()); // Local validator/private RPC preferred
@@ -7115,10 +7518,26 @@ async fn run_geyser_loop(
     let pump_amm_dex = Arc::new(pump_inner);
     *ctx.pump_amm_dex.write() = Some(Arc::clone(&pump_amm_dex));
 
-    // Phase-R-R2: single-writer `md-state` OS thread (before wallet snapshot — wallet path enqueues).
+    // Phase-R-R2: single-writer `md-track-worker` OS thread (before wallet snapshot — wallet path enqueues).
     let track_worker = spawn_track_worker(Arc::clone(&ctx));
     // Phase 3 P3 (I-MD-6): restore explicit Geyser set before first Geyser connect.
-    MarketDataContext::restore_explicit_set_from_snapshot_on_startup(&track_worker);
+    MarketDataContext::restore_explicit_set_from_snapshot_on_startup(ctx.as_ref(), &track_worker);
+    if !ctx.geyser_explicit_readiness_ok() {
+        anyhow::bail!(
+            "Geyser explicit admission not ready: {}",
+            ctx.geyser_explicit_config_error
+                .read()
+                .clone()
+                .unwrap_or_else(|| "protected explicit overflow".into())
+        );
+    }
+    if ctx
+        .geyser_connect_barrier
+        .wait_ready(Duration::from_secs(30))
+        .is_err()
+    {
+        anyhow::bail!("Geyser explicit restore/convergence barrier failed before connect");
+    }
     // PR169c / Phase-2b: coalesce momentum NATS bursts before md-track-worker.
     let momentum_coalesce_tx =
         spawn_momentum_tracking_coalescer(Arc::clone(&ctx), track_worker.clone());
@@ -7164,7 +7583,7 @@ async fn run_geyser_loop(
 
     if wallet_snapshot_only {
         info!("Wallet snapshot only mode enabled, exiting after snapshot");
-        return Ok(());
+        return Ok(track_worker);
     }
 
     let wallet_snapshot_periodic_secs = std::env::var("IRONCRAB_WALLET_SNAPSHOT_PERIODIC_SECS")
@@ -7476,7 +7895,7 @@ async fn run_geyser_loop(
         Arc::clone(&ctx),
         account_publish_tx.clone(),
         md_state.clone(),
-        track_worker,
+        track_worker.clone(),
     );
 
     // Option A (MARKET-DATA-TX-INGEST-FAIRNESS): dedizierter Tokio-Task für Geyser-Txs.
@@ -8307,7 +8726,7 @@ async fn run_geyser_loop(
                                     "Received Config Update from control-plane"
                                 );
                                 let response =
-                                    ctx.apply_config_update(&update, Some(&md_state));
+                                    ctx.apply_config_update(&update, Some(&md_state), Some(&track_worker));
                                 info!(
                                     status = ?response.status,
                                     applied = ?response.applied_keys,
@@ -8375,7 +8794,7 @@ async fn run_geyser_loop(
 
             _ = &mut shutdown => {
                 info!("Shutdown signal received");
-                flush_explicit_set_snapshot(ctx.as_ref());
+                flush_explicit_set_snapshot(&track_worker);
                 tx_listener_handle.abort();
                 account_listener_handle.abort();
                 break;
@@ -8383,7 +8802,7 @@ async fn run_geyser_loop(
         }
     }
 
-    Ok(())
+    Ok(track_worker)
 }
 
 /// Run simulation loop (for testing without Geyser)
@@ -8391,7 +8810,7 @@ async fn run_simulation_loop(
     ctx: Arc<MarketDataContext>,
     run_id: &str,
     mut config_subscription: Option<ironcrab::nats::NatsSubscription>,
-) -> Result<()> {
+) -> Result<TrackWorkerSender> {
     // RPC client for EnsurePumpAmmPoolAccounts (Cold Path Discovery, same handler as Normalmodus)
     let rpc_url =
         std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string());
@@ -8824,7 +9243,7 @@ async fn run_simulation_loop(
                                     "Received Config Update from control-plane"
                                 );
                                 let response =
-                                    ctx.apply_config_update(&update, Some(&md_state));
+                                    ctx.apply_config_update(&update, Some(&md_state), Some(&track_worker));
                                 info!(
                                     status = ?response.status,
                                     applied = ?response.applied_keys,
@@ -8849,7 +9268,7 @@ async fn run_simulation_loop(
         }
     }
 
-    Ok(())
+    Ok(track_worker)
 }
 
 // ============================================================================
@@ -9936,6 +10355,9 @@ mod wallet_snapshot_stale_cleanup_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+            geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
+            geyser_explicit_ready: AtomicBool::new(true),
+            geyser_explicit_config_error: parking_lot::RwLock::new(None),
         }
     }
 
@@ -10156,6 +10578,9 @@ mod wallet_tx_meta_balance_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+            geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
+            geyser_explicit_ready: AtomicBool::new(true),
+            geyser_explicit_config_error: parking_lot::RwLock::new(None),
         })
     }
 
@@ -10475,9 +10900,9 @@ mod pr_b_geyser_tracking_tests {
     const PUMPFUN_AMM_PROGRAM_OWNER: Pubkey =
         solana_sdk::pubkey!("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
     use ironcrab::market_data::track::{
-        merge_momentum_active_pools_updates, rebuild_desired_explicit_set_from_ctx,
+        converge_admission_from_ctx, merge_momentum_active_pools_updates,
         spawn_inline_track_worker_sender, spawn_noop_track_worker_sender,
-        track_worker_execute_coalesced_push, track_worker_try_enqueue, DesiredExplicitSet,
+        track_worker_execute_coalesced_push, track_worker_try_enqueue, FixedCapAdmission,
         TrackWorkerCommand, MARKET_DATA_TRACK_WORKER_COALESCE_MS,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11029,6 +11454,9 @@ mod pr_b_geyser_tracking_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+            geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
+            geyser_explicit_ready: AtomicBool::new(true),
+            geyser_explicit_config_error: parking_lot::RwLock::new(None),
         })
     }
 
@@ -11101,6 +11529,9 @@ mod pr_b_geyser_tracking_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+            geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
+            geyser_explicit_ready: AtomicBool::new(true),
+            geyser_explicit_config_error: parking_lot::RwLock::new(None),
         });
         (
             ctx,
@@ -13808,14 +14239,15 @@ mod pr_b_geyser_tracking_tests {
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
-        let mut desired = DesiredExplicitSet::new(25_000);
+        let mut admission = FixedCapAdmission::new(25_000);
         let before = ctx.snapshot_explicit_subscription_pubkeys();
         use ironcrab::metrics::MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL;
         let skip0 = MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL.load(Ordering::Relaxed);
         assert!(track_worker_execute_coalesced_push(
             &ctx,
-            &mut desired,
+            &mut admission,
             before,
+            false,
             false,
             false,
         ));
@@ -13833,9 +14265,9 @@ mod pr_b_geyser_tracking_tests {
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
         let mint = Pubkey::new_unique();
         ctx.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet));
-        let mut desired = DesiredExplicitSet::new(25_000);
-        rebuild_desired_explicit_set_from_ctx(ctx.as_ref(), &mut desired);
-        assert_eq!(desired.len(), 1);
+        let mut admission = FixedCapAdmission::new(25_000);
+        ironcrab::market_data::track::converge_admission_from_ctx(ctx.as_ref(), &mut admission);
+        assert_eq!(admission.len(), 1);
         assert_eq!(
             ironcrab::metrics::market_data_geyser_explicit_set_size_value(),
             1
@@ -14002,7 +14434,9 @@ mod pr_b_geyser_tracking_tests {
         let mint = Pubkey::new_unique();
         ctx.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::MomentumActive));
 
-        let snapshot = ctx.build_explicit_set_snapshot();
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        converge_admission_from_ctx(ctx.as_ref(), &mut admission);
+        let snapshot = ctx.build_explicit_set_snapshot(&admission);
         assert!(!snapshot.rows.is_empty());
 
         let fresh = minimal_market_data_context_for_pr_d_tests(
@@ -14035,7 +14469,9 @@ mod pr_b_geyser_tracking_tests {
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
         let mint = Pubkey::new_unique();
         ctx.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::ArbMultiDex));
-        let snapshot = ctx.build_explicit_set_snapshot();
+        let mut snap_admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        converge_admission_from_ctx(ctx.as_ref(), &mut snap_admission);
+        let snapshot = ctx.build_explicit_set_snapshot(&snap_admission);
 
         let track_worker = spawn_track_worker(Arc::clone(&ctx));
         assert!(track_worker_try_enqueue(
@@ -14050,14 +14486,15 @@ mod pr_b_geyser_tracking_tests {
             MARKET_DATA_TRACK_WORKER_COALESCE_MS + 200,
         ));
 
-        let mut desired = DesiredExplicitSet::new(25_000);
+        let mut admission = FixedCapAdmission::new(25_000);
         let keys = ctx.snapshot_explicit_subscription_pubkeys();
         use ironcrab::metrics::MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL;
         let skip0 = MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL.load(Ordering::Relaxed);
         assert!(track_worker_execute_coalesced_push(
             &ctx,
-            &mut desired,
+            &mut admission,
             keys,
+            false,
             false,
             false,
         ));

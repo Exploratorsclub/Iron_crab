@@ -32,6 +32,10 @@ pub enum TrackWorkerCommand {
     /// Phase 3 P3: restore explicit set from on-disk snapshot (I-MD-6).
     RestoreExplicitSnapshot(ExplicitSetSnapshot),
     ContinueGeyserEvict,
+    /// Shutdown / external caller: write explicit-set snapshot using worker admission.
+    FlushExplicitSetSnapshot {
+        done: std::sync::mpsc::Sender<()>,
+    },
 }
 
 /// Consumer/stream identity for monotone revision assignment.
@@ -80,7 +84,8 @@ pub fn stream_for_command(cmd: &TrackWorkerCommand) -> TrackCommandStream {
         | TrackWorkerCommand::ScheduleGeyserPush
         | TrackWorkerCommand::ScheduleGeyserPushDebounced
         | TrackWorkerCommand::RestoreExplicitSnapshot(_)
-        | TrackWorkerCommand::ContinueGeyserEvict => TrackCommandStream::Control,
+        | TrackWorkerCommand::ContinueGeyserEvict
+        | TrackWorkerCommand::FlushExplicitSetSnapshot { .. } => TrackCommandStream::Control,
     }
 }
 

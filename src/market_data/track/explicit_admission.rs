@@ -369,6 +369,16 @@ impl FixedCapAdmission {
         self.physical_len == 0
     }
 
+    pub fn contains(&self, pubkey: &Pubkey) -> bool {
+        self.ownership.contains(pubkey)
+    }
+
+    /// Reset ownership/LRU for cold restore while preserving the configured cap.
+    pub fn clear_for_restore(&mut self) {
+        let cap = self.cap;
+        *self = Self::new(cap);
+    }
+
     pub fn snapshot_pubkeys(&self) -> Vec<Pubkey> {
         self.ownership.snapshot_pubkeys()
     }
