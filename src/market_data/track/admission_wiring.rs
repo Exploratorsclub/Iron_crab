@@ -99,7 +99,8 @@ fn owner_group_key(owner: &ExplicitOwner) -> (ExplicitConsumer, ExplicitOwnerKey
     (owner.consumer, owner.owner_key.clone())
 }
 
-fn admit_or_replace(
+/// Admit or replace one immutable owner group (eviction when required).
+pub fn try_admit_owner_group(
     admission: &mut FixedCapAdmission,
     owner: ExplicitOwner,
     pubkeys: Vec<Pubkey>,
@@ -179,7 +180,7 @@ pub fn converge_admission_from_groups(
     ordered.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     for (owner, pubkeys) in ordered {
-        if !admit_or_replace(admission, owner, pubkeys) {
+        if !try_admit_owner_group(admission, owner, pubkeys) {
             if admission.wallet_demand_exceeds_cap(cap) {
                 return AdmissionConvergeResult::ProtectedOverflow;
             }
@@ -227,7 +228,7 @@ pub fn restore_admission_from_owner_groups(
             consumer: group.consumer,
             owner_key: group.owner_key.clone(),
         };
-        if !admit_or_replace(admission, owner, group.pubkeys.clone()) {
+        if !try_admit_owner_group(admission, owner, group.pubkeys.clone()) {
             if admission.wallet_demand_exceeds_cap(cap) {
                 return AdmissionRestoreResult::ProtectedOverflow;
             }
@@ -370,7 +371,7 @@ mod tests {
         assert!(!admission_exceeds_configured_cap(&admission, 10_000));
         assert!(admission_exceeds_configured_cap(&admission, 5_000));
         let owner = pool_owner(ExplicitConsumer::Momentum, Pubkey::new_unique());
-        assert!(admit_or_replace(
+        assert!(try_admit_owner_group(
             &mut admission,
             owner,
             vec![Pubkey::new_unique()]
@@ -418,7 +419,7 @@ mod tests {
         let tracker_pk = Pubkey::new_unique();
         let arb_pk = Pubkey::new_unique();
         let tracker_owner = pool_owner(ExplicitConsumer::Tracker, pool);
-        assert!(admit_or_replace(
+        assert!(try_admit_owner_group(
             &mut admission,
             tracker_owner.clone(),
             vec![tracker_pk]
@@ -441,7 +442,7 @@ mod tests {
         let mut admission = FixedCapAdmission::new(10);
         let stale_pool = Pubkey::new_unique();
         let stale_pk = Pubkey::new_unique();
-        assert!(admit_or_replace(
+        assert!(try_admit_owner_group(
             &mut admission,
             pool_owner(ExplicitConsumer::Momentum, stale_pool),
             vec![stale_pk]
