@@ -21,13 +21,14 @@ pub use enrichment::{
     is_enrichment_member_from_inputs, pool_is_enrichment_member, EnrichmentMembershipInputs,
 };
 pub use eviction_planner::{
-    select_eviction_victims, ConsumerProtectionRank, EvictionPlanningSnapshot, EvictionTier,
+    select_cap_shrink_victims, select_eviction_victims, CapShrinkSelectionPlan,
+    CapShrinkSelectionResult, ConsumerProtectionRank, EvictionPlanningSnapshot, EvictionTier,
     OwnerLruEntry, OwnerPlanningRecord, PubkeyOwnerIndex, SnapshotBuildError,
     TierFeasibilityRequest, TierFeasibilityResult, VictimSelectionPlan, VictimSelectionRequest,
     VictimSelectionResult,
 };
 pub use explicit_admission::{
-    AdmissionEvictionPlanResult, EvictingAdmissionResult, FixedCapAdmission,
+    AdmissionEvictionPlanResult, CapShrinkResult, EvictingAdmissionResult, FixedCapAdmission,
     FixedCapAdmissionResult, FixedCapRemoveRecovery, FixedCapRemoveResult, FixedCapReplaceResult,
     InvariantViolationRecovery, TouchResult,
 };

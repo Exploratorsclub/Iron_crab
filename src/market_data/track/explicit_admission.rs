@@ -9,11 +9,13 @@
 //! may scan ownership only on exceptional invariant/rollback failure.
 
 use super::eviction_planner::{
-    select_eviction_victims, EvictionPlanningSnapshot, EvictionTier, OwnerLruEntry,
+    select_cap_shrink_victims, select_eviction_victims, CapShrinkSelectionPlan,
+    CapShrinkSelectionResult, EvictionPlanningSnapshot, EvictionTier, OwnerLruEntry,
     VictimSelectionPlan, VictimSelectionRequest, VictimSelectionResult,
 };
 use super::explicit_ownership::{
-    EmptyOwnerGroupError, ExplicitOwner, ExplicitOwnership, GroupChange, OwnerGroupSnapshot,
+    EmptyOwnerGroupError, ExplicitConsumer, ExplicitOwner, ExplicitOwnership, GroupChange,
+    OwnerGroupSnapshot,
 };
 use solana_sdk::pubkey::Pubkey;
 use std::collections::{BTreeMap, BTreeSet};
@@ -97,6 +99,35 @@ pub enum EvictingAdmissionResult {
         required_to_free: usize,
     },
     /// Empty incoming group.
+    RejectedInvalidInput,
+    /// Candidate build/validation or planner inconsistency; live state unchanged.
+    InternalInvariantViolation,
+}
+
+/// Result of a deterministic cap-shrink attempt (PR 1c3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapShrinkResult {
+    /// Cap lowered with eviction when `physical_len` exceeded the new cap.
+    Converged {
+        old_cap: usize,
+        new_cap: usize,
+        physical_removed: Vec<Pubkey>,
+        victims: Vec<ExplicitOwner>,
+        opened_through: EvictionTier,
+    },
+    /// `physical_len <= new_cap`; only the cap field changed.
+    NoOpAlreadyWithinCap { old_cap: usize, new_cap: usize },
+    /// Requested cap exceeds the current cap; no mutation.
+    RejectedCapIncrease {
+        old_cap: usize,
+        requested_cap: usize,
+    },
+    /// Protected wallet pubkeys alone exceed the requested cap; no mutation.
+    ProtectedOverflow {
+        wallet_physical: usize,
+        requested_cap: usize,
+    },
+    /// Invalid shrink input (e.g. `new_cap == 0` with positive physical length).
     RejectedInvalidInput,
     /// Candidate build/validation or planner inconsistency; live state unchanged.
     InternalInvariantViolation,
@@ -756,6 +787,320 @@ impl FixedCapAdmission {
         }
 
         mapped
+    }
+
+    /// Count deduplicated physically tracked pubkeys owned by wallet groups.
+    pub fn wallet_physical_len(&self) -> usize {
+        let mut wallet_pubkeys = BTreeSet::new();
+        for group in self.ownership.snapshot_owner_groups() {
+            if group.consumer == ExplicitConsumer::Wallet {
+                wallet_pubkeys.extend(group.pubkeys.iter().copied());
+            }
+        }
+        wallet_pubkeys.len()
+    }
+
+    /// Whether deduplicated wallet pubkeys alone exceed `cap`.
+    pub fn wallet_demand_exceeds_cap(&self, cap: usize) -> bool {
+        self.wallet_physical_len() > cap
+    }
+
+    /// Plan cap-shrink victims using only internal state (read-only).
+    pub fn plan_cap_shrink(&self, target_cap: usize) -> CapShrinkSelectionResult {
+        let snapshot = match EvictionPlanningSnapshot::from_ownership(
+            &self.ownership,
+            self.eviction_planning_lru_entries(),
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return CapShrinkSelectionResult::InternalInvariantViolation,
+        };
+        select_cap_shrink_victims(&snapshot, target_cap)
+    }
+
+    /// Lower the hard cap, evicting victims when `physical_len` exceeds the new cap.
+    ///
+    /// Cap increases are rejected without mutation. When `physical_len <= new_cap`, only the cap
+    /// field is updated. The eviction path builds and validates a full candidate snapshot, then
+    /// commits via infallible swap.
+    pub fn try_shrink_cap(&mut self, new_cap: usize) -> CapShrinkResult {
+        let old_cap = self.cap;
+
+        if new_cap > old_cap {
+            return CapShrinkResult::RejectedCapIncrease {
+                old_cap,
+                requested_cap: new_cap,
+            };
+        }
+
+        if self.wallet_demand_exceeds_cap(new_cap) {
+            return CapShrinkResult::ProtectedOverflow {
+                wallet_physical: self.wallet_physical_len(),
+                requested_cap: new_cap,
+            };
+        }
+
+        if self.physical_len <= new_cap {
+            self.cap = new_cap;
+            return CapShrinkResult::NoOpAlreadyWithinCap { old_cap, new_cap };
+        }
+
+        let plan_result = self.plan_cap_shrink(new_cap);
+        let plan = match plan_result {
+            CapShrinkSelectionResult::Planned(plan) => plan,
+            CapShrinkSelectionResult::NoShrinkNeeded => {
+                self.cap = new_cap;
+                return CapShrinkResult::NoOpAlreadyWithinCap { old_cap, new_cap };
+            }
+            CapShrinkSelectionResult::RejectedProtected { required_to_free } => {
+                if self.wallet_demand_exceeds_cap(new_cap) {
+                    return CapShrinkResult::ProtectedOverflow {
+                        wallet_physical: self.wallet_physical_len(),
+                        requested_cap: new_cap,
+                    };
+                }
+                let _ = required_to_free;
+                return CapShrinkResult::InternalInvariantViolation;
+            }
+            CapShrinkSelectionResult::InternalInvariantViolation => {
+                return CapShrinkResult::InternalInvariantViolation;
+            }
+        };
+
+        let (candidate, stats_delta) = match self.build_shrink_candidate(&plan) {
+            Ok(state) => state,
+            Err(()) => return CapShrinkResult::InternalInvariantViolation,
+        };
+
+        if !self.validate_shrink_candidate(&candidate, &plan, new_cap) {
+            return CapShrinkResult::InternalInvariantViolation;
+        }
+
+        #[cfg(test)]
+        let post_stats = match self.planning_stats.after_eviction_delta(stats_delta) {
+            Some(stats) => stats,
+            None => return CapShrinkResult::InternalInvariantViolation,
+        };
+        #[cfg(not(test))]
+        let _stats_delta = stats_delta;
+
+        let result = CapShrinkResult::Converged {
+            old_cap,
+            new_cap,
+            physical_removed: plan.physical_freed.clone(),
+            victims: plan.victims.clone(),
+            opened_through: plan.opened_through,
+        };
+
+        self.ownership = candidate.ownership;
+        self.owner_lru = candidate.owner_lru;
+        self.next_touch_stamp = candidate.next_touch_stamp;
+        self.physical_len = candidate.physical_len;
+        self.cap = new_cap;
+        #[cfg(test)]
+        {
+            self.planning_stats = post_stats;
+        }
+
+        result
+    }
+
+    fn build_shrink_candidate(
+        &self,
+        plan: &CapShrinkSelectionPlan,
+    ) -> Result<(EvictingCandidateState, EvictingStatsDelta), ()> {
+        let victims: BTreeSet<ExplicitOwner> = plan.victims.iter().cloned().collect();
+
+        let mut candidate_ownership = ExplicitOwnership::new();
+        let mut group_edges = 0usize;
+        for group in self.ownership.snapshot_owner_groups() {
+            let owner = ExplicitOwner {
+                consumer: group.consumer,
+                owner_key: group.owner_key,
+            };
+            if victims.contains(&owner) {
+                continue;
+            }
+            #[cfg(test)]
+            if self.test_force_evicting_omit_survivor.as_ref() == Some(&owner) {
+                return Err(());
+            }
+            group_edges = group_edges.saturating_add(group.pubkeys.len());
+            candidate_ownership
+                .upsert_group(owner, group.pubkeys.clone())
+                .map_err(|EmptyOwnerGroupError| ())?;
+        }
+
+        #[cfg(test)]
+        if let Some((extra_owner, extra_pubkeys)) = &self.test_force_evicting_extra_candidate_owner
+        {
+            candidate_ownership
+                .upsert_group(extra_owner.clone(), extra_pubkeys.clone())
+                .map_err(|EmptyOwnerGroupError| ())?;
+            group_edges = group_edges.saturating_add(extra_pubkeys.len());
+        }
+
+        let mut candidate_lru = self.owner_lru.clone();
+        for victim in &plan.victims {
+            candidate_lru.remove(victim);
+        }
+
+        #[cfg(test)]
+        {
+            if let Some(owner) = &self.test_force_evicting_corrupt_survivor_stamp {
+                if let Some(stamp) = candidate_lru.get_mut(owner) {
+                    *stamp = stamp.saturating_add(1);
+                }
+            }
+        }
+
+        let next_touch_stamp = {
+            #[cfg(test)]
+            {
+                if self.test_force_evicting_corrupt_next_touch_stamp {
+                    candidate_lru.values().copied().min().unwrap_or(0)
+                } else {
+                    self.next_touch_stamp
+                }
+            }
+            #[cfg(not(test))]
+            {
+                self.next_touch_stamp
+            }
+        };
+
+        let physical_len = {
+            let base = candidate_ownership.len();
+            #[cfg(test)]
+            {
+                if self.test_force_evicting_corrupt_physical_len {
+                    base.saturating_add(1)
+                } else {
+                    base
+                }
+            }
+            #[cfg(not(test))]
+            {
+                base
+            }
+        };
+
+        let stats_delta = EvictingStatsDelta {
+            owner_group_lookups: 0,
+            refcount_lookups: 0,
+            candidate_builds: 1,
+            candidate_group_edges: u64::try_from(group_edges).map_err(|_| ())?,
+        };
+
+        Ok((
+            EvictingCandidateState {
+                ownership: candidate_ownership,
+                owner_lru: candidate_lru,
+                next_touch_stamp,
+                physical_len,
+            },
+            stats_delta,
+        ))
+    }
+
+    fn validate_shrink_candidate(
+        &self,
+        candidate: &EvictingCandidateState,
+        plan: &CapShrinkSelectionPlan,
+        new_cap: usize,
+    ) -> bool {
+        let victims: BTreeSet<ExplicitOwner> = plan.victims.iter().cloned().collect();
+
+        let expected_owners: BTreeSet<ExplicitOwner> = self
+            .ownership
+            .snapshot_owner_groups()
+            .into_iter()
+            .map(|group| ExplicitOwner {
+                consumer: group.consumer,
+                owner_key: group.owner_key,
+            })
+            .filter(|owner| !victims.contains(owner))
+            .collect();
+
+        let candidate_owners: BTreeSet<ExplicitOwner> = candidate
+            .ownership
+            .snapshot_owner_groups()
+            .into_iter()
+            .map(|group| ExplicitOwner {
+                consumer: group.consumer,
+                owner_key: group.owner_key,
+            })
+            .collect();
+        if candidate_owners != expected_owners {
+            return false;
+        }
+
+        for victim in &plan.victims {
+            if candidate.ownership.owner_group(victim).is_some() {
+                return false;
+            }
+            if candidate.owner_lru.contains_key(victim) {
+                return false;
+            }
+        }
+
+        for group in self.ownership.snapshot_owner_groups() {
+            let owner = ExplicitOwner {
+                consumer: group.consumer,
+                owner_key: group.owner_key,
+            };
+            if victims.contains(&owner) {
+                continue;
+            }
+            if self.ownership.owner_group(&owner) != candidate.ownership.owner_group(&owner) {
+                return false;
+            }
+            match (self.owner_lru.get(&owner), candidate.owner_lru.get(&owner)) {
+                (Some(live), Some(cand)) if live == cand => {}
+                _ => return false,
+            }
+        }
+
+        if candidate.next_touch_stamp != self.next_touch_stamp {
+            return false;
+        }
+
+        let live_keys: BTreeSet<Pubkey> = self.ownership.snapshot_pubkeys().into_iter().collect();
+        let candidate_keys: BTreeSet<Pubkey> =
+            candidate.ownership.snapshot_pubkeys().into_iter().collect();
+        let mut removed: Vec<Pubkey> = live_keys.difference(&candidate_keys).copied().collect();
+        removed.sort();
+        let mut expected_freed = plan.physical_freed.clone();
+        expected_freed.sort();
+        if removed != expected_freed {
+            return false;
+        }
+
+        if !candidate_keys.is_subset(&live_keys) {
+            return false;
+        }
+
+        if candidate.physical_len != plan.projected_final_len {
+            return false;
+        }
+        if candidate.physical_len != new_cap {
+            return false;
+        }
+        if candidate.physical_len > new_cap {
+            return false;
+        }
+        if candidate.physical_len != candidate.ownership.len() {
+            return false;
+        }
+
+        let lru_entries: Vec<OwnerLruEntry> = candidate
+            .owner_lru
+            .iter()
+            .map(|(owner, &last_touch)| OwnerLruEntry {
+                owner: owner.clone(),
+                last_touch,
+            })
+            .collect();
+        EvictionPlanningSnapshot::from_ownership(&candidate.ownership, lru_entries).is_ok()
     }
 
     fn build_evicting_candidate(
@@ -5565,6 +5910,438 @@ mod tests {
                         let _ = admission.remove_group(owner.clone());
                         let _ = model.remove_group(owner);
                         assert_evicting_model_matches_admission(&admission, &model);
+                    }
+                }
+            }
+        }
+    }
+
+    use super::super::eviction_planner::{select_cap_shrink_victims, CapShrinkSelectionResult};
+
+    fn assert_cap_shrink_converged(result: CapShrinkResult) -> (Vec<Pubkey>, Vec<ExplicitOwner>) {
+        match result {
+            CapShrinkResult::Converged {
+                physical_removed,
+                victims,
+                ..
+            } => (physical_removed, victims),
+            other => panic!("expected converged cap shrink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cap_shrink_within_cap_only_updates_cap_field() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let admission = admission_from_eviction_fixtures(5, &[(tracker, 1, vec![pk(1)])]);
+        let before = snapshot_admission_plan_state(&admission);
+        let mut admission = admission;
+        assert_eq!(
+            admission.try_shrink_cap(4),
+            CapShrinkResult::NoOpAlreadyWithinCap {
+                old_cap: 5,
+                new_cap: 4,
+            }
+        );
+        assert_eq!(admission.cap(), 4);
+        assert_eq!(admission.len(), 1);
+        let mut after = snapshot_admission_plan_state(&admission);
+        after.cap = 5;
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn cap_shrink_evicts_tracker_before_arb_and_momentum() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let arb = pool_owner(ExplicitConsumer::Arb, 2);
+        let momentum = pool_owner(ExplicitConsumer::Momentum, 3);
+        let mut admission = admission_from_eviction_fixtures(
+            4,
+            &[
+                (tracker.clone(), 10, vec![pk(1)]),
+                (arb.clone(), 20, vec![pk(2)]),
+                (momentum.clone(), 30, vec![pk(3)]),
+            ],
+        );
+        let (removed, victims) = assert_cap_shrink_converged(admission.try_shrink_cap(2));
+        assert_eq!(removed, vec![pk(1)]);
+        assert_eq!(victims, vec![tracker]);
+        assert_eq!(admission.cap(), 2);
+        assert_eq!(admission.len(), 2);
+    }
+
+    #[test]
+    fn cap_shrink_true_lru_within_tier() {
+        let t_old = pool_owner(ExplicitConsumer::Tracker, 1);
+        let t_new = pool_owner(ExplicitConsumer::Tracker, 2);
+        let mut admission = admission_from_eviction_fixtures(
+            3,
+            &[
+                (t_old.clone(), 10, vec![pk(1)]),
+                (t_new.clone(), 20, vec![pk(2)]),
+                (pool_owner(ExplicitConsumer::Arb, 3), 30, vec![pk(3)]),
+            ],
+        );
+        let (_, victims) = assert_cap_shrink_converged(admission.try_shrink_cap(2));
+        assert_eq!(victims, vec![t_old]);
+    }
+
+    #[test]
+    fn cap_shrink_joint_shared_victims() {
+        let shared_a = pk(60);
+        let shared_b = pk(61);
+        let t1 = pool_owner(ExplicitConsumer::Tracker, 1);
+        let t2 = pool_owner(ExplicitConsumer::Tracker, 2);
+        let t3 = pool_owner(ExplicitConsumer::Tracker, 3);
+        let t4 = pool_owner(ExplicitConsumer::Tracker, 4);
+        let mut admission = admission_from_eviction_fixtures(
+            3,
+            &[
+                (t1.clone(), 10, vec![shared_a]),
+                (t2.clone(), 20, vec![shared_a]),
+                (t3.clone(), 30, vec![shared_b]),
+                (t4.clone(), 40, vec![shared_b]),
+            ],
+        );
+        let (removed, victims) = assert_cap_shrink_converged(admission.try_shrink_cap(1));
+        assert_eq!(removed, vec![shared_a]);
+        assert_eq!(victims, vec![t1, t2]);
+    }
+
+    #[test]
+    fn cap_shrink_wallet_only_over_cap_protected_overflow_no_mutation() {
+        let wallet = pool_owner(ExplicitConsumer::Wallet, 1);
+        let mut admission =
+            admission_from_eviction_fixtures(5, &[(wallet, 1, vec![pk(1), pk(2), pk(3)])]);
+        let before = snapshot_admission_plan_state(&admission);
+        assert_eq!(
+            admission.try_shrink_cap(2),
+            CapShrinkResult::ProtectedOverflow {
+                wallet_physical: 3,
+                requested_cap: 2,
+            }
+        );
+        assert_admission_live_state_unchanged(&admission, &before);
+    }
+
+    #[test]
+    fn cap_shrink_rejected_cap_increase_without_mutation() {
+        let mut admission = admission_from_eviction_fixtures(
+            4,
+            &[(pool_owner(ExplicitConsumer::Tracker, 1), 1, vec![pk(1)])],
+        );
+        let before = snapshot_admission_plan_state(&admission);
+        assert_eq!(
+            admission.try_shrink_cap(6),
+            CapShrinkResult::RejectedCapIncrease {
+                old_cap: 4,
+                requested_cap: 6,
+            }
+        );
+        assert_admission_live_state_unchanged(&admission, &before);
+    }
+
+    #[test]
+    fn cap_shrink_exact_physical_removed_and_final_len_parity() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let arb = pool_owner(ExplicitConsumer::Arb, 2);
+        let mut admission = admission_from_eviction_fixtures(
+            3,
+            &[
+                (tracker.clone(), 10, vec![pk(1)]),
+                (arb.clone(), 20, vec![pk(2)]),
+            ],
+        );
+        let result = admission.try_shrink_cap(1);
+        let (removed, _) = assert_cap_shrink_converged(result);
+        assert_eq!(admission.len(), 1);
+        assert_eq!(admission.cap(), 1);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(admission.snapshot_pubkeys(), vec![pk(2)]);
+    }
+
+    #[test]
+    fn cap_shrink_victim_stamps_removed_survivor_stamps_preserved() {
+        let t1 = pool_owner(ExplicitConsumer::Tracker, 1);
+        let t2 = pool_owner(ExplicitConsumer::Tracker, 2);
+        let mut admission = admission_from_eviction_fixtures(
+            3,
+            &[(t1.clone(), 10, vec![pk(1)]), (t2.clone(), 20, vec![pk(2)])],
+        );
+        let stamp_before = admission.last_touch(&t2).unwrap();
+        let next_before = admission.test_owner_stamps();
+        let _ = admission.try_shrink_cap(1);
+        assert!(admission.last_touch(&t1).is_none());
+        assert_eq!(admission.last_touch(&t2), Some(stamp_before));
+        assert_eq!(admission.test_owner_stamps().get(&t2), next_before.get(&t2));
+    }
+
+    #[test]
+    fn cap_shrink_wallet_never_victim() {
+        let wallet = pool_owner(ExplicitConsumer::Wallet, 1);
+        let shared = pk(50);
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 2);
+        let mut admission = admission_from_eviction_fixtures(
+            4,
+            &[
+                (wallet.clone(), 1, vec![shared, pk(1)]),
+                (tracker.clone(), 10, vec![shared, pk(2)]),
+                (pool_owner(ExplicitConsumer::Arb, 3), 20, vec![pk(3)]),
+            ],
+        );
+        let (_, victims) = assert_cap_shrink_converged(admission.try_shrink_cap(2));
+        assert!(!victims.contains(&wallet));
+    }
+
+    #[test]
+    fn cap_shrink_candidate_fault_seams_never_commit() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let arb = pool_owner(ExplicitConsumer::Arb, 2);
+        let fixtures = [
+            (tracker.clone(), 10, vec![pk(1)]),
+            (arb.clone(), 20, vec![pk(2)]),
+        ];
+
+        let mut omit = admission_from_eviction_fixtures(3, &fixtures);
+        omit.set_test_force_evicting_omit_survivor(Some(arb.clone()));
+        let before_omit = snapshot_admission_plan_state(&omit);
+        assert_eq!(
+            omit.try_shrink_cap(1),
+            CapShrinkResult::InternalInvariantViolation
+        );
+        assert_admission_live_state_unchanged(&omit, &before_omit);
+
+        let mut corrupt_len = admission_from_eviction_fixtures(3, &fixtures);
+        corrupt_len.set_test_force_evicting_corrupt_physical_len(true);
+        let before_len = snapshot_admission_plan_state(&corrupt_len);
+        assert_eq!(
+            corrupt_len.try_shrink_cap(1),
+            CapShrinkResult::InternalInvariantViolation
+        );
+        assert_admission_live_state_unchanged(&corrupt_len, &before_len);
+
+        let mut corrupt_stamp = admission_from_eviction_fixtures(3, &fixtures);
+        corrupt_stamp.set_test_force_evicting_corrupt_survivor_stamp(Some(arb.clone()));
+        let before_stamp = snapshot_admission_plan_state(&corrupt_stamp);
+        assert_eq!(
+            corrupt_stamp.try_shrink_cap(1),
+            CapShrinkResult::InternalInvariantViolation
+        );
+        assert_admission_live_state_unchanged(&corrupt_stamp, &before_stamp);
+    }
+
+    #[test]
+    fn cap_shrink_plan_facade_matches_direct_selector() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let arb = pool_owner(ExplicitConsumer::Arb, 2);
+        let fixtures = [
+            (tracker.clone(), 10, vec![pk(1)]),
+            (arb.clone(), 20, vec![pk(2)]),
+        ];
+        let admission = admission_from_eviction_fixtures(3, &fixtures);
+        let snapshot = admission
+            .test_build_eviction_snapshot()
+            .expect("fixture admission must build eviction snapshot");
+        let expected = select_cap_shrink_victims(&snapshot, 1);
+        let before = snapshot_admission_plan_state(&admission);
+        let actual = admission.plan_cap_shrink(1);
+        assert_admission_plan_state_unchanged(&admission, &before);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn cap_shrink_repeated_deterministic_fixtures() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let arb = pool_owner(ExplicitConsumer::Arb, 2);
+        let fixtures = [
+            (tracker.clone(), 10, vec![pk(1)]),
+            (arb.clone(), 20, vec![pk(2)]),
+        ];
+        let first = {
+            let mut admission = admission_from_eviction_fixtures(3, &fixtures);
+            admission.try_shrink_cap(1)
+        };
+        for _ in 0..5 {
+            let mut admission = admission_from_eviction_fixtures(3, &fixtures);
+            assert_eq!(admission.try_shrink_cap(1), first);
+        }
+    }
+
+    /// Independent cap-shrink oracle — never calls production planner/selector or [`FixedCapAdmission`].
+    struct RefCapShrinkOracle(RefEvictingOracle);
+
+    impl RefCapShrinkOracle {
+        fn from_state(
+            groups: &BTreeMap<ExplicitOwner, BTreeSet<Pubkey>>,
+            lru: &BTreeMap<ExplicitOwner, u64>,
+        ) -> Self {
+            Self(RefEvictingOracle::from_state(groups, lru))
+        }
+
+        fn wallet_physical_len(&self) -> usize {
+            let mut wallet_pubkeys = BTreeSet::new();
+            for (owner, (_, pubkeys)) in &self.0.owner_records {
+                if owner.consumer == ExplicitConsumer::Wallet {
+                    wallet_pubkeys.extend(pubkeys.iter().copied());
+                }
+            }
+            wallet_pubkeys.len()
+        }
+
+        fn predict_shrink(&self, target_cap: usize) -> CapShrinkResult {
+            if self.wallet_physical_len() > target_cap {
+                return CapShrinkResult::ProtectedOverflow {
+                    wallet_physical: self.wallet_physical_len(),
+                    requested_cap: target_cap,
+                };
+            }
+            if self.0.physical_len <= target_cap {
+                return CapShrinkResult::NoOpAlreadyWithinCap {
+                    old_cap: usize::MAX,
+                    new_cap: target_cap,
+                };
+            }
+            let incoming = BTreeSet::new();
+            let required = self.0.physical_len - target_cap;
+            let allowed_tiers = [
+                RefOraclePolicyTier::Tracker,
+                RefOraclePolicyTier::Arb,
+                RefOraclePolicyTier::Momentum,
+            ];
+            let mut opened = None;
+            for tier in allowed_tiers {
+                if self.0.pubkey_freeable_count_at_tier(tier, &incoming) >= required {
+                    opened = Some(tier);
+                    break;
+                }
+            }
+            let Some(opened_tier) = opened else {
+                return CapShrinkResult::InternalInvariantViolation;
+            };
+            let allowed = self.0.eligible_owners_at_tier(opened_tier);
+            let Some((victims, freed)) = self.0.procedural_selection(&allowed, &incoming, required)
+            else {
+                return CapShrinkResult::InternalInvariantViolation;
+            };
+            let mut physical_removed: Vec<Pubkey> = freed.into_iter().collect();
+            physical_removed.sort();
+            CapShrinkResult::Converged {
+                old_cap: usize::MAX,
+                new_cap: target_cap,
+                physical_removed,
+                victims,
+                opened_through: opened_tier.to_eviction_tier(),
+            }
+        }
+    }
+
+    fn assert_cap_shrink_model_matches_admission(
+        admission: &FixedCapAdmission,
+        groups: &BTreeMap<ExplicitOwner, BTreeSet<Pubkey>>,
+        lru: &BTreeMap<ExplicitOwner, u64>,
+    ) {
+        assert_eq!(admission_groups(admission), *groups);
+        assert_eq!(admission.test_owner_stamps(), *lru);
+        assert!(admission.len() <= admission.cap());
+    }
+
+    #[test]
+    fn cap_shrink_independent_model_matches_final_graph() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let arb = pool_owner(ExplicitConsumer::Arb, 2);
+        let fixtures = [
+            (tracker.clone(), 10, vec![pk(1)]),
+            (arb.clone(), 20, vec![pk(2)]),
+        ];
+        let mut admission = admission_from_eviction_fixtures(3, &fixtures);
+        let oracle = RefCapShrinkOracle::from_state(
+            &admission_groups(&admission),
+            &admission.test_owner_stamps(),
+        );
+        let expected = oracle.predict_shrink(1);
+        let actual = admission.try_shrink_cap(1);
+        match (&actual, &expected) {
+            (
+                CapShrinkResult::Converged {
+                    physical_removed: a_removed,
+                    victims: a_victims,
+                    ..
+                },
+                CapShrinkResult::Converged {
+                    physical_removed: e_removed,
+                    victims: e_victims,
+                    ..
+                },
+            ) => {
+                assert_eq!(a_removed, e_removed);
+                assert_eq!(a_victims, e_victims);
+            }
+            (
+                CapShrinkResult::NoOpAlreadyWithinCap { .. },
+                CapShrinkResult::NoOpAlreadyWithinCap { .. },
+            ) => {}
+            _ => panic!("oracle mismatch: actual={actual:?} expected={expected:?}"),
+        }
+        assert_cap_shrink_model_matches_admission(
+            &admission,
+            &admission_groups(&admission),
+            &admission.test_owner_stamps(),
+        );
+    }
+
+    #[test]
+    fn cap_shrink_property_sequence_mixed_operations_with_hard_cap() {
+        let caps = [2usize, 3, 5];
+        let seeds = [5u8, 17, 31];
+
+        for initial_cap in caps {
+            for seed in seeds {
+                let mut admission = FixedCapAdmission::new(initial_cap);
+                let owners = [
+                    pool_owner(ExplicitConsumer::Tracker, seed),
+                    pool_owner(ExplicitConsumer::Arb, seed.wrapping_add(1)),
+                    pool_owner(ExplicitConsumer::Momentum, seed.wrapping_add(2)),
+                ];
+                let key_pool: Vec<Pubkey> = (0u8..6).map(|b| pk(b.wrapping_add(seed))).collect();
+
+                for (step, owner) in owners.iter().enumerate() {
+                    let keys: Vec<Pubkey> = key_pool
+                        .iter()
+                        .copied()
+                        .filter(|k| (k.to_bytes()[0] as usize + step) % 2 == 0)
+                        .take(1 + step % 2)
+                        .collect();
+                    if keys.is_empty() {
+                        continue;
+                    }
+                    let _ = admission.try_admit_new_group(owner.clone(), keys);
+                    assert!(admission.len() <= admission.cap());
+                }
+
+                let shrink_targets = [initial_cap.saturating_sub(1), 1usize.max(initial_cap / 2)];
+                for new_cap in shrink_targets {
+                    if new_cap > admission.cap() {
+                        continue;
+                    }
+                    let before = snapshot_admission_plan_state(&admission);
+                    let result = admission.try_shrink_cap(new_cap);
+                    match result {
+                        CapShrinkResult::RejectedCapIncrease { .. }
+                        | CapShrinkResult::ProtectedOverflow { .. }
+                        | CapShrinkResult::InternalInvariantViolation => {
+                            assert_admission_live_state_unchanged(&admission, &before);
+                        }
+                        CapShrinkResult::NoOpAlreadyWithinCap { .. }
+                        | CapShrinkResult::Converged { .. } => {
+                            assert_eq!(admission.cap(), new_cap);
+                            assert!(admission.len() <= admission.cap());
+                        }
+                        CapShrinkResult::RejectedInvalidInput => {}
+                    }
+                }
+
+                if let Some(owner) = owners.first() {
+                    if admission.owner_group(owner).is_some() {
+                        let _ = admission.touch_group(owner.clone());
                     }
                 }
             }
