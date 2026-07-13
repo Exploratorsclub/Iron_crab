@@ -27,8 +27,9 @@ pub use eviction_planner::{
     VictimSelectionResult,
 };
 pub use explicit_admission::{
-    FixedCapAdmission, FixedCapAdmissionResult, FixedCapRemoveRecovery, FixedCapRemoveResult,
-    FixedCapReplaceResult, InvariantViolationRecovery, TouchResult,
+    AdmissionEvictionPlanResult, FixedCapAdmission, FixedCapAdmissionResult,
+    FixedCapRemoveRecovery, FixedCapRemoveResult, FixedCapReplaceResult,
+    InvariantViolationRecovery, TouchResult,
 };
 pub use explicit_ownership::{
     EmptyOwnerGroupError, ExplicitConsumer, ExplicitOwner, ExplicitOwnerKey, ExplicitOwnership,
