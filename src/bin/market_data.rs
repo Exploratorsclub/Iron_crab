@@ -1016,6 +1016,10 @@ struct MarketDataContext {
 
     /// Momentum active hot pools (single writer: track-worker / md-state).
     hot_pool_registry: Arc<UnifiedHotPoolRegistry>,
+    /// PR4a: pools whose Momentum owner group passed `FixedCapAdmission` (bypass gate).
+    explicit_admitted_momentum_pools: parking_lot::RwLock<HashSet<Pubkey>>,
+    /// PR4a: pools whose Arb owner group passed `FixedCapAdmission` (bypass gate).
+    explicit_admitted_arb_pools: parking_lot::RwLock<HashSet<Pubkey>>,
 
     /// Known pump_amm pools (already seen first trade).
     /// We emit PoolCreated + DexPoolAccounts on FIRST trade, then just DexPoolAccounts on subsequent trades.
@@ -2554,14 +2558,39 @@ impl MarketDataContext {
         self.tracked_wallet_mint_decimals.read().contains_key(mint)
     }
 
-    /// PR-B: explicit vault/bin-array/mint Geyser filters — hot-set or wallet only.
+    fn pool_has_explicit_momentum_admission(&self, pool: Pubkey) -> bool {
+        self.explicit_admitted_momentum_pools.read().contains(&pool)
+    }
+
+    fn pool_has_explicit_arb_admission(&self, pool: Pubkey) -> bool {
+        self.explicit_admitted_arb_pools.read().contains(&pool)
+    }
+
+    fn note_explicit_momentum_pool_admitted(&self, pool: Pubkey) {
+        self.explicit_admitted_momentum_pools.write().insert(pool);
+    }
+
+    fn note_explicit_arb_pool_admitted(&self, pool: Pubkey) {
+        self.explicit_admitted_arb_pools.write().insert(pool);
+    }
+
+    fn clear_explicit_momentum_pool_admitted(&self, pool: Pubkey) {
+        self.explicit_admitted_momentum_pools.write().remove(&pool);
+    }
+
+    fn clear_explicit_arb_pool_admitted(&self, pool: Pubkey) {
+        self.explicit_admitted_arb_pools.write().remove(&pool);
+    }
+
+    /// PR-B: explicit vault/bin-array/mint Geyser filters — admitted pool groups or wallet only.
     fn admit_geyser_explicit_pool_assets(
         &self,
         pool: Pubkey,
         base_mint: Pubkey,
         quote_mint: Pubkey,
     ) -> bool {
-        self.hot_pool_registry.is_hot_pool(pool)
+        self.pool_has_explicit_momentum_admission(pool)
+            || self.pool_has_explicit_arb_admission(pool)
             || self.wallet_tracks_mint_for_geyser(&base_mint)
             || self.wallet_tracks_mint_for_geyser(&quote_mint)
     }
@@ -4489,8 +4518,9 @@ impl MarketDataContext {
                 warn!(pool = %a.pool, "MomentumActivePoolsUpdate.active: invalid pool");
                 continue;
             };
+            self.hot_pool_registry.pin_pool(mint_pk, pool_pk);
             if self.try_admit_pool_consumer_group(admission, pool_pk, ExplicitConsumer::Momentum) {
-                self.hot_pool_registry.pin_pool(mint_pk, pool_pk);
+                self.note_explicit_momentum_pool_admitted(pool_pk);
                 inc_market_data_momentum_admission_admitted_total();
                 if self.register_geyser_reserves_for_momentum_active_pool(pool_pk) {
                     batch_dirty = true;
@@ -4537,6 +4567,7 @@ impl MarketDataContext {
         // row remains after this unpin (PR #147 follow-up).
         if !self.hot_pool_registry.pool_has_any_pin(pool) {
             self.release_pool_consumer_group(admission, pool, ExplicitConsumer::Momentum);
+            self.clear_explicit_momentum_pool_admitted(pool);
             {
                 let mut vaults = self.tracked_vaults.write();
                 for v in vaults.values_mut() {
@@ -4672,8 +4703,9 @@ impl MarketDataContext {
                 warn!(pool = %a.pool, "ArbTrackRequestsUpdate.active: invalid pool");
                 continue;
             };
+            self.hot_pool_registry.pin_arb_pool(pool_pk);
             if self.try_admit_pool_consumer_group(admission, pool_pk, ExplicitConsumer::Arb) {
-                self.hot_pool_registry.pin_arb_pool(pool_pk);
+                self.note_explicit_arb_pool_admitted(pool_pk);
                 inc_market_data_arb_admission_admitted_total();
                 if self.register_geyser_reserves_for_arb_active_pool(pool_pk) {
                     batch_dirty = true;
@@ -4750,6 +4782,7 @@ impl MarketDataContext {
         pool: Pubkey,
     ) -> bool {
         self.release_pool_consumer_group(admission, pool, ExplicitConsumer::Arb);
+        self.clear_explicit_arb_pool_admitted(pool);
         self.hot_pool_registry.unpin_arb_pool(pool);
         let mut changed = false;
         if !self.hot_pool_registry.pool_has_arb(pool)
@@ -6883,6 +6916,8 @@ async fn main() -> Result<()> {
         tracked_mints: parking_lot::RwLock::new(std::collections::HashMap::new()),
         tracked_mints_tx,
         hot_pool_registry: Arc::new(UnifiedHotPoolRegistry::new()),
+        explicit_admitted_momentum_pools: parking_lot::RwLock::new(HashSet::new()),
+        explicit_admitted_arb_pools: parking_lot::RwLock::new(HashSet::new()),
         known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
         known_trade_dex_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
         pumpfun_pool_discovery_mint_info_emitted: parking_lot::RwLock::new(
@@ -10507,6 +10542,8 @@ mod wallet_snapshot_stale_cleanup_tests {
             tracked_mints: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_mints_tx,
             hot_pool_registry: Arc::new(UnifiedHotPoolRegistry::new()),
+            explicit_admitted_momentum_pools: parking_lot::RwLock::new(HashSet::new()),
+            explicit_admitted_arb_pools: parking_lot::RwLock::new(HashSet::new()),
             known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
             known_trade_dex_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
             pumpfun_pool_discovery_mint_info_emitted: parking_lot::RwLock::new(
@@ -10730,6 +10767,8 @@ mod wallet_tx_meta_balance_tests {
             tracked_mints: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_mints_tx,
             hot_pool_registry: Arc::new(UnifiedHotPoolRegistry::new()),
+            explicit_admitted_momentum_pools: parking_lot::RwLock::new(HashSet::new()),
+            explicit_admitted_arb_pools: parking_lot::RwLock::new(HashSet::new()),
             known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
             known_trade_dex_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
             pumpfun_pool_discovery_mint_info_emitted: parking_lot::RwLock::new(
@@ -11610,6 +11649,8 @@ mod pr_b_geyser_tracking_tests {
             tracked_mints: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_mints_tx,
             hot_pool_registry: Arc::new(UnifiedHotPoolRegistry::new()),
+            explicit_admitted_momentum_pools: parking_lot::RwLock::new(HashSet::new()),
+            explicit_admitted_arb_pools: parking_lot::RwLock::new(HashSet::new()),
             known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
             known_trade_dex_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
             pumpfun_pool_discovery_mint_info_emitted: parking_lot::RwLock::new(
@@ -11685,6 +11726,8 @@ mod pr_b_geyser_tracking_tests {
             tracked_mints: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_mints_tx,
             hot_pool_registry: Arc::new(UnifiedHotPoolRegistry::new()),
+            explicit_admitted_momentum_pools: parking_lot::RwLock::new(HashSet::new()),
+            explicit_admitted_arb_pools: parking_lot::RwLock::new(HashSet::new()),
             known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
             known_trade_dex_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
             pumpfun_pool_discovery_mint_info_emitted: parking_lot::RwLock::new(
@@ -12473,6 +12516,7 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
 
+        ctx.hot_pool_registry.pin_pool(base_mint, pool);
         MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool);
 
         let vs = ctx.tracked_vaults.read();
@@ -12505,6 +12549,7 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
         ctx.hot_pool_registry.pin_pool(base_mint, pool);
+        ctx.note_explicit_momentum_pool_admitted(pool);
 
         MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool);
 
@@ -12561,6 +12606,8 @@ mod pr_b_geyser_tracking_tests {
         );
         ctx.hot_pool_registry.pin_pool(base_a, pool_a);
         ctx.hot_pool_registry.pin_pool(base_b, pool_b);
+        ctx.note_explicit_momentum_pool_admitted(pool_a);
+        ctx.note_explicit_momentum_pool_admitted(pool_b);
 
         let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
         let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
@@ -12617,6 +12664,7 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
         ctx.hot_pool_registry.pin_pool(base, pool);
+        ctx.note_explicit_momentum_pool_admitted(pool);
         assert!(MarketDataContext::register_geyser_reserves_after_trade(
             &ctx, pool
         ));
@@ -12664,6 +12712,7 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
         ctx.hot_pool_registry.pin_pool(base, pool);
+        ctx.note_explicit_momentum_pool_admitted(pool);
         assert!(MarketDataContext::register_geyser_reserves_after_trade(
             &ctx, pool
         ));
@@ -12709,6 +12758,7 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
         ctx.hot_pool_registry.pin_pool(base, pool);
+        ctx.note_explicit_momentum_pool_admitted(pool);
         let coin_vault = coin;
         assert!(MarketDataContext::register_geyser_reserves_after_trade(
             &ctx, pool
@@ -13118,6 +13168,7 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
         ctx.hot_pool_registry.pin_pool(base_mint, pool);
+        ctx.note_explicit_momentum_pool_admitted(pool);
 
         let md_state = test_spawn_md_state(&ctx);
 
@@ -14849,7 +14900,8 @@ mod pr_b_geyser_tracking_tests {
         );
         assert_eq!(ctx.tracked_vaults.read().len(), vaults_before);
         assert_eq!(ctx.tracked_mints.read().len(), mints_before);
-        assert!(!ctx.hot_pool_registry.is_hot_pool(pool));
+        assert!(ctx.hot_pool_registry.is_hot_pool(pool));
+        assert!(!ctx.pool_has_explicit_momentum_admission(pool));
     }
 
     /// Phase 2c: trade handler must not reference arb reconcile enqueue helpers.
