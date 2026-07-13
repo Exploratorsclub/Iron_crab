@@ -557,6 +557,27 @@ pub enum VictimSelectionResult {
     InternalInvariantViolation,
 }
 
+/// Concrete victim plan for cap shrink (no incoming group).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapShrinkSelectionPlan {
+    pub victims: Vec<ExplicitOwner>,
+    pub physical_freed: Vec<Pubkey>,
+    pub projected_final_len: usize,
+    pub opened_through: EvictionTier,
+}
+
+/// Outcome of priority/LRU victim selection for cap shrink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapShrinkSelectionResult {
+    /// `physical_len <= target_cap`; no victims required.
+    NoShrinkNeeded,
+    Planned(CapShrinkSelectionPlan),
+    RejectedProtected {
+        required_to_free: usize,
+    },
+    InternalInvariantViolation,
+}
+
 /// Test-only counters for selector hot loops (not clone/tautology metrics).
 #[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -682,6 +703,186 @@ fn run_victim_selection<S: SelectorStatsSink>(
     incoming_pubkeys.dedup();
     let incoming_set: BTreeSet<Pubkey> = incoming_pubkeys.iter().copied().collect();
 
+    let Some((victims, physical_freed)) = execute_victim_selection(
+        snapshot,
+        &incoming_set,
+        required_to_free,
+        opened_through,
+        stats,
+    ) else {
+        return VictimSelectionResult::InternalInvariantViolation;
+    };
+
+    let projected_final_len = match snapshot
+        .physical_len()
+        .checked_add(incoming_physical_added)
+        .and_then(|v| v.checked_sub(physical_freed.len()))
+    {
+        Some(v) => v,
+        None => return VictimSelectionResult::InternalInvariantViolation,
+    };
+
+    VictimSelectionResult::Planned(VictimSelectionPlan {
+        victims,
+        physical_freed,
+        incoming_physical_added,
+        projected_final_len,
+        opened_through,
+    })
+}
+
+enum CapShrinkFeasibilityOutcome {
+    NoShrinkNeeded,
+    Feasible {
+        required_to_free: usize,
+        opened_through: EvictionTier,
+    },
+    RejectedProtected {
+        required_to_free: usize,
+    },
+    InternalInvariantViolation,
+}
+
+const CAP_SHRINK_ALLOWED_TIERS: &[EvictionTier] = &[
+    EvictionTier::Tracker,
+    EvictionTier::Arb,
+    EvictionTier::Momentum,
+];
+
+fn analyze_cap_shrink_feasibility(
+    snapshot: &EvictionPlanningSnapshot,
+    target_cap: usize,
+) -> CapShrinkFeasibilityOutcome {
+    let physical_len = snapshot.physical_len();
+    if physical_len <= target_cap {
+        return CapShrinkFeasibilityOutcome::NoShrinkNeeded;
+    }
+    let required_to_free = match physical_len.checked_sub(target_cap) {
+        Some(needed) => needed,
+        None => return CapShrinkFeasibilityOutcome::InternalInvariantViolation,
+    };
+
+    let mut evictable_owners_by_tier: BTreeMap<EvictionTier, BTreeSet<ExplicitOwner>> =
+        BTreeMap::new();
+    for record in snapshot.owners() {
+        let consumer = record.owner.consumer;
+        if consumer == ExplicitConsumer::Wallet {
+            continue;
+        }
+        for tier in CAP_SHRINK_ALLOWED_TIERS {
+            if EvictionTier::cumulative_consumers(*tier).contains(&consumer) {
+                evictable_owners_by_tier
+                    .entry(*tier)
+                    .or_default()
+                    .insert(record.owner.clone());
+            }
+        }
+    }
+
+    let empty_evictable_owners = BTreeSet::new();
+    let mut freeable_by_tier: BTreeMap<EvictionTier, Vec<Pubkey>> = BTreeMap::new();
+    for row in snapshot.pubkey_index() {
+        for tier in CAP_SHRINK_ALLOWED_TIERS {
+            let evictable = evictable_owners_by_tier
+                .get(tier)
+                .unwrap_or(&empty_evictable_owners);
+            if row.owners.iter().all(|owner| evictable.contains(owner)) {
+                freeable_by_tier.entry(*tier).or_default().push(row.pubkey);
+            }
+        }
+    }
+
+    for pubkeys in freeable_by_tier.values_mut() {
+        pubkeys.sort();
+        pubkeys.dedup();
+    }
+
+    let mut opened_through = None;
+    for tier in CAP_SHRINK_ALLOWED_TIERS {
+        let freeable = freeable_by_tier.get(tier).map(Vec::as_slice).unwrap_or(&[]);
+        if freeable.len() >= required_to_free {
+            opened_through = Some(*tier);
+            break;
+        }
+    }
+
+    match opened_through {
+        Some(tier) => CapShrinkFeasibilityOutcome::Feasible {
+            required_to_free,
+            opened_through: tier,
+        },
+        None => CapShrinkFeasibilityOutcome::RejectedProtected { required_to_free },
+    }
+}
+
+/// Side-effect-free victim selection for cap shrink — no incoming group.
+pub fn select_cap_shrink_victims(
+    snapshot: &EvictionPlanningSnapshot,
+    target_cap: usize,
+) -> CapShrinkSelectionResult {
+    select_cap_shrink_victims_inner(snapshot, target_cap, &mut NoopSelectorStats)
+}
+
+#[cfg(test)]
+pub fn select_cap_shrink_victims_with_stats(
+    snapshot: &EvictionPlanningSnapshot,
+    target_cap: usize,
+    stats: &mut SelectorStats,
+) -> CapShrinkSelectionResult {
+    select_cap_shrink_victims_inner(snapshot, target_cap, stats)
+}
+
+fn select_cap_shrink_victims_inner<S: SelectorStatsSink>(
+    snapshot: &EvictionPlanningSnapshot,
+    target_cap: usize,
+    stats: &mut S,
+) -> CapShrinkSelectionResult {
+    match analyze_cap_shrink_feasibility(snapshot, target_cap) {
+        CapShrinkFeasibilityOutcome::NoShrinkNeeded => CapShrinkSelectionResult::NoShrinkNeeded,
+        CapShrinkFeasibilityOutcome::InternalInvariantViolation => {
+            CapShrinkSelectionResult::InternalInvariantViolation
+        }
+        CapShrinkFeasibilityOutcome::RejectedProtected { required_to_free } => {
+            CapShrinkSelectionResult::RejectedProtected { required_to_free }
+        }
+        CapShrinkFeasibilityOutcome::Feasible {
+            required_to_free,
+            opened_through,
+        } => {
+            let incoming_set = BTreeSet::new();
+            let Some((victims, physical_freed)) = execute_victim_selection(
+                snapshot,
+                &incoming_set,
+                required_to_free,
+                opened_through,
+                stats,
+            ) else {
+                return CapShrinkSelectionResult::InternalInvariantViolation;
+            };
+
+            let projected_final_len =
+                match snapshot.physical_len().checked_sub(physical_freed.len()) {
+                    Some(v) => v,
+                    None => return CapShrinkSelectionResult::InternalInvariantViolation,
+                };
+
+            CapShrinkSelectionResult::Planned(CapShrinkSelectionPlan {
+                victims,
+                physical_freed,
+                projected_final_len,
+                opened_through,
+            })
+        }
+    }
+}
+
+fn execute_victim_selection<S: SelectorStatsSink>(
+    snapshot: &EvictionPlanningSnapshot,
+    incoming_set: &BTreeSet<Pubkey>,
+    required_to_free: usize,
+    opened_through: EvictionTier,
+    stats: &mut S,
+) -> Option<(Vec<ExplicitOwner>, Vec<Pubkey>)> {
     let cumulative = EvictionTier::cumulative_consumers(opened_through);
     let allowed_owners: BTreeSet<ExplicitOwner> = snapshot
         .owners()
@@ -718,7 +919,7 @@ fn run_victim_selection<S: SelectorStatsSink>(
         pubkey_index,
         owner_pubkey_indices,
         projected_refcounts,
-        incoming_set,
+        incoming_set: incoming_set.clone(),
         allowed_owners,
         selected: BTreeSet::new(),
         victims: Vec::new(),
@@ -745,12 +946,9 @@ fn run_victim_selection<S: SelectorStatsSink>(
 
         let packages = workspace.collect_joint_packages(stats);
 
-        let Some(best_package) = packages
+        let best_package = packages
             .into_iter()
-            .min_by(|a, b| compare_joint_packages(a, b, snapshot))
-        else {
-            return VictimSelectionResult::InternalInvariantViolation;
-        };
+            .min_by(|a, b| compare_joint_packages(a, b, snapshot))?;
 
         for owner in &candidates {
             if best_package.contains(owner) && !workspace.selected.contains(owner) {
@@ -760,22 +958,7 @@ fn run_victim_selection<S: SelectorStatsSink>(
     }
 
     let physical_freed: Vec<Pubkey> = workspace.freed_pubkeys.into_iter().collect();
-    let projected_final_len = match snapshot
-        .physical_len()
-        .checked_add(incoming_physical_added)
-        .and_then(|v| v.checked_sub(physical_freed.len()))
-    {
-        Some(v) => v,
-        None => return VictimSelectionResult::InternalInvariantViolation,
-    };
-
-    VictimSelectionResult::Planned(VictimSelectionPlan {
-        victims: workspace.victims,
-        physical_freed,
-        incoming_physical_added,
-        projected_final_len,
-        opened_through,
-    })
+    Some((workspace.victims, physical_freed))
 }
 
 struct SelectorWorkspace<'a> {
@@ -3018,5 +3201,125 @@ mod tests {
                 case.fixtures, case.incoming, case.keys, case.cap
             );
         }
+    }
+
+    fn assert_cap_shrink_planned(
+        result: &CapShrinkSelectionResult,
+        victims: &[ExplicitOwner],
+        physical_freed: &[Pubkey],
+        opened_through: EvictionTier,
+        projected_final_len: usize,
+    ) {
+        match result {
+            CapShrinkSelectionResult::Planned(plan) => {
+                assert_eq!(plan.victims.as_slice(), victims);
+                assert_eq!(plan.physical_freed.as_slice(), physical_freed);
+                assert_eq!(plan.opened_through, opened_through);
+                assert_eq!(plan.projected_final_len, projected_final_len);
+            }
+            other => panic!("expected planned cap shrink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cap_shrink_selector_no_shrink_needed_when_within_cap() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let fixtures = [(tracker, 1, vec![pk(1)])];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        assert_eq!(
+            select_cap_shrink_victims(&snapshot, 5),
+            CapShrinkSelectionResult::NoShrinkNeeded
+        );
+    }
+
+    #[test]
+    fn cap_shrink_selector_evicts_tracker_before_arb() {
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 1);
+        let arb = pool_owner(ExplicitConsumer::Arb, 2);
+        let fixtures = [
+            (tracker.clone(), 10, vec![pk(1)]),
+            (arb.clone(), 20, vec![pk(2)]),
+        ];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        assert_cap_shrink_planned(
+            &select_cap_shrink_victims(&snapshot, 1),
+            &[tracker],
+            &[pk(1)],
+            EvictionTier::Tracker,
+            1,
+        );
+    }
+
+    #[test]
+    fn cap_shrink_selector_true_lru_within_tier() {
+        let t_old = pool_owner(ExplicitConsumer::Tracker, 1);
+        let t_new = pool_owner(ExplicitConsumer::Tracker, 2);
+        let fixtures = [
+            (t_old.clone(), 10, vec![pk(1)]),
+            (t_new.clone(), 20, vec![pk(2)]),
+        ];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        assert_cap_shrink_planned(
+            &select_cap_shrink_victims(&snapshot, 1),
+            &[t_old],
+            &[pk(1)],
+            EvictionTier::Tracker,
+            1,
+        );
+    }
+
+    #[test]
+    fn cap_shrink_selector_joint_shared_victims() {
+        let shared_a = pk(60);
+        let shared_b = pk(61);
+        let t1 = pool_owner(ExplicitConsumer::Tracker, 1);
+        let t2 = pool_owner(ExplicitConsumer::Tracker, 2);
+        let t3 = pool_owner(ExplicitConsumer::Tracker, 3);
+        let t4 = pool_owner(ExplicitConsumer::Tracker, 4);
+        let fixtures = [
+            (t1.clone(), 10, vec![shared_a]),
+            (t2.clone(), 20, vec![shared_a]),
+            (t3.clone(), 30, vec![shared_b]),
+            (t4.clone(), 40, vec![shared_b]),
+        ];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        assert_cap_shrink_planned(
+            &select_cap_shrink_victims(&snapshot, 1),
+            &[t1.clone(), t2.clone()],
+            &[shared_a],
+            EvictionTier::Tracker,
+            1,
+        );
+    }
+
+    #[test]
+    fn cap_shrink_selector_wallet_never_victim() {
+        let wallet = pool_owner(ExplicitConsumer::Wallet, 1);
+        let shared = pk(50);
+        let tracker = pool_owner(ExplicitConsumer::Tracker, 2);
+        let fixtures = [
+            (wallet.clone(), 1, vec![shared, pk(1)]),
+            (tracker.clone(), 10, vec![shared, pk(2)]),
+        ];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        match select_cap_shrink_victims(&snapshot, 2) {
+            CapShrinkSelectionResult::Planned(plan) => {
+                assert!(!plan.victims.contains(&wallet));
+            }
+            other => panic!("expected planned shrink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cap_shrink_selector_protected_when_wallet_exceeds_target() {
+        let wallet = pool_owner(ExplicitConsumer::Wallet, 1);
+        let fixtures = [(wallet, 1, vec![pk(1), pk(2), pk(3)])];
+        let snapshot = snapshot_from_fixtures(&fixtures);
+        assert_eq!(
+            select_cap_shrink_victims(&snapshot, 2),
+            CapShrinkSelectionResult::RejectedProtected {
+                required_to_free: 1
+            }
+        );
     }
 }
