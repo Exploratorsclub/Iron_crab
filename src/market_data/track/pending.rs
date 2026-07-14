@@ -231,8 +231,8 @@ impl BoundedProtocolStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::worker_commands::TrackPinReason;
+    use super::*;
     use crate::nats::MomentumActivePoolsUpdate;
     use solana_sdk::pubkey::Pubkey;
 
