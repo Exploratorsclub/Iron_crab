@@ -91,7 +91,7 @@ pub fn track_worker_execute_coalesced_push<C: TrackWorkerContext>(
     ctx.prune_tracked_maps_to_admitted(admission);
     let after_keys = admitted;
     let delta = symmetric_diff(&before_keys, &after_keys);
-    if delta.is_empty() && !continue_evict && !ctx.pending_geyser_evict() {
+    if delta.is_empty() && !continue_evict {
         inc_market_data_geyser_sync_skipped_no_delta_total();
         set_market_data_geyser_sync_pending(0);
         ctx.publish_admitted_explicit_physical(admission);
@@ -131,7 +131,6 @@ pub fn track_worker_execute_coalesced_push<C: TrackWorkerContext>(
         }
         return false;
     }
-    ctx.clear_pending_geyser_evict();
     if restore_barrier_pending {
         ctx.signal_restore_barrier(true);
     }

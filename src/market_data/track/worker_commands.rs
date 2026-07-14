@@ -13,7 +13,7 @@ pub enum TrackPinReason {
     ArbMultiDex,
 }
 
-/// Legacy commands for the `md-track-worker` OS thread (DesiredExplicitSet + coalesced Geyser push).
+/// Commands for the `md-track-worker` OS thread (`FixedCapAdmission` SSOT + coalesced Geyser push).
 #[derive(Debug, Clone)]
 pub enum TrackWorkerCommand {
     ApplyMomentumActivePools(MomentumActivePoolsUpdate),

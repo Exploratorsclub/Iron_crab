@@ -100,7 +100,6 @@ pub trait TrackWorkerContext: Send + Sync {
     fn hot_pool_registry_arb_pool_count(&self) -> usize;
     fn refresh_hot_pool_registry_gauges(&self);
     fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey>;
-    fn pending_geyser_evict(&self) -> bool;
     fn sync_geyser_tracked_accounts_batched_flush_with_deadline(
         &self,
         deadline: Instant,
@@ -122,7 +121,6 @@ pub trait TrackWorkerContext: Send + Sync {
         admission: &mut FixedCapAdmission,
         snapshot: &ExplicitSetSnapshot,
     ) -> AdmissionRestoreResult;
-    fn apply_explicit_set_snapshot_legacy(&self, snapshot: &ExplicitSetSnapshot) -> usize;
     fn on_admission_converge_result(
         &self,
         admission: &FixedCapAdmission,
@@ -133,7 +131,6 @@ pub trait TrackWorkerContext: Send + Sync {
     fn last_synced_explicit_pubkeys_write(
         &self,
     ) -> parking_lot::RwLockWriteGuard<'_, HashSet<Pubkey>>;
-    fn clear_pending_geyser_evict(&self);
     fn geyser_explicit_readiness_ok(&self) -> bool;
     fn geyser_connect_barrier_pending(&self) -> bool;
     fn signal_restore_barrier(&self, ok: bool);
@@ -283,10 +280,9 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
             true
         }
         TrackWorkerCommand::RestoreExplicitSnapshot(snapshot) => {
-            let legacy = ctx.apply_explicit_set_snapshot_legacy(&snapshot);
             let restore = ctx.apply_explicit_set_snapshot(admission, &snapshot);
             *restore_barrier_pending = true;
-            legacy > 0 || matches!(restore, AdmissionRestoreResult::Restored)
+            matches!(restore, AdmissionRestoreResult::Restored)
         }
         TrackWorkerCommand::ScheduleGeyserPush
         | TrackWorkerCommand::ScheduleGeyserPushDebounced => {
@@ -894,10 +890,6 @@ mod tests {
             HashSet::new()
         }
 
-        fn pending_geyser_evict(&self) -> bool {
-            false
-        }
-
         fn sync_geyser_tracked_accounts_batched_flush_with_deadline(
             &self,
             _deadline: Instant,
@@ -943,13 +935,6 @@ mod tests {
             AdmissionRestoreResult::Restored
         }
 
-        fn apply_explicit_set_snapshot_legacy(
-            &self,
-            _snapshot: &super::ExplicitSetSnapshot,
-        ) -> usize {
-            0
-        }
-
         fn on_admission_converge_result(
             &self,
             _admission: &FixedCapAdmission,
@@ -968,8 +953,6 @@ mod tests {
                 std::sync::LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
             KEYS.write()
         }
-
-        fn clear_pending_geyser_evict(&self) {}
 
         fn geyser_explicit_readiness_ok(&self) -> bool {
             true
@@ -1202,10 +1185,6 @@ mod tests {
                 HashSet::new()
             }
 
-            fn pending_geyser_evict(&self) -> bool {
-                false
-            }
-
             fn sync_geyser_tracked_accounts_batched_flush_with_deadline(
                 &self,
                 _deadline: Instant,
@@ -1251,13 +1230,6 @@ mod tests {
                 AdmissionRestoreResult::Restored
             }
 
-            fn apply_explicit_set_snapshot_legacy(
-                &self,
-                _snapshot: &super::ExplicitSetSnapshot,
-            ) -> usize {
-                0
-            }
-
             fn on_admission_converge_result(
                 &self,
                 _admission: &FixedCapAdmission,
@@ -1276,8 +1248,6 @@ mod tests {
                     std::sync::LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
                 KEYS.write()
             }
-
-            fn clear_pending_geyser_evict(&self) {}
 
             fn geyser_explicit_readiness_ok(&self) -> bool {
                 true
@@ -1455,10 +1425,6 @@ mod tests {
             HashSet::new()
         }
 
-        fn pending_geyser_evict(&self) -> bool {
-            false
-        }
-
         fn sync_geyser_tracked_accounts_batched_flush_with_deadline(
             &self,
             _deadline: Instant,
@@ -1504,13 +1470,6 @@ mod tests {
             AdmissionRestoreResult::Restored
         }
 
-        fn apply_explicit_set_snapshot_legacy(
-            &self,
-            _snapshot: &super::ExplicitSetSnapshot,
-        ) -> usize {
-            0
-        }
-
         fn on_admission_converge_result(
             &self,
             _admission: &FixedCapAdmission,
@@ -1529,8 +1488,6 @@ mod tests {
                 std::sync::LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
             KEYS.write()
         }
-
-        fn clear_pending_geyser_evict(&self) {}
 
         fn geyser_explicit_readiness_ok(&self) -> bool {
             true

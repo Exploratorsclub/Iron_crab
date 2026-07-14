@@ -380,7 +380,7 @@ pub static MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL: Lazy<AtomicU64> =
 /// Debounced Geyser sync flush skipped due to per-second rate cap (startup burst protection).
 pub static MARKET_DATA_GEYSER_SYNC_SKIPPED_RATE_LIMIT_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
-/// Phase 2a: current explicit Geyser pubkey count in DesiredExplicitSet.
+/// Legacy alias: admitted explicit Geyser pubkey count (mirrors `MARKET_DATA_GEYSER_EXPLICIT_ADMITTED_ACCOUNTS`).
 pub static MARKET_DATA_GEYSER_EXPLICIT_SET_SIZE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// PR3: physically admitted explicit pubkey count (FixedCapAdmission SSOT).
 pub static MARKET_DATA_GEYSER_EXPLICIT_ADMITTED_ACCOUNTS: Lazy<AtomicU64> =
