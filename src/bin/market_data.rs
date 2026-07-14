@@ -2765,11 +2765,19 @@ impl MarketDataContext {
     ) -> bool {
         match pin {
             None => {
-                if !try_admit_owner_group(admission, Self::tracker_mint_owner(mint), vec![mint]) {
-                    inc_market_data_tracker_admission_rejected_total();
-                    return false;
+                let skip_tracker_admit = self
+                    .tracked_mints
+                    .read()
+                    .get(&mint)
+                    .is_some_and(|info| info.pin.is_some());
+                if !skip_tracker_admit {
+                    if !try_admit_owner_group(admission, Self::tracker_mint_owner(mint), vec![mint])
+                    {
+                        inc_market_data_tracker_admission_rejected_total();
+                        return false;
+                    }
+                    inc_market_data_tracker_admission_admitted_total();
                 }
-                inc_market_data_tracker_admission_admitted_total();
                 self.track_mint_for_geyser_metadata(mint, None)
             }
             Some(TrackPinReason::Wallet) => self.apply_wallet_pin(admission, mint),
