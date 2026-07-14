@@ -249,18 +249,34 @@ mod tests {
             store.stage_on_queue_full(cmd);
         }
         assert!(store.pending_len() <= MARKET_DATA_TRACK_PENDING_CAP);
-        assert_eq!(TrackCommandStream::COUNT, 3);
+        assert_eq!(TrackCommandStream::COUNT, 5);
     }
 
     #[test]
-    fn control_stream_separate_revision_sequence() {
+    fn wallet_withdraw_supersedes_older_pending_pin() {
         let mut store = BoundedProtocolStore::new(8, 64);
-        let m = store.wrap_command(momentum_cmd(1));
         let mint = Pubkey::new_unique();
-        let c = store.wrap_command(TrackWorkerCommand::TrackMint { mint, pin: None });
-        assert_eq!(m.stream, TrackCommandStream::Momentum);
-        assert_eq!(c.stream, TrackCommandStream::Control);
-        assert_eq!(m.revision, 1);
-        assert_eq!(c.revision, 1);
+        let pin_old = store.wrap_command(TrackWorkerCommand::ApplyWalletPin { mint });
+        store.stage_on_queue_full(pin_old.clone());
+        let withdraw = store.wrap_command(TrackWorkerCommand::WithdrawWalletPin { mint });
+        store.mark_applied(withdraw.stream, withdraw.revision);
+        assert!(!store.is_applicable(pin_old.stream, pin_old.revision));
+        let applicable = store.take_applicable_pending_sorted();
+        assert!(
+            applicable.is_empty(),
+            "stale wallet pin must not replay after newer withdraw advances watermark"
+        );
+    }
+
+    #[test]
+    fn tracker_stream_separate_from_control() {
+        let mut store = BoundedProtocolStore::new(8, 64);
+        let mint = Pubkey::new_unique();
+        let tracker = store.wrap_command(TrackWorkerCommand::TrackMint { mint, pin: None });
+        let control = store.wrap_command(TrackWorkerCommand::ScheduleGeyserPush);
+        assert_eq!(tracker.stream, TrackCommandStream::Tracker);
+        assert_eq!(control.stream, TrackCommandStream::Control);
+        assert_eq!(tracker.revision, 1);
+        assert_eq!(control.revision, 1);
     }
 }

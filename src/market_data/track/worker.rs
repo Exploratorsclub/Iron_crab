@@ -87,7 +87,14 @@ pub trait TrackWorkerContext: Send + Sync {
         admission: &mut FixedCapAdmission,
         chunk: &[ArbTrackActiveEntry],
     ) -> bool;
-    fn track_mint_for_geyser_metadata(&self, mint: Pubkey, pin: Option<TrackPinReason>) -> bool;
+    fn apply_wallet_pin(&self, admission: &mut FixedCapAdmission, mint: Pubkey) -> bool;
+    fn withdraw_wallet_pin(&self, admission: &mut FixedCapAdmission, mint: Pubkey) -> bool;
+    fn apply_track_mint(
+        &self,
+        admission: &mut FixedCapAdmission,
+        mint: Pubkey,
+        pin: Option<TrackPinReason>,
+    ) -> bool;
     fn refresh_geyser_pins_gauge(&self);
     fn hot_pool_registry_pair_count(&self) -> usize;
     fn hot_pool_registry_arb_pool_count(&self) -> usize;
@@ -267,12 +274,9 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
         TrackWorkerCommand::ApplyArbTrackRequests(update) => {
             apply_arb_track_requests_on_track_worker(ctx, admission, update)
         }
-        TrackWorkerCommand::ApplyWalletPin { mint } => {
-            ctx.track_mint_for_geyser_metadata(mint, Some(TrackPinReason::Wallet))
-        }
-        TrackWorkerCommand::TrackMint { mint, pin } => {
-            ctx.track_mint_for_geyser_metadata(mint, pin)
-        }
+        TrackWorkerCommand::ApplyWalletPin { mint } => ctx.apply_wallet_pin(admission, mint),
+        TrackWorkerCommand::WithdrawWalletPin { mint } => ctx.withdraw_wallet_pin(admission, mint),
+        TrackWorkerCommand::TrackMint { mint, pin } => ctx.apply_track_mint(admission, mint, pin),
         TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange => {
             let new_cap = ctx.max_tracked_accounts();
             let _ = ctx.apply_explicit_cap_shrink(admission, new_cap);

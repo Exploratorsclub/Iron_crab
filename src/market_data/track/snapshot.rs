@@ -34,6 +34,7 @@ impl From<ConsumerId> for SnapshotConsumer {
             ConsumerId::Wallet => SnapshotConsumer::Wallet,
             ConsumerId::Momentum => SnapshotConsumer::Momentum,
             ConsumerId::Arb => SnapshotConsumer::Arb,
+            ConsumerId::Tracker => SnapshotConsumer::Tracker,
         }
     }
 }

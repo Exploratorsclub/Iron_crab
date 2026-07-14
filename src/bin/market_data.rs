@@ -106,7 +106,11 @@ use ironcrab::metrics::{
     inc_market_data_md_state_evict_steps_budget_exhausted_total,
     inc_market_data_md_state_evict_steps_total, inc_market_data_momentum_admission_admitted_total,
     inc_market_data_momentum_admission_rejected_total,
-    inc_market_data_vault_high_priority_dispatch_total, market_data_bump_geyser_head_slot,
+    inc_market_data_tracker_admission_admitted_total,
+    inc_market_data_tracker_admission_rejected_total,
+    inc_market_data_vault_high_priority_dispatch_total,
+    inc_market_data_wallet_admission_admitted_total,
+    inc_market_data_wallet_admission_rejected_total, market_data_bump_geyser_head_slot,
     market_data_geyser_head_slot_value, market_data_geyser_tracking_enqueue_dropped_value,
     market_data_geyser_tracking_jobs_processed_value, market_data_md_state_bursts_completed_value,
     market_data_request_account_session_reconnect, market_data_request_tx_session_reconnect,
@@ -1909,7 +1913,8 @@ fn consumer_id_for_geyser_pin(pin: Option<GeyserPinReason>) -> ConsumerId {
     match pin {
         Some(GeyserPinReason::Wallet) => ConsumerId::Wallet,
         Some(GeyserPinReason::MomentumActive) => ConsumerId::Momentum,
-        Some(GeyserPinReason::ArbMultiDex) | None => ConsumerId::Arb,
+        Some(GeyserPinReason::ArbMultiDex) => ConsumerId::Arb,
+        None => ConsumerId::Tracker,
     }
 }
 
@@ -1994,8 +1999,21 @@ impl TrackWorkerContext for MarketDataContext {
         self.apply_arb_active_entries(admission, chunk)
     }
 
-    fn track_mint_for_geyser_metadata(&self, mint: Pubkey, pin: Option<TrackPinReason>) -> bool {
-        self.track_mint_for_geyser_metadata(mint, track_pin_to_geyser_pin(pin))
+    fn apply_wallet_pin(&self, admission: &mut FixedCapAdmission, mint: Pubkey) -> bool {
+        self.apply_wallet_pin(admission, mint)
+    }
+
+    fn withdraw_wallet_pin(&self, admission: &mut FixedCapAdmission, mint: Pubkey) -> bool {
+        self.withdraw_wallet_pin(admission, mint)
+    }
+
+    fn apply_track_mint(
+        &self,
+        admission: &mut FixedCapAdmission,
+        mint: Pubkey,
+        pin: Option<TrackPinReason>,
+    ) -> bool {
+        self.apply_track_mint(admission, mint, pin)
     }
 
     fn refresh_geyser_pins_gauge(&self) {
@@ -2651,6 +2669,113 @@ impl MarketDataContext {
             enable_meteora_cpmm,
             enable_meteora_dlmm,
         )
+    }
+
+    /// PR4b: wallet owner-group pubkeys for admission (accounts + wallet-pinned mints).
+    fn wallet_owner_group_pubkeys(&self, pending_mint: Option<Pubkey>) -> Vec<Pubkey> {
+        let mut set = self.wallet_explicit_demand_pubkeys();
+        for (pk, m) in self.tracked_mints.read().iter() {
+            if m.pin == Some(GeyserPinReason::Wallet) {
+                set.insert(*pk);
+            }
+        }
+        if let Some(mint) = pending_mint {
+            set.insert(mint);
+        }
+        let mut pubkeys: Vec<Pubkey> = set.into_iter().collect();
+        pubkeys.sort();
+        pubkeys
+    }
+
+    fn wallet_owner_group() -> ExplicitOwner {
+        ExplicitOwner {
+            consumer: ExplicitConsumer::Wallet,
+            owner_key: ExplicitOwnerKey::Wallet,
+        }
+    }
+
+    fn tracker_mint_owner(mint: Pubkey) -> ExplicitOwner {
+        ExplicitOwner {
+            consumer: ExplicitConsumer::Tracker,
+            owner_key: ExplicitOwnerKey::Mint(mint),
+        }
+    }
+
+    /// PR4b: admit wallet protected owner group before tracked-map mutation.
+    fn try_admit_wallet_owner_group(
+        &self,
+        admission: &mut FixedCapAdmission,
+        pending_mint: Option<Pubkey>,
+    ) -> bool {
+        let pubkeys = self.wallet_owner_group_pubkeys(pending_mint);
+        if pubkeys.is_empty() {
+            let _ = admission.remove_group(Self::wallet_owner_group());
+            return true;
+        }
+        if pubkeys.len() > admission.cap() {
+            return false;
+        }
+        try_admit_owner_group(admission, Self::wallet_owner_group(), pubkeys)
+    }
+
+    /// PR4b: wallet mint pin — admission gate then tracked-map mutation.
+    fn apply_wallet_pin(&self, admission: &mut FixedCapAdmission, mint: Pubkey) -> bool {
+        if !self.try_admit_wallet_owner_group(admission, Some(mint)) {
+            inc_market_data_wallet_admission_rejected_total();
+            return false;
+        }
+        inc_market_data_wallet_admission_admitted_total();
+        self.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet))
+    }
+
+    /// PR4b: explicit wallet-pin withdrawal — admission refresh then map removal.
+    fn withdraw_wallet_pin(&self, admission: &mut FixedCapAdmission, mint: Pubkey) -> bool {
+        let removed = {
+            let mut mints = self.tracked_mints.write();
+            if mints
+                .get(&mint)
+                .is_some_and(|info| info.pin == Some(GeyserPinReason::Wallet))
+            {
+                mints.remove(&mint);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            let _ = admission.remove_group(Self::tracker_mint_owner(mint));
+        }
+        if !self.try_admit_wallet_owner_group(admission, None) {
+            inc_market_data_wallet_admission_rejected_total();
+            return removed;
+        }
+        if removed {
+            inc_market_data_wallet_admission_admitted_total();
+        }
+        removed
+    }
+
+    /// PR4b: tracker (`pin == None`) or promoted pin mint apply with admission gate where required.
+    fn apply_track_mint(
+        &self,
+        admission: &mut FixedCapAdmission,
+        mint: Pubkey,
+        pin: Option<TrackPinReason>,
+    ) -> bool {
+        match pin {
+            None => {
+                if !try_admit_owner_group(admission, Self::tracker_mint_owner(mint), vec![mint]) {
+                    inc_market_data_tracker_admission_rejected_total();
+                    return false;
+                }
+                inc_market_data_tracker_admission_admitted_total();
+                self.track_mint_for_geyser_metadata(mint, None)
+            }
+            Some(TrackPinReason::Wallet) => self.apply_wallet_pin(admission, mint),
+            Some(other) => {
+                self.track_mint_for_geyser_metadata(mint, track_pin_to_geyser_pin(Some(other)))
+            }
+        }
     }
 
     /// PR4a: admit immutable pool owner group before tracked-map mutation.
@@ -11687,10 +11812,20 @@ mod pr_b_geyser_tracking_tests {
     fn minimal_market_data_context_for_pr_d_tests(
         jsonl_writer: QueuedJsonlWriter,
     ) -> Arc<MarketDataContext> {
+        minimal_market_data_context_for_pr_d_tests_with_wallet(jsonl_writer, None, &[])
+    }
+
+    fn minimal_market_data_context_for_pr_d_tests_with_wallet(
+        jsonl_writer: QueuedJsonlWriter,
+        tracked_wallet: Option<TrackedWallet>,
+        extra_wallet_token_accounts: &[Pubkey],
+    ) -> Arc<MarketDataContext> {
         let (tracked_mints_tx, _tracked_mints_rx) = watch::channel(Vec::<Pubkey>::new());
         let (tracked_vaults_tx, _tracked_vaults_rx) = watch::channel(Vec::<Pubkey>::new());
         let (tracked_bin_arrays_tx, _tracked_bin_arrays_rx) = watch::channel(Vec::<Pubkey>::new());
         let (tracked_wallet_tx, _tracked_wallet_rx) = watch::channel(Vec::<Pubkey>::new());
+        let mut wallet_token_accounts = std::collections::HashSet::new();
+        wallet_token_accounts.extend(extra_wallet_token_accounts.iter().copied());
         Arc::new(MarketDataContext {
             run_id: "run-prd-test".to_string(),
             config: parking_lot::RwLock::new(MarketDataConfig::default()),
@@ -11723,11 +11858,9 @@ mod pr_b_geyser_tracking_tests {
             pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             high_priority_bonding_curves: parking_lot::RwLock::new(HashSet::new()),
             raydium_serum_fetched: parking_lot::RwLock::new(std::collections::HashSet::new()),
-            tracked_wallet: None,
+            tracked_wallet,
             tracked_wallet_tx,
-            tracked_wallet_token_accounts: parking_lot::RwLock::new(
-                std::collections::HashSet::new(),
-            ),
+            tracked_wallet_token_accounts: parking_lot::RwLock::new(wallet_token_accounts),
             tracked_wallet_mint_decimals: parking_lot::RwLock::new(std::collections::HashMap::new()),
             execution_results_deduper: parking_lot::Mutex::new(ExecutionResultDeduper::default()),
             last_emitted_curve_progress: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -15083,6 +15216,76 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(ctx.tracked_mints.read().len(), mints_before);
         assert!(ctx.hot_pool_registry.is_hot_pool(pool));
         assert!(!ctx.pool_has_explicit_momentum_admission(pool));
+    }
+
+    #[test]
+    fn pr4b_tracker_admission_reject_skips_tracked_map_mutation() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let mint = Pubkey::new_unique();
+        let mints_before = ctx.tracked_mints.read().len();
+        let mut admission = FixedCapAdmission::new(2);
+        let w1 = Pubkey::new_unique();
+        let w2 = Pubkey::new_unique();
+        assert!(try_admit_owner_group(
+            &mut admission,
+            ExplicitOwner {
+                consumer: ExplicitConsumer::Wallet,
+                owner_key: ExplicitOwnerKey::Wallet,
+            },
+            vec![w1, w2],
+        ));
+        assert!(!ctx.apply_track_mint(&mut admission, mint, None));
+        assert_eq!(ctx.tracked_mints.read().len(), mints_before);
+        assert!(!ctx.tracked_mints.read().contains_key(&mint));
+    }
+
+    #[test]
+    fn pr4b_wallet_admission_reject_skips_tracked_map_mutation() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let wallet = Pubkey::new_unique();
+        let tracked = TrackedWallet::new(wallet);
+        let extra_ata = Pubkey::new_unique();
+        let ctx = minimal_market_data_context_for_pr_d_tests_with_wallet(
+            jsonl,
+            Some(tracked),
+            &[extra_ata],
+        );
+        ctx.config.write().max_tracked_accounts = 2;
+
+        let mint = Pubkey::new_unique();
+        let mints_before = ctx.tracked_mints.read().len();
+        let mut admission = FixedCapAdmission::new(2);
+        assert!(!ctx.apply_wallet_pin(&mut admission, mint));
+        assert_eq!(ctx.tracked_mints.read().len(), mints_before);
+        assert!(!ctx.tracked_mints.read().contains_key(&mint));
+    }
+
+    #[test]
+    fn pr4b_withdraw_wallet_pin_demotes_mint_and_refreshes_admission() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let mint = Pubkey::new_unique();
+        let mut admission = FixedCapAdmission::new(25_000);
+        assert!(ctx.apply_wallet_pin(&mut admission, mint));
+        assert!(ctx.tracked_mints.read().contains_key(&mint));
+        assert!(admission.contains(&mint));
+        assert!(ctx.withdraw_wallet_pin(&mut admission, mint));
+        assert!(!ctx.tracked_mints.read().contains_key(&mint));
+        assert!(!admission.contains(&mint));
+    }
+
+    #[test]
+    fn pr4b_consumer_id_for_unpinned_mint_is_tracker() {
+        assert_eq!(consumer_id_for_geyser_pin(None), ConsumerId::Tracker);
     }
 
     /// Phase 2c: trade handler must not reference arb reconcile enqueue helpers.

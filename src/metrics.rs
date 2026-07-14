@@ -982,6 +982,18 @@ pub static MARKET_DATA_ARB_ADMISSION_ADMITTED_TOTAL: Lazy<AtomicU64> =
 /// PR4a: arb pool groups rejected at admission (no tracked-map mutation).
 pub static MARKET_DATA_ARB_ADMISSION_REJECTED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// PR4b: wallet owner groups admitted before tracked-map mutation.
+pub static MARKET_DATA_WALLET_ADMISSION_ADMITTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR4b: wallet owner groups rejected at admission (no tracked-map mutation).
+pub static MARKET_DATA_WALLET_ADMISSION_REJECTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR4b: tracker mint groups admitted before tracked-map mutation.
+pub static MARKET_DATA_TRACKER_ADMISSION_ADMITTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR4b: tracker mint groups rejected at admission (no tracked-map mutation).
+pub static MARKET_DATA_TRACKER_ADMISSION_REJECTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 /// Bounded track-worker protocol: pending slot depth (gauge).
 pub static MARKET_DATA_TRACK_PROTOCOL_PENDING_DEPTH: Lazy<AtomicU64> =
@@ -1266,6 +1278,26 @@ pub fn inc_market_data_arb_admission_admitted_total() {
 #[inline]
 pub fn inc_market_data_arb_admission_rejected_total() {
     MARKET_DATA_ARB_ADMISSION_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_wallet_admission_admitted_total() {
+    MARKET_DATA_WALLET_ADMISSION_ADMITTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_wallet_admission_rejected_total() {
+    MARKET_DATA_WALLET_ADMISSION_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tracker_admission_admitted_total() {
+    MARKET_DATA_TRACKER_ADMISSION_ADMITTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tracker_admission_rejected_total() {
+    MARKET_DATA_TRACKER_ADMISSION_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -5958,6 +5990,22 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_arb_admission_rejected_total",
         MARKET_DATA_ARB_ADMISSION_REJECTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_wallet_admission_admitted_total",
+        MARKET_DATA_WALLET_ADMISSION_ADMITTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_wallet_admission_rejected_total",
+        MARKET_DATA_WALLET_ADMISSION_REJECTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tracker_admission_admitted_total",
+        MARKET_DATA_TRACKER_ADMISSION_ADMITTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tracker_admission_rejected_total",
+        MARKET_DATA_TRACKER_ADMISSION_REJECTED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_track_protocol_pending_depth",

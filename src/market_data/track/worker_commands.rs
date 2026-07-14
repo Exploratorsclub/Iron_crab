@@ -20,6 +20,10 @@ pub enum TrackWorkerCommand {
     ApplyWalletPin {
         mint: Pubkey,
     },
+    /// PR4b: explicit wallet-pin withdrawal before tracked-map demotion (I-MD-8).
+    WithdrawWalletPin {
+        mint: Pubkey,
+    },
     TrackMint {
         mint: Pubkey,
         pin: Option<TrackPinReason>,
@@ -43,11 +47,13 @@ pub enum TrackWorkerCommand {
 pub enum TrackCommandStream {
     Momentum = 0,
     Arb = 1,
-    Control = 2,
+    Wallet = 2,
+    Tracker = 3,
+    Control = 4,
 }
 
 impl TrackCommandStream {
-    pub const COUNT: usize = 3;
+    pub const COUNT: usize = 5;
 
     #[inline]
     pub fn index(self) -> usize {
@@ -79,7 +85,9 @@ pub fn stream_for_command(cmd: &TrackWorkerCommand) -> TrackCommandStream {
         TrackWorkerCommand::ApplyMomentumActivePools(_) => TrackCommandStream::Momentum,
         TrackWorkerCommand::ApplyArbTrackRequests(_) => TrackCommandStream::Arb,
         TrackWorkerCommand::ApplyWalletPin { .. }
-        | TrackWorkerCommand::TrackMint { .. }
+        | TrackWorkerCommand::WithdrawWalletPin { .. } => TrackCommandStream::Wallet,
+        TrackWorkerCommand::TrackMint { pin: None, .. } => TrackCommandStream::Tracker,
+        TrackWorkerCommand::TrackMint { .. }
         | TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange
         | TrackWorkerCommand::ScheduleGeyserPush
         | TrackWorkerCommand::ScheduleGeyserPushDebounced
@@ -134,6 +142,17 @@ mod tests {
             ),
             (
                 TrackWorkerCommand::TrackMint { mint, pin: None },
+                TrackCommandStream::Tracker,
+            ),
+            (
+                TrackWorkerCommand::ApplyWalletPin { mint },
+                TrackCommandStream::Wallet,
+            ),
+            (
+                TrackWorkerCommand::TrackMint {
+                    mint,
+                    pin: Some(TrackPinReason::MomentumActive),
+                },
                 TrackCommandStream::Control,
             ),
         ];

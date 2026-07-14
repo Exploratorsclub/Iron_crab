@@ -32,6 +32,7 @@ pub fn consumer_id_to_explicit(consumer: ConsumerId) -> ExplicitConsumer {
         ConsumerId::Wallet => ExplicitConsumer::Wallet,
         ConsumerId::Momentum => ExplicitConsumer::Momentum,
         ConsumerId::Arb => ExplicitConsumer::Arb,
+        ConsumerId::Tracker => ExplicitConsumer::Tracker,
     }
 }
 
@@ -69,8 +70,8 @@ pub fn rows_to_owner_groups(
         .collect()
 }
 
-/// Until PR 4b emits live Tracker demand via ctx rows, preserve Tracker-labelled owner
-/// groups already in admission (e.g. cold restore) as authoritative demand during converge.
+/// Preserve Tracker-labelled owner groups already in admission (e.g. cold restore) when ctx
+/// rows omit them transiently during converge.
 pub fn merge_admission_tracker_owner_groups(
     admission: &FixedCapAdmission,
     authoritative: &mut Vec<(ExplicitOwner, Vec<Pubkey>)>,
