@@ -2672,10 +2672,14 @@ impl MarketDataContext {
     }
 
     /// PR4b: wallet owner-group pubkeys for admission (accounts + wallet-pinned mints).
-    fn wallet_owner_group_pubkeys(&self, pending_mint: Option<Pubkey>) -> Vec<Pubkey> {
+    fn wallet_owner_group_pubkeys(
+        &self,
+        pending_mint: Option<Pubkey>,
+        exclude_mint: Option<Pubkey>,
+    ) -> Vec<Pubkey> {
         let mut set = self.wallet_explicit_demand_pubkeys();
         for (pk, m) in self.tracked_mints.read().iter() {
-            if m.pin == Some(GeyserPinReason::Wallet) {
+            if m.pin == Some(GeyserPinReason::Wallet) && exclude_mint != Some(*pk) {
                 set.insert(*pk);
             }
         }
@@ -2706,8 +2710,9 @@ impl MarketDataContext {
         &self,
         admission: &mut FixedCapAdmission,
         pending_mint: Option<Pubkey>,
+        exclude_mint: Option<Pubkey>,
     ) -> bool {
-        let pubkeys = self.wallet_owner_group_pubkeys(pending_mint);
+        let pubkeys = self.wallet_owner_group_pubkeys(pending_mint, exclude_mint);
         if pubkeys.is_empty() {
             let _ = admission.remove_group(Self::wallet_owner_group());
             return true;
@@ -2720,7 +2725,7 @@ impl MarketDataContext {
 
     /// PR4b: wallet mint pin — admission gate then tracked-map mutation.
     fn apply_wallet_pin(&self, admission: &mut FixedCapAdmission, mint: Pubkey) -> bool {
-        if !self.try_admit_wallet_owner_group(admission, Some(mint)) {
+        if !self.try_admit_wallet_owner_group(admission, Some(mint), None) {
             inc_market_data_wallet_admission_rejected_total();
             return false;
         }
@@ -2731,29 +2736,22 @@ impl MarketDataContext {
 
     /// PR4b: explicit wallet-pin withdrawal — admission refresh then map removal.
     fn withdraw_wallet_pin(&self, admission: &mut FixedCapAdmission, mint: Pubkey) -> bool {
-        let removed = {
-            let mut mints = self.tracked_mints.write();
-            if mints
-                .get(&mint)
-                .is_some_and(|info| info.pin == Some(GeyserPinReason::Wallet))
-            {
-                mints.remove(&mint);
-                true
-            } else {
-                false
-            }
-        };
-        if removed {
-            let _ = admission.remove_group(Self::tracker_mint_owner(mint));
+        let should_remove = self
+            .tracked_mints
+            .read()
+            .get(&mint)
+            .is_some_and(|info| info.pin == Some(GeyserPinReason::Wallet));
+        if !should_remove {
+            return false;
         }
-        if !self.try_admit_wallet_owner_group(admission, None) {
+        if !self.try_admit_wallet_owner_group(admission, None, Some(mint)) {
             inc_market_data_wallet_admission_rejected_total();
-            return removed;
+            return false;
         }
-        if removed {
-            inc_market_data_wallet_admission_admitted_total();
-        }
-        removed
+        let _ = admission.remove_group(Self::tracker_mint_owner(mint));
+        self.tracked_mints.write().remove(&mint);
+        inc_market_data_wallet_admission_admitted_total();
+        true
     }
 
     /// PR4b: tracker (`pin == None`) or promoted pin mint apply with admission gate where required.
