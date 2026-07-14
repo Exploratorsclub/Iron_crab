@@ -970,6 +970,18 @@ pub static MARKET_DATA_MOMENTUM_TRACK_WORKER_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU
 /// Phase 3: arb track requests enqueue dropped on full track-worker queue.
 pub static MARKET_DATA_ARB_TRACK_WORKER_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// PR4a: momentum pool groups admitted before tracked-map mutation.
+pub static MARKET_DATA_MOMENTUM_ADMISSION_ADMITTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR4a: momentum pool groups rejected at admission (no tracked-map mutation).
+pub static MARKET_DATA_MOMENTUM_ADMISSION_REJECTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR4a: arb pool groups admitted before tracked-map mutation.
+pub static MARKET_DATA_ARB_ADMISSION_ADMITTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR4a: arb pool groups rejected at admission (no tracked-map mutation).
+pub static MARKET_DATA_ARB_ADMISSION_REJECTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 /// Bounded track-worker protocol: pending slot depth (gauge).
 pub static MARKET_DATA_TRACK_PROTOCOL_PENDING_DEPTH: Lazy<AtomicU64> =
@@ -1234,6 +1246,26 @@ pub fn set_market_data_track_worker_queue_depth(depth: usize) {
 #[inline]
 pub fn inc_market_data_momentum_track_worker_enqueue_dropped_total() {
     MARKET_DATA_MOMENTUM_TRACK_WORKER_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_momentum_admission_admitted_total() {
+    MARKET_DATA_MOMENTUM_ADMISSION_ADMITTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_momentum_admission_rejected_total() {
+    MARKET_DATA_MOMENTUM_ADMISSION_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_admission_admitted_total() {
+    MARKET_DATA_ARB_ADMISSION_ADMITTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_admission_rejected_total() {
+    MARKET_DATA_ARB_ADMISSION_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -5910,6 +5942,22 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_momentum_track_worker_enqueue_dropped_total",
         MARKET_DATA_MOMENTUM_TRACK_WORKER_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_momentum_admission_admitted_total",
+        MARKET_DATA_MOMENTUM_ADMISSION_ADMITTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_momentum_admission_rejected_total",
+        MARKET_DATA_MOMENTUM_ADMISSION_REJECTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_arb_admission_admitted_total",
+        MARKET_DATA_ARB_ADMISSION_ADMITTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_arb_admission_rejected_total",
+        MARKET_DATA_ARB_ADMISSION_REJECTED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_track_protocol_pending_depth",

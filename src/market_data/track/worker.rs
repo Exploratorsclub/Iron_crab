@@ -47,14 +47,46 @@ pub const MARKET_DATA_ARB_APPLY_CHUNK_SIZE: usize = 16;
 pub trait TrackWorkerContext: Send + Sync {
     fn geyser_sync_batch_debounce_ms(&self) -> u64;
     fn max_tracked_accounts(&self) -> usize;
-    fn apply_momentum_active_pools_update(&self, update: &MomentumActivePoolsUpdate) -> bool;
-    fn apply_momentum_snapshot_reconcile(&self, active: &[MomentumActivePoolEntry]) -> bool;
-    fn apply_momentum_removed_entries(&self, chunk: &[MomentumRemovedPoolEntry]) -> bool;
-    fn apply_momentum_active_entries(&self, chunk: &[MomentumActivePoolEntry]) -> bool;
-    fn apply_arb_track_requests_update(&self, update: &ArbTrackRequestsUpdate) -> bool;
-    fn apply_arb_snapshot_reconcile(&self, active: &[ArbTrackActiveEntry]) -> bool;
-    fn apply_arb_removed_entries(&self, chunk: &[ArbTrackRemovedEntry]) -> bool;
-    fn apply_arb_active_entries(&self, chunk: &[ArbTrackActiveEntry]) -> bool;
+    fn apply_momentum_active_pools_update(
+        &self,
+        admission: &mut FixedCapAdmission,
+        update: &MomentumActivePoolsUpdate,
+    ) -> bool;
+    fn apply_momentum_snapshot_reconcile(
+        &self,
+        admission: &mut FixedCapAdmission,
+        active: &[MomentumActivePoolEntry],
+    ) -> bool;
+    fn apply_momentum_removed_entries(
+        &self,
+        admission: &mut FixedCapAdmission,
+        chunk: &[MomentumRemovedPoolEntry],
+    ) -> bool;
+    fn apply_momentum_active_entries(
+        &self,
+        admission: &mut FixedCapAdmission,
+        chunk: &[MomentumActivePoolEntry],
+    ) -> bool;
+    fn apply_arb_track_requests_update(
+        &self,
+        admission: &mut FixedCapAdmission,
+        update: &ArbTrackRequestsUpdate,
+    ) -> bool;
+    fn apply_arb_snapshot_reconcile(
+        &self,
+        admission: &mut FixedCapAdmission,
+        active: &[ArbTrackActiveEntry],
+    ) -> bool;
+    fn apply_arb_removed_entries(
+        &self,
+        admission: &mut FixedCapAdmission,
+        chunk: &[ArbTrackRemovedEntry],
+    ) -> bool;
+    fn apply_arb_active_entries(
+        &self,
+        admission: &mut FixedCapAdmission,
+        chunk: &[ArbTrackActiveEntry],
+    ) -> bool;
     fn track_mint_for_geyser_metadata(&self, mint: Pubkey, pin: Option<TrackPinReason>) -> bool;
     fn refresh_geyser_pins_gauge(&self);
     fn hot_pool_registry_pair_count(&self) -> usize;
@@ -163,24 +195,25 @@ fn track_worker_dec_queue_depth(
 /// Phase-2b: sync momentum apply on `md-track-worker` thread (no Tokio yield).
 pub fn apply_momentum_active_pools_on_track_worker<C: TrackWorkerContext>(
     ctx: &Arc<C>,
+    admission: &mut FixedCapAdmission,
     update: MomentumActivePoolsUpdate,
 ) -> bool {
     let item_count = update.active.len() + update.removed.len();
     if item_count <= MARKET_DATA_MOMENTUM_APPLY_CHUNK_THRESHOLD {
-        return ctx.apply_momentum_active_pools_update(&update);
+        return ctx.apply_momentum_active_pools_update(admission, &update);
     }
     record_market_data_momentum_active_pool_messages_total();
     let mut batch_dirty = false;
     if update.full_active_snapshot {
-        batch_dirty |= ctx.apply_momentum_snapshot_reconcile(&update.active);
+        batch_dirty |= ctx.apply_momentum_snapshot_reconcile(admission, &update.active);
         std::thread::yield_now();
     }
     for chunk in update.removed.chunks(MARKET_DATA_MOMENTUM_APPLY_CHUNK_SIZE) {
-        batch_dirty |= ctx.apply_momentum_removed_entries(chunk);
+        batch_dirty |= ctx.apply_momentum_removed_entries(admission, chunk);
         std::thread::yield_now();
     }
     for chunk in update.active.chunks(MARKET_DATA_MOMENTUM_APPLY_CHUNK_SIZE) {
-        batch_dirty |= ctx.apply_momentum_active_entries(chunk);
+        batch_dirty |= ctx.apply_momentum_active_entries(admission, chunk);
         std::thread::yield_now();
     }
     if !batch_dirty {
@@ -193,24 +226,25 @@ pub fn apply_momentum_active_pools_on_track_worker<C: TrackWorkerContext>(
 /// Phase 3: sync arb track apply on `md-track-worker` thread (no Tokio yield).
 pub fn apply_arb_track_requests_on_track_worker<C: TrackWorkerContext>(
     ctx: &Arc<C>,
+    admission: &mut FixedCapAdmission,
     update: ArbTrackRequestsUpdate,
 ) -> bool {
     let item_count = update.active.len() + update.removed.len();
     if item_count <= MARKET_DATA_ARB_APPLY_CHUNK_THRESHOLD {
-        return ctx.apply_arb_track_requests_update(&update);
+        return ctx.apply_arb_track_requests_update(admission, &update);
     }
     record_market_data_arb_track_requests_messages_total();
     let mut batch_dirty = false;
     if update.reconcile {
-        batch_dirty |= ctx.apply_arb_snapshot_reconcile(&update.active);
+        batch_dirty |= ctx.apply_arb_snapshot_reconcile(admission, &update.active);
         std::thread::yield_now();
     }
     for chunk in update.removed.chunks(MARKET_DATA_ARB_APPLY_CHUNK_SIZE) {
-        batch_dirty |= ctx.apply_arb_removed_entries(chunk);
+        batch_dirty |= ctx.apply_arb_removed_entries(admission, chunk);
         std::thread::yield_now();
     }
     for chunk in update.active.chunks(MARKET_DATA_ARB_APPLY_CHUNK_SIZE) {
-        batch_dirty |= ctx.apply_arb_active_entries(chunk);
+        batch_dirty |= ctx.apply_arb_active_entries(admission, chunk);
         std::thread::yield_now();
     }
     if !batch_dirty {
@@ -228,10 +262,10 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
 ) -> bool {
     match job {
         TrackWorkerCommand::ApplyMomentumActivePools(update) => {
-            apply_momentum_active_pools_on_track_worker(ctx, update)
+            apply_momentum_active_pools_on_track_worker(ctx, admission, update)
         }
         TrackWorkerCommand::ApplyArbTrackRequests(update) => {
-            apply_arb_track_requests_on_track_worker(ctx, update)
+            apply_arb_track_requests_on_track_worker(ctx, admission, update)
         }
         TrackWorkerCommand::ApplyWalletPin { mint } => {
             ctx.track_mint_for_geyser_metadata(mint, Some(TrackPinReason::Wallet))
