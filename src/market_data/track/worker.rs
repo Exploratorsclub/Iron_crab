@@ -353,13 +353,7 @@ fn track_worker_apply_protocol_command<C: TrackWorkerContext>(
     let protocol_cmd = ImmutableTrackCommand::new(stream, revision, payload_backup);
     if track_protocol_should_advance_revision(stream, handler_succeeded) {
         let mut store = protocol.lock().expect("track protocol store lock");
-        if stream == TrackCommandStream::Wallet
-            && matches!(
-                protocol_cmd.payload,
-                TrackWorkerCommand::ApplyWalletPin { .. }
-                    | TrackWorkerCommand::WithdrawWalletPin { .. }
-            )
-        {
+        if stream == TrackCommandStream::Wallet {
             store.mark_applied_wallet_demand(&protocol_cmd);
         } else {
             store.mark_applied(&protocol_cmd);
@@ -874,10 +868,13 @@ mod tests {
 
         fn apply_track_mint(
             &self,
-            _admission: &mut FixedCapAdmission,
-            _mint: Pubkey,
-            _pin: Option<TrackPinReason>,
+            admission: &mut FixedCapAdmission,
+            mint: Pubkey,
+            pin: Option<TrackPinReason>,
         ) -> bool {
+            if pin == Some(TrackPinReason::Wallet) {
+                return self.apply_wallet_pin(admission, mint);
+            }
             true
         }
 
@@ -1046,6 +1043,48 @@ mod tests {
                 "successful wallet pin must advance revision"
             );
         }
+        assert_eq!(ctx.pinned.lock().as_slice(), &[mint]);
+    }
+
+    #[test]
+    fn wallet_track_mint_replays_after_transient_reject() {
+        let ctx = Arc::new(WalletReplayTestCtx::fail_once());
+        let protocol = Arc::new(Mutex::new(BoundedProtocolStore::default_caps()));
+        let mint = Pubkey::new_unique();
+        let cmd = {
+            let mut store = protocol.lock().expect("lock");
+            store.wrap_command(TrackWorkerCommand::TrackMint {
+                mint,
+                pin: Some(TrackPinReason::Wallet),
+            })
+        };
+        assert_eq!(cmd.stream, TrackCommandStream::Wallet);
+        let mut admission = FixedCapAdmission::new(25_000);
+        let mut restore_barrier_pending = false;
+
+        track_worker_apply_protocol_command(
+            &ctx,
+            &protocol,
+            &mut admission,
+            &mut restore_barrier_pending,
+            cmd.clone(),
+        );
+        {
+            let store = protocol.lock().expect("lock");
+            assert!(store.is_applicable(&cmd));
+            assert_eq!(store.pending_len(), 1);
+        }
+
+        track_worker_drain_pending_replay(
+            &ctx,
+            &protocol,
+            &mut admission,
+            &mut restore_barrier_pending,
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut false,
+        );
         assert_eq!(ctx.pinned.lock().as_slice(), &[mint]);
     }
 

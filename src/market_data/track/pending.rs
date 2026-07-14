@@ -232,6 +232,7 @@ impl BoundedProtocolStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::worker_commands::TrackPinReason;
     use crate::nats::MomentumActivePoolsUpdate;
     use solana_sdk::pubkey::Pubkey;
 
@@ -397,6 +398,36 @@ mod tests {
         store.mark_applied_wallet_demand(&pin);
         assert!(!store.is_applicable(&tracker));
         assert!(store.take_applicable_pending_sorted().is_empty());
+    }
+
+    #[test]
+    fn wallet_track_mint_uses_wallet_stream_per_mint_revision() {
+        let mut store = BoundedProtocolStore::new(8, 64);
+        let mint = Pubkey::new_unique();
+        let cmd = store.wrap_command(TrackWorkerCommand::TrackMint {
+            mint,
+            pin: Some(TrackPinReason::Wallet),
+        });
+        assert_eq!(cmd.stream, TrackCommandStream::Wallet);
+        assert_eq!(cmd.revision, 1);
+        let cmd2 = store.wrap_command(TrackWorkerCommand::TrackMint {
+            mint,
+            pin: Some(TrackPinReason::Wallet),
+        });
+        assert_eq!(cmd2.revision, 2);
+    }
+
+    #[test]
+    fn wallet_track_mint_reject_re_stages_pending() {
+        let mut store = BoundedProtocolStore::new(8, 64);
+        let mint = Pubkey::new_unique();
+        let cmd = store.wrap_command(TrackWorkerCommand::TrackMint {
+            mint,
+            pin: Some(TrackPinReason::Wallet),
+        });
+        assert_eq!(store.stage_on_queue_full(cmd.clone()), StageResult::Staged);
+        assert_eq!(store.pending_len(), 1);
+        assert!(store.is_applicable(&cmd));
     }
 
     #[test]

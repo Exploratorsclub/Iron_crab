@@ -87,6 +87,10 @@ pub fn stream_for_command(cmd: &TrackWorkerCommand) -> TrackCommandStream {
         TrackWorkerCommand::ApplyArbTrackRequests(_) => TrackCommandStream::Arb,
         TrackWorkerCommand::ApplyWalletPin { .. }
         | TrackWorkerCommand::WithdrawWalletPin { .. } => TrackCommandStream::Wallet,
+        TrackWorkerCommand::TrackMint {
+            pin: Some(TrackPinReason::Wallet),
+            ..
+        } => TrackCommandStream::Wallet,
         TrackWorkerCommand::TrackMint { pin: None, .. } => TrackCommandStream::Tracker,
         TrackWorkerCommand::TrackMint { .. }
         | TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange
@@ -103,7 +107,10 @@ pub fn demand_mint_for_command(cmd: &TrackWorkerCommand) -> Option<Pubkey> {
     match cmd {
         TrackWorkerCommand::ApplyWalletPin { mint }
         | TrackWorkerCommand::WithdrawWalletPin { mint } => Some(*mint),
-        TrackWorkerCommand::TrackMint { mint, pin: None } => Some(*mint),
+        TrackWorkerCommand::TrackMint {
+            mint,
+            pin: None | Some(TrackPinReason::Wallet),
+        } => Some(*mint),
         _ => None,
     }
 }
@@ -194,6 +201,13 @@ mod tests {
             ),
             (
                 TrackWorkerCommand::ApplyWalletPin { mint },
+                TrackCommandStream::Wallet,
+            ),
+            (
+                TrackWorkerCommand::TrackMint {
+                    mint,
+                    pin: Some(TrackPinReason::Wallet),
+                },
                 TrackCommandStream::Wallet,
             ),
             (
