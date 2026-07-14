@@ -111,6 +111,10 @@ pub fn md_state_process_job<C: MdStateContext>(
             track_worker_try_enqueue(track_worker, TrackWorkerCommand::ApplyWalletPin { mint });
             false
         }
+        MdStateCommand::WithdrawWalletMint { mint } => {
+            track_worker_try_enqueue(track_worker, TrackWorkerCommand::WithdrawWalletPin { mint });
+            false
+        }
         MdStateCommand::ScheduleGeyserSyncAfterConfigChange => {
             track_worker_try_enqueue(
                 track_worker,

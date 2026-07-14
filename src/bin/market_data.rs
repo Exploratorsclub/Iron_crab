@@ -338,6 +338,9 @@ mod eval_grep_md_state_command {
         TrackWalletMint {
             mint: Pubkey,
         },
+        WithdrawWalletMint {
+            mint: Pubkey,
+        },
         ScheduleGeyserSyncAfterConfigChange,
         FlushGeyserSyncDebounced,
         ContinueGeyserEvict,
@@ -9012,6 +9015,20 @@ async fn run_geyser_loop(
                                                 tracked_wallet.last_wsol_balance.store(0, Ordering::Relaxed);
                                             }
 
+                                            let should_withdraw_wallet_pin = ctx
+                                                .tracked_mints
+                                                .read()
+                                                .get(&mint)
+                                                .is_some_and(|info| {
+                                                    info.pin == Some(GeyserPinReason::Wallet)
+                                                });
+                                            if should_withdraw_wallet_pin {
+                                                md_state_try_enqueue(
+                                                    &md_state,
+                                                    MdStateCommand::WithdrawWalletMint { mint },
+                                                );
+                                            }
+
                                             let mut set = ctx.tracked_wallet_token_accounts.write();
                                             if set.remove(&ata) {
                                                 let mut accounts: Vec<Pubkey> = Vec::new();
@@ -15329,6 +15346,26 @@ mod pr_b_geyser_tracking_tests {
         let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
         assert!(ctx.apply_wallet_pin(&mut admission, mint));
         assert!(ctx.apply_wallet_pin(&mut admission, mint));
+    }
+
+    #[tokio::test]
+    async fn pr4b_withdraw_wallet_mint_actor_enqueues_protocol_withdraw() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let md_state = test_spawn_md_state(&ctx);
+
+        let mint = Pubkey::new_unique();
+        assert!(ctx.apply_wallet_pin(
+            &mut FixedCapAdmission::new(ctx.max_tracked_accounts()),
+            mint
+        ));
+
+        md_state_try_enqueue(&md_state, MdStateCommand::WithdrawWalletMint { mint });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(!ctx.tracked_mints.read().contains_key(&mint));
     }
 
     /// PR4b: tracker snapshot rows restore as unpinned mints, not arb-pinned.

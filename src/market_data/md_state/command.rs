@@ -11,6 +11,8 @@ pub enum MdStateCommand {
     },
     /// PR169b: wallet bootstrap / execution-results mint pin (no immediate sync).
     TrackWalletMint { mint: Pubkey },
+    /// PR4b: wallet position close — withdraw wallet pin before map demotion.
+    WithdrawWalletMint { mint: Pubkey },
     /// PR169b: `max_tracked_accounts` cap change — debounced flush/eviction only.
     ScheduleGeyserSyncAfterConfigChange,
     /// PR233: debounced explicit Geyser sync flush — executed only on `md-state` thread.

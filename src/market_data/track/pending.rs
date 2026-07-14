@@ -1,8 +1,8 @@
 //! Bounded pending / inflight / revision store for track-worker queue-full replay.
 
 use super::worker_commands::{
-    stream_for_command, ImmutableTrackCommand, RevisionAssigner, TrackCommandStream,
-    TrackWorkerCommand,
+    demand_mint_for_command, stream_for_command, stream_uses_per_mint_revision,
+    ImmutableTrackCommand, RevisionAssigner, TrackCommandStream, TrackWorkerCommand,
 };
 use crate::metrics::{
     inc_market_data_track_protocol_pending_evicted_total,
@@ -10,6 +10,8 @@ use crate::metrics::{
     inc_market_data_track_protocol_superseded_revisions_total,
     set_market_data_track_protocol_inflight_depth, set_market_data_track_protocol_pending_depth,
 };
+use solana_sdk::pubkey::Pubkey;
+use std::collections::HashMap;
 
 /// Bounded cap for pending slots when the worker queue is full (I-MD-5).
 pub const MARKET_DATA_TRACK_PENDING_CAP: usize = 512;
@@ -25,7 +27,7 @@ pub enum StageResult {
     Lost,
 }
 
-/// Bounded store: pending slots, inflight accounting, last-applied revision per stream.
+/// Bounded store: pending slots, inflight accounting, last-applied revision per stream/mint.
 #[derive(Debug)]
 pub struct BoundedProtocolStore {
     pending: Vec<ImmutableTrackCommand>,
@@ -35,6 +37,8 @@ pub struct BoundedProtocolStore {
     inflight_cap: usize,
     revision: RevisionAssigner,
     last_applied: [u64; TrackCommandStream::COUNT],
+    last_applied_wallet_mint: HashMap<Pubkey, u64>,
+    last_applied_tracker_mint: HashMap<Pubkey, u64>,
 }
 
 impl BoundedProtocolStore {
@@ -46,6 +50,8 @@ impl BoundedProtocolStore {
             inflight_cap,
             revision: RevisionAssigner::default(),
             last_applied: [0; TrackCommandStream::COUNT],
+            last_applied_wallet_mint: HashMap::new(),
+            last_applied_tracker_mint: HashMap::new(),
         }
     }
 
@@ -66,19 +72,61 @@ impl BoundedProtocolStore {
         self.inflight
     }
 
-    /// Wrap a legacy command with the next monotone revision for its stream.
+    /// Wrap a legacy command with the next monotone revision for its stream (per-mint for wallet/tracker).
     pub fn wrap_command(&mut self, payload: TrackWorkerCommand) -> ImmutableTrackCommand {
         let stream = stream_for_command(&payload);
-        let revision = self.revision.next_revision(stream);
+        let demand_mint = demand_mint_for_command(&payload);
+        let revision = self.revision.next_revision(stream, demand_mint);
         ImmutableTrackCommand::new(stream, revision, payload)
     }
 
-    /// True when `revision` is strictly newer than the last applied revision for `stream`.
-    pub fn is_applicable(&self, stream: TrackCommandStream, revision: u64) -> bool {
+    fn last_applied_for_cmd(&self, cmd: &ImmutableTrackCommand) -> u64 {
+        if stream_uses_per_mint_revision(cmd.stream) {
+            let mint = demand_mint_for_command(&cmd.payload)
+                .expect("wallet/tracker command requires demand mint");
+            let map = match cmd.stream {
+                TrackCommandStream::Wallet => &self.last_applied_wallet_mint,
+                TrackCommandStream::Tracker => &self.last_applied_tracker_mint,
+                _ => unreachable!(),
+            };
+            *map.get(&mint).unwrap_or(&0)
+        } else {
+            self.last_applied[cmd.stream.index()]
+        }
+    }
+
+    /// True when `cmd.revision` is strictly newer than the last applied revision for its demand key.
+    pub fn is_applicable(&self, cmd: &ImmutableTrackCommand) -> bool {
+        cmd.revision > self.last_applied_for_cmd(cmd)
+    }
+
+    pub fn mark_applied(&mut self, cmd: &ImmutableTrackCommand) {
+        if stream_uses_per_mint_revision(cmd.stream) {
+            let mint = demand_mint_for_command(&cmd.payload)
+                .expect("wallet/tracker command requires demand mint");
+            let map = match cmd.stream {
+                TrackCommandStream::Wallet => &mut self.last_applied_wallet_mint,
+                TrackCommandStream::Tracker => &mut self.last_applied_tracker_mint,
+                _ => unreachable!(),
+            };
+            let entry = map.entry(mint).or_insert(0);
+            if cmd.revision > *entry {
+                *entry = cmd.revision;
+            }
+            return;
+        }
+        let idx = cmd.stream.index();
+        if cmd.revision > self.last_applied[idx] {
+            self.last_applied[idx] = cmd.revision;
+        }
+    }
+
+    /// Backward-compatible helper for global-stream tests.
+    pub fn is_applicable_stream(&self, stream: TrackCommandStream, revision: u64) -> bool {
         revision > self.last_applied[stream.index()]
     }
 
-    pub fn mark_applied(&mut self, stream: TrackCommandStream, revision: u64) {
+    pub fn mark_applied_stream(&mut self, stream: TrackCommandStream, revision: u64) {
         let idx = stream.index();
         if revision > self.last_applied[idx] {
             self.last_applied[idx] = revision;
@@ -138,7 +186,7 @@ impl BoundedProtocolStore {
                 .collect();
             stream_cmds.sort_by_key(|cmd| cmd.revision);
             for cmd in stream_cmds {
-                if self.is_applicable(cmd.stream, cmd.revision) {
+                if self.is_applicable(&cmd) {
                     applicable.push(cmd);
                 } else {
                     inc_market_data_track_protocol_superseded_revisions_total();
@@ -184,7 +232,7 @@ mod tests {
         store.stage_on_queue_full(c2.clone());
         let mut applied = Vec::new();
         for cmd in store.take_applicable_pending_sorted() {
-            store.mark_applied(cmd.stream, cmd.revision);
+            store.mark_applied(&cmd);
             applied.push(cmd.revision);
         }
         assert_eq!(applied, vec![1, 2]);
@@ -196,13 +244,13 @@ mod tests {
         let mut store = BoundedProtocolStore::new(8, 64);
         let c1 = store.wrap_command(momentum_cmd(1));
         let c2 = store.wrap_command(momentum_cmd(2));
-        store.mark_applied(TrackCommandStream::Momentum, 2);
+        store.mark_applied_stream(TrackCommandStream::Momentum, 2);
         store.stage_on_queue_full(c1);
         store.stage_on_queue_full(c2);
         let mut applied = Vec::new();
         for cmd in store.take_applicable_pending_sorted() {
-            if store.is_applicable(cmd.stream, cmd.revision) {
-                store.mark_applied(cmd.stream, cmd.revision);
+            if store.is_applicable(&cmd) {
+                store.mark_applied(&cmd);
                 applied.push(cmd.revision);
             }
         }
@@ -221,7 +269,7 @@ mod tests {
         store.stage_on_queue_full(c2);
         let mut applied = Vec::new();
         for cmd in store.take_applicable_pending_sorted() {
-            store.mark_applied(cmd.stream, cmd.revision);
+            store.mark_applied(&cmd);
             applied.push(cmd.revision);
         }
         assert_eq!(applied, vec![1, 2, 3]);
@@ -259,12 +307,33 @@ mod tests {
         let pin_old = store.wrap_command(TrackWorkerCommand::ApplyWalletPin { mint });
         store.stage_on_queue_full(pin_old.clone());
         let withdraw = store.wrap_command(TrackWorkerCommand::WithdrawWalletPin { mint });
-        store.mark_applied(withdraw.stream, withdraw.revision);
-        assert!(!store.is_applicable(pin_old.stream, pin_old.revision));
+        store.mark_applied(&withdraw);
+        assert!(!store.is_applicable(&pin_old));
         let applicable = store.take_applicable_pending_sorted();
         assert!(
             applicable.is_empty(),
             "stale wallet pin must not replay after newer withdraw advances watermark"
+        );
+    }
+
+    #[test]
+    fn wallet_later_mint_does_not_supersede_pending_pin_for_other_mint() {
+        let mut store = BoundedProtocolStore::new(8, 64);
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let pin_a = store.wrap_command(TrackWorkerCommand::ApplyWalletPin { mint: mint_a });
+        store.stage_on_queue_full(pin_a.clone());
+        let pin_b = store.wrap_command(TrackWorkerCommand::ApplyWalletPin { mint: mint_b });
+        store.mark_applied(&pin_b);
+        assert!(
+            store.is_applicable(&pin_a),
+            "pending wallet pin for mint A must remain applicable after mint B advances"
+        );
+        let applicable = store.take_applicable_pending_sorted();
+        assert_eq!(applicable.len(), 1);
+        assert_eq!(
+            demand_mint_for_command(&applicable[0].payload),
+            Some(mint_a)
         );
     }
 

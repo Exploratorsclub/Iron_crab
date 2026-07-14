@@ -335,7 +335,7 @@ fn track_worker_apply_protocol_command<C: TrackWorkerContext>(
 ) {
     let applicable = {
         let store = protocol.lock().expect("track protocol store lock");
-        store.is_applicable(cmd.stream, cmd.revision)
+        store.is_applicable(&cmd)
     };
     if !applicable {
         inc_market_data_track_protocol_superseded_revisions_total();
@@ -347,21 +347,15 @@ fn track_worker_apply_protocol_command<C: TrackWorkerContext>(
         stream,
         TrackCommandStream::Wallet | TrackCommandStream::Tracker
     );
-    let payload_for_restage = if restage_on_failure {
-        Some(cmd.payload.clone())
-    } else {
-        None
-    };
+    let payload_backup = cmd.payload.clone();
     let handler_succeeded =
         track_worker_process_command(ctx, admission, restore_barrier_pending, cmd.payload);
+    let protocol_cmd = ImmutableTrackCommand::new(stream, revision, payload_backup);
     if track_protocol_should_advance_revision(stream, handler_succeeded) {
         let mut store = protocol.lock().expect("track protocol store lock");
-        store.mark_applied(stream, revision);
+        store.mark_applied(&protocol_cmd);
     } else if restage_on_failure {
-        track_protocol_stage_for_replay(
-            protocol,
-            ImmutableTrackCommand::new(stream, revision, payload_for_restage.expect("restage")),
-        );
+        track_protocol_stage_for_replay(protocol, protocol_cmd);
     }
 }
 
@@ -400,7 +394,7 @@ fn track_worker_receive_protocol_command<C: TrackWorkerContext>(
 ) {
     let applicable = {
         let store = protocol.lock().expect("track protocol store lock");
-        store.is_applicable(cmd.stream, cmd.revision)
+        store.is_applicable(&cmd)
     };
     if applicable {
         track_worker_prepare_command_delivery(
@@ -433,7 +427,7 @@ fn track_worker_drain_pending_replay<C: TrackWorkerContext>(
     for cmd in pending_cmds {
         let applicable = {
             let store = protocol.lock().expect("track protocol store lock");
-            store.is_applicable(cmd.stream, cmd.revision)
+            store.is_applicable(&cmd)
         };
         if applicable {
             track_worker_prepare_command_delivery(
@@ -719,13 +713,13 @@ mod tests {
                     full_active_snapshot: false,
                 },
             ));
-            store.mark_applied(TrackCommandStream::Momentum, c.revision);
+            store.mark_applied(&c);
             c
         };
         assert!(sender.tx.try_send(cmd.clone()).is_ok());
         // inline apply path not running; verify applicability directly
         let store = sender.protocol.lock().expect("lock");
-        assert!(!store.is_applicable(cmd.stream, cmd.revision));
+        assert!(!store.is_applicable(&cmd));
     }
 
     #[test]
@@ -734,8 +728,8 @@ mod tests {
         let push_old = store.wrap_command(TrackWorkerCommand::ScheduleGeyserPush);
         store.stage_on_queue_full(push_old.clone());
         let push_new = store.wrap_command(TrackWorkerCommand::ScheduleGeyserPush);
-        store.mark_applied(push_new.stream, push_new.revision);
-        assert!(!store.is_applicable(push_old.stream, push_old.revision));
+        store.mark_applied(&push_new);
+        assert!(!store.is_applicable(&push_old));
         let applicable = store.take_applicable_pending_sorted();
         assert!(
             applicable.is_empty(),
@@ -750,10 +744,10 @@ mod tests {
         let cmd = store.wrap_command(TrackWorkerCommand::ApplyWalletPin { mint });
         assert_eq!(cmd.stream, TrackCommandStream::Wallet);
         assert!(!track_protocol_should_advance_revision(cmd.stream, false));
-        assert!(store.is_applicable(cmd.stream, cmd.revision));
+        assert!(store.is_applicable(&cmd));
         assert!(track_protocol_should_advance_revision(cmd.stream, true));
-        store.mark_applied(cmd.stream, cmd.revision);
-        assert!(!store.is_applicable(cmd.stream, cmd.revision));
+        store.mark_applied(&cmd);
+        assert!(!store.is_applicable(&cmd));
     }
 
     #[test]
@@ -763,7 +757,7 @@ mod tests {
         let cmd = store.wrap_command(TrackWorkerCommand::TrackMint { mint, pin: None });
         assert_eq!(cmd.stream, TrackCommandStream::Tracker);
         assert!(!track_protocol_should_advance_revision(cmd.stream, false));
-        assert!(store.is_applicable(cmd.stream, cmd.revision));
+        assert!(store.is_applicable(&cmd));
     }
 
     struct WalletReplayTestCtx {
@@ -1014,7 +1008,7 @@ mod tests {
         {
             let store = protocol.lock().expect("lock");
             assert!(
-                store.is_applicable(cmd.stream, cmd.revision),
+                store.is_applicable(&cmd),
                 "failed wallet pin must not advance revision"
             );
             assert_eq!(
@@ -1038,7 +1032,7 @@ mod tests {
         {
             let store = protocol.lock().expect("lock");
             assert!(
-                !store.is_applicable(cmd.stream, cmd.revision),
+                !store.is_applicable(&cmd),
                 "successful wallet pin must advance revision"
             );
         }
@@ -1283,7 +1277,7 @@ mod tests {
                 "idempotent tracker mint must not re-stage pending"
             );
             assert!(
-                !store.is_applicable(cmd.stream, cmd.revision),
+                !store.is_applicable(&cmd),
                 "each tracker mint command must advance revision"
             );
         }
@@ -1298,9 +1292,9 @@ mod tests {
             TrackWorkerCommand::ContinueGeyserEvict,
         ] {
             let cmd = store.wrap_command(payload);
-            store.mark_applied(cmd.stream, cmd.revision);
+            store.mark_applied(&cmd);
             assert!(
-                !store.is_applicable(cmd.stream, cmd.revision),
+                !store.is_applicable(&cmd),
                 "applied revision must not remain applicable"
             );
         }
