@@ -148,6 +148,16 @@ impl RevisionAssigner {
         self.next[idx] = rev;
         rev
     }
+
+    /// Highest revision already assigned for a per-mint wallet/tracker stream (0 if none).
+    pub fn last_issued_revision_for_mint(&self, stream: TrackCommandStream, mint: Pubkey) -> u64 {
+        let map = match stream {
+            TrackCommandStream::Wallet => &self.wallet_mint_next,
+            TrackCommandStream::Tracker => &self.tracker_mint_next,
+            _ => return 0,
+        };
+        *map.get(&mint).unwrap_or(&0)
+    }
 }
 
 #[cfg(test)]

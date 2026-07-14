@@ -133,6 +133,37 @@ impl BoundedProtocolStore {
         }
     }
 
+    /// Wallet pin/withdraw supersedes unpinned tracker demand for the same mint (cross-stream).
+    pub fn supersede_tracker_demand_for_mint(&mut self, mint: Pubkey) {
+        let mut watermark = *self.last_applied_tracker_mint.get(&mint).unwrap_or(&0);
+        watermark = watermark.max(
+            self.revision
+                .last_issued_revision_for_mint(TrackCommandStream::Tracker, mint),
+        );
+        for cmd in &self.pending {
+            if cmd.stream == TrackCommandStream::Tracker
+                && demand_mint_for_command(&cmd.payload) == Some(mint)
+            {
+                watermark = watermark.max(cmd.revision);
+            }
+        }
+        if watermark > 0 {
+            let entry = self.last_applied_tracker_mint.entry(mint).or_insert(0);
+            if watermark > *entry {
+                *entry = watermark;
+            }
+        }
+    }
+
+    /// Mark wallet demand applied and supersede stale tracker protocol demand for the mint.
+    pub fn mark_applied_wallet_demand(&mut self, cmd: &ImmutableTrackCommand) {
+        debug_assert_eq!(cmd.stream, TrackCommandStream::Wallet);
+        self.mark_applied(cmd);
+        if let Some(mint) = demand_mint_for_command(&cmd.payload) {
+            self.supersede_tracker_demand_for_mint(mint);
+        }
+    }
+
     pub fn begin_inflight(&mut self) {
         self.inflight = self.inflight.saturating_add(1);
         set_market_data_track_protocol_inflight_depth(self.inflight);
@@ -335,6 +366,37 @@ mod tests {
             demand_mint_for_command(&applicable[0].payload),
             Some(mint_a)
         );
+    }
+
+    #[test]
+    fn wallet_withdraw_supersedes_pending_tracker_demand_for_same_mint() {
+        let mut store = BoundedProtocolStore::new(8, 64);
+        let mint = Pubkey::new_unique();
+        let tracker = store.wrap_command(TrackWorkerCommand::TrackMint { mint, pin: None });
+        store.stage_on_queue_full(tracker.clone());
+        let withdraw = store.wrap_command(TrackWorkerCommand::WithdrawWalletPin { mint });
+        store.mark_applied_wallet_demand(&withdraw);
+        assert!(
+            !store.is_applicable(&tracker),
+            "wallet withdraw must supersede pending tracker demand for same mint"
+        );
+        let applicable = store.take_applicable_pending_sorted();
+        assert!(
+            applicable.is_empty(),
+            "superseded tracker demand must not replay after wallet withdraw"
+        );
+    }
+
+    #[test]
+    fn wallet_pin_supersedes_pending_tracker_demand_for_same_mint() {
+        let mut store = BoundedProtocolStore::new(8, 64);
+        let mint = Pubkey::new_unique();
+        let tracker = store.wrap_command(TrackWorkerCommand::TrackMint { mint, pin: None });
+        store.stage_on_queue_full(tracker.clone());
+        let pin = store.wrap_command(TrackWorkerCommand::ApplyWalletPin { mint });
+        store.mark_applied_wallet_demand(&pin);
+        assert!(!store.is_applicable(&tracker));
+        assert!(store.take_applicable_pending_sorted().is_empty());
     }
 
     #[test]
