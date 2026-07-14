@@ -2732,7 +2732,9 @@ impl MarketDataContext {
         }
         let _ = admission.remove_group(Self::tracker_mint_owner(mint));
         inc_market_data_wallet_admission_admitted_total();
-        self.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet))
+        let _ = self.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet));
+        // Idempotent wallet pin / LRU refresh must not fail protocol replay (I-MD-5).
+        true
     }
 
     /// PR4b: explicit wallet-pin withdrawal — admission refresh then map removal.
@@ -2777,7 +2779,9 @@ impl MarketDataContext {
                     }
                     inc_market_data_tracker_admission_admitted_total();
                 }
-                self.track_mint_for_geyser_metadata(mint, None)
+                let _ = self.track_mint_for_geyser_metadata(mint, None);
+                // Unpinned tracker LRU refresh / already-tracked mint is idempotent success.
+                true
             }
             Some(TrackPinReason::Wallet) => self.apply_wallet_pin(admission, mint),
             Some(other) => {
@@ -15298,6 +15302,33 @@ mod pr_b_geyser_tracking_tests {
     #[test]
     fn pr4b_consumer_id_for_unpinned_mint_is_tracker() {
         assert_eq!(consumer_id_for_geyser_pin(None), ConsumerId::Tracker);
+    }
+
+    #[test]
+    fn pr4b_repeated_track_mint_unpinned_is_idempotent_success() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let mint = Pubkey::new_unique();
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        assert!(ctx.apply_track_mint(&mut admission, mint, None));
+        assert!(ctx.tracked_mints.read().contains_key(&mint));
+        assert!(ctx.apply_track_mint(&mut admission, mint, None));
+    }
+
+    #[test]
+    fn pr4b_repeated_wallet_pin_is_idempotent_success() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let mint = Pubkey::new_unique();
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        assert!(ctx.apply_wallet_pin(&mut admission, mint));
+        assert!(ctx.apply_wallet_pin(&mut admission, mint));
     }
 
     /// PR4b: tracker snapshot rows restore as unpinned mints, not arb-pinned.

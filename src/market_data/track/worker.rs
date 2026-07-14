@@ -1046,6 +1046,250 @@ mod tests {
     }
 
     #[test]
+    fn repeated_tracker_mint_advances_revision_without_pending_growth() {
+        struct TrackerIdempotentCtx;
+
+        impl TrackWorkerContext for TrackerIdempotentCtx {
+            fn geyser_sync_batch_debounce_ms(&self) -> u64 {
+                0
+            }
+
+            fn max_tracked_accounts(&self) -> usize {
+                25_000
+            }
+
+            fn apply_momentum_active_pools_update(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _update: &MomentumActivePoolsUpdate,
+            ) -> bool {
+                false
+            }
+
+            fn apply_momentum_snapshot_reconcile(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _active: &[MomentumActivePoolEntry],
+            ) -> bool {
+                false
+            }
+
+            fn apply_momentum_removed_entries(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _chunk: &[MomentumRemovedPoolEntry],
+            ) -> bool {
+                false
+            }
+
+            fn apply_momentum_active_entries(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _chunk: &[MomentumActivePoolEntry],
+            ) -> bool {
+                false
+            }
+
+            fn apply_arb_track_requests_update(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _update: &ArbTrackRequestsUpdate,
+            ) -> bool {
+                false
+            }
+
+            fn apply_arb_snapshot_reconcile(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _active: &[ArbTrackActiveEntry],
+            ) -> bool {
+                false
+            }
+
+            fn apply_arb_removed_entries(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _chunk: &[ArbTrackRemovedEntry],
+            ) -> bool {
+                false
+            }
+
+            fn apply_arb_active_entries(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _chunk: &[ArbTrackActiveEntry],
+            ) -> bool {
+                false
+            }
+
+            fn apply_wallet_pin(&self, _admission: &mut FixedCapAdmission, _mint: Pubkey) -> bool {
+                true
+            }
+
+            fn withdraw_wallet_pin(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _mint: Pubkey,
+            ) -> bool {
+                true
+            }
+
+            fn apply_track_mint(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _mint: Pubkey,
+                _pin: Option<TrackPinReason>,
+            ) -> bool {
+                true
+            }
+
+            fn refresh_geyser_pins_gauge(&self) {}
+
+            fn hot_pool_registry_pair_count(&self) -> usize {
+                0
+            }
+
+            fn hot_pool_registry_arb_pool_count(&self) -> usize {
+                0
+            }
+
+            fn refresh_hot_pool_registry_gauges(&self) {}
+
+            fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
+                HashSet::new()
+            }
+
+            fn pending_geyser_evict(&self) -> bool {
+                false
+            }
+
+            fn sync_geyser_tracked_accounts_batched_flush_with_deadline(
+                &self,
+                _deadline: Instant,
+                _admission: &FixedCapAdmission,
+            ) -> bool {
+                true
+            }
+
+            fn continue_geyser_evict_with_deadline(
+                &self,
+                _deadline: Instant,
+                _admission: &FixedCapAdmission,
+            ) -> bool {
+                true
+            }
+
+            fn release_geyser_sync_flush_slot(&self) {}
+
+            fn refresh_tracked_membership_snapshot(&self) {}
+
+            fn explicit_pubkey_rows_for_desired_set(
+                &self,
+            ) -> Vec<(
+                Pubkey,
+                crate::market_data::track::ConsumerId,
+                Option<Pubkey>,
+            )> {
+                Vec::new()
+            }
+
+            fn build_explicit_set_snapshot(
+                &self,
+                _admission: &FixedCapAdmission,
+            ) -> super::ExplicitSetSnapshot {
+                super::ExplicitSetSnapshot::new(None)
+            }
+
+            fn apply_explicit_set_snapshot(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _snapshot: &super::ExplicitSetSnapshot,
+            ) -> AdmissionRestoreResult {
+                AdmissionRestoreResult::Restored
+            }
+
+            fn apply_explicit_set_snapshot_legacy(
+                &self,
+                _snapshot: &super::ExplicitSetSnapshot,
+            ) -> usize {
+                0
+            }
+
+            fn on_admission_converge_result(
+                &self,
+                _admission: &FixedCapAdmission,
+                _result: AdmissionConvergeResult,
+            ) {
+            }
+
+            fn prune_tracked_maps_to_admitted(&self, _admission: &FixedCapAdmission) {}
+
+            fn publish_admitted_explicit_physical(&self, _admission: &FixedCapAdmission) {}
+
+            fn last_synced_explicit_pubkeys_write(
+                &self,
+            ) -> parking_lot::RwLockWriteGuard<'_, HashSet<Pubkey>> {
+                static KEYS: std::sync::LazyLock<parking_lot::RwLock<HashSet<Pubkey>>> =
+                    std::sync::LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
+                KEYS.write()
+            }
+
+            fn clear_pending_geyser_evict(&self) {}
+
+            fn geyser_explicit_readiness_ok(&self) -> bool {
+                true
+            }
+
+            fn geyser_connect_barrier_pending(&self) -> bool {
+                false
+            }
+
+            fn signal_restore_barrier(&self, _ok: bool) {}
+
+            fn apply_explicit_cap_shrink(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _new_cap: usize,
+            ) -> CapShrinkResult {
+                CapShrinkResult::NoOpAlreadyWithinCap {
+                    old_cap: 25_000,
+                    new_cap: 25_000,
+                }
+            }
+        }
+
+        let ctx = Arc::new(TrackerIdempotentCtx);
+        let protocol = Arc::new(Mutex::new(BoundedProtocolStore::default_caps()));
+        let mint = Pubkey::new_unique();
+        let mut admission = FixedCapAdmission::new(25_000);
+        let mut restore_barrier_pending = false;
+
+        for _ in 0..2 {
+            let cmd = {
+                let mut store = protocol.lock().expect("lock");
+                store.wrap_command(TrackWorkerCommand::TrackMint { mint, pin: None })
+            };
+            track_worker_apply_protocol_command(
+                &ctx,
+                &protocol,
+                &mut admission,
+                &mut restore_barrier_pending,
+                cmd.clone(),
+            );
+            let store = protocol.lock().expect("lock");
+            assert_eq!(
+                store.pending_len(),
+                0,
+                "idempotent tracker mint must not re-stage pending"
+            );
+            assert!(
+                !store.is_applicable(cmd.stream, cmd.revision),
+                "each tracker mint command must advance revision"
+            );
+        }
+    }
+
+    #[test]
     fn control_push_evict_variants_advance_revision() {
         let mut store = BoundedProtocolStore::default_caps();
         for payload in [
