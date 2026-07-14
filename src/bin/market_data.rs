@@ -2724,6 +2724,7 @@ impl MarketDataContext {
             inc_market_data_wallet_admission_rejected_total();
             return false;
         }
+        let _ = admission.remove_group(Self::tracker_mint_owner(mint));
         inc_market_data_wallet_admission_admitted_total();
         self.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet))
     }
