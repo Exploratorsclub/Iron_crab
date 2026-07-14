@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 /// Context surface for the `md-state` OS thread worker loop.
 pub trait MdStateContext: Send + Sync {
-    fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey>;
+    fn snapshot_explicit_demand_pubkeys(&self) -> HashSet<Pubkey>;
     fn schedule_geyser_sync_batch_debounced(ctx: &Arc<Self>, md_state: &MdStateSender);
     fn refresh_hot_pool_registry_gauges(&self);
     fn refresh_tracked_membership_snapshot(&self);

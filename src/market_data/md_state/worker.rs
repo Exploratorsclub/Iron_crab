@@ -236,7 +236,7 @@ fn md_state_worker_loop<C: MdStateContext + 'static>(
         let schedule_sync_after_config = jobs
             .iter()
             .any(|job| matches!(job, MdStateCommand::ScheduleGeyserSyncAfterConfigChange));
-        let before_keys = ctx.snapshot_explicit_subscription_pubkeys();
+        let before_keys = ctx.snapshot_explicit_demand_pubkeys();
         let job_deadline =
             Instant::now() + Duration::from_millis(MARKET_DATA_MD_STATE_JOB_BUDGET_MS);
         let mut deferred_this_burst = VecDeque::new();
@@ -254,7 +254,7 @@ fn md_state_worker_loop<C: MdStateContext + 'static>(
         while let Some(job) = deferred_this_burst.pop_front() {
             deferred_jobs.push_back(job);
         }
-        let after_keys = ctx.snapshot_explicit_subscription_pubkeys();
+        let after_keys = ctx.snapshot_explicit_demand_pubkeys();
         if explicit_subscription_has_new_keys(&before_keys, &after_keys)
             || schedule_sync_after_config
         {

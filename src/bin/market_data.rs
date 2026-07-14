@@ -23,7 +23,7 @@ use clap::Parser;
 use serde::Serialize;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -93,18 +93,15 @@ use ironcrab::market_data::track::{
 use ironcrab::metrics::{
     dec_market_data_account_high_priority_queue_depth,
     dec_market_data_account_low_priority_queue_depth, dec_market_data_account_worker_queue_depth,
-    geyser_account_listener_account_updates_value, geyser_metrics_inc_tracked_evicted,
-    geyser_metrics_set_subscription_accounts, geyser_metrics_set_tracked_pinned_accounts,
-    inc_market_data_account_high_priority_queue_depth,
+    geyser_account_listener_account_updates_value, geyser_metrics_set_subscription_accounts,
+    geyser_metrics_set_tracked_pinned_accounts, inc_market_data_account_high_priority_queue_depth,
     inc_market_data_account_low_priority_queue_depth, inc_market_data_account_worker_queue_depth,
     inc_market_data_arb_admission_admitted_total, inc_market_data_arb_admission_rejected_total,
     inc_market_data_arb_pin_geyser_register_deferred_total,
-    inc_market_data_balance_updated_from_cache_total, inc_market_data_geyser_sync_partial_total,
+    inc_market_data_balance_updated_from_cache_total,
     inc_market_data_geyser_sync_skipped_rate_limit_total,
     inc_market_data_ingest_membership_snapshot_hits_total,
-    inc_market_data_jsonl_enqueue_dropped_total,
-    inc_market_data_md_state_evict_steps_budget_exhausted_total,
-    inc_market_data_md_state_evict_steps_total, inc_market_data_momentum_admission_admitted_total,
+    inc_market_data_jsonl_enqueue_dropped_total, inc_market_data_momentum_admission_admitted_total,
     inc_market_data_momentum_admission_rejected_total,
     inc_market_data_tracker_admission_admitted_total,
     inc_market_data_tracker_admission_rejected_total,
@@ -119,8 +116,8 @@ use ironcrab::metrics::{
     record_market_data_account_handler_duration_us,
     record_market_data_arb_track_requests_messages_total,
     record_market_data_geyser_merge_coalesced_total, record_market_data_geyser_sync_batch_total,
-    record_market_data_geyser_sync_immediate_total, record_market_data_global_ingest_stall,
-    record_market_data_md_state_stall, record_market_data_md_state_writer_wait_us,
+    record_market_data_global_ingest_stall, record_market_data_md_state_stall,
+    record_market_data_md_state_writer_wait_us,
     record_market_data_momentum_active_pool_messages_total,
     record_market_data_tokio_liveness_stall, record_market_data_tokio_progress,
     record_market_data_tx_broadcast_lagged, serve_metrics,
@@ -131,14 +128,12 @@ use ironcrab::metrics::{
     set_market_data_geyser_explicit_admitted_accounts,
     set_market_data_geyser_explicit_cap_overflow, set_market_data_geyser_explicit_set_size,
     set_market_data_geyser_merge_pending, set_market_data_geyser_sync_pending,
-    set_market_data_hot_pool_registry_pools_gauge, set_market_data_md_state_evict_pending,
-    set_market_data_momentum_active_pool_pins_gauge, set_market_data_tx_broadcast_queue_depth,
-    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
-    touch_market_data_global_ingest_progress,
+    set_market_data_hot_pool_registry_pools_gauge, set_market_data_momentum_active_pool_pins_gauge,
+    set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
+    set_readiness_nats_connected, touch_market_data_global_ingest_progress,
     touch_market_data_tracked_membership_snapshot_refresh, update_readiness_market_data_current,
-    GeyserTrackedEvictKind, MarketDataLatencySegment, MetricsComponent,
-    MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_RECEIVED_TOTAL,
-    POOLS_TRACKED_GAUGE,
+    MarketDataLatencySegment, MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
+    MARKET_EVENTS_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -187,8 +182,6 @@ const MARKET_DATA_GEYSER_SYNC_STARTUP_WINDOW: Duration = Duration::from_secs(120
 const MARKET_DATA_GEYSER_SYNC_STARTUP_MIN_MS: u64 = 250;
 /// PR233: max debounced Geyser sync flushes per second during startup burst.
 const MARKET_DATA_GEYSER_SYNC_FLUSH_MAX_PER_SEC: usize = 4;
-/// PR234: max LRU eviction steps per sync/evict slice on md-state.
-const MARKET_DATA_GEYSER_EVICT_MAX_STEPS_PER_FLUSH: usize = 16;
 /// PR234: md-state liveness poll interval (OS thread).
 const MARKET_DATA_MD_STATE_STALL_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// PR234: queue near-cap + flat progress before stall metric.
@@ -1129,12 +1122,8 @@ struct MarketDataContext {
 
     /// PR164: dedupe `PoolCreated` NATS/JSONL for the same pool (account-path vault spam).
     pool_discovery_poolcreated_emitted: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
-    /// Explicit Geyser subscription pubkeys after last [`Self::sync_geyser_tracked_accounts_core`] flush.
+    /// Explicit Geyser subscription pubkeys after last admitted physical publish (SSOT).
     last_synced_explicit_pubkeys: parking_lot::RwLock<HashSet<Pubkey>>,
-    /// PR234: LRU eviction to cap incomplete — resume on next flush/`ContinueGeyserEvict`.
-    pending_geyser_evict: AtomicBool,
-    /// PR235: min-heap LRU index for O(log n) eviction (vault/bin/mint).
-    geyser_lru_index: parking_lot::Mutex<GeyserLruIndex>,
     /// PR235: skip redundant momentum snapshot reconcile when target set unchanged.
     last_momentum_snapshot_target: parking_lot::RwLock<Option<HashSet<(Pubkey, Pubkey)>>>,
     /// Phase 3: skip redundant arb snapshot reconcile when target pool set unchanged.
@@ -1398,86 +1387,6 @@ struct TrackedMembershipSnapshot {
 struct PoolTrackedLegs {
     vaults: Vec<Pubkey>,
     bin_arrays: Vec<Pubkey>,
-}
-
-/// PR235: O(log n) global LRU min-heap for Geyser explicit-account eviction (lazy stale pop).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum GeyserLruKind {
-    Vault,
-    Bin,
-    Mint,
-}
-
-#[derive(Clone, Copy)]
-struct GeyserLruHeapEntry {
-    last_used_at: Instant,
-    kind: GeyserLruKind,
-    pubkey: Pubkey,
-}
-
-impl PartialEq for GeyserLruHeapEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.last_used_at == other.last_used_at
-            && self.kind == other.kind
-            && self.pubkey == other.pubkey
-    }
-}
-
-impl Eq for GeyserLruHeapEntry {}
-
-impl PartialOrd for GeyserLruHeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for GeyserLruHeapEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other
-            .last_used_at
-            .cmp(&self.last_used_at)
-            .then_with(|| self.pubkey.cmp(&other.pubkey))
-    }
-}
-
-#[derive(Default)]
-struct GeyserLruIndex {
-    heap: BinaryHeap<GeyserLruHeapEntry>,
-}
-
-impl GeyserLruIndex {
-    fn note(&mut self, kind: GeyserLruKind, pubkey: Pubkey, last_used_at: Instant) {
-        self.heap.push(GeyserLruHeapEntry {
-            last_used_at,
-            kind,
-            pubkey,
-        });
-    }
-
-    fn pop_lru_candidate(
-        &mut self,
-        vaults: &std::collections::HashMap<Pubkey, VaultInfo>,
-        bins: &std::collections::HashMap<Pubkey, BinArrayInfo>,
-        mints: &std::collections::HashMap<Pubkey, MintTrackInfo>,
-    ) -> Option<GeyserLruHeapEntry> {
-        while let Some(entry) = self.heap.pop() {
-            let still_lru = match entry.kind {
-                GeyserLruKind::Vault => vaults
-                    .get(&entry.pubkey)
-                    .is_some_and(|v| !v.pinned && v.last_used_at == entry.last_used_at),
-                GeyserLruKind::Bin => bins
-                    .get(&entry.pubkey)
-                    .is_some_and(|b| !b.pinned && b.last_used_at == entry.last_used_at),
-                GeyserLruKind::Mint => mints
-                    .get(&entry.pubkey)
-                    .is_some_and(|m| !m.pinned && m.last_used_at == entry.last_used_at),
-            };
-            if still_lru {
-                return Some(entry);
-            }
-        }
-        None
-    }
 }
 
 /// Extract normalized balance fields from MASTER cache for JetStream BalanceUpdated.
@@ -2037,11 +1946,7 @@ impl TrackWorkerContext for MarketDataContext {
     }
 
     fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
-        self.snapshot_explicit_subscription_pubkeys()
-    }
-
-    fn pending_geyser_evict(&self) -> bool {
-        self.pending_geyser_evict.load(Ordering::Relaxed)
+        MarketDataContext::snapshot_explicit_subscription_pubkeys(self)
     }
 
     fn continue_geyser_evict_with_deadline(
@@ -2077,15 +1982,12 @@ impl TrackWorkerContext for MarketDataContext {
         MarketDataContext::build_explicit_set_snapshot(self, admission)
     }
 
-    fn apply_explicit_set_snapshot_legacy(&self, snapshot: &ExplicitSetSnapshot) -> usize {
-        self.apply_explicit_set_snapshot_impl(snapshot)
-    }
-
     fn apply_explicit_set_snapshot(
         &self,
         admission: &mut FixedCapAdmission,
         snapshot: &ExplicitSetSnapshot,
     ) -> AdmissionRestoreResult {
+        self.restore_tracked_maps_from_snapshot_rows(snapshot);
         MarketDataContext::restore_explicit_admission_from_snapshot(self, admission, snapshot)
     }
 
@@ -2109,11 +2011,6 @@ impl TrackWorkerContext for MarketDataContext {
         &self,
     ) -> parking_lot::RwLockWriteGuard<'_, HashSet<Pubkey>> {
         self.last_synced_explicit_pubkeys.write()
-    }
-
-    fn clear_pending_geyser_evict(&self) {
-        self.pending_geyser_evict.store(false, Ordering::Relaxed);
-        set_market_data_md_state_evict_pending(false);
     }
 
     fn geyser_explicit_readiness_ok(&self) -> bool {
@@ -2531,8 +2428,8 @@ impl AccountIngestHost for MarketDataContext {
 }
 
 impl MdStateContext for MarketDataContext {
-    fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
-        MarketDataContext::snapshot_explicit_subscription_pubkeys(self)
+    fn snapshot_explicit_demand_pubkeys(&self) -> HashSet<Pubkey> {
+        MarketDataContext::snapshot_explicit_demand_pubkeys(self)
     }
 
     fn schedule_geyser_sync_batch_debounced(ctx: &Arc<Self>, md_state: &MdStateSender) {
@@ -2827,6 +2724,11 @@ impl MarketDataContext {
     }
 
     fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
+        self.last_synced_explicit_pubkeys.read().clone()
+    }
+
+    /// Tracked-map demand pubkeys (pre-admission); for internal delta detection only.
+    fn snapshot_explicit_demand_pubkeys(&self) -> HashSet<Pubkey> {
         let mut set = HashSet::new();
         set.extend(self.tracked_mints.read().keys().copied());
         set.extend(self.tracked_vaults.read().keys().copied());
@@ -2887,7 +2789,7 @@ impl MarketDataContext {
             .collect()
     }
 
-    fn apply_explicit_set_snapshot_impl(&self, snapshot: &ExplicitSetSnapshot) -> usize {
+    fn restore_tracked_maps_from_snapshot_rows(&self, snapshot: &ExplicitSetSnapshot) -> usize {
         let now = Instant::now();
         let mut restored = 0usize;
         for (pool, mint) in &snapshot.pool_mint_map {
@@ -3000,7 +2902,6 @@ impl MarketDataContext {
                 }
             }
         }
-        self.broadcast_tracked_geyser_explicit_to_merge();
         self.refresh_tracked_membership_snapshot();
         self.refresh_hot_pool_registry_gauges();
         restored
@@ -3575,13 +3476,6 @@ impl MarketDataContext {
         }
     }
 
-    fn combined_geyser_explicit_accounts(&self) -> usize {
-        self.tracked_vaults.read().len()
-            + self.tracked_bin_arrays.read().len()
-            + self.tracked_mints.read().len()
-            + self.count_geyser_wallet_explicit_accounts()
-    }
-
     fn refresh_geyser_pins_gauge(&self) {
         let mut pinned: usize = 0;
         pinned += self
@@ -3607,8 +3501,9 @@ impl MarketDataContext {
         geyser_metrics_set_tracked_pinned_accounts(pinned);
     }
 
-    /// Partner vault (opposite base/quote leg) eligible for paired LRU eviction.
+    /// Partner vault (opposite base/quote leg) eligible for paired eviction.
     /// Never returns a pinned sibling — pinned vaults must stay subscribed.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn geyser_unpinned_sibling_vault_pubkey(
         vaults: &std::collections::HashMap<Pubkey, VaultInfo>,
         pool: Pubkey,
@@ -3623,7 +3518,7 @@ impl MarketDataContext {
     }
 
     /// Whether a **pinned** partner vault exists for the same pool (opposite leg).
-    /// Used after evicting an unpinned vault to detect half-pair subscription (documented `warn!`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn geyser_pinned_sibling_vault_present(
         vaults: &std::collections::HashMap<Pubkey, VaultInfo>,
         pool: Pubkey,
@@ -3632,237 +3527,6 @@ impl MarketDataContext {
         vaults.values().any(|vi| {
             vi.pool_address == pool && vi.is_base_vault != primary_is_base_vault && vi.pinned
         })
-    }
-
-    /// PR-B / PR234 / PR235: one LRU eviction step via min-heap (no full-map scan).
-    fn evict_one_geyser_lru_step(&self) -> bool {
-        let cap = self.config.read().max_tracked_accounts;
-        if self.combined_geyser_explicit_accounts() <= cap {
-            return false;
-        }
-        let run_id = self.run_id.clone();
-
-        let vaults_read = self.tracked_vaults.read();
-        let bins_read = self.tracked_bin_arrays.read();
-        let mints_read = self.tracked_mints.read();
-        let candidate = {
-            let mut index = self.geyser_lru_index.lock();
-            index.pop_lru_candidate(&vaults_read, &bins_read, &mints_read)
-        };
-        drop(vaults_read);
-        drop(bins_read);
-        drop(mints_read);
-
-        let Some(entry) = candidate else {
-            error!(
-                run_id = %run_id,
-                cap,
-                combined = self.combined_geyser_explicit_accounts(),
-                "geyser_evict: cannot reach cap — only pinned explicit accounts remain (no LRU candidates)"
-            );
-            self.pending_geyser_evict.store(false, Ordering::Relaxed);
-            set_market_data_md_state_evict_pending(false);
-            return false;
-        };
-
-        let oldest_at = entry.last_used_at;
-        match entry.kind {
-            GeyserLruKind::Vault => {
-                let mut vaults = self.tracked_vaults.write();
-                match vaults.get(&entry.pubkey) {
-                    None => return false,
-                    Some(v) if v.pinned => return false,
-                    Some(_) => {}
-                }
-                if let Some(v) = vaults.remove(&entry.pubkey) {
-                    geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Vault);
-                    info!(
-                        run_id = %run_id,
-                        pool = %v.pool_address,
-                        mint = %v.base_mint,
-                        vault = %entry.pubkey,
-                        reason = "lru_cap",
-                        oldest_age_ms = ?oldest_at.elapsed().as_millis(),
-                        "geyser_evicted"
-                    );
-                    let pool = v.pool_address;
-                    self.pool_tracked_legs_remove_vault(pool, entry.pubkey);
-                    let this_is_base = v.is_base_vault;
-                    let sibling_pk =
-                        Self::geyser_unpinned_sibling_vault_pubkey(&vaults, pool, this_is_base);
-                    if let Some(spk) = sibling_pk {
-                        let remove_sibling = vaults.get(&spk).map(|sv| !sv.pinned).unwrap_or(false);
-                        if remove_sibling {
-                            if let Some(sv) = vaults.remove(&spk) {
-                                geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Vault);
-                                info!(
-                                    run_id = %run_id,
-                                    pool = %sv.pool_address,
-                                    mint = %sv.base_mint,
-                                    vault = %spk,
-                                    reason = "lru_cap_pair",
-                                    oldest_age_ms = ?oldest_at.elapsed().as_millis(),
-                                    "geyser_evicted"
-                                );
-                                self.pool_tracked_legs_remove_vault(sv.pool_address, spk);
-                            }
-                        }
-                    } else if Self::geyser_pinned_sibling_vault_present(&vaults, pool, this_is_base)
-                    {
-                        warn!(
-                            run_id = %run_id,
-                            pool = %pool,
-                            evicted_vault = %entry.pubkey,
-                            evicted_was_base_vault = this_is_base,
-                            "geyser_evict: removed unpinned vault but pinned sibling vault remains tracked (half-pair subscription)"
-                        );
-                    }
-                }
-            }
-            GeyserLruKind::Bin => {
-                let mut bins = self.tracked_bin_arrays.write();
-                match bins.get(&entry.pubkey) {
-                    None => return false,
-                    Some(b) if b.pinned => return false,
-                    Some(_) => {}
-                }
-                if let Some(b) = bins.remove(&entry.pubkey) {
-                    geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::BinArray);
-                    info!(
-                        run_id = %run_id,
-                        pool = %b.pool_address,
-                        bin_array = %entry.pubkey,
-                        reason = "lru_cap",
-                        "geyser_evicted"
-                    );
-                    self.pool_tracked_legs_remove_bin(b.pool_address, entry.pubkey);
-                }
-            }
-            GeyserLruKind::Mint => {
-                let mut mints = self.tracked_mints.write();
-                match mints.get(&entry.pubkey) {
-                    None => return false,
-                    Some(m) if m.pinned => return false,
-                    Some(_) => {}
-                }
-                if mints.remove(&entry.pubkey).is_some() {
-                    geyser_metrics_inc_tracked_evicted(GeyserTrackedEvictKind::Mint);
-                    info!(
-                        run_id = %run_id,
-                        mint = %entry.pubkey,
-                        reason = "lru_cap",
-                        "geyser_evicted"
-                    );
-                }
-            }
-        }
-        true
-    }
-
-    fn geyser_lru_note_vault(&self, pubkey: Pubkey, last_used_at: Instant) {
-        self.geyser_lru_index
-            .lock()
-            .note(GeyserLruKind::Vault, pubkey, last_used_at);
-    }
-
-    fn geyser_lru_note_bin(&self, pubkey: Pubkey, last_used_at: Instant) {
-        self.geyser_lru_index
-            .lock()
-            .note(GeyserLruKind::Bin, pubkey, last_used_at);
-    }
-
-    fn geyser_lru_note_mint(&self, pubkey: Pubkey, last_used_at: Instant) {
-        self.geyser_lru_index
-            .lock()
-            .note(GeyserLruKind::Mint, pubkey, last_used_at);
-    }
-
-    /// PR234: budgeted LRU eviction — max steps and wall deadline per md-state slice.
-    fn evict_geyser_unpinned_lru_budgeted(&self, deadline: Instant) -> bool {
-        let cap = self.config.read().max_tracked_accounts;
-        let mut steps = 0usize;
-        while self.combined_geyser_explicit_accounts() > cap
-            && steps < MARKET_DATA_GEYSER_EVICT_MAX_STEPS_PER_FLUSH
-            && Instant::now() < deadline
-        {
-            if !self.evict_one_geyser_lru_step() {
-                break;
-            }
-            steps += 1;
-            std::thread::yield_now();
-        }
-        if steps > 0 {
-            inc_market_data_md_state_evict_steps_total(steps as u64);
-        }
-        let cap_reached = self.combined_geyser_explicit_accounts() <= cap;
-        if cap_reached {
-            self.pending_geyser_evict.store(false, Ordering::Relaxed);
-            set_market_data_md_state_evict_pending(false);
-        } else {
-            self.pending_geyser_evict.store(true, Ordering::Relaxed);
-            set_market_data_md_state_evict_pending(true);
-            inc_market_data_md_state_evict_steps_budget_exhausted_total();
-        }
-        cap_reached
-    }
-
-    /// Push current explicit tracked keys to all merge-task channels after eviction.
-    /// Cross-type LRU can evict vaults/bin-arrays/mints from any map; callers must run
-    /// [`Self::sync_geyser_tracked_accounts`] so every channel refreshes and the combined Geyser
-    /// subscription list stays in sync.
-    fn broadcast_tracked_geyser_explicit_to_merge(&self) {
-        let mints: Vec<Pubkey> = self.tracked_mints.read().keys().copied().collect();
-        let vaults: Vec<Pubkey> = self.tracked_vaults.read().keys().copied().collect();
-        let bins: Vec<Pubkey> = self.tracked_bin_arrays.read().keys().copied().collect();
-        let _ = self.tracked_mints_tx.send(mints);
-        let _ = self.tracked_vaults_tx.send(vaults);
-        let _ = self.tracked_bin_arrays_tx.send(bins);
-        self.refresh_geyser_pins_gauge();
-    }
-
-    /// Returns true when eviction finished (cap OK or no LRU candidates) and broadcast/snapshot applied.
-    fn sync_geyser_tracked_accounts_core_with_deadline(&self, deadline: Instant) -> bool {
-        let cap_reached = self.evict_geyser_unpinned_lru_budgeted(deadline);
-        let evict_complete = cap_reached || !self.pending_geyser_evict.load(Ordering::Relaxed);
-        if evict_complete {
-            self.broadcast_tracked_geyser_explicit_to_merge();
-            *self.last_synced_explicit_pubkeys.write() =
-                self.snapshot_explicit_subscription_pubkeys();
-            true
-        } else {
-            inc_market_data_geyser_sync_partial_total();
-            false
-        }
-    }
-
-    #[allow(dead_code)] // legacy LRU path; track-worker uses admission flush via TrackWorkerContext
-    fn continue_geyser_evict_with_deadline(&self, deadline: Instant) -> bool {
-        self.sync_geyser_tracked_accounts_core_with_deadline(deadline)
-    }
-
-    /// Debounced TX-path flush on md-state: bounded eviction + broadcast when complete.
-    #[allow(dead_code)] // legacy LRU path; track-worker uses admission flush via TrackWorkerContext
-    fn sync_geyser_tracked_accounts_batched_flush_with_deadline(&self, deadline: Instant) -> bool {
-        set_market_data_geyser_sync_pending(0);
-        record_market_data_geyser_sync_batch_total();
-        self.sync_geyser_tracked_accounts_core_with_deadline(deadline)
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn sync_geyser_tracked_accounts_core(&self) {
-        let deadline = Instant::now() + Duration::from_secs(300);
-        while !self.sync_geyser_tracked_accounts_core_with_deadline(deadline)
-            && self.pending_geyser_evict.load(Ordering::Relaxed)
-        {
-            std::thread::yield_now();
-        }
-    }
-
-    /// Immediate subscription-list sync (momentum pins, wallet tracks, config, account-path admission, …).
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn sync_geyser_tracked_accounts(&self) {
-        record_market_data_geyser_sync_immediate_total();
-        self.sync_geyser_tracked_accounts_core();
     }
 
     /// PR167: longer debounce during startup pin burst (min 250 ms for first 120 s).
@@ -4044,13 +3708,11 @@ impl MarketDataContext {
                     pinned,
                     pin,
                 });
-                self.geyser_lru_note_mint(mint, now);
                 true
             }
             Entry::Occupied(mut e) => {
                 let v = e.get_mut();
                 v.last_used_at = now;
-                self.geyser_lru_note_mint(mint, now);
                 match pin {
                     None => false,
                     Some(GeyserPinReason::Wallet) => {
@@ -4091,14 +3753,10 @@ impl MarketDataContext {
         vaults_changed: &mut bool,
         spec: TrackedVaultPairInsert<'_>,
     ) {
-        let now = spec.now;
         let pool = spec.pool;
         let inserted = insert_tracked_vault_pair(vaults, vaults_changed, spec);
         for pk in &inserted {
             self.pool_tracked_legs_note_vault(pool, *pk);
-        }
-        for pk in inserted {
-            self.geyser_lru_note_vault(pk, now);
         }
     }
 
@@ -4107,7 +3765,6 @@ impl MarketDataContext {
         let mut vaults = self.tracked_vaults_write_timed();
         let sibling = if let Some(v) = vaults.get_mut(vault) {
             v.last_used_at = now;
-            self.geyser_lru_note_vault(*vault, now);
             v.sibling_vault
                 .filter(|sibling_pk| vaults.get(sibling_pk).is_some_and(|sv| !sv.pinned))
         } else {
@@ -4116,7 +3773,6 @@ impl MarketDataContext {
         if let Some(sibling_pk) = sibling {
             if let Some(sv) = vaults.get_mut(&sibling_pk) {
                 sv.last_used_at = now;
-                self.geyser_lru_note_vault(sibling_pk, now);
             }
         }
     }
@@ -4125,7 +3781,6 @@ impl MarketDataContext {
         let now = Instant::now();
         if let Some(b) = self.tracked_bin_arrays_write_timed().get_mut(pda) {
             b.last_used_at = now;
-            self.geyser_lru_note_bin(*pda, now);
         }
     }
 
@@ -4233,12 +3888,9 @@ impl MarketDataContext {
         if !self.admit_geyser_explicit_pool_assets(pool, base_mint, quote_mint) {
             return false;
         }
-        let before_keys = self.snapshot_explicit_subscription_pubkeys();
+        let before_keys = self.snapshot_explicit_demand_pubkeys();
         self.register_geyser_reserves_impl(pool, GeyserPinReason::MomentumActive);
-        explicit_subscription_has_new_keys(
-            &before_keys,
-            &self.snapshot_explicit_subscription_pubkeys(),
-        )
+        explicit_subscription_has_new_keys(&before_keys, &self.snapshot_explicit_demand_pubkeys())
     }
 
     /// RaydiumCpmm / MeteoraCpmm / Meteora DLMM / PumpAmm vault rows from a MASTER cache entry.
@@ -4413,7 +4065,7 @@ impl MarketDataContext {
             (cfg.enable_meteora_cpmm, cfg.enable_meteora_dlmm)
         };
         let now = Instant::now();
-        let before_keys = self.snapshot_explicit_subscription_pubkeys();
+        let before_keys = self.snapshot_explicit_demand_pubkeys();
         let _vaults_changed = self.register_four_dex_pool_vaults_from_cached_state(
             pool,
             &cached_state,
@@ -4422,10 +4074,7 @@ impl MarketDataContext {
             enable_meteora_dlmm,
             true,
         );
-        explicit_subscription_has_new_keys(
-            &before_keys,
-            &self.snapshot_explicit_subscription_pubkeys(),
-        )
+        explicit_subscription_has_new_keys(&before_keys, &self.snapshot_explicit_demand_pubkeys())
     }
 
     /// PR-D / Phase 3: explicit vault/bin subscriptions when cache has layout.
@@ -4498,7 +4147,6 @@ impl MarketDataContext {
             }
         }
         for pda in new_bins {
-            self.geyser_lru_note_bin(pda, now);
             self.pool_tracked_legs_note_bin(pool, pda);
         }
         if bins_changed {
@@ -7158,8 +6806,6 @@ async fn main() -> Result<()> {
             std::collections::HashSet::new(),
         ),
         last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
-        pending_geyser_evict: AtomicBool::new(false),
-        geyser_lru_index: parking_lot::Mutex::new(GeyserLruIndex::default()),
         last_momentum_snapshot_target: parking_lot::RwLock::new(None),
         last_arb_snapshot_target: parking_lot::RwLock::new(None),
         dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
@@ -10814,8 +10460,6 @@ mod wallet_snapshot_stale_cleanup_tests {
                 std::collections::HashSet::new(),
             ),
             last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
-            pending_geyser_evict: AtomicBool::new(false),
-            geyser_lru_index: parking_lot::Mutex::new(GeyserLruIndex::default()),
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
@@ -11039,8 +10683,6 @@ mod wallet_tx_meta_balance_tests {
                 std::collections::HashSet::new(),
             ),
             last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
-            pending_geyser_evict: AtomicBool::new(false),
-            geyser_lru_index: parking_lot::Mutex::new(GeyserLruIndex::default()),
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
@@ -11930,8 +11572,6 @@ mod pr_b_geyser_tracking_tests {
                 std::collections::HashSet::new(),
             ),
             last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
-            pending_geyser_evict: AtomicBool::new(false),
-            geyser_lru_index: parking_lot::Mutex::new(GeyserLruIndex::default()),
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
@@ -12007,8 +11647,6 @@ mod pr_b_geyser_tracking_tests {
                 std::collections::HashSet::new(),
             ),
             last_synced_explicit_pubkeys: parking_lot::RwLock::new(HashSet::new()),
-            pending_geyser_evict: AtomicBool::new(false),
-            geyser_lru_index: parking_lot::Mutex::new(GeyserLruIndex::default()),
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
@@ -12959,7 +12597,12 @@ mod pr_b_geyser_tracking_tests {
         assert!(MarketDataContext::register_geyser_reserves_after_trade(
             &ctx, pool
         ));
-        ctx.sync_geyser_tracked_accounts();
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        ironcrab::market_data::track::converge_admission_from_ctx(ctx.as_ref(), &mut admission);
+        ctx.prune_tracked_maps_to_admitted(&admission);
+        ctx.publish_admitted_explicit_physical(&admission);
+        *ctx.last_synced_explicit_pubkeys.write() =
+            admission.snapshot_pubkeys().into_iter().collect();
 
         assert!(
             ctx.pool_has_live_vault_geyser_feed(pool),
@@ -13097,31 +12740,6 @@ mod pr_b_geyser_tracking_tests {
         watch_task.abort();
         let _ = merge_task.await;
         let _ = watch_task.await;
-    }
-
-    /// PR161 / #158: `sync_geyser_tracked_accounts` counts as immediate sync, not batch.
-    #[tokio::test(flavor = "current_thread")]
-    async fn pr161_sync_geyser_tracked_accounts_increments_immediate_only() {
-        use ironcrab::metrics::{
-            MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL, MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL,
-        };
-
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
-        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
-        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
-
-        let batch0 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
-        let imm0 = MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed);
-        ctx.sync_geyser_tracked_accounts();
-        assert_eq!(
-            MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed),
-            imm0 + 1
-        );
-        assert_eq!(
-            MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed),
-            batch0
-        );
     }
 
     #[test]
@@ -14152,60 +13770,7 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(vaults.get(&quote_b).unwrap().last_used_at, old);
     }
 
-    /// PR234: budgeted eviction stops before cap and resumes on next slice.
-    #[test]
-    fn pr234_evict_budget_stops_and_sets_pending() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
-        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
-        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
-        {
-            let mut cfg = ctx.config.write();
-            cfg.max_tracked_accounts = 2;
-        }
-        let old = Instant::now() - Duration::from_secs(3600);
-        let mk_vault = |pool: Pubkey, is_base: bool| VaultInfo {
-            pool_address: pool,
-            dex: "x".into(),
-            base_mint: Pubkey::new_unique(),
-            quote_mint: Pubkey::new_unique(),
-            is_base_vault: is_base,
-            last_balance: std::sync::atomic::AtomicU64::new(0),
-            last_used_at: old,
-            pinned: false,
-            pin: None,
-            active_id: None,
-            bin_step: None,
-            sibling_vault: None,
-        };
-        {
-            let mut vaults = ctx.tracked_vaults.write();
-            for _ in 0..25 {
-                let pool = Pubkey::new_unique();
-                let pk = Pubkey::new_unique();
-                vaults.insert(pk, mk_vault(pool, true));
-                ctx.geyser_lru_note_vault(pk, old);
-            }
-        }
-        let combined_before = ctx.combined_geyser_explicit_accounts();
-        assert!(combined_before > 2);
-        let short_deadline = Instant::now() + Duration::from_secs(1);
-        let cap_reached = ctx.evict_geyser_unpinned_lru_budgeted(short_deadline);
-        assert!(!cap_reached);
-        assert!(ctx.pending_geyser_evict.load(Ordering::Relaxed));
-        assert!(ctx.combined_geyser_explicit_accounts() < combined_before);
-        assert!(ctx.combined_geyser_explicit_accounts() > 2);
-        let long_deadline = Instant::now() + Duration::from_secs(5);
-        while !ctx.evict_geyser_unpinned_lru_budgeted(long_deadline)
-            && ctx.pending_geyser_evict.load(Ordering::Relaxed)
-        {
-            std::thread::yield_now();
-        }
-        assert!(ctx.combined_geyser_explicit_accounts() <= 2);
-        assert!(!ctx.pending_geyser_evict.load(Ordering::Relaxed));
-    }
-
-    /// PR234: debounced flush slot is released after md-state flush attempt.
+    /// PR234: debounced flush slot acquire/release and per-second rate cap.
     #[test]
     fn pr234_geyser_sync_flush_slot_acquire_flush_release() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -14215,9 +13780,6 @@ mod pr_b_geyser_tracking_tests {
         assert!(ctx.try_acquire_geyser_sync_flush_slot());
         let before = ctx.geyser_sync_flush_timestamps.lock().len();
         assert_eq!(before, 1);
-        let _ = ctx.sync_geyser_tracked_accounts_core_with_deadline(
-            Instant::now() + Duration::from_secs(1),
-        );
         ctx.release_geyser_sync_flush_slot();
         assert_eq!(ctx.geyser_sync_flush_timestamps.lock().len(), 0);
         for _ in 0..MARKET_DATA_GEYSER_SYNC_FLUSH_MAX_PER_SEC {
@@ -14256,61 +13818,6 @@ mod pr_b_geyser_tracking_tests {
             !acc_body.contains("sync_geyser_tracked_accounts_batched_flush"),
             "account handler must not call sync_geyser_tracked_accounts_batched_flush"
         );
-    }
-
-    /// PR235: LRU heap evicts 100 steps from 10k entries within ms budget (no full-map scan per step).
-    #[test]
-    fn pr235_lru_heap_evicts_10k_under_ms_budget() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
-        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
-        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
-        {
-            let mut cfg = ctx.config.write();
-            cfg.max_tracked_accounts = 100;
-        }
-        let base_time = Instant::now() - Duration::from_secs(7200);
-        {
-            let mut vaults = ctx.tracked_vaults.write();
-            for i in 0..10_000usize {
-                let pool = Pubkey::new_unique();
-                let pk = Pubkey::new_unique();
-                let at = base_time + Duration::from_millis(i as u64);
-                vaults.insert(
-                    pk,
-                    VaultInfo {
-                        pool_address: pool,
-                        dex: "x".into(),
-                        base_mint: Pubkey::new_unique(),
-                        quote_mint: Pubkey::new_unique(),
-                        is_base_vault: true,
-                        last_balance: std::sync::atomic::AtomicU64::new(0),
-                        last_used_at: at,
-                        pinned: false,
-                        pin: None,
-                        active_id: None,
-                        bin_step: None,
-                        sibling_vault: None,
-                    },
-                );
-                ctx.geyser_lru_note_vault(pk, at);
-            }
-        }
-        let before = ctx.combined_geyser_explicit_accounts();
-        assert_eq!(before, 10_000);
-        let start = Instant::now();
-        for step in 0..100 {
-            assert!(
-                ctx.evict_one_geyser_lru_step(),
-                "heap eviction step {step} failed before reaching cap"
-            );
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "100 heap evictions took too long on this host: {:?}",
-            start.elapsed()
-        );
-        assert!(ctx.combined_geyser_explicit_accounts() < before);
     }
 
     /// PR235: idempotent register guard skips when vault pair already tracked.
@@ -14963,11 +14470,9 @@ mod pr_b_geyser_tracking_tests {
         );
         assert!(fresh.snapshot_explicit_subscription_pubkeys().is_empty());
 
-        let restored = fresh.apply_explicit_set_snapshot_impl(&snapshot);
+        let restored = fresh.restore_tracked_maps_from_snapshot_rows(&snapshot);
         assert!(restored > 0);
-        assert!(fresh
-            .snapshot_explicit_subscription_pubkeys()
-            .contains(&mint));
+        assert!(fresh.tracked_mints.read().contains_key(&mint));
 
         let path = tmp.path().join("explicit_set.snapshot");
         write_explicit_set_snapshot(&path, &snapshot).expect("write snapshot");
@@ -15078,7 +14583,7 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
 
-        let before = ctx.snapshot_explicit_subscription_pubkeys();
+        let before = ctx.snapshot_explicit_demand_pubkeys();
         assert!(track_worker_try_enqueue(
             &track_worker,
             TrackWorkerCommand::ApplyMomentumActivePools(MomentumActivePoolsUpdate {
@@ -15094,7 +14599,7 @@ mod pr_b_geyser_tracking_tests {
             }),
         ));
         std::thread::sleep(Duration::from_millis(50));
-        let mid = ctx.snapshot_explicit_subscription_pubkeys();
+        let mid = ctx.snapshot_explicit_demand_pubkeys();
         assert!(explicit_subscription_has_new_keys(&before, &mid));
         assert!(ctx.hot_pool_registry.is_hot_pool(pool));
         let vs = ctx.tracked_vaults.read();
@@ -15434,7 +14939,7 @@ mod pr_b_geyser_tracking_tests {
             )
             .expect("jsonl2"),
         );
-        let restored = fresh.apply_explicit_set_snapshot_impl(&snapshot);
+        let restored = fresh.restore_tracked_maps_from_snapshot_rows(&snapshot);
         assert!(restored > 0);
         let tracked = fresh.tracked_mints.read();
         let info = tracked.get(&mint).expect("restored tracker mint");
