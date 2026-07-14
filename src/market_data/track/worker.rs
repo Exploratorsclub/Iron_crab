@@ -895,7 +895,11 @@ mod tests {
 
         fn explicit_pubkey_rows_for_desired_set(
             &self,
-        ) -> Vec<(Pubkey, crate::market_data::track::ConsumerId, Option<Pubkey>)> {
+        ) -> Vec<(
+            Pubkey,
+            crate::market_data::track::ConsumerId,
+            Option<Pubkey>,
+        )> {
             Vec::new()
         }
 
