@@ -83,12 +83,12 @@ use ironcrab::market_data::track::{
     arb_coalesce_try_send, explicit_admitted_pool_sets_from_admission, explicit_set_snapshot_path,
     explicit_subscription_has_new_keys, flush_explicit_set_snapshot, load_explicit_set_snapshot,
     momentum_coalesce_try_send, owner_group_snapshot_to_disk, pool_is_enrichment_member,
-    restore_admission_from_owner_groups, spawn_track_worker, track_worker_try_enqueue,
-    try_admit_owner_group, AdmissionConvergeResult, AdmissionRestoreResult, CapShrinkResult,
-    ConsumerId, ExplicitAccountKind, ExplicitConsumer, ExplicitOwner, ExplicitOwnerKey,
-    ExplicitSetSnapshot, ExplicitSnapshotRow, FixedCapAdmission, GeyserConnectBarrier,
-    SnapshotConsumer, TrackPinReason, TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,
-    EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
+    restore_admission_from_owner_groups, spawn_track_worker, touch_admitted_pool_owner_groups,
+    track_worker_try_enqueue, try_admit_owner_group, AdmissionConvergeResult,
+    AdmissionRestoreResult, CapShrinkResult, ConsumerId, ExplicitAccountKind, ExplicitConsumer,
+    ExplicitOwner, ExplicitOwnerKey, ExplicitSetSnapshot, ExplicitSnapshotRow, FixedCapAdmission,
+    GeyserConnectBarrier, SnapshotConsumer, TrackPinReason, TrackWorkerCommand, TrackWorkerContext,
+    TrackWorkerSender, EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
 };
 use ironcrab::metrics::{
     dec_market_data_account_high_priority_queue_depth,
@@ -1051,6 +1051,8 @@ struct MarketDataContext {
     tracked_membership: ArcSwap<TrackedMembershipSnapshot>,
     /// PR237: pool → vault/bin pubkeys for O(legs) LRU touch (md-state writer only).
     pool_tracked_legs: parking_lot::RwLock<HashMap<Pubkey, PoolTrackedLegs>>,
+    /// Pools whose vault/bin activity should refresh admission owner LRU on track-worker.
+    pending_admission_lru_pools: parking_lot::Mutex<HashSet<Pubkey>>,
 
     /// MASTER LivePoolCache - Single Source of Truth for all pool state.
     /// Updated via Geyser events and propagated to execution-engine via NATS.
@@ -2031,6 +2033,10 @@ impl TrackWorkerContext for MarketDataContext {
         new_cap: usize,
     ) -> CapShrinkResult {
         MarketDataContext::apply_explicit_cap_shrink(self, admission, new_cap)
+    }
+
+    fn apply_pending_admission_lru_touches(&self, admission: &mut FixedCapAdmission) {
+        MarketDataContext::apply_pending_admission_lru_touches(self, admission);
     }
 }
 
@@ -3445,6 +3451,17 @@ impl MarketDataContext {
         }
     }
 
+    fn note_pending_admission_lru_pool(&self, pool: Pubkey) {
+        self.pending_admission_lru_pools.lock().insert(pool);
+    }
+
+    fn apply_pending_admission_lru_touches(&self, admission: &mut FixedCapAdmission) {
+        let pools: Vec<Pubkey> = self.pending_admission_lru_pools.lock().drain().collect();
+        for pool in pools {
+            touch_admitted_pool_owner_groups(admission, pool);
+        }
+    }
+
     fn tracked_vaults_write_timed(
         &self,
     ) -> parking_lot::RwLockWriteGuard<'_, HashMap<Pubkey, VaultInfo>> {
@@ -3763,24 +3780,38 @@ impl MarketDataContext {
     fn touch_tracked_vault_pubkey(&self, vault: &Pubkey) {
         let now = Instant::now();
         let mut vaults = self.tracked_vaults_write_timed();
-        let sibling = if let Some(v) = vaults.get_mut(vault) {
+        let (pool, sibling) = if let Some(v) = vaults.get_mut(vault) {
             v.last_used_at = now;
-            v.sibling_vault
-                .filter(|sibling_pk| vaults.get(sibling_pk).is_some_and(|sv| !sv.pinned))
+            let pool = v.pool_address;
+            let sibling = v
+                .sibling_vault
+                .filter(|sibling_pk| vaults.get(sibling_pk).is_some_and(|sv| !sv.pinned));
+            (Some(pool), sibling)
         } else {
-            None
+            (None, None)
         };
         if let Some(sibling_pk) = sibling {
             if let Some(sv) = vaults.get_mut(&sibling_pk) {
                 sv.last_used_at = now;
             }
         }
+        drop(vaults);
+        if let Some(pool) = pool {
+            self.note_pending_admission_lru_pool(pool);
+        }
     }
 
     fn touch_tracked_bin_array_pubkey(&self, pda: &Pubkey) {
         let now = Instant::now();
-        if let Some(b) = self.tracked_bin_arrays_write_timed().get_mut(pda) {
-            b.last_used_at = now;
+        let pool = {
+            let mut bins = self.tracked_bin_arrays_write_timed();
+            bins.get_mut(pda).map(|b| {
+                b.last_used_at = now;
+                b.pool_address
+            })
+        };
+        if let Some(pool) = pool {
+            self.note_pending_admission_lru_pool(pool);
         }
     }
 
@@ -6783,6 +6814,7 @@ async fn main() -> Result<()> {
         tracked_bin_arrays_tx,
         tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
         pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
+        pending_admission_lru_pools: parking_lot::Mutex::new(HashSet::new()),
         live_pool_cache: Arc::new(LivePoolCache::new()),
         creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
         pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -10435,6 +10467,7 @@ mod wallet_snapshot_stale_cleanup_tests {
             tracked_bin_arrays_tx,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
             pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
+            pending_admission_lru_pools: parking_lot::Mutex::new(HashSet::new()),
             live_pool_cache: Arc::new(LivePoolCache::new()),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -10658,6 +10691,7 @@ mod wallet_tx_meta_balance_tests {
             tracked_bin_arrays_tx,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
             pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
+            pending_admission_lru_pools: parking_lot::Mutex::new(HashSet::new()),
             live_pool_cache: Arc::new(LivePoolCache::new()),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -11549,6 +11583,7 @@ mod pr_b_geyser_tracking_tests {
             tracked_bin_arrays_tx,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
             pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
+            pending_admission_lru_pools: parking_lot::Mutex::new(HashSet::new()),
             live_pool_cache: Arc::new(LivePoolCache::new()),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -11622,6 +11657,7 @@ mod pr_b_geyser_tracking_tests {
             tracked_bin_arrays_tx,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
             pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
+            pending_admission_lru_pools: parking_lot::Mutex::new(HashSet::new()),
             live_pool_cache: Arc::new(LivePoolCache::new()),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),

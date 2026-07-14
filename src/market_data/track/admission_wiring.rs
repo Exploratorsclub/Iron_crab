@@ -356,6 +356,23 @@ pub fn apply_cap_shrink(admission: &mut FixedCapAdmission, new_cap: usize) -> Ca
     admission.try_shrink_cap(new_cap)
 }
 
+/// Advance LRU stamps for every admitted owner group scoped to `pool`.
+pub fn touch_admitted_pool_owner_groups(admission: &mut FixedCapAdmission, pool: Pubkey) {
+    for consumer in [
+        ExplicitConsumer::Tracker,
+        ExplicitConsumer::Momentum,
+        ExplicitConsumer::Arb,
+    ] {
+        let owner = ExplicitOwner {
+            consumer,
+            owner_key: ExplicitOwnerKey::Pool(pool),
+        };
+        if admission.owner_group(&owner).is_some() {
+            let _ = admission.touch_group(owner);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +522,43 @@ mod tests {
         let (momentum, arb) = explicit_admitted_pool_sets_from_admission(&admission);
         assert_eq!(momentum, std::collections::HashSet::from([mom_pool]));
         assert_eq!(arb, std::collections::HashSet::from([arb_pool]));
+    }
+
+    #[test]
+    fn touch_admitted_pool_owner_groups_refreshes_lru_for_admitted_consumers() {
+        let mut admission = FixedCapAdmission::new(100);
+        let pool = Pubkey::new_unique();
+        let tracker_pk = Pubkey::new_unique();
+        let mom_pk = Pubkey::new_unique();
+        assert!(try_admit_owner_group(
+            &mut admission,
+            pool_owner(ExplicitConsumer::Tracker, pool),
+            vec![tracker_pk]
+        ));
+        assert!(try_admit_owner_group(
+            &mut admission,
+            pool_owner(ExplicitConsumer::Momentum, pool),
+            vec![mom_pk]
+        ));
+        let tracker_stamp = admission
+            .last_touch(&pool_owner(ExplicitConsumer::Tracker, pool))
+            .unwrap();
+        let mom_stamp = admission
+            .last_touch(&pool_owner(ExplicitConsumer::Momentum, pool))
+            .unwrap();
+        touch_admitted_pool_owner_groups(&mut admission, pool);
+        assert!(
+            admission
+                .last_touch(&pool_owner(ExplicitConsumer::Tracker, pool))
+                .unwrap()
+                > tracker_stamp
+        );
+        assert!(
+            admission
+                .last_touch(&pool_owner(ExplicitConsumer::Momentum, pool))
+                .unwrap()
+                > mom_stamp
+        );
     }
 
     #[test]

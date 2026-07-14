@@ -139,6 +139,7 @@ pub trait TrackWorkerContext: Send + Sync {
         admission: &mut FixedCapAdmission,
         new_cap: usize,
     ) -> CapShrinkResult;
+    fn apply_pending_admission_lru_touches(&self, admission: &mut FixedCapAdmission);
 }
 
 #[derive(Clone)]
@@ -264,6 +265,7 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
     restore_barrier_pending: &mut bool,
     job: TrackWorkerCommand,
 ) -> bool {
+    ctx.apply_pending_admission_lru_touches(admission);
     match job {
         TrackWorkerCommand::ApplyMomentumActivePools(update) => {
             apply_momentum_active_pools_on_track_worker(ctx, admission, update)
@@ -974,6 +976,8 @@ mod tests {
                 new_cap: 25_000,
             }
         }
+
+        fn apply_pending_admission_lru_touches(&self, _admission: &mut FixedCapAdmission) {}
     }
 
     #[test]
@@ -1269,6 +1273,8 @@ mod tests {
                     new_cap: 25_000,
                 }
             }
+
+            fn apply_pending_admission_lru_touches(&self, _admission: &mut FixedCapAdmission) {}
         }
 
         let ctx = Arc::new(TrackerIdempotentCtx);
@@ -1509,6 +1515,8 @@ mod tests {
                 new_cap: 25_000,
             }
         }
+
+        fn apply_pending_admission_lru_touches(&self, _admission: &mut FixedCapAdmission) {}
     }
 
     #[test]

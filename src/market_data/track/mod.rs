@@ -17,7 +17,8 @@ pub use admission_wiring::{
     converge_admission_from_groups, explicit_admitted_pool_sets_from_admission,
     merge_admission_tracker_owner_groups, partition_admitted_pubkeys_for_geyser_channels,
     pool_pubkey_from_owner_group, restore_admission_from_owner_groups, rows_to_owner_groups,
-    try_admit_owner_group, AdmissionConvergeResult, AdmissionRestoreResult,
+    touch_admitted_pool_owner_groups, try_admit_owner_group, AdmissionConvergeResult,
+    AdmissionRestoreResult,
 };
 pub use barrier::GeyserConnectBarrier;
 pub use coalesce::{

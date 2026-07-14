@@ -34,6 +34,7 @@ pub fn converge_admission_from_ctx<C: TrackWorkerContext>(
     ctx: &C,
     admission: &mut FixedCapAdmission,
 ) -> AdmissionConvergeResult {
+    ctx.apply_pending_admission_lru_touches(admission);
     let rows = ctx.explicit_pubkey_rows_for_desired_set();
     let mut groups = rows_to_owner_groups(&rows);
     merge_admission_tracker_owner_groups(admission, &mut groups);
