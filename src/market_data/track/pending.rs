@@ -1,8 +1,8 @@
 //! Bounded pending / inflight / revision store for track-worker queue-full replay.
 
 use super::worker_commands::{
-    stream_for_command, ImmutableTrackCommand, RevisionAssigner, TrackCommandStream,
-    TrackWorkerCommand,
+    demand_mint_for_command, stream_for_command, stream_uses_per_mint_revision,
+    ImmutableTrackCommand, RevisionAssigner, TrackCommandStream, TrackWorkerCommand,
 };
 use crate::metrics::{
     inc_market_data_track_protocol_pending_evicted_total,
@@ -10,6 +10,8 @@ use crate::metrics::{
     inc_market_data_track_protocol_superseded_revisions_total,
     set_market_data_track_protocol_inflight_depth, set_market_data_track_protocol_pending_depth,
 };
+use solana_sdk::pubkey::Pubkey;
+use std::collections::HashMap;
 
 /// Bounded cap for pending slots when the worker queue is full (I-MD-5).
 pub const MARKET_DATA_TRACK_PENDING_CAP: usize = 512;
@@ -25,7 +27,7 @@ pub enum StageResult {
     Lost,
 }
 
-/// Bounded store: pending slots, inflight accounting, last-applied revision per stream.
+/// Bounded store: pending slots, inflight accounting, last-applied revision per stream/mint.
 #[derive(Debug)]
 pub struct BoundedProtocolStore {
     pending: Vec<ImmutableTrackCommand>,
@@ -35,6 +37,8 @@ pub struct BoundedProtocolStore {
     inflight_cap: usize,
     revision: RevisionAssigner,
     last_applied: [u64; TrackCommandStream::COUNT],
+    last_applied_wallet_mint: HashMap<Pubkey, u64>,
+    last_applied_tracker_mint: HashMap<Pubkey, u64>,
 }
 
 impl BoundedProtocolStore {
@@ -46,6 +50,8 @@ impl BoundedProtocolStore {
             inflight_cap,
             revision: RevisionAssigner::default(),
             last_applied: [0; TrackCommandStream::COUNT],
+            last_applied_wallet_mint: HashMap::new(),
+            last_applied_tracker_mint: HashMap::new(),
         }
     }
 
@@ -66,22 +72,95 @@ impl BoundedProtocolStore {
         self.inflight
     }
 
-    /// Wrap a legacy command with the next monotone revision for its stream.
+    /// Wrap a legacy command with the next monotone revision for its stream (per-mint for wallet/tracker).
     pub fn wrap_command(&mut self, payload: TrackWorkerCommand) -> ImmutableTrackCommand {
         let stream = stream_for_command(&payload);
-        let revision = self.revision.next_revision(stream);
+        let demand_mint = demand_mint_for_command(&payload);
+        let revision = self.revision.next_revision(stream, demand_mint);
         ImmutableTrackCommand::new(stream, revision, payload)
     }
 
-    /// True when `revision` is strictly newer than the last applied revision for `stream`.
-    pub fn is_applicable(&self, stream: TrackCommandStream, revision: u64) -> bool {
+    fn last_applied_for_cmd(&self, cmd: &ImmutableTrackCommand) -> u64 {
+        if stream_uses_per_mint_revision(cmd.stream) {
+            let mint = demand_mint_for_command(&cmd.payload)
+                .expect("wallet/tracker command requires demand mint");
+            let map = match cmd.stream {
+                TrackCommandStream::Wallet => &self.last_applied_wallet_mint,
+                TrackCommandStream::Tracker => &self.last_applied_tracker_mint,
+                _ => unreachable!(),
+            };
+            *map.get(&mint).unwrap_or(&0)
+        } else {
+            self.last_applied[cmd.stream.index()]
+        }
+    }
+
+    /// True when `cmd.revision` is strictly newer than the last applied revision for its demand key.
+    pub fn is_applicable(&self, cmd: &ImmutableTrackCommand) -> bool {
+        cmd.revision > self.last_applied_for_cmd(cmd)
+    }
+
+    pub fn mark_applied(&mut self, cmd: &ImmutableTrackCommand) {
+        if stream_uses_per_mint_revision(cmd.stream) {
+            let mint = demand_mint_for_command(&cmd.payload)
+                .expect("wallet/tracker command requires demand mint");
+            let map = match cmd.stream {
+                TrackCommandStream::Wallet => &mut self.last_applied_wallet_mint,
+                TrackCommandStream::Tracker => &mut self.last_applied_tracker_mint,
+                _ => unreachable!(),
+            };
+            let entry = map.entry(mint).or_insert(0);
+            if cmd.revision > *entry {
+                *entry = cmd.revision;
+            }
+            return;
+        }
+        let idx = cmd.stream.index();
+        if cmd.revision > self.last_applied[idx] {
+            self.last_applied[idx] = cmd.revision;
+        }
+    }
+
+    /// Backward-compatible helper for global-stream tests.
+    pub fn is_applicable_stream(&self, stream: TrackCommandStream, revision: u64) -> bool {
         revision > self.last_applied[stream.index()]
     }
 
-    pub fn mark_applied(&mut self, stream: TrackCommandStream, revision: u64) {
+    pub fn mark_applied_stream(&mut self, stream: TrackCommandStream, revision: u64) {
         let idx = stream.index();
         if revision > self.last_applied[idx] {
             self.last_applied[idx] = revision;
+        }
+    }
+
+    /// Wallet pin/withdraw supersedes unpinned tracker demand for the same mint (cross-stream).
+    pub fn supersede_tracker_demand_for_mint(&mut self, mint: Pubkey) {
+        let mut watermark = *self.last_applied_tracker_mint.get(&mint).unwrap_or(&0);
+        watermark = watermark.max(
+            self.revision
+                .last_issued_revision_for_mint(TrackCommandStream::Tracker, mint),
+        );
+        for cmd in &self.pending {
+            if cmd.stream == TrackCommandStream::Tracker
+                && demand_mint_for_command(&cmd.payload) == Some(mint)
+            {
+                watermark = watermark.max(cmd.revision);
+            }
+        }
+        if watermark > 0 {
+            let entry = self.last_applied_tracker_mint.entry(mint).or_insert(0);
+            if watermark > *entry {
+                *entry = watermark;
+            }
+        }
+    }
+
+    /// Mark wallet demand applied and supersede stale tracker protocol demand for the mint.
+    pub fn mark_applied_wallet_demand(&mut self, cmd: &ImmutableTrackCommand) {
+        debug_assert_eq!(cmd.stream, TrackCommandStream::Wallet);
+        self.mark_applied(cmd);
+        if let Some(mint) = demand_mint_for_command(&cmd.payload) {
+            self.supersede_tracker_demand_for_mint(mint);
         }
     }
 
@@ -99,7 +178,7 @@ impl BoundedProtocolStore {
         set_market_data_track_protocol_pending_depth(self.pending.len());
     }
 
-    /// Stage command in bounded pending when the worker queue is full (I-MD-5).
+    /// Stage command for later replay (queue full or transient wallet/tracker admission reject).
     pub fn stage_on_queue_full(&mut self, cmd: ImmutableTrackCommand) -> StageResult {
         inc_market_data_track_protocol_replay_triggers_total();
         if self.pending.len() < self.pending_cap {
@@ -138,7 +217,7 @@ impl BoundedProtocolStore {
                 .collect();
             stream_cmds.sort_by_key(|cmd| cmd.revision);
             for cmd in stream_cmds {
-                if self.is_applicable(cmd.stream, cmd.revision) {
+                if self.is_applicable(&cmd) {
                     applicable.push(cmd);
                 } else {
                     inc_market_data_track_protocol_superseded_revisions_total();
@@ -152,6 +231,7 @@ impl BoundedProtocolStore {
 
 #[cfg(test)]
 mod tests {
+    use super::super::worker_commands::TrackPinReason;
     use super::*;
     use crate::nats::MomentumActivePoolsUpdate;
     use solana_sdk::pubkey::Pubkey;
@@ -184,7 +264,7 @@ mod tests {
         store.stage_on_queue_full(c2.clone());
         let mut applied = Vec::new();
         for cmd in store.take_applicable_pending_sorted() {
-            store.mark_applied(cmd.stream, cmd.revision);
+            store.mark_applied(&cmd);
             applied.push(cmd.revision);
         }
         assert_eq!(applied, vec![1, 2]);
@@ -196,13 +276,13 @@ mod tests {
         let mut store = BoundedProtocolStore::new(8, 64);
         let c1 = store.wrap_command(momentum_cmd(1));
         let c2 = store.wrap_command(momentum_cmd(2));
-        store.mark_applied(TrackCommandStream::Momentum, 2);
+        store.mark_applied_stream(TrackCommandStream::Momentum, 2);
         store.stage_on_queue_full(c1);
         store.stage_on_queue_full(c2);
         let mut applied = Vec::new();
         for cmd in store.take_applicable_pending_sorted() {
-            if store.is_applicable(cmd.stream, cmd.revision) {
-                store.mark_applied(cmd.stream, cmd.revision);
+            if store.is_applicable(&cmd) {
+                store.mark_applied(&cmd);
                 applied.push(cmd.revision);
             }
         }
@@ -221,7 +301,7 @@ mod tests {
         store.stage_on_queue_full(c2);
         let mut applied = Vec::new();
         for cmd in store.take_applicable_pending_sorted() {
-            store.mark_applied(cmd.stream, cmd.revision);
+            store.mark_applied(&cmd);
             applied.push(cmd.revision);
         }
         assert_eq!(applied, vec![1, 2, 3]);
@@ -249,18 +329,116 @@ mod tests {
             store.stage_on_queue_full(cmd);
         }
         assert!(store.pending_len() <= MARKET_DATA_TRACK_PENDING_CAP);
-        assert_eq!(TrackCommandStream::COUNT, 3);
+        assert_eq!(TrackCommandStream::COUNT, 5);
     }
 
     #[test]
-    fn control_stream_separate_revision_sequence() {
+    fn wallet_withdraw_supersedes_older_pending_pin() {
         let mut store = BoundedProtocolStore::new(8, 64);
-        let m = store.wrap_command(momentum_cmd(1));
         let mint = Pubkey::new_unique();
-        let c = store.wrap_command(TrackWorkerCommand::TrackMint { mint, pin: None });
-        assert_eq!(m.stream, TrackCommandStream::Momentum);
-        assert_eq!(c.stream, TrackCommandStream::Control);
-        assert_eq!(m.revision, 1);
-        assert_eq!(c.revision, 1);
+        let pin_old = store.wrap_command(TrackWorkerCommand::ApplyWalletPin { mint });
+        store.stage_on_queue_full(pin_old.clone());
+        let withdraw = store.wrap_command(TrackWorkerCommand::WithdrawWalletPin { mint });
+        store.mark_applied(&withdraw);
+        assert!(!store.is_applicable(&pin_old));
+        let applicable = store.take_applicable_pending_sorted();
+        assert!(
+            applicable.is_empty(),
+            "stale wallet pin must not replay after newer withdraw advances watermark"
+        );
+    }
+
+    #[test]
+    fn wallet_later_mint_does_not_supersede_pending_pin_for_other_mint() {
+        let mut store = BoundedProtocolStore::new(8, 64);
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let pin_a = store.wrap_command(TrackWorkerCommand::ApplyWalletPin { mint: mint_a });
+        store.stage_on_queue_full(pin_a.clone());
+        let pin_b = store.wrap_command(TrackWorkerCommand::ApplyWalletPin { mint: mint_b });
+        store.mark_applied(&pin_b);
+        assert!(
+            store.is_applicable(&pin_a),
+            "pending wallet pin for mint A must remain applicable after mint B advances"
+        );
+        let applicable = store.take_applicable_pending_sorted();
+        assert_eq!(applicable.len(), 1);
+        assert_eq!(
+            demand_mint_for_command(&applicable[0].payload),
+            Some(mint_a)
+        );
+    }
+
+    #[test]
+    fn wallet_withdraw_supersedes_pending_tracker_demand_for_same_mint() {
+        let mut store = BoundedProtocolStore::new(8, 64);
+        let mint = Pubkey::new_unique();
+        let tracker = store.wrap_command(TrackWorkerCommand::TrackMint { mint, pin: None });
+        store.stage_on_queue_full(tracker.clone());
+        let withdraw = store.wrap_command(TrackWorkerCommand::WithdrawWalletPin { mint });
+        store.mark_applied_wallet_demand(&withdraw);
+        assert!(
+            !store.is_applicable(&tracker),
+            "wallet withdraw must supersede pending tracker demand for same mint"
+        );
+        let applicable = store.take_applicable_pending_sorted();
+        assert!(
+            applicable.is_empty(),
+            "superseded tracker demand must not replay after wallet withdraw"
+        );
+    }
+
+    #[test]
+    fn wallet_pin_supersedes_pending_tracker_demand_for_same_mint() {
+        let mut store = BoundedProtocolStore::new(8, 64);
+        let mint = Pubkey::new_unique();
+        let tracker = store.wrap_command(TrackWorkerCommand::TrackMint { mint, pin: None });
+        store.stage_on_queue_full(tracker.clone());
+        let pin = store.wrap_command(TrackWorkerCommand::ApplyWalletPin { mint });
+        store.mark_applied_wallet_demand(&pin);
+        assert!(!store.is_applicable(&tracker));
+        assert!(store.take_applicable_pending_sorted().is_empty());
+    }
+
+    #[test]
+    fn wallet_track_mint_uses_wallet_stream_per_mint_revision() {
+        let mut store = BoundedProtocolStore::new(8, 64);
+        let mint = Pubkey::new_unique();
+        let cmd = store.wrap_command(TrackWorkerCommand::TrackMint {
+            mint,
+            pin: Some(TrackPinReason::Wallet),
+        });
+        assert_eq!(cmd.stream, TrackCommandStream::Wallet);
+        assert_eq!(cmd.revision, 1);
+        let cmd2 = store.wrap_command(TrackWorkerCommand::TrackMint {
+            mint,
+            pin: Some(TrackPinReason::Wallet),
+        });
+        assert_eq!(cmd2.revision, 2);
+    }
+
+    #[test]
+    fn wallet_track_mint_reject_re_stages_pending() {
+        let mut store = BoundedProtocolStore::new(8, 64);
+        let mint = Pubkey::new_unique();
+        let cmd = store.wrap_command(TrackWorkerCommand::TrackMint {
+            mint,
+            pin: Some(TrackPinReason::Wallet),
+        });
+        assert_eq!(store.stage_on_queue_full(cmd.clone()), StageResult::Staged);
+        assert_eq!(store.pending_len(), 1);
+        assert!(store.is_applicable(&cmd));
+    }
+
+    #[test]
+    fn tracker_stream_separate_from_control() {
+        let mut store = BoundedProtocolStore::new(8, 64);
+        let mint = Pubkey::new_unique();
+        let tracker = store.wrap_command(TrackWorkerCommand::TrackMint { mint, pin: None });
+        let control = store.wrap_command(TrackWorkerCommand::ScheduleGeyserPush);
+        assert_eq!(tracker.stream, TrackCommandStream::Tracker);
+        assert_eq!(control.stream, TrackCommandStream::Control);
+        assert_eq!(tracker.revision, 1);
+        assert_eq!(control.revision, 1);
     }
 }

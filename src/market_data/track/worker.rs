@@ -9,7 +9,7 @@ use super::snapshot::{
     MARKET_DATA_EXPLICIT_SET_SNAPSHOT_INTERVAL_SECS,
 };
 use super::worker_commands::ImmutableTrackCommand;
-pub use super::worker_commands::{TrackPinReason, TrackWorkerCommand};
+pub use super::worker_commands::{TrackCommandStream, TrackPinReason, TrackWorkerCommand};
 use crate::metrics::{
     inc_market_data_explicit_set_snapshot_write_errors_total,
     inc_market_data_explicit_set_snapshot_write_total,
@@ -87,7 +87,14 @@ pub trait TrackWorkerContext: Send + Sync {
         admission: &mut FixedCapAdmission,
         chunk: &[ArbTrackActiveEntry],
     ) -> bool;
-    fn track_mint_for_geyser_metadata(&self, mint: Pubkey, pin: Option<TrackPinReason>) -> bool;
+    fn apply_wallet_pin(&self, admission: &mut FixedCapAdmission, mint: Pubkey) -> bool;
+    fn withdraw_wallet_pin(&self, admission: &mut FixedCapAdmission, mint: Pubkey) -> bool;
+    fn apply_track_mint(
+        &self,
+        admission: &mut FixedCapAdmission,
+        mint: Pubkey,
+        pin: Option<TrackPinReason>,
+    ) -> bool;
     fn refresh_geyser_pins_gauge(&self);
     fn hot_pool_registry_pair_count(&self) -> usize;
     fn hot_pool_registry_arb_pool_count(&self) -> usize;
@@ -267,12 +274,9 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
         TrackWorkerCommand::ApplyArbTrackRequests(update) => {
             apply_arb_track_requests_on_track_worker(ctx, admission, update)
         }
-        TrackWorkerCommand::ApplyWalletPin { mint } => {
-            ctx.track_mint_for_geyser_metadata(mint, Some(TrackPinReason::Wallet))
-        }
-        TrackWorkerCommand::TrackMint { mint, pin } => {
-            ctx.track_mint_for_geyser_metadata(mint, pin)
-        }
+        TrackWorkerCommand::ApplyWalletPin { mint } => ctx.apply_wallet_pin(admission, mint),
+        TrackWorkerCommand::WithdrawWalletPin { mint } => ctx.withdraw_wallet_pin(admission, mint),
+        TrackWorkerCommand::TrackMint { mint, pin } => ctx.apply_track_mint(admission, mint, pin),
         TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange => {
             let new_cap = ctx.max_tracked_accounts();
             let _ = ctx.apply_explicit_cap_shrink(admission, new_cap);
@@ -300,6 +304,28 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
     }
 }
 
+/// Wallet/Tracker demand commands only advance the monotone revision when the handler
+/// succeeds so transient admission rejects remain replayable (I-MD-5).
+fn track_protocol_should_advance_revision(
+    stream: TrackCommandStream,
+    handler_succeeded: bool,
+) -> bool {
+    match stream {
+        TrackCommandStream::Wallet | TrackCommandStream::Tracker => handler_succeeded,
+        TrackCommandStream::Momentum | TrackCommandStream::Arb | TrackCommandStream::Control => {
+            true
+        }
+    }
+}
+
+fn track_protocol_stage_for_replay(
+    protocol: &Arc<Mutex<BoundedProtocolStore>>,
+    cmd: ImmutableTrackCommand,
+) {
+    let mut store = protocol.lock().expect("track protocol store lock");
+    let _ = store.stage_on_queue_full(cmd);
+}
+
 fn track_worker_apply_protocol_command<C: TrackWorkerContext>(
     ctx: &Arc<C>,
     protocol: &Arc<Mutex<BoundedProtocolStore>>,
@@ -309,15 +335,32 @@ fn track_worker_apply_protocol_command<C: TrackWorkerContext>(
 ) {
     let applicable = {
         let store = protocol.lock().expect("track protocol store lock");
-        store.is_applicable(cmd.stream, cmd.revision)
+        store.is_applicable(&cmd)
     };
     if !applicable {
         inc_market_data_track_protocol_superseded_revisions_total();
         return;
     }
-    let _ = track_worker_process_command(ctx, admission, restore_barrier_pending, cmd.payload);
-    let mut store = protocol.lock().expect("track protocol store lock");
-    store.mark_applied(cmd.stream, cmd.revision);
+    let stream = cmd.stream;
+    let revision = cmd.revision;
+    let restage_on_failure = matches!(
+        stream,
+        TrackCommandStream::Wallet | TrackCommandStream::Tracker
+    );
+    let payload_backup = cmd.payload.clone();
+    let handler_succeeded =
+        track_worker_process_command(ctx, admission, restore_barrier_pending, cmd.payload);
+    let protocol_cmd = ImmutableTrackCommand::new(stream, revision, payload_backup);
+    if track_protocol_should_advance_revision(stream, handler_succeeded) {
+        let mut store = protocol.lock().expect("track protocol store lock");
+        if stream == TrackCommandStream::Wallet {
+            store.mark_applied_wallet_demand(&protocol_cmd);
+        } else {
+            store.mark_applied(&protocol_cmd);
+        }
+    } else if restage_on_failure {
+        track_protocol_stage_for_replay(protocol, protocol_cmd);
+    }
 }
 
 fn track_worker_prepare_command_delivery<C: TrackWorkerContext>(
@@ -355,7 +398,7 @@ fn track_worker_receive_protocol_command<C: TrackWorkerContext>(
 ) {
     let applicable = {
         let store = protocol.lock().expect("track protocol store lock");
-        store.is_applicable(cmd.stream, cmd.revision)
+        store.is_applicable(&cmd)
     };
     if applicable {
         track_worker_prepare_command_delivery(
@@ -388,7 +431,7 @@ fn track_worker_drain_pending_replay<C: TrackWorkerContext>(
     for cmd in pending_cmds {
         let applicable = {
             let store = protocol.lock().expect("track protocol store lock");
-            store.is_applicable(cmd.stream, cmd.revision)
+            store.is_applicable(&cmd)
         };
         if applicable {
             track_worker_prepare_command_delivery(
@@ -674,13 +717,13 @@ mod tests {
                     full_active_snapshot: false,
                 },
             ));
-            store.mark_applied(TrackCommandStream::Momentum, c.revision);
+            store.mark_applied(&c);
             c
         };
         assert!(sender.tx.try_send(cmd.clone()).is_ok());
         // inline apply path not running; verify applicability directly
         let store = sender.protocol.lock().expect("lock");
-        assert!(!store.is_applicable(cmd.stream, cmd.revision));
+        assert!(!store.is_applicable(&cmd));
     }
 
     #[test]
@@ -689,13 +732,875 @@ mod tests {
         let push_old = store.wrap_command(TrackWorkerCommand::ScheduleGeyserPush);
         store.stage_on_queue_full(push_old.clone());
         let push_new = store.wrap_command(TrackWorkerCommand::ScheduleGeyserPush);
-        store.mark_applied(push_new.stream, push_new.revision);
-        assert!(!store.is_applicable(push_old.stream, push_old.revision));
+        store.mark_applied(&push_new);
+        assert!(!store.is_applicable(&push_old));
         let applicable = store.take_applicable_pending_sorted();
         assert!(
             applicable.is_empty(),
             "older pending push must be superseded after newer push advances watermark"
         );
+    }
+
+    #[test]
+    fn wallet_stream_revision_held_on_handler_failure() {
+        let mut store = BoundedProtocolStore::default_caps();
+        let mint = Pubkey::new_unique();
+        let cmd = store.wrap_command(TrackWorkerCommand::ApplyWalletPin { mint });
+        assert_eq!(cmd.stream, TrackCommandStream::Wallet);
+        assert!(!track_protocol_should_advance_revision(cmd.stream, false));
+        assert!(store.is_applicable(&cmd));
+        assert!(track_protocol_should_advance_revision(cmd.stream, true));
+        store.mark_applied(&cmd);
+        assert!(!store.is_applicable(&cmd));
+    }
+
+    #[test]
+    fn tracker_stream_revision_held_on_handler_failure() {
+        let mut store = BoundedProtocolStore::default_caps();
+        let mint = Pubkey::new_unique();
+        let cmd = store.wrap_command(TrackWorkerCommand::TrackMint { mint, pin: None });
+        assert_eq!(cmd.stream, TrackCommandStream::Tracker);
+        assert!(!track_protocol_should_advance_revision(cmd.stream, false));
+        assert!(store.is_applicable(&cmd));
+    }
+
+    struct WalletReplayTestCtx {
+        fail_wallet_pin_once: std::sync::atomic::AtomicBool,
+        pinned: parking_lot::Mutex<Vec<Pubkey>>,
+    }
+
+    impl WalletReplayTestCtx {
+        fn fail_once() -> Self {
+            Self {
+                fail_wallet_pin_once: std::sync::atomic::AtomicBool::new(true),
+                pinned: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl TrackWorkerContext for WalletReplayTestCtx {
+        fn geyser_sync_batch_debounce_ms(&self) -> u64 {
+            0
+        }
+
+        fn max_tracked_accounts(&self) -> usize {
+            25_000
+        }
+
+        fn apply_momentum_active_pools_update(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _update: &MomentumActivePoolsUpdate,
+        ) -> bool {
+            false
+        }
+
+        fn apply_momentum_snapshot_reconcile(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _active: &[MomentumActivePoolEntry],
+        ) -> bool {
+            false
+        }
+
+        fn apply_momentum_removed_entries(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _chunk: &[MomentumRemovedPoolEntry],
+        ) -> bool {
+            false
+        }
+
+        fn apply_momentum_active_entries(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _chunk: &[MomentumActivePoolEntry],
+        ) -> bool {
+            false
+        }
+
+        fn apply_arb_track_requests_update(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _update: &ArbTrackRequestsUpdate,
+        ) -> bool {
+            false
+        }
+
+        fn apply_arb_snapshot_reconcile(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _active: &[ArbTrackActiveEntry],
+        ) -> bool {
+            false
+        }
+
+        fn apply_arb_removed_entries(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _chunk: &[ArbTrackRemovedEntry],
+        ) -> bool {
+            false
+        }
+
+        fn apply_arb_active_entries(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _chunk: &[ArbTrackActiveEntry],
+        ) -> bool {
+            false
+        }
+
+        fn apply_wallet_pin(&self, _admission: &mut FixedCapAdmission, mint: Pubkey) -> bool {
+            if self
+                .fail_wallet_pin_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return false;
+            }
+            self.pinned.lock().push(mint);
+            true
+        }
+
+        fn withdraw_wallet_pin(&self, _admission: &mut FixedCapAdmission, _mint: Pubkey) -> bool {
+            true
+        }
+
+        fn apply_track_mint(
+            &self,
+            admission: &mut FixedCapAdmission,
+            mint: Pubkey,
+            pin: Option<TrackPinReason>,
+        ) -> bool {
+            if pin == Some(TrackPinReason::Wallet) {
+                return self.apply_wallet_pin(admission, mint);
+            }
+            true
+        }
+
+        fn refresh_geyser_pins_gauge(&self) {}
+
+        fn hot_pool_registry_pair_count(&self) -> usize {
+            0
+        }
+
+        fn hot_pool_registry_arb_pool_count(&self) -> usize {
+            0
+        }
+
+        fn refresh_hot_pool_registry_gauges(&self) {}
+
+        fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
+            HashSet::new()
+        }
+
+        fn pending_geyser_evict(&self) -> bool {
+            false
+        }
+
+        fn sync_geyser_tracked_accounts_batched_flush_with_deadline(
+            &self,
+            _deadline: Instant,
+            _admission: &FixedCapAdmission,
+        ) -> bool {
+            true
+        }
+
+        fn continue_geyser_evict_with_deadline(
+            &self,
+            _deadline: Instant,
+            _admission: &FixedCapAdmission,
+        ) -> bool {
+            true
+        }
+
+        fn release_geyser_sync_flush_slot(&self) {}
+
+        fn refresh_tracked_membership_snapshot(&self) {}
+
+        fn explicit_pubkey_rows_for_desired_set(
+            &self,
+        ) -> Vec<(
+            Pubkey,
+            crate::market_data::track::ConsumerId,
+            Option<Pubkey>,
+        )> {
+            Vec::new()
+        }
+
+        fn build_explicit_set_snapshot(
+            &self,
+            _admission: &FixedCapAdmission,
+        ) -> super::ExplicitSetSnapshot {
+            super::ExplicitSetSnapshot::new(None)
+        }
+
+        fn apply_explicit_set_snapshot(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _snapshot: &super::ExplicitSetSnapshot,
+        ) -> AdmissionRestoreResult {
+            AdmissionRestoreResult::Restored
+        }
+
+        fn apply_explicit_set_snapshot_legacy(
+            &self,
+            _snapshot: &super::ExplicitSetSnapshot,
+        ) -> usize {
+            0
+        }
+
+        fn on_admission_converge_result(
+            &self,
+            _admission: &FixedCapAdmission,
+            _result: AdmissionConvergeResult,
+        ) {
+        }
+
+        fn prune_tracked_maps_to_admitted(&self, _admission: &FixedCapAdmission) {}
+
+        fn publish_admitted_explicit_physical(&self, _admission: &FixedCapAdmission) {}
+
+        fn last_synced_explicit_pubkeys_write(
+            &self,
+        ) -> parking_lot::RwLockWriteGuard<'_, HashSet<Pubkey>> {
+            static KEYS: std::sync::LazyLock<parking_lot::RwLock<HashSet<Pubkey>>> =
+                std::sync::LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
+            KEYS.write()
+        }
+
+        fn clear_pending_geyser_evict(&self) {}
+
+        fn geyser_explicit_readiness_ok(&self) -> bool {
+            true
+        }
+
+        fn geyser_connect_barrier_pending(&self) -> bool {
+            false
+        }
+
+        fn signal_restore_barrier(&self, _ok: bool) {}
+
+        fn apply_explicit_cap_shrink(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _new_cap: usize,
+        ) -> CapShrinkResult {
+            CapShrinkResult::NoOpAlreadyWithinCap {
+                old_cap: 25_000,
+                new_cap: 25_000,
+            }
+        }
+    }
+
+    #[test]
+    fn wallet_pin_replays_via_protocol_after_transient_reject() {
+        let ctx = Arc::new(WalletReplayTestCtx::fail_once());
+        let protocol = Arc::new(Mutex::new(BoundedProtocolStore::default_caps()));
+        let mint = Pubkey::new_unique();
+        let cmd = {
+            let mut store = protocol.lock().expect("lock");
+            store.wrap_command(TrackWorkerCommand::ApplyWalletPin { mint })
+        };
+        let mut admission = FixedCapAdmission::new(25_000);
+        let mut restore_barrier_pending = false;
+
+        track_worker_apply_protocol_command(
+            &ctx,
+            &protocol,
+            &mut admission,
+            &mut restore_barrier_pending,
+            cmd.clone(),
+        );
+        {
+            let store = protocol.lock().expect("lock");
+            assert!(
+                store.is_applicable(&cmd),
+                "failed wallet pin must not advance revision"
+            );
+            assert_eq!(
+                store.pending_len(),
+                1,
+                "failed wallet pin must be re-staged into bounded pending"
+            );
+        }
+        assert!(ctx.pinned.lock().is_empty());
+
+        track_worker_drain_pending_replay(
+            &ctx,
+            &protocol,
+            &mut admission,
+            &mut restore_barrier_pending,
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut false,
+        );
+        {
+            let store = protocol.lock().expect("lock");
+            assert!(
+                !store.is_applicable(&cmd),
+                "successful wallet pin must advance revision"
+            );
+        }
+        assert_eq!(ctx.pinned.lock().as_slice(), &[mint]);
+    }
+
+    #[test]
+    fn wallet_track_mint_replays_after_transient_reject() {
+        let ctx = Arc::new(WalletReplayTestCtx::fail_once());
+        let protocol = Arc::new(Mutex::new(BoundedProtocolStore::default_caps()));
+        let mint = Pubkey::new_unique();
+        let cmd = {
+            let mut store = protocol.lock().expect("lock");
+            store.wrap_command(TrackWorkerCommand::TrackMint {
+                mint,
+                pin: Some(TrackPinReason::Wallet),
+            })
+        };
+        assert_eq!(cmd.stream, TrackCommandStream::Wallet);
+        let mut admission = FixedCapAdmission::new(25_000);
+        let mut restore_barrier_pending = false;
+
+        track_worker_apply_protocol_command(
+            &ctx,
+            &protocol,
+            &mut admission,
+            &mut restore_barrier_pending,
+            cmd.clone(),
+        );
+        {
+            let store = protocol.lock().expect("lock");
+            assert!(store.is_applicable(&cmd));
+            assert_eq!(store.pending_len(), 1);
+        }
+
+        track_worker_drain_pending_replay(
+            &ctx,
+            &protocol,
+            &mut admission,
+            &mut restore_barrier_pending,
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut false,
+        );
+        assert_eq!(ctx.pinned.lock().as_slice(), &[mint]);
+    }
+
+    #[test]
+    fn repeated_tracker_mint_advances_revision_without_pending_growth() {
+        struct TrackerIdempotentCtx;
+
+        impl TrackWorkerContext for TrackerIdempotentCtx {
+            fn geyser_sync_batch_debounce_ms(&self) -> u64 {
+                0
+            }
+
+            fn max_tracked_accounts(&self) -> usize {
+                25_000
+            }
+
+            fn apply_momentum_active_pools_update(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _update: &MomentumActivePoolsUpdate,
+            ) -> bool {
+                false
+            }
+
+            fn apply_momentum_snapshot_reconcile(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _active: &[MomentumActivePoolEntry],
+            ) -> bool {
+                false
+            }
+
+            fn apply_momentum_removed_entries(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _chunk: &[MomentumRemovedPoolEntry],
+            ) -> bool {
+                false
+            }
+
+            fn apply_momentum_active_entries(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _chunk: &[MomentumActivePoolEntry],
+            ) -> bool {
+                false
+            }
+
+            fn apply_arb_track_requests_update(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _update: &ArbTrackRequestsUpdate,
+            ) -> bool {
+                false
+            }
+
+            fn apply_arb_snapshot_reconcile(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _active: &[ArbTrackActiveEntry],
+            ) -> bool {
+                false
+            }
+
+            fn apply_arb_removed_entries(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _chunk: &[ArbTrackRemovedEntry],
+            ) -> bool {
+                false
+            }
+
+            fn apply_arb_active_entries(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _chunk: &[ArbTrackActiveEntry],
+            ) -> bool {
+                false
+            }
+
+            fn apply_wallet_pin(&self, _admission: &mut FixedCapAdmission, _mint: Pubkey) -> bool {
+                true
+            }
+
+            fn withdraw_wallet_pin(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _mint: Pubkey,
+            ) -> bool {
+                true
+            }
+
+            fn apply_track_mint(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _mint: Pubkey,
+                _pin: Option<TrackPinReason>,
+            ) -> bool {
+                true
+            }
+
+            fn refresh_geyser_pins_gauge(&self) {}
+
+            fn hot_pool_registry_pair_count(&self) -> usize {
+                0
+            }
+
+            fn hot_pool_registry_arb_pool_count(&self) -> usize {
+                0
+            }
+
+            fn refresh_hot_pool_registry_gauges(&self) {}
+
+            fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
+                HashSet::new()
+            }
+
+            fn pending_geyser_evict(&self) -> bool {
+                false
+            }
+
+            fn sync_geyser_tracked_accounts_batched_flush_with_deadline(
+                &self,
+                _deadline: Instant,
+                _admission: &FixedCapAdmission,
+            ) -> bool {
+                true
+            }
+
+            fn continue_geyser_evict_with_deadline(
+                &self,
+                _deadline: Instant,
+                _admission: &FixedCapAdmission,
+            ) -> bool {
+                true
+            }
+
+            fn release_geyser_sync_flush_slot(&self) {}
+
+            fn refresh_tracked_membership_snapshot(&self) {}
+
+            fn explicit_pubkey_rows_for_desired_set(
+                &self,
+            ) -> Vec<(
+                Pubkey,
+                crate::market_data::track::ConsumerId,
+                Option<Pubkey>,
+            )> {
+                Vec::new()
+            }
+
+            fn build_explicit_set_snapshot(
+                &self,
+                _admission: &FixedCapAdmission,
+            ) -> super::ExplicitSetSnapshot {
+                super::ExplicitSetSnapshot::new(None)
+            }
+
+            fn apply_explicit_set_snapshot(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _snapshot: &super::ExplicitSetSnapshot,
+            ) -> AdmissionRestoreResult {
+                AdmissionRestoreResult::Restored
+            }
+
+            fn apply_explicit_set_snapshot_legacy(
+                &self,
+                _snapshot: &super::ExplicitSetSnapshot,
+            ) -> usize {
+                0
+            }
+
+            fn on_admission_converge_result(
+                &self,
+                _admission: &FixedCapAdmission,
+                _result: AdmissionConvergeResult,
+            ) {
+            }
+
+            fn prune_tracked_maps_to_admitted(&self, _admission: &FixedCapAdmission) {}
+
+            fn publish_admitted_explicit_physical(&self, _admission: &FixedCapAdmission) {}
+
+            fn last_synced_explicit_pubkeys_write(
+                &self,
+            ) -> parking_lot::RwLockWriteGuard<'_, HashSet<Pubkey>> {
+                static KEYS: std::sync::LazyLock<parking_lot::RwLock<HashSet<Pubkey>>> =
+                    std::sync::LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
+                KEYS.write()
+            }
+
+            fn clear_pending_geyser_evict(&self) {}
+
+            fn geyser_explicit_readiness_ok(&self) -> bool {
+                true
+            }
+
+            fn geyser_connect_barrier_pending(&self) -> bool {
+                false
+            }
+
+            fn signal_restore_barrier(&self, _ok: bool) {}
+
+            fn apply_explicit_cap_shrink(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _new_cap: usize,
+            ) -> CapShrinkResult {
+                CapShrinkResult::NoOpAlreadyWithinCap {
+                    old_cap: 25_000,
+                    new_cap: 25_000,
+                }
+            }
+        }
+
+        let ctx = Arc::new(TrackerIdempotentCtx);
+        let protocol = Arc::new(Mutex::new(BoundedProtocolStore::default_caps()));
+        let mint = Pubkey::new_unique();
+        let mut admission = FixedCapAdmission::new(25_000);
+        let mut restore_barrier_pending = false;
+
+        for _ in 0..2 {
+            let cmd = {
+                let mut store = protocol.lock().expect("lock");
+                store.wrap_command(TrackWorkerCommand::TrackMint { mint, pin: None })
+            };
+            track_worker_apply_protocol_command(
+                &ctx,
+                &protocol,
+                &mut admission,
+                &mut restore_barrier_pending,
+                cmd.clone(),
+            );
+            let store = protocol.lock().expect("lock");
+            assert_eq!(
+                store.pending_len(),
+                0,
+                "idempotent tracker mint must not re-stage pending"
+            );
+            assert!(
+                !store.is_applicable(&cmd),
+                "each tracker mint command must advance revision"
+            );
+        }
+    }
+
+    struct WithdrawSupersedesTrackerTestCtx {
+        tracked: parking_lot::Mutex<std::collections::HashSet<Pubkey>>,
+    }
+
+    impl WithdrawSupersedesTrackerTestCtx {
+        fn new() -> Self {
+            Self {
+                tracked: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            }
+        }
+    }
+
+    impl TrackWorkerContext for WithdrawSupersedesTrackerTestCtx {
+        fn geyser_sync_batch_debounce_ms(&self) -> u64 {
+            0
+        }
+
+        fn max_tracked_accounts(&self) -> usize {
+            25_000
+        }
+
+        fn apply_momentum_active_pools_update(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _update: &MomentumActivePoolsUpdate,
+        ) -> bool {
+            false
+        }
+
+        fn apply_momentum_snapshot_reconcile(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _active: &[MomentumActivePoolEntry],
+        ) -> bool {
+            false
+        }
+
+        fn apply_momentum_removed_entries(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _chunk: &[MomentumRemovedPoolEntry],
+        ) -> bool {
+            false
+        }
+
+        fn apply_momentum_active_entries(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _chunk: &[MomentumActivePoolEntry],
+        ) -> bool {
+            false
+        }
+
+        fn apply_arb_track_requests_update(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _update: &ArbTrackRequestsUpdate,
+        ) -> bool {
+            false
+        }
+
+        fn apply_arb_snapshot_reconcile(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _active: &[ArbTrackActiveEntry],
+        ) -> bool {
+            false
+        }
+
+        fn apply_arb_removed_entries(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _chunk: &[ArbTrackRemovedEntry],
+        ) -> bool {
+            false
+        }
+
+        fn apply_arb_active_entries(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _chunk: &[ArbTrackActiveEntry],
+        ) -> bool {
+            false
+        }
+
+        fn apply_wallet_pin(&self, _admission: &mut FixedCapAdmission, mint: Pubkey) -> bool {
+            self.tracked.lock().insert(mint);
+            true
+        }
+
+        fn withdraw_wallet_pin(&self, _admission: &mut FixedCapAdmission, mint: Pubkey) -> bool {
+            self.tracked.lock().remove(&mint);
+            true
+        }
+
+        fn apply_track_mint(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            mint: Pubkey,
+            pin: Option<TrackPinReason>,
+        ) -> bool {
+            if pin.is_none() {
+                self.tracked.lock().insert(mint);
+            }
+            true
+        }
+
+        fn refresh_geyser_pins_gauge(&self) {}
+
+        fn hot_pool_registry_pair_count(&self) -> usize {
+            0
+        }
+
+        fn hot_pool_registry_arb_pool_count(&self) -> usize {
+            0
+        }
+
+        fn refresh_hot_pool_registry_gauges(&self) {}
+
+        fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
+            HashSet::new()
+        }
+
+        fn pending_geyser_evict(&self) -> bool {
+            false
+        }
+
+        fn sync_geyser_tracked_accounts_batched_flush_with_deadline(
+            &self,
+            _deadline: Instant,
+            _admission: &FixedCapAdmission,
+        ) -> bool {
+            true
+        }
+
+        fn continue_geyser_evict_with_deadline(
+            &self,
+            _deadline: Instant,
+            _admission: &FixedCapAdmission,
+        ) -> bool {
+            true
+        }
+
+        fn release_geyser_sync_flush_slot(&self) {}
+
+        fn refresh_tracked_membership_snapshot(&self) {}
+
+        fn explicit_pubkey_rows_for_desired_set(
+            &self,
+        ) -> Vec<(
+            Pubkey,
+            crate::market_data::track::ConsumerId,
+            Option<Pubkey>,
+        )> {
+            Vec::new()
+        }
+
+        fn build_explicit_set_snapshot(
+            &self,
+            _admission: &FixedCapAdmission,
+        ) -> super::ExplicitSetSnapshot {
+            super::ExplicitSetSnapshot::new(None)
+        }
+
+        fn apply_explicit_set_snapshot(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _snapshot: &super::ExplicitSetSnapshot,
+        ) -> AdmissionRestoreResult {
+            AdmissionRestoreResult::Restored
+        }
+
+        fn apply_explicit_set_snapshot_legacy(
+            &self,
+            _snapshot: &super::ExplicitSetSnapshot,
+        ) -> usize {
+            0
+        }
+
+        fn on_admission_converge_result(
+            &self,
+            _admission: &FixedCapAdmission,
+            _result: AdmissionConvergeResult,
+        ) {
+        }
+
+        fn prune_tracked_maps_to_admitted(&self, _admission: &FixedCapAdmission) {}
+
+        fn publish_admitted_explicit_physical(&self, _admission: &FixedCapAdmission) {}
+
+        fn last_synced_explicit_pubkeys_write(
+            &self,
+        ) -> parking_lot::RwLockWriteGuard<'_, HashSet<Pubkey>> {
+            static KEYS: std::sync::LazyLock<parking_lot::RwLock<HashSet<Pubkey>>> =
+                std::sync::LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
+            KEYS.write()
+        }
+
+        fn clear_pending_geyser_evict(&self) {}
+
+        fn geyser_explicit_readiness_ok(&self) -> bool {
+            true
+        }
+
+        fn geyser_connect_barrier_pending(&self) -> bool {
+            false
+        }
+
+        fn signal_restore_barrier(&self, _ok: bool) {}
+
+        fn apply_explicit_cap_shrink(
+            &self,
+            _admission: &mut FixedCapAdmission,
+            _new_cap: usize,
+        ) -> CapShrinkResult {
+            CapShrinkResult::NoOpAlreadyWithinCap {
+                old_cap: 25_000,
+                new_cap: 25_000,
+            }
+        }
+    }
+
+    #[test]
+    fn wallet_withdraw_supersedes_staged_tracker_replay() {
+        let ctx = Arc::new(WithdrawSupersedesTrackerTestCtx::new());
+        let protocol = Arc::new(Mutex::new(BoundedProtocolStore::default_caps()));
+        let mint = Pubkey::new_unique();
+        let mut admission = FixedCapAdmission::new(25_000);
+        let mut restore_barrier_pending = false;
+
+        let tracker_cmd = {
+            let mut store = protocol.lock().expect("lock");
+            let cmd = store.wrap_command(TrackWorkerCommand::TrackMint { mint, pin: None });
+            store.stage_on_queue_full(cmd.clone());
+            cmd
+        };
+        ctx.tracked.lock().insert(mint);
+
+        let withdraw_cmd = {
+            let mut store = protocol.lock().expect("lock");
+            store.wrap_command(TrackWorkerCommand::WithdrawWalletPin { mint })
+        };
+        track_worker_apply_protocol_command(
+            &ctx,
+            &protocol,
+            &mut admission,
+            &mut restore_barrier_pending,
+            withdraw_cmd,
+        );
+        assert!(!ctx.tracked.lock().contains(&mint));
+
+        track_worker_drain_pending_replay(
+            &ctx,
+            &protocol,
+            &mut admission,
+            &mut restore_barrier_pending,
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut false,
+        );
+        assert!(
+            !ctx.tracked.lock().contains(&mint),
+            "superseded tracker replay must not re-admit mint after wallet withdraw"
+        );
+        {
+            let store = protocol.lock().expect("lock");
+            assert!(!store.is_applicable(&tracker_cmd));
+        }
     }
 
     #[test]
@@ -707,9 +1612,9 @@ mod tests {
             TrackWorkerCommand::ContinueGeyserEvict,
         ] {
             let cmd = store.wrap_command(payload);
-            store.mark_applied(cmd.stream, cmd.revision);
+            store.mark_applied(&cmd);
             assert!(
-                !store.is_applicable(cmd.stream, cmd.revision),
+                !store.is_applicable(&cmd),
                 "applied revision must not remain applicable"
             );
         }

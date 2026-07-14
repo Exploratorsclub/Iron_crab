@@ -9,6 +9,8 @@ pub enum ConsumerId {
     Wallet,
     Momentum,
     Arb,
+    /// Unpinned mint / recent-trade LRU demand (I-MD-5: lowest protection).
+    Tracker,
 }
 
 /// Pin priority for cap eviction — lower ordinal = higher protection (Plan §3.4).
@@ -192,6 +194,7 @@ pub fn pin_priority_from_consumer(consumer: ConsumerId) -> PinPriority {
         ConsumerId::Wallet => PinPriority::Wallet,
         ConsumerId::Momentum => PinPriority::Momentum,
         ConsumerId::Arb => PinPriority::Arb,
+        ConsumerId::Tracker => PinPriority::Tracker,
     }
 }
 

@@ -3,6 +3,7 @@
 use super::snapshot::ExplicitSetSnapshot;
 use crate::nats::{ArbTrackRequestsUpdate, MomentumActivePoolsUpdate};
 use solana_sdk::pubkey::Pubkey;
+use std::collections::HashMap;
 
 /// Pin reason for explicit Geyser tracking (maps to [`super::ConsumerId`] in rebuild).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +19,10 @@ pub enum TrackWorkerCommand {
     ApplyMomentumActivePools(MomentumActivePoolsUpdate),
     ApplyArbTrackRequests(ArbTrackRequestsUpdate),
     ApplyWalletPin {
+        mint: Pubkey,
+    },
+    /// PR4b: explicit wallet-pin withdrawal before tracked-map demotion (I-MD-8).
+    WithdrawWalletPin {
         mint: Pubkey,
     },
     TrackMint {
@@ -43,11 +48,13 @@ pub enum TrackWorkerCommand {
 pub enum TrackCommandStream {
     Momentum = 0,
     Arb = 1,
-    Control = 2,
+    Wallet = 2,
+    Tracker = 3,
+    Control = 4,
 }
 
 impl TrackCommandStream {
-    pub const COUNT: usize = 3;
+    pub const COUNT: usize = 5;
 
     #[inline]
     pub fn index(self) -> usize {
@@ -79,7 +86,13 @@ pub fn stream_for_command(cmd: &TrackWorkerCommand) -> TrackCommandStream {
         TrackWorkerCommand::ApplyMomentumActivePools(_) => TrackCommandStream::Momentum,
         TrackWorkerCommand::ApplyArbTrackRequests(_) => TrackCommandStream::Arb,
         TrackWorkerCommand::ApplyWalletPin { .. }
-        | TrackWorkerCommand::TrackMint { .. }
+        | TrackWorkerCommand::WithdrawWalletPin { .. } => TrackCommandStream::Wallet,
+        TrackWorkerCommand::TrackMint {
+            pin: Some(TrackPinReason::Wallet),
+            ..
+        } => TrackCommandStream::Wallet,
+        TrackWorkerCommand::TrackMint { pin: None, .. } => TrackCommandStream::Tracker,
+        TrackWorkerCommand::TrackMint { .. }
         | TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange
         | TrackWorkerCommand::ScheduleGeyserPush
         | TrackWorkerCommand::ScheduleGeyserPushDebounced
@@ -89,18 +102,68 @@ pub fn stream_for_command(cmd: &TrackWorkerCommand) -> TrackCommandStream {
     }
 }
 
-/// Monotone revision counter per stream (starts at 1).
+/// Per-mint demand key for wallet/tracker streams (supersession scoped per mint).
+pub fn demand_mint_for_command(cmd: &TrackWorkerCommand) -> Option<Pubkey> {
+    match cmd {
+        TrackWorkerCommand::ApplyWalletPin { mint }
+        | TrackWorkerCommand::WithdrawWalletPin { mint } => Some(*mint),
+        TrackWorkerCommand::TrackMint {
+            mint,
+            pin: None | Some(TrackPinReason::Wallet),
+        } => Some(*mint),
+        _ => None,
+    }
+}
+
+#[inline]
+pub fn stream_uses_per_mint_revision(stream: TrackCommandStream) -> bool {
+    matches!(
+        stream,
+        TrackCommandStream::Wallet | TrackCommandStream::Tracker
+    )
+}
+
+/// Monotone revision counter per stream (starts at 1); wallet/tracker use per-mint counters.
 #[derive(Debug, Clone, Default)]
 pub struct RevisionAssigner {
     next: [u64; TrackCommandStream::COUNT],
+    wallet_mint_next: HashMap<Pubkey, u64>,
+    tracker_mint_next: HashMap<Pubkey, u64>,
 }
 
 impl RevisionAssigner {
-    pub fn next_revision(&mut self, stream: TrackCommandStream) -> u64 {
+    pub fn next_revision(
+        &mut self,
+        stream: TrackCommandStream,
+        demand_mint: Option<Pubkey>,
+    ) -> u64 {
+        if stream_uses_per_mint_revision(stream) {
+            let mint = demand_mint.expect("wallet/tracker revision requires demand mint");
+            let map = match stream {
+                TrackCommandStream::Wallet => &mut self.wallet_mint_next,
+                TrackCommandStream::Tracker => &mut self.tracker_mint_next,
+                _ => unreachable!(),
+            };
+            let rev = map
+                .entry(mint)
+                .and_modify(|r| *r = r.saturating_add(1))
+                .or_insert(1);
+            return *rev;
+        }
         let idx = stream.index();
         let rev = self.next[idx].saturating_add(1);
         self.next[idx] = rev;
         rev
+    }
+
+    /// Highest revision already assigned for a per-mint wallet/tracker stream (0 if none).
+    pub fn last_issued_revision_for_mint(&self, stream: TrackCommandStream, mint: Pubkey) -> u64 {
+        let map = match stream {
+            TrackCommandStream::Wallet => &self.wallet_mint_next,
+            TrackCommandStream::Tracker => &self.tracker_mint_next,
+            _ => return 0,
+        };
+        *map.get(&mint).unwrap_or(&0)
     }
 }
 
@@ -134,6 +197,24 @@ mod tests {
             ),
             (
                 TrackWorkerCommand::TrackMint { mint, pin: None },
+                TrackCommandStream::Tracker,
+            ),
+            (
+                TrackWorkerCommand::ApplyWalletPin { mint },
+                TrackCommandStream::Wallet,
+            ),
+            (
+                TrackWorkerCommand::TrackMint {
+                    mint,
+                    pin: Some(TrackPinReason::Wallet),
+                },
+                TrackCommandStream::Wallet,
+            ),
+            (
+                TrackWorkerCommand::TrackMint {
+                    mint,
+                    pin: Some(TrackPinReason::MomentumActive),
+                },
                 TrackCommandStream::Control,
             ),
         ];
@@ -145,12 +226,29 @@ mod tests {
     #[test]
     fn revision_assigner_is_monotone_per_stream() {
         let mut assigner = RevisionAssigner::default();
-        let r1 = assigner.next_revision(TrackCommandStream::Momentum);
-        let r2 = assigner.next_revision(TrackCommandStream::Momentum);
-        let a1 = assigner.next_revision(TrackCommandStream::Arb);
+        let r1 = assigner.next_revision(TrackCommandStream::Momentum, None);
+        let r2 = assigner.next_revision(TrackCommandStream::Momentum, None);
+        let a1 = assigner.next_revision(TrackCommandStream::Arb, None);
         assert!(r2 > r1);
         assert_eq!(a1, 1);
         assert_eq!(r1, 1);
         assert_eq!(r2, 2);
+    }
+
+    #[test]
+    fn revision_assigner_wallet_tracker_is_per_mint() {
+        let mut assigner = RevisionAssigner::default();
+        let m1 = Pubkey::new_unique();
+        let m2 = Pubkey::new_unique();
+        let w1a = assigner.next_revision(TrackCommandStream::Wallet, Some(m1));
+        let w2a = assigner.next_revision(TrackCommandStream::Wallet, Some(m2));
+        let w1b = assigner.next_revision(TrackCommandStream::Wallet, Some(m1));
+        let t1a = assigner.next_revision(TrackCommandStream::Tracker, Some(m1));
+        let t2a = assigner.next_revision(TrackCommandStream::Tracker, Some(m2));
+        assert_eq!(w1a, 1);
+        assert_eq!(w2a, 1);
+        assert_eq!(w1b, 2);
+        assert_eq!(t1a, 1);
+        assert_eq!(t2a, 1);
     }
 }

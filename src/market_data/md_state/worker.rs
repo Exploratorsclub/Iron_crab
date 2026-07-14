@@ -14,6 +14,7 @@ use crate::metrics::{
     set_market_data_md_state_burst_in_progress, set_market_data_md_state_deferred_jobs_len,
     set_market_data_md_state_queue_depth,
 };
+use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -29,6 +30,8 @@ pub const MARKET_DATA_MD_STATE_BURST_MAX: usize = 256;
 pub const MARKET_DATA_MD_STATE_JOB_BUDGET_MS: u64 = 16;
 /// PR235: minimum jobs completed per burst before time-budget defer (avoids re-defer loops).
 pub const MARKET_DATA_MD_STATE_MIN_JOBS_PER_BURST: usize = 32;
+/// Bounded retries for critical md-state enqueues that must not be silently dropped (PR4b).
+pub const MARKET_DATA_MD_STATE_CRITICAL_ENQUEUE_ATTEMPTS: usize = 32;
 
 /// Bounded enqueue handle for the `md-state` OS thread (non-Tokio).
 #[derive(Clone)]
@@ -111,6 +114,10 @@ pub fn md_state_process_job<C: MdStateContext>(
             track_worker_try_enqueue(track_worker, TrackWorkerCommand::ApplyWalletPin { mint });
             false
         }
+        MdStateCommand::WithdrawWalletMint { mint } => {
+            track_worker_try_enqueue(track_worker, TrackWorkerCommand::WithdrawWalletPin { mint });
+            false
+        }
         MdStateCommand::ScheduleGeyserSyncAfterConfigChange => {
             track_worker_try_enqueue(
                 track_worker,
@@ -167,6 +174,19 @@ pub fn md_state_try_enqueue(sender: &MdStateSender, job: MdStateCommand) -> bool
         inc_market_data_geyser_tracking_enqueue_dropped_total();
         false
     }
+}
+
+/// PR4b: enqueue wallet-pin withdraw with bounded yield-retry (I-MD-8 demand must not be lost).
+pub fn md_state_try_enqueue_withdraw_wallet_mint(sender: &MdStateSender, mint: Pubkey) -> bool {
+    for attempt in 0..MARKET_DATA_MD_STATE_CRITICAL_ENQUEUE_ATTEMPTS {
+        if md_state_try_enqueue(sender, MdStateCommand::WithdrawWalletMint { mint }) {
+            return true;
+        }
+        if attempt + 1 < MARKET_DATA_MD_STATE_CRITICAL_ENQUEUE_ATTEMPTS {
+            std::thread::yield_now();
+        }
+    }
+    false
 }
 
 fn md_state_worker_loop<C: MdStateContext + 'static>(
