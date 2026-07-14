@@ -2742,7 +2742,7 @@ impl MarketDataContext {
             .get(&mint)
             .is_some_and(|info| info.pin == Some(GeyserPinReason::Wallet));
         if !should_remove {
-            return false;
+            return true;
         }
         if !self.try_admit_wallet_owner_group(admission, None, Some(mint)) {
             inc_market_data_wallet_admission_rejected_total();
