@@ -99,6 +99,37 @@ fn owner_group_key(owner: &ExplicitOwner) -> (ExplicitConsumer, ExplicitOwnerKey
     (owner.consumer, owner.owner_key.clone())
 }
 
+/// Pool pubkey for pool-scoped owner groups (`ExplicitOwnerKey::Pool`).
+pub fn pool_pubkey_from_owner_group(group: &OwnerGroupSnapshot) -> Option<Pubkey> {
+    match group.owner_key {
+        ExplicitOwnerKey::Pool(pool) => Some(pool),
+        _ => None,
+    }
+}
+
+/// Derive bypass-gate pool sets from [`FixedCapAdmission`] owner groups (SSOT).
+pub fn explicit_admitted_pool_sets_from_admission(
+    admission: &FixedCapAdmission,
+) -> (HashSet<Pubkey>, HashSet<Pubkey>) {
+    let mut momentum = HashSet::new();
+    let mut arb = HashSet::new();
+    for group in admission.snapshot_owner_groups() {
+        let Some(pool) = pool_pubkey_from_owner_group(&group) else {
+            continue;
+        };
+        match group.consumer {
+            ExplicitConsumer::Momentum => {
+                momentum.insert(pool);
+            }
+            ExplicitConsumer::Arb => {
+                arb.insert(pool);
+            }
+            ExplicitConsumer::Wallet | ExplicitConsumer::Tracker => {}
+        }
+    }
+    (momentum, arb)
+}
+
 /// Admit or replace one immutable owner group (eviction when required).
 pub fn try_admit_owner_group(
     admission: &mut FixedCapAdmission,
@@ -453,5 +484,39 @@ mod tests {
             AdmissionConvergeResult::Converged
         );
         assert!(!admission.contains(&stale_pk));
+    }
+
+    #[test]
+    fn explicit_admitted_pool_sets_from_admission_maps_pool_owner_groups() {
+        let mut admission = FixedCapAdmission::new(100);
+        let mom_pool = Pubkey::new_unique();
+        let arb_pool = Pubkey::new_unique();
+        assert!(try_admit_owner_group(
+            &mut admission,
+            pool_owner(ExplicitConsumer::Momentum, mom_pool),
+            vec![Pubkey::new_unique()]
+        ));
+        assert!(try_admit_owner_group(
+            &mut admission,
+            pool_owner(ExplicitConsumer::Arb, arb_pool),
+            vec![Pubkey::new_unique()]
+        ));
+        let (momentum, arb) = explicit_admitted_pool_sets_from_admission(&admission);
+        assert_eq!(momentum, std::collections::HashSet::from([mom_pool]));
+        assert_eq!(arb, std::collections::HashSet::from([arb_pool]));
+    }
+
+    #[test]
+    fn explicit_admitted_pool_sets_omit_wallet_and_tracker_pool_groups() {
+        let mut admission = FixedCapAdmission::new(100);
+        let pool = Pubkey::new_unique();
+        assert!(try_admit_owner_group(
+            &mut admission,
+            pool_owner(ExplicitConsumer::Tracker, pool),
+            vec![Pubkey::new_unique()]
+        ));
+        let (momentum, arb) = explicit_admitted_pool_sets_from_admission(&admission);
+        assert!(momentum.is_empty());
+        assert!(arb.is_empty());
     }
 }

@@ -80,14 +80,15 @@ use ironcrab::market_data::sidefx::{
     SidefxVaultMembershipView, SidefxWorkerHost, MARKET_DATA_MD_SIDEFX_QUEUE_CAP,
 };
 use ironcrab::market_data::track::{
-    arb_coalesce_try_send, explicit_set_snapshot_path, explicit_subscription_has_new_keys,
-    flush_explicit_set_snapshot, load_explicit_set_snapshot, momentum_coalesce_try_send,
-    owner_group_snapshot_to_disk, pool_is_enrichment_member, restore_admission_from_owner_groups,
-    spawn_track_worker, track_worker_try_enqueue, try_admit_owner_group, AdmissionConvergeResult,
-    AdmissionRestoreResult, CapShrinkResult, ConsumerId, ExplicitAccountKind, ExplicitConsumer,
-    ExplicitOwner, ExplicitOwnerKey, ExplicitSetSnapshot, ExplicitSnapshotRow, FixedCapAdmission,
-    GeyserConnectBarrier, SnapshotConsumer, TrackPinReason, TrackWorkerCommand, TrackWorkerContext,
-    TrackWorkerSender, EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
+    arb_coalesce_try_send, explicit_admitted_pool_sets_from_admission, explicit_set_snapshot_path,
+    explicit_subscription_has_new_keys, flush_explicit_set_snapshot, load_explicit_set_snapshot,
+    momentum_coalesce_try_send, owner_group_snapshot_to_disk, pool_is_enrichment_member,
+    restore_admission_from_owner_groups, spawn_track_worker, track_worker_try_enqueue,
+    try_admit_owner_group, AdmissionConvergeResult, AdmissionRestoreResult, CapShrinkResult,
+    ConsumerId, ExplicitAccountKind, ExplicitConsumer, ExplicitOwner, ExplicitOwnerKey,
+    ExplicitSetSnapshot, ExplicitSnapshotRow, FixedCapAdmission, GeyserConnectBarrier,
+    SnapshotConsumer, TrackPinReason, TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,
+    EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
 };
 use ironcrab::metrics::{
     dec_market_data_account_high_priority_queue_depth,
@@ -2582,6 +2583,40 @@ impl MarketDataContext {
         self.explicit_admitted_arb_pools.write().remove(&pool);
     }
 
+    /// PR4a: keep bypass-gate pool sets aligned with [`FixedCapAdmission`] SSOT.
+    fn rebuild_explicit_admitted_pools_from_admission(&self, admission: &FixedCapAdmission) {
+        let (momentum, arb) = explicit_admitted_pool_sets_from_admission(admission);
+        *self.explicit_admitted_momentum_pools.write() = momentum;
+        *self.explicit_admitted_arb_pools.write() = arb;
+    }
+
+    fn sync_explicit_pool_admitted_from_admission(
+        &self,
+        admission: &FixedCapAdmission,
+        pool: Pubkey,
+        consumer: ExplicitConsumer,
+    ) {
+        let owner = Self::pool_consumer_owner(pool, consumer);
+        let admitted = admission.owner_group(&owner).is_some();
+        match consumer {
+            ExplicitConsumer::Momentum => {
+                if admitted {
+                    self.note_explicit_momentum_pool_admitted(pool);
+                } else {
+                    self.clear_explicit_momentum_pool_admitted(pool);
+                }
+            }
+            ExplicitConsumer::Arb => {
+                if admitted {
+                    self.note_explicit_arb_pool_admitted(pool);
+                } else {
+                    self.clear_explicit_arb_pool_admitted(pool);
+                }
+            }
+            ExplicitConsumer::Wallet | ExplicitConsumer::Tracker => {}
+        }
+    }
+
     /// PR-B: explicit vault/bin-array/mint Geyser filters — admitted pool groups or wallet only.
     fn admit_geyser_explicit_pool_assets(
         &self,
@@ -2644,6 +2679,11 @@ impl MarketDataContext {
         consumer: ExplicitConsumer,
     ) {
         let _ = admission.remove_group(Self::pool_consumer_owner(pool, consumer));
+        match consumer {
+            ExplicitConsumer::Momentum => self.clear_explicit_momentum_pool_admitted(pool),
+            ExplicitConsumer::Arb => self.clear_explicit_arb_pool_admitted(pool),
+            ExplicitConsumer::Wallet | ExplicitConsumer::Tracker => {}
+        }
     }
 
     fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
@@ -2885,6 +2925,7 @@ impl MarketDataContext {
         admission: &FixedCapAdmission,
         result: AdmissionConvergeResult,
     ) {
+        self.rebuild_explicit_admitted_pools_from_admission(admission);
         set_market_data_geyser_explicit_cap_overflow(
             if matches!(
                 result,
@@ -3053,6 +3094,7 @@ impl MarketDataContext {
         let result = restore_admission_from_owner_groups(admission, &groups);
         match result {
             AdmissionRestoreResult::Restored => {
+                self.rebuild_explicit_admitted_pools_from_admission(admission);
                 if self.admission_exceeds_configured_cap(admission) {
                     self.mark_explicit_admission_config_cap_desync(
                         admission,
@@ -3112,6 +3154,12 @@ impl MarketDataContext {
             };
         }
         let result = admission.try_shrink_cap(new_cap);
+        if matches!(
+            result,
+            CapShrinkResult::Converged { .. } | CapShrinkResult::NoOpAlreadyWithinCap { .. }
+        ) {
+            self.rebuild_explicit_admitted_pools_from_admission(admission);
+        }
         match result {
             CapShrinkResult::Converged { .. } | CapShrinkResult::NoOpAlreadyWithinCap { .. } => {
                 if self.admission_exceeds_configured_cap(admission) {
@@ -4520,7 +4568,6 @@ impl MarketDataContext {
             };
             self.hot_pool_registry.pin_pool(mint_pk, pool_pk);
             if self.try_admit_pool_consumer_group(admission, pool_pk, ExplicitConsumer::Momentum) {
-                self.note_explicit_momentum_pool_admitted(pool_pk);
                 inc_market_data_momentum_admission_admitted_total();
                 if self.register_geyser_reserves_for_momentum_active_pool(pool_pk) {
                     batch_dirty = true;
@@ -4528,6 +4575,11 @@ impl MarketDataContext {
             } else {
                 inc_market_data_momentum_admission_rejected_total();
             }
+            self.sync_explicit_pool_admitted_from_admission(
+                admission,
+                pool_pk,
+                ExplicitConsumer::Momentum,
+            );
             let _ = &a.pin_reason;
         }
         batch_dirty
@@ -4567,7 +4619,6 @@ impl MarketDataContext {
         // row remains after this unpin (PR #147 follow-up).
         if !self.hot_pool_registry.pool_has_any_pin(pool) {
             self.release_pool_consumer_group(admission, pool, ExplicitConsumer::Momentum);
-            self.clear_explicit_momentum_pool_admitted(pool);
             {
                 let mut vaults = self.tracked_vaults.write();
                 for v in vaults.values_mut() {
@@ -4705,7 +4756,6 @@ impl MarketDataContext {
             };
             self.hot_pool_registry.pin_arb_pool(pool_pk);
             if self.try_admit_pool_consumer_group(admission, pool_pk, ExplicitConsumer::Arb) {
-                self.note_explicit_arb_pool_admitted(pool_pk);
                 inc_market_data_arb_admission_admitted_total();
                 if self.register_geyser_reserves_for_arb_active_pool(pool_pk) {
                     batch_dirty = true;
@@ -4754,6 +4804,11 @@ impl MarketDataContext {
             } else {
                 inc_market_data_arb_admission_rejected_total();
             }
+            self.sync_explicit_pool_admitted_from_admission(
+                admission,
+                pool_pk,
+                ExplicitConsumer::Arb,
+            );
             let _ = &a.reason;
         }
         batch_dirty
@@ -4782,7 +4837,6 @@ impl MarketDataContext {
         pool: Pubkey,
     ) -> bool {
         self.release_pool_consumer_group(admission, pool, ExplicitConsumer::Arb);
-        self.clear_explicit_arb_pool_admitted(pool);
         self.hot_pool_registry.unpin_arb_pool(pool);
         let mut changed = false;
         if !self.hot_pool_registry.pool_has_arb(pool)
@@ -11132,7 +11186,8 @@ mod pr_b_geyser_tracking_tests {
     const PUMPFUN_AMM_PROGRAM_OWNER: Pubkey =
         solana_sdk::pubkey!("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
     use ironcrab::market_data::track::{
-        converge_admission_from_ctx, merge_momentum_active_pools_updates,
+        converge_admission_from_ctx, converge_admission_from_groups,
+        merge_momentum_active_pools_updates,
         spawn_inline_track_worker_sender, spawn_noop_track_worker_sender,
         track_worker_execute_coalesced_push, track_worker_try_enqueue, FixedCapAdmission,
         TrackWorkerCommand, MARKET_DATA_TRACK_WORKER_COALESCE_MS,
@@ -14859,6 +14914,132 @@ mod pr_b_geyser_tracking_tests {
             vs.get(&coin).unwrap().pin,
             Some(GeyserPinReason::MomentumActive)
         );
+    }
+
+    #[test]
+    fn release_pool_consumer_group_clears_explicit_momentum_bypass_gate() {
+        use ironcrab::market_data::track::{
+            try_admit_owner_group, ExplicitConsumer, ExplicitOwner, ExplicitOwnerKey,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: mint,
+                token_1_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1),
+                reserve_1: Some(1),
+            }),
+            1,
+        );
+
+        let mut admission = FixedCapAdmission::new(100);
+        let owner = ExplicitOwner {
+            consumer: ExplicitConsumer::Momentum,
+            owner_key: ExplicitOwnerKey::Pool(pool),
+        };
+        assert!(try_admit_owner_group(&mut admission, owner, vec![coin, pc]));
+        ctx.note_explicit_momentum_pool_admitted(pool);
+        assert!(ctx.pool_has_explicit_momentum_admission(pool));
+
+        ctx.release_pool_consumer_group(&mut admission, pool, ExplicitConsumer::Momentum);
+        assert!(!ctx.pool_has_explicit_momentum_admission(pool));
+
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+        MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool);
+        let vs = ctx.tracked_vaults.read();
+        assert!(!vs.contains_key(&coin));
+        assert!(!vs.contains_key(&pc));
+    }
+
+    #[test]
+    fn converge_rebuild_clears_stale_explicit_momentum_pool() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let stale_pool = Pubkey::new_unique();
+        ctx.note_explicit_momentum_pool_admitted(stale_pool);
+        assert!(ctx.pool_has_explicit_momentum_admission(stale_pool));
+
+        let mut admission = FixedCapAdmission::new(100);
+        assert_eq!(
+            converge_admission_from_groups(&mut admission, &[]),
+            AdmissionConvergeResult::Converged
+        );
+        ctx.on_admission_converge_result(&admission, AdmissionConvergeResult::Converged);
+        assert!(!ctx.pool_has_explicit_momentum_admission(stale_pool));
+    }
+
+    #[test]
+    fn restore_explicit_admission_rebuilds_bypass_gate_pool_sets() {
+        use ironcrab::market_data::track::AdmissionRestoreResult;
+        use ironcrab::nats::{MomentumActivePinReason, MomentumActivePoolEntry};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: mint,
+                token_1_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1),
+                reserve_1: Some(1),
+            }),
+            1,
+        );
+
+        let mut snap_admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        ctx.apply_momentum_active_entries(
+            &mut snap_admission,
+            &[MomentumActivePoolEntry {
+                mint: mint.to_string(),
+                pool: pool.to_string(),
+                pin_reason: MomentumActivePinReason::Tracker,
+            }],
+        );
+        let snapshot = ctx.build_explicit_set_snapshot(&snap_admission);
+        assert!(ctx.pool_has_explicit_momentum_admission(pool));
+
+        let fresh = minimal_market_data_context_for_pr_d_tests(
+            QueuedJsonlWriter::spawn(
+                JsonlWriterConfig::new("market_events").with_log_dir(tmp.path()),
+                256,
+            )
+            .expect("jsonl2"),
+        );
+        assert!(!fresh.pool_has_explicit_momentum_admission(pool));
+
+        let mut admission = FixedCapAdmission::new(fresh.max_tracked_accounts());
+        let result = fresh.restore_explicit_admission_from_snapshot(&mut admission, &snapshot);
+        assert_eq!(result, AdmissionRestoreResult::Restored);
+        assert!(fresh.pool_has_explicit_momentum_admission(pool));
+        assert!(fresh.admit_geyser_explicit_pool_assets(
+            pool,
+            mint,
+            Pubkey::from_str(NATIVE_SOL_MINT).unwrap()
+        ));
     }
 
     #[test]
