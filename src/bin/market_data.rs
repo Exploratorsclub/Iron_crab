@@ -56,8 +56,8 @@ use ironcrab::market_data::jsonl::{
     spawn_market_data_jsonl_writer, write_market_event_jsonl, JsonlHost,
 };
 use ironcrab::market_data::md_state::{
-    md_state_try_enqueue, spawn_md_state_worker, MdStateCommand, MdStateContext, MdStateSender,
-    MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP,
+    md_state_try_enqueue, md_state_try_enqueue_withdraw_wallet_mint, spawn_md_state_worker,
+    MdStateCommand, MdStateContext, MdStateSender, MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP,
 };
 use ironcrab::market_data::publish::{
     account_path_enqueue_core_market_event as publish_enqueue_core_market_event,
@@ -5877,6 +5877,14 @@ fn execution_result_sell_closes_wallet_position(exec: &ExecutionResult) -> bool 
     )
 }
 
+/// PR4b: keep wallet ATA tracked until wallet-pin withdraw is successfully enqueued.
+fn wallet_sell_close_should_untrack_ata(
+    should_withdraw_wallet_pin: bool,
+    withdraw_enqueued: bool,
+) -> bool {
+    !should_withdraw_wallet_pin || withdraw_enqueued
+}
+
 /// Mixed-deploy / foreign producers may omit Scope 48 fields. Preserve legacy behavior: assume
 /// full close so zero snapshot + untrack still runs for old sell-all tooling, etc.
 /// **Never** backfill `execution-engine` results — that process must emit explicit metadata.
@@ -9022,28 +9030,42 @@ async fn run_geyser_loop(
                                                 .is_some_and(|info| {
                                                     info.pin == Some(GeyserPinReason::Wallet)
                                                 });
-                                            if should_withdraw_wallet_pin {
-                                                md_state_try_enqueue(
-                                                    &md_state,
-                                                    MdStateCommand::WithdrawWalletMint { mint },
+                                            let withdraw_enqueued = if should_withdraw_wallet_pin {
+                                                md_state_try_enqueue_withdraw_wallet_mint(
+                                                    &md_state, mint,
+                                                )
+                                            } else {
+                                                true
+                                            };
+                                            if should_withdraw_wallet_pin && !withdraw_enqueued {
+                                                warn!(
+                                                    mint = %mint_str,
+                                                    ata = %ata,
+                                                    "WithdrawWalletMint enqueue dropped after retries; keeping ATA tracked until withdraw succeeds"
                                                 );
                                             }
 
-                                            let mut set = ctx.tracked_wallet_token_accounts.write();
-                                            if set.remove(&ata) {
-                                                let mut accounts: Vec<Pubkey> = Vec::new();
-                                                accounts.push(tracked_wallet.wallet);
-                                                accounts.push(tracked_wallet.wsol_ata);
-                                                accounts.extend(set.iter().copied());
-                                                accounts.sort();
-                                                accounts.dedup();
-                                                let _ = ctx.tracked_wallet_tx.send(accounts);
-                                                info!(
-                                                    mint = %mint_str,
-                                                    ata = %ata,
-                                                    remaining_tracked = set.len(),
-                                                    "Untracked ATA after confirmed SELL"
-                                                );
+                                            if wallet_sell_close_should_untrack_ata(
+                                                should_withdraw_wallet_pin,
+                                                withdraw_enqueued,
+                                            ) {
+                                                let mut set =
+                                                    ctx.tracked_wallet_token_accounts.write();
+                                                if set.remove(&ata) {
+                                                    let mut accounts: Vec<Pubkey> = Vec::new();
+                                                    accounts.push(tracked_wallet.wallet);
+                                                    accounts.push(tracked_wallet.wsol_ata);
+                                                    accounts.extend(set.iter().copied());
+                                                    accounts.sort();
+                                                    accounts.dedup();
+                                                    let _ = ctx.tracked_wallet_tx.send(accounts);
+                                                    info!(
+                                                        mint = %mint_str,
+                                                        ata = %ata,
+                                                        remaining_tracked = set.len(),
+                                                        "Untracked ATA after confirmed SELL"
+                                                    );
+                                                }
                                             }
                                         } else if is_confirmed_sell {
                                             info!(
@@ -15346,6 +15368,23 @@ mod pr_b_geyser_tracking_tests {
         let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
         assert!(ctx.apply_wallet_pin(&mut admission, mint));
         assert!(ctx.apply_wallet_pin(&mut admission, mint));
+    }
+
+    #[test]
+    fn pr4b_sell_close_skips_ata_untrack_when_withdraw_enqueue_drops() {
+        assert!(!wallet_sell_close_should_untrack_ata(true, false));
+        assert!(wallet_sell_close_should_untrack_ata(true, true));
+        assert!(wallet_sell_close_should_untrack_ata(false, false));
+    }
+
+    #[test]
+    fn pr4b_withdraw_wallet_mint_enqueue_fails_when_md_state_queue_saturated() {
+        let (md_state, _, _) = test_md_state_sender_no_worker();
+        fill_md_state_queue(&md_state);
+        assert!(!md_state_try_enqueue_withdraw_wallet_mint(
+            &md_state,
+            Pubkey::new_unique()
+        ));
     }
 
     #[tokio::test]
