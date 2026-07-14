@@ -99,7 +99,7 @@ impl BoundedProtocolStore {
         set_market_data_track_protocol_pending_depth(self.pending.len());
     }
 
-    /// Stage command in bounded pending when the worker queue is full (I-MD-5).
+    /// Stage command for later replay (queue full or transient wallet/tracker admission reject).
     pub fn stage_on_queue_full(&mut self, cmd: ImmutableTrackCommand) -> StageResult {
         inc_market_data_track_protocol_replay_triggers_total();
         if self.pending.len() < self.pending_cap {

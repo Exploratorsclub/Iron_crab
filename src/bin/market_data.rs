@@ -1918,11 +1918,12 @@ fn consumer_id_for_geyser_pin(pin: Option<GeyserPinReason>) -> ConsumerId {
     }
 }
 
-fn snapshot_consumer_to_geyser_pin(consumer: SnapshotConsumer) -> GeyserPinReason {
+fn snapshot_consumer_to_geyser_pin(consumer: SnapshotConsumer) -> Option<GeyserPinReason> {
     match consumer {
-        SnapshotConsumer::Wallet => GeyserPinReason::Wallet,
-        SnapshotConsumer::Momentum => GeyserPinReason::MomentumActive,
-        SnapshotConsumer::Arb | SnapshotConsumer::Tracker => GeyserPinReason::ArbMultiDex,
+        SnapshotConsumer::Wallet => Some(GeyserPinReason::Wallet),
+        SnapshotConsumer::Momentum => Some(GeyserPinReason::MomentumActive),
+        SnapshotConsumer::Arb => Some(GeyserPinReason::ArbMultiDex),
+        SnapshotConsumer::Tracker => None,
     }
 }
 
@@ -2909,7 +2910,7 @@ impl MarketDataContext {
             let pool = row.pool.as_deref().and_then(|s| Pubkey::from_str(s).ok());
             match row.kind {
                 ExplicitAccountKind::Mint => {
-                    let _ = self.track_mint_for_geyser_metadata(pk, Some(pin));
+                    let _ = self.track_mint_for_geyser_metadata(pk, pin);
                     if self.tracked_mints.read().contains_key(&pk) {
                         restored += 1;
                     }
@@ -2932,8 +2933,8 @@ impl MarketDataContext {
                                 is_base_vault: true,
                                 last_balance: std::sync::atomic::AtomicU64::new(0),
                                 last_used_at: now,
-                                pinned: true,
-                                pin: Some(pin),
+                                pinned: pin.is_some(),
+                                pin,
                                 active_id: None,
                                 bin_step: None,
                                 sibling_vault: None,
@@ -2947,9 +2948,11 @@ impl MarketDataContext {
                         Entry::Occupied(mut e) => {
                             let v = e.get_mut();
                             v.last_used_at = now;
-                            if Self::geyser_pin_may_promote(v.pin, pin) {
-                                v.pinned = true;
-                                v.pin = Some(pin);
+                            if let Some(target) = pin {
+                                if Self::geyser_pin_may_promote(v.pin, target) {
+                                    v.pinned = true;
+                                    v.pin = Some(target);
+                                }
                             }
                             restored += 1;
                         }
@@ -2966,8 +2969,8 @@ impl MarketDataContext {
                                 bin_array_index: 0,
                                 bin_step: 0,
                                 last_used_at: now,
-                                pinned: true,
-                                pin: Some(pin),
+                                pinned: pin.is_some(),
+                                pin,
                             });
                             drop(bins);
                             if pool_addr != Pubkey::default() {
@@ -2978,9 +2981,11 @@ impl MarketDataContext {
                         Entry::Occupied(mut e) => {
                             let b = e.get_mut();
                             b.last_used_at = now;
-                            if Self::geyser_pin_may_promote(b.pin, pin) {
-                                b.pinned = true;
-                                b.pin = Some(pin);
+                            if let Some(target) = pin {
+                                if Self::geyser_pin_may_promote(b.pin, target) {
+                                    b.pinned = true;
+                                    b.pin = Some(target);
+                                }
                             }
                             restored += 1;
                         }
@@ -15293,6 +15298,41 @@ mod pr_b_geyser_tracking_tests {
     #[test]
     fn pr4b_consumer_id_for_unpinned_mint_is_tracker() {
         assert_eq!(consumer_id_for_geyser_pin(None), ConsumerId::Tracker);
+    }
+
+    /// PR4b: tracker snapshot rows restore as unpinned mints, not arb-pinned.
+    #[test]
+    fn pr4b_tracker_snapshot_mint_restores_unpinned() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let mint = Pubkey::new_unique();
+        ctx.track_mint_for_geyser_metadata(mint, None);
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        converge_admission_from_ctx(ctx.as_ref(), &mut admission);
+        let snapshot = ctx.build_explicit_set_snapshot(&admission);
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|r| r.pubkey == mint.to_string())
+            .expect("tracker mint row");
+        assert_eq!(row.consumer, SnapshotConsumer::Tracker);
+
+        let fresh = minimal_market_data_context_for_pr_d_tests(
+            QueuedJsonlWriter::spawn(
+                JsonlWriterConfig::new("market_events").with_log_dir(tmp.path()),
+                256,
+            )
+            .expect("jsonl2"),
+        );
+        let restored = fresh.apply_explicit_set_snapshot_impl(&snapshot);
+        assert!(restored > 0);
+        let tracked = fresh.tracked_mints.read();
+        let info = tracked.get(&mint).expect("restored tracker mint");
+        assert_eq!(info.pin, None);
+        assert!(!info.pinned);
     }
 
     /// Phase 2c: trade handler must not reference arb reconcile enqueue helpers.

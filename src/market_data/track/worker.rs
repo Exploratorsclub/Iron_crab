@@ -318,6 +318,14 @@ fn track_protocol_should_advance_revision(
     }
 }
 
+fn track_protocol_stage_for_replay(
+    protocol: &Arc<Mutex<BoundedProtocolStore>>,
+    cmd: ImmutableTrackCommand,
+) {
+    let mut store = protocol.lock().expect("track protocol store lock");
+    let _ = store.stage_on_queue_full(cmd);
+}
+
 fn track_worker_apply_protocol_command<C: TrackWorkerContext>(
     ctx: &Arc<C>,
     protocol: &Arc<Mutex<BoundedProtocolStore>>,
@@ -333,11 +341,27 @@ fn track_worker_apply_protocol_command<C: TrackWorkerContext>(
         inc_market_data_track_protocol_superseded_revisions_total();
         return;
     }
+    let stream = cmd.stream;
+    let revision = cmd.revision;
+    let restage_on_failure = matches!(
+        stream,
+        TrackCommandStream::Wallet | TrackCommandStream::Tracker
+    );
+    let payload_for_restage = if restage_on_failure {
+        Some(cmd.payload.clone())
+    } else {
+        None
+    };
     let handler_succeeded =
         track_worker_process_command(ctx, admission, restore_barrier_pending, cmd.payload);
-    if track_protocol_should_advance_revision(cmd.stream, handler_succeeded) {
+    if track_protocol_should_advance_revision(stream, handler_succeeded) {
         let mut store = protocol.lock().expect("track protocol store lock");
-        store.mark_applied(cmd.stream, cmd.revision);
+        store.mark_applied(stream, revision);
+    } else if restage_on_failure {
+        track_protocol_stage_for_replay(
+            protocol,
+            ImmutableTrackCommand::new(stream, revision, payload_for_restage.expect("restage")),
+        );
     }
 }
 
@@ -993,15 +1017,23 @@ mod tests {
                 store.is_applicable(cmd.stream, cmd.revision),
                 "failed wallet pin must not advance revision"
             );
+            assert_eq!(
+                store.pending_len(),
+                1,
+                "failed wallet pin must be re-staged into bounded pending"
+            );
         }
         assert!(ctx.pinned.lock().is_empty());
 
-        track_worker_apply_protocol_command(
+        track_worker_drain_pending_replay(
             &ctx,
             &protocol,
             &mut admission,
             &mut restore_barrier_pending,
-            cmd.clone(),
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut false,
         );
         {
             let store = protocol.lock().expect("lock");
