@@ -14,6 +14,7 @@ Cmnd_Alias IRONCRAB_DEPLOY_CP = \
     /usr/bin/cp /home/ironcrab/Iron_crab/docs/systemd/arb-strategy.service /etc/systemd/system/, \
     /usr/bin/cp /home/ironcrab/Iron_crab/docs/systemd/execution-engine.service /etc/systemd/system/, \
     /usr/bin/cp /home/ironcrab/Iron_crab/docs/systemd/control-plane.service /etc/systemd/system/, \
+    /usr/bin/cp /home/ironcrab/Iron_crab/docs/systemd/trades-server.service /etc/systemd/system/, \
     /usr/bin/cp /home/ironcrab/Iron_crab/docs/systemd/ironcrab.target /etc/systemd/system/
 
 Cmnd_Alias IRONCRAB_DEPLOY_SYSTEMCTL = \
@@ -31,6 +32,7 @@ Cmnd_Alias IRONCRAB_DEPLOY_SYSTEMCTL = \
     /usr/bin/systemctl is-active momentum-bot, \
     /usr/bin/systemctl is-active arb-strategy, \
     /usr/bin/systemctl is-active execution-engine, \
-    /usr/bin/systemctl is-active control-plane
+    /usr/bin/systemctl is-active control-plane, \
+    /usr/bin/systemctl is-active trades-server
 
 IRONCRAB_BOT ALL=(root) NOPASSWD: IRONCRAB_DEPLOY_CP, IRONCRAB_DEPLOY_SYSTEMCTL
