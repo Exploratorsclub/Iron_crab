@@ -115,9 +115,6 @@ fn is_non_tradeable_momentum_mint(mint: &str) -> bool {
 /// JetStream replay dedup for orphaned BUY path — bounded so memory does not grow forever.
 const ORPHANED_RECOVERED_INTENT_IDS_CAP: usize = 50_000;
 
-/// Grace window for wallet-snapshot vs ExecutionResult fill dedup (same order as ghost cleanup).
-const WALLET_SNAPSHOT_EXEC_DEDUP_GRACE_SECS: u64 = 90;
-
 /// Returns true when `position_raw` and `fill_raw` are the same BUY fill within tolerance (0.1% or 1 raw).
 #[inline]
 fn wallet_snapshot_fill_amount_matches(position_raw: u64, fill_raw: u64) -> bool {
@@ -6992,6 +6989,7 @@ impl MomentumContext {
 
     /// Pending BUY lifecycle or intent blocks wallet-snapshot `open_position` reconcile (same fill expected via ExecutionResult).
     fn pending_buy_blocks_wallet_snapshot_reconcile(&self, mint: &str) -> Option<String> {
+        self.prune_stale_pending_buy_mint_index();
         if let Some(intent_id) = self.pending_buy_mint_index.read().get(mint) {
             return Some(intent_id.clone());
         }
@@ -7004,15 +7002,8 @@ impl MomentumContext {
 
     /// Wallet-snapshot position already reflects this orphan BUY fill — skip scale-in to avoid double-count.
     fn wallet_snapshot_orphan_fill_already_applied(pos: &PositionTracker, fill_raw: u64) -> bool {
-        if pos.entry_source != PositionEntrySource::WalletSnapshot {
-            return false;
-        }
-        // Exact match: snapshot reconcile already sized to this fill. `entry_time` may be
-        // backdated for timed-exit on wallet reconcile — do not require grace for exact equality.
-        if pos.token_amount == fill_raw {
-            return true;
-        }
-        pos.entry_time.elapsed().as_secs() < WALLET_SNAPSHOT_EXEC_DEDUP_GRACE_SECS
+        // `entry_time` may be backdated for timed-exit on wallet reconcile — amount tolerance only.
+        pos.entry_source == PositionEntrySource::WalletSnapshot
             && wallet_snapshot_fill_amount_matches(pos.token_amount, fill_raw)
     }
 
