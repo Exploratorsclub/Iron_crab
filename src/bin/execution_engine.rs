@@ -74,6 +74,7 @@ use ironcrab::ipc::{
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
+    dec_execution_intent_rx_queue_depth, inc_execution_intent_rx_queue_depth,
     record_execution_engine_interval_tick_duration_ms, record_execution_intent_channel_wait_ms,
     record_execution_intent_jetstream_to_channel_ms, record_execution_process_intent_us,
     record_execution_slot_lag_at_send_slots, record_recent_trade,
@@ -6825,6 +6826,139 @@ impl IntentChannelEnqueueTracker {
     }
 }
 
+/// Log when pending intents in `intent_rx` exceed this depth (backpressure visibility).
+const INTENT_RX_QUEUE_DEPTH_WARN_THRESHOLD: u64 = 10;
+
+async fn drain_completed_intent_tasks(task_set: &mut tokio::task::JoinSet<()>) {
+    while let Some(result) = task_set.try_join_next() {
+        if let Err(e) = result {
+            error!(error = %e, "Intent task panicked");
+        }
+    }
+}
+
+fn spawn_process_intent_task(
+    task_set: &mut tokio::task::JoinSet<()>,
+    ctx: Arc<ExecutionContext>,
+    intent: TradeIntent,
+) {
+    let sem = Arc::clone(&ctx.intent_semaphore);
+    let intent_id = intent.intent_id.clone();
+    task_set.spawn(async move {
+        let _permit = match sem.acquire().await {
+            Ok(p) => p,
+            Err(_) => {
+                warn!(intent_id = %intent_id, "Intent semaphore closed, dropping intent");
+                return;
+            }
+        };
+        CONCURRENT_INTENTS_GAUGE.fetch_add(1, Ordering::Relaxed);
+        let result = process_intent(&ctx, intent).await;
+        CONCURRENT_INTENTS_GAUGE.fetch_sub(1, Ordering::Relaxed);
+        if let Err(e) = result {
+            error!(error = %e, "Failed to process intent");
+        }
+    });
+}
+
+fn dispatch_intent_from_channel(
+    task_set: &mut tokio::task::JoinSet<()>,
+    ctx: &Arc<ExecutionContext>,
+    intent: TradeIntent,
+    enqueue_tracker: &Arc<IntentChannelEnqueueTracker>,
+) {
+    let recv_ms = wall_clock_unix_ms_now();
+    enqueue_tracker.take_and_record_channel_wait(&intent.intent_id, recv_ms);
+    let queue_depth = dec_execution_intent_rx_queue_depth();
+    if queue_depth >= INTENT_RX_QUEUE_DEPTH_WARN_THRESHOLD {
+        warn!(
+            queue_depth,
+            intent_id = %intent.intent_id,
+            "Intent RX queue depth at or above threshold; possible dispatch backlog"
+        );
+    }
+    info!(
+        intent_id = %intent.intent_id,
+        source = %intent.source,
+        "Received TradeIntent from NATS"
+    );
+    spawn_process_intent_task(task_set, Arc::clone(ctx), intent);
+}
+
+async fn shutdown_intent_dispatcher_tasks(
+    task_set: &mut tokio::task::JoinSet<()>,
+    ctx: &Arc<ExecutionContext>,
+) {
+    ctx.intent_semaphore.close();
+    let shutdown_deadline = tokio::time::sleep(Duration::from_secs(60));
+    tokio::pin!(shutdown_deadline);
+    loop {
+        tokio::select! {
+            result = task_set.join_next() => {
+                match result {
+                    Some(Err(e)) => error!(error = %e, "Intent task panicked during shutdown"),
+                    Some(Ok(())) => {}
+                    None => {
+                        info!("All in-flight intents completed");
+                        break;
+                    }
+                }
+            }
+            _ = &mut shutdown_deadline => {
+                warn!(
+                    remaining = task_set.len(),
+                    "Shutdown timeout (60s), aborting remaining intent tasks"
+                );
+                task_set.abort_all();
+                break;
+            }
+        }
+    }
+}
+
+/// Dedicated hot-path loop: reads `intent_rx` and spawns `process_intent` without sharing
+/// the main-loop `select!` with Pool/Wallet heartbeat work (prevents intent starvation).
+async fn run_intent_dispatcher(
+    mut intent_rx: tokio::sync::mpsc::Receiver<TradeIntent>,
+    ctx: Arc<ExecutionContext>,
+    enqueue_tracker: Arc<IntentChannelEnqueueTracker>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut task_set = tokio::task::JoinSet::new();
+    let mut drain_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    drain_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        if *shutdown_rx.borrow() {
+            info!(
+                in_flight = task_set.len(),
+                "Intent dispatcher shutdown requested"
+            );
+            break;
+        }
+
+        tokio::select! {
+            Some(intent) = intent_rx.recv() => {
+                dispatch_intent_from_channel(&mut task_set, &ctx, intent, &enqueue_tracker);
+            }
+            _ = drain_interval.tick() => {
+                drain_completed_intent_tasks(&mut task_set).await;
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    info!(
+                        in_flight = task_set.len(),
+                        "Intent dispatcher shutdown requested"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    shutdown_intent_dispatcher_tasks(&mut task_set, &ctx).await;
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -7892,7 +8026,7 @@ async fn main() -> Result<()> {
 
     // Use channels to bridge NATS subscriptions to the main select! loop
     // This prevents message loss when one branch is busy
-    let (intent_tx, mut intent_rx) = tokio::sync::mpsc::channel::<TradeIntent>(100);
+    let (intent_tx, intent_rx) = tokio::sync::mpsc::channel::<TradeIntent>(100);
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<ControlRequest>(10);
     let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<ConfigUpdate>(10);
     let intent_channel_enqueue_tracker = IntentChannelEnqueueTracker::new();
@@ -7922,6 +8056,7 @@ async fn main() -> Result<()> {
                                             warn!("TradeIntent channel closed, stopping JetStream consumer");
                                             return;
                                         }
+                                        inc_execution_intent_rx_queue_depth();
                                         let enqueue_ms = wall_clock_unix_ms_now();
                                         record_execution_intent_jetstream_to_channel_ms(
                                             enqueue_ms.saturating_sub(deser_done_ms),
@@ -8395,37 +8530,18 @@ async fn main() -> Result<()> {
     // E2E Readiness: consuming state paths (LockManager, LivePoolCache, JetStream consumers) initialized
     set_readiness_state_paths_initialized(true);
 
-    // FIX-31: Track spawned intent tasks for graceful shutdown
-    let mut task_set = tokio::task::JoinSet::new();
+    // Hot-path isolation: intent dispatch in its own task (not in main-loop select! with Pool/Wallet).
+    let intent_dispatcher_handle = {
+        let ctx = Arc::clone(&ctx);
+        let enqueue_tracker = Arc::clone(&intent_channel_enqueue_tracker);
+        let shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            run_intent_dispatcher(intent_rx, ctx, enqueue_tracker, shutdown_rx).await;
+        })
+    };
 
     loop {
         tokio::select! {
-            // FIX-31: Spawn intent processing as a parallel task (was: blocking await)
-            Some(intent) = intent_rx.recv() => {
-                let recv_ms = wall_clock_unix_ms_now();
-                intent_channel_enqueue_tracker
-                    .take_and_record_channel_wait(&intent.intent_id, recv_ms);
-                info!(intent_id = %intent.intent_id, source = %intent.source, "Received TradeIntent from NATS");
-                let ctx_clone = Arc::clone(&ctx);
-                let sem = Arc::clone(&ctx.intent_semaphore);
-                task_set.spawn(async move {
-                    let _permit = match sem.acquire().await {
-                        Ok(p) => p,
-                        Err(_) => {
-                            warn!(intent_id = %intent.intent_id, "Intent semaphore closed, dropping intent");
-                            return;
-                        }
-                    };
-                    CONCURRENT_INTENTS_GAUGE.fetch_add(1, Ordering::Relaxed);
-                    let result = process_intent(&ctx_clone, intent).await;
-                    CONCURRENT_INTENTS_GAUGE.fetch_sub(1, Ordering::Relaxed);
-                    if let Err(e) = result {
-                        error!(error = %e, "Failed to process intent");
-                    }
-                });
-            }
-
-            // Receive Config Updates from channel
             Some(update) = config_rx.recv() => {
                 // Only process if targeted at execution-engine
                 if update.target_component == "execution-engine" {
@@ -8622,13 +8738,6 @@ async fn main() -> Result<()> {
 
             _ = interval.tick() => {
                 simulated_tick += 1;
-
-                // FIX-31: Drain completed intent tasks to prevent memory leaks
-                while let Some(result) = task_set.try_join_next() {
-                    if let Err(e) = result {
-                        error!(error = %e, "Intent task panicked");
-                    }
-                }
 
                 let interval_tick_block_started_ms = wall_clock_unix_ms_now();
 
@@ -8863,36 +8972,15 @@ async fn main() -> Result<()> {
                 }
             }
             _ = &mut shutdown => {
-                info!(in_flight = task_set.len(), "Shutdown signal received, draining in-flight intents");
-                // Signal shutdown to background tasks (WsolManager, etc.)
+                info!("Shutdown signal received, draining intent dispatcher");
                 let _ = shutdown_tx.send(true);
-                // FIX-31: Prevent new intent tasks from acquiring the semaphore
-                ctx.intent_semaphore.close();
-                // FIX-31: Wait for in-flight intent tasks with a timeout
-                let shutdown_deadline = tokio::time::sleep(Duration::from_secs(60));
-                tokio::pin!(shutdown_deadline);
-                loop {
-                    tokio::select! {
-                        result = task_set.join_next() => {
-                            match result {
-                                Some(Err(e)) => error!(error = %e, "Intent task panicked during shutdown"),
-                                Some(Ok(())) => {}
-                                None => {
-                                    info!("All in-flight intents completed");
-                                    break;
-                                }
-                            }
-                        }
-                        _ = &mut shutdown_deadline => {
-                            warn!(remaining = task_set.len(), "Shutdown timeout (60s), aborting remaining intent tasks");
-                            task_set.abort_all();
-                            break;
-                        }
-                    }
-                }
                 break;
             }
         }
+    }
+
+    if let Err(e) = intent_dispatcher_handle.await {
+        error!(error = %e, "Intent dispatcher task failed");
     }
 
     // P1: Save state snapshot on shutdown (DoD K)
@@ -15403,5 +15491,66 @@ mod execution_engine_tests {
         let confirm = rx.await.expect("waiter should receive confirm");
         assert_eq!(confirm.slot, 77);
         assert!(confirm.err.is_none());
+    }
+
+    /// Phase-1 hot-path isolation: intent dispatch must not wait on main-loop Pool/Wallet heartbeat work.
+    #[tokio::test]
+    async fn intent_dispatcher_not_starved_by_simulated_main_loop_block() {
+        use super::{build_replay_context, create_test_intent, run_intent_dispatcher};
+        use ironcrab::metrics::inc_execution_intent_rx_queue_depth;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("intent_dispatch_decisions.jsonl");
+        let ctx = Arc::new(build_replay_context(&path, None).await.expect("replay ctx"));
+        let (intent_tx, intent_rx) = tokio::sync::mpsc::channel::<ironcrab::ipc::TradeIntent>(100);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let enqueue_tracker = super::IntentChannelEnqueueTracker::new();
+
+        let dispatcher = tokio::spawn(run_intent_dispatcher(
+            intent_rx,
+            Arc::clone(&ctx),
+            enqueue_tracker,
+            shutdown_rx,
+        ));
+
+        // Simulate main-loop heartbeat stuck in Pool/Wallet batch processing.
+        let main_loop_blocker = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let intent = create_test_intent("intent-dispatch-test");
+        let send_started = Instant::now();
+        intent_tx.send(intent).await.expect("enqueue intent");
+        inc_execution_intent_rx_queue_depth();
+
+        let deadline = tokio::time::sleep(Duration::from_millis(100));
+        tokio::pin!(deadline);
+        loop {
+            if ctx.intents_received.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+            tokio::select! {
+                _ = &mut deadline => {
+                    panic!(
+                        "intent not dispatched within 100ms while main loop blocked for 5s (elapsed {:?})",
+                        send_started.elapsed()
+                    );
+                }
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+        }
+
+        assert!(
+            send_started.elapsed() < Duration::from_millis(100),
+            "dispatch latency {:?} exceeded 100ms target",
+            send_started.elapsed()
+        );
+
+        shutdown_tx.send(true).expect("signal shutdown");
+        dispatcher.await.expect("dispatcher join");
+        main_loop_blocker.abort();
     }
 }

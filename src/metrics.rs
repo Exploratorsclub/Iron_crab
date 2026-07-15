@@ -5223,6 +5223,8 @@ pub static POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE: Lazy<AtomicU64> =
 /// `authority_open - lockmanager_open` (signed; Prometheus scalar).
 pub static POSITION_AUTHORITY_DRIFT_LOCKMANAGER: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
 pub static CONCURRENT_INTENTS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Pending TradeIntents in `intent_rx` between JetStream enqueue and dispatcher recv.
+pub static EXECUTION_INTENT_RX_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static DAILY_REALIZED_PNL_SOL_MICRO: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static LIQUIDITY_ESTIMATE_SOL_MICRO: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Histogram (swap latency) simplified: we keep bucket counters manually (ns)
@@ -5698,7 +5700,36 @@ pub fn record_execution_intent_jetstream_to_channel_ms(ms: u64) {
     );
 }
 
-/// Channel enqueue → main-loop `intent_rx.recv` before `process_intent` spawn (ms).
+/// JetStream consumer successfully enqueued a TradeIntent into `intent_rx`.
+#[inline]
+pub fn inc_execution_intent_rx_queue_depth() -> u64 {
+    EXECUTION_INTENT_RX_QUEUE_DEPTH.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Intent dispatcher dequeued a TradeIntent from `intent_rx`.
+#[inline]
+pub fn dec_execution_intent_rx_queue_depth() -> u64 {
+    let mut depth = EXECUTION_INTENT_RX_QUEUE_DEPTH.load(Ordering::Relaxed);
+    loop {
+        let new_depth = depth.saturating_sub(1);
+        match EXECUTION_INTENT_RX_QUEUE_DEPTH.compare_exchange_weak(
+            depth,
+            new_depth,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return new_depth,
+            Err(actual) => depth = actual,
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn reset_execution_intent_rx_queue_depth_for_test() {
+    EXECUTION_INTENT_RX_QUEUE_DEPTH.store(0, Ordering::Relaxed);
+}
+
+/// Channel enqueue → intent-dispatcher `intent_rx.recv` before `process_intent` spawn (ms).
 #[inline]
 pub fn record_execution_intent_channel_wait_ms(ms: u64) {
     record_histogram_u64_into(
@@ -8456,6 +8487,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "concurrent_intents",
         CONCURRENT_INTENTS_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "execution_intent_rx_queue_depth",
+        EXECUTION_INTENT_RX_QUEUE_DEPTH.load(Ordering::Relaxed)
     );
     line!(
         "daily_realized_pnl_sol",
