@@ -75,12 +75,13 @@ use ironcrab::ipc::{
 use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
     dec_execution_intent_rx_queue_depth, inc_execution_intent_rx_queue_depth,
-    record_execution_engine_interval_tick_duration_ms, record_execution_intent_channel_wait_ms,
-    record_execution_intent_jetstream_to_channel_ms, record_execution_process_intent_us,
-    record_execution_slot_lag_at_send_slots, record_recent_trade,
-    record_tx_confirmed_slot_delta_slots, record_tx_priority_fee_source, record_tx_rebroadcast,
-    record_tx_rebroadcast_during_confirm_ms, record_tx_rebroadcast_method,
+    inc_execution_pool_cache_messages_processed, record_execution_engine_interval_tick_duration_ms,
+    record_execution_intent_channel_wait_ms, record_execution_intent_jetstream_to_channel_ms,
+    record_execution_process_intent_us, record_execution_slot_lag_at_send_slots,
+    record_recent_trade, record_tx_confirmed_slot_delta_slots, record_tx_priority_fee_source,
+    record_tx_rebroadcast, record_tx_rebroadcast_during_confirm_ms, record_tx_rebroadcast_method,
     record_tx_send_to_confirm_ms, record_tx_slot_to_send_ms, serve_metrics,
+    set_execution_pool_cache_consumer_pending, set_execution_wallet_snapshot_consumer_pending,
     set_readiness_control_response_sub_active, set_readiness_control_sub_active,
     set_readiness_mode, set_readiness_nats_connected, set_readiness_state_paths_initialized,
     try_record_execution_intent_header_to_receive_ms, try_record_execution_intent_to_confirm_ms,
@@ -107,8 +108,8 @@ use ironcrab::metrics::{
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
-    ensure_trade_intents_stream, wallet_snapshot_consumer_config,
-    wallet_snapshot_live_consumer_config_execution_engine,
+    ensure_trade_intents_stream, pool_cache_live_consumer_config_execution_engine,
+    wallet_snapshot_consumer_config, wallet_snapshot_live_consumer_config_execution_engine,
     wallet_tx_confirm_live_consumer_config_execution_engine, NatsClient, NatsConfig,
     CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_CONTROL_REQUESTS, TOPIC_CONTROL_RESPONSES,
     TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
@@ -6397,6 +6398,52 @@ impl ExecutionContext {
         self.refresh_position_authority_metrics();
     }
 
+    /// Apply a WalletBalanceSnapshot MarketEvent to LockManager + decimals cache.
+    /// NATIVE_SOL / WSOL handlers stay separate (KNOWN_BUG #23).
+    fn apply_wallet_balance_snapshot_event(&self, event: &MarketEvent) {
+        if let MarketEventKind::WalletBalanceSnapshot {
+            mint,
+            balance_raw,
+            decimals,
+            ..
+        } = &event.kind
+        {
+            if mint == "NATIVE_SOL" {
+                self.lock_manager.update_native_sol_only(*balance_raw);
+                if let Some(ref tx) = self.wsol_balance_tx {
+                    let wsol = self.lock_manager.wsol_balance();
+                    let _ = tx.try_send((*balance_raw, Some(wsol)));
+                }
+            } else if mint == WSOL_MINT || mint == SOL_MINT {
+                self.lock_manager.update_wsol_only(*balance_raw);
+                if let Some(ref tx) = self.wsol_balance_tx {
+                    let sol = self.lock_manager.total_native_sol();
+                    let _ = tx.try_send((sol, Some(*balance_raw)));
+                }
+            } else {
+                let old = self.lock_manager.available_token_balance(mint);
+                self.lock_manager
+                    .set_available_token_balance(mint.clone(), *balance_raw);
+
+                if old != *balance_raw {
+                    info!(
+                        mint = %mint,
+                        old_balance = old,
+                        new_balance = *balance_raw,
+                        "Token balance sync: LockManager updated from Geyser"
+                    );
+                }
+
+                if let (Some(cache), Ok(mint_pk)) =
+                    (self.live_pool_cache.as_ref(), Pubkey::from_str(mint))
+                {
+                    cache.set_mint_decimals(mint_pk, *decimals);
+                }
+            }
+        }
+        self.apply_position_authority_from_wallet_event_kind(&event.kind);
+    }
+
     fn refresh_position_authority_metrics(&self) {
         let a = self.position_authority.lock();
         let auth_open = a.open_positions_count();
@@ -6828,6 +6875,331 @@ impl IntentChannelEnqueueTracker {
 
 /// Log when pending intents in `intent_rx` exceed this depth (backpressure visibility).
 const INTENT_RX_QUEUE_DEPTH_WARN_THRESHOLD: u64 = 10;
+
+/// Max JetStream messages processed per cold-path consumer iteration (Pool/Wallet/TX-confirm).
+const EE_JETSTREAM_CONSUMER_BATCH_MAX: usize = 15;
+const EE_JETSTREAM_CONSUMER_FETCH_EXPIRES: Duration = Duration::from_millis(100);
+/// Warn when JetStream consumer `num_pending` exceeds this threshold.
+const EE_CONSUMER_PENDING_WARN_THRESHOLD: u64 = 100;
+
+type JetStreamPullConsumer =
+    async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>;
+
+async fn create_pool_cache_live_consumer_for_ee(
+    nats_client: &NatsClient,
+) -> Option<JetStreamPullConsumer> {
+    use async_nats::jetstream;
+
+    let jetstream = jetstream::new(nats_client.client().clone());
+    let stream = match jetstream.get_stream(STREAM_NAME).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                error = %e,
+                stream = STREAM_NAME,
+                "JetStream stream not found for live PoolCacheUpdate sync (market-data may not be running)"
+            );
+            return None;
+        }
+    };
+
+    match stream
+        .create_consumer(pool_cache_live_consumer_config_execution_engine())
+        .await
+    {
+        Ok(consumer) => {
+            info!(
+                stream = STREAM_NAME,
+                deliver_policy = "New",
+                "Subscribed to JetStream PoolCacheUpdate (live, cold-path task)"
+            );
+            Some(consumer)
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to create JetStream consumer for live PoolCacheUpdate sync");
+            None
+        }
+    }
+}
+
+async fn refresh_pool_cache_consumer_metrics(consumer: &mut JetStreamPullConsumer) {
+    match consumer.info().await {
+        Ok(info) => {
+            set_execution_pool_cache_consumer_pending(info.num_pending);
+            if info.num_pending > EE_CONSUMER_PENDING_WARN_THRESHOLD {
+                warn!(
+                    pending = info.num_pending,
+                    threshold = EE_CONSUMER_PENDING_WARN_THRESHOLD,
+                    "Pool cache JetStream consumer backlog above threshold"
+                );
+            }
+        }
+        Err(e) => {
+            debug!(error = %e, "Failed to read pool cache consumer info for metrics");
+        }
+    }
+}
+
+async fn refresh_wallet_snapshot_consumer_metrics(consumer: &mut JetStreamPullConsumer) {
+    match consumer.info().await {
+        Ok(info) => {
+            set_execution_wallet_snapshot_consumer_pending(info.num_pending);
+            if info.num_pending > EE_CONSUMER_PENDING_WARN_THRESHOLD {
+                warn!(
+                    pending = info.num_pending,
+                    threshold = EE_CONSUMER_PENDING_WARN_THRESHOLD,
+                    "Wallet snapshot JetStream consumer backlog above threshold"
+                );
+            }
+        }
+        Err(e) => {
+            debug!(error = %e, "Failed to read wallet snapshot consumer info for metrics");
+        }
+    }
+}
+
+/// Cold-path task: PoolCacheUpdate JetStream → LivePoolCache (bounded batches + yield).
+async fn run_pool_cache_consumer_task(
+    ctx: Arc<ExecutionContext>,
+    consumer: JetStreamPullConsumer,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    use futures::StreamExt;
+
+    let mut consumer = consumer;
+    let mut info_poll_counter: u32 = 0;
+
+    loop {
+        if *shutdown_rx.borrow() {
+            info!("Pool cache consumer task shutting down");
+            break;
+        }
+
+        match consumer
+            .fetch()
+            .max_messages(EE_JETSTREAM_CONSUMER_BATCH_MAX)
+            .expires(EE_JETSTREAM_CONSUMER_FETCH_EXPIRES)
+            .messages()
+            .await
+        {
+            Ok(mut messages) => {
+                let mut processed = 0u64;
+                while let Some(msg_result) = messages.next().await {
+                    match msg_result {
+                        Ok(msg) => {
+                            match serde_json::from_slice::<PoolCacheUpdate>(&msg.payload) {
+                                Ok(update) => {
+                                    if let Some(ref cache) = ctx.live_pool_cache {
+                                        if apply_pool_cache_update(cache, &update) {
+                                            processed += 1;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to deserialize PoolCacheUpdate");
+                                }
+                            }
+                            if let Err(e) = msg.ack().await {
+                                warn!(error = %e, "Failed to ack JetStream PoolCacheUpdate message");
+                            }
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "JetStream pool cache fetch returned error");
+                        }
+                    }
+                }
+                if processed > 0 {
+                    inc_execution_pool_cache_messages_processed(processed);
+                    debug!(
+                        processed,
+                        "SLAVE CACHE: Synced PoolCacheUpdates from JetStream (cold-path task)"
+                    );
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, "No new PoolCacheUpdate messages in JetStream");
+            }
+        }
+
+        info_poll_counter = info_poll_counter.saturating_add(1);
+        if info_poll_counter % 10 == 0 {
+            refresh_pool_cache_consumer_metrics(&mut consumer).await;
+        }
+
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Cold-path task: WalletBalanceSnapshot JetStream → LockManager (last-value wins per mint).
+async fn run_wallet_snapshot_consumer_task(
+    ctx: Arc<ExecutionContext>,
+    consumer: JetStreamPullConsumer,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    use futures::StreamExt;
+
+    let mut consumer = consumer;
+    let mut info_poll_counter: u32 = 0;
+
+    loop {
+        if *shutdown_rx.borrow() {
+            info!("Wallet snapshot consumer task shutting down");
+            break;
+        }
+
+        match consumer
+            .fetch()
+            .max_messages(EE_JETSTREAM_CONSUMER_BATCH_MAX)
+            .expires(EE_JETSTREAM_CONSUMER_FETCH_EXPIRES)
+            .messages()
+            .await
+        {
+            Ok(mut messages) => {
+                let mut batch: Vec<(async_nats::jetstream::Message, MarketEvent)> = Vec::new();
+                while let Some(msg_result) = messages.next().await {
+                    match msg_result {
+                        Ok(msg) => match serde_json::from_slice::<MarketEvent>(&msg.payload) {
+                            Ok(event) => batch.push((msg, event)),
+                            Err(e) => {
+                                debug!(error = %e, "Failed to deserialize wallet snapshot MarketEvent");
+                                let _ = msg.ack().await;
+                            }
+                        },
+                        Err(e) => {
+                            debug!(error = %e, "JetStream wallet snapshot fetch returned error");
+                        }
+                    }
+                }
+
+                let mut last_index_by_mint: HashMap<String, usize> = HashMap::new();
+                for (idx, (_, event)) in batch.iter().enumerate() {
+                    if let MarketEventKind::WalletBalanceSnapshot { mint, .. } = &event.kind {
+                        last_index_by_mint.insert(mint.clone(), idx);
+                    }
+                }
+
+                for (idx, (msg, event)) in batch.into_iter().enumerate() {
+                    let apply =
+                        if let MarketEventKind::WalletBalanceSnapshot { mint, .. } = &event.kind {
+                            last_index_by_mint.get(mint) == Some(&idx)
+                        } else {
+                            true
+                        };
+                    if apply {
+                        ctx.apply_wallet_balance_snapshot_event(&event);
+                    }
+                    if let Err(e) = msg.ack().await {
+                        debug!(error = %e, "Failed to ack wallet snapshot message");
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, "No new wallet snapshot messages in JetStream");
+            }
+        }
+
+        info_poll_counter = info_poll_counter.saturating_add(1);
+        if info_poll_counter % 10 == 0 {
+            refresh_wallet_snapshot_consumer_metrics(&mut consumer).await;
+        }
+
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Cold-path task: WalletTxConfirmed JetStream → pending confirm waiters (bounded batches).
+async fn run_wallet_tx_confirm_consumer_task(
+    ctx: Arc<ExecutionContext>,
+    wallet: Pubkey,
+    mut consumer: Option<JetStreamPullConsumer>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    use futures::StreamExt;
+
+    loop {
+        if *shutdown_rx.borrow() {
+            info!("Wallet TX confirm consumer task shutting down");
+            break;
+        }
+
+        if consumer.is_none() {
+            if let Some(ref nats) = ctx.nats {
+                consumer = create_wallet_tx_confirm_live_consumer(nats, &wallet).await;
+            }
+        }
+
+        if let Some(ref mut active_consumer) = consumer {
+            match active_consumer
+                .fetch()
+                .max_messages(EE_JETSTREAM_CONSUMER_BATCH_MAX)
+                .expires(EE_JETSTREAM_CONSUMER_FETCH_EXPIRES)
+                .messages()
+                .await
+            {
+                Ok(mut messages) => {
+                    while let Some(msg_result) = messages.next().await {
+                        match msg_result {
+                            Ok(msg) => {
+                                match serde_json::from_slice::<MarketEvent>(&msg.payload) {
+                                    Ok(event) => {
+                                        if let MarketEventKind::WalletTxConfirmed {
+                                            signature,
+                                            err,
+                                            ..
+                                        } = event.kind
+                                        {
+                                            if let Some(slot) = event.slot {
+                                                dispatch_wallet_tx_confirmed(
+                                                    &ctx.pending_tx_confirms,
+                                                    &ctx.recent_orphan_tx_confirms,
+                                                    &signature,
+                                                    slot,
+                                                    err,
+                                                );
+                                            } else {
+                                                warn!(
+                                                    sig = %signature,
+                                                    "WalletTxConfirmed missing event.slot; skipping dispatch"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        TX_CONFIRM_DESERIALIZE_ERRORS_TOTAL
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        warn!(
+                                            error = %e,
+                                            "Failed to deserialize WalletTxConfirmed MarketEvent"
+                                        );
+                                    }
+                                }
+                                if let Err(e) = msg.ack().await {
+                                    debug!(
+                                        error = %e,
+                                        "Failed to ack wallet TX confirm message"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                debug!(
+                                    error = %e,
+                                    "JetStream wallet TX confirm fetch returned error"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, "No new wallet TX confirm messages in JetStream");
+                }
+            }
+        }
+
+        evict_stale_orphan_tx_confirms(&ctx.recent_orphan_tx_confirms, ORPHAN_TX_CONFIRM_TTL);
+
+        tokio::task::yield_now().await;
+    }
+}
 
 async fn drain_completed_intent_tasks(task_set: &mut tokio::task::JoinSet<()>) {
     while let Some(result) = task_set.try_join_next() {
@@ -7467,28 +7839,22 @@ async fn main() -> Result<()> {
             create_shared_cache()
         });
 
-    // Bootstrap LivePoolCache from JetStream (state recovery after restart)
-    // The consumer is returned so it can be reused in the main loop,
-    // avoiding a second LastPerSubject replay of ~579k messages.
-    let bootstrap_consumer = if let (Some(ref nats_client), Some(ref cache)) =
-        (&nats, &live_pool_cache)
-    {
+    // Bootstrap LivePoolCache from JetStream (state recovery after restart).
+    // Live sync uses a separate DeliverPolicy::New durable consumer in a dedicated task
+    // (bootstrap ephemeral LastPerSubject consumer is dropped after seeding).
+    if let (Some(ref nats_client), Some(ref cache)) = (&nats, &live_pool_cache) {
         match bootstrap_pool_cache_from_jetstream(nats_client, cache).await {
-            Ok((pools_recovered, consumer)) => {
+            Ok((pools_recovered, _bootstrap_consumer)) => {
                 info!(
                     pools_recovered,
                     "SLAVE CACHE: State recovered from JetStream"
                 );
-                consumer
             }
             Err(e) => {
                 warn!(error = %e, "SLAVE CACHE: JetStream bootstrap failed (will rely on incremental updates)");
-                None
             }
         }
-    } else {
-        None
-    };
+    }
 
     // I-24d: No global Startup-Seeding/Discovery-Rebuild. market-data is Discovery authority.
     // Pool_accounts arrive via JetStream PoolCacheUpdate or Discovery Request/Reply on demand.
@@ -7730,7 +8096,7 @@ async fn main() -> Result<()> {
     }
 
     // NOTE: LockManager balance updates now come from JetStream WalletBalanceSnapshot
-    // in the main loop (wallet_snapshot_consumer_opt). No separate balance-updater task.
+    // Wallet snapshots are applied in a dedicated cold-path JetStream task (not main-loop tick).
 
     // === AccountJanitor: Background cleanup of empty ATAs and dust ===
     if let Some(ref treasury) = ctx.treasury {
@@ -8013,8 +8379,6 @@ async fn main() -> Result<()> {
     };
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    let mut wallet_tx_confirm_interval =
-        tokio::time::interval(std::time::Duration::from_millis(100));
 
     // For MVP dry-run test
     let mut simulated_tick: u64 = 0;
@@ -8436,63 +8800,18 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Subscribe to PoolCacheUpdates from JetStream (Single Source of Truth)
-    // CRITICAL: Reuse the bootstrap consumer if available. Creating a NEW ephemeral
-    // consumer with LastPerSubject would replay ALL ~579k messages again at 100/tick,
-    // taking ~97 minutes before new updates (e.g. from purchased tokens) are processed.
-    let pool_cache_consumer = if let Some(consumer) = bootstrap_consumer {
-        info!(
-            stream = STREAM_NAME,
-            "Reusing bootstrap consumer for live PoolCacheUpdate sync (no duplicate replay)"
-        );
-        Some(consumer)
-    } else if let Some(ref nats) = ctx.nats {
-        use async_nats::jetstream;
-
-        let jetstream = jetstream::new(nats.client().clone());
-
-        match jetstream.get_stream(STREAM_NAME).await {
-            Ok(stream) => {
-                // No bootstrap ran → create consumer with DeliverPolicy::New to avoid
-                // replaying all historical messages (the cache is empty anyway).
-                let config = async_nats::jetstream::consumer::pull::Config {
-                    deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::New,
-                    ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
-                    max_ack_pending: 1000,
-                    filter_subject: "ironcrab.pool_cache.>".to_string(),
-                    ..Default::default()
-                };
-                match stream.create_consumer(config).await {
-                    Ok(consumer) => {
-                        info!(
-                            stream = STREAM_NAME,
-                            "Created NEW JetStream consumer (no bootstrap, DeliverPolicy::New)"
-                        );
-                        Some(consumer)
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to create JetStream consumer for PoolCacheUpdates");
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, stream = STREAM_NAME, "JetStream stream not found (market-data may not be running)");
-                None
-            }
+    // Cold-path JetStream consumers: PoolCache, WalletSnapshot, WalletTxConfirm (bounded batches).
+    let pool_cache_live_consumer = if ctx.live_pool_cache.is_some() {
+        if let Some(ref nats) = ctx.nats {
+            create_pool_cache_live_consumer_for_ee(nats).await
+        } else {
+            None
         }
     } else {
         None
     };
 
-    let mut pool_cache_consumer_opt = pool_cache_consumer;
-
-    // Subscribe to WalletBalanceSnapshot from JetStream (subject-per-wallet+mint).
-    //
-    // This keeps LockManager token balances synced WITHOUT any RPC calls.
-    // Reuse the consumer created right after bootstrap when available; otherwise create
-    // now (e.g. stream appeared after bootstrap) with LastPerSubject if bootstrap missed.
-    let wallet_snapshot_consumer = if let Some(consumer) = wallet_snapshot_bootstrap_consumer {
+    let wallet_snapshot_live_consumer = if let Some(consumer) = wallet_snapshot_bootstrap_consumer {
         info!(
             stream = WALLET_SNAPSHOT_STREAM_NAME,
             "Reusing early wallet snapshot consumer for live sync (no startup gap)"
@@ -8505,19 +8824,16 @@ async fn main() -> Result<()> {
         None
     };
 
-    let mut wallet_snapshot_consumer_opt = wallet_snapshot_consumer;
-
-    let wallet_tx_confirm_consumer_opt =
+    let wallet_tx_confirm_live_consumer =
         if let (Some(ref nats), Some(wallet)) = (&ctx.nats, ctx.wallet_pubkey) {
             create_wallet_tx_confirm_live_consumer(nats, &wallet).await
         } else {
             None
         };
-    let mut wallet_tx_confirm_consumer_opt = wallet_tx_confirm_consumer_opt;
 
     if ctx.config.read().jetstream_tx_confirm_enabled
         && ctx.wallet_pubkey.is_some()
-        && wallet_tx_confirm_consumer_opt.is_none()
+        && wallet_tx_confirm_live_consumer.is_none()
     {
         warn!(
             stream = WALLET_TX_CONFIRM_STREAM_NAME,
@@ -8539,6 +8855,36 @@ async fn main() -> Result<()> {
             run_intent_dispatcher(intent_rx, ctx, enqueue_tracker, shutdown_rx).await;
         })
     };
+
+    if let Some(consumer) = pool_cache_live_consumer {
+        let ctx = Arc::clone(&ctx);
+        let shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            run_pool_cache_consumer_task(ctx, consumer, shutdown_rx).await;
+        });
+    }
+
+    if let Some(consumer) = wallet_snapshot_live_consumer {
+        let ctx = Arc::clone(&ctx);
+        let shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            run_wallet_snapshot_consumer_task(ctx, consumer, shutdown_rx).await;
+        });
+    }
+
+    if let Some(wallet) = ctx.wallet_pubkey {
+        let ctx = Arc::clone(&ctx);
+        let shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            run_wallet_tx_confirm_consumer_task(
+                ctx,
+                wallet,
+                wallet_tx_confirm_live_consumer,
+                shutdown_rx,
+            )
+            .await;
+        });
+    }
 
     loop {
         tokio::select! {
@@ -8654,88 +9000,6 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // PR3: WalletTxConfirmed from JetStream → pending confirm waiters (no RPC).
-            // Polled at 100ms (not the 1s heartbeat tick) to minimize confirm latency.
-            _ = wallet_tx_confirm_interval.tick() => {
-                if wallet_tx_confirm_consumer_opt.is_none() {
-                    if let (Some(ref nats), Some(wallet)) = (&ctx.nats, ctx.wallet_pubkey) {
-                        wallet_tx_confirm_consumer_opt =
-                            create_wallet_tx_confirm_live_consumer(nats, &wallet).await;
-                    }
-                }
-                if let Some(ref mut consumer) = wallet_tx_confirm_consumer_opt {
-                    use futures::StreamExt;
-                    match consumer
-                        .fetch()
-                        .max_messages(100)
-                        .expires(std::time::Duration::from_millis(100))
-                        .messages()
-                        .await
-                    {
-                        Ok(mut messages) => {
-                            while let Some(msg_result) = messages.next().await {
-                                match msg_result {
-                                    Ok(msg) => {
-                                        match serde_json::from_slice::<MarketEvent>(&msg.payload) {
-                                            Ok(event) => {
-                                                if let MarketEventKind::WalletTxConfirmed {
-                                                    signature,
-                                                    err,
-                                                    ..
-                                                } = event.kind
-                                                {
-                                                    if let Some(slot) = event.slot {
-                                                        dispatch_wallet_tx_confirmed(
-                                                            &ctx.pending_tx_confirms,
-                                                            &ctx.recent_orphan_tx_confirms,
-                                                            &signature,
-                                                            slot,
-                                                            err,
-                                                        );
-                                                    } else {
-                                                        warn!(
-                                                            sig = %signature,
-                                                            "WalletTxConfirmed missing event.slot; skipping dispatch"
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                TX_CONFIRM_DESERIALIZE_ERRORS_TOTAL
-                                                    .fetch_add(1, Ordering::Relaxed);
-                                                warn!(
-                                                    error = %e,
-                                                    "Failed to deserialize WalletTxConfirmed MarketEvent"
-                                                );
-                                            }
-                                        }
-                                        if let Err(e) = msg.ack().await {
-                                            debug!(
-                                                error = %e,
-                                                "Failed to ack wallet TX confirm message"
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        debug!(
-                                            error = %e,
-                                            "JetStream wallet TX confirm fetch returned error"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            debug!(error = %e, "No new wallet TX confirm messages in JetStream");
-                        }
-                    }
-                }
-                evict_stale_orphan_tx_confirms(
-                    &ctx.recent_orphan_tx_confirms,
-                    ORPHAN_TX_CONFIRM_TTL,
-                );
-            }
-
             _ = interval.tick() => {
                 simulated_tick += 1;
 
@@ -8753,137 +9017,6 @@ async fn main() -> Result<()> {
                     control_sub_secs,
                     control_response_secs,
                 );
-
-                // Process any available PoolCacheUpdates from JetStream Consumer
-                if let Some(ref mut consumer) = pool_cache_consumer_opt {
-                    use futures::StreamExt;
-
-                    // Fetch up to 100 messages per tick with 100ms timeout (NON-BLOCKING!)
-                    // Without expires(), fetch() can block indefinitely waiting for messages,
-                    // which freezes the entire select! loop and prevents processing intents/control requests.
-                    match consumer.fetch().max_messages(100).expires(std::time::Duration::from_millis(100)).messages().await {
-                        Ok(mut messages) => {
-                            let mut msg_count = 0;
-                            while let Some(msg_result) = messages.next().await {
-                                match msg_result {
-                                    Ok(msg) => {
-                                        match serde_json::from_slice::<PoolCacheUpdate>(&msg.payload) {
-                                            Ok(update) => {
-                                                // Apply update to local LivePoolCache (shared module)
-                                                if let Some(ref cache) = ctx.live_pool_cache {
-                                                    if apply_pool_cache_update(cache, &update) {
-                                                        msg_count += 1;
-                                                    }
-                                                }
-                                                // Ack the message
-                                                if let Err(e) = msg.ack().await {
-                                                    warn!(error = %e, "Failed to ack JetStream message");
-                                                }
-                                            }
-                                            Err(e) => {
-                                                warn!(error = %e, "Failed to deserialize PoolCacheUpdate");
-                                                if let Err(ack_err) = msg.ack().await {
-                                                    warn!(error = %ack_err, "Failed to ack message");
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        debug!(error = %e, "JetStream fetch returned error");
-                                    }
-                                }
-                            }
-                            if msg_count > 0 {
-                                debug!(msg_count, "SLAVE CACHE: Synced PoolCacheUpdates from JetStream");
-                            }
-                        }
-                        Err(e) => {
-                            // Expected when no new messages - don't log as warning
-                            debug!(error = %e, "No new messages in JetStream");
-                        }
-                    }
-                }
-
-                // Process WalletBalanceSnapshot updates from JetStream (token balances).
-                // Same non-blocking pattern as PoolCacheUpdates to avoid freezing the select! loop.
-                // Also tracks open_positions: balance transitions (non-zero→0 = closed,
-                // 0→non-zero = opened) keep the gauge accurate even for stale bootstrap data.
-                if let Some(ref mut consumer) = wallet_snapshot_consumer_opt {
-                    use futures::StreamExt;
-                    match consumer
-                        .fetch()
-                        .max_messages(500)
-                        .expires(std::time::Duration::from_millis(100))
-                        .messages()
-                        .await
-                    {
-                        Ok(mut messages) => {
-                            while let Some(msg_result) = messages.next().await {
-                                match msg_result {
-                                    Ok(msg) => {
-                                        match serde_json::from_slice::<MarketEvent>(&msg.payload) {
-                                            Ok(event) => {
-                                                if let MarketEventKind::WalletBalanceSnapshot { mint, balance_raw, decimals, .. } = &event.kind {
-                                                    if mint == "NATIVE_SOL" {
-                                                        // Native SOL sentinel: update LockManager wallet balance
-                                                        ctx.lock_manager.update_native_sol_only(*balance_raw);
-                                                        if let Some(ref tx) = ctx.wsol_balance_tx {
-                                                            let wsol = ctx.lock_manager.wsol_balance();
-                                                            let _ = tx.try_send((*balance_raw, Some(wsol)));
-                                                        }
-                                                    } else if mint == WSOL_MINT || mint == SOL_MINT {
-                                                        // WSOL balance update: update LockManager wallet balance
-                                                        ctx.lock_manager.update_wsol_only(*balance_raw);
-                                                        if let Some(ref tx) = ctx.wsol_balance_tx {
-                                                            let sol = ctx.lock_manager.total_native_sol();
-                                                            let _ = tx.try_send((sol, Some(*balance_raw)));
-                                                        }
-                                                    } else {
-                                                        // Regular token: update balance (open_positions derived from LockManager)
-                                                        let old = ctx.lock_manager.available_token_balance(mint);
-                                                        ctx.lock_manager.set_available_token_balance(
-                                                            mint.clone(),
-                                                            *balance_raw,
-                                                        );
-
-                                                        if old != *balance_raw {
-                                                            info!(
-                                                                mint = %mint,
-                                                                old_balance = old,
-                                                                new_balance = *balance_raw,
-                                                                "Token balance sync: LockManager updated from Geyser"
-                                                            );
-                                                        }
-
-                                                        // Cache decimals from Geyser-resolved wallet snapshots
-                                                        if let (Some(cache), Ok(mint_pk)) = (ctx.live_pool_cache.as_ref(), Pubkey::from_str(mint)) {
-                                                            cache.set_mint_decimals(mint_pk, *decimals);
-                                                        }
-                                                    }
-                                                }
-                                                // PA-2: passive PositionAuthority from same JetStream events (SOL/WSOL ignored for open count)
-                                                ctx.apply_position_authority_from_wallet_event_kind(&event.kind);
-                                            }
-                                            Err(e) => {
-                                                debug!(error = %e, "Failed to deserialize wallet snapshot MarketEvent");
-                                            }
-                                        }
-                                        if let Err(e) = msg.ack().await {
-                                            debug!(error = %e, "Failed to ack wallet snapshot message");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        debug!(error = %e, "JetStream wallet snapshot fetch returned error");
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            // Expected when no new messages - keep debug-level
-                            debug!(error = %e, "No new wallet snapshot messages in JetStream");
-                        }
-                    }
-                }
 
                 record_execution_engine_interval_tick_duration_ms(
                     wall_clock_unix_ms_now().saturating_sub(interval_tick_block_started_ms),
