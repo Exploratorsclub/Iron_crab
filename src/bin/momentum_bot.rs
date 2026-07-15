@@ -115,6 +115,17 @@ fn is_non_tradeable_momentum_mint(mint: &str) -> bool {
 /// JetStream replay dedup for orphaned BUY path — bounded so memory does not grow forever.
 const ORPHANED_RECOVERED_INTENT_IDS_CAP: usize = 50_000;
 
+/// Returns true when `position_raw` and `fill_raw` are the same BUY fill within tolerance (0.1% or 1 raw).
+#[inline]
+fn wallet_snapshot_fill_amount_matches(position_raw: u64, fill_raw: u64) -> bool {
+    if position_raw == fill_raw {
+        return true;
+    }
+    let diff = position_raw.abs_diff(fill_raw);
+    let tol = (position_raw.max(fill_raw) / 1000).max(1);
+    diff <= tol
+}
+
 /// Wire version for [`TOPIC_MOMENTUM_ACTIVE_POOLS`] JSON payloads (PR-D).
 const MOMENTUM_ACTIVE_POOLS_WIRE_VERSION: u32 = 1;
 /// Discovery/Validation trackers without a trade for this long are dropped (PR-D plan #4).
@@ -3090,6 +3101,20 @@ struct OpenPositionParams<'a> {
     initial_bonding: Option<CachedBondingCurveState>,
 }
 
+/// Metadata refresh when wallet snapshot already sized the position (orphan BUY dedup).
+struct WalletSnapshotOrphanConfirmParams<'a> {
+    mint: &'a str,
+    pool: &'a str,
+    dex: &'a str,
+    entry_price: f64,
+    sol_invested: u64,
+    token_decimals: u8,
+    token_program: Option<String>,
+    creator: Option<String>,
+    entry_confirmed_slot: u64,
+    initial_bonding: Option<CachedBondingCurveState>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryKind {
     Probe,
@@ -3138,6 +3163,7 @@ struct IntentPublishJob {
 }
 
 type IntentPublishOrderRecorder = Arc<parking_lot::Mutex<Vec<String>>>;
+type IntentPublishStepRecorder = Arc<parking_lot::Mutex<Vec<&'static str>>>;
 
 /// Information about a pool for multi-pool routing
 #[derive(Debug, Clone)]
@@ -6961,6 +6987,85 @@ impl MomentumContext {
             .any(|p| p.mint == mint && matches!(p.side, TradeSide::Sell))
     }
 
+    /// Pending BUY lifecycle or intent blocks wallet-snapshot `open_position` reconcile (same fill expected via ExecutionResult).
+    fn pending_buy_blocks_wallet_snapshot_reconcile(&self, mint: &str) -> Option<String> {
+        self.prune_stale_pending_buy_mint_index();
+        if let Some(intent_id) = self.pending_buy_mint_index.read().get(mint) {
+            return Some(intent_id.clone());
+        }
+        self.pending_intents
+            .read()
+            .iter()
+            .find(|(_, p)| p.mint == mint && p.side == TradeSide::Buy)
+            .map(|(id, _)| id.clone())
+    }
+
+    /// Wallet-snapshot position already reflects this orphan BUY fill — skip scale-in to avoid double-count.
+    fn wallet_snapshot_orphan_fill_already_applied(pos: &PositionTracker, fill_raw: u64) -> bool {
+        // `entry_time` may be backdated for timed-exit on wallet reconcile — amount tolerance only.
+        pos.entry_source == PositionEntrySource::WalletSnapshot
+            && wallet_snapshot_fill_amount_matches(pos.token_amount, fill_raw)
+    }
+
+    /// Orphan BUY confirmed after wallet snapshot reconcile: refresh metadata without adding tokens again.
+    fn confirm_wallet_snapshot_position_from_orphan_buy(
+        self: &Arc<Self>,
+        p: WalletSnapshotOrphanConfirmParams<'_>,
+    ) {
+        let tracker = {
+            let mut positions = self.positions.write();
+            let Some(pos) = positions.get_mut(p.mint) else {
+                return;
+            };
+            pos.entry_source = PositionEntrySource::Live;
+            if p.sol_invested > 0 {
+                pos.sol_invested = p.sol_invested;
+            }
+            if p.entry_price > 0.0 && p.entry_price.is_finite() {
+                pos.entry_price = p.entry_price;
+                pos.current_price = p.entry_price;
+                pos.trade_mark_tps = p.entry_price;
+                pos.highest_price = p.entry_price;
+            }
+            if pos.token_decimals == 0 && p.token_decimals != 0 {
+                pos.token_decimals = p.token_decimals;
+            }
+            if pos.token_program.is_none() && p.token_program.is_some() {
+                pos.token_program = p.token_program.clone();
+            }
+            if pos.creator.is_none() && p.creator.is_some() && pos.dex == "pumpfun" {
+                pos.creator = p.creator.clone();
+            }
+            if p.entry_confirmed_slot > 0 {
+                pos.entry_confirmed_slot = p.entry_confirmed_slot;
+                pos.last_price_slot = 0;
+            }
+            if let Some(ref snap) = p.initial_bonding {
+                pos.bonding_curve_progress_bps = Some(
+                    snap.progress_bps
+                        .max(pos.bonding_curve_progress_bps.unwrap_or(0)),
+                );
+            }
+            let _ = self.apply_latest_sticky_state_to_position(p.mint, pos);
+            pos.clone()
+        };
+        info!(
+            mint = %p.mint,
+            pool = %p.pool,
+            dex = %p.dex,
+            token_amount_raw = tracker.token_amount,
+            sol_invested = p.sol_invested,
+            "Wallet-snapshot position confirmed from ExecutionResult (dedup: no scale-in)"
+        );
+        let ctx = Arc::clone(self);
+        let mint_owned = p.mint.to_string();
+        tokio::spawn(async move {
+            ctx.save_position_to_kv(&mint_owned, &tracker).await;
+        });
+        self.queue_momentum_active_pool_active(p.mint, p.pool, MomentumActivePinReason::Position);
+        self.flush_momentum_active_pool_publish_queue();
+    }
+
     /// Phase 4 P4: record signed drift between confirmed position size and wallet snapshot hint.
     fn record_wallet_balance_divergence_if_any(
         &self,
@@ -7005,6 +7110,10 @@ impl MomentumContext {
         if overlay > 0 {
             if let Some(snap) = snapshot {
                 self.record_wallet_balance_divergence_if_any(mint, overlay, snap);
+                // Safety: when position overstates wallet (double-count race), cap SELL to snapshot.
+                if overlay > snap {
+                    return snap;
+                }
             } else {
                 ironcrab::metrics::clear_momentum_wallet_balance_divergence_for_mint(mint);
             }
@@ -7232,42 +7341,83 @@ impl MomentumContext {
                                             &entries,
                                         )
                                     };
-                                    info!(
-                                        intent_id = %result.intent_id,
-                                        mint = %mint,
-                                        pool = %pool,
-                                        dex = %dex,
-                                        sol_invested,
-                                        token_amount_raw = fill_out.raw,
-                                        used_position_routing = used_position_routing,
-                                        entry_kind = ?entry_kind,
-                                        "⚠️ ORPHANED BUY APPLIED TO EXISTING POSITION — scale-in fill \
-                                         recovered after pending intent was dropped"
-                                    );
+                                    let entry_confirmed_slot =
+                                        entry_confirmed_slot_from_execution(result);
                                     let initial_bonding = self.clone_latest_bonding_snapshot(mint);
-                                    self.remove_pending_buy_entry_by_intent(&result.intent_id);
-                                    self.open_position(OpenPositionParams {
-                                        mint,
-                                        pool: &pool,
-                                        dex: &dex,
-                                        entry_price,
-                                        token_decimals,
-                                        token_amount: fill_out.raw,
-                                        sol_invested,
-                                        token_program,
-                                        creator,
-                                        entry_confirmed_slot: entry_confirmed_slot_from_execution(
-                                            result,
-                                        ),
-                                        initial_bonding,
+                                    let snapshot_dedup = existing.as_ref().is_some_and(|pos| {
+                                        Self::wallet_snapshot_orphan_fill_already_applied(
+                                            pos,
+                                            fill_out.raw,
+                                        )
                                     });
-                                    self.apply_orphan_buy_tracker_state_after_recovery(
-                                        mint, &pool, entry_kind,
-                                    );
-                                    let ctx_exit = Arc::clone(self);
-                                    tokio::spawn(async move {
-                                        ctx_exit.process_exit_signals(None).await;
-                                    });
+                                    if snapshot_dedup {
+                                        info!(
+                                            intent_id = %result.intent_id,
+                                            mint = %mint,
+                                            pool = %pool,
+                                            dex = %dex,
+                                            fill_out_raw = fill_out.raw,
+                                            position_raw = existing.as_ref().map(|p| p.token_amount),
+                                            entry_kind = ?entry_kind,
+                                            "ORPHANED BUY dedup: wallet snapshot already sized position — metadata confirm only"
+                                        );
+                                        self.remove_pending_buy_entry_by_intent(&result.intent_id);
+                                        self.confirm_wallet_snapshot_position_from_orphan_buy(
+                                            WalletSnapshotOrphanConfirmParams {
+                                                mint,
+                                                pool: &pool,
+                                                dex: &dex,
+                                                entry_price,
+                                                sol_invested,
+                                                token_decimals,
+                                                token_program,
+                                                creator,
+                                                entry_confirmed_slot,
+                                                initial_bonding,
+                                            },
+                                        );
+                                        self.apply_orphan_buy_tracker_state_after_recovery(
+                                            mint, &pool, entry_kind,
+                                        );
+                                        let ctx_exit = Arc::clone(self);
+                                        tokio::spawn(async move {
+                                            ctx_exit.process_exit_signals(None).await;
+                                        });
+                                    } else {
+                                        info!(
+                                            intent_id = %result.intent_id,
+                                            mint = %mint,
+                                            pool = %pool,
+                                            dex = %dex,
+                                            sol_invested,
+                                            token_amount_raw = fill_out.raw,
+                                            used_position_routing = used_position_routing,
+                                            entry_kind = ?entry_kind,
+                                            "⚠️ ORPHANED BUY APPLIED TO EXISTING POSITION — scale-in fill \
+                                             recovered after pending intent was dropped"
+                                        );
+                                        self.remove_pending_buy_entry_by_intent(&result.intent_id);
+                                        self.open_position(OpenPositionParams {
+                                            mint,
+                                            pool: &pool,
+                                            dex: &dex,
+                                            entry_price,
+                                            token_decimals,
+                                            token_amount: fill_out.raw,
+                                            sol_invested,
+                                            token_program,
+                                            creator,
+                                            entry_confirmed_slot,
+                                            initial_bonding,
+                                        });
+                                        self.apply_orphan_buy_tracker_state_after_recovery(
+                                            mint, &pool, entry_kind,
+                                        );
+                                        let ctx_exit = Arc::clone(self);
+                                        tokio::spawn(async move {
+                                            ctx_exit.process_exit_signals(None).await;
+                                        });
+                                    }
                                 } else {
                                     self.remove_pending_buy_entry_by_intent(&result.intent_id);
                                     self.orphaned_recovered_intent_ids
@@ -9724,6 +9874,7 @@ async fn main() -> Result<()> {
         intent_publish_rx,
         nats_for_intent_worker,
         None,
+        None,
     );
 
     // === P0: Wallet snapshot recovery from JetStream ===
@@ -10802,14 +10953,46 @@ async fn intent_publish_jsonl_write(writer: &QueuedJsonlWriter, intent: &TradeIn
     }
 }
 
+/// JetStream publish for trade intents; records header-to-publish latency on success.
+async fn intent_publish_jetstream(nats: &NatsClient, intent: &TradeIntent) -> bool {
+    match nats.jetstream_publish(TOPIC_TRADE_INTENTS, intent).await {
+        Ok(true) => {
+            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            let now_ms = wall_clock_unix_ms_now();
+            try_record_momentum_intent_header_to_publish_ms(now_ms, intent.header.ts_unix_ms);
+            true
+        }
+        Ok(false) => {
+            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                intent_id = %intent.intent_id,
+                topic = TOPIC_TRADE_INTENTS,
+                "Intent JetStream publish dropped/failed in worker"
+            );
+            false
+        }
+        Err(e) => {
+            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                intent_id = %intent.intent_id,
+                error = %e,
+                "Intent JetStream publish error in worker"
+            );
+            false
+        }
+    }
+}
+
 async fn intent_publish_worker_loop(
     ctx: Arc<MomentumContext>,
     mut rx: mpsc::Receiver<IntentPublishJob>,
     nats: Option<NatsClient>,
     order_recorder: Option<IntentPublishOrderRecorder>,
+    step_recorder: Option<IntentPublishStepRecorder>,
 ) {
     while let Some(job) = rx.recv().await {
         let intent = job.intent;
+        let is_exit = matches!(&job.post_action, IntentPublishPostAction::Exit { .. });
 
         // FIX-30b may remove queued BUY rows from `pending_intents` before this worker runs.
         if let IntentPublishPostAction::Buy {
@@ -10822,41 +11005,37 @@ async fn intent_publish_worker_loop(
             }
         }
 
-        intent_publish_jsonl_write(&ctx.jsonl_writer, &intent).await;
-
         let mut publish_ok = nats.is_none();
-        if let Some(ref nats) = nats {
-            let buy_cancelled_before_publish =
-                matches!(&job.post_action, IntentPublishPostAction::Buy { .. })
-                    && !ctx.pending_intents.read().contains_key(&intent.intent_id);
-            if buy_cancelled_before_publish {
-                publish_ok = false;
-            } else {
-                match nats.jetstream_publish(TOPIC_TRADE_INTENTS, &intent).await {
-                    Ok(true) => {
-                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        let now_ms = wall_clock_unix_ms_now();
-                        try_record_momentum_intent_header_to_publish_ms(
-                            now_ms,
-                            intent.header.ts_unix_ms,
-                        );
-                        publish_ok = true;
-                    }
-                    Ok(false) => {
-                        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            intent_id = %intent.intent_id,
-                            topic = TOPIC_TRADE_INTENTS,
-                            "Intent JetStream publish dropped/failed in worker"
-                        );
-                    }
-                    Err(e) => {
-                        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            intent_id = %intent.intent_id,
-                            error = %e,
-                            "Intent JetStream publish error in worker"
-                        );
+        if is_exit {
+            // P0: Exit TTL — JetStream is the critical path; JSONL must not block publish.
+            if let Some(ref nats) = nats {
+                publish_ok = intent_publish_jetstream(nats, &intent).await;
+                if let Some(ref steps) = step_recorder {
+                    steps.lock().push("jetstream");
+                }
+            }
+            let ctx_jsonl = Arc::clone(&ctx);
+            let intent_jsonl = intent.clone();
+            tokio::spawn(async move {
+                intent_publish_jsonl_write(&ctx_jsonl.jsonl_writer, &intent_jsonl).await;
+            });
+            if let Some(ref steps) = step_recorder {
+                steps.lock().push("jsonl_spawned");
+            }
+        } else {
+            intent_publish_jsonl_write(&ctx.jsonl_writer, &intent).await;
+            if let Some(ref steps) = step_recorder {
+                steps.lock().push("jsonl");
+            }
+            if let Some(ref nats) = nats {
+                let buy_cancelled_before_publish =
+                    !ctx.pending_intents.read().contains_key(&intent.intent_id);
+                if buy_cancelled_before_publish {
+                    publish_ok = false;
+                } else {
+                    publish_ok = intent_publish_jetstream(nats, &intent).await;
+                    if let Some(ref steps) = step_recorder {
+                        steps.lock().push("jetstream");
                     }
                 }
             }
@@ -10938,8 +11117,15 @@ fn spawn_intent_publish_worker(
     rx: mpsc::Receiver<IntentPublishJob>,
     nats: Option<NatsClient>,
     order_recorder: Option<IntentPublishOrderRecorder>,
+    step_recorder: Option<IntentPublishStepRecorder>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(intent_publish_worker_loop(ctx, rx, nats, order_recorder))
+    tokio::spawn(intent_publish_worker_loop(
+        ctx,
+        rx,
+        nats,
+        order_recorder,
+        step_recorder,
+    ))
 }
 
 /// Generate and publish a BUY TradeIntent based on an entry signal.
@@ -11927,6 +12113,7 @@ mod tests {
             intent_publish_rx,
             None,
             None,
+            None,
         ));
         ctx
     }
@@ -12004,6 +12191,7 @@ mod tests {
             rx,
             None,
             Some(Arc::clone(&processed)),
+            None,
         ));
 
         let ids = ["int-order-001", "int-order-002", "int-order-003"];
@@ -19223,6 +19411,273 @@ mod tests {
             confirmed_raw
         );
     }
+
+    fn orphan_buy_execution_result(
+        intent_id: &str,
+        mint: &str,
+        fill_raw: u64,
+        sol_spent: u64,
+    ) -> ExecutionResult {
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("side".to_string(), "BUY".to_string());
+        ExecutionResult {
+            header: RecordHeader::new("test", BUILD_VERSION, "run-test"),
+            execution_id: format!("ex-{intent_id}"),
+            decision_id: format!("dec-{intent_id}"),
+            intent_id: intent_id.to_string(),
+            source: "momentum-bot".to_string(),
+            token_mint: Some(mint.to_string()),
+            signature: Some(format!("sig-{intent_id}")),
+            bundle_id: None,
+            status: ExecutionStatus::Confirmed,
+            fill_in: Some(ExplicitAmount::new(sol_spent, 9)),
+            fill_out: Some(ExplicitAmount::new(fill_raw, 6)),
+            fill_status: Some(FillStatus::Complete),
+            fill_unavailable_reason: None,
+            confirmed_slot: Some(100),
+            block_time_unix_ms: None,
+            fees: None,
+            pnl: None,
+            wallet_sol_delta_lamports: Some(-(sol_spent as i128)),
+            error_message: None,
+            error_code: None,
+            latency_ms: Some(1),
+            metadata: meta,
+        }
+    }
+
+    /// Prod race: wallet snapshot reconcile then orphan ExecutionResult must not double-count fill.
+    #[tokio::test]
+    async fn position_dedup_snapshot_first_then_orphan_execution_result() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "DedupSnapFirstMintttttttttttttttttttttttttt";
+        let pool = "DedupSnapFirstPoolttttttttttttttttttttttttt";
+        let fill_raw = 6_781_839_913u64;
+        let sol_spent = 1_250_000u64;
+
+        ctx.register_pool(mint, pool, "raydium", 1);
+        ctx.update_pool_trade_data(mint, pool, "raydium", 1_000_000_000, fill_raw, 1);
+
+        process_market_event(
+            &ctx,
+            &wallet_balance_snapshot_event(mint, fill_raw, 6),
+            false,
+        )
+        .await
+        .expect("wallet snapshot reconcile");
+
+        let positions = ctx.positions.read();
+        let pos = positions.get(mint).expect("snapshot position");
+        assert_eq!(pos.token_amount, fill_raw);
+        assert_eq!(pos.entry_source, PositionEntrySource::WalletSnapshot);
+        drop(positions);
+
+        Arc::clone(&ctx).handle_execution_result(&orphan_buy_execution_result(
+            "int-dedup-snap-first",
+            mint,
+            fill_raw,
+            sol_spent,
+        ));
+
+        let positions = ctx.positions.read();
+        let pos = positions.get(mint).expect("position after orphan");
+        assert_eq!(
+            pos.token_amount, fill_raw,
+            "orphan BUY after snapshot reconcile must not scale-in duplicate fill"
+        );
+        assert_eq!(pos.entry_source, PositionEntrySource::Live);
+        assert_eq!(pos.sol_invested, sol_spent);
+    }
+
+    /// ExecutionResult first, then wallet snapshot — snapshot is hint-only (no double-count).
+    #[tokio::test]
+    async fn position_dedup_execution_result_first_then_wallet_snapshot() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "DedupExecFirstMinttttttttttttttttttttttttttt";
+        let pool = "DedupExecFirstPooltttttttttttttttttttttttttt";
+        let fill_raw = 5_432_100u64;
+
+        ctx.register_pool(mint, pool, "raydium", 1);
+        ctx.token_trackers.write().insert(
+            MomentumContext::tracker_storage_key(mint, pool),
+            TokenTracker::new(mint, pool, "raydium", 1, 0),
+        );
+
+        Arc::clone(&ctx).handle_execution_result(&orphan_buy_execution_result(
+            "int-dedup-exec-first",
+            mint,
+            fill_raw,
+            1_000_000,
+        ));
+
+        assert_eq!(
+            ctx.positions.read().get(mint).unwrap().token_amount,
+            fill_raw
+        );
+
+        process_market_event(
+            &ctx,
+            &wallet_balance_snapshot_event(mint, fill_raw, 6),
+            false,
+        )
+        .await
+        .expect("wallet snapshot hint");
+
+        assert_eq!(
+            ctx.positions.read().get(mint).unwrap().token_amount,
+            fill_raw,
+            "wallet snapshot after orphan recovery must not resize position"
+        );
+    }
+
+    #[tokio::test]
+    async fn position_dedup_pending_buy_blocks_snapshot_reconcile() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "DedupPendingMintttttttttttttttttttttttttttt";
+        let pool = "DedupPendingPoolttttttttttttttttttttttttttt";
+        let fill_raw = 1_234_567u64;
+
+        ctx.register_pool(mint, pool, "raydium", 1);
+        ctx.mint_pools.write().get_mut(mint).unwrap()[0].last_trade_ratio =
+            Some(1_000_000.0 / fill_raw as f64);
+        ctx.register_buy_intent("int-pending-block", mint, pool, "raydium", 1_000_000, None);
+
+        process_market_event(
+            &ctx,
+            &wallet_balance_snapshot_event(mint, fill_raw, 6),
+            false,
+        )
+        .await
+        .expect("wallet snapshot with pending buy");
+
+        assert!(
+            !ctx.positions.read().contains_key(mint),
+            "pending BUY must block wallet-snapshot open_position reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_exit_token_amount_caps_to_wallet_snapshot_when_position_overstates() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "ExitCapMinttttttttttttttttttttttttttttttttt";
+        let wallet_raw = 6_781_839_913u64;
+        let overstated = wallet_raw.saturating_mul(2);
+
+        {
+            let mut positions = ctx.positions.write();
+            let mut tracker =
+                PositionTracker::new(mint, "pool", "raydium", 1.0, 6, overstated, 1_000_000);
+            tracker.entry_confirmed_slot = 1;
+            positions.insert(mint.to_string(), tracker);
+        }
+        ctx.cache_wallet_balance_snapshot_raw(mint, wallet_raw);
+
+        assert_eq!(
+            ctx.resolve_exit_token_amount_raw(mint, overstated),
+            wallet_raw,
+            "SELL sizing must cap to wallet snapshot when position overstates balance"
+        );
+    }
+
+    /// Exit publish worker must not await JSONL backpressure before post-action (exit latch).
+    #[tokio::test]
+    async fn intent_publish_exit_jetstream_before_jsonl_under_backpressure() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        // Tiny queue: JSONL enqueue may spin in background task while worker continues.
+        let jsonl_writer = QueuedJsonlWriter::spawn(jsonl_config, 1).expect("jsonl writer");
+        let steps: IntentPublishStepRecorder = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::channel(INTENT_PUBLISH_QUEUE_CAP);
+        let ctx =
+            empty_test_context_with_publish_sender(jsonl_writer, MomentumConfig::default(), tx);
+        std::mem::forget(spawn_intent_publish_worker(
+            Arc::clone(&ctx),
+            rx,
+            None,
+            None,
+            Some(Arc::clone(&steps)),
+        ));
+
+        let mint = "ExitPubMinttttttttttttttttttttttttttttttttt";
+        let pool = "ExitPubPooltttttttttttttttttttttttttttttttt";
+        ctx.register_pool(mint, pool, "raydium", 1);
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool,
+            dex: "raydium",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 1_000_000,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 1,
+            initial_bonding: None,
+        });
+        {
+            let mut positions = ctx.positions.write();
+            positions.get_mut(mint).unwrap().exit_generated = false;
+        }
+
+        let intent_id = "int-exit-pub-order";
+        ctx.register_sell_intent(intent_id, mint, pool, "raydium", 1_000_000);
+
+        let jsonl_records_before = ctx.jsonl_writer.stats().0;
+        let intent = TradeIntent::new(
+            "momentum-bot",
+            BUILD_VERSION,
+            &ctx.run_id,
+            intent_id.to_string(),
+            "momentum-bot",
+            IntentTier::Tier1,
+            IntentOrigin::StrategyA,
+            ExplicitAmount::new(1_000_000, 6),
+            TradeResources::default(),
+            0,
+            500,
+            TradeSide::Sell,
+            TradingRegime::Early,
+        );
+        ctx.enqueue_intent_publish(IntentPublishJob {
+            intent,
+            post_action: IntentPublishPostAction::Exit {
+                mint: mint.to_string(),
+                source_event_ts_unix_ms: None,
+                slot_seen_at_ms: 0,
+            },
+        })
+        .await
+        .expect("enqueue exit");
+
+        for _ in 0..100 {
+            if ctx.positions.read().get(mint).unwrap().exit_generated {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            ctx.positions.read().get(mint).unwrap().exit_generated,
+            "exit post-action must complete without waiting for JSONL queue drain"
+        );
+        assert!(
+            steps.lock().contains(&"jsonl_spawned"),
+            "exit path must offload JSONL to background (jetstream/critical path first)"
+        );
+        // Post-action may finish before JSONL writer thread records the line.
+        let _ = jsonl_records_before;
+    }
 }
 
 /// Generate and publish a SELL intent for position exit
@@ -20188,6 +20643,15 @@ async fn process_market_event(
                         mint = %mint,
                         balance_raw = *balance_raw,
                         "✅ WalletBalanceSnapshot: position verified in wallet (hint only; no size overwrite)"
+                    );
+                } else if let Some(pending_intent_id) =
+                    ctx.pending_buy_blocks_wallet_snapshot_reconcile(mint)
+                {
+                    debug!(
+                        mint = %mint,
+                        balance_raw = *balance_raw,
+                        pending_intent_id = %pending_intent_id,
+                        "WalletBalanceSnapshot: pending BUY — skip reconcile (await ExecutionResult)"
                     );
                 } else if let Some(reconciled) =
                     ctx.build_reconciled_position(mint, *balance_raw, *decimals)
