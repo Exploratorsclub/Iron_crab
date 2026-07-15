@@ -4,9 +4,12 @@
 //! `position-manager` / JetStream consumption.
 
 use std::collections::btree_map::Entry;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
-use crate::ipc::schema::{ExecutionResult, ExecutionStatus, MarketEventKind, NATIVE_SOL_MINT};
+use crate::ipc::schema::{
+    ExecutionResult, ExecutionStatus, MarketEventKind, PositionAuthoritySnapshot,
+    PositionAuthorityStatus, PositionAuthorityUpdateSource, NATIVE_SOL_MINT,
+};
 
 // ---------------------------------------------------------------------------
 // Public domain types
@@ -172,11 +175,51 @@ pub fn is_sol_or_wsol_mint(mint: &str) -> bool {
     mint == "NATIVE_SOL" || mint == NATIVE_SOL_MINT
 }
 
+/// `authority open count` minus `momentum overlay count` (PA-5.1 drift metric).
+#[inline]
+pub fn position_authority_drift_momentum(authority_open: usize, momentum_overlay: usize) -> i64 {
+    authority_open as i64 - momentum_overlay as i64
+}
+
 /// `authority open count` minus `lock manager open count` (same notion as
 /// `LockManager::count_non_zero_token_balances` in execution-engine).
 #[inline]
 pub fn position_authority_drift_lockmanager(authority_open: usize, lockmanager_open: usize) -> i64 {
     authority_open as i64 - lockmanager_open as i64
+}
+
+/// KV publish delta after a reducer apply (PA-5.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PositionAuthorityChange {
+    /// Upsert snapshot for mint.
+    Put(PositionAuthoritySnapshot),
+    /// Remove key from KV (mint absent from in-process authority).
+    Tombstone { mint: String },
+}
+
+impl PositionState {
+    /// Serialize to JetStream KV snapshot (PA-5.1).
+    pub fn to_snapshot(&self) -> PositionAuthoritySnapshot {
+        PositionAuthoritySnapshot {
+            mint: self.mint.clone(),
+            balance_raw: self.balance_raw,
+            decimals: self.decimals,
+            status: match self.status {
+                PositionStatus::Open => PositionAuthorityStatus::Open,
+                PositionStatus::Closed => PositionAuthorityStatus::Closed,
+                PositionStatus::ReconcileNeeded => PositionAuthorityStatus::ReconcileNeeded,
+            },
+            last_update_source: match self.last_update_source {
+                UpdateSource::Execution => PositionAuthorityUpdateSource::Execution,
+                UpdateSource::WalletSnapshot => PositionAuthorityUpdateSource::WalletSnapshot,
+            },
+            sold_raw_total: if self.sold_raw_total > 0 {
+                Some(self.sold_raw_total)
+            } else {
+                None
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -195,20 +238,30 @@ impl PositionAuthority {
     }
 
     /// PA-2: same mapping as execution-engine (confirmed-only; WSOL/SOL execution rows ignored).
-    pub fn apply_from_confirmed_execution_result(&mut self, result: &ExecutionResult) {
+    pub fn apply_from_confirmed_execution_result(
+        &mut self,
+        result: &ExecutionResult,
+    ) -> Vec<PositionAuthorityChange> {
         if let Some(ev) = PositionEvent::try_from_execution_result(result) {
-            self.apply(&ev);
+            self.apply(&ev)
+        } else {
+            Vec::new()
         }
     }
 
     /// PA-2: `MarketEventKind` → same filter as `try_from_market_event_kind` (skips SOL/WSOL for snapshots).
-    pub fn apply_from_wallet_market_event_kind(&mut self, kind: &MarketEventKind) {
+    pub fn apply_from_wallet_market_event_kind(
+        &mut self,
+        kind: &MarketEventKind,
+    ) -> Vec<PositionAuthorityChange> {
         if let Some(ev) = PositionEvent::try_from_market_event_kind(kind) {
-            self.apply(&ev);
+            self.apply(&ev)
+        } else {
+            Vec::new()
         }
     }
 
-    pub fn apply(&mut self, event: &PositionEvent) {
+    pub fn apply(&mut self, event: &PositionEvent) -> Vec<PositionAuthorityChange> {
         match event {
             PositionEvent::BuyConfirmed {
                 mint,
@@ -216,26 +269,32 @@ impl PositionAuthority {
                 decimals,
                 token_program,
                 ata,
-            } => {
-                self.apply_buy(mint, *fill_raw, *decimals, token_program, ata.as_ref());
-            }
+            } => self.apply_buy(mint, *fill_raw, *decimals, token_program, ata.as_ref()),
             PositionEvent::SellConfirmed {
                 mint,
                 sold_raw,
                 decimals,
                 token_program,
-            } => {
-                self.apply_sell(mint, *sold_raw, *decimals, token_program);
-            }
+            } => self.apply_sell(mint, *sold_raw, *decimals, token_program),
             PositionEvent::WalletBalanceSnapshot {
                 mint,
                 balance_raw,
                 decimals,
                 token_program,
-            } => {
-                self.apply_wallet_snapshot(mint, *balance_raw, *decimals, token_program);
+            } => self.apply_wallet_snapshot(mint, *balance_raw, *decimals, token_program),
+            PositionEvent::WalletSnapshotComplete {
+                mints_in_wallet, ..
+            } => self.apply_wallet_snapshot_complete(mints_in_wallet),
+        }
+    }
+
+    fn change_for_mint(&self, mint: &str) -> PositionAuthorityChange {
+        if let Some(state) = self.by_mint.get(mint) {
+            PositionAuthorityChange::Put(state.to_snapshot())
+        } else {
+            PositionAuthorityChange::Tombstone {
+                mint: mint.to_string(),
             }
-            PositionEvent::WalletSnapshotComplete { .. } => {}
         }
     }
 
@@ -246,7 +305,7 @@ impl PositionAuthority {
         decimals: u8,
         token_program: &str,
         ata: Option<&String>,
-    ) {
+    ) -> Vec<PositionAuthorityChange> {
         let e = self
             .by_mint
             .entry(mint.to_string())
@@ -274,9 +333,16 @@ impl PositionAuthority {
             PositionStatus::Open
         };
         e.last_update_source = UpdateSource::Execution;
+        vec![self.change_for_mint(mint)]
     }
 
-    fn apply_sell(&mut self, mint: &str, sold_raw: u64, decimals: u8, token_program: &str) {
+    fn apply_sell(
+        &mut self,
+        mint: &str,
+        sold_raw: u64,
+        decimals: u8,
+        token_program: &str,
+    ) -> Vec<PositionAuthorityChange> {
         let e = self
             .by_mint
             .entry(mint.to_string())
@@ -307,6 +373,7 @@ impl PositionAuthority {
             };
         }
         e.last_update_source = UpdateSource::Execution;
+        vec![self.change_for_mint(mint)]
     }
 
     fn apply_wallet_snapshot(
@@ -315,10 +382,12 @@ impl PositionAuthority {
         balance_raw: u64,
         decimals: u8,
         token_program: &str,
-    ) {
+    ) -> Vec<PositionAuthorityChange> {
         if balance_raw == 0 {
             self.by_mint.remove(mint);
-            return;
+            return vec![PositionAuthorityChange::Tombstone {
+                mint: mint.to_string(),
+            }];
         }
 
         match self.by_mint.entry(mint.to_string()) {
@@ -351,6 +420,31 @@ impl PositionAuthority {
                 });
             }
         }
+        vec![self.change_for_mint(mint)]
+    }
+
+    /// PA-5.1: close ghost mints not present in wallet after `WalletSnapshotComplete`.
+    fn apply_wallet_snapshot_complete(
+        &mut self,
+        mints_in_wallet: &[String],
+    ) -> Vec<PositionAuthorityChange> {
+        let wallet_set: HashSet<&str> = mints_in_wallet.iter().map(|s| s.as_str()).collect();
+        let ghosts: Vec<String> = self
+            .by_mint
+            .iter()
+            .filter(|(mint, p)| {
+                p.balance_raw > 0
+                    && !is_sol_or_wsol_mint(mint)
+                    && !wallet_set.contains(mint.as_str())
+            })
+            .map(|(mint, _)| mint.clone())
+            .collect();
+        let mut changes = Vec::with_capacity(ghosts.len());
+        for mint in ghosts {
+            self.by_mint.remove(&mint);
+            changes.push(PositionAuthorityChange::Tombstone { mint });
+        }
+        changes
     }
 
     pub fn get(&self, mint: &str) -> Option<&PositionState> {
@@ -411,6 +505,32 @@ mod tests {
             decimals: dec,
             token_program: default_spl_token_program(),
         }
+    }
+
+    #[test]
+    fn wallet_snapshot_complete_closes_ghost_not_in_wallet() {
+        let m = mint();
+        let ghost = "GhostMinttttttttttttttttttttttttttttttttttt".to_string();
+        let mut a = PositionAuthority::new();
+        a.apply(&buy(&m, 400, 6));
+        a.apply(&buy(&ghost, 200, 6));
+        assert_eq!(a.open_positions_count(), 2);
+
+        let changes = a.apply(&PositionEvent::WalletSnapshotComplete {
+            wallet: "wallet".to_string(),
+            mints_in_wallet: vec![m.clone()],
+            is_periodic: true,
+        });
+        assert_eq!(a.open_positions_count(), 1);
+        assert!(a.get(&ghost).is_none());
+        assert!(a.get(&m).is_some());
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0],
+            PositionAuthorityChange::Tombstone {
+                mint: ghost.clone()
+            }
+        );
     }
 
     #[test]

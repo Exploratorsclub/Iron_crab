@@ -43,8 +43,9 @@ use ironcrab::execution::tokens_per_sol;
 use ironcrab::ipc::{
     ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ControlRequest, ControlRequestKind,
     ExecutionResult, ExecutionStatus, ExplicitAmount, IntentOrigin, IntentTier, MarketEvent,
-    MarketEventKind, TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide,
-    TradingRegime, NATIVE_SOL_MINT,
+    MarketEventKind, PositionAuthoritySnapshot, PositionAuthorityStatus, TradeExecutionConstraints,
+    TradeIntent, TradeResources, TradeSide, TradingRegime, NATIVE_SOL_MINT,
+    POSITION_AUTHORITY_KV_BUCKET,
 };
 use ironcrab::metrics::{
     momentum_event_ts_latency_delta_ms, record_momentum_active_pools_messages_total,
@@ -53,11 +54,12 @@ use ironcrab::metrics::{
     record_momentum_core_market_events_received_kind, record_momentum_ingest_to_process_us,
     record_momentum_market_events_last_applied_slot,
     record_momentum_market_events_subscription_max_dequeued_slot,
-    record_momentum_nats_batch_prepare_us, record_momentum_signal_eval_us,
-    record_momentum_tracker_rejected, record_momentum_tracker_trades_recorded,
-    record_momentum_trades_received_no_tracker, serve_metrics,
-    set_momentum_bot_process_start_unix_sec,
-    set_momentum_market_events_ingest_max_wall_lag_ms_last_batch, set_readiness_nats_connected,
+    record_momentum_nats_batch_prepare_us, record_momentum_overlay_closed_by_authority_total,
+    record_momentum_signal_eval_us, record_momentum_tracker_rejected,
+    record_momentum_tracker_trades_recorded, record_momentum_trades_received_no_tracker,
+    serve_metrics, set_momentum_bot_process_start_unix_sec,
+    set_momentum_market_events_ingest_max_wall_lag_ms_last_batch,
+    set_position_authority_drift_momentum, set_readiness_nats_connected,
     try_record_momentum_event_to_ingest_ms, try_record_momentum_event_to_intent_publish_ms,
     try_record_momentum_intent_header_to_publish_ms,
     try_record_momentum_jetstream_poolcache_event_to_ingest_ms,
@@ -79,6 +81,7 @@ use ironcrab::nats::{
     TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_MOMENTUM_ACTIVE_POOLS,
     TOPIC_MOMENTUM_MARKET_EVENTS, TOPIC_TRADE_INTENTS, WALLET_SNAPSHOT_STREAM_NAME,
 };
+use ironcrab::position_authority::position_authority_drift_momentum;
 use ironcrab::solana::dex_parser::SOL_MINT_PUBKEY;
 use ironcrab::storage::{JsonlWriterConfig, QueuedJsonlWriter};
 use tokio::sync::mpsc;
@@ -3260,6 +3263,10 @@ struct MomentumContext {
     open_position_pool_recovery_last_sent: parking_lot::RwLock<HashMap<String, Instant>>,
     /// JetStream KV Store for position persistence (initialized lazily)
     position_kv: tokio::sync::OnceCell<async_nats::jetstream::kv::Store>,
+    /// PA-5.1: JetStream KV for readonly PositionAuthority snapshots (I-24a).
+    position_authority_kv: tokio::sync::OnceCell<async_nats::jetstream::kv::Store>,
+    /// PA-5.1: readonly cache of execution-engine PositionAuthority (mint → snapshot).
+    authority_by_mint: parking_lot::RwLock<HashMap<String, PositionAuthoritySnapshot>>,
     /// Mints with non-zero wallet balance that could not be reconciled at bootstrap
     /// because no pool was known yet. Checked when new pools are registered.
     orphaned_mints: parking_lot::RwLock<HashMap<String, (u64, u8)>>,
@@ -5839,6 +5846,153 @@ impl MomentumContext {
         });
     }
 
+    /// PA-5.1: close overlay when PositionAuthority signals closed / absent / zero balance.
+    fn close_position_by_authority(self: &Arc<Self>, mint: &str, reason: &str) {
+        if !self.positions.read().contains_key(mint) {
+            return;
+        }
+        info!(
+            mint = %mint,
+            reason = %reason,
+            "PositionAuthority closed overlay (ghost cleanup)"
+        );
+        record_momentum_overlay_closed_by_authority_total();
+        self.close_position(mint);
+    }
+
+    fn authority_signals_closed(snap: Option<&PositionAuthoritySnapshot>) -> bool {
+        match snap {
+            None => true,
+            Some(s) => s.balance_raw == 0 || s.status == PositionAuthorityStatus::Closed,
+        }
+    }
+
+    /// Apply a PositionAuthority KV update and enforce overlay-close rule.
+    fn apply_authority_snapshot_update(
+        self: &Arc<Self>,
+        mint: &str,
+        snap: Option<PositionAuthoritySnapshot>,
+    ) {
+        {
+            let mut cache = self.authority_by_mint.write();
+            match snap {
+                Some(s) => {
+                    cache.insert(mint.to_string(), s);
+                }
+                None => {
+                    cache.remove(mint);
+                }
+            }
+        }
+        self.refresh_position_authority_drift_metrics();
+        let closed = {
+            let cache = self.authority_by_mint.read();
+            Self::authority_signals_closed(cache.get(mint))
+        };
+        if closed && self.positions.read().contains_key(mint) {
+            self.close_position_by_authority(mint, "authority_closed_or_tombstoned");
+        }
+    }
+
+    fn refresh_position_authority_drift_metrics(&self) {
+        let authority_open = self
+            .authority_by_mint
+            .read()
+            .values()
+            .filter(|s| s.balance_raw > 0 && s.status != PositionAuthorityStatus::Closed)
+            .count();
+        let overlay_count = self.positions.read().len();
+        set_position_authority_drift_momentum(position_authority_drift_momentum(
+            authority_open,
+            overlay_count,
+        ));
+    }
+
+    async fn get_position_authority_kv(&self) -> Option<&async_nats::jetstream::kv::Store> {
+        let nats = self.nats.as_ref()?;
+        if let Some(store) = self.position_authority_kv.get() {
+            return Some(store);
+        }
+        match nats
+            .get_or_create_kv_bucket(POSITION_AUTHORITY_KV_BUCKET)
+            .await
+        {
+            Ok(store) => {
+                let _ = self.position_authority_kv.set(store);
+                self.position_authority_kv.get()
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to create PositionAuthority KV bucket");
+                None
+            }
+        }
+    }
+
+    /// Bootstrap + live watch on `POSITION_AUTHORITY` KV (readonly, no RPC).
+    async fn bootstrap_and_watch_position_authority_kv(self: &Arc<Self>) {
+        let Some(nats) = self.nats.as_ref() else {
+            return;
+        };
+        let Some(store) = self.get_position_authority_kv().await else {
+            return;
+        };
+
+        match nats.kv_get_all::<PositionAuthoritySnapshot>(store).await {
+            Ok(entries) => {
+                info!(
+                    count = entries.len(),
+                    "Bootstrapped PositionAuthority snapshots from JetStream KV"
+                );
+                for (mint, snap) in entries {
+                    self.apply_authority_snapshot_update(&mint, Some(snap));
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to bootstrap PositionAuthority KV");
+            }
+        }
+
+        let ctx = Arc::clone(self);
+        let store = store.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut watch = match store.watch_all().await {
+                Ok(w) => w,
+                Err(e) => {
+                    error!(error = %e, "PositionAuthority KV watch failed to start");
+                    return;
+                }
+            };
+            info!("PositionAuthority KV watch started");
+            while let Some(entry_res) = watch.next().await {
+                match entry_res {
+                    Ok(entry) => {
+                        let mint = entry.key;
+                        if entry.operation == async_nats::jetstream::kv::Operation::Delete
+                            || entry.value.is_empty()
+                        {
+                            ctx.apply_authority_snapshot_update(&mint, None);
+                            continue;
+                        }
+                        match serde_json::from_slice::<PositionAuthoritySnapshot>(&entry.value) {
+                            Ok(snap) => {
+                                ctx.apply_authority_snapshot_update(&mint, Some(snap));
+                            }
+                            Err(e) => {
+                                warn!(mint = %mint, error = %e, "Invalid PositionAuthority KV payload");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "PositionAuthority KV watch error");
+                        break;
+                    }
+                }
+            }
+            warn!("PositionAuthority KV watch ended");
+        });
+    }
+
     // =========================================================================
     // JetStream KV Position Persistence
     // =========================================================================
@@ -7090,8 +7244,26 @@ impl MomentumContext {
         );
     }
 
-    /// Phase 4 P2: confirmed `PositionTracker.token_amount` is SSOT for exit sizing; snapshot is hint.
+    /// Phase 4 P2 + PA-5.1: confirmed overlay SSOT; Authority caps exit when published.
     fn resolve_exit_token_amount_raw(&self, mint: &str, hint_amount: u64) -> u64 {
+        let authority_snap = self.authority_by_mint.read().get(mint).cloned();
+        if let Some(ref auth) = authority_snap {
+            if Self::authority_signals_closed(Some(auth)) {
+                return 0;
+            }
+            let overlay = self
+                .positions
+                .read()
+                .get(mint)
+                .map(|p| p.token_amount)
+                .filter(|t| *t > 0)
+                .unwrap_or(hint_amount);
+            if overlay > 0 {
+                return overlay.min(auth.balance_raw);
+            }
+            return auth.balance_raw.min(hint_amount);
+        }
+
         let overlay = self
             .positions
             .read()
@@ -7127,6 +7299,13 @@ impl MomentumContext {
         }
     }
 
+    fn execution_result_removes_pending(status: ExecutionStatus) -> bool {
+        matches!(
+            status,
+            ExecutionStatus::Confirmed | ExecutionStatus::Failed | ExecutionStatus::Timeout
+        )
+    }
+
     fn try_apply_reserve_hint_as_position_price(
         pos: &mut PositionTracker,
         hint: &CachedPoolReservePriceHint,
@@ -7158,9 +7337,14 @@ impl MomentumContext {
     /// Handle execution result from execution-engine
     fn handle_execution_result(self: &Arc<Self>, result: &ExecutionResult) {
         // Find the pending intent by id (source is not authoritative).
+        // PA-5.1: `Sent` must not remove pending — confirm path needs it for close_position.
         let pending_opt = {
             let mut pending = self.pending_intents.write();
-            pending.remove(&result.intent_id)
+            if Self::execution_result_removes_pending(result.status) {
+                pending.remove(&result.intent_id)
+            } else {
+                pending.get(&result.intent_id).cloned()
+            }
         };
 
         let Some(pending) = pending_opt else {
@@ -9852,6 +10036,8 @@ async fn main() -> Result<()> {
         live_pool_cache,
         open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
         position_kv: tokio::sync::OnceCell::new(),
+        position_authority_kv: tokio::sync::OnceCell::new(),
+        authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
         orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
         orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
             ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -9885,6 +10071,9 @@ async fn main() -> Result<()> {
     }
 
     startup_wallet_ghost_reconciliation(&ctx).await;
+
+    // PA-5.1: readonly PositionAuthority from JetStream KV (bootstrap + watch).
+    ctx.bootstrap_and_watch_position_authority_kv().await;
 
     // Open positions: request authoritative pool rows from market-data (bounded, deduped; no RPC here).
     ctx.schedule_open_position_pool_recoveries("startup").await;
@@ -12076,6 +12265,8 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
+            position_authority_kv: tokio::sync::OnceCell::new(),
+            authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -13934,6 +14125,8 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
+            position_authority_kv: tokio::sync::OnceCell::new(),
+            authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -14003,6 +14196,8 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
+            position_authority_kv: tokio::sync::OnceCell::new(),
+            authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -16362,6 +16557,8 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
+            position_authority_kv: tokio::sync::OnceCell::new(),
+            authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -16453,6 +16650,8 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
+            position_authority_kv: tokio::sync::OnceCell::new(),
+            authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -16538,6 +16737,8 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
+            position_authority_kv: tokio::sync::OnceCell::new(),
+            authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -16708,6 +16909,8 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
+            position_authority_kv: tokio::sync::OnceCell::new(),
+            authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -16823,6 +17026,8 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
+            position_authority_kv: tokio::sync::OnceCell::new(),
+            authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -16923,6 +17128,8 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
+            position_authority_kv: tokio::sync::OnceCell::new(),
+            authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -17000,6 +17207,8 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
+            position_authority_kv: tokio::sync::OnceCell::new(),
+            authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -17069,6 +17278,8 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
+            position_authority_kv: tokio::sync::OnceCell::new(),
+            authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -18076,6 +18287,8 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
+            position_authority_kv: tokio::sync::OnceCell::new(),
+            authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -18226,6 +18439,8 @@ mod tests {
             live_pool_cache: LivePoolCache::new(),
             open_position_pool_recovery_last_sent: parking_lot::RwLock::new(HashMap::new()),
             position_kv: tokio::sync::OnceCell::new(),
+            position_authority_kv: tokio::sync::OnceCell::new(),
+            authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -19412,6 +19627,136 @@ mod tests {
         );
     }
 
+    /// PA-5.1: `ExecutionStatus::Sent` must not remove pending (confirm needs it for close).
+    #[test]
+    fn pa51_sent_execution_result_keeps_pending() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let intent_id = "sell-sent-pending";
+        let mint = "SentPendingMintttttttttttttttttttttttttttttt";
+        ctx.pending_intents.write().insert(
+            intent_id.to_string(),
+            PendingIntent {
+                mint: mint.to_string(),
+                pool: "pool".to_string(),
+                dex: "raydium".to_string(),
+                side: TradeSide::Sell,
+                entry_kind: None,
+                sol_amount: 0,
+                token_amount: 1_000,
+                created_at: Instant::now(),
+            },
+        );
+
+        let result = ExecutionResult {
+            header: RecordHeader::new("test", BUILD_VERSION, "run-test"),
+            execution_id: "ex-sent".to_string(),
+            decision_id: "dec-sent".to_string(),
+            intent_id: intent_id.to_string(),
+            source: "momentum-bot".to_string(),
+            token_mint: Some(mint.to_string()),
+            signature: Some("sig".to_string()),
+            bundle_id: None,
+            status: ExecutionStatus::Sent,
+            fill_in: None,
+            fill_out: None,
+            fill_status: None,
+            fill_unavailable_reason: None,
+            confirmed_slot: None,
+            block_time_unix_ms: None,
+            fees: None,
+            pnl: None,
+            wallet_sol_delta_lamports: None,
+            error_message: None,
+            error_code: None,
+            latency_ms: None,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        Arc::clone(&ctx).handle_execution_result(&result);
+        assert!(
+            ctx.pending_intents.read().contains_key(intent_id),
+            "Sent must not remove pending intent"
+        );
+    }
+
+    /// PA-5.1: Authority tombstone/closed closes momentum overlay.
+    #[tokio::test]
+    async fn pa51_authority_closed_closes_overlay() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "AuthCloseMinttttttttttttttttttttttttttttttt";
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "pool",
+            dex: "raydium",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 500,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 1,
+            initial_bonding: None,
+        });
+
+        Arc::clone(&ctx).apply_authority_snapshot_update(
+            mint,
+            Some(PositionAuthoritySnapshot {
+                mint: mint.to_string(),
+                balance_raw: 0,
+                decimals: 6,
+                status: PositionAuthorityStatus::Closed,
+                last_update_source: ironcrab::ipc::PositionAuthorityUpdateSource::Execution,
+                sold_raw_total: None,
+            }),
+        );
+        assert!(
+            !ctx.positions.read().contains_key(mint),
+            "overlay must close when authority is closed"
+        );
+    }
+
+    /// PA-5.1: exit sizing uses min(overlay, authority.balance_raw).
+    #[tokio::test]
+    async fn pa51_exit_amount_min_authority_balance() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "AuthExitMintttttttttttttttttttttttttttttttt";
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "pool",
+            dex: "raydium",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 1_000,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 1,
+            initial_bonding: None,
+        });
+        ctx.authority_by_mint.write().insert(
+            mint.to_string(),
+            PositionAuthoritySnapshot {
+                mint: mint.to_string(),
+                balance_raw: 400,
+                decimals: 6,
+                status: PositionAuthorityStatus::Open,
+                last_update_source: ironcrab::ipc::PositionAuthorityUpdateSource::WalletSnapshot,
+                sold_raw_total: None,
+            },
+        );
+
+        assert_eq!(ctx.resolve_exit_token_amount_raw(mint, 1_000), 400);
+    }
+
     fn orphan_buy_execution_result(
         intent_id: &str,
         mint: &str,
@@ -19695,8 +20040,16 @@ async fn generate_and_publish_exit_intent(
     // bootstrap, and any `check_for_exits()`-driven scan where one event is not tied to each exit.
     source_event_ts_unix_ms: Option<u64>,
 ) -> Result<()> {
-    // Authoritative sell size: overlay + optional JetStream wallet snapshot (Scope 57 / PA-5 interim).
+    // Authoritative sell size: overlay + PositionAuthority when published (PA-5.1).
     let token_amount = ctx.resolve_exit_token_amount_raw(mint, token_amount);
+    if token_amount == 0 {
+        debug!(
+            mint = %mint,
+            exit_type = %exit_type,
+            "Exit suppressed: PositionAuthority closed or zero balance"
+        );
+        return Ok(());
+    }
 
     // Phase 3: Slippage escalation — when prior sells failed with 6002, increase tolerance
     let max_slippage = {

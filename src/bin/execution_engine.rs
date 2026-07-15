@@ -70,7 +70,7 @@ use ironcrab::ipc::{
     FairnessPolicy, FeePolicy, FillStatus, FillUnavailableReason, IntentOrigin, IntentTier,
     KillSwitchContext, MarketEvent, MarketEventKind, PoolCacheUpdate, PriorityFeePercentiles,
     RecordHeader, RejectReason, SimulationResult, TradeExecutionConstraints, TradeIntent,
-    TradeResources, TradeSide, TradingRegime,
+    TradeResources, TradeSide, TradingRegime, POSITION_AUTHORITY_KV_BUCKET,
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
@@ -116,7 +116,9 @@ use ironcrab::nats::{
     TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS, TRADE_INTENTS_STREAM_NAME,
     WALLET_SNAPSHOT_STREAM_NAME, WALLET_TX_CONFIRM_STREAM_NAME,
 };
-use ironcrab::position_authority::{position_authority_drift_lockmanager, PositionAuthority};
+use ironcrab::position_authority::{
+    position_authority_drift_lockmanager, PositionAuthority, PositionAuthorityChange,
+};
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::dex::meteora_dlmm::MeteoraDlmm;
 use ironcrab::solana::dex::orca::Orca;
@@ -2425,6 +2427,8 @@ struct ExecutionContext {
     lock_manager: LockManager,
     /// PA-2: passive PositionAuthority (metrics only; not used for gating or reservations).
     position_authority: Arc<ParkingMutex<PositionAuthority>>,
+    /// PA-5.1: cached JetStream KV store for PositionAuthority snapshots (I-24a).
+    position_authority_kv: tokio::sync::OnceCell<async_nats::jetstream::kv::Store>,
     log_base: PathBuf, // P1: For state persistence
     decision_counter: std::sync::atomic::AtomicU64,
     execution_counter: std::sync::atomic::AtomicU64,
@@ -6384,18 +6388,40 @@ impl ExecutionContext {
     }
 
     fn apply_position_authority_from_execution_result(&self, exec: &ExecutionResult) {
-        self.position_authority
+        let changes = self
+            .position_authority
             .lock()
             .apply_from_confirmed_execution_result(exec);
         self.refresh_position_authority_metrics();
+        self.spawn_publish_position_authority_changes(changes);
     }
 
     /// Wallet snapshot: same filter as `PositionEvent::try_from_market_event_kind` (ignores SOL/WSOL for authority open count).
     fn apply_position_authority_from_wallet_event_kind(&self, kind: &MarketEventKind) {
-        self.position_authority
+        let changes = self
+            .position_authority
             .lock()
             .apply_from_wallet_market_event_kind(kind);
         self.refresh_position_authority_metrics();
+        self.spawn_publish_position_authority_changes(changes);
+    }
+
+    /// PA-5.1: fire-and-forget KV publish after reducer apply (non-blocking on hot path).
+    fn spawn_publish_position_authority_changes(&self, changes: Vec<PositionAuthorityChange>) {
+        if changes.is_empty() {
+            return;
+        }
+        let Some(nats) = self.nats.as_ref() else {
+            return;
+        };
+        let nats = nats.clone_for_spawned_publish();
+        let kv_cell = self.position_authority_kv.clone();
+        tokio::spawn(async move {
+            if let Err(e) = publish_position_authority_changes_to_kv(&nats, &kv_cell, changes).await
+            {
+                warn!(error = %e, "PositionAuthority KV publish failed");
+            }
+        });
     }
 
     /// Apply a WalletBalanceSnapshot MarketEvent to LockManager + decimals cache.
@@ -6456,6 +6482,40 @@ impl ExecutionContext {
         POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE.store(lock_open as u64, Ordering::Relaxed);
         POSITION_AUTHORITY_DRIFT_LOCKMANAGER.store(drift, Ordering::Relaxed);
     }
+}
+
+/// PA-5.1: write PositionAuthority deltas to JetStream KV (`POSITION_AUTHORITY` bucket).
+async fn publish_position_authority_changes_to_kv(
+    nats: &NatsClient,
+    kv_cell: &tokio::sync::OnceCell<async_nats::jetstream::kv::Store>,
+    changes: Vec<PositionAuthorityChange>,
+) -> anyhow::Result<()> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let store = if let Some(store) = kv_cell.get() {
+        store.clone()
+    } else {
+        let store = nats
+            .get_or_create_kv_bucket(POSITION_AUTHORITY_KV_BUCKET)
+            .await?;
+        let _ = kv_cell.set(store.clone());
+        store
+    };
+    for change in changes {
+        match change {
+            PositionAuthorityChange::Put(snapshot) => {
+                let mint = snapshot.mint.clone();
+                nats.kv_put(&store, &mint, &snapshot).await?;
+            }
+            PositionAuthorityChange::Tombstone { mint } => {
+                if let Err(e) = nats.kv_delete(&store, &mint).await {
+                    debug!(mint = %mint, error = %e, "PositionAuthority KV tombstone delete (may not exist)");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -7915,6 +7975,7 @@ async fn main() -> Result<()> {
         burn_writer,
         lock_manager,
         position_authority: Arc::new(ParkingMutex::new(PositionAuthority::new())),
+        position_authority_kv: tokio::sync::OnceCell::new(),
         log_base: log_base.clone(),
         decision_counter: std::sync::atomic::AtomicU64::new(initial_decision_counter),
         execution_counter: std::sync::atomic::AtomicU64::new(initial_execution_counter),
@@ -9254,6 +9315,7 @@ async fn build_replay_context(
         burn_writer,
         lock_manager,
         position_authority: Arc::new(ParkingMutex::new(PositionAuthority::new())),
+        position_authority_kv: tokio::sync::OnceCell::new(),
         log_base: log_dir,
         decision_counter: std::sync::atomic::AtomicU64::new(0),
         execution_counter: std::sync::atomic::AtomicU64::new(0),

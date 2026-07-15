@@ -23,6 +23,10 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// Native SOL mint address
 pub const NATIVE_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
+/// JetStream KV bucket for PositionAuthority snapshots (PA-5.1, I-24a).
+/// Key = mint (base58), value = [`PositionAuthoritySnapshot`] JSON.
+pub const POSITION_AUTHORITY_KV_BUCKET: &str = "POSITION_AUTHORITY";
+
 /// Default quote mint for backward compatibility (SOL)
 fn default_sol_mint() -> String {
     NATIVE_SOL_MINT.to_string()
@@ -1784,6 +1788,37 @@ impl DecisionRecord {
         self.input_snapshots.insert(key, value);
         self
     }
+}
+
+// ============================================================================
+// PositionAuthority snapshot (PA-5.1 JetStream KV, I-24a)
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PositionAuthorityStatus {
+    Open,
+    Closed,
+    ReconcileNeeded,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PositionAuthorityUpdateSource {
+    Execution,
+    WalletSnapshot,
+}
+
+/// Compact per-mint PositionAuthority view published by execution-engine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PositionAuthoritySnapshot {
+    pub mint: String,
+    pub balance_raw: u64,
+    pub decimals: u8,
+    pub status: PositionAuthorityStatus,
+    pub last_update_source: PositionAuthorityUpdateSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sold_raw_total: Option<u64>,
 }
 
 // ============================================================================
