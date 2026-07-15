@@ -25,6 +25,7 @@ Cmnd_Alias IRONCRAB_DEPLOY_SYSTEMCTL = \
     /usr/bin/systemctl restart arb-strategy, \
     /usr/bin/systemctl restart execution-engine, \
     /usr/bin/systemctl restart control-plane, \
+    /usr/bin/systemctl restart trades-server, \
     /usr/bin/systemctl enable ironcrab.target, \
     /usr/bin/systemctl is-active market-data, \
     /usr/bin/systemctl is-active momentum-bot, \
