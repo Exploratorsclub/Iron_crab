@@ -6879,6 +6879,8 @@ const INTENT_RX_QUEUE_DEPTH_WARN_THRESHOLD: u64 = 10;
 /// Max JetStream messages processed per cold-path consumer iteration (Pool/Wallet/TX-confirm).
 const EE_JETSTREAM_CONSUMER_BATCH_MAX: usize = 15;
 const EE_JETSTREAM_CONSUMER_FETCH_EXPIRES: Duration = Duration::from_millis(100);
+/// Backoff when WalletTxConfirmed consumer is missing (matches former 100ms poll interval).
+const EE_WALLET_TX_CONFIRM_RECREATE_BACKOFF: Duration = Duration::from_millis(100);
 /// Warn when JetStream consumer `num_pending` exceeds this threshold.
 const EE_CONSUMER_PENDING_WARN_THRESHOLD: u64 = 100;
 
@@ -6960,7 +6962,7 @@ async fn refresh_wallet_snapshot_consumer_metrics(consumer: &mut JetStreamPullCo
 
 /// Cold-path task: PoolCacheUpdate JetStream → LivePoolCache (bounded batches + yield).
 async fn run_pool_cache_consumer_task(
-    ctx: Arc<ExecutionContext>,
+    live_pool_cache: SharedLivePoolCache,
     consumer: JetStreamPullConsumer,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -6989,10 +6991,8 @@ async fn run_pool_cache_consumer_task(
                         Ok(msg) => {
                             match serde_json::from_slice::<PoolCacheUpdate>(&msg.payload) {
                                 Ok(update) => {
-                                    if let Some(ref cache) = ctx.live_pool_cache {
-                                        if apply_pool_cache_update(cache, &update) {
-                                            processed += 1;
-                                        }
+                                    if apply_pool_cache_update(&live_pool_cache, &update) {
+                                        processed += 1;
                                     }
                                 }
                                 Err(e) => {
@@ -7078,6 +7078,9 @@ async fn run_wallet_snapshot_consumer_task(
                     }
                 }
 
+                // Last-value wins per mint within this batch only. Intermediate transitions
+                // (e.g. >0→0→>0) are collapsed to the final snapshot; PositionAuthority uses
+                // the same end-state and ignores SOL/WSOL for open-count (PA-2).
                 for (idx, (msg, event)) in batch.into_iter().enumerate() {
                     let apply =
                         if let MarketEventKind::WalletBalanceSnapshot { mint, .. } = &event.kind {
@@ -7125,6 +7128,14 @@ async fn run_wallet_tx_confirm_consumer_task(
         if consumer.is_none() {
             if let Some(ref nats) = ctx.nats {
                 consumer = create_wallet_tx_confirm_live_consumer(nats, &wallet).await;
+            }
+            if consumer.is_none() {
+                evict_stale_orphan_tx_confirms(
+                    &ctx.recent_orphan_tx_confirms,
+                    ORPHAN_TX_CONFIRM_TTL,
+                );
+                tokio::time::sleep(EE_WALLET_TX_CONFIRM_RECREATE_BACKOFF).await;
+                continue;
             }
         }
 
@@ -7839,9 +7850,13 @@ async fn main() -> Result<()> {
             create_shared_cache()
         });
 
+    // Shutdown channel created early so pool-cache live consumer can spawn immediately
+    // after bootstrap — no gap between bootstrap end and DeliverPolicy::New durable.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
     // Bootstrap LivePoolCache from JetStream (state recovery after restart).
-    // Live sync uses a separate DeliverPolicy::New durable consumer in a dedicated task
-    // (bootstrap ephemeral LastPerSubject consumer is dropped after seeding).
+    // Immediately after bootstrap: create DeliverPolicy::New durable consumer and spawn
+    // cold-path task (bootstrap ephemeral LastPerSubject consumer is dropped; no replay).
     if let (Some(ref nats_client), Some(ref cache)) = (&nats, &live_pool_cache) {
         match bootstrap_pool_cache_from_jetstream(nats_client, cache).await {
             Ok((pools_recovered, _bootstrap_consumer)) => {
@@ -7853,6 +7868,18 @@ async fn main() -> Result<()> {
             Err(e) => {
                 warn!(error = %e, "SLAVE CACHE: JetStream bootstrap failed (will rely on incremental updates)");
             }
+        }
+
+        if let Some(consumer) = create_pool_cache_live_consumer_for_ee(nats_client).await {
+            let cache_spawn = Arc::clone(cache);
+            let shutdown_rx_pool = shutdown_rx.clone();
+            tokio::spawn(async move {
+                run_pool_cache_consumer_task(cache_spawn, consumer, shutdown_rx_pool).await;
+            });
+            info!(
+                stream = STREAM_NAME,
+                "Pool cache live consumer task started immediately after bootstrap (no startup gap)"
+            );
         }
     }
 
@@ -8017,9 +8044,6 @@ async fn main() -> Result<()> {
     // Publish initial gauge values immediately (before the first 30s heartbeat).
     OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
     ctx.refresh_position_authority_metrics();
-
-    // Shutdown channel for background tasks (WsolManager, etc.)
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // === WsolManager: Background WSOL balance maintenance ===
     // Professional arb bots don't wrap/unwrap in the arb TX itself
@@ -8800,17 +8824,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Cold-path JetStream consumers: PoolCache, WalletSnapshot, WalletTxConfirm (bounded batches).
-    let pool_cache_live_consumer = if ctx.live_pool_cache.is_some() {
-        if let Some(ref nats) = ctx.nats {
-            create_pool_cache_live_consumer_for_ee(nats).await
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
+    // Cold-path JetStream consumers: WalletSnapshot, WalletTxConfirm (bounded batches).
+    // Pool-cache consumer already spawned immediately after bootstrap (no startup gap).
     let wallet_snapshot_live_consumer = if let Some(consumer) = wallet_snapshot_bootstrap_consumer {
         info!(
             stream = WALLET_SNAPSHOT_STREAM_NAME,
@@ -8855,14 +8870,6 @@ async fn main() -> Result<()> {
             run_intent_dispatcher(intent_rx, ctx, enqueue_tracker, shutdown_rx).await;
         })
     };
-
-    if let Some(consumer) = pool_cache_live_consumer {
-        let ctx = Arc::clone(&ctx);
-        let shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
-            run_pool_cache_consumer_task(ctx, consumer, shutdown_rx).await;
-        });
-    }
 
     if let Some(consumer) = wallet_snapshot_live_consumer {
         let ctx = Arc::clone(&ctx);
