@@ -178,10 +178,14 @@ if [ -n "$COMPONENT" ]; then
     log_info "Restarting only: $COMPONENT"
     sudo systemctl restart "$COMPONENT"
 else
+    # systemctl start ironcrab.target does NOT restart already-running Wants= units;
+    # after cargo build replaces binaries, stale processes keep the old inode until restarted.
     log_info "Restarting all IronCrab services..."
-    sudo systemctl stop ironcrab.target 2>/dev/null || true
-    sleep 1
-    sudo systemctl start ironcrab.target
+    SERVICES=(market-data momentum-bot arb-strategy execution-engine control-plane trades-server)
+    for svc in "${SERVICES[@]}"; do
+        log_info "Restarting $svc..."
+        sudo systemctl restart "$svc"
+    done
 fi
 
 # -----------------------------------------------------------------------------
