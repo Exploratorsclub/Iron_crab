@@ -5225,6 +5225,14 @@ pub static POSITION_AUTHORITY_DRIFT_LOCKMANAGER: Lazy<AtomicI64> = Lazy::new(|| 
 pub static CONCURRENT_INTENTS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// Pending TradeIntents in `intent_rx` between JetStream enqueue and dispatcher recv.
 pub static EXECUTION_INTENT_RX_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// JetStream `num_pending` for execution-engine pool-cache live consumer (cold-path sync).
+pub static EXECUTION_POOL_CACHE_CONSUMER_PENDING: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// JetStream `num_pending` for execution-engine wallet-snapshot live consumer.
+pub static EXECUTION_WALLET_SNAPSHOT_CONSUMER_PENDING: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PoolCacheUpdate messages applied by the EE live consumer task.
+pub static EXECUTION_POOL_CACHE_MESSAGES_PROCESSED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static DAILY_REALIZED_PNL_SOL_MICRO: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static LIQUIDITY_ESTIMATE_SOL_MICRO: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Histogram (swap latency) simplified: we keep bucket counters manually (ns)
@@ -5729,6 +5737,31 @@ pub fn reset_execution_intent_rx_queue_depth_for_test() {
     EXECUTION_INTENT_RX_QUEUE_DEPTH.store(0, Ordering::Relaxed);
 }
 
+/// Update JetStream pending count for the EE pool-cache live consumer.
+#[inline]
+pub fn set_execution_pool_cache_consumer_pending(pending: u64) {
+    EXECUTION_POOL_CACHE_CONSUMER_PENDING.store(pending, Ordering::Relaxed);
+}
+
+/// Update JetStream pending count for the EE wallet-snapshot live consumer.
+#[inline]
+pub fn set_execution_wallet_snapshot_consumer_pending(pending: u64) {
+    EXECUTION_WALLET_SNAPSHOT_CONSUMER_PENDING.store(pending, Ordering::Relaxed);
+}
+
+/// Increment when the EE pool-cache consumer applies updates.
+#[inline]
+pub fn inc_execution_pool_cache_messages_processed(count: u64) {
+    EXECUTION_POOL_CACHE_MESSAGES_PROCESSED_TOTAL.fetch_add(count, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub fn reset_execution_consumer_metrics_for_test() {
+    EXECUTION_POOL_CACHE_CONSUMER_PENDING.store(0, Ordering::Relaxed);
+    EXECUTION_WALLET_SNAPSHOT_CONSUMER_PENDING.store(0, Ordering::Relaxed);
+    EXECUTION_POOL_CACHE_MESSAGES_PROCESSED_TOTAL.store(0, Ordering::Relaxed);
+}
+
 /// Channel enqueue → intent-dispatcher `intent_rx.recv` before `process_intent` spawn (ms).
 #[inline]
 pub fn record_execution_intent_channel_wait_ms(ms: u64) {
@@ -5742,7 +5775,8 @@ pub fn record_execution_intent_channel_wait_ms(ms: u64) {
     );
 }
 
-/// PoolCache + WalletSnapshot JetStream batch work inside `interval.tick` (ms).
+/// PoolCache + WalletSnapshot JetStream batch work inside main-loop heartbeat (ms).
+/// After cold-path consumer isolation, this tracks heartbeat/control work only.
 #[inline]
 pub fn record_execution_engine_interval_tick_duration_ms(ms: u64) {
     record_histogram_u64_into(
@@ -8491,6 +8525,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "execution_intent_rx_queue_depth",
         EXECUTION_INTENT_RX_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "execution_pool_cache_consumer_pending",
+        EXECUTION_POOL_CACHE_CONSUMER_PENDING.load(Ordering::Relaxed)
+    );
+    line!(
+        "execution_wallet_snapshot_consumer_pending",
+        EXECUTION_WALLET_SNAPSHOT_CONSUMER_PENDING.load(Ordering::Relaxed)
+    );
+    line!(
+        "execution_pool_cache_messages_processed_total",
+        EXECUTION_POOL_CACHE_MESSAGES_PROCESSED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "daily_realized_pnl_sol",

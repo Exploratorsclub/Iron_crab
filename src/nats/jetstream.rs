@@ -432,6 +432,22 @@ pub fn pool_cache_live_consumer_config() -> jetstream::consumer::pull::Config {
     }
 }
 
+/// Live `POOL_CACHE` consumer for **execution-engine** (`DeliverPolicy::New`).
+///
+/// Bootstrap uses [`slave_consumer_config`] (`LastPerSubject`) once at startup via
+/// `pool_cache_sync::bootstrap_pool_cache_from_jetstream`; this durable consumer receives only
+/// incremental updates after bootstrap (same split as momentum-bot / arb-strategy).
+pub fn pool_cache_live_consumer_config_execution_engine() -> jetstream::consumer::pull::Config {
+    jetstream::consumer::pull::Config {
+        deliver_policy: jetstream::consumer::DeliverPolicy::New,
+        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+        durable_name: Some("execution-engine-pool-cache-live".to_string()),
+        max_ack_pending: 1000,
+        filter_subject: "ironcrab.pool_cache.>".to_string(),
+        ..Default::default()
+    }
+}
+
 /// Live `POOL_CACHE` consumer for **arb-strategy** (`DeliverPolicy::New`).
 ///
 /// Bootstrap uses [`slave_consumer_config`] (`LastPerSubject`) once at startup; this durable
@@ -550,6 +566,16 @@ mod tests {
         );
         assert_eq!(live.filter_subject, "ironcrab.pool_cache.>");
 
+        let ee_live = pool_cache_live_consumer_config_execution_engine();
+        assert!(matches!(
+            ee_live.deliver_policy,
+            jetstream::consumer::DeliverPolicy::New
+        ));
+        assert_eq!(
+            ee_live.durable_name.as_deref(),
+            Some("execution-engine-pool-cache-live")
+        );
+
         let arb_live = arb_strategy_pool_cache_live_consumer_config();
         assert!(matches!(
             arb_live.deliver_policy,
@@ -562,6 +588,14 @@ mod tests {
         assert_ne!(
             arb_live.durable_name, live.durable_name,
             "arb and momentum must not share the same durable POOL_CACHE live consumer"
+        );
+        assert_ne!(
+            ee_live.durable_name, live.durable_name,
+            "execution-engine and momentum must not share the same durable POOL_CACHE live consumer"
+        );
+        assert_ne!(
+            ee_live.durable_name, arb_live.durable_name,
+            "execution-engine and arb must not share the same durable POOL_CACHE live consumer"
         );
 
         let slave = slave_consumer_config();
