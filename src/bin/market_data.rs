@@ -1599,33 +1599,6 @@ fn expected_pool_vault_pubkeys_from_cache(
     }
 }
 
-/// True when expected vault rows for a hot pool are already registered with sibling links.
-#[cfg(test)]
-fn pool_vaults_fully_tracked_for_cache(
-    ctx: &MarketDataContext,
-    pool: Pubkey,
-    cached_state: &CachedPoolState,
-) -> bool {
-    let (enable_meteora_cpmm, enable_meteora_dlmm) = {
-        let cfg = ctx.config.read();
-        (cfg.enable_meteora_cpmm, cfg.enable_meteora_dlmm)
-    };
-    let Some((base_vault, quote_vault)) = expected_pool_vault_pubkeys_from_cache(
-        cached_state,
-        enable_meteora_cpmm,
-        enable_meteora_dlmm,
-    ) else {
-        return true;
-    };
-    let vaults = ctx.tracked_vaults.read();
-    vaults
-        .get(&base_vault)
-        .is_some_and(|v| v.pool_address == pool && v.sibling_vault == Some(quote_vault))
-        && vaults
-            .get(&quote_vault)
-            .is_some_and(|v| v.pool_address == pool && v.sibling_vault == Some(base_vault))
-}
-
 /// True when a hot-pool cache upsert still needs vault registration (missing vault rows).
 #[cfg(test)]
 fn pool_needs_tracking_refresh_after_cache_upsert(
@@ -1636,11 +1609,34 @@ fn pool_needs_tracking_refresh_after_cache_upsert(
     if !ctx.hot_pool_registry.is_hot_pool(pool) {
         return false;
     }
-    if pool_vaults_fully_tracked_for_cache(ctx, pool, cached_state) {
+    if ctx.pool_vaults_fully_tracked_for_cache(pool, cached_state) {
         ironcrab::metrics::inc_market_data_md_state_register_skipped_idempotent_total();
         return false;
     }
     true
+}
+
+/// True when expected vault rows for a pool are already registered with sibling links.
+fn pool_vaults_fully_tracked_for_cache_inner(
+    tracked_vaults: &std::collections::HashMap<Pubkey, VaultInfo>,
+    pool: Pubkey,
+    cached_state: &CachedPoolState,
+    enable_meteora_cpmm: bool,
+    enable_meteora_dlmm: bool,
+) -> bool {
+    let Some((base_vault, quote_vault)) = expected_pool_vault_pubkeys_from_cache(
+        cached_state,
+        enable_meteora_cpmm,
+        enable_meteora_dlmm,
+    ) else {
+        return true;
+    };
+    tracked_vaults
+        .get(&base_vault)
+        .is_some_and(|v| v.pool_address == pool && v.sibling_vault == Some(quote_vault))
+        && tracked_vaults
+            .get(&quote_vault)
+            .is_some_and(|v| v.pool_address == pool && v.sibling_vault == Some(base_vault))
 }
 
 /// PR237: cache-first vault/bin pubkeys for trade-path LRU touch (no full-map scan).
@@ -4090,31 +4086,6 @@ impl MarketDataContext {
         vaults_changed
     }
 
-    /// True when expected vault rows for a hot pool are already registered with sibling links.
-    fn pool_vaults_fully_tracked_for_hot_pool(&self, pool: Pubkey) -> bool {
-        let Some(state) = self.live_pool_cache.get(&pool) else {
-            return false;
-        };
-        let (enable_meteora_cpmm, enable_meteora_dlmm) = {
-            let cfg = self.config.read();
-            (cfg.enable_meteora_cpmm, cfg.enable_meteora_dlmm)
-        };
-        let Some((base_vault, quote_vault)) = expected_pool_vault_pubkeys_from_cache(
-            &state,
-            enable_meteora_cpmm,
-            enable_meteora_dlmm,
-        ) else {
-            return true;
-        };
-        let vaults = self.tracked_vaults.read();
-        vaults
-            .get(&base_vault)
-            .is_some_and(|v| v.pool_address == pool && v.sibling_vault == Some(quote_vault))
-            && vaults
-                .get(&quote_vault)
-                .is_some_and(|v| v.pool_address == pool && v.sibling_vault == Some(base_vault))
-    }
-
     /// PR169a: register vault ATAs from MASTER cache after account-path pool upsert (hot pools only).
     #[cfg_attr(not(test), allow(dead_code))]
     fn register_pool_vaults_from_account(&self, pool: Pubkey) -> bool {
@@ -4122,26 +4093,27 @@ impl MarketDataContext {
         if !self.hot_pool_registry.is_hot_pool(pool) {
             return false;
         }
-        let Some(state) = self.live_pool_cache.get(&pool) else {
+        let Some(cached_state) = self.live_pool_cache.get(&pool) else {
             return false;
         };
-        let Some((base_mint, quote_mint)) = pool_mints_for_geyser_explicit_tracking(&state) else {
-            return false;
+        let (enable_meteora_cpmm, enable_meteora_dlmm) = {
+            let cfg = self.config.read();
+            (cfg.enable_meteora_cpmm, cfg.enable_meteora_dlmm)
         };
-        if !self.admit_geyser_explicit_pool_assets(pool, base_mint, quote_mint) {
-            return false;
-        }
-        let pin = if self.hot_pool_registry.pool_has_arb(pool) {
-            GeyserPinReason::ArbMultiDex
-        } else {
-            GeyserPinReason::MomentumActive
-        };
+        let now = Instant::now();
         let before_keys = self.snapshot_explicit_demand_pubkeys();
-        let changed = self.register_geyser_reserves_impl(pool, pin);
-        if changed || self.pool_vaults_fully_tracked_for_hot_pool(pool) {
+        let vaults_changed = self.register_four_dex_pool_vaults_from_cached_state(
+            pool,
+            &cached_state,
+            now,
+            enable_meteora_cpmm,
+            enable_meteora_dlmm,
+            true,
+        );
+        if vaults_changed || self.hot_pool_reserve_registration_satisfied(pool) {
             self.clear_deferred_hot_pool_reserve_registration(pool);
         }
-        changed
+        vaults_changed
             || explicit_subscription_has_new_keys(
                 &before_keys,
                 &self.snapshot_explicit_demand_pubkeys(),
@@ -4171,6 +4143,61 @@ impl MarketDataContext {
         self.register_geyser_reserves_for_active_pool(pool, GeyserPinReason::ArbMultiDex)
     }
 
+    fn pool_vaults_fully_tracked_for_cache(
+        &self,
+        pool: Pubkey,
+        cached_state: &CachedPoolState,
+    ) -> bool {
+        let (enable_meteora_cpmm, enable_meteora_dlmm) = {
+            let cfg = self.config.read();
+            (cfg.enable_meteora_cpmm, cfg.enable_meteora_dlmm)
+        };
+        pool_vaults_fully_tracked_for_cache_inner(
+            &self.tracked_vaults.read(),
+            pool,
+            cached_state,
+            enable_meteora_cpmm,
+            enable_meteora_dlmm,
+        )
+    }
+
+    fn pool_geyser_bins_fully_tracked_for_cache(
+        &self,
+        pool: Pubkey,
+        cached_state: &CachedPoolState,
+    ) -> bool {
+        if !self.config.read().enable_meteora_dlmm {
+            return true;
+        }
+        let CachedPoolState::Meteora(s) = cached_state else {
+            return true;
+        };
+        let active_array_index = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(s.active_id);
+        let bins = self.tracked_bin_arrays.read();
+        for offset in -3i64..=3i64 {
+            let index = active_array_index + offset;
+            let Ok(pda) = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&pool, index) else {
+                continue;
+            };
+            if !bins.contains_key(&pda) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// True when cache has layout and expected vault/bin rows are already tracked (registration no-op).
+    fn hot_pool_reserve_registration_satisfied(&self, pool: Pubkey) -> bool {
+        if !self.hot_pool_registry.is_hot_pool(pool) {
+            return true;
+        }
+        let Some(state) = self.live_pool_cache.get(&pool) else {
+            return false;
+        };
+        self.pool_vaults_fully_tracked_for_cache(pool, &state)
+            && self.pool_geyser_bins_fully_tracked_for_cache(pool, &state)
+    }
+
     fn note_deferred_hot_pool_reserve_registration(&self, pool: Pubkey, pin: GeyserPinReason) {
         if !self.hot_pool_registry.is_hot_pool(pool) {
             return;
@@ -4182,6 +4209,25 @@ impl MarketDataContext {
 
     fn clear_deferred_hot_pool_reserve_registration(&self, pool: Pubkey) {
         self.deferred_hot_pool_reserve_pins.write().remove(&pool);
+    }
+
+    /// Drop deferred retry when cache layout exists and vault/bin rows need no further work.
+    fn maybe_clear_deferred_hot_pool_reserve_if_satisfied(&self, pool: Pubkey) -> bool {
+        if !self
+            .deferred_hot_pool_reserve_pins
+            .read()
+            .contains_key(&pool)
+        {
+            return false;
+        }
+        if !self.hot_pool_reserve_registration_satisfied(pool) {
+            return false;
+        }
+        self.clear_deferred_hot_pool_reserve_registration(pool);
+        if self.hot_pool_registry.is_position_pin_for_pool(pool) {
+            inc_market_data_open_position_pin_applied_total();
+        }
+        true
     }
 
     /// Bounded retry when LivePoolCache gains layout for a pinned hot pool (no RPC).
@@ -4215,7 +4261,7 @@ impl MarketDataContext {
             };
             let _ = self.try_admit_pool_consumer_group(admission, pool, consumer);
             let changed = self.register_geyser_reserves_for_active_pool(pool, pin);
-            let reserves_satisfied = changed || self.pool_vaults_fully_tracked_for_hot_pool(pool);
+            let reserves_satisfied = changed || self.hot_pool_reserve_registration_satisfied(pool);
             if reserves_satisfied {
                 self.clear_deferred_hot_pool_reserve_registration(pool);
                 if self.hot_pool_registry.is_position_pin_for_pool(pool) {
@@ -4249,11 +4295,8 @@ impl MarketDataContext {
             if is_position {
                 inc_market_data_open_position_pin_deferred_cache_miss_total();
             }
-        } else if self.pool_vaults_fully_tracked_for_hot_pool(pool) {
-            self.clear_deferred_hot_pool_reserve_registration(pool);
-            if is_position {
-                inc_market_data_open_position_pin_applied_total();
-            }
+        } else {
+            self.maybe_clear_deferred_hot_pool_reserve_if_satisfied(pool);
         }
     }
 
@@ -12281,6 +12324,104 @@ mod pr_b_geyser_tracking_tests {
             vs.get(&coin_vault).and_then(|v| v.pin),
             Some(GeyserPinReason::MomentumActive)
         );
+    }
+
+    /// Scope C: deferred pin cleared when vaults already tracked (registration no-op).
+    #[test]
+    fn scope_c_deferred_pin_cleared_when_vaults_already_tracked() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        let state = CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+            token_0_mint: base_mint,
+            token_1_mint: quote,
+            token_0_vault: coin_vault,
+            token_1_vault: pc_vault,
+            reserve_0: Some(1_000_000),
+            reserve_1: Some(2_000_000),
+        });
+
+        ctx.live_pool_cache.upsert(pool, state.clone(), 1);
+        ctx.hot_pool_registry
+            .pin_pool_with_reason(base_mint, pool, true);
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            let mut vaults_changed = false;
+            ctx.register_tracked_vault_pair_lru(
+                &mut vaults,
+                &mut vaults_changed,
+                TrackedVaultPairInsert {
+                    pool,
+                    now: Instant::now(),
+                    dex: "raydium_cpmm",
+                    base_mint,
+                    quote_mint: quote,
+                    base_vault: coin_vault,
+                    quote_vault: pc_vault,
+                    active_id: None,
+                    bin_step: None,
+                },
+            );
+        }
+        assert!(ctx.pool_vaults_fully_tracked_for_cache(pool, &state));
+
+        ctx.deferred_hot_pool_reserve_pins
+            .write()
+            .insert(pool, GeyserPinReason::MomentumActive);
+
+        let mut admission = test_admission_for(&ctx);
+        ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission);
+        assert!(!ctx
+            .deferred_hot_pool_reserve_pins
+            .read()
+            .contains_key(&pool));
+        assert_eq!(ctx.tracked_vaults.read().len(), 2);
+        assert!(!ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission));
+    }
+
+    /// PR169a regression: account-path vault register requires explicit admission (no cap hole).
+    #[test]
+    fn register_pool_vaults_from_account_requires_explicit_admission() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_mint,
+                token_1_mint: quote,
+                token_0_vault: coin_vault,
+                token_1_vault: pc_vault,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(base_mint, pool);
+        assert!(!ctx.pool_has_explicit_momentum_admission(pool));
+
+        assert!(!ctx.register_pool_vaults_from_account(pool));
+        assert!(ctx.tracked_vaults.read().is_empty());
+
+        ctx.note_explicit_momentum_pool_admitted(pool);
+        assert!(ctx.register_pool_vaults_from_account(pool));
+        let vs = ctx.tracked_vaults.read();
+        assert!(vs.contains_key(&coin_vault));
+        assert!(vs.contains_key(&pc_vault));
     }
 
     /// Scope C: Tracker downgrade clears position-subset membership while momentum pin remains.
