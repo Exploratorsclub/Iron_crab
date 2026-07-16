@@ -7336,15 +7336,9 @@ fn account_enrich_coalesce_try_flush(
             Ok(()) => {
                 shard.in_mpsc.insert(pk);
             }
-            Err(mpsc::error::TrySendError::Full(work)) => {
+            Err(mpsc::error::TrySendError::Full(work))
+            | Err(mpsc::error::TrySendError::Closed(work)) => {
                 shard.pending.insert(pk, work);
-                return;
-            }
-            Err(mpsc::error::TrySendError::Closed(work)) => {
-                dec_market_data_account_low_priority_queue_depth();
-                dec_market_data_account_worker_queue_depth();
-                inc_market_data_account_enrich_enqueue_dropped_total();
-                let _ = work;
                 return;
             }
         }
@@ -12675,7 +12669,43 @@ mod pr_b_geyser_tracking_tests {
             },
         );
         assert_eq!(shard.unique_pending_pubkey_count(), 1);
+    }
+
+    #[test]
+    fn account_enrich_coalesce_try_flush_closed_restores_pending() {
+        const CAP: usize = 4;
+        let mut shard = AccountEnrichCoalesceShard::new();
+        let pk = Pubkey::new_unique();
+        let mk = |slot: u64| AccountWorkItem {
+            update: GeyserAccountUpdate {
+                pubkey: pk,
+                slot,
+                owner: PUMPFUN_PROGRAM_OWNER,
+                data: vec![],
+                lamports: 0,
+                grpc_recv_at: Instant::now(),
+            },
+            recv_at: Instant::now(),
+        };
+        assert!(matches!(
+            account_enrich_coalesce_upsert_with_cap(&mut shard, mk(7), CAP),
+            AccountEnrichCoalesceUpsert::NewPending
+        ));
         assert_eq!(shard.unique_pending_pubkey_count(), 1);
+        let (closed_tx, closed_rx) = mpsc::channel(4);
+        drop(closed_rx);
+        account_enrich_coalesce_try_flush(&mut shard, &closed_tx);
+        assert_eq!(
+            shard.pending.get(&pk).unwrap().update.slot,
+            7,
+            "Closed channel must restore pending work instead of dropping it"
+        );
+        assert!(shard.in_mpsc.is_empty());
+        assert_eq!(
+            shard.unique_pending_pubkey_count(),
+            1,
+            "logical depth unchanged when Closed restores pending"
+        );
     }
 
     #[test]
