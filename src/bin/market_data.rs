@@ -4345,7 +4345,9 @@ impl MarketDataContext {
                     momentum_explicit_consumer_for_pool(self, pool)
                 }
             };
-            let _ = self.try_admit_pool_consumer_group(admission, pool, consumer);
+            if !self.try_admit_pool_consumer_group(admission, pool, consumer) {
+                continue;
+            }
             let changed = self.register_geyser_reserves_for_active_pool(pool, pin);
             let reserves_satisfied = changed || self.hot_pool_reserve_registration_satisfied(pool);
             if reserves_satisfied {
@@ -4671,13 +4673,13 @@ impl MarketDataContext {
             } else {
                 ExplicitConsumer::MomentumPosition
             };
-            if admission
+            let superseded_present = admission
                 .owner_group(&Self::pool_consumer_owner(pool_pk, superseded_consumer))
-                .is_some()
-            {
-                self.release_pool_consumer_group(admission, pool_pk, superseded_consumer);
-            }
+                .is_some();
             if self.try_admit_pool_consumer_group(admission, pool_pk, momentum_consumer) {
+                if superseded_present {
+                    self.release_pool_consumer_group(admission, pool_pk, superseded_consumer);
+                }
                 inc_market_data_momentum_admission_admitted_total();
                 let registered = self.register_geyser_reserves_for_momentum_active_pool(pool_pk);
                 self.record_momentum_active_pool_reserve_registration_outcome(
@@ -12112,13 +12114,14 @@ mod pr_b_geyser_tracking_tests {
     fn minimal_market_data_context_for_pr_d_tests(
         jsonl_writer: QueuedJsonlWriter,
     ) -> Arc<MarketDataContext> {
-        minimal_market_data_context_for_pr_d_tests_with_wallet(jsonl_writer, None, &[])
+        minimal_market_data_context_for_pr_d_tests_with_wallet(jsonl_writer, None, &[], None)
     }
 
     fn minimal_market_data_context_for_pr_d_tests_with_wallet(
         jsonl_writer: QueuedJsonlWriter,
         tracked_wallet: Option<TrackedWallet>,
         extra_wallet_token_accounts: &[Pubkey],
+        live_pool_cache: Option<Arc<LivePoolCache>>,
     ) -> Arc<MarketDataContext> {
         let (tracked_mints_tx, _tracked_mints_rx) = watch::channel(Vec::<Pubkey>::new());
         let (tracked_vaults_tx, _tracked_vaults_rx) = watch::channel(Vec::<Pubkey>::new());
@@ -12152,7 +12155,7 @@ mod pr_b_geyser_tracking_tests {
             tracked_bin_arrays_tx,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
             pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
-            live_pool_cache: Arc::new(LivePoolCache::new()),
+            live_pool_cache: live_pool_cache.unwrap_or_else(|| Arc::new(LivePoolCache::new())),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -12722,6 +12725,119 @@ mod pr_b_geyser_tracking_tests {
             "tracker downgrade must admit Momentum consumer group"
         );
         assert!(ctx.pool_has_explicit_momentum_admission(pool));
+    }
+
+    /// Scope C: Tracker→Position upgrade must admit Position before releasing Momentum; on admit failure keep Momentum.
+    #[test]
+    fn scope_c_tracker_to_position_upgrade_keeps_momentum_on_admit_failure() {
+        use ironcrab::market_data::track::{
+            try_admit_owner_group, ExplicitConsumer, ExplicitOwner, ExplicitOwnerKey,
+        };
+        use ironcrab::nats::{MomentumActivePinReason, MomentumActivePoolEntry};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        let momentum_owner = ExplicitOwner {
+            consumer: ExplicitConsumer::Momentum,
+            owner_key: ExplicitOwnerKey::Pool(pool),
+        };
+        let position_owner = ExplicitOwner {
+            consumer: ExplicitConsumer::MomentumPosition,
+            owner_key: ExplicitOwnerKey::Pool(pool),
+        };
+
+        let mut admission = test_admission_for(&ctx);
+        assert!(try_admit_owner_group(
+            &mut admission,
+            momentum_owner.clone(),
+            vec![coin_vault, pc_vault, base_mint, quote],
+        ));
+        ctx.hot_pool_registry.pin_pool(base_mint, pool);
+
+        // No LivePoolCache layout: Position admit must fail while Momentum stays admitted.
+        ctx.apply_momentum_active_entries(
+            &mut admission,
+            &[MomentumActivePoolEntry {
+                mint: base_mint.to_string(),
+                pool: pool.to_string(),
+                pin_reason: MomentumActivePinReason::Position,
+            }],
+        );
+        assert!(
+            admission.owner_group(&momentum_owner).is_some(),
+            "failed Position admit must not release existing Momentum consumer"
+        );
+        assert!(
+            admission.owner_group(&position_owner).is_none(),
+            "Position admit should fail when cache layout is unavailable"
+        );
+    }
+
+    /// Scope C: deferred retry must not clear deferred when pool consumer admit fails.
+    #[test]
+    fn scope_c_deferred_retry_keeps_deferred_on_admit_failure() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        let state = CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+            token_0_mint: base_mint,
+            token_1_mint: quote,
+            token_0_vault: coin_vault,
+            token_1_vault: pc_vault,
+            reserve_0: Some(1_000_000),
+            reserve_1: Some(2_000_000),
+        });
+
+        ctx.live_pool_cache.upsert(pool, state.clone(), 1);
+        ctx.hot_pool_registry
+            .pin_pool_with_reason(base_mint, pool, true);
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            let mut vaults_changed = false;
+            ctx.register_tracked_vault_pair_lru(
+                &mut vaults,
+                &mut vaults_changed,
+                TrackedVaultPairInsert {
+                    pool,
+                    now: Instant::now(),
+                    dex: "raydium_cpmm",
+                    base_mint,
+                    quote_mint: quote,
+                    base_vault: coin_vault,
+                    quote_vault: pc_vault,
+                    active_id: None,
+                    bin_step: None,
+                },
+            );
+        }
+        assert!(ctx.pool_vaults_fully_tracked_for_cache(pool, &state));
+        ctx.deferred_hot_pool_reserve_pins
+            .write()
+            .insert(pool, GeyserPinReason::MomentumActive);
+
+        let mut admission = FixedCapAdmission::new(0);
+        ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission);
+        assert!(
+            ctx.deferred_hot_pool_reserve_pins
+                .read()
+                .contains_key(&pool),
+            "deferred pin must remain when admit fails despite satisfied reserves"
+        );
     }
 
     /// Scope C: releasing one momentum consumer must not clear bypass while sibling remains.
@@ -16141,6 +16257,7 @@ mod pr_b_geyser_tracking_tests {
             jsonl,
             Some(tracked),
             &[extra_ata],
+            None,
         );
         ctx.config.write().max_tracked_accounts = 2;
 
