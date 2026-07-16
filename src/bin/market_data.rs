@@ -30,7 +30,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -94,7 +94,9 @@ use ironcrab::metrics::{
     dec_market_data_account_high_priority_queue_depth,
     dec_market_data_account_low_priority_queue_depth, dec_market_data_account_worker_queue_depth,
     geyser_account_listener_account_updates_value, geyser_metrics_set_subscription_accounts,
-    geyser_metrics_set_tracked_pinned_accounts, inc_market_data_account_high_priority_queue_depth,
+    geyser_metrics_set_tracked_pinned_accounts, inc_market_data_account_enrich_coalesce_total,
+    inc_market_data_account_enrich_enqueue_dropped_total,
+    inc_market_data_account_high_priority_queue_depth,
     inc_market_data_account_low_priority_queue_depth, inc_market_data_account_updates_total,
     inc_market_data_account_worker_queue_depth, inc_market_data_arb_admission_admitted_total,
     inc_market_data_arb_admission_rejected_total,
@@ -7196,9 +7198,136 @@ fn spawn_market_data_md_state_liveness_task(process_started: Instant) {
         .expect("spawn md-state-liveness thread");
 }
 
+#[derive(Clone)]
 struct AccountWorkItem {
     update: GeyserAccountUpdate,
     recv_at: Instant,
+}
+
+/// Per-shard ENRICH latest-wins buffer before / alongside the LOW `mpsc`.
+struct AccountEnrichCoalesceShard {
+    pending: HashMap<Pubkey, AccountWorkItem>,
+    /// Pubkeys with an item already handed to the LOW channel (not yet consumed by worker).
+    in_mpsc: HashSet<Pubkey>,
+}
+
+impl AccountEnrichCoalesceShard {
+    fn new() -> Self {
+        Self {
+            pending: HashMap::new(),
+            in_mpsc: HashSet::new(),
+        }
+    }
+
+    fn pending_count(&self) -> usize {
+        self.pending.len() + self.in_mpsc.len()
+    }
+}
+
+#[inline]
+fn account_enrich_item_is_newer(a: &AccountWorkItem, b: &AccountWorkItem) -> bool {
+    if a.update.slot != b.update.slot {
+        return a.update.slot > b.update.slot;
+    }
+    if a.update.grpc_recv_at != b.update.grpc_recv_at {
+        return a.update.grpc_recv_at > b.update.grpc_recv_at;
+    }
+    a.recv_at > b.recv_at
+}
+
+enum AccountEnrichCoalesceUpsert {
+    /// First pending item for this pubkey (depth incremented).
+    NewPending,
+    /// Replaced an existing pending or in-flight supersede entry (latest-wins).
+    Coalesced,
+    /// Incoming update is older than what we already hold.
+    StaleDiscarded,
+    /// Evicted oldest pending pubkey to make room; incoming item stored.
+    EvictedOldest,
+}
+
+fn account_enrich_coalesce_upsert(
+    shard: &mut AccountEnrichCoalesceShard,
+    work: AccountWorkItem,
+) -> AccountEnrichCoalesceUpsert {
+    let pk = work.update.pubkey;
+    if let Some(existing) = shard.pending.get(&pk) {
+        if account_enrich_item_is_newer(&work, existing) {
+            shard.pending.insert(pk, work);
+            return AccountEnrichCoalesceUpsert::Coalesced;
+        }
+        return AccountEnrichCoalesceUpsert::StaleDiscarded;
+    }
+    if shard.in_mpsc.contains(&pk) {
+        shard.pending.insert(pk, work);
+        return AccountEnrichCoalesceUpsert::Coalesced;
+    }
+    let mut evicted = false;
+    if shard.pending_count() >= MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP {
+        if let Some(drop_pk) = shard.pending.keys().next().copied() {
+            shard.pending.remove(&drop_pk);
+            dec_market_data_account_low_priority_queue_depth();
+            dec_market_data_account_worker_queue_depth();
+            inc_market_data_account_enrich_enqueue_dropped_total();
+            evicted = true;
+        } else {
+            inc_market_data_account_enrich_enqueue_dropped_total();
+            return AccountEnrichCoalesceUpsert::StaleDiscarded;
+        }
+    }
+    shard.pending.insert(pk, work);
+    inc_market_data_account_low_priority_queue_depth();
+    inc_market_data_account_worker_queue_depth();
+    if evicted {
+        AccountEnrichCoalesceUpsert::EvictedOldest
+    } else {
+        AccountEnrichCoalesceUpsert::NewPending
+    }
+}
+
+fn account_enrich_coalesce_try_flush(
+    shard: &mut AccountEnrichCoalesceShard,
+    low_tx: &mpsc::Sender<AccountWorkItem>,
+) {
+    let keys: Vec<Pubkey> = shard.pending.keys().copied().collect();
+    for pk in keys {
+        if shard.in_mpsc.contains(&pk) {
+            continue;
+        }
+        let Some(work) = shard.pending.remove(&pk) else {
+            continue;
+        };
+        match low_tx.try_send(work) {
+            Ok(()) => {
+                shard.in_mpsc.insert(pk);
+            }
+            Err(mpsc::error::TrySendError::Full(work)) => {
+                shard.pending.insert(pk, work);
+                return;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return,
+        }
+    }
+}
+
+/// After LOW dequeue: apply latest-wins supersede from coalesce map and refill LOW channel.
+fn account_enrich_resolve_after_dequeue(
+    shard: &mut AccountEnrichCoalesceShard,
+    low_tx: &mpsc::Sender<AccountWorkItem>,
+    work: AccountWorkItem,
+) -> AccountWorkItem {
+    let pk = work.update.pubkey;
+    shard.in_mpsc.remove(&pk);
+    let mut resolved = work;
+    if let Some(pending) = shard.pending.remove(&pk) {
+        if account_enrich_item_is_newer(&pending, &resolved) {
+            resolved = pending;
+        }
+    }
+    dec_market_data_account_low_priority_queue_depth();
+    dec_market_data_account_worker_queue_depth();
+    account_enrich_coalesce_try_flush(shard, low_tx);
+    resolved
 }
 
 #[inline]
@@ -7208,20 +7337,26 @@ fn market_data_account_worker_shard(pubkey: &Pubkey) -> usize {
     (h.finish() as usize) % MARKET_DATA_ACCOUNT_WORKER_COUNT
 }
 
+/// Dequeued account work tagged by ingest class queue (HIGH vs LOW).
+enum AccountWorkerDequeue {
+    ExecHot(AccountWorkItem),
+    Enrich(AccountWorkItem),
+}
+
 /// Strict HIGH-then-LOW dequeue for one account worker (two `mpsc` channels per shard).
 async fn account_worker_recv_next(
     high: &mut mpsc::Receiver<AccountWorkItem>,
     low: &mut mpsc::Receiver<AccountWorkItem>,
-) -> Option<AccountWorkItem> {
+) -> Option<AccountWorkerDequeue> {
     let mut pending_low: Option<AccountWorkItem> = None;
     loop {
         if let Ok(w) = high.try_recv() {
             dec_market_data_account_high_priority_queue_depth();
             dec_market_data_account_worker_queue_depth();
-            return Some(w);
+            return Some(AccountWorkerDequeue::ExecHot(w));
         }
         if let Some(w) = pending_low.take() {
-            return Some(w);
+            return Some(AccountWorkerDequeue::Enrich(w));
         }
         tokio::select! {
             biased;
@@ -7229,29 +7364,25 @@ async fn account_worker_recv_next(
                 Some(w) => {
                     dec_market_data_account_high_priority_queue_depth();
                     dec_market_data_account_worker_queue_depth();
-                    return Some(w);
+                    return Some(AccountWorkerDequeue::ExecHot(w));
                 }
                 None => {
                     if let Ok(w) = high.try_recv() {
                         dec_market_data_account_high_priority_queue_depth();
                         dec_market_data_account_worker_queue_depth();
-                        return Some(w);
+                        return Some(AccountWorkerDequeue::ExecHot(w));
                     }
                     if let Some(w) = pending_low.take() {
-                        return Some(w);
+                        return Some(AccountWorkerDequeue::Enrich(w));
                     }
                     if let Some(w) = low.recv().await {
-                        dec_market_data_account_low_priority_queue_depth();
-                        dec_market_data_account_worker_queue_depth();
-                        return Some(w);
+                        return Some(AccountWorkerDequeue::Enrich(w));
                     }
                     return None;
                 }
             },
             l = low.recv() => match l {
                 Some(w) => {
-                    dec_market_data_account_low_priority_queue_depth();
-                    dec_market_data_account_worker_queue_depth();
                     pending_low = Some(w);
                     continue;
                 }
@@ -7259,16 +7390,16 @@ async fn account_worker_recv_next(
                     if let Ok(w) = high.try_recv() {
                         dec_market_data_account_high_priority_queue_depth();
                         dec_market_data_account_worker_queue_depth();
-                        return Some(w);
+                        return Some(AccountWorkerDequeue::ExecHot(w));
                     }
                     if let Some(w) = pending_low.take() {
-                        return Some(w);
+                        return Some(AccountWorkerDequeue::Enrich(w));
                     }
                     return match high.recv().await {
                         Some(w) => {
                             dec_market_data_account_high_priority_queue_depth();
                             dec_market_data_account_worker_queue_depth();
-                            Some(w)
+                            Some(AccountWorkerDequeue::ExecHot(w))
                         }
                         None => None,
                     };
@@ -8055,19 +8186,44 @@ async fn run_geyser_loop(
         Vec::with_capacity(MARKET_DATA_ACCOUNT_WORKER_COUNT);
     let mut worker_low_tx_list: Vec<mpsc::Sender<AccountWorkItem>> =
         Vec::with_capacity(MARKET_DATA_ACCOUNT_WORKER_COUNT);
+    let mut enrich_coalesce_shards: Vec<Arc<Mutex<AccountEnrichCoalesceShard>>> =
+        Vec::with_capacity(MARKET_DATA_ACCOUNT_WORKER_COUNT);
+    let mut enrich_coalesce_notifies: Vec<Arc<Notify>> =
+        Vec::with_capacity(MARKET_DATA_ACCOUNT_WORKER_COUNT);
     for wid in 0..MARKET_DATA_ACCOUNT_WORKER_COUNT {
         let (high_tx, mut high_rx) = mpsc::channel(MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP);
         let (low_tx, mut low_rx) = mpsc::channel(MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP);
-        worker_high_tx_list.push(high_tx);
-        worker_low_tx_list.push(low_tx);
+        worker_high_tx_list.push(high_tx.clone());
+        worker_low_tx_list.push(low_tx.clone());
+        let enrich_coalesce = Arc::new(Mutex::new(AccountEnrichCoalesceShard::new()));
+        enrich_coalesce_shards.push(Arc::clone(&enrich_coalesce));
+        let enrich_notify = Arc::new(Notify::new());
+        enrich_coalesce_notifies.push(Arc::clone(&enrich_notify));
         let ctx_w = Arc::clone(&ctx_geyser_acc);
         let run_id_w = run_id_geyser_acc.clone();
         let account_count_w = Arc::clone(&account_count_geyser_acc);
         let publish_tx_w = account_publish_tx.clone();
         let md_state_w = md_state.clone();
         let md_sidefx_w = md_sidefx.clone();
+        let low_tx_drain = low_tx.clone();
+        let enrich_coalesce_drain = Arc::clone(&enrich_coalesce);
+        let enrich_notify_drain = Arc::clone(&enrich_notify);
         tokio::spawn(async move {
-            while let Some(work) = account_worker_recv_next(&mut high_rx, &mut low_rx).await {
+            loop {
+                enrich_notify_drain.notified().await;
+                let mut shard = enrich_coalesce_drain.lock().await;
+                account_enrich_coalesce_try_flush(&mut shard, &low_tx_drain);
+            }
+        });
+        tokio::spawn(async move {
+            while let Some(dequeued) = account_worker_recv_next(&mut high_rx, &mut low_rx).await {
+                let work = match dequeued {
+                    AccountWorkerDequeue::ExecHot(work) => work,
+                    AccountWorkerDequeue::Enrich(work) => {
+                        let mut shard = enrich_coalesce.lock().await;
+                        account_enrich_resolve_after_dequeue(&mut shard, &low_tx, work)
+                    }
+                };
                 let handler_start = Instant::now();
                 handle_geyser_account(
                     Arc::clone(&ctx_w),
@@ -8092,9 +8248,13 @@ async fn run_geyser_loop(
     }
     let worker_high_dispatch = Arc::new(worker_high_tx_list);
     let worker_low_dispatch = Arc::new(worker_low_tx_list);
+    let enrich_coalesce_dispatch = Arc::new(enrich_coalesce_shards);
+    let enrich_coalesce_notify_dispatch = Arc::new(enrich_coalesce_notifies);
 
     let worker_high_recv = Arc::clone(&worker_high_dispatch);
     let worker_low_recv = Arc::clone(&worker_low_dispatch);
+    let enrich_coalesce_recv = Arc::clone(&enrich_coalesce_dispatch);
+    let enrich_coalesce_notify_recv = Arc::clone(&enrich_coalesce_notify_dispatch);
     tokio::spawn(async move {
         loop {
             match account_rx_geyser.recv().await {
@@ -8127,35 +8287,40 @@ async fn run_geyser_loop(
                         class,
                         ironcrab::market_data::ingest::AccountUpdateClass::ExecHot
                     );
-                    let send_res = if high {
-                        worker_high_recv[shard]
+                    if high {
+                        let send_res = worker_high_recv[shard]
                             .send(AccountWorkItem {
                                 update: account_update,
                                 recv_at,
                             })
-                            .await
-                    } else {
-                        worker_low_recv[shard]
-                            .send(AccountWorkItem {
-                                update: account_update,
-                                recv_at,
-                            })
-                            .await
-                    };
-                    if send_res.is_ok() {
-                        inc_market_data_account_worker_queue_depth();
-                        if high {
+                            .await;
+                        if send_res.is_ok() {
+                            inc_market_data_account_worker_queue_depth();
                             inc_market_data_account_high_priority_queue_depth();
                         } else {
-                            inc_market_data_account_low_priority_queue_depth();
+                            error!(
+                                shard = shard,
+                                "account HIGH worker queue closed; stopping Geyser account stream"
+                            );
+                            let _ = geyser_account_stream_stopped_tx.send(true);
+                            break;
                         }
                     } else {
-                        error!(
-                            shard = shard,
-                            "account worker queue closed; stopping Geyser account stream"
+                        let work = AccountWorkItem {
+                            update: account_update,
+                            recv_at,
+                        };
+                        let mut coalesce_shard = enrich_coalesce_recv[shard].lock().await;
+                        let upsert = account_enrich_coalesce_upsert(&mut coalesce_shard, work);
+                        if matches!(upsert, AccountEnrichCoalesceUpsert::Coalesced) {
+                            inc_market_data_account_enrich_coalesce_total();
+                        }
+                        account_enrich_coalesce_try_flush(
+                            &mut coalesce_shard,
+                            &worker_low_recv[shard],
                         );
-                        let _ = geyser_account_stream_stopped_tx.send(true);
-                        break;
+                        drop(coalesce_shard);
+                        enrich_coalesce_notify_recv[shard].notify_one();
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -12329,16 +12494,6 @@ mod pr_b_geyser_tracking_tests {
 
     #[tokio::test]
     async fn account_worker_recv_next_prefers_high_queue() {
-        use ironcrab::metrics::{
-            inc_market_data_account_high_priority_queue_depth,
-            inc_market_data_account_low_priority_queue_depth,
-            inc_market_data_account_worker_queue_depth,
-            MARKET_DATA_ACCOUNT_HIGH_PRIORITY_QUEUE_DEPTH,
-            MARKET_DATA_ACCOUNT_LOW_PRIORITY_QUEUE_DEPTH, MARKET_DATA_ACCOUNT_WORKER_QUEUE_DEPTH,
-        };
-        MARKET_DATA_ACCOUNT_WORKER_QUEUE_DEPTH.store(0, Ordering::Relaxed);
-        MARKET_DATA_ACCOUNT_HIGH_PRIORITY_QUEUE_DEPTH.store(0, Ordering::Relaxed);
-        MARKET_DATA_ACCOUNT_LOW_PRIORITY_QUEUE_DEPTH.store(0, Ordering::Relaxed);
         let (htx, mut hrx) = mpsc::channel(8);
         let (ltx, mut lrx) = mpsc::channel(8);
         let pool_h = Pubkey::new_unique();
@@ -12355,33 +12510,143 @@ mod pr_b_geyser_tracking_tests {
             recv_at: Instant::now(),
         };
         ltx.send(mk(pool_l)).await.unwrap();
-        inc_market_data_account_low_priority_queue_depth();
-        inc_market_data_account_worker_queue_depth();
         htx.send(mk(pool_h)).await.unwrap();
-        inc_market_data_account_high_priority_queue_depth();
-        inc_market_data_account_worker_queue_depth();
         drop(htx);
         drop(ltx);
         let w1 = account_worker_recv_next(&mut hrx, &mut lrx)
             .await
             .expect("high item");
-        assert_eq!(w1.update.pubkey, pool_h);
+        assert!(matches!(w1, AccountWorkerDequeue::ExecHot(_)));
+        assert_eq!(
+            match w1 {
+                AccountWorkerDequeue::ExecHot(w) => w.update.pubkey,
+                AccountWorkerDequeue::Enrich(_) => unreachable!(),
+            },
+            pool_h
+        );
         let w2 = account_worker_recv_next(&mut hrx, &mut lrx)
             .await
             .expect("low item");
-        assert_eq!(w2.update.pubkey, pool_l);
+        assert!(matches!(w2, AccountWorkerDequeue::Enrich(_)));
+        assert_eq!(
+            match w2 {
+                AccountWorkerDequeue::Enrich(w) => w.update.pubkey,
+                AccountWorkerDequeue::ExecHot(_) => unreachable!(),
+            },
+            pool_l
+        );
         assert!(account_worker_recv_next(&mut hrx, &mut lrx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn account_worker_recv_next_never_drains_low_while_high_available() {
+        let (htx, mut hrx) = mpsc::channel(32);
+        let (ltx, mut lrx) = mpsc::channel(32);
+        let mk = |slot: u64| AccountWorkItem {
+            update: GeyserAccountUpdate {
+                pubkey: Pubkey::new_unique(),
+                slot,
+                owner: PUMPFUN_PROGRAM_OWNER,
+                data: vec![],
+                lamports: 0,
+                grpc_recv_at: Instant::now(),
+            },
+            recv_at: Instant::now(),
+        };
+        for slot in 0..16 {
+            ltx.send(mk(slot)).await.unwrap();
+        }
+        htx.send(mk(100)).await.unwrap();
+        drop(htx);
+        drop(ltx);
+        let first = account_worker_recv_next(&mut hrx, &mut lrx)
+            .await
+            .expect("high must win under load");
+        assert!(matches!(first, AccountWorkerDequeue::ExecHot(_)));
         assert_eq!(
-            MARKET_DATA_ACCOUNT_WORKER_QUEUE_DEPTH.load(Ordering::Relaxed),
-            0
+            match first {
+                AccountWorkerDequeue::ExecHot(w) => w.update.slot,
+                AccountWorkerDequeue::Enrich(_) => unreachable!(),
+            },
+            100
         );
+    }
+
+    #[test]
+    fn account_enrich_coalesce_keeps_latest_per_pubkey() {
+        use ironcrab::metrics::{
+            inc_market_data_account_enrich_coalesce_total,
+            MARKET_DATA_ACCOUNT_ENRICH_COALESCE_TOTAL,
+        };
+        MARKET_DATA_ACCOUNT_ENRICH_COALESCE_TOTAL.store(0, Ordering::Relaxed);
+        let (low_tx, _low_rx) = mpsc::channel(4);
+        let mut shard = AccountEnrichCoalesceShard::new();
+        let pk = Pubkey::new_unique();
+        let mk = |slot: u64| AccountWorkItem {
+            update: GeyserAccountUpdate {
+                pubkey: pk,
+                slot,
+                owner: PUMPFUN_PROGRAM_OWNER,
+                data: vec![],
+                lamports: 0,
+                grpc_recv_at: Instant::now(),
+            },
+            recv_at: Instant::now(),
+        };
+        assert!(matches!(
+            account_enrich_coalesce_upsert(&mut shard, mk(1)),
+            AccountEnrichCoalesceUpsert::NewPending
+        ));
+        assert!(matches!(
+            account_enrich_coalesce_upsert(&mut shard, mk(2)),
+            AccountEnrichCoalesceUpsert::Coalesced
+        ));
+        inc_market_data_account_enrich_coalesce_total();
+        assert_eq!(shard.pending.get(&pk).unwrap().update.slot, 2);
+        assert_eq!(shard.pending_count(), 1);
+        account_enrich_coalesce_try_flush(&mut shard, &low_tx);
+        assert_eq!(shard.in_mpsc.len(), 1);
+        assert!(shard.pending.is_empty());
         assert_eq!(
-            MARKET_DATA_ACCOUNT_HIGH_PRIORITY_QUEUE_DEPTH.load(Ordering::Relaxed),
-            0
+            shard.pending_count(),
+            1,
+            "one logical pending pubkey after flush"
         );
-        assert_eq!(
-            MARKET_DATA_ACCOUNT_LOW_PRIORITY_QUEUE_DEPTH.load(Ordering::Relaxed),
-            0
+    }
+
+    #[test]
+    fn account_enrich_queue_depth_stays_within_cap() {
+        let (low_tx, _low_rx) = mpsc::channel(MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP);
+        let mut shard = AccountEnrichCoalesceShard::new();
+        for i in 0..MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP {
+            let upsert = account_enrich_coalesce_upsert(
+                &mut shard,
+                AccountWorkItem {
+                    update: GeyserAccountUpdate {
+                        pubkey: Pubkey::new_unique(),
+                        slot: i as u64,
+                        owner: PUMPFUN_PROGRAM_OWNER,
+                        data: vec![],
+                        lamports: 0,
+                        grpc_recv_at: Instant::now(),
+                    },
+                    recv_at: Instant::now(),
+                },
+            );
+            assert!(matches!(
+                upsert,
+                AccountEnrichCoalesceUpsert::NewPending
+                    | AccountEnrichCoalesceUpsert::EvictedOldest
+            ));
+            assert!(
+                shard.pending_count() <= MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP,
+                "coalesce shard must stay within cap after upsert {i}"
+            );
+        }
+        account_enrich_coalesce_try_flush(&mut shard, &low_tx);
+        assert!(
+            shard.pending_count() <= MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP,
+            "coalesce shard pending must stay within cap after flush"
         );
     }
 
