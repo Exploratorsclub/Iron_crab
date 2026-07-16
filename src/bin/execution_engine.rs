@@ -6529,6 +6529,16 @@ async fn publish_position_authority_changes_to_kv(
     Ok(())
 }
 
+/// PA-5.1: tombstone sweep only when bootstrap included `WalletSnapshotComplete`
+/// (partial balance snapshots alone are not a complete wallet picture).
+fn wallet_bootstrap_allows_pa_kv_tombstone_sweep(
+    wallet_snapshot_kinds: &[MarketEventKind],
+) -> bool {
+    wallet_snapshot_kinds
+        .iter()
+        .any(|k| matches!(k, MarketEventKind::WalletSnapshotComplete { .. }))
+}
+
 /// PA-5.1: after EE restart, seed in-process PositionAuthority from wallet bootstrap and
 /// tombstone JetStream KV keys that no longer exist in the authority model.
 async fn reconcile_position_authority_kv_after_restart(
@@ -6559,24 +6569,40 @@ async fn reconcile_position_authority_kv_after_restart(
         store
     };
 
-    let kv_entries = nats
-        .kv_get_all::<PositionAuthoritySnapshot>(&store)
-        .await
-        .unwrap_or_default();
-    for mint in kv_entries.keys() {
-        if !tracked.contains(mint) {
-            changes.push(PositionAuthorityChange::Tombstone { mint: mint.clone() });
-        }
-    }
+    let allow_tombstone_sweep =
+        wallet_bootstrap_allows_pa_kv_tombstone_sweep(wallet_snapshot_kinds);
 
-    if !changes.is_empty() {
-        publish_position_authority_changes_to_kv(nats, kv_cell, changes).await?;
-        info!(
+    if allow_tombstone_sweep {
+        let kv_entries = nats
+            .kv_get_all::<PositionAuthoritySnapshot>(&store)
+            .await
+            .unwrap_or_default();
+        for mint in kv_entries.keys() {
+            if !tracked.contains(mint) {
+                changes.push(PositionAuthorityChange::Tombstone { mint: mint.clone() });
+            }
+        }
+        if !changes.is_empty() {
+            publish_position_authority_changes_to_kv(nats, kv_cell, changes).await?;
+            info!(
+                wallet_snapshots = wallet_snapshot_kinds.len(),
+                kv_keys = kv_entries.len(),
+                tracked_mints = tracked.len(),
+                "PositionAuthority KV reconciled after execution-engine restart (tombstone sweep)"
+            );
+        }
+    } else {
+        if !changes.is_empty() {
+            publish_position_authority_changes_to_kv(nats, kv_cell, changes).await?;
+        }
+        warn!(
             wallet_snapshots = wallet_snapshot_kinds.len(),
-            kv_keys = kv_entries.len(),
-            "PositionAuthority KV reconciled after execution-engine restart"
+            has_snapshot_complete = false,
+            tracked_mints = tracked.len(),
+            "PositionAuthority KV reconcile: tombstone sweep skipped (wallet bootstrap missing WalletSnapshotComplete or empty)"
         );
     }
+
     Ok(())
 }
 
@@ -6789,6 +6815,9 @@ async fn bootstrap_token_balances_from_wallet_snapshot(
                     lock_manager.set_available_token_balance(mint.clone(), *balance_raw);
                     wallet_snapshot_kinds.push(event.kind.clone());
                 }
+            } else if matches!(event.kind, MarketEventKind::WalletSnapshotComplete { .. }) {
+                observed += 1;
+                wallet_snapshot_kinds.push(event.kind.clone());
             }
 
             let _ = msg.ack().await;
@@ -13770,9 +13799,9 @@ mod execution_engine_tests {
         try_pump_amm_hot_path_refresh_publish, wait_for_meteora_dlmm_slave_after_recovery,
         wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder,
         wait_for_pump_amm_slave_after_recovery, wait_for_pumpfun_bonding_cache_refresh,
-        ComputedIntentFills, DiscoveryRequestOutcome, ExecutionConfig,
-        PumpAmmHotPathRefreshDecision, RouteCandidate, PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN,
-        WSOL_MINT,
+        wallet_bootstrap_allows_pa_kv_tombstone_sweep, ComputedIntentFills,
+        DiscoveryRequestOutcome, ExecutionConfig, PumpAmmHotPathRefreshDecision, RouteCandidate,
+        PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN, WSOL_MINT,
     };
     use ironcrab::execution::live_pool_cache::{
         CachedPoolState, LivePoolCache, MeteoraState, PumpAmmState, PumpFunState,
@@ -13783,8 +13812,8 @@ mod execution_engine_tests {
     use ironcrab::ipc::{
         CheckResult, ControlResponse, ControlResponseStatus, DecisionOutcome, DecisionRecord,
         DexPoolReadiness, ExecutionResult, ExecutionStatus, ExplicitAmount, FillStatus,
-        IntentOrigin, IntentTier, PoolCacheUpdate, TradeIntent, TradeResources, TradeSide,
-        TradingRegime,
+        IntentOrigin, IntentTier, MarketEventKind, PoolCacheUpdate, TradeIntent, TradeResources,
+        TradeSide, TradingRegime,
     };
     use ironcrab::solana::address_lookup_table::LoadedAlt;
     use ironcrab::solana::dex::pumpfun::PumpFunDex;
@@ -13828,6 +13857,33 @@ mod execution_engine_tests {
 
         assert_eq!(unsigned.message, signed.message);
         assert!(matches!(unsigned.message, VersionedMessage::Legacy(_)));
+    }
+
+    #[test]
+    fn wallet_bootstrap_tombstone_sweep_requires_snapshot_complete() {
+        let balance_only = vec![MarketEventKind::WalletBalanceSnapshot {
+            mint: "mintA".to_string(),
+            balance_raw: 1,
+            decimals: 6,
+            token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+        }];
+        assert!(
+            !wallet_bootstrap_allows_pa_kv_tombstone_sweep(&balance_only),
+            "partial balance snapshots must not authorize tombstone sweep"
+        );
+        assert!(
+            !wallet_bootstrap_allows_pa_kv_tombstone_sweep(&[]),
+            "empty bootstrap must not authorize tombstone sweep"
+        );
+        let with_complete = vec![MarketEventKind::WalletSnapshotComplete {
+            wallet: "wallet".to_string(),
+            mints_in_wallet: vec!["mintA".to_string()],
+            is_periodic: true,
+        }];
+        assert!(
+            wallet_bootstrap_allows_pa_kv_tombstone_sweep(&with_complete),
+            "WalletSnapshotComplete authorizes tombstone sweep"
+        );
     }
 
     #[test]

@@ -5867,6 +5867,22 @@ impl MomentumContext {
         }
     }
 
+    /// Overlay token amount when authority close is deferred by the 90s grace period.
+    fn overlay_exit_amount_during_authority_grace(&self, mint: &str) -> Option<u64> {
+        const GHOST_CLEANUP_GRACE_SECS: u64 = 90;
+        let positions = self.positions.read();
+        let pos = positions.get(mint)?;
+        if pos.entry_time.elapsed().as_secs() >= GHOST_CLEANUP_GRACE_SECS {
+            return None;
+        }
+        let amount = pos.token_amount;
+        if amount > 0 {
+            Some(amount)
+        } else {
+            None
+        }
+    }
+
     /// Apply a PositionAuthority KV update and enforce overlay-close rule.
     fn apply_authority_snapshot_update(
         self: &Arc<Self>,
@@ -7288,6 +7304,10 @@ impl MomentumContext {
         let authority_snap = self.authority_by_mint.read().get(mint).cloned();
         if let Some(ref auth) = authority_snap {
             if Self::authority_signals_closed(Some(auth)) {
+                // Grace: defer overlay close but do not block exits on a fresh position.
+                if let Some(overlay_grace) = self.overlay_exit_amount_during_authority_grace(mint) {
+                    return overlay_grace;
+                }
                 return 0;
             }
             let overlay = self
@@ -19799,6 +19819,50 @@ mod tests {
         );
 
         assert_eq!(ctx.resolve_exit_token_amount_raw(mint, 1_000), 400);
+    }
+
+    /// PA-5.1 bugfix: authority closed during 90s grace must not suppress exits.
+    #[tokio::test]
+    async fn pa51_authority_closed_grace_allows_exit_amount() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "AuthGraceMintttttttttttttttttttttttttttttttt";
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "pool",
+            dex: "raydium",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 800,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 1,
+            initial_bonding: None,
+        });
+        ctx.authority_by_mint.write().insert(
+            mint.to_string(),
+            PositionAuthoritySnapshot {
+                mint: mint.to_string(),
+                balance_raw: 0,
+                decimals: 6,
+                status: PositionAuthorityStatus::Closed,
+                last_update_source: ironcrab::ipc::PositionAuthorityUpdateSource::Execution,
+                sold_raw_total: None,
+            },
+        );
+
+        assert_eq!(
+            ctx.resolve_exit_token_amount_raw(mint, 800),
+            800,
+            "fresh overlay must still exit during authority-close grace"
+        );
+        assert!(
+            ctx.positions.read().contains_key(mint),
+            "overlay must remain open during grace"
+        );
     }
 
     fn orphan_buy_execution_result(
