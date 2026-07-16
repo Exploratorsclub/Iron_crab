@@ -821,6 +821,14 @@ impl UnifiedHotPoolRegistry {
         self.momentum_pairs.read().clone()
     }
 
+    fn snapshot_position_pool_pubkeys(&self) -> HashSet<Pubkey> {
+        self.momentum_position_pairs
+            .read()
+            .iter()
+            .map(|(_, pool)| *pool)
+            .collect()
+    }
+
     /// Pool is in the execution hot set (momentum active and/or arb track pin).
     fn is_hot_pool(&self, pool: Pubkey) -> bool {
         self.pool_has_momentum(pool) || self.pool_has_arb(pool)
@@ -1883,7 +1891,9 @@ fn momentum_explicit_consumer_for_pool(ctx: &MarketDataContext, pool: Pubkey) ->
 fn snapshot_consumer_to_geyser_pin(consumer: SnapshotConsumer) -> Option<GeyserPinReason> {
     match consumer {
         SnapshotConsumer::Wallet => Some(GeyserPinReason::Wallet),
-        SnapshotConsumer::Momentum => Some(GeyserPinReason::MomentumActive),
+        SnapshotConsumer::MomentumPosition | SnapshotConsumer::Momentum => {
+            Some(GeyserPinReason::MomentumActive)
+        }
         SnapshotConsumer::Arb => Some(GeyserPinReason::ArbMultiDex),
         SnapshotConsumer::Tracker => None,
     }
@@ -2831,7 +2841,7 @@ impl MarketDataContext {
         for (pk, v) in self.tracked_vaults.read().iter() {
             rows.push(ExplicitSnapshotRow {
                 pubkey: pk.to_string(),
-                consumer: consumer_id_for_geyser_pin(v.pin).into(),
+                consumer: consumer_id_for_pool_explicit_row(self, v.pool_address, v.pin).into(),
                 pool: Some(v.pool_address.to_string()),
                 kind: ExplicitAccountKind::Vault,
             });
@@ -2839,7 +2849,7 @@ impl MarketDataContext {
         for (pk, b) in self.tracked_bin_arrays.read().iter() {
             rows.push(ExplicitSnapshotRow {
                 pubkey: pk.to_string(),
-                consumer: consumer_id_for_geyser_pin(b.pin).into(),
+                consumer: consumer_id_for_pool_explicit_row(self, b.pool_address, b.pin).into(),
                 pool: Some(b.pool_address.to_string()),
                 kind: ExplicitAccountKind::BinArray,
             });
@@ -2878,7 +2888,16 @@ impl MarketDataContext {
             if let Ok(pool) = Pubkey::from_str(pool_str) {
                 if let Some(mint_str) = self.pool_mint_map.read().get(pool_str) {
                     if let Ok(mint) = Pubkey::from_str(mint_str) {
-                        self.hot_pool_registry.pin_pool(mint, pool);
+                        let is_position = snapshot
+                            .momentum_position_pools
+                            .iter()
+                            .any(|p| p == pool_str);
+                        if is_position {
+                            self.hot_pool_registry
+                                .pin_pool_with_reason(mint, pool, true);
+                        } else {
+                            self.hot_pool_registry.pin_pool(mint, pool);
+                        }
                     }
                 }
             }
@@ -2907,6 +2926,18 @@ impl MarketDataContext {
                 }
                 ExplicitAccountKind::Vault => {
                     let pool_addr = pool.unwrap_or_default();
+                    if row.consumer == SnapshotConsumer::MomentumPosition
+                        && pool_addr != Pubkey::default()
+                    {
+                        if let Some(mint_str) =
+                            self.pool_mint_map.read().get(&pool_addr.to_string())
+                        {
+                            if let Ok(mint) = Pubkey::from_str(mint_str) {
+                                self.hot_pool_registry
+                                    .pin_pool_with_reason(mint, pool_addr, true);
+                            }
+                        }
+                    }
                     let mut vaults = self.tracked_vaults.write();
                     use std::collections::hash_map::Entry;
                     match vaults.entry(pk) {
@@ -3205,6 +3236,12 @@ impl MarketDataContext {
             .map(|(_, pool)| pool.to_string())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
+            .collect();
+        snapshot.momentum_position_pools = self
+            .hot_pool_registry
+            .snapshot_position_pool_pubkeys()
+            .into_iter()
+            .map(|p| p.to_string())
             .collect();
         snapshot.arb_pools = self
             .hot_pool_registry
@@ -16234,6 +16271,70 @@ mod pr_b_geyser_tracking_tests {
         let info = tracked.get(&mint).expect("restored tracker mint");
         assert_eq!(info.pin, None);
         assert!(!info.pinned);
+    }
+
+    /// Scope C / Bugbot: position pools survive snapshot restore with MomentumPosition consumer + pin subset.
+    #[test]
+    fn scope_c_position_pool_snapshot_restore_preserves_position_pin() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        ctx.pool_mint_map
+            .write()
+            .insert(pool.to_string(), base_mint.to_string());
+        ctx.hot_pool_registry
+            .pin_pool_with_reason(base_mint, pool, true);
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            let mut vaults_changed = false;
+            ctx.register_tracked_vault_pair_lru(
+                &mut vaults,
+                &mut vaults_changed,
+                TrackedVaultPairInsert {
+                    pool,
+                    now: Instant::now(),
+                    dex: "raydium_cpmm",
+                    base_mint,
+                    quote_mint: quote,
+                    base_vault: coin_vault,
+                    quote_vault: pc_vault,
+                    active_id: None,
+                    bin_step: None,
+                },
+            );
+            vaults.get_mut(&coin_vault).expect("coin").pin = Some(GeyserPinReason::MomentumActive);
+            vaults.get_mut(&pc_vault).expect("pc").pin = Some(GeyserPinReason::MomentumActive);
+        }
+
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        converge_admission_from_ctx(ctx.as_ref(), &mut admission);
+        let snapshot = ctx.build_explicit_set_snapshot(&admission);
+        let vault_row = snapshot
+            .rows
+            .iter()
+            .find(|r| r.pubkey == coin_vault.to_string())
+            .expect("position vault row");
+        assert_eq!(vault_row.consumer, SnapshotConsumer::MomentumPosition);
+        assert!(snapshot.momentum_position_pools.contains(&pool.to_string()));
+
+        let fresh = minimal_market_data_context_for_pr_d_tests(
+            QueuedJsonlWriter::spawn(
+                JsonlWriterConfig::new("market_events").with_log_dir(tmp.path()),
+                256,
+            )
+            .expect("jsonl2"),
+        );
+        let restored = fresh.restore_tracked_maps_from_snapshot_rows(&snapshot);
+        assert!(restored > 0);
+        assert!(fresh.hot_pool_registry.is_position_pin_for_pool(pool));
+        assert!(fresh.hot_pool_registry.is_position_pin(base_mint, pool));
     }
 
     /// Phase 2c: trade handler must not reference arb reconcile enqueue helpers.

@@ -9,10 +9,12 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// On-disk snapshot format version (v2 adds complete owner groups).
-pub const EXPLICIT_SET_SNAPSHOT_VERSION: u32 = 2;
+/// On-disk snapshot format version (v3 adds `MomentumPosition` consumer + position pool list).
+pub const EXPLICIT_SET_SNAPSHOT_VERSION: u32 = 3;
 /// Legacy v1 snapshots remain readable for restore.
 pub const EXPLICIT_SET_SNAPSHOT_VERSION_V1: u32 = 1;
+/// v2 adds complete owner groups (MomentumPosition still collapsed to Momentum).
+pub const EXPLICIT_SET_SNAPSHOT_VERSION_V2: u32 = 2;
 /// Default production snapshot path (I-MD-6).
 pub const EXPLICIT_SET_SNAPSHOT_DEFAULT_PATH: &str = "/var/lib/ironcrab/explicit_set.snapshot";
 /// Periodic snapshot write interval (5 min).
@@ -23,6 +25,7 @@ pub const EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP: usize = 50_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnapshotConsumer {
     Wallet,
+    MomentumPosition,
     Momentum,
     Arb,
     Tracker,
@@ -32,7 +35,8 @@ impl From<ConsumerId> for SnapshotConsumer {
     fn from(c: ConsumerId) -> Self {
         match c {
             ConsumerId::Wallet => SnapshotConsumer::Wallet,
-            ConsumerId::MomentumPosition | ConsumerId::Momentum => SnapshotConsumer::Momentum,
+            ConsumerId::MomentumPosition => SnapshotConsumer::MomentumPosition,
+            ConsumerId::Momentum => SnapshotConsumer::Momentum,
             ConsumerId::Arb => SnapshotConsumer::Arb,
             ConsumerId::Tracker => SnapshotConsumer::Tracker,
         }
@@ -43,9 +47,8 @@ impl From<ExplicitConsumer> for SnapshotConsumer {
     fn from(c: ExplicitConsumer) -> Self {
         match c {
             ExplicitConsumer::Wallet => SnapshotConsumer::Wallet,
-            ExplicitConsumer::MomentumPosition | ExplicitConsumer::Momentum => {
-                SnapshotConsumer::Momentum
-            }
+            ExplicitConsumer::MomentumPosition => SnapshotConsumer::MomentumPosition,
+            ExplicitConsumer::Momentum => SnapshotConsumer::Momentum,
             ExplicitConsumer::Arb => SnapshotConsumer::Arb,
             ExplicitConsumer::Tracker => SnapshotConsumer::Tracker,
         }
@@ -91,6 +94,8 @@ pub struct ExplicitSetSnapshot {
     pub owner_groups: Vec<SnapshotOwnerGroup>,
     pub pool_mint_map: Vec<(String, String)>,
     pub momentum_pools: Vec<String>,
+    #[serde(default)]
+    pub momentum_position_pools: Vec<String>,
     pub arb_pools: Vec<String>,
 }
 
@@ -104,12 +109,14 @@ impl ExplicitSetSnapshot {
             owner_groups: Vec::new(),
             pool_mint_map: Vec::new(),
             momentum_pools: Vec::new(),
+            momentum_position_pools: Vec::new(),
             arb_pools: Vec::new(),
         }
     }
 
     pub fn is_compatible(&self) -> bool {
         self.version == EXPLICIT_SET_SNAPSHOT_VERSION_V1
+            || self.version == EXPLICIT_SET_SNAPSHOT_VERSION_V2
             || self.version == EXPLICIT_SET_SNAPSHOT_VERSION
     }
 
@@ -179,6 +186,7 @@ pub fn snapshot_owner_key_to_domain(key: &SnapshotOwnerKey) -> Option<ExplicitOw
 fn snapshot_consumer_to_domain(c: SnapshotConsumer) -> ExplicitConsumer {
     match c {
         SnapshotConsumer::Wallet => ExplicitConsumer::Wallet,
+        SnapshotConsumer::MomentumPosition => ExplicitConsumer::MomentumPosition,
         SnapshotConsumer::Momentum => ExplicitConsumer::Momentum,
         SnapshotConsumer::Arb => ExplicitConsumer::Arb,
         SnapshotConsumer::Tracker => ExplicitConsumer::Tracker,
@@ -220,6 +228,7 @@ pub fn rows_to_owner_group_snapshots(rows: &[ExplicitSnapshotRow]) -> Vec<OwnerG
         };
         let consumer = match row.consumer {
             SnapshotConsumer::Wallet => ExplicitConsumer::Wallet,
+            SnapshotConsumer::MomentumPosition => ExplicitConsumer::MomentumPosition,
             SnapshotConsumer::Momentum => ExplicitConsumer::Momentum,
             SnapshotConsumer::Arb => ExplicitConsumer::Arb,
             SnapshotConsumer::Tracker => ExplicitConsumer::Tracker,
@@ -307,6 +316,31 @@ mod tests {
         assert_eq!(loaded, snap);
         assert!(loaded.is_compatible());
         assert_eq!(loaded.to_owner_group_snapshots().len(), 1);
+    }
+
+    #[test]
+    fn explicit_set_snapshot_v3_momentum_position_roundtrip_json() {
+        let mut snap = ExplicitSetSnapshot::new(Some("run-v3".to_string()));
+        let pool = Pubkey::new_unique();
+        snap.owner_groups.push(SnapshotOwnerGroup {
+            consumer: SnapshotConsumer::MomentumPosition,
+            owner: SnapshotOwnerKey {
+                kind: "pool".to_string(),
+                pubkey: Some(pool.to_string()),
+            },
+            pubkeys: vec![Pubkey::new_unique().to_string()],
+        });
+        snap.momentum_position_pools.push(pool.to_string());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("explicit_set.snapshot");
+        write_explicit_set_snapshot(&path, &snap).expect("write");
+        let loaded = load_explicit_set_snapshot(&path).expect("load");
+        assert_eq!(loaded.version, EXPLICIT_SET_SNAPSHOT_VERSION);
+        assert_eq!(loaded.momentum_position_pools, snap.momentum_position_pools);
+        let groups = loaded.to_owner_group_snapshots();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].consumer, ExplicitConsumer::MomentumPosition);
     }
 
     #[test]

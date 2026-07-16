@@ -314,6 +314,27 @@ fn is_regular_momentum_hot_path_sell(intent: &TradeIntent) -> bool {
     true
 }
 
+/// Scope C: EE open-position pool pin — momentum-sourced confirmed BUY only; skip SOL/WSOL and Arb legs.
+#[inline]
+fn should_publish_open_position_pool_pin_after_confirmed_buy(intent: &TradeIntent) -> bool {
+    if intent.side != TradeSide::Buy {
+        return false;
+    }
+    // Dual-consumer: Arb / manual / sell-all must not publish Momentum Position pins.
+    if intent.source != "momentum-bot" {
+        return false;
+    }
+    let mint = intent.resources.output_mint.as_str();
+    if mint.is_empty() || ironcrab::position_authority::is_sol_or_wsol_mint(mint) {
+        return false;
+    }
+    intent
+        .resources
+        .pools
+        .first()
+        .is_some_and(|pool| !pool.is_empty())
+}
+
 /// I-24e (P184m): Liquidation / stale-SLAVE PumpSwap discovery must not reuse cache-first MD path.
 #[inline]
 fn pump_amm_liquidation_discovery_force_refresh() -> bool {
@@ -6405,16 +6426,13 @@ impl ExecutionContext {
         intent: &TradeIntent,
         exec: &ExecutionResult,
     ) {
-        if exec.status != ExecutionStatus::Confirmed || intent.side != TradeSide::Buy {
+        if exec.status != ExecutionStatus::Confirmed
+            || !should_publish_open_position_pool_pin_after_confirmed_buy(intent)
+        {
             return;
         }
-        let Some(pool) = intent.resources.pools.first().filter(|p| !p.is_empty()) else {
-            return;
-        };
+        let pool = intent.resources.pools.first().expect("checked in filter");
         let mint = intent.resources.output_mint.as_str();
-        if mint.is_empty() {
-            return;
-        }
         let Some(nats) = self.nats.as_ref() else {
             return;
         };
@@ -13840,9 +13858,10 @@ mod execution_engine_tests {
         pump_amm_liquidation_quote_timeout_str, pump_amm_pool_market_hint_merge,
         pump_amm_slave_recovery_snapshot, record_pump_amm_hot_path_refresh_after_success,
         scale_in_max_open_positions_skip_details, scope48_confirmed_sell_close_decision,
-        sim_failure_reject_reason, simulation_result_on_rpc_timeout,
-        sort_route_candidates_by_amount_out, take_next_multi_pool_buildable_fallback_route,
-        try_pump_amm_hot_path_refresh_publish, wait_for_meteora_dlmm_slave_after_recovery,
+        should_publish_open_position_pool_pin_after_confirmed_buy, sim_failure_reject_reason,
+        simulation_result_on_rpc_timeout, sort_route_candidates_by_amount_out,
+        take_next_multi_pool_buildable_fallback_route, try_pump_amm_hot_path_refresh_publish,
+        wait_for_meteora_dlmm_slave_after_recovery,
         wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder,
         wait_for_pump_amm_slave_after_recovery, wait_for_pumpfun_bonding_cache_refresh,
         wallet_bootstrap_allows_pa_kv_tombstone_sweep, ComputedIntentFills,
@@ -14522,6 +14541,59 @@ mod execution_engine_tests {
             .metadata
             .insert("sell_all".to_string(), "true".to_string());
         assert!(!is_regular_momentum_hot_path_sell(&intent));
+    }
+
+    #[test]
+    fn open_position_pool_pin_filters_arb_sol_and_requires_momentum_buy() {
+        let token_mint = "Mint111111111111111111111111111111111111111".to_string();
+        let pool = "Pool123".to_string();
+        let mut intent = TradeIntent::new(
+            "momentum-bot",
+            "v0.1.0",
+            "run-1",
+            "id-buy".to_string(),
+            "momentum-bot",
+            IntentTier::Tier1,
+            IntentOrigin::StrategyA,
+            ExplicitAmount::new(1_000_000, 6),
+            TradeResources {
+                input_mint: ironcrab::ipc::NATIVE_SOL_MINT.to_string(),
+                output_mint: token_mint.clone(),
+                pools: vec![pool.clone()],
+                accounts: vec![],
+                token_program: None,
+            },
+            0,
+            200,
+            TradeSide::Buy,
+            TradingRegime::Early,
+        );
+        assert!(should_publish_open_position_pool_pin_after_confirmed_buy(
+            &intent
+        ));
+
+        intent.source = "arb-strategy".to_string();
+        assert!(!should_publish_open_position_pool_pin_after_confirmed_buy(
+            &intent
+        ));
+
+        intent.source = "momentum-bot".to_string();
+        intent.resources.output_mint = ironcrab::ipc::NATIVE_SOL_MINT.to_string();
+        assert!(!should_publish_open_position_pool_pin_after_confirmed_buy(
+            &intent
+        ));
+
+        intent.resources.output_mint = token_mint;
+        intent.side = TradeSide::Sell;
+        assert!(!should_publish_open_position_pool_pin_after_confirmed_buy(
+            &intent
+        ));
+
+        intent.side = TradeSide::Buy;
+        intent.resources.pools.clear();
+        assert!(!should_publish_open_position_pool_pin_after_confirmed_buy(
+            &intent
+        ));
     }
 
     #[test]
