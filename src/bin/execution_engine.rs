@@ -68,9 +68,10 @@ use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
     DecisionRecord, DexPoolReadiness, ExecutionResult, ExecutionStatus, ExplicitAmount,
     FairnessPolicy, FeePolicy, FillStatus, FillUnavailableReason, IntentOrigin, IntentTier,
-    KillSwitchContext, MarketEvent, MarketEventKind, PoolCacheUpdate, PriorityFeePercentiles,
-    RecordHeader, RejectReason, SimulationResult, TradeExecutionConstraints, TradeIntent,
-    TradeResources, TradeSide, TradingRegime, POSITION_AUTHORITY_KV_BUCKET,
+    KillSwitchContext, MarketEvent, MarketEventKind, PoolCacheUpdate, PositionAuthoritySnapshot,
+    PriorityFeePercentiles, RecordHeader, RejectReason, SimulationResult,
+    TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide, TradingRegime,
+    POSITION_AUTHORITY_KV_BUCKET,
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
@@ -6528,6 +6529,57 @@ async fn publish_position_authority_changes_to_kv(
     Ok(())
 }
 
+/// PA-5.1: after EE restart, seed in-process PositionAuthority from wallet bootstrap and
+/// tombstone JetStream KV keys that no longer exist in the authority model.
+async fn reconcile_position_authority_kv_after_restart(
+    nats: &NatsClient,
+    position_authority: &ParkingMutex<PositionAuthority>,
+    kv_cell: &tokio::sync::OnceCell<async_nats::jetstream::kv::Store>,
+    wallet_snapshot_kinds: &[MarketEventKind],
+) -> anyhow::Result<()> {
+    let (changes, tracked) = {
+        let mut pa = position_authority.lock();
+        let mut changes = Vec::new();
+        for kind in wallet_snapshot_kinds {
+            changes.extend(pa.apply_from_wallet_market_event_kind(kind));
+        }
+        let tracked: std::collections::HashSet<String> = pa.tracked_mints().into_iter().collect();
+        (changes, tracked)
+    };
+
+    let mut changes = changes;
+
+    let store = if let Some(store) = kv_cell.get() {
+        store.clone()
+    } else {
+        let store = nats
+            .get_or_create_kv_bucket(POSITION_AUTHORITY_KV_BUCKET)
+            .await?;
+        let _ = kv_cell.set(store.clone());
+        store
+    };
+
+    let kv_entries = nats
+        .kv_get_all::<PositionAuthoritySnapshot>(&store)
+        .await
+        .unwrap_or_default();
+    for mint in kv_entries.keys() {
+        if !tracked.contains(mint) {
+            changes.push(PositionAuthorityChange::Tombstone { mint: mint.clone() });
+        }
+    }
+
+    if !changes.is_empty() {
+        publish_position_authority_changes_to_kv(nats, kv_cell, changes).await?;
+        info!(
+            wallet_snapshots = wallet_snapshot_kinds.len(),
+            kv_keys = kv_entries.len(),
+            "PositionAuthority KV reconciled after execution-engine restart"
+        );
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 fn token_program_for_mint_owner(owner: &Pubkey) -> Option<Pubkey> {
     let spl_token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
@@ -6669,7 +6721,7 @@ async fn bootstrap_token_balances_from_wallet_snapshot(
     nats_client: &NatsClient,
     wallet: &Pubkey,
     lock_manager: &LockManager,
-) -> Result<usize> {
+) -> Result<(usize, Vec<MarketEventKind>)> {
     use async_nats::jetstream;
     use futures::StreamExt;
 
@@ -6682,7 +6734,7 @@ async fn bootstrap_token_balances_from_wallet_snapshot(
                 stream = WALLET_SNAPSHOT_STREAM_NAME,
                 "Wallet snapshot stream not found (market-data may not be running)"
             );
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
     };
 
@@ -6695,6 +6747,7 @@ async fn bootstrap_token_balances_from_wallet_snapshot(
     let mut observed = 0usize;
     let mut bootstrap_sol: Option<u64> = None;
     let mut bootstrap_wsol: Option<u64> = None;
+    let mut wallet_snapshot_kinds = Vec::new();
 
     loop {
         let mut messages = consumer.fetch().max_messages(batch_size).messages().await?;
@@ -6734,6 +6787,7 @@ async fn bootstrap_token_balances_from_wallet_snapshot(
                     // Regular token balance (skip SOL_MINT which equals WSOL_MINT
                     // but could appear from old JetStream entries)
                     lock_manager.set_available_token_balance(mint.clone(), *balance_raw);
+                    wallet_snapshot_kinds.push(event.kind.clone());
                 }
             }
 
@@ -6774,7 +6828,7 @@ async fn bootstrap_token_balances_from_wallet_snapshot(
         );
     }
 
-    Ok(observed)
+    Ok((observed, wallet_snapshot_kinds))
 }
 
 /// Create the durable live wallet snapshot consumer for the main loop.
@@ -7867,22 +7921,20 @@ async fn main() -> Result<()> {
     // The live consumer is created immediately after bootstrap (reused in the main loop)
     // so snapshots published during the long startup phase are not missed (DeliverPolicy::New).
     let mut wallet_snapshot_bootstrap_observed = 0usize;
+    let mut wallet_snapshot_kinds: Vec<MarketEventKind> = Vec::new();
     let wallet_snapshot_bootstrap_consumer = if let (Some(ref nats_client), Some(wallet)) =
         (&nats, wallet_pubkey)
     {
-        wallet_snapshot_bootstrap_observed = match bootstrap_token_balances_from_wallet_snapshot(
-            nats_client,
-            &wallet,
-            &lock_manager,
-        )
-        .await
-        {
-            Ok(observed) => observed,
-            Err(e) => {
-                warn!(error = %e, "Wallet snapshot bootstrap: failed to seed token balances");
-                0
-            }
-        };
+        (wallet_snapshot_bootstrap_observed, wallet_snapshot_kinds) =
+            match bootstrap_token_balances_from_wallet_snapshot(nats_client, &wallet, &lock_manager)
+                .await
+            {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!(error = %e, "Wallet snapshot bootstrap: failed to seed token balances");
+                    (0, Vec::new())
+                }
+            };
         // "Available WSOL" metric: always actual WSOL (0 when no ATA), never native SOL fallback.
         let wsol = lock_manager.available_wsol();
         AVAILABLE_SOL_LAMPORTS.store(wsol, Ordering::Relaxed);
@@ -8036,6 +8088,23 @@ async fn main() -> Result<()> {
         replay_mode: false,
         pump_amm_hot_path_refresh_last: Arc::new(ParkingMutex::new(HashMap::new())),
     };
+
+    if let Some(ref nats_client) = ctx.nats {
+        if let Err(e) = reconcile_position_authority_kv_after_restart(
+            nats_client,
+            &ctx.position_authority,
+            &position_authority_kv,
+            &wallet_snapshot_kinds,
+        )
+        .await
+        {
+            warn!(
+                error = %e,
+                "PositionAuthority KV startup reconcile failed (Momentum may see stale KV until next update)"
+            );
+        }
+        ctx.refresh_position_authority_metrics();
+    }
 
     // Sync kill switch to global metric so control plane /status can display correct state after restarts
     KILL_SWITCH_ACTIVE.store(initial_kill_switch_active, Ordering::Relaxed);

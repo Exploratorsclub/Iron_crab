@@ -5876,6 +5876,20 @@ impl MomentumContext {
         const GHOST_CLEANUP_GRACE_SECS: u64 = 90;
 
         let closed = Self::authority_signals_closed(snap.as_ref());
+
+        {
+            let mut cache = self.authority_by_mint.write();
+            match snap {
+                Some(s) => {
+                    cache.insert(mint.to_string(), s);
+                }
+                None => {
+                    cache.remove(mint);
+                }
+            }
+        }
+        self.refresh_position_authority_drift_metrics();
+
         if closed && self.positions.read().contains_key(mint) {
             let hold_secs = self
                 .positions
@@ -5892,21 +5906,6 @@ impl MomentumContext {
                 );
                 return;
             }
-        }
-
-        {
-            let mut cache = self.authority_by_mint.write();
-            match snap {
-                Some(s) => {
-                    cache.insert(mint.to_string(), s);
-                }
-                None => {
-                    cache.remove(mint);
-                }
-            }
-        }
-        self.refresh_position_authority_drift_metrics();
-        if closed && self.positions.read().contains_key(mint) {
             self.close_position_by_authority(mint, "authority_closed_or_tombstoned");
         }
     }

@@ -434,7 +434,7 @@ impl PositionAuthority {
                     sold_raw_total: 0,
                     status: PositionStatus::ReconcileNeeded,
                     last_update_source: UpdateSource::WalletSnapshot,
-                    last_execution_unix_secs: None,
+                    last_execution_unix_secs: Some(unix_secs_now()),
                 });
             }
         }
@@ -471,6 +471,11 @@ impl PositionAuthority {
 
     pub fn get(&self, mint: &str) -> Option<&PositionState> {
         self.by_mint.get(mint)
+    }
+
+    /// Mint keys currently tracked in the in-process authority model.
+    pub fn tracked_mints(&self) -> Vec<String> {
+        self.by_mint.keys().cloned().collect()
     }
 
     /// Count of mints with a non-zero balance in this model.
@@ -577,6 +582,32 @@ mod tests {
         assert_eq!(a.open_positions_count(), 1);
         assert!(a.get(&ghost).is_none());
         assert!(a.get(&m).is_some());
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0],
+            PositionAuthorityChange::Tombstone {
+                mint: ghost.clone()
+            }
+        );
+    }
+
+    #[test]
+    fn wallet_snapshot_complete_closes_wallet_only_ghost() {
+        let m = mint();
+        let ghost = "WalletOnlyGhostMintttttttttttttttttttttttttttt".to_string();
+        let mut a = PositionAuthority::new();
+        a.apply(&buy(&m, 400, 6));
+        a.apply(&snap(&ghost, 200, 6));
+        assert_eq!(a.open_positions_count(), 2);
+        a.test_backdate_last_execution(&ghost, GHOST_CLEANUP_GRACE_SECS + 1);
+
+        let changes = a.apply(&PositionEvent::WalletSnapshotComplete {
+            wallet: "wallet".to_string(),
+            mints_in_wallet: vec![m.clone()],
+            is_periodic: true,
+        });
+        assert_eq!(a.open_positions_count(), 1);
+        assert!(a.get(&ghost).is_none());
         assert_eq!(changes.len(), 1);
         assert_eq!(
             changes[0],
