@@ -7340,7 +7340,13 @@ fn account_enrich_coalesce_try_flush(
                 shard.pending.insert(pk, work);
                 return;
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => return,
+            Err(mpsc::error::TrySendError::Closed(work)) => {
+                dec_market_data_account_low_priority_queue_depth();
+                dec_market_data_account_worker_queue_depth();
+                inc_market_data_account_enrich_enqueue_dropped_total();
+                let _ = work;
+                return;
+            }
         }
     }
 }
