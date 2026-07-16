@@ -1860,6 +1860,26 @@ fn consumer_id_for_geyser_pin(pin: Option<GeyserPinReason>) -> ConsumerId {
     }
 }
 
+fn consumer_id_for_pool_explicit_row(
+    ctx: &MarketDataContext,
+    pool: Pubkey,
+    pin: Option<GeyserPinReason>,
+) -> ConsumerId {
+    if ctx.hot_pool_registry.is_position_pin_for_pool(pool) {
+        ConsumerId::MomentumPosition
+    } else {
+        consumer_id_for_geyser_pin(pin)
+    }
+}
+
+fn momentum_explicit_consumer_for_pool(ctx: &MarketDataContext, pool: Pubkey) -> ExplicitConsumer {
+    if ctx.hot_pool_registry.is_position_pin_for_pool(pool) {
+        ExplicitConsumer::MomentumPosition
+    } else {
+        ExplicitConsumer::Momentum
+    }
+}
+
 fn snapshot_consumer_to_geyser_pin(consumer: SnapshotConsumer) -> Option<GeyserPinReason> {
     match consumer {
         SnapshotConsumer::Wallet => Some(GeyserPinReason::Wallet),
@@ -2555,11 +2575,23 @@ impl MarketDataContext {
         let owner = Self::pool_consumer_owner(pool, consumer);
         let admitted = admission.owner_group(&owner).is_some();
         match consumer {
-            ExplicitConsumer::Momentum => {
+            ExplicitConsumer::Momentum | ExplicitConsumer::MomentumPosition => {
                 if admitted {
                     self.note_explicit_momentum_pool_admitted(pool);
                 } else {
-                    self.clear_explicit_momentum_pool_admitted(pool);
+                    let other = if consumer == ExplicitConsumer::Momentum {
+                        ExplicitConsumer::MomentumPosition
+                    } else {
+                        ExplicitConsumer::Momentum
+                    };
+                    let other_admitted = admission
+                        .owner_group(&Self::pool_consumer_owner(pool, other))
+                        .is_some();
+                    if other_admitted {
+                        self.note_explicit_momentum_pool_admitted(pool);
+                    } else {
+                        self.clear_explicit_momentum_pool_admitted(pool);
+                    }
                 }
             }
             ExplicitConsumer::Arb => {
@@ -2754,7 +2786,9 @@ impl MarketDataContext {
     ) {
         let _ = admission.remove_group(Self::pool_consumer_owner(pool, consumer));
         match consumer {
-            ExplicitConsumer::Momentum => self.clear_explicit_momentum_pool_admitted(pool),
+            ExplicitConsumer::Momentum | ExplicitConsumer::MomentumPosition => {
+                self.clear_explicit_momentum_pool_admitted(pool)
+            }
             ExplicitConsumer::Arb => self.clear_explicit_arb_pool_admitted(pool),
             ExplicitConsumer::Wallet | ExplicitConsumer::Tracker => {}
         }
@@ -2950,10 +2984,18 @@ impl MarketDataContext {
             rows.push((*pk, consumer_id_for_geyser_pin(m.pin), None));
         }
         for (pk, v) in self.tracked_vaults.read().iter() {
-            rows.push((*pk, consumer_id_for_geyser_pin(v.pin), Some(v.pool_address)));
+            rows.push((
+                *pk,
+                consumer_id_for_pool_explicit_row(self, v.pool_address, v.pin),
+                Some(v.pool_address),
+            ));
         }
         for (pk, b) in self.tracked_bin_arrays.read().iter() {
-            rows.push((*pk, consumer_id_for_geyser_pin(b.pin), Some(b.pool_address)));
+            rows.push((
+                *pk,
+                consumer_id_for_pool_explicit_row(self, b.pool_address, b.pin),
+                Some(b.pool_address),
+            ));
         }
         if let Some(w) = &self.tracked_wallet {
             rows.push((w.wallet, ConsumerId::Wallet, None));
@@ -4257,7 +4299,7 @@ impl MarketDataContext {
             let consumer = match pin {
                 GeyserPinReason::ArbMultiDex => ExplicitConsumer::Arb,
                 GeyserPinReason::MomentumActive | GeyserPinReason::Wallet => {
-                    ExplicitConsumer::Momentum
+                    momentum_explicit_consumer_for_pool(self, pool)
                 }
             };
             let _ = self.try_admit_pool_consumer_group(admission, pool, consumer);
@@ -4296,9 +4338,13 @@ impl MarketDataContext {
             if is_position {
                 inc_market_data_open_position_pin_deferred_cache_miss_total();
             }
-        } else {
-            self.maybe_clear_deferred_hot_pool_reserve_if_satisfied(pool);
+            return;
         }
+        if self.hot_pool_reserve_registration_satisfied(pool) {
+            self.maybe_clear_deferred_hot_pool_reserve_if_satisfied(pool);
+            return;
+        }
+        self.note_deferred_hot_pool_reserve_registration(pool, pin);
     }
 
     fn register_meteora_dlmm_bin_arrays(
@@ -4562,13 +4608,22 @@ impl MarketDataContext {
             };
             let is_position = a.pin_reason == MomentumActivePinReason::Position;
             let explicit_entry = ExplicitEntry {
-                consumers: HashSet::from([ConsumerId::Momentum]),
+                consumers: HashSet::from([if is_position {
+                    ConsumerId::MomentumPosition
+                } else {
+                    ConsumerId::Momentum
+                }]),
                 pool: Some(pool_pk),
                 pin_priority: pin_priority_for_momentum_active_pin(a.pin_reason),
             };
             self.hot_pool_registry
                 .pin_pool_with_reason(mint_pk, pool_pk, is_position);
-            if self.try_admit_pool_consumer_group(admission, pool_pk, ExplicitConsumer::Momentum) {
+            let momentum_consumer = if is_position {
+                ExplicitConsumer::MomentumPosition
+            } else {
+                ExplicitConsumer::Momentum
+            };
+            if self.try_admit_pool_consumer_group(admission, pool_pk, momentum_consumer) {
                 inc_market_data_momentum_admission_admitted_total();
                 let registered = self.register_geyser_reserves_for_momentum_active_pool(pool_pk);
                 self.record_momentum_active_pool_reserve_registration_outcome(
@@ -4589,40 +4644,21 @@ impl MarketDataContext {
                 }
             } else {
                 inc_market_data_momentum_admission_rejected_total();
-                let registered = if self.live_pool_cache.get(&pool_pk).is_none() {
-                    false
-                } else if is_position {
-                    self.register_geyser_reserves_for_momentum_active_pool(pool_pk)
-                } else {
-                    self.hot_pool_reserve_registration_satisfied(pool_pk)
-                };
                 self.record_momentum_active_pool_reserve_registration_outcome(
                     pool_pk,
                     GeyserPinReason::MomentumActive,
                     is_position,
-                    registered,
+                    false,
                 );
-                if is_position && registered {
-                    batch_dirty = true;
-                }
             }
-            self.sync_explicit_pool_admitted_from_admission(
-                admission,
-                pool_pk,
-                ExplicitConsumer::Momentum,
-            );
+            self.sync_explicit_pool_admitted_from_admission(admission, pool_pk, momentum_consumer);
             if explicit_entry.pin_priority <= PinPriority::MomentumPosition
                 && admission
-                    .owner_group(&Self::pool_consumer_owner(
-                        pool_pk,
-                        ExplicitConsumer::Momentum,
-                    ))
+                    .owner_group(&Self::pool_consumer_owner(pool_pk, momentum_consumer))
                     .is_some()
             {
-                let _ = admission.touch_group(Self::pool_consumer_owner(
-                    pool_pk,
-                    ExplicitConsumer::Momentum,
-                ));
+                let _ =
+                    admission.touch_group(Self::pool_consumer_owner(pool_pk, momentum_consumer));
             }
         }
         batch_dirty
@@ -4661,6 +4697,7 @@ impl MarketDataContext {
         // Pool-level reserve pins are shared: only demote vaults/bin arrays when no `(m, pool)`
         // row remains after this unpin (PR #147 follow-up).
         if !self.hot_pool_registry.pool_has_any_pin(pool) {
+            self.release_pool_consumer_group(admission, pool, ExplicitConsumer::MomentumPosition);
             self.release_pool_consumer_group(admission, pool, ExplicitConsumer::Momentum);
             {
                 let mut vaults = self.tracked_vaults.write();
@@ -12411,6 +12448,109 @@ mod pr_b_geyser_tracking_tests {
             .contains_key(&pool));
         assert_eq!(ctx.tracked_vaults.read().len(), 2);
         assert!(!ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission));
+    }
+
+    /// Scope C: admission reject with cache hit still defers reserve registration for retry.
+    #[test]
+    fn scope_c_admission_reject_cache_hit_defers_reserve_registration() {
+        use ironcrab::nats::{MomentumActivePinReason, MomentumActivePoolEntry};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_mint,
+                token_1_mint: quote,
+                token_0_vault: coin_vault,
+                token_1_vault: pc_vault,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+
+        let mut admission = FixedCapAdmission::new(0);
+        ctx.apply_momentum_active_entries(
+            &mut admission,
+            &[MomentumActivePoolEntry {
+                mint: base_mint.to_string(),
+                pool: pool.to_string(),
+                pin_reason: MomentumActivePinReason::Position,
+            }],
+        );
+
+        assert!(ctx.hot_pool_registry.is_hot_pool(pool));
+        assert!(ctx
+            .deferred_hot_pool_reserve_pins
+            .read()
+            .contains_key(&pool));
+        assert!(ctx.tracked_vaults.read().is_empty());
+    }
+
+    /// Scope C: position pool vault rows use MomentumPosition consumer for desired-set admission.
+    #[test]
+    fn scope_c_position_pool_explicit_rows_use_momentum_position_consumer() {
+        use ironcrab::market_data::track::ConsumerId;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_mint,
+                token_1_mint: quote,
+                token_0_vault: coin_vault,
+                token_1_vault: pc_vault,
+                reserve_0: Some(1),
+                reserve_1: Some(1),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry
+            .pin_pool_with_reason(base_mint, pool, true);
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            let mut vaults_changed = false;
+            ctx.register_tracked_vault_pair_lru(
+                &mut vaults,
+                &mut vaults_changed,
+                TrackedVaultPairInsert {
+                    pool,
+                    now: Instant::now(),
+                    dex: "raydium_cpmm",
+                    base_mint,
+                    quote_mint: quote,
+                    base_vault: coin_vault,
+                    quote_vault: pc_vault,
+                    active_id: None,
+                    bin_step: None,
+                },
+            );
+        }
+
+        let rows = ctx.explicit_pubkey_rows_for_desired_set();
+        assert!(rows.iter().any(|(pk, consumer, pool_opt)| {
+            *pk == coin_vault
+                && *consumer == ConsumerId::MomentumPosition
+                && *pool_opt == Some(pool)
+        }));
     }
 
     /// PR169a regression: account-path vault register requires explicit admission (no cap hole).

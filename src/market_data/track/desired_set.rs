@@ -10,6 +10,8 @@ use std::collections::HashSet;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConsumerId {
     Wallet,
+    /// Open-position pool pin (Scope C): eviction protection above [`Self::Momentum`].
+    MomentumPosition,
     Momentum,
     Arb,
     /// Unpinned mint / recent-trade LRU demand (I-MD-5: lowest protection).
@@ -37,6 +39,7 @@ pub struct ExplicitEntry {
 pub fn pin_priority_from_consumer(consumer: ConsumerId) -> PinPriority {
     match consumer {
         ConsumerId::Wallet => PinPriority::Wallet,
+        ConsumerId::MomentumPosition => PinPriority::MomentumPosition,
         ConsumerId::Momentum => PinPriority::Momentum,
         ConsumerId::Arb => PinPriority::Arb,
         ConsumerId::Tracker => PinPriority::Tracker,
@@ -61,6 +64,20 @@ pub fn symmetric_diff(a: &HashSet<Pubkey>, b: &HashSet<Pubkey>) -> HashSet<Pubke
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pin_priority_for_momentum_active_pin_orders_position_above_tracker() {
+        use crate::nats::MomentumActivePinReason;
+
+        assert!(
+            pin_priority_for_momentum_active_pin(MomentumActivePinReason::Position)
+                < pin_priority_for_momentum_active_pin(MomentumActivePinReason::Tracker)
+        );
+        assert_eq!(
+            pin_priority_for_momentum_active_pin(MomentumActivePinReason::Position),
+            PinPriority::MomentumPosition
+        );
+    }
 
     #[test]
     fn symmetric_diff_detects_add_and_remove() {

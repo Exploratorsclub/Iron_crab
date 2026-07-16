@@ -32,7 +32,7 @@ impl From<ConsumerId> for SnapshotConsumer {
     fn from(c: ConsumerId) -> Self {
         match c {
             ConsumerId::Wallet => SnapshotConsumer::Wallet,
-            ConsumerId::Momentum => SnapshotConsumer::Momentum,
+            ConsumerId::MomentumPosition | ConsumerId::Momentum => SnapshotConsumer::Momentum,
             ConsumerId::Arb => SnapshotConsumer::Arb,
             ConsumerId::Tracker => SnapshotConsumer::Tracker,
         }
@@ -43,7 +43,9 @@ impl From<ExplicitConsumer> for SnapshotConsumer {
     fn from(c: ExplicitConsumer) -> Self {
         match c {
             ExplicitConsumer::Wallet => SnapshotConsumer::Wallet,
-            ExplicitConsumer::Momentum => SnapshotConsumer::Momentum,
+            ExplicitConsumer::MomentumPosition | ExplicitConsumer::Momentum => {
+                SnapshotConsumer::Momentum
+            }
             ExplicitConsumer::Arb => SnapshotConsumer::Arb,
             ExplicitConsumer::Tracker => SnapshotConsumer::Tracker,
         }

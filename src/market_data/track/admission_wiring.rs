@@ -30,6 +30,7 @@ pub enum AdmissionRestoreResult {
 pub fn consumer_id_to_explicit(consumer: ConsumerId) -> ExplicitConsumer {
     match consumer {
         ConsumerId::Wallet => ExplicitConsumer::Wallet,
+        ConsumerId::MomentumPosition => ExplicitConsumer::MomentumPosition,
         ConsumerId::Momentum => ExplicitConsumer::Momentum,
         ConsumerId::Arb => ExplicitConsumer::Arb,
         ConsumerId::Tracker => ExplicitConsumer::Tracker,
@@ -119,7 +120,7 @@ pub fn explicit_admitted_pool_sets_from_admission(
             continue;
         };
         match group.consumer {
-            ExplicitConsumer::Momentum => {
+            ExplicitConsumer::Momentum | ExplicitConsumer::MomentumPosition => {
                 momentum.insert(pool);
             }
             ExplicitConsumer::Arb => {

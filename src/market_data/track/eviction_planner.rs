@@ -90,17 +90,19 @@ impl ConsumerProtectionRank {
     pub fn of(consumer: ExplicitConsumer) -> Self {
         Self(match consumer {
             ExplicitConsumer::Wallet => 0,
-            ExplicitConsumer::Momentum => 1,
-            ExplicitConsumer::Arb => 2,
-            ExplicitConsumer::Tracker => 3,
+            ExplicitConsumer::MomentumPosition => 1,
+            ExplicitConsumer::Momentum => 2,
+            ExplicitConsumer::Arb => 3,
+            ExplicitConsumer::Tracker => 4,
         })
     }
 
     pub fn consumer(self) -> ExplicitConsumer {
         match self.0 {
             0 => ExplicitConsumer::Wallet,
-            1 => ExplicitConsumer::Momentum,
-            2 => ExplicitConsumer::Arb,
+            1 => ExplicitConsumer::MomentumPosition,
+            2 => ExplicitConsumer::Momentum,
+            3 => ExplicitConsumer::Arb,
             _ => ExplicitConsumer::Tracker,
         }
     }
@@ -115,6 +117,7 @@ pub enum EvictionTier {
     Tracker,
     Arb,
     Momentum,
+    MomentumPosition,
 }
 
 impl EvictionTier {
@@ -127,6 +130,12 @@ impl EvictionTier {
                 ExplicitConsumer::Arb,
                 ExplicitConsumer::Momentum,
             ],
+            Self::MomentumPosition => &[
+                ExplicitConsumer::Tracker,
+                ExplicitConsumer::Arb,
+                ExplicitConsumer::Momentum,
+                ExplicitConsumer::MomentumPosition,
+            ],
         }
     }
 
@@ -134,9 +143,13 @@ impl EvictionTier {
         match consumer {
             ExplicitConsumer::Tracker => &[Self::Tracker],
             ExplicitConsumer::Arb => &[Self::Tracker, Self::Arb],
-            ExplicitConsumer::Momentum | ExplicitConsumer::Wallet => {
-                &[Self::Tracker, Self::Arb, Self::Momentum]
-            }
+            ExplicitConsumer::Momentum => &[Self::Tracker, Self::Arb, Self::Momentum],
+            ExplicitConsumer::MomentumPosition | ExplicitConsumer::Wallet => &[
+                Self::Tracker,
+                Self::Arb,
+                Self::Momentum,
+                Self::MomentumPosition,
+            ],
         }
     }
 }
@@ -626,6 +639,7 @@ fn consumer_eviction_priority(consumer: ExplicitConsumer) -> u8 {
         ExplicitConsumer::Tracker => 0,
         ExplicitConsumer::Arb => 1,
         ExplicitConsumer::Momentum => 2,
+        ExplicitConsumer::MomentumPosition => 3,
         ExplicitConsumer::Wallet => u8::MAX,
     }
 }
@@ -747,6 +761,7 @@ const CAP_SHRINK_ALLOWED_TIERS: &[EvictionTier] = &[
     EvictionTier::Tracker,
     EvictionTier::Arb,
     EvictionTier::Momentum,
+    EvictionTier::MomentumPosition,
 ];
 
 fn analyze_cap_shrink_feasibility(
@@ -1551,6 +1566,7 @@ mod tests {
         Tracker,
         Arb,
         Momentum,
+        MomentumPosition,
     }
 
     impl OracleTier {
@@ -1559,6 +1575,7 @@ mod tests {
                 Self::Tracker => EvictionTier::Tracker,
                 Self::Arb => EvictionTier::Arb,
                 Self::Momentum => EvictionTier::Momentum,
+                Self::MomentumPosition => EvictionTier::MomentumPosition,
             }
         }
     }
@@ -1567,9 +1584,15 @@ mod tests {
         match incoming {
             ExplicitConsumer::Tracker => &[OracleTier::Tracker],
             ExplicitConsumer::Arb => &[OracleTier::Tracker, OracleTier::Arb],
-            ExplicitConsumer::Momentum | ExplicitConsumer::Wallet => {
+            ExplicitConsumer::Momentum => {
                 &[OracleTier::Tracker, OracleTier::Arb, OracleTier::Momentum]
             }
+            ExplicitConsumer::MomentumPosition | ExplicitConsumer::Wallet => &[
+                OracleTier::Tracker,
+                OracleTier::Arb,
+                OracleTier::Momentum,
+                OracleTier::MomentumPosition,
+            ],
         }
     }
 
@@ -1577,8 +1600,16 @@ mod tests {
         match owner.consumer {
             ExplicitConsumer::Wallet => false,
             ExplicitConsumer::Tracker => true,
-            ExplicitConsumer::Arb => matches!(tier, OracleTier::Arb | OracleTier::Momentum),
-            ExplicitConsumer::Momentum => tier == OracleTier::Momentum,
+            ExplicitConsumer::Arb => {
+                matches!(
+                    tier,
+                    OracleTier::Arb | OracleTier::Momentum | OracleTier::MomentumPosition
+                )
+            }
+            ExplicitConsumer::Momentum => {
+                matches!(tier, OracleTier::Momentum | OracleTier::MomentumPosition)
+            }
+            ExplicitConsumer::MomentumPosition => tier == OracleTier::MomentumPosition,
         }
     }
 
@@ -1598,7 +1629,12 @@ mod tests {
 
             let mut evictable_owners_by_tier: BTreeMap<OracleTier, BTreeSet<ExplicitOwner>> =
                 BTreeMap::new();
-            for tier in [OracleTier::Tracker, OracleTier::Arb, OracleTier::Momentum] {
+            for tier in [
+                OracleTier::Tracker,
+                OracleTier::Arb,
+                OracleTier::Momentum,
+                OracleTier::MomentumPosition,
+            ] {
                 for owner in &all_owners {
                     if oracle_owner_in_cumulative_tier(owner, tier) {
                         evictable_owners_by_tier
@@ -2655,6 +2691,7 @@ mod tests {
         Tracker,
         Arb,
         Momentum,
+        MomentumPosition,
     }
 
     impl PolicyTier {
@@ -2663,6 +2700,7 @@ mod tests {
                 Self::Tracker => EvictionTier::Tracker,
                 Self::Arb => EvictionTier::Arb,
                 Self::Momentum => EvictionTier::Momentum,
+                Self::MomentumPosition => EvictionTier::MomentumPosition,
             }
         }
 
@@ -2670,9 +2708,13 @@ mod tests {
             match consumer {
                 ExplicitConsumer::Tracker => &[Self::Tracker],
                 ExplicitConsumer::Arb => &[Self::Tracker, Self::Arb],
-                ExplicitConsumer::Momentum | ExplicitConsumer::Wallet => {
-                    &[Self::Tracker, Self::Arb, Self::Momentum]
-                }
+                ExplicitConsumer::Momentum => &[Self::Tracker, Self::Arb, Self::Momentum],
+                ExplicitConsumer::MomentumPosition | ExplicitConsumer::Wallet => &[
+                    Self::Tracker,
+                    Self::Arb,
+                    Self::Momentum,
+                    Self::MomentumPosition,
+                ],
             }
         }
 
@@ -2684,6 +2726,12 @@ mod tests {
                     ExplicitConsumer::Tracker,
                     ExplicitConsumer::Arb,
                     ExplicitConsumer::Momentum,
+                ],
+                Self::MomentumPosition => &[
+                    ExplicitConsumer::Tracker,
+                    ExplicitConsumer::Arb,
+                    ExplicitConsumer::Momentum,
+                    ExplicitConsumer::MomentumPosition,
                 ],
             }
         }
@@ -2702,6 +2750,7 @@ mod tests {
                 ExplicitConsumer::Tracker => 0,
                 ExplicitConsumer::Arb => 1,
                 ExplicitConsumer::Momentum => 2,
+                ExplicitConsumer::MomentumPosition => 3,
                 ExplicitConsumer::Wallet => u8::MAX,
             }
         }
