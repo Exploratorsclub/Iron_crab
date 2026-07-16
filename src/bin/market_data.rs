@@ -7320,10 +7320,21 @@ fn account_enrich_coalesce_upsert_with_cap(
     }
 }
 
+/// Result of attempting to move pending ENRICH work into the LOW `mpsc`.
+#[derive(Debug, PartialEq, Eq)]
+enum AccountEnrichFlushStatus {
+    /// At least one item flushed, or nothing pending to flush.
+    Ok,
+    /// LOW channel full; pending restored for retry.
+    BlockedFull,
+    /// LOW receivers gone; pending restored; caller should stop the account stream.
+    LowChannelClosed,
+}
+
 fn account_enrich_coalesce_try_flush(
     shard: &mut AccountEnrichCoalesceShard,
     low_tx: &mpsc::Sender<AccountWorkItem>,
-) {
+) -> AccountEnrichFlushStatus {
     let keys: Vec<Pubkey> = shard.pending.keys().copied().collect();
     for pk in keys {
         if shard.in_mpsc.contains(&pk) {
@@ -7336,13 +7347,17 @@ fn account_enrich_coalesce_try_flush(
             Ok(()) => {
                 shard.in_mpsc.insert(pk);
             }
-            Err(mpsc::error::TrySendError::Full(work))
-            | Err(mpsc::error::TrySendError::Closed(work)) => {
+            Err(mpsc::error::TrySendError::Full(work)) => {
                 shard.pending.insert(pk, work);
-                return;
+                return AccountEnrichFlushStatus::BlockedFull;
+            }
+            Err(mpsc::error::TrySendError::Closed(work)) => {
+                shard.pending.insert(pk, work);
+                return AccountEnrichFlushStatus::LowChannelClosed;
             }
         }
     }
+    AccountEnrichFlushStatus::Ok
 }
 
 /// After LOW dequeue: apply latest-wins supersede from coalesce map and refill LOW channel.
@@ -7350,7 +7365,7 @@ fn account_enrich_resolve_after_dequeue(
     shard: &mut AccountEnrichCoalesceShard,
     low_tx: &mpsc::Sender<AccountWorkItem>,
     work: AccountWorkItem,
-) -> AccountWorkItem {
+) -> (AccountWorkItem, AccountEnrichFlushStatus) {
     let pk = work.update.pubkey;
     shard.in_mpsc.remove(&pk);
     let mut resolved = work;
@@ -7361,8 +7376,8 @@ fn account_enrich_resolve_after_dequeue(
     }
     dec_market_data_account_low_priority_queue_depth();
     dec_market_data_account_worker_queue_depth();
-    account_enrich_coalesce_try_flush(shard, low_tx);
-    resolved
+    let flush_status = account_enrich_coalesce_try_flush(shard, low_tx);
+    (resolved, flush_status)
 }
 
 #[inline]
@@ -8243,20 +8258,41 @@ async fn run_geyser_loop(
         let low_tx_drain = low_tx.clone();
         let enrich_coalesce_drain = Arc::clone(&enrich_coalesce);
         let enrich_notify_drain = Arc::clone(&enrich_notify);
+        let geyser_account_stopped_drain = geyser_account_stream_stopped_tx.clone();
         tokio::spawn(async move {
             loop {
                 enrich_notify_drain.notified().await;
                 let mut shard = enrich_coalesce_drain.lock().await;
-                account_enrich_coalesce_try_flush(&mut shard, &low_tx_drain);
+                if matches!(
+                    account_enrich_coalesce_try_flush(&mut shard, &low_tx_drain),
+                    AccountEnrichFlushStatus::LowChannelClosed
+                ) {
+                    error!(
+                        worker = wid,
+                        "account LOW worker queue closed; stopping Geyser account stream"
+                    );
+                    let _ = geyser_account_stopped_drain.send(true);
+                    break;
+                }
             }
         });
+        let geyser_account_stopped_worker = geyser_account_stream_stopped_tx.clone();
         tokio::spawn(async move {
             while let Some(dequeued) = account_worker_recv_next(&mut high_rx, &mut low_rx).await {
                 let work = match dequeued {
                     AccountWorkerDequeue::ExecHot(work) => work,
                     AccountWorkerDequeue::Enrich(work) => {
                         let mut shard = enrich_coalesce.lock().await;
-                        account_enrich_resolve_after_dequeue(&mut shard, &low_tx, work)
+                        let (work, flush_status) =
+                            account_enrich_resolve_after_dequeue(&mut shard, &low_tx, work);
+                        if matches!(flush_status, AccountEnrichFlushStatus::LowChannelClosed) {
+                            error!(
+                                worker = wid,
+                                "account LOW worker queue closed; stopping Geyser account stream"
+                            );
+                            let _ = geyser_account_stopped_worker.send(true);
+                        }
+                        work
                     }
                 };
                 let handler_start = Instant::now();
@@ -8350,11 +8386,19 @@ async fn run_geyser_loop(
                         if matches!(upsert, AccountEnrichCoalesceUpsert::Coalesced) {
                             inc_market_data_account_enrich_coalesce_total();
                         }
-                        account_enrich_coalesce_try_flush(
+                        let flush_status = account_enrich_coalesce_try_flush(
                             &mut coalesce_shard,
                             &worker_low_recv[shard],
                         );
                         drop(coalesce_shard);
+                        if matches!(flush_status, AccountEnrichFlushStatus::LowChannelClosed) {
+                            error!(
+                                shard = shard,
+                                "account LOW worker queue closed; stopping Geyser account stream"
+                            );
+                            let _ = geyser_account_stream_stopped_tx.send(true);
+                            break;
+                        }
                         enrich_coalesce_notify_recv[shard].notify_one();
                     }
                 }
@@ -12694,7 +12738,10 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(shard.unique_pending_pubkey_count(), 1);
         let (closed_tx, closed_rx) = mpsc::channel(4);
         drop(closed_rx);
-        account_enrich_coalesce_try_flush(&mut shard, &closed_tx);
+        assert_eq!(
+            account_enrich_coalesce_try_flush(&mut shard, &closed_tx),
+            AccountEnrichFlushStatus::LowChannelClosed
+        );
         assert_eq!(
             shard.pending.get(&pk).unwrap().update.slot,
             7,
@@ -12706,6 +12753,52 @@ mod pr_b_geyser_tracking_tests {
             1,
             "logical depth unchanged when Closed restores pending"
         );
+    }
+
+    #[test]
+    fn account_enrich_coalesce_try_flush_full_restores_pending_without_closed() {
+        const CAP: usize = 1;
+        let mut shard = AccountEnrichCoalesceShard::new();
+        let pk = Pubkey::new_unique();
+        let work = AccountWorkItem {
+            update: GeyserAccountUpdate {
+                pubkey: pk,
+                slot: 1,
+                owner: PUMPFUN_PROGRAM_OWNER,
+                data: vec![],
+                lamports: 0,
+                grpc_recv_at: Instant::now(),
+            },
+            recv_at: Instant::now(),
+        };
+        assert!(matches!(
+            account_enrich_coalesce_upsert_with_cap(&mut shard, work, CAP),
+            AccountEnrichCoalesceUpsert::NewPending
+        ));
+        let (full_tx, full_rx) = mpsc::channel(1);
+        let blocker = AccountWorkItem {
+            update: GeyserAccountUpdate {
+                pubkey: Pubkey::new_unique(),
+                slot: 0,
+                owner: PUMPFUN_PROGRAM_OWNER,
+                data: vec![],
+                lamports: 0,
+                grpc_recv_at: Instant::now(),
+            },
+            recv_at: Instant::now(),
+        };
+        full_tx.try_send(blocker).expect("prefill channel");
+        assert_eq!(
+            account_enrich_coalesce_try_flush(&mut shard, &full_tx),
+            AccountEnrichFlushStatus::BlockedFull
+        );
+        assert_eq!(shard.pending.get(&pk).unwrap().update.slot, 1);
+        drop(full_rx);
+        assert_eq!(
+            account_enrich_coalesce_try_flush(&mut shard, &full_tx),
+            AccountEnrichFlushStatus::LowChannelClosed
+        );
+        assert!(shard.pending.contains_key(&pk));
     }
 
     #[test]
