@@ -82,12 +82,13 @@ use ironcrab::market_data::sidefx::{
 use ironcrab::market_data::track::{
     arb_coalesce_try_send, explicit_admitted_pool_sets_from_admission, explicit_set_snapshot_path,
     explicit_subscription_has_new_keys, flush_explicit_set_snapshot, load_explicit_set_snapshot,
-    momentum_coalesce_try_send, owner_group_snapshot_to_disk, pool_is_enrichment_member,
-    restore_admission_from_owner_groups, spawn_track_worker, track_worker_try_enqueue,
-    try_admit_owner_group, AdmissionConvergeResult, AdmissionRestoreResult, CapShrinkResult,
-    ConsumerId, ExplicitAccountKind, ExplicitConsumer, ExplicitOwner, ExplicitOwnerKey,
-    ExplicitSetSnapshot, ExplicitSnapshotRow, FixedCapAdmission, GeyserConnectBarrier,
-    SnapshotConsumer, TrackPinReason, TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,
+    momentum_coalesce_try_send, owner_group_snapshot_to_disk, pin_priority_for_momentum_active_pin,
+    pool_is_enrichment_member, restore_admission_from_owner_groups, spawn_track_worker,
+    track_worker_try_enqueue, try_admit_owner_group, AdmissionConvergeResult,
+    AdmissionRestoreResult, CapShrinkResult, ConsumerId, ExplicitAccountKind, ExplicitConsumer,
+    ExplicitEntry, ExplicitOwner, ExplicitOwnerKey, ExplicitSetSnapshot, ExplicitSnapshotRow,
+    FixedCapAdmission, GeyserConnectBarrier, PinPriority, SnapshotConsumer, TrackPinReason,
+    TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,
     EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
 };
 use ironcrab::metrics::{
@@ -4560,6 +4561,11 @@ impl MarketDataContext {
                 continue;
             };
             let is_position = a.pin_reason == MomentumActivePinReason::Position;
+            let explicit_entry = ExplicitEntry {
+                consumers: HashSet::from([ConsumerId::Momentum]),
+                pool: Some(pool_pk),
+                pin_priority: pin_priority_for_momentum_active_pin(a.pin_reason),
+            };
             self.hot_pool_registry
                 .pin_pool_with_reason(mint_pk, pool_pk, is_position);
             if self.try_admit_pool_consumer_group(admission, pool_pk, ExplicitConsumer::Momentum) {
@@ -4583,13 +4589,21 @@ impl MarketDataContext {
                 }
             } else {
                 inc_market_data_momentum_admission_rejected_total();
-                if self.live_pool_cache.get(&pool_pk).is_none() {
-                    self.record_momentum_active_pool_reserve_registration_outcome(
-                        pool_pk,
-                        GeyserPinReason::MomentumActive,
-                        is_position,
-                        false,
-                    );
+                let registered = if self.live_pool_cache.get(&pool_pk).is_none() {
+                    false
+                } else if is_position {
+                    self.register_geyser_reserves_for_momentum_active_pool(pool_pk)
+                } else {
+                    self.hot_pool_reserve_registration_satisfied(pool_pk)
+                };
+                self.record_momentum_active_pool_reserve_registration_outcome(
+                    pool_pk,
+                    GeyserPinReason::MomentumActive,
+                    is_position,
+                    registered,
+                );
+                if is_position && registered {
+                    batch_dirty = true;
                 }
             }
             self.sync_explicit_pool_admitted_from_admission(
@@ -4597,6 +4611,19 @@ impl MarketDataContext {
                 pool_pk,
                 ExplicitConsumer::Momentum,
             );
+            if explicit_entry.pin_priority <= PinPriority::MomentumPosition
+                && admission
+                    .owner_group(&Self::pool_consumer_owner(
+                        pool_pk,
+                        ExplicitConsumer::Momentum,
+                    ))
+                    .is_some()
+            {
+                let _ = admission.touch_group(Self::pool_consumer_owner(
+                    pool_pk,
+                    ExplicitConsumer::Momentum,
+                ));
+            }
         }
         batch_dirty
     }

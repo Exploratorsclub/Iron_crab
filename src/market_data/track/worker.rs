@@ -225,6 +225,7 @@ pub fn apply_momentum_active_pools_on_track_worker<C: TrackWorkerContext>(
         batch_dirty |= ctx.apply_momentum_active_entries(admission, chunk);
         std::thread::yield_now();
     }
+    batch_dirty |= ctx.retry_deferred_hot_pool_reserve_registrations(admission);
     if !batch_dirty {
         ctx.refresh_geyser_pins_gauge();
     }
