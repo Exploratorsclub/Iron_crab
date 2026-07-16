@@ -434,7 +434,7 @@ impl PositionAuthority {
                     sold_raw_total: 0,
                     status: PositionStatus::ReconcileNeeded,
                     last_update_source: UpdateSource::WalletSnapshot,
-                    last_execution_unix_secs: Some(unix_secs_now()),
+                    last_execution_unix_secs: None,
                 });
             }
         }
@@ -455,9 +455,7 @@ impl PositionAuthority {
                 p.balance_raw > 0
                     && !is_sol_or_wsol_mint(mint)
                     && !wallet_set.contains(mint.as_str())
-                    && p.last_execution_unix_secs
-                        .map(|t| now_secs.saturating_sub(t) >= GHOST_CLEANUP_GRACE_SECS)
-                        .unwrap_or(false)
+                    && Self::ghost_eligible_after_snapshot_complete(p, now_secs)
             })
             .map(|(mint, _)| mint.clone())
             .collect();
@@ -467,6 +465,14 @@ impl PositionAuthority {
             changes.push(PositionAuthorityChange::Tombstone { mint });
         }
         changes
+    }
+
+    /// Execution-confirmed rows get 90s grace vs stale Complete lists; wallet-only rows do not.
+    fn ghost_eligible_after_snapshot_complete(p: &PositionState, now_secs: u64) -> bool {
+        match p.last_execution_unix_secs {
+            Some(t) => now_secs.saturating_sub(t) >= GHOST_CLEANUP_GRACE_SECS,
+            None => true,
+        }
     }
 
     pub fn get(&self, mint: &str) -> Option<&PositionState> {
@@ -592,14 +598,17 @@ mod tests {
     }
 
     #[test]
-    fn wallet_snapshot_complete_closes_wallet_only_ghost() {
+    fn wallet_snapshot_complete_closes_wallet_only_ghost_immediately() {
         let m = mint();
         let ghost = "WalletOnlyGhostMintttttttttttttttttttttttttttt".to_string();
         let mut a = PositionAuthority::new();
         a.apply(&buy(&m, 400, 6));
         a.apply(&snap(&ghost, 200, 6));
         assert_eq!(a.open_positions_count(), 2);
-        a.test_backdate_last_execution(&ghost, GHOST_CLEANUP_GRACE_SECS + 1);
+        assert!(
+            a.get(&ghost).unwrap().last_execution_unix_secs.is_none(),
+            "wallet-only vacant insert must not set execution timestamp"
+        );
 
         let changes = a.apply(&PositionEvent::WalletSnapshotComplete {
             wallet: "wallet".to_string(),
@@ -672,6 +681,10 @@ mod tests {
         assert_eq!(p.balance_raw, 250);
         assert_eq!(p.status, PositionStatus::ReconcileNeeded);
         assert_eq!(p.last_update_source, UpdateSource::WalletSnapshot);
+        assert!(
+            p.last_execution_unix_secs.is_none(),
+            "wallet-only recovery must not set execution timestamp"
+        );
     }
 
     #[test]
