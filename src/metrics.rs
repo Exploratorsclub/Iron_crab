@@ -1646,6 +1646,38 @@ static MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = 
 static MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 static MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+static MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_EXEC_HOT_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_EXEC_HOT_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_EXEC_HOT_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+static MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_ENRICH_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_ENRICH_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_ENRICH_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Account ingest class counter `market_data_account_updates_total{class=...}`.
+pub static MARKET_DATA_ACCOUNT_UPDATES_TOTAL_EXEC_HOT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ACCOUNT_UPDATES_TOTAL_ENRICH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ACCOUNT_UPDATES_TOTAL_DROP: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// Pump.fun: wall ms from Geyser `grpc_recv_at` on the TX update to `DevWalletIdentified` publish (TX fast-path after `pool_mint_map` insert).
 static MARKET_DATA_POOL_MINT_MAP_TO_DEVWALLET_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
     Lazy::new(|| {
@@ -1899,6 +1931,50 @@ pub fn record_market_data_account_channel_lag_ms(grpc_recv_at: Instant, recv_at:
         ms,
         MARKET_DATA_LATENCY_MS_SUM_CAP,
     );
+}
+
+/// Per-class account channel lag (`class="exec_hot"` | `class="enrich"`).
+#[inline]
+pub fn record_market_data_account_channel_lag_ms_for_class(
+    class: &str,
+    grpc_recv_at: Instant,
+    recv_at: Instant,
+) {
+    let ms = recv_at
+        .saturating_duration_since(grpc_recv_at)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    match class {
+        "exec_hot" => record_histogram_u64_into(
+            MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+            &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_EXEC_HOT_BUCKET_COUNTS,
+            &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_EXEC_HOT_SUM,
+            &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_EXEC_HOT_COUNT,
+            ms,
+            MARKET_DATA_LATENCY_MS_SUM_CAP,
+        ),
+        "enrich" => record_histogram_u64_into(
+            MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+            &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_ENRICH_BUCKET_COUNTS,
+            &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_ENRICH_SUM,
+            &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_ENRICH_COUNT,
+            ms,
+            MARKET_DATA_LATENCY_MS_SUM_CAP,
+        ),
+        _ => {}
+    }
+}
+
+/// Increment `market_data_account_updates_total{class=...}`.
+#[inline]
+pub fn inc_market_data_account_updates_total(class: &str) {
+    let counter = match class {
+        "exec_hot" => &*MARKET_DATA_ACCOUNT_UPDATES_TOTAL_EXEC_HOT,
+        "enrich" => &*MARKET_DATA_ACCOUNT_UPDATES_TOTAL_ENRICH,
+        "drop" => &*MARKET_DATA_ACCOUNT_UPDATES_TOTAL_DROP,
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Pump.fun trade publish: chain slots since last bonding-curve progress publish for the same pool key.
@@ -5892,6 +5968,32 @@ fn append_momentum_latency_histogram_prometheus(
     out.push_str(&format!("{}_count {}\n", metric, c));
 }
 
+fn append_account_channel_lag_ms_labeled_histogram(
+    out: &mut String,
+    class: &str,
+    bucket_counts: &[AtomicU64],
+    sum: &AtomicU64,
+    count: &AtomicU64,
+) {
+    let c = count.load(Ordering::Relaxed);
+    let s = sum.load(Ordering::Relaxed);
+    for (i, b) in MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS.iter().enumerate() {
+        let v = bucket_counts[i].load(Ordering::Relaxed);
+        out.push_str(&format!(
+            "market_data_account_channel_lag_ms_bucket{{class=\"{class}\",le=\"{b}\"}} {v}\n"
+        ));
+    }
+    out.push_str(&format!(
+        "market_data_account_channel_lag_ms_bucket{{class=\"{class}\",le=\"+Inf\"}} {c}\n"
+    ));
+    out.push_str(&format!(
+        "market_data_account_channel_lag_ms_sum{{class=\"{class}\"}} {s}\n"
+    ));
+    out.push_str(&format!(
+        "market_data_account_channel_lag_ms_count{{class=\"{class}\"}} {c}\n"
+    ));
+}
+
 /// Append `_bucket{le=...}`, `_sum`, `_count` lines (same layout as `tx_slot_to_send_ms`).
 #[allow(clippy::too_many_arguments)]
 fn append_labeled_duration_seconds_histogram(
@@ -6781,6 +6883,20 @@ async fn metrics_response() -> Response<Body> {
         &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_SUM,
         &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_COUNT,
     );
+    append_account_channel_lag_ms_labeled_histogram(
+        &mut out,
+        "exec_hot",
+        &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_EXEC_HOT_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_EXEC_HOT_SUM,
+        &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_EXEC_HOT_COUNT,
+    );
+    append_account_channel_lag_ms_labeled_histogram(
+        &mut out,
+        "enrich",
+        &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_ENRICH_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_ENRICH_SUM,
+        &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_ENRICH_COUNT,
+    );
     append_momentum_latency_histogram_prometheus(
         &mut out,
         "market_data_pool_mint_map_to_devwallet_ms",
@@ -6881,6 +6997,27 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("market_data_account_early_drop_total{reason=\"dex_pool_not_enrichment\"} ");
     out.push_str(
         &MARKET_DATA_ACCOUNT_EARLY_DROP_DEX_POOL_NOT_ENRICHMENT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_account_updates_total{class=\"exec_hot\"} ");
+    out.push_str(
+        &MARKET_DATA_ACCOUNT_UPDATES_TOTAL_EXEC_HOT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_account_updates_total{class=\"enrich\"} ");
+    out.push_str(
+        &MARKET_DATA_ACCOUNT_UPDATES_TOTAL_ENRICH
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_account_updates_total{class=\"drop\"} ");
+    out.push_str(
+        &MARKET_DATA_ACCOUNT_UPDATES_TOTAL_DROP
             .load(Ordering::Relaxed)
             .to_string(),
     );

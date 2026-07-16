@@ -95,8 +95,9 @@ use ironcrab::metrics::{
     dec_market_data_account_low_priority_queue_depth, dec_market_data_account_worker_queue_depth,
     geyser_account_listener_account_updates_value, geyser_metrics_set_subscription_accounts,
     geyser_metrics_set_tracked_pinned_accounts, inc_market_data_account_high_priority_queue_depth,
-    inc_market_data_account_low_priority_queue_depth, inc_market_data_account_worker_queue_depth,
-    inc_market_data_arb_admission_admitted_total, inc_market_data_arb_admission_rejected_total,
+    inc_market_data_account_low_priority_queue_depth, inc_market_data_account_updates_total,
+    inc_market_data_account_worker_queue_depth, inc_market_data_arb_admission_admitted_total,
+    inc_market_data_arb_admission_rejected_total,
     inc_market_data_arb_pin_geyser_register_deferred_total,
     inc_market_data_balance_updated_from_cache_total,
     inc_market_data_geyser_sync_skipped_rate_limit_total,
@@ -112,8 +113,8 @@ use ironcrab::metrics::{
     market_data_geyser_tracking_jobs_processed_value, market_data_md_state_bursts_completed_value,
     market_data_request_account_session_reconnect, market_data_request_tx_session_reconnect,
     market_data_tx_handler_processed_value, record_market_data_account_broadcast_lagged,
-    record_market_data_account_channel_lag_ms, record_market_data_account_early_drop,
-    record_market_data_account_handler_duration_us,
+    record_market_data_account_channel_lag_ms, record_market_data_account_channel_lag_ms_for_class,
+    record_market_data_account_early_drop, record_market_data_account_handler_duration_us,
     record_market_data_arb_track_requests_messages_total,
     record_market_data_geyser_merge_coalesced_total, record_market_data_geyser_sync_batch_total,
     record_market_data_global_ingest_stall, record_market_data_md_state_stall,
@@ -312,6 +313,7 @@ fn account_geyser_update_relevance(
 }
 
 /// Eval grep: account dispatch priority in `ingest/account_filter.rs` (tracked_membership snapshot).
+#[allow(dead_code)]
 fn account_geyser_dispatch_priority_high(ctx: &MarketDataContext, u: &GeyserAccountUpdate) -> bool {
     // I-4b eval grep: tracked_membership / tracked_membership_contains_pubkey snapshot (ingest/account_filter.rs).
     ironcrab::market_data::ingest::account_geyser_dispatch_priority_high(ctx, u)
@@ -8101,19 +8103,33 @@ async fn run_geyser_loop(
                     set_market_data_account_broadcast_queue_depth(account_rx_geyser.len());
                     market_data_bump_geyser_head_slot(account_update.slot);
 
-                    match account_geyser_update_relevance(&ctx_geyser_acc, &account_update) {
-                        ironcrab::market_data::ingest::AccountGeyserRelevance::Relevant => {}
-                        ironcrab::market_data::ingest::AccountGeyserRelevance::EarlyDrop(
+                    let class = ironcrab::market_data::ingest::classify_account_geyser_update(
+                        &ctx_geyser_acc,
+                        &account_update,
+                    );
+                    inc_market_data_account_updates_total(class.as_prometheus_label());
+
+                    if class == ironcrab::market_data::ingest::AccountUpdateClass::Drop {
+                        if let ironcrab::market_data::ingest::AccountGeyserRelevance::EarlyDrop(
                             reason,
-                        ) => {
+                        ) = account_geyser_update_relevance(&ctx_geyser_acc, &account_update)
+                        {
                             record_market_data_account_early_drop(reason);
-                            continue;
                         }
+                        continue;
                     }
 
+                    record_market_data_account_channel_lag_ms_for_class(
+                        class.as_prometheus_label(),
+                        account_update.grpc_recv_at,
+                        recv_at,
+                    );
+
                     let shard = market_data_account_worker_shard(&account_update.pubkey);
-                    let high =
-                        account_geyser_dispatch_priority_high(&ctx_geyser_acc, &account_update);
+                    let high = matches!(
+                        class,
+                        ironcrab::market_data::ingest::AccountUpdateClass::ExecHot
+                    );
                     let send_res = if high {
                         worker_high_recv[shard]
                             .send(AccountWorkItem {
