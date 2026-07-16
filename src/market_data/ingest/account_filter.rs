@@ -129,18 +129,22 @@ pub fn account_geyser_update_might_be_relevant<H: IngestHost>(
 }
 
 /// Classify a Geyser account update for lag/throughput metrics (reuses relevance + HIGH logic).
+///
+/// Returns `(class, early_drop_reason)` from a single relevance evaluation so recv-loop
+/// metrics cannot diverge from enqueue decisions when ingest membership changes concurrently.
 pub fn classify_account_geyser_update<H: IngestHost>(
     host: &H,
     u: &GeyserAccountUpdate,
-) -> AccountUpdateClass {
+) -> (AccountUpdateClass, Option<MarketDataAccountEarlyDropReason>) {
     match account_geyser_update_relevance(host, u) {
-        AccountGeyserRelevance::EarlyDrop(_) => AccountUpdateClass::Drop,
+        AccountGeyserRelevance::EarlyDrop(reason) => (AccountUpdateClass::Drop, Some(reason)),
         AccountGeyserRelevance::Relevant => {
-            if account_geyser_dispatch_priority_high(host, u) {
+            let class = if account_geyser_dispatch_priority_high(host, u) {
                 AccountUpdateClass::ExecHot
             } else {
                 AccountUpdateClass::Enrich
-            }
+            };
+            (class, None)
         }
     }
 }
@@ -319,7 +323,7 @@ mod tests {
         host.hot_pools.insert(pool);
         let u = sample_update(pool, RAYDIUM_CPMM_OWNER);
         assert_eq!(
-            classify_account_geyser_update(&host, &u),
+            classify_account_geyser_update(&host, &u).0,
             AccountUpdateClass::ExecHot
         );
     }
@@ -331,7 +335,7 @@ mod tests {
         host.hot_pools.insert(pool);
         let u = sample_update(pool, ORCA_WHIRLPOOL_OWNER);
         assert_eq!(
-            classify_account_geyser_update(&host, &u),
+            classify_account_geyser_update(&host, &u).0,
             AccountUpdateClass::ExecHot
         );
     }
@@ -343,7 +347,7 @@ mod tests {
         host.membership.insert(mint);
         let u = sample_update(mint, Pubkey::new_unique());
         assert_eq!(
-            classify_account_geyser_update(&host, &u),
+            classify_account_geyser_update(&host, &u).0,
             AccountUpdateClass::Enrich
         );
     }
@@ -353,9 +357,11 @@ mod tests {
         let host = MockIngestHost::new();
         let pool = Pubkey::new_unique();
         let u = sample_update(pool, RAYDIUM_CPMM_OWNER);
+        let (class, reason) = classify_account_geyser_update(&host, &u);
+        assert_eq!(class, AccountUpdateClass::Drop);
         assert_eq!(
-            classify_account_geyser_update(&host, &u),
-            AccountUpdateClass::Drop
+            reason,
+            Some(MarketDataAccountEarlyDropReason::DexPoolNotEnrichment)
         );
     }
 }

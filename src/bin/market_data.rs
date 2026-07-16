@@ -305,6 +305,7 @@ fn account_geyser_update_might_be_relevant(
 }
 
 /// Eval grep: account relevance filter with early-drop reason in `ingest/account_filter.rs`.
+#[allow(dead_code)]
 fn account_geyser_update_relevance(
     ctx: &MarketDataContext,
     u: &GeyserAccountUpdate,
@@ -8103,17 +8104,15 @@ async fn run_geyser_loop(
                     set_market_data_account_broadcast_queue_depth(account_rx_geyser.len());
                     market_data_bump_geyser_head_slot(account_update.slot);
 
-                    let class = ironcrab::market_data::ingest::classify_account_geyser_update(
-                        &ctx_geyser_acc,
-                        &account_update,
-                    );
+                    let (class, early_drop_reason) =
+                        ironcrab::market_data::ingest::classify_account_geyser_update(
+                            &ctx_geyser_acc,
+                            &account_update,
+                        );
                     inc_market_data_account_updates_total(class.as_prometheus_label());
 
                     if class == ironcrab::market_data::ingest::AccountUpdateClass::Drop {
-                        if let ironcrab::market_data::ingest::AccountGeyserRelevance::EarlyDrop(
-                            reason,
-                        ) = account_geyser_update_relevance(&ctx_geyser_acc, &account_update)
-                        {
+                        if let Some(reason) = early_drop_reason {
                             record_market_data_account_early_drop(reason);
                         }
                         continue;
