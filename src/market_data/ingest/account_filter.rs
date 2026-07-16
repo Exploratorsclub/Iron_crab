@@ -322,10 +322,9 @@ mod tests {
         let mut host = MockIngestHost::new();
         host.hot_pools.insert(pool);
         let u = sample_update(pool, RAYDIUM_CPMM_OWNER);
-        assert_eq!(
-            classify_account_geyser_update(&host, &u).0,
-            AccountUpdateClass::ExecHot
-        );
+        let (class, early_drop_reason) = classify_account_geyser_update(&host, &u);
+        assert_eq!(class, AccountUpdateClass::ExecHot);
+        assert_eq!(early_drop_reason, None);
     }
 
     #[test]
@@ -334,10 +333,9 @@ mod tests {
         let mut host = MockIngestHost::new();
         host.hot_pools.insert(pool);
         let u = sample_update(pool, ORCA_WHIRLPOOL_OWNER);
-        assert_eq!(
-            classify_account_geyser_update(&host, &u).0,
-            AccountUpdateClass::ExecHot
-        );
+        let (class, early_drop_reason) = classify_account_geyser_update(&host, &u);
+        assert_eq!(class, AccountUpdateClass::ExecHot);
+        assert_eq!(early_drop_reason, None);
     }
 
     #[test]
@@ -346,10 +344,9 @@ mod tests {
         let mut host = MockIngestHost::new();
         host.membership.insert(mint);
         let u = sample_update(mint, Pubkey::new_unique());
-        assert_eq!(
-            classify_account_geyser_update(&host, &u).0,
-            AccountUpdateClass::Enrich
-        );
+        let (class, early_drop_reason) = classify_account_geyser_update(&host, &u);
+        assert_eq!(class, AccountUpdateClass::Enrich);
+        assert_eq!(early_drop_reason, None);
     }
 
     #[test]
@@ -357,10 +354,10 @@ mod tests {
         let host = MockIngestHost::new();
         let pool = Pubkey::new_unique();
         let u = sample_update(pool, RAYDIUM_CPMM_OWNER);
-        let (class, reason) = classify_account_geyser_update(&host, &u);
+        let (class, early_drop_reason) = classify_account_geyser_update(&host, &u);
         assert_eq!(class, AccountUpdateClass::Drop);
         assert_eq!(
-            reason,
+            early_drop_reason,
             Some(MarketDataAccountEarlyDropReason::DexPoolNotEnrichment)
         );
     }

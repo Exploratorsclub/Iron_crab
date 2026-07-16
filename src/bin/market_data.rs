@@ -8111,10 +8111,8 @@ async fn run_geyser_loop(
                         );
                     inc_market_data_account_updates_total(class.as_prometheus_label());
 
-                    if class == ironcrab::market_data::ingest::AccountUpdateClass::Drop {
-                        if let Some(reason) = early_drop_reason {
-                            record_market_data_account_early_drop(reason);
-                        }
+                    if let Some(reason) = early_drop_reason {
+                        record_market_data_account_early_drop(reason);
                         continue;
                     }
 
