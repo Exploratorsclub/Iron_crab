@@ -20,9 +20,11 @@ pub enum ConsumerId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PinPriority {
     Wallet = 0,
-    Momentum = 1,
-    Arb = 2,
-    Tracker = 3,
+    /// Open-position pool pin (Scope C): protected at least at momentum-active tier.
+    MomentumPosition = 1,
+    Momentum = 2,
+    Arb = 3,
+    Tracker = 4,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +40,16 @@ pub fn pin_priority_from_consumer(consumer: ConsumerId) -> PinPriority {
         ConsumerId::Momentum => PinPriority::Momentum,
         ConsumerId::Arb => PinPriority::Arb,
         ConsumerId::Tracker => PinPriority::Tracker,
+    }
+}
+
+/// Scope C: position pins must not lose eviction protection to tracker noise.
+pub fn pin_priority_for_momentum_active_pin(
+    pin_reason: crate::nats::MomentumActivePinReason,
+) -> PinPriority {
+    match pin_reason {
+        crate::nats::MomentumActivePinReason::Position => PinPriority::MomentumPosition,
+        crate::nats::MomentumActivePinReason::Tracker => PinPriority::Momentum,
     }
 }
 

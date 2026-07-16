@@ -41,6 +41,8 @@ pub enum TrackWorkerCommand {
     FlushExplicitSetSnapshot {
         done: std::sync::mpsc::Sender<()>,
     },
+    /// Scope C: retry deferred hot-pool vault/bin registration after LivePoolCache fill.
+    RetryDeferredHotPoolReserves,
 }
 
 /// Consumer/stream identity for monotone revision assignment.
@@ -98,6 +100,7 @@ pub fn stream_for_command(cmd: &TrackWorkerCommand) -> TrackCommandStream {
         | TrackWorkerCommand::ScheduleGeyserPushDebounced
         | TrackWorkerCommand::RestoreExplicitSnapshot(_)
         | TrackWorkerCommand::ContinueGeyserEvict
+        | TrackWorkerCommand::RetryDeferredHotPoolReserves
         | TrackWorkerCommand::FlushExplicitSetSnapshot { .. } => TrackCommandStream::Control,
     }
 }

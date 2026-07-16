@@ -139,6 +139,11 @@ pub trait TrackWorkerContext: Send + Sync {
         admission: &mut FixedCapAdmission,
         new_cap: usize,
     ) -> CapShrinkResult;
+    /// Scope C: retry vault/bin registration for hot pools deferred on LivePoolCache miss.
+    fn retry_deferred_hot_pool_reserve_registrations(
+        &self,
+        admission: &mut FixedCapAdmission,
+    ) -> bool;
 }
 
 #[derive(Clone)]
@@ -296,6 +301,9 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
             try_write_explicit_set_snapshot_from_ctx(ctx.as_ref(), admission);
             let _ = done.send(());
             false
+        }
+        TrackWorkerCommand::RetryDeferredHotPoolReserves => {
+            ctx.retry_deferred_hot_pool_reserve_registrations(admission)
         }
     }
 }
@@ -531,6 +539,7 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
             pending_release_flush_slot = false;
             restore_barrier_pending = false;
             coalesce_deadline = None;
+            let _ = ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission);
             let push_ok = track_worker_execute_coalesced_push(
                 &ctx,
                 &mut admission,
@@ -974,6 +983,13 @@ mod tests {
                 new_cap: 25_000,
             }
         }
+
+        fn retry_deferred_hot_pool_reserve_registrations(
+            &self,
+            _admission: &mut FixedCapAdmission,
+        ) -> bool {
+            false
+        }
     }
 
     #[test]
@@ -1269,6 +1285,13 @@ mod tests {
                     new_cap: 25_000,
                 }
             }
+
+            fn retry_deferred_hot_pool_reserve_registrations(
+                &self,
+                _admission: &mut FixedCapAdmission,
+            ) -> bool {
+                false
+            }
         }
 
         let ctx = Arc::new(TrackerIdempotentCtx);
@@ -1508,6 +1531,13 @@ mod tests {
                 old_cap: 25_000,
                 new_cap: 25_000,
             }
+        }
+
+        fn retry_deferred_hot_pool_reserve_registrations(
+            &self,
+            _admission: &mut FixedCapAdmission,
+        ) -> bool {
+            false
         }
     }
 

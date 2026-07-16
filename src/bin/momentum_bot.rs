@@ -4268,6 +4268,11 @@ impl MomentumContext {
                     hold_secs,
                     "🧭 Orphaned mint reconciled into position (pool now known)"
                 );
+                self.queue_momentum_active_pool_active(
+                    mint,
+                    &reconciled.pool,
+                    MomentumActivePinReason::Position,
+                );
             }
         }
     }
@@ -21131,6 +21136,12 @@ async fn process_market_event(
                         "🧭 Wallet snapshot reconciled into position (timed exit will apply)"
                     );
                     ctx.save_position_to_kv(mint, &reconciled).await;
+                    ctx.queue_momentum_active_pool_active(
+                        mint,
+                        &reconciled.pool,
+                        MomentumActivePinReason::Position,
+                    );
+                    ctx.flush_momentum_active_pool_publish_queue();
                     return Ok(true);
                 } else {
                     // Wallet has tokens but no pool known yet. Store as orphaned so

@@ -4,6 +4,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Wire version for [`MomentumActivePoolsUpdate`] (stable across producers).
+pub const MOMENTUM_ACTIVE_POOLS_WIRE_VERSION: u32 = 1;
+
 /// Wire payload for `ironcrab.v1.momentum.active_pools` ([`crate::nats::topics::TOPIC_MOMENTUM_ACTIVE_POOLS`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MomentumActivePoolsUpdate {

@@ -111,11 +111,12 @@ use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
     ensure_trade_intents_stream, pool_cache_live_consumer_config_execution_engine,
     wallet_snapshot_consumer_config, wallet_snapshot_live_consumer_config_execution_engine,
-    wallet_tx_confirm_live_consumer_config_execution_engine, NatsClient, NatsConfig,
-    CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_CONTROL_REQUESTS, TOPIC_CONTROL_RESPONSES,
-    TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
-    TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS, TRADE_INTENTS_STREAM_NAME,
-    WALLET_SNAPSHOT_STREAM_NAME, WALLET_TX_CONFIRM_STREAM_NAME,
+    wallet_tx_confirm_live_consumer_config_execution_engine, MomentumActivePinReason,
+    MomentumActivePoolEntry, MomentumActivePoolsUpdate, NatsClient, NatsConfig, CONFIG_STREAM_NAME,
+    MOMENTUM_ACTIVE_POOLS_WIRE_VERSION, STREAM_NAME, TOPIC_CONTROL_REQUESTS,
+    TOPIC_CONTROL_RESPONSES, TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
+    TOPIC_MOMENTUM_ACTIVE_POOLS, TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS,
+    TRADE_INTENTS_STREAM_NAME, WALLET_SNAPSHOT_STREAM_NAME, WALLET_TX_CONFIRM_STREAM_NAME,
 };
 use ironcrab::position_authority::{
     position_authority_drift_lockmanager, PositionAuthority, PositionAuthorityChange,
@@ -6398,6 +6399,47 @@ impl ExecutionContext {
         self.refresh_position_authority_metrics();
     }
 
+    /// Scope C: EE-only / authority BUY confirms publish Position pin when routed pool is known.
+    async fn publish_open_position_pool_pin_after_confirmed_buy(
+        &self,
+        intent: &TradeIntent,
+        exec: &ExecutionResult,
+    ) {
+        if exec.status != ExecutionStatus::Confirmed || intent.side != TradeSide::Buy {
+            return;
+        }
+        let Some(pool) = intent.resources.pools.first().filter(|p| !p.is_empty()) else {
+            return;
+        };
+        let mint = intent.resources.output_mint.as_str();
+        if mint.is_empty() {
+            return;
+        }
+        let Some(nats) = self.nats.as_ref() else {
+            return;
+        };
+        let update = MomentumActivePoolsUpdate {
+            version: MOMENTUM_ACTIVE_POOLS_WIRE_VERSION,
+            ts_unix_ms: wall_clock_unix_ms_now(),
+            active: vec![MomentumActivePoolEntry {
+                mint: mint.to_string(),
+                pool: pool.clone(),
+                pin_reason: MomentumActivePinReason::Position,
+            }],
+            removed: vec![],
+            full_active_snapshot: false,
+        };
+        if let Err(e) = nats.publish(TOPIC_MOMENTUM_ACTIVE_POOLS, &update).await {
+            warn!(
+                error = %e,
+                intent_id = %intent.intent_id,
+                mint = %mint,
+                pool = %pool,
+                "Failed to publish open-position pool pin for confirmed BUY"
+            );
+        }
+    }
+
     /// Wallet snapshot: same filter as `PositionEvent::try_from_market_event_kind` (ignores SOL/WSOL for authority open count).
     fn apply_position_authority_from_wallet_event_kind(&self, kind: &MarketEventKind) {
         {
@@ -12308,6 +12350,10 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
             }
             if exec.status == ExecutionStatus::Confirmed {
                 ctx.apply_position_authority_from_execution_result(&exec);
+                if intent.side == TradeSide::Buy {
+                    ctx.publish_open_position_pool_pin_after_confirmed_buy(&intent, &exec)
+                        .await;
+                }
             }
         }
     }

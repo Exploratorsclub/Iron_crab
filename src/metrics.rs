@@ -976,6 +976,12 @@ pub static MARKET_DATA_MOMENTUM_ADMISSION_ADMITTED_TOTAL: Lazy<AtomicU64> =
 /// PR4a: momentum pool groups rejected at admission (no tracked-map mutation).
 pub static MARKET_DATA_MOMENTUM_ADMISSION_REJECTED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Scope C: open-position pool pins applied (vault/bin registration succeeded).
+pub static MARKET_DATA_OPEN_POSITION_PIN_APPLIED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Scope C: open-position pool pins deferred (LivePoolCache miss; registry row kept).
+pub static MARKET_DATA_OPEN_POSITION_PIN_DEFERRED_CACHE_MISS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// PR4a: arb pool groups admitted before tracked-map mutation.
 pub static MARKET_DATA_ARB_ADMISSION_ADMITTED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -1268,6 +1274,16 @@ pub fn inc_market_data_momentum_admission_admitted_total() {
 #[inline]
 pub fn inc_market_data_momentum_admission_rejected_total() {
     MARKET_DATA_MOMENTUM_ADMISSION_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_open_position_pin_applied_total() {
+    MARKET_DATA_OPEN_POSITION_PIN_APPLIED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_open_position_pin_deferred_cache_miss_total() {
+    MARKET_DATA_OPEN_POSITION_PIN_DEFERRED_CACHE_MISS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -6182,6 +6198,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_momentum_admission_rejected_total",
         MARKET_DATA_MOMENTUM_ADMISSION_REJECTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_open_position_pin_applied_total",
+        MARKET_DATA_OPEN_POSITION_PIN_APPLIED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_open_position_pin_deferred_cache_miss_total",
+        MARKET_DATA_OPEN_POSITION_PIN_DEFERRED_CACHE_MISS_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_arb_admission_admitted_total",
