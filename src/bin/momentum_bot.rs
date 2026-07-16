@@ -5956,40 +5956,63 @@ impl MomentumContext {
         let store = store.clone();
         tokio::spawn(async move {
             use futures::StreamExt;
-            let mut watch = match store.watch_all().await {
-                Ok(w) => w,
-                Err(e) => {
-                    error!(error = %e, "PositionAuthority KV watch failed to start");
-                    return;
-                }
-            };
-            info!("PositionAuthority KV watch started");
-            while let Some(entry_res) = watch.next().await {
-                match entry_res {
-                    Ok(entry) => {
-                        let mint = entry.key;
-                        if entry.operation == async_nats::jetstream::kv::Operation::Delete
-                            || entry.value.is_empty()
-                        {
-                            ctx.apply_authority_snapshot_update(&mint, None);
-                            continue;
-                        }
-                        match serde_json::from_slice::<PositionAuthoritySnapshot>(&entry.value) {
-                            Ok(snap) => {
-                                ctx.apply_authority_snapshot_update(&mint, Some(snap));
-                            }
-                            Err(e) => {
-                                warn!(mint = %mint, error = %e, "Invalid PositionAuthority KV payload");
-                            }
-                        }
-                    }
+            use std::time::Duration;
+
+            const WATCH_BACKOFF_INITIAL_MS: u64 = 500;
+            const WATCH_BACKOFF_MAX_MS: u64 = 30_000;
+            let mut backoff_ms = WATCH_BACKOFF_INITIAL_MS;
+
+            loop {
+                let mut watch = match store.watch_all().await {
+                    Ok(w) => w,
                     Err(e) => {
-                        warn!(error = %e, "PositionAuthority KV watch error");
-                        break;
+                        error!(
+                            error = %e,
+                            backoff_ms,
+                            "PositionAuthority KV watch failed to start"
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(WATCH_BACKOFF_MAX_MS);
+                        continue;
+                    }
+                };
+                info!("PositionAuthority KV watch started");
+                backoff_ms = WATCH_BACKOFF_INITIAL_MS;
+
+                while let Some(entry_res) = watch.next().await {
+                    match entry_res {
+                        Ok(entry) => {
+                            let mint = entry.key;
+                            if entry.operation == async_nats::jetstream::kv::Operation::Delete
+                                || entry.value.is_empty()
+                            {
+                                ctx.apply_authority_snapshot_update(&mint, None);
+                                continue;
+                            }
+                            match serde_json::from_slice::<PositionAuthoritySnapshot>(&entry.value)
+                            {
+                                Ok(snap) => {
+                                    ctx.apply_authority_snapshot_update(&mint, Some(snap));
+                                }
+                                Err(e) => {
+                                    warn!(mint = %mint, error = %e, "Invalid PositionAuthority KV payload");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                backoff_ms,
+                                "PositionAuthority KV watch error"
+                            );
+                            break;
+                        }
                     }
                 }
+                warn!(backoff_ms, "PositionAuthority KV watch ended, reconnecting");
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(WATCH_BACKOFF_MAX_MS);
             }
-            warn!("PositionAuthority KV watch ended");
         });
     }
 

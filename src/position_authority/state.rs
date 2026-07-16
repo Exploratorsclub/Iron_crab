@@ -5,6 +5,7 @@
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ipc::schema::{
     ExecutionResult, ExecutionStatus, MarketEventKind, PositionAuthoritySnapshot,
@@ -32,6 +33,18 @@ pub struct PositionState {
     pub sold_raw_total: u64,
     pub status: PositionStatus,
     pub last_update_source: UpdateSource,
+    /// Wall-clock secs of last execution-confirmed BUY/SELL (ghost-cleanup grace).
+    pub last_execution_unix_secs: Option<u64>,
+}
+
+/// Skip ghost cleanup for positions with a recent execution update (stale wallet lists).
+const GHOST_CLEANUP_GRACE_SECS: u64 = 90;
+
+fn unix_secs_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// High-level position lifecycle for PA-1.
@@ -319,12 +332,14 @@ impl PositionAuthority {
                 sold_raw_total: 0,
                 status: PositionStatus::Closed,
                 last_update_source: UpdateSource::Execution,
+                last_execution_unix_secs: None,
             });
         e.decimals = decimals;
         e.token_program = token_program.to_string();
         if let Some(a) = ata {
             e.ata = Some(a.clone());
         }
+        e.last_execution_unix_secs = Some(unix_secs_now());
         e.buy_fills.push(fill_raw);
         e.balance_raw = e.balance_raw.saturating_add(fill_raw);
         e.status = if e.balance_raw == 0 {
@@ -356,9 +371,11 @@ impl PositionAuthority {
                 sold_raw_total: 0,
                 status: PositionStatus::Closed,
                 last_update_source: UpdateSource::Execution,
+                last_execution_unix_secs: None,
             });
         e.decimals = decimals;
         e.token_program = token_program.to_string();
+        e.last_execution_unix_secs = Some(unix_secs_now());
         e.sold_raw_total = e.sold_raw_total.saturating_add(sold_raw);
         let new_bal = e.balance_raw.saturating_sub(sold_raw);
         if sold_raw > e.balance_raw {
@@ -417,6 +434,7 @@ impl PositionAuthority {
                     sold_raw_total: 0,
                     status: PositionStatus::ReconcileNeeded,
                     last_update_source: UpdateSource::WalletSnapshot,
+                    last_execution_unix_secs: None,
                 });
             }
         }
@@ -429,6 +447,7 @@ impl PositionAuthority {
         mints_in_wallet: &[String],
     ) -> Vec<PositionAuthorityChange> {
         let wallet_set: HashSet<&str> = mints_in_wallet.iter().map(|s| s.as_str()).collect();
+        let now_secs = unix_secs_now();
         let ghosts: Vec<String> = self
             .by_mint
             .iter()
@@ -436,6 +455,9 @@ impl PositionAuthority {
                 p.balance_raw > 0
                     && !is_sol_or_wsol_mint(mint)
                     && !wallet_set.contains(mint.as_str())
+                    && p.last_execution_unix_secs
+                        .map(|t| now_secs.saturating_sub(t) >= GHOST_CLEANUP_GRACE_SECS)
+                        .unwrap_or(true)
             })
             .map(|(mint, _)| mint.clone())
             .collect();
@@ -462,6 +484,16 @@ impl PositionAuthority {
             .values()
             .filter(|p| p.balance_raw > 0 && p.status == PositionStatus::ReconcileNeeded)
             .count()
+    }
+}
+
+#[cfg(test)]
+impl PositionAuthority {
+    fn test_backdate_last_execution(&mut self, mint: &str, secs_ago: u64) {
+        let now = unix_secs_now();
+        if let Some(p) = self.by_mint.get_mut(mint) {
+            p.last_execution_unix_secs = Some(now.saturating_sub(secs_ago));
+        }
     }
 }
 
@@ -508,6 +540,25 @@ mod tests {
     }
 
     #[test]
+    fn wallet_snapshot_complete_skips_fresh_execution_ghost() {
+        let m = mint();
+        let ghost = "FreshGhostMintttttttttttttttttttttttttttttt".to_string();
+        let mut a = PositionAuthority::new();
+        a.apply(&buy(&m, 400, 6));
+        a.apply(&buy(&ghost, 200, 6));
+        assert_eq!(a.open_positions_count(), 2);
+
+        let changes = a.apply(&PositionEvent::WalletSnapshotComplete {
+            wallet: "wallet".to_string(),
+            mints_in_wallet: vec![m.clone()],
+            is_periodic: true,
+        });
+        assert_eq!(a.open_positions_count(), 2);
+        assert!(a.get(&ghost).is_some());
+        assert!(changes.is_empty());
+    }
+
+    #[test]
     fn wallet_snapshot_complete_closes_ghost_not_in_wallet() {
         let m = mint();
         let ghost = "GhostMinttttttttttttttttttttttttttttttttttt".to_string();
@@ -515,6 +566,8 @@ mod tests {
         a.apply(&buy(&m, 400, 6));
         a.apply(&buy(&ghost, 200, 6));
         assert_eq!(a.open_positions_count(), 2);
+        // Ghost mint must be older than grace period (matches momentum-bot WalletSnapshotComplete).
+        a.test_backdate_last_execution(&ghost, GHOST_CLEANUP_GRACE_SECS + 1);
 
         let changes = a.apply(&PositionEvent::WalletSnapshotComplete {
             wallet: "wallet".to_string(),
