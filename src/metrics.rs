@@ -1744,6 +1744,14 @@ pub static MARKET_DATA_ACCOUNT_HIGH_PRIORITY_QUEUE_DEPTH: Lazy<AtomicU64> =
 pub static MARKET_DATA_ACCOUNT_LOW_PRIORITY_QUEUE_DEPTH: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// ENRICH coalesce: replaced an existing pending update for the same pubkey (latest-wins).
+pub static MARKET_DATA_ACCOUNT_ENRICH_COALESCE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// ENRICH enqueue dropped after coalesce map at cap (oldest evicted or try_send exhausted).
+pub static MARKET_DATA_ACCOUNT_ENRICH_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// Account ingest: jobs waiting in the dedicated NATS publish `mpsc` (JetStream + core publish).
 pub static MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -2049,6 +2057,16 @@ pub fn inc_market_data_account_low_priority_queue_depth() {
 #[inline]
 pub fn dec_market_data_account_low_priority_queue_depth() {
     MARKET_DATA_ACCOUNT_LOW_PRIORITY_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_enrich_coalesce_total() {
+    MARKET_DATA_ACCOUNT_ENRICH_COALESCE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_enrich_enqueue_dropped_total() {
+    MARKET_DATA_ACCOUNT_ENRICH_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -6952,6 +6970,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_account_low_priority_queue_depth",
         MARKET_DATA_ACCOUNT_LOW_PRIORITY_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_enrich_coalesce_total",
+        MARKET_DATA_ACCOUNT_ENRICH_COALESCE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_enrich_enqueue_dropped_total",
+        MARKET_DATA_ACCOUNT_ENRICH_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_account_publish_queue_depth",
