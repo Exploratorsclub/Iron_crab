@@ -757,6 +757,8 @@ impl UnifiedHotPoolRegistry {
         self.momentum_pairs.write().insert((mint, pool));
         if is_position {
             self.momentum_position_pairs.write().insert((mint, pool));
+        } else {
+            self.momentum_position_pairs.write().remove(&(mint, pool));
         }
     }
 
@@ -12238,6 +12240,67 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(
             vs.get(&coin_vault).and_then(|v| v.pin),
             Some(GeyserPinReason::MomentumActive)
+        );
+    }
+
+    /// Scope C: Tracker downgrade clears position-subset membership while momentum pin remains.
+    #[test]
+    fn scope_c_tracker_downgrade_clears_position_pin_subset() {
+        use ironcrab::nats::{MomentumActivePinReason, MomentumActivePoolEntry};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_mint,
+                token_1_mint: quote,
+                token_0_vault: coin_vault,
+                token_1_vault: pc_vault,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+
+        let mut admission = test_admission_for(&ctx);
+        let position_then_tracker = |pin_reason| MomentumActivePoolsUpdate {
+            version: 1,
+            ts_unix_ms: 1,
+            active: vec![MomentumActivePoolEntry {
+                mint: base_mint.to_string(),
+                pool: pool.to_string(),
+                pin_reason,
+            }],
+            removed: vec![],
+            full_active_snapshot: false,
+        };
+
+        ctx.apply_momentum_active_pools_update(
+            &mut admission,
+            &position_then_tracker(MomentumActivePinReason::Position),
+        );
+        assert!(ctx.hot_pool_registry.is_position_pin(base_mint, pool));
+
+        ctx.apply_momentum_active_pools_update(
+            &mut admission,
+            &position_then_tracker(MomentumActivePinReason::Tracker),
+        );
+        assert!(
+            ctx.hot_pool_registry.is_hot_pool(pool),
+            "momentum pair pin must remain for tracker"
+        );
+        assert!(
+            !ctx.hot_pool_registry.is_position_pin(base_mint, pool),
+            "position subset must clear on tracker downgrade"
         );
     }
 
