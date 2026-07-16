@@ -53,6 +53,33 @@ pub enum AccountGeyserRelevance {
     EarlyDrop(MarketDataAccountEarlyDropReason),
 }
 
+/// Observability class for each Geyser account update at market-data recv (Scope A).
+///
+/// Maps to existing HIGH/LOW worker dispatch without changing queue semantics:
+/// - `Drop` — `account_geyser_update_relevance` early drop (no worker enqueue)
+/// - `ExecHot` — `account_geyser_dispatch_priority_high` (vault/bin/hot-pool pins incl. Arb)
+/// - `Enrich` — relevant but not EXEC_HOT (e.g. wallet token ATA without pin)
+///
+/// Known gap (Scope C): open-position pools without Momentum/Arb pin are often `Enrich`, not
+/// `ExecHot` — do not silently widen HIGH dispatch here; only metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountUpdateClass {
+    ExecHot,
+    Enrich,
+    Drop,
+}
+
+impl AccountUpdateClass {
+    #[inline]
+    pub fn as_prometheus_label(self) -> &'static str {
+        match self {
+            Self::ExecHot => "exec_hot",
+            Self::Enrich => "enrich",
+            Self::Drop => "drop",
+        }
+    }
+}
+
 /// Cheap filter before DEX parse / heavy locks: drop clearly irrelevant account updates.
 /// Conservative: any DEX program owner we parse in `parse_pool_account` / `parse_account_update` stays in.
 pub fn account_geyser_update_relevance<H: IngestHost>(
@@ -101,6 +128,27 @@ pub fn account_geyser_update_might_be_relevant<H: IngestHost>(
     )
 }
 
+/// Classify a Geyser account update for lag/throughput metrics (reuses relevance + HIGH logic).
+///
+/// Returns `(class, early_drop_reason)` from a single relevance evaluation so recv-loop
+/// metrics cannot diverge from enqueue decisions when ingest membership changes concurrently.
+pub fn classify_account_geyser_update<H: IngestHost>(
+    host: &H,
+    u: &GeyserAccountUpdate,
+) -> (AccountUpdateClass, Option<MarketDataAccountEarlyDropReason>) {
+    match account_geyser_update_relevance(host, u) {
+        AccountGeyserRelevance::EarlyDrop(reason) => (AccountUpdateClass::Drop, Some(reason)),
+        AccountGeyserRelevance::Relevant => {
+            let class = if account_geyser_dispatch_priority_high(host, u) {
+                AccountUpdateClass::ExecHot
+            } else {
+                AccountUpdateClass::Enrich
+            };
+            (class, None)
+        }
+    }
+}
+
 /// Strategic HIGH admission for account worker sharding (ACCOUNT-PATH-TX-PARITY-CREATOR).
 pub fn account_geyser_dispatch_priority_high<H: IngestHost>(
     host: &H,
@@ -143,7 +191,21 @@ mod tests {
     struct MockIngestHost {
         membership: HashSet<Pubkey>,
         enrichment_members: HashSet<Pubkey>,
+        hot_pools: HashSet<Pubkey>,
+        tracked_wallet_token_accounts: HashSet<Pubkey>,
         pumpfun_wallet_track: HashSet<Pubkey>,
+    }
+
+    impl MockIngestHost {
+        fn new() -> Self {
+            Self {
+                membership: HashSet::new(),
+                enrichment_members: HashSet::new(),
+                hot_pools: HashSet::new(),
+                tracked_wallet_token_accounts: HashSet::new(),
+                pumpfun_wallet_track: HashSet::new(),
+            }
+        }
     }
 
     impl IngestHost for MockIngestHost {
@@ -151,8 +213,8 @@ mod tests {
             None
         }
 
-        fn ingest_tracked_wallet_token_account_contains(&self, _pubkey: &Pubkey) -> bool {
-            false
+        fn ingest_tracked_wallet_token_account_contains(&self, pubkey: &Pubkey) -> bool {
+            self.tracked_wallet_token_accounts.contains(pubkey)
         }
 
         fn ingest_membership_contains(&self, pubkey: &Pubkey) -> bool {
@@ -167,12 +229,12 @@ mod tests {
             false
         }
 
-        fn ingest_is_hot_pool(&self, _pool: &Pubkey) -> bool {
-            false
+        fn ingest_is_hot_pool(&self, pool: &Pubkey) -> bool {
+            self.hot_pools.contains(pool)
         }
 
         fn ingest_is_enrichment_member(&self, pool: &Pubkey) -> bool {
-            self.enrichment_members.contains(pool)
+            self.enrichment_members.contains(pool) || self.hot_pools.contains(pool)
         }
 
         fn ingest_pool_mint_map_contains(&self, pool: &Pubkey) -> bool {
@@ -215,11 +277,7 @@ mod tests {
 
     #[test]
     fn account_geyser_update_relevance_non_enrichment_dex_pool() {
-        let host = MockIngestHost {
-            membership: HashSet::new(),
-            enrichment_members: HashSet::new(),
-            pumpfun_wallet_track: HashSet::new(),
-        };
+        let host = MockIngestHost::new();
         let pool = Pubkey::new_unique();
         let u = sample_update(pool, RAYDIUM_CPMM_OWNER);
         assert_eq!(
@@ -233,11 +291,7 @@ mod tests {
 
     #[test]
     fn account_geyser_update_relevance_random_non_dex_pubkey() {
-        let host = MockIngestHost {
-            membership: HashSet::new(),
-            enrichment_members: HashSet::new(),
-            pumpfun_wallet_track: HashSet::new(),
-        };
+        let host = MockIngestHost::new();
         let pubkey = Pubkey::new_unique();
         let u = sample_update(pubkey, Pubkey::new_unique());
         assert_eq!(
@@ -252,16 +306,59 @@ mod tests {
     #[test]
     fn account_geyser_update_relevance_membership_explicit_vault_no_early_drop() {
         let vault = Pubkey::new_unique();
-        let host = MockIngestHost {
-            membership: HashSet::from([vault]),
-            enrichment_members: HashSet::new(),
-            pumpfun_wallet_track: HashSet::new(),
-        };
+        let mut host = MockIngestHost::new();
+        host.membership.insert(vault);
         let u = sample_update(vault, Pubkey::new_unique());
         assert_eq!(
             account_geyser_update_relevance(&host, &u),
             AccountGeyserRelevance::Relevant
         );
         assert!(account_geyser_update_might_be_relevant(&host, &u));
+    }
+
+    #[test]
+    fn classify_account_geyser_update_exec_hot_via_hot_pool_pin() {
+        let pool = Pubkey::new_unique();
+        let mut host = MockIngestHost::new();
+        host.hot_pools.insert(pool);
+        let u = sample_update(pool, RAYDIUM_CPMM_OWNER);
+        let (class, early_drop_reason) = classify_account_geyser_update(&host, &u);
+        assert_eq!(class, AccountUpdateClass::ExecHot);
+        assert_eq!(early_drop_reason, None);
+    }
+
+    #[test]
+    fn classify_account_geyser_update_exec_hot_via_arb_hot_pool_equivalent() {
+        let pool = Pubkey::new_unique();
+        let mut host = MockIngestHost::new();
+        host.hot_pools.insert(pool);
+        let u = sample_update(pool, ORCA_WHIRLPOOL_OWNER);
+        let (class, early_drop_reason) = classify_account_geyser_update(&host, &u);
+        assert_eq!(class, AccountUpdateClass::ExecHot);
+        assert_eq!(early_drop_reason, None);
+    }
+
+    #[test]
+    fn classify_account_geyser_update_enrich_membership_mint_without_high_dispatch() {
+        let mint = Pubkey::new_unique();
+        let mut host = MockIngestHost::new();
+        host.membership.insert(mint);
+        let u = sample_update(mint, Pubkey::new_unique());
+        let (class, early_drop_reason) = classify_account_geyser_update(&host, &u);
+        assert_eq!(class, AccountUpdateClass::Enrich);
+        assert_eq!(early_drop_reason, None);
+    }
+
+    #[test]
+    fn classify_account_geyser_update_drop_non_enrichment_dex_pool() {
+        let host = MockIngestHost::new();
+        let pool = Pubkey::new_unique();
+        let u = sample_update(pool, RAYDIUM_CPMM_OWNER);
+        let (class, early_drop_reason) = classify_account_geyser_update(&host, &u);
+        assert_eq!(class, AccountUpdateClass::Drop);
+        assert_eq!(
+            early_drop_reason,
+            Some(MarketDataAccountEarlyDropReason::DexPoolNotEnrichment)
+        );
     }
 }

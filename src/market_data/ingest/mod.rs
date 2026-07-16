@@ -11,7 +11,7 @@ pub mod tx_parse;
 pub use account_filter::{
     account_geyser_dispatch_priority_high, account_geyser_update_is_dex_pool_owner,
     account_geyser_update_might_be_relevant, account_geyser_update_relevance,
-    AccountGeyserRelevance,
+    classify_account_geyser_update, AccountGeyserRelevance, AccountUpdateClass,
 };
 pub use account_handler::handle_geyser_account_update;
 pub use account_host::{AccountBinArrayView, AccountIngestHost, AccountTrackedWalletView};
