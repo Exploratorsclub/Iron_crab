@@ -457,7 +457,7 @@ impl PositionAuthority {
                     && !wallet_set.contains(mint.as_str())
                     && p.last_execution_unix_secs
                         .map(|t| now_secs.saturating_sub(t) >= GHOST_CLEANUP_GRACE_SECS)
-                        .unwrap_or(true)
+                        .unwrap_or(false)
             })
             .map(|(mint, _)| mint.clone())
             .collect();

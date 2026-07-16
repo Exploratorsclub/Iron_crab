@@ -5873,6 +5873,27 @@ impl MomentumContext {
         mint: &str,
         snap: Option<PositionAuthoritySnapshot>,
     ) {
+        const GHOST_CLEANUP_GRACE_SECS: u64 = 90;
+
+        let closed = Self::authority_signals_closed(snap.as_ref());
+        if closed && self.positions.read().contains_key(mint) {
+            let hold_secs = self
+                .positions
+                .read()
+                .get(mint)
+                .map(|p| p.entry_time.elapsed().as_secs())
+                .unwrap_or(u64::MAX);
+            if hold_secs < GHOST_CLEANUP_GRACE_SECS {
+                warn!(
+                    mint = %mint,
+                    hold_secs,
+                    grace_secs = GHOST_CLEANUP_GRACE_SECS,
+                    "Authority close skipped: overlay too fresh (grace period)"
+                );
+                return;
+            }
+        }
+
         {
             let mut cache = self.authority_by_mint.write();
             match snap {
@@ -5885,10 +5906,6 @@ impl MomentumContext {
             }
         }
         self.refresh_position_authority_drift_metrics();
-        let closed = {
-            let cache = self.authority_by_mint.read();
-            Self::authority_signals_closed(cache.get(mint))
-        };
         if closed && self.positions.read().contains_key(mint) {
             self.close_position_by_authority(mint, "authority_closed_or_tombstoned");
         }
@@ -19726,6 +19743,11 @@ mod tests {
             entry_confirmed_slot: 1,
             initial_bonding: None,
         });
+        ctx.positions
+            .write()
+            .get_mut(mint)
+            .expect("position")
+            .set_entry_time_ago(std::time::Duration::from_secs(91));
 
         Arc::clone(&ctx).apply_authority_snapshot_update(
             mint,
