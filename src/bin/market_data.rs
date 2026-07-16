@@ -7219,8 +7219,14 @@ impl AccountEnrichCoalesceShard {
         }
     }
 
-    fn pending_count(&self) -> usize {
-        self.pending.len() + self.in_mpsc.len()
+    /// Logical depth: unique pubkeys in `pending ∪ in_mpsc` (no double-count when both hold the same key).
+    fn unique_pending_pubkey_count(&self) -> usize {
+        self.pending.len()
+            + self
+                .in_mpsc
+                .iter()
+                .filter(|pk| !self.pending.contains_key(pk))
+                .count()
     }
 }
 
@@ -7242,13 +7248,46 @@ enum AccountEnrichCoalesceUpsert {
     Coalesced,
     /// Incoming update is older than what we already hold.
     StaleDiscarded,
-    /// Evicted oldest pending pubkey to make room; incoming item stored.
+    /// Evicted oldest pending-only pubkey to make room; incoming item stored.
     EvictedOldest,
+}
+
+/// Evict the pending-only entry with the oldest slot (ties: `grpc_recv_at`, then `recv_at`).
+/// Never evicts a pending supersede for a pubkey still listed in `in_mpsc`.
+fn account_enrich_evict_oldest_pending_only(shard: &mut AccountEnrichCoalesceShard) -> bool {
+    let drop_pk = shard
+        .pending
+        .iter()
+        .filter(|(pk, _)| !shard.in_mpsc.contains(*pk))
+        .min_by(|(_, a), (_, b)| {
+            (a.update.slot, a.update.grpc_recv_at, a.recv_at).cmp(&(
+                b.update.slot,
+                b.update.grpc_recv_at,
+                b.recv_at,
+            ))
+        })
+        .map(|(pk, _)| *pk);
+    let Some(drop_pk) = drop_pk else {
+        return false;
+    };
+    shard.pending.remove(&drop_pk);
+    dec_market_data_account_low_priority_queue_depth();
+    dec_market_data_account_worker_queue_depth();
+    inc_market_data_account_enrich_enqueue_dropped_total();
+    true
 }
 
 fn account_enrich_coalesce_upsert(
     shard: &mut AccountEnrichCoalesceShard,
     work: AccountWorkItem,
+) -> AccountEnrichCoalesceUpsert {
+    account_enrich_coalesce_upsert_with_cap(shard, work, MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP)
+}
+
+fn account_enrich_coalesce_upsert_with_cap(
+    shard: &mut AccountEnrichCoalesceShard,
+    work: AccountWorkItem,
+    cap: usize,
 ) -> AccountEnrichCoalesceUpsert {
     let pk = work.update.pubkey;
     if let Some(existing) = shard.pending.get(&pk) {
@@ -7263,12 +7302,8 @@ fn account_enrich_coalesce_upsert(
         return AccountEnrichCoalesceUpsert::Coalesced;
     }
     let mut evicted = false;
-    if shard.pending_count() >= MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP {
-        if let Some(drop_pk) = shard.pending.keys().next().copied() {
-            shard.pending.remove(&drop_pk);
-            dec_market_data_account_low_priority_queue_depth();
-            dec_market_data_account_worker_queue_depth();
-            inc_market_data_account_enrich_enqueue_dropped_total();
+    if shard.unique_pending_pubkey_count() >= cap {
+        if account_enrich_evict_oldest_pending_only(shard) {
             evicted = true;
         } else {
             inc_market_data_account_enrich_enqueue_dropped_total();
@@ -12603,14 +12638,94 @@ mod pr_b_geyser_tracking_tests {
         ));
         inc_market_data_account_enrich_coalesce_total();
         assert_eq!(shard.pending.get(&pk).unwrap().update.slot, 2);
-        assert_eq!(shard.pending_count(), 1);
+        assert_eq!(shard.unique_pending_pubkey_count(), 1);
         account_enrich_coalesce_try_flush(&mut shard, &low_tx);
         assert_eq!(shard.in_mpsc.len(), 1);
         assert!(shard.pending.is_empty());
         assert_eq!(
-            shard.pending_count(),
+            shard.unique_pending_pubkey_count(),
             1,
             "one logical pending pubkey after flush"
+        );
+    }
+
+    #[test]
+    fn account_enrich_unique_count_not_double_in_mpsc_and_pending() {
+        let mut shard = AccountEnrichCoalesceShard::new();
+        let pk = Pubkey::new_unique();
+        shard.in_mpsc.insert(pk);
+        shard.pending.insert(
+            pk,
+            AccountWorkItem {
+                update: GeyserAccountUpdate {
+                    pubkey: pk,
+                    slot: 2,
+                    owner: PUMPFUN_PROGRAM_OWNER,
+                    data: vec![],
+                    lamports: 0,
+                    grpc_recv_at: Instant::now(),
+                },
+                recv_at: Instant::now(),
+            },
+        );
+        assert_eq!(shard.unique_pending_pubkey_count(), 1);
+        assert_eq!(shard.unique_pending_pubkey_count(), 1);
+    }
+
+    #[test]
+    fn account_enrich_cap_eviction_preserves_in_flight_supersede() {
+        const CAP: usize = 4;
+        let mut shard = AccountEnrichCoalesceShard::new();
+        let pk_a = Pubkey::new_unique();
+        let mut stale_keys = Vec::new();
+        let mk = |pk: Pubkey, slot: u64| AccountWorkItem {
+            update: GeyserAccountUpdate {
+                pubkey: pk,
+                slot,
+                owner: PUMPFUN_PROGRAM_OWNER,
+                data: vec![],
+                lamports: 0,
+                grpc_recv_at: Instant::now(),
+            },
+            recv_at: Instant::now(),
+        };
+        for slot in 0..3 {
+            let pk = Pubkey::new_unique();
+            stale_keys.push(pk);
+            assert!(matches!(
+                account_enrich_coalesce_upsert_with_cap(&mut shard, mk(pk, slot), CAP),
+                AccountEnrichCoalesceUpsert::NewPending
+            ));
+        }
+        shard.in_mpsc.insert(pk_a);
+        assert!(matches!(
+            account_enrich_coalesce_upsert_with_cap(&mut shard, mk(pk_a, 10), CAP),
+            AccountEnrichCoalesceUpsert::Coalesced
+        ));
+        assert_eq!(shard.unique_pending_pubkey_count(), CAP);
+        assert_eq!(shard.pending.get(&pk_a).unwrap().update.slot, 10);
+
+        let pk_b = Pubkey::new_unique();
+        assert!(matches!(
+            account_enrich_coalesce_upsert_with_cap(&mut shard, mk(pk_b, 20), CAP),
+            AccountEnrichCoalesceUpsert::EvictedOldest
+        ));
+        assert_eq!(
+            shard.pending.get(&pk_a).unwrap().update.slot,
+            10,
+            "in-flight supersede for A must survive cap eviction"
+        );
+        assert!(
+            shard.pending.contains_key(&pk_b),
+            "new pubkey B must be admitted after evicting a pending-only stale key"
+        );
+        let evicted_stale = stale_keys
+            .iter()
+            .filter(|pk| !shard.pending.contains_key(pk))
+            .count();
+        assert_eq!(
+            evicted_stale, 1,
+            "exactly one pending-only stale pubkey should be evicted"
         );
     }
 
@@ -12639,13 +12754,13 @@ mod pr_b_geyser_tracking_tests {
                     | AccountEnrichCoalesceUpsert::EvictedOldest
             ));
             assert!(
-                shard.pending_count() <= MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP,
+                shard.unique_pending_pubkey_count() <= MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP,
                 "coalesce shard must stay within cap after upsert {i}"
             );
         }
         account_enrich_coalesce_try_flush(&mut shard, &low_tx);
         assert!(
-            shard.pending_count() <= MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP,
+            shard.unique_pending_pubkey_count() <= MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP,
             "coalesce shard pending must stay within cap after flush"
         );
     }
