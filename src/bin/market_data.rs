@@ -4090,6 +4090,31 @@ impl MarketDataContext {
         vaults_changed
     }
 
+    /// True when expected vault rows for a hot pool are already registered with sibling links.
+    fn pool_vaults_fully_tracked_for_hot_pool(&self, pool: Pubkey) -> bool {
+        let Some(state) = self.live_pool_cache.get(&pool) else {
+            return false;
+        };
+        let (enable_meteora_cpmm, enable_meteora_dlmm) = {
+            let cfg = self.config.read();
+            (cfg.enable_meteora_cpmm, cfg.enable_meteora_dlmm)
+        };
+        let Some((base_vault, quote_vault)) = expected_pool_vault_pubkeys_from_cache(
+            &state,
+            enable_meteora_cpmm,
+            enable_meteora_dlmm,
+        ) else {
+            return true;
+        };
+        let vaults = self.tracked_vaults.read();
+        vaults
+            .get(&base_vault)
+            .is_some_and(|v| v.pool_address == pool && v.sibling_vault == Some(quote_vault))
+            && vaults
+                .get(&quote_vault)
+                .is_some_and(|v| v.pool_address == pool && v.sibling_vault == Some(base_vault))
+    }
+
     /// PR169a: register vault ATAs from MASTER cache after account-path pool upsert (hot pools only).
     #[cfg_attr(not(test), allow(dead_code))]
     fn register_pool_vaults_from_account(&self, pool: Pubkey) -> bool {
@@ -4097,7 +4122,13 @@ impl MarketDataContext {
         if !self.hot_pool_registry.is_hot_pool(pool) {
             return false;
         }
-        if self.live_pool_cache.get(&pool).is_none() {
+        let Some(state) = self.live_pool_cache.get(&pool) else {
+            return false;
+        };
+        let Some((base_mint, quote_mint)) = pool_mints_for_geyser_explicit_tracking(&state) else {
+            return false;
+        };
+        if !self.admit_geyser_explicit_pool_assets(pool, base_mint, quote_mint) {
             return false;
         }
         let pin = if self.hot_pool_registry.pool_has_arb(pool) {
@@ -4107,7 +4138,7 @@ impl MarketDataContext {
         };
         let before_keys = self.snapshot_explicit_demand_pubkeys();
         let changed = self.register_geyser_reserves_impl(pool, pin);
-        if changed {
+        if changed || self.pool_vaults_fully_tracked_for_hot_pool(pool) {
             self.clear_deferred_hot_pool_reserve_registration(pool);
         }
         changed
@@ -4183,12 +4214,16 @@ impl MarketDataContext {
                 }
             };
             let _ = self.try_admit_pool_consumer_group(admission, pool, consumer);
-            if self.register_geyser_reserves_for_active_pool(pool, pin) {
+            let changed = self.register_geyser_reserves_for_active_pool(pool, pin);
+            let reserves_satisfied = changed || self.pool_vaults_fully_tracked_for_hot_pool(pool);
+            if reserves_satisfied {
                 self.clear_deferred_hot_pool_reserve_registration(pool);
                 if self.hot_pool_registry.is_position_pin_for_pool(pool) {
                     inc_market_data_open_position_pin_applied_total();
                 }
-                batch_dirty = true;
+                if changed {
+                    batch_dirty = true;
+                }
             }
             self.sync_explicit_pool_admitted_from_admission(admission, pool, consumer);
         }
@@ -4213,6 +4248,11 @@ impl MarketDataContext {
             self.note_deferred_hot_pool_reserve_registration(pool, pin);
             if is_position {
                 inc_market_data_open_position_pin_deferred_cache_miss_total();
+            }
+        } else if self.pool_vaults_fully_tracked_for_hot_pool(pool) {
+            self.clear_deferred_hot_pool_reserve_registration(pool);
+            if is_position {
+                inc_market_data_open_position_pin_applied_total();
             }
         }
     }
