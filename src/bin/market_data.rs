@@ -2566,35 +2566,41 @@ impl MarketDataContext {
         *self.explicit_admitted_arb_pools.write() = arb;
     }
 
+    fn sync_explicit_momentum_pool_admitted_from_admission(
+        &self,
+        admission: &FixedCapAdmission,
+        pool: Pubkey,
+    ) {
+        let momentum_admitted = admission
+            .owner_group(&Self::pool_consumer_owner(pool, ExplicitConsumer::Momentum))
+            .is_some();
+        let position_admitted = admission
+            .owner_group(&Self::pool_consumer_owner(
+                pool,
+                ExplicitConsumer::MomentumPosition,
+            ))
+            .is_some();
+        if momentum_admitted || position_admitted {
+            self.note_explicit_momentum_pool_admitted(pool);
+        } else {
+            self.clear_explicit_momentum_pool_admitted(pool);
+        }
+    }
+
     fn sync_explicit_pool_admitted_from_admission(
         &self,
         admission: &FixedCapAdmission,
         pool: Pubkey,
         consumer: ExplicitConsumer,
     ) {
-        let owner = Self::pool_consumer_owner(pool, consumer);
-        let admitted = admission.owner_group(&owner).is_some();
         match consumer {
             ExplicitConsumer::Momentum | ExplicitConsumer::MomentumPosition => {
-                if admitted {
-                    self.note_explicit_momentum_pool_admitted(pool);
-                } else {
-                    let other = if consumer == ExplicitConsumer::Momentum {
-                        ExplicitConsumer::MomentumPosition
-                    } else {
-                        ExplicitConsumer::Momentum
-                    };
-                    let other_admitted = admission
-                        .owner_group(&Self::pool_consumer_owner(pool, other))
-                        .is_some();
-                    if other_admitted {
-                        self.note_explicit_momentum_pool_admitted(pool);
-                    } else {
-                        self.clear_explicit_momentum_pool_admitted(pool);
-                    }
-                }
+                self.sync_explicit_momentum_pool_admitted_from_admission(admission, pool);
             }
             ExplicitConsumer::Arb => {
+                let admitted = admission
+                    .owner_group(&Self::pool_consumer_owner(pool, consumer))
+                    .is_some();
                 if admitted {
                     self.note_explicit_arb_pool_admitted(pool);
                 } else {
@@ -2787,7 +2793,7 @@ impl MarketDataContext {
         let _ = admission.remove_group(Self::pool_consumer_owner(pool, consumer));
         match consumer {
             ExplicitConsumer::Momentum | ExplicitConsumer::MomentumPosition => {
-                self.clear_explicit_momentum_pool_admitted(pool)
+                self.sync_explicit_momentum_pool_admitted_from_admission(admission, pool);
             }
             ExplicitConsumer::Arb => self.clear_explicit_arb_pool_admitted(pool),
             ExplicitConsumer::Wallet | ExplicitConsumer::Tracker => {}
@@ -4623,6 +4629,17 @@ impl MarketDataContext {
             } else {
                 ExplicitConsumer::Momentum
             };
+            let superseded_consumer = if is_position {
+                ExplicitConsumer::Momentum
+            } else {
+                ExplicitConsumer::MomentumPosition
+            };
+            if admission
+                .owner_group(&Self::pool_consumer_owner(pool_pk, superseded_consumer))
+                .is_some()
+            {
+                self.release_pool_consumer_group(admission, pool_pk, superseded_consumer);
+            }
             if self.try_admit_pool_consumer_group(admission, pool_pk, momentum_consumer) {
                 inc_market_data_momentum_admission_admitted_total();
                 let registered = self.register_geyser_reserves_for_momentum_active_pool(pool_pk);
@@ -12594,6 +12611,7 @@ mod pr_b_geyser_tracking_tests {
     /// Scope C: Tracker downgrade clears position-subset membership while momentum pin remains.
     #[test]
     fn scope_c_tracker_downgrade_clears_position_pin_subset() {
+        use ironcrab::market_data::track::{ExplicitConsumer, ExplicitOwner, ExplicitOwnerKey};
         use ironcrab::nats::{MomentumActivePinReason, MomentumActivePoolEntry};
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -12650,6 +12668,75 @@ mod pr_b_geyser_tracking_tests {
             !ctx.hot_pool_registry.is_position_pin(base_mint, pool),
             "position subset must clear on tracker downgrade"
         );
+        let momentum_owner = ExplicitOwner {
+            consumer: ExplicitConsumer::Momentum,
+            owner_key: ExplicitOwnerKey::Pool(pool),
+        };
+        let position_owner = ExplicitOwner {
+            consumer: ExplicitConsumer::MomentumPosition,
+            owner_key: ExplicitOwnerKey::Pool(pool),
+        };
+        assert!(
+            admission.owner_group(&position_owner).is_none(),
+            "tracker downgrade must release MomentumPosition admission owner"
+        );
+        assert!(
+            admission.owner_group(&momentum_owner).is_some(),
+            "tracker downgrade must admit Momentum consumer group"
+        );
+        assert!(ctx.pool_has_explicit_momentum_admission(pool));
+    }
+
+    /// Scope C: releasing one momentum consumer must not clear bypass while sibling remains.
+    #[test]
+    fn release_pool_consumer_group_keeps_bypass_while_sibling_momentum_consumer_admitted() {
+        use ironcrab::market_data::track::{
+            try_admit_owner_group, ExplicitConsumer, ExplicitOwner, ExplicitOwnerKey,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+        let position_owner = ExplicitOwner {
+            consumer: ExplicitConsumer::MomentumPosition,
+            owner_key: ExplicitOwnerKey::Pool(pool),
+        };
+        let momentum_owner = ExplicitOwner {
+            consumer: ExplicitConsumer::Momentum,
+            owner_key: ExplicitOwnerKey::Pool(pool),
+        };
+
+        let mut admission = FixedCapAdmission::new(100);
+        assert!(try_admit_owner_group(
+            &mut admission,
+            position_owner.clone(),
+            vec![coin, pc],
+        ));
+        assert!(try_admit_owner_group(
+            &mut admission,
+            momentum_owner.clone(),
+            vec![coin, pc],
+        ));
+        ctx.note_explicit_momentum_pool_admitted(pool);
+        assert!(ctx.pool_has_explicit_momentum_admission(pool));
+
+        ctx.release_pool_consumer_group(&mut admission, pool, ExplicitConsumer::MomentumPosition);
+        assert!(
+            admission.owner_group(&momentum_owner).is_some(),
+            "Momentum owner must remain after releasing MomentumPosition"
+        );
+        assert!(
+            ctx.pool_has_explicit_momentum_admission(pool),
+            "bypass gate must stay while sibling Momentum consumer remains"
+        );
+
+        ctx.release_pool_consumer_group(&mut admission, pool, ExplicitConsumer::Momentum);
+        assert!(!ctx.pool_has_explicit_momentum_admission(pool));
     }
 
     #[test]
