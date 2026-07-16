@@ -2436,6 +2436,9 @@ pub static MOMENTUM_ORPHAN_SCALE_IN_RECOVERY_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static MOMENTUM_EXIT_AMOUNT_OVERLAY_ONLY_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// PA-5.1: overlay closed because PositionAuthority signaled closed/absent/zero.
+pub static MOMENTUM_OVERLAY_CLOSED_BY_AUTHORITY_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 pub static MOMENTUM_SCALE_IN_GATE_BLOCKED_MISSING_PROBE_STATE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -2458,6 +2461,16 @@ pub fn record_momentum_orphan_scale_in_recovery_total() {
 #[inline]
 pub fn record_momentum_exit_amount_overlay_only_total() {
     MOMENTUM_EXIT_AMOUNT_OVERLAY_ONLY_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_momentum_overlay_closed_by_authority_total() {
+    MOMENTUM_OVERLAY_CLOSED_BY_AUTHORITY_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_position_authority_drift_momentum(drift: i64) {
+    POSITION_AUTHORITY_DRIFT_MOMENTUM.store(drift, Ordering::Relaxed);
 }
 
 /// Per-mint signed divergence: `position.token_amount_raw - wallet_snapshot.balance_raw`.
@@ -5222,6 +5235,8 @@ pub static POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// `authority_open - lockmanager_open` (signed; Prometheus scalar).
 pub static POSITION_AUTHORITY_DRIFT_LOCKMANAGER: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
+/// PA-5.1: `authority_open - momentum_overlay_count` (signed; Prometheus scalar).
+pub static POSITION_AUTHORITY_DRIFT_MOMENTUM: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
 pub static CONCURRENT_INTENTS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// Pending TradeIntents in `intent_rx` between JetStream enqueue and dispatcher recv.
 pub static EXECUTION_INTENT_RX_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -6990,6 +7005,10 @@ async fn metrics_response() -> Response<Body> {
         MOMENTUM_EXIT_AMOUNT_OVERLAY_ONLY_TOTAL.load(Ordering::Relaxed)
     );
     line!(
+        "momentum_overlay_closed_by_authority_total",
+        MOMENTUM_OVERLAY_CLOSED_BY_AUTHORITY_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
         "momentum_wallet_balance_divergence_total",
         MOMENTUM_WALLET_BALANCE_DIVERGENCE_TOTAL.load(Ordering::Relaxed)
     );
@@ -8517,6 +8536,10 @@ async fn metrics_response() -> Response<Body> {
     out.push_str(&format!(
         "position_authority_drift_lockmanager {}\n",
         POSITION_AUTHORITY_DRIFT_LOCKMANAGER.load(Ordering::Relaxed)
+    ));
+    out.push_str(&format!(
+        "position_authority_drift_momentum {}\n",
+        POSITION_AUTHORITY_DRIFT_MOMENTUM.load(Ordering::Relaxed)
     ));
     line!(
         "concurrent_intents",
