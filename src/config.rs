@@ -225,7 +225,7 @@ pub struct MarketDataGeyserCfg {
 }
 
 fn default_max_tracked_accounts() -> usize {
-    25_000
+    500_000
 }
 
 fn default_geyser_full_reconnect_threshold() -> usize {
