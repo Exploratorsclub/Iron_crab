@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ExplicitConsumer {
     Wallet,
+    /// Open-position pool pin (Scope C): higher eviction protection than [`Self::Momentum`].
+    MomentumPosition,
     Momentum,
     Arb,
     Tracker,

@@ -4268,6 +4268,11 @@ impl MomentumContext {
                     hold_secs,
                     "🧭 Orphaned mint reconciled into position (pool now known)"
                 );
+                self.queue_momentum_active_pool_active(
+                    mint,
+                    &reconciled.pool,
+                    MomentumActivePinReason::Position,
+                );
             }
         }
     }
@@ -4338,6 +4343,11 @@ impl MomentumContext {
                         dex = %reconciled.dex,
                         balance_raw,
                         "Orphaned mint reconciled into position (pool discovered via trade)"
+                    );
+                    self.queue_momentum_active_pool_active(
+                        mint,
+                        &reconciled.pool,
+                        MomentumActivePinReason::Position,
                     );
                 }
             }
@@ -12370,6 +12380,26 @@ mod tests {
 
     fn empty_test_context(jsonl_writer: QueuedJsonlWriter) -> Arc<MomentumContext> {
         empty_test_context_with_config(jsonl_writer, MomentumConfig::default())
+    }
+
+    /// FIX-37: orphan reconcile via trade auto-register must queue Position active-pool pin.
+    #[test]
+    fn fix37_orphan_trade_reconcile_queues_position_active_pool_pin() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        ctx.orphaned_mints
+            .write()
+            .insert("mint".to_string(), (1_000_000, 6));
+        ctx.update_pool_trade_data("mint", "pool", "raydium", 1_000_000_000, 1_000_000, 1);
+
+        assert!(ctx.positions.read().contains_key("mint"));
+        let q = ctx.momentum_active_pool_publish_queue.lock();
+        assert_eq!(q.active.len(), 1);
+        assert_eq!(q.active[0].mint, "mint");
+        assert_eq!(q.active[0].pool, "pool");
+        assert_eq!(q.active[0].pin_reason, MomentumActivePinReason::Position);
     }
 
     #[tokio::test]
@@ -21131,6 +21161,12 @@ async fn process_market_event(
                         "🧭 Wallet snapshot reconciled into position (timed exit will apply)"
                     );
                     ctx.save_position_to_kv(mint, &reconciled).await;
+                    ctx.queue_momentum_active_pool_active(
+                        mint,
+                        &reconciled.pool,
+                        MomentumActivePinReason::Position,
+                    );
+                    ctx.flush_momentum_active_pool_publish_queue();
                     return Ok(true);
                 } else {
                     // Wallet has tokens but no pool known yet. Store as orphaned so

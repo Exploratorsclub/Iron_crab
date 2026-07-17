@@ -4738,6 +4738,7 @@ mod tests {
         Tracker,
         Arb,
         Momentum,
+        MomentumPosition,
     }
 
     impl RefOraclePolicyTier {
@@ -4746,6 +4747,7 @@ mod tests {
                 Self::Tracker => EvictionTier::Tracker,
                 Self::Arb => EvictionTier::Arb,
                 Self::Momentum => EvictionTier::Momentum,
+                Self::MomentumPosition => EvictionTier::MomentumPosition,
             }
         }
 
@@ -4753,9 +4755,13 @@ mod tests {
             match consumer {
                 ExplicitConsumer::Tracker => &[Self::Tracker],
                 ExplicitConsumer::Arb => &[Self::Tracker, Self::Arb],
-                ExplicitConsumer::Momentum | ExplicitConsumer::Wallet => {
-                    &[Self::Tracker, Self::Arb, Self::Momentum]
-                }
+                ExplicitConsumer::Momentum => &[Self::Tracker, Self::Arb, Self::Momentum],
+                ExplicitConsumer::MomentumPosition | ExplicitConsumer::Wallet => &[
+                    Self::Tracker,
+                    Self::Arb,
+                    Self::Momentum,
+                    Self::MomentumPosition,
+                ],
             }
         }
 
@@ -4767,6 +4773,12 @@ mod tests {
                     ExplicitConsumer::Tracker,
                     ExplicitConsumer::Arb,
                     ExplicitConsumer::Momentum,
+                ],
+                Self::MomentumPosition => &[
+                    ExplicitConsumer::Tracker,
+                    ExplicitConsumer::Arb,
+                    ExplicitConsumer::Momentum,
+                    ExplicitConsumer::MomentumPosition,
                 ],
             }
         }
@@ -4786,6 +4798,7 @@ mod tests {
                 ExplicitConsumer::Tracker => 0,
                 ExplicitConsumer::Arb => 1,
                 ExplicitConsumer::Momentum => 2,
+                ExplicitConsumer::MomentumPosition => 3,
                 ExplicitConsumer::Wallet => u8::MAX,
             }
         }

@@ -139,6 +139,11 @@ pub trait TrackWorkerContext: Send + Sync {
         admission: &mut FixedCapAdmission,
         new_cap: usize,
     ) -> CapShrinkResult;
+    /// Scope C: retry vault/bin registration for hot pools deferred on LivePoolCache miss.
+    fn retry_deferred_hot_pool_reserve_registrations(
+        &self,
+        admission: &mut FixedCapAdmission,
+    ) -> bool;
 }
 
 #[derive(Clone)]
@@ -220,6 +225,7 @@ pub fn apply_momentum_active_pools_on_track_worker<C: TrackWorkerContext>(
         batch_dirty |= ctx.apply_momentum_active_entries(admission, chunk);
         std::thread::yield_now();
     }
+    batch_dirty |= ctx.retry_deferred_hot_pool_reserve_registrations(admission);
     if !batch_dirty {
         ctx.refresh_geyser_pins_gauge();
     }
@@ -296,6 +302,9 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
             try_write_explicit_set_snapshot_from_ctx(ctx.as_ref(), admission);
             let _ = done.send(());
             false
+        }
+        TrackWorkerCommand::RetryDeferredHotPoolReserves => {
+            ctx.retry_deferred_hot_pool_reserve_registrations(admission)
         }
     }
 }
@@ -531,6 +540,7 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
             pending_release_flush_slot = false;
             restore_barrier_pending = false;
             coalesce_deadline = None;
+            let _ = ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission);
             let push_ok = track_worker_execute_coalesced_push(
                 &ctx,
                 &mut admission,
@@ -974,6 +984,13 @@ mod tests {
                 new_cap: 25_000,
             }
         }
+
+        fn retry_deferred_hot_pool_reserve_registrations(
+            &self,
+            _admission: &mut FixedCapAdmission,
+        ) -> bool {
+            false
+        }
     }
 
     #[test]
@@ -1269,6 +1286,13 @@ mod tests {
                     new_cap: 25_000,
                 }
             }
+
+            fn retry_deferred_hot_pool_reserve_registrations(
+                &self,
+                _admission: &mut FixedCapAdmission,
+            ) -> bool {
+                false
+            }
         }
 
         let ctx = Arc::new(TrackerIdempotentCtx);
@@ -1509,6 +1533,13 @@ mod tests {
                 new_cap: 25_000,
             }
         }
+
+        fn retry_deferred_hot_pool_reserve_registrations(
+            &self,
+            _admission: &mut FixedCapAdmission,
+        ) -> bool {
+            false
+        }
     }
 
     #[test]
@@ -1558,6 +1589,208 @@ mod tests {
             let store = protocol.lock().expect("lock");
             assert!(!store.is_applicable(&tracker_cmd));
         }
+    }
+
+    #[test]
+    fn chunked_momentum_apply_retries_deferred_hot_pool_reserves() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ChunkedRetryCtx {
+            retry_calls: AtomicUsize,
+            last_synced: parking_lot::RwLock<HashSet<Pubkey>>,
+        }
+
+        impl TrackWorkerContext for ChunkedRetryCtx {
+            fn geyser_sync_batch_debounce_ms(&self) -> u64 {
+                0
+            }
+            fn max_tracked_accounts(&self) -> usize {
+                25_000
+            }
+            fn apply_momentum_active_pools_update(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _update: &MomentumActivePoolsUpdate,
+            ) -> bool {
+                false
+            }
+            fn apply_momentum_snapshot_reconcile(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _active: &[MomentumActivePoolEntry],
+            ) -> bool {
+                false
+            }
+            fn apply_momentum_removed_entries(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _removed: &[MomentumRemovedPoolEntry],
+            ) -> bool {
+                false
+            }
+            fn apply_momentum_active_entries(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _active: &[MomentumActivePoolEntry],
+            ) -> bool {
+                false
+            }
+            fn apply_arb_track_requests_update(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _update: &ArbTrackRequestsUpdate,
+            ) -> bool {
+                false
+            }
+            fn apply_arb_snapshot_reconcile(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _active: &[ArbTrackActiveEntry],
+            ) -> bool {
+                false
+            }
+            fn apply_arb_removed_entries(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _removed: &[ArbTrackRemovedEntry],
+            ) -> bool {
+                false
+            }
+            fn apply_arb_active_entries(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _active: &[ArbTrackActiveEntry],
+            ) -> bool {
+                false
+            }
+            fn apply_wallet_pin(&self, _admission: &mut FixedCapAdmission, _mint: Pubkey) -> bool {
+                false
+            }
+            fn withdraw_wallet_pin(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _mint: Pubkey,
+            ) -> bool {
+                false
+            }
+            fn apply_track_mint(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _mint: Pubkey,
+                _pin: Option<TrackPinReason>,
+            ) -> bool {
+                false
+            }
+            fn refresh_geyser_pins_gauge(&self) {}
+            fn hot_pool_registry_pair_count(&self) -> usize {
+                0
+            }
+            fn hot_pool_registry_arb_pool_count(&self) -> usize {
+                0
+            }
+            fn refresh_hot_pool_registry_gauges(&self) {}
+            fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
+                HashSet::new()
+            }
+            fn sync_geyser_tracked_accounts_batched_flush_with_deadline(
+                &self,
+                _deadline: Instant,
+                _admission: &FixedCapAdmission,
+            ) -> bool {
+                true
+            }
+            fn continue_geyser_evict_with_deadline(
+                &self,
+                _deadline: Instant,
+                _admission: &FixedCapAdmission,
+            ) -> bool {
+                true
+            }
+            fn release_geyser_sync_flush_slot(&self) {}
+            fn refresh_tracked_membership_snapshot(&self) {}
+            fn explicit_pubkey_rows_for_desired_set(
+                &self,
+            ) -> Vec<(Pubkey, super::super::ConsumerId, Option<Pubkey>)> {
+                Vec::new()
+            }
+            fn build_explicit_set_snapshot(
+                &self,
+                _admission: &FixedCapAdmission,
+            ) -> super::super::snapshot::ExplicitSetSnapshot {
+                super::super::snapshot::ExplicitSetSnapshot::new(None)
+            }
+            fn apply_explicit_set_snapshot(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _snapshot: &super::super::snapshot::ExplicitSetSnapshot,
+            ) -> super::super::admission_wiring::AdmissionRestoreResult {
+                super::super::admission_wiring::AdmissionRestoreResult::Restored
+            }
+            fn on_admission_converge_result(
+                &self,
+                _admission: &FixedCapAdmission,
+                _result: super::super::admission_wiring::AdmissionConvergeResult,
+            ) {
+            }
+            fn prune_tracked_maps_to_admitted(&self, _admission: &FixedCapAdmission) {}
+            fn publish_admitted_explicit_physical(&self, _admission: &FixedCapAdmission) {}
+            fn last_synced_explicit_pubkeys_write(
+                &self,
+            ) -> parking_lot::RwLockWriteGuard<'_, HashSet<Pubkey>> {
+                self.last_synced.write()
+            }
+            fn geyser_explicit_readiness_ok(&self) -> bool {
+                true
+            }
+            fn geyser_connect_barrier_pending(&self) -> bool {
+                false
+            }
+            fn signal_restore_barrier(&self, _ok: bool) {}
+            fn apply_explicit_cap_shrink(
+                &self,
+                _admission: &mut FixedCapAdmission,
+                _new_cap: usize,
+            ) -> super::super::explicit_admission::CapShrinkResult {
+                super::super::explicit_admission::CapShrinkResult::NoOpAlreadyWithinCap {
+                    old_cap: 25_000,
+                    new_cap: 25_000,
+                }
+            }
+            fn retry_deferred_hot_pool_reserve_registrations(
+                &self,
+                _admission: &mut FixedCapAdmission,
+            ) -> bool {
+                self.retry_calls.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+
+        let ctx = Arc::new(ChunkedRetryCtx {
+            retry_calls: AtomicUsize::new(0),
+            last_synced: parking_lot::RwLock::new(HashSet::new()),
+        });
+        let mut admission = FixedCapAdmission::new(25_000);
+        let mut active = Vec::new();
+        for i in 0..48 {
+            active.push(MomentumActivePoolEntry {
+                mint: Pubkey::new_unique().to_string(),
+                pool: Pubkey::new_unique().to_string(),
+                pin_reason: crate::nats::MomentumActivePinReason::Tracker,
+            });
+            let _ = i;
+        }
+        apply_momentum_active_pools_on_track_worker(
+            &ctx,
+            &mut admission,
+            MomentumActivePoolsUpdate {
+                version: 1,
+                ts_unix_ms: 1,
+                active,
+                removed: vec![],
+                full_active_snapshot: false,
+            },
+        );
+        assert_eq!(ctx.retry_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

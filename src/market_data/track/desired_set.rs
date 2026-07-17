@@ -10,6 +10,8 @@ use std::collections::HashSet;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConsumerId {
     Wallet,
+    /// Open-position pool pin (Scope C): eviction protection above [`Self::Momentum`].
+    MomentumPosition,
     Momentum,
     Arb,
     /// Unpinned mint / recent-trade LRU demand (I-MD-5: lowest protection).
@@ -20,9 +22,11 @@ pub enum ConsumerId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PinPriority {
     Wallet = 0,
-    Momentum = 1,
-    Arb = 2,
-    Tracker = 3,
+    /// Open-position pool pin (Scope C): protected at least at momentum-active tier.
+    MomentumPosition = 1,
+    Momentum = 2,
+    Arb = 3,
+    Tracker = 4,
 }
 
 #[derive(Debug, Clone)]
@@ -35,9 +39,20 @@ pub struct ExplicitEntry {
 pub fn pin_priority_from_consumer(consumer: ConsumerId) -> PinPriority {
     match consumer {
         ConsumerId::Wallet => PinPriority::Wallet,
+        ConsumerId::MomentumPosition => PinPriority::MomentumPosition,
         ConsumerId::Momentum => PinPriority::Momentum,
         ConsumerId::Arb => PinPriority::Arb,
         ConsumerId::Tracker => PinPriority::Tracker,
+    }
+}
+
+/// Scope C: position pins must not lose eviction protection to tracker noise.
+pub fn pin_priority_for_momentum_active_pin(
+    pin_reason: crate::nats::MomentumActivePinReason,
+) -> PinPriority {
+    match pin_reason {
+        crate::nats::MomentumActivePinReason::Position => PinPriority::MomentumPosition,
+        crate::nats::MomentumActivePinReason::Tracker => PinPriority::Momentum,
     }
 }
 
@@ -49,6 +64,20 @@ pub fn symmetric_diff(a: &HashSet<Pubkey>, b: &HashSet<Pubkey>) -> HashSet<Pubke
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pin_priority_for_momentum_active_pin_orders_position_above_tracker() {
+        use crate::nats::MomentumActivePinReason;
+
+        assert!(
+            pin_priority_for_momentum_active_pin(MomentumActivePinReason::Position)
+                < pin_priority_for_momentum_active_pin(MomentumActivePinReason::Tracker)
+        );
+        assert_eq!(
+            pin_priority_for_momentum_active_pin(MomentumActivePinReason::Position),
+            PinPriority::MomentumPosition
+        );
+    }
 
     #[test]
     fn symmetric_diff_detects_add_and_remove() {

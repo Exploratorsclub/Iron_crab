@@ -13,8 +13,8 @@ use crate::metrics::{
     inc_market_data_momentum_track_worker_enqueue_dropped_total,
 };
 use crate::nats::{
-    ArbTrackActiveEntry, ArbTrackRemovedEntry, ArbTrackRequestsUpdate, MomentumActivePoolEntry,
-    MomentumActivePoolsUpdate, MomentumRemovedPoolEntry,
+    ArbTrackActiveEntry, ArbTrackRemovedEntry, ArbTrackRequestsUpdate, MomentumActivePinReason,
+    MomentumActivePoolEntry, MomentumActivePoolsUpdate, MomentumRemovedPoolEntry,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -28,6 +28,20 @@ pub const MARKET_DATA_MOMENTUM_COALESCE_CHANNEL_CAP: usize = 512;
 pub const MARKET_DATA_ARB_COALESCE_CHANNEL_CAP: usize = 512;
 
 type MomentumPoolKey = (String, String);
+
+/// When coalescing bursts, Position pins must not be downgraded to Tracker for the same `(mint, pool)`.
+fn merge_momentum_active_pin_reason(
+    existing: MomentumActivePinReason,
+    incoming: MomentumActivePinReason,
+) -> MomentumActivePinReason {
+    if existing == MomentumActivePinReason::Position
+        || incoming == MomentumActivePinReason::Position
+    {
+        MomentumActivePinReason::Position
+    } else {
+        MomentumActivePinReason::Tracker
+    }
+}
 
 /// PR169c: merge a burst of momentum updates into one payload equivalent to sequential applies.
 pub fn merge_momentum_active_pools_updates(
@@ -67,7 +81,21 @@ pub fn merge_momentum_active_pools_updates(
             for a in &update.active {
                 let key = (a.mint.clone(), a.pool.clone());
                 removed_map.remove(&key);
-                active_map.insert(key, a.clone());
+                match active_map.get(&key) {
+                    Some(existing) => {
+                        let merged = MomentumActivePoolEntry {
+                            pin_reason: merge_momentum_active_pin_reason(
+                                existing.pin_reason,
+                                a.pin_reason,
+                            ),
+                            ..a.clone()
+                        };
+                        active_map.insert(key, merged);
+                    }
+                    None => {
+                        active_map.insert(key, a.clone());
+                    }
+                }
             }
         } else {
             for r in &update.removed {
@@ -78,7 +106,21 @@ pub fn merge_momentum_active_pools_updates(
             for a in &update.active {
                 let key = (a.mint.clone(), a.pool.clone());
                 removed_map.remove(&key);
-                active_map.insert(key, a.clone());
+                match active_map.get(&key) {
+                    Some(existing) => {
+                        let merged = MomentumActivePoolEntry {
+                            pin_reason: merge_momentum_active_pin_reason(
+                                existing.pin_reason,
+                                a.pin_reason,
+                            ),
+                            ..a.clone()
+                        };
+                        active_map.insert(key, merged);
+                    }
+                    None => {
+                        active_map.insert(key, a.clone());
+                    }
+                }
             }
         }
     }
@@ -241,4 +283,43 @@ pub fn spawn_arb_tracking_coalescer<C: TrackWorkerContext + 'static>(
         }
     });
     coalesce_tx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_momentum_active_pools_prefers_position_over_tracker() {
+        let merged = merge_momentum_active_pools_updates(&[
+            MomentumActivePoolsUpdate {
+                version: 1,
+                ts_unix_ms: 1,
+                active: vec![MomentumActivePoolEntry {
+                    mint: "m".into(),
+                    pool: "p".into(),
+                    pin_reason: MomentumActivePinReason::Tracker,
+                }],
+                removed: vec![],
+                full_active_snapshot: false,
+            },
+            MomentumActivePoolsUpdate {
+                version: 1,
+                ts_unix_ms: 2,
+                active: vec![MomentumActivePoolEntry {
+                    mint: "m".into(),
+                    pool: "p".into(),
+                    pin_reason: MomentumActivePinReason::Position,
+                }],
+                removed: vec![],
+                full_active_snapshot: false,
+            },
+        ])
+        .expect("merged");
+        assert_eq!(merged.active.len(), 1);
+        assert_eq!(
+            merged.active[0].pin_reason,
+            MomentumActivePinReason::Position
+        );
+    }
 }
