@@ -15947,7 +15947,7 @@ mod pr_b_geyser_tracking_tests {
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
-        let mut admission = FixedCapAdmission::new(25_000);
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
         let before = ctx.snapshot_explicit_subscription_pubkeys();
         use ironcrab::metrics::MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL;
         let skip0 = MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL.load(Ordering::Relaxed);
@@ -15973,7 +15973,7 @@ mod pr_b_geyser_tracking_tests {
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
         let mint = Pubkey::new_unique();
         ctx.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet));
-        let mut admission = FixedCapAdmission::new(25_000);
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
         ironcrab::market_data::track::converge_admission_from_ctx(ctx.as_ref(), &mut admission);
         assert_eq!(admission.len(), 1);
         assert_eq!(
@@ -16192,7 +16192,7 @@ mod pr_b_geyser_tracking_tests {
             MARKET_DATA_TRACK_WORKER_COALESCE_MS + 200,
         ));
 
-        let mut admission = FixedCapAdmission::new(25_000);
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
         let keys = ctx.snapshot_explicit_subscription_pubkeys();
         use ironcrab::metrics::MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL;
         let skip0 = MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL.load(Ordering::Relaxed);
@@ -16521,7 +16521,7 @@ mod pr_b_geyser_tracking_tests {
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
 
         let mint = Pubkey::new_unique();
-        let mut admission = FixedCapAdmission::new(25_000);
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
         assert!(ctx.apply_wallet_pin(&mut admission, mint));
         assert!(ctx.tracked_mints.read().contains_key(&mint));
         assert!(admission.contains(&mint));

@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn converge_wallet_mint_row() {
-        let mut admission = FixedCapAdmission::new(25_000);
+        let mut admission = FixedCapAdmission::new(500_000);
         let mint = Pubkey::new_unique();
         let owner = explicit_owner_from_row(ConsumerId::Wallet, None, mint);
         assert_eq!(

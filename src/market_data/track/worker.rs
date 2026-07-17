@@ -790,7 +790,7 @@ mod tests {
         }
 
         fn max_tracked_accounts(&self) -> usize {
-            25_000
+            500_000
         }
 
         fn apply_momentum_active_pools_update(
@@ -980,8 +980,8 @@ mod tests {
             _new_cap: usize,
         ) -> CapShrinkResult {
             CapShrinkResult::NoOpAlreadyWithinCap {
-                old_cap: 25_000,
-                new_cap: 25_000,
+                old_cap: 500_000,
+                new_cap: 500_000,
             }
         }
 
@@ -1002,7 +1002,7 @@ mod tests {
             let mut store = protocol.lock().expect("lock");
             store.wrap_command(TrackWorkerCommand::ApplyWalletPin { mint })
         };
-        let mut admission = FixedCapAdmission::new(25_000);
+        let mut admission = FixedCapAdmission::new(500_000);
         let mut restore_barrier_pending = false;
 
         track_worker_apply_protocol_command(
@@ -1059,7 +1059,7 @@ mod tests {
             })
         };
         assert_eq!(cmd.stream, TrackCommandStream::Wallet);
-        let mut admission = FixedCapAdmission::new(25_000);
+        let mut admission = FixedCapAdmission::new(500_000);
         let mut restore_barrier_pending = false;
 
         track_worker_apply_protocol_command(
@@ -1098,7 +1098,7 @@ mod tests {
             }
 
             fn max_tracked_accounts(&self) -> usize {
-                25_000
+                500_000
             }
 
             fn apply_momentum_active_pools_update(
@@ -1282,8 +1282,8 @@ mod tests {
                 _new_cap: usize,
             ) -> CapShrinkResult {
                 CapShrinkResult::NoOpAlreadyWithinCap {
-                    old_cap: 25_000,
-                    new_cap: 25_000,
+                    old_cap: 500_000,
+                    new_cap: 500_000,
                 }
             }
 
@@ -1298,7 +1298,7 @@ mod tests {
         let ctx = Arc::new(TrackerIdempotentCtx);
         let protocol = Arc::new(Mutex::new(BoundedProtocolStore::default_caps()));
         let mint = Pubkey::new_unique();
-        let mut admission = FixedCapAdmission::new(25_000);
+        let mut admission = FixedCapAdmission::new(500_000);
         let mut restore_barrier_pending = false;
 
         for _ in 0..2 {
@@ -1344,7 +1344,7 @@ mod tests {
         }
 
         fn max_tracked_accounts(&self) -> usize {
-            25_000
+            500_000
         }
 
         fn apply_momentum_active_pools_update(
@@ -1529,8 +1529,8 @@ mod tests {
             _new_cap: usize,
         ) -> CapShrinkResult {
             CapShrinkResult::NoOpAlreadyWithinCap {
-                old_cap: 25_000,
-                new_cap: 25_000,
+                old_cap: 500_000,
+                new_cap: 500_000,
             }
         }
 
@@ -1547,7 +1547,7 @@ mod tests {
         let ctx = Arc::new(WithdrawSupersedesTrackerTestCtx::new());
         let protocol = Arc::new(Mutex::new(BoundedProtocolStore::default_caps()));
         let mint = Pubkey::new_unique();
-        let mut admission = FixedCapAdmission::new(25_000);
+        let mut admission = FixedCapAdmission::new(500_000);
         let mut restore_barrier_pending = false;
 
         let tracker_cmd = {
@@ -1605,7 +1605,7 @@ mod tests {
                 0
             }
             fn max_tracked_accounts(&self) -> usize {
-                25_000
+                500_000
             }
             fn apply_momentum_active_pools_update(
                 &self,
@@ -1752,8 +1752,8 @@ mod tests {
                 _new_cap: usize,
             ) -> super::super::explicit_admission::CapShrinkResult {
                 super::super::explicit_admission::CapShrinkResult::NoOpAlreadyWithinCap {
-                    old_cap: 25_000,
-                    new_cap: 25_000,
+                    old_cap: 500_000,
+                    new_cap: 500_000,
                 }
             }
             fn retry_deferred_hot_pool_reserve_registrations(
@@ -1769,7 +1769,7 @@ mod tests {
             retry_calls: AtomicUsize::new(0),
             last_synced: parking_lot::RwLock::new(HashSet::new()),
         });
-        let mut admission = FixedCapAdmission::new(25_000);
+        let mut admission = FixedCapAdmission::new(500_000);
         let mut active = Vec::new();
         for i in 0..48 {
             active.push(MomentumActivePoolEntry {
