@@ -489,7 +489,11 @@ mod tests {
         let MdSidefxCommand::LivePoolCacheAccountUpdate { account_data, .. } = &out[0] else {
             panic!("expected LivePoolCacheAccountUpdate");
         };
-        assert_eq!(account_data, &vec![1], "latest-wins data from last job in burst");
+        assert_eq!(
+            account_data,
+            &vec![1],
+            "latest-wins data from last job in burst"
+        );
     }
 
     #[test]
