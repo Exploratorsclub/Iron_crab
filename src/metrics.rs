@@ -1097,6 +1097,12 @@ pub static MARKET_DATA_MD_SIDEFX_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| Ato
 /// Phase-R-R4: `md-sidefx` queue full (`try_send` drop).
 pub static MARKET_DATA_MD_SIDEFX_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Scope D: ENRICH sidefx enqueue dropped (cap / headroom).
+pub static MARKET_DATA_MD_SIDEFX_ENRICH_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Scope D: ENRICH JetStream publish skipped (redundant under vault feed / unchanged layout).
+pub static MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// Phase-R-R4: jobs processed by the `md-sidefx` worker.
 pub static MARKET_DATA_MD_SIDEFX_JOBS_PROCESSED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -1482,6 +1488,16 @@ pub fn set_market_data_md_sidefx_queue_depth(depth: usize) {
 #[inline]
 pub fn inc_market_data_md_sidefx_enqueue_dropped_total() {
     MARKET_DATA_MD_SIDEFX_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_md_sidefx_enrich_enqueue_dropped_total() {
+    MARKET_DATA_MD_SIDEFX_ENRICH_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_md_sidefx_enrich_publish_skipped_total() {
+    MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -6338,6 +6354,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_md_sidefx_enqueue_dropped_total",
         MARKET_DATA_MD_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_md_sidefx_enrich_enqueue_dropped_total",
+        MARKET_DATA_MD_SIDEFX_ENRICH_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_md_sidefx_enrich_publish_skipped_total",
+        MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_md_sidefx_jobs_processed_total",

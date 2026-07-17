@@ -77,7 +77,8 @@ use ironcrab::market_data::sidefx::{
     md_sidefx_process_vault_balance_tick as sidefx_process_vault_balance_tick,
     md_sidefx_try_enqueue as sidefx_try_enqueue, spawn_md_sidefx_worker as spawn_sidefx_worker,
     MarketEventCorePublishTrace, MdSidefxBurstScratch, MdSidefxCommand, MdSidefxSender,
-    SidefxVaultMembershipView, SidefxWorkerHost, MARKET_DATA_MD_SIDEFX_QUEUE_CAP,
+    SidefxUpdateClass, SidefxVaultMembershipView, SidefxWorkerHost,
+    MARKET_DATA_MD_SIDEFX_QUEUE_CAP,
 };
 use ironcrab::market_data::track::{
     arb_coalesce_try_send, explicit_admitted_pool_sets_from_admission, explicit_set_snapshot_path,
@@ -455,11 +456,26 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
         if scratch.lru_touches_empty() {
             return;
         }
-        let (vaults, bin_arrays) = scratch.drain_lru_touches();
-        md_state_try_enqueue(
-            &self.md_state,
-            MdStateCommand::TouchTrackedLruBatch { vaults, bin_arrays },
-        );
+        let (exec_hot_vaults, enrich_vaults, exec_hot_bins, enrich_bins) =
+            scratch.drain_lru_touches();
+        if !exec_hot_vaults.is_empty() || !exec_hot_bins.is_empty() {
+            md_state_try_enqueue(
+                &self.md_state,
+                MdStateCommand::TouchTrackedLruBatch {
+                    vaults: exec_hot_vaults,
+                    bin_arrays: exec_hot_bins,
+                },
+            );
+        }
+        if !enrich_vaults.is_empty() || !enrich_bins.is_empty() {
+            md_state_try_enqueue(
+                &self.md_state,
+                MdStateCommand::TouchTrackedLruBatch {
+                    vaults: enrich_vaults,
+                    bin_arrays: enrich_bins,
+                },
+            );
+        }
     }
 
     fn live_pool_cache(&self) -> &LivePoolCache {
@@ -1667,8 +1683,8 @@ fn note_trade_pool_lru_touches_from_cache(
     if let Some((base_vault, quote_vault)) =
         expected_pool_vault_pubkeys_from_cache(&state, enable_meteora_cpmm, enable_meteora_dlmm)
     {
-        scratch.note_vault_touch(base_vault);
-        scratch.note_vault_touch(quote_vault);
+        scratch.note_vault_touch(base_vault, SidefxUpdateClass::ExecHot);
+        scratch.note_vault_touch(quote_vault, SidefxUpdateClass::ExecHot);
     }
     if enable_meteora_dlmm {
         if let CachedPoolState::Meteora(s) = &state {
@@ -1676,7 +1692,7 @@ fn note_trade_pool_lru_touches_from_cache(
             for offset in -3i64..=3i64 {
                 let index = active_array_index + offset;
                 if let Ok(pda) = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&pool, index) {
-                    scratch.note_bin_array_touch(pda);
+                    scratch.note_bin_array_touch(pda, SidefxUpdateClass::ExecHot);
                 }
             }
         }
@@ -7542,6 +7558,7 @@ fn spawn_market_data_md_state_liveness_task(process_started: Instant) {
 struct AccountWorkItem {
     update: GeyserAccountUpdate,
     recv_at: Instant,
+    class: ironcrab::market_data::ingest::AccountUpdateClass,
 }
 
 /// Per-shard ENRICH latest-wins buffer before / alongside the LOW `mpsc`.
@@ -8056,6 +8073,7 @@ async fn handle_geyser_account(
     publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
     md_state: &MdStateSender,
     md_sidefx: &MdSidefxSender,
+    update_class: ironcrab::market_data::ingest::AccountUpdateClass,
 ) {
     handle_geyser_account_update(
         ctx.as_ref(),
@@ -8066,6 +8084,7 @@ async fn handle_geyser_account(
         publish_tx,
         md_state,
         md_sidefx,
+        update_class,
     )
     .await;
 }
@@ -8645,6 +8664,7 @@ async fn run_geyser_loop(
                     publish_tx_w.as_ref(),
                     &md_state_w,
                     &md_sidefx_w,
+                    work.class,
                 )
                 .await;
                 record_market_data_account_handler_duration_us(
@@ -8703,6 +8723,7 @@ async fn run_geyser_loop(
                             .send(AccountWorkItem {
                                 update: account_update,
                                 recv_at,
+                                class,
                             })
                             .await;
                         if send_res.is_ok() {
@@ -8720,6 +8741,7 @@ async fn run_geyser_loop(
                         let work = AccountWorkItem {
                             update: account_update,
                             recv_at,
+                            class,
                         };
                         let mut coalesce_shard = enrich_coalesce_recv[shard].lock().await;
                         let upsert = account_enrich_coalesce_upsert(&mut coalesce_shard, work);
@@ -11606,6 +11628,8 @@ mod momentum_nats_subject_tests {
 mod pr_b_geyser_tracking_tests {
     use super::*;
     use ironcrab::market_data::ingest::maybe_emit_dev_wallet_after_pool_mint_map;
+    use ironcrab::market_data::ingest::AccountUpdateClass;
+    use ironcrab::market_data::sidefx::SidefxUpdateClass;
     const RAYDIUM_CPMM_OWNER: Pubkey =
         solana_sdk::pubkey!("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C");
     const PUMPFUN_PROGRAM_OWNER: Pubkey =
@@ -11737,6 +11761,7 @@ mod pr_b_geyser_tracking_tests {
             account_data: account_data.clone(),
             slot: 1,
             grpc_recv_at: Instant::now(),
+            update_class: SidefxUpdateClass::Enrich,
         };
         let mut scratch = MdSidefxBurstScratch::new();
         md_sidefx_process_live_pool_cache_account_update(&worker, &job, &mut scratch);
@@ -11754,6 +11779,7 @@ mod pr_b_geyser_tracking_tests {
                 account_data: account_data.clone(),
                 slot: 2,
                 grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::ExecHot,
             },
             &mut scratch,
         );
@@ -11775,6 +11801,7 @@ mod pr_b_geyser_tracking_tests {
                 account_data,
                 slot: 3,
                 grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::ExecHot,
             },
             &mut scratch2,
         );
@@ -11784,6 +11811,197 @@ mod pr_b_geyser_tracking_tests {
             0,
             "phase1: repeat hot upsert still must not enqueue md-state register from sidefx"
         );
+    }
+
+    /// Scope D: ENRICH account-parse sidefx skips redundant JetStream when vault feed is live.
+    #[test]
+    fn scope_d_enrich_sidefx_skips_redundant_pool_discovered_under_vault_feed() {
+        use ironcrab::metrics::MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, _depth, _md_state_rx) = test_md_state_sender_no_worker();
+        let worker = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        let account_data = test_raydium_cpmm_account_data(base, quote, coin_vault, pc_vault);
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin_vault,
+                token_1_vault: pc_vault,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(base, pool);
+        ctx.note_explicit_momentum_pool_admitted(pool);
+        assert!(MarketDataContext::register_geyser_reserves_after_trade(
+            &ctx, pool
+        ));
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        ironcrab::market_data::track::converge_admission_from_ctx(ctx.as_ref(), &mut admission);
+        ctx.prune_tracked_maps_to_admitted(&admission);
+        ctx.publish_admitted_explicit_physical(&admission);
+        *ctx.last_synced_explicit_pubkeys.write() =
+            admission.snapshot_pubkeys().into_iter().collect();
+        assert!(worker.pool_has_live_vault_geyser_feed(pool));
+
+        MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.store(0, Ordering::Relaxed);
+        let mk_job =
+            |slot: u64, class: SidefxUpdateClass| MdSidefxCommand::LivePoolCacheAccountUpdate {
+                run_id: "scope-d".into(),
+                pool_pubkey: pool,
+                owner: RAYDIUM_CPMM_OWNER,
+                account_data: account_data.clone(),
+                slot,
+                grpc_recv_at: Instant::now(),
+                update_class: class,
+            };
+
+        let mut scratch = MdSidefxBurstScratch::new();
+        md_sidefx_process_live_pool_cache_account_update(
+            &worker,
+            &mk_job(10, SidefxUpdateClass::Enrich),
+            &mut scratch,
+        );
+        let skipped_after_first =
+            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed);
+
+        let mut scratch2 = MdSidefxBurstScratch::new();
+        md_sidefx_process_live_pool_cache_account_update(
+            &worker,
+            &mk_job(11, SidefxUpdateClass::Enrich),
+            &mut scratch2,
+        );
+        assert!(
+            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed)
+                > skipped_after_first,
+            "second ENRICH upsert with unchanged reserves under vault feed must skip JetStream"
+        );
+
+        let skipped_before_exec_hot =
+            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed);
+        let mut scratch3 = MdSidefxBurstScratch::new();
+        md_sidefx_process_live_pool_cache_account_update(
+            &worker,
+            &mk_job(12, SidefxUpdateClass::ExecHot),
+            &mut scratch3,
+        );
+        assert_eq!(
+            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed),
+            skipped_before_exec_hot,
+            "EXEC_HOT must not increment ENRICH skip counter (I-MD-4)"
+        );
+    }
+
+    /// Bugbot: ENRICH JetStream skip must not skip MASTER readiness merge.
+    #[test]
+    fn scope_d_enrich_skips_publish_but_merges_readiness() {
+        use ironcrab::ipc::DexPoolReadiness;
+        use ironcrab::metrics::MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, _depth, _md_state_rx) = test_md_state_sender_no_worker();
+        let worker = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        let account_data = test_raydium_cpmm_account_data(base, quote, coin_vault, pc_vault);
+
+        // Seed MASTER cache from parse-shaped row (no vault balances in pool account bytes).
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin_vault,
+                token_1_vault: pc_vault,
+                reserve_0: None,
+                reserve_1: None,
+            }),
+            1,
+        );
+        assert_eq!(ctx.live_pool_cache.raydium_cpmm_readiness(&pool), None);
+
+        ctx.hot_pool_registry.pin_pool(base, pool);
+        ctx.note_explicit_momentum_pool_admitted(pool);
+        assert!(MarketDataContext::register_geyser_reserves_after_trade(
+            &ctx, pool
+        ));
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        ironcrab::market_data::track::converge_admission_from_ctx(ctx.as_ref(), &mut admission);
+        ctx.prune_tracked_maps_to_admitted(&admission);
+        ctx.publish_admitted_explicit_physical(&admission);
+        *ctx.last_synced_explicit_pubkeys.write() =
+            admission.snapshot_pubkeys().into_iter().collect();
+        assert!(worker.pool_has_live_vault_geyser_feed(pool));
+
+        MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.store(0, Ordering::Relaxed);
+        let mut scratch = MdSidefxBurstScratch::new();
+        md_sidefx_process_live_pool_cache_account_update(
+            &worker,
+            &MdSidefxCommand::LivePoolCacheAccountUpdate {
+                run_id: "scope-d-readiness".into(),
+                pool_pubkey: pool,
+                owner: RAYDIUM_CPMM_OWNER,
+                account_data,
+                slot: 2,
+                grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::Enrich,
+            },
+            &mut scratch,
+        );
+
+        assert!(
+            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed) > 0,
+            "ENRICH must skip redundant JetStream under vault feed + unchanged layout/reserves"
+        );
+        assert_eq!(
+            ctx.live_pool_cache.raydium_cpmm_readiness(&pool),
+            Some(DexPoolReadiness::Observed),
+            "readiness merge must run even when JetStream publish is skipped"
+        );
+    }
+
+    /// Scope D regression: arb-pinned pool uses EXEC_HOT class (dual-consumer, not momentum-only).
+    #[test]
+    fn scope_d_arb_hot_pool_sidefx_uses_exec_hot_class() {
+        use ironcrab::market_data::ingest::{classify_account_geyser_update, AccountUpdateClass};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        let update = GeyserAccountUpdate {
+            pubkey: pool,
+            slot: 7,
+            owner: RAYDIUM_CPMM_OWNER,
+            data: vec![],
+            lamports: 0,
+            grpc_recv_at: Instant::now(),
+        };
+        let (class, _) = classify_account_geyser_update(&ctx, &update);
+        assert_eq!(class, AccountUpdateClass::ExecHot);
+        assert!(SidefxUpdateClass::from(class).is_exec_hot());
     }
 
     #[test]
@@ -11796,6 +12014,7 @@ mod pr_b_geyser_tracking_tests {
                 balance: i + 1,
                 slot: i + 1,
                 grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::ExecHot,
             })
             .collect();
         let out = md_sidefx_coalesce_burst(jobs);
@@ -13497,7 +13716,7 @@ mod pr_b_geyser_tracking_tests {
         let (ltx, mut lrx) = mpsc::channel(8);
         let pool_h = Pubkey::new_unique();
         let pool_l = Pubkey::new_unique();
-        let mk = |p: Pubkey| AccountWorkItem {
+        let mk_high = |p: Pubkey| AccountWorkItem {
             update: GeyserAccountUpdate {
                 pubkey: p,
                 slot: 1,
@@ -13507,9 +13726,22 @@ mod pr_b_geyser_tracking_tests {
                 grpc_recv_at: Instant::now(),
             },
             recv_at: Instant::now(),
+            class: AccountUpdateClass::ExecHot,
         };
-        ltx.send(mk(pool_l)).await.unwrap();
-        htx.send(mk(pool_h)).await.unwrap();
+        let mk_low = |p: Pubkey| AccountWorkItem {
+            update: GeyserAccountUpdate {
+                pubkey: p,
+                slot: 1,
+                owner: PUMPFUN_PROGRAM_OWNER,
+                data: vec![],
+                lamports: 0,
+                grpc_recv_at: Instant::now(),
+            },
+            recv_at: Instant::now(),
+            class: AccountUpdateClass::Enrich,
+        };
+        ltx.send(mk_low(pool_l)).await.unwrap();
+        htx.send(mk_high(pool_h)).await.unwrap();
         drop(htx);
         drop(ltx);
         let w1 = account_worker_recv_next(&mut hrx, &mut lrx)
@@ -13551,6 +13783,7 @@ mod pr_b_geyser_tracking_tests {
                 grpc_recv_at: Instant::now(),
             },
             recv_at: Instant::now(),
+            class: AccountUpdateClass::Enrich,
         };
         for slot in 0..16 {
             ltx.send(mk(slot)).await.unwrap();
@@ -13591,6 +13824,7 @@ mod pr_b_geyser_tracking_tests {
                 grpc_recv_at: Instant::now(),
             },
             recv_at: Instant::now(),
+            class: AccountUpdateClass::Enrich,
         };
         assert!(matches!(
             account_enrich_coalesce_upsert(&mut shard, mk(1)),
@@ -13630,6 +13864,7 @@ mod pr_b_geyser_tracking_tests {
                     grpc_recv_at: Instant::now(),
                 },
                 recv_at: Instant::now(),
+                class: AccountUpdateClass::Enrich,
             },
         );
         assert_eq!(shard.unique_pending_pubkey_count(), 1);
@@ -13650,6 +13885,7 @@ mod pr_b_geyser_tracking_tests {
                 grpc_recv_at: Instant::now(),
             },
             recv_at: Instant::now(),
+            class: AccountUpdateClass::Enrich,
         };
         assert!(matches!(
             account_enrich_coalesce_upsert_with_cap(&mut shard, mk(7), CAP),
@@ -13690,6 +13926,7 @@ mod pr_b_geyser_tracking_tests {
                 grpc_recv_at: Instant::now(),
             },
             recv_at: Instant::now(),
+            class: AccountUpdateClass::Enrich,
         };
         assert!(matches!(
             account_enrich_coalesce_upsert_with_cap(&mut shard, work, CAP),
@@ -13706,6 +13943,7 @@ mod pr_b_geyser_tracking_tests {
                 grpc_recv_at: Instant::now(),
             },
             recv_at: Instant::now(),
+            class: AccountUpdateClass::Enrich,
         };
         full_tx.try_send(blocker).expect("prefill channel");
         assert_eq!(
@@ -13737,6 +13975,7 @@ mod pr_b_geyser_tracking_tests {
                 grpc_recv_at: Instant::now(),
             },
             recv_at: Instant::now(),
+            class: AccountUpdateClass::Enrich,
         };
         for slot in 0..3 {
             let pk = Pubkey::new_unique();
@@ -13795,6 +14034,7 @@ mod pr_b_geyser_tracking_tests {
                         grpc_recv_at: Instant::now(),
                     },
                     recv_at: Instant::now(),
+                    class: AccountUpdateClass::Enrich,
                 },
             );
             assert!(matches!(
@@ -14403,6 +14643,7 @@ mod pr_b_geyser_tracking_tests {
             None,
             &md_state,
             &md_sidefx,
+            AccountUpdateClass::ExecHot,
         )
         .await;
 
@@ -15559,6 +15800,7 @@ mod pr_b_geyser_tracking_tests {
                 pool_address: pool,
                 slot: 50,
                 grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::ExecHot,
             },
             &mut scratch,
         );
@@ -15569,6 +15811,7 @@ mod pr_b_geyser_tracking_tests {
                 pool_address: pool,
                 slot: 99,
                 grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::ExecHot,
             },
             &mut scratch,
         );
@@ -15680,6 +15923,7 @@ mod pr_b_geyser_tracking_tests {
                 balance: 10_000,
                 slot: 42,
                 grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::ExecHot,
             },
             &mut scratch,
         );

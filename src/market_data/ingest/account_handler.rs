@@ -11,12 +11,14 @@ use super::account_parse::{
     WalletGeyserUpdateSource,
 };
 use crate::ipc::{BinData, MarketEvent, MarketEventKind, NATIVE_SOL_MINT};
+use crate::market_data::ingest::AccountUpdateClass;
 use crate::market_data::md_state::MdStateSender;
 use crate::market_data::publish::{
     account_path_enqueue_core_market_event, account_path_enqueue_jetstream, AccountPublishSender,
 };
 use crate::market_data::sidefx::{
-    md_sidefx_try_enqueue, MarketEventCorePublishTrace, MdSidefxCommand, MdSidefxSender,
+    md_sidefx_try_enqueue_classed, MarketEventCorePublishTrace, MdSidefxCommand, MdSidefxSender,
+    SidefxUpdateClass,
 };
 use crate::metrics::{
     record_market_data_tokio_progress, record_market_data_unparsed_account_dropped,
@@ -47,7 +49,9 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
     publish_tx: Option<&AccountPublishSender>,
     _md_state: &MdStateSender,
     md_sidefx: &MdSidefxSender,
+    update_class: AccountUpdateClass,
 ) {
+    let sidefx_class = SidefxUpdateClass::from(update_class);
     let account_geyser_recv_at = recv_at;
     account_count.fetch_add(1, Ordering::Relaxed);
     record_market_data_tokio_progress();
@@ -244,8 +248,9 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
             host.account_wallet_mint_decimals_insert(account_update.pubkey, decimals);
 
             // Phase-R-R4b: MASTER mint_decimals off account ingest (`md-sidefx`).
-            md_sidefx_try_enqueue(
+            md_sidefx_try_enqueue_classed(
                 md_sidefx,
+                SidefxUpdateClass::ExecHot,
                 MdSidefxCommand::LivePoolCacheMintDecimals {
                     mint: account_update.pubkey,
                     decimals,
@@ -317,14 +322,16 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
     {
         // Phase-R-R4: vault pairing + publish off hot path (`md-sidefx`; no `tracked_vaults` read here).
         if let Some(balance) = try_parse_token_account_balance(&account_update.data) {
-            md_sidefx_try_enqueue(
+            md_sidefx_try_enqueue_classed(
                 md_sidefx,
+                sidefx_class,
                 MdSidefxCommand::VaultBalanceTick {
                     run_id: run_id.to_string(),
                     vault_pubkey: account_update.pubkey,
                     balance,
                     slot: account_update.slot,
                     grpc_recv_at: account_update.grpc_recv_at,
+                    update_class: sidefx_class,
                 },
             );
             return;
@@ -338,10 +345,12 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
     if account_update.owner == dlmm_program {
         if let Some(bin_array_info) = host.account_membership_bin_array_info(&account_update.pubkey)
         {
-            md_sidefx_try_enqueue(
+            md_sidefx_try_enqueue_classed(
                 md_sidefx,
+                sidefx_class,
                 MdSidefxCommand::TouchBinArrayTick {
                     pda: account_update.pubkey,
+                    update_class: sidefx_class,
                 },
             );
             // Parse bin array to extract liquidity distribution
@@ -395,13 +404,15 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
                             .await;
                         }
                         if host.ingest_is_hot_pool(&bin_array_info.pool_address) {
-                            md_sidefx_try_enqueue(
+                            md_sidefx_try_enqueue_classed(
                                 md_sidefx,
+                                SidefxUpdateClass::ExecHot,
                                 MdSidefxCommand::DlmmPoolStatePublishSignal {
                                     run_id: run_id.to_string(),
                                     pool_address: bin_array_info.pool_address,
                                     slot: account_update.slot,
                                     grpc_recv_at: account_geyser_recv_at,
+                                    update_class: SidefxUpdateClass::ExecHot,
                                 },
                             );
                         }
@@ -421,8 +432,9 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
 
     // Phase-R-R4b: LivePoolCache populate + PoolCacheUpdate off account ingest (`md-sidefx`).
     if account_geyser_update_is_dex_pool_owner(&account_update.owner) {
-        md_sidefx_try_enqueue(
+        md_sidefx_try_enqueue_classed(
             md_sidefx,
+            sidefx_class,
             MdSidefxCommand::LivePoolCacheAccountUpdate {
                 run_id: run_id.to_string(),
                 pool_pubkey: account_update.pubkey,
@@ -430,6 +442,7 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
                 account_data: account_update.data.clone(),
                 slot: account_update.slot,
                 grpc_recv_at: account_geyser_recv_at,
+                update_class: sidefx_class,
             },
         );
         if account_geyser_update_is_sidefx_only_pool_owner(&account_update.owner) {
@@ -453,8 +466,9 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
         slot,
     }) = &parsed
     {
-        md_sidefx_try_enqueue(
+        md_sidefx_try_enqueue_classed(
             md_sidefx,
+            sidefx_class,
             MdSidefxCommand::BondingCurveDevWallet {
                 run_id: run_id.to_string(),
                 pool_address: *pool_address,
