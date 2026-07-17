@@ -11905,6 +11905,81 @@ mod pr_b_geyser_tracking_tests {
         );
     }
 
+    /// Bugbot: ENRICH JetStream skip must not skip MASTER readiness merge.
+    #[test]
+    fn scope_d_enrich_skips_publish_but_merges_readiness() {
+        use ironcrab::ipc::DexPoolReadiness;
+        use ironcrab::metrics::MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, _depth, _md_state_rx) = test_md_state_sender_no_worker();
+        let worker = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        let account_data = test_raydium_cpmm_account_data(base, quote, coin_vault, pc_vault);
+
+        // Seed MASTER cache from parse-shaped row (no vault balances in pool account bytes).
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin_vault,
+                token_1_vault: pc_vault,
+                reserve_0: None,
+                reserve_1: None,
+            }),
+            1,
+        );
+        assert_eq!(ctx.live_pool_cache.raydium_cpmm_readiness(&pool), None);
+
+        ctx.hot_pool_registry.pin_pool(base, pool);
+        ctx.note_explicit_momentum_pool_admitted(pool);
+        assert!(MarketDataContext::register_geyser_reserves_after_trade(
+            &ctx, pool
+        ));
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        ironcrab::market_data::track::converge_admission_from_ctx(ctx.as_ref(), &mut admission);
+        ctx.prune_tracked_maps_to_admitted(&admission);
+        ctx.publish_admitted_explicit_physical(&admission);
+        *ctx.last_synced_explicit_pubkeys.write() =
+            admission.snapshot_pubkeys().into_iter().collect();
+        assert!(worker.pool_has_live_vault_geyser_feed(pool));
+
+        MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.store(0, Ordering::Relaxed);
+        let mut scratch = MdSidefxBurstScratch::new();
+        md_sidefx_process_live_pool_cache_account_update(
+            &worker,
+            &MdSidefxCommand::LivePoolCacheAccountUpdate {
+                run_id: "scope-d-readiness".into(),
+                pool_pubkey: pool,
+                owner: RAYDIUM_CPMM_OWNER,
+                account_data,
+                slot: 2,
+                grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::Enrich,
+            },
+            &mut scratch,
+        );
+
+        assert!(
+            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed) > 0,
+            "ENRICH must skip redundant JetStream under vault feed + unchanged layout/reserves"
+        );
+        assert_eq!(
+            ctx.live_pool_cache.raydium_cpmm_readiness(&pool),
+            Some(DexPoolReadiness::Observed),
+            "readiness merge must run even when JetStream publish is skipped"
+        );
+    }
+
     /// Scope D regression: arb-pinned pool uses EXEC_HOT class (dual-consumer, not momentum-only).
     #[test]
     fn scope_d_arb_hot_pool_sidefx_uses_exec_hot_class() {

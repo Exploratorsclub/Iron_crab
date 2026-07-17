@@ -325,6 +325,9 @@ pub fn cache_balance_fields_unchanged(prev: &CachedPoolState, new: &CachedPoolSt
 }
 
 /// True when parsed pool layout metadata materially changed (ENRICH publish gate, Scope D).
+///
+/// Compares vault pubkeys, mints, Serum/DLMM/Orca layout fields — not reserve balances
+/// (those are gated separately via [`cache_balance_fields_unchanged`]).
 pub fn pool_cache_state_layout_significant_change(
     prev: &CachedPoolState,
     new: &CachedPoolState,
@@ -335,62 +338,67 @@ pub fn pool_cache_state_layout_significant_change(
     match (prev, new) {
         (CachedPoolState::RaydiumAmm(p), CachedPoolState::RaydiumAmm(n)) => {
             p.market_id != n.market_id
-                || p.serum_bids != n.serum_bids
-                || p.serum_asks != n.serum_asks
-                || p.serum_event_queue != n.serum_event_queue
                 || p.coin_vault != n.coin_vault
                 || p.pc_vault != n.pc_vault
                 || p.base_mint != n.base_mint
                 || p.quote_mint != n.quote_mint
+                || p.serum_bids != n.serum_bids
+                || p.serum_asks != n.serum_asks
+                || p.serum_event_queue != n.serum_event_queue
         }
         (CachedPoolState::RaydiumCpmm(p), CachedPoolState::RaydiumCpmm(n)) => {
-            p.token_0_vault != n.token_0_vault
-                || p.token_1_vault != n.token_1_vault
-                || p.token_0_mint != n.token_0_mint
+            p.token_0_mint != n.token_0_mint
                 || p.token_1_mint != n.token_1_mint
+                || p.token_0_vault != n.token_0_vault
+                || p.token_1_vault != n.token_1_vault
         }
         (CachedPoolState::MeteoraCpmm(p), CachedPoolState::MeteoraCpmm(n)) => {
-            p.token_0_vault != n.token_0_vault
-                || p.token_1_vault != n.token_1_vault
-                || p.token_0_mint != n.token_0_mint
+            p.token_0_mint != n.token_0_mint
                 || p.token_1_mint != n.token_1_mint
+                || p.token_0_vault != n.token_0_vault
+                || p.token_1_vault != n.token_1_vault
                 || p.amm_config != n.amm_config
                 || p.observation_key != n.observation_key
                 || p.token_0_program != n.token_0_program
                 || p.token_1_program != n.token_1_program
+                || p.status != n.status
         }
         (CachedPoolState::Meteora(p), CachedPoolState::Meteora(n)) => {
             p.active_id != n.active_id
                 || p.bin_step != n.bin_step
-                || p.reserve_x != n.reserve_x
-                || p.reserve_y != n.reserve_y
                 || p.token_x_mint != n.token_x_mint
                 || p.token_y_mint != n.token_y_mint
+                || p.reserve_x != n.reserve_x
+                || p.reserve_y != n.reserve_y
         }
         (CachedPoolState::PumpAmm(p), CachedPoolState::PumpAmm(n)) => {
             p.pool_accounts != n.pool_accounts
-                || p.creator != n.creator
                 || p.pool_base_token_account != n.pool_base_token_account
                 || p.pool_quote_token_account != n.pool_quote_token_account
                 || p.base_mint != n.base_mint
                 || p.quote_mint != n.quote_mint
+                || p.creator != n.creator
         }
         (CachedPoolState::PumpFun(p), CachedPoolState::PumpFun(n)) => {
             p.complete != n.complete
                 || p.real_token_reserves != n.real_token_reserves
                 || p.real_sol_reserves != n.real_sol_reserves
                 || p.creator != n.creator
+                || p.token_mint != n.token_mint
                 || p.associated_bonding_curve != n.associated_bonding_curve
                 || p.cashback_enabled != n.cashback_enabled
         }
         (CachedPoolState::Orca(p), CachedPoolState::Orca(n)) => {
             p.tick_current_index != n.tick_current_index
                 || p.sqrt_price != n.sqrt_price
-                || p.token_vault_a != n.token_vault_a
-                || p.token_vault_b != n.token_vault_b
                 || p.token_mint_a != n.token_mint_a
                 || p.token_mint_b != n.token_mint_b
+                || p.token_vault_a != n.token_vault_a
+                || p.token_vault_b != n.token_vault_b
                 || p.tick_spacing != n.tick_spacing
+                || p.fee_rate != n.fee_rate
+                || p.protocol_fee_rate != n.protocol_fee_rate
+                || p.liquidity != n.liquidity
                 || p.token_a_program != n.token_a_program
                 || p.token_b_program != n.token_b_program
         }
@@ -455,5 +463,108 @@ mod tests {
         });
         assert!(cache_balance_fields_unchanged(&a, &b));
         assert!(!cache_balance_fields_unchanged(&a, &c));
+    }
+
+    #[test]
+    fn layout_change_raydium_cpmm_vault_pubkey_is_significant() {
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let v0 = Pubkey::new_unique();
+        let v1 = Pubkey::new_unique();
+        let prev = CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+            token_0_mint: mint_a,
+            token_1_mint: mint_b,
+            token_0_vault: v0,
+            token_1_vault: v1,
+            reserve_0: Some(100),
+            reserve_1: Some(200),
+        });
+        let new_vault = CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+            token_0_mint: mint_a,
+            token_1_mint: mint_b,
+            token_0_vault: Pubkey::new_unique(),
+            token_1_vault: v1,
+            reserve_0: Some(100),
+            reserve_1: Some(200),
+        });
+        assert!(pool_cache_state_layout_significant_change(
+            &prev, &new_vault
+        ));
+        assert!(!pool_cache_state_layout_significant_change(&prev, &prev));
+    }
+
+    #[test]
+    fn layout_change_raydium_cpmm_reserve_only_is_not_significant() {
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let v0 = Pubkey::new_unique();
+        let v1 = Pubkey::new_unique();
+        let prev = CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+            token_0_mint: mint_a,
+            token_1_mint: mint_b,
+            token_0_vault: v0,
+            token_1_vault: v1,
+            reserve_0: Some(100),
+            reserve_1: Some(200),
+        });
+        let new_bal = CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+            token_0_mint: mint_a,
+            token_1_mint: mint_b,
+            token_0_vault: v0,
+            token_1_vault: v1,
+            reserve_0: Some(101),
+            reserve_1: Some(200),
+        });
+        assert!(!pool_cache_state_layout_significant_change(&prev, &new_bal));
+        assert!(!cache_balance_fields_unchanged(&prev, &new_bal));
+    }
+
+    #[test]
+    fn layout_change_raydium_amm_serum_accounts_is_significant() {
+        use crate::execution::live_pool_cache::RaydiumAmmState;
+
+        let base = |serum_bids: Option<Pubkey>| {
+            CachedPoolState::RaydiumAmm(RaydiumAmmState {
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                coin_vault: Pubkey::new_unique(),
+                pc_vault: Pubkey::new_unique(),
+                base_decimals: 6,
+                quote_decimals: 9,
+                coin_reserve: Some(1),
+                pc_reserve: Some(2),
+                market_id: Pubkey::new_unique(),
+                serum_bids,
+                serum_asks: Some(Pubkey::new_unique()),
+                serum_event_queue: Some(Pubkey::new_unique()),
+            })
+        };
+        let prev = base(Some(Pubkey::new_unique()));
+        let with_new_bids = base(Some(Pubkey::new_unique()));
+        assert!(pool_cache_state_layout_significant_change(
+            &prev,
+            &with_new_bids
+        ));
+    }
+
+    #[test]
+    fn layout_change_meteora_dlmm_reserve_pubkeys_is_significant() {
+        use crate::execution::live_pool_cache::MeteoraState;
+
+        let mk = |reserve_x: Pubkey| {
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: Pubkey::new_unique(),
+                token_y_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                reserve_x,
+                reserve_y: Pubkey::new_unique(),
+                active_id: 1,
+                bin_step: 10,
+                reserve_x_balance: Some(1),
+                reserve_y_balance: Some(2),
+            })
+        };
+        let prev = mk(Pubkey::new_unique());
+        let next = mk(Pubkey::new_unique());
+        assert!(pool_cache_state_layout_significant_change(&prev, &next));
     }
 }

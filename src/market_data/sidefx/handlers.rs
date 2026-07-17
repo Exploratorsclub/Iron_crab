@@ -1267,6 +1267,8 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
             return;
         }
 
+        md_sidefx_merge_pool_readiness_from_cached_state(host, pool_pubkey, &cached_state);
+
         if let CachedPoolState::Meteora(ref s) = cached_state {
             let meta_changed = match prev_meteora_meta {
                 None => host.is_hot_pool(pool_pubkey),
@@ -1380,8 +1382,6 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                 }
             }
         };
-
-        md_sidefx_merge_pool_readiness_from_cached_state(host, pool_pubkey, &cached_state);
 
         // Publish PoolCacheUpdate to JetStream (Single Source of Truth for pool state)
         let should_publish_pool_cache = update_class.is_exec_hot()
