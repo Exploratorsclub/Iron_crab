@@ -333,20 +333,66 @@ pub fn pool_cache_state_layout_significant_change(
         return true;
     }
     match (prev, new) {
+        (CachedPoolState::RaydiumAmm(p), CachedPoolState::RaydiumAmm(n)) => {
+            p.market_id != n.market_id
+                || p.serum_bids != n.serum_bids
+                || p.serum_asks != n.serum_asks
+                || p.serum_event_queue != n.serum_event_queue
+                || p.coin_vault != n.coin_vault
+                || p.pc_vault != n.pc_vault
+                || p.base_mint != n.base_mint
+                || p.quote_mint != n.quote_mint
+        }
+        (CachedPoolState::RaydiumCpmm(p), CachedPoolState::RaydiumCpmm(n)) => {
+            p.token_0_vault != n.token_0_vault
+                || p.token_1_vault != n.token_1_vault
+                || p.token_0_mint != n.token_0_mint
+                || p.token_1_mint != n.token_1_mint
+        }
+        (CachedPoolState::MeteoraCpmm(p), CachedPoolState::MeteoraCpmm(n)) => {
+            p.token_0_vault != n.token_0_vault
+                || p.token_1_vault != n.token_1_vault
+                || p.token_0_mint != n.token_0_mint
+                || p.token_1_mint != n.token_1_mint
+                || p.amm_config != n.amm_config
+                || p.observation_key != n.observation_key
+                || p.token_0_program != n.token_0_program
+                || p.token_1_program != n.token_1_program
+        }
         (CachedPoolState::Meteora(p), CachedPoolState::Meteora(n)) => {
-            p.active_id != n.active_id || p.bin_step != n.bin_step
+            p.active_id != n.active_id
+                || p.bin_step != n.bin_step
+                || p.reserve_x != n.reserve_x
+                || p.reserve_y != n.reserve_y
+                || p.token_x_mint != n.token_x_mint
+                || p.token_y_mint != n.token_y_mint
         }
         (CachedPoolState::PumpAmm(p), CachedPoolState::PumpAmm(n)) => {
             p.pool_accounts != n.pool_accounts
+                || p.creator != n.creator
+                || p.pool_base_token_account != n.pool_base_token_account
+                || p.pool_quote_token_account != n.pool_quote_token_account
+                || p.base_mint != n.base_mint
+                || p.quote_mint != n.quote_mint
         }
         (CachedPoolState::PumpFun(p), CachedPoolState::PumpFun(n)) => {
             p.complete != n.complete
                 || p.real_token_reserves != n.real_token_reserves
                 || p.real_sol_reserves != n.real_sol_reserves
                 || p.creator != n.creator
+                || p.associated_bonding_curve != n.associated_bonding_curve
+                || p.cashback_enabled != n.cashback_enabled
         }
         (CachedPoolState::Orca(p), CachedPoolState::Orca(n)) => {
-            p.tick_current_index != n.tick_current_index || p.sqrt_price != n.sqrt_price
+            p.tick_current_index != n.tick_current_index
+                || p.sqrt_price != n.sqrt_price
+                || p.token_vault_a != n.token_vault_a
+                || p.token_vault_b != n.token_vault_b
+                || p.token_mint_a != n.token_mint_a
+                || p.token_mint_b != n.token_mint_b
+                || p.tick_spacing != n.tick_spacing
+                || p.token_a_program != n.token_a_program
+                || p.token_b_program != n.token_b_program
         }
         _ => false,
     }

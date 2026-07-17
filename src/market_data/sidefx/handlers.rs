@@ -216,6 +216,49 @@ fn md_sidefx_should_publish_enrich_pool_cache_update(
     true
 }
 
+/// Refresh MASTER monotonic readiness maps after cache upsert (independent of ENRICH publish throttle).
+fn md_sidefx_merge_pool_readiness_from_cached_state(
+    host: &dyn SidefxWorkerHost,
+    pool_pubkey: &Pubkey,
+    cached_state: &CachedPoolState,
+) {
+    match cached_state {
+        CachedPoolState::PumpFun(_) => {
+            host.live_pool_cache()
+                .merge_pumpfun_bonding_readiness(*pool_pubkey, DexPoolReadiness::Partial);
+        }
+        CachedPoolState::PumpAmm(_) => {
+            host.live_pool_cache()
+                .merge_pump_amm_pool_accounts_readiness(*pool_pubkey, DexPoolReadiness::Partial);
+        }
+        CachedPoolState::RaydiumAmm(s) => {
+            let readiness = raydium_amm_readiness_for_pool_cache_update(s);
+            host.live_pool_cache()
+                .merge_raydium_amm_pool_readiness(*pool_pubkey, readiness);
+        }
+        CachedPoolState::RaydiumCpmm(s) => {
+            let readiness = raydium_cpmm_readiness_for_pool_cache_update(s);
+            host.live_pool_cache()
+                .merge_raydium_cpmm_pool_readiness(*pool_pubkey, readiness);
+        }
+        CachedPoolState::MeteoraCpmm(s) => {
+            let readiness = meteora_cpmm_readiness_for_pool_cache_update(s);
+            host.live_pool_cache()
+                .merge_meteora_cpmm_pool_readiness(*pool_pubkey, readiness);
+        }
+        CachedPoolState::Orca(s) => {
+            let readiness = orca_readiness_for_pool_cache_update(s);
+            host.live_pool_cache()
+                .merge_orca_pool_readiness(*pool_pubkey, readiness);
+        }
+        CachedPoolState::Meteora(s) => {
+            let readiness = meteora_dlmm_readiness_for_pool_cache_update(s);
+            host.live_pool_cache()
+                .merge_meteora_dlmm_pool_readiness(*pool_pubkey, readiness);
+        }
+    }
+}
+
 /// P2 SLO: count enrichment publishes only for EnrichmentRegistry members.
 fn md_sidefx_inc_enrichment_publish_metrics_if_member(
     host: &dyn SidefxWorkerHost,
@@ -1338,6 +1381,8 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
             }
         };
 
+        md_sidefx_merge_pool_readiness_from_cached_state(host, pool_pubkey, &cached_state);
+
         // Publish PoolCacheUpdate to JetStream (Single Source of Truth for pool state)
         let should_publish_pool_cache = update_class.is_exec_hot()
             || md_sidefx_should_publish_enrich_pool_cache_update(
@@ -1394,8 +1439,6 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                     pool_update.metadata = Some(meta);
                     // Geyser-fed bonding curve: observation / partial only — not cold-path verified Ready.
                     pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Partial);
-                    host.live_pool_cache()
-                        .merge_pumpfun_bonding_readiness(*pool_pubkey, DexPoolReadiness::Partial);
 
                     // === BondingCurveProgress event for momentum-bot exit signal ===
                     // PumpFun initial real_token_reserves = 793_100_000_000_000
@@ -1487,11 +1530,6 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                     }
                     // Geyser-fed accounts + reserves: stronger than observation-only, not Ready until verified trade/discovery.
                     pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Partial);
-                    host.live_pool_cache()
-                        .merge_pump_amm_pool_accounts_readiness(
-                            *pool_pubkey,
-                            DexPoolReadiness::Partial,
-                        );
                 }
                 CachedPoolState::RaydiumAmm(s) => {
                     // FIX-29: Always propagate market_id (from Geyser parse),
@@ -1512,8 +1550,6 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                     }
                     let readiness = raydium_amm_readiness_for_pool_cache_update(s);
                     pool_update.set_dex_readiness_in_metadata(readiness);
-                    host.live_pool_cache()
-                        .merge_raydium_amm_pool_readiness(*pool_pubkey, readiness);
                 }
                 CachedPoolState::RaydiumCpmm(s) => {
                     let mut meta = std::collections::HashMap::new();
@@ -1524,8 +1560,6 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                     pool_update.metadata = Some(meta);
                     let readiness = raydium_cpmm_readiness_for_pool_cache_update(s);
                     pool_update.set_dex_readiness_in_metadata(readiness);
-                    host.live_pool_cache()
-                        .merge_raydium_cpmm_pool_readiness(*pool_pubkey, readiness);
                 }
                 CachedPoolState::MeteoraCpmm(s) => {
                     let mut meta = std::collections::HashMap::new();
@@ -1540,22 +1574,16 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                     pool_update.metadata = Some(meta);
                     let readiness = meteora_cpmm_readiness_for_pool_cache_update(s);
                     pool_update.set_dex_readiness_in_metadata(readiness);
-                    host.live_pool_cache()
-                        .merge_meteora_cpmm_pool_readiness(*pool_pubkey, readiness);
                 }
                 CachedPoolState::Orca(s) => {
                     pool_update.metadata = Some(orca_metadata_for_pool_cache_update(s));
                     let readiness = orca_readiness_for_pool_cache_update(s);
                     pool_update.set_dex_readiness_in_metadata(readiness);
-                    host.live_pool_cache()
-                        .merge_orca_pool_readiness(*pool_pubkey, readiness);
                 }
                 CachedPoolState::Meteora(s) => {
                     pool_update.metadata = Some(meteora_dlmm_metadata_for_pool_cache_update(s));
                     let readiness = meteora_dlmm_readiness_for_pool_cache_update(s);
                     pool_update.set_dex_readiness_in_metadata(readiness);
-                    host.live_pool_cache()
-                        .merge_meteora_dlmm_pool_readiness(*pool_pubkey, readiness);
                 }
             }
             // P3 #13: Propagate base_decimals and quote_decimals to SLAVE caches (all DEX types)
