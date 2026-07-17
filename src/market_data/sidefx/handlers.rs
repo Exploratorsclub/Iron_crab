@@ -5,8 +5,9 @@ use super::pool_publish::{
     cache_balance_fields_unchanged, cached_pool_has_fresh_reserve_basis,
     meteora_cpmm_onchain_mints_for_pool_cache_update, meteora_cpmm_vaults_for_pool_cache_update,
     meteora_dlmm_metadata_for_pool_cache_update, orca_metadata_for_pool_cache_update,
-    pool_cache_balance_fields_from_state, pump_amm_sell_layout_publish_state,
-    raydium_cpmm_readiness_for_pool_cache_update, raydium_cpmm_vaults_for_pool_cache_update,
+    pool_cache_balance_fields_from_state, pool_cache_state_layout_significant_change,
+    pump_amm_sell_layout_publish_state, raydium_cpmm_readiness_for_pool_cache_update,
+    raydium_cpmm_vaults_for_pool_cache_update,
 };
 use super::worker::{DlmmPoolStateSignal, MdSidefxBurstScratch, MdSidefxCommand};
 use crate::execution::live_pool_cache::{
@@ -23,6 +24,7 @@ use crate::metrics::{
     inc_market_data_devwallet_bonding_path_total, inc_market_data_devwallet_tx_published_total,
     inc_market_data_enrichment_balance_updated_total,
     inc_market_data_enrichment_pool_state_publish_total,
+    inc_market_data_md_sidefx_enrich_publish_skipped_total,
     inc_market_data_pool_state_publish_skipped_balance_unchanged_total,
     record_market_data_bonding_curve_grpc_to_devwallet_ms,
     record_market_data_pool_mint_map_to_devwallet_ms, MarketDataLatencySegment,
@@ -187,6 +189,33 @@ fn md_sidefx_publish_enrichment_from_cache_upsert(
     }
 }
 
+/// ENRICH-only: skip redundant JetStream `PoolCacheUpdate` when vault feed already covers reserves.
+/// EXEC_HOT always publishes (I-MD-4). Stale upsert early-return is handled before this gate.
+fn md_sidefx_should_publish_enrich_pool_cache_update(
+    host: &dyn SidefxWorkerHost,
+    pool_pubkey: &Pubkey,
+    prev_state: Option<&CachedPoolState>,
+    cached_state: &CachedPoolState,
+) -> bool {
+    let Some(prev) = prev_state else {
+        return true;
+    };
+    if pool_cache_state_layout_significant_change(prev, cached_state) {
+        return true;
+    }
+    if host.pool_has_live_vault_geyser_feed(*pool_pubkey)
+        && cache_balance_fields_unchanged(prev, cached_state)
+    {
+        inc_market_data_md_sidefx_enrich_publish_skipped_total();
+        return false;
+    }
+    if cache_balance_fields_unchanged(prev, cached_state) {
+        inc_market_data_md_sidefx_enrich_publish_skipped_total();
+        return false;
+    }
+    true
+}
+
 /// P2 SLO: count enrichment publishes only for EnrichmentRegistry members.
 fn md_sidefx_inc_enrichment_publish_metrics_if_member(
     host: &dyn SidefxWorkerHost,
@@ -296,6 +325,7 @@ pub fn md_sidefx_process_dlmm_pool_state_publish_signal(
         pool_address,
         slot,
         grpc_recv_at,
+        update_class: _,
     } = job
     else {
         return;
@@ -1153,6 +1183,7 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
         account_data,
         slot,
         grpc_recv_at,
+        update_class,
     } = job
     else {
         return;
@@ -1308,7 +1339,14 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
         };
 
         // Publish PoolCacheUpdate to JetStream (Single Source of Truth for pool state)
-        if host.nats_enabled() {
+        let should_publish_pool_cache = update_class.is_exec_hot()
+            || md_sidefx_should_publish_enrich_pool_cache_update(
+                host,
+                pool_pubkey,
+                prev_state.as_ref(),
+                &cached_state,
+            );
+        if should_publish_pool_cache && host.nats_enabled() {
             let mut pool_update = PoolCacheUpdate::new_pool_discovered(
                 "market-data",
                 host.build_version(),
@@ -1576,6 +1614,7 @@ pub fn md_sidefx_process_vault_balance_tick(
         balance,
         slot,
         grpc_recv_at,
+        update_class,
     } = job
     else {
         return;
@@ -1590,7 +1629,7 @@ pub fn md_sidefx_process_vault_balance_tick(
         inc_market_data_pool_state_publish_skipped_balance_unchanged_total();
         return;
     }
-    scratch.note_vault_touch(*vault_pubkey);
+    scratch.note_vault_touch(*vault_pubkey, *update_class);
 
     let (mut final_base, mut final_quote) = host
         .snapshot_vault_pair_balances(vault_pubkey, *balance)
@@ -1617,7 +1656,8 @@ pub fn md_sidefx_process_vault_balance_tick(
     host.live_pool_cache()
         .update_vault_balance(vault_pubkey, *balance, *slot);
 
-    if host.nats_enabled() {
+    let publish_jetstream = update_class.is_exec_hot();
+    if publish_jetstream && host.nats_enabled() {
         let mut balance_update = PoolCacheUpdate::new_balance_updated(
             "market-data",
             host.build_version(),
@@ -1725,6 +1765,8 @@ pub fn md_sidefx_process_vault_balance_tick(
             slot = slot,
             "MASTER CACHE: PoolCacheUpdate::BalanceUpdated enqueued for JetStream"
         );
+    } else if !update_class.is_exec_hot() {
+        inc_market_data_md_sidefx_enrich_publish_skipped_total();
     }
 
     let state_event = MarketEvent::new(
@@ -1749,7 +1791,7 @@ pub fn md_sidefx_process_vault_balance_tick(
 
     host.write_market_event_jsonl(&state_event);
 
-    if host.nats_enabled() {
+    if publish_jetstream && host.nats_enabled() {
         let pool_state_enqueued = host.enqueue_core_market_event(
             state_event,
             Some(MarketEventCorePublishTrace {
@@ -1772,10 +1814,10 @@ pub fn md_sidefx_process_touch_bin_array_tick(
     job: &MdSidefxCommand,
     scratch: &mut MdSidefxBurstScratch,
 ) {
-    let MdSidefxCommand::TouchBinArrayTick { pda } = job else {
+    let MdSidefxCommand::TouchBinArrayTick { pda, update_class } = job else {
         return;
     };
-    scratch.note_bin_array_touch(*pda);
+    scratch.note_bin_array_touch(*pda, *update_class);
 }
 
 pub fn md_sidefx_process_trade_pool_lru_touch(

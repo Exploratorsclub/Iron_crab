@@ -2,8 +2,10 @@
 
 use super::handlers::md_sidefx_process_job;
 use super::host::SidefxWorkerHost;
+use crate::market_data::ingest::AccountUpdateClass;
 use crate::metrics::{
     inc_market_data_md_sidefx_enqueue_dropped_total,
+    inc_market_data_md_sidefx_enrich_enqueue_dropped_total,
     inc_market_data_md_sidefx_jobs_processed_total, set_market_data_md_sidefx_queue_depth,
 };
 use crate::solana::dex_parser::DexType;
@@ -14,6 +16,41 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
+
+/// Sidefx job priority propagated from account ingest classification (Scope D).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidefxUpdateClass {
+    ExecHot,
+    Enrich,
+}
+
+impl SidefxUpdateClass {
+    #[inline]
+    pub fn is_exec_hot(self) -> bool {
+        matches!(self, Self::ExecHot)
+    }
+
+    #[inline]
+    pub fn merge_priority(self, other: Self) -> Self {
+        if self.is_exec_hot() || other.is_exec_hot() {
+            Self::ExecHot
+        } else {
+            Self::Enrich
+        }
+    }
+}
+
+impl From<AccountUpdateClass> for SidefxUpdateClass {
+    fn from(class: AccountUpdateClass) -> Self {
+        match class {
+            AccountUpdateClass::ExecHot => Self::ExecHot,
+            AccountUpdateClass::Enrich | AccountUpdateClass::Drop => Self::Enrich,
+        }
+    }
+}
+
+/// Reserve headroom for EXEC_HOT when the sidefx queue is under pressure.
+const MARKET_DATA_MD_SIDEFX_ENRICH_HEADROOM: usize = 512;
 
 /// Phase-R-R4: bounded queue for deferred pool_mint_map / publish / live_pool_cache side-effects.
 pub const MARKET_DATA_MD_SIDEFX_QUEUE_CAP: usize = 4096;
@@ -93,15 +130,20 @@ pub enum MdSidefxCommand {
         balance: u64,
         slot: u64,
         grpc_recv_at: Instant,
+        update_class: SidefxUpdateClass,
     },
     /// DLMM bin-array LRU touch off account ingest (coalesced in md-sidefx burst).
-    TouchBinArrayTick { pda: Pubkey },
+    TouchBinArrayTick {
+        pda: Pubkey,
+        update_class: SidefxUpdateClass,
+    },
     /// P0: coalesced PoolStateUpdate for hot Meteora DLMM pools (bin/state signal, no vault delta).
     DlmmPoolStatePublishSignal {
         run_id: String,
         pool_address: Pubkey,
         slot: u64,
         grpc_recv_at: Instant,
+        update_class: SidefxUpdateClass,
     },
     /// PR237: trade-path vault/bin LRU touch via sidefx scratch (replaces md-state TouchPool).
     TradePoolLruTouch { pool: Pubkey },
@@ -113,6 +155,7 @@ pub enum MdSidefxCommand {
         account_data: Vec<u8>,
         slot: u64,
         grpc_recv_at: Instant,
+        update_class: SidefxUpdateClass,
     },
     /// Phase-R-R4b: mint decimals mirror into MASTER cache (TokenMintInfo path).
     LivePoolCacheMintDecimals { mint: Pubkey, decimals: u8 },
@@ -134,10 +177,12 @@ pub struct DlmmPoolStateSignal {
     pub grpc_recv_at: Instant,
 }
 
-/// Per-burst scratch: LRU touches coalesced before md-state enqueue.
+/// Per-burst scratch: LRU touches coalesced before md-state enqueue (class-split for Scope D).
 pub struct MdSidefxBurstScratch {
-    pending_vault_touches: HashSet<Pubkey>,
-    pending_bin_array_touches: HashSet<Pubkey>,
+    pending_exec_hot_vault_touches: HashSet<Pubkey>,
+    pending_enrich_vault_touches: HashSet<Pubkey>,
+    pending_exec_hot_bin_array_touches: HashSet<Pubkey>,
+    pending_enrich_bin_array_touches: HashSet<Pubkey>,
     pending_dlmm_pool_state_signals: HashMap<Pubkey, DlmmPoolStateSignal>,
 }
 
@@ -150,18 +195,30 @@ impl Default for MdSidefxBurstScratch {
 impl MdSidefxBurstScratch {
     pub fn new() -> Self {
         Self {
-            pending_vault_touches: HashSet::new(),
-            pending_bin_array_touches: HashSet::new(),
+            pending_exec_hot_vault_touches: HashSet::new(),
+            pending_enrich_vault_touches: HashSet::new(),
+            pending_exec_hot_bin_array_touches: HashSet::new(),
+            pending_enrich_bin_array_touches: HashSet::new(),
             pending_dlmm_pool_state_signals: HashMap::new(),
         }
     }
 
-    pub fn note_vault_touch(&mut self, vault: Pubkey) {
-        self.pending_vault_touches.insert(vault);
+    pub fn note_vault_touch(&mut self, vault: Pubkey, class: SidefxUpdateClass) {
+        if class.is_exec_hot() {
+            self.pending_exec_hot_vault_touches.insert(vault);
+            self.pending_enrich_vault_touches.remove(&vault);
+        } else {
+            self.pending_enrich_vault_touches.insert(vault);
+        }
     }
 
-    pub fn note_bin_array_touch(&mut self, pda: Pubkey) {
-        self.pending_bin_array_touches.insert(pda);
+    pub fn note_bin_array_touch(&mut self, pda: Pubkey, class: SidefxUpdateClass) {
+        if class.is_exec_hot() {
+            self.pending_exec_hot_bin_array_touches.insert(pda);
+            self.pending_enrich_bin_array_touches.remove(&pda);
+        } else {
+            self.pending_enrich_bin_array_touches.insert(pda);
+        }
     }
 
     pub fn note_dlmm_pool_state_signal(
@@ -191,17 +248,23 @@ impl MdSidefxBurstScratch {
     }
 
     pub fn pending_vault_touches_contains(&self, vault: &Pubkey) -> bool {
-        self.pending_vault_touches.contains(vault)
+        self.pending_exec_hot_vault_touches.contains(vault)
+            || self.pending_enrich_vault_touches.contains(vault)
     }
 
     pub fn lru_touches_empty(&self) -> bool {
-        self.pending_vault_touches.is_empty() && self.pending_bin_array_touches.is_empty()
+        self.pending_exec_hot_vault_touches.is_empty()
+            && self.pending_enrich_vault_touches.is_empty()
+            && self.pending_exec_hot_bin_array_touches.is_empty()
+            && self.pending_enrich_bin_array_touches.is_empty()
     }
 
-    pub fn drain_lru_touches(&mut self) -> (Vec<Pubkey>, Vec<Pubkey>) {
+    pub fn drain_lru_touches(&mut self) -> (Vec<Pubkey>, Vec<Pubkey>, Vec<Pubkey>, Vec<Pubkey>) {
         (
-            self.pending_vault_touches.drain().collect(),
-            self.pending_bin_array_touches.drain().collect(),
+            self.pending_exec_hot_vault_touches.drain().collect(),
+            self.pending_enrich_vault_touches.drain().collect(),
+            self.pending_exec_hot_bin_array_touches.drain().collect(),
+            self.pending_enrich_bin_array_touches.drain().collect(),
         )
     }
 }
@@ -212,6 +275,27 @@ pub fn md_sidefx_flush_pending_md_state_jobs(
 ) {
     super::handlers::md_sidefx_flush_pending_dlmm_pool_state_publishes(host, scratch);
     host.flush_lru_touches(scratch);
+}
+
+/// Read propagated ingest class from account-path sidefx commands (TX-path defaults to EXEC_HOT).
+pub fn md_sidefx_job_update_class(job: &MdSidefxCommand) -> SidefxUpdateClass {
+    match job {
+        MdSidefxCommand::LivePoolCacheAccountUpdate { update_class, .. } => *update_class,
+        MdSidefxCommand::VaultBalanceTick { update_class, .. } => *update_class,
+        MdSidefxCommand::TouchBinArrayTick { update_class, .. } => *update_class,
+        MdSidefxCommand::DlmmPoolStatePublishSignal { update_class, .. } => *update_class,
+        _ => SidefxUpdateClass::ExecHot,
+    }
+}
+
+fn md_sidefx_apply_update_class(job: &mut MdSidefxCommand, class: SidefxUpdateClass) {
+    match job {
+        MdSidefxCommand::LivePoolCacheAccountUpdate { update_class, .. } => *update_class = class,
+        MdSidefxCommand::VaultBalanceTick { update_class, .. } => *update_class = class,
+        MdSidefxCommand::TouchBinArrayTick { update_class, .. } => *update_class = class,
+        MdSidefxCommand::DlmmPoolStatePublishSignal { update_class, .. } => *update_class = class,
+        _ => {}
+    }
 }
 
 fn md_sidefx_dec_queue_depth(queue_depth: &AtomicUsize) {
@@ -230,15 +314,37 @@ fn md_sidefx_dec_queue_depth(queue_depth: &AtomicUsize) {
 }
 
 pub fn md_sidefx_try_enqueue(sender: &MdSidefxSender, job: MdSidefxCommand) {
-    if sender.queue_depth.load(Ordering::Relaxed) >= sender.queue_capacity {
-        inc_market_data_md_sidefx_enqueue_dropped_total();
+    let class = md_sidefx_job_update_class(&job);
+    md_sidefx_try_enqueue_classed(sender, class, job);
+}
+
+pub fn md_sidefx_try_enqueue_classed(
+    sender: &MdSidefxSender,
+    class: SidefxUpdateClass,
+    job: MdSidefxCommand,
+) {
+    let depth = sender.queue_depth.load(Ordering::Relaxed);
+    if depth >= sender.queue_capacity {
+        if class.is_exec_hot() {
+            inc_market_data_md_sidefx_enqueue_dropped_total();
+        } else {
+            inc_market_data_md_sidefx_enrich_enqueue_dropped_total();
+        }
+        return;
+    }
+    if !class.is_exec_hot()
+        && depth + MARKET_DATA_MD_SIDEFX_ENRICH_HEADROOM >= sender.queue_capacity
+    {
+        inc_market_data_md_sidefx_enrich_enqueue_dropped_total();
         return;
     }
     if sender.tx.try_send(job).is_ok() {
-        let depth = sender.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
-        set_market_data_md_sidefx_queue_depth(depth);
-    } else {
+        let new_depth = sender.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        set_market_data_md_sidefx_queue_depth(new_depth);
+    } else if class.is_exec_hot() {
         inc_market_data_md_sidefx_enqueue_dropped_total();
+    } else {
+        inc_market_data_md_sidefx_enrich_enqueue_dropped_total();
     }
 }
 
@@ -249,7 +355,7 @@ pub fn md_sidefx_coalesce_key(job: &MdSidefxCommand) -> Option<Pubkey> {
         MdSidefxCommand::PumpAmmCreatePoolObserved { pool_address, .. } => Some(*pool_address),
         MdSidefxCommand::LivePoolCacheAccountUpdate { pool_pubkey, .. } => Some(*pool_pubkey),
         MdSidefxCommand::VaultBalanceTick { vault_pubkey, .. } => Some(*vault_pubkey),
-        MdSidefxCommand::TouchBinArrayTick { pda } => Some(*pda),
+        MdSidefxCommand::TouchBinArrayTick { pda, .. } => Some(*pda),
         MdSidefxCommand::DlmmPoolStatePublishSignal { pool_address, .. } => Some(*pool_address),
         MdSidefxCommand::TradePoolLruTouch { pool } => Some(*pool),
         _ => None,
@@ -262,7 +368,10 @@ pub fn md_sidefx_coalesce_burst(jobs: Vec<MdSidefxCommand>) -> Vec<MdSidefxComma
     for job in jobs {
         if let Some(pool) = md_sidefx_coalesce_key(&job) {
             if let Some(&idx) = coalesced.get(&pool) {
+                let merged_class = md_sidefx_job_update_class(&out[idx])
+                    .merge_priority(md_sidefx_job_update_class(&job));
                 out[idx] = job;
+                md_sidefx_apply_update_class(&mut out[idx], merged_class);
             } else {
                 coalesced.insert(pool, out.len());
                 out.push(job);
@@ -272,6 +381,21 @@ pub fn md_sidefx_coalesce_burst(jobs: Vec<MdSidefxCommand>) -> Vec<MdSidefxComma
         }
     }
     out
+}
+
+fn md_sidefx_partition_by_class(
+    jobs: Vec<MdSidefxCommand>,
+) -> (Vec<MdSidefxCommand>, Vec<MdSidefxCommand>) {
+    let mut exec_hot = Vec::new();
+    let mut enrich = Vec::new();
+    for job in jobs {
+        if md_sidefx_job_update_class(&job).is_exec_hot() {
+            exec_hot.push(job);
+        } else {
+            enrich.push(job);
+        }
+    }
+    (exec_hot, enrich)
 }
 
 fn md_sidefx_worker_loop(
@@ -298,7 +422,12 @@ fn md_sidefx_worker_loop(
             }
         }
         let mut scratch = MdSidefxBurstScratch::new();
-        for job in md_sidefx_coalesce_burst(jobs) {
+        let coalesced = md_sidefx_coalesce_burst(jobs);
+        let (exec_hot_jobs, enrich_jobs) = md_sidefx_partition_by_class(coalesced);
+        for job in exec_hot_jobs {
+            md_sidefx_process_job(worker.as_ref(), &job, &mut scratch);
+        }
+        for job in enrich_jobs {
             md_sidefx_process_job(worker.as_ref(), &job, &mut scratch);
         }
         md_sidefx_flush_pending_md_state_jobs(worker.as_ref(), &mut scratch);
@@ -320,5 +449,91 @@ pub fn spawn_md_sidefx_worker(
         tx,
         queue_depth,
         queue_capacity,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RAYDIUM_CPMM_OWNER: Pubkey =
+        solana_sdk::pubkey!("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C");
+
+    #[test]
+    fn md_sidefx_coalesce_preserves_exec_hot_class_over_enrich() {
+        let pool = Pubkey::new_unique();
+        let exec_hot = MdSidefxCommand::LivePoolCacheAccountUpdate {
+            run_id: "r".into(),
+            pool_pubkey: pool,
+            owner: RAYDIUM_CPMM_OWNER,
+            account_data: vec![1],
+            slot: 1,
+            grpc_recv_at: Instant::now(),
+            update_class: SidefxUpdateClass::ExecHot,
+        };
+        let enrich = MdSidefxCommand::LivePoolCacheAccountUpdate {
+            run_id: "r".into(),
+            pool_pubkey: pool,
+            owner: RAYDIUM_CPMM_OWNER,
+            account_data: vec![2],
+            slot: 2,
+            grpc_recv_at: Instant::now(),
+            update_class: SidefxUpdateClass::Enrich,
+        };
+        let out = md_sidefx_coalesce_burst(vec![enrich, exec_hot]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            md_sidefx_job_update_class(&out[0]),
+            SidefxUpdateClass::ExecHot
+        );
+        let MdSidefxCommand::LivePoolCacheAccountUpdate { account_data, .. } = &out[0] else {
+            panic!("expected LivePoolCacheAccountUpdate");
+        };
+        assert_eq!(account_data, &vec![1], "latest-wins data from last job in burst");
+    }
+
+    #[test]
+    fn md_sidefx_partition_processes_exec_hot_before_enrich() {
+        let pool_hot = Pubkey::new_unique();
+        let pool_enrich = Pubkey::new_unique();
+        let jobs = vec![
+            MdSidefxCommand::LivePoolCacheAccountUpdate {
+                run_id: "r".into(),
+                pool_pubkey: pool_enrich,
+                owner: RAYDIUM_CPMM_OWNER,
+                account_data: vec![],
+                slot: 1,
+                grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::Enrich,
+            },
+            MdSidefxCommand::LivePoolCacheAccountUpdate {
+                run_id: "r".into(),
+                pool_pubkey: pool_hot,
+                owner: RAYDIUM_CPMM_OWNER,
+                account_data: vec![],
+                slot: 1,
+                grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::ExecHot,
+            },
+        ];
+        let coalesced = md_sidefx_coalesce_burst(jobs);
+        let (exec_hot, enrich) = md_sidefx_partition_by_class(coalesced);
+        assert_eq!(exec_hot.len(), 1);
+        assert_eq!(enrich.len(), 1);
+        assert!(matches!(
+            exec_hot[0],
+            MdSidefxCommand::LivePoolCacheAccountUpdate { .. }
+        ));
+    }
+
+    #[test]
+    fn md_sidefx_burst_scratch_exec_hot_wins_vault_touch() {
+        let vault = Pubkey::new_unique();
+        let mut scratch = MdSidefxBurstScratch::new();
+        scratch.note_vault_touch(vault, SidefxUpdateClass::Enrich);
+        scratch.note_vault_touch(vault, SidefxUpdateClass::ExecHot);
+        let (hot_vaults, enrich_vaults, _, _) = scratch.drain_lru_touches();
+        assert_eq!(hot_vaults, vec![vault]);
+        assert!(enrich_vaults.is_empty());
     }
 }

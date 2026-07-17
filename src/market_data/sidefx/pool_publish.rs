@@ -324,6 +324,34 @@ pub fn cache_balance_fields_unchanged(prev: &CachedPoolState, new: &CachedPoolSt
     }
 }
 
+/// True when parsed pool layout metadata materially changed (ENRICH publish gate, Scope D).
+pub fn pool_cache_state_layout_significant_change(
+    prev: &CachedPoolState,
+    new: &CachedPoolState,
+) -> bool {
+    if std::mem::discriminant(prev) != std::mem::discriminant(new) {
+        return true;
+    }
+    match (prev, new) {
+        (CachedPoolState::Meteora(p), CachedPoolState::Meteora(n)) => {
+            p.active_id != n.active_id || p.bin_step != n.bin_step
+        }
+        (CachedPoolState::PumpAmm(p), CachedPoolState::PumpAmm(n)) => {
+            p.pool_accounts != n.pool_accounts
+        }
+        (CachedPoolState::PumpFun(p), CachedPoolState::PumpFun(n)) => {
+            p.complete != n.complete
+                || p.real_token_reserves != n.real_token_reserves
+                || p.real_sol_reserves != n.real_sol_reserves
+                || p.creator != n.creator
+        }
+        (CachedPoolState::Orca(p), CachedPoolState::Orca(n)) => {
+            p.tick_current_index != n.tick_current_index || p.sqrt_price != n.sqrt_price
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
