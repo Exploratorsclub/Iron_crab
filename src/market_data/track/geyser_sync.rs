@@ -114,11 +114,11 @@ pub fn track_worker_execute_coalesced_push<C: TrackWorkerContext>(
         sync_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
     );
     set_market_data_geyser_sync_pending(0);
+    ctx.refresh_tracked_membership_snapshot();
     if release_flush_slot {
         ctx.release_geyser_sync_flush_slot();
     }
     if sync_complete {
-        ctx.refresh_tracked_membership_snapshot();
         if restore_barrier_pending {
             ctx.signal_restore_barrier(true);
         }
