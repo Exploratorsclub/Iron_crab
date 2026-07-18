@@ -128,6 +128,10 @@ pub trait TrackWorkerContext: Send + Sync {
     );
     fn prune_tracked_maps_to_admitted(&self, admission: &FixedCapAdmission);
     fn publish_admitted_explicit_physical(&self, admission: &FixedCapAdmission);
+    /// True when `tracked_*` maps contain pubkeys not present in admitted set.
+    fn tracked_maps_need_prune(&self, admission: &FixedCapAdmission) -> bool;
+    /// Publish physical explicit set even when admission matches `last_synced` (restore barrier).
+    fn publish_admitted_explicit_physical_force(&self, admission: &FixedCapAdmission);
     fn last_synced_explicit_pubkeys_write(
         &self,
     ) -> parking_lot::RwLockWriteGuard<'_, HashSet<Pubkey>>;
@@ -956,6 +960,12 @@ mod tests {
 
         fn publish_admitted_explicit_physical(&self, _admission: &FixedCapAdmission) {}
 
+        fn tracked_maps_need_prune(&self, _admission: &FixedCapAdmission) -> bool {
+            false
+        }
+
+        fn publish_admitted_explicit_physical_force(&self, _admission: &FixedCapAdmission) {}
+
         fn last_synced_explicit_pubkeys_write(
             &self,
         ) -> parking_lot::RwLockWriteGuard<'_, HashSet<Pubkey>> {
@@ -1258,6 +1268,12 @@ mod tests {
 
             fn publish_admitted_explicit_physical(&self, _admission: &FixedCapAdmission) {}
 
+            fn tracked_maps_need_prune(&self, _admission: &FixedCapAdmission) -> bool {
+                false
+            }
+
+            fn publish_admitted_explicit_physical_force(&self, _admission: &FixedCapAdmission) {}
+
             fn last_synced_explicit_pubkeys_write(
                 &self,
             ) -> parking_lot::RwLockWriteGuard<'_, HashSet<Pubkey>> {
@@ -1505,6 +1521,12 @@ mod tests {
 
         fn publish_admitted_explicit_physical(&self, _admission: &FixedCapAdmission) {}
 
+        fn tracked_maps_need_prune(&self, _admission: &FixedCapAdmission) -> bool {
+            false
+        }
+
+        fn publish_admitted_explicit_physical_force(&self, _admission: &FixedCapAdmission) {}
+
         fn last_synced_explicit_pubkeys_write(
             &self,
         ) -> parking_lot::RwLockWriteGuard<'_, HashSet<Pubkey>> {
@@ -1734,6 +1756,10 @@ mod tests {
             }
             fn prune_tracked_maps_to_admitted(&self, _admission: &FixedCapAdmission) {}
             fn publish_admitted_explicit_physical(&self, _admission: &FixedCapAdmission) {}
+            fn tracked_maps_need_prune(&self, _admission: &FixedCapAdmission) -> bool {
+                false
+            }
+            fn publish_admitted_explicit_physical_force(&self, _admission: &FixedCapAdmission) {}
             fn last_synced_explicit_pubkeys_write(
                 &self,
             ) -> parking_lot::RwLockWriteGuard<'_, HashSet<Pubkey>> {
