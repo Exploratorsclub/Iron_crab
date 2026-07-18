@@ -3359,6 +3359,7 @@ impl MarketDataContext {
             let map = resume.map;
             drop(resume);
             self.apply_prune_batch(map, &batch);
+            self.refresh_tracked_membership_snapshot();
             resume = self.geyser_prune_resume.lock();
 
             if Instant::now() >= deadline
@@ -16204,6 +16205,112 @@ mod pr_b_geyser_tracking_tests {
             "expired deadline must return incomplete for ContinueGeyserEvict"
         );
         assert_eq!(ctx.tracked_vaults.read().len(), 2_000);
+    }
+
+    /// Bugbot PR307: budgeted prune must refresh membership snapshot after each batch,
+    /// including when sync returns incomplete (ContinueGeyserEvict).
+    #[test]
+    fn geyser_prune_incomplete_sync_refreshes_membership_snapshot() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            for _ in 0..1_024 {
+                let pk = Pubkey::new_unique();
+                vaults.insert(
+                    pk,
+                    VaultInfo {
+                        pool_address: pool,
+                        dex: "test".into(),
+                        base_mint: Pubkey::new_unique(),
+                        quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                        is_base_vault: true,
+                        last_balance: std::sync::atomic::AtomicU64::new(0),
+                        last_used_at: Instant::now(),
+                        pinned: false,
+                        pin: None,
+                        active_id: None,
+                        bin_step: None,
+                        sibling_vault: None,
+                    },
+                );
+            }
+        }
+        ctx.refresh_tracked_membership_snapshot();
+        assert_eq!(ctx.tracked_membership.load().vaults.len(), 1_024);
+
+        let admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        let deadline = Instant::now() + Duration::from_micros(500);
+        let complete = TrackWorkerContext::sync_geyser_tracked_accounts_batched_flush_with_deadline(
+            ctx.as_ref(),
+            deadline,
+            &admission,
+        );
+        let maps_len = ctx.tracked_vaults.read().len();
+        let snapshot_len = ctx.tracked_membership.load().vaults.len();
+        assert!(
+            !complete && maps_len < 1_024,
+            "expected partial prune with incomplete sync (complete={complete}, maps_len={maps_len})"
+        );
+        assert_eq!(
+            snapshot_len, maps_len,
+            "membership snapshot must track tracked_vaults after partial prune batch"
+        );
+        let maps_keys: HashSet<Pubkey> = ctx.tracked_vaults.read().keys().copied().collect();
+        assert_eq!(
+            ctx.tracked_membership.load().vaults,
+            maps_keys,
+            "membership snapshot keys must equal tracked_vaults after incomplete prune"
+        );
+    }
+
+    #[test]
+    fn geyser_prune_complete_sync_refreshes_membership_snapshot_without_extra_call() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            for _ in 0..600 {
+                let stale = Pubkey::new_unique();
+                vaults.insert(
+                    stale,
+                    VaultInfo {
+                        pool_address: pool,
+                        dex: "test".into(),
+                        base_mint: Pubkey::new_unique(),
+                        quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                        is_base_vault: true,
+                        last_balance: std::sync::atomic::AtomicU64::new(0),
+                        last_used_at: Instant::now(),
+                        pinned: false,
+                        pin: None,
+                        active_id: None,
+                        bin_step: None,
+                        sibling_vault: None,
+                    },
+                );
+            }
+        }
+        ctx.refresh_tracked_membership_snapshot();
+        assert_eq!(ctx.tracked_membership.load().vaults.len(), 600);
+
+        let admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(
+            TrackWorkerContext::sync_geyser_tracked_accounts_batched_flush_with_deadline(
+                ctx.as_ref(),
+                deadline,
+                &admission,
+            )
+        );
+        assert!(ctx.tracked_vaults.read().is_empty());
+        assert!(ctx.tracked_membership.load().vaults.is_empty());
     }
 
     #[test]
