@@ -1193,6 +1193,44 @@ struct MarketDataContext {
     /// PR3: explicit admission readiness (wallet-over-cap fail-closed).
     geyser_explicit_ready: AtomicBool,
     geyser_explicit_config_error: parking_lot::RwLock<Option<String>>,
+    /// Resume cursor for budgeted prune across `ContinueGeyserEvict` slices.
+    geyser_prune_resume: parking_lot::Mutex<GeyserPruneResume>,
+}
+
+/// Max removals per budget slice when pruning tracked maps to admitted set.
+const GEYSER_PRUNE_SLICE_MAX_REMOVALS: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeyserPruneMap {
+    Mints,
+    Vaults,
+    Bins,
+    Wallets,
+    Done,
+}
+
+impl GeyserPruneMap {
+    fn next(self) -> Self {
+        match self {
+            Self::Mints => Self::Vaults,
+            Self::Vaults => Self::Bins,
+            Self::Bins => Self::Wallets,
+            Self::Wallets | Self::Done => Self::Done,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct GeyserPruneResume {
+    active: bool,
+    map: GeyserPruneMap,
+    pending: Vec<Pubkey>,
+}
+
+impl Default for GeyserPruneMap {
+    fn default() -> Self {
+        Self::Mints
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2038,7 +2076,7 @@ impl TrackWorkerContext for MarketDataContext {
         deadline: Instant,
         admission: &FixedCapAdmission,
     ) -> bool {
-        let _ = deadline;
+        self.clear_geyser_prune_resume();
         self.sync_geyser_tracked_accounts_from_admission_with_deadline(deadline, admission)
     }
 
@@ -3171,42 +3209,184 @@ impl MarketDataContext {
         self.geyser_explicit_ready.load(Ordering::Relaxed)
     }
 
-    fn prune_tracked_maps_to_admitted(&self, admission: &FixedCapAdmission) {
-        let admitted: HashSet<Pubkey> = admission.snapshot_pubkeys().into_iter().collect();
+    fn clear_geyser_prune_resume(&self) {
+        *self.geyser_prune_resume.lock() = GeyserPruneResume::default();
+    }
+
+    fn tracked_maps_need_prune(&self, admitted: &HashSet<Pubkey>) -> bool {
+        if self
+            .tracked_mints
+            .read()
+            .keys()
+            .any(|pk| !admitted.contains(pk))
         {
-            let mut mints = self.tracked_mints.write();
-            mints.retain(|pk, _| admitted.contains(pk));
+            return true;
         }
+        if self
+            .tracked_vaults
+            .read()
+            .keys()
+            .any(|pk| !admitted.contains(pk))
         {
-            let mut vaults = self.tracked_vaults.write();
-            let removed: Vec<(Pubkey, Pubkey)> = vaults
-                .iter()
-                .filter(|(pk, _)| !admitted.contains(pk))
-                .map(|(pk, v)| (*pk, v.pool_address))
-                .collect();
-            for (pk, pool) in removed {
-                vaults.remove(&pk);
-                self.pool_tracked_legs_remove_vault(pool, pk);
-            }
+            return true;
         }
+        if self
+            .tracked_bin_arrays
+            .read()
+            .keys()
+            .any(|pk| !admitted.contains(pk))
         {
-            let mut bins = self.tracked_bin_arrays.write();
-            let removed: Vec<(Pubkey, Pubkey)> = bins
-                .iter()
-                .filter(|(pk, _)| !admitted.contains(pk))
-                .map(|(pk, b)| (*pk, b.pool_address))
-                .collect();
-            for (pk, pool) in removed {
-                bins.remove(&pk);
-                self.pool_tracked_legs_remove_bin(pool, pk);
-            }
+            return true;
         }
         self.tracked_wallet_token_accounts
-            .write()
-            .retain(|pk| admitted.contains(pk));
+            .read()
+            .iter()
+            .any(|pk| !admitted.contains(pk))
+    }
+
+    fn collect_extraneous_keys_for_prune_map(
+        &self,
+        admitted: &HashSet<Pubkey>,
+        map: GeyserPruneMap,
+    ) -> Vec<Pubkey> {
+        match map {
+            GeyserPruneMap::Mints => self
+                .tracked_mints
+                .read()
+                .keys()
+                .filter(|pk| !admitted.contains(*pk))
+                .copied()
+                .collect(),
+            GeyserPruneMap::Vaults => self
+                .tracked_vaults
+                .read()
+                .keys()
+                .filter(|pk| !admitted.contains(*pk))
+                .copied()
+                .collect(),
+            GeyserPruneMap::Bins => self
+                .tracked_bin_arrays
+                .read()
+                .keys()
+                .filter(|pk| !admitted.contains(*pk))
+                .copied()
+                .collect(),
+            GeyserPruneMap::Wallets => self
+                .tracked_wallet_token_accounts
+                .read()
+                .iter()
+                .filter(|pk| !admitted.contains(*pk))
+                .copied()
+                .collect(),
+            GeyserPruneMap::Done => Vec::new(),
+        }
+    }
+
+    fn apply_prune_batch(&self, map: GeyserPruneMap, batch: &[Pubkey]) {
+        match map {
+            GeyserPruneMap::Mints => {
+                let mut mints = self.tracked_mints.write();
+                for pk in batch {
+                    mints.remove(pk);
+                }
+            }
+            GeyserPruneMap::Vaults => {
+                let mut vaults = self.tracked_vaults.write();
+                for pk in batch {
+                    if let Some(info) = vaults.remove(pk) {
+                        self.pool_tracked_legs_remove_vault(info.pool_address, *pk);
+                    }
+                }
+            }
+            GeyserPruneMap::Bins => {
+                let mut bins = self.tracked_bin_arrays.write();
+                for pk in batch {
+                    if let Some(info) = bins.remove(pk) {
+                        self.pool_tracked_legs_remove_bin(info.pool_address, *pk);
+                    }
+                }
+            }
+            GeyserPruneMap::Wallets => {
+                let mut wallets = self.tracked_wallet_token_accounts.write();
+                for pk in batch {
+                    wallets.remove(pk);
+                }
+            }
+            GeyserPruneMap::Done => {}
+        }
+    }
+
+    /// Budgeted prune: returns `true` when tracked maps match admitted set.
+    fn prune_tracked_maps_to_admitted_with_deadline(
+        &self,
+        deadline: Instant,
+        admission: &FixedCapAdmission,
+    ) -> bool {
+        let admitted: HashSet<Pubkey> = admission.snapshot_pubkeys().into_iter().collect();
+        let mut resume = self.geyser_prune_resume.lock();
+
+        if !resume.active {
+            if !self.tracked_maps_need_prune(&admitted) {
+                return true;
+            }
+            resume.active = true;
+            resume.map = GeyserPruneMap::Mints;
+            resume.pending.clear();
+        }
+
+        loop {
+            if Instant::now() >= deadline {
+                return false;
+            }
+
+            if resume.pending.is_empty() {
+                while resume.map != GeyserPruneMap::Done {
+                    resume.pending =
+                        self.collect_extraneous_keys_for_prune_map(&admitted, resume.map);
+                    if !resume.pending.is_empty() {
+                        break;
+                    }
+                    resume.map = resume.map.next();
+                }
+                if resume.pending.is_empty() {
+                    resume.active = false;
+                    return true;
+                }
+            }
+
+            let batch_len = resume.pending.len().min(GEYSER_PRUNE_SLICE_MAX_REMOVALS);
+            let batch: Vec<Pubkey> = resume.pending.drain(..batch_len).collect();
+            let map = resume.map;
+            drop(resume);
+            self.apply_prune_batch(map, &batch);
+            resume = self.geyser_prune_resume.lock();
+
+            if Instant::now() >= deadline
+                && (!resume.pending.is_empty() || resume.map != GeyserPruneMap::Done)
+            {
+                return false;
+            }
+            if resume.pending.is_empty() {
+                resume.map = resume.map.next();
+            }
+        }
+    }
+
+    fn prune_tracked_maps_to_admitted(&self, admission: &FixedCapAdmission) {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let _ = self.prune_tracked_maps_to_admitted_with_deadline(deadline, admission);
+        self.clear_geyser_prune_resume();
+    }
+
+    fn explicit_physical_publish_needed(&self, admission: &FixedCapAdmission) -> bool {
+        let admitted: HashSet<Pubkey> = admission.snapshot_pubkeys().into_iter().collect();
+        admitted != *self.last_synced_explicit_pubkeys.read()
     }
 
     fn publish_admitted_explicit_physical(&self, admission: &FixedCapAdmission) {
+        if !self.explicit_physical_publish_needed(admission) {
+            return;
+        }
         if self.admission_exceeds_configured_cap(admission) {
             self.mark_explicit_admission_config_cap_desync(
                 admission,
@@ -3372,15 +3552,23 @@ impl MarketDataContext {
 
     fn sync_geyser_tracked_accounts_from_admission_with_deadline(
         &self,
-        _deadline: Instant,
+        deadline: Instant,
         admission: &FixedCapAdmission,
     ) -> bool {
         set_market_data_geyser_sync_pending(0);
         record_market_data_geyser_sync_batch_total();
-        self.prune_tracked_maps_to_admitted(admission);
-        self.publish_admitted_explicit_physical(admission);
+        if !self.prune_tracked_maps_to_admitted_with_deadline(deadline, admission) {
+            return false;
+        }
+        if self.explicit_physical_publish_needed(admission) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.publish_admitted_explicit_physical(admission);
+        }
         *self.last_synced_explicit_pubkeys.write() =
             admission.snapshot_pubkeys().into_iter().collect();
+        self.clear_geyser_prune_resume();
         true
     }
 
@@ -7173,6 +7361,7 @@ async fn main() -> Result<()> {
         geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
         geyser_explicit_ready: AtomicBool::new(true),
         geyser_explicit_config_error: parking_lot::RwLock::new(None),
+        geyser_prune_resume: parking_lot::Mutex::new(GeyserPruneResume::default()),
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -11092,6 +11281,7 @@ mod wallet_snapshot_stale_cleanup_tests {
             geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
             geyser_explicit_ready: AtomicBool::new(true),
             geyser_explicit_config_error: parking_lot::RwLock::new(None),
+            geyser_prune_resume: parking_lot::Mutex::new(GeyserPruneResume::default()),
         }
     }
 
@@ -11316,6 +11506,7 @@ mod wallet_tx_meta_balance_tests {
             geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
             geyser_explicit_ready: AtomicBool::new(true),
             geyser_explicit_config_error: parking_lot::RwLock::new(None),
+            geyser_prune_resume: parking_lot::Mutex::new(GeyserPruneResume::default()),
         })
     }
 
@@ -11640,7 +11831,7 @@ mod pr_b_geyser_tracking_tests {
         converge_admission_from_ctx, converge_admission_from_groups,
         merge_momentum_active_pools_updates, spawn_inline_track_worker_sender,
         spawn_noop_track_worker_sender, track_worker_execute_coalesced_push,
-        track_worker_try_enqueue, FixedCapAdmission, TrackWorkerCommand,
+        track_worker_try_enqueue, FixedCapAdmission, TrackWorkerCommand, TrackWorkerContext,
         MARKET_DATA_TRACK_WORKER_COALESCE_MS,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12404,6 +12595,7 @@ mod pr_b_geyser_tracking_tests {
             geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
             geyser_explicit_ready: AtomicBool::new(true),
             geyser_explicit_config_error: parking_lot::RwLock::new(None),
+            geyser_prune_resume: parking_lot::Mutex::new(GeyserPruneResume::default()),
         })
     }
 
@@ -12480,6 +12672,7 @@ mod pr_b_geyser_tracking_tests {
             geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
             geyser_explicit_ready: AtomicBool::new(true),
             geyser_explicit_config_error: parking_lot::RwLock::new(None),
+            geyser_prune_resume: parking_lot::Mutex::new(GeyserPruneResume::default()),
         });
         (
             ctx,
@@ -15963,6 +16156,81 @@ mod pr_b_geyser_tracking_tests {
             MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL.load(Ordering::Relaxed) > skip0,
             "empty delta must increment skipped_no_delta metric"
         );
+        let mints_after = ctx.tracked_mints_tx.borrow().clone();
+        assert!(
+            mints_after.is_empty(),
+            "no-delta skip must not republish explicit watch channels"
+        );
+    }
+
+    #[test]
+    fn geyser_sync_flush_deadline_incomplete_when_prune_exceeds_budget() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            for _ in 0..2_000 {
+                let stale = Pubkey::new_unique();
+                vaults.insert(
+                    stale,
+                    VaultInfo {
+                        pool_address: pool,
+                        dex: "test".into(),
+                        base_mint: Pubkey::new_unique(),
+                        quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                        is_base_vault: true,
+                        last_balance: std::sync::atomic::AtomicU64::new(0),
+                        last_used_at: Instant::now(),
+                        pinned: false,
+                        pin: None,
+                        active_id: None,
+                        bin_step: None,
+                        sibling_vault: None,
+                    },
+                );
+            }
+        }
+        let admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        let expired = Instant::now();
+        assert!(
+            !TrackWorkerContext::sync_geyser_tracked_accounts_batched_flush_with_deadline(
+                ctx.as_ref(),
+                expired,
+                &admission,
+            ),
+            "expired deadline must return incomplete for ContinueGeyserEvict"
+        );
+        assert_eq!(ctx.tracked_vaults.read().len(), 2_000);
+    }
+
+    #[test]
+    fn geyser_sync_flush_published_set_matches_admitted_i_md_7() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let (ctx, tracked_mints_rx, _, _, _) =
+            minimal_market_data_context_and_merge_receivers_for_pr161(jsonl);
+        let mint = Pubkey::new_unique();
+        ctx.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet));
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        converge_admission_from_ctx(ctx.as_ref(), &mut admission);
+        assert_eq!(admission.len(), 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(
+            TrackWorkerContext::sync_geyser_tracked_accounts_batched_flush_with_deadline(
+                ctx.as_ref(),
+                deadline,
+                &admission,
+            )
+        );
+        let admitted: HashSet<Pubkey> = admission.snapshot_pubkeys().into_iter().collect();
+        assert_eq!(*ctx.last_synced_explicit_pubkeys.read(), admitted);
+        let published_mints: HashSet<Pubkey> = tracked_mints_rx.borrow().iter().copied().collect();
+        assert_eq!(published_mints, admitted);
+        drop(tracked_mints_rx);
     }
 
     #[test]
