@@ -2121,6 +2121,15 @@ impl TrackWorkerContext for MarketDataContext {
         MarketDataContext::publish_admitted_explicit_physical(self, admission);
     }
 
+    fn tracked_maps_need_prune(&self, admission: &FixedCapAdmission) -> bool {
+        let admitted: HashSet<Pubkey> = admission.snapshot_pubkeys().into_iter().collect();
+        MarketDataContext::tracked_maps_need_prune(self, &admitted)
+    }
+
+    fn publish_admitted_explicit_physical_force(&self, admission: &FixedCapAdmission) {
+        MarketDataContext::publish_admitted_explicit_physical_force(self, admission);
+    }
+
     fn last_synced_explicit_pubkeys_write(
         &self,
     ) -> parking_lot::RwLockWriteGuard<'_, HashSet<Pubkey>> {
@@ -3388,6 +3397,16 @@ impl MarketDataContext {
         if !self.explicit_physical_publish_needed(admission) {
             return;
         }
+        self.send_admitted_explicit_physical(admission);
+    }
+
+    fn publish_admitted_explicit_physical_force(&self, admission: &FixedCapAdmission) {
+        self.send_admitted_explicit_physical(admission);
+        *self.last_synced_explicit_pubkeys.write() =
+            admission.snapshot_pubkeys().into_iter().collect();
+    }
+
+    fn send_admitted_explicit_physical(&self, admission: &FixedCapAdmission) {
         if self.admission_exceeds_configured_cap(admission) {
             self.mark_explicit_admission_config_cap_desync(
                 admission,
@@ -11829,7 +11848,7 @@ mod pr_b_geyser_tracking_tests {
     const PUMPFUN_AMM_PROGRAM_OWNER: Pubkey =
         solana_sdk::pubkey!("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
     use ironcrab::market_data::track::{
-        converge_admission_from_ctx, converge_admission_from_groups,
+        admitted_pubkey_set, converge_admission_from_ctx, converge_admission_from_groups,
         merge_momentum_active_pools_updates, spawn_inline_track_worker_sender,
         spawn_noop_track_worker_sender, track_worker_execute_coalesced_push,
         track_worker_try_enqueue, FixedCapAdmission, TrackWorkerCommand, TrackWorkerContext,
@@ -16162,6 +16181,127 @@ mod pr_b_geyser_tracking_tests {
             mints_after.is_empty(),
             "no-delta skip must not republish explicit watch channels"
         );
+    }
+
+    #[test]
+    fn tracked_maps_need_prune_detects_extraneous_tracked_vault() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        let stale = Pubkey::new_unique();
+        ctx.tracked_vaults.write().insert(
+            stale,
+            VaultInfo {
+                pool_address: pool,
+                dex: "test".into(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                is_base_vault: true,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: Instant::now(),
+                pinned: false,
+                pin: None,
+                active_id: None,
+                bin_step: None,
+                sibling_vault: None,
+            },
+        );
+        let admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        assert!(TrackWorkerContext::tracked_maps_need_prune(
+            ctx.as_ref(),
+            &admission
+        ));
+    }
+
+    #[test]
+    fn geyser_push_no_delta_with_extraneous_tracked_keys_runs_prune_not_skip() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let mut admission = FixedCapAdmission::new(2);
+        {
+            let mut tracked = ctx.tracked_vaults.write();
+            for _ in 0..3 {
+                let pool = Pubkey::new_unique();
+                let vault = Pubkey::new_unique();
+                tracked.insert(
+                    vault,
+                    VaultInfo {
+                        pool_address: pool,
+                        dex: "test".into(),
+                        base_mint: Pubkey::new_unique(),
+                        quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                        is_base_vault: true,
+                        last_balance: std::sync::atomic::AtomicU64::new(0),
+                        last_used_at: Instant::now(),
+                        pinned: false,
+                        pin: None,
+                        active_id: None,
+                        bin_step: None,
+                        sibling_vault: None,
+                    },
+                );
+            }
+        }
+        let converge = converge_admission_from_ctx(ctx.as_ref(), &mut admission);
+        assert!(
+            matches!(converge, AdmissionConvergeResult::Converged),
+            "cap=2 must converge with eviction for 3 tracked vaults"
+        );
+        assert_eq!(admission.len(), 2);
+        assert_eq!(ctx.tracked_vaults.read().len(), 3);
+        assert!(TrackWorkerContext::tracked_maps_need_prune(
+            ctx.as_ref(),
+            &admission
+        ));
+        let before = admitted_pubkey_set(&admission);
+        use ironcrab::metrics::MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL;
+        let skip0 = MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL.load(Ordering::Relaxed);
+        assert!(track_worker_execute_coalesced_push(
+            &ctx,
+            &mut admission,
+            before,
+            false,
+            false,
+            false,
+        ));
+        assert_eq!(
+            MARKET_DATA_GEYSER_SYNC_SKIPPED_NO_DELTA_TOTAL.load(Ordering::Relaxed),
+            skip0,
+            "no-delta with extraneous tracked keys must not increment skipped_no_delta"
+        );
+        assert_eq!(ctx.tracked_vaults.read().len(), 2);
+    }
+
+    #[test]
+    fn geyser_push_restore_barrier_no_delta_force_publishes_watch_channels() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let (ctx, tracked_mints_rx, _, _, _) =
+            minimal_market_data_context_and_merge_receivers_for_pr161(jsonl);
+        let mint = Pubkey::new_unique();
+        ctx.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet));
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        converge_admission_from_ctx(ctx.as_ref(), &mut admission);
+        let admitted: HashSet<Pubkey> = admission.snapshot_pubkeys().into_iter().collect();
+        *ctx.last_synced_explicit_pubkeys.write() = admitted.clone();
+        assert!(tracked_mints_rx.borrow().is_empty());
+        assert!(track_worker_execute_coalesced_push(
+            &ctx,
+            &mut admission,
+            admitted.clone(),
+            false,
+            false,
+            true,
+        ));
+        let published: HashSet<Pubkey> = tracked_mints_rx.borrow().iter().copied().collect();
+        assert_eq!(published, admitted);
+        assert!(ctx.geyser_connect_barrier.is_ready());
+        drop(tracked_mints_rx);
     }
 
     #[test]
