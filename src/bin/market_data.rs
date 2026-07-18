@@ -3364,7 +3364,11 @@ impl MarketDataContext {
             }
 
             let batch_len = resume.pending.len().min(GEYSER_PRUNE_SLICE_MAX_REMOVALS);
-            let batch: Vec<Pubkey> = resume.pending.drain(..batch_len).collect();
+            let batch: Vec<Pubkey> = resume
+                .pending
+                .drain(..batch_len)
+                .filter(|pk| !admitted.contains(pk))
+                .collect();
             let map = resume.map;
             drop(resume);
             self.apply_prune_batch(map, &batch);
