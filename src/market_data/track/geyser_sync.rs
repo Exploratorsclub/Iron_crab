@@ -91,13 +91,35 @@ pub fn track_worker_execute_coalesced_push<C: TrackWorkerContext>(
     if delta.is_empty() && !continue_evict {
         inc_market_data_geyser_sync_skipped_no_delta_total();
         set_market_data_geyser_sync_pending(0);
+        let flush_deadline =
+            Instant::now() + Duration::from_millis(MARKET_DATA_MD_STATE_FLUSH_BUDGET_MS);
+        let sync_start = Instant::now();
+        let sync_complete =
+            ctx.sync_geyser_tracked_accounts_batched_flush_with_deadline(flush_deadline, admission);
+        record_market_data_md_state_sync_flush_duration_us(
+            sync_start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+        );
+        ctx.refresh_tracked_membership_snapshot();
+        if restore_barrier_pending && sync_complete {
+            // Restored tracked maps may match the prior explicit pubkey set; force channel
+            // republish so Geyser subscribers observe post-restore physical membership.
+            *ctx.last_synced_explicit_pubkeys_write() = HashSet::new();
+            ctx.publish_admitted_explicit_physical(admission);
+            *ctx.last_synced_explicit_pubkeys_write() = admitted.clone();
+        }
         if release_flush_slot {
             ctx.release_geyser_sync_flush_slot();
         }
-        if restore_barrier_pending {
-            ctx.signal_restore_barrier(true);
+        if sync_complete {
+            if restore_barrier_pending {
+                ctx.signal_restore_barrier(true);
+            }
+            return true;
         }
-        return true;
+        if restore_barrier_pending {
+            ctx.signal_restore_barrier(false);
+        }
+        return false;
     }
     if !delta.is_empty() {
         record_market_data_geyser_subscribe_delta_pubkeys(delta.len() as u64);
