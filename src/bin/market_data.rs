@@ -3331,21 +3331,24 @@ impl MarketDataContext {
         deadline: Instant,
         admission: &FixedCapAdmission,
     ) -> bool {
-        let admitted: HashSet<Pubkey> = admission.snapshot_pubkeys().into_iter().collect();
         let mut resume = self.geyser_prune_resume.lock();
-
-        if !resume.active {
-            if !self.tracked_maps_need_prune(&admitted) {
-                return true;
-            }
-            resume.active = true;
-            resume.map = GeyserPruneMap::Mints;
-            resume.pending.clear();
-        }
 
         loop {
             if Instant::now() >= deadline {
                 return false;
+            }
+
+            let admitted: HashSet<Pubkey> = admission.snapshot_pubkeys().into_iter().collect();
+
+            if !resume.active {
+                if !self.tracked_maps_need_prune(&admitted) {
+                    return true;
+                }
+                resume.active = true;
+                resume.map = GeyserPruneMap::Mints;
+                resume.pending.clear();
+            } else {
+                resume.pending.retain(|pk| !admitted.contains(pk));
             }
 
             if resume.pending.is_empty() {
@@ -3371,8 +3374,10 @@ impl MarketDataContext {
                 .collect();
             let map = resume.map;
             drop(resume);
-            self.apply_prune_batch(map, &batch);
-            self.refresh_tracked_membership_snapshot();
+            if !batch.is_empty() {
+                self.apply_prune_batch(map, &batch);
+                self.refresh_tracked_membership_snapshot();
+            }
             resume = self.geyser_prune_resume.lock();
 
             if Instant::now() >= deadline
@@ -16408,6 +16413,51 @@ mod pr_b_geyser_tracking_tests {
             ctx.tracked_membership.load().vaults,
             maps_keys,
             "membership snapshot keys must equal tracked_vaults after incomplete prune"
+        );
+    }
+
+    #[test]
+    fn geyser_prune_resume_pending_does_not_remove_re_admitted_key() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        let vault = Pubkey::new_unique();
+        ctx.tracked_vaults.write().insert(
+            vault,
+            VaultInfo {
+                pool_address: pool,
+                dex: "test".into(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                is_base_vault: true,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: Instant::now(),
+                pinned: false,
+                pin: None,
+                active_id: None,
+                bin_step: None,
+                sibling_vault: None,
+            },
+        );
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        converge_admission_from_ctx(ctx.as_ref(), &mut admission);
+        assert!(admission.snapshot_pubkeys().contains(&vault));
+        *ctx.geyser_prune_resume.lock() = GeyserPruneResume {
+            active: true,
+            map: GeyserPruneMap::Vaults,
+            pending: vec![vault],
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(TrackWorkerContext::continue_geyser_evict_with_deadline(
+            ctx.as_ref(),
+            deadline,
+            &admission,
+        ));
+        assert!(
+            ctx.tracked_vaults.read().contains_key(&vault),
+            "re-admitted vault queued for prune must not be removed on continue slice"
         );
     }
 
