@@ -3205,10 +3205,13 @@ impl MarketDataContext {
     }
 
     fn signal_restore_barrier(&self, ok: bool) {
-        let wallet_fits =
-            self.wallet_explicit_demand_pubkeys().len() <= self.config.read().max_tracked_accounts;
-        if ok && self.geyser_explicit_readiness_ok() && wallet_fits {
-            self.geyser_connect_barrier.mark_ready();
+        if ok {
+            let wallet_fits = self.wallet_explicit_demand_pubkeys().len()
+                <= self.config.read().max_tracked_accounts;
+            if self.geyser_explicit_readiness_ok() && wallet_fits {
+                self.geyser_connect_barrier.mark_ready();
+            }
+            // Incomplete restore slices stay PENDING until physical publish completes.
         } else {
             self.geyser_connect_barrier.mark_failed();
         }
@@ -3602,6 +3605,33 @@ impl MarketDataContext {
     }
 
     /// Phase 3 P3: restore explicit set from disk before first Geyser connect (I-MD-6).
+    fn geyser_restore_barrier_timeout(snapshot_pubkey_count: u64) -> Duration {
+        const MIN_SECS: u64 = 30;
+        let scaled = MIN_SECS.saturating_add(snapshot_pubkey_count / 2_000);
+        Duration::from_secs(scaled.max(MIN_SECS))
+    }
+
+    fn geyser_explicit_not_ready_bail_message(&self) -> String {
+        self.geyser_explicit_config_error
+            .read()
+            .clone()
+            .unwrap_or_else(|| {
+                if self.geyser_connect_barrier.is_failed() {
+                    "geyser explicit restore barrier failed".to_string()
+                } else {
+                    "geyser explicit admission not ready (unknown reason)".to_string()
+                }
+            })
+    }
+
+    fn geyser_barrier_wait_bail_message(&self, wait_err: &'static str) -> String {
+        if let Some(msg) = self.geyser_explicit_config_error.read().clone() {
+            format!("{wait_err}: {msg}")
+        } else {
+            wait_err.to_string()
+        }
+    }
+
     fn restore_explicit_set_from_snapshot_on_startup(
         ctx: &MarketDataContext,
         track_worker: &TrackWorkerSender,
@@ -3609,13 +3639,16 @@ impl MarketDataContext {
         let path = explicit_set_snapshot_path();
         let Some(snapshot) = load_explicit_set_snapshot(&path) else {
             let _ = track_worker_try_enqueue(track_worker, TrackWorkerCommand::ScheduleGeyserPush);
-            if ctx
+            if let Err(wait_err) = ctx
                 .geyser_connect_barrier
-                .wait_ready(Duration::from_secs(30))
-                .is_err()
+                .wait_ready(Self::geyser_restore_barrier_timeout(0))
             {
                 warn!("explicit Geyser startup barrier failed or timed out (no snapshot, fail-closed)");
                 ctx.geyser_explicit_ready.store(false, Ordering::Release);
+                if ctx.geyser_explicit_config_error.read().is_none() {
+                    *ctx.geyser_explicit_config_error.write() =
+                        Some(ctx.geyser_barrier_wait_bail_message(wait_err));
+                }
             }
             return;
         };
@@ -3633,13 +3666,16 @@ impl MarketDataContext {
             TrackWorkerCommand::RestoreExplicitSnapshot(snapshot),
         );
         let _ = track_worker_try_enqueue(track_worker, TrackWorkerCommand::ScheduleGeyserPush);
-        if ctx
+        if let Err(wait_err) = ctx
             .geyser_connect_barrier
-            .wait_ready(Duration::from_secs(30))
-            .is_err()
+            .wait_ready(Self::geyser_restore_barrier_timeout(pubkey_count))
         {
             warn!("explicit Geyser restore barrier failed or timed out (fail-closed)");
             ctx.geyser_explicit_ready.store(false, Ordering::Release);
+            if ctx.geyser_explicit_config_error.read().is_none() {
+                *ctx.geyser_explicit_config_error.write() =
+                    Some(ctx.geyser_barrier_wait_bail_message(wait_err));
+            }
         }
         set_market_data_explicit_set_snapshot_restore_pubkeys(pubkey_count);
         set_market_data_explicit_set_snapshot_restore_duration_ms(
@@ -8366,18 +8402,14 @@ async fn run_geyser_loop(
     if !ctx.geyser_explicit_readiness_ok() {
         anyhow::bail!(
             "Geyser explicit admission not ready: {}",
-            ctx.geyser_explicit_config_error
-                .read()
-                .clone()
-                .unwrap_or_else(|| "protected explicit overflow".into())
+            ctx.geyser_explicit_not_ready_bail_message()
         );
     }
-    if ctx
+    if let Err(wait_err) = ctx
         .geyser_connect_barrier
-        .wait_ready(Duration::from_secs(30))
-        .is_err()
+        .wait_ready(MarketDataContext::geyser_restore_barrier_timeout(0))
     {
-        anyhow::bail!("Geyser explicit restore/convergence barrier failed before connect");
+        anyhow::bail!("{}", ctx.geyser_barrier_wait_bail_message(wait_err));
     }
     // PR169c / Phase-2b: coalesce momentum NATS bursts before md-track-worker.
     let momentum_coalesce_tx =
@@ -16311,6 +16343,127 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(published, admitted);
         assert!(ctx.geyser_connect_barrier.is_ready());
         drop(tracked_mints_rx);
+    }
+
+    #[test]
+    fn restore_barrier_incomplete_sync_stays_pending_then_ready() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            for _ in 0..50_000 {
+                let stale = Pubkey::new_unique();
+                vaults.insert(
+                    stale,
+                    VaultInfo {
+                        pool_address: pool,
+                        dex: "test".into(),
+                        base_mint: Pubkey::new_unique(),
+                        quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                        is_base_vault: true,
+                        last_balance: std::sync::atomic::AtomicU64::new(0),
+                        last_used_at: Instant::now(),
+                        pinned: false,
+                        pin: None,
+                        active_id: None,
+                        bin_step: None,
+                        sibling_vault: None,
+                    },
+                );
+            }
+        }
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        converge_admission_from_ctx(ctx.as_ref(), &mut admission);
+        *ctx.geyser_prune_resume.lock() = GeyserPruneResume {
+            active: true,
+            map: GeyserPruneMap::Vaults,
+            pending: ctx.tracked_vaults.read().keys().copied().collect(),
+        };
+
+        let before = admitted_pubkey_set(&admission);
+        let incomplete =
+            !track_worker_execute_coalesced_push(&ctx, &mut admission, before, true, false, true);
+        assert!(
+            incomplete,
+            "budgeted continue slice must be incomplete for large prune backlog"
+        );
+        assert!(ctx.geyser_connect_barrier.is_pending());
+        assert!(!ctx.geyser_connect_barrier.is_failed());
+        assert!(!ctx.geyser_connect_barrier.is_ready());
+
+        while TrackWorkerContext::tracked_maps_need_prune(ctx.as_ref(), &admission) {
+            let before = admitted_pubkey_set(&admission);
+            track_worker_execute_coalesced_push(&ctx, &mut admission, before, true, false, true);
+        }
+        if !ctx.geyser_connect_barrier.is_ready() {
+            let before = admitted_pubkey_set(&admission);
+            assert!(track_worker_execute_coalesced_push(
+                &ctx,
+                &mut admission,
+                before,
+                false,
+                false,
+                true,
+            ));
+        }
+        assert!(ctx.geyser_connect_barrier.is_ready());
+    }
+
+    #[test]
+    fn restore_barrier_protected_overflow_marks_failed_with_message() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let admission = FixedCapAdmission::new(2);
+        ctx.on_admission_converge_result(&admission, AdmissionConvergeResult::ProtectedOverflow);
+        assert!(!ctx.geyser_explicit_ready.load(Ordering::Relaxed));
+        assert!(ctx.geyser_connect_barrier.is_failed());
+        let msg = ctx
+            .geyser_explicit_config_error
+            .read()
+            .clone()
+            .expect("protected overflow message");
+        assert!(msg.contains("wallet protected explicit demand"));
+    }
+
+    #[test]
+    fn geyser_explicit_not_ready_bail_message_avoids_default_overflow() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        ctx.geyser_explicit_ready.store(false, Ordering::Release);
+        assert_eq!(
+            ctx.geyser_explicit_not_ready_bail_message(),
+            "geyser explicit admission not ready (unknown reason)"
+        );
+        ctx.geyser_connect_barrier.mark_failed();
+        assert_eq!(
+            ctx.geyser_explicit_not_ready_bail_message(),
+            "geyser explicit restore barrier failed"
+        );
+        *ctx.geyser_explicit_config_error.write() =
+            Some("explicit admission cap unconverged".into());
+        assert_eq!(
+            ctx.geyser_explicit_not_ready_bail_message(),
+            "explicit admission cap unconverged"
+        );
+    }
+
+    #[test]
+    fn geyser_restore_barrier_timeout_scales_with_snapshot_size() {
+        assert_eq!(
+            MarketDataContext::geyser_restore_barrier_timeout(0),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            MarketDataContext::geyser_restore_barrier_timeout(96_000),
+            Duration::from_secs(78)
+        );
     }
 
     #[test]

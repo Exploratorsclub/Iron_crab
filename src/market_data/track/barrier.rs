@@ -38,6 +38,14 @@ impl GeyserConnectBarrier {
         self.state.load(Ordering::Acquire) == BARRIER_READY
     }
 
+    pub fn is_failed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == BARRIER_FAILED
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.state.load(Ordering::Acquire) == BARRIER_PENDING
+    }
+
     pub fn wait_ready(&self, timeout: Duration) -> Result<(), &'static str> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -68,9 +76,24 @@ mod tests {
         let b = GeyserConnectBarrier::new();
         b.mark_failed();
         assert!(!b.is_ready());
+        assert!(b.is_failed());
+        assert!(!b.is_pending());
         assert_eq!(
             b.wait_ready(Duration::from_millis(20)),
             Err("geyser_explicit_barrier_failed")
         );
+    }
+
+    #[test]
+    fn barrier_stays_pending_until_ready_or_failed() {
+        let b = GeyserConnectBarrier::new();
+        assert!(b.is_pending());
+        assert!(!b.is_ready());
+        assert!(!b.is_failed());
+        assert_eq!(
+            b.wait_ready(Duration::from_millis(20)),
+            Err("geyser_explicit_barrier_timeout")
+        );
+        assert!(b.is_pending());
     }
 }

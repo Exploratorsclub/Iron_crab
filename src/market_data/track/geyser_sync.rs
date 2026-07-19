@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 
 /// PR235: wall time budget for sync/evict slice after job batch (track-worker only).
 pub const MARKET_DATA_MD_STATE_FLUSH_BUDGET_MS: u64 = 8;
+/// First restore publish may use a larger slice budget while `restore_barrier_pending`.
+pub const MARKET_DATA_MD_STATE_RESTORE_FLUSH_BUDGET_MS: u64 = 64;
 
 pub fn explicit_subscription_has_new_keys(
     before: &HashSet<Pubkey>,
@@ -106,8 +108,12 @@ pub fn track_worker_execute_coalesced_push<C: TrackWorkerContext>(
     if !delta.is_empty() {
         record_market_data_geyser_subscribe_delta_pubkeys(delta.len() as u64);
     }
-    let flush_deadline =
-        Instant::now() + Duration::from_millis(MARKET_DATA_MD_STATE_FLUSH_BUDGET_MS);
+    let flush_budget_ms = if restore_barrier_pending && !continue_evict {
+        MARKET_DATA_MD_STATE_RESTORE_FLUSH_BUDGET_MS
+    } else {
+        MARKET_DATA_MD_STATE_FLUSH_BUDGET_MS
+    };
+    let flush_deadline = Instant::now() + Duration::from_millis(flush_budget_ms);
     let sync_start = Instant::now();
     let sync_complete = if continue_evict {
         ctx.continue_geyser_evict_with_deadline(flush_deadline, admission)
@@ -128,9 +134,8 @@ pub fn track_worker_execute_coalesced_push<C: TrackWorkerContext>(
         }
         true
     } else {
-        if restore_barrier_pending {
-            ctx.signal_restore_barrier(false);
-        }
+        // Budgeted incomplete sync during restore: barrier stays PENDING until a later
+        // `ContinueGeyserEvict` slice completes physical publish (I-MD-6).
         false
     }
 }
