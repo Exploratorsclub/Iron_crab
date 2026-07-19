@@ -22,8 +22,9 @@ use std::time::{Duration, Instant};
 
 /// PR235: wall time budget for sync/evict slice after job batch (track-worker only).
 pub const MARKET_DATA_MD_STATE_FLUSH_BUDGET_MS: u64 = 8;
-/// First restore publish may use a larger slice budget while `restore_barrier_pending`.
-pub const MARKET_DATA_MD_STATE_RESTORE_FLUSH_BUDGET_MS: u64 = 64;
+/// Restore slices (initial push and ContinueGeyserEvict) use a larger flush budget while
+/// `restore_barrier_pending` so large snapshots converge before `wait_ready` (I-MD-6).
+pub const MARKET_DATA_MD_STATE_RESTORE_FLUSH_BUDGET_MS: u64 = 250;
 
 pub fn explicit_subscription_has_new_keys(
     before: &HashSet<Pubkey>,
@@ -108,11 +109,7 @@ pub fn track_worker_execute_coalesced_push<C: TrackWorkerContext>(
     if !delta.is_empty() {
         record_market_data_geyser_subscribe_delta_pubkeys(delta.len() as u64);
     }
-    let flush_budget_ms = if restore_barrier_pending && !continue_evict {
-        MARKET_DATA_MD_STATE_RESTORE_FLUSH_BUDGET_MS
-    } else {
-        MARKET_DATA_MD_STATE_FLUSH_BUDGET_MS
-    };
+    let flush_budget_ms = md_state_flush_budget_ms(restore_barrier_pending);
     let flush_deadline = Instant::now() + Duration::from_millis(flush_budget_ms);
     let sync_start = Instant::now();
     let sync_complete = if continue_evict {
@@ -140,6 +137,17 @@ pub fn track_worker_execute_coalesced_push<C: TrackWorkerContext>(
     }
 }
 
+/// Steady-state flush uses 8ms; restore barrier uses [`MARKET_DATA_MD_STATE_RESTORE_FLUSH_BUDGET_MS`]
+/// for every slice including `ContinueGeyserEvict`.
+#[inline]
+pub fn md_state_flush_budget_ms(restore_barrier_pending: bool) -> u64 {
+    if restore_barrier_pending {
+        MARKET_DATA_MD_STATE_RESTORE_FLUSH_BUDGET_MS
+    } else {
+        MARKET_DATA_MD_STATE_FLUSH_BUDGET_MS
+    }
+}
+
 pub fn consumer_id_for_track_pin(
     pin: super::worker::TrackPinReason,
 ) -> super::desired_set::ConsumerId {
@@ -147,5 +155,27 @@ pub fn consumer_id_for_track_pin(
         super::worker::TrackPinReason::Wallet => super::desired_set::ConsumerId::Wallet,
         super::worker::TrackPinReason::MomentumActive => super::desired_set::ConsumerId::Momentum,
         super::worker::TrackPinReason::ArbMultiDex => super::desired_set::ConsumerId::Arb,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_flush_budget_applies_to_continue_slices() {
+        assert_eq!(
+            md_state_flush_budget_ms(true),
+            MARKET_DATA_MD_STATE_RESTORE_FLUSH_BUDGET_MS
+        );
+        assert_eq!(
+            md_state_flush_budget_ms(false),
+            MARKET_DATA_MD_STATE_FLUSH_BUDGET_MS
+        );
+        assert_ne!(
+            md_state_flush_budget_ms(true),
+            MARKET_DATA_MD_STATE_FLUSH_BUDGET_MS,
+            "continue_evict slices under restore_barrier_pending must not use steady-state 8ms"
+        );
     }
 }

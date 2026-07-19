@@ -3605,9 +3605,11 @@ impl MarketDataContext {
     }
 
     /// Phase 3 P3: restore explicit set from disk before first Geyser connect (I-MD-6).
+    /// Wall-clock budget for `wait_ready` during explicit-set restore (I-MD-6).
+    /// Must cover large snapshots (~100k pubkeys) converging via budgeted Continue slices.
     fn geyser_restore_barrier_timeout(snapshot_pubkey_count: u64) -> Duration {
-        const MIN_SECS: u64 = 30;
-        let scaled = MIN_SECS.saturating_add(snapshot_pubkey_count / 2_000);
+        const MIN_SECS: u64 = 120;
+        let scaled = MIN_SECS.saturating_add(snapshot_pubkey_count / 400);
         Duration::from_secs(scaled.max(MIN_SECS))
     }
 
@@ -16354,7 +16356,7 @@ mod pr_b_geyser_tracking_tests {
         let pool = Pubkey::new_unique();
         {
             let mut vaults = ctx.tracked_vaults.write();
-            for _ in 0..50_000 {
+            for _ in 0..250_000 {
                 let stale = Pubkey::new_unique();
                 vaults.insert(
                     stale,
@@ -16458,12 +16460,14 @@ mod pr_b_geyser_tracking_tests {
     fn geyser_restore_barrier_timeout_scales_with_snapshot_size() {
         assert_eq!(
             MarketDataContext::geyser_restore_barrier_timeout(0),
-            Duration::from_secs(30)
+            Duration::from_secs(120)
         );
-        assert_eq!(
-            MarketDataContext::geyser_restore_barrier_timeout(96_000),
-            Duration::from_secs(78)
+        let timeout_96k = MarketDataContext::geyser_restore_barrier_timeout(96_000);
+        assert!(
+            timeout_96k >= Duration::from_secs(300),
+            "96k snapshot restore must have >=5min wait_ready budget, got {timeout_96k:?}"
         );
+        assert_eq!(timeout_96k, Duration::from_secs(360));
     }
 
     #[test]
