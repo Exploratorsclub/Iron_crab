@@ -301,7 +301,12 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
             }
             false
         }
-        TrackWorkerCommand::ContinueGeyserEvict => false,
+        TrackWorkerCommand::ContinueGeyserEvict => {
+            if ctx.geyser_connect_barrier_pending() {
+                *restore_barrier_pending = true;
+            }
+            false
+        }
         TrackWorkerCommand::FlushExplicitSetSnapshot { done } => {
             try_write_explicit_set_snapshot_from_ctx(ctx.as_ref(), admission);
             let _ = done.send(());
