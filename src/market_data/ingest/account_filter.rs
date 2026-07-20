@@ -57,11 +57,8 @@ pub enum AccountGeyserRelevance {
 ///
 /// Maps to existing HIGH/LOW worker dispatch without changing queue semantics:
 /// - `Drop` — `account_geyser_update_relevance` early drop (no worker enqueue)
-/// - `ExecHot` — `account_geyser_dispatch_priority_high` (vault/bin/hot-pool pins incl. Arb)
-/// - `Enrich` — relevant but not EXEC_HOT (e.g. wallet token ATA without pin)
-///
-/// Known gap (Scope C): open-position pools without Momentum/Arb pin are often `Enrich`, not
-/// `ExecHot` — do not silently widen HIGH dispatch here; only metrics.
+/// - `ExecHot` — `account_geyser_dispatch_priority_high` (hot-pool vault/bin snapshot + Scope C wallet/bonding)
+/// - `Enrich` — relevant explicit membership / discovery without EXEC_HOT admission
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountUpdateClass {
     ExecHot,
@@ -149,27 +146,24 @@ pub fn classify_account_geyser_update<H: IngestHost>(
     }
 }
 
-/// Strategic HIGH admission for account worker sharding (ACCOUNT-PATH-TX-PARITY-CREATOR).
+/// Strategic HIGH admission for account worker sharding (Scope F: hot-pool legs + Scope C wallet/bonding).
 pub fn account_geyser_dispatch_priority_high<H: IngestHost>(
     host: &H,
     u: &GeyserAccountUpdate,
 ) -> bool {
     let pool_pk = u.pubkey;
-    if host.ingest_membership_vault_contains(&pool_pk) {
+    if account_geyser_update_is_dex_pool_owner(&u.owner) && host.ingest_is_hot_pool(&pool_pk) {
+        return true;
+    }
+    if host.ingest_exec_hot_vault_contains(&pool_pk) {
         host.ingest_record_vault_high_priority_dispatch();
         return true;
     }
-    if host.ingest_membership_bin_array_contains(&pool_pk) {
+    if host.ingest_exec_hot_bin_array_contains(&pool_pk) {
         host.ingest_record_membership_snapshot_hit();
         return true;
     }
     if host.ingest_high_priority_bonding_curve_contains(&pool_pk) {
-        return true;
-    }
-    if host.ingest_pool_mint_map_contains(&pool_pk) {
-        return true;
-    }
-    if host.ingest_is_enrichment_member(&pool_pk) {
         return true;
     }
     if host.ingest_wallet_tracks_mint(&pool_pk) {
@@ -192,6 +186,8 @@ mod tests {
         membership: HashSet<Pubkey>,
         enrichment_members: HashSet<Pubkey>,
         hot_pools: HashSet<Pubkey>,
+        exec_hot_vaults: HashSet<Pubkey>,
+        exec_hot_bin_arrays: HashSet<Pubkey>,
         tracked_wallet_token_accounts: HashSet<Pubkey>,
         pumpfun_wallet_track: HashSet<Pubkey>,
     }
@@ -202,6 +198,8 @@ mod tests {
                 membership: HashSet::new(),
                 enrichment_members: HashSet::new(),
                 hot_pools: HashSet::new(),
+                exec_hot_vaults: HashSet::new(),
+                exec_hot_bin_arrays: HashSet::new(),
                 tracked_wallet_token_accounts: HashSet::new(),
                 pumpfun_wallet_track: HashSet::new(),
             }
@@ -227,6 +225,14 @@ mod tests {
 
         fn ingest_membership_bin_array_contains(&self, _pubkey: &Pubkey) -> bool {
             false
+        }
+
+        fn ingest_exec_hot_vault_contains(&self, pubkey: &Pubkey) -> bool {
+            self.exec_hot_vaults.contains(pubkey)
+        }
+
+        fn ingest_exec_hot_bin_array_contains(&self, pubkey: &Pubkey) -> bool {
+            self.exec_hot_bin_arrays.contains(pubkey)
         }
 
         fn ingest_is_hot_pool(&self, pool: &Pubkey) -> bool {
@@ -314,6 +320,52 @@ mod tests {
             AccountGeyserRelevance::Relevant
         );
         assert!(account_geyser_update_might_be_relevant(&host, &u));
+    }
+
+    #[test]
+    fn classify_account_geyser_update_enrich_membership_vault_without_hot_pool() {
+        let vault = Pubkey::new_unique();
+        let mut host = MockIngestHost::new();
+        host.membership.insert(vault);
+        let u = sample_update(vault, Pubkey::new_unique());
+        let (class, early_drop_reason) = classify_account_geyser_update(&host, &u);
+        assert_eq!(class, AccountUpdateClass::Enrich);
+        assert_eq!(early_drop_reason, None);
+    }
+
+    #[test]
+    fn classify_account_geyser_update_exec_hot_via_hot_pool_vault_snapshot() {
+        let vault = Pubkey::new_unique();
+        let mut host = MockIngestHost::new();
+        host.membership.insert(vault);
+        host.exec_hot_vaults.insert(vault);
+        let u = sample_update(vault, Pubkey::new_unique());
+        let (class, early_drop_reason) = classify_account_geyser_update(&host, &u);
+        assert_eq!(class, AccountUpdateClass::ExecHot);
+        assert_eq!(early_drop_reason, None);
+    }
+
+    #[test]
+    fn classify_account_geyser_update_exec_hot_via_hot_pool_bin_snapshot() {
+        let bin = Pubkey::new_unique();
+        let mut host = MockIngestHost::new();
+        host.membership.insert(bin);
+        host.exec_hot_bin_arrays.insert(bin);
+        let u = sample_update(bin, Pubkey::new_unique());
+        let (class, early_drop_reason) = classify_account_geyser_update(&host, &u);
+        assert_eq!(class, AccountUpdateClass::ExecHot);
+        assert_eq!(early_drop_reason, None);
+    }
+
+    #[test]
+    fn classify_account_geyser_update_enrich_enrichment_only_pool() {
+        let pool = Pubkey::new_unique();
+        let mut host = MockIngestHost::new();
+        host.enrichment_members.insert(pool);
+        let u = sample_update(pool, RAYDIUM_CPMM_OWNER);
+        let (class, early_drop_reason) = classify_account_geyser_update(&host, &u);
+        assert_eq!(class, AccountUpdateClass::Enrich);
+        assert_eq!(early_drop_reason, None);
     }
 
     #[test]

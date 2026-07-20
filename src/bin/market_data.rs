@@ -845,6 +845,14 @@ impl UnifiedHotPoolRegistry {
             .collect()
     }
 
+    fn snapshot_hot_pool_pubkeys(&self) -> HashSet<Pubkey> {
+        let mut pools = self.snapshot_arb_pools();
+        for (_, pool) in self.snapshot_pairs() {
+            pools.insert(pool);
+        }
+        pools
+    }
+
     /// Pool is in the execution hot set (momentum active and/or arb track pin).
     fn is_hot_pool(&self, pool: Pubkey) -> bool {
         self.pool_has_momentum(pool) || self.pool_has_arb(pool)
@@ -1105,6 +1113,8 @@ struct MarketDataContext {
 
     /// PR237: ingest hot-path membership (no `tracked_*` read locks).
     tracked_membership: ArcSwap<TrackedMembershipSnapshot>,
+    /// Scope F: EXEC_HOT vault/bin pubkeys for hot-pool legs only (no full explicit-set flood).
+    exec_hot_membership: ArcSwap<ExecHotMembershipSnapshot>,
     /// PR237: pool → vault/bin pubkeys for O(legs) LRU touch (md-state writer only).
     pool_tracked_legs: parking_lot::RwLock<HashMap<Pubkey, PoolTrackedLegs>>,
 
@@ -1476,6 +1486,13 @@ struct TrackedMembershipSnapshot {
     bin_arrays: HashSet<Pubkey>,
     vault_by_pubkey: HashMap<Pubkey, SnapshotVaultView>,
     bin_array_by_pubkey: HashMap<Pubkey, SnapshotBinArrayView>,
+}
+
+/// Scope F: lock-free EXEC_HOT vault/bin view (hot-pool legs only, not full explicit membership).
+#[derive(Clone, Default)]
+struct ExecHotMembershipSnapshot {
+    vaults: HashSet<Pubkey>,
+    bin_arrays: HashSet<Pubkey>,
 }
 
 /// PR237: reverse index pool → tracked vault/bin pubkeys (md-state writer only).
@@ -2230,6 +2247,14 @@ impl IngestHost for MarketDataContext {
 
     fn ingest_membership_bin_array_contains(&self, pubkey: &Pubkey) -> bool {
         self.tracked_membership.load().bin_arrays.contains(pubkey)
+    }
+
+    fn ingest_exec_hot_vault_contains(&self, pubkey: &Pubkey) -> bool {
+        self.exec_hot_membership.load().vaults.contains(pubkey)
+    }
+
+    fn ingest_exec_hot_bin_array_contains(&self, pubkey: &Pubkey) -> bool {
+        self.exec_hot_membership.load().bin_arrays.contains(pubkey)
     }
 
     fn ingest_is_hot_pool(&self, pool: &Pubkey) -> bool {
@@ -3722,6 +3747,7 @@ impl MarketDataContext {
         set_market_data_momentum_active_pool_pins_gauge(self.hot_pool_registry.pair_count());
         set_market_data_arb_pinned_pools_gauge(arb);
         self.refresh_enrichment_registry_gauge();
+        self.refresh_exec_hot_membership_snapshot();
     }
 
     fn refresh_enrichment_registry_gauge(&self) {
@@ -3800,6 +3826,36 @@ impl MarketDataContext {
                 bin_array_by_pubkey,
             }));
         touch_market_data_tracked_membership_snapshot_refresh();
+        self.refresh_exec_hot_membership_snapshot();
+    }
+
+    /// Scope F: rebuild EXEC_HOT vault/bin snapshot from hot-pool registry + tracked legs.
+    fn refresh_exec_hot_membership_snapshot(&self) {
+        let hot_pools = self.hot_pool_registry.snapshot_hot_pool_pubkeys();
+        let mut vaults = HashSet::new();
+        let mut bin_arrays = HashSet::new();
+        {
+            let legs = self.pool_tracked_legs.read();
+            for pool in &hot_pools {
+                if let Some(entry) = legs.get(pool) {
+                    vaults.extend(entry.vaults.iter().copied());
+                    bin_arrays.extend(entry.bin_arrays.iter().copied());
+                }
+            }
+        }
+        let membership = self.tracked_membership.load();
+        for (pk, view) in membership.vault_by_pubkey.iter() {
+            if hot_pools.contains(&view.pool_address) {
+                vaults.insert(*pk);
+            }
+        }
+        for (pk, view) in membership.bin_array_by_pubkey.iter() {
+            if hot_pools.contains(&view.pool_address) {
+                bin_arrays.insert(*pk);
+            }
+        }
+        self.exec_hot_membership
+            .store(Arc::new(ExecHotMembershipSnapshot { vaults, bin_arrays }));
     }
 
     fn pool_tracked_legs_note_vault(&self, pool: Pubkey, vault: Pubkey) {
@@ -7397,6 +7453,7 @@ async fn main() -> Result<()> {
         tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
         tracked_bin_arrays_tx,
         tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
+        exec_hot_membership: ArcSwap::from_pointee(ExecHotMembershipSnapshot::default()),
         pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
         live_pool_cache: Arc::new(LivePoolCache::new()),
         creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -11311,6 +11368,7 @@ mod wallet_snapshot_stale_cleanup_tests {
             tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_bin_arrays_tx,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
+            exec_hot_membership: ArcSwap::from_pointee(ExecHotMembershipSnapshot::default()),
             pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: Arc::new(LivePoolCache::new()),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -11536,6 +11594,7 @@ mod wallet_tx_meta_balance_tests {
             tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_bin_arrays_tx,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
+            exec_hot_membership: ArcSwap::from_pointee(ExecHotMembershipSnapshot::default()),
             pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: Arc::new(LivePoolCache::new()),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -12627,6 +12686,7 @@ mod pr_b_geyser_tracking_tests {
             tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_bin_arrays_tx,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
+            exec_hot_membership: ArcSwap::from_pointee(ExecHotMembershipSnapshot::default()),
             pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: live_pool_cache.unwrap_or_else(|| Arc::new(LivePoolCache::new())),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -12702,6 +12762,7 @@ mod pr_b_geyser_tracking_tests {
             tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_bin_arrays_tx,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
+            exec_hot_membership: ArcSwap::from_pointee(ExecHotMembershipSnapshot::default()),
             pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: Arc::new(LivePoolCache::new()),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -13903,7 +13964,7 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
-    fn account_geyser_dispatch_high_when_pool_mint_map_contains_pubkey() {
+    fn account_geyser_dispatch_not_high_when_pool_mint_map_only() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
@@ -13920,11 +13981,11 @@ mod pr_b_geyser_tracking_tests {
             lamports: 0,
             grpc_recv_at: Instant::now(),
         };
-        assert!(account_geyser_dispatch_priority_high(&ctx, &u));
+        assert!(!account_geyser_dispatch_priority_high(&ctx, &u));
     }
 
     #[test]
-    fn account_geyser_dispatch_high_when_tracked_vault_pubkey() {
+    fn account_geyser_dispatch_not_high_when_tracked_vault_without_hot_pool() {
         use ironcrab::metrics::MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL;
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -13939,6 +14000,52 @@ mod pr_b_geyser_tracking_tests {
                 pool_address: Pubkey::new_unique(),
                 dex: "raydium_cpmm".to_string(),
                 base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                is_base_vault: true,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: Instant::now(),
+                pinned: false,
+                pin: None,
+                active_id: None,
+                bin_step: None,
+                sibling_vault: None,
+            },
+        );
+        ctx.refresh_tracked_membership_snapshot();
+        let u = GeyserAccountUpdate {
+            pubkey: vault,
+            slot: 1,
+            owner: Pubkey::new_unique(),
+            data: vec![],
+            lamports: 0,
+            grpc_recv_at: Instant::now(),
+        };
+        assert!(!account_geyser_dispatch_priority_high(&ctx, &u));
+        assert_eq!(
+            MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL.load(Ordering::Relaxed),
+            before
+        );
+    }
+
+    #[test]
+    fn account_geyser_dispatch_high_when_tracked_vault_for_hot_pool() {
+        use ironcrab::metrics::MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let vault = Pubkey::new_unique();
+        let before = MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL.load(Ordering::Relaxed);
+        ctx.hot_pool_registry.pin_pool(base_mint, pool);
+        ctx.tracked_vaults.write().insert(
+            vault,
+            VaultInfo {
+                pool_address: pool,
+                dex: "raydium_cpmm".to_string(),
+                base_mint,
                 quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
                 is_base_vault: true,
                 last_balance: std::sync::atomic::AtomicU64::new(0),
@@ -15863,7 +15970,7 @@ mod pr_b_geyser_tracking_tests {
             grpc_recv_at: Instant::now(),
         };
         assert!(account_geyser_update_might_be_relevant(&ctx, &u));
-        assert!(account_geyser_dispatch_priority_high(&ctx, &u));
+        assert!(!account_geyser_dispatch_priority_high(&ctx, &u));
     }
 
     /// PR237: pool touch uses reverse index (O(legs)), not full-map scan.

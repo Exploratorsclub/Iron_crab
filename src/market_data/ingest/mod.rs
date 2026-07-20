@@ -58,6 +58,14 @@ impl<T: IngestHost + ?Sized> IngestHost for Arc<T> {
         (**self).ingest_membership_bin_array_contains(pubkey)
     }
 
+    fn ingest_exec_hot_vault_contains(&self, pubkey: &solana_sdk::pubkey::Pubkey) -> bool {
+        (**self).ingest_exec_hot_vault_contains(pubkey)
+    }
+
+    fn ingest_exec_hot_bin_array_contains(&self, pubkey: &solana_sdk::pubkey::Pubkey) -> bool {
+        (**self).ingest_exec_hot_bin_array_contains(pubkey)
+    }
+
     fn ingest_is_hot_pool(&self, pool: &solana_sdk::pubkey::Pubkey) -> bool {
         (**self).ingest_is_hot_pool(pool)
     }
