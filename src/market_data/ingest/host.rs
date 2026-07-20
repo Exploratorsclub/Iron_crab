@@ -16,6 +16,12 @@ pub trait IngestHost: Send + Sync {
 
     fn ingest_membership_bin_array_contains(&self, pubkey: &Pubkey) -> bool;
 
+    /// EXEC_HOT vault membership: vault pubkeys for hot-pool legs only (not full explicit set).
+    fn ingest_exec_hot_vault_contains(&self, pubkey: &Pubkey) -> bool;
+
+    /// EXEC_HOT bin-array membership: bin PDAs for hot-pool legs only.
+    fn ingest_exec_hot_bin_array_contains(&self, pubkey: &Pubkey) -> bool;
+
     fn ingest_is_hot_pool(&self, pool: &Pubkey) -> bool;
 
     /// P2 EnrichmentRegistry: pool_mint_map ∪ bonding-curve priority ∪ hot-pool pins.
