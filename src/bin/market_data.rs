@@ -2831,6 +2831,7 @@ impl MarketDataContext {
         let _ = admission.remove_group(Self::tracker_mint_owner(mint));
         self.tracked_mints.write().remove(&mint);
         inc_market_data_wallet_admission_admitted_total();
+        self.refresh_tracked_membership_snapshot();
         true
     }
 
