@@ -46,8 +46,8 @@ pub struct BoundedProtocolStore {
     last_applied_tracker_mint: HashMap<Pubkey, u64>,
     /// In-flight (queued, not yet dequeued) sync intents for enqueue dedupe.
     inflight_sync_intent: u32,
-    /// Strongest sync intent strength among in-flight sync commands.
-    inflight_sync_strength_max: Option<SyncIntentStrength>,
+    /// In-flight sync commands per strength (Debounced, Push, ConfigChange).
+    inflight_sync_strength_counts: [u32; 3],
     /// In-flight continue-evict commands for enqueue dedupe.
     inflight_continue_evict: u32,
 }
@@ -64,7 +64,7 @@ impl BoundedProtocolStore {
             last_applied_wallet_mint: HashMap::new(),
             last_applied_tracker_mint: HashMap::new(),
             inflight_sync_intent: 0,
-            inflight_sync_strength_max: None,
+            inflight_sync_strength_counts: [0; 3],
             inflight_continue_evict: 0,
         }
     }
@@ -204,15 +204,31 @@ impl BoundedProtocolStore {
         self.pending.iter().any(|c| is_continue_evict(&c.payload))
     }
 
+    #[inline]
+    fn inflight_sync_strength_index(strength: SyncIntentStrength) -> usize {
+        strength as usize
+    }
+
+    #[inline]
+    fn inflight_sync_strength_max(&self) -> Option<SyncIntentStrength> {
+        (0..3)
+            .rev()
+            .find(|&i| self.inflight_sync_strength_counts[i] > 0)
+            .map(|i| match i {
+                0 => SyncIntentStrength::Debounced,
+                1 => SyncIntentStrength::Push,
+                2 => SyncIntentStrength::ConfigChange,
+                _ => unreachable!(),
+            })
+    }
+
     /// Record inflight dedupe flags when a command is enqueued to the worker queue.
     pub fn note_inflight_enqueued(&mut self, cmd: &ImmutableTrackCommand) {
         if let Some(strength) = sync_intent_strength(&cmd.payload) {
             self.inflight_sync_intent = self.inflight_sync_intent.saturating_add(1);
-            self.inflight_sync_strength_max = Some(
-                self.inflight_sync_strength_max
-                    .map(|existing| existing.max(strength))
-                    .unwrap_or(strength),
-            );
+            let idx = Self::inflight_sync_strength_index(strength);
+            self.inflight_sync_strength_counts[idx] =
+                self.inflight_sync_strength_counts[idx].saturating_add(1);
         }
         if is_continue_evict(&cmd.payload) {
             self.inflight_continue_evict = self.inflight_continue_evict.saturating_add(1);
@@ -221,11 +237,11 @@ impl BoundedProtocolStore {
 
     /// Clear inflight dedupe flags when a command is dequeued by the worker.
     pub fn note_inflight_dequeued(&mut self, cmd: &ImmutableTrackCommand) {
-        if sync_intent_strength(&cmd.payload).is_some() {
+        if let Some(strength) = sync_intent_strength(&cmd.payload) {
             self.inflight_sync_intent = self.inflight_sync_intent.saturating_sub(1);
-            if self.inflight_sync_intent == 0 {
-                self.inflight_sync_strength_max = None;
-            }
+            let idx = Self::inflight_sync_strength_index(strength);
+            self.inflight_sync_strength_counts[idx] =
+                self.inflight_sync_strength_counts[idx].saturating_sub(1);
         }
         if is_continue_evict(&cmd.payload) {
             self.inflight_continue_evict = self.inflight_continue_evict.saturating_sub(1);
@@ -303,7 +319,7 @@ impl BoundedProtocolStore {
         if let Some(new_strength) = sync_intent_strength(job) {
             if self.inflight_sync_intent > 0 {
                 let inflight_strength = self
-                    .inflight_sync_strength_max
+                    .inflight_sync_strength_max()
                     .unwrap_or(SyncIntentStrength::Debounced);
                 if new_strength <= inflight_strength {
                     return true;
