@@ -1016,6 +1016,18 @@ pub static MARKET_DATA_TRACK_PROTOCOL_SUPERSEDED_REVISIONS_TOTAL: Lazy<AtomicU64
 /// Oldest pending slot evicted when pending cap is full (bounded store).
 pub static MARKET_DATA_TRACK_PROTOCOL_PENDING_EVICTED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Scope G: track-worker enqueue by coarse command kind (low cardinality).
+pub static MARKET_DATA_TRACK_WORKER_ENQUEUE_BY_KIND_TOTAL: Lazy<[AtomicU64; 7]> =
+    Lazy::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
+/// Scope G: protocol stage (queue-full replay) by coarse command kind.
+pub static MARKET_DATA_TRACK_PROTOCOL_STAGE_BY_KIND_TOTAL: Lazy<[AtomicU64; 7]> =
+    Lazy::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
+/// Scope G: enqueue deduped because equivalent intent already queued or pending.
+pub static MARKET_DATA_TRACK_WORKER_ENQUEUE_DEDUPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Scope G: pending supersede/coalesce avoided a new slot (no eviction).
+pub static MARKET_DATA_TRACK_PROTOCOL_PENDING_COALESCED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 /// PR169a: single-writer Geyser tracking actor queue depth (gauge).
 pub static MARKET_DATA_GEYSER_TRACKING_QUEUE_DEPTH: Lazy<AtomicU64> =
@@ -1345,6 +1357,30 @@ pub fn inc_market_data_track_protocol_superseded_revisions_total() {
 #[inline]
 pub fn inc_market_data_track_protocol_pending_evicted_total() {
     MARKET_DATA_TRACK_PROTOCOL_PENDING_EVICTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_track_worker_enqueue_by_kind(kind_index: usize) {
+    if kind_index < MARKET_DATA_TRACK_WORKER_ENQUEUE_BY_KIND_TOTAL.len() {
+        MARKET_DATA_TRACK_WORKER_ENQUEUE_BY_KIND_TOTAL[kind_index].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn inc_market_data_track_protocol_stage_by_kind(kind_index: usize) {
+    if kind_index < MARKET_DATA_TRACK_PROTOCOL_STAGE_BY_KIND_TOTAL.len() {
+        MARKET_DATA_TRACK_PROTOCOL_STAGE_BY_KIND_TOTAL[kind_index].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn inc_market_data_track_worker_enqueue_deduped_total() {
+    MARKET_DATA_TRACK_WORKER_ENQUEUE_DEDUPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_track_protocol_pending_coalesced_total() {
+    MARKET_DATA_TRACK_PROTOCOL_PENDING_COALESCED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -6266,6 +6302,32 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_track_protocol_pending_evicted_total",
         MARKET_DATA_TRACK_PROTOCOL_PENDING_EVICTED_TOTAL.load(Ordering::Relaxed)
+    );
+    for (name, idx) in [
+        ("momentum", 0usize),
+        ("arb", 1),
+        ("wallet", 2),
+        ("tracker", 3),
+        ("sync", 4),
+        ("continue", 5),
+        ("other", 6),
+    ] {
+        line!(
+            &format!("market_data_track_worker_enqueue_{name}_total"),
+            MARKET_DATA_TRACK_WORKER_ENQUEUE_BY_KIND_TOTAL[idx].load(Ordering::Relaxed)
+        );
+        line!(
+            &format!("market_data_track_protocol_stage_{name}_total"),
+            MARKET_DATA_TRACK_PROTOCOL_STAGE_BY_KIND_TOTAL[idx].load(Ordering::Relaxed)
+        );
+    }
+    line!(
+        "market_data_track_worker_enqueue_deduped_total",
+        MARKET_DATA_TRACK_WORKER_ENQUEUE_DEDUPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_track_protocol_pending_coalesced_total",
+        MARKET_DATA_TRACK_PROTOCOL_PENDING_COALESCED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_geyser_tracking_queue_depth",

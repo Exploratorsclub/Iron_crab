@@ -8,6 +8,7 @@ use super::snapshot::{
     explicit_set_snapshot_path, write_explicit_set_snapshot, ExplicitSetSnapshot,
     MARKET_DATA_EXPLICIT_SET_SNAPSHOT_INTERVAL_SECS,
 };
+use super::worker_commands::track_command_kind;
 use super::worker_commands::ImmutableTrackCommand;
 pub use super::worker_commands::{TrackCommandStream, TrackPinReason, TrackWorkerCommand};
 use crate::metrics::{
@@ -16,6 +17,8 @@ use crate::metrics::{
     inc_market_data_geyser_tracking_enqueue_dropped_total,
     inc_market_data_track_protocol_superseded_revisions_total,
     inc_market_data_track_request_coalesce_batches_total,
+    inc_market_data_track_worker_enqueue_by_kind,
+    inc_market_data_track_worker_enqueue_deduped_total,
     record_market_data_arb_track_requests_messages_total,
     record_market_data_momentum_active_pool_messages_total, set_market_data_arb_pinned_pools_gauge,
     set_market_data_momentum_active_pool_pins_gauge, set_market_data_track_worker_queue_depth,
@@ -173,8 +176,14 @@ fn track_worker_stage_on_queue_full(
 }
 
 pub fn track_worker_try_enqueue(sender: &TrackWorkerSender, job: TrackWorkerCommand) -> bool {
+    let kind_idx = track_command_kind(&job).index();
+    inc_market_data_track_worker_enqueue_by_kind(kind_idx);
     let immutable = {
         let mut store = sender.protocol.lock().expect("track protocol store lock");
+        if store.try_dedupe_enqueue(&job) {
+            inc_market_data_track_worker_enqueue_deduped_total();
+            return true;
+        }
         store.wrap_command(job)
     };
     if sender.queue_depth.load(Ordering::Relaxed) >= sender.queue_capacity {
@@ -184,11 +193,24 @@ pub fn track_worker_try_enqueue(sender: &TrackWorkerSender, job: TrackWorkerComm
         let depth = sender.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
         set_market_data_track_worker_queue_depth(depth);
         let mut store = sender.protocol.lock().expect("track protocol store lock");
+        store.note_inflight_enqueued(&immutable);
         store.begin_inflight();
         true
     } else {
         track_worker_stage_on_queue_full(&sender.protocol, immutable)
     }
+}
+
+fn track_worker_on_dequeue(
+    queue_depth: &AtomicUsize,
+    protocol: &Arc<Mutex<BoundedProtocolStore>>,
+    cmd: &ImmutableTrackCommand,
+) {
+    {
+        let mut store = protocol.lock().expect("track protocol store lock");
+        store.note_inflight_dequeued(cmd);
+    }
+    track_worker_dec_queue_depth(queue_depth, protocol);
 }
 
 fn track_worker_dec_queue_depth(
@@ -496,7 +518,7 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
 
         match recv_result {
             Ok(job) => {
-                track_worker_dec_queue_depth(&queue_depth, &protocol);
+                track_worker_on_dequeue(&queue_depth, &protocol, &job);
                 track_worker_receive_protocol_command(
                     &ctx,
                     &protocol,
@@ -509,7 +531,7 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
                     &mut pending_release_flush_slot,
                 );
                 while let Ok(more) = rx.try_recv() {
-                    track_worker_dec_queue_depth(&queue_depth, &protocol);
+                    track_worker_on_dequeue(&queue_depth, &protocol, &more);
                     track_worker_receive_protocol_command(
                         &ctx,
                         &protocol,
@@ -594,15 +616,21 @@ fn try_write_explicit_set_snapshot_from_ctx<C: TrackWorkerContext>(
 }
 
 fn track_worker_enqueue_blocking(sender: &TrackWorkerSender, job: TrackWorkerCommand) -> bool {
+    inc_market_data_track_worker_enqueue_by_kind(track_command_kind(&job).index());
     let immutable = {
         let mut store = sender.protocol.lock().expect("track protocol store lock");
+        if store.try_dedupe_enqueue(&job) {
+            inc_market_data_track_worker_enqueue_deduped_total();
+            return true;
+        }
         store.wrap_command(job)
     };
-    match sender.tx.send(immutable) {
+    match sender.tx.send(immutable.clone()) {
         Ok(()) => {
             let depth = sender.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
             set_market_data_track_worker_queue_depth(depth);
             let mut store = sender.protocol.lock().expect("track protocol store lock");
+            store.note_inflight_enqueued(&immutable);
             store.begin_inflight();
             true
         }
@@ -1839,5 +1867,24 @@ mod tests {
                 "applied revision must not remain applicable"
             );
         }
+    }
+
+    #[test]
+    fn enqueue_dedupe_skips_duplicate_sync_when_queued() {
+        let sender = spawn_noop_track_worker_sender(1);
+        assert!(track_worker_try_enqueue(
+            &sender,
+            TrackWorkerCommand::ScheduleGeyserPush
+        ));
+        assert!(track_worker_try_enqueue(
+            &sender,
+            TrackWorkerCommand::ScheduleGeyserPushDebounced
+        ));
+        let store = sender.protocol.lock().expect("lock");
+        assert_eq!(
+            store.pending_len(),
+            0,
+            "deduped sync must not stage when inflight"
+        );
     }
 }

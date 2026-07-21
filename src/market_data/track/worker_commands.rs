@@ -105,6 +105,95 @@ pub fn stream_for_command(cmd: &TrackWorkerCommand) -> TrackCommandStream {
     }
 }
 
+/// Coarse command kind for low-cardinality enqueue/stage metrics (no pubkey labels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackCommandKind {
+    Momentum,
+    Arb,
+    Wallet,
+    Tracker,
+    Sync,
+    Continue,
+    Other,
+}
+
+impl TrackCommandKind {
+    pub const COUNT: usize = 7;
+
+    #[inline]
+    pub fn index(self) -> usize {
+        match self {
+            Self::Momentum => 0,
+            Self::Arb => 1,
+            Self::Wallet => 2,
+            Self::Tracker => 3,
+            Self::Sync => 4,
+            Self::Continue => 5,
+            Self::Other => 6,
+        }
+    }
+}
+
+/// Relative strength for idempotent Geyser sync intents (higher wins on merge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SyncIntentStrength {
+    Debounced = 0,
+    Push = 1,
+    ConfigChange = 2,
+}
+
+#[inline]
+pub fn track_command_kind(cmd: &TrackWorkerCommand) -> TrackCommandKind {
+    match cmd {
+        TrackWorkerCommand::ApplyMomentumActivePools(_) => TrackCommandKind::Momentum,
+        TrackWorkerCommand::ApplyArbTrackRequests(_) => TrackCommandKind::Arb,
+        TrackWorkerCommand::ApplyWalletPin { .. }
+        | TrackWorkerCommand::WithdrawWalletPin { .. } => TrackCommandKind::Wallet,
+        TrackWorkerCommand::TrackMint {
+            pin: Some(TrackPinReason::Wallet),
+            ..
+        } => TrackCommandKind::Wallet,
+        TrackWorkerCommand::TrackMint { pin: None, .. } => TrackCommandKind::Tracker,
+        TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange
+        | TrackWorkerCommand::ScheduleGeyserPush
+        | TrackWorkerCommand::ScheduleGeyserPushDebounced => TrackCommandKind::Sync,
+        TrackWorkerCommand::ContinueGeyserEvict => TrackCommandKind::Continue,
+        _ => TrackCommandKind::Other,
+    }
+}
+
+#[inline]
+pub fn sync_intent_strength(cmd: &TrackWorkerCommand) -> Option<SyncIntentStrength> {
+    match cmd {
+        TrackWorkerCommand::ScheduleGeyserPushDebounced => Some(SyncIntentStrength::Debounced),
+        TrackWorkerCommand::ScheduleGeyserPush => Some(SyncIntentStrength::Push),
+        TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange => {
+            Some(SyncIntentStrength::ConfigChange)
+        }
+        _ => None,
+    }
+}
+
+#[inline]
+pub fn is_continue_evict(cmd: &TrackWorkerCommand) -> bool {
+    matches!(cmd, TrackWorkerCommand::ContinueGeyserEvict)
+}
+
+/// Merge multiple sync intents into a single strongest payload (push-needed semantics).
+pub fn merge_sync_intent_payloads(commands: &[TrackWorkerCommand]) -> TrackWorkerCommand {
+    let mut strength = SyncIntentStrength::Debounced;
+    for cmd in commands {
+        if let Some(s) = sync_intent_strength(cmd) {
+            strength = strength.max(s);
+        }
+    }
+    match strength {
+        SyncIntentStrength::ConfigChange => TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange,
+        SyncIntentStrength::Push => TrackWorkerCommand::ScheduleGeyserPush,
+        SyncIntentStrength::Debounced => TrackWorkerCommand::ScheduleGeyserPushDebounced,
+    }
+}
+
 /// Per-mint demand key for wallet/tracker streams (supersession scoped per mint).
 pub fn demand_mint_for_command(cmd: &TrackWorkerCommand) -> Option<Pubkey> {
     match cmd {
@@ -253,5 +342,24 @@ mod tests {
         assert_eq!(w1b, 2);
         assert_eq!(t1a, 1);
         assert_eq!(t2a, 1);
+    }
+
+    #[test]
+    fn merge_sync_intent_prefers_config_change_then_push() {
+        use super::merge_sync_intent_payloads;
+        let merged = merge_sync_intent_payloads(&[
+            TrackWorkerCommand::ScheduleGeyserPushDebounced,
+            TrackWorkerCommand::ScheduleGeyserPush,
+            TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange,
+        ]);
+        assert!(matches!(
+            merged,
+            TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange
+        ));
+        let merged2 = merge_sync_intent_payloads(&[
+            TrackWorkerCommand::ScheduleGeyserPushDebounced,
+            TrackWorkerCommand::ScheduleGeyserPush,
+        ]);
+        assert!(matches!(merged2, TrackWorkerCommand::ScheduleGeyserPush));
     }
 }
