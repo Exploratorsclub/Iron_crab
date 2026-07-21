@@ -129,6 +129,49 @@ pub fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> 
     out
 }
 
+/// Split wallet/strategy pins out before tracker batch enqueue (I-MD-5 wallet demand preserved).
+fn enqueue_track_mints_to_worker(
+    track_worker: &TrackWorkerSender,
+    entries: Vec<(Pubkey, Option<TrackPinReason>)>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let mut tracker_entries = Vec::with_capacity(entries.len());
+    for (mint, pin) in entries {
+        match pin {
+            Some(TrackPinReason::Wallet) => {
+                track_worker_try_enqueue(track_worker, TrackWorkerCommand::ApplyWalletPin { mint });
+            }
+            None => tracker_entries.push((mint, pin)),
+            Some(other) => {
+                track_worker_try_enqueue(
+                    track_worker,
+                    TrackWorkerCommand::TrackMint {
+                        mint,
+                        pin: Some(other),
+                    },
+                );
+            }
+        }
+    }
+    match tracker_entries.len() {
+        0 => {}
+        1 => {
+            let (mint, pin) = tracker_entries[0];
+            track_worker_try_enqueue(track_worker, TrackWorkerCommand::TrackMint { mint, pin });
+        }
+        _ => {
+            track_worker_try_enqueue(
+                track_worker,
+                TrackWorkerCommand::TrackMints {
+                    entries: tracker_entries,
+                },
+            );
+        }
+    }
+}
+
 pub fn md_state_process_job<C: MdStateContext>(
     ctx: &Arc<C>,
     job: MdStateCommand,
@@ -140,15 +183,7 @@ pub fn md_state_process_job<C: MdStateContext>(
             false
         }
         MdStateCommand::TrackMints { entries } => {
-            if entries.is_empty() {
-                return false;
-            }
-            if entries.len() == 1 {
-                let (mint, pin) = entries[0];
-                track_worker_try_enqueue(track_worker, TrackWorkerCommand::TrackMint { mint, pin });
-            } else {
-                track_worker_try_enqueue(track_worker, TrackWorkerCommand::TrackMints { entries });
-            }
+            enqueue_track_mints_to_worker(track_worker, entries);
             false
         }
         MdStateCommand::TrackWalletMint { mint } => {

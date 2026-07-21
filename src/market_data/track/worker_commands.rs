@@ -86,6 +86,22 @@ impl ImmutableTrackCommand {
     }
 }
 
+/// Protocol stream for a coalesced TrackMints batch (after wallet pins are split out).
+pub fn track_mints_batch_stream(
+    entries: &[(Pubkey, Option<TrackPinReason>)],
+) -> TrackCommandStream {
+    match entries.len() {
+        0 => TrackCommandStream::Control,
+        1 => stream_for_command(&TrackWorkerCommand::TrackMint {
+            mint: entries[0].0,
+            pin: entries[0].1,
+        }),
+        // Multi-mint unpinned tracker batches use Control revision (per-mint keys need demand_mint).
+        _ if entries.iter().all(|(_, pin)| pin.is_none()) => TrackCommandStream::Control,
+        _ => TrackCommandStream::Control,
+    }
+}
+
 /// Map a legacy command to its protocol stream.
 pub fn stream_for_command(cmd: &TrackWorkerCommand) -> TrackCommandStream {
     match cmd {
@@ -98,8 +114,8 @@ pub fn stream_for_command(cmd: &TrackWorkerCommand) -> TrackCommandStream {
             ..
         } => TrackCommandStream::Wallet,
         TrackWorkerCommand::TrackMint { pin: None, .. } => TrackCommandStream::Tracker,
-        TrackWorkerCommand::TrackMints { .. }
-        | TrackWorkerCommand::TrackMint { .. }
+        TrackWorkerCommand::TrackMints { entries } => track_mints_batch_stream(entries),
+        TrackWorkerCommand::TrackMint { .. }
         | TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange
         | TrackWorkerCommand::ScheduleGeyserPush
         | TrackWorkerCommand::ScheduleGeyserPushDebounced
@@ -359,11 +375,23 @@ mod tests {
     }
 
     #[test]
-    fn stream_mapping_track_mints_is_control() {
+    fn stream_mapping_track_mints_single_unpinned_is_tracker() {
         let mint = Pubkey::new_unique();
         assert_eq!(
             stream_for_command(&TrackWorkerCommand::TrackMints {
                 entries: vec![(mint, None)],
+            }),
+            TrackCommandStream::Tracker
+        );
+    }
+
+    #[test]
+    fn stream_mapping_track_mints_multi_unpinned_is_control() {
+        let m1 = Pubkey::new_unique();
+        let m2 = Pubkey::new_unique();
+        assert_eq!(
+            stream_for_command(&TrackWorkerCommand::TrackMints {
+                entries: vec![(m1, None), (m2, None)],
             }),
             TrackCommandStream::Control
         );
