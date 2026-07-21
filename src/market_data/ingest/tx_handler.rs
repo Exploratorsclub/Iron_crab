@@ -7,6 +7,7 @@ use super::tx_parse::{
     resolve_pumpfun_creator_tx_path, tx_publish_segment, unparsed_tx_drop_reason,
 };
 use crate::ipc::{IntentTier, MarketEvent, MarketEventKind, PriorityFeePercentiles};
+use crate::market_data::ingest::host::IngestHost;
 use crate::market_data::md_state::{md_state_try_enqueue, MdStateCommand, MdStateSender};
 use crate::market_data::publish::{
     account_path_enqueue_core_market_event, account_path_enqueue_priority_fee_sample,
@@ -17,8 +18,9 @@ use crate::market_data::sidefx::{
     MdSidefxCommand, MdSidefxSender,
 };
 use crate::metrics::{
-    market_data_bump_geyser_head_slot, record_market_data_tx_channel_lag_ms,
-    record_market_data_tx_handler_processed, record_market_data_unparsed_tx_dropped,
+    inc_market_data_track_mint_skipped_already_tracked_total, market_data_bump_geyser_head_slot,
+    record_market_data_tx_channel_lag_ms, record_market_data_tx_handler_processed,
+    record_market_data_unparsed_tx_dropped,
 };
 use crate::nats::TOPIC_PRIORITY_FEE_SAMPLES;
 use crate::solana::dex_parser::{
@@ -116,7 +118,11 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
             ParsedDexEvent::BondingCurveUpdate { .. } => None,
         };
         if let Some((mint, dex_opt)) = mint_and_dex {
-            md_state_try_enqueue(md_state, MdStateCommand::TrackMint { mint, pin: None });
+            if IngestHost::ingest_membership_mint_contains(host, &mint) {
+                inc_market_data_track_mint_skipped_already_tracked_total();
+            } else {
+                md_state_try_enqueue(md_state, MdStateCommand::TrackMint { mint, pin: None });
+            }
             debug!(
                 mint = %mint,
                 dex = ?dex_opt,

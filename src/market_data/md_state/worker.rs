@@ -3,19 +3,21 @@
 use super::command::MdStateCommand;
 use super::host::MdStateContext;
 use crate::market_data::track::{
-    explicit_subscription_has_new_keys, track_worker_try_enqueue, TrackWorkerCommand,
-    TrackWorkerSender,
+    explicit_subscription_has_new_keys, merge_track_mint_pin, track_worker_try_enqueue,
+    TrackPinReason, TrackWorkerCommand, TrackWorkerSender,
 };
 use crate::metrics::{
     inc_market_data_geyser_sync_skipped_no_delta_total,
     inc_market_data_geyser_tracking_enqueue_dropped_total,
     inc_market_data_geyser_tracking_jobs_processed_total,
-    inc_market_data_md_state_bursts_completed_total, set_market_data_geyser_tracking_queue_depth,
-    set_market_data_md_state_burst_in_progress, set_market_data_md_state_deferred_jobs_len,
-    set_market_data_md_state_queue_depth,
+    inc_market_data_md_state_bursts_completed_total,
+    inc_market_data_md_state_track_mint_coalesce_batches_out,
+    inc_market_data_md_state_track_mint_coalesce_messages_in,
+    set_market_data_geyser_tracking_queue_depth, set_market_data_md_state_burst_in_progress,
+    set_market_data_md_state_deferred_jobs_len, set_market_data_md_state_queue_depth,
 };
 use solana_sdk::pubkey::Pubkey;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
@@ -64,6 +66,8 @@ pub fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> 
     let mut lru_bin_arrays = HashSet::new();
     let mut pending_flush = false;
     let mut pending_evict_continue = false;
+    let mut track_mints: HashMap<Pubkey, Option<TrackPinReason>> = HashMap::new();
+    let mut track_mint_messages_in = 0u64;
     for job in jobs {
         match job {
             MdStateCommand::FlushGeyserSyncDebounced => {
@@ -82,7 +86,32 @@ pub fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> 
                 lru_vaults.extend(vaults);
                 lru_bin_arrays.extend(bin_arrays);
             }
+            MdStateCommand::TrackMint { mint, pin } => {
+                track_mint_messages_in += 1;
+                track_mints
+                    .entry(mint)
+                    .and_modify(|existing| *existing = merge_track_mint_pin(*existing, pin))
+                    .or_insert(pin);
+            }
+            MdStateCommand::TrackMints { entries } => {
+                track_mint_messages_in += entries.len() as u64;
+                for (mint, pin) in entries {
+                    track_mints
+                        .entry(mint)
+                        .and_modify(|existing| *existing = merge_track_mint_pin(*existing, pin))
+                        .or_insert(pin);
+                }
+            }
             other => out.push(other),
+        }
+    }
+    if track_mint_messages_in > 0 {
+        inc_market_data_md_state_track_mint_coalesce_messages_in(track_mint_messages_in);
+        if !track_mints.is_empty() {
+            inc_market_data_md_state_track_mint_coalesce_batches_out();
+            out.push(MdStateCommand::TrackMints {
+                entries: track_mints.into_iter().collect(),
+            });
         }
     }
     if !lru_vaults.is_empty() || !lru_bin_arrays.is_empty() {
@@ -100,6 +129,49 @@ pub fn md_state_coalesce_jobs(jobs: Vec<MdStateCommand>) -> Vec<MdStateCommand> 
     out
 }
 
+/// Split wallet/strategy pins out before tracker batch enqueue (I-MD-5 wallet demand preserved).
+fn enqueue_track_mints_to_worker(
+    track_worker: &TrackWorkerSender,
+    entries: Vec<(Pubkey, Option<TrackPinReason>)>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let mut tracker_entries = Vec::with_capacity(entries.len());
+    for (mint, pin) in entries {
+        match pin {
+            Some(TrackPinReason::Wallet) => {
+                track_worker_try_enqueue(track_worker, TrackWorkerCommand::ApplyWalletPin { mint });
+            }
+            None => tracker_entries.push((mint, pin)),
+            Some(other) => {
+                track_worker_try_enqueue(
+                    track_worker,
+                    TrackWorkerCommand::TrackMint {
+                        mint,
+                        pin: Some(other),
+                    },
+                );
+            }
+        }
+    }
+    match tracker_entries.len() {
+        0 => {}
+        1 => {
+            let (mint, pin) = tracker_entries[0];
+            track_worker_try_enqueue(track_worker, TrackWorkerCommand::TrackMint { mint, pin });
+        }
+        _ => {
+            track_worker_try_enqueue(
+                track_worker,
+                TrackWorkerCommand::TrackMints {
+                    entries: tracker_entries,
+                },
+            );
+        }
+    }
+}
+
 pub fn md_state_process_job<C: MdStateContext>(
     ctx: &Arc<C>,
     job: MdStateCommand,
@@ -108,6 +180,10 @@ pub fn md_state_process_job<C: MdStateContext>(
     match job {
         MdStateCommand::TrackMint { mint, pin } => {
             track_worker_try_enqueue(track_worker, TrackWorkerCommand::TrackMint { mint, pin });
+            false
+        }
+        MdStateCommand::TrackMints { entries } => {
+            enqueue_track_mints_to_worker(track_worker, entries);
             false
         }
         MdStateCommand::TrackWalletMint { mint } => {
@@ -303,4 +379,47 @@ pub fn spawn_md_state_worker<C: MdStateContext + 'static>(
         })
         .expect("spawn md-state thread");
     md_state_sender
+}
+
+#[cfg(test)]
+mod tests {
+    use super::md_state_coalesce_jobs;
+    use crate::market_data::md_state::MdStateCommand;
+    use crate::market_data::track::TrackPinReason;
+    use solana_sdk::pubkey::Pubkey;
+
+    #[test]
+    fn scope_h_coalesce_dedupes_repeated_track_mint() {
+        let mint = Pubkey::new_unique();
+        let jobs: Vec<_> = (0..100)
+            .map(|_| MdStateCommand::TrackMint { mint, pin: None })
+            .collect();
+        let out = md_state_coalesce_jobs(jobs);
+        assert_eq!(out.len(), 1);
+        let MdStateCommand::TrackMints { entries } = &out[0] else {
+            panic!("expected TrackMints batch");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], (mint, None));
+    }
+
+    #[test]
+    fn scope_h_coalesce_track_mint_wallet_pin_wins() {
+        let mint = Pubkey::new_unique();
+        let jobs = vec![
+            MdStateCommand::TrackMint { mint, pin: None },
+            MdStateCommand::TrackMint {
+                mint,
+                pin: Some(TrackPinReason::Wallet),
+            },
+            MdStateCommand::TrackMint { mint, pin: None },
+        ];
+        let out = md_state_coalesce_jobs(jobs);
+        assert_eq!(out.len(), 1);
+        let MdStateCommand::TrackMints { entries } = &out[0] else {
+            panic!("expected TrackMints batch");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], (mint, Some(TrackPinReason::Wallet)));
+    }
 }

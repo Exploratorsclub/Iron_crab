@@ -306,6 +306,13 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
         TrackWorkerCommand::ApplyWalletPin { mint } => ctx.apply_wallet_pin(admission, mint),
         TrackWorkerCommand::WithdrawWalletPin { mint } => ctx.withdraw_wallet_pin(admission, mint),
         TrackWorkerCommand::TrackMint { mint, pin } => ctx.apply_track_mint(admission, mint, pin),
+        TrackWorkerCommand::TrackMints { entries } => {
+            let mut all_ok = true;
+            for (mint, pin) in entries {
+                all_ok &= ctx.apply_track_mint(admission, mint, pin);
+            }
+            all_ok
+        }
         TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange => {
             let new_cap = ctx.max_tracked_accounts();
             let _ = ctx.apply_explicit_cap_shrink(admission, new_cap);
@@ -354,6 +361,12 @@ fn track_protocol_should_advance_revision(
     }
 }
 
+/// Coalesced TrackMints batches use Control revision but must replay like tracker demand.
+#[inline]
+fn track_mints_batch_requires_replay_on_failure(payload: &TrackWorkerCommand) -> bool {
+    matches!(payload, TrackWorkerCommand::TrackMints { .. })
+}
+
 fn track_protocol_stage_for_replay(
     protocol: &Arc<Mutex<BoundedProtocolStore>>,
     cmd: ImmutableTrackCommand,
@@ -379,15 +392,20 @@ fn track_worker_apply_protocol_command<C: TrackWorkerContext>(
     }
     let stream = cmd.stream;
     let revision = cmd.revision;
+    let payload_backup = cmd.payload.clone();
     let restage_on_failure = matches!(
         stream,
         TrackCommandStream::Wallet | TrackCommandStream::Tracker
-    );
-    let payload_backup = cmd.payload.clone();
+    ) || track_mints_batch_requires_replay_on_failure(&payload_backup);
     let handler_succeeded =
         track_worker_process_command(ctx, admission, restore_barrier_pending, cmd.payload);
     let protocol_cmd = ImmutableTrackCommand::new(stream, revision, payload_backup);
-    if track_protocol_should_advance_revision(stream, handler_succeeded) {
+    let should_advance = if track_mints_batch_requires_replay_on_failure(&protocol_cmd.payload) {
+        handler_succeeded
+    } else {
+        track_protocol_should_advance_revision(stream, handler_succeeded)
+    };
+    if should_advance {
         let mut store = protocol.lock().expect("track protocol store lock");
         if stream == TrackCommandStream::Wallet {
             store.mark_applied_wallet_demand(&protocol_cmd);

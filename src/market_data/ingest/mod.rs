@@ -54,6 +54,10 @@ impl<T: IngestHost + ?Sized> IngestHost for Arc<T> {
         (**self).ingest_membership_vault_contains(pubkey)
     }
 
+    fn ingest_membership_mint_contains(&self, pubkey: &solana_sdk::pubkey::Pubkey) -> bool {
+        (**self).ingest_membership_mint_contains(pubkey)
+    }
+
     fn ingest_membership_bin_array_contains(&self, pubkey: &solana_sdk::pubkey::Pubkey) -> bool {
         (**self).ingest_membership_bin_array_contains(pubkey)
     }

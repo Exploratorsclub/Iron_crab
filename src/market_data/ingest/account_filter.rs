@@ -223,6 +223,10 @@ mod tests {
             false
         }
 
+        fn ingest_membership_mint_contains(&self, pubkey: &Pubkey) -> bool {
+            self.membership.contains(pubkey)
+        }
+
         fn ingest_membership_bin_array_contains(&self, _pubkey: &Pubkey) -> bool {
             false
         }

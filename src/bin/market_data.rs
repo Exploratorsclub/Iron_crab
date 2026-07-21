@@ -2245,6 +2245,10 @@ impl IngestHost for MarketDataContext {
         self.tracked_membership.load().vaults.contains(pubkey)
     }
 
+    fn ingest_membership_mint_contains(&self, pubkey: &Pubkey) -> bool {
+        self.tracked_membership.load().mints.contains(pubkey)
+    }
+
     fn ingest_membership_bin_array_contains(&self, pubkey: &Pubkey) -> bool {
         self.tracked_membership.load().bin_arrays.contains(pubkey)
     }
@@ -2827,6 +2831,7 @@ impl MarketDataContext {
         let _ = admission.remove_group(Self::tracker_mint_owner(mint));
         self.tracked_mints.write().remove(&mint);
         inc_market_data_wallet_admission_admitted_total();
+        self.refresh_tracked_membership_snapshot();
         true
     }
 
@@ -17366,6 +17371,53 @@ mod pr_b_geyser_tracking_tests {
         assert!(ctx.apply_track_mint(&mut admission, mint, None));
         assert!(ctx.tracked_mints.read().contains_key(&mint));
         assert!(ctx.apply_track_mint(&mut admission, mint, None));
+    }
+
+    /// Scope H: lock-free mint membership snapshot gates redundant TX TrackMint enqueue.
+    #[test]
+    fn scope_h_ingest_membership_mint_contains_after_track() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let mint = Pubkey::new_unique();
+        assert!(!ctx.ingest_membership_mint_contains(&mint));
+
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        assert!(ctx.apply_track_mint(&mut admission, mint, None));
+        ctx.refresh_tracked_membership_snapshot();
+        assert!(ctx.ingest_membership_mint_contains(&mint));
+    }
+
+    /// Scope H: batched TrackMints must not downgrade wallet pin to unpinned tracker.
+    #[test]
+    fn scope_h_track_mints_batch_preserves_wallet_pin() {
+        use ironcrab::market_data::track::{track_worker_process_command, TrackWorkerCommand};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let mint = Pubkey::new_unique();
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        let mut restore_barrier_pending = false;
+
+        assert!(track_worker_process_command(
+            &ctx,
+            &mut admission,
+            &mut restore_barrier_pending,
+            TrackWorkerCommand::TrackMints {
+                entries: vec![(mint, None), (mint, Some(TrackPinReason::Wallet)),],
+            },
+        ));
+        let info = ctx
+            .tracked_mints
+            .read()
+            .get(&mint)
+            .cloned()
+            .expect("mint tracked");
+        assert!(info.pinned);
+        assert_eq!(info.pin, Some(GeyserPinReason::Wallet));
     }
 
     #[test]
