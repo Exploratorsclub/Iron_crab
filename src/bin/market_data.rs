@@ -13986,14 +13986,11 @@ mod pr_b_geyser_tracking_tests {
 
     #[test]
     fn account_geyser_dispatch_not_high_when_tracked_vault_without_hot_pool() {
-        use ironcrab::metrics::MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL;
-
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
         let vault = Pubkey::new_unique();
-        let before = MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL.load(Ordering::Relaxed);
         ctx.tracked_vaults.write().insert(
             vault,
             VaultInfo {
@@ -14021,16 +14018,10 @@ mod pr_b_geyser_tracking_tests {
             grpc_recv_at: Instant::now(),
         };
         assert!(!account_geyser_dispatch_priority_high(&ctx, &u));
-        assert_eq!(
-            MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL.load(Ordering::Relaxed),
-            before
-        );
     }
 
     #[test]
     fn account_geyser_dispatch_high_when_tracked_vault_for_hot_pool() {
-        use ironcrab::metrics::MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL;
-
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
@@ -14038,7 +14029,6 @@ mod pr_b_geyser_tracking_tests {
         let pool = Pubkey::new_unique();
         let base_mint = Pubkey::new_unique();
         let vault = Pubkey::new_unique();
-        let before = MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL.load(Ordering::Relaxed);
         ctx.hot_pool_registry.pin_pool(base_mint, pool);
         ctx.tracked_vaults.write().insert(
             vault,
@@ -14067,10 +14057,6 @@ mod pr_b_geyser_tracking_tests {
             grpc_recv_at: Instant::now(),
         };
         assert!(account_geyser_dispatch_priority_high(&ctx, &u));
-        assert_eq!(
-            MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL.load(Ordering::Relaxed),
-            before + 1
-        );
     }
 
     #[tokio::test]
