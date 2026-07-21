@@ -93,11 +93,14 @@ use ironcrab::market_data::track::{
     EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
 };
 use ironcrab::metrics::{
+    dec_market_data_account_enrich_ingress_queue_depth,
     dec_market_data_account_high_priority_queue_depth,
     dec_market_data_account_low_priority_queue_depth, dec_market_data_account_worker_queue_depth,
     geyser_account_listener_account_updates_value, geyser_metrics_set_subscription_accounts,
     geyser_metrics_set_tracked_pinned_accounts, inc_market_data_account_enrich_coalesce_total,
+    inc_market_data_account_enrich_dispatch_contended_total,
     inc_market_data_account_enrich_enqueue_dropped_total,
+    inc_market_data_account_enrich_ingress_queue_depth,
     inc_market_data_account_high_priority_queue_depth,
     inc_market_data_account_low_priority_queue_depth, inc_market_data_account_updates_total,
     inc_market_data_account_worker_queue_depth, inc_market_data_arb_admission_admitted_total,
@@ -234,6 +237,8 @@ const METEORA_CPMM: &str = "cpmmpPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D";
 const MARKET_DATA_ACCOUNT_WORKER_COUNT: usize = 2;
 /// Per-shard `tokio::mpsc` capacity; total backpressure budget ≈ `N * cap` (~10k).
 const MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP: usize = 5000;
+/// Per-shard ENRICH ingress `mpsc` (recv → enrich-dispatch); recv never awaits coalesce mutex.
+const MARKET_DATA_ACCOUNT_ENRICH_INGRESS_QUEUE_CAP: usize = 5000;
 /// Eval grep: momentum NATS fan-out classification lives in `publish/core.rs`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn market_event_is_momentum_nats_relevant(kind: &MarketEventKind) -> bool {
@@ -8055,6 +8060,46 @@ fn account_enrich_resolve_after_dequeue(
     (resolved, flush_status)
 }
 
+/// Result of non-blocking ENRICH ingress enqueue from the broadcast recv task.
+#[derive(Debug, PartialEq, Eq)]
+enum AccountEnrichIngressSend {
+    Ok,
+    ContendedFull,
+    Closed,
+}
+
+/// Enqueue ENRICH work into the per-shard ingress channel without touching the coalesce mutex.
+fn account_enrich_ingress_try_send(
+    ingress_tx: &mpsc::Sender<AccountWorkItem>,
+    work: AccountWorkItem,
+) -> AccountEnrichIngressSend {
+    match ingress_tx.try_send(work) {
+        Ok(()) => {
+            inc_market_data_account_enrich_ingress_queue_depth();
+            AccountEnrichIngressSend::Ok
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            inc_market_data_account_enrich_dispatch_contended_total();
+            inc_market_data_account_enrich_enqueue_dropped_total();
+            AccountEnrichIngressSend::ContendedFull
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => AccountEnrichIngressSend::Closed,
+    }
+}
+
+/// Upsert + flush for the enrich-dispatch task (owns the coalesce mutex).
+fn account_enrich_dispatch_upsert_and_flush(
+    shard: &mut AccountEnrichCoalesceShard,
+    low_tx: &mpsc::Sender<AccountWorkItem>,
+    work: AccountWorkItem,
+) -> AccountEnrichFlushStatus {
+    let upsert = account_enrich_coalesce_upsert(shard, work);
+    if matches!(upsert, AccountEnrichCoalesceUpsert::Coalesced) {
+        inc_market_data_account_enrich_coalesce_total();
+    }
+    account_enrich_coalesce_try_flush(shard, low_tx)
+}
+
 #[inline]
 fn market_data_account_worker_shard(pubkey: &Pubkey) -> usize {
     let mut h = DefaultHasher::new();
@@ -8907,21 +8952,17 @@ async fn run_geyser_loop(
 
     let mut worker_high_tx_list: Vec<mpsc::Sender<AccountWorkItem>> =
         Vec::with_capacity(MARKET_DATA_ACCOUNT_WORKER_COUNT);
-    let mut worker_low_tx_list: Vec<mpsc::Sender<AccountWorkItem>> =
-        Vec::with_capacity(MARKET_DATA_ACCOUNT_WORKER_COUNT);
-    let mut enrich_coalesce_shards: Vec<Arc<Mutex<AccountEnrichCoalesceShard>>> =
-        Vec::with_capacity(MARKET_DATA_ACCOUNT_WORKER_COUNT);
-    let mut enrich_coalesce_notifies: Vec<Arc<Notify>> =
+    let mut enrich_ingress_tx_list: Vec<mpsc::Sender<AccountWorkItem>> =
         Vec::with_capacity(MARKET_DATA_ACCOUNT_WORKER_COUNT);
     for wid in 0..MARKET_DATA_ACCOUNT_WORKER_COUNT {
         let (high_tx, mut high_rx) = mpsc::channel(MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP);
         let (low_tx, mut low_rx) = mpsc::channel(MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP);
+        let (enrich_ingress_tx, mut enrich_ingress_rx) =
+            mpsc::channel(MARKET_DATA_ACCOUNT_ENRICH_INGRESS_QUEUE_CAP);
         worker_high_tx_list.push(high_tx.clone());
-        worker_low_tx_list.push(low_tx.clone());
+        enrich_ingress_tx_list.push(enrich_ingress_tx.clone());
         let enrich_coalesce = Arc::new(Mutex::new(AccountEnrichCoalesceShard::new()));
-        enrich_coalesce_shards.push(Arc::clone(&enrich_coalesce));
         let enrich_notify = Arc::new(Notify::new());
-        enrich_coalesce_notifies.push(Arc::clone(&enrich_notify));
         let ctx_w = Arc::clone(&ctx_geyser_acc);
         let run_id_w = run_id_geyser_acc.clone();
         let account_count_w = Arc::clone(&account_count_geyser_acc);
@@ -8948,6 +8989,29 @@ async fn run_geyser_loop(
                     break;
                 }
             }
+        });
+        let low_tx_dispatch = low_tx.clone();
+        let enrich_coalesce_dispatch = Arc::clone(&enrich_coalesce);
+        let enrich_notify_dispatch = Arc::clone(&enrich_notify);
+        let geyser_account_stopped_dispatch = geyser_account_stream_stopped_tx.clone();
+        tokio::spawn(async move {
+            while let Some(work) = enrich_ingress_rx.recv().await {
+                dec_market_data_account_enrich_ingress_queue_depth();
+                let mut shard = enrich_coalesce_dispatch.lock().await;
+                let flush_status =
+                    account_enrich_dispatch_upsert_and_flush(&mut shard, &low_tx_dispatch, work);
+                drop(shard);
+                if matches!(flush_status, AccountEnrichFlushStatus::LowChannelClosed) {
+                    error!(
+                        worker = wid,
+                        "account LOW worker queue closed; stopping Geyser account stream"
+                    );
+                    let _ = geyser_account_stopped_dispatch.send(true);
+                    break;
+                }
+                enrich_notify_dispatch.notify_one();
+            }
+            warn!(worker = wid, "account enrich ingress channel closed");
         });
         let geyser_account_stopped_worker = geyser_account_stream_stopped_tx.clone();
         tokio::spawn(async move {
@@ -8992,14 +9056,10 @@ async fn run_geyser_loop(
         });
     }
     let worker_high_dispatch = Arc::new(worker_high_tx_list);
-    let worker_low_dispatch = Arc::new(worker_low_tx_list);
-    let enrich_coalesce_dispatch = Arc::new(enrich_coalesce_shards);
-    let enrich_coalesce_notify_dispatch = Arc::new(enrich_coalesce_notifies);
+    let enrich_ingress_dispatch = Arc::new(enrich_ingress_tx_list);
 
     let worker_high_recv = Arc::clone(&worker_high_dispatch);
-    let worker_low_recv = Arc::clone(&worker_low_dispatch);
-    let enrich_coalesce_recv = Arc::clone(&enrich_coalesce_dispatch);
-    let enrich_coalesce_notify_recv = Arc::clone(&enrich_coalesce_notify_dispatch);
+    let enrich_ingress_recv = Arc::clone(&enrich_ingress_dispatch);
     tokio::spawn(async move {
         loop {
             match account_rx_geyser.recv().await {
@@ -9057,25 +9117,18 @@ async fn run_geyser_loop(
                             recv_at,
                             class,
                         };
-                        let mut coalesce_shard = enrich_coalesce_recv[shard].lock().await;
-                        let upsert = account_enrich_coalesce_upsert(&mut coalesce_shard, work);
-                        if matches!(upsert, AccountEnrichCoalesceUpsert::Coalesced) {
-                            inc_market_data_account_enrich_coalesce_total();
+                        match account_enrich_ingress_try_send(&enrich_ingress_recv[shard], work) {
+                            AccountEnrichIngressSend::Ok => {}
+                            AccountEnrichIngressSend::ContendedFull => {}
+                            AccountEnrichIngressSend::Closed => {
+                                error!(
+                                    shard = shard,
+                                    "account ENRICH ingress channel closed; stopping Geyser account stream"
+                                );
+                                let _ = geyser_account_stream_stopped_tx.send(true);
+                                break;
+                            }
                         }
-                        let flush_status = account_enrich_coalesce_try_flush(
-                            &mut coalesce_shard,
-                            &worker_low_recv[shard],
-                        );
-                        drop(coalesce_shard);
-                        if matches!(flush_status, AccountEnrichFlushStatus::LowChannelClosed) {
-                            error!(
-                                shard = shard,
-                                "account LOW worker queue closed; stopping Geyser account stream"
-                            );
-                            let _ = geyser_account_stream_stopped_tx.send(true);
-                            break;
-                        }
-                        enrich_coalesce_notify_recv[shard].notify_one();
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -14156,6 +14209,133 @@ mod pr_b_geyser_tracking_tests {
             },
             100
         );
+    }
+
+    #[tokio::test]
+    async fn account_recv_exec_hot_not_blocked_by_enrich_coalesce_mutex() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let (high_tx, mut high_rx) = mpsc::channel(8);
+        let (ingress_tx, _ingress_rx) = mpsc::channel(8);
+        let coalesce = Arc::new(Mutex::new(AccountEnrichCoalesceShard::new()));
+        let coalesce_hold = Arc::clone(&coalesce);
+        let hold_task = tokio::spawn(async move {
+            let _guard = coalesce_hold.lock().await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let exec_pool = Pubkey::new_unique();
+        high_tx
+            .send(AccountWorkItem {
+                update: GeyserAccountUpdate {
+                    pubkey: exec_pool,
+                    slot: 1,
+                    owner: PUMPFUN_PROGRAM_OWNER,
+                    data: vec![],
+                    lamports: 0,
+                    grpc_recv_at: Instant::now(),
+                },
+                recv_at: Instant::now(),
+                class: AccountUpdateClass::ExecHot,
+            })
+            .await
+            .expect("EXEC_HOT must enqueue while enrich mutex is held");
+
+        let enrich_pk = Pubkey::new_unique();
+        assert_eq!(
+            account_enrich_ingress_try_send(
+                &ingress_tx,
+                AccountWorkItem {
+                    update: GeyserAccountUpdate {
+                        pubkey: enrich_pk,
+                        slot: 2,
+                        owner: PUMPFUN_PROGRAM_OWNER,
+                        data: vec![],
+                        lamports: 0,
+                        grpc_recv_at: Instant::now(),
+                    },
+                    recv_at: Instant::now(),
+                    class: AccountUpdateClass::Enrich,
+                },
+            ),
+            AccountEnrichIngressSend::Ok,
+            "ENRICH ingress must not await enrich coalesce mutex"
+        );
+
+        let received = tokio::time::timeout(std::time::Duration::from_millis(100), high_rx.recv())
+            .await
+            .expect("HIGH recv should not time out")
+            .expect("HIGH item present");
+        assert!(matches!(received.class, AccountUpdateClass::ExecHot));
+        assert_eq!(received.update.pubkey, exec_pool);
+
+        hold_task.abort();
+        let _ = hold_task.await;
+    }
+
+    #[tokio::test]
+    async fn account_enrich_ingress_full_does_not_block_recv_path() {
+        let (ingress_tx, _ingress_rx) = mpsc::channel(1);
+        let mk = |slot: u64| AccountWorkItem {
+            update: GeyserAccountUpdate {
+                pubkey: Pubkey::new_unique(),
+                slot,
+                owner: PUMPFUN_PROGRAM_OWNER,
+                data: vec![],
+                lamports: 0,
+                grpc_recv_at: Instant::now(),
+            },
+            recv_at: Instant::now(),
+            class: AccountUpdateClass::Enrich,
+        };
+        assert_eq!(
+            account_enrich_ingress_try_send(&ingress_tx, mk(1)),
+            AccountEnrichIngressSend::Ok
+        );
+        assert_eq!(
+            account_enrich_ingress_try_send(&ingress_tx, mk(2)),
+            AccountEnrichIngressSend::ContendedFull
+        );
+    }
+
+    #[test]
+    fn account_enrich_dispatch_upsert_and_flush_preserves_latest_wins() {
+        use ironcrab::metrics::MARKET_DATA_ACCOUNT_ENRICH_COALESCE_TOTAL;
+        MARKET_DATA_ACCOUNT_ENRICH_COALESCE_TOTAL.store(0, Ordering::Relaxed);
+        let (low_tx, mut low_rx) = mpsc::channel(4);
+        let mut shard = AccountEnrichCoalesceShard::new();
+        let pk = Pubkey::new_unique();
+        let mk = |slot: u64| AccountWorkItem {
+            update: GeyserAccountUpdate {
+                pubkey: pk,
+                slot,
+                owner: PUMPFUN_PROGRAM_OWNER,
+                data: vec![],
+                lamports: 0,
+                grpc_recv_at: Instant::now(),
+            },
+            recv_at: Instant::now(),
+            class: AccountUpdateClass::Enrich,
+        };
+        assert_eq!(
+            account_enrich_dispatch_upsert_and_flush(&mut shard, &low_tx, mk(1)),
+            AccountEnrichFlushStatus::Ok
+        );
+        assert_eq!(
+            account_enrich_dispatch_upsert_and_flush(&mut shard, &low_tx, mk(2)),
+            AccountEnrichFlushStatus::Ok
+        );
+        assert_eq!(
+            MARKET_DATA_ACCOUNT_ENRICH_COALESCE_TOTAL.load(Ordering::Relaxed),
+            1
+        );
+        let flushed = low_rx.try_recv().expect("first flush");
+        assert_eq!(flushed.update.slot, 1);
+        assert!(shard.pending.contains_key(&pk));
+        let (resolved, _) = account_enrich_resolve_after_dequeue(&mut shard, &low_tx, flushed);
+        assert_eq!(resolved.update.slot, 2);
     }
 
     #[test]
