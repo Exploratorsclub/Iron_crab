@@ -29,6 +29,10 @@ pub enum TrackWorkerCommand {
         mint: Pubkey,
         pin: Option<TrackPinReason>,
     },
+    /// Scope H: burst-coalesced tracker/wallet TrackMint demand (deduped by mint, single Geyser schedule).
+    TrackMints {
+        entries: Vec<(Pubkey, Option<TrackPinReason>)>,
+    },
     ScheduleGeyserSyncAfterConfigChange,
     /// Coalesced explicit Geyser push (md-state burst / trade path).
     ScheduleGeyserPush,
@@ -94,7 +98,8 @@ pub fn stream_for_command(cmd: &TrackWorkerCommand) -> TrackCommandStream {
             ..
         } => TrackCommandStream::Wallet,
         TrackWorkerCommand::TrackMint { pin: None, .. } => TrackCommandStream::Tracker,
-        TrackWorkerCommand::TrackMint { .. }
+        TrackWorkerCommand::TrackMints { .. }
+        | TrackWorkerCommand::TrackMint { .. }
         | TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange
         | TrackWorkerCommand::ScheduleGeyserPush
         | TrackWorkerCommand::ScheduleGeyserPushDebounced
@@ -134,6 +139,30 @@ impl TrackCommandKind {
     }
 }
 
+/// Relative strength for TrackMint pin merge (higher wins on coalesce).
+#[inline]
+pub fn track_mint_pin_strength(pin: Option<TrackPinReason>) -> u8 {
+    match pin {
+        Some(TrackPinReason::Wallet) => 3,
+        Some(TrackPinReason::MomentumActive) => 2,
+        Some(TrackPinReason::ArbMultiDex) => 1,
+        None => 0,
+    }
+}
+
+/// Merge two TrackMint pins; stronger pin wins (Wallet > strategy pins > unpinned tracker).
+#[inline]
+pub fn merge_track_mint_pin(
+    existing: Option<TrackPinReason>,
+    incoming: Option<TrackPinReason>,
+) -> Option<TrackPinReason> {
+    if track_mint_pin_strength(incoming) >= track_mint_pin_strength(existing) {
+        incoming
+    } else {
+        existing
+    }
+}
+
 /// Relative strength for idempotent Geyser sync intents (higher wins on merge).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SyncIntentStrength {
@@ -154,6 +183,7 @@ pub fn track_command_kind(cmd: &TrackWorkerCommand) -> TrackCommandKind {
             ..
         } => TrackCommandKind::Wallet,
         TrackWorkerCommand::TrackMint { pin: None, .. } => TrackCommandKind::Tracker,
+        TrackWorkerCommand::TrackMints { .. } => TrackCommandKind::Tracker,
         TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange
         | TrackWorkerCommand::ScheduleGeyserPush
         | TrackWorkerCommand::ScheduleGeyserPushDebounced => TrackCommandKind::Sync,
@@ -313,6 +343,30 @@ mod tests {
         for (cmd, expected) in streams {
             assert_eq!(stream_for_command(&cmd), expected);
         }
+    }
+
+    #[test]
+    fn merge_track_mint_pin_prefers_wallet_over_unpinned() {
+        use super::merge_track_mint_pin;
+        assert_eq!(
+            merge_track_mint_pin(None, Some(TrackPinReason::Wallet)),
+            Some(TrackPinReason::Wallet)
+        );
+        assert_eq!(
+            merge_track_mint_pin(Some(TrackPinReason::Wallet), None),
+            Some(TrackPinReason::Wallet)
+        );
+    }
+
+    #[test]
+    fn stream_mapping_track_mints_is_control() {
+        let mint = Pubkey::new_unique();
+        assert_eq!(
+            stream_for_command(&TrackWorkerCommand::TrackMints {
+                entries: vec![(mint, None)],
+            }),
+            TrackCommandStream::Control
+        );
     }
 
     #[test]

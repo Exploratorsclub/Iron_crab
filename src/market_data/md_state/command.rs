@@ -9,6 +9,10 @@ pub enum MdStateCommand {
         mint: Pubkey,
         pin: Option<TrackPinReason>,
     },
+    /// Scope H: burst-coalesced tracker/wallet TrackMint demand (deduped by mint).
+    TrackMints {
+        entries: Vec<(Pubkey, Option<TrackPinReason>)>,
+    },
     /// PR169b: wallet bootstrap / execution-results mint pin (no immediate sync).
     TrackWalletMint { mint: Pubkey },
     /// PR4b: wallet position close — withdraw wallet pin before map demotion.

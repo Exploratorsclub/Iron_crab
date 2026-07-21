@@ -1025,8 +1025,17 @@ pub static MARKET_DATA_TRACK_PROTOCOL_STAGE_BY_KIND_TOTAL: Lazy<[AtomicU64; 7]> 
 /// Scope G: enqueue deduped because equivalent intent already queued or pending.
 pub static MARKET_DATA_TRACK_WORKER_ENQUEUE_DEDUPED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
-/// Scope G: pending supersede/coalesce avoided a new slot (no eviction).
+/// Scope H: pending supersede/coalesce avoided a new slot (no eviction).
 pub static MARKET_DATA_TRACK_PROTOCOL_PENDING_COALESCED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Scope H: TX ingest skipped TrackMint because mint is already in tracked-membership snapshot.
+pub static MARKET_DATA_TRACK_MINT_SKIPPED_ALREADY_TRACKED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Scope H: TrackMint messages absorbed by md-state burst coalesce (before dedupe).
+pub static MARKET_DATA_MD_STATE_TRACK_MINT_COALESCE_MESSAGES_IN_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Scope H: TrackMints batches emitted by md-state burst coalesce.
+pub static MARKET_DATA_MD_STATE_TRACK_MINT_COALESCE_BATCHES_OUT_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
 /// PR169a: single-writer Geyser tracking actor queue depth (gauge).
@@ -1381,6 +1390,21 @@ pub fn inc_market_data_track_worker_enqueue_deduped_total() {
 #[inline]
 pub fn inc_market_data_track_protocol_pending_coalesced_total() {
     MARKET_DATA_TRACK_PROTOCOL_PENDING_COALESCED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_track_mint_skipped_already_tracked_total() {
+    MARKET_DATA_TRACK_MINT_SKIPPED_ALREADY_TRACKED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_md_state_track_mint_coalesce_messages_in(n: u64) {
+    MARKET_DATA_MD_STATE_TRACK_MINT_COALESCE_MESSAGES_IN_TOTAL.fetch_add(n, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_md_state_track_mint_coalesce_batches_out() {
+    MARKET_DATA_MD_STATE_TRACK_MINT_COALESCE_BATCHES_OUT_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -6328,6 +6352,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_track_protocol_pending_coalesced_total",
         MARKET_DATA_TRACK_PROTOCOL_PENDING_COALESCED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_track_mint_skipped_already_tracked_total",
+        MARKET_DATA_TRACK_MINT_SKIPPED_ALREADY_TRACKED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_md_state_track_mint_coalesce_messages_in_total",
+        MARKET_DATA_MD_STATE_TRACK_MINT_COALESCE_MESSAGES_IN_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_md_state_track_mint_coalesce_batches_out_total",
+        MARKET_DATA_MD_STATE_TRACK_MINT_COALESCE_BATCHES_OUT_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_geyser_tracking_queue_depth",

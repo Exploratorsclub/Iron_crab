@@ -14,6 +14,9 @@ pub trait IngestHost: Send + Sync {
 
     fn ingest_membership_vault_contains(&self, pubkey: &Pubkey) -> bool;
 
+    /// Lock-free tracked-mint membership (tracker TrackMint idempotency gate, I-4b).
+    fn ingest_membership_mint_contains(&self, pubkey: &Pubkey) -> bool;
+
     fn ingest_membership_bin_array_contains(&self, pubkey: &Pubkey) -> bool;
 
     /// EXEC_HOT vault membership: vault pubkeys for hot-pool legs only (not full explicit set).

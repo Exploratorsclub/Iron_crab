@@ -306,6 +306,13 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
         TrackWorkerCommand::ApplyWalletPin { mint } => ctx.apply_wallet_pin(admission, mint),
         TrackWorkerCommand::WithdrawWalletPin { mint } => ctx.withdraw_wallet_pin(admission, mint),
         TrackWorkerCommand::TrackMint { mint, pin } => ctx.apply_track_mint(admission, mint, pin),
+        TrackWorkerCommand::TrackMints { entries } => {
+            let mut batch_dirty = false;
+            for (mint, pin) in entries {
+                batch_dirty |= ctx.apply_track_mint(admission, mint, pin);
+            }
+            batch_dirty
+        }
         TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange => {
             let new_cap = ctx.max_tracked_accounts();
             let _ = ctx.apply_explicit_cap_shrink(admission, new_cap);

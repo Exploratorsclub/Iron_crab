@@ -74,5 +74,6 @@ pub use worker::{
     MARKET_DATA_TRACK_WORKER_QUEUE_CAP,
 };
 pub use worker_commands::{
-    stream_for_command, ImmutableTrackCommand, RevisionAssigner, TrackCommandStream,
+    merge_track_mint_pin, stream_for_command, ImmutableTrackCommand, RevisionAssigner,
+    TrackCommandStream,
 };
