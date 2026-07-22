@@ -122,7 +122,8 @@ const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
 /// Wire format version for `TOPIC_ARB_TRACK_REQUESTS`.
 const ARB_TRACK_REQUESTS_WIRE_VERSION: u32 = 1;
 /// Default cap for baseline reconcile `active[]` (configurable via `arb_track_baseline_max_pools`).
-const ARB_TRACK_BASELINE_MAX_POOLS_DEFAULT: usize = 500;
+/// Raised after pair-complete selection (S1): budget applies to complete pairs only; orphan gauge stays 0.
+const ARB_TRACK_BASELINE_MAX_POOLS_DEFAULT: usize = 2000;
 /// Default baseline reconcile interval (configurable via `arb_track_reconcile_interval_secs`).
 const ARB_TRACK_RECONCILE_INTERVAL_SECS_DEFAULT: u64 = 60;
 /// Max trade-signal pairs remembered per mint (bounded LRU by recency).
@@ -177,7 +178,7 @@ struct ArbConfig {
     intent_ttl_ms: u64,
     /// Enable 2-hop arbitrage (A→B on DEX1, B→A on DEX2). Default: true
     two_hop_enabled: bool,
-    /// Max pools in baseline reconcile snapshot. Default: 500.
+    /// Max pools in baseline reconcile snapshot. Default: 2000.
     arb_track_baseline_max_pools: usize,
     /// Baseline reconcile publish interval in seconds. Default: 60.
     arb_track_reconcile_interval_secs: u64,
@@ -10990,7 +10991,7 @@ mod two_hop_price_tests {
             last_activity_unix_ms: 2,
         };
         let config = TrackSelectionConfig {
-            max_pools: 500,
+            max_pools: ARB_TRACK_BASELINE_MAX_POOLS_DEFAULT,
             max_pools_per_mint: 3,
             probe_lamports: 10_000_000,
             freshness: QuoteFreshnessConfig::default(),

@@ -254,11 +254,11 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_baseline_500_stays_single_chunk() {
+    fn reconcile_baseline_2000_stays_single_chunk() {
         let update = ArbTrackRequestsUpdate {
             version: 1,
             ts_unix_ms: 1_700_000_000,
-            active: large_baseline_active(500),
+            active: large_baseline_active(2000),
             removed: Vec::new(),
             reconcile: true,
         };
