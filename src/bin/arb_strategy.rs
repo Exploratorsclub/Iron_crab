@@ -6084,6 +6084,8 @@ impl ArbContext {
         set_arb_track_selection_metrics(
             result.selected.len(),
             result.selected_mints,
+            result.pair_complete_mints,
+            result.orphan_pools,
             &result.candidate_counts,
         );
 
