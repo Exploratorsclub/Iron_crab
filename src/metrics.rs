@@ -1852,6 +1852,10 @@ pub static MARKET_DATA_ACCOUNT_ENRICH_INGRESS_QUEUE_DEPTH: Lazy<AtomicU64> =
 pub static MARKET_DATA_ACCOUNT_ENRICH_DISPATCH_CONTENDED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// EXEC_HOT HIGH `try_send` dropped (channel full); recv did not block on worker backlog.
+pub static MARKET_DATA_ACCOUNT_HIGH_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// Account ingest: jobs waiting in the dedicated NATS publish `mpsc` (JetStream + core publish).
 pub static MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -2257,6 +2261,11 @@ pub fn dec_market_data_account_enrich_ingress_queue_depth() {
 #[inline]
 pub fn inc_market_data_account_enrich_dispatch_contended_total() {
     MARKET_DATA_ACCOUNT_ENRICH_DISPATCH_CONTENDED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_high_enqueue_dropped_total() {
+    MARKET_DATA_ACCOUNT_HIGH_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -7288,6 +7297,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_account_enrich_dispatch_contended_total",
         MARKET_DATA_ACCOUNT_ENRICH_DISPATCH_CONTENDED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_high_enqueue_dropped_total",
+        MARKET_DATA_ACCOUNT_HIGH_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_account_publish_queue_depth",

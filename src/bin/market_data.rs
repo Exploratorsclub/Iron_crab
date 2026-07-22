@@ -101,6 +101,7 @@ use ironcrab::metrics::{
     inc_market_data_account_enrich_dispatch_contended_total,
     inc_market_data_account_enrich_enqueue_dropped_total,
     inc_market_data_account_enrich_ingress_queue_depth,
+    inc_market_data_account_high_enqueue_dropped_total,
     inc_market_data_account_high_priority_queue_depth,
     inc_market_data_account_low_priority_queue_depth,
     inc_market_data_account_recv_iterations_total, inc_market_data_account_updates_total,
@@ -8073,6 +8074,33 @@ enum AccountEnrichIngressSend {
     Closed,
 }
 
+/// Result of non-blocking EXEC_HOT HIGH enqueue from the broadcast recv task.
+#[derive(Debug, PartialEq, Eq)]
+enum AccountHighIngressSend {
+    Ok,
+    ContendedFull,
+    Closed,
+}
+
+/// Enqueue EXEC_HOT work into the per-shard HIGH channel without blocking the recv task.
+fn account_high_ingress_try_send(
+    high_tx: &mpsc::Sender<AccountWorkItem>,
+    work: AccountWorkItem,
+) -> AccountHighIngressSend {
+    match high_tx.try_send(work) {
+        Ok(()) => {
+            inc_market_data_account_worker_queue_depth();
+            inc_market_data_account_high_priority_queue_depth();
+            AccountHighIngressSend::Ok
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            inc_market_data_account_high_enqueue_dropped_total();
+            AccountHighIngressSend::ContendedFull
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => AccountHighIngressSend::Closed,
+    }
+}
+
 /// Enqueue ENRICH work into the per-shard ingress channel without touching the coalesce mutex.
 fn account_enrich_ingress_try_send(
     ingress_tx: &mpsc::Sender<AccountWorkItem>,
@@ -9114,30 +9142,31 @@ async fn run_geyser_loop(
                     );
                     if high {
                         let enqueue_start = Instant::now();
-                        let send_res = worker_high_recv[shard]
-                            .send(AccountWorkItem {
+                        match account_high_ingress_try_send(
+                            &worker_high_recv[shard],
+                            AccountWorkItem {
                                 update: account_update,
                                 recv_at,
                                 class,
-                            })
-                            .await;
+                            },
+                        ) {
+                            AccountHighIngressSend::Ok => {}
+                            AccountHighIngressSend::ContendedFull => {}
+                            AccountHighIngressSend::Closed => {
+                                error!(
+                                    shard = shard,
+                                    "account HIGH worker queue closed; stopping Geyser account stream"
+                                );
+                                let _ = geyser_account_stream_stopped_tx.send(true);
+                                break;
+                            }
+                        }
                         record_market_data_account_recv_high_enqueue_duration_us(
                             enqueue_start
                                 .elapsed()
                                 .as_micros()
                                 .min(u128::from(u64::MAX)) as u64,
                         );
-                        if send_res.is_ok() {
-                            inc_market_data_account_worker_queue_depth();
-                            inc_market_data_account_high_priority_queue_depth();
-                        } else {
-                            error!(
-                                shard = shard,
-                                "account HIGH worker queue closed; stopping Geyser account stream"
-                            );
-                            let _ = geyser_account_stream_stopped_tx.send(true);
-                            break;
-                        }
                     } else {
                         let work = AccountWorkItem {
                             update: account_update,
@@ -14337,6 +14366,39 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(
             account_enrich_ingress_try_send(&ingress_tx, mk(2)),
             AccountEnrichIngressSend::ContendedFull
+        );
+    }
+
+    #[test]
+    fn account_high_ingress_full_does_not_block_recv_path() {
+        use ironcrab::metrics::MARKET_DATA_ACCOUNT_HIGH_ENQUEUE_DROPPED_TOTAL;
+        use std::sync::atomic::Ordering;
+
+        MARKET_DATA_ACCOUNT_HIGH_ENQUEUE_DROPPED_TOTAL.store(0, Ordering::Relaxed);
+        let (high_tx, _high_rx) = mpsc::channel(1);
+        let mk = |slot: u64| AccountWorkItem {
+            update: GeyserAccountUpdate {
+                pubkey: Pubkey::new_unique(),
+                slot,
+                owner: PUMPFUN_PROGRAM_OWNER,
+                data: vec![],
+                lamports: 0,
+                grpc_recv_at: Instant::now(),
+            },
+            recv_at: Instant::now(),
+            class: AccountUpdateClass::ExecHot,
+        };
+        assert_eq!(
+            account_high_ingress_try_send(&high_tx, mk(1)),
+            AccountHighIngressSend::Ok
+        );
+        assert_eq!(
+            account_high_ingress_try_send(&high_tx, mk(2)),
+            AccountHighIngressSend::ContendedFull
+        );
+        assert_eq!(
+            MARKET_DATA_ACCOUNT_HIGH_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed),
+            1
         );
     }
 
