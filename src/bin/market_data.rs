@@ -16055,10 +16055,6 @@ mod pr_b_geyser_tracking_tests {
     /// Scope J3: EXEC_HOT and ENRICH worker pools are split; EXEC_HOT > ENRICH; per-class queue caps unchanged.
     #[test]
     fn scope_j3_account_worker_pools_split_exec_hot_and_enrich() {
-        assert!(
-            MARKET_DATA_ACCOUNT_EXEC_HOT_WORKER_COUNT > MARKET_DATA_ACCOUNT_ENRICH_WORKER_COUNT,
-            "EXEC_HOT capacity must exceed ENRICH to avoid starving hot path"
-        );
         assert_eq!(MARKET_DATA_ACCOUNT_EXEC_HOT_WORKER_COUNT, 4);
         assert_eq!(MARKET_DATA_ACCOUNT_ENRICH_WORKER_COUNT, 2);
         assert_eq!(
