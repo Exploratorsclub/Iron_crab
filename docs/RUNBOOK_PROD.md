@@ -202,6 +202,11 @@ Alle Werte nutzen konsistent `RecordHeader.ts_unix_ms` bzw. Geyser-`Instant::now
 | Account-Publish-Queue (Gauge) | `market_data_account_publish_queue_depth` | Jobs in der dedizierten NATS-Publish-`mpsc` (JetStream + Core MarketEvent) |
 | Account-Early-Drop (Counter) | `market_data_account_early_drop_total` | Billiger Relevanz-Filter im Recv-Task (kein DEX-Parse) |
 | Account-Handler-Zeit (Histogram, µs) | `market_data_account_handler_duration_us_*` | Wall-Time pro Worker für `handle_geyser_account` (ohne Warteschlangen-Wartezeit) |
+| Account-Recv-Drain (Counter) | `market_data_account_recv_iterations_total` | Erfolgreiche Account-Broadcast-`recv`-Iterationen; Drain-Rate via `rate(market_data_account_recv_iterations_total[5m])` |
+| Account-Recv-Classify (Histogram, µs) | `market_data_account_recv_classify_duration_us_*` | Wall-Time `classify_account_geyser_update` im dedizierten Recv-Task |
+| Account-Recv-HIGH-Enqueue (Histogram, µs) | `market_data_account_recv_high_enqueue_duration_us_*` | Wall-Time `mpsc::send().await` auf den HIGH-Worker-Shard im Recv-Task |
+| Account-Recv-ENRICH-Ingress (Histogram, µs) | `market_data_account_recv_enrich_ingress_duration_us_*` | Wall-Time `account_enrich_ingress_try_send` im Recv-Task |
+| Account-Recv-Iteration (Histogram, µs) | `market_data_account_recv_iteration_duration_us_*` | Gesamtzeit pro Recv-Iteration (`recv` → Dispatch fertig) |
 | Drops | `market_data_tx_broadcast_lagged_total`, `market_data_account_broadcast_lagged_total` | Summe der übersprungenen Nachrichten bei `RecvError::Lagged` |
 | Ketten vs. Wall | `market_data_bonding_to_trade_slot_delta_slots` | Slot-Delta letztes `BondingCurveProgress` → nächstes Pump.fun-`Trade` (I-16: Geyser-Slots) |
 
@@ -276,6 +281,24 @@ market_data_account_broadcast_lagged_total
 histogram_quantile(0.50, sum(rate(market_data_tx_channel_lag_ms_bucket[5m])) by (le))
 histogram_quantile(0.50, sum(rate(market_data_geyser_to_publish_ms_trade_bucket[5m])) by (le))
 ```
+
+**Account-Recv-Engpass-Diagnose (Scope J1, nach Deploy):** Wenn `market_data_account_broadcast_queue_depth` am Cap klebt und `market_data_account_channel_lag_ms` hoch ist, trennen die Recv-Segment-Histogramme **Classify** vs. **HIGH-await** vs. **ENRICH-Ingress**. Drain-Rate: `rate(market_data_account_recv_iterations_total[5m])` (sollte in der Größenordnung der Geyser-Account-Rate liegen; deutlich darunter = Recv-Sättigung).
+
+```promql
+# Drain-Rate (Iterationen/s)
+rate(market_data_account_recv_iterations_total[5m])
+# Engpass-Segmentierung (p95, µs)
+histogram_quantile(0.95, sum(rate(market_data_account_recv_classify_duration_us_bucket[5m])) by (le))
+histogram_quantile(0.95, sum(rate(market_data_account_recv_high_enqueue_duration_us_bucket[5m])) by (le))
+histogram_quantile(0.95, sum(rate(market_data_account_recv_enrich_ingress_duration_us_bucket[5m])) by (le))
+histogram_quantile(0.95, sum(rate(market_data_account_recv_iteration_duration_us_bucket[5m])) by (le))
+# Kontext (unverändert)
+market_data_account_broadcast_queue_depth
+rate(market_data_account_broadcast_lagged_total[5m])
+histogram_quantile(0.95, sum(rate(market_data_account_channel_lag_ms_bucket[5m])) by (le))
+```
+
+**Interpretation für J2-Entscheidung:** Hohes `recv_high_enqueue_duration_us` bei niedrigem `recv_classify_duration_us` und niedrigem `recv_enrich_ingress_duration_us` → Recv blockiert auf HIGH-`send().await` (Kandidat J2 try_send). Hohes `recv_classify_duration_us` bei niedrigen Enqueue-Zeiten → Classify/Registry-Hotspot. Hohes `recv_iteration_duration_us` ohne dominantes Segment → mehrere kleine Anteile oder Scheduling-Jitter; `iteration` vs. Summe der Segmente vergleichen.
 
 | Segment | Metrik (Präfix je nach Export) | Kurzinterpretation |
 |--------|--------------------------------|---------------------|

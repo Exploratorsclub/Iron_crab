@@ -1935,6 +1935,81 @@ static MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_SUM: Lazy<AtomicU64> =
 static MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_COUNT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// Successful account broadcast `recv` iterations (drain rate via `rate(...)`).
+pub static MARKET_DATA_ACCOUNT_RECV_ITERATIONS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Wall microseconds for `classify_account_geyser_update` in the account recv task.
+const MARKET_DATA_ACCOUNT_RECV_CLASSIFY_DURATION_US_BUCKETS: &[u64] = &[
+    1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000,
+    500_000,
+];
+
+static MARKET_DATA_ACCOUNT_RECV_CLASSIFY_DURATION_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_ACCOUNT_RECV_CLASSIFY_DURATION_US_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_ACCOUNT_RECV_CLASSIFY_DURATION_US_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_ACCOUNT_RECV_CLASSIFY_DURATION_US_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Wall microseconds for HIGH-path `mpsc::send().await` in the account recv task.
+const MARKET_DATA_ACCOUNT_RECV_HIGH_ENQUEUE_DURATION_US_BUCKETS: &[u64] = &[
+    50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+    1_000_000, 2_000_000,
+];
+
+static MARKET_DATA_ACCOUNT_RECV_HIGH_ENQUEUE_DURATION_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_ACCOUNT_RECV_HIGH_ENQUEUE_DURATION_US_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_ACCOUNT_RECV_HIGH_ENQUEUE_DURATION_US_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_ACCOUNT_RECV_HIGH_ENQUEUE_DURATION_US_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Wall microseconds for ENRICH-path `account_enrich_ingress_try_send` in the account recv task.
+const MARKET_DATA_ACCOUNT_RECV_ENRICH_INGRESS_DURATION_US_BUCKETS: &[u64] = &[
+    1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000,
+];
+
+static MARKET_DATA_ACCOUNT_RECV_ENRICH_INGRESS_DURATION_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_ACCOUNT_RECV_ENRICH_INGRESS_DURATION_US_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_ACCOUNT_RECV_ENRICH_INGRESS_DURATION_US_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_ACCOUNT_RECV_ENRICH_INGRESS_DURATION_US_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Wall microseconds per account recv loop iteration (`recv` → dispatch done).
+const MARKET_DATA_ACCOUNT_RECV_ITERATION_DURATION_US_BUCKETS: &[u64] = &[
+    50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+    1_000_000, 2_000_000,
+];
+
+static MARKET_DATA_ACCOUNT_RECV_ITERATION_DURATION_US_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| {
+        MARKET_DATA_ACCOUNT_RECV_ITERATION_DURATION_US_BUCKETS
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    });
+static MARKET_DATA_ACCOUNT_RECV_ITERATION_DURATION_US_SUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_ACCOUNT_RECV_ITERATION_DURATION_US_COUNT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// Monotonic tick bumped on Geyser account/tx ingest (Tokio liveness vs OS-thread watchdog).
 pub static MARKET_DATA_INGEST_PROGRESS_TICK: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
@@ -2299,6 +2374,64 @@ pub fn record_market_data_account_handler_duration_us(us: u64) {
         &MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_BUCKET_COUNTS,
         &MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_SUM,
         &MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_COUNT,
+        us,
+        u64::MAX,
+    );
+}
+
+/// Successful account broadcast recv iteration (one `Ok(account_update)` handled).
+#[inline]
+pub fn inc_market_data_account_recv_iterations_total() {
+    MARKET_DATA_ACCOUNT_RECV_ITERATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Classify wall time in the account recv task, microseconds.
+#[inline]
+pub fn record_market_data_account_recv_classify_duration_us(us: u64) {
+    record_histogram_u64_into(
+        MARKET_DATA_ACCOUNT_RECV_CLASSIFY_DURATION_US_BUCKETS,
+        &MARKET_DATA_ACCOUNT_RECV_CLASSIFY_DURATION_US_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_RECV_CLASSIFY_DURATION_US_SUM,
+        &MARKET_DATA_ACCOUNT_RECV_CLASSIFY_DURATION_US_COUNT,
+        us,
+        u64::MAX,
+    );
+}
+
+/// HIGH-path worker enqueue wall time in the account recv task, microseconds.
+#[inline]
+pub fn record_market_data_account_recv_high_enqueue_duration_us(us: u64) {
+    record_histogram_u64_into(
+        MARKET_DATA_ACCOUNT_RECV_HIGH_ENQUEUE_DURATION_US_BUCKETS,
+        &MARKET_DATA_ACCOUNT_RECV_HIGH_ENQUEUE_DURATION_US_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_RECV_HIGH_ENQUEUE_DURATION_US_SUM,
+        &MARKET_DATA_ACCOUNT_RECV_HIGH_ENQUEUE_DURATION_US_COUNT,
+        us,
+        u64::MAX,
+    );
+}
+
+/// ENRICH ingress try-send wall time in the account recv task, microseconds.
+#[inline]
+pub fn record_market_data_account_recv_enrich_ingress_duration_us(us: u64) {
+    record_histogram_u64_into(
+        MARKET_DATA_ACCOUNT_RECV_ENRICH_INGRESS_DURATION_US_BUCKETS,
+        &MARKET_DATA_ACCOUNT_RECV_ENRICH_INGRESS_DURATION_US_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_RECV_ENRICH_INGRESS_DURATION_US_SUM,
+        &MARKET_DATA_ACCOUNT_RECV_ENRICH_INGRESS_DURATION_US_COUNT,
+        us,
+        u64::MAX,
+    );
+}
+
+/// Total recv-loop iteration wall time (`recv` → dispatch done), microseconds.
+#[inline]
+pub fn record_market_data_account_recv_iteration_duration_us(us: u64) {
+    record_histogram_u64_into(
+        MARKET_DATA_ACCOUNT_RECV_ITERATION_DURATION_US_BUCKETS,
+        &MARKET_DATA_ACCOUNT_RECV_ITERATION_DURATION_US_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_RECV_ITERATION_DURATION_US_SUM,
+        &MARKET_DATA_ACCOUNT_RECV_ITERATION_DURATION_US_COUNT,
         us,
         u64::MAX,
     );
@@ -7233,6 +7366,42 @@ async fn metrics_response() -> Response<Body> {
         &MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_SUM,
         &MARKET_DATA_ACCOUNT_HANDLER_DURATION_US_COUNT,
     );
+    line!(
+        "market_data_account_recv_iterations_total",
+        MARKET_DATA_ACCOUNT_RECV_ITERATIONS_TOTAL.load(Ordering::Relaxed)
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_account_recv_classify_duration_us",
+        MARKET_DATA_ACCOUNT_RECV_CLASSIFY_DURATION_US_BUCKETS,
+        &MARKET_DATA_ACCOUNT_RECV_CLASSIFY_DURATION_US_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_RECV_CLASSIFY_DURATION_US_SUM,
+        &MARKET_DATA_ACCOUNT_RECV_CLASSIFY_DURATION_US_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_account_recv_high_enqueue_duration_us",
+        MARKET_DATA_ACCOUNT_RECV_HIGH_ENQUEUE_DURATION_US_BUCKETS,
+        &MARKET_DATA_ACCOUNT_RECV_HIGH_ENQUEUE_DURATION_US_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_RECV_HIGH_ENQUEUE_DURATION_US_SUM,
+        &MARKET_DATA_ACCOUNT_RECV_HIGH_ENQUEUE_DURATION_US_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_account_recv_enrich_ingress_duration_us",
+        MARKET_DATA_ACCOUNT_RECV_ENRICH_INGRESS_DURATION_US_BUCKETS,
+        &MARKET_DATA_ACCOUNT_RECV_ENRICH_INGRESS_DURATION_US_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_RECV_ENRICH_INGRESS_DURATION_US_SUM,
+        &MARKET_DATA_ACCOUNT_RECV_ENRICH_INGRESS_DURATION_US_COUNT,
+    );
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "market_data_account_recv_iteration_duration_us",
+        MARKET_DATA_ACCOUNT_RECV_ITERATION_DURATION_US_BUCKETS,
+        &MARKET_DATA_ACCOUNT_RECV_ITERATION_DURATION_US_BUCKET_COUNTS,
+        &MARKET_DATA_ACCOUNT_RECV_ITERATION_DURATION_US_SUM,
+        &MARKET_DATA_ACCOUNT_RECV_ITERATION_DURATION_US_COUNT,
+    );
 
     // --- momentum-bot service ---
     line!(
@@ -9721,5 +9890,52 @@ mod arb_two_hop_v2_sell_quote_none_detail_metrics_tests {
                 "missing sell_quote_none detail label {label}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod market_data_account_recv_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn recv_record_functions_increment_histogram_counts() {
+        let classify_before =
+            MARKET_DATA_ACCOUNT_RECV_CLASSIFY_DURATION_US_COUNT.load(Ordering::Relaxed);
+        record_market_data_account_recv_classify_duration_us(42);
+        assert_eq!(
+            MARKET_DATA_ACCOUNT_RECV_CLASSIFY_DURATION_US_COUNT.load(Ordering::Relaxed),
+            classify_before + 1
+        );
+
+        let high_before =
+            MARKET_DATA_ACCOUNT_RECV_HIGH_ENQUEUE_DURATION_US_COUNT.load(Ordering::Relaxed);
+        record_market_data_account_recv_high_enqueue_duration_us(100);
+        assert_eq!(
+            MARKET_DATA_ACCOUNT_RECV_HIGH_ENQUEUE_DURATION_US_COUNT.load(Ordering::Relaxed),
+            high_before + 1
+        );
+
+        let enrich_before =
+            MARKET_DATA_ACCOUNT_RECV_ENRICH_INGRESS_DURATION_US_COUNT.load(Ordering::Relaxed);
+        record_market_data_account_recv_enrich_ingress_duration_us(5);
+        assert_eq!(
+            MARKET_DATA_ACCOUNT_RECV_ENRICH_INGRESS_DURATION_US_COUNT.load(Ordering::Relaxed),
+            enrich_before + 1
+        );
+
+        let iter_before =
+            MARKET_DATA_ACCOUNT_RECV_ITERATION_DURATION_US_COUNT.load(Ordering::Relaxed);
+        record_market_data_account_recv_iteration_duration_us(250);
+        assert_eq!(
+            MARKET_DATA_ACCOUNT_RECV_ITERATION_DURATION_US_COUNT.load(Ordering::Relaxed),
+            iter_before + 1
+        );
+
+        let recv_iters_before = MARKET_DATA_ACCOUNT_RECV_ITERATIONS_TOTAL.load(Ordering::Relaxed);
+        inc_market_data_account_recv_iterations_total();
+        assert_eq!(
+            MARKET_DATA_ACCOUNT_RECV_ITERATIONS_TOTAL.load(Ordering::Relaxed),
+            recv_iters_before + 1
+        );
     }
 }
