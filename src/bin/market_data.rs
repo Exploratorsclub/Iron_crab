@@ -137,7 +137,8 @@ use ironcrab::metrics::{
     record_market_data_momentum_active_pool_messages_total,
     record_market_data_tokio_liveness_stall, record_market_data_tokio_progress,
     record_market_data_tx_broadcast_lagged, serve_metrics,
-    set_market_data_account_broadcast_queue_depth, set_market_data_account_worker_count,
+    set_market_data_account_broadcast_queue_depth, set_market_data_account_enrich_worker_count,
+    set_market_data_account_exec_hot_worker_count, set_market_data_account_worker_count,
     set_market_data_arb_pinned_pools_gauge, set_market_data_enrichment_registry_pools_gauge,
     set_market_data_explicit_set_snapshot_restore_duration_ms,
     set_market_data_explicit_set_snapshot_restore_pubkeys,
@@ -237,10 +238,10 @@ const PUMPFUN_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const METEORA_DLMM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const METEORA_CPMM: &str = "cpmmpPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D";
 
-/// Parallel account workers (shard = `hash(pubkey) % N` for per-pubkey ordering + cache locality).
-/// Post-R4 prod soak: 8 workers + heavy account handler caused md-sidefx/md-state queue convoy;
-/// reverted PR141 scale-down to 2 until soak proves higher count safe.
-const MARKET_DATA_ACCOUNT_WORKER_COUNT: usize = 2;
+/// Scope J3: EXEC_HOT workers (HIGH queue only). More capacity than ENRICH without shared-pool convoy.
+const MARKET_DATA_ACCOUNT_EXEC_HOT_WORKER_COUNT: usize = 4;
+/// Scope J3: ENRICH workers (LOW + ingress/coalesce). Kept at R4b scale; sidefx uses try_send + cap.
+const MARKET_DATA_ACCOUNT_ENRICH_WORKER_COUNT: usize = 2;
 /// Per-shard `tokio::mpsc` capacity; total backpressure budget ≈ `N * cap` (~10k).
 const MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP: usize = 5000;
 /// Per-shard ENRICH ingress `mpsc` (recv → enrich-dispatch); recv never awaits coalesce mutex.
@@ -8134,19 +8135,30 @@ fn account_enrich_dispatch_upsert_and_flush(
 }
 
 #[inline]
-fn market_data_account_worker_shard(pubkey: &Pubkey) -> usize {
+fn market_data_account_exec_hot_shard(pubkey: &Pubkey) -> usize {
     let mut h = DefaultHasher::new();
     pubkey.hash(&mut h);
-    (h.finish() as usize) % MARKET_DATA_ACCOUNT_WORKER_COUNT
+    (h.finish() as usize) % MARKET_DATA_ACCOUNT_EXEC_HOT_WORKER_COUNT
+}
+
+#[inline]
+fn market_data_account_enrich_shard(pubkey: &Pubkey) -> usize {
+    let mut h = DefaultHasher::new();
+    pubkey.hash(&mut h);
+    (h.finish() as usize) % MARKET_DATA_ACCOUNT_ENRICH_WORKER_COUNT
 }
 
 /// Dequeued account work tagged by ingest class queue (HIGH vs LOW).
+/// Retained for unit tests documenting strict HIGH-before-LOW dequeue semantics.
+#[cfg_attr(not(test), allow(dead_code))]
 enum AccountWorkerDequeue {
     ExecHot(AccountWorkItem),
     Enrich(AccountWorkItem),
 }
 
 /// Strict HIGH-then-LOW dequeue for one account worker (two `mpsc` channels per shard).
+/// Production uses split EXEC_HOT / ENRICH pools (Scope J3); kept for regression tests.
+#[cfg_attr(not(test), allow(dead_code))]
 async fn account_worker_recv_next(
     high: &mut mpsc::Receiver<AccountWorkItem>,
     low: &mut mpsc::Receiver<AccountWorkItem>,
@@ -8981,19 +8993,62 @@ async fn run_geyser_loop(
     let account_count_geyser_acc = Arc::clone(&account_count);
     let mut account_rx_geyser = account_rx;
 
-    set_market_data_account_worker_count(MARKET_DATA_ACCOUNT_WORKER_COUNT);
+    set_market_data_account_exec_hot_worker_count(MARKET_DATA_ACCOUNT_EXEC_HOT_WORKER_COUNT);
+    set_market_data_account_enrich_worker_count(MARKET_DATA_ACCOUNT_ENRICH_WORKER_COUNT);
+    set_market_data_account_worker_count(
+        MARKET_DATA_ACCOUNT_EXEC_HOT_WORKER_COUNT + MARKET_DATA_ACCOUNT_ENRICH_WORKER_COUNT,
+    );
 
     let mut worker_high_tx_list: Vec<mpsc::Sender<AccountWorkItem>> =
-        Vec::with_capacity(MARKET_DATA_ACCOUNT_WORKER_COUNT);
-    let mut enrich_ingress_tx_list: Vec<mpsc::Sender<AccountWorkItem>> =
-        Vec::with_capacity(MARKET_DATA_ACCOUNT_WORKER_COUNT);
-    for wid in 0..MARKET_DATA_ACCOUNT_WORKER_COUNT {
+        Vec::with_capacity(MARKET_DATA_ACCOUNT_EXEC_HOT_WORKER_COUNT);
+    for wid in 0..MARKET_DATA_ACCOUNT_EXEC_HOT_WORKER_COUNT {
         let (high_tx, mut high_rx) = mpsc::channel(MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP);
+        worker_high_tx_list.push(high_tx);
+        let ctx_w = Arc::clone(&ctx_geyser_acc);
+        let run_id_w = run_id_geyser_acc.clone();
+        let account_count_w = Arc::clone(&account_count_geyser_acc);
+        let publish_tx_w = account_publish_tx.clone();
+        let md_state_w = md_state.clone();
+        let md_sidefx_w = md_sidefx.clone();
+        tokio::spawn(async move {
+            while let Some(work) = high_rx.recv().await {
+                dec_market_data_account_high_priority_queue_depth();
+                dec_market_data_account_worker_queue_depth();
+                let handler_start = Instant::now();
+                handle_geyser_account(
+                    Arc::clone(&ctx_w),
+                    run_id_w.as_str(),
+                    work.update,
+                    account_count_w.as_ref(),
+                    work.recv_at,
+                    publish_tx_w.as_ref(),
+                    &md_state_w,
+                    &md_sidefx_w,
+                    work.class,
+                )
+                .await;
+                record_market_data_account_handler_duration_us(
+                    handler_start
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX)) as u64,
+                );
+            }
+            warn!(
+                worker = wid,
+                class = "exec_hot",
+                "account ingest worker: HIGH channel closed"
+            );
+        });
+    }
+
+    let mut enrich_ingress_tx_list: Vec<mpsc::Sender<AccountWorkItem>> =
+        Vec::with_capacity(MARKET_DATA_ACCOUNT_ENRICH_WORKER_COUNT);
+    for wid in 0..MARKET_DATA_ACCOUNT_ENRICH_WORKER_COUNT {
         let (low_tx, mut low_rx) = mpsc::channel(MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP);
         let (enrich_ingress_tx, mut enrich_ingress_rx) =
             mpsc::channel(MARKET_DATA_ACCOUNT_ENRICH_INGRESS_QUEUE_CAP);
-        worker_high_tx_list.push(high_tx.clone());
-        enrich_ingress_tx_list.push(enrich_ingress_tx.clone());
+        enrich_ingress_tx_list.push(enrich_ingress_tx);
         let enrich_coalesce = Arc::new(Mutex::new(AccountEnrichCoalesceShard::new()));
         let enrich_notify = Arc::new(Notify::new());
         let ctx_w = Arc::clone(&ctx_geyser_acc);
@@ -9016,6 +9071,7 @@ async fn run_geyser_loop(
                 ) {
                     error!(
                         worker = wid,
+                        class = "enrich",
                         "account LOW worker queue closed; stopping Geyser account stream"
                     );
                     let _ = geyser_account_stopped_drain.send(true);
@@ -9037,6 +9093,7 @@ async fn run_geyser_loop(
                 if matches!(flush_status, AccountEnrichFlushStatus::LowChannelClosed) {
                     error!(
                         worker = wid,
+                        class = "enrich",
                         "account LOW worker queue closed; stopping Geyser account stream"
                     );
                     let _ = geyser_account_stopped_dispatch.send(true);
@@ -9044,27 +9101,27 @@ async fn run_geyser_loop(
                 }
                 enrich_notify_dispatch.notify_one();
             }
-            warn!(worker = wid, "account enrich ingress channel closed");
+            warn!(
+                worker = wid,
+                class = "enrich",
+                "account enrich ingress channel closed"
+            );
         });
         let geyser_account_stopped_worker = geyser_account_stream_stopped_tx.clone();
         tokio::spawn(async move {
-            while let Some(dequeued) = account_worker_recv_next(&mut high_rx, &mut low_rx).await {
-                let work = match dequeued {
-                    AccountWorkerDequeue::ExecHot(work) => work,
-                    AccountWorkerDequeue::Enrich(work) => {
-                        let mut shard = enrich_coalesce.lock().await;
-                        let (work, flush_status) =
-                            account_enrich_resolve_after_dequeue(&mut shard, &low_tx, work);
-                        if matches!(flush_status, AccountEnrichFlushStatus::LowChannelClosed) {
-                            error!(
-                                worker = wid,
-                                "account LOW worker queue closed; stopping Geyser account stream"
-                            );
-                            let _ = geyser_account_stopped_worker.send(true);
-                        }
-                        work
-                    }
-                };
+            while let Some(work) = low_rx.recv().await {
+                let mut shard = enrich_coalesce.lock().await;
+                let (work, flush_status) =
+                    account_enrich_resolve_after_dequeue(&mut shard, &low_tx, work);
+                if matches!(flush_status, AccountEnrichFlushStatus::LowChannelClosed) {
+                    error!(
+                        worker = wid,
+                        class = "enrich",
+                        "account LOW worker queue closed; stopping Geyser account stream"
+                    );
+                    let _ = geyser_account_stopped_worker.send(true);
+                }
+                drop(shard);
                 let handler_start = Instant::now();
                 handle_geyser_account(
                     Arc::clone(&ctx_w),
@@ -9085,7 +9142,11 @@ async fn run_geyser_loop(
                         .min(u128::from(u64::MAX)) as u64,
                 );
             }
-            warn!(worker = wid, "account ingest worker: input channel closed");
+            warn!(
+                worker = wid,
+                class = "enrich",
+                "account ingest worker: LOW channel closed"
+            );
         });
     }
     let worker_high_dispatch = Arc::new(worker_high_tx_list);
@@ -9135,12 +9196,12 @@ async fn run_geyser_loop(
                         recv_at,
                     );
 
-                    let shard = market_data_account_worker_shard(&account_update.pubkey);
                     let high = matches!(
                         class,
                         ironcrab::market_data::ingest::AccountUpdateClass::ExecHot
                     );
                     if high {
+                        let shard = market_data_account_exec_hot_shard(&account_update.pubkey);
                         let enqueue_start = Instant::now();
                         match account_high_ingress_try_send(
                             &worker_high_recv[shard],
@@ -9155,6 +9216,7 @@ async fn run_geyser_loop(
                             AccountHighIngressSend::Closed => {
                                 error!(
                                     shard = shard,
+                                    class = "exec_hot",
                                     "account HIGH worker queue closed; stopping Geyser account stream"
                                 );
                                 let _ = geyser_account_stream_stopped_tx.send(true);
@@ -9168,6 +9230,7 @@ async fn run_geyser_loop(
                                 .min(u128::from(u64::MAX)) as u64,
                         );
                     } else {
+                        let shard = market_data_account_enrich_shard(&account_update.pubkey);
                         let work = AccountWorkItem {
                             update: account_update,
                             recv_at,
@@ -9180,6 +9243,7 @@ async fn run_geyser_loop(
                             AccountEnrichIngressSend::Closed => {
                                 error!(
                                     shard = shard,
+                                    class = "enrich",
                                     "account ENRICH ingress channel closed; stopping Geyser account stream"
                                 );
                                 let _ = geyser_account_stream_stopped_tx.send(true);
@@ -15988,14 +16052,24 @@ mod pr_b_geyser_tracking_tests {
         );
     }
 
-    /// Phase-R-R4b: account worker pool scaled down after post-R4 prod convoy.
+    /// Scope J3: EXEC_HOT and ENRICH worker pools are split; EXEC_HOT > ENRICH; per-class queue caps unchanged.
     #[test]
-    fn pr_r4b_account_worker_count_is_two() {
-        assert_eq!(MARKET_DATA_ACCOUNT_WORKER_COUNT, 2);
+    fn scope_j3_account_worker_pools_split_exec_hot_and_enrich() {
+        assert!(
+            MARKET_DATA_ACCOUNT_EXEC_HOT_WORKER_COUNT > MARKET_DATA_ACCOUNT_ENRICH_WORKER_COUNT,
+            "EXEC_HOT capacity must exceed ENRICH to avoid starving hot path"
+        );
+        assert_eq!(MARKET_DATA_ACCOUNT_EXEC_HOT_WORKER_COUNT, 4);
+        assert_eq!(MARKET_DATA_ACCOUNT_ENRICH_WORKER_COUNT, 2);
         assert_eq!(
-            MARKET_DATA_ACCOUNT_WORKER_COUNT * MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP,
+            MARKET_DATA_ACCOUNT_EXEC_HOT_WORKER_COUNT * MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP,
+            20_000,
+            "EXEC_HOT per-shard cap unchanged; total HIGH backpressure budget"
+        );
+        assert_eq!(
+            MARKET_DATA_ACCOUNT_ENRICH_WORKER_COUNT * MARKET_DATA_ACCOUNT_WORKER_QUEUE_CAP,
             10_000,
-            "total account queue backpressure budget ~10k"
+            "ENRICH per-shard cap unchanged; total LOW backpressure budget (R4b scale)"
         );
     }
 
