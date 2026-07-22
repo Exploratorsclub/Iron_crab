@@ -102,7 +102,8 @@ use ironcrab::metrics::{
     inc_market_data_account_enrich_enqueue_dropped_total,
     inc_market_data_account_enrich_ingress_queue_depth,
     inc_market_data_account_high_priority_queue_depth,
-    inc_market_data_account_low_priority_queue_depth, inc_market_data_account_updates_total,
+    inc_market_data_account_low_priority_queue_depth,
+    inc_market_data_account_recv_iterations_total, inc_market_data_account_updates_total,
     inc_market_data_account_worker_queue_depth, inc_market_data_arb_admission_admitted_total,
     inc_market_data_arb_admission_rejected_total,
     inc_market_data_arb_pin_geyser_register_deferred_total,
@@ -124,6 +125,10 @@ use ironcrab::metrics::{
     market_data_tx_handler_processed_value, record_market_data_account_broadcast_lagged,
     record_market_data_account_channel_lag_ms, record_market_data_account_channel_lag_ms_for_class,
     record_market_data_account_early_drop, record_market_data_account_handler_duration_us,
+    record_market_data_account_recv_classify_duration_us,
+    record_market_data_account_recv_enrich_ingress_duration_us,
+    record_market_data_account_recv_high_enqueue_duration_us,
+    record_market_data_account_recv_iteration_duration_us,
     record_market_data_arb_track_requests_messages_total,
     record_market_data_geyser_merge_coalesced_total, record_market_data_geyser_sync_batch_total,
     record_market_data_global_ingest_stall, record_market_data_md_state_stall,
@@ -9064,20 +9069,35 @@ async fn run_geyser_loop(
         loop {
             match account_rx_geyser.recv().await {
                 Ok(account_update) => {
+                    let iteration_start = Instant::now();
                     let recv_at = Instant::now();
+                    inc_market_data_account_recv_iterations_total();
                     record_market_data_account_channel_lag_ms(account_update.grpc_recv_at, recv_at);
                     set_market_data_account_broadcast_queue_depth(account_rx_geyser.len());
                     market_data_bump_geyser_head_slot(account_update.slot);
 
+                    let classify_start = Instant::now();
                     let (class, early_drop_reason) =
                         ironcrab::market_data::ingest::classify_account_geyser_update(
                             &ctx_geyser_acc,
                             &account_update,
                         );
+                    record_market_data_account_recv_classify_duration_us(
+                        classify_start
+                            .elapsed()
+                            .as_micros()
+                            .min(u128::from(u64::MAX)) as u64,
+                    );
                     inc_market_data_account_updates_total(class.as_prometheus_label());
 
                     if let Some(reason) = early_drop_reason {
                         record_market_data_account_early_drop(reason);
+                        record_market_data_account_recv_iteration_duration_us(
+                            iteration_start
+                                .elapsed()
+                                .as_micros()
+                                .min(u128::from(u64::MAX)) as u64,
+                        );
                         continue;
                     }
 
@@ -9093,6 +9113,7 @@ async fn run_geyser_loop(
                         ironcrab::market_data::ingest::AccountUpdateClass::ExecHot
                     );
                     if high {
+                        let enqueue_start = Instant::now();
                         let send_res = worker_high_recv[shard]
                             .send(AccountWorkItem {
                                 update: account_update,
@@ -9100,6 +9121,12 @@ async fn run_geyser_loop(
                                 class,
                             })
                             .await;
+                        record_market_data_account_recv_high_enqueue_duration_us(
+                            enqueue_start
+                                .elapsed()
+                                .as_micros()
+                                .min(u128::from(u64::MAX)) as u64,
+                        );
                         if send_res.is_ok() {
                             inc_market_data_account_worker_queue_depth();
                             inc_market_data_account_high_priority_queue_depth();
@@ -9117,6 +9144,7 @@ async fn run_geyser_loop(
                             recv_at,
                             class,
                         };
+                        let ingress_start = Instant::now();
                         match account_enrich_ingress_try_send(&enrich_ingress_recv[shard], work) {
                             AccountEnrichIngressSend::Ok => {}
                             AccountEnrichIngressSend::ContendedFull => {}
@@ -9129,7 +9157,19 @@ async fn run_geyser_loop(
                                 break;
                             }
                         }
+                        record_market_data_account_recv_enrich_ingress_duration_us(
+                            ingress_start
+                                .elapsed()
+                                .as_micros()
+                                .min(u128::from(u64::MAX)) as u64,
+                        );
                     }
+                    record_market_data_account_recv_iteration_duration_us(
+                        iteration_start
+                            .elapsed()
+                            .as_micros()
+                            .min(u128::from(u64::MAX)) as u64,
+                    );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     record_market_data_account_broadcast_lagged(n);
