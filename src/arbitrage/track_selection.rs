@@ -103,6 +103,10 @@ pub struct TrackSelectionResult {
     /// Pools that would have been selected for a mint but were dropped by the global budget.
     pub budget_displaced: Vec<String>,
     pub selected_mints: usize,
+    /// Mints with ≥2 selected pools on ≥2 distinct DEXes (I-ARB-10b).
+    pub pair_complete_mints: usize,
+    /// Selected pools whose mint lacks a cross-DEX pair in the selected set (Soll: 0).
+    pub orphan_pools: usize,
     pub candidate_counts: TrackCandidateCounts,
 }
 
@@ -167,12 +171,50 @@ pub fn select_arb_track_pools(
     budget_displaced.sort();
     budget_displaced.dedup();
 
+    let (pair_complete_mints, orphan_pools) = compute_pair_completeness_stats(&selected, mints);
+
     TrackSelectionResult {
         selected_mints: selected_mints.len(),
+        pair_complete_mints,
+        orphan_pools,
         selected,
         budget_displaced,
         candidate_counts,
     }
+}
+
+/// Count pair-complete mints and orphan pools in the selected set (I-ARB-10b observability).
+pub fn compute_pair_completeness_stats(
+    selected: &[SelectedTrackPool],
+    mints: &[TrackMintInput],
+) -> (usize, usize) {
+    let pool_dex: HashMap<&str, &str> = mints
+        .iter()
+        .flat_map(|mint| {
+            mint.pools
+                .iter()
+                .map(|pool| (pool.pool_address.as_str(), pool.dex.as_str()))
+        })
+        .collect();
+
+    let mut by_mint: HashMap<&str, Vec<&str>> = HashMap::new();
+    for entry in selected {
+        if let Some(dex) = pool_dex.get(entry.pool.as_str()) {
+            by_mint.entry(entry.mint.as_str()).or_default().push(*dex);
+        }
+    }
+
+    let mut pair_complete_mints = 0usize;
+    let mut orphan_pools = 0usize;
+    for pools in by_mint.values() {
+        let distinct_dexes: HashSet<&str> = pools.iter().copied().collect();
+        if pools.len() >= 2 && distinct_dexes.len() >= 2 {
+            pair_complete_mints += 1;
+        } else {
+            orphan_pools += pools.len();
+        }
+    }
+    (pair_complete_mints, orphan_pools)
 }
 
 /// Map selection removals for pools no longer in the target set.
@@ -654,6 +696,150 @@ mod tests {
     const MINT: &str = "TokenMint11111111111111111111111111111111";
     const RESERVE_BASE: u64 = 1_000_000_000_000;
     const RESERVE_QUOTE: u64 = 1_000_000_000;
+
+    #[test]
+    fn cross_dex_quotable_pair_both_selected() {
+        let fresh_vault = vault(RESERVE_BASE, RESERVE_QUOTE);
+        let mint = mint_input(
+            MINT,
+            vec![
+                pool_input(
+                    "orca",
+                    "orca_quote",
+                    MINT,
+                    true,
+                    true,
+                    Some(fresh_vault),
+                    10,
+                ),
+                pool_input(
+                    "pump_amm",
+                    "pump_quote",
+                    MINT,
+                    true,
+                    true,
+                    Some(vault(RESERVE_BASE, RESERVE_QUOTE * 2)),
+                    9,
+                ),
+            ],
+            10,
+            None,
+        );
+        let result = select_arb_track_pools(&[mint], &default_config(500));
+        assert_eq!(result.selected.len(), 2);
+        assert_eq!(result.pair_complete_mints, 1);
+        assert_eq!(result.orphan_pools, 0);
+        let pools: HashSet<_> = result.selected.iter().map(|p| p.pool.as_str()).collect();
+        assert!(pools.contains("orca_quote"));
+        assert!(pools.contains("pump_quote"));
+    }
+
+    #[test]
+    fn multi_dex_mint_rejected_when_filters_leave_lt_2_candidates() {
+        let mint = mint_input(
+            MINT,
+            vec![
+                pool_input(
+                    "orca",
+                    "orca_ok",
+                    MINT,
+                    true,
+                    true,
+                    Some(vault(RESERVE_BASE, RESERVE_QUOTE)),
+                    10,
+                ),
+                pool_input("pump_amm", "pump_unknown", MINT, false, false, None, 9),
+                pool_input("raydium", "ray_unknown", MINT, false, false, None, 8),
+            ],
+            10,
+            None,
+        );
+        let result = select_arb_track_pools(&[mint], &default_config(500));
+        assert!(result.selected.is_empty());
+        assert_eq!(result.pair_complete_mints, 0);
+        assert_eq!(result.orphan_pools, 0);
+    }
+
+    #[test]
+    fn budget_prefers_fewer_complete_mints_over_orphan_fill() {
+        let make_mint = |idx: u64| {
+            mint_input(
+                &format!("Mint{idx:04}"),
+                vec![
+                    pool_input(
+                        "orca",
+                        &format!("orca_{idx}"),
+                        MINT,
+                        true,
+                        true,
+                        Some(vault(RESERVE_BASE, RESERVE_QUOTE)),
+                        idx,
+                    ),
+                    pool_input(
+                        "pump_amm",
+                        &format!("pump_{idx}"),
+                        MINT,
+                        true,
+                        true,
+                        Some(vault(RESERVE_BASE, RESERVE_QUOTE * 2)),
+                        idx,
+                    ),
+                ],
+                idx,
+                None,
+            )
+        };
+        let mints: Vec<_> = (0..5).map(make_mint).collect();
+        let result = select_arb_track_pools(&mints, &default_config(4));
+        assert_eq!(result.selected.len(), 4);
+        assert_eq!(result.orphan_pools, 0);
+        assert_eq!(result.pair_complete_mints, 2);
+        assert_eq!(result.selected_mints, 2);
+    }
+
+    #[test]
+    fn pair_complete_stats_detect_orphans() {
+        let selected = vec![
+            SelectedTrackPool {
+                mint: "m1".to_string(),
+                pool: "solo".to_string(),
+                readiness: TrackPoolReadiness::QuoteReady,
+                active_reason: ArbTrackActiveReason::MultiDex,
+            },
+            SelectedTrackPool {
+                mint: "m2".to_string(),
+                pool: "a".to_string(),
+                readiness: TrackPoolReadiness::QuoteReady,
+                active_reason: ArbTrackActiveReason::MultiDex,
+            },
+            SelectedTrackPool {
+                mint: "m2".to_string(),
+                pool: "b".to_string(),
+                readiness: TrackPoolReadiness::QuoteReady,
+                active_reason: ArbTrackActiveReason::MultiDex,
+            },
+        ];
+        let mints = vec![
+            TrackMintInput {
+                mint: "m1".to_string(),
+                pools: vec![pool_input("orca", "solo", MINT, true, true, None, 1)],
+                trade_signal_pools: None,
+                last_activity_unix_ms: 1,
+            },
+            TrackMintInput {
+                mint: "m2".to_string(),
+                pools: vec![
+                    pool_input("orca", "a", MINT, true, true, None, 2),
+                    pool_input("pump_amm", "b", MINT, true, true, None, 2),
+                ],
+                trade_signal_pools: None,
+                last_activity_unix_ms: 2,
+            },
+        ];
+        let (pair_complete, orphans) = compute_pair_completeness_stats(&selected, &mints);
+        assert_eq!(pair_complete, 1);
+        assert_eq!(orphans, 1);
+    }
 
     #[test]
     fn single_dex_mint_selects_nothing() {

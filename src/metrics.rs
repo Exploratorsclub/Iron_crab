@@ -3750,6 +3750,9 @@ pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_MINT_DIRECTION_INVALID: Lazy<At
 pub static ARB_PROACTIVE_TRACK_PUBLISH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACK_SELECTED_POOLS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACK_SELECTED_MINTS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_SELECTED_PAIR_COMPLETE_MINTS_GAUGE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_SELECTED_ORPHAN_POOLS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACK_CANDIDATE_POOLS_EXECUTABLE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACK_CANDIDATE_POOLS_QUOTE_READY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACK_CANDIDATE_POOLS_WARMABLE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -4420,10 +4423,15 @@ pub fn record_arb_proactive_track_publish_total() {
 pub fn set_arb_track_selection_metrics(
     selected_pools: usize,
     selected_mints: usize,
+    pair_complete_mints: usize,
+    orphan_pools: usize,
     candidate_counts: &crate::arbitrage::TrackCandidateCounts,
 ) {
     ARB_TRACK_SELECTED_POOLS_GAUGE.store(selected_pools as u64, Ordering::Relaxed);
     ARB_TRACK_SELECTED_MINTS_GAUGE.store(selected_mints as u64, Ordering::Relaxed);
+    ARB_TRACK_SELECTED_PAIR_COMPLETE_MINTS_GAUGE
+        .store(pair_complete_mints as u64, Ordering::Relaxed);
+    ARB_TRACK_SELECTED_ORPHAN_POOLS_GAUGE.store(orphan_pools as u64, Ordering::Relaxed);
     ARB_TRACK_CANDIDATE_POOLS_EXECUTABLE.store(candidate_counts.executable, Ordering::Relaxed);
     ARB_TRACK_CANDIDATE_POOLS_QUOTE_READY.store(candidate_counts.quote_ready, Ordering::Relaxed);
     ARB_TRACK_CANDIDATE_POOLS_WARMABLE.store(candidate_counts.warmable, Ordering::Relaxed);
@@ -8307,6 +8315,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_track_selected_mints",
         ARB_TRACK_SELECTED_MINTS_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_track_selected_pair_complete_mints",
+        ARB_TRACK_SELECTED_PAIR_COMPLETE_MINTS_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_track_selected_orphan_pools",
+        ARB_TRACK_SELECTED_ORPHAN_POOLS_GAUGE.load(Ordering::Relaxed)
     );
     out.push_str("arb_track_candidate_pools_total{readiness=\"executable\"} ");
     out.push_str(
