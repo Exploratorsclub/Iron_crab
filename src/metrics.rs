@@ -3773,6 +3773,18 @@ pub static ARB_TRACK_CANDIDATE_POOLS_EXECUTABLE: Lazy<AtomicU64> = Lazy::new(|| 
 pub static ARB_TRACK_CANDIDATE_POOLS_QUOTE_READY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACK_CANDIDATE_POOLS_WARMABLE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACK_CANDIDATE_POOLS_REJECTED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_SELECTED_POOL_READINESS_EXECUTABLE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_SELECTED_POOL_READINESS_QUOTE_READY: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_SELECTED_POOL_READINESS_WARMABLE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRACK_SELECTED_POOL_READINESS_REJECTED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_SCREEN_SKIPPED_MINT_NOT_SELECTED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_ROUND_TRIP_FORMABLE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACK_REMOVED_BUDGET_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACK_REMOVED_STALE_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACK_REMOVED_COOLDOWN_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -4452,6 +4464,38 @@ pub fn set_arb_track_selection_metrics(
     ARB_TRACK_CANDIDATE_POOLS_QUOTE_READY.store(candidate_counts.quote_ready, Ordering::Relaxed);
     ARB_TRACK_CANDIDATE_POOLS_WARMABLE.store(candidate_counts.warmable, Ordering::Relaxed);
     ARB_TRACK_CANDIDATE_POOLS_REJECTED.store(candidate_counts.rejected, Ordering::Relaxed);
+}
+
+/// Update readiness histogram for pools in the authoritative selected pin set (I-ARB-10b).
+pub fn set_arb_track_selected_pool_readiness_metrics(
+    candidate_counts: &crate::arbitrage::TrackCandidateCounts,
+) {
+    ARB_TRACK_SELECTED_POOL_READINESS_EXECUTABLE
+        .store(candidate_counts.executable, Ordering::Relaxed);
+    ARB_TRACK_SELECTED_POOL_READINESS_QUOTE_READY
+        .store(candidate_counts.quote_ready, Ordering::Relaxed);
+    ARB_TRACK_SELECTED_POOL_READINESS_WARMABLE.store(candidate_counts.warmable, Ordering::Relaxed);
+    ARB_TRACK_SELECTED_POOL_READINESS_REJECTED.store(candidate_counts.rejected, Ordering::Relaxed);
+}
+
+/// Skip reason for `arb_two_hop_v2_screen_skipped_total{reason=...}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbTwoHopV2ScreenSkipReason {
+    MintNotSelected,
+}
+
+/// Increment `arb_two_hop_v2_screen_skipped_total{reason=...}`.
+pub fn arb_two_hop_v2_screen_skipped_inc(reason: ArbTwoHopV2ScreenSkipReason) {
+    match reason {
+        ArbTwoHopV2ScreenSkipReason::MintNotSelected => {
+            ARB_TWO_HOP_V2_SCREEN_SKIPPED_MINT_NOT_SELECTED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Increment `arb_two_hop_v2_round_trip_formable_total` when `select_round_trip_pools` succeeds.
+pub fn arb_two_hop_v2_round_trip_formable_inc() {
+    ARB_TWO_HOP_V2_ROUND_TRIP_FORMABLE_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Increment `arb_track_removed_total{reason=...}`.
@@ -8309,6 +8353,17 @@ async fn metrics_response() -> Response<Body> {
         "arb_two_hop_v2_screen_multi_dex_total",
         ARB_TWO_HOP_V2_SCREEN_MULTI_DEX_TOTAL.load(Ordering::Relaxed)
     );
+    out.push_str("arb_two_hop_v2_screen_skipped_total{reason=\"mint_not_selected\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_SCREEN_SKIPPED_MINT_NOT_SELECTED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "arb_two_hop_v2_round_trip_formable_total",
+        ARB_TWO_HOP_V2_ROUND_TRIP_FORMABLE_TOTAL.load(Ordering::Relaxed)
+    );
     append_arb_two_hop_v2_insufficient_subreason_total(&mut out);
     append_arb_two_hop_v2_no_cross_dex_sell_detail_total(&mut out);
     append_arb_two_hop_v2_sell_quote_none_detail_total(&mut out);
@@ -8372,6 +8427,34 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("arb_track_candidate_pools_total{readiness=\"rejected\"} ");
     out.push_str(
         &ARB_TRACK_CANDIDATE_POOLS_REJECTED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_track_selected_pool_readiness_total{readiness=\"executable\"} ");
+    out.push_str(
+        &ARB_TRACK_SELECTED_POOL_READINESS_EXECUTABLE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_track_selected_pool_readiness_total{readiness=\"quote_ready\"} ");
+    out.push_str(
+        &ARB_TRACK_SELECTED_POOL_READINESS_QUOTE_READY
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_track_selected_pool_readiness_total{readiness=\"warmable\"} ");
+    out.push_str(
+        &ARB_TRACK_SELECTED_POOL_READINESS_WARMABLE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_track_selected_pool_readiness_total{readiness=\"rejected\"} ");
+    out.push_str(
+        &ARB_TRACK_SELECTED_POOL_READINESS_REJECTED
             .load(Ordering::Relaxed)
             .to_string(),
     );

@@ -38,8 +38,8 @@ use ironcrab::arbitrage::{
     MultiHopConfig, MultiHopIntentBatch, NoCrossDexSellDetailReason, PoolQuote,
     QuoteFreshnessConfig, QuoteKind, QuotePoolInput, QuoteVaultInput, RoundTripInsufficient,
     RoundTripInsufficientSubreason, RoundTripLeg, RoundTripPoolCandidate, RoundTripSelectFailure,
-    SellQuoteNoneDetailReason, TrackMintInput, TrackPoolInput, TrackSelectionConfig,
-    DLMM_PROBE_SOL_LAMPORTS,
+    SellQuoteNoneDetailReason, TrackCandidateCounts, TrackMintInput, TrackPoolInput,
+    TrackSelectionConfig, DLMM_PROBE_SOL_LAMPORTS,
 };
 use ironcrab::config::Config as AppConfig;
 use ironcrab::execution::live_pool_cache::{
@@ -72,7 +72,8 @@ use ironcrab::metrics::{
     arb_two_hop_rejected_inc, arb_two_hop_tracker_seeded_pools_add,
     arb_two_hop_v2_incompatible_kind_inc, arb_two_hop_v2_insufficient_subreason_inc,
     arb_two_hop_v2_no_cross_dex_sell_detail_inc, arb_two_hop_v2_rejected_inc,
-    arb_two_hop_v2_screen_inc, arb_two_hop_v2_screen_multi_dex_inc,
+    arb_two_hop_v2_round_trip_formable_inc, arb_two_hop_v2_screen_inc,
+    arb_two_hop_v2_screen_multi_dex_inc, arb_two_hop_v2_screen_skipped_inc,
     arb_two_hop_v2_sell_quote_none_detail_inc, record_arb_heartbeat_phase,
     record_arb_price_freshness_stale_age_ms, record_arb_proactive_pin_first_publish,
     record_arb_proactive_track_publish_total, record_arb_quote_pair_slot_delta,
@@ -82,16 +83,17 @@ use ironcrab::metrics::{
     record_arb_track_selection_blocking_join_failed_total,
     record_arb_track_selection_queue_overflow_total, record_arb_track_selection_recompute_total,
     record_arb_writer_lock_wait, serve_metrics, set_arb_pool_cache_apply_batch_size_gauge,
-    set_arb_quote_shadow_legacy_spread_bps, set_arb_track_selection_metrics,
-    set_arb_tracker_write_coalescer_pending, set_arb_tracker_write_queue_depth,
-    set_arb_two_hop_blocked_on_apply_trade, set_readiness_nats_connected,
-    tick_arb_heartbeat_seconds_since_last_finish, tick_arb_tracker_write_seconds_since_last_finish,
+    set_arb_quote_shadow_legacy_spread_bps, set_arb_track_selected_pool_readiness_metrics,
+    set_arb_track_selection_metrics, set_arb_tracker_write_coalescer_pending,
+    set_arb_tracker_write_queue_depth, set_arb_two_hop_blocked_on_apply_trade,
+    set_readiness_nats_connected, tick_arb_heartbeat_seconds_since_last_finish,
+    tick_arb_tracker_write_seconds_since_last_finish,
     try_record_arb_track_pin_before_first_screen_ms, wall_clock_unix_ms_now, ArbHeartbeatPhase,
     ArbStrategyWarmupSkipReason, ArbTrackerWriteJobType, ArbTwoHopInsufficientSubreason,
     ArbTwoHopPoolGate, ArbTwoHopRejectReason, ArbTwoHopRejectSubreason,
     ArbTwoHopV2InsufficientSubreason, ArbTwoHopV2NoCrossDexSellDetail, ArbTwoHopV2RejectReason,
-    ArbTwoHopV2SellQuoteNoneDetail, ArbWriterLockKind, MetricsComponent,
-    ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH, ARB_REJECTED_MISSING_ACCOUNTS,
+    ArbTwoHopV2ScreenSkipReason, ArbTwoHopV2SellQuoteNoneDetail, ArbWriterLockKind,
+    MetricsComponent, ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH, ARB_REJECTED_MISSING_ACCOUNTS,
     ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL, ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH,
     ARB_TRACKER_WRITE_COALESCER_PENDING, ARB_TRACKER_WRITE_CURRENT_JOB_STARTED_UNIX_MS,
     ARB_TRACKER_WRITE_CURRENT_JOB_TYPE, ARB_TRACKER_WRITE_QUEUE_DEPTH,
@@ -2695,6 +2697,10 @@ struct ArbCheckContext<'a> {
     data_quality_rejects: &'a AtomicU64,
     forensics: Option<&'a ArbEligibilityForensics>,
     v2_forensics: Option<&'a ArbV2EligibilityForensics>,
+    /// When set, v2 screens run only for mints in the authoritative selection set (I-ARB-10b).
+    selected_mints: Option<&'a HashSet<String>>,
+    /// When set and the mint has pinned pools, round-trip candidates use only those pools.
+    pinned_pools: Option<&'a HashSet<String>>,
 }
 
 fn pool_state_to_quote_input(
@@ -2978,10 +2984,24 @@ impl TokenArbTracker {
         vault_balances: &HashMap<String, VaultBalanceCache>,
         bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
         token_decimals: u8,
+        pinned_pools: Option<&HashSet<String>>,
     ) -> Vec<OwnedRoundTripCandidate> {
+        let mint_pinned_filter: Option<HashSet<&str>> = pinned_pools.map(|pinned| {
+            self.pools
+                .keys()
+                .filter(|addr| pinned.contains(*addr))
+                .map(|addr| addr.as_str())
+                .collect()
+        });
+
         self.pools
             .values()
             .filter(|p| known_pools.contains(&p.pool_address))
+            .filter(|p| {
+                mint_pinned_filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.contains(p.pool_address.as_str()))
+            })
             .filter(|p| is_known_dex_label(&p.dex))
             .filter(|p| p.dex != "pumpfun")
             .map(|pool| {
@@ -3011,12 +3031,14 @@ impl TokenArbTracker {
         probe: u64,
         freshness: &QuoteFreshnessConfig,
         reject_subreason: RoundTripInsufficientSubreason,
+        pinned_pools: Option<&HashSet<String>>,
     ) -> MintV2EligibilityBreakdown {
         let owned_candidates = self.build_round_trip_candidates(
             known_pools,
             vault_balances,
             bin_arrays,
             token_decimals,
+            pinned_pools,
         );
         let candidates: Vec<RoundTripPoolCandidate<'_>> = owned_candidates
             .iter()
@@ -3165,7 +3187,15 @@ impl TokenArbTracker {
         vault_balances: &HashMap<String, VaultBalanceCache>,
         bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
         v2_forensics: Option<&ArbV2EligibilityForensics>,
+        check_ctx: &ArbCheckContext<'_>,
     ) -> Option<ArbOpportunity> {
+        if let Some(selected_mints) = check_ctx.selected_mints {
+            if !selected_mints.contains(&self.base_mint) {
+                arb_two_hop_v2_screen_skipped_inc(ArbTwoHopV2ScreenSkipReason::MintNotSelected);
+                return None;
+            }
+        }
+
         arb_two_hop_v2_screen_inc();
         if self.pool_count_on_distinct_dexes() >= 2 {
             arb_two_hop_v2_screen_multi_dex_inc();
@@ -3190,6 +3220,7 @@ impl TokenArbTracker {
             vault_balances,
             bin_arrays,
             token_decimals,
+            check_ctx.pinned_pools,
         );
         let candidates: Vec<RoundTripPoolCandidate<'_>> = owned_candidates
             .iter()
@@ -3223,6 +3254,7 @@ impl TokenArbTracker {
                         probe,
                         &freshness,
                         insufficient.subreason,
+                        check_ctx.pinned_pools,
                     );
                     collector.record(breakdown);
                 }
@@ -3238,6 +3270,8 @@ impl TokenArbTracker {
                 return None;
             }
         };
+
+        arb_two_hop_v2_round_trip_formable_inc();
 
         let slot_delta = selection
             .buy_quote
@@ -3352,6 +3386,7 @@ impl TokenArbTracker {
                 vault_balances,
                 bin_arrays,
                 check_ctx.v2_forensics,
+                check_ctx,
             );
         }
 
@@ -4182,6 +4217,8 @@ fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoH
             let mint = apply_result.mint.clone();
             let ctx_for_check = Arc::clone(&ctx);
             let known_pools = ctx.known_pools.read().clone();
+            let selected_mints = ctx.arb_selected_mints.read().clone();
+            let pinned_pools = ctx.arb_pinned_pools.read().clone();
             let opp = tokio::task::spawn_blocking(move || {
                 apply_result.tracker_snapshot.check_arbitrage(
                     &apply_result.config,
@@ -4193,6 +4230,8 @@ fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoH
                         data_quality_rejects: &ctx_for_check.data_quality_rejects,
                         forensics: Some(&ctx_for_check.eligibility_forensics),
                         v2_forensics: Some(&ctx_for_check.v2_eligibility_forensics),
+                        selected_mints: Some(&selected_mints),
+                        pinned_pools: Some(&pinned_pools),
                     },
                 )
             })
@@ -4474,6 +4513,8 @@ struct ArbContext {
 
     /// Phase 3: pools published as active via `TOPIC_ARB_TRACK_REQUESTS`.
     arb_pinned_pools: RwLock<HashSet<String>>,
+    /// Mints with at least one pool in the authoritative selected pin set (I-ARB-10b).
+    arb_selected_mints: RwLock<HashSet<String>>,
     /// Bounded per-mint trade-signal pairs (mint -> buy/sell + recency).
     arb_trade_signal_pairs: RwLock<HashMap<String, ArbTradeSignalPair>>,
     /// LRU order for trade-signal pair eviction (oldest at front).
@@ -5791,6 +5832,8 @@ impl ArbContext {
         let known_pools = self.known_pools.read();
         let vault_balances = self.vault_balances.read();
         let bin_arrays = self.bin_arrays.read();
+        let selected_mints = self.arb_selected_mints.read();
+        let pinned_pools = self.arb_pinned_pools.read();
         let opp = tracker_snapshot.check_arbitrage(
             &config,
             &known_pools,
@@ -5801,6 +5844,8 @@ impl ArbContext {
                 data_quality_rejects: &self.data_quality_rejects,
                 forensics: Some(&self.eligibility_forensics),
                 v2_forensics: Some(&self.v2_eligibility_forensics),
+                selected_mints: Some(&selected_mints),
+                pinned_pools: Some(&pinned_pools),
             },
         )?;
         self.finalize_trade_opportunity(mint, config.intent_cooldown_ms, opp)
@@ -6090,9 +6135,28 @@ impl ArbContext {
             &result.candidate_counts,
         );
 
+        let mut selected_pool_counts = TrackCandidateCounts::default();
+        for pool in &result.selected {
+            selected_pool_counts.record(pool.readiness);
+        }
+        set_arb_track_selected_pool_readiness_metrics(&selected_pool_counts);
+
+        let selected_mint_set: HashSet<String> =
+            result.selected.iter().map(|p| p.mint.clone()).collect();
+
         let budget_displaced: HashSet<String> = result.budget_displaced.into_iter().collect();
         let new_pools: HashSet<String> = result.selected.iter().map(|p| p.pool.clone()).collect();
         let old_pools = self.arb_pinned_pools.read().clone();
+
+        if old_pools != new_pools {
+            let mut pinned = self.arb_pinned_pools.write();
+            *pinned = new_pools.clone();
+        }
+
+        {
+            let mut selected_mints = self.arb_selected_mints.write();
+            *selected_mints = selected_mint_set;
+        }
 
         if !reconcile && old_pools == new_pools {
             record_arb_track_publish_skipped_unchanged_total();
@@ -6147,11 +6211,6 @@ impl ArbContext {
                 })
                 .collect()
         };
-
-        {
-            let mut pinned = self.arb_pinned_pools.write();
-            *pinned = new_pools;
-        }
 
         let will_publish = reconcile || !active.is_empty() || !removed.is_empty();
         if !will_publish {
@@ -7137,6 +7196,7 @@ async fn main() -> Result<()> {
         eligibility_forensics: ArbEligibilityForensics::new(),
         v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
         arb_pinned_pools: RwLock::new(HashSet::new()),
+        arb_selected_mints: RwLock::new(HashSet::new()),
         arb_trade_signal_pairs: RwLock::new(HashMap::new()),
         arb_trade_signal_pair_order: RwLock::new(Vec::new()),
         arb_track_mint_snapshots: RwLock::new(ArbTrackMintSnapshotCache::default()),
@@ -8203,6 +8263,7 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_selected_mints: RwLock::new(HashSet::new()),
             arb_trade_signal_pairs: RwLock::new(HashMap::new()),
             arb_trade_signal_pair_order: RwLock::new(Vec::new()),
             arb_track_mint_snapshots: RwLock::new(ArbTrackMintSnapshotCache::default()),
@@ -8314,6 +8375,7 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_selected_mints: RwLock::new(HashSet::new()),
             arb_trade_signal_pairs: RwLock::new(HashMap::new()),
             arb_trade_signal_pair_order: RwLock::new(Vec::new()),
             arb_track_mint_snapshots: RwLock::new(ArbTrackMintSnapshotCache::default()),
@@ -8423,6 +8485,7 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_selected_mints: RwLock::new(HashSet::new()),
             arb_trade_signal_pairs: RwLock::new(HashMap::new()),
             arb_trade_signal_pair_order: RwLock::new(Vec::new()),
             arb_track_mint_snapshots: RwLock::new(ArbTrackMintSnapshotCache::default()),
@@ -8642,6 +8705,7 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_selected_mints: RwLock::new(HashSet::new()),
             arb_trade_signal_pairs: RwLock::new(HashMap::new()),
             arb_trade_signal_pair_order: RwLock::new(Vec::new()),
             arb_track_mint_snapshots: RwLock::new(ArbTrackMintSnapshotCache::default()),
@@ -8749,6 +8813,7 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_selected_mints: RwLock::new(HashSet::new()),
             arb_trade_signal_pairs: RwLock::new(HashMap::new()),
             arb_trade_signal_pair_order: RwLock::new(Vec::new()),
             arb_track_mint_snapshots: RwLock::new(ArbTrackMintSnapshotCache::default()),
@@ -8860,6 +8925,7 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_selected_mints: RwLock::new(HashSet::new()),
             arb_trade_signal_pairs: RwLock::new(HashMap::new()),
             arb_trade_signal_pair_order: RwLock::new(Vec::new()),
             arb_track_mint_snapshots: RwLock::new(ArbTrackMintSnapshotCache::default()),
@@ -8942,6 +9008,7 @@ mod event_pipeline_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_selected_mints: RwLock::new(HashSet::new()),
             arb_trade_signal_pairs: RwLock::new(HashMap::new()),
             arb_trade_signal_pair_order: RwLock::new(Vec::new()),
             arb_track_mint_snapshots: RwLock::new(ArbTrackMintSnapshotCache::default()),
@@ -9085,6 +9152,7 @@ mod two_hop_price_tests {
             eligibility_forensics: ArbEligibilityForensics::new(),
             v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
             arb_pinned_pools: RwLock::new(HashSet::new()),
+            arb_selected_mints: RwLock::new(HashSet::new()),
             arb_trade_signal_pairs: RwLock::new(HashMap::new()),
             arb_trade_signal_pair_order: RwLock::new(Vec::new()),
             arb_track_mint_snapshots: RwLock::new(ArbTrackMintSnapshotCache::default()),
@@ -9546,6 +9614,8 @@ mod two_hop_price_tests {
                 data_quality_rejects: &data_quality_rejects,
                 forensics: None,
                 v2_forensics: None,
+                selected_mints: None,
+                pinned_pools: None,
             },
         );
         // Same reserves → spread ~0, rejected by spread_below_min not insufficient_pools
@@ -9631,6 +9701,8 @@ mod two_hop_price_tests {
                 data_quality_rejects: &data_quality_rejects,
                 forensics: None,
                 v2_forensics: None,
+                selected_mints: None,
+                pinned_pools: None,
             },
         );
         let opp = opp.expect("v2 round-trip should find cross-dex edge");
@@ -9716,6 +9788,8 @@ mod two_hop_price_tests {
                 data_quality_rejects: &data_quality_rejects,
                 forensics: None,
                 v2_forensics: None,
+                selected_mints: None,
+                pinned_pools: None,
             },
         );
         assert!(opp.is_none(), "slot delta 99 should exceed default gate");
@@ -10365,6 +10439,8 @@ mod two_hop_price_tests {
                 data_quality_rejects: &data_quality_rejects,
                 forensics: None,
                 v2_forensics: None,
+                selected_mints: None,
+                pinned_pools: None,
             },
         );
         assert!(opp.is_none());
@@ -10438,6 +10514,8 @@ mod two_hop_price_tests {
                 data_quality_rejects: &data_quality_rejects,
                 forensics: Some(forensics),
                 v2_forensics: None,
+                selected_mints: None,
+                pinned_pools: None,
             },
         )
     }
@@ -10464,6 +10542,8 @@ mod two_hop_price_tests {
                 data_quality_rejects: &data_quality_rejects,
                 forensics: None,
                 v2_forensics: Some(v2_forensics),
+                selected_mints: None,
+                pinned_pools: None,
             },
         )
     }
@@ -10917,11 +10997,122 @@ mod two_hop_price_tests {
                 data_quality_rejects: &data_quality_rejects,
                 forensics: None,
                 v2_forensics: None,
+                selected_mints: None,
+                pinned_pools: None,
             },
         );
         assert!(
             ironcrab::metrics::ARB_TWO_HOP_V2_SCREEN_MULTI_DEX_TOTAL.load(Ordering::Relaxed)
                 > before_multi
+        );
+    }
+
+    #[test]
+    fn v2_screen_skipped_when_mint_not_in_selected_set() {
+        let before_skip = ironcrab::metrics::ARB_TWO_HOP_V2_SCREEN_SKIPPED_MINT_NOT_SELECTED
+            .load(Ordering::Relaxed);
+        let before_screen = ironcrab::metrics::ARB_TWO_HOP_V2_SCREEN_TOTAL.load(Ordering::Relaxed);
+
+        let mint = "SelectedGateMint11111111111111111111111";
+        let mut tracker = TokenArbTracker::new(mint);
+        tracker.token_decimals = Some(6);
+        tracker.upsert_pool(sample_pool("orca", "poolA", None, None));
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert("poolA".to_string());
+        let spread_warn_last = RwLock::new(HashMap::new());
+        let data_quality_rejects = AtomicU64::new(0);
+        let selected_mints = HashSet::new();
+        let pinned_pools = HashSet::new();
+        let config = ArbConfig {
+            arb_two_hop_v2_enabled: true,
+            ..Default::default()
+        };
+
+        let _ = tracker.check_arbitrage(
+            &config,
+            &known_pools,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ArbCheckContext {
+                spread_warn_last: &spread_warn_last,
+                data_quality_rejects: &data_quality_rejects,
+                forensics: None,
+                v2_forensics: None,
+                selected_mints: Some(&selected_mints),
+                pinned_pools: Some(&pinned_pools),
+            },
+        );
+
+        assert_eq!(
+            ironcrab::metrics::ARB_TWO_HOP_V2_SCREEN_SKIPPED_MINT_NOT_SELECTED
+                .load(Ordering::Relaxed),
+            before_skip + 1
+        );
+        assert_eq!(
+            ironcrab::metrics::ARB_TWO_HOP_V2_SCREEN_TOTAL.load(Ordering::Relaxed),
+            before_screen
+        );
+    }
+
+    #[test]
+    fn v2_round_trip_candidates_use_pinned_pools_only() {
+        let before_formable =
+            ironcrab::metrics::ARB_TWO_HOP_V2_ROUND_TRIP_FORMABLE_TOTAL.load(Ordering::Relaxed);
+        let reserves = (1_000_000_000_000u64, 1_000_000_000u64);
+        let mint = "PinnedOnlyMint1111111111111111111111111";
+        let mut tracker = TokenArbTracker::new(mint);
+        tracker.token_decimals = Some(6);
+        tracker.upsert_pool(sample_pool("orca", "orca_pool", None, None));
+        tracker.upsert_pool(sample_pool("pump_amm", "pump_pool", None, None));
+        tracker.upsert_pool(sample_pool("raydium", "ray_pool", None, None));
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert("orca_pool".to_string());
+        known_pools.insert("pump_pool".to_string());
+        known_pools.insert("ray_pool".to_string());
+
+        let vault_balances = HashMap::from([
+            ("orca_pool".to_string(), vault(reserves.0, reserves.1)),
+            ("pump_pool".to_string(), vault(reserves.0, reserves.1)),
+            ("ray_pool".to_string(), vault(reserves.0, reserves.1)),
+        ]);
+
+        let mut selected_mints = HashSet::new();
+        selected_mints.insert(mint.to_string());
+        let mut pinned_pools = HashSet::new();
+        pinned_pools.insert("orca_pool".to_string());
+        pinned_pools.insert("pump_pool".to_string());
+
+        let spread_warn_last = RwLock::new(HashMap::new());
+        let data_quality_rejects = AtomicU64::new(0);
+        let config = ArbConfig {
+            arb_two_hop_v2_enabled: true,
+            min_spread_bps: 1,
+            min_profit_lamports: 1,
+            est_tx_cost_lamports: 1,
+            ..Default::default()
+        };
+
+        let _ = tracker.check_arbitrage(
+            &config,
+            &known_pools,
+            &vault_balances,
+            &HashMap::new(),
+            &ArbCheckContext {
+                spread_warn_last: &spread_warn_last,
+                data_quality_rejects: &data_quality_rejects,
+                forensics: None,
+                v2_forensics: None,
+                selected_mints: Some(&selected_mints),
+                pinned_pools: Some(&pinned_pools),
+            },
+        );
+
+        assert!(
+            ironcrab::metrics::ARB_TWO_HOP_V2_ROUND_TRIP_FORMABLE_TOTAL.load(Ordering::Relaxed)
+                > before_formable,
+            "pinned orca+pump pair should form a round trip even with extra non-pinned ray pool in tracker"
         );
     }
 
