@@ -1816,9 +1816,22 @@ pub static MARKET_DATA_TX_BROADCAST_LAGGED_TOTAL: Lazy<AtomicU64> = Lazy::new(||
 /// (ingest task only). Under healthy fairness this should stay near 0.
 pub static MARKET_DATA_TX_BROADCAST_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// Remaining account updates in the Geyser→market-data `broadcast` buffer after each successful `recv`.
+/// Legacy gauge: max of EXEC_HOT and ENRICH recv depths (Scope L1 split).
 pub static MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Scope L1: EXEC_HOT-dedicated broadcast receiver backlog.
+pub static MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH_EXEC_HOT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Scope L1: ENRICH-dedicated broadcast receiver backlog.
+pub static MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH_ENRICH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Scope L1: skipped messages on the EXEC_HOT broadcast receiver (`RecvError::Lagged`).
+pub static MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL_EXEC_HOT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Scope L1: skipped messages on the ENRICH broadcast receiver (`RecvError::Lagged`).
+pub static MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL_ENRICH: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
 /// Configured account worker pool size (total EXEC_HOT + ENRICH; backward-compat ops gauge).
@@ -2202,11 +2215,54 @@ pub fn set_market_data_account_broadcast_queue_depth(depth: usize) {
     MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
 }
 
+/// Scope L1: per-recv-path broadcast backlog (`class` = `exec_hot` | `enrich`).
+#[inline]
+pub fn set_market_data_account_broadcast_queue_depth_for_class(class: &str, depth: usize) {
+    match class {
+        "exec_hot" => {
+            MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH_EXEC_HOT
+                .store(depth as u64, Ordering::Relaxed);
+        }
+        "enrich" => {
+            MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH_ENRICH.store(depth as u64, Ordering::Relaxed);
+        }
+        _ => return,
+    }
+    refresh_market_data_account_broadcast_queue_depth_legacy();
+}
+
+#[inline]
+fn refresh_market_data_account_broadcast_queue_depth_legacy() {
+    let exec_hot = MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH_EXEC_HOT.load(Ordering::Relaxed);
+    let enrich = MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH_ENRICH.load(Ordering::Relaxed);
+    MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH.store(exec_hot.max(enrich), Ordering::Relaxed);
+}
+
 #[inline]
 pub fn record_market_data_account_broadcast_lagged(skipped_messages: u64) {
     if skipped_messages > 0 {
         MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL.fetch_add(skipped_messages, Ordering::Relaxed);
     }
+}
+
+/// Scope L1: per-recv-path `RecvError::Lagged` (`class` = `exec_hot` | `enrich`).
+#[inline]
+pub fn record_market_data_account_broadcast_lagged_for_class(class: &str, skipped_messages: u64) {
+    if skipped_messages == 0 {
+        return;
+    }
+    match class {
+        "exec_hot" => {
+            MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL_EXEC_HOT
+                .fetch_add(skipped_messages, Ordering::Relaxed);
+        }
+        "enrich" => {
+            MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL_ENRICH
+                .fetch_add(skipped_messages, Ordering::Relaxed);
+        }
+        _ => return,
+    }
+    MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL.fetch_add(skipped_messages, Ordering::Relaxed);
 }
 
 #[inline]
@@ -7331,8 +7387,24 @@ async fn metrics_response() -> Response<Body> {
         MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
+        "market_data_account_broadcast_lagged_total{class=\"exec_hot\"}",
+        MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL_EXEC_HOT.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_broadcast_lagged_total{class=\"enrich\"}",
+        MARKET_DATA_ACCOUNT_BROADCAST_LAGGED_TOTAL_ENRICH.load(Ordering::Relaxed)
+    );
+    line!(
         "market_data_account_broadcast_queue_depth",
         MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_broadcast_queue_depth{class=\"exec_hot\"}",
+        MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH_EXEC_HOT.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_broadcast_queue_depth{class=\"enrich\"}",
+        MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH_ENRICH.load(Ordering::Relaxed)
     );
     line!(
         "market_data_account_worker_count",
