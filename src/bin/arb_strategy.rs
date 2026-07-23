@@ -2986,18 +2986,12 @@ impl TokenArbTracker {
         token_decimals: u8,
         pinned_pools: Option<&HashSet<String>>,
     ) -> Vec<OwnedRoundTripCandidate> {
-        let mint_pinned_filter: Option<HashSet<&str>> = pinned_pools.and_then(|pinned| {
-            let mint_pinned: HashSet<&str> = self
-                .pools
+        let mint_pinned_filter: Option<HashSet<&str>> = pinned_pools.map(|pinned| {
+            self.pools
                 .keys()
                 .filter(|addr| pinned.contains(*addr))
                 .map(|addr| addr.as_str())
-                .collect();
-            if mint_pinned.is_empty() {
-                None
-            } else {
-                Some(mint_pinned)
-            }
+                .collect()
         });
 
         self.pools
