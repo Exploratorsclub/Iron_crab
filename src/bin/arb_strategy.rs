@@ -6149,14 +6149,20 @@ impl ArbContext {
 
         let selected_mint_set: HashSet<String> =
             result.selected.iter().map(|p| p.mint.clone()).collect();
-        {
-            let mut selected_mints = self.arb_selected_mints.write();
-            *selected_mints = selected_mint_set;
-        }
 
         let budget_displaced: HashSet<String> = result.budget_displaced.into_iter().collect();
         let new_pools: HashSet<String> = result.selected.iter().map(|p| p.pool.clone()).collect();
         let old_pools = self.arb_pinned_pools.read().clone();
+
+        if old_pools != new_pools {
+            let mut pinned = self.arb_pinned_pools.write();
+            *pinned = new_pools.clone();
+        }
+
+        {
+            let mut selected_mints = self.arb_selected_mints.write();
+            *selected_mints = selected_mint_set;
+        }
 
         if !reconcile && old_pools == new_pools {
             record_arb_track_publish_skipped_unchanged_total();
@@ -6211,11 +6217,6 @@ impl ArbContext {
                 })
                 .collect()
         };
-
-        {
-            let mut pinned = self.arb_pinned_pools.write();
-            *pinned = new_pools;
-        }
 
         let will_publish = reconcile || !active.is_empty() || !removed.is_empty();
         if !will_publish {
