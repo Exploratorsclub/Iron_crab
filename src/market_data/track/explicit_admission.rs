@@ -133,6 +133,13 @@ pub enum CapShrinkResult {
     InternalInvariantViolation,
 }
 
+/// Result of shedding tracker-only owner groups under EXEC_HOT pressure (Scope L2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShedTrackerGroupsResult {
+    pub groups_evicted: usize,
+    pub pubkeys_evicted: usize,
+}
+
 /// Result of an explicit owner-group LRU touch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TouchResult {
@@ -1541,6 +1548,44 @@ impl FixedCapAdmission {
         self.apply_stamp_plan(stamp_plan);
         FixedCapRemoveResult::Removed {
             physical_removed: plan.physical_removed,
+        }
+    }
+
+    /// Evict up to `max_groups` tracker-only owner groups (LRU first). Never touches Wallet,
+    /// MomentumPosition, Momentum, or Arb groups (Scope L2 EXEC_HOT pressure shed).
+    pub fn shed_tracker_owner_groups(&mut self, max_groups: usize) -> ShedTrackerGroupsResult {
+        if max_groups == 0 {
+            return ShedTrackerGroupsResult {
+                groups_evicted: 0,
+                pubkeys_evicted: 0,
+            };
+        }
+
+        let mut tracker_owners: Vec<(ExplicitOwner, u64)> = self
+            .snapshot_lru_entries()
+            .into_iter()
+            .filter(|entry| entry.owner.consumer == ExplicitConsumer::Tracker)
+            .map(|entry| (entry.owner, entry.last_touch))
+            .collect();
+        tracker_owners.sort_by_key(|(_, touch)| *touch);
+
+        let mut groups_evicted = 0usize;
+        let mut pubkeys_evicted = 0usize;
+        for (owner, _) in tracker_owners.into_iter().take(max_groups) {
+            match self.remove_group(owner) {
+                FixedCapRemoveResult::Removed { physical_removed } => {
+                    groups_evicted += 1;
+                    pubkeys_evicted += physical_removed.len();
+                }
+                FixedCapRemoveResult::NotFound
+                | FixedCapRemoveResult::PlanningInvariantViolation
+                | FixedCapRemoveResult::InternalInvariantViolation { .. } => {}
+            }
+        }
+
+        ShedTrackerGroupsResult {
+            groups_evicted,
+            pubkeys_evicted,
         }
     }
 
@@ -6366,5 +6411,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn shed_tracker_owner_groups_evicts_lru_tracker_only() {
+        let wallet = ExplicitOwner {
+            consumer: ExplicitConsumer::Wallet,
+            owner_key: ExplicitOwnerKey::Wallet,
+        };
+        let tracker_old = pool_owner(ExplicitConsumer::Tracker, 1);
+        let tracker_new = pool_owner(ExplicitConsumer::Tracker, 2);
+        let arb = pool_owner(ExplicitConsumer::Arb, 3);
+        let momentum = pool_owner(ExplicitConsumer::Momentum, 4);
+
+        let mut admission = FixedCapAdmission::new(16);
+        assert_admitted(admission.try_admit_new_group(wallet.clone(), vec![pk(10)]));
+        assert_admitted(admission.try_admit_new_group(tracker_old.clone(), vec![pk(1)]));
+        assert_admitted(admission.try_admit_new_group(tracker_new.clone(), vec![pk(2)]));
+        assert_admitted(admission.try_admit_new_group(arb.clone(), vec![pk(3)]));
+        assert_admitted(admission.try_admit_new_group(momentum.clone(), vec![pk(4)]));
+
+        admission.set_test_owner_stamp(tracker_old.clone(), 1);
+        admission.set_test_owner_stamp(tracker_new.clone(), 2);
+        admission.set_test_owner_stamp(arb.clone(), 3);
+        admission.set_test_owner_stamp(momentum.clone(), 4);
+        admission.set_test_owner_stamp(wallet.clone(), 5);
+
+        let result = admission.shed_tracker_owner_groups(8);
+        assert_eq!(result.groups_evicted, 2);
+        assert!(admission.owner_group(&tracker_old).is_none());
+        assert!(admission.owner_group(&tracker_new).is_none());
+        assert!(admission.owner_group(&wallet).is_some());
+        assert!(admission.owner_group(&arb).is_some());
+        assert!(admission.owner_group(&momentum).is_some());
     }
 }

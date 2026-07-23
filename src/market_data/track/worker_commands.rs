@@ -45,6 +45,10 @@ pub enum TrackWorkerCommand {
     FlushExplicitSetSnapshot {
         done: std::sync::mpsc::Sender<()>,
     },
+    /// Scope L2: evict tracker-only owner groups under EXEC_HOT broadcast pressure (LRU).
+    ShedTrackerUnderExecHotPressure {
+        max_groups: usize,
+    },
     /// Scope C: retry deferred hot-pool vault/bin registration after LivePoolCache fill.
     RetryDeferredHotPoolReserves,
 }
@@ -121,6 +125,7 @@ pub fn stream_for_command(cmd: &TrackWorkerCommand) -> TrackCommandStream {
         | TrackWorkerCommand::ScheduleGeyserPushDebounced
         | TrackWorkerCommand::RestoreExplicitSnapshot(_)
         | TrackWorkerCommand::ContinueGeyserEvict
+        | TrackWorkerCommand::ShedTrackerUnderExecHotPressure { .. }
         | TrackWorkerCommand::RetryDeferredHotPoolReserves
         | TrackWorkerCommand::FlushExplicitSetSnapshot { .. } => TrackCommandStream::Control,
     }

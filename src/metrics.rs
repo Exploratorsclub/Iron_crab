@@ -1875,6 +1875,20 @@ pub static MARKET_DATA_ACCOUNT_ENRICH_DISPATCH_CONTENDED_TOTAL: Lazy<AtomicU64> 
 pub static MARKET_DATA_ACCOUNT_HIGH_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// Scope L2: soft enrich shed active under EXEC_HOT broadcast pressure (0/1).
+pub static MARKET_DATA_EXEC_HOT_SHED_SOFT_ACTIVE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Scope L2: lock-free flag read from ENRICH broadcast recv (drain-only, no classify/enqueue).
+pub static MARKET_DATA_ENRICH_SHED_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Scope L2: ENRICH recv messages dropped while soft shed is active.
+pub static MARKET_DATA_ACCOUNT_ENRICH_SHED_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Scope L2: hard shed controller steps (tracker group eviction under EXEC_HOT pressure).
+pub static MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Scope L2: tracker owner groups evicted by hard shed.
+pub static MARKET_DATA_EXEC_HOT_HARD_SHED_GROUPS_EVICTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// Account ingest: jobs waiting in the dedicated NATS publish `mpsc` (JetStream + core publish).
 pub static MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -2338,6 +2352,36 @@ pub fn inc_market_data_account_enrich_dispatch_contended_total() {
 #[inline]
 pub fn inc_market_data_account_high_enqueue_dropped_total() {
     MARKET_DATA_ACCOUNT_HIGH_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Scope L2: true when ENRICH recv should drain-only (no classify/enqueue).
+#[inline]
+pub fn market_data_enrich_shed_active() -> bool {
+    MARKET_DATA_ENRICH_SHED_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Scope L2: set soft enrich shed active (also updates prometheus gauge).
+#[inline]
+pub fn set_market_data_exec_hot_shed_soft_active(active: bool) {
+    MARKET_DATA_ENRICH_SHED_ACTIVE.store(active, Ordering::Relaxed);
+    MARKET_DATA_EXEC_HOT_SHED_SOFT_ACTIVE.store(u64::from(active), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_enrich_shed_dropped_total() {
+    MARKET_DATA_ACCOUNT_ENRICH_SHED_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_exec_hot_hard_shed_steps_total() {
+    MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn add_market_data_exec_hot_hard_shed_groups_evicted_total(n: u64) {
+    if n > 0 {
+        MARKET_DATA_EXEC_HOT_HARD_SHED_GROUPS_EVICTED_TOTAL.fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 #[inline]
@@ -7449,6 +7493,22 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_account_high_enqueue_dropped_total",
         MARKET_DATA_ACCOUNT_HIGH_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_shed_soft_active",
+        MARKET_DATA_EXEC_HOT_SHED_SOFT_ACTIVE.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_enrich_shed_dropped_total",
+        MARKET_DATA_ACCOUNT_ENRICH_SHED_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_hard_shed_steps_total",
+        MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_hard_shed_groups_evicted_total",
+        MARKET_DATA_EXEC_HOT_HARD_SHED_GROUPS_EVICTED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_account_publish_queue_depth",
