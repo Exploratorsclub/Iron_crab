@@ -20,6 +20,7 @@
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use clap::Parser;
+use dashmap::DashMap;
 use serde::Serialize;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::hash_map::DefaultHasher;
@@ -8107,7 +8108,15 @@ enum AccountBroadcastRecvOutcome {
     StopStream,
 }
 
+/// Per-update routing state for split EXEC_HOT / ENRICH broadcast recv (Scope L1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountBroadcastRouteState {
+    PendingEnrichPath,
+    Done,
+}
+
 /// Handle one `Ok(account_update)` from the account broadcast channel (Scope L1 split recv).
+#[allow(clippy::too_many_arguments)]
 fn handle_account_broadcast_recv_ok(
     path: AccountBroadcastRecvPath,
     ctx: &MarketDataContext,
@@ -8115,6 +8124,7 @@ fn handle_account_broadcast_recv_ok(
     recv_at: Instant,
     worker_high: &[mpsc::Sender<AccountWorkItem>],
     enrich_ingress: &[mpsc::Sender<AccountWorkItem>],
+    route_states: &DashMap<(Pubkey, u64), AccountBroadcastRouteState>,
     stream_stopped: &watch::Sender<bool>,
 ) -> AccountBroadcastRecvOutcome {
     let iteration_start = Instant::now();
@@ -8142,6 +8152,7 @@ fn handle_account_broadcast_recv_ok(
     if let Some(reason) = early_drop_reason {
         if matches!(path, AccountBroadcastRecvPath::ExecHot) {
             record_market_data_account_early_drop(reason);
+            inc_market_data_account_updates_total(class.as_prometheus_label());
             record_market_data_account_recv_iteration_duration_us(
                 iteration_start
                     .elapsed()
@@ -8152,25 +8163,42 @@ fn handle_account_broadcast_recv_ok(
         return AccountBroadcastRecvOutcome::Continue;
     }
 
+    let route_key = (account_update.pubkey, account_update.slot);
+
     match path {
-        AccountBroadcastRecvPath::ExecHot => {
-            if !matches!(
-                class,
-                ironcrab::market_data::ingest::AccountUpdateClass::ExecHot
-            ) {
+        AccountBroadcastRecvPath::ExecHot => match class {
+            ironcrab::market_data::ingest::AccountUpdateClass::ExecHot => {
                 if matches!(
-                    class,
-                    ironcrab::market_data::ingest::AccountUpdateClass::Drop
+                    route_states.get(&route_key).map(|entry| *entry),
+                    Some(AccountBroadcastRouteState::Done)
                 ) {
-                    inc_market_data_account_updates_total(class.as_prometheus_label());
+                    return AccountBroadcastRecvOutcome::Continue;
                 }
+            }
+            ironcrab::market_data::ingest::AccountUpdateClass::Enrich => {
+                if route_states.contains_key(&route_key) {
+                    return AccountBroadcastRecvOutcome::Continue;
+                }
+                route_states.insert(route_key, AccountBroadcastRouteState::PendingEnrichPath);
                 return AccountBroadcastRecvOutcome::Continue;
             }
-        }
+            ironcrab::market_data::ingest::AccountUpdateClass::Drop => {
+                inc_market_data_account_updates_total(class.as_prometheus_label());
+                return AccountBroadcastRecvOutcome::Continue;
+            }
+        },
         AccountBroadcastRecvPath::Enrich => {
+            if matches!(
+                route_states.get(&route_key).map(|entry| *entry),
+                Some(AccountBroadcastRouteState::Done)
+            ) {
+                return AccountBroadcastRecvOutcome::Continue;
+            }
+            route_states.remove(&route_key);
             if !matches!(
                 class,
                 ironcrab::market_data::ingest::AccountUpdateClass::Enrich
+                    | ironcrab::market_data::ingest::AccountUpdateClass::ExecHot
             ) {
                 return AccountBroadcastRecvOutcome::Continue;
             }
@@ -8185,11 +8213,11 @@ fn handle_account_broadcast_recv_ok(
     );
     inc_market_data_account_updates_total(class.as_prometheus_label());
 
-    match path {
-        AccountBroadcastRecvPath::ExecHot => {
+    let enqueue_outcome = match class {
+        ironcrab::market_data::ingest::AccountUpdateClass::ExecHot => {
             let shard = market_data_account_exec_hot_shard(&account_update.pubkey);
             let enqueue_start = Instant::now();
-            match account_high_ingress_try_send(
+            let outcome = match account_high_ingress_try_send(
                 &worker_high[shard],
                 AccountWorkItem {
                     update: account_update,
@@ -8197,8 +8225,8 @@ fn handle_account_broadcast_recv_ok(
                     class,
                 },
             ) {
-                AccountHighIngressSend::Ok => {}
-                AccountHighIngressSend::ContendedFull => {}
+                AccountHighIngressSend::Ok => AccountBroadcastRecvOutcome::Continue,
+                AccountHighIngressSend::ContendedFull => AccountBroadcastRecvOutcome::Continue,
                 AccountHighIngressSend::Closed => {
                     error!(
                         shard = shard,
@@ -8206,17 +8234,18 @@ fn handle_account_broadcast_recv_ok(
                         "account HIGH worker queue closed; stopping Geyser account stream"
                     );
                     let _ = stream_stopped.send(true);
-                    return AccountBroadcastRecvOutcome::StopStream;
+                    AccountBroadcastRecvOutcome::StopStream
                 }
-            }
+            };
             record_market_data_account_recv_high_enqueue_duration_us(
                 enqueue_start
                     .elapsed()
                     .as_micros()
                     .min(u128::from(u64::MAX)) as u64,
             );
+            outcome
         }
-        AccountBroadcastRecvPath::Enrich => {
+        ironcrab::market_data::ingest::AccountUpdateClass::Enrich => {
             let shard = market_data_account_enrich_shard(&account_update.pubkey);
             let work = AccountWorkItem {
                 update: account_update,
@@ -8224,9 +8253,9 @@ fn handle_account_broadcast_recv_ok(
                 class,
             };
             let ingress_start = Instant::now();
-            match account_enrich_ingress_try_send(&enrich_ingress[shard], work) {
-                AccountEnrichIngressSend::Ok => {}
-                AccountEnrichIngressSend::ContendedFull => {}
+            let outcome = match account_enrich_ingress_try_send(&enrich_ingress[shard], work) {
+                AccountEnrichIngressSend::Ok => AccountBroadcastRecvOutcome::Continue,
+                AccountEnrichIngressSend::ContendedFull => AccountBroadcastRecvOutcome::Continue,
                 AccountEnrichIngressSend::Closed => {
                     error!(
                         shard = shard,
@@ -8234,16 +8263,23 @@ fn handle_account_broadcast_recv_ok(
                         "account ENRICH ingress channel closed; stopping Geyser account stream"
                     );
                     let _ = stream_stopped.send(true);
-                    return AccountBroadcastRecvOutcome::StopStream;
+                    AccountBroadcastRecvOutcome::StopStream
                 }
-            }
+            };
             record_market_data_account_recv_enrich_ingress_duration_us(
                 ingress_start
                     .elapsed()
                     .as_micros()
                     .min(u128::from(u64::MAX)) as u64,
             );
+            outcome
         }
+        ironcrab::market_data::ingest::AccountUpdateClass::Drop => {
+            unreachable!("drop updates are handled by early_drop_reason")
+        }
+    };
+    if matches!(enqueue_outcome, AccountBroadcastRecvOutcome::Continue) {
+        route_states.insert(route_key, AccountBroadcastRouteState::Done);
     }
 
     record_market_data_account_recv_iteration_duration_us(
@@ -8252,7 +8288,7 @@ fn handle_account_broadcast_recv_ok(
             .as_micros()
             .min(u128::from(u64::MAX)) as u64,
     );
-    AccountBroadcastRecvOutcome::Continue
+    enqueue_outcome
 }
 
 /// Enqueue EXEC_HOT work into the per-shard HIGH channel without blocking the recv task.
@@ -9328,9 +9364,12 @@ async fn run_geyser_loop(
 
     let worker_high_recv = Arc::clone(&worker_high_dispatch);
     let enrich_ingress_recv = Arc::clone(&enrich_ingress_dispatch);
+    let account_broadcast_route_states =
+        Arc::new(DashMap::<(Pubkey, u64), AccountBroadcastRouteState>::new());
     let ctx_exec_hot_recv = Arc::clone(&ctx_geyser_acc);
     let worker_high_exec_hot = Arc::clone(&worker_high_recv);
     let enrich_ingress_exec_hot = Arc::clone(&enrich_ingress_recv);
+    let route_states_exec_hot = Arc::clone(&account_broadcast_route_states);
     let geyser_account_stream_stopped_exec_hot = geyser_account_stream_stopped_tx.clone();
     tokio::spawn(async move {
         loop {
@@ -9351,6 +9390,7 @@ async fn run_geyser_loop(
                             recv_at,
                             worker_high_exec_hot.as_ref(),
                             enrich_ingress_exec_hot.as_ref(),
+                            route_states_exec_hot.as_ref(),
                             &geyser_account_stream_stopped_exec_hot,
                         ),
                         AccountBroadcastRecvOutcome::StopStream
@@ -9376,6 +9416,7 @@ async fn run_geyser_loop(
     let ctx_enrich_recv = Arc::clone(&ctx_geyser_acc);
     let worker_high_enrich = Arc::clone(&worker_high_recv);
     let enrich_ingress_enrich = Arc::clone(&enrich_ingress_recv);
+    let route_states_enrich = Arc::clone(&account_broadcast_route_states);
     let geyser_account_stream_stopped_enrich = geyser_account_stream_stopped_tx.clone();
     tokio::spawn(async move {
         loop {
@@ -9396,6 +9437,7 @@ async fn run_geyser_loop(
                             recv_at,
                             worker_high_enrich.as_ref(),
                             enrich_ingress_enrich.as_ref(),
+                            route_states_enrich.as_ref(),
                             &geyser_account_stream_stopped_enrich,
                         ),
                         AccountBroadcastRecvOutcome::StopStream
@@ -14664,10 +14706,12 @@ mod pr_b_geyser_tracking_tests {
 
         let worker_high = Arc::new(high_txs);
         let enrich_ingress = Arc::new(enrich_ingress_txs);
+        let route_states = Arc::new(DashMap::<(Pubkey, u64), AccountBroadcastRouteState>::new());
 
         let ctx_exec = Arc::clone(&ctx);
         let worker_high_exec = Arc::clone(&worker_high);
         let enrich_ingress_exec = Arc::clone(&enrich_ingress);
+        let route_states_exec = Arc::clone(&route_states);
         let stream_stopped_exec = stream_stopped_tx.clone();
         let exec_recv = tokio::spawn(async move {
             loop {
@@ -14682,6 +14726,7 @@ mod pr_b_geyser_tracking_tests {
                                 recv_at,
                                 worker_high_exec.as_ref(),
                                 enrich_ingress_exec.as_ref(),
+                                route_states_exec.as_ref(),
                                 &stream_stopped_exec,
                             ),
                             AccountBroadcastRecvOutcome::StopStream
@@ -14698,6 +14743,7 @@ mod pr_b_geyser_tracking_tests {
         let ctx_enrich = Arc::clone(&ctx);
         let worker_high_enrich = Arc::clone(&worker_high);
         let enrich_ingress_enrich = Arc::clone(&enrich_ingress);
+        let route_states_enrich = Arc::clone(&route_states);
         let stream_stopped_enrich = stream_stopped_tx.clone();
         let enrich_recv = tokio::spawn(async move {
             loop {
@@ -14712,6 +14758,7 @@ mod pr_b_geyser_tracking_tests {
                                 recv_at,
                                 worker_high_enrich.as_ref(),
                                 enrich_ingress_enrich.as_ref(),
+                                route_states_enrich.as_ref(),
                                 &stream_stopped_enrich,
                             ),
                             AccountBroadcastRecvOutcome::StopStream
