@@ -12,6 +12,7 @@ use super::worker_commands::track_command_kind;
 use super::worker_commands::ImmutableTrackCommand;
 pub use super::worker_commands::{TrackCommandStream, TrackPinReason, TrackWorkerCommand};
 use crate::metrics::{
+    add_market_data_exec_hot_hard_shed_groups_evicted_total,
     inc_market_data_explicit_set_snapshot_write_errors_total,
     inc_market_data_explicit_set_snapshot_write_total,
     inc_market_data_geyser_tracking_enqueue_dropped_total,
@@ -335,6 +336,17 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
                 *restore_barrier_pending = true;
             }
             false
+        }
+        TrackWorkerCommand::ShedTrackerUnderExecHotPressure { max_groups } => {
+            let result = admission.shed_tracker_owner_groups(max_groups);
+            if result.groups_evicted > 0 {
+                add_market_data_exec_hot_hard_shed_groups_evicted_total(
+                    result.groups_evicted as u64,
+                );
+                ctx.prune_tracked_maps_to_admitted(admission);
+                ctx.refresh_tracked_membership_snapshot();
+            }
+            result.groups_evicted > 0
         }
         TrackWorkerCommand::FlushExplicitSetSnapshot { done } => {
             try_write_explicit_set_snapshot_from_ctx(ctx.as_ref(), admission);
@@ -1877,6 +1889,7 @@ mod tests {
             TrackWorkerCommand::ScheduleGeyserPush,
             TrackWorkerCommand::ScheduleGeyserPushDebounced,
             TrackWorkerCommand::ContinueGeyserEvict,
+            TrackWorkerCommand::ShedTrackerUnderExecHotPressure { max_groups: 8 },
         ] {
             let cmd = store.wrap_command(payload);
             store.mark_applied(&cmd);

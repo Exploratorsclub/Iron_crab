@@ -101,6 +101,7 @@ use ironcrab::metrics::{
     inc_market_data_account_enrich_dispatch_contended_total,
     inc_market_data_account_enrich_enqueue_dropped_total,
     inc_market_data_account_enrich_ingress_queue_depth,
+    inc_market_data_account_enrich_shed_dropped_total,
     inc_market_data_account_high_enqueue_dropped_total,
     inc_market_data_account_high_priority_queue_depth,
     inc_market_data_account_low_priority_queue_depth,
@@ -109,6 +110,7 @@ use ironcrab::metrics::{
     inc_market_data_arb_admission_rejected_total,
     inc_market_data_arb_pin_geyser_register_deferred_total,
     inc_market_data_balance_updated_from_cache_total,
+    inc_market_data_exec_hot_hard_shed_steps_total,
     inc_market_data_geyser_sync_skipped_rate_limit_total,
     inc_market_data_ingest_membership_snapshot_hits_total,
     inc_market_data_jsonl_enqueue_dropped_total, inc_market_data_momentum_admission_admitted_total,
@@ -120,7 +122,8 @@ use ironcrab::metrics::{
     inc_market_data_vault_high_priority_dispatch_total,
     inc_market_data_wallet_admission_admitted_total,
     inc_market_data_wallet_admission_rejected_total, market_data_bump_geyser_head_slot,
-    market_data_geyser_head_slot_value, market_data_geyser_tracking_enqueue_dropped_value,
+    market_data_enrich_shed_active, market_data_geyser_head_slot_value,
+    market_data_geyser_tracking_enqueue_dropped_value,
     market_data_geyser_tracking_jobs_processed_value, market_data_md_state_bursts_completed_value,
     market_data_request_account_session_reconnect, market_data_request_tx_session_reconnect,
     market_data_tx_handler_processed_value, record_market_data_account_broadcast_lagged_for_class,
@@ -140,7 +143,7 @@ use ironcrab::metrics::{
     set_market_data_account_broadcast_queue_depth_for_class,
     set_market_data_account_enrich_worker_count, set_market_data_account_exec_hot_worker_count,
     set_market_data_account_worker_count, set_market_data_arb_pinned_pools_gauge,
-    set_market_data_enrichment_registry_pools_gauge,
+    set_market_data_enrichment_registry_pools_gauge, set_market_data_exec_hot_shed_soft_active,
     set_market_data_explicit_set_snapshot_restore_duration_ms,
     set_market_data_explicit_set_snapshot_restore_pubkeys,
     set_market_data_geyser_explicit_admitted_accounts,
@@ -150,8 +153,9 @@ use ironcrab::metrics::{
     set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
     set_readiness_nats_connected, touch_market_data_global_ingest_progress,
     touch_market_data_tracked_membership_snapshot_refresh, update_readiness_market_data_current,
-    MarketDataLatencySegment, MetricsComponent, MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS,
-    MARKET_EVENTS_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
+    MarketDataLatencySegment, MetricsComponent, MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH_EXEC_HOT,
+    MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_RECEIVED_TOTAL,
+    POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -210,6 +214,14 @@ const MARKET_DATA_MD_STATE_STALL_EXIT_AFTER: Duration = Duration::from_secs(120)
 const MARKET_DATA_MD_STATE_STALL_QUEUE_FRAC: f64 = 0.95;
 /// PR235: when false, md-state liveness records stalls but does not exit(1) for systemd restart.
 const MARKET_DATA_MD_STATE_STALL_EXIT_ENABLED: bool = false;
+
+/// Scope L2: EXEC_HOT broadcast depth thresholds for enrich/tracker pressure shed.
+const EXEC_HOT_SHED_D_WARN: usize = 64;
+const EXEC_HOT_SHED_D_CRITICAL: usize = 256;
+const EXEC_HOT_SHED_D_CLEAR: usize = 16;
+const EXEC_HOT_SHED_HARD_MAX_GROUPS: usize = 16;
+const EXEC_HOT_SHED_SOFT_SAMPLES_FOR_HARD: u32 = 3;
+const EXEC_HOT_SHED_CONTROLLER_INTERVAL: Duration = Duration::from_millis(300);
 
 /// ExecutionResult dedup: prevents replay storms from re-tracking the same ATA/mint over and over.
 ///
@@ -8084,6 +8096,47 @@ enum AccountHighIngressSend {
     Closed,
 }
 
+/// Scope L2: monitor EXEC_HOT broadcast depth and shed ENRICH/Tracker under pressure.
+fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
+    tokio::spawn(async move {
+        let mut soft_shed = false;
+        let mut soft_shed_samples = 0u32;
+        let mut interval = tokio::time::interval(EXEC_HOT_SHED_CONTROLLER_INTERVAL);
+        loop {
+            interval.tick().await;
+            let depth =
+                MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH_EXEC_HOT.load(Ordering::Relaxed) as usize;
+
+            if depth >= EXEC_HOT_SHED_D_WARN {
+                soft_shed = true;
+            } else if depth < EXEC_HOT_SHED_D_CLEAR {
+                soft_shed = false;
+                soft_shed_samples = 0;
+            }
+
+            set_market_data_exec_hot_shed_soft_active(soft_shed);
+
+            if soft_shed {
+                soft_shed_samples = soft_shed_samples.saturating_add(1);
+            }
+
+            let trigger_hard = depth >= EXEC_HOT_SHED_D_CRITICAL
+                || (soft_shed && soft_shed_samples >= EXEC_HOT_SHED_SOFT_SAMPLES_FOR_HARD);
+            if trigger_hard {
+                soft_shed_samples = 0;
+                if track_worker_try_enqueue(
+                    &track_worker,
+                    TrackWorkerCommand::ShedTrackerUnderExecHotPressure {
+                        max_groups: EXEC_HOT_SHED_HARD_MAX_GROUPS,
+                    },
+                ) {
+                    inc_market_data_exec_hot_hard_shed_steps_total();
+                }
+            }
+        }
+    });
+}
+
 /// Scope L1: split account broadcast recv paths (EXEC_HOT vs ENRICH).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AccountBroadcastRecvPath {
@@ -9404,6 +9457,10 @@ async fn run_geyser_loop(
                         AccountBroadcastRecvPath::Enrich.metrics_class(),
                         account_rx_enrich.len(),
                     );
+                    if market_data_enrich_shed_active() {
+                        inc_market_data_account_enrich_shed_dropped_total();
+                        continue;
+                    }
                     market_data_bump_geyser_head_slot(account_update.slot);
 
                     if matches!(
@@ -9435,6 +9492,8 @@ async fn run_geyser_loop(
             }
         }
     });
+
+    spawn_exec_hot_pressure_shed_controller(track_worker.clone());
 
     loop {
         tokio::select! {
@@ -14624,6 +14683,61 @@ mod pr_b_geyser_tracking_tests {
             MARKET_DATA_ACCOUNT_HIGH_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed),
             1
         );
+    }
+
+    #[test]
+    fn enrich_recv_soft_shed_skips_classify_and_ingress_enqueue() {
+        use ironcrab::metrics::{
+            MARKET_DATA_ACCOUNT_ENRICH_SHED_DROPPED_TOTAL, MARKET_DATA_ENRICH_SHED_ACTIVE,
+        };
+        use std::sync::atomic::Ordering;
+
+        MARKET_DATA_ENRICH_SHED_ACTIVE.store(true, Ordering::Relaxed);
+        MARKET_DATA_ACCOUNT_ENRICH_SHED_DROPPED_TOTAL.store(0, Ordering::Relaxed);
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = Arc::new(minimal_market_data_context_for_pr_d_tests(jsonl));
+        let enrich_pool = Pubkey::new_unique();
+        ctx.pool_mint_map
+            .write()
+            .insert(enrich_pool.to_string(), Pubkey::new_unique().to_string());
+
+        let (high_tx, _high_rx) = mpsc::channel(4);
+        let (enrich_ingress_tx, mut enrich_ingress_rx) = mpsc::channel(4);
+        let (stream_stopped_tx, _) = watch::channel(false);
+
+        let update = GeyserAccountUpdate {
+            pubkey: enrich_pool,
+            slot: 1,
+            owner: RAYDIUM_CPMM_OWNER,
+            data: vec![],
+            lamports: 0,
+            grpc_recv_at: Instant::now(),
+        };
+
+        if market_data_enrich_shed_active() {
+            inc_market_data_account_enrich_shed_dropped_total();
+        } else {
+            let _ = handle_account_broadcast_recv_ok(
+                AccountBroadcastRecvPath::Enrich,
+                ctx.as_ref(),
+                update,
+                Instant::now(),
+                std::slice::from_ref(&high_tx),
+                std::slice::from_ref(&enrich_ingress_tx),
+                &stream_stopped_tx,
+            );
+        }
+
+        assert_eq!(
+            MARKET_DATA_ACCOUNT_ENRICH_SHED_DROPPED_TOTAL.load(Ordering::Relaxed),
+            1
+        );
+        assert!(enrich_ingress_rx.try_recv().is_err());
+
+        MARKET_DATA_ENRICH_SHED_ACTIVE.store(false, Ordering::Relaxed);
     }
 
     /// Scope L1: EXEC_HOT broadcast recv must enqueue under ENRICH ingress backlog (split cursors).
