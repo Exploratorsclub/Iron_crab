@@ -2885,15 +2885,17 @@ impl MarketDataContext {
                     .get(&mint)
                     .is_some_and(|info| info.pin.is_some());
                 if !skip_tracker_admit {
-                    if market_data_exec_hot_tracker_admit_suppress() {
+                    let owner = Self::tracker_mint_owner(mint);
+                    if admission.owner_group(&owner).is_none()
+                        && market_data_exec_hot_tracker_admit_suppress()
+                    {
                         inc_market_data_exec_hot_pressure_admit_rejected_total(
                             ExecHotShedTier::Tracker,
                         );
                         inc_market_data_tracker_admission_rejected_total();
                         return false;
                     }
-                    if !try_admit_owner_group(admission, Self::tracker_mint_owner(mint), vec![mint])
-                    {
+                    if !try_admit_owner_group(admission, owner, vec![mint]) {
                         inc_market_data_tracker_admission_rejected_total();
                         return false;
                     }
@@ -8188,6 +8190,7 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
                 let groups = market_data_exec_hot_last_shed_groups(tier);
                 if groups == EXEC_HOT_SHED_GROUPS_PENDING {
                     last_enqueued_tier = Some(tier);
+                    continue;
                 } else {
                     match tier {
                         ExecHotShedTier::Tracker => {
