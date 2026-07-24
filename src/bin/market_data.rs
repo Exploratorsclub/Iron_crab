@@ -147,8 +147,8 @@ use ironcrab::metrics::{
     set_market_data_account_enrich_worker_count, set_market_data_account_exec_hot_worker_count,
     set_market_data_account_worker_count, set_market_data_arb_pinned_pools_gauge,
     set_market_data_enrichment_registry_pools_gauge, set_market_data_exec_hot_admit_suppress,
-    set_market_data_exec_hot_shed_soft_active, set_market_data_exec_hot_shed_tier,
-    set_market_data_explicit_set_snapshot_restore_duration_ms,
+    set_market_data_exec_hot_last_shed_groups, set_market_data_exec_hot_shed_soft_active,
+    set_market_data_exec_hot_shed_tier, set_market_data_explicit_set_snapshot_restore_duration_ms,
     set_market_data_explicit_set_snapshot_restore_pubkeys,
     set_market_data_geyser_explicit_admitted_accounts,
     set_market_data_geyser_explicit_cap_overflow, set_market_data_geyser_explicit_set_size,
@@ -229,6 +229,8 @@ const EXEC_HOT_SHED_D_CLEAR: usize = 16;
 const EXEC_HOT_SHED_HARD_MAX_GROUPS: usize = 16;
 const EXEC_HOT_SHED_SOFT_SAMPLES_FOR_HARD: u32 = 3;
 const EXEC_HOT_SHED_IDLE_ESCALATE_TICKS: u32 = 3;
+/// Sentinel written at shed enqueue; worker overwrites when the command completes.
+const EXEC_HOT_SHED_GROUPS_PENDING: u64 = u64::MAX;
 const EXEC_HOT_SHED_CONTROLLER_INTERVAL: Duration = Duration::from_millis(300);
 
 /// ExecutionResult dedup: prevents replay storms from re-tracking the same ATA/mint over and over.
@@ -8184,22 +8186,26 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
 
             if let Some(tier) = last_enqueued_tier.take() {
                 let groups = market_data_exec_hot_last_shed_groups(tier);
-                match tier {
-                    ExecHotShedTier::Tracker => {
-                        if groups == 0 && depth >= EXEC_HOT_SHED_D_CRITICAL {
-                            tracker_idle_ticks = tracker_idle_ticks.saturating_add(1);
-                        } else {
-                            tracker_idle_ticks = 0;
+                if groups == EXEC_HOT_SHED_GROUPS_PENDING {
+                    last_enqueued_tier = Some(tier);
+                } else {
+                    match tier {
+                        ExecHotShedTier::Tracker => {
+                            if groups == 0 && depth >= EXEC_HOT_SHED_D_CRITICAL {
+                                tracker_idle_ticks = tracker_idle_ticks.saturating_add(1);
+                            } else {
+                                tracker_idle_ticks = 0;
+                            }
                         }
-                    }
-                    ExecHotShedTier::Momentum => {
-                        if groups == 0 && depth >= EXEC_HOT_SHED_D_SEVERE {
-                            momentum_idle_ticks = momentum_idle_ticks.saturating_add(1);
-                        } else {
-                            momentum_idle_ticks = 0;
+                        ExecHotShedTier::Momentum => {
+                            if groups == 0 && depth >= EXEC_HOT_SHED_D_SEVERE {
+                                momentum_idle_ticks = momentum_idle_ticks.saturating_add(1);
+                            } else {
+                                momentum_idle_ticks = 0;
+                            }
                         }
+                        ExecHotShedTier::Arb | ExecHotShedTier::None => {}
                     }
-                    ExecHotShedTier::Arb | ExecHotShedTier::None => {}
                 }
             }
 
@@ -8216,9 +8222,11 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
 
             let tracker_admit_suppress = soft_shed || depth >= EXEC_HOT_SHED_D_CRITICAL;
             let momentum_admit_suppress = depth >= EXEC_HOT_SHED_D_SEVERE
-                || tracker_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS;
+                || (tracker_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
+                    && depth >= EXEC_HOT_SHED_D_CRITICAL);
             let arb_admit_suppress = depth >= EXEC_HOT_SHED_D_EMERGENCY
-                || momentum_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS;
+                || (momentum_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
+                    && depth >= EXEC_HOT_SHED_D_SEVERE);
             set_market_data_exec_hot_admit_suppress(
                 tracker_admit_suppress,
                 momentum_admit_suppress,
@@ -8261,6 +8269,7 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
 
             if track_worker_try_enqueue(&track_worker, cmd) {
                 inc_market_data_exec_hot_hard_shed_steps_for_tier(shed_tier);
+                set_market_data_exec_hot_last_shed_groups(shed_tier, EXEC_HOT_SHED_GROUPS_PENDING);
                 last_enqueued_tier = Some(shed_tier);
             }
         }
