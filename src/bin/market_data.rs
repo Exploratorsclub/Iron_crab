@@ -110,7 +110,8 @@ use ironcrab::metrics::{
     inc_market_data_arb_admission_rejected_total,
     inc_market_data_arb_pin_geyser_register_deferred_total,
     inc_market_data_balance_updated_from_cache_total,
-    inc_market_data_exec_hot_hard_shed_steps_total,
+    inc_market_data_exec_hot_hard_shed_steps_for_tier,
+    inc_market_data_exec_hot_pressure_admit_rejected_total,
     inc_market_data_geyser_sync_skipped_rate_limit_total,
     inc_market_data_ingest_membership_snapshot_hits_total,
     inc_market_data_jsonl_enqueue_dropped_total, inc_market_data_momentum_admission_admitted_total,
@@ -122,7 +123,9 @@ use ironcrab::metrics::{
     inc_market_data_vault_high_priority_dispatch_total,
     inc_market_data_wallet_admission_admitted_total,
     inc_market_data_wallet_admission_rejected_total, market_data_bump_geyser_head_slot,
-    market_data_enrich_shed_active, market_data_geyser_head_slot_value,
+    market_data_enrich_shed_active, market_data_exec_hot_arb_admit_suppress,
+    market_data_exec_hot_last_shed_groups, market_data_exec_hot_momentum_admit_suppress,
+    market_data_exec_hot_tracker_admit_suppress, market_data_geyser_head_slot_value,
     market_data_geyser_tracking_enqueue_dropped_value,
     market_data_geyser_tracking_jobs_processed_value, market_data_md_state_bursts_completed_value,
     market_data_request_account_session_reconnect, market_data_request_tx_session_reconnect,
@@ -143,7 +146,8 @@ use ironcrab::metrics::{
     set_market_data_account_broadcast_queue_depth_for_class,
     set_market_data_account_enrich_worker_count, set_market_data_account_exec_hot_worker_count,
     set_market_data_account_worker_count, set_market_data_arb_pinned_pools_gauge,
-    set_market_data_enrichment_registry_pools_gauge, set_market_data_exec_hot_shed_soft_active,
+    set_market_data_enrichment_registry_pools_gauge, set_market_data_exec_hot_admit_suppress,
+    set_market_data_exec_hot_shed_soft_active, set_market_data_exec_hot_shed_tier,
     set_market_data_explicit_set_snapshot_restore_duration_ms,
     set_market_data_explicit_set_snapshot_restore_pubkeys,
     set_market_data_geyser_explicit_admitted_accounts,
@@ -153,7 +157,8 @@ use ironcrab::metrics::{
     set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
     set_readiness_nats_connected, touch_market_data_global_ingest_progress,
     touch_market_data_tracked_membership_snapshot_refresh, update_readiness_market_data_current,
-    MarketDataLatencySegment, MetricsComponent, MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH_EXEC_HOT,
+    ExecHotShedTier, MarketDataLatencySegment, MetricsComponent,
+    MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH_EXEC_HOT,
     MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_RECEIVED_TOTAL,
     POOLS_TRACKED_GAUGE,
 };
@@ -218,9 +223,12 @@ const MARKET_DATA_MD_STATE_STALL_EXIT_ENABLED: bool = false;
 /// Scope L2: EXEC_HOT broadcast depth thresholds for enrich/tracker pressure shed.
 const EXEC_HOT_SHED_D_WARN: usize = 64;
 const EXEC_HOT_SHED_D_CRITICAL: usize = 256;
+const EXEC_HOT_SHED_D_SEVERE: usize = 2_000;
+const EXEC_HOT_SHED_D_EMERGENCY: usize = 10_000;
 const EXEC_HOT_SHED_D_CLEAR: usize = 16;
 const EXEC_HOT_SHED_HARD_MAX_GROUPS: usize = 16;
 const EXEC_HOT_SHED_SOFT_SAMPLES_FOR_HARD: u32 = 3;
+const EXEC_HOT_SHED_IDLE_ESCALATE_TICKS: u32 = 3;
 const EXEC_HOT_SHED_CONTROLLER_INTERVAL: Duration = Duration::from_millis(300);
 
 /// ExecutionResult dedup: prevents replay storms from re-tracking the same ATA/mint over and over.
@@ -2875,6 +2883,13 @@ impl MarketDataContext {
                     .get(&mint)
                     .is_some_and(|info| info.pin.is_some());
                 if !skip_tracker_admit {
+                    if market_data_exec_hot_tracker_admit_suppress() {
+                        inc_market_data_exec_hot_pressure_admit_rejected_total(
+                            ExecHotShedTier::Tracker,
+                        );
+                        inc_market_data_tracker_admission_rejected_total();
+                        return false;
+                    }
                     if !try_admit_owner_group(admission, Self::tracker_mint_owner(mint), vec![mint])
                     {
                         inc_market_data_tracker_admission_rejected_total();
@@ -5033,6 +5048,24 @@ impl MarketDataContext {
             let superseded_present = admission
                 .owner_group(&Self::pool_consumer_owner(pool_pk, superseded_consumer))
                 .is_some();
+            if momentum_consumer == ExplicitConsumer::Momentum
+                && market_data_exec_hot_momentum_admit_suppress()
+            {
+                inc_market_data_exec_hot_pressure_admit_rejected_total(ExecHotShedTier::Momentum);
+                inc_market_data_momentum_admission_rejected_total();
+                self.record_momentum_active_pool_reserve_registration_outcome(
+                    pool_pk,
+                    GeyserPinReason::MomentumActive,
+                    is_position,
+                    false,
+                );
+                self.sync_explicit_pool_admitted_from_admission(
+                    admission,
+                    pool_pk,
+                    momentum_consumer,
+                );
+                continue;
+            }
             if self.try_admit_pool_consumer_group(admission, pool_pk, momentum_consumer) {
                 if superseded_present {
                     self.release_pool_consumer_group(admission, pool_pk, superseded_consumer);
@@ -5248,6 +5281,17 @@ impl MarketDataContext {
                 continue;
             };
             self.hot_pool_registry.pin_arb_pool(pool_pk);
+            if market_data_exec_hot_arb_admit_suppress() {
+                inc_market_data_exec_hot_pressure_admit_rejected_total(ExecHotShedTier::Arb);
+                inc_market_data_arb_admission_rejected_total();
+                self.sync_explicit_pool_admitted_from_admission(
+                    admission,
+                    pool_pk,
+                    ExplicitConsumer::Arb,
+                );
+                let _ = &a.reason;
+                continue;
+            }
             if self.try_admit_pool_consumer_group(admission, pool_pk, ExplicitConsumer::Arb) {
                 inc_market_data_arb_admission_admitted_total();
                 if self.register_geyser_reserves_for_arb_active_pool(pool_pk) {
@@ -8096,42 +8140,128 @@ enum AccountHighIngressSend {
     Closed,
 }
 
-/// Scope L2: monitor EXEC_HOT broadcast depth and shed ENRICH/Tracker under pressure.
+/// Pure tier selection for EXEC_HOT pressure shed (Scope L2b); one action per controller tick.
+fn select_exec_hot_shed_tier(
+    depth: usize,
+    soft_shed: bool,
+    soft_shed_samples: u32,
+    tracker_idle_ticks: u32,
+    momentum_idle_ticks: u32,
+) -> ExecHotShedTier {
+    let tracker_trigger = depth >= EXEC_HOT_SHED_D_CRITICAL
+        || (soft_shed && soft_shed_samples >= EXEC_HOT_SHED_SOFT_SAMPLES_FOR_HARD);
+    let momentum_trigger = depth >= EXEC_HOT_SHED_D_SEVERE
+        || (tracker_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
+            && depth >= EXEC_HOT_SHED_D_CRITICAL);
+    let arb_trigger = depth >= EXEC_HOT_SHED_D_EMERGENCY
+        || (momentum_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
+            && depth >= EXEC_HOT_SHED_D_SEVERE);
+
+    if tracker_trigger && tracker_idle_ticks < EXEC_HOT_SHED_IDLE_ESCALATE_TICKS {
+        ExecHotShedTier::Tracker
+    } else if momentum_trigger && momentum_idle_ticks < EXEC_HOT_SHED_IDLE_ESCALATE_TICKS {
+        ExecHotShedTier::Momentum
+    } else if arb_trigger {
+        ExecHotShedTier::Arb
+    } else {
+        ExecHotShedTier::None
+    }
+}
+
+/// Scope L2 / L2b: monitor EXEC_HOT broadcast depth and shed ENRICH/Tracker/Momentum/Arb under pressure.
 fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
     tokio::spawn(async move {
         let mut soft_shed = false;
         let mut soft_shed_samples = 0u32;
+        let mut tracker_idle_ticks = 0u32;
+        let mut momentum_idle_ticks = 0u32;
+        let mut last_enqueued_tier: Option<ExecHotShedTier> = None;
         let mut interval = tokio::time::interval(EXEC_HOT_SHED_CONTROLLER_INTERVAL);
         loop {
             interval.tick().await;
             let depth =
                 MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH_EXEC_HOT.load(Ordering::Relaxed) as usize;
 
+            if let Some(tier) = last_enqueued_tier.take() {
+                let groups = market_data_exec_hot_last_shed_groups(tier);
+                match tier {
+                    ExecHotShedTier::Tracker => {
+                        if groups == 0 && depth >= EXEC_HOT_SHED_D_CRITICAL {
+                            tracker_idle_ticks = tracker_idle_ticks.saturating_add(1);
+                        } else {
+                            tracker_idle_ticks = 0;
+                        }
+                    }
+                    ExecHotShedTier::Momentum => {
+                        if groups == 0 && depth >= EXEC_HOT_SHED_D_SEVERE {
+                            momentum_idle_ticks = momentum_idle_ticks.saturating_add(1);
+                        } else {
+                            momentum_idle_ticks = 0;
+                        }
+                    }
+                    ExecHotShedTier::Arb | ExecHotShedTier::None => {}
+                }
+            }
+
             if depth >= EXEC_HOT_SHED_D_WARN {
                 soft_shed = true;
             } else if depth < EXEC_HOT_SHED_D_CLEAR {
                 soft_shed = false;
                 soft_shed_samples = 0;
+                tracker_idle_ticks = 0;
+                momentum_idle_ticks = 0;
             }
 
             set_market_data_exec_hot_shed_soft_active(soft_shed);
+
+            let tracker_admit_suppress = soft_shed || depth >= EXEC_HOT_SHED_D_CRITICAL;
+            let momentum_admit_suppress = depth >= EXEC_HOT_SHED_D_SEVERE
+                || tracker_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS;
+            let arb_admit_suppress = depth >= EXEC_HOT_SHED_D_EMERGENCY
+                || momentum_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS;
+            set_market_data_exec_hot_admit_suppress(
+                tracker_admit_suppress,
+                momentum_admit_suppress,
+                arb_admit_suppress,
+            );
 
             if soft_shed {
                 soft_shed_samples = soft_shed_samples.saturating_add(1);
             }
 
-            let trigger_hard = depth >= EXEC_HOT_SHED_D_CRITICAL
-                || (soft_shed && soft_shed_samples >= EXEC_HOT_SHED_SOFT_SAMPLES_FOR_HARD);
-            if trigger_hard {
+            let shed_tier = select_exec_hot_shed_tier(
+                depth,
+                soft_shed,
+                soft_shed_samples,
+                tracker_idle_ticks,
+                momentum_idle_ticks,
+            );
+            set_market_data_exec_hot_shed_tier(shed_tier);
+
+            if shed_tier == ExecHotShedTier::None {
+                continue;
+            }
+
+            if soft_shed && shed_tier == ExecHotShedTier::Tracker {
                 soft_shed_samples = 0;
-                if track_worker_try_enqueue(
-                    &track_worker,
-                    TrackWorkerCommand::ShedTrackerUnderExecHotPressure {
-                        max_groups: EXEC_HOT_SHED_HARD_MAX_GROUPS,
-                    },
-                ) {
-                    inc_market_data_exec_hot_hard_shed_steps_total();
-                }
+            }
+
+            let cmd = match shed_tier {
+                ExecHotShedTier::Tracker => TrackWorkerCommand::ShedTrackerUnderExecHotPressure {
+                    max_groups: EXEC_HOT_SHED_HARD_MAX_GROUPS,
+                },
+                ExecHotShedTier::Momentum => TrackWorkerCommand::ShedMomentumUnderExecHotPressure {
+                    max_groups: EXEC_HOT_SHED_HARD_MAX_GROUPS,
+                },
+                ExecHotShedTier::Arb => TrackWorkerCommand::ShedArbUnderExecHotPressure {
+                    max_groups: EXEC_HOT_SHED_HARD_MAX_GROUPS,
+                },
+                ExecHotShedTier::None => continue,
+            };
+
+            if track_worker_try_enqueue(&track_worker, cmd) {
+                inc_market_data_exec_hot_hard_shed_steps_for_tier(shed_tier);
+                last_enqueued_tier = Some(shed_tier);
             }
         }
     });
@@ -14738,6 +14868,56 @@ mod pr_b_geyser_tracking_tests {
         assert!(enrich_ingress_rx.try_recv().is_err());
 
         MARKET_DATA_ENRICH_SHED_ACTIVE.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn exec_hot_shed_tier_prefers_tracker_then_escalates_on_idle() {
+        use ironcrab::metrics::ExecHotShedTier;
+
+        assert_eq!(
+            select_exec_hot_shed_tier(300, false, 0, 0, 0),
+            ExecHotShedTier::Tracker
+        );
+        assert_eq!(
+            select_exec_hot_shed_tier(300, false, 0, 3, 0),
+            ExecHotShedTier::Momentum
+        );
+        assert_eq!(
+            select_exec_hot_shed_tier(262_000, false, 0, 3, 0),
+            ExecHotShedTier::Momentum
+        );
+        assert_eq!(
+            select_exec_hot_shed_tier(5_000, false, 0, 3, 0),
+            ExecHotShedTier::Momentum
+        );
+        assert_eq!(
+            select_exec_hot_shed_tier(5_000, false, 0, 3, 3),
+            ExecHotShedTier::Arb
+        );
+        assert_eq!(
+            select_exec_hot_shed_tier(12_000, false, 0, 3, 3),
+            ExecHotShedTier::Arb
+        );
+        assert_eq!(
+            select_exec_hot_shed_tier(12_000, false, 0, 3, 0),
+            ExecHotShedTier::Momentum
+        );
+        assert_eq!(
+            select_exec_hot_shed_tier(10, false, 0, 0, 0),
+            ExecHotShedTier::None
+        );
+    }
+
+    #[test]
+    fn exec_hot_tracker_admit_suppress_under_soft_or_critical_depth() {
+        use ironcrab::metrics::{
+            market_data_exec_hot_tracker_admit_suppress, set_market_data_exec_hot_admit_suppress,
+        };
+
+        set_market_data_exec_hot_admit_suppress(true, false, false);
+        assert!(market_data_exec_hot_tracker_admit_suppress());
+        set_market_data_exec_hot_admit_suppress(false, false, false);
+        assert!(!market_data_exec_hot_tracker_admit_suppress());
     }
 
     /// Scope L1: EXEC_HOT broadcast recv must enqueue under ENRICH ingress backlog (split cursors).

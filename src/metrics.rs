@@ -1889,6 +1889,46 @@ pub static MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_TOTAL: Lazy<AtomicU64> =
 pub static MARKET_DATA_EXEC_HOT_HARD_SHED_GROUPS_EVICTED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// Scope L2b: EXEC_HOT pressure shed tier (0=none, 1=tracker, 2=momentum, 3=arb).
+pub static MARKET_DATA_EXEC_HOT_SHED_TIER: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// Scope L2b: per-tier hard shed steps (`tier` = tracker|momentum|arb).
+pub static MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_TRACKER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_MOMENTUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_ARB: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Scope L2b: per-tier owner groups evicted by hard shed.
+pub static MARKET_DATA_EXEC_HOT_HARD_SHED_GROUPS_TRACKER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_EXEC_HOT_HARD_SHED_GROUPS_MOMENTUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_EXEC_HOT_HARD_SHED_GROUPS_ARB: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Scope L2b: last shed result groups evicted (feedback for controller idle escalation).
+pub static MARKET_DATA_EXEC_HOT_LAST_SHED_GROUPS_TRACKER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_EXEC_HOT_LAST_SHED_GROUPS_MOMENTUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_EXEC_HOT_LAST_SHED_GROUPS_ARB: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// Scope L2b: lock-free admit suppress flags (controller sets, track-worker reads).
+pub static MARKET_DATA_EXEC_HOT_TRACKER_ADMIT_SUPPRESS: AtomicBool = AtomicBool::new(false);
+pub static MARKET_DATA_EXEC_HOT_MOMENTUM_ADMIT_SUPPRESS: AtomicBool = AtomicBool::new(false);
+pub static MARKET_DATA_EXEC_HOT_ARB_ADMIT_SUPPRESS: AtomicBool = AtomicBool::new(false);
+
+/// Scope L2b: admits rejected due to EXEC_HOT pressure suppress.
+pub static MARKET_DATA_EXEC_HOT_PRESSURE_ADMIT_REJECTED_TRACKER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_EXEC_HOT_PRESSURE_ADMIT_REJECTED_MOMENTUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_EXEC_HOT_PRESSURE_ADMIT_REJECTED_ARB: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 /// Account ingest: jobs waiting in the dedicated NATS publish `mpsc` (JetStream + core publish).
 pub static MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -2377,11 +2417,124 @@ pub fn inc_market_data_exec_hot_hard_shed_steps_total() {
     MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Scope L2b: EXEC_HOT hard shed tier for controller / worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecHotShedTier {
+    None = 0,
+    Tracker = 1,
+    Momentum = 2,
+    Arb = 3,
+}
+
+impl ExecHotShedTier {
+    #[inline]
+    pub fn as_u64(self) -> u64 {
+        self as u64
+    }
+
+    #[inline]
+    pub fn prometheus_label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Tracker => "tracker",
+            Self::Momentum => "momentum",
+            Self::Arb => "arb",
+        }
+    }
+}
+
+#[inline]
+pub fn set_market_data_exec_hot_shed_tier(tier: ExecHotShedTier) {
+    MARKET_DATA_EXEC_HOT_SHED_TIER.store(tier.as_u64(), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_exec_hot_hard_shed_steps_for_tier(tier: ExecHotShedTier) {
+    inc_market_data_exec_hot_hard_shed_steps_total();
+    let cell = match tier {
+        ExecHotShedTier::Tracker => &*MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_TRACKER,
+        ExecHotShedTier::Momentum => &*MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_MOMENTUM,
+        ExecHotShedTier::Arb => &*MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_ARB,
+        ExecHotShedTier::None => return,
+    };
+    cell.fetch_add(1, Ordering::Relaxed);
+}
+
 #[inline]
 pub fn add_market_data_exec_hot_hard_shed_groups_evicted_total(n: u64) {
     if n > 0 {
         MARKET_DATA_EXEC_HOT_HARD_SHED_GROUPS_EVICTED_TOTAL.fetch_add(n, Ordering::Relaxed);
     }
+}
+
+#[inline]
+pub fn add_market_data_exec_hot_hard_shed_groups_for_tier(tier: ExecHotShedTier, n: u64) {
+    if n == 0 {
+        return;
+    }
+    add_market_data_exec_hot_hard_shed_groups_evicted_total(n);
+    let cell = match tier {
+        ExecHotShedTier::Tracker => &*MARKET_DATA_EXEC_HOT_HARD_SHED_GROUPS_TRACKER,
+        ExecHotShedTier::Momentum => &*MARKET_DATA_EXEC_HOT_HARD_SHED_GROUPS_MOMENTUM,
+        ExecHotShedTier::Arb => &*MARKET_DATA_EXEC_HOT_HARD_SHED_GROUPS_ARB,
+        ExecHotShedTier::None => return,
+    };
+    cell.fetch_add(n, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_exec_hot_last_shed_groups(tier: ExecHotShedTier, groups: u64) {
+    let cell = match tier {
+        ExecHotShedTier::Tracker => &*MARKET_DATA_EXEC_HOT_LAST_SHED_GROUPS_TRACKER,
+        ExecHotShedTier::Momentum => &*MARKET_DATA_EXEC_HOT_LAST_SHED_GROUPS_MOMENTUM,
+        ExecHotShedTier::Arb => &*MARKET_DATA_EXEC_HOT_LAST_SHED_GROUPS_ARB,
+        ExecHotShedTier::None => return,
+    };
+    cell.store(groups, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn market_data_exec_hot_last_shed_groups(tier: ExecHotShedTier) -> u64 {
+    let cell = match tier {
+        ExecHotShedTier::Tracker => &*MARKET_DATA_EXEC_HOT_LAST_SHED_GROUPS_TRACKER,
+        ExecHotShedTier::Momentum => &*MARKET_DATA_EXEC_HOT_LAST_SHED_GROUPS_MOMENTUM,
+        ExecHotShedTier::Arb => &*MARKET_DATA_EXEC_HOT_LAST_SHED_GROUPS_ARB,
+        ExecHotShedTier::None => return 0,
+    };
+    cell.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn set_market_data_exec_hot_admit_suppress(tracker: bool, momentum: bool, arb: bool) {
+    MARKET_DATA_EXEC_HOT_TRACKER_ADMIT_SUPPRESS.store(tracker, Ordering::Relaxed);
+    MARKET_DATA_EXEC_HOT_MOMENTUM_ADMIT_SUPPRESS.store(momentum, Ordering::Relaxed);
+    MARKET_DATA_EXEC_HOT_ARB_ADMIT_SUPPRESS.store(arb, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn market_data_exec_hot_tracker_admit_suppress() -> bool {
+    MARKET_DATA_EXEC_HOT_TRACKER_ADMIT_SUPPRESS.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn market_data_exec_hot_momentum_admit_suppress() -> bool {
+    MARKET_DATA_EXEC_HOT_MOMENTUM_ADMIT_SUPPRESS.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn market_data_exec_hot_arb_admit_suppress() -> bool {
+    MARKET_DATA_EXEC_HOT_ARB_ADMIT_SUPPRESS.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn inc_market_data_exec_hot_pressure_admit_rejected_total(tier: ExecHotShedTier) {
+    let cell = match tier {
+        ExecHotShedTier::Tracker => &*MARKET_DATA_EXEC_HOT_PRESSURE_ADMIT_REJECTED_TRACKER,
+        ExecHotShedTier::Momentum => &*MARKET_DATA_EXEC_HOT_PRESSURE_ADMIT_REJECTED_MOMENTUM,
+        ExecHotShedTier::Arb => &*MARKET_DATA_EXEC_HOT_PRESSURE_ADMIT_REJECTED_ARB,
+        ExecHotShedTier::None => return,
+    };
+    cell.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -7509,6 +7662,46 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_exec_hot_hard_shed_groups_evicted_total",
         MARKET_DATA_EXEC_HOT_HARD_SHED_GROUPS_EVICTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_shed_tier",
+        MARKET_DATA_EXEC_HOT_SHED_TIER.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_hard_shed_steps_total{tier=\"tracker\"}",
+        MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_TRACKER.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_hard_shed_steps_total{tier=\"momentum\"}",
+        MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_MOMENTUM.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_hard_shed_steps_total{tier=\"arb\"}",
+        MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_ARB.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_hard_shed_groups_evicted_total{tier=\"tracker\"}",
+        MARKET_DATA_EXEC_HOT_HARD_SHED_GROUPS_TRACKER.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_hard_shed_groups_evicted_total{tier=\"momentum\"}",
+        MARKET_DATA_EXEC_HOT_HARD_SHED_GROUPS_MOMENTUM.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_hard_shed_groups_evicted_total{tier=\"arb\"}",
+        MARKET_DATA_EXEC_HOT_HARD_SHED_GROUPS_ARB.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_pressure_admit_rejected_total{tier=\"tracker\"}",
+        MARKET_DATA_EXEC_HOT_PRESSURE_ADMIT_REJECTED_TRACKER.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_pressure_admit_rejected_total{tier=\"momentum\"}",
+        MARKET_DATA_EXEC_HOT_PRESSURE_ADMIT_REJECTED_MOMENTUM.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_pressure_admit_rejected_total{tier=\"arb\"}",
+        MARKET_DATA_EXEC_HOT_PRESSURE_ADMIT_REJECTED_ARB.load(Ordering::Relaxed)
     );
     line!(
         "market_data_account_publish_queue_depth",

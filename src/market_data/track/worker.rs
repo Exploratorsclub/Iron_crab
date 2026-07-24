@@ -12,7 +12,7 @@ use super::worker_commands::track_command_kind;
 use super::worker_commands::ImmutableTrackCommand;
 pub use super::worker_commands::{TrackCommandStream, TrackPinReason, TrackWorkerCommand};
 use crate::metrics::{
-    add_market_data_exec_hot_hard_shed_groups_evicted_total,
+    add_market_data_exec_hot_hard_shed_groups_for_tier,
     inc_market_data_explicit_set_snapshot_write_errors_total,
     inc_market_data_explicit_set_snapshot_write_total,
     inc_market_data_geyser_tracking_enqueue_dropped_total,
@@ -22,7 +22,8 @@ use crate::metrics::{
     inc_market_data_track_worker_enqueue_deduped_total,
     record_market_data_arb_track_requests_messages_total,
     record_market_data_momentum_active_pool_messages_total, set_market_data_arb_pinned_pools_gauge,
-    set_market_data_momentum_active_pool_pins_gauge, set_market_data_track_worker_queue_depth,
+    set_market_data_exec_hot_last_shed_groups, set_market_data_momentum_active_pool_pins_gauge,
+    set_market_data_track_worker_queue_depth, ExecHotShedTier,
 };
 use crate::nats::{
     ArbTrackActiveEntry, ArbTrackRemovedEntry, ArbTrackRequestsUpdate, MomentumActivePoolEntry,
@@ -291,6 +292,29 @@ pub fn apply_arb_track_requests_on_track_worker<C: TrackWorkerContext>(
     batch_dirty
 }
 
+fn apply_exec_hot_pressure_shed<C: TrackWorkerContext>(
+    ctx: &Arc<C>,
+    admission: &mut FixedCapAdmission,
+    tier: ExecHotShedTier,
+    max_groups: usize,
+) -> bool {
+    let result = match tier {
+        ExecHotShedTier::Tracker => admission.shed_tracker_owner_groups(max_groups),
+        ExecHotShedTier::Momentum => admission.shed_momentum_owner_groups(max_groups),
+        ExecHotShedTier::Arb => admission.shed_arb_owner_groups(max_groups),
+        ExecHotShedTier::None => {
+            return false;
+        }
+    };
+    set_market_data_exec_hot_last_shed_groups(tier, result.groups_evicted as u64);
+    if result.groups_evicted > 0 {
+        add_market_data_exec_hot_hard_shed_groups_for_tier(tier, result.groups_evicted as u64);
+        ctx.prune_tracked_maps_to_admitted(admission);
+        ctx.refresh_tracked_membership_snapshot();
+    }
+    result.groups_evicted > 0
+}
+
 pub fn track_worker_process_command<C: TrackWorkerContext>(
     ctx: &Arc<C>,
     admission: &mut FixedCapAdmission,
@@ -338,15 +362,13 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
             false
         }
         TrackWorkerCommand::ShedTrackerUnderExecHotPressure { max_groups } => {
-            let result = admission.shed_tracker_owner_groups(max_groups);
-            if result.groups_evicted > 0 {
-                add_market_data_exec_hot_hard_shed_groups_evicted_total(
-                    result.groups_evicted as u64,
-                );
-                ctx.prune_tracked_maps_to_admitted(admission);
-                ctx.refresh_tracked_membership_snapshot();
-            }
-            result.groups_evicted > 0
+            apply_exec_hot_pressure_shed(ctx, admission, ExecHotShedTier::Tracker, max_groups)
+        }
+        TrackWorkerCommand::ShedMomentumUnderExecHotPressure { max_groups } => {
+            apply_exec_hot_pressure_shed(ctx, admission, ExecHotShedTier::Momentum, max_groups)
+        }
+        TrackWorkerCommand::ShedArbUnderExecHotPressure { max_groups } => {
+            apply_exec_hot_pressure_shed(ctx, admission, ExecHotShedTier::Arb, max_groups)
         }
         TrackWorkerCommand::FlushExplicitSetSnapshot { done } => {
             try_write_explicit_set_snapshot_from_ctx(ctx.as_ref(), admission);
@@ -1890,6 +1912,8 @@ mod tests {
             TrackWorkerCommand::ScheduleGeyserPushDebounced,
             TrackWorkerCommand::ContinueGeyserEvict,
             TrackWorkerCommand::ShedTrackerUnderExecHotPressure { max_groups: 8 },
+            TrackWorkerCommand::ShedMomentumUnderExecHotPressure { max_groups: 8 },
+            TrackWorkerCommand::ShedArbUnderExecHotPressure { max_groups: 8 },
         ] {
             let cmd = store.wrap_command(payload);
             store.mark_applied(&cmd);

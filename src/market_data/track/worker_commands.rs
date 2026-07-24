@@ -49,6 +49,14 @@ pub enum TrackWorkerCommand {
     ShedTrackerUnderExecHotPressure {
         max_groups: usize,
     },
+    /// Scope L2b: evict momentum-active (non-position) owner groups under EXEC_HOT pressure.
+    ShedMomentumUnderExecHotPressure {
+        max_groups: usize,
+    },
+    /// Scope L2b: evict arb owner groups under EXEC_HOT pressure.
+    ShedArbUnderExecHotPressure {
+        max_groups: usize,
+    },
     /// Scope C: retry deferred hot-pool vault/bin registration after LivePoolCache fill.
     RetryDeferredHotPoolReserves,
 }
@@ -126,6 +134,8 @@ pub fn stream_for_command(cmd: &TrackWorkerCommand) -> TrackCommandStream {
         | TrackWorkerCommand::RestoreExplicitSnapshot(_)
         | TrackWorkerCommand::ContinueGeyserEvict
         | TrackWorkerCommand::ShedTrackerUnderExecHotPressure { .. }
+        | TrackWorkerCommand::ShedMomentumUnderExecHotPressure { .. }
+        | TrackWorkerCommand::ShedArbUnderExecHotPressure { .. }
         | TrackWorkerCommand::RetryDeferredHotPoolReserves
         | TrackWorkerCommand::FlushExplicitSetSnapshot { .. } => TrackCommandStream::Control,
     }
