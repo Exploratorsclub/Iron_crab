@@ -96,8 +96,9 @@ use ironcrab::metrics::{
     dec_market_data_account_enrich_ingress_queue_depth,
     dec_market_data_account_high_priority_queue_depth,
     dec_market_data_account_low_priority_queue_depth, dec_market_data_account_worker_queue_depth,
-    geyser_account_listener_account_updates_value, geyser_metrics_set_subscription_accounts,
-    geyser_metrics_set_tracked_pinned_accounts, inc_market_data_account_enrich_coalesce_total,
+    exec_hot_lag_raw_alarm, exec_hot_lag_raw_clear, geyser_account_listener_account_updates_value,
+    geyser_metrics_set_subscription_accounts, geyser_metrics_set_tracked_pinned_accounts,
+    inc_market_data_account_enrich_coalesce_total,
     inc_market_data_account_enrich_dispatch_contended_total,
     inc_market_data_account_enrich_enqueue_dropped_total,
     inc_market_data_account_enrich_ingress_queue_depth,
@@ -110,7 +111,7 @@ use ironcrab::metrics::{
     inc_market_data_arb_admission_rejected_total,
     inc_market_data_arb_pin_geyser_register_deferred_total,
     inc_market_data_balance_updated_from_cache_total,
-    inc_market_data_exec_hot_hard_shed_steps_for_tier,
+    inc_market_data_exec_hot_hard_shed_steps_for_tier_reason,
     inc_market_data_exec_hot_pressure_admit_rejected_total,
     inc_market_data_geyser_sync_skipped_rate_limit_total,
     inc_market_data_ingest_membership_snapshot_hits_total,
@@ -124,6 +125,7 @@ use ironcrab::metrics::{
     inc_market_data_wallet_admission_admitted_total,
     inc_market_data_wallet_admission_rejected_total, market_data_bump_geyser_head_slot,
     market_data_enrich_shed_active, market_data_exec_hot_arb_admit_suppress,
+    market_data_exec_hot_lag_p50_est_ms, market_data_exec_hot_lag_p99_est_ms,
     market_data_exec_hot_last_shed_groups, market_data_exec_hot_momentum_admit_suppress,
     market_data_exec_hot_tracker_admit_suppress, market_data_geyser_head_slot_value,
     market_data_geyser_tracking_enqueue_dropped_value,
@@ -142,13 +144,14 @@ use ironcrab::metrics::{
     record_market_data_md_state_writer_wait_us,
     record_market_data_momentum_active_pool_messages_total,
     record_market_data_tokio_liveness_stall, record_market_data_tokio_progress,
-    record_market_data_tx_broadcast_lagged, serve_metrics,
-    set_market_data_account_broadcast_queue_depth_for_class,
+    record_market_data_tx_broadcast_lagged, refresh_exec_hot_lag_percentile_estimates,
+    serve_metrics, set_market_data_account_broadcast_queue_depth_for_class,
     set_market_data_account_enrich_worker_count, set_market_data_account_exec_hot_worker_count,
     set_market_data_account_worker_count, set_market_data_arb_pinned_pools_gauge,
     set_market_data_enrichment_registry_pools_gauge, set_market_data_exec_hot_admit_suppress,
-    set_market_data_exec_hot_last_shed_groups, set_market_data_exec_hot_shed_soft_active,
-    set_market_data_exec_hot_shed_tier, set_market_data_explicit_set_snapshot_restore_duration_ms,
+    set_market_data_exec_hot_lag_alarm, set_market_data_exec_hot_last_shed_groups,
+    set_market_data_exec_hot_shed_soft_active, set_market_data_exec_hot_shed_tier,
+    set_market_data_explicit_set_snapshot_restore_duration_ms,
     set_market_data_explicit_set_snapshot_restore_pubkeys,
     set_market_data_geyser_explicit_admitted_accounts,
     set_market_data_geyser_explicit_cap_overflow, set_market_data_geyser_explicit_set_size,
@@ -223,12 +226,15 @@ const MARKET_DATA_MD_STATE_STALL_EXIT_ENABLED: bool = false;
 /// Scope L2: EXEC_HOT broadcast depth thresholds for enrich/tracker pressure shed.
 const EXEC_HOT_SHED_D_WARN: usize = 64;
 const EXEC_HOT_SHED_D_CRITICAL: usize = 256;
+const EXEC_HOT_SHED_D_ARB: usize = 1_024;
 const EXEC_HOT_SHED_D_SEVERE: usize = 2_000;
 const EXEC_HOT_SHED_D_EMERGENCY: usize = 10_000;
 const EXEC_HOT_SHED_D_CLEAR: usize = 16;
 const EXEC_HOT_SHED_HARD_MAX_GROUPS: usize = 16;
 const EXEC_HOT_SHED_SOFT_SAMPLES_FOR_HARD: u32 = 3;
 const EXEC_HOT_SHED_IDLE_ESCALATE_TICKS: u32 = 3;
+/// Scope L2c-MD: consecutive controller ticks below clear thresholds before lag alarm clears.
+const EXEC_HOT_SHED_LAG_ALARM_CLEAR_TICKS: u32 = 3;
 /// Sentinel written at shed enqueue; worker overwrites when the command completes.
 const EXEC_HOT_SHED_GROUPS_PENDING: u64 = u64::MAX;
 const EXEC_HOT_SHED_CONTROLLER_INTERVAL: Duration = Duration::from_millis(300);
@@ -8144,45 +8150,93 @@ enum AccountHighIngressSend {
     Closed,
 }
 
-/// Pure tier selection for EXEC_HOT pressure shed (Scope L2b); one action per controller tick.
+/// Pure tier selection for EXEC_HOT pressure shed (Scope L2b/L2c-MD); one action per controller tick.
+/// Escalation order: Tracker → Arb → Momentum (non-position).
 fn select_exec_hot_shed_tier(
     depth: usize,
+    lag_alarm: bool,
     soft_shed: bool,
     soft_shed_samples: u32,
     tracker_idle_ticks: u32,
-    momentum_idle_ticks: u32,
+    arb_idle_ticks: u32,
 ) -> ExecHotShedTier {
     let tracker_trigger = depth >= EXEC_HOT_SHED_D_CRITICAL
+        || lag_alarm
         || (soft_shed && soft_shed_samples >= EXEC_HOT_SHED_SOFT_SAMPLES_FOR_HARD);
-    let momentum_trigger = depth >= EXEC_HOT_SHED_D_SEVERE
+    let arb_trigger = depth >= EXEC_HOT_SHED_D_ARB
+        || (lag_alarm && tracker_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS)
         || (tracker_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
             && depth >= EXEC_HOT_SHED_D_CRITICAL);
-    let arb_trigger = depth >= EXEC_HOT_SHED_D_EMERGENCY
-        || (momentum_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
-            && depth >= EXEC_HOT_SHED_D_SEVERE);
+    let momentum_trigger = depth >= EXEC_HOT_SHED_D_EMERGENCY
+        || (lag_alarm && arb_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS)
+        || (arb_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS && depth >= EXEC_HOT_SHED_D_SEVERE);
 
     if tracker_trigger && tracker_idle_ticks < EXEC_HOT_SHED_IDLE_ESCALATE_TICKS {
         ExecHotShedTier::Tracker
-    } else if momentum_trigger && momentum_idle_ticks < EXEC_HOT_SHED_IDLE_ESCALATE_TICKS {
-        ExecHotShedTier::Momentum
-    } else if arb_trigger {
+    } else if arb_trigger && arb_idle_ticks < EXEC_HOT_SHED_IDLE_ESCALATE_TICKS {
         ExecHotShedTier::Arb
+    } else if momentum_trigger {
+        ExecHotShedTier::Momentum
     } else {
         ExecHotShedTier::None
     }
 }
 
-/// Scope L2 / L2b: monitor EXEC_HOT broadcast depth and shed ENRICH/Tracker/Momentum/Arb under pressure.
+/// Returns whether the chosen tier was primarily driven by lag (for shed reason metrics).
+fn exec_hot_shed_tier_lag_triggered(
+    tier: ExecHotShedTier,
+    depth: usize,
+    lag_alarm: bool,
+    tracker_idle_ticks: u32,
+    arb_idle_ticks: u32,
+) -> bool {
+    if !lag_alarm {
+        return false;
+    }
+    match tier {
+        ExecHotShedTier::Tracker => true,
+        ExecHotShedTier::Arb => {
+            depth < EXEC_HOT_SHED_D_ARB || tracker_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
+        }
+        ExecHotShedTier::Momentum => {
+            depth < EXEC_HOT_SHED_D_EMERGENCY || arb_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
+        }
+        ExecHotShedTier::None => false,
+    }
+}
+
+/// Scope L2 / L2b / L2c-MD: monitor EXEC_HOT broadcast depth + lag and shed under pressure.
 fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
     tokio::spawn(async move {
         let mut soft_shed = false;
         let mut soft_shed_samples = 0u32;
         let mut tracker_idle_ticks = 0u32;
-        let mut momentum_idle_ticks = 0u32;
+        let mut arb_idle_ticks = 0u32;
+        let mut lag_alarm = false;
+        let mut lag_clear_ticks = 0u32;
         let mut last_enqueued_tier: Option<ExecHotShedTier> = None;
         let mut interval = tokio::time::interval(EXEC_HOT_SHED_CONTROLLER_INTERVAL);
         loop {
             interval.tick().await;
+            refresh_exec_hot_lag_percentile_estimates();
+            let lag_p50 = market_data_exec_hot_lag_p50_est_ms();
+            let lag_p99 = market_data_exec_hot_lag_p99_est_ms();
+            if lag_alarm {
+                if exec_hot_lag_raw_clear(lag_p50, lag_p99) {
+                    lag_clear_ticks = lag_clear_ticks.saturating_add(1);
+                    if lag_clear_ticks >= EXEC_HOT_SHED_LAG_ALARM_CLEAR_TICKS {
+                        lag_alarm = false;
+                        lag_clear_ticks = 0;
+                    }
+                } else {
+                    lag_clear_ticks = 0;
+                }
+            } else if exec_hot_lag_raw_alarm(lag_p50, lag_p99) {
+                lag_alarm = true;
+                lag_clear_ticks = 0;
+            }
+            set_market_data_exec_hot_lag_alarm(lag_alarm);
+
             let depth =
                 MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH_EXEC_HOT.load(Ordering::Relaxed) as usize;
 
@@ -8194,42 +8248,54 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
                 } else {
                     match tier {
                         ExecHotShedTier::Tracker => {
-                            if groups == 0 && depth >= EXEC_HOT_SHED_D_CRITICAL {
+                            if groups == 0 && (depth >= EXEC_HOT_SHED_D_CRITICAL || lag_alarm) {
                                 tracker_idle_ticks = tracker_idle_ticks.saturating_add(1);
                             } else {
                                 tracker_idle_ticks = 0;
                             }
                         }
-                        ExecHotShedTier::Momentum => {
-                            if groups == 0 && depth >= EXEC_HOT_SHED_D_SEVERE {
-                                momentum_idle_ticks = momentum_idle_ticks.saturating_add(1);
+                        ExecHotShedTier::Arb => {
+                            if groups == 0
+                                && (depth >= EXEC_HOT_SHED_D_ARB
+                                    || (lag_alarm
+                                        && tracker_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS))
+                            {
+                                arb_idle_ticks = arb_idle_ticks.saturating_add(1);
                             } else {
-                                momentum_idle_ticks = 0;
+                                arb_idle_ticks = 0;
                             }
                         }
-                        ExecHotShedTier::Arb | ExecHotShedTier::None => {}
+                        ExecHotShedTier::Momentum | ExecHotShedTier::None => {}
                     }
                 }
             }
 
-            if depth >= EXEC_HOT_SHED_D_WARN {
+            if depth >= EXEC_HOT_SHED_D_WARN || lag_alarm {
                 soft_shed = true;
-            } else if depth < EXEC_HOT_SHED_D_CLEAR {
+            } else if depth < EXEC_HOT_SHED_D_CLEAR && !lag_alarm {
                 soft_shed = false;
                 soft_shed_samples = 0;
                 tracker_idle_ticks = 0;
-                momentum_idle_ticks = 0;
+                arb_idle_ticks = 0;
             }
 
             set_market_data_exec_hot_shed_soft_active(soft_shed);
 
-            let tracker_admit_suppress = soft_shed || depth >= EXEC_HOT_SHED_D_CRITICAL;
-            let momentum_admit_suppress = depth >= EXEC_HOT_SHED_D_SEVERE
-                || (tracker_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
-                    && depth >= EXEC_HOT_SHED_D_CRITICAL);
-            let arb_admit_suppress = depth >= EXEC_HOT_SHED_D_EMERGENCY
-                || (momentum_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
-                    && depth >= EXEC_HOT_SHED_D_SEVERE);
+            let shed_tier = select_exec_hot_shed_tier(
+                depth,
+                lag_alarm,
+                soft_shed,
+                soft_shed_samples,
+                tracker_idle_ticks,
+                arb_idle_ticks,
+            );
+
+            let tracker_admit_suppress =
+                soft_shed || depth >= EXEC_HOT_SHED_D_CRITICAL || lag_alarm;
+            let arb_admit_suppress = depth >= EXEC_HOT_SHED_D_ARB || lag_alarm;
+            let momentum_admit_suppress = shed_tier == ExecHotShedTier::Momentum
+                || depth >= EXEC_HOT_SHED_D_EMERGENCY
+                || (lag_alarm && arb_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS);
             set_market_data_exec_hot_admit_suppress(
                 tracker_admit_suppress,
                 momentum_admit_suppress,
@@ -8240,13 +8306,6 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
                 soft_shed_samples = soft_shed_samples.saturating_add(1);
             }
 
-            let shed_tier = select_exec_hot_shed_tier(
-                depth,
-                soft_shed,
-                soft_shed_samples,
-                tracker_idle_ticks,
-                momentum_idle_ticks,
-            );
             set_market_data_exec_hot_shed_tier(shed_tier);
 
             if shed_tier == ExecHotShedTier::None {
@@ -8256,6 +8315,14 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
             if soft_shed && shed_tier == ExecHotShedTier::Tracker {
                 soft_shed_samples = 0;
             }
+
+            let lag_triggered = exec_hot_shed_tier_lag_triggered(
+                shed_tier,
+                depth,
+                lag_alarm,
+                tracker_idle_ticks,
+                arb_idle_ticks,
+            );
 
             let cmd = match shed_tier {
                 ExecHotShedTier::Tracker => TrackWorkerCommand::ShedTrackerUnderExecHotPressure {
@@ -8271,7 +8338,7 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
             };
 
             if track_worker_try_enqueue(&track_worker, cmd) {
-                inc_market_data_exec_hot_hard_shed_steps_for_tier(shed_tier);
+                inc_market_data_exec_hot_hard_shed_steps_for_tier_reason(shed_tier, lag_triggered);
                 set_market_data_exec_hot_last_shed_groups(shed_tier, EXEC_HOT_SHED_GROUPS_PENDING);
                 last_enqueued_tier = Some(shed_tier);
             }
@@ -14887,37 +14954,91 @@ mod pr_b_geyser_tracking_tests {
         use ironcrab::metrics::ExecHotShedTier;
 
         assert_eq!(
-            select_exec_hot_shed_tier(300, false, 0, 0, 0),
+            select_exec_hot_shed_tier(300, false, false, 0, 0, 0),
             ExecHotShedTier::Tracker
         );
         assert_eq!(
-            select_exec_hot_shed_tier(300, false, 0, 3, 0),
-            ExecHotShedTier::Momentum
-        );
-        assert_eq!(
-            select_exec_hot_shed_tier(262_000, false, 0, 3, 0),
-            ExecHotShedTier::Momentum
-        );
-        assert_eq!(
-            select_exec_hot_shed_tier(5_000, false, 0, 3, 0),
-            ExecHotShedTier::Momentum
-        );
-        assert_eq!(
-            select_exec_hot_shed_tier(5_000, false, 0, 3, 3),
+            select_exec_hot_shed_tier(300, false, false, 0, 3, 0),
             ExecHotShedTier::Arb
         );
         assert_eq!(
-            select_exec_hot_shed_tier(12_000, false, 0, 3, 3),
+            select_exec_hot_shed_tier(262_000, false, false, 0, 3, 0),
             ExecHotShedTier::Arb
         );
         assert_eq!(
-            select_exec_hot_shed_tier(12_000, false, 0, 3, 0),
+            select_exec_hot_shed_tier(5_000, false, false, 0, 3, 0),
+            ExecHotShedTier::Arb
+        );
+        assert_eq!(
+            select_exec_hot_shed_tier(5_000, false, false, 0, 3, 3),
             ExecHotShedTier::Momentum
         );
         assert_eq!(
-            select_exec_hot_shed_tier(10, false, 0, 0, 0),
+            select_exec_hot_shed_tier(12_000, false, false, 0, 3, 3),
+            ExecHotShedTier::Momentum
+        );
+        assert_eq!(
+            select_exec_hot_shed_tier(12_000, false, false, 0, 3, 0),
+            ExecHotShedTier::Arb
+        );
+        assert_eq!(
+            select_exec_hot_shed_tier(10, false, false, 0, 0, 0),
             ExecHotShedTier::None
         );
+    }
+
+    #[test]
+    fn exec_hot_shed_tier_lag_alarm_triggers_arb_without_emergency_depth() {
+        use ironcrab::metrics::ExecHotShedTier;
+
+        assert_eq!(
+            select_exec_hot_shed_tier(100, true, false, 0, 0, 0),
+            ExecHotShedTier::Tracker
+        );
+        assert_eq!(
+            select_exec_hot_shed_tier(100, true, false, 0, 3, 0),
+            ExecHotShedTier::Arb
+        );
+        assert_eq!(
+            select_exec_hot_shed_tier(500, true, false, 0, 3, 3),
+            ExecHotShedTier::Momentum
+        );
+    }
+
+    #[test]
+    fn exec_hot_lag_alarm_hysteresis_requires_clear_ticks() {
+        use ironcrab::metrics::{exec_hot_lag_raw_alarm, exec_hot_lag_raw_clear};
+
+        assert!(exec_hot_lag_raw_alarm(60, 100));
+        assert!(!exec_hot_lag_raw_clear(60, 100));
+        assert!(exec_hot_lag_raw_clear(30, 100));
+    }
+
+    #[test]
+    fn exec_hot_shed_tier_lag_triggered_attributes_lag_reason() {
+        use ironcrab::metrics::ExecHotShedTier;
+
+        assert!(exec_hot_shed_tier_lag_triggered(
+            ExecHotShedTier::Tracker,
+            10,
+            true,
+            0,
+            0
+        ));
+        assert!(exec_hot_shed_tier_lag_triggered(
+            ExecHotShedTier::Arb,
+            100,
+            true,
+            3,
+            0
+        ));
+        assert!(!exec_hot_shed_tier_lag_triggered(
+            ExecHotShedTier::Arb,
+            2_000,
+            false,
+            3,
+            0
+        ));
     }
 
     #[test]
