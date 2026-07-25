@@ -817,6 +817,9 @@ pub struct MomentumCfg {
     /// Pause after any pre-entry dev sell before re-evaluating standard soft gates. Default: 30s
     #[serde(default = "default_dev_sell_revalidation_delay_secs")]
     pub dev_sell_revalidation_delay_secs: u64,
+    /// Max seconds in `WaitHotSet` awaiting fresh vault reserves before unpin (I-MD-9). Default: 45
+    #[serde(default = "default_wait_hot_set_timeout_secs")]
+    pub wait_hot_set_timeout_secs: u64,
 
     // === Token Safety: Mint/Freeze Authority (via TokenMintInfo MarketEvents) ===
     /// Require mint authority to be renounced (mint_authority == None) before entering.
@@ -1034,6 +1037,9 @@ fn default_max_single_dump() -> u64 {
 fn default_dev_sell_revalidation_delay_secs() -> u64 {
     30
 }
+fn default_wait_hot_set_timeout_secs() -> u64 {
+    45
+}
 fn default_require_mint_authority_renounced() -> bool {
     false
 }
@@ -1180,6 +1186,7 @@ impl Default for MomentumCfg {
             inflow_window_secs: default_inflow_window(),
             max_single_dump_lamports: default_max_single_dump(),
             dev_sell_revalidation_delay_secs: default_dev_sell_revalidation_delay_secs(),
+            wait_hot_set_timeout_secs: default_wait_hot_set_timeout_secs(),
             require_mint_authority_renounced: default_require_mint_authority_renounced(),
             require_freeze_authority_none: default_require_freeze_authority_none(),
             hard_stop_min_hold_secs: default_hard_stop_min_hold_secs(),
