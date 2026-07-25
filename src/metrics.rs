@@ -1929,6 +1929,28 @@ pub static MARKET_DATA_EXEC_HOT_PRESSURE_ADMIT_REJECTED_MOMENTUM: Lazy<AtomicU64
 pub static MARKET_DATA_EXEC_HOT_PRESSURE_ADMIT_REJECTED_ARB: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+/// Scope L2c-MD: rolling EXEC_HOT channel lag estimates (ms), updated from recv samples.
+pub static MARKET_DATA_EXEC_HOT_LAG_P50_EST_MS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_EXEC_HOT_LAG_P99_EST_MS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Scope L2c-MD: controller hysteresis output (0/1).
+pub static MARKET_DATA_EXEC_HOT_LAG_ALARM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// Scope L2c-MD: hard shed steps attributed to lag (vs depth) per tier.
+pub static MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_TRACKER_LAG: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_MOMENTUM_LAG: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_ARB_LAG: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+const EXEC_HOT_LAG_RING_CAP: usize = 64;
+static EXEC_HOT_LAG_RING: Lazy<[AtomicU64; EXEC_HOT_LAG_RING_CAP]> =
+    Lazy::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
+static EXEC_HOT_LAG_RING_WRITE_IDX: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static EXEC_HOT_LAG_SAMPLE_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static EXEC_HOT_LAG_EWMA_P50_MS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static EXEC_HOT_LAG_EWMA_P99_MS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
 /// Account ingest: jobs waiting in the dedicated NATS publish `mpsc` (JetStream + core publish).
 pub static MARKET_DATA_ACCOUNT_PUBLISH_QUEUE_DEPTH: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -2205,14 +2227,17 @@ pub fn record_market_data_account_channel_lag_ms_for_class(
         .as_millis()
         .min(u128::from(u64::MAX)) as u64;
     match class {
-        "exec_hot" => record_histogram_u64_into(
-            MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
-            &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_EXEC_HOT_BUCKET_COUNTS,
-            &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_EXEC_HOT_SUM,
-            &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_EXEC_HOT_COUNT,
-            ms,
-            MARKET_DATA_LATENCY_MS_SUM_CAP,
-        ),
+        "exec_hot" => {
+            record_histogram_u64_into(
+                MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
+                &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_EXEC_HOT_BUCKET_COUNTS,
+                &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_EXEC_HOT_SUM,
+                &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_EXEC_HOT_COUNT,
+                ms,
+                MARKET_DATA_LATENCY_MS_SUM_CAP,
+            );
+            record_exec_hot_channel_lag_sample(ms);
+        }
         "enrich" => record_histogram_u64_into(
             MARKET_DATA_GEYSER_TO_PUBLISH_MS_BUCKETS,
             &MARKET_DATA_ACCOUNT_CHANNEL_LAG_MS_ENRICH_BUCKET_COUNTS,
@@ -2535,6 +2560,144 @@ pub fn inc_market_data_exec_hot_pressure_admit_rejected_total(tier: ExecHotShedT
         ExecHotShedTier::None => return,
     };
     cell.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Scope L2c-MD: SLO breach thresholds for EXEC_HOT channel lag alarm (ms).
+pub const EXEC_HOT_LAG_ALARM_P50_MS: u64 = 50;
+pub const EXEC_HOT_LAG_ALARM_P99_MS: u64 = 200;
+/// Hysteresis clear thresholds (ms).
+pub const EXEC_HOT_LAG_CLEAR_P50_MS: u64 = 40;
+pub const EXEC_HOT_LAG_CLEAR_P99_MS: u64 = 150;
+
+/// Pure alarm predicate for unit tests and controller hysteresis input.
+#[inline]
+pub fn exec_hot_lag_raw_alarm(p50_ms: u64, p99_ms: u64) -> bool {
+    p99_ms > EXEC_HOT_LAG_ALARM_P99_MS || p50_ms > EXEC_HOT_LAG_ALARM_P50_MS
+}
+
+/// Pure clear predicate for controller hysteresis.
+#[inline]
+pub fn exec_hot_lag_raw_clear(p50_ms: u64, p99_ms: u64) -> bool {
+    p99_ms < EXEC_HOT_LAG_CLEAR_P99_MS && p50_ms < EXEC_HOT_LAG_CLEAR_P50_MS
+}
+
+/// Lock-free recv-path sample: ring slot + EWMA p50/p99 estimates.
+#[inline]
+pub fn record_exec_hot_channel_lag_sample(lag_ms: u64) {
+    let idx = EXEC_HOT_LAG_RING_WRITE_IDX.fetch_add(1, Ordering::Relaxed) as usize
+        % EXEC_HOT_LAG_RING_CAP;
+    EXEC_HOT_LAG_RING[idx].store(lag_ms, Ordering::Relaxed);
+    EXEC_HOT_LAG_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    let old_p50 = EXEC_HOT_LAG_EWMA_P50_MS.load(Ordering::Relaxed);
+    let new_p50 = if old_p50 == 0 {
+        lag_ms
+    } else {
+        (lag_ms * 2 + old_p50 * 8) / 10
+    };
+    EXEC_HOT_LAG_EWMA_P50_MS.store(new_p50, Ordering::Relaxed);
+
+    let old_p99 = EXEC_HOT_LAG_EWMA_P99_MS.load(Ordering::Relaxed);
+    let new_p99 = if old_p99 == 0 {
+        lag_ms
+    } else if lag_ms >= old_p99 {
+        (lag_ms * 3 + old_p99 * 7) / 10
+    } else {
+        (lag_ms + old_p99 * 19) / 20
+    };
+    EXEC_HOT_LAG_EWMA_P99_MS.store(new_p99, Ordering::Relaxed);
+
+    MARKET_DATA_EXEC_HOT_LAG_P50_EST_MS.store(new_p50, Ordering::Relaxed);
+    MARKET_DATA_EXEC_HOT_LAG_P99_EST_MS.store(new_p99, Ordering::Relaxed);
+}
+
+/// Recompute percentile estimates from the ring (controller tick; not on recv hot path).
+pub fn refresh_exec_hot_lag_percentile_estimates() {
+    let count = EXEC_HOT_LAG_SAMPLE_COUNT.load(Ordering::Relaxed);
+    if count == 0 {
+        return;
+    }
+    let take = (count as usize).min(EXEC_HOT_LAG_RING_CAP);
+    let mut samples: Vec<u64> = (0..take)
+        .map(|i| EXEC_HOT_LAG_RING[i].load(Ordering::Relaxed))
+        .filter(|&v| v > 0)
+        .collect();
+    if samples.is_empty() {
+        return;
+    }
+    samples.sort_unstable();
+    let p50 = samples[samples.len() * 50 / 100];
+    let p99 = samples[samples
+        .len()
+        .saturating_sub(1)
+        .max(samples.len() * 99 / 100)];
+    MARKET_DATA_EXEC_HOT_LAG_P50_EST_MS.store(p50, Ordering::Relaxed);
+    MARKET_DATA_EXEC_HOT_LAG_P99_EST_MS.store(p99, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn market_data_exec_hot_lag_p50_est_ms() -> u64 {
+    MARKET_DATA_EXEC_HOT_LAG_P50_EST_MS.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn market_data_exec_hot_lag_p99_est_ms() -> u64 {
+    MARKET_DATA_EXEC_HOT_LAG_P99_EST_MS.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn set_market_data_exec_hot_lag_alarm(active: bool) {
+    MARKET_DATA_EXEC_HOT_LAG_ALARM.store(u64::from(active), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn market_data_exec_hot_lag_alarm() -> bool {
+    MARKET_DATA_EXEC_HOT_LAG_ALARM.load(Ordering::Relaxed) != 0
+}
+
+/// Hard shed step with optional lag attribution (reason label `depth|lag`).
+#[inline]
+pub fn inc_market_data_exec_hot_hard_shed_steps_for_tier_reason(
+    tier: ExecHotShedTier,
+    lag_triggered: bool,
+) {
+    inc_market_data_exec_hot_hard_shed_steps_for_tier(tier);
+    if !lag_triggered {
+        return;
+    }
+    let cell = match tier {
+        ExecHotShedTier::Tracker => &*MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_TRACKER_LAG,
+        ExecHotShedTier::Momentum => &*MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_MOMENTUM_LAG,
+        ExecHotShedTier::Arb => &*MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_ARB_LAG,
+        ExecHotShedTier::None => return,
+    };
+    cell.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod exec_hot_lag_tests {
+    use super::*;
+
+    #[test]
+    fn exec_hot_lag_alarm_and_clear_thresholds() {
+        assert!(!exec_hot_lag_raw_alarm(50, 200));
+        assert!(exec_hot_lag_raw_alarm(51, 100));
+        assert!(exec_hot_lag_raw_alarm(30, 201));
+        assert!(exec_hot_lag_raw_clear(39, 149));
+        assert!(!exec_hot_lag_raw_clear(40, 149));
+        assert!(!exec_hot_lag_raw_clear(39, 150));
+    }
+
+    #[test]
+    fn exec_hot_lag_samples_raise_alarm_estimate() {
+        for ms in [10_u64, 20, 300, 400, 500] {
+            record_exec_hot_channel_lag_sample(ms);
+        }
+        refresh_exec_hot_lag_percentile_estimates();
+        let p50 = market_data_exec_hot_lag_p50_est_ms();
+        let p99 = market_data_exec_hot_lag_p99_est_ms();
+        assert!(exec_hot_lag_raw_alarm(p50, p99), "p50={p50} p99={p99}");
+    }
 }
 
 #[inline]
@@ -7702,6 +7865,30 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_exec_hot_pressure_admit_rejected_total{tier=\"arb\"}",
         MARKET_DATA_EXEC_HOT_PRESSURE_ADMIT_REJECTED_ARB.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_lag_p50_est_ms",
+        MARKET_DATA_EXEC_HOT_LAG_P50_EST_MS.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_lag_p99_est_ms",
+        MARKET_DATA_EXEC_HOT_LAG_P99_EST_MS.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_lag_alarm",
+        MARKET_DATA_EXEC_HOT_LAG_ALARM.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_hard_shed_steps_total{tier=\"tracker\",reason=\"lag\"}",
+        MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_TRACKER_LAG.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_hard_shed_steps_total{tier=\"momentum\",reason=\"lag\"}",
+        MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_MOMENTUM_LAG.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_exec_hot_hard_shed_steps_total{tier=\"arb\",reason=\"lag\"}",
+        MARKET_DATA_EXEC_HOT_HARD_SHED_STEPS_ARB_LAG.load(Ordering::Relaxed)
     );
     line!(
         "market_data_account_publish_queue_depth",
