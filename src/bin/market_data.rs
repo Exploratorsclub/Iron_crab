@@ -230,8 +230,12 @@ const EXEC_HOT_SHED_D_SEVERE: usize = 2_000;
 const EXEC_HOT_SHED_D_EMERGENCY: usize = 10_000;
 const EXEC_HOT_SHED_D_CLEAR: usize = 16;
 const EXEC_HOT_SHED_HARD_MAX_GROUPS: usize = 16;
+/// Scope L2c-MD-fu: larger arb shed batches under lag alarm (~700 pins shrink faster).
+const EXEC_HOT_SHED_LAG_ARB_MAX_GROUPS: usize = 48;
 const EXEC_HOT_SHED_SOFT_SAMPLES_FOR_HARD: u32 = 3;
 const EXEC_HOT_SHED_IDLE_ESCALATE_TICKS: u32 = 3;
+/// Scope L2c-MD-fu: lag path escalates Tracker→Arb→Momentum after fewer completed shed attempts.
+const EXEC_HOT_SHED_LAG_ARB_ESCALATE_TICKS: u32 = 1;
 /// Scope L2c-MD: consecutive controller ticks below clear thresholds before lag alarm clears.
 const EXEC_HOT_SHED_LAG_ALARM_CLEAR_TICKS: u32 = 3;
 /// Sentinel written at shed enqueue; worker overwrites when the command completes.
@@ -8209,30 +8213,66 @@ enum AccountHighIngressSend {
     Closed,
 }
 
+/// Idle / completed-shed counters driving Tracker→Arb→Momentum escalation in the pressure controller.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ExecHotShedEscalationState {
+    tracker_idle_ticks: u32,
+    arb_idle_ticks: u32,
+    lag_tracker_shed_ticks: u32,
+    lag_arb_shed_ticks: u32,
+}
+
 /// Pure tier selection for EXEC_HOT pressure shed (Scope L2b/L2c-MD); one action per controller tick.
 /// Escalation order: Tracker → Arb → Momentum (non-position).
+///
+/// Under `lag_alarm`, escalation uses completed shed attempts (`lag_tracker_shed_ticks` /
+/// `lag_arb_shed_ticks`) instead of requiring tracker shed to return zero groups.
 fn select_exec_hot_shed_tier(
     depth: usize,
     lag_alarm: bool,
     soft_shed: bool,
     soft_shed_samples: u32,
-    tracker_idle_ticks: u32,
-    arb_idle_ticks: u32,
+    escalation: ExecHotShedEscalationState,
 ) -> ExecHotShedTier {
+    let tracker_idle_ticks = escalation.tracker_idle_ticks;
+    let arb_idle_ticks = escalation.arb_idle_ticks;
+    let lag_tracker_shed_ticks = escalation.lag_tracker_shed_ticks;
+    let lag_arb_shed_ticks = escalation.lag_arb_shed_ticks;
     let tracker_trigger = depth >= EXEC_HOT_SHED_D_CRITICAL
         || lag_alarm
         || (soft_shed && soft_shed_samples >= EXEC_HOT_SHED_SOFT_SAMPLES_FOR_HARD);
     let arb_trigger = depth >= EXEC_HOT_SHED_D_ARB
-        || (lag_alarm && tracker_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS)
+        || (lag_alarm && lag_tracker_shed_ticks >= EXEC_HOT_SHED_LAG_ARB_ESCALATE_TICKS)
         || (tracker_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
             && depth >= EXEC_HOT_SHED_D_CRITICAL);
     let momentum_trigger = depth >= EXEC_HOT_SHED_D_EMERGENCY
-        || (lag_alarm && arb_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS)
+        || (lag_alarm && lag_arb_shed_ticks >= EXEC_HOT_SHED_LAG_ARB_ESCALATE_TICKS)
         || (arb_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS && depth >= EXEC_HOT_SHED_D_SEVERE);
 
-    if tracker_trigger && tracker_idle_ticks < EXEC_HOT_SHED_IDLE_ESCALATE_TICKS {
+    let tracker_escalate_threshold = if lag_alarm {
+        EXEC_HOT_SHED_LAG_ARB_ESCALATE_TICKS
+    } else {
+        EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
+    };
+    let tracker_escalate_progress = if lag_alarm {
+        lag_tracker_shed_ticks
+    } else {
+        tracker_idle_ticks
+    };
+    let arb_escalate_threshold = if lag_alarm {
+        EXEC_HOT_SHED_LAG_ARB_ESCALATE_TICKS
+    } else {
+        EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
+    };
+    let arb_escalate_progress = if lag_alarm {
+        lag_arb_shed_ticks
+    } else {
+        arb_idle_ticks
+    };
+
+    if tracker_trigger && tracker_escalate_progress < tracker_escalate_threshold {
         ExecHotShedTier::Tracker
-    } else if arb_trigger && arb_idle_ticks < EXEC_HOT_SHED_IDLE_ESCALATE_TICKS {
+    } else if arb_trigger && arb_escalate_progress < arb_escalate_threshold {
         ExecHotShedTier::Arb
     } else if momentum_trigger {
         ExecHotShedTier::Momentum
@@ -8246,19 +8286,29 @@ fn exec_hot_shed_tier_lag_triggered(
     tier: ExecHotShedTier,
     depth: usize,
     lag_alarm: bool,
-    tracker_idle_ticks: u32,
-    arb_idle_ticks: u32,
+    escalation: ExecHotShedEscalationState,
 ) -> bool {
+    if !lag_alarm {
+        return false;
+    }
+    let tracker_idle_ticks = escalation.tracker_idle_ticks;
+    let arb_idle_ticks = escalation.arb_idle_ticks;
+    let lag_tracker_shed_ticks = escalation.lag_tracker_shed_ticks;
+    let lag_arb_shed_ticks = escalation.lag_arb_shed_ticks;
     if !lag_alarm {
         return false;
     }
     match tier {
         ExecHotShedTier::Tracker => true,
         ExecHotShedTier::Arb => {
-            depth < EXEC_HOT_SHED_D_ARB || tracker_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
+            depth < EXEC_HOT_SHED_D_ARB
+                || tracker_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
+                || lag_tracker_shed_ticks >= EXEC_HOT_SHED_LAG_ARB_ESCALATE_TICKS
         }
         ExecHotShedTier::Momentum => {
-            depth < EXEC_HOT_SHED_D_EMERGENCY || arb_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
+            depth < EXEC_HOT_SHED_D_EMERGENCY
+                || arb_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
+                || lag_arb_shed_ticks >= EXEC_HOT_SHED_LAG_ARB_ESCALATE_TICKS
         }
         ExecHotShedTier::None => false,
     }
@@ -8271,6 +8321,8 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
         let mut soft_shed_samples = 0u32;
         let mut tracker_idle_ticks = 0u32;
         let mut arb_idle_ticks = 0u32;
+        let mut lag_tracker_shed_ticks = 0u32;
+        let mut lag_arb_shed_ticks = 0u32;
         let mut lag_alarm = false;
         let mut lag_clear_ticks = 0u32;
         let mut last_enqueued_tier: Option<ExecHotShedTier> = None;
@@ -8286,6 +8338,8 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
                     if lag_clear_ticks >= EXEC_HOT_SHED_LAG_ALARM_CLEAR_TICKS {
                         lag_alarm = false;
                         lag_clear_ticks = 0;
+                        lag_tracker_shed_ticks = 0;
+                        lag_arb_shed_ticks = 0;
                     }
                 } else {
                     lag_clear_ticks = 0;
@@ -8307,20 +8361,29 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
                 } else {
                     match tier {
                         ExecHotShedTier::Tracker => {
+                            if lag_alarm {
+                                lag_tracker_shed_ticks = lag_tracker_shed_ticks.saturating_add(1);
+                            }
                             if groups == 0 && (depth >= EXEC_HOT_SHED_D_CRITICAL || lag_alarm) {
                                 tracker_idle_ticks = tracker_idle_ticks.saturating_add(1);
-                            } else {
+                            } else if !lag_alarm {
                                 tracker_idle_ticks = 0;
                             }
                         }
                         ExecHotShedTier::Arb => {
+                            if lag_alarm {
+                                lag_arb_shed_ticks = lag_arb_shed_ticks.saturating_add(1);
+                            }
                             if groups == 0
                                 && (depth >= EXEC_HOT_SHED_D_ARB
                                     || (lag_alarm
-                                        && tracker_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS))
+                                        && (lag_tracker_shed_ticks
+                                            >= EXEC_HOT_SHED_LAG_ARB_ESCALATE_TICKS
+                                            || tracker_idle_ticks
+                                                >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS)))
                             {
                                 arb_idle_ticks = arb_idle_ticks.saturating_add(1);
-                            } else {
+                            } else if !lag_alarm {
                                 arb_idle_ticks = 0;
                             }
                         }
@@ -8336,17 +8399,25 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
                 soft_shed_samples = 0;
                 tracker_idle_ticks = 0;
                 arb_idle_ticks = 0;
+                lag_tracker_shed_ticks = 0;
+                lag_arb_shed_ticks = 0;
             }
 
             set_market_data_exec_hot_shed_soft_active(soft_shed);
+
+            let escalation = ExecHotShedEscalationState {
+                tracker_idle_ticks,
+                arb_idle_ticks,
+                lag_tracker_shed_ticks,
+                lag_arb_shed_ticks,
+            };
 
             let shed_tier = select_exec_hot_shed_tier(
                 depth,
                 lag_alarm,
                 soft_shed,
                 soft_shed_samples,
-                tracker_idle_ticks,
-                arb_idle_ticks,
+                escalation,
             );
 
             let tracker_admit_suppress =
@@ -8354,7 +8425,7 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
             let arb_admit_suppress = depth >= EXEC_HOT_SHED_D_ARB || lag_alarm;
             let momentum_admit_suppress = shed_tier == ExecHotShedTier::Momentum
                 || depth >= EXEC_HOT_SHED_D_EMERGENCY
-                || (lag_alarm && arb_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS);
+                || (lag_alarm && lag_arb_shed_ticks >= EXEC_HOT_SHED_LAG_ARB_ESCALATE_TICKS);
             set_market_data_exec_hot_admit_suppress(
                 tracker_admit_suppress,
                 momentum_admit_suppress,
@@ -8375,13 +8446,8 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
                 soft_shed_samples = 0;
             }
 
-            let lag_triggered = exec_hot_shed_tier_lag_triggered(
-                shed_tier,
-                depth,
-                lag_alarm,
-                tracker_idle_ticks,
-                arb_idle_ticks,
-            );
+            let lag_triggered =
+                exec_hot_shed_tier_lag_triggered(shed_tier, depth, lag_alarm, escalation);
 
             let cmd = match shed_tier {
                 ExecHotShedTier::Tracker => TrackWorkerCommand::ShedTrackerUnderExecHotPressure {
@@ -8391,7 +8457,11 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
                     max_groups: EXEC_HOT_SHED_HARD_MAX_GROUPS,
                 },
                 ExecHotShedTier::Arb => TrackWorkerCommand::ShedArbUnderExecHotPressure {
-                    max_groups: EXEC_HOT_SHED_HARD_MAX_GROUPS,
+                    max_groups: if lag_alarm {
+                        EXEC_HOT_SHED_LAG_ARB_MAX_GROUPS
+                    } else {
+                        EXEC_HOT_SHED_HARD_MAX_GROUPS
+                    },
                 },
                 ExecHotShedTier::None => continue,
             };
@@ -15129,36 +15199,50 @@ mod pr_b_geyser_tracking_tests {
     fn exec_hot_shed_tier_prefers_tracker_then_escalates_on_idle() {
         use ironcrab::metrics::ExecHotShedTier;
 
+        let none = ExecHotShedEscalationState::default();
         assert_eq!(
-            select_exec_hot_shed_tier(300, false, false, 0, 0, 0),
+            select_exec_hot_shed_tier(300, false, false, 0, none),
             ExecHotShedTier::Tracker
         );
+        let tracker_idle = ExecHotShedEscalationState {
+            tracker_idle_ticks: 3,
+            ..none
+        };
         assert_eq!(
-            select_exec_hot_shed_tier(300, false, false, 0, 3, 0),
+            select_exec_hot_shed_tier(300, false, false, 0, tracker_idle),
             ExecHotShedTier::Arb
         );
         assert_eq!(
-            select_exec_hot_shed_tier(262_000, false, false, 0, 3, 0),
+            select_exec_hot_shed_tier(262_000, false, false, 0, tracker_idle),
             ExecHotShedTier::Arb
         );
         assert_eq!(
-            select_exec_hot_shed_tier(5_000, false, false, 0, 3, 0),
+            select_exec_hot_shed_tier(5_000, false, false, 0, tracker_idle),
             ExecHotShedTier::Arb
         );
+        let arb_idle = ExecHotShedEscalationState {
+            tracker_idle_ticks: 3,
+            arb_idle_ticks: 3,
+            ..none
+        };
         assert_eq!(
-            select_exec_hot_shed_tier(5_000, false, false, 0, 3, 3),
+            select_exec_hot_shed_tier(5_000, false, false, 0, arb_idle),
             ExecHotShedTier::Momentum
         );
         assert_eq!(
-            select_exec_hot_shed_tier(12_000, false, false, 0, 3, 3),
+            select_exec_hot_shed_tier(12_000, false, false, 0, arb_idle),
             ExecHotShedTier::Momentum
         );
+        let tracker_only = ExecHotShedEscalationState {
+            tracker_idle_ticks: 3,
+            ..none
+        };
         assert_eq!(
-            select_exec_hot_shed_tier(12_000, false, false, 0, 3, 0),
+            select_exec_hot_shed_tier(12_000, false, false, 0, tracker_only),
             ExecHotShedTier::Arb
         );
         assert_eq!(
-            select_exec_hot_shed_tier(10, false, false, 0, 0, 0),
+            select_exec_hot_shed_tier(10, false, false, 0, none),
             ExecHotShedTier::None
         );
     }
@@ -15167,17 +15251,54 @@ mod pr_b_geyser_tracking_tests {
     fn exec_hot_shed_tier_lag_alarm_triggers_arb_without_emergency_depth() {
         use ironcrab::metrics::ExecHotShedTier;
 
+        let none = ExecHotShedEscalationState::default();
         assert_eq!(
-            select_exec_hot_shed_tier(100, true, false, 0, 0, 0),
+            select_exec_hot_shed_tier(100, true, false, 0, none),
             ExecHotShedTier::Tracker
         );
+        let lag_tracker_done = ExecHotShedEscalationState {
+            lag_tracker_shed_ticks: 1,
+            ..none
+        };
         assert_eq!(
-            select_exec_hot_shed_tier(100, true, false, 0, 3, 0),
+            select_exec_hot_shed_tier(100, true, false, 0, lag_tracker_done),
             ExecHotShedTier::Arb
         );
+        let lag_arb_done = ExecHotShedEscalationState {
+            lag_tracker_shed_ticks: 1,
+            lag_arb_shed_ticks: 1,
+            ..none
+        };
         assert_eq!(
-            select_exec_hot_shed_tier(500, true, false, 0, 3, 3),
+            select_exec_hot_shed_tier(500, true, false, 0, lag_arb_done),
             ExecHotShedTier::Momentum
+        );
+    }
+
+    #[test]
+    fn exec_hot_shed_tier_lag_alarm_arb_without_tracker_zero_groups_idle() {
+        use ironcrab::metrics::ExecHotShedTier;
+
+        let lag_tracker_done = ExecHotShedEscalationState {
+            lag_tracker_shed_ticks: 1,
+            ..ExecHotShedEscalationState::default()
+        };
+        assert_eq!(
+            select_exec_hot_shed_tier(10, true, false, 0, lag_tracker_done),
+            ExecHotShedTier::Arb
+        );
+        let none = ExecHotShedEscalationState::default();
+        assert_eq!(
+            select_exec_hot_shed_tier(300, false, false, 0, none),
+            ExecHotShedTier::Tracker
+        );
+        let partial_idle = ExecHotShedEscalationState {
+            tracker_idle_ticks: 2,
+            ..none
+        };
+        assert_eq!(
+            select_exec_hot_shed_tier(300, false, false, 0, partial_idle),
+            ExecHotShedTier::Tracker
         );
     }
 
@@ -15198,22 +15319,25 @@ mod pr_b_geyser_tracking_tests {
             ExecHotShedTier::Tracker,
             10,
             true,
-            0,
-            0
+            ExecHotShedEscalationState::default()
         ));
         assert!(exec_hot_shed_tier_lag_triggered(
             ExecHotShedTier::Arb,
             100,
             true,
-            3,
-            0
+            ExecHotShedEscalationState {
+                lag_tracker_shed_ticks: 1,
+                ..ExecHotShedEscalationState::default()
+            }
         ));
         assert!(!exec_hot_shed_tier_lag_triggered(
             ExecHotShedTier::Arb,
             2_000,
             false,
-            3,
-            0
+            ExecHotShedEscalationState {
+                tracker_idle_ticks: 3,
+                ..ExecHotShedEscalationState::default()
+            }
         ));
     }
 
