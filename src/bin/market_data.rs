@@ -12732,6 +12732,22 @@ mod pr_b_geyser_tracking_tests {
         )
     }
 
+    /// Poll until track-worker coalesce flush records a batched Geyser sync (500 ms coalesce window).
+    async fn wait_for_geyser_sync_batch_increase(batch_before: u64) {
+        use ironcrab::metrics::MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL;
+
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(MARKET_DATA_TRACK_WORKER_COALESCE_MS + 500);
+        while tokio::time::Instant::now() < deadline {
+            if MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed) > batch_before {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let batch_after = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
+        panic!("expected geyser sync batch increase (before={batch_before}, after={batch_after})");
+    }
+
     fn test_noop_track_worker_sender() -> TrackWorkerSender {
         spawn_noop_track_worker_sender(4096)
     }
@@ -15910,14 +15926,13 @@ mod pr_b_geyser_tracking_tests {
         MarketDataContext::register_geyser_reserves_after_trade(&ctx, pool_b);
         md_state_try_enqueue(&md_state, MdStateCommand::FlushGeyserSyncDebounced);
 
-        // Let the actor drain; PR167 startup debounce min 250 ms — one coalesced flush.
-        tokio::time::sleep(Duration::from_millis(400)).await;
-
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             MARKET_DATA_GEYSER_SYNC_IMMEDIATE_TOTAL.load(Ordering::Relaxed),
             imm0,
             "trade-path reserve registration must not immediate-sync before debounce flush"
         );
+        wait_for_geyser_sync_batch_increase(batch0).await;
         let batch1 = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed);
         assert!(
             batch1 > batch0,
@@ -16464,7 +16479,7 @@ mod pr_b_geyser_tracking_tests {
             "account-path vault register must not immediate-sync"
         );
 
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        wait_for_geyser_sync_batch_increase(batch0).await;
         let batch_delta = MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed) - batch0;
         assert!(
             batch_delta >= 1,
@@ -16584,7 +16599,7 @@ mod pr_b_geyser_tracking_tests {
             "wallet mint track must not immediate-sync"
         );
 
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        wait_for_geyser_sync_batch_increase(batch0).await;
         assert!(
             MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL.load(Ordering::Relaxed) > batch0,
             "expected debounced batch sync after wallet mint track"
