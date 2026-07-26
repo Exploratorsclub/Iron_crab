@@ -84,13 +84,12 @@ use ironcrab::market_data::track::{
     arb_coalesce_try_send, explicit_admitted_pool_sets_from_admission, explicit_set_snapshot_path,
     explicit_subscription_has_new_keys, flush_explicit_set_snapshot, load_explicit_set_snapshot,
     momentum_coalesce_try_send, owner_group_snapshot_to_disk, pin_priority_for_momentum_active_pin,
-    pool_is_enrichment_member, restore_admission_from_owner_groups, spawn_track_worker,
-    track_worker_try_enqueue, try_admit_owner_group, AdmissionConvergeResult,
-    AdmissionRestoreResult, CapShrinkResult, ConsumerId, ExplicitAccountKind, ExplicitConsumer,
-    ExplicitEntry, ExplicitOwner, ExplicitOwnerKey, ExplicitSetSnapshot, ExplicitSnapshotRow,
-    FixedCapAdmission, GeyserConnectBarrier, PinPriority, SnapshotConsumer, TrackPinReason,
-    TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,
-    EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
+    restore_admission_from_owner_groups, spawn_track_worker, track_worker_try_enqueue,
+    try_admit_owner_group, AdmissionConvergeResult, AdmissionRestoreResult, CapShrinkResult,
+    ConsumerId, ExplicitAccountKind, ExplicitConsumer, ExplicitEntry, ExplicitOwner,
+    ExplicitOwnerKey, ExplicitSetSnapshot, ExplicitSnapshotRow, FixedCapAdmission,
+    GeyserConnectBarrier, PinPriority, SnapshotConsumer, TrackPinReason, TrackWorkerCommand,
+    TrackWorkerContext, TrackWorkerSender, EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
 };
 use ironcrab::metrics::{
     dec_market_data_account_enrich_ingress_queue_depth,
@@ -525,6 +524,7 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
 
     fn pool_mint_map_insert(&self, pool: String, mint: String) {
         self.ctx.pool_mint_map.write().insert(pool, mint);
+        self.ctx.refresh_pool_mint_map_pools_snapshot();
     }
 
     fn pool_mint_map_get(&self, pool: &str) -> Option<String> {
@@ -574,6 +574,7 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
 
     fn high_priority_bonding_curves_insert(&self, pool: Pubkey) {
         self.ctx.high_priority_bonding_curves.write().insert(pool);
+        self.ctx.refresh_high_priority_bonding_curves_snapshot();
     }
 
     fn known_pump_amm_pools_insert(&self, pool: Pubkey) -> bool {
@@ -795,6 +796,8 @@ struct UnifiedHotPoolRegistry {
     /// Scope C: subset of `momentum_pairs` opened via Position pin (exit hot-path).
     momentum_position_pairs: parking_lot::RwLock<std::collections::HashSet<(Pubkey, Pubkey)>>,
     arb_pools: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
+    /// L2d: lock-free ingest hot-pool membership (refreshed on pin/unpin).
+    hot_pool_pubkeys_snapshot: ArcSwap<HashSet<Pubkey>>,
 }
 
 #[allow(dead_code)]
@@ -804,7 +807,18 @@ impl UnifiedHotPoolRegistry {
             momentum_pairs: parking_lot::RwLock::new(std::collections::HashSet::new()),
             momentum_position_pairs: parking_lot::RwLock::new(std::collections::HashSet::new()),
             arb_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            hot_pool_pubkeys_snapshot: ArcSwap::from_pointee(HashSet::new()),
         }
+    }
+
+    fn refresh_hot_pool_pubkeys_snapshot(&self) {
+        self.hot_pool_pubkeys_snapshot
+            .store(Arc::new(self.snapshot_hot_pool_pubkeys()));
+    }
+
+    /// O(1) ingest classify lookup — no `pool_has_any_pin` scan on recv path.
+    fn ingest_is_hot_pool(&self, pool: &Pubkey) -> bool {
+        self.hot_pool_pubkeys_snapshot.load().contains(pool)
     }
 
     fn pin_pool(&self, mint: Pubkey, pool: Pubkey) {
@@ -818,6 +832,7 @@ impl UnifiedHotPoolRegistry {
         } else {
             self.momentum_position_pairs.write().remove(&(mint, pool));
         }
+        self.refresh_hot_pool_pubkeys_snapshot();
     }
 
     fn is_position_pin(&self, mint: Pubkey, pool: Pubkey) -> bool {
@@ -834,14 +849,17 @@ impl UnifiedHotPoolRegistry {
     fn unpin_pool(&self, mint: Pubkey, pool: Pubkey) {
         self.momentum_pairs.write().remove(&(mint, pool));
         self.momentum_position_pairs.write().remove(&(mint, pool));
+        self.refresh_hot_pool_pubkeys_snapshot();
     }
 
     fn pin_arb_pool(&self, pool: Pubkey) {
         self.arb_pools.write().insert(pool);
+        self.refresh_hot_pool_pubkeys_snapshot();
     }
 
     fn unpin_arb_pool(&self, pool: Pubkey) {
         self.arb_pools.write().remove(&pool);
+        self.refresh_hot_pool_pubkeys_snapshot();
     }
 
     fn pool_has_arb(&self, pool: Pubkey) -> bool {
@@ -1156,6 +1174,12 @@ struct MarketDataContext {
     tracked_membership: ArcSwap<TrackedMembershipSnapshot>,
     /// Scope F: EXEC_HOT vault/bin pubkeys for hot-pool legs only (no full explicit-set flood).
     exec_hot_membership: ArcSwap<ExecHotMembershipSnapshot>,
+    /// L2d: lock-free ingest enrichment pool_mint_map keys (Pubkey, no string hash on recv).
+    pool_mint_map_pools_snapshot: ArcSwap<HashSet<Pubkey>>,
+    /// L2d: lock-free ingest high-priority bonding-curve pubkeys.
+    high_priority_bonding_curves_snapshot: ArcSwap<HashSet<Pubkey>>,
+    /// L2d: lock-free PumpFun bonding-curve PDAs for tracked wallet mints.
+    pumpfun_wallet_bonding_curves_snapshot: ArcSwap<HashSet<Pubkey>>,
     /// PR237: pool → vault/bin pubkeys for O(legs) LRU touch (md-state writer only).
     pool_tracked_legs: parking_lot::RwLock<HashMap<Pubkey, PoolTrackedLegs>>,
 
@@ -2303,23 +2327,26 @@ impl IngestHost for MarketDataContext {
     }
 
     fn ingest_is_hot_pool(&self, pool: &Pubkey) -> bool {
-        self.hot_pool_registry.is_hot_pool(*pool)
+        self.hot_pool_registry.ingest_is_hot_pool(pool)
     }
 
     fn ingest_is_enrichment_member(&self, pool: &Pubkey) -> bool {
-        pool_is_enrichment_member(
-            self.pool_mint_map.read().contains_key(&pool.to_string()),
-            self.high_priority_bonding_curves.read().contains(pool),
-            self.hot_pool_registry.is_hot_pool(*pool),
-        )
+        self.pool_mint_map_pools_snapshot.load().contains(pool)
+            || self
+                .high_priority_bonding_curves_snapshot
+                .load()
+                .contains(pool)
+            || self.hot_pool_registry.ingest_is_hot_pool(pool)
     }
 
     fn ingest_pool_mint_map_contains(&self, pool: &Pubkey) -> bool {
-        self.pool_mint_map.read().contains_key(&pool.to_string())
+        self.pool_mint_map_pools_snapshot.load().contains(pool)
     }
 
     fn ingest_high_priority_bonding_curve_contains(&self, pool: &Pubkey) -> bool {
-        self.high_priority_bonding_curves.read().contains(pool)
+        self.high_priority_bonding_curves_snapshot
+            .load()
+            .contains(pool)
     }
 
     fn ingest_wallet_tracks_mint(&self, mint: &Pubkey) -> bool {
@@ -2327,13 +2354,9 @@ impl IngestHost for MarketDataContext {
     }
 
     fn ingest_pumpfun_bonding_curve_tracks_wallet(&self, pool: &Pubkey) -> bool {
-        for mint in self.tracked_wallet_mint_decimals.read().keys() {
-            let (bonding_curve, _) = PumpFunDex::derive_bonding_curve_static(mint);
-            if bonding_curve == *pool {
-                return true;
-            }
-        }
-        false
+        self.pumpfun_wallet_bonding_curves_snapshot
+            .load()
+            .contains(pool)
     }
 
     fn ingest_pumpfun_wallet_tracks_pool_mint(&self, pool: &Pubkey) -> bool {
@@ -2518,9 +2541,7 @@ impl TxIngestHost for MarketDataContext {
     }
 
     fn tx_wallet_mint_decimals_insert(&self, mint: Pubkey, decimals: u8) {
-        self.tracked_wallet_mint_decimals
-            .write()
-            .insert(mint, decimals);
+        self.note_tracked_wallet_mint_decimals(mint, decimals);
     }
 
     fn tx_wallet_notify_geyser_subscribe_accounts_changed(&self) {
@@ -2602,9 +2623,7 @@ impl AccountIngestHost for MarketDataContext {
     }
 
     fn account_wallet_mint_decimals_insert(&self, mint: Pubkey, decimals: u8) {
-        self.tracked_wallet_mint_decimals
-            .write()
-            .insert(mint, decimals);
+        self.note_tracked_wallet_mint_decimals(mint, decimals);
     }
 
     fn account_membership_mint_contains(&self, pubkey: &Pubkey) -> bool {
@@ -2676,6 +2695,14 @@ impl MarketDataContext {
 
     fn wallet_tracks_mint_for_geyser(&self, mint: &Pubkey) -> bool {
         self.tracked_wallet_mint_decimals.read().contains_key(mint)
+    }
+
+    /// Single writer path for tracked wallet mint decimals + ingest PumpFun bonding snapshot.
+    fn note_tracked_wallet_mint_decimals(&self, mint: Pubkey, decimals: u8) {
+        self.tracked_wallet_mint_decimals
+            .write()
+            .insert(mint, decimals);
+        self.refresh_pumpfun_wallet_bonding_curves_snapshot();
     }
 
     fn pool_has_explicit_momentum_admission(&self, pool: Pubkey) -> bool {
@@ -3153,6 +3180,7 @@ impl MarketDataContext {
                 }
             }
         }
+        self.refresh_pool_mint_map_pools_snapshot();
         self.refresh_tracked_membership_snapshot();
         self.refresh_hot_pool_registry_gauges();
         restored
@@ -3802,7 +3830,37 @@ impl MarketDataContext {
         set_market_data_momentum_active_pool_pins_gauge(self.hot_pool_registry.pair_count());
         set_market_data_arb_pinned_pools_gauge(arb);
         self.refresh_enrichment_registry_gauge();
+        self.hot_pool_registry.refresh_hot_pool_pubkeys_snapshot();
         self.refresh_exec_hot_membership_snapshot();
+    }
+
+    /// L2d: rebuild lock-free `pool_mint_map` pubkey set for ingest classify.
+    fn refresh_pool_mint_map_pools_snapshot(&self) {
+        let mut pools = HashSet::new();
+        for pool_str in self.pool_mint_map.read().keys() {
+            if let Ok(pk) = Pubkey::from_str(pool_str) {
+                pools.insert(pk);
+            }
+        }
+        self.pool_mint_map_pools_snapshot.store(Arc::new(pools));
+    }
+
+    /// L2d: rebuild lock-free high-priority bonding-curve set for ingest classify.
+    fn refresh_high_priority_bonding_curves_snapshot(&self) {
+        let curves = self.high_priority_bonding_curves.read().clone();
+        self.high_priority_bonding_curves_snapshot
+            .store(Arc::new(curves));
+    }
+
+    /// L2d: rebuild lock-free PumpFun wallet-bonding PDA set for ingest classify.
+    fn refresh_pumpfun_wallet_bonding_curves_snapshot(&self) {
+        let mut curves = HashSet::new();
+        for mint in self.tracked_wallet_mint_decimals.read().keys() {
+            let (bonding_curve, _) = PumpFunDex::derive_bonding_curve_static(mint);
+            curves.insert(bonding_curve);
+        }
+        self.pumpfun_wallet_bonding_curves_snapshot
+            .store(Arc::new(curves));
     }
 
     fn refresh_enrichment_registry_gauge(&self) {
@@ -6909,9 +6967,7 @@ async fn publish_wallet_snapshot(
                 );
                 6
             });
-        ctx.tracked_wallet_mint_decimals
-            .write()
-            .insert(*mint, decimals);
+        ctx.note_tracked_wallet_mint_decimals(*mint, decimals);
 
         // Resolve balance via ATA accounts only (no scanning).
         let ata_spl = derive_ata(wallet, mint, &token_program, &ata_program);
@@ -7538,6 +7594,9 @@ async fn main() -> Result<()> {
         tracked_bin_arrays_tx,
         tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
         exec_hot_membership: ArcSwap::from_pointee(ExecHotMembershipSnapshot::default()),
+        pool_mint_map_pools_snapshot: ArcSwap::from_pointee(HashSet::new()),
+        high_priority_bonding_curves_snapshot: ArcSwap::from_pointee(HashSet::new()),
+        pumpfun_wallet_bonding_curves_snapshot: ArcSwap::from_pointee(HashSet::new()),
         pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
         live_pool_cache: Arc::new(LivePoolCache::new()),
         creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -8387,6 +8446,15 @@ fn handle_account_broadcast_recv_ok(
     let iteration_start = Instant::now();
     if matches!(path, AccountBroadcastRecvPath::ExecHot) {
         inc_market_data_account_recv_iterations_total();
+    }
+
+    if matches!(path, AccountBroadcastRecvPath::Enrich)
+        && !ironcrab::market_data::ingest::account_geyser_enrich_path_needs_classify(
+            ctx,
+            &account_update,
+        )
+    {
+        return AccountBroadcastRecvOutcome::Continue;
     }
 
     let classify_start = Instant::now();
@@ -10143,7 +10211,7 @@ async fn run_geyser_loop(
 
                                         // 2) Cache decimals if provided
                                         if let Some(d) = mint_decimals {
-                                            ctx.tracked_wallet_mint_decimals.write().insert(mint, d);
+                                            ctx.note_tracked_wallet_mint_decimals(mint, d);
                                             ctx.live_pool_cache.set_mint_decimals(mint, d);
                                         }
 
@@ -11988,6 +12056,9 @@ mod wallet_snapshot_stale_cleanup_tests {
             tracked_bin_arrays_tx,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
             exec_hot_membership: ArcSwap::from_pointee(ExecHotMembershipSnapshot::default()),
+            pool_mint_map_pools_snapshot: ArcSwap::from_pointee(HashSet::new()),
+            high_priority_bonding_curves_snapshot: ArcSwap::from_pointee(HashSet::new()),
+            pumpfun_wallet_bonding_curves_snapshot: ArcSwap::from_pointee(HashSet::new()),
             pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: Arc::new(LivePoolCache::new()),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -12214,6 +12285,9 @@ mod wallet_tx_meta_balance_tests {
             tracked_bin_arrays_tx,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
             exec_hot_membership: ArcSwap::from_pointee(ExecHotMembershipSnapshot::default()),
+            pool_mint_map_pools_snapshot: ArcSwap::from_pointee(HashSet::new()),
+            high_priority_bonding_curves_snapshot: ArcSwap::from_pointee(HashSet::new()),
+            pumpfun_wallet_bonding_curves_snapshot: ArcSwap::from_pointee(HashSet::new()),
             pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: Arc::new(LivePoolCache::new()),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -13160,6 +13234,98 @@ mod pr_b_geyser_tracking_tests {
         assert!(!s.pool_has_any_pin(pool));
     }
 
+    /// L2d: hot-pool ingest snapshot stays correct with many momentum pins (O(1) lookup, no scan).
+    #[test]
+    fn l2d_hot_pool_snapshot_o1_many_pins() {
+        let registry = UnifiedHotPoolRegistry::new();
+        let target_pool = Pubkey::new_unique();
+        for i in 0..2_048 {
+            let mint = Pubkey::new_unique();
+            let pool = if i == 1_024 {
+                target_pool
+            } else {
+                Pubkey::new_unique()
+            };
+            registry.pin_pool(mint, pool);
+        }
+        assert!(registry.ingest_is_hot_pool(&target_pool));
+        assert!(!registry.ingest_is_hot_pool(&Pubkey::new_unique()));
+    }
+
+    /// L2d: enrichment membership via `pool_mint_map` pubkey snapshot after insert.
+    #[test]
+    fn l2d_enrichment_snapshot_after_pool_mint_map_insert() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        assert!(!ctx.ingest_is_enrichment_member(&pool));
+        ctx.pool_mint_map
+            .write()
+            .insert(pool.to_string(), Pubkey::new_unique().to_string());
+        ctx.refresh_pool_mint_map_pools_snapshot();
+        assert!(ctx.ingest_pool_mint_map_contains(&pool));
+        assert!(ctx.ingest_is_enrichment_member(&pool));
+    }
+
+    /// L2d: PumpFun wallet-bonding PDA snapshot drives relevance without recv-path PDA loop.
+    #[test]
+    fn l2d_pumpfun_wallet_bonding_snapshot_relevance() {
+        use ironcrab::market_data::ingest::account_geyser_update_relevance;
+        use ironcrab::solana::dex::pumpfun::PumpFunDex;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let mint = Pubkey::new_unique();
+        let (bonding_curve, _) = PumpFunDex::derive_bonding_curve_static(&mint);
+        ctx.account_wallet_mint_decimals_insert(mint, 6);
+        assert!(ctx.ingest_pumpfun_bonding_curve_tracks_wallet(&bonding_curve));
+        let u = GeyserAccountUpdate {
+            pubkey: bonding_curve,
+            slot: 1,
+            owner: solana_sdk::pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),
+            data: vec![],
+            lamports: 0,
+            grpc_recv_at: Instant::now(),
+        };
+        assert_eq!(
+            account_geyser_update_relevance(&ctx, &u),
+            ironcrab::market_data::ingest::AccountGeyserRelevance::Relevant
+        );
+    }
+
+    /// L2d follow-up: NATS/wallet-track insert path must refresh bonding PDA snapshot.
+    #[test]
+    fn l2d_pumpfun_wallet_bonding_snapshot_via_note_tracked_wallet_mint_decimals() {
+        use ironcrab::market_data::ingest::account_geyser_update_relevance;
+        use ironcrab::solana::dex::pumpfun::PumpFunDex;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let mint = Pubkey::new_unique();
+        let (bonding_curve, _) = PumpFunDex::derive_bonding_curve_static(&mint);
+        assert!(!ctx.ingest_pumpfun_bonding_curve_tracks_wallet(&bonding_curve));
+        ctx.note_tracked_wallet_mint_decimals(mint, 9);
+        assert!(ctx.ingest_pumpfun_bonding_curve_tracks_wallet(&bonding_curve));
+        let u = GeyserAccountUpdate {
+            pubkey: bonding_curve,
+            slot: 1,
+            owner: solana_sdk::pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),
+            data: vec![],
+            lamports: 0,
+            grpc_recv_at: Instant::now(),
+        };
+        assert_eq!(
+            account_geyser_update_relevance(&ctx, &u),
+            ironcrab::market_data::ingest::AccountGeyserRelevance::Relevant
+        );
+    }
+
     /// Bugbot PR-146: paired vault eviction must never pick a pinned sibling for `lru_cap_pair`.
     #[test]
     fn geyser_sibling_evict_helper_skips_pinned_leg() {
@@ -13306,6 +13472,9 @@ mod pr_b_geyser_tracking_tests {
             tracked_bin_arrays_tx,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
             exec_hot_membership: ArcSwap::from_pointee(ExecHotMembershipSnapshot::default()),
+            pool_mint_map_pools_snapshot: ArcSwap::from_pointee(HashSet::new()),
+            high_priority_bonding_curves_snapshot: ArcSwap::from_pointee(HashSet::new()),
+            pumpfun_wallet_bonding_curves_snapshot: ArcSwap::from_pointee(HashSet::new()),
             pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: live_pool_cache.unwrap_or_else(|| Arc::new(LivePoolCache::new())),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -13382,6 +13551,9 @@ mod pr_b_geyser_tracking_tests {
             tracked_bin_arrays_tx,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
             exec_hot_membership: ArcSwap::from_pointee(ExecHotMembershipSnapshot::default()),
+            pool_mint_map_pools_snapshot: ArcSwap::from_pointee(HashSet::new()),
+            high_priority_bonding_curves_snapshot: ArcSwap::from_pointee(HashSet::new()),
+            pumpfun_wallet_bonding_curves_snapshot: ArcSwap::from_pointee(HashSet::new()),
             pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: Arc::new(LivePoolCache::new()),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -14435,6 +14607,7 @@ mod pr_b_geyser_tracking_tests {
         ctx.pool_mint_map
             .write()
             .insert(pool.to_string(), Pubkey::new_unique().to_string());
+        ctx.refresh_pool_mint_map_pools_snapshot();
         let u = GeyserAccountUpdate {
             pubkey: pool,
             slot: 1,
@@ -14577,6 +14750,7 @@ mod pr_b_geyser_tracking_tests {
         ctx.pool_mint_map
             .write()
             .insert(pool.to_string(), Pubkey::new_unique().to_string());
+        ctx.refresh_pool_mint_map_pools_snapshot();
         assert!(worker.is_enrichment_member(&pool));
         assert!(!worker.is_hot_pool(&pool));
         assert!(!worker.pool_has_live_vault_geyser_feed(pool));
@@ -14592,6 +14766,7 @@ mod pr_b_geyser_tracking_tests {
         ctx.pool_mint_map
             .write()
             .insert(pool.to_string(), Pubkey::new_unique().to_string());
+        ctx.refresh_pool_mint_map_pools_snapshot();
         let u = GeyserAccountUpdate {
             pubkey: pool,
             slot: 1,
@@ -14912,6 +15087,7 @@ mod pr_b_geyser_tracking_tests {
         ctx.pool_mint_map
             .write()
             .insert(enrich_pool.to_string(), Pubkey::new_unique().to_string());
+        ctx.refresh_pool_mint_map_pools_snapshot();
 
         let (high_tx, _high_rx) = mpsc::channel(4);
         let (enrich_ingress_tx, mut enrich_ingress_rx) = mpsc::channel(4);
@@ -15071,6 +15247,7 @@ mod pr_b_geyser_tracking_tests {
         ctx.pool_mint_map
             .write()
             .insert(enrich_pool.to_string(), Pubkey::new_unique().to_string());
+        ctx.refresh_pool_mint_map_pools_snapshot();
 
         let mk_update = |pubkey: Pubkey, slot: u64| GeyserAccountUpdate {
             pubkey,
