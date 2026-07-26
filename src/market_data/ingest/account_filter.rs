@@ -113,6 +113,57 @@ pub fn account_geyser_update_relevance<H: IngestHost>(
     AccountGeyserRelevance::EarlyDrop(MarketDataAccountEarlyDropReason::DexPoolNotEnrichment)
 }
 
+/// L2d: ENRICH recv cheap prefilter — skip full classify when class cannot be `Enrich`.
+///
+/// Uses only O(1) snapshot lookups (no RwLock holds, no string keys, no pin scans).
+#[inline]
+pub fn account_geyser_enrich_path_needs_classify<H: IngestHost>(
+    host: &H,
+    u: &GeyserAccountUpdate,
+) -> bool {
+    if let Some((wallet, wsol_ata)) = host.ingest_tracked_wallet_pubkeys() {
+        if u.pubkey == wallet || u.pubkey == wsol_ata {
+            return true;
+        }
+        if host.ingest_tracked_wallet_token_account_contains(&u.pubkey) {
+            return true;
+        }
+    }
+    if host.ingest_membership_contains(&u.pubkey) {
+        if host.ingest_exec_hot_vault_contains(&u.pubkey)
+            || host.ingest_exec_hot_bin_array_contains(&u.pubkey)
+        {
+            return false;
+        }
+        return true;
+    }
+    if !account_geyser_update_is_dex_pool_owner(&u.owner) {
+        return false;
+    }
+    let pool_pk = u.pubkey;
+    if host.ingest_is_hot_pool(&pool_pk) {
+        return false;
+    }
+    if host.ingest_high_priority_bonding_curve_contains(&pool_pk) {
+        return false;
+    }
+    if host.ingest_wallet_tracks_mint(&pool_pk) {
+        return false;
+    }
+    if u.owner == PUMPFUN_PROGRAM_OWNER {
+        if host.ingest_pumpfun_bonding_curve_tracks_wallet(&pool_pk) {
+            return true;
+        }
+        if host.ingest_pumpfun_wallet_tracks_pool_mint(&pool_pk) {
+            return false;
+        }
+    }
+    if host.ingest_pool_mint_map_contains(&pool_pk) {
+        return true;
+    }
+    false
+}
+
 /// Cheap filter before DEX parse / heavy locks: drop clearly irrelevant account updates.
 /// Conservative: any DEX program owner we parse in `parse_pool_account` / `parse_account_update` stays in.
 pub fn account_geyser_update_might_be_relevant<H: IngestHost>(
@@ -416,5 +467,27 @@ mod tests {
             early_drop_reason,
             Some(MarketDataAccountEarlyDropReason::DexPoolNotEnrichment)
         );
+    }
+
+    #[test]
+    fn account_geyser_enrich_path_skips_exec_hot_hot_pool() {
+        let pool = Pubkey::new_unique();
+        let mut host = MockIngestHost::new();
+        host.hot_pools.insert(pool);
+        let u = sample_update(pool, RAYDIUM_CPMM_OWNER);
+        assert!(!account_geyser_enrich_path_needs_classify(&host, &u));
+        let (class, _) = classify_account_geyser_update(&host, &u);
+        assert_eq!(class, AccountUpdateClass::ExecHot);
+    }
+
+    #[test]
+    fn account_geyser_enrich_path_needs_classify_for_enrichment_only_pool() {
+        let pool = Pubkey::new_unique();
+        let mut host = MockIngestHost::new();
+        host.enrichment_members.insert(pool);
+        let u = sample_update(pool, RAYDIUM_CPMM_OWNER);
+        assert!(account_geyser_enrich_path_needs_classify(&host, &u));
+        let (class, _) = classify_account_geyser_update(&host, &u);
+        assert_eq!(class, AccountUpdateClass::Enrich);
     }
 }
