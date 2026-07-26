@@ -2541,9 +2541,7 @@ impl TxIngestHost for MarketDataContext {
     }
 
     fn tx_wallet_mint_decimals_insert(&self, mint: Pubkey, decimals: u8) {
-        self.tracked_wallet_mint_decimals
-            .write()
-            .insert(mint, decimals);
+        self.note_tracked_wallet_mint_decimals(mint, decimals);
     }
 
     fn tx_wallet_notify_geyser_subscribe_accounts_changed(&self) {
@@ -2625,10 +2623,7 @@ impl AccountIngestHost for MarketDataContext {
     }
 
     fn account_wallet_mint_decimals_insert(&self, mint: Pubkey, decimals: u8) {
-        self.tracked_wallet_mint_decimals
-            .write()
-            .insert(mint, decimals);
-        self.refresh_pumpfun_wallet_bonding_curves_snapshot();
+        self.note_tracked_wallet_mint_decimals(mint, decimals);
     }
 
     fn account_membership_mint_contains(&self, pubkey: &Pubkey) -> bool {
@@ -2700,6 +2695,14 @@ impl MarketDataContext {
 
     fn wallet_tracks_mint_for_geyser(&self, mint: &Pubkey) -> bool {
         self.tracked_wallet_mint_decimals.read().contains_key(mint)
+    }
+
+    /// Single writer path for tracked wallet mint decimals + ingest PumpFun bonding snapshot.
+    fn note_tracked_wallet_mint_decimals(&self, mint: Pubkey, decimals: u8) {
+        self.tracked_wallet_mint_decimals
+            .write()
+            .insert(mint, decimals);
+        self.refresh_pumpfun_wallet_bonding_curves_snapshot();
     }
 
     fn pool_has_explicit_momentum_admission(&self, pool: Pubkey) -> bool {
@@ -6964,9 +6967,7 @@ async fn publish_wallet_snapshot(
                 );
                 6
             });
-        ctx.tracked_wallet_mint_decimals
-            .write()
-            .insert(*mint, decimals);
+        ctx.note_tracked_wallet_mint_decimals(*mint, decimals);
 
         // Resolve balance via ATA accounts only (no scanning).
         let ata_spl = derive_ata(wallet, mint, &token_program, &ata_program);
@@ -10210,7 +10211,7 @@ async fn run_geyser_loop(
 
                                         // 2) Cache decimals if provided
                                         if let Some(d) = mint_decimals {
-                                            ctx.tracked_wallet_mint_decimals.write().insert(mint, d);
+                                            ctx.note_tracked_wallet_mint_decimals(mint, d);
                                             ctx.live_pool_cache.set_mint_decimals(mint, d);
                                         }
 
@@ -13281,6 +13282,35 @@ mod pr_b_geyser_tracking_tests {
         let mint = Pubkey::new_unique();
         let (bonding_curve, _) = PumpFunDex::derive_bonding_curve_static(&mint);
         ctx.account_wallet_mint_decimals_insert(mint, 6);
+        assert!(ctx.ingest_pumpfun_bonding_curve_tracks_wallet(&bonding_curve));
+        let u = GeyserAccountUpdate {
+            pubkey: bonding_curve,
+            slot: 1,
+            owner: solana_sdk::pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),
+            data: vec![],
+            lamports: 0,
+            grpc_recv_at: Instant::now(),
+        };
+        assert_eq!(
+            account_geyser_update_relevance(&ctx, &u),
+            ironcrab::market_data::ingest::AccountGeyserRelevance::Relevant
+        );
+    }
+
+    /// L2d follow-up: NATS/wallet-track insert path must refresh bonding PDA snapshot.
+    #[test]
+    fn l2d_pumpfun_wallet_bonding_snapshot_via_note_tracked_wallet_mint_decimals() {
+        use ironcrab::market_data::ingest::account_geyser_update_relevance;
+        use ironcrab::solana::dex::pumpfun::PumpFunDex;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let mint = Pubkey::new_unique();
+        let (bonding_curve, _) = PumpFunDex::derive_bonding_curve_static(&mint);
+        assert!(!ctx.ingest_pumpfun_bonding_curve_tracks_wallet(&bonding_curve));
+        ctx.note_tracked_wallet_mint_decimals(mint, 9);
         assert!(ctx.ingest_pumpfun_bonding_curve_tracks_wallet(&bonding_curve));
         let u = GeyserAccountUpdate {
             pubkey: bonding_curve,
