@@ -1677,7 +1677,16 @@ fn pool_cache_balance_fields_from_state(
             s.pc_reserve.unwrap_or(0),
             "raydium",
         )),
-        CachedPoolState::PumpFun(_) => None,
+        CachedPoolState::PumpFun(s) => {
+            let wsol = Pubkey::from_str(NATIVE_SOL_MINT).ok()?;
+            Some((
+                s.token_mint,
+                wsol,
+                s.virtual_token_reserves,
+                s.virtual_sol_reserves,
+                "pumpfun",
+            ))
+        }
     }
 }
 
@@ -1693,7 +1702,9 @@ fn cached_pool_has_fresh_reserve_basis(state: &CachedPoolState) -> bool {
         CachedPoolState::PumpAmm(s) => fresh(s.base_reserve) || fresh(s.quote_reserve),
         CachedPoolState::Orca(s) => fresh(s.vault_a_balance) || fresh(s.vault_b_balance),
         CachedPoolState::RaydiumAmm(s) => fresh(s.coin_reserve) || fresh(s.pc_reserve),
-        CachedPoolState::PumpFun(_) => false,
+        CachedPoolState::PumpFun(s) => {
+            !s.complete && s.virtual_sol_reserves > 0 && s.virtual_token_reserves > 0
+        }
     }
 }
 
@@ -1901,6 +1912,9 @@ fn planned_explicit_pubkeys_for_pool_from_cache(
                 }
             }
         }
+    }
+    if let CachedPoolState::PumpFun(_) = state {
+        set.insert(pool);
     }
     if let Some((a, b)) = pool_mints_for_geyser_explicit_tracking(state) {
         set.insert(a);
@@ -3811,7 +3825,29 @@ impl MarketDataContext {
                 out.push(*pk);
             }
         }
+        if self.hot_pool_registry.is_hot_pool(pool) {
+            if let Some(CachedPoolState::PumpFun(_)) = self.live_pool_cache.get(&pool) {
+                out.push(pool);
+            }
+        }
         out
+    }
+
+    /// PumpFun bonding curve must be in the last Geyser explicit flush (not vacuous vault satisfied).
+    fn pool_pumpfun_bonding_curve_registration_satisfied(
+        &self,
+        pool: Pubkey,
+        state: &CachedPoolState,
+    ) -> bool {
+        match state {
+            CachedPoolState::PumpFun(_) => {
+                if !self.hot_pool_registry.is_hot_pool(pool) {
+                    return true;
+                }
+                self.last_synced_explicit_pubkeys.read().contains(&pool)
+            }
+            _ => true,
+        }
     }
 
     /// True when all vault/bin pubkeys for this pool were included in the last Geyser sync flush.
@@ -4425,6 +4461,32 @@ impl MarketDataContext {
                     let readiness = raydium_cpmm_readiness_for_pool_cache_update(s);
                     balance_update.set_dex_readiness_in_metadata(readiness);
                 }
+            } else if dex == "pumpfun" {
+                if let CachedPoolState::PumpFun(ref s) = state {
+                    let mut meta = std::collections::HashMap::new();
+                    if s.creator != Pubkey::default() {
+                        meta.insert("creator".to_string(), s.creator.to_string());
+                    }
+                    meta.insert(
+                        "associated_bonding_curve".to_string(),
+                        s.associated_bonding_curve.to_string(),
+                    );
+                    meta.insert("complete".to_string(), s.complete.to_string());
+                    meta.insert(
+                        "real_token_reserves".to_string(),
+                        s.real_token_reserves.to_string(),
+                    );
+                    meta.insert(
+                        "real_sol_reserves".to_string(),
+                        s.real_sol_reserves.to_string(),
+                    );
+                    meta.insert(
+                        "cashback_enabled".to_string(),
+                        s.cashback_enabled.to_string(),
+                    );
+                    balance_update.metadata = Some(meta);
+                    balance_update.set_dex_readiness_in_metadata(DexPoolReadiness::Partial);
+                }
             }
             let subject = pool_subject(&pool_str);
             let _ = nats.jetstream_publish(&subject, &balance_update).await;
@@ -4726,6 +4788,7 @@ impl MarketDataContext {
         };
         self.pool_vaults_fully_tracked_for_cache(pool, &state)
             && self.pool_geyser_bins_fully_tracked_for_cache(pool, &state)
+            && self.pool_pumpfun_bonding_curve_registration_satisfied(pool, &state)
     }
 
     fn note_deferred_hot_pool_reserve_registration(&self, pool: Pubkey, pin: GeyserPinReason) {
@@ -5132,6 +5195,8 @@ impl MarketDataContext {
             let superseded_present = admission
                 .owner_group(&Self::pool_consumer_owner(pool_pk, superseded_consumer))
                 .is_some();
+            let admitted_before: HashSet<Pubkey> =
+                admission.snapshot_pubkeys().into_iter().collect();
             if momentum_consumer == ExplicitConsumer::Momentum
                 && market_data_exec_hot_momentum_admit_suppress()
             {
@@ -5150,6 +5215,11 @@ impl MarketDataContext {
             if self.try_admit_pool_consumer_group(admission, pool_pk, momentum_consumer) {
                 if superseded_present {
                     self.release_pool_consumer_group(admission, pool_pk, superseded_consumer);
+                }
+                let admitted_after: HashSet<Pubkey> =
+                    admission.snapshot_pubkeys().into_iter().collect();
+                if admitted_before != admitted_after {
+                    batch_dirty = true;
                 }
                 inc_market_data_momentum_admission_admitted_total();
                 let registered = self.register_geyser_reserves_for_momentum_active_pool(pool_pk);
@@ -12829,6 +12899,181 @@ mod pr_b_geyser_tracking_tests {
         data[137..169].copy_from_slice(token_0_vault.as_ref());
         data[169..201].copy_from_slice(token_1_vault.as_ref());
         data
+    }
+
+    fn test_pumpfun_bonding_curve_account_data(
+        virtual_token: u64,
+        virtual_sol: u64,
+        real_token: u64,
+        real_sol: u64,
+        creator: Pubkey,
+    ) -> Vec<u8> {
+        let mut data = vec![0u8; 83];
+        data[8..16].copy_from_slice(&virtual_token.to_le_bytes());
+        data[16..24].copy_from_slice(&virtual_sol.to_le_bytes());
+        data[24..32].copy_from_slice(&real_token.to_le_bytes());
+        data[32..40].copy_from_slice(&real_sol.to_le_bytes());
+        data[49..81].copy_from_slice(creator.as_ref());
+        data
+    }
+
+    #[test]
+    fn planned_explicit_pubkeys_includes_pumpfun_bonding_curve() {
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let state = CachedPoolState::PumpFun(PumpFunState {
+            token_mint: mint,
+            bonding_curve: pool,
+            associated_bonding_curve: Pubkey::new_unique(),
+            virtual_sol_reserves: 30_000_000_000,
+            virtual_token_reserves: 1_073_000_000_000_000,
+            real_sol_reserves: 10_000_000_000,
+            real_token_reserves: 500_000_000_000_000,
+            complete: false,
+            creator: Pubkey::new_unique(),
+            cashback_enabled: false,
+        });
+        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true);
+        assert!(
+            pubkeys.contains(&pool),
+            "bonding curve (pool pubkey) must be in planned explicit set"
+        );
+        assert!(pubkeys.contains(&mint));
+    }
+
+    #[test]
+    fn pumpfun_hot_pin_reserve_registration_requires_curve_sync() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: mint,
+                bonding_curve: pool,
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: 30_000_000_000,
+                virtual_token_reserves: 1_073_000_000_000_000,
+                real_sol_reserves: 10_000_000_000,
+                real_token_reserves: 500_000_000_000_000,
+                complete: false,
+                creator: Pubkey::new_unique(),
+                cashback_enabled: false,
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+        ctx.note_explicit_momentum_pool_admitted(pool);
+
+        assert!(
+            !ctx.hot_pool_reserve_registration_satisfied(pool),
+            "vacuous vault satisfied must not apply before bonding curve Geyser sync"
+        );
+
+        ctx.last_synced_explicit_pubkeys.write().insert(pool);
+        assert!(
+            ctx.hot_pool_reserve_registration_satisfied(pool),
+            "after curve pubkey synced, hot-pool reserve registration must be satisfied"
+        );
+    }
+
+    #[test]
+    fn try_publish_balance_updated_from_cache_pumpfun_uses_fresh_basis() {
+        use ironcrab::metrics::MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: mint,
+                bonding_curve: pool,
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: 30_000_000_000,
+                virtual_token_reserves: 1_073_000_000_000_000,
+                real_sol_reserves: 10_000_000_000,
+                real_token_reserves: 500_000_000_000_000,
+                complete: false,
+                creator: Pubkey::new_unique(),
+                cashback_enabled: false,
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+
+        let counter_before = MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed);
+        ctx.try_publish_balance_updated_from_cache(pool);
+        assert_eq!(
+            MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed),
+            counter_before,
+            "without NATS the publish is a no-op, but fresh-basis gate must not block earlier"
+        );
+        assert!(
+            cached_pool_has_fresh_reserve_basis(&ctx.live_pool_cache.get(&pool).unwrap()),
+            "PumpFun with virtual reserves must pass fresh-basis gate"
+        );
+    }
+
+    #[test]
+    fn pumpfun_exec_hot_account_update_enqueues_pool_cache_publish() {
+        use ironcrab::market_data::sidefx::handlers::md_sidefx_process_live_pool_cache_account_update;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, _depth, _md_state_rx) = test_md_state_sender_no_worker();
+        let worker = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        ctx.pool_mint_map
+            .write()
+            .insert(pool.to_string(), mint.to_string());
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+
+        let account_data = test_pumpfun_bonding_curve_account_data(
+            1_073_000_000_000_000,
+            30_000_000_000,
+            500_000_000_000_000,
+            10_000_000_000,
+            creator,
+        );
+
+        let mut scratch = MdSidefxBurstScratch::new();
+        md_sidefx_process_live_pool_cache_account_update(
+            &worker,
+            &MdSidefxCommand::LivePoolCacheAccountUpdate {
+                run_id: "pumpfun-exec-hot".into(),
+                pool_pubkey: pool,
+                owner: PUMPFUN_PROGRAM_OWNER,
+                account_data,
+                slot: 42,
+                grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::ExecHot,
+            },
+            &mut scratch,
+        );
+        assert!(ctx.live_pool_cache.get(&pool).is_some());
+        let state = ctx.live_pool_cache.get(&pool).expect("cache row");
+        assert!(
+            cached_pool_has_fresh_reserve_basis(&state),
+            "ExecHot bonding-curve parse must populate fresh virtual reserves"
+        );
+        assert!(
+            pool_cache_balance_fields_from_state(&state).is_some(),
+            "PumpFun must expose balance fields for JetStream publish path"
+        );
     }
 
     #[test]
