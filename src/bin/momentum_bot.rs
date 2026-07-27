@@ -5472,6 +5472,14 @@ impl MomentumContext {
                                 > Duration::from_secs(config.wait_hot_set_timeout_secs)
                     );
                     if wait_hot_timed_out {
+                        if let TrackerState::WaitHotSet { entered_at } = tracker.state {
+                            let duration_ms =
+                                wall_now.duration_since(entered_at).as_millis() as u64;
+                            ironcrab::metrics::record_momentum_wait_hot_set_exit(
+                                ironcrab::metrics::MomentumWaitHotSetExitReason::Timeout,
+                                duration_ms,
+                            );
+                        }
                         tracker.state = TrackerState::Validation;
                         tracker.last_wait_filter_obs_key = None;
                         self.queue_momentum_active_pool_removed(
@@ -5481,6 +5489,10 @@ impl MomentumContext {
                         );
                         continue 'tracker_keys;
                     }
+                    let wait_hot_entered_at = match tracker.state {
+                        TrackerState::WaitHotSet { entered_at } => Some(entered_at),
+                        _ => None,
+                    };
                     let (should_trade, reason) = tracker.should_generate_intent(
                         config,
                         mint_info,
@@ -5488,6 +5500,16 @@ impl MomentumContext {
                         wall_now,
                     );
                     if was_not_rejected && tracker.is_rejected() {
+                        if was_wait_hot_set {
+                            if let Some(entered_at) = wait_hot_entered_at {
+                                let duration_ms =
+                                    wall_now.duration_since(entered_at).as_millis() as u64;
+                                ironcrab::metrics::record_momentum_wait_hot_set_exit(
+                                    ironcrab::metrics::MomentumWaitHotSetExitReason::FilterFailed,
+                                    duration_ms,
+                                );
+                            }
+                        }
                         self.record_token_blacklisted_once(&mint);
                         let removed_reason = if was_wait_hot_set {
                             "filter_failed"
@@ -5506,6 +5528,9 @@ impl MomentumContext {
                             self.mark_entry_eval_dirty_key(key);
                             continue 'tracker_keys;
                         }
+                        let entry_hot_fresh =
+                            self.entry_hot_set_fresh(&mint, tracker.pool.as_str());
+                        ironcrab::metrics::record_momentum_filter_pass_hot_fresh(entry_hot_fresh);
                         if probe_sol == 0 {
                             warn!(
                                 mint = %mint,
@@ -5521,9 +5546,20 @@ impl MomentumContext {
                             continue 'tracker_keys;
                         }
                         if matches!(tracker.state, TrackerState::WaitHotSet { .. }) {
-                            if self.entry_hot_set_fresh(&mint, tracker.pool.as_str()) {
+                            if entry_hot_fresh {
+                                if let TrackerState::WaitHotSet { entered_at } = tracker.state {
+                                    let duration_ms =
+                                        wall_now.duration_since(entered_at).as_millis() as u64;
+                                    ironcrab::metrics::record_momentum_wait_hot_set_exit(
+                                        ironcrab::metrics::MomentumWaitHotSetExitReason::Intent,
+                                        duration_ms,
+                                    );
+                                }
                                 tracker.state = TrackerState::ProbeBuyPending { sent_at: wall_now };
                                 mint_emitted_entry_this_tick.insert(mint.clone());
+                                ironcrab::metrics::record_momentum_intent_path(
+                                    ironcrab::metrics::MomentumIntentPath::AfterWaitHot,
+                                );
                                 signals.push(EntrySignal {
                                     mint,
                                     pool: tracker.pool.clone(),
@@ -5535,10 +5571,25 @@ impl MomentumContext {
                             } else {
                                 self.mark_entry_eval_dirty_key(key);
                             }
+                        } else if entry_hot_fresh {
+                            tracker.state = TrackerState::ProbeBuyPending { sent_at: wall_now };
+                            mint_emitted_entry_this_tick.insert(mint.clone());
+                            ironcrab::metrics::record_momentum_intent_path(
+                                ironcrab::metrics::MomentumIntentPath::ImmediateHot,
+                            );
+                            signals.push(EntrySignal {
+                                mint,
+                                pool: tracker.pool.clone(),
+                                dex: tracker.dex.clone(),
+                                sol_amount: probe_sol,
+                                kind: EntryKind::Probe,
+                                reason: format!("ENTER_PROBE_BUY: {reason}"),
+                            });
                         } else {
                             tracker.state = TrackerState::WaitHotSet {
                                 entered_at: wall_now,
                             };
+                            ironcrab::metrics::inc_momentum_wait_hot_set_enter_total();
                             self.queue_momentum_active_pool_active(
                                 &mint,
                                 tracker.pool.as_str(),
@@ -13183,9 +13234,6 @@ mod tests {
         ctx.mark_entry_eval_dirty_key(&hot_key);
 
         seed_test_entry_hot_set(&ctx, mint.as_str(), pool_hot.as_str());
-        let _ = ctx.check_for_signals_dirty_priority_tick();
-        ctx.dirty_entry_tracker_keys.write().clear();
-        ctx.mark_entry_eval_dirty_key(&hot_key);
         let signals = ctx.check_for_signals_dirty_priority_tick();
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].pool, pool_hot);
@@ -13303,17 +13351,6 @@ mod tests {
 
         seed_test_entry_hot_set(&ctx, mint.as_str(), pool_first.as_str());
         seed_test_entry_hot_set(&ctx, mint.as_str(), pool_second.as_str());
-        let _ = ctx.check_for_signals_dirty_priority_tick();
-        ctx.dirty_entry_tracker_keys.write().clear();
-        ctx.mark_entry_eval_dirty_key(&MomentumContext::tracker_storage_key(
-            mint.as_str(),
-            pool_first.as_str(),
-        ));
-        ctx.mark_entry_eval_dirty_key(&MomentumContext::tracker_storage_key(
-            mint.as_str(),
-            pool_second.as_str(),
-        ));
-
         let signals = ctx.check_for_signals_dirty_priority_tick();
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].pool, pool_first);
@@ -19555,20 +19592,17 @@ mod tests {
         ));
 
         seed_test_entry_hot_set(&ctx, mint.as_str(), pool.as_str());
-        let _ = ctx.check_for_signals_dirty_priority_tick();
-        ctx.dirty_entry_tracker_keys.write().clear();
-        ctx.mark_entry_eval_dirty_key(&MomentumContext::tracker_storage_key(
-            mint.as_str(),
-            pool.as_str(),
-        ));
-
         let signals = ctx.check_for_signals_dirty_priority_tick();
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].pool, pool);
     }
 
     #[test]
+    #[serial_test::serial]
     fn wait_hot_set_timeout_unpins_without_intent() {
+        use ironcrab::metrics::wait_hot_set_test_counters;
+        wait_hot_set_test_counters::reset();
+
         let cfg = {
             let mut c = MomentumConfig::default();
             c.default_position_lamports = 1_000;
@@ -19658,6 +19692,119 @@ mod tests {
                 .any(|r| r.reason == "hot_set_timeout"),
             "timeout must publish removed hot_set_timeout"
         );
+        assert_eq!(
+            wait_hot_set_test_counters::wait_hot_set_exit_timeout_total(),
+            1,
+            "timeout must record wait_hot_set exit reason=timeout"
+        );
+        assert_eq!(
+            wait_hot_set_test_counters::wait_hot_set_duration_count(),
+            1,
+            "timeout must record wait_hot_set duration histogram sample"
+        );
+    }
+
+    fn probe_entry_filter_pass_config() -> MomentumConfig {
+        let mut c = MomentumConfig::default();
+        c.default_position_lamports = 1_000;
+        c.probe_buy_pct = 0.25;
+        c.early_min_liquidity_sol = 0.0;
+        c.min_unique_buyers = 0;
+        c.min_trades_per_min = 0.0;
+        c.min_buy_dominance = 0.0;
+        c.min_sol_inflow_lamports = 0;
+        c.require_mint_authority_renounced = false;
+        c.require_freeze_authority_none = false;
+        c.top1_buyer_share_cap = 1.0;
+        c.top3_buyer_share_cap = 1.0;
+        c.repeat_buyer_min_ratio = 0.0;
+        c.min_trade_size_lamports = 0;
+        c.small_buy_ratio_cap = 1.0;
+        c.min_token_age_secs = 0;
+        c
+    }
+
+    fn seed_probe_ready_tracker(
+        ctx: &MomentumContext,
+        cfg: &MomentumConfig,
+        mint: &str,
+        pool: &str,
+    ) -> String {
+        let sk = MomentumContext::tracker_storage_key(mint, pool);
+        assert!(ctx.get_or_create_tracker(mint, pool, "raydium", 1, 10_000_000_000));
+        let mut trackers = ctx.token_trackers.write();
+        let tr = trackers.get_mut(&sk).expect("tracker");
+        for i in 0..20 {
+            tr.record_trade(
+                &format!("buy{i:03}"),
+                true,
+                200_000_000,
+                2_000_000,
+                &format!("sig{i:03}"),
+                1 + i as u64,
+                cfg,
+            );
+        }
+        sk
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn wait_hot_set_stale_cache_enters_and_records_metrics() {
+        use ironcrab::metrics::wait_hot_set_test_counters;
+        wait_hot_set_test_counters::reset();
+
+        let cfg = probe_entry_filter_pass_config();
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "MintWaitHotStale88888888888888888888888888888";
+        let pool = "poolWaitHotStale8888888888888888888888888888";
+        let sk = seed_probe_ready_tracker(&ctx, &cfg, mint, pool);
+
+        let signals = ctx.check_for_signals();
+        assert!(signals.is_empty());
+        assert!(ctx
+            .token_trackers
+            .read()
+            .get(&sk)
+            .is_some_and(|t| matches!(t.state, TrackerState::WaitHotSet { .. })));
+        assert_eq!(wait_hot_set_test_counters::wait_hot_set_enter_total(), 1);
+        assert_eq!(wait_hot_set_test_counters::filter_pass_hot_fresh_false(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn filter_pass_fresh_emits_immediate_hot_without_wait_hot_set() {
+        use ironcrab::metrics::wait_hot_set_test_counters;
+        wait_hot_set_test_counters::reset();
+
+        let cfg = probe_entry_filter_pass_config();
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg.clone();
+
+        let mint = Pubkey::new_from_array([0x66u8; 32]).to_string();
+        let pool = Pubkey::new_from_array([0x67u8; 32]).to_string();
+        let sk = seed_probe_ready_tracker(&ctx, &cfg, mint.as_str(), pool.as_str());
+        assert!(seed_test_entry_hot_set(&ctx, mint.as_str(), pool.as_str()));
+
+        let signals = ctx.check_for_signals();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].kind, EntryKind::Probe);
+        assert!(!matches!(
+            ctx.token_trackers.read().get(&sk).map(|t| &t.state),
+            Some(TrackerState::WaitHotSet { .. })
+        ));
+        assert_eq!(wait_hot_set_test_counters::wait_hot_set_enter_total(), 0);
+        assert_eq!(
+            wait_hot_set_test_counters::intent_path_immediate_hot_total(),
+            1
+        );
+        assert_eq!(wait_hot_set_test_counters::filter_pass_hot_fresh_true(), 1);
     }
 
     #[test]

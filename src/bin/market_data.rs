@@ -4816,6 +4816,9 @@ impl MarketDataContext {
         registered: bool,
     ) {
         if registered {
+            ironcrab::metrics::inc_market_data_momentum_pin_vault_register_total(
+                ironcrab::metrics::MomentumPinVaultRegisterResult::Ok,
+            );
             self.clear_deferred_hot_pool_reserve_registration(pool);
             if is_position {
                 inc_market_data_open_position_pin_applied_total();
@@ -4823,6 +4826,9 @@ impl MarketDataContext {
             return;
         }
         if self.live_pool_cache.get(&pool).is_none() {
+            ironcrab::metrics::inc_market_data_momentum_pin_vault_register_total(
+                ironcrab::metrics::MomentumPinVaultRegisterResult::CacheMiss,
+            );
             self.note_deferred_hot_pool_reserve_registration(pool, pin);
             if is_position {
                 inc_market_data_open_position_pin_deferred_cache_miss_total();
@@ -4830,9 +4836,15 @@ impl MarketDataContext {
             return;
         }
         if self.hot_pool_reserve_registration_satisfied(pool) {
+            ironcrab::metrics::inc_market_data_momentum_pin_vault_register_total(
+                ironcrab::metrics::MomentumPinVaultRegisterResult::AlreadySatisfied,
+            );
             self.maybe_clear_deferred_hot_pool_reserve_if_satisfied(pool);
             return;
         }
+        ironcrab::metrics::inc_market_data_momentum_pin_vault_register_total(
+            ironcrab::metrics::MomentumPinVaultRegisterResult::Deferred,
+        );
         self.note_deferred_hot_pool_reserve_registration(pool, pin);
     }
 
@@ -5125,11 +5137,8 @@ impl MarketDataContext {
             {
                 inc_market_data_exec_hot_pressure_admit_rejected_total(ExecHotShedTier::Momentum);
                 inc_market_data_momentum_admission_rejected_total();
-                self.record_momentum_active_pool_reserve_registration_outcome(
-                    pool_pk,
-                    GeyserPinReason::MomentumActive,
-                    is_position,
-                    false,
+                ironcrab::metrics::inc_market_data_momentum_pin_vault_register_total(
+                    ironcrab::metrics::MomentumPinVaultRegisterResult::AdmissionRejected,
                 );
                 self.sync_explicit_pool_admitted_from_admission(
                     admission,
@@ -8246,7 +8255,6 @@ fn select_exec_hot_shed_tier(
         || (tracker_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
             && depth >= EXEC_HOT_SHED_D_CRITICAL);
     let momentum_trigger = depth >= EXEC_HOT_SHED_D_EMERGENCY
-        || (lag_alarm && lag_arb_shed_ticks >= EXEC_HOT_SHED_LAG_ARB_ESCALATE_TICKS)
         || (arb_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS && depth >= EXEC_HOT_SHED_D_SEVERE);
 
     let tracker_escalate_threshold = if lag_alarm {
@@ -8292,12 +8300,7 @@ fn exec_hot_shed_tier_lag_triggered(
         return false;
     }
     let tracker_idle_ticks = escalation.tracker_idle_ticks;
-    let arb_idle_ticks = escalation.arb_idle_ticks;
     let lag_tracker_shed_ticks = escalation.lag_tracker_shed_ticks;
-    let lag_arb_shed_ticks = escalation.lag_arb_shed_ticks;
-    if !lag_alarm {
-        return false;
-    }
     match tier {
         ExecHotShedTier::Tracker => true,
         ExecHotShedTier::Arb => {
@@ -8305,11 +8308,7 @@ fn exec_hot_shed_tier_lag_triggered(
                 || tracker_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
                 || lag_tracker_shed_ticks >= EXEC_HOT_SHED_LAG_ARB_ESCALATE_TICKS
         }
-        ExecHotShedTier::Momentum => {
-            depth < EXEC_HOT_SHED_D_EMERGENCY
-                || arb_idle_ticks >= EXEC_HOT_SHED_IDLE_ESCALATE_TICKS
-                || lag_arb_shed_ticks >= EXEC_HOT_SHED_LAG_ARB_ESCALATE_TICKS
-        }
+        ExecHotShedTier::Momentum => false,
         ExecHotShedTier::None => false,
     }
 }
@@ -8423,9 +8422,8 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
             let tracker_admit_suppress =
                 soft_shed || depth >= EXEC_HOT_SHED_D_CRITICAL || lag_alarm;
             let arb_admit_suppress = depth >= EXEC_HOT_SHED_D_ARB || lag_alarm;
-            let momentum_admit_suppress = shed_tier == ExecHotShedTier::Momentum
-                || depth >= EXEC_HOT_SHED_D_EMERGENCY
-                || (lag_alarm && lag_arb_shed_ticks >= EXEC_HOT_SHED_LAG_ARB_ESCALATE_TICKS);
+            let momentum_admit_suppress =
+                shed_tier == ExecHotShedTier::Momentum || depth >= EXEC_HOT_SHED_D_EMERGENCY;
             set_market_data_exec_hot_admit_suppress(
                 tracker_admit_suppress,
                 momentum_admit_suppress,
@@ -15287,6 +15285,21 @@ mod pr_b_geyser_tracking_tests {
         };
         assert_eq!(
             select_exec_hot_shed_tier(500, true, false, 0, lag_arb_done),
+            ExecHotShedTier::None
+        );
+    }
+
+    #[test]
+    fn exec_hot_shed_tier_depth_emergency_still_sheds_momentum_under_lag() {
+        use ironcrab::metrics::ExecHotShedTier;
+
+        let lag_arb_done = ExecHotShedEscalationState {
+            lag_tracker_shed_ticks: 1,
+            lag_arb_shed_ticks: 1,
+            ..ExecHotShedEscalationState::default()
+        };
+        assert_eq!(
+            select_exec_hot_shed_tier(12_000, true, false, 0, lag_arb_done),
             ExecHotShedTier::Momentum
         );
     }
@@ -15515,7 +15528,7 @@ mod pr_b_geyser_tracking_tests {
     #[test]
     fn account_enrich_dispatch_upsert_and_flush_preserves_latest_wins() {
         use ironcrab::metrics::MARKET_DATA_ACCOUNT_ENRICH_COALESCE_TOTAL;
-        MARKET_DATA_ACCOUNT_ENRICH_COALESCE_TOTAL.store(0, Ordering::Relaxed);
+        let coalesce_before = MARKET_DATA_ACCOUNT_ENRICH_COALESCE_TOTAL.load(Ordering::Relaxed);
         let (low_tx, mut low_rx) = mpsc::channel(4);
         let mut shard = AccountEnrichCoalesceShard::new();
         let pk = Pubkey::new_unique();
@@ -15541,7 +15554,7 @@ mod pr_b_geyser_tracking_tests {
         );
         assert_eq!(
             MARKET_DATA_ACCOUNT_ENRICH_COALESCE_TOTAL.load(Ordering::Relaxed),
-            1
+            coalesce_before + 1
         );
         let flushed = low_rx.try_recv().expect("first flush");
         assert_eq!(flushed.update.slot, 1);

@@ -3309,6 +3309,166 @@ pub fn record_momentum_scale_in_gate_blocked_total(reason: MomentumScaleInGateBl
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
+/// I-MD-9 WaitHotSet observability: hot-set freshness at pre-entry filter pass.
+#[inline]
+pub fn record_momentum_filter_pass_hot_fresh(fresh: bool) {
+    let counter = if fresh {
+        &*MOMENTUM_FILTER_PASS_HOT_FRESH_TRUE
+    } else {
+        &*MOMENTUM_FILTER_PASS_HOT_FRESH_FALSE
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_momentum_wait_hot_set_enter_total() {
+    MOMENTUM_WAIT_HOT_SET_ENTER_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// WaitHotSet exit reason (Prometheus label `reason`).
+#[derive(Debug, Clone, Copy)]
+pub enum MomentumWaitHotSetExitReason {
+    Intent,
+    Timeout,
+    FilterFailed,
+}
+
+#[inline]
+pub fn record_momentum_wait_hot_set_exit(reason: MomentumWaitHotSetExitReason, duration_ms: u64) {
+    let counter = match reason {
+        MomentumWaitHotSetExitReason::Intent => &*MOMENTUM_WAIT_HOT_SET_EXIT_INTENT,
+        MomentumWaitHotSetExitReason::Timeout => &*MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT,
+        MomentumWaitHotSetExitReason::FilterFailed => &*MOMENTUM_WAIT_HOT_SET_EXIT_FILTER_FAILED,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    record_histogram_u64_into(
+        EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS,
+        MOMENTUM_WAIT_HOT_SET_DURATION_MS_BUCKET_COUNTS.as_slice(),
+        &MOMENTUM_WAIT_HOT_SET_DURATION_MS_SUM,
+        &MOMENTUM_WAIT_HOT_SET_DURATION_MS_COUNT,
+        duration_ms,
+        MOMENTUM_LATENCY_MS_SUM_CAP,
+    );
+}
+
+/// Probe-buy intent path after I-MD-9 hot-set gate (Prometheus label `path`).
+#[derive(Debug, Clone, Copy)]
+pub enum MomentumIntentPath {
+    ImmediateHot,
+    AfterWaitHot,
+}
+
+#[inline]
+pub fn record_momentum_intent_path(path: MomentumIntentPath) {
+    let counter = match path {
+        MomentumIntentPath::ImmediateHot => &*MOMENTUM_INTENT_PATH_IMMEDIATE_HOT,
+        MomentumIntentPath::AfterWaitHot => &*MOMENTUM_INTENT_PATH_AFTER_WAIT_HOT,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `register_geyser_reserves_impl` / momentum-active pin registration outcome.
+#[derive(Debug, Clone, Copy)]
+pub enum MomentumPinVaultRegisterResult {
+    Ok,
+    CacheMiss,
+    AdmissionRejected,
+    AlreadySatisfied,
+    Deferred,
+}
+
+#[inline]
+pub fn inc_market_data_momentum_pin_vault_register_total(result: MomentumPinVaultRegisterResult) {
+    let counter = match result {
+        MomentumPinVaultRegisterResult::Ok => &*MARKET_DATA_MOMENTUM_PIN_VAULT_REGISTER_OK,
+        MomentumPinVaultRegisterResult::CacheMiss => {
+            &*MARKET_DATA_MOMENTUM_PIN_VAULT_REGISTER_CACHE_MISS
+        }
+        MomentumPinVaultRegisterResult::AdmissionRejected => {
+            &*MARKET_DATA_MOMENTUM_PIN_VAULT_REGISTER_ADMISSION_REJECTED
+        }
+        MomentumPinVaultRegisterResult::AlreadySatisfied => {
+            &*MARKET_DATA_MOMENTUM_PIN_VAULT_REGISTER_ALREADY_SATISFIED
+        }
+        MomentumPinVaultRegisterResult::Deferred => {
+            &*MARKET_DATA_MOMENTUM_PIN_VAULT_REGISTER_DEFERRED
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+static MOMENTUM_FILTER_PASS_HOT_FRESH_TRUE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MOMENTUM_FILTER_PASS_HOT_FRESH_FALSE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MOMENTUM_WAIT_HOT_SET_ENTER_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MOMENTUM_WAIT_HOT_SET_EXIT_INTENT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MOMENTUM_WAIT_HOT_SET_EXIT_FILTER_FAILED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MOMENTUM_WAIT_HOT_SET_DURATION_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+static MOMENTUM_WAIT_HOT_SET_DURATION_MS_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MOMENTUM_WAIT_HOT_SET_DURATION_MS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MOMENTUM_INTENT_PATH_IMMEDIATE_HOT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MOMENTUM_INTENT_PATH_AFTER_WAIT_HOT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_MOMENTUM_PIN_VAULT_REGISTER_OK: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_MOMENTUM_PIN_VAULT_REGISTER_CACHE_MISS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_MOMENTUM_PIN_VAULT_REGISTER_ADMISSION_REJECTED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_MOMENTUM_PIN_VAULT_REGISTER_ALREADY_SATISFIED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_MOMENTUM_PIN_VAULT_REGISTER_DEFERRED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub mod wait_hot_set_test_counters {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    pub fn reset() {
+        MOMENTUM_FILTER_PASS_HOT_FRESH_TRUE.store(0, Ordering::Relaxed);
+        MOMENTUM_FILTER_PASS_HOT_FRESH_FALSE.store(0, Ordering::Relaxed);
+        MOMENTUM_WAIT_HOT_SET_ENTER_TOTAL.store(0, Ordering::Relaxed);
+        MOMENTUM_WAIT_HOT_SET_EXIT_INTENT.store(0, Ordering::Relaxed);
+        MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT.store(0, Ordering::Relaxed);
+        MOMENTUM_WAIT_HOT_SET_EXIT_FILTER_FAILED.store(0, Ordering::Relaxed);
+        MOMENTUM_WAIT_HOT_SET_DURATION_MS_COUNT.store(0, Ordering::Relaxed);
+        MOMENTUM_INTENT_PATH_IMMEDIATE_HOT.store(0, Ordering::Relaxed);
+        MOMENTUM_INTENT_PATH_AFTER_WAIT_HOT.store(0, Ordering::Relaxed);
+    }
+
+    pub fn filter_pass_hot_fresh_true() -> u64 {
+        MOMENTUM_FILTER_PASS_HOT_FRESH_TRUE.load(Ordering::Relaxed)
+    }
+
+    pub fn filter_pass_hot_fresh_false() -> u64 {
+        MOMENTUM_FILTER_PASS_HOT_FRESH_FALSE.load(Ordering::Relaxed)
+    }
+
+    pub fn wait_hot_set_enter_total() -> u64 {
+        MOMENTUM_WAIT_HOT_SET_ENTER_TOTAL.load(Ordering::Relaxed)
+    }
+
+    pub fn wait_hot_set_exit_timeout_total() -> u64 {
+        MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT.load(Ordering::Relaxed)
+    }
+
+    pub fn wait_hot_set_duration_count() -> u64 {
+        MOMENTUM_WAIT_HOT_SET_DURATION_MS_COUNT.load(Ordering::Relaxed)
+    }
+
+    pub fn intent_path_immediate_hot_total() -> u64 {
+        MOMENTUM_INTENT_PATH_IMMEDIATE_HOT.load(Ordering::Relaxed)
+    }
+
+    pub fn intent_path_after_wait_hot_total() -> u64 {
+        MOMENTUM_INTENT_PATH_AFTER_WAIT_HOT.load(Ordering::Relaxed)
+    }
+}
+
 // PR170: tracker trade ingest forensics (static metric names — no dynamic labels).
 pub static MOMENTUM_TRACKER_TRADES_RECORDED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -8153,6 +8313,102 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("momentum_scale_in_gate_blocked_total{reason=\"no_quote\"} ");
     out.push_str(
         &MOMENTUM_SCALE_IN_GATE_BLOCKED_NO_QUOTE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("momentum_filter_pass_hot_fresh_total{fresh=\"true\"} ");
+    out.push_str(
+        &MOMENTUM_FILTER_PASS_HOT_FRESH_TRUE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("momentum_filter_pass_hot_fresh_total{fresh=\"false\"} ");
+    out.push_str(
+        &MOMENTUM_FILTER_PASS_HOT_FRESH_FALSE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "momentum_wait_hot_set_enter_total",
+        MOMENTUM_WAIT_HOT_SET_ENTER_TOTAL.load(Ordering::Relaxed)
+    );
+    out.push_str("momentum_wait_hot_set_exit_total{reason=\"intent\"} ");
+    out.push_str(
+        &MOMENTUM_WAIT_HOT_SET_EXIT_INTENT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("momentum_wait_hot_set_exit_total{reason=\"timeout\"} ");
+    out.push_str(
+        &MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("momentum_wait_hot_set_exit_total{reason=\"filter_failed\"} ");
+    out.push_str(
+        &MOMENTUM_WAIT_HOT_SET_EXIT_FILTER_FAILED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    append_momentum_latency_histogram_prometheus(
+        &mut out,
+        "momentum_wait_hot_set_duration_ms",
+        EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS,
+        &MOMENTUM_WAIT_HOT_SET_DURATION_MS_BUCKET_COUNTS,
+        &MOMENTUM_WAIT_HOT_SET_DURATION_MS_SUM,
+        &MOMENTUM_WAIT_HOT_SET_DURATION_MS_COUNT,
+    );
+    out.push_str("momentum_intent_path_total{path=\"immediate_hot\"} ");
+    out.push_str(
+        &MOMENTUM_INTENT_PATH_IMMEDIATE_HOT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("momentum_intent_path_total{path=\"after_wait_hot\"} ");
+    out.push_str(
+        &MOMENTUM_INTENT_PATH_AFTER_WAIT_HOT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_momentum_pin_vault_register_total{result=\"ok\"} ");
+    out.push_str(
+        &MARKET_DATA_MOMENTUM_PIN_VAULT_REGISTER_OK
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_momentum_pin_vault_register_total{result=\"cache_miss\"} ");
+    out.push_str(
+        &MARKET_DATA_MOMENTUM_PIN_VAULT_REGISTER_CACHE_MISS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_momentum_pin_vault_register_total{result=\"admission_rejected\"} ");
+    out.push_str(
+        &MARKET_DATA_MOMENTUM_PIN_VAULT_REGISTER_ADMISSION_REJECTED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_momentum_pin_vault_register_total{result=\"already_satisfied\"} ");
+    out.push_str(
+        &MARKET_DATA_MOMENTUM_PIN_VAULT_REGISTER_ALREADY_SATISFIED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_momentum_pin_vault_register_total{result=\"deferred\"} ");
+    out.push_str(
+        &MARKET_DATA_MOMENTUM_PIN_VAULT_REGISTER_DEFERRED
             .load(Ordering::Relaxed)
             .to_string(),
     );

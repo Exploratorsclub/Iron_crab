@@ -6556,4 +6556,22 @@ mod tests {
         assert!(admission.owner_group(&tracker).is_none());
         assert!(admission.owner_group(&momentum).is_some());
     }
+
+    #[test]
+    fn shed_momentum_owner_groups_never_touches_wallet_or_position() {
+        let wallet = pool_owner(ExplicitConsumer::Wallet, 0);
+        let momentum_pos = pool_owner(ExplicitConsumer::MomentumPosition, 3);
+        let momentum = pool_owner(ExplicitConsumer::Momentum, 2);
+
+        let mut admission = FixedCapAdmission::new(8);
+        assert_admitted(admission.try_admit_new_group(wallet.clone(), vec![pk(10)]));
+        assert_admitted(admission.try_admit_new_group(momentum_pos.clone(), vec![pk(11)]));
+        assert_admitted(admission.try_admit_new_group(momentum.clone(), vec![pk(12)]));
+
+        let result = admission.shed_momentum_owner_groups(8);
+        assert_eq!(result.groups_evicted, 1);
+        assert!(admission.owner_group(&wallet).is_some());
+        assert!(admission.owner_group(&momentum_pos).is_some());
+        assert!(admission.owner_group(&momentum).is_none());
+    }
 }
