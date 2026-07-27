@@ -19598,6 +19598,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn wait_hot_set_timeout_unpins_without_intent() {
         use ironcrab::metrics::wait_hot_set_test_counters;
         wait_hot_set_test_counters::reset();
@@ -19691,12 +19692,14 @@ mod tests {
                 .any(|r| r.reason == "hot_set_timeout"),
             "timeout must publish removed hot_set_timeout"
         );
-        assert!(
-            wait_hot_set_test_counters::wait_hot_set_exit_timeout_total() > 0,
+        assert_eq!(
+            wait_hot_set_test_counters::wait_hot_set_exit_timeout_total(),
+            1,
             "timeout must record wait_hot_set exit reason=timeout"
         );
-        assert!(
-            wait_hot_set_test_counters::wait_hot_set_duration_count() > 0,
+        assert_eq!(
+            wait_hot_set_test_counters::wait_hot_set_duration_count(),
+            1,
             "timeout must record wait_hot_set duration histogram sample"
         );
     }
@@ -19746,6 +19749,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn wait_hot_set_stale_cache_enters_and_records_metrics() {
         use ironcrab::metrics::wait_hot_set_test_counters;
         wait_hot_set_test_counters::reset();
@@ -19760,9 +19764,6 @@ mod tests {
         let pool = "poolWaitHotStale8888888888888888888888888888";
         let sk = seed_probe_ready_tracker(&ctx, &cfg, mint, pool);
 
-        let enter_before = wait_hot_set_test_counters::wait_hot_set_enter_total();
-        let fresh_false_before = wait_hot_set_test_counters::filter_pass_hot_fresh_false();
-
         let signals = ctx.check_for_signals();
         assert!(signals.is_empty());
         assert!(ctx
@@ -19770,17 +19771,12 @@ mod tests {
             .read()
             .get(&sk)
             .is_some_and(|t| matches!(t.state, TrackerState::WaitHotSet { .. })));
-        assert_eq!(
-            wait_hot_set_test_counters::wait_hot_set_enter_total(),
-            enter_before + 1
-        );
-        assert_eq!(
-            wait_hot_set_test_counters::filter_pass_hot_fresh_false(),
-            fresh_false_before + 1
-        );
+        assert_eq!(wait_hot_set_test_counters::wait_hot_set_enter_total(), 1);
+        assert_eq!(wait_hot_set_test_counters::filter_pass_hot_fresh_false(), 1);
     }
 
     #[test]
+    #[serial_test::serial]
     fn filter_pass_fresh_emits_immediate_hot_without_wait_hot_set() {
         use ironcrab::metrics::wait_hot_set_test_counters;
         wait_hot_set_test_counters::reset();
@@ -19796,10 +19792,6 @@ mod tests {
         let sk = seed_probe_ready_tracker(&ctx, &cfg, mint.as_str(), pool.as_str());
         assert!(seed_test_entry_hot_set(&ctx, mint.as_str(), pool.as_str()));
 
-        let enter_before = wait_hot_set_test_counters::wait_hot_set_enter_total();
-        let immediate_before = wait_hot_set_test_counters::intent_path_immediate_hot_total();
-        let fresh_true_before = wait_hot_set_test_counters::filter_pass_hot_fresh_true();
-
         let signals = ctx.check_for_signals();
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].kind, EntryKind::Probe);
@@ -19807,18 +19799,12 @@ mod tests {
             ctx.token_trackers.read().get(&sk).map(|t| &t.state),
             Some(TrackerState::WaitHotSet { .. })
         ));
-        assert_eq!(
-            wait_hot_set_test_counters::wait_hot_set_enter_total(),
-            enter_before
-        );
+        assert_eq!(wait_hot_set_test_counters::wait_hot_set_enter_total(), 0);
         assert_eq!(
             wait_hot_set_test_counters::intent_path_immediate_hot_total(),
-            immediate_before + 1
+            1
         );
-        assert_eq!(
-            wait_hot_set_test_counters::filter_pass_hot_fresh_true(),
-            fresh_true_before + 1
-        );
+        assert_eq!(wait_hot_set_test_counters::filter_pass_hot_fresh_true(), 1);
     }
 
     #[test]
