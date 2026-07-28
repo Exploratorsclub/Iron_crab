@@ -1832,6 +1832,12 @@ fn note_trade_pool_lru_touches_from_cache(
             }
         }
     }
+
+    // Sustained JetStream SLAVE refresh during WaitHotSet (I-MD-9): trade → cache-first publish.
+    if ctx.hot_pool_registry.pool_has_momentum(pool) && cached_pool_has_fresh_reserve_basis(&state)
+    {
+        ctx.register_geyser_reserves_after_trade(pool);
+    }
 }
 
 /// Phase1: pair reserve balances from snapshot vault views (no `tracked_vaults` map lock).
@@ -2157,6 +2163,10 @@ impl TrackWorkerContext for MarketDataContext {
 
     fn refresh_hot_pool_registry_gauges(&self) {
         self.refresh_hot_pool_registry_gauges();
+    }
+
+    fn tick_momentum_hot_balance_refresh_heartbeat(&self) {
+        self.tick_momentum_hot_balance_refresh_heartbeat();
     }
 
     fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
@@ -4428,6 +4438,18 @@ impl MarketDataContext {
         }
     }
 
+    /// Periodic heartbeat for momentum-hot pins: sustain SLAVE `LivePoolCache` age during WaitHotSet.
+    fn tick_momentum_hot_balance_refresh_heartbeat(&self) {
+        if self.hot_pool_registry.hot_pool_count_momentum() == 0 {
+            return;
+        }
+        for pool in self.hot_pool_registry.snapshot_hot_pool_pubkeys() {
+            if self.hot_pool_registry.pool_has_momentum(pool) {
+                self.try_publish_balance_updated_from_cache(pool);
+            }
+        }
+    }
+
     /// After explicit Geyser sync, refresh SLAVE age once when a momentum-hot pool's feed becomes live.
     fn publish_momentum_hot_balance_refresh_after_explicit_sync(
         &self,
@@ -4455,7 +4477,6 @@ impl MarketDataContext {
     }
 
     /// Cache-first JetStream BalanceUpdated for pools with fresh reserve basis (no vault Geyser sub required).
-    #[cfg_attr(not(test), allow(dead_code))]
     fn try_publish_balance_updated_from_cache(&self, pool: Pubkey) {
         if self.balance_updated_from_cache_skipped_for_live_feed(pool) {
             return;
@@ -4544,8 +4565,7 @@ impl MarketDataContext {
     }
 
     /// PR-B: after a parsed swap trade — cache-first BalanceUpdated; vault/bin registration only for hot pools.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn register_geyser_reserves_after_trade(self: &Arc<Self>, pool: Pubkey) -> bool {
+    fn register_geyser_reserves_after_trade(&self, pool: Pubkey) -> bool {
         self.try_publish_balance_updated_from_cache(pool);
         if !self.hot_pool_registry.pool_has_momentum(pool) {
             return false;
@@ -16521,6 +16541,213 @@ mod pr_b_geyser_tracking_tests {
             MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed),
             counter_before,
             "without NATS/handle publish is a no-op, but live-feed gate must not block"
+        );
+    }
+
+    #[test]
+    fn trade_path_wires_momentum_hot_balance_refresh_after_trade() {
+        use ironcrab::market_data::sidefx::worker::MdSidefxBurstScratch;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(base, pool);
+        ctx.note_explicit_momentum_pool_admitted(pool);
+
+        let mut scratch = MdSidefxBurstScratch::default();
+        note_trade_pool_lru_touches_from_cache(&ctx, pool, &mut scratch);
+        assert!(
+            !ctx.balance_updated_from_cache_skipped_for_live_feed(pool),
+            "momentum-hot trade path must reach cache-first publish (not live-feed skip)"
+        );
+        assert!(
+            ctx.tracked_vaults.read().contains_key(&coin),
+            "trade path must wire register_geyser_reserves_after_trade for momentum-hot pool"
+        );
+    }
+
+    #[test]
+    fn trade_path_skips_balance_refresh_for_arb_only_hot_pool() {
+        use ironcrab::market_data::sidefx::worker::MdSidefxBurstScratch;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+
+        let vaults_before = ctx.tracked_vaults.read().len();
+        let mut scratch = MdSidefxBurstScratch::default();
+        note_trade_pool_lru_touches_from_cache(&ctx, pool, &mut scratch);
+        assert_eq!(
+            ctx.tracked_vaults.read().len(),
+            vaults_before,
+            "arb-only hot pool must not trigger momentum trade register path"
+        );
+    }
+
+    #[test]
+    fn momentum_hot_heartbeat_publishes_balance_refresh() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: mint,
+                bonding_curve: pool,
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: 30_000_000_000,
+                virtual_token_reserves: 1_073_000_000_000_000,
+                real_sol_reserves: 10_000_000_000,
+                real_token_reserves: 500_000_000_000_000,
+                complete: false,
+                creator: Pubkey::new_unique(),
+                cashback_enabled: false,
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+
+        assert!(ctx.hot_pool_registry.pool_has_momentum(pool));
+        assert!(!ctx.balance_updated_from_cache_skipped_for_live_feed(pool));
+        ctx.tick_momentum_hot_balance_refresh_heartbeat();
+        assert!(
+            cached_pool_has_fresh_reserve_basis(&ctx.live_pool_cache.get(&pool).unwrap()),
+            "heartbeat must target momentum-hot pool with publishable reserve basis"
+        );
+    }
+
+    #[test]
+    fn momentum_hot_heartbeat_skips_arb_only_pool() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: Pubkey::new_unique(),
+                token_1_vault: Pubkey::new_unique(),
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+
+        assert!(!ctx.hot_pool_registry.pool_has_momentum(pool));
+        ctx.tick_momentum_hot_balance_refresh_heartbeat();
+    }
+
+    #[test]
+    fn momentum_hot_heartbeat_stops_after_unpin() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: mint,
+                bonding_curve: pool,
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: 30_000_000_000,
+                virtual_token_reserves: 1_073_000_000_000_000,
+                real_sol_reserves: 10_000_000_000,
+                real_token_reserves: 500_000_000_000_000,
+                complete: false,
+                creator: Pubkey::new_unique(),
+                cashback_enabled: false,
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+        ctx.hot_pool_registry.unpin_pool(mint, pool);
+
+        assert!(!ctx.hot_pool_registry.pool_has_momentum(pool));
+        assert!(
+            !ctx.hot_pool_registry
+                .snapshot_hot_pool_pubkeys()
+                .contains(&pool),
+            "unpinned pool must leave hot registry before heartbeat tick"
+        );
+        ctx.tick_momentum_hot_balance_refresh_heartbeat();
+    }
+
+    #[test]
+    fn trade_path_source_wires_register_geyser_reserves_after_trade() {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/bin/market_data.rs"
+        ));
+        let start = src
+            .find("fn note_trade_pool_lru_touches_from_cache")
+            .expect("note_trade_pool_lru_touches_from_cache");
+        let end = src[start..]
+            .find("\n/// Phase1: pair reserve balances")
+            .map(|off| start + off)
+            .unwrap_or(start + 4000);
+        let block = &src[start..end];
+        assert!(
+            block.contains("register_geyser_reserves_after_trade"),
+            "trade LRU touch must wire register_geyser_reserves_after_trade for momentum-hot"
+        );
+        assert!(
+            block.contains("pool_has_momentum"),
+            "trade refresh must be gated to momentum-hot pools"
         );
     }
 
