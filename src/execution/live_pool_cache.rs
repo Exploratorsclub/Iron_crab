@@ -340,6 +340,23 @@ impl CachedPoolState {
     }
 }
 
+/// True when the cached pool row has at least one non-zero reserve / vault balance.
+pub fn pool_state_has_reserve_basis(state: &CachedPoolState) -> bool {
+    let fresh = |opt: Option<u64>| opt.is_some_and(|v| v > 0);
+    let fresh_u64 = |v: u64| v > 0;
+    match state {
+        CachedPoolState::RaydiumCpmm(s) => fresh(s.reserve_0) || fresh(s.reserve_1),
+        CachedPoolState::MeteoraCpmm(s) => fresh_u64(s.reserve_0) || fresh_u64(s.reserve_1),
+        CachedPoolState::Meteora(s) => fresh(s.reserve_x_balance) || fresh(s.reserve_y_balance),
+        CachedPoolState::PumpAmm(s) => fresh(s.base_reserve) || fresh(s.quote_reserve),
+        CachedPoolState::Orca(s) => fresh(s.vault_a_balance) || fresh(s.vault_b_balance),
+        CachedPoolState::RaydiumAmm(s) => fresh(s.coin_reserve) || fresh(s.pc_reserve),
+        CachedPoolState::PumpFun(s) => {
+            !s.complete && s.virtual_sol_reserves > 0 && s.virtual_token_reserves > 0
+        }
+    }
+}
+
 // ============================================================================
 // Cache entry with metadata
 // ============================================================================
@@ -581,7 +598,11 @@ impl LivePoolCache {
     /// `slot == 0` means "no Geyser slot" (e.g. cold-path RPC hydration): the state is applied,
     /// but an existing non-zero slot watermark is preserved so later stale Geyser snapshots are
     /// still rejected.
+    ///
+    /// Updates without quotable reserve basis (e.g. 0/0 `PoolDiscovered`) do **not** refresh
+    /// `updated_at` on an existing row — prevents age-gate spoofing without quote readiness.
     pub fn upsert(&self, pool: Pubkey, state: CachedPoolState, slot: u64) -> bool {
+        let refresh_age = pool_state_has_reserve_basis(&state);
         match self.pools.entry(pool) {
             Entry::Vacant(v) => {
                 let stored_slot = if slot == 0 { 0 } else { slot };
@@ -596,8 +617,13 @@ impl LivePoolCache {
                     return false;
                 }
                 let stored_slot = if slot == 0 { prev_slot } else { slot };
+                let prev_updated_at = o.get().updated_at;
                 self.register_vaults(&pool, &state);
-                *o.get_mut() = CacheEntry::new(state, stored_slot);
+                let mut entry = CacheEntry::new(state, stored_slot);
+                if !refresh_age {
+                    entry.updated_at = prev_updated_at;
+                }
+                *o.get_mut() = entry;
                 self.updates_total.fetch_add(1, Ordering::Relaxed);
                 true
             }
@@ -2478,6 +2504,51 @@ mod tests {
             entry.is_stale(1000)
         };
         assert!(!is_stale); // Not stale within 1s
+    }
+
+    #[test]
+    fn upsert_without_reserve_basis_does_not_refresh_updated_at() {
+        use std::time::Duration;
+
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let zero_state = CachedPoolState::PumpAmm(PumpAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            pool_base_token_account: Pubkey::new_unique(),
+            pool_quote_token_account: Pubkey::new_unique(),
+            base_reserve: Some(0),
+            quote_reserve: Some(0),
+            pool_accounts: Vec::new(),
+            creator: None,
+        });
+
+        cache.upsert(pool, zero_state.clone(), 1);
+        std::thread::sleep(Duration::from_millis(40));
+        let (_, _, age_before_repeat) = cache.get_with_metadata(&pool).expect("cached");
+        cache.upsert(pool, zero_state, 2);
+        let (_, _, age_after_repeat) = cache.get_with_metadata(&pool).expect("cached");
+        assert!(
+            age_after_repeat >= age_before_repeat,
+            "0/0 upsert must not reset cache age"
+        );
+
+        let with_reserves = CachedPoolState::PumpAmm(PumpAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            pool_base_token_account: Pubkey::new_unique(),
+            pool_quote_token_account: Pubkey::new_unique(),
+            base_reserve: Some(1_000_000),
+            quote_reserve: Some(50_000_000_000),
+            pool_accounts: Vec::new(),
+            creator: None,
+        });
+        cache.upsert(pool, with_reserves, 3);
+        let (_, _, age_after_quotable) = cache.get_with_metadata(&pool).expect("cached");
+        assert!(
+            age_after_quotable < 20,
+            "quotable upsert must refresh cache age"
+        );
     }
 
     #[test]

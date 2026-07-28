@@ -3320,6 +3320,49 @@ pub fn record_momentum_filter_pass_hot_fresh(fresh: bool) {
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Why `entry_hot_set_fresh` failed (Prometheus labels `reason`, `dex`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MomentumEntryHotFreshFailReason {
+    Missing,
+    Age,
+    Quote,
+}
+
+impl MomentumEntryHotFreshFailReason {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Age => "age",
+            Self::Quote => "quote",
+        }
+    }
+}
+
+fn normalize_momentum_entry_hot_fresh_fail_dex(dex: &str) -> String {
+    match dex {
+        "pumpswap" | "PumpFunAmm" | "PumpFun AMM" => "pump_amm".to_string(),
+        "pumpfun" | "PumpFun" => "pumpfun".to_string(),
+        "orca" => "orca".to_string(),
+        "raydium" => "raydium".to_string(),
+        "raydium_cpmm" => "raydium_cpmm".to_string(),
+        "meteora_dlmm" => "meteora_dlmm".to_string(),
+        "meteora_cpmm" => "meteora_cpmm".to_string(),
+        _ => "other".to_string(),
+    }
+}
+
+/// Increment `momentum_entry_hot_fresh_fail_total{reason,dex}`.
+#[inline]
+pub fn record_momentum_entry_hot_fresh_fail(reason: MomentumEntryHotFreshFailReason, dex: &str) {
+    let key = format!(
+        "{}|{}",
+        reason.as_label(),
+        normalize_momentum_entry_hot_fresh_fail_dex(dex)
+    );
+    let mut map = MOMENTUM_ENTRY_HOT_FRESH_FAIL_TOTAL.write();
+    *map.entry(key).or_insert(0) += 1;
+}
+
 #[inline]
 pub fn inc_momentum_wait_hot_set_enter_total() {
     MOMENTUM_WAIT_HOT_SET_ENTER_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -3399,6 +3442,8 @@ pub fn inc_market_data_momentum_pin_vault_register_total(result: MomentumPinVaul
 
 static MOMENTUM_FILTER_PASS_HOT_FRESH_TRUE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 static MOMENTUM_FILTER_PASS_HOT_FRESH_FALSE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MOMENTUM_ENTRY_HOT_FRESH_FAIL_TOTAL: Lazy<RwLock<HashMap<String, u64>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
 static MOMENTUM_WAIT_HOT_SET_ENTER_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 static MOMENTUM_WAIT_HOT_SET_EXIT_INTENT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 static MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -3431,6 +3476,7 @@ pub mod wait_hot_set_test_counters {
     pub fn reset() {
         MOMENTUM_FILTER_PASS_HOT_FRESH_TRUE.store(0, Ordering::Relaxed);
         MOMENTUM_FILTER_PASS_HOT_FRESH_FALSE.store(0, Ordering::Relaxed);
+        MOMENTUM_ENTRY_HOT_FRESH_FAIL_TOTAL.write().clear();
         MOMENTUM_WAIT_HOT_SET_ENTER_TOTAL.store(0, Ordering::Relaxed);
         MOMENTUM_WAIT_HOT_SET_EXIT_INTENT.store(0, Ordering::Relaxed);
         MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT.store(0, Ordering::Relaxed);
@@ -3446,6 +3492,19 @@ pub mod wait_hot_set_test_counters {
 
     pub fn filter_pass_hot_fresh_false() -> u64 {
         MOMENTUM_FILTER_PASS_HOT_FRESH_FALSE.load(Ordering::Relaxed)
+    }
+
+    pub fn entry_hot_fresh_fail_total(reason: MomentumEntryHotFreshFailReason, dex: &str) -> u64 {
+        let key = format!(
+            "{}|{}",
+            reason.as_label(),
+            normalize_momentum_entry_hot_fresh_fail_dex(dex)
+        );
+        MOMENTUM_ENTRY_HOT_FRESH_FAIL_TOTAL
+            .read()
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn wait_hot_set_enter_total() -> u64 {
@@ -8331,6 +8390,16 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
+    for (key, count) in MOMENTUM_ENTRY_HOT_FRESH_FAIL_TOTAL.read().iter() {
+        let (reason, dex) = key.split_once('|').unwrap_or((key.as_str(), "other"));
+        out.push_str("momentum_entry_hot_fresh_fail_total{reason=\"");
+        out.push_str(reason);
+        out.push_str("\",dex=\"");
+        out.push_str(dex);
+        out.push_str("\"} ");
+        out.push_str(&count.to_string());
+        out.push('\n');
+    }
     line!(
         "momentum_wait_hot_set_enter_total",
         MOMENTUM_WAIT_HOT_SET_ENTER_TOTAL.load(Ordering::Relaxed)
