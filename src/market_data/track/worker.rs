@@ -39,6 +39,9 @@ use std::time::{Duration, Instant};
 
 /// Phase 2a: track-worker Geyser push coalesce window (I-4d prep).
 pub const MARKET_DATA_TRACK_WORKER_COALESCE_MS: u64 = 500;
+
+/// Momentum-hot JetStream balance refresh heartbeat interval (must stay below 4s entry-age gate).
+pub const MARKET_DATA_MOMENTUM_HOT_BALANCE_REFRESH_HEARTBEAT_MS: u64 = 2000;
 /// Phase 2a: bounded queue for md-track-worker commands.
 pub const MARKET_DATA_TRACK_WORKER_QUEUE_CAP: usize = 8192;
 /// PR169c: chunk large momentum applies so the tracking actor yields to ingest tasks.
@@ -104,6 +107,8 @@ pub trait TrackWorkerContext: Send + Sync {
     fn hot_pool_registry_pair_count(&self) -> usize;
     fn hot_pool_registry_arb_pool_count(&self) -> usize;
     fn refresh_hot_pool_registry_gauges(&self);
+    /// Periodic JetStream refresh for momentum-hot pins (WaitHotSet sustained freshness).
+    fn tick_momentum_hot_balance_refresh_heartbeat(&self);
     fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey>;
     fn sync_geyser_tracked_accounts_batched_flush_with_deadline(
         &self,
@@ -553,6 +558,11 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
             MARKET_DATA_EXPLICIT_SET_SNAPSHOT_INTERVAL_SECS,
         ))
         .unwrap_or_else(Instant::now);
+    let mut last_momentum_hot_balance_heartbeat = Instant::now()
+        .checked_sub(Duration::from_millis(
+            MARKET_DATA_MOMENTUM_HOT_BALANCE_REFRESH_HEARTBEAT_MS,
+        ))
+        .unwrap_or_else(Instant::now);
 
     loop {
         let timeout = match coalesce_deadline {
@@ -644,6 +654,13 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
                 last_snapshot_write = Instant::now();
                 try_write_explicit_set_snapshot_from_ctx(ctx.as_ref(), &admission);
             }
+        }
+
+        if last_momentum_hot_balance_heartbeat.elapsed()
+            >= Duration::from_millis(MARKET_DATA_MOMENTUM_HOT_BALANCE_REFRESH_HEARTBEAT_MS)
+        {
+            last_momentum_hot_balance_heartbeat = Instant::now();
+            ctx.tick_momentum_hot_balance_refresh_heartbeat();
         }
     }
 }
@@ -985,6 +1002,8 @@ mod tests {
 
         fn refresh_hot_pool_registry_gauges(&self) {}
 
+        fn tick_momentum_hot_balance_refresh_heartbeat(&self) {}
+
         fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
             HashSet::new()
         }
@@ -1293,6 +1312,8 @@ mod tests {
 
             fn refresh_hot_pool_registry_gauges(&self) {}
 
+            fn tick_momentum_hot_balance_refresh_heartbeat(&self) {}
+
             fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
                 HashSet::new()
             }
@@ -1546,6 +1567,8 @@ mod tests {
 
         fn refresh_hot_pool_registry_gauges(&self) {}
 
+        fn tick_momentum_hot_balance_refresh_heartbeat(&self) {}
+
         fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
             HashSet::new()
         }
@@ -1796,6 +1819,7 @@ mod tests {
                 0
             }
             fn refresh_hot_pool_registry_gauges(&self) {}
+            fn tick_momentum_hot_balance_refresh_heartbeat(&self) {}
             fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
                 HashSet::new()
             }
