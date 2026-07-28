@@ -135,7 +135,34 @@ fn md_sidefx_build_balance_updated_from_cache(
             host.live_pool_cache()
                 .merge_meteora_dlmm_pool_readiness(*pool_pubkey, readiness);
         }
-        CachedPoolState::PumpAmm(_) | CachedPoolState::PumpFun(_) => {}
+        CachedPoolState::PumpFun(s) => {
+            let mut meta = std::collections::HashMap::new();
+            if s.creator != Pubkey::default() {
+                meta.insert("creator".to_string(), s.creator.to_string());
+            }
+            meta.insert(
+                "associated_bonding_curve".to_string(),
+                s.associated_bonding_curve.to_string(),
+            );
+            meta.insert("complete".to_string(), s.complete.to_string());
+            meta.insert(
+                "real_token_reserves".to_string(),
+                s.real_token_reserves.to_string(),
+            );
+            meta.insert(
+                "real_sol_reserves".to_string(),
+                s.real_sol_reserves.to_string(),
+            );
+            meta.insert(
+                "cashback_enabled".to_string(),
+                s.cashback_enabled.to_string(),
+            );
+            balance_update.metadata = Some(meta);
+            balance_update.set_dex_readiness_in_metadata(DexPoolReadiness::Partial);
+            host.live_pool_cache()
+                .merge_pumpfun_bonding_readiness(*pool_pubkey, DexPoolReadiness::Partial);
+        }
+        CachedPoolState::PumpAmm(_) => {}
     }
     Some(balance_update)
 }

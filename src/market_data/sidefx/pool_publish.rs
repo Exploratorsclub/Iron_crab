@@ -294,7 +294,16 @@ pub fn pool_cache_balance_fields_from_state(
             s.pc_reserve.unwrap_or(0),
             "raydium",
         )),
-        CachedPoolState::PumpFun(_) => None,
+        CachedPoolState::PumpFun(s) => {
+            let wsol = Pubkey::from_str(NATIVE_SOL_MINT).ok()?;
+            Some((
+                s.token_mint,
+                wsol,
+                s.virtual_token_reserves,
+                s.virtual_sol_reserves,
+                "pumpfun",
+            ))
+        }
     }
 }
 
@@ -309,7 +318,9 @@ pub fn cached_pool_has_fresh_reserve_basis(state: &CachedPoolState) -> bool {
         CachedPoolState::PumpAmm(s) => fresh(s.base_reserve) || fresh(s.quote_reserve),
         CachedPoolState::Orca(s) => fresh(s.vault_a_balance) || fresh(s.vault_b_balance),
         CachedPoolState::RaydiumAmm(s) => fresh(s.coin_reserve) || fresh(s.pc_reserve),
-        CachedPoolState::PumpFun(_) => false,
+        CachedPoolState::PumpFun(s) => {
+            !s.complete && s.virtual_sol_reserves > 0 && s.virtual_token_reserves > 0
+        }
     }
 }
 
@@ -410,6 +421,65 @@ pub fn pool_cache_state_layout_significant_change(
 mod tests {
     use super::*;
     use crate::execution::live_pool_cache::RaydiumCpmmState;
+
+    #[test]
+    fn pumpfun_fresh_reserve_basis_requires_virtual_reserves() {
+        use crate::execution::live_pool_cache::PumpFunState;
+
+        let with = CachedPoolState::PumpFun(PumpFunState {
+            token_mint: Pubkey::new_unique(),
+            bonding_curve: Pubkey::new_unique(),
+            associated_bonding_curve: Pubkey::new_unique(),
+            virtual_sol_reserves: 1,
+            virtual_token_reserves: 1,
+            real_sol_reserves: 0,
+            real_token_reserves: 0,
+            complete: false,
+            creator: Pubkey::new_unique(),
+            cashback_enabled: false,
+        });
+        let without = CachedPoolState::PumpFun(PumpFunState {
+            token_mint: Pubkey::new_unique(),
+            bonding_curve: Pubkey::new_unique(),
+            associated_bonding_curve: Pubkey::new_unique(),
+            virtual_sol_reserves: 0,
+            virtual_token_reserves: 0,
+            real_sol_reserves: 0,
+            real_token_reserves: 0,
+            complete: false,
+            creator: Pubkey::new_unique(),
+            cashback_enabled: false,
+        });
+        assert!(cached_pool_has_fresh_reserve_basis(&with));
+        assert!(!cached_pool_has_fresh_reserve_basis(&without));
+    }
+
+    #[test]
+    fn pumpfun_balance_fields_from_state() {
+        use crate::execution::live_pool_cache::PumpFunState;
+
+        let mint = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let state = CachedPoolState::PumpFun(PumpFunState {
+            token_mint: mint,
+            bonding_curve: Pubkey::new_unique(),
+            associated_bonding_curve: Pubkey::new_unique(),
+            virtual_sol_reserves: 30_000_000_000,
+            virtual_token_reserves: 1_073_000_000_000_000,
+            real_sol_reserves: 10_000_000_000,
+            real_token_reserves: 500_000_000_000_000,
+            complete: false,
+            creator: Pubkey::new_unique(),
+            cashback_enabled: false,
+        });
+        let (base, quote, base_r, quote_r, dex) =
+            pool_cache_balance_fields_from_state(&state).expect("pumpfun fields");
+        assert_eq!(base, mint);
+        assert_eq!(quote, wsol);
+        assert_eq!(base_r, 1_073_000_000_000_000);
+        assert_eq!(quote_r, 30_000_000_000);
+        assert_eq!(dex, "pumpfun");
+    }
 
     #[test]
     fn cached_pool_has_fresh_reserve_basis_requires_nonzero() {
