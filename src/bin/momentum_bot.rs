@@ -20048,7 +20048,7 @@ mod tests {
         );
 
         let buy_out =
-            quote_calculator::quote_output_amount(&state, probe_lamports, &*SOL_MINT_PUBKEY)
+            quote_calculator::quote_output_amount(&state, probe_lamports, &SOL_MINT_PUBKEY)
                 .expect("BUY probe quote");
         assert!(buy_out > 0, "BUY SOL probe must be quotable on early curve");
 
