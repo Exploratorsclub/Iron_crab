@@ -3274,6 +3274,11 @@ pub fn set_position_authority_drift_momentum(drift: i64) {
     POSITION_AUTHORITY_DRIFT_MOMENTUM.store(drift, Ordering::Relaxed);
 }
 
+#[inline]
+pub fn record_liquidation_seed_skipped_authority_total() {
+    LIQUIDATION_SEED_SKIPPED_AUTHORITY_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Per-mint signed divergence: `position.token_amount_raw - wallet_snapshot.balance_raw`.
 /// Cardinality bounded to open positions with non-zero drift (pruned on close / align).
 pub static MOMENTUM_WALLET_BALANCE_DIVERGENCE_BY_MINT: Lazy<RwLock<HashMap<String, i64>>> =
@@ -6309,6 +6314,9 @@ pub static POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE: Lazy<AtomicU64> =
 pub static POSITION_AUTHORITY_DRIFT_LOCKMANAGER: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
 /// PA-5.1: `authority_open - momentum_overlay_count` (signed; Prometheus scalar).
 pub static POSITION_AUTHORITY_DRIFT_MOMENTUM: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
+/// PA-4: liquidation skipped LockManager seed because PositionAuthority reports closed/zero.
+pub static LIQUIDATION_SEED_SKIPPED_AUTHORITY_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static CONCURRENT_INTENTS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// Pending TradeIntents in `intent_rx` between JetStream enqueue and dispatcher recv.
 pub static EXECUTION_INTENT_RX_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -10049,6 +10057,10 @@ async fn metrics_response() -> Response<Body> {
         "position_authority_drift_momentum {}\n",
         POSITION_AUTHORITY_DRIFT_MOMENTUM.load(Ordering::Relaxed)
     ));
+    line!(
+        "liquidation_seed_skipped_authority_total",
+        LIQUIDATION_SEED_SKIPPED_AUTHORITY_TOTAL.load(Ordering::Relaxed)
+    );
     line!(
         "concurrent_intents",
         CONCURRENT_INTENTS_GAUGE.load(Ordering::Relaxed)

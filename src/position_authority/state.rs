@@ -496,6 +496,20 @@ impl PositionAuthority {
             .filter(|p| p.balance_raw > 0 && p.status == PositionStatus::ReconcileNeeded)
             .count()
     }
+
+    /// Tradable token balance for SELL preflight and liquidation LockManager seed (PA-4).
+    ///
+    /// - Tracked mint with status [`PositionStatus::Open`] or [`PositionStatus::ReconcileNeeded`]:
+    ///   `Some(balance_raw)` (may be zero).
+    /// - Tracked mint with status [`PositionStatus::Closed`]: `Some(0)` (authority knows flat).
+    /// - Untracked mint: `None` (unknown — caller may fall back to LockManager).
+    pub fn tradable_balance_raw(&self, mint: &str) -> Option<u64> {
+        match self.by_mint.get(mint) {
+            None => None,
+            Some(p) if p.status == PositionStatus::Closed => Some(0),
+            Some(p) => Some(p.balance_raw),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -992,5 +1006,37 @@ mod tests {
         a.apply(&ev);
         assert_eq!(a.get(&m).unwrap().balance_raw, 50);
         assert_eq!(a.get(&m).unwrap().token_program, token_2022());
+    }
+
+    #[test]
+    fn tradable_balance_open_returns_balance_raw() {
+        let m = mint();
+        let mut a = PositionAuthority::new();
+        a.apply(&buy(&m, 500, 6));
+        assert_eq!(a.tradable_balance_raw(&m), Some(500));
+    }
+
+    #[test]
+    fn tradable_balance_closed_returns_zero() {
+        let m = mint();
+        let mut a = PositionAuthority::new();
+        a.apply(&buy(&m, 500, 6));
+        a.apply(&sell(&m, 500, 6));
+        assert_eq!(a.get(&m).unwrap().status, PositionStatus::Closed);
+        assert_eq!(a.tradable_balance_raw(&m), Some(0));
+    }
+
+    #[test]
+    fn tradable_balance_unknown_mint_returns_none() {
+        let a = PositionAuthority::new();
+        assert_eq!(a.tradable_balance_raw("unknownMint"), None);
+    }
+
+    #[test]
+    fn tradable_balance_reconcile_needed_returns_balance_raw() {
+        let m = mint();
+        let mut a = PositionAuthority::new();
+        a.apply(&snap(&m, 250, 6));
+        assert_eq!(a.tradable_balance_raw(&m), Some(250));
     }
 }
