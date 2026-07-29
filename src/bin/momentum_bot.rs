@@ -55,21 +55,22 @@ use ironcrab::metrics::{
     record_momentum_market_events_last_applied_slot,
     record_momentum_market_events_subscription_max_dequeued_slot,
     record_momentum_nats_batch_prepare_us, record_momentum_overlay_closed_by_authority_total,
-    record_momentum_signal_eval_us, record_momentum_tracker_rejected,
-    record_momentum_tracker_trades_recorded, record_momentum_trades_received_no_tracker,
-    serve_metrics, set_momentum_bot_process_start_unix_sec,
+    record_momentum_signal_eval_us, record_momentum_soft_exit_suppressed_authority_total,
+    record_momentum_tracker_rejected, record_momentum_tracker_trades_recorded,
+    record_momentum_trades_received_no_tracker, serve_metrics,
+    set_momentum_bot_process_start_unix_sec,
     set_momentum_market_events_ingest_max_wall_lag_ms_last_batch,
     set_position_authority_drift_momentum, set_readiness_nats_connected,
     try_record_momentum_event_to_ingest_ms, try_record_momentum_event_to_intent_publish_ms,
     try_record_momentum_intent_header_to_publish_ms,
     try_record_momentum_jetstream_poolcache_event_to_ingest_ms,
     try_record_momentum_publish_to_intent_ms, wall_clock_unix_ms_now, MetricsComponent,
-    EXITS_GENERATED_TOTAL, FILTER_PASSED_TOTAL, FILTER_REJECTED_BUYER_QUALITY,
-    FILTER_REJECTED_DEV_BEHAVIOR, FILTER_REJECTED_DOWNTREND, FILTER_REJECTED_INFLOW,
-    FILTER_REJECTED_LIQUIDITY, FILTER_REJECTED_TOKEN_AGE, FILTER_REJECTED_TOTAL,
-    FILTER_REJECTED_VELOCITY, INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL,
-    NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
-    POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
+    MomentumSoftExitAuthoritySuppressReason, EXITS_GENERATED_TOTAL, FILTER_PASSED_TOTAL,
+    FILTER_REJECTED_BUYER_QUALITY, FILTER_REJECTED_DEV_BEHAVIOR, FILTER_REJECTED_DOWNTREND,
+    FILTER_REJECTED_INFLOW, FILTER_REJECTED_LIQUIDITY, FILTER_REJECTED_TOKEN_AGE,
+    FILTER_REJECTED_TOTAL, FILTER_REJECTED_VELOCITY, INTENTS_GENERATED_TOTAL,
+    MARKET_EVENTS_CONSUMED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
+    NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -6115,6 +6116,43 @@ impl MomentumContext {
         }
     }
 
+    /// PA-5: soft exits require PositionAuthority open (or reconcile-needed) with tradable balance.
+    fn authority_allows_soft_exit(&self, mint: &str) -> bool {
+        self.authority_soft_exit_suppress_reason(mint).is_none()
+    }
+
+    fn authority_soft_exit_suppress_reason(
+        &self,
+        mint: &str,
+    ) -> Option<MomentumSoftExitAuthoritySuppressReason> {
+        let Some(snap) = self.authority_by_mint.read().get(mint).cloned() else {
+            return Some(MomentumSoftExitAuthoritySuppressReason::Missing);
+        };
+        if snap.status == PositionAuthorityStatus::Closed {
+            return Some(MomentumSoftExitAuthoritySuppressReason::Closed);
+        }
+        if snap.balance_raw == 0 {
+            return Some(MomentumSoftExitAuthoritySuppressReason::Zero);
+        }
+        match snap.status {
+            PositionAuthorityStatus::Open | PositionAuthorityStatus::ReconcileNeeded => None,
+            PositionAuthorityStatus::Closed => {
+                Some(MomentumSoftExitAuthoritySuppressReason::Closed)
+            }
+        }
+    }
+
+    fn record_soft_exit_authority_suppressed(&self, mint: &str) {
+        if let Some(reason) = self.authority_soft_exit_suppress_reason(mint) {
+            record_momentum_soft_exit_suppressed_authority_total(reason);
+            debug!(
+                mint = %mint,
+                reason = reason.as_label(),
+                "Soft exit suppressed: PositionAuthority not open/tradable"
+            );
+        }
+    }
+
     fn has_recent_confirmed_full_sell(&self, mint: &str) -> bool {
         self.confirmed_full_sell_at
             .read()
@@ -6769,18 +6807,9 @@ impl MomentumContext {
                 continue;
             }
 
-            // PA-5.2: suppress soft exits when PositionAuthority signals flat/closed.
-            if self
-                .authority_by_mint
-                .read()
-                .get(mint)
-                .map(|s| Self::authority_signals_closed(Some(s)))
-                .unwrap_or(false)
-            {
-                debug!(
-                    mint = %mint,
-                    "Soft exit suppressed: PositionAuthority closed or zero balance"
-                );
+            // PA-5: soft exits only when PositionAuthority is open/reconcile-needed with tradable balance.
+            if !self.authority_allows_soft_exit(mint) {
+                self.record_soft_exit_authority_suppressed(mint);
                 continue;
             }
 
@@ -6795,6 +6824,13 @@ impl MomentumContext {
                 chain_head_slot,
                 live_trades_per_min,
             ) {
+                let overlay_amount = pos.token_amount;
+                let exit_amount = self
+                    .authority_by_mint
+                    .read()
+                    .get(mint)
+                    .map(|auth| overlay_amount.min(auth.balance_raw))
+                    .unwrap_or(overlay_amount);
                 // Note: exit_generated is set by caller after successful publish
                 exits.push((
                     mint.clone(),
@@ -6802,7 +6838,7 @@ impl MomentumContext {
                     pos.dex.clone(),
                     exit_type,
                     reason,
-                    pos.token_amount,
+                    exit_amount,
                 ));
             }
         }
@@ -12784,6 +12820,25 @@ mod tests {
         empty_test_context_with_config(jsonl_writer, MomentumConfig::default())
     }
 
+    fn insert_test_authority_open(
+        ctx: &MomentumContext,
+        mint: &str,
+        balance_raw: u64,
+        decimals: u8,
+    ) {
+        ctx.authority_by_mint.write().insert(
+            mint.to_string(),
+            PositionAuthoritySnapshot {
+                mint: mint.to_string(),
+                balance_raw,
+                decimals,
+                status: PositionAuthorityStatus::Open,
+                last_update_source: PositionAuthorityUpdateSource::Execution,
+                sold_raw_total: None,
+            },
+        );
+    }
+
     /// FIX-37: orphan reconcile via trade auto-register must queue Position active-pool pin.
     #[test]
     fn fix37_orphan_trade_reconcile_queues_position_active_pool_pin() {
@@ -17802,6 +17857,7 @@ mod tests {
             let pos = positions.get_mut(mint).unwrap();
             pos.last_sell_fail_at = Some(Instant::now() - Duration::from_secs(20));
         }
+        insert_test_authority_open(&ctx, mint, 1_000, 6);
 
         let exits = ctx.check_for_exits();
         assert_eq!(exits.len(), 1, "exit should resume after cooldown");
@@ -19244,6 +19300,7 @@ mod tests {
             let p = w.get_mut(mint).expect("position for time exit");
             p.set_entry_time_ago(Duration::from_secs(400));
         }
+        insert_test_authority_open(&ctx, mint, expected, 6);
         let exits = ctx.check_for_exits();
         assert_eq!(exits.len(), 1, "expected one TIME_EXIT");
         assert_eq!(exits[0].0, mint);
@@ -19377,6 +19434,7 @@ mod tests {
             let p = w.get_mut(mint).expect("pos");
             p.set_entry_time_ago(Duration::from_secs(400));
         }
+        insert_test_authority_open(&ctx, mint, expected, 6);
         let exits = ctx.check_for_exits();
         assert_eq!(exits.len(), 1);
         assert_eq!(exits[0].5, expected);
@@ -21312,6 +21370,141 @@ mod tests {
             ctx.check_for_exits().is_empty(),
             "TIME_EXIT and other soft exits must be suppressed when authority is closed"
         );
+    }
+
+    /// PA-5: soft exits suppressed when PositionAuthority entry is missing.
+    #[tokio::test]
+    async fn pa5_soft_exit_suppressed_when_authority_missing() {
+        let mut cfg = MomentumConfig::default();
+        cfg.max_hold_time_secs = 1;
+        cfg.take_profit_pct = 1.0;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context_with_config(jsonl_writer, cfg);
+
+        let mint = "Pa5MissingAuthMintttttttttttttttttttttttttttt";
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "pool",
+            dex: "raydium",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 1_000,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 1,
+            initial_bonding: None,
+        });
+        ctx.positions
+            .write()
+            .get_mut(mint)
+            .expect("position")
+            .set_entry_time_ago(std::time::Duration::from_secs(120));
+
+        assert!(
+            ctx.check_for_exits().is_empty(),
+            "overlay-only soft exits must not fire without PositionAuthority"
+        );
+    }
+
+    /// PA-5: soft exit sizing follows PositionAuthority balance when overlay is larger.
+    #[tokio::test]
+    async fn pa5_soft_exit_sized_to_authority_balance() {
+        let mut cfg = MomentumConfig::default();
+        cfg.max_hold_time_secs = 1;
+        cfg.take_profit_pct = 1.0;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context_with_config(jsonl_writer, cfg);
+
+        let mint = "Pa5SoftSizeMinttttttttttttttttttttttttttttttt";
+        let authority_balance = 400u64;
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "pool",
+            dex: "raydium",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 1_000,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 1,
+            initial_bonding: None,
+        });
+        ctx.positions
+            .write()
+            .get_mut(mint)
+            .expect("position")
+            .set_entry_time_ago(std::time::Duration::from_secs(120));
+        insert_test_authority_open(&ctx, mint, authority_balance, 6);
+
+        let exits = ctx.check_for_exits();
+        assert_eq!(exits.len(), 1, "TIME_EXIT expected with open authority");
+        assert_eq!(exits[0].3, "TIME_EXIT");
+        assert_eq!(
+            exits[0].5, authority_balance,
+            "soft exit hint must cap to authority balance"
+        );
+    }
+
+    /// PA-5: hard exits remain allowed when soft exits are authority-suppressed.
+    #[test]
+    fn pa5_hard_exit_allowed_when_authority_closed() {
+        let mut cfg = MomentumConfig::default();
+        cfg.hard_stop_loss_pct = 1_000.0;
+        cfg.take_profit_pct = 1_000.0;
+        cfg.trailing_stop_pct = 1_000.0;
+        cfg.trailing_activation_pct = 1_000.0;
+        cfg.max_hold_time_secs = 1;
+        cfg.momentum_exit_buy_ratio = 0.0;
+        cfg.momentum_exit_window_secs = 30;
+        cfg.momentum_exit_min_trades = 999_999;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let ctx = empty_test_context(test_queued_jsonl_writer(tmp.path()));
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "Pa5HardExitMintttttttttttttttttttttttttttttt";
+        {
+            let mut positions = ctx.positions.write();
+            let mut pos = PositionTracker::new(mint, "pool", "dex", 1.0, 6, 123, 1_000);
+            pos.entry_time = Instant::now() - Duration::from_secs(120);
+            pos.entry_confirmed_slot = 100;
+            pos.last_price_slot = 150;
+            positions.insert(mint.to_string(), pos);
+        }
+        ctx.authority_by_mint.write().insert(
+            mint.to_string(),
+            PositionAuthoritySnapshot {
+                mint: mint.to_string(),
+                balance_raw: 0,
+                decimals: 6,
+                status: PositionAuthorityStatus::Closed,
+                last_update_source: PositionAuthorityUpdateSource::Execution,
+                sold_raw_total: None,
+            },
+        );
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let mut tracker = TokenTracker::new(mint, "pool", "dex", 1, 0);
+            tracker.dev_wallet = Some("dev".to_string());
+            tracker.record_trade("dev", false, 2_000_000_000, 1, "devsig", 200, &cfg);
+            trackers.insert(MomentumContext::tracker_storage_key(mint, "pool"), tracker);
+        }
+        ctx.last_event_slot
+            .store(250, std::sync::atomic::Ordering::Relaxed);
+
+        let exits = ctx.check_for_exits();
+        assert_eq!(
+            exits.len(),
+            1,
+            "DEV_SELL must bypass authority soft-exit gate"
+        );
+        assert_eq!(exits[0].3, "DEV_SELL");
     }
 
     fn orphan_buy_execution_result(
