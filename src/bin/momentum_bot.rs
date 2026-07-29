@@ -1072,6 +1072,8 @@ fn sell_fail_cooldown_secs(error_code: Option<&str>, sell_fail_count: u32) -> u6
 /// Below `quote_calculator`'s 5s warning so we do not SELL-trigger on long-stale reserve snapshots
 /// when the chain may have moved (I-16).
 const EXIT_QUOTE_MAX_CACHE_AGE_MS: u64 = 4_000;
+/// Max ratio between executable quote TPS and entry/mark TPS before rejecting price exits.
+const EXIT_QUOTE_TPS_MAX_SCALE_RATIO: f64 = 100.0;
 /// Max `LivePoolCache` age for imminent-entry hot-set readiness (I-MD-9; same conservatism as exits).
 const ENTRY_HOT_SET_MAX_CACHE_AGE_MS: u64 = EXIT_QUOTE_MAX_CACHE_AGE_MS;
 
@@ -1096,6 +1098,32 @@ fn dex_pool_accounts_include_wsol_and_position_mint(
     let has_wsol = accounts.iter().any(|a| a == WSOL_MINT);
     let has_mint = accounts.iter().any(|a| a == position_token_mint);
     has_wsol && has_mint
+}
+
+#[inline]
+fn exit_quote_tps_scale_mismatch(pos: &PositionTracker, q: &ExitExecutableQuote) -> bool {
+    let max_ratio = EXIT_QUOTE_TPS_MAX_SCALE_RATIO;
+    if pos.entry_price > 0.0
+        && q.tokens_per_sol > 0.0
+        && tokens_per_sol::exit_quote_tps_scale_ratio_exceeded(
+            pos.entry_price,
+            q.tokens_per_sol,
+            max_ratio,
+        )
+    {
+        return true;
+    }
+    if pos.current_price > 0.0
+        && q.tokens_per_sol > 0.0
+        && tokens_per_sol::exit_quote_tps_scale_ratio_exceeded(
+            pos.current_price,
+            q.tokens_per_sol,
+            max_ratio,
+        )
+    {
+        return true;
+    }
+    false
 }
 
 /// Returns `Some(reason_code)` when this quote must **not** drive price-based exits.
@@ -1129,6 +1157,10 @@ fn exit_quote_price_exit_guard_violation(
         {
             return Some("QUOTE_POOL_ACCOUNTS_NOT_VERIFIED_SOL_PAIR");
         }
+    }
+    if exit_quote_tps_scale_mismatch(pos, q) {
+        ironcrab::metrics::record_momentum_exit_quote_scale_mismatch_total();
+        return Some("QUOTE_TPS_SCALE_MISMATCH");
     }
     None
 }
@@ -15135,7 +15167,7 @@ mod tests {
                     &mint,
                     &pool,
                     "raydium",
-                    5_727_593.0,
+                    12_000.0, // above executable ~10k tps → modest probe gain (I-14)
                     6,
                     7_159_492_133,
                     250_000_000,
@@ -19118,6 +19150,64 @@ mod tests {
         );
         let ok = vec!["x".to_string(), WSOL_MINT.to_string(), "mint9".to_string()];
         assert!(exit_quote_price_exit_guard_violation(&pos, &ex, Some(&ok)).is_none());
+    }
+
+    #[test]
+    fn scale_mismatch_guard_rejects_absurd_quote_tps_vs_entry() {
+        let pos = PositionTracker::new("m", "p", "dex", 1.0e7, 6, 69_000_000_000, 0);
+        let ex = sample_exit_quote(0.17);
+        assert_eq!(
+            exit_quote_price_exit_guard_violation(&pos, &ex, None),
+            Some("QUOTE_TPS_SCALE_MISMATCH")
+        );
+    }
+
+    #[test]
+    fn scale_mismatch_guard_allows_quote_within_100x_of_entry() {
+        let pos = PositionTracker::new("m", "p", "dex", 1.0e7, 6, 1_000_000, 0);
+        let ex = sample_exit_quote(9.0e6);
+        assert!(exit_quote_price_exit_guard_violation(&pos, &ex, None).is_none());
+    }
+
+    #[test]
+    fn take_profit_suppressed_on_quote_tps_scale_mismatch_despite_absurd_pnl() {
+        let mut c = make_exit_config();
+        c.take_profit_pct = 20.0;
+        c.take_profit_min_hold_secs = 0;
+        c.hard_stop_loss_pct = 1_000.0;
+        let entry = 1.0e7;
+        let mut pos = PositionTracker::new("m", "p", "dex", entry, 6, 69_000_000_000, 0);
+        pos.current_price = entry * 1.05; // mark slightly negative PnL
+        pos.highest_price = entry;
+        let ex = sample_exit_quote(0.17);
+        let absurd_pnl = tokens_per_sol::pnl_pct(entry, ex.tokens_per_sol);
+        assert!(
+            absurd_pnl > c.take_profit_pct,
+            "sanity: absurd quote would trip TP without guard, pnl={absurd_pnl}"
+        );
+        assert!(
+            pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
+                .is_none(),
+            "scale mismatch must suppress TAKE_PROFIT"
+        );
+    }
+
+    #[test]
+    fn take_profit_still_quote_first_when_scale_matches_entry() {
+        let mut c = make_exit_config();
+        c.take_profit_pct = 20.0;
+        c.take_profit_min_hold_secs = 0;
+        c.hard_stop_loss_pct = 1_000.0;
+        let entry = 1.0e7;
+        let exec_tps = 8.0e6; // ~+25% executable gain (within 100× of entry)
+        let mut pos = PositionTracker::new("m", "p", "dex", entry, 6, 1_000_000, 0);
+        pos.current_price = entry;
+        pos.highest_price = entry;
+        let ex = sample_exit_quote(exec_tps);
+        let (ty, _) = pos
+            .should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
+            .expect("TAKE_PROFIT");
+        assert_eq!(ty, "TAKE_PROFIT");
     }
 
     /// Lower executable tps than entry → positive PnL in our convention

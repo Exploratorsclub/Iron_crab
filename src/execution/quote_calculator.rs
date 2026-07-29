@@ -22,6 +22,21 @@ use anyhow::{anyhow, Result};
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 
+/// Native SOL / WSOL mint (lamport-denominated input for PumpFun buys).
+const WSOL_MINT_PK: Pubkey = solana_sdk::pubkey!("So11111111111111111111111111111111111111112");
+
+/// Infer PumpFun swap direction when `input_mint` is the token being sold or SOL being spent.
+fn pumpfun_is_buy_input(state: &PumpFunState, input_mint: &Pubkey) -> bool {
+    if state.token_mint != Pubkey::default() {
+        // SOL/WSOL in → buy tokens; position token mint in → sell for SOL.
+        *input_mint != state.token_mint
+    } else {
+        // `parse_pumpfun_bonding` leaves `token_mint` default until market-data enrichment.
+        // Without a known curve mint, only native SOL input is a buy; token input is a sell.
+        *input_mint == WSOL_MINT_PK
+    }
+}
+
 // ============================================================================
 // Main API
 // ============================================================================
@@ -141,7 +156,7 @@ pub fn quote_output_amount(
 ) -> Result<u64> {
     match state {
         CachedPoolState::PumpFun(s) => {
-            let is_buy = *input_mint != s.token_mint; // SOL in → buy tokens
+            let is_buy = pumpfun_is_buy_input(s, input_mint);
             calculate_pumpfun_quote(s, amount_in, is_buy)
         }
         CachedPoolState::PumpAmm(s) => {
@@ -700,6 +715,38 @@ mod tests {
         // Expected from virtual: (100M * 30 SOL) / (1B + 100M) ≈ 2.73 SOL; capped by real (5 SOL)
         assert!(amount_out > 2_500_000_000);
         assert!(amount_out <= 5_000_000_000); // cannot exceed real_sol_reserves
+    }
+
+    /// Prod-scale: missing `token_mint` in cache must not flip sell → buy (token out as lamports).
+    #[test]
+    fn pumpfun_sell_quote_tps_same_order_when_token_mint_missing_from_cache() {
+        use crate::execution::tokens_per_sol;
+
+        let token_mint = Pubkey::new_unique();
+        let state = PumpFunState {
+            token_mint: Pubkey::default(),
+            bonding_curve: Pubkey::new_unique(),
+            associated_bonding_curve: Pubkey::new_unique(),
+            virtual_sol_reserves: 30_000_000_000,
+            virtual_token_reserves: 1_000_000_000_000_000,
+            real_sol_reserves: 5_000_000_000,
+            real_token_reserves: 793_100_000_000_000,
+            complete: false,
+            creator: Pubkey::new_unique(),
+            cashback_enabled: false,
+        };
+        let sell_raw = 69_000_000_000u64;
+        let sol_out = quote_output_amount(&CachedPoolState::PumpFun(state), sell_raw, &token_mint)
+            .expect("sell quote");
+        let tps = tokens_per_sol::ui_tokens_per_sol(sell_raw, 6, sol_out);
+        assert!(
+            tps > 1_000_000.0 && tps < 100_000_000.0,
+            "expected entry-scale tps (not ~0.17), got {tps}"
+        );
+        let entry_tps = 1.0e7;
+        assert!(!tokens_per_sol::exit_quote_tps_scale_ratio_exceeded(
+            entry_tps, tps, 100.0
+        ));
     }
 
     #[test]
