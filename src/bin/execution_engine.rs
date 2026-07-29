@@ -6406,9 +6406,14 @@ impl ExecutionContext {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Get current open positions count
+    /// Get current open positions count (LockManager — snapshot/metrics; not BUY gate authority).
     fn get_open_positions(&self) -> usize {
         self.lock_manager.count_non_zero_token_balances()
+    }
+
+    /// PA-3: PositionAuthority open count for max_open_positions BUY gate (in-process, no RPC).
+    fn get_position_authority_open_positions_count(&self) -> Option<usize> {
+        Some(self.position_authority.lock().open_positions_count())
     }
 
     fn apply_position_authority_from_execution_result(&self, exec: &ExecutionResult) {
@@ -9660,26 +9665,36 @@ fn create_test_intent(run_id: &str) -> TradeIntent {
     .with_ttl_ms(5000)
 }
 
-/// BUY max-open-positions gate: conservative count vs config limit (A.28 / Scope 49).
+/// BUY max-open-positions gate: conservative count vs config limit (A.28 / Scope 49 / PA-3).
 ///
-/// `authoritative_current` must come from [`ExecutionContext::get_open_positions`]
-/// (`LockManager::count_non_zero_token_balances`) — in-process only, no wallet scan / RPC.
-/// `metadata_current` is strategy-reported (`current_open_positions`); we take the max of both
-/// so neither stale-low metadata nor optimistic-high metadata alone can bypass the limit.
+/// In-process only — no wallet scan / RPC.
+/// `authority_current` is [`PositionAuthority::open_positions_count`] when available.
+/// `lockmanager_current` is [`LockManager::count_non_zero_token_balances`].
+/// `metadata_current` is strategy-reported (`current_open_positions`).
+/// Effective count is the max of all available sources so neither ghost locks nor stale metadata
+/// alone can bypass the limit.
 fn max_open_positions_buy_gate(
     metadata_current: usize,
-    authoritative_current: usize,
+    authority_current: Option<usize>,
+    lockmanager_current: usize,
     max_open: usize,
 ) -> (bool, String) {
-    let effective_current = metadata_current.max(authoritative_current);
+    let (effective_current, source, authority_suffix) = match authority_current {
+        Some(authority) => (
+            metadata_current.max(authority).max(lockmanager_current),
+            "position_authority(+lockmanager)",
+            format!("authority_current={authority} "),
+        ),
+        None => (
+            metadata_current.max(lockmanager_current),
+            "lockmanager",
+            "authority_unavailable=true ".to_string(),
+        ),
+    };
     let passed = effective_current < max_open;
     let details = format!(
-        "metadata_current={} authoritative_current={} effective_current={} {} max={}",
-        metadata_current,
-        authoritative_current,
-        effective_current,
+        "{authority_suffix}lockmanager_current={lockmanager_current} metadata_current={metadata_current} effective_current={effective_current} {} max={max_open} source={source}",
         if passed { "<" } else { ">=" },
-        max_open
     );
     (passed, details)
 }
@@ -10087,8 +10102,8 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
     }
 
     // Check 3c: Max open positions (applies to BUY only; SELL exits should remain possible)
-    // Authoritative count: LockManager non-zero token balances (A.28). Strategy metadata is kept
-    // for observability but must not be the sole enforcement source (Scope 49).
+    // PA-3: primary count from PositionAuthority; LockManager + strategy metadata kept
+    // conservatively (max of all three). In-process only — no wallet scan / RPC.
     // Scale-in BUY (`entry_kind=scale_in`) skips this gate when LockManager already holds the mint
     // (P179): adds to an existing probe position, does not open a new token mint slot.
     if intent.side == TradeSide::Buy {
@@ -10110,10 +10125,12 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                 .get("current_open_positions")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(0);
-            let authoritative_current = ctx.get_open_positions();
+            let authority_current = ctx.get_position_authority_open_positions_count();
+            let lockmanager_current = ctx.lock_manager.count_non_zero_token_balances();
             let (passed, details) = max_open_positions_buy_gate(
                 metadata_current,
-                authoritative_current,
+                authority_current,
+                lockmanager_current,
                 config.max_open_positions,
             );
 
@@ -14158,35 +14175,64 @@ mod execution_engine_tests {
     }
 
     #[test]
+    fn max_open_positions_gate_rejects_when_authority_exceeds_max() {
+        let max_open = 5usize;
+        let (passed, details) = max_open_positions_buy_gate(1, Some(5), 1, max_open);
+        assert!(!passed);
+        assert!(details.contains("authority_current=5"));
+        assert!(details.contains("lockmanager_current=1"));
+        assert!(details.contains("metadata_current=1"));
+        assert!(details.contains("effective_current=5"));
+        assert!(details.contains("source=position_authority(+lockmanager)"));
+        assert!(details.contains("max=5"));
+    }
+
+    #[test]
     fn max_open_positions_gate_rejects_when_lock_manager_exceeds_metadata() {
         let max_open = 5usize;
-        let (passed, details) = max_open_positions_buy_gate(1, 5, max_open);
+        let (passed, details) = max_open_positions_buy_gate(1, Some(1), 5, max_open);
         assert!(!passed);
+        assert!(details.contains("authority_current=1"));
+        assert!(details.contains("lockmanager_current=5"));
         assert!(details.contains("metadata_current=1"));
-        assert!(details.contains("authoritative_current=5"));
         assert!(details.contains("effective_current=5"));
         assert!(details.contains("max=5"));
     }
 
     #[test]
-    fn max_open_positions_gate_rejects_when_metadata_exceeds_lock_manager() {
+    fn max_open_positions_gate_rejects_when_metadata_exceeds_authority_and_lockmanager() {
         let max_open = 5usize;
-        let (passed, details) = max_open_positions_buy_gate(5, 1, max_open);
+        let (passed, details) = max_open_positions_buy_gate(5, Some(1), 1, max_open);
         assert!(!passed);
         assert!(details.contains("metadata_current=5"));
-        assert!(details.contains("authoritative_current=1"));
+        assert!(details.contains("authority_current=1"));
+        assert!(details.contains("lockmanager_current=1"));
         assert!(details.contains("effective_current=5"));
     }
 
     #[test]
-    fn max_open_positions_gate_passes_when_both_counts_below_max() {
+    fn max_open_positions_gate_passes_when_all_counts_below_max() {
         let max_open = 5usize;
-        let (passed, details) = max_open_positions_buy_gate(2, 3, max_open);
+        let (passed, details) = max_open_positions_buy_gate(2, Some(3), 1, max_open);
         assert!(passed);
+        assert!(details.contains("authority_current=3"));
+        assert!(details.contains("lockmanager_current=1"));
         assert!(details.contains("metadata_current=2"));
-        assert!(details.contains("authoritative_current=3"));
         assert!(details.contains("effective_current=3"));
         assert!(details.contains("< max=5"));
+        assert!(details.contains("source=position_authority(+lockmanager)"));
+    }
+
+    #[test]
+    fn max_open_positions_gate_fallback_when_authority_unavailable() {
+        let max_open = 5usize;
+        let (passed, details) = max_open_positions_buy_gate(1, None, 5, max_open);
+        assert!(!passed);
+        assert!(details.contains("authority_unavailable=true"));
+        assert!(details.contains("lockmanager_current=5"));
+        assert!(details.contains("metadata_current=1"));
+        assert!(details.contains("effective_current=5"));
+        assert!(details.contains("source=lockmanager"));
     }
 
     #[test]
@@ -14199,7 +14245,7 @@ mod execution_engine_tests {
         let details = skip.unwrap();
         assert!(details.contains("skipped_for_scale_in"));
         assert!(details.contains("existing_balance_raw=1000000"));
-        let (passed, _) = max_open_positions_buy_gate(10, 10, 5);
+        let (passed, _) = max_open_positions_buy_gate(10, Some(10), 10, 5);
         assert!(
             !passed,
             "gate would reject at limit; skip must bypass in process_intent"
@@ -14209,7 +14255,7 @@ mod execution_engine_tests {
     #[test]
     fn max_open_positions_gate_still_rejects_probe_at_limit() {
         let max_open = 5usize;
-        let (passed, details) = max_open_positions_buy_gate(10, 10, max_open);
+        let (passed, details) = max_open_positions_buy_gate(10, Some(10), 10, max_open);
         assert!(!passed);
         assert!(details.contains("effective_current=10"));
         let lm = LockManager::new(0);
@@ -14223,7 +14269,7 @@ mod execution_engine_tests {
             scale_in_max_open_positions_skip_details(Some("scale_in"), "NoBalanceMint", &lm)
                 .is_none()
         );
-        let (passed, details) = max_open_positions_buy_gate(10, 10, 5);
+        let (passed, details) = max_open_positions_buy_gate(10, Some(10), 10, 5);
         assert!(!passed);
         assert!(details.contains(">="));
     }
