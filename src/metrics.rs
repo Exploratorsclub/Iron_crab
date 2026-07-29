@@ -988,6 +988,12 @@ pub static MARKET_DATA_ARB_ADMISSION_ADMITTED_TOTAL: Lazy<AtomicU64> =
 /// PR4a: arb pool groups rejected at admission (no tracked-map mutation).
 pub static MARKET_DATA_ARB_ADMISSION_REJECTED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// C1b: arb pins with incomplete vault/bin Geyser registration (gauge).
+pub static MARKET_DATA_ARB_PIN_REGISTRATION_INCOMPLETE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// C1b: arb shed skipped Must-hot (quote_ready / executable) owner groups.
+pub static MARKET_DATA_ARB_SHED_SKIPPED_MUST_HOT_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// PR4b: wallet owner groups admitted before tracked-map mutation.
 pub static MARKET_DATA_WALLET_ADMISSION_ADMITTED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -1321,6 +1327,18 @@ pub fn inc_market_data_arb_admission_admitted_total() {
 #[inline]
 pub fn inc_market_data_arb_admission_rejected_total() {
     MARKET_DATA_ARB_ADMISSION_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_arb_pin_registration_incomplete_gauge(n: usize) {
+    MARKET_DATA_ARB_PIN_REGISTRATION_INCOMPLETE.store(n as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn add_market_data_arb_shed_skipped_must_hot_total(n: u64) {
+    if n > 0 {
+        MARKET_DATA_ARB_SHED_SKIPPED_MUST_HOT_TOTAL.fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 #[inline]
@@ -7158,6 +7176,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_arb_admission_rejected_total",
         MARKET_DATA_ARB_ADMISSION_REJECTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_arb_pin_registration_incomplete",
+        MARKET_DATA_ARB_PIN_REGISTRATION_INCOMPLETE.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_arb_shed_skipped_must_hot_total{reason=\"must_hot\"}",
+        MARKET_DATA_ARB_SHED_SKIPPED_MUST_HOT_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_wallet_admission_admitted_total",

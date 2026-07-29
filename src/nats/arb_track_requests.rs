@@ -20,10 +20,37 @@ pub struct ArbTrackRequestsUpdate {
     pub reconcile: bool,
 }
 
+/// Arb pin readiness tier from strategy selection (wire transport for Must-hot shed protection).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ArbTrackReadiness {
+    Rejected,
+    Warmable,
+    QuoteReady,
+    Executable,
+}
+
+impl Default for ArbTrackReadiness {
+    /// Missing wire field defaults to shed-eligible warmable (backward compat).
+    fn default() -> Self {
+        Self::Warmable
+    }
+}
+
+impl ArbTrackReadiness {
+    /// Must-hot pins are never evicted under EXEC_HOT arb shed (quote_ready / executable).
+    pub fn is_must_hot(self) -> bool {
+        matches!(self, Self::QuoteReady | Self::Executable)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArbTrackActiveEntry {
     pub pool: String,
     pub reason: ArbTrackActiveReason,
+    /// Selection readiness; omitted on wire → [`ArbTrackReadiness::Warmable`].
+    #[serde(default)]
+    pub readiness: ArbTrackReadiness,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -182,6 +209,7 @@ mod tests {
             .map(|i| ArbTrackActiveEntry {
                 pool: sample_pool_id(i),
                 reason: ArbTrackActiveReason::Baseline,
+                readiness: ArbTrackReadiness::Warmable,
             })
             .collect()
     }
@@ -194,6 +222,7 @@ mod tests {
             active: vec![ArbTrackActiveEntry {
                 pool: "Pool111111111111111111111111111111111111111".to_string(),
                 reason: ArbTrackActiveReason::MultiDex,
+                readiness: ArbTrackReadiness::QuoteReady,
             }],
             removed: vec![ArbTrackRemovedEntry {
                 pool: "Pool222222222222222222222222222222222222222".to_string(),
@@ -215,6 +244,27 @@ mod tests {
         let json = r#"{"version":1,"ts_unix_ms":1,"active":[],"removed":[]}"#;
         let u: ArbTrackRequestsUpdate = serde_json::from_str(json).expect("deserialize");
         assert!(!u.reconcile);
+    }
+
+    #[test]
+    fn arb_track_active_entry_deserializes_without_readiness_defaults_warmable() {
+        let json = r#"{"pool":"Pool111111111111111111111111111111111111111","reason":"baseline"}"#;
+        let entry: ArbTrackActiveEntry = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(entry.readiness, ArbTrackReadiness::Warmable);
+    }
+
+    #[test]
+    fn arb_track_readiness_roundtrip_snake_case() {
+        let entry = ArbTrackActiveEntry {
+            pool: "Pool111111111111111111111111111111111111111".to_string(),
+            reason: ArbTrackActiveReason::Baseline,
+            readiness: ArbTrackReadiness::Executable,
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        assert!(json.contains("\"readiness\":\"executable\""));
+        let back: ArbTrackActiveEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.readiness, ArbTrackReadiness::Executable);
+        assert!(back.readiness.is_must_hot());
     }
 
     #[test]

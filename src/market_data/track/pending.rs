@@ -559,8 +559,8 @@ mod tests {
     use super::super::worker_commands::TrackPinReason;
     use super::*;
     use crate::nats::{
-        ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackRequestsUpdate, MomentumActivePinReason,
-        MomentumActivePoolEntry, MomentumActivePoolsUpdate,
+        ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackReadiness, ArbTrackRequestsUpdate,
+        MomentumActivePinReason, MomentumActivePoolEntry, MomentumActivePoolsUpdate,
     };
     use solana_sdk::pubkey::Pubkey;
 
@@ -585,6 +585,7 @@ mod tests {
             active: vec![ArbTrackActiveEntry {
                 pool: pool.into(),
                 reason: ArbTrackActiveReason::Baseline,
+                readiness: ArbTrackReadiness::Warmable,
             }],
             removed: vec![],
             reconcile: false,

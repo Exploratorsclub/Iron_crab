@@ -12,6 +12,7 @@ use super::worker_commands::track_command_kind;
 use super::worker_commands::ImmutableTrackCommand;
 pub use super::worker_commands::{TrackCommandStream, TrackPinReason, TrackWorkerCommand};
 use crate::metrics::{
+    add_market_data_arb_shed_skipped_must_hot_total,
     add_market_data_exec_hot_hard_shed_groups_for_tier,
     inc_market_data_explicit_set_snapshot_write_errors_total,
     inc_market_data_explicit_set_snapshot_write_total,
@@ -106,6 +107,7 @@ pub trait TrackWorkerContext: Send + Sync {
     fn refresh_geyser_pins_gauge(&self);
     fn hot_pool_registry_pair_count(&self) -> usize;
     fn hot_pool_registry_arb_pool_count(&self) -> usize;
+    fn arb_pool_is_must_hot(&self, pool: Pubkey) -> bool;
     fn refresh_hot_pool_registry_gauges(&self);
     /// Periodic JetStream refresh for momentum-hot pins (WaitHotSet sustained freshness).
     fn tick_momentum_hot_balance_refresh_heartbeat(&self);
@@ -306,11 +308,16 @@ fn apply_exec_hot_pressure_shed<C: TrackWorkerContext>(
     let result = match tier {
         ExecHotShedTier::Tracker => admission.shed_tracker_owner_groups(max_groups),
         ExecHotShedTier::Momentum => admission.shed_momentum_owner_groups(max_groups),
-        ExecHotShedTier::Arb => admission.shed_arb_owner_groups(max_groups),
+        ExecHotShedTier::Arb => {
+            admission.shed_arb_owner_groups(max_groups, |pool| ctx.arb_pool_is_must_hot(pool))
+        }
         ExecHotShedTier::None => {
             return false;
         }
     };
+    if result.groups_skipped_must_hot > 0 {
+        add_market_data_arb_shed_skipped_must_hot_total(result.groups_skipped_must_hot as u64);
+    }
     set_market_data_exec_hot_last_shed_groups(tier, result.groups_evicted as u64);
     if result.groups_evicted > 0 {
         add_market_data_exec_hot_hard_shed_groups_for_tier(tier, result.groups_evicted as u64);
@@ -1000,6 +1007,10 @@ mod tests {
             0
         }
 
+        fn arb_pool_is_must_hot(&self, _pool: Pubkey) -> bool {
+            false
+        }
+
         fn refresh_hot_pool_registry_gauges(&self) {}
 
         fn tick_momentum_hot_balance_refresh_heartbeat(&self) {}
@@ -1310,6 +1321,10 @@ mod tests {
                 0
             }
 
+            fn arb_pool_is_must_hot(&self, _pool: Pubkey) -> bool {
+                false
+            }
+
             fn refresh_hot_pool_registry_gauges(&self) {}
 
             fn tick_momentum_hot_balance_refresh_heartbeat(&self) {}
@@ -1565,6 +1580,10 @@ mod tests {
             0
         }
 
+        fn arb_pool_is_must_hot(&self, _pool: Pubkey) -> bool {
+            false
+        }
+
         fn refresh_hot_pool_registry_gauges(&self) {}
 
         fn tick_momentum_hot_balance_refresh_heartbeat(&self) {}
@@ -1817,6 +1836,9 @@ mod tests {
             }
             fn hot_pool_registry_arb_pool_count(&self) -> usize {
                 0
+            }
+            fn arb_pool_is_must_hot(&self, _pool: Pubkey) -> bool {
+                false
             }
             fn refresh_hot_pool_registry_gauges(&self) {}
             fn tick_momentum_hot_balance_refresh_heartbeat(&self) {}
