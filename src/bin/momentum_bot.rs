@@ -1013,6 +1013,55 @@ fn exit_executable_quote_is_usable(q: &ExitExecutableQuote) -> bool {
     q.pool_sourced && q.tokens_per_sol > 0.0 && q.tokens_per_sol.is_finite()
 }
 
+/// Structural sim errors that need progressive sell-fail cooldown (aligned with EE matchers).
+#[inline]
+fn is_structural_sell_fail_error(error_code: Option<&str>) -> bool {
+    error_code
+        .map(|e| {
+            e.contains("6023")
+                || e.contains("6024")
+                || e.contains("6013")
+                || e.contains("InvalidProtocolFeeRecipient")
+                || e.contains("Overflow")
+                || e.contains("0x1787")
+                || e.contains("0x177d")
+                || e.contains("0x177D")
+                || e.contains("0x1788")
+        })
+        .unwrap_or(false)
+}
+
+#[inline]
+fn is_sim_insufficient_balance_error(error_code: Option<&str>) -> bool {
+    error_code
+        .map(|e| e.contains("SIM_INSUFFICIENT_BALANCE"))
+        .unwrap_or(false)
+}
+
+/// Progressive retry delay after repeated sell failures (matches timed-exit reconcile).
+#[inline]
+fn progressive_sell_fail_retry_secs(sell_fail_count: u32) -> u64 {
+    match sell_fail_count {
+        0 => 15,
+        1 => 30,
+        2 => 60,
+        _ => 120,
+    }
+}
+
+/// Cooldown before generating a new exit intent after a SELL execution failure.
+#[inline]
+fn sell_fail_cooldown_secs(error_code: Option<&str>, sell_fail_count: u32) -> u64 {
+    if is_sim_insufficient_balance_error(error_code) {
+        return 30;
+    }
+    if is_structural_sell_fail_error(error_code) {
+        return progressive_sell_fail_retry_secs(sell_fail_count);
+    }
+    // Transient failures: short floor, never zero.
+    10
+}
+
 /// Conservative max `LivePoolCache` age for **price-based** exits (STOP / TP).
 /// Below `quote_calculator`'s 5s warning so we do not SELL-trigger on long-stale reserve snapshots
 /// when the chain may have moved (I-16).
@@ -6345,8 +6394,66 @@ impl MomentumContext {
         }
     }
 
-    /// Check all positions for exit signals
-    /// Returns exit signals without marking exit_generated - caller must call mark_exit_generated() after successful publish
+    /// Max sell_fail_count across pools for a mint (progressive cooldown input).
+    fn sell_fail_count_for_mint(&self, mint: &str) -> u32 {
+        self.mint_pools
+            .read()
+            .get(mint)
+            .map(|pools| pools.iter().map(|p| p.sell_fail_count).max().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// True when a recent SELL failure is still inside its retry cooldown window.
+    fn sell_fail_cooldown_blocks_soft_exit(&self, mint: &str, pos: &PositionTracker) -> bool {
+        let Some(fail_at) = pos.last_sell_fail_at else {
+            return false;
+        };
+        let sell_fail_count = self.sell_fail_count_for_mint(mint);
+        let retry_after_secs =
+            sell_fail_cooldown_secs(pos.last_sell_error_code.as_deref(), sell_fail_count);
+        let age_secs = fail_at.elapsed().as_secs();
+        if age_secs < retry_after_secs {
+            debug!(
+                mint = %mint,
+                error_code = ?pos.last_sell_error_code,
+                age_secs = age_secs,
+                retry_after_secs = retry_after_secs,
+                "exit_suppressed_sell_fail_cooldown"
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Close overlay when wallet hint is zero after SIM_INSUFFICIENT_BALANCE (no RPC).
+    fn try_close_ghost_after_sim_insufficient_balance(
+        self: &Arc<Self>,
+        mint: &str,
+        error_code: Option<&str>,
+    ) -> bool {
+        if !is_sim_insufficient_balance_error(error_code) {
+            return false;
+        }
+        let wallet_zero = self
+            .latest_wallet_balance_raw_by_mint
+            .read()
+            .get(mint)
+            .copied()
+            == Some(0);
+        if !wallet_zero || !self.positions.read().contains_key(mint) {
+            return false;
+        }
+        info!(
+            mint = %mint,
+            "Ghost position closed after SIM_INSUFFICIENT_BALANCE with zero wallet hint"
+        );
+        self.close_position(mint);
+        true
+    }
+
+    /// Check all positions for exit signals.
+    /// Soft exits honour sell-fail cooldown; hard exits (DEV_SELL/LP_REMOVAL) bypass it.
+    /// `register_sell_intent` sets `exit_generated` early to prevent concurrent exit bursts.
     fn check_for_exits(&self) -> Vec<(String, String, String, String, String, u64)> {
         // Returns: Vec<(mint, pool, dex, exit_type, reason, token_amount)>
         let config = self.config.read().clone();
@@ -6583,6 +6690,10 @@ impl MomentumContext {
                 }
             }
 
+            if self.sell_fail_cooldown_blocks_soft_exit(mint, pos) {
+                continue;
+            }
+
             let exit_q = self.executable_exit_quote(pos, None);
             let live_trades_per_min = trades_per_min_by_tracker_key
                 .get(&Self::tracker_storage_key(mint, &pos.pool))
@@ -6660,21 +6771,17 @@ impl MomentumContext {
 
             if pos.exit_generated {
                 if let Some(age) = last_exit_age {
-                    // Phase 2: Progressive cooldowns based on sell_fail_count across pools
                     let sell_fail_count: u32 = mint_pools
                         .get(mint)
                         .map(|pools| pools.iter().map(|p| p.sell_fail_count).max().unwrap_or(0))
                         .unwrap_or(0);
-                    let retry_after_secs: u64 = match sell_fail_count {
-                        0 => 15,
-                        1 => 30,
-                        2 => 60,
-                        _ => 120,
-                    };
+                    let retry_after_secs = progressive_sell_fail_retry_secs(sell_fail_count);
                     if age < retry_after_secs {
                         continue;
                     }
                 }
+            } else if self.sell_fail_cooldown_blocks_soft_exit(mint, pos) {
+                continue;
             }
 
             let (pool, dex) = if !pos.pool.is_empty() && !pos.dex.is_empty() {
@@ -6925,6 +7032,8 @@ impl MomentumContext {
             },
         );
         debug!(intent_id = %intent_id, mint = %mint, "Registered pending SELL intent");
+        // Early latch: block concurrent exit scans before JetStream publish completes.
+        self.mark_exit_generated(mint);
     }
 
     async fn enqueue_intent_publish(&self, job: IntentPublishJob) -> Result<()> {
@@ -7961,6 +8070,13 @@ impl MomentumContext {
                     }
                     drop(positions);
 
+                    if self.try_close_ghost_after_sim_insufficient_balance(
+                        mint.as_str(),
+                        result.error_code.as_deref(),
+                    ) {
+                        return;
+                    }
+
                     // 6005 (BondingCurveComplete): mark PumpFun complete for orphaned path
                     if result
                         .error_code
@@ -8354,7 +8470,16 @@ impl MomentumContext {
                             "Reset exit_generated after sell FAILURE — will retry on next tick"
                         );
                     }
+                    let mint_for_ghost = pending.mint.clone();
                     drop(positions);
+
+                    if self.try_close_ghost_after_sim_insufficient_balance(
+                        &mint_for_ghost,
+                        result.error_code.as_deref(),
+                    ) {
+                        self.pending_intents.write().remove(&result.intent_id);
+                        return;
+                    }
 
                     // 6005 (BondingCurveComplete): mark PumpFun complete so find_best_sell_pool uses PumpSwap AMM
                     if result
@@ -8447,7 +8572,16 @@ impl MomentumContext {
                             "Reset exit_generated after sell TIMEOUT — will retry on next tick"
                         );
                     }
+                    let mint_for_ghost = pending.mint.clone();
                     drop(positions);
+
+                    if self.try_close_ghost_after_sim_insufficient_balance(
+                        &mint_for_ghost,
+                        result.error_code.as_deref(),
+                    ) {
+                        self.pending_intents.write().remove(&result.intent_id);
+                        return;
+                    }
 
                     // 6005 (BondingCurveComplete): mark PumpFun complete
                     if result
@@ -17518,7 +17652,196 @@ mod tests {
         Arc::clone(&ctx).handle_execution_result(&result);
         let pos = ctx.positions.read().get("mintZ").unwrap().clone();
         assert!(!pos.exit_generated);
+        assert!(pos.last_sell_fail_at.is_some());
         assert_eq!(pos.token_amount, 1_000);
+
+        // Cooldown must block a new soft exit until it expires.
+        let mut cfg = ctx.config.write();
+        cfg.max_hold_time_secs = 1;
+        cfg.hard_stop_loss_pct = 1_000.0;
+        cfg.take_profit_pct = 1_000.0;
+        drop(cfg);
+        {
+            let mut positions = ctx.positions.write();
+            let pos = positions.get_mut("mintZ").unwrap();
+            pos.entry_time = Instant::now() - Duration::from_secs(120);
+        }
+        assert!(
+            ctx.check_for_exits().is_empty(),
+            "transient sell fail cooldown should suppress TIME_EXIT"
+        );
+    }
+
+    #[test]
+    fn sell_fail_6023_suppresses_exit_during_cooldown_then_allows_after() {
+        let mut cfg = MomentumConfig::default();
+        cfg.max_hold_time_secs = 60;
+        cfg.hard_stop_loss_pct = 1_000.0;
+        cfg.take_profit_pct = 1_000.0;
+        cfg.trailing_stop_pct = 1_000.0;
+        cfg.trailing_activation_pct = 1_000.0;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let ctx = empty_test_context(test_queued_jsonl_writer(tmp.path()));
+        *ctx.config.write() = cfg;
+
+        let mint = "mint6023";
+        {
+            let mut positions = ctx.positions.write();
+            let mut pos = PositionTracker::new(mint, "pool", "raydium", 1.0, 6, 1_000, 1_000_000);
+            pos.entry_time = Instant::now() - Duration::from_secs(120);
+            pos.last_sell_error_code = Some("Custom(6023)".to_string());
+            pos.last_sell_fail_at = Some(Instant::now());
+            positions.insert(mint.to_string(), pos);
+        }
+
+        assert!(
+            ctx.check_for_exits().is_empty(),
+            "6023 fail cooldown should suppress TIME_EXIT"
+        );
+
+        {
+            let mut positions = ctx.positions.write();
+            let pos = positions.get_mut(mint).unwrap();
+            pos.last_sell_fail_at = Some(Instant::now() - Duration::from_secs(20));
+        }
+
+        let exits = ctx.check_for_exits();
+        assert_eq!(exits.len(), 1, "exit should resume after cooldown");
+        assert_eq!(exits[0].3, "TIME_EXIT");
+    }
+
+    #[test]
+    fn hard_exit_bypasses_sell_fail_cooldown() {
+        let mut cfg = MomentumConfig::default();
+        cfg.hard_stop_loss_pct = 1_000.0;
+        cfg.take_profit_pct = 1_000.0;
+        cfg.max_hold_time_secs = 999_999;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let ctx = empty_test_context(test_queued_jsonl_writer(tmp.path()));
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "mintHard";
+        {
+            let mut positions = ctx.positions.write();
+            let mut pos = PositionTracker::new(mint, "pool", "dex", 1.0, 6, 123, 1_000);
+            pos.entry_time = Instant::now() - Duration::from_secs(10);
+            pos.entry_confirmed_slot = 100;
+            pos.last_price_slot = 150;
+            pos.last_sell_error_code = Some("Custom(6023)".to_string());
+            pos.last_sell_fail_at = Some(Instant::now());
+            positions.insert(mint.to_string(), pos);
+        }
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let mut tracker = TokenTracker::new(mint, "pool", "dex", 1, 0);
+            tracker.dev_wallet = Some("dev".to_string());
+            tracker.record_trade("dev", false, 2_000_000_000, 1, "devsig", 200, &cfg);
+            trackers.insert(MomentumContext::tracker_storage_key(mint, "pool"), tracker);
+        }
+        ctx.last_event_slot
+            .store(250, std::sync::atomic::Ordering::Relaxed);
+
+        let exits = ctx.check_for_exits();
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].3, "DEV_SELL");
+    }
+
+    #[test]
+    fn register_sell_intent_sets_early_exit_latch() {
+        let tmp = TempDir::new().expect("tempdir");
+        let ctx = empty_test_context(test_queued_jsonl_writer(tmp.path()));
+
+        {
+            let mut positions = ctx.positions.write();
+            let pos = PositionTracker::new(
+                "mintLatch",
+                "poolLatch",
+                "raydium",
+                1.0,
+                6,
+                1_000_000,
+                1_000_000,
+            );
+            positions.insert("mintLatch".to_string(), pos);
+        }
+
+        ctx.register_sell_intent(
+            "sell-latch-1",
+            "mintLatch",
+            "poolLatch",
+            "raydium",
+            1_000_000,
+        );
+        assert!(
+            ctx.positions
+                .read()
+                .get("mintLatch")
+                .unwrap()
+                .exit_generated
+        );
+        assert!(ctx.check_for_exits().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sim_insufficient_balance_zero_wallet_closes_ghost_position() {
+        let tmp = TempDir::new().expect("tempdir");
+        let ctx = empty_test_context(test_queued_jsonl_writer(tmp.path()));
+
+        let mint = "mintGhost";
+        {
+            let mut positions = ctx.positions.write();
+            let pos =
+                PositionTracker::new(mint, "poolGhost", "raydium", 1.0, 6, 500_000, 1_000_000);
+            positions.insert(mint.to_string(), pos);
+        }
+        ctx.mark_exit_generated(mint);
+        ctx.register_sell_intent("sell-ghost", mint, "poolGhost", "raydium", 500_000);
+        ctx.latest_wallet_balance_raw_by_mint
+            .write()
+            .insert(mint.to_string(), 0);
+
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("side".to_string(), "SELL".to_string());
+        let result = ExecutionResult {
+            header: RecordHeader::new("test", BUILD_VERSION, "run-test"),
+            execution_id: "ex-ghost".to_string(),
+            decision_id: "dec-ghost".to_string(),
+            intent_id: "sell-ghost".to_string(),
+            source: "momentum-bot".to_string(),
+            token_mint: Some(mint.to_string()),
+            signature: None,
+            bundle_id: None,
+            status: ExecutionStatus::Failed,
+            fill_in: None,
+            fill_out: None,
+            fill_status: None,
+            fill_unavailable_reason: None,
+            confirmed_slot: None,
+            block_time_unix_ms: None,
+            fees: None,
+            pnl: None,
+            wallet_sol_delta_lamports: None,
+            error_message: Some("sim insufficient".to_string()),
+            error_code: Some("SIM_INSUFFICIENT_BALANCE".to_string()),
+            latency_ms: None,
+            metadata: meta,
+        };
+
+        Arc::clone(&ctx).handle_execution_result(&result);
+        assert!(!ctx.positions.read().contains_key(mint));
+    }
+
+    #[test]
+    fn sell_fail_cooldown_secs_helpers() {
+        assert_eq!(sell_fail_cooldown_secs(Some("Custom(6023)"), 0), 15);
+        assert_eq!(sell_fail_cooldown_secs(Some("Custom(6023)"), 2), 60);
+        assert_eq!(
+            sell_fail_cooldown_secs(Some("SIM_INSUFFICIENT_BALANCE"), 0),
+            30
+        );
+        assert_eq!(sell_fail_cooldown_secs(Some("pool locked"), 0), 10);
     }
 
     #[test]
@@ -20966,18 +21289,18 @@ mod tests {
         .expect("enqueue exit");
 
         for _ in 0..100 {
-            if ctx.positions.read().get(mint).unwrap().exit_generated {
+            if steps.lock().contains(&"jsonl_spawned") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         assert!(
-            ctx.positions.read().get(mint).unwrap().exit_generated,
-            "exit post-action must complete without waiting for JSONL queue drain"
-        );
-        assert!(
             steps.lock().contains(&"jsonl_spawned"),
             "exit path must offload JSONL to background (jetstream/critical path first)"
+        );
+        assert!(
+            ctx.positions.read().get(mint).unwrap().exit_generated,
+            "exit latch must be set (early at register_sell_intent)"
         );
         // Post-action may finish before JSONL writer thread records the line.
         let _ = jsonl_records_before;
@@ -21380,7 +21703,7 @@ async fn generate_and_publish_exit_intent(
         })
         .await
     {
-        ctx.pending_intents.write().remove(&intent_id);
+        ctx.rollback_exit_intent_after_publish_failure(&intent_id, mint);
         return Err(e);
     }
 
