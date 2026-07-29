@@ -3789,8 +3789,11 @@ impl MomentumContext {
     }
 
     /// I-MD-9: Geyser hot-set readiness for imminent entry — fresh `LivePoolCache` reserves, no RPC.
-    fn entry_hot_set_fresh(&self, mint: &str, pool: &str, dex: &str) -> bool {
-        match self.entry_hot_set_fresh_reason(mint, pool) {
+    ///
+    /// `probe_lamports` must match the planned entry BUY size (probe or scale-in SOL in), EE-aligned.
+    fn entry_hot_set_fresh(&self, mint: &str, pool: &str, dex: &str, probe_lamports: u64) -> bool {
+        let _ = mint; // callers pass mint for log/context symmetry; cache key is pool
+        match self.entry_hot_set_fresh_reason(pool, probe_lamports) {
             Ok(()) => true,
             Err(reason) => {
                 ironcrab::metrics::record_momentum_entry_hot_fresh_fail(reason, dex);
@@ -3801,13 +3804,10 @@ impl MomentumContext {
 
     fn entry_hot_set_fresh_reason(
         &self,
-        mint: &str,
         pool: &str,
+        probe_lamports: u64,
     ) -> Result<(), ironcrab::metrics::MomentumEntryHotFreshFailReason> {
         let Ok(pool_pk) = solana_sdk::pubkey::Pubkey::from_str(pool) else {
-            return Err(ironcrab::metrics::MomentumEntryHotFreshFailReason::Missing);
-        };
-        let Ok(token_mint) = solana_sdk::pubkey::Pubkey::from_str(mint) else {
             return Err(ironcrab::metrics::MomentumEntryHotFreshFailReason::Missing);
         };
         let Some((state, _slot, age_ms)) = self.live_pool_cache.get_with_metadata(&pool_pk) else {
@@ -3816,9 +3816,13 @@ impl MomentumContext {
         if age_ms > ENTRY_HOT_SET_MAX_CACHE_AGE_MS {
             return Err(ironcrab::metrics::MomentumEntryHotFreshFailReason::Age);
         }
-        const PROBE_TOKENS: u64 = 1_000;
-        match quote_calculator::quote_output_amount(&state, PROBE_TOKENS, &token_mint) {
-            Ok(sol_out) if sol_out > 0 => Ok(()),
+        if probe_lamports == 0 {
+            return Err(ironcrab::metrics::MomentumEntryHotFreshFailReason::Quote);
+        }
+        // Entry BUY probe: SOL in → tokens out (same semantics as EE `calculate_fresh_min_out`).
+        let sol_mint = *SOL_MINT_PUBKEY;
+        match quote_calculator::quote_output_amount(&state, probe_lamports, &sol_mint) {
+            Ok(tokens_out) if tokens_out > 0 => Ok(()),
             _ => Err(ironcrab::metrics::MomentumEntryHotFreshFailReason::Quote),
         }
     }
@@ -5546,6 +5550,7 @@ impl MomentumContext {
                             &mint,
                             tracker.pool.as_str(),
                             tracker.dex.as_str(),
+                            probe_sol,
                         );
                         ironcrab::metrics::record_momentum_filter_pass_hot_fresh(entry_hot_fresh);
                         if probe_sol == 0 {
@@ -5713,6 +5718,7 @@ impl MomentumContext {
                             &mint,
                             tracker.pool.as_str(),
                             tracker.dex.as_str(),
+                            scale_sol,
                         ) {
                             self.mark_entry_eval_dirty_key(key);
                             continue 'tracker_keys;
@@ -13621,6 +13627,12 @@ mod tests {
         pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, &upd)
     }
 
+    fn entry_probe_sol_lamports(cfg: &MomentumConfig) -> u64 {
+        ((cfg.default_position_lamports as f64) * cfg.probe_buy_pct)
+            .round()
+            .clamp(0.0, cfg.default_position_lamports as f64) as u64
+    }
+
     /// Full-scan entry eval through WaitHotSet → probe intent (I-MD-9).
     fn check_for_probe_signals_imminent_entry(
         ctx: &MomentumContext,
@@ -19844,9 +19856,10 @@ mod tests {
 
         let mint = Pubkey::new_from_array([0x68u8; 32]).to_string();
         let pool = Pubkey::new_from_array([0x69u8; 32]).to_string();
+        let probe_lamports = entry_probe_sol_lamports(&ctx.config.read());
 
         assert!(
-            !ctx.entry_hot_set_fresh(mint.as_str(), pool.as_str(), "raydium"),
+            !ctx.entry_hot_set_fresh(mint.as_str(), pool.as_str(), "raydium", probe_lamports),
             "missing cache row"
         );
         assert_eq!(
@@ -19867,7 +19880,7 @@ mod tests {
         );
         pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, &zero_quote);
         assert!(
-            !ctx.entry_hot_set_fresh(mint.as_str(), pool.as_str(), "raydium"),
+            !ctx.entry_hot_set_fresh(mint.as_str(), pool.as_str(), "raydium", probe_lamports),
             "zero reserves must fail quote gate"
         );
         assert_eq!(
@@ -19881,7 +19894,7 @@ mod tests {
         assert!(seed_test_entry_hot_set(&ctx, mint.as_str(), pool.as_str()));
         std::thread::sleep(Duration::from_millis(ENTRY_HOT_SET_MAX_CACHE_AGE_MS + 200));
         assert!(
-            !ctx.entry_hot_set_fresh(mint.as_str(), pool.as_str(), "raydium"),
+            !ctx.entry_hot_set_fresh(mint.as_str(), pool.as_str(), "raydium", probe_lamports),
             "stale cache must fail age gate"
         );
         assert_eq!(
@@ -19991,9 +20004,103 @@ mod tests {
         );
 
         assert!(seed_test_entry_hot_set(&ctx, mint.as_str(), pool.as_str()));
+        let probe_lamports = entry_probe_sol_lamports(&ctx.config.read());
         assert!(
-            ctx.entry_hot_set_fresh(mint.as_str(), pool.as_str(), "raydium"),
+            ctx.entry_hot_set_fresh(mint.as_str(), pool.as_str(), "raydium", probe_lamports),
             "quotable balance update must allow fresh=true"
+        );
+    }
+
+    #[test]
+    fn entry_hot_set_fresh_pumpfun_early_curve_buy_probe_passes() {
+        use ironcrab::execution::live_pool_cache::{CachedPoolState, PumpFunState};
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = Pubkey::new_from_array([0x70u8; 32]);
+        let pool = Pubkey::new_from_array([0x71u8; 32]);
+        let probe_lamports = entry_probe_sol_lamports(&ctx.config.read());
+
+        let state = CachedPoolState::PumpFun(PumpFunState {
+            token_mint: mint,
+            bonding_curve: pool,
+            associated_bonding_curve: Pubkey::default(),
+            virtual_sol_reserves: 30_000_000_000,
+            virtual_token_reserves: 1_000_000_000_000_000,
+            real_sol_reserves: 30_000_000_000,
+            real_token_reserves: 1_000_000_000_000_000,
+            complete: false,
+            creator: Pubkey::new_from_array([0x72u8; 32]),
+            cashback_enabled: false,
+        });
+        assert!(ctx.live_pool_cache.upsert(pool, state.clone(), 1));
+
+        // Regression: mini token-SELL dust probe would be zero on early curves.
+        const LEGACY_SELL_PROBE_TOKENS: u64 = 1_000;
+        let legacy_sell_out =
+            quote_calculator::quote_output_amount(&state, LEGACY_SELL_PROBE_TOKENS, &mint)
+                .unwrap_or(0);
+        assert_eq!(
+            legacy_sell_out, 0,
+            "legacy SELL dust probe must not pass on early PumpFun curves"
+        );
+
+        let buy_out =
+            quote_calculator::quote_output_amount(&state, probe_lamports, &*SOL_MINT_PUBKEY)
+                .expect("BUY probe quote");
+        assert!(buy_out > 0, "BUY SOL probe must be quotable on early curve");
+
+        let mint_str = mint.to_string();
+        let pool_str = pool.to_string();
+        assert!(
+            ctx.entry_hot_set_fresh(
+                mint_str.as_str(),
+                pool_str.as_str(),
+                "pumpfun",
+                probe_lamports
+            ),
+            "entry hot-set gate must pass with EE-aligned BUY probe"
+        );
+    }
+
+    #[test]
+    fn entry_hot_set_fresh_pumpfun_complete_fails_quote() {
+        use ironcrab::execution::live_pool_cache::{CachedPoolState, PumpFunState};
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = Pubkey::new_from_array([0x73u8; 32]);
+        let pool = Pubkey::new_from_array([0x74u8; 32]);
+        let probe_lamports = entry_probe_sol_lamports(&ctx.config.read());
+
+        let state = CachedPoolState::PumpFun(PumpFunState {
+            token_mint: mint,
+            bonding_curve: pool,
+            associated_bonding_curve: Pubkey::default(),
+            virtual_sol_reserves: 30_000_000_000,
+            virtual_token_reserves: 1_000_000_000_000_000,
+            real_sol_reserves: 30_000_000_000,
+            real_token_reserves: 1_000_000_000_000_000,
+            complete: true,
+            creator: Pubkey::new_from_array([0x75u8; 32]),
+            cashback_enabled: false,
+        });
+        assert!(ctx.live_pool_cache.upsert(pool, state, 1));
+
+        let mint_str = mint.to_string();
+        let pool_str = pool.to_string();
+        assert!(
+            !ctx.entry_hot_set_fresh(
+                mint_str.as_str(),
+                pool_str.as_str(),
+                "pumpfun",
+                probe_lamports
+            ),
+            "completed PumpFun curve must fail quote gate"
         );
     }
 
