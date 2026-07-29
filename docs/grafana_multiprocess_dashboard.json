@@ -1688,6 +1688,7 @@
     {
       "type": "stat",
       "title": "Open Positions",
+      "description": "PA-2 Rest: `open_positions` is PositionAuthority open count (not LockManager ghosts).",
       "targets": [
         {
           "expr": "open_positions{job=\"execution-engine\"}",

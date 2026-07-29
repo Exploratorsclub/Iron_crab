@@ -6,7 +6,7 @@
   "panels": [
     { "type": "timeseries", "title": "Sharpe Ratio", "targets": [{ "expr": "ironcrab_sharpe_ratio" }], "gridPos": {"h":6,"w":8,"x":0,"y":0} },
     { "type": "timeseries", "title": "Drawdown %", "targets": [{ "expr": "ironcrab_drawdown_pct" }], "gridPos": {"h":6,"w":8,"x":8,"y":0} },
-    { "type": "timeseries", "title": "Open Positions", "targets": [{ "expr": "open_positions" }], "gridPos": {"h":6,"w":8,"x":16,"y":0} },
+    { "type": "timeseries", "title": "Open Positions", "description": "PA-2 Rest: `open_positions` is PositionAuthority open count (not LockManager ghosts).", "targets": [{ "expr": "open_positions" }], "gridPos": {"h":6,"w":8,"x":16,"y":0} },
 
     { "type": "timeseries", "title": "Gross vs Net Realized PnL (SOL)", "targets": [
         { "expr": "gross_realized_pnl_sol" },
