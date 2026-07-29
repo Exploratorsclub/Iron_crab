@@ -4454,15 +4454,22 @@ pub static ARB_TRACK_SELECTION_QUEUE_OVERFLOW_TOTAL: Lazy<AtomicU64> =
 pub static ARB_TRACK_SELECTION_BLOCKING_JOIN_FAILED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
-const ARB_QUOTE_PAIR_SLOT_DELTA_BUCKETS: &[u64] = &[0, 1, 2, 3, 4, 5, 8, 16, 32];
-static ARB_QUOTE_PAIR_SLOT_DELTA_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
-    ARB_QUOTE_PAIR_SLOT_DELTA_BUCKETS
+const ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_BUCKETS: &[u64] =
+    &[0, 1, 2, 3, 5, 10, 20, 50, 100, 500, 1000, 5000];
+static ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_BUCKETS
         .iter()
         .map(|_| AtomicU64::new(0))
         .collect()
 });
-pub static ARB_QUOTE_PAIR_SLOT_DELTA_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
-pub static ARB_QUOTE_PAIR_SLOT_DELTA_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_QUOTE_PAIR_SLOT_SKEW_LEG_EQUAL_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 const ARB_TRACK_PIN_BEFORE_FIRST_SCREEN_MS_BUCKETS: &[u64] = &[
     10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000,
@@ -5044,16 +5051,65 @@ pub fn arb_two_hop_v2_rejected_inc(reason: ArbTwoHopV2RejectReason) {
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Record `|buy.as_of_slot - sell.as_of_slot|` for a v2 round-trip screen.
-pub fn record_arb_quote_pair_slot_delta(delta_slots: u64) {
+/// Which v2 round-trip leg has the older `as_of_slot` (lower slot = staler quote).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbQuotePairSlotSkewLeg {
+    Buy,
+    Sell,
+    Equal,
+}
+
+/// Classify which leg is staler for slot-skew attribution.
+#[inline]
+pub fn classify_arb_quote_pair_slot_skew_leg(
+    buy_as_of_slot: u64,
+    sell_as_of_slot: u64,
+) -> ArbQuotePairSlotSkewLeg {
+    match buy_as_of_slot.cmp(&sell_as_of_slot) {
+        std::cmp::Ordering::Less => ArbQuotePairSlotSkewLeg::Buy,
+        std::cmp::Ordering::Greater => ArbQuotePairSlotSkewLeg::Sell,
+        std::cmp::Ordering::Equal => ArbQuotePairSlotSkewLeg::Equal,
+    }
+}
+
+/// Increment `arb_quote_pair_slot_skew_leg_total{leg=...}`.
+#[inline]
+pub fn arb_quote_pair_slot_skew_leg_inc(leg: ArbQuotePairSlotSkewLeg) {
+    let counter = match leg {
+        ArbQuotePairSlotSkewLeg::Buy => &*ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL,
+        ArbQuotePairSlotSkewLeg::Sell => &*ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL,
+        ArbQuotePairSlotSkewLeg::Equal => &*ARB_QUOTE_PAIR_SLOT_SKEW_LEG_EQUAL_TOTAL,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record `|buy.as_of_slot - sell.as_of_slot|` histogram and stale-leg attribution for a v2 screen.
+pub fn record_arb_quote_pair_slot_delta(buy_as_of_slot: u64, sell_as_of_slot: u64) {
+    let slot_delta = buy_as_of_slot.abs_diff(sell_as_of_slot);
     record_histogram_u64_into(
-        ARB_QUOTE_PAIR_SLOT_DELTA_BUCKETS,
-        ARB_QUOTE_PAIR_SLOT_DELTA_BUCKET_COUNTS.as_slice(),
-        &ARB_QUOTE_PAIR_SLOT_DELTA_SUM,
-        &ARB_QUOTE_PAIR_SLOT_DELTA_COUNT,
-        delta_slots,
+        ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_BUCKETS,
+        ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_BUCKET_COUNTS.as_slice(),
+        &ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM,
+        &ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_COUNT,
+        slot_delta,
         u64::MAX,
     );
+    arb_quote_pair_slot_skew_leg_inc(classify_arb_quote_pair_slot_skew_leg(
+        buy_as_of_slot,
+        sell_as_of_slot,
+    ));
+}
+
+#[cfg(any(test, feature = "test_helpers"))]
+pub fn reset_arb_quote_pair_slot_skew_metrics_for_test() {
+    for bucket in ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_BUCKET_COUNTS.iter() {
+        bucket.store(0, Ordering::Relaxed);
+    }
+    ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.store(0, Ordering::Relaxed);
+    ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_COUNT.store(0, Ordering::Relaxed);
+    ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL.store(0, Ordering::Relaxed);
+    ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL.store(0, Ordering::Relaxed);
+    ARB_QUOTE_PAIR_SLOT_SKEW_LEG_EQUAL_TOTAL.store(0, Ordering::Relaxed);
 }
 
 /// Record first proactive multi-DEX pin publish for pin-before-first-screen latency.
@@ -9240,12 +9296,33 @@ async fn metrics_response() -> Response<Body> {
     append_arb_two_hop_v2_sell_quote_none_detail_total(&mut out);
     append_momentum_latency_histogram_prometheus(
         &mut out,
-        "arb_quote_pair_slot_delta",
-        ARB_QUOTE_PAIR_SLOT_DELTA_BUCKETS,
-        ARB_QUOTE_PAIR_SLOT_DELTA_BUCKET_COUNTS.as_slice(),
-        &ARB_QUOTE_PAIR_SLOT_DELTA_SUM,
-        &ARB_QUOTE_PAIR_SLOT_DELTA_COUNT,
+        "arb_quote_pair_slot_delta_slots",
+        ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_BUCKETS,
+        ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_BUCKET_COUNTS.as_slice(),
+        &ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM,
+        &ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_COUNT,
     );
+    out.push_str("arb_quote_pair_slot_skew_leg_total{leg=\"buy\"} ");
+    out.push_str(
+        &ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_quote_pair_slot_skew_leg_total{leg=\"sell\"} ");
+    out.push_str(
+        &ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_quote_pair_slot_skew_leg_total{leg=\"equal\"} ");
+    out.push_str(
+        &ARB_QUOTE_PAIR_SLOT_SKEW_LEG_EQUAL_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     append_momentum_latency_histogram_prometheus(
         &mut out,
         "arb_track_pin_before_first_screen_ms",
@@ -10947,6 +11024,93 @@ mod market_data_account_recv_metrics_tests {
         assert_eq!(
             MARKET_DATA_ACCOUNT_RECV_ITERATIONS_TOTAL.load(Ordering::Relaxed),
             recv_iters_before + 1
+        );
+    }
+}
+
+#[cfg(test)]
+mod arb_quote_pair_slot_skew_metrics_tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn record_slot_delta_histogram_and_leg_attribution() {
+        reset_arb_quote_pair_slot_skew_metrics_for_test();
+
+        record_arb_quote_pair_slot_delta(50, 50);
+        assert_eq!(
+            classify_arb_quote_pair_slot_skew_leg(50, 50),
+            ArbQuotePairSlotSkewLeg::Equal
+        );
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_COUNT.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_EQUAL_TOTAL.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_BUCKET_COUNTS[0].load(Ordering::Relaxed),
+            1
+        );
+
+        reset_arb_quote_pair_slot_skew_metrics_for_test();
+        record_arb_quote_pair_slot_delta(48, 50);
+        assert_eq!(
+            classify_arb_quote_pair_slot_skew_leg(48, 50),
+            ArbQuotePairSlotSkewLeg::Buy
+        );
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_BUCKET_COUNTS[2].load(Ordering::Relaxed),
+            1
+        );
+
+        reset_arb_quote_pair_slot_skew_metrics_for_test();
+        record_arb_quote_pair_slot_delta(1, 101);
+        assert_eq!(
+            classify_arb_quote_pair_slot_skew_leg(1, 101),
+            ArbQuotePairSlotSkewLeg::Buy
+        );
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed),
+            100
+        );
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_BUCKET_COUNTS[8].load(Ordering::Relaxed),
+            1
+        );
+
+        reset_arb_quote_pair_slot_skew_metrics_for_test();
+        record_arb_quote_pair_slot_delta(120, 20);
+        assert_eq!(
+            classify_arb_quote_pair_slot_skew_leg(120, 20),
+            ArbQuotePairSlotSkewLeg::Sell
+        );
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL.load(Ordering::Relaxed),
+            1
         );
     }
 }
