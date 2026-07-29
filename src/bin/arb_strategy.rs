@@ -3283,11 +3283,10 @@ impl TokenArbTracker {
 
         arb_two_hop_v2_round_trip_formable_inc();
 
-        let slot_delta = selection
-            .buy_quote
-            .as_of_slot
-            .abs_diff(selection.sell_quote.as_of_slot);
-        record_arb_quote_pair_slot_delta(slot_delta);
+        let buy_as_of_slot = selection.buy_quote.as_of_slot;
+        let sell_as_of_slot = selection.sell_quote.as_of_slot;
+        let slot_delta = buy_as_of_slot.abs_diff(sell_as_of_slot);
+        record_arb_quote_pair_slot_delta(buy_as_of_slot, sell_as_of_slot);
         if config.arb_max_leg_slot_delta > 0 && slot_delta > config.arb_max_leg_slot_delta {
             arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::SlotDeltaExceeded);
             return None;
@@ -9808,6 +9807,140 @@ mod two_hop_price_tests {
         assert!(
             ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED.load(Ordering::Relaxed)
                 > before
+        );
+    }
+
+    fn run_v2_slot_skew_screen(buy_slot: u64, sell_slot: u64) {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+
+        let update_orca = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_a.to_string(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            980_000_000,
+            buy_slot,
+        );
+        let update_pump = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_b.to_string(),
+            "pump_amm".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            1_020_000_000,
+            sell_slot,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        seed_token_tracker_from_live_pool_cache(
+            &mint_str,
+            &cache,
+            &mut trackers,
+            &mut vault_balances,
+            None,
+        );
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert(pool_a.to_string());
+        known_pools.insert(pool_b.to_string());
+
+        let tracker = trackers.get_mut(&mint_str).unwrap();
+        tracker.token_decimals = Some(6);
+
+        let config = ArbConfig {
+            arb_two_hop_v2_enabled: true,
+            arb_max_leg_slot_delta: 0,
+            min_spread_bps: 1,
+            min_profit_lamports: 1,
+            est_tx_cost_lamports: 1,
+            ..Default::default()
+        };
+
+        let bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
+        let spread_warn_last = RwLock::new(HashMap::new());
+        let data_quality_rejects = AtomicU64::new(0);
+        let _ = tracker.check_arbitrage(
+            &config,
+            &known_pools,
+            &vault_balances,
+            &bin_arrays,
+            &ArbCheckContext {
+                spread_warn_last: &spread_warn_last,
+                data_quality_rejects: &data_quality_rejects,
+                forensics: None,
+                v2_forensics: None,
+                selected_mints: None,
+                pinned_pools: None,
+            },
+        );
+    }
+
+    #[test]
+    fn check_arbitrage_v2_records_slot_skew_histogram_and_leg_attribution() {
+        use ironcrab::metrics::{
+            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_COUNT, ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM,
+            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL, ARB_QUOTE_PAIR_SLOT_SKEW_LEG_EQUAL_TOTAL,
+            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL,
+        };
+
+        let count_before = ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_COUNT.load(Ordering::Relaxed);
+        let equal_before = ARB_QUOTE_PAIR_SLOT_SKEW_LEG_EQUAL_TOTAL.load(Ordering::Relaxed);
+        let sum_before = ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed);
+        run_v2_slot_skew_screen(50, 50);
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_COUNT.load(Ordering::Relaxed),
+            count_before + 1
+        );
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_EQUAL_TOTAL.load(Ordering::Relaxed),
+            equal_before + 1
+        );
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed),
+            sum_before
+        );
+
+        let buy_before = ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL.load(Ordering::Relaxed);
+        let sum_before = ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed);
+        run_v2_slot_skew_screen(48, 50);
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL.load(Ordering::Relaxed),
+            buy_before + 1
+        );
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed),
+            sum_before + 2
+        );
+
+        let buy_before = ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL.load(Ordering::Relaxed);
+        let sell_before = ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL.load(Ordering::Relaxed);
+        let sum_before = ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed);
+        run_v2_slot_skew_screen(1, 101);
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL.load(Ordering::Relaxed),
+            buy_before + 1
+        );
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL.load(Ordering::Relaxed),
+            sell_before
+        );
+        assert_eq!(
+            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed),
+            sum_before + 100
         );
     }
 
