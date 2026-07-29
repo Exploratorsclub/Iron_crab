@@ -39,7 +39,7 @@ use ironcrab::arbitrage::{
     QuoteFreshnessConfig, QuoteKind, QuotePoolInput, QuoteVaultInput, RoundTripInsufficient,
     RoundTripInsufficientSubreason, RoundTripLeg, RoundTripPoolCandidate, RoundTripSelectFailure,
     SellQuoteNoneDetailReason, TrackCandidateCounts, TrackMintInput, TrackPoolInput,
-    TrackSelectionConfig, DLMM_PROBE_SOL_LAMPORTS,
+    TrackPoolReadiness, TrackSelectionConfig, DLMM_PROBE_SOL_LAMPORTS,
 };
 use ironcrab::config::Config as AppConfig;
 use ironcrab::execution::live_pool_cache::{
@@ -104,8 +104,8 @@ use ironcrab::metrics::{
 use ironcrab::nats::{
     arb_strategy_pool_cache_live_consumer_config, arb_track_payload_bytes, config_consumer_config,
     config_subject, split_arb_track_requests_update, trim_reconcile_update_to_budget,
-    ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackRemovedEntry, ArbTrackRequestsUpdate,
-    ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES, CONFIG_STREAM_NAME, STREAM_NAME,
+    ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackReadiness, ArbTrackRemovedEntry,
+    ArbTrackRequestsUpdate, ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES, CONFIG_STREAM_NAME, STREAM_NAME,
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_ARB_TRACK_REQUESTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
@@ -120,6 +120,16 @@ const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// NATS topic for config reload commands from control-plane (Core NATS fallback)
 const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
+
+/// Map selection readiness to arb track wire format.
+fn track_pool_readiness_to_wire(r: TrackPoolReadiness) -> ArbTrackReadiness {
+    match r {
+        TrackPoolReadiness::Rejected => ArbTrackReadiness::Rejected,
+        TrackPoolReadiness::Warmable => ArbTrackReadiness::Warmable,
+        TrackPoolReadiness::QuoteReady => ArbTrackReadiness::QuoteReady,
+        TrackPoolReadiness::Executable => ArbTrackReadiness::Executable,
+    }
+}
 
 /// Wire format version for `TOPIC_ARB_TRACK_REQUESTS`.
 const ARB_TRACK_REQUESTS_WIRE_VERSION: u32 = 1;
@@ -6181,6 +6191,7 @@ impl ArbContext {
                     } else {
                         ArbTrackActiveReason::Baseline
                     },
+                    readiness: track_pool_readiness_to_wire(p.readiness),
                 })
                 .collect()
         } else {
@@ -6191,6 +6202,7 @@ impl ArbContext {
                 .map(|p| ArbTrackActiveEntry {
                     pool: p.pool.clone(),
                     reason: p.active_reason,
+                    readiness: track_pool_readiness_to_wire(p.readiness),
                 })
                 .collect::<Vec<_>>()
         };
@@ -11810,6 +11822,7 @@ mod two_hop_price_tests {
             active: vec![ArbTrackActiveEntry {
                 pool: "Pool111111111111111111111111111111111111111".to_string(),
                 reason: ArbTrackActiveReason::Baseline,
+                readiness: ArbTrackReadiness::Warmable,
             }],
             removed: vec![],
             reconcile: true,

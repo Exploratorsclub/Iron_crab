@@ -146,11 +146,11 @@ use ironcrab::metrics::{
     record_market_data_tx_broadcast_lagged, refresh_exec_hot_lag_percentile_estimates,
     serve_metrics, set_market_data_account_broadcast_queue_depth_for_class,
     set_market_data_account_enrich_worker_count, set_market_data_account_exec_hot_worker_count,
-    set_market_data_account_worker_count, set_market_data_arb_pinned_pools_gauge,
-    set_market_data_enrichment_registry_pools_gauge, set_market_data_exec_hot_admit_suppress,
-    set_market_data_exec_hot_lag_alarm, set_market_data_exec_hot_last_shed_groups,
-    set_market_data_exec_hot_shed_soft_active, set_market_data_exec_hot_shed_tier,
-    set_market_data_explicit_set_snapshot_restore_duration_ms,
+    set_market_data_account_worker_count, set_market_data_arb_pin_registration_incomplete_gauge,
+    set_market_data_arb_pinned_pools_gauge, set_market_data_enrichment_registry_pools_gauge,
+    set_market_data_exec_hot_admit_suppress, set_market_data_exec_hot_lag_alarm,
+    set_market_data_exec_hot_last_shed_groups, set_market_data_exec_hot_shed_soft_active,
+    set_market_data_exec_hot_shed_tier, set_market_data_explicit_set_snapshot_restore_duration_ms,
     set_market_data_explicit_set_snapshot_restore_pubkeys,
     set_market_data_geyser_explicit_admitted_accounts,
     set_market_data_geyser_explicit_cap_overflow, set_market_data_geyser_explicit_set_size,
@@ -168,8 +168,8 @@ use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
     ensure_pool_cache_stream, ensure_wallet_snapshot_stream, ensure_wallet_tx_confirm_stream,
     execution_results_consumer_config, pool_subject, wallet_snapshot_consumer_config,
-    wallet_snapshot_subject, wallet_tx_confirm_subject, ArbTrackActiveEntry, ArbTrackRemovedEntry,
-    ArbTrackRequestsUpdate, MomentumActivePinReason, MomentumActivePoolEntry,
+    wallet_snapshot_subject, wallet_tx_confirm_subject, ArbTrackActiveEntry, ArbTrackReadiness,
+    ArbTrackRemovedEntry, ArbTrackRequestsUpdate, MomentumActivePinReason, MomentumActivePoolEntry,
     MomentumActivePoolsUpdate, MomentumRemovedPoolEntry, NatsClient, NatsConfig,
     CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME, TOPIC_ARB_TRACK_REQUESTS,
     TOPIC_CONTROL_REQUESTS, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
@@ -800,6 +800,8 @@ struct UnifiedHotPoolRegistry {
     /// Scope C: subset of `momentum_pairs` opened via Position pin (exit hot-path).
     momentum_position_pairs: parking_lot::RwLock<std::collections::HashSet<(Pubkey, Pubkey)>>,
     arb_pools: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
+    /// C1b: last-seen selection readiness per arb pool (Must-hot shed protection).
+    arb_pool_readiness: parking_lot::RwLock<std::collections::HashMap<Pubkey, ArbTrackReadiness>>,
     /// L2d: lock-free ingest hot-pool membership (refreshed on pin/unpin).
     hot_pool_pubkeys_snapshot: ArcSwap<HashSet<Pubkey>>,
 }
@@ -811,6 +813,7 @@ impl UnifiedHotPoolRegistry {
             momentum_pairs: parking_lot::RwLock::new(std::collections::HashSet::new()),
             momentum_position_pairs: parking_lot::RwLock::new(std::collections::HashSet::new()),
             arb_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            arb_pool_readiness: parking_lot::RwLock::new(std::collections::HashMap::new()),
             hot_pool_pubkeys_snapshot: ArcSwap::from_pointee(HashSet::new()),
         }
     }
@@ -861,8 +864,26 @@ impl UnifiedHotPoolRegistry {
         self.refresh_hot_pool_pubkeys_snapshot();
     }
 
+    fn set_arb_pool_readiness(&self, pool: Pubkey, readiness: ArbTrackReadiness) {
+        self.arb_pool_readiness.write().insert(pool, readiness);
+    }
+
+    fn clear_arb_pool_readiness(&self, pool: Pubkey) {
+        self.arb_pool_readiness.write().remove(&pool);
+    }
+
+    fn arb_pool_is_must_hot(&self, pool: Pubkey) -> bool {
+        self.arb_pool_readiness
+            .read()
+            .get(&pool)
+            .copied()
+            .unwrap_or(ArbTrackReadiness::Warmable)
+            .is_must_hot()
+    }
+
     fn unpin_arb_pool(&self, pool: Pubkey) {
         self.arb_pools.write().remove(&pool);
+        self.arb_pool_readiness.write().remove(&pool);
         self.refresh_hot_pool_pubkeys_snapshot();
     }
 
@@ -2159,6 +2180,10 @@ impl TrackWorkerContext for MarketDataContext {
 
     fn hot_pool_registry_arb_pool_count(&self) -> usize {
         self.hot_pool_registry.arb_pool_count()
+    }
+
+    fn arb_pool_is_must_hot(&self, pool: Pubkey) -> bool {
+        self.hot_pool_registry.arb_pool_is_must_hot(pool)
     }
 
     fn refresh_hot_pool_registry_gauges(&self) {
@@ -4854,6 +4879,17 @@ impl MarketDataContext {
             && self.pool_pumpfun_bonding_curve_registration_satisfied(pool, &state)
     }
 
+    /// C1b: gauge arb pins with incomplete vault/bin Geyser registration (no RPC).
+    fn refresh_arb_pin_registration_incomplete_gauge(&self) {
+        let incomplete = self
+            .hot_pool_registry
+            .snapshot_arb_pools()
+            .into_iter()
+            .filter(|pool| !self.hot_pool_reserve_registration_satisfied(*pool))
+            .count();
+        set_market_data_arb_pin_registration_incomplete_gauge(incomplete);
+    }
+
     fn note_deferred_hot_pool_reserve_registration(&self, pool: Pubkey, pin: GeyserPinReason) {
         if !self.hot_pool_registry.is_hot_pool(pool) {
             return;
@@ -5436,6 +5472,7 @@ impl MarketDataContext {
             self.refresh_geyser_pins_gauge();
         }
         set_market_data_arb_pinned_pools_gauge(self.hot_pool_registry.arb_pool_count());
+        self.refresh_arb_pin_registration_incomplete_gauge();
         batch_dirty
     }
 
@@ -5499,6 +5536,8 @@ impl MarketDataContext {
                 continue;
             };
             self.hot_pool_registry.pin_arb_pool(pool_pk);
+            self.hot_pool_registry
+                .set_arb_pool_readiness(pool_pk, a.readiness);
             if market_data_exec_hot_arb_admit_suppress() {
                 inc_market_data_exec_hot_pressure_admit_rejected_total(ExecHotShedTier::Arb);
                 inc_market_data_arb_admission_rejected_total();
@@ -20219,6 +20258,7 @@ mod pr_b_geyser_tracking_tests {
                 active: vec![ArbTrackActiveEntry {
                     pool: pool.to_string(),
                     reason: ArbTrackActiveReason::Baseline,
+                    readiness: ArbTrackReadiness::Warmable,
                 }],
                 removed: vec![],
                 reconcile: false,

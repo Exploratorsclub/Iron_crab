@@ -14,8 +14,8 @@ use super::eviction_planner::{
     VictimSelectionPlan, VictimSelectionRequest, VictimSelectionResult,
 };
 use super::explicit_ownership::{
-    EmptyOwnerGroupError, ExplicitConsumer, ExplicitOwner, ExplicitOwnership, GroupChange,
-    OwnerGroupSnapshot,
+    EmptyOwnerGroupError, ExplicitConsumer, ExplicitOwner, ExplicitOwnerKey, ExplicitOwnership,
+    GroupChange, OwnerGroupSnapshot,
 };
 use solana_sdk::pubkey::Pubkey;
 use std::collections::{BTreeMap, BTreeSet};
@@ -138,6 +138,8 @@ pub enum CapShrinkResult {
 pub struct ShedOwnerGroupsResult {
     pub groups_evicted: usize,
     pub pubkeys_evicted: usize,
+    /// Arb Must-hot (quote_ready / executable) candidates skipped during arb shed.
+    pub groups_skipped_must_hot: usize,
 }
 
 /// Back-compat alias for L2 tracker shed tests and call sites.
@@ -1565,6 +1567,7 @@ impl FixedCapAdmission {
             return ShedOwnerGroupsResult {
                 groups_evicted: 0,
                 pubkeys_evicted: 0,
+                groups_skipped_must_hot: 0,
             };
         }
 
@@ -1596,6 +1599,63 @@ impl FixedCapAdmission {
         ShedOwnerGroupsResult {
             groups_evicted,
             pubkeys_evicted,
+            groups_skipped_must_hot: 0,
+        }
+    }
+
+    /// Evict up to `max_groups` arb owner groups (Scope L2b / C1b Must-hot protection).
+    ///
+    /// `is_must_hot` returns true for quote_ready / executable selected pools that must not
+    /// be shed under EXEC_HOT pressure.
+    pub fn shed_arb_owner_groups(
+        &mut self,
+        max_groups: usize,
+        is_must_hot: impl Fn(Pubkey) -> bool,
+    ) -> ShedOwnerGroupsResult {
+        if max_groups == 0 {
+            return ShedOwnerGroupsResult {
+                groups_evicted: 0,
+                pubkeys_evicted: 0,
+                groups_skipped_must_hot: 0,
+            };
+        }
+
+        let mut victims: Vec<(ExplicitOwner, u64)> = self
+            .snapshot_lru_entries()
+            .into_iter()
+            .filter(|entry| entry.owner.consumer == ExplicitConsumer::Arb)
+            .map(|entry| (entry.owner, entry.last_touch))
+            .collect();
+        victims.sort_by_key(|(_, touch)| *touch);
+
+        let mut groups_evicted = 0usize;
+        let mut pubkeys_evicted = 0usize;
+        let mut groups_skipped_must_hot = 0usize;
+        for (owner, _) in victims {
+            if groups_evicted >= max_groups {
+                break;
+            }
+            if let ExplicitOwnerKey::Pool(pool) = owner.owner_key {
+                if is_must_hot(pool) {
+                    groups_skipped_must_hot += 1;
+                    continue;
+                }
+            }
+            match self.remove_group(owner) {
+                FixedCapRemoveResult::Removed { physical_removed } => {
+                    groups_evicted += 1;
+                    pubkeys_evicted += physical_removed.len();
+                }
+                FixedCapRemoveResult::NotFound
+                | FixedCapRemoveResult::PlanningInvariantViolation
+                | FixedCapRemoveResult::InternalInvariantViolation { .. } => {}
+            }
+        }
+
+        ShedOwnerGroupsResult {
+            groups_evicted,
+            pubkeys_evicted,
+            groups_skipped_must_hot,
         }
     }
 
@@ -1608,11 +1668,6 @@ impl FixedCapAdmission {
     /// Evict up to `max_groups` momentum-active (non-position) owner groups (Scope L2b).
     pub fn shed_momentum_owner_groups(&mut self, max_groups: usize) -> ShedOwnerGroupsResult {
         self.shed_owner_groups_for_consumers(&[ExplicitConsumer::Momentum], max_groups)
-    }
-
-    /// Evict up to `max_groups` arb owner groups (Scope L2b).
-    pub fn shed_arb_owner_groups(&mut self, max_groups: usize) -> ShedOwnerGroupsResult {
-        self.shed_owner_groups_for_consumers(&[ExplicitConsumer::Arb], max_groups)
     }
 
     fn plan_insert(&mut self, normalized: &[Pubkey]) -> InsertPlanOutcome {
@@ -6533,13 +6588,41 @@ mod tests {
         admission.set_test_owner_stamp(momentum.clone(), 4);
         admission.set_test_owner_stamp(wallet.clone(), 5);
 
-        let result = admission.shed_arb_owner_groups(8);
+        let result = admission.shed_arb_owner_groups(8, |_| false);
         assert_eq!(result.groups_evicted, 2);
+        assert_eq!(result.groups_skipped_must_hot, 0);
         assert!(admission.owner_group(&arb_old).is_none());
         assert!(admission.owner_group(&arb_new).is_none());
         assert!(admission.owner_group(&momentum_pos).is_some());
         assert!(admission.owner_group(&wallet).is_some());
         assert!(admission.owner_group(&momentum).is_some());
+    }
+
+    #[test]
+    fn shed_arb_owner_groups_skips_must_hot_evicts_warmable() {
+        let warm_pool = Pubkey::new_unique();
+        let hot_pool = Pubkey::new_unique();
+        let arb_warm = ExplicitOwner {
+            consumer: ExplicitConsumer::Arb,
+            owner_key: ExplicitOwnerKey::Pool(warm_pool),
+        };
+        let arb_hot = ExplicitOwner {
+            consumer: ExplicitConsumer::Arb,
+            owner_key: ExplicitOwnerKey::Pool(hot_pool),
+        };
+
+        let mut admission = FixedCapAdmission::new(16);
+        assert_admitted(admission.try_admit_new_group(arb_warm.clone(), vec![pk(1)]));
+        assert_admitted(admission.try_admit_new_group(arb_hot.clone(), vec![pk(2)]));
+        admission.set_test_owner_stamp(arb_warm.clone(), 1);
+        admission.set_test_owner_stamp(arb_hot.clone(), 2);
+
+        let must_hot: std::collections::HashSet<Pubkey> = std::iter::once(hot_pool).collect();
+        let result = admission.shed_arb_owner_groups(8, |p| must_hot.contains(&p));
+        assert_eq!(result.groups_evicted, 1);
+        assert_eq!(result.groups_skipped_must_hot, 1);
+        assert!(admission.owner_group(&arb_warm).is_none());
+        assert!(admission.owner_group(&arb_hot).is_some());
     }
 
     #[test]
