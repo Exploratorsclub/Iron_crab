@@ -112,6 +112,27 @@ jobs:
             perl -i -0777 -pe 's/(\| ControlResponseStatus::Error)(\s*\n\s*\);)/$1\n                | ControlResponseStatus::Busy$2/s' "$f"
           done
 
+      # C1b: ArbTrackActiveEntry gained `readiness` — eval main struct literals may lag wire API.
+      - name: Align eval ArbTrackActiveEntry struct literals with readiness field
+        run: |
+          set -euo pipefail
+          EVAL="${{ github.workspace }}/Iron_crab-eval"
+          for f in "$EVAL"/tests/*.rs; do
+            test -f "$f" || continue
+            grep -q 'ArbTrackActiveEntry' "$f" || continue
+            perl -i -0777 -pe '
+              s{
+                (\bArbTrackActiveEntry\s*\{[^\}]*?\breason\s*:\s*[^\n,]+,?)
+                (\n\s*\})
+              }{
+                $1 =~ /readiness/ ? "$1$2" : "$1\n                readiness: ArbTrackReadiness::Warmable,$2"
+              }gsex
+            ' "$f"
+            if grep -q 'ArbTrackReadiness::Warmable' "$f"; then
+              perl -i -pe 's/(ArbTrackActiveEntry,)(?! ArbTrackReadiness)/$1 ArbTrackReadiness,/' "$f"
+            fi
+          done
+
       - name: Patch eval git-dep to use PR checkout
         run: |
           cat >> "${{ github.workspace }}/Iron_crab-eval/Cargo.toml" <<'EOF'

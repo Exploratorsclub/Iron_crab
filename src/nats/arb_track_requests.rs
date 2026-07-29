@@ -44,7 +44,7 @@ impl ArbTrackReadiness {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ArbTrackActiveEntry {
     pub pool: String,
     pub reason: ArbTrackActiveReason,
@@ -53,9 +53,10 @@ pub struct ArbTrackActiveEntry {
     pub readiness: ArbTrackReadiness,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ArbTrackActiveReason {
+    #[default]
     Baseline,
     MultiDex,
     TradeSignal,
@@ -244,6 +245,14 @@ mod tests {
         let json = r#"{"version":1,"ts_unix_ms":1,"active":[],"removed":[]}"#;
         let u: ArbTrackRequestsUpdate = serde_json::from_str(json).expect("deserialize");
         assert!(!u.reconcile);
+    }
+
+    #[test]
+    fn arb_track_active_entry_default_is_warmable_baseline() {
+        let entry = ArbTrackActiveEntry::default();
+        assert!(entry.pool.is_empty());
+        assert_eq!(entry.reason, ArbTrackActiveReason::Baseline);
+        assert_eq!(entry.readiness, ArbTrackReadiness::Warmable);
     }
 
     #[test]
