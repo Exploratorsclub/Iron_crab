@@ -58,6 +58,20 @@ pub fn drawdown_from_ath_pct(highest_price: f64, current_price: f64) -> f64 {
     ((current_price / highest_price) - 1.0) * 100.0
 }
 
+/// True when `quote_tps` deviates from `reference_tps` by more than `max_ratio` (either direction).
+/// Used to reject absurd executable exit quotes whose scale does not match entry/mark (I-14).
+pub fn exit_quote_tps_scale_ratio_exceeded(
+    reference_tps: f64,
+    quote_tps: f64,
+    max_ratio: f64,
+) -> bool {
+    if reference_tps <= 0.0 || quote_tps <= 0.0 || max_ratio <= 1.0 {
+        return false;
+    }
+    let ratio = quote_tps / reference_tps;
+    ratio > max_ratio || ratio < 1.0 / max_ratio
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +153,23 @@ mod tests {
     fn higher_exec_tps_than_entry_is_loss_stop_loss_range() {
         let p = pnl_pct(1_000.0, 2_000.0);
         assert!(p < 0.0, "higher tps = loss");
+    }
+
+    #[test]
+    fn exit_quote_tps_scale_ratio_exceeded_prod_absurd_quote() {
+        let entry = 1.0e7;
+        let absurd_quote = 0.17;
+        assert!(exit_quote_tps_scale_ratio_exceeded(
+            entry,
+            absurd_quote,
+            100.0
+        ));
+    }
+
+    #[test]
+    fn exit_quote_tps_scale_ratio_ok_within_100x() {
+        let entry = 1.0e7;
+        let quote = 9.0e6;
+        assert!(!exit_quote_tps_scale_ratio_exceeded(entry, quote, 100.0));
     }
 }
