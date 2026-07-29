@@ -3240,6 +3240,12 @@ pub static MOMENTUM_EXIT_AMOUNT_OVERLAY_ONLY_TOTAL: Lazy<AtomicU64> =
 /// PA-5.1: overlay closed because PositionAuthority signaled closed/absent/zero.
 pub static MOMENTUM_OVERLAY_CLOSED_BY_AUTHORITY_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+static MOMENTUM_SOFT_EXIT_SUPPRESSED_AUTHORITY_MISSING: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MOMENTUM_SOFT_EXIT_SUPPRESSED_AUTHORITY_CLOSED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MOMENTUM_SOFT_EXIT_SUPPRESSED_AUTHORITY_ZERO: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 pub static MOMENTUM_SCALE_IN_GATE_BLOCKED_MISSING_PROBE_STATE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -3267,6 +3273,42 @@ pub fn record_momentum_exit_amount_overlay_only_total() {
 #[inline]
 pub fn record_momentum_overlay_closed_by_authority_total() {
     MOMENTUM_OVERLAY_CLOSED_BY_AUTHORITY_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// PA-5: soft exit suppressed because PositionAuthority is missing/closed/zero.
+#[derive(Debug, Clone, Copy)]
+pub enum MomentumSoftExitAuthoritySuppressReason {
+    Missing,
+    Closed,
+    Zero,
+}
+
+impl MomentumSoftExitAuthoritySuppressReason {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Closed => "closed",
+            Self::Zero => "zero",
+        }
+    }
+}
+
+#[inline]
+pub fn record_momentum_soft_exit_suppressed_authority_total(
+    reason: MomentumSoftExitAuthoritySuppressReason,
+) {
+    let counter = match reason {
+        MomentumSoftExitAuthoritySuppressReason::Missing => {
+            &*MOMENTUM_SOFT_EXIT_SUPPRESSED_AUTHORITY_MISSING
+        }
+        MomentumSoftExitAuthoritySuppressReason::Closed => {
+            &*MOMENTUM_SOFT_EXIT_SUPPRESSED_AUTHORITY_CLOSED
+        }
+        MomentumSoftExitAuthoritySuppressReason::Zero => {
+            &*MOMENTUM_SOFT_EXIT_SUPPRESSED_AUTHORITY_ZERO
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -8427,6 +8469,27 @@ async fn metrics_response() -> Response<Body> {
         "momentum_overlay_closed_by_authority_total",
         MOMENTUM_OVERLAY_CLOSED_BY_AUTHORITY_TOTAL.load(Ordering::Relaxed)
     );
+    out.push_str("momentum_soft_exit_suppressed_authority_total{reason=\"missing\"} ");
+    out.push_str(
+        &MOMENTUM_SOFT_EXIT_SUPPRESSED_AUTHORITY_MISSING
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("momentum_soft_exit_suppressed_authority_total{reason=\"closed\"} ");
+    out.push_str(
+        &MOMENTUM_SOFT_EXIT_SUPPRESSED_AUTHORITY_CLOSED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("momentum_soft_exit_suppressed_authority_total{reason=\"zero\"} ");
+    out.push_str(
+        &MOMENTUM_SOFT_EXIT_SUPPRESSED_AUTHORITY_ZERO
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     line!(
         "momentum_wallet_balance_divergence_total",
         MOMENTUM_WALLET_BALANCE_DIVERGENCE_TOTAL.load(Ordering::Relaxed)
