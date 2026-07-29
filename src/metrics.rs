@@ -6399,8 +6399,9 @@ pub static RPC_BACKOFF_MS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0
 pub static RPC_CONCURRENCY_ADJUSTMENTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static RPC_INFLIGHT_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static RPC_ALLOWED_CONCURRENCY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// PA-2 Rest: primary open-position count for dashboards (`open_positions`); sourced from PositionAuthority.
 pub static OPEN_POSITIONS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
-/// PA-2: PositionAuthority model open count (read-only; does not replace `open_positions`).
+/// PA-2: PositionAuthority model open count (mirrors `open_positions` after PA-2 Rest).
 pub static POSITION_AUTHORITY_OPEN_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// Count of authority positions in `ReconcileNeeded` with non-zero balance.
 pub static POSITION_AUTHORITY_RECONCILE_NEEDED_GAUGE: Lazy<AtomicU64> =

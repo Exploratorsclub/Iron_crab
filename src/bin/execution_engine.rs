@@ -2557,6 +2557,80 @@ struct ExecutionContext {
     pump_amm_hot_path_refresh_last: Arc<ParkingMutex<HashMap<Pubkey, Instant>>>,
 }
 
+#[cfg(test)]
+impl ExecutionContext {
+    fn test_for_pa2_metrics(
+        lock_manager: LockManager,
+        position_authority: PositionAuthority,
+    ) -> Self {
+        use ironcrab::storage::JsonlWriterConfig;
+        let log_dir =
+            std::env::temp_dir().join(format!("ironcrab_ee_pa2_metrics_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&log_dir);
+        let decision_writer = JsonlWriter::new(
+            JsonlWriterConfig::new("test_decisions").with_log_dir(log_dir.join("decisions")),
+        )
+        .expect("decision writer");
+        let execution_writer = JsonlWriter::new(
+            JsonlWriterConfig::new("test_executions").with_log_dir(log_dir.join("executions")),
+        )
+        .expect("execution writer");
+        let burn_writer = JsonlWriter::new(
+            JsonlWriterConfig::new("test_burns").with_log_dir(log_dir.join("burns")),
+        )
+        .expect("burn writer");
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        Self {
+            run_id: "test".to_string(),
+            rpc_url: "test".to_string(),
+            helius_rpc_url: None,
+            wallet_pubkey: None,
+            treasury: None,
+            config: parking_lot::RwLock::new(ExecutionConfig::default()),
+            config_snapshot_id: parking_lot::RwLock::new("test".to_string()),
+            nats: None,
+            decision_writer,
+            execution_writer,
+            burn_writer,
+            lock_manager,
+            position_authority: Arc::new(ParkingMutex::new(position_authority)),
+            position_authority_kv_tx: None,
+            log_base: log_dir,
+            decision_counter: std::sync::atomic::AtomicU64::new(0),
+            execution_counter: std::sync::atomic::AtomicU64::new(0),
+            current_day: parking_lot::RwLock::new(chrono::Utc::now().date_naive()),
+            daily_loss_lamports: std::sync::atomic::AtomicI64::new(0),
+            kill_switch_active: AtomicBool::new(false),
+            liquidation_in_progress: AtomicBool::new(false),
+            kill_switch_context: parking_lot::RwLock::new(None),
+            burn_in_progress: AtomicBool::new(false),
+            jito_client: None,
+            bundles_submitted: std::sync::atomic::AtomicU64::new(0),
+            bundles_confirmed: std::sync::atomic::AtomicU64::new(0),
+            cross_dex_handler: None,
+            rpc,
+            address_lookup_table: None,
+            tx_sender: None,
+            dynamic_fee_percentiles: parking_lot::RwLock::new(None),
+            cached_blockhash: parking_lot::RwLock::new(None),
+            live_pool_cache: None,
+            intent_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            pending_discovery_responses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            wsol_balance_tx: None,
+            pending_tx_confirms: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            recent_orphan_tx_confirms: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            intents_received: std::sync::atomic::AtomicU64::new(0),
+            intents_rejected: std::sync::atomic::AtomicU64::new(0),
+            sim_failures: std::sync::atomic::AtomicU64::new(0),
+            tx_sent: std::sync::atomic::AtomicU64::new(0),
+            arb_validated: std::sync::atomic::AtomicU64::new(0),
+            arb_executed: std::sync::atomic::AtomicU64::new(0),
+            replay_mode: true,
+            pump_amm_hot_path_refresh_last: Arc::new(ParkingMutex::new(HashMap::new())),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct BurnOpRecord {
     #[serde(flatten)]
@@ -6449,7 +6523,7 @@ impl ExecutionContext {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Get current open positions count (LockManager — snapshot/metrics; not BUY gate authority).
+    /// LockManager non-zero token balances (state snapshot persistence; not primary metrics / BUY gate).
     fn get_open_positions(&self) -> usize {
         self.lock_manager.count_non_zero_token_balances()
     }
@@ -6579,6 +6653,8 @@ impl ExecutionContext {
         let lock_open = self.lock_manager.count_non_zero_token_balances();
         let drift = position_authority_drift_lockmanager(auth_open, lock_open);
         drop(a);
+        // PA-2 Rest: primary `open_positions` gauge follows PositionAuthority (I-24a).
+        OPEN_POSITIONS_GAUGE.store(auth_open as u64, Ordering::Relaxed);
         POSITION_AUTHORITY_OPEN_GAUGE.store(auth_open as u64, Ordering::Relaxed);
         POSITION_AUTHORITY_RECONCILE_NEEDED_GAUGE.store(reconcile as u64, Ordering::Relaxed);
         POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE.store(lock_open as u64, Ordering::Relaxed);
@@ -8327,7 +8403,6 @@ async fn main() -> Result<()> {
     // No longer spawning cache_geyser_task - execution-engine subscribes to PoolCacheUpdates instead
 
     // Publish initial gauge values immediately (before the first 30s heartbeat).
-    OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
     ctx.refresh_position_authority_metrics();
 
     // === WsolManager: Background WSOL balance maintenance ===
@@ -9351,7 +9426,6 @@ async fn main() -> Result<()> {
                     INTENTS_RECEIVED_TOTAL.store(received, Ordering::Relaxed);
                     INTENTS_REJECTED_TOTAL.store(rejected, Ordering::Relaxed);
                     SIMULATION_FAILURES_TOTAL.store(sim_fail, Ordering::Relaxed);
-                    OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
                     ctx.refresh_position_authority_metrics();
                     ACTIVE_CAPITAL_LOCKS.store(cap_locks as u64, Ordering::Relaxed);
                     ACTIVE_RESOURCE_LOCKS.store(res_locks as u64, Ordering::Relaxed);
@@ -12493,8 +12567,8 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
     ) {
         INTENTS_EXECUTED_TOTAL.fetch_add(1, Ordering::Relaxed);
 
-        // open_positions is derived from LockManager.count_non_zero_token_balances()
-        // (Single Source of Truth). No separate counter — avoids dual-path drift.
+        // Primary `open_positions` gauge is refreshed from PositionAuthority (PA-2 Rest).
+        // LockManager balance updates below affect lockmanager overlay gauge only.
         match intent.side {
             TradeSide::Buy => {
                 // Immediately update LockManager with bought token balance so that
@@ -12693,7 +12767,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         decision.outcome,
         DecisionOutcome::Confirmed | DecisionOutcome::FailedConfirmed
     ) {
-        OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
+        ctx.refresh_position_authority_metrics();
     }
 
     info!(
@@ -14388,6 +14462,52 @@ mod execution_engine_tests {
             decimals: 6,
             token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
         }
+    }
+
+    #[test]
+    fn primary_open_positions_gauge_uses_authority_not_lockmanager_ghost() {
+        use super::ExecutionContext;
+        use crate::{
+            OPEN_POSITIONS_GAUGE, POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE,
+            POSITION_AUTHORITY_OPEN_GAUGE,
+        };
+        use std::sync::atomic::Ordering;
+
+        const M1: &str = "MintA1111111111111111111111111111111111111";
+        const M2: &str = "MintB1111111111111111111111111111111111111";
+        const M3: &str = "MintC1111111111111111111111111111111111111";
+
+        let lm = LockManager::new(1_000_000_000);
+        lm.set_available_token_balance(M1.to_string(), 100);
+        lm.set_available_token_balance(M2.to_string(), 200);
+        lm.set_available_token_balance(M3.to_string(), 300);
+
+        let mut pa = PositionAuthority::new();
+        pa.apply(&pa_buy(M1, 100));
+
+        let ctx = ExecutionContext::test_for_pa2_metrics(lm, pa);
+        ctx.refresh_position_authority_metrics();
+
+        assert_eq!(POSITION_AUTHORITY_OPEN_GAUGE.load(Ordering::Relaxed), 1);
+        assert_eq!(OPEN_POSITIONS_GAUGE.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE.load(Ordering::Relaxed),
+            3
+        );
+
+        {
+            let mut pa = ctx.position_authority.lock();
+            pa.apply(&pa_sell(M1, 100));
+        }
+        ctx.refresh_position_authority_metrics();
+
+        assert_eq!(OPEN_POSITIONS_GAUGE.load(Ordering::Relaxed), 0);
+        assert_eq!(POSITION_AUTHORITY_OPEN_GAUGE.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE.load(Ordering::Relaxed),
+            3,
+            "lockmanager ghost gauge must still reflect non-zero balances"
+        );
     }
 
     #[test]

@@ -70,7 +70,7 @@ use ironcrab::metrics::{
     FILTER_REJECTED_INFLOW, FILTER_REJECTED_LIQUIDITY, FILTER_REJECTED_TOKEN_AGE,
     FILTER_REJECTED_TOTAL, FILTER_REJECTED_VELOCITY, INTENTS_GENERATED_TOTAL,
     MARKET_EVENTS_CONSUMED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
-    NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
+    NATS_MESSAGES_RECEIVED_TOTAL, OPEN_POSITIONS_GAUGE, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -6282,6 +6282,8 @@ impl MomentumContext {
             .filter(|s| s.balance_raw > 0 && s.status != PositionAuthorityStatus::Closed)
             .count();
         let overlay_count = self.positions.read().len();
+        // PA-2 Rest: primary `open_positions` on momentum-bot /metrics follows authority KV.
+        OPEN_POSITIONS_GAUGE.store(authority_open as u64, std::sync::atomic::Ordering::Relaxed);
         set_position_authority_drift_momentum(position_authority_drift_momentum(
             authority_open,
             overlay_count,
