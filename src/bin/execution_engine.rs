@@ -79,8 +79,9 @@ use ironcrab::metrics::{
     inc_execution_pool_cache_messages_processed, record_execution_engine_interval_tick_duration_ms,
     record_execution_intent_channel_wait_ms, record_execution_intent_jetstream_to_channel_ms,
     record_execution_process_intent_us, record_execution_slot_lag_at_send_slots,
-    record_recent_trade, record_tx_confirmed_slot_delta_slots, record_tx_priority_fee_source,
-    record_tx_rebroadcast, record_tx_rebroadcast_during_confirm_ms, record_tx_rebroadcast_method,
+    record_liquidation_seed_skipped_authority_total, record_recent_trade,
+    record_tx_confirmed_slot_delta_slots, record_tx_priority_fee_source, record_tx_rebroadcast,
+    record_tx_rebroadcast_during_confirm_ms, record_tx_rebroadcast_method,
     record_tx_send_to_confirm_ms, record_tx_slot_to_send_ms, serve_metrics,
     set_execution_pool_cache_consumer_pending, set_execution_wallet_snapshot_consumer_pending,
     set_readiness_control_response_sub_active, set_readiness_control_sub_active,
@@ -3926,6 +3927,48 @@ impl ExecutionContext {
         info!(
             non_zero_positions = inventory.len(),
             "Liquidation: inventory filtered (non-zero, non-SOL/WSOL)"
+        );
+
+        // PA-4: filter inventory and cap seed amounts via PositionAuthority (no ghost LockManager seeds).
+        let inventory = {
+            let pa = ctx.position_authority.lock();
+            let mut authority_filtered_inventory = Vec::with_capacity(inventory.len());
+            for (mint_str, balance_raw, decimals, token_prog, ta_pubkey) in inventory {
+                match liquidation_lockmanager_seed_decision(&pa, &mint_str, balance_raw) {
+                    LiquidationSeedDecision::Skip => {
+                        info!(
+                            mint = %mint_str,
+                            rpc_balance_raw = balance_raw,
+                            "Liquidation: skipped LockManager seed (authority_closed_or_zero)"
+                        );
+                        record_liquidation_seed_skipped_authority_total();
+                    }
+                    LiquidationSeedDecision::Seed(seed_amount) if seed_amount > 0 => {
+                        if seed_amount < balance_raw {
+                            info!(
+                                mint = %mint_str,
+                                rpc_balance_raw = balance_raw,
+                                authority_capped_seed = seed_amount,
+                                "Liquidation: capped LockManager seed to PositionAuthority tradable"
+                            );
+                        }
+                        authority_filtered_inventory.push((
+                            mint_str,
+                            seed_amount,
+                            decimals,
+                            token_prog,
+                            ta_pubkey,
+                        ));
+                    }
+                    LiquidationSeedDecision::Seed(_) => {}
+                }
+            }
+            authority_filtered_inventory
+        };
+
+        info!(
+            positions_after_authority_guard = inventory.len(),
+            "Liquidation: inventory after PositionAuthority seed guard"
         );
 
         // Seed LockManager with RPC-discovered balances so that the
@@ -9699,6 +9742,51 @@ fn max_open_positions_buy_gate(
     (passed, details)
 }
 
+/// SELL token-balance preflight: conservative min of LockManager and PositionAuthority (PA-4).
+///
+/// In-process only — no RPC. When authority does not track the mint, falls back to LockManager only.
+fn sell_token_balance_gate(
+    lockmanager_available: u64,
+    authority_tradable: Option<u64>,
+    required_raw: u64,
+    mint: &str,
+) -> (bool, String, u64) {
+    let (effective, source) = match authority_tradable {
+        Some(auth) => (
+            lockmanager_available.min(auth),
+            "position_authority(+lockmanager)",
+        ),
+        None => (lockmanager_available, "lockmanager_fallback"),
+    };
+    let passed = effective >= required_raw;
+    let authority_display = authority_tradable
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let details = format!(
+        "authority_tradable={authority_display} lockmanager_available={lockmanager_available} effective={effective} required={required_raw} mint={mint} source={source}"
+    );
+    (passed, details, effective)
+}
+
+/// Liquidation LockManager seed decision (PA-4): skip ghost seeds when authority is closed/zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiquidationSeedDecision {
+    Skip,
+    Seed(u64),
+}
+
+fn liquidation_lockmanager_seed_decision(
+    authority: &PositionAuthority,
+    mint: &str,
+    rpc_balance_raw: u64,
+) -> LiquidationSeedDecision {
+    match authority.tradable_balance_raw(mint) {
+        None => LiquidationSeedDecision::Seed(rpc_balance_raw),
+        Some(0) => LiquidationSeedDecision::Skip,
+        Some(auth_bal) => LiquidationSeedDecision::Seed(rpc_balance_raw.min(auth_bal)),
+    }
+}
+
 /// Scale-in BUY adds to an existing mint position; it must not consume a new `max_open_positions` slot.
 ///
 /// Returns skip details when `entry_kind=scale_in` **and** LockManager already tracks a non-zero
@@ -10213,17 +10301,24 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
             return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
         }
 
-        let available_raw = ctx.lock_manager.available_token_balance(&mint_str);
-        if available_raw < required_raw {
+        let lockmanager_available = ctx.lock_manager.available_token_balance(&mint_str);
+        let authority_tradable = {
+            let pa = ctx.position_authority.lock();
+            pa.tradable_balance_raw(&mint_str)
+        };
+        let (passed, details, effective_raw) = sell_token_balance_gate(
+            lockmanager_available,
+            authority_tradable,
+            required_raw,
+            &mint_str,
+        );
+        if !passed {
             let reason = RejectReason::SimInsufficientBalance;
             checks.push(CheckResult {
                 check_name: "sell_token_balance".to_string(),
                 passed: false,
                 reason_code: Some(reason.to_string()),
-                details: Some(format!(
-                    "available={} < required={} (mint={})",
-                    available_raw, required_raw, mint_str
-                )),
+                details: Some(details),
             });
             return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
         }
@@ -10232,12 +10327,9 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
             check_name: "sell_token_balance".to_string(),
             passed: true,
             reason_code: None,
-            details: Some(format!(
-                "available={} >= required={} (mint={})",
-                available_raw, required_raw, mint_str
-            )),
+            details: Some(details),
         });
-        Some((available_raw, required_raw))
+        Some((effective_raw, required_raw))
     } else {
         None
     };
@@ -13868,22 +13960,24 @@ mod execution_engine_tests {
         compute_pre_send_capital_lock_ttl, effective_intent_ttl_ms, intent_is_expired,
         is_cold_path_recovery_sell, is_pump_amm_structural_sim_error,
         is_pumpfun_bonding_curve_structural_sim_error, is_regular_momentum_hot_path_sell,
-        liquidation_pumpfun_sell_preference, liquidation_store_multi_pool_fallback_metadata,
-        max_open_positions_buy_gate, prepare_unsigned_versioned_tx_for_simulation,
+        liquidation_lockmanager_seed_decision, liquidation_pumpfun_sell_preference,
+        liquidation_store_multi_pool_fallback_metadata, max_open_positions_buy_gate,
+        prepare_unsigned_versioned_tx_for_simulation,
         pump_amm_hint_pool_cache_usable_for_tx_plan_builder,
         pump_amm_hot_path_quote_not_ready_detail, pump_amm_liquidation_discovery_force_refresh,
         pump_amm_liquidation_quote_timeout_str, pump_amm_pool_market_hint_merge,
         pump_amm_slave_recovery_snapshot, record_pump_amm_hot_path_refresh_after_success,
         scale_in_max_open_positions_skip_details, scope48_confirmed_sell_close_decision,
-        should_publish_open_position_pool_pin_after_confirmed_buy, sim_failure_reject_reason,
-        simulation_result_on_rpc_timeout, sort_route_candidates_by_amount_out,
-        take_next_multi_pool_buildable_fallback_route, try_pump_amm_hot_path_refresh_publish,
-        wait_for_meteora_dlmm_slave_after_recovery,
+        sell_token_balance_gate, should_publish_open_position_pool_pin_after_confirmed_buy,
+        sim_failure_reject_reason, simulation_result_on_rpc_timeout,
+        sort_route_candidates_by_amount_out, take_next_multi_pool_buildable_fallback_route,
+        try_pump_amm_hot_path_refresh_publish, wait_for_meteora_dlmm_slave_after_recovery,
         wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder,
         wait_for_pump_amm_slave_after_recovery, wait_for_pumpfun_bonding_cache_refresh,
         wallet_bootstrap_allows_pa_kv_tombstone_sweep, ComputedIntentFills,
-        DiscoveryRequestOutcome, ExecutionConfig, PumpAmmHotPathRefreshDecision, RouteCandidate,
-        PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN, WSOL_MINT,
+        DiscoveryRequestOutcome, ExecutionConfig, LiquidationSeedDecision,
+        PumpAmmHotPathRefreshDecision, RouteCandidate, PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN,
+        WSOL_MINT,
     };
     use ironcrab::execution::live_pool_cache::{
         CachedPoolState, LivePoolCache, MeteoraState, PumpAmmState, PumpFunState,
@@ -13897,6 +13991,7 @@ mod execution_engine_tests {
         IntentOrigin, IntentTier, MarketEventKind, PoolCacheUpdate, TradeIntent, TradeResources,
         TradeSide, TradingRegime,
     };
+    use ironcrab::position_authority::{PositionAuthority, PositionEvent};
     use ironcrab::solana::address_lookup_table::LoadedAlt;
     use ironcrab::solana::dex::pumpfun::PumpFunDex;
     use ironcrab::storage::locks::{LockHolder, LockManager, LockResult};
@@ -14272,6 +14367,101 @@ mod execution_engine_tests {
         let (passed, details) = max_open_positions_buy_gate(10, Some(10), 10, 5);
         assert!(!passed);
         assert!(details.contains(">="));
+    }
+
+    const SELL_GATE_MINT: &str = "SellGateMint111111111111111111111111111";
+
+    fn pa_buy(mint: &str, raw: u64) -> PositionEvent {
+        PositionEvent::BuyConfirmed {
+            mint: mint.to_string(),
+            fill_raw: raw,
+            decimals: 6,
+            token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            ata: None,
+        }
+    }
+
+    fn pa_sell(mint: &str, raw: u64) -> PositionEvent {
+        PositionEvent::SellConfirmed {
+            mint: mint.to_string(),
+            sold_raw: raw,
+            decimals: 6,
+            token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+        }
+    }
+
+    #[test]
+    fn sell_token_balance_gate_rejects_when_authority_tradable_below_required() {
+        let (passed, details, effective) =
+            sell_token_balance_gate(1_000_000, Some(500_000), 600_000, SELL_GATE_MINT);
+        assert!(!passed);
+        assert_eq!(effective, 500_000);
+        assert!(details.contains("authority_tradable=500000"));
+        assert!(details.contains("lockmanager_available=1000000"));
+        assert!(details.contains("effective=500000"));
+        assert!(details.contains("required=600000"));
+        assert!(details.contains("source=position_authority(+lockmanager)"));
+    }
+
+    #[test]
+    fn sell_token_balance_gate_rejects_ghost_lock_when_authority_closed() {
+        let (passed, details, effective) =
+            sell_token_balance_gate(1_000_000, Some(0), 100, SELL_GATE_MINT);
+        assert!(!passed);
+        assert_eq!(effective, 0);
+        assert!(details.contains("authority_tradable=0"));
+        assert!(details.contains("lockmanager_available=1000000"));
+        assert!(details.contains("source=position_authority(+lockmanager)"));
+    }
+
+    #[test]
+    fn sell_token_balance_gate_passes_lockmanager_fallback_when_authority_unknown() {
+        let (passed, details, effective) =
+            sell_token_balance_gate(1_000_000, None, 500_000, SELL_GATE_MINT);
+        assert!(passed);
+        assert_eq!(effective, 1_000_000);
+        assert!(details.contains("authority_tradable=unknown"));
+        assert!(details.contains("source=lockmanager_fallback"));
+    }
+
+    #[test]
+    fn sell_token_balance_gate_passes_when_authority_and_lock_match() {
+        let (passed, details, effective) =
+            sell_token_balance_gate(1_000_000, Some(1_000_000), 1_000_000, SELL_GATE_MINT);
+        assert!(passed);
+        assert_eq!(effective, 1_000_000);
+        assert!(details.contains("effective=1000000"));
+        assert!(details.contains("required=1000000"));
+    }
+
+    #[test]
+    fn liquidation_seed_skipped_when_authority_closed_or_zero() {
+        let mut pa = PositionAuthority::new();
+        pa.apply(&pa_buy(SELL_GATE_MINT, 1_000_000));
+        pa.apply(&pa_sell(SELL_GATE_MINT, 1_000_000));
+        assert_eq!(
+            liquidation_lockmanager_seed_decision(&pa, SELL_GATE_MINT, 500_000),
+            LiquidationSeedDecision::Skip
+        );
+    }
+
+    #[test]
+    fn liquidation_seed_capped_to_authority_tradable() {
+        let mut pa = PositionAuthority::new();
+        pa.apply(&pa_buy(SELL_GATE_MINT, 400_000));
+        assert_eq!(
+            liquidation_lockmanager_seed_decision(&pa, SELL_GATE_MINT, 1_000_000),
+            LiquidationSeedDecision::Seed(400_000)
+        );
+    }
+
+    #[test]
+    fn liquidation_seed_uses_rpc_when_authority_unknown() {
+        let pa = PositionAuthority::new();
+        assert_eq!(
+            liquidation_lockmanager_seed_decision(&pa, SELL_GATE_MINT, 1_000_000),
+            LiquidationSeedDecision::Seed(1_000_000)
+        );
     }
 
     /// Scope 51: timeout log text matches `PUMPSWAP_LIQUIDATION_QUOTE_TIMEOUT_SECS` (45s).
