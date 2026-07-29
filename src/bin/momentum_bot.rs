@@ -43,9 +43,9 @@ use ironcrab::execution::tokens_per_sol;
 use ironcrab::ipc::{
     ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ControlRequest, ControlRequestKind,
     ExecutionResult, ExecutionStatus, ExplicitAmount, IntentOrigin, IntentTier, MarketEvent,
-    MarketEventKind, PositionAuthoritySnapshot, PositionAuthorityStatus, TradeExecutionConstraints,
-    TradeIntent, TradeResources, TradeSide, TradingRegime, NATIVE_SOL_MINT,
-    POSITION_AUTHORITY_KV_BUCKET,
+    MarketEventKind, PositionAuthoritySnapshot, PositionAuthorityStatus,
+    PositionAuthorityUpdateSource, TradeExecutionConstraints, TradeIntent, TradeResources,
+    TradeSide, TradingRegime, NATIVE_SOL_MINT, POSITION_AUTHORITY_KV_BUCKET,
 };
 use ironcrab::metrics::{
     momentum_event_ts_latency_delta_ms, record_momentum_active_pools_messages_total,
@@ -117,6 +117,11 @@ fn is_non_tradeable_momentum_mint(mint: &str) -> bool {
 
 /// JetStream replay dedup for orphaned BUY path — bounded so memory does not grow forever.
 const ORPHANED_RECOVERED_INTENT_IDS_CAP: usize = 50_000;
+
+/// PA-5.1/5.2: protect fresh BUY overlays from premature authority tombstone close (BUY-race).
+const GHOST_CLEANUP_GRACE_SECS: u64 = 90;
+/// PA-5.2: suppress wallet/orphan overlay reopen briefly after confirmed full SELL.
+const CONFIRMED_FULL_SELL_REOPEN_GUARD_SECS: u64 = 90;
 
 /// Returns true when `position_raw` and `fill_raw` are the same BUY fill within tolerance (0.1% or 1 raw).
 #[inline]
@@ -3324,6 +3329,8 @@ struct MomentumContext {
     position_authority_kv: tokio::sync::OnceCell<async_nats::jetstream::kv::Store>,
     /// PA-5.1: readonly cache of execution-engine PositionAuthority (mint → snapshot).
     authority_by_mint: parking_lot::RwLock<HashMap<String, PositionAuthoritySnapshot>>,
+    /// PA-5.2: confirmed full SELL timestamps — grace bypass + reopen guard window.
+    confirmed_full_sell_at: parking_lot::RwLock<HashMap<String, Instant>>,
     /// Mints with non-zero wallet balance that could not be reconciled at bootstrap
     /// because no pool was known yet. Checked when new pools are registered.
     orphaned_mints: parking_lot::RwLock<HashMap<String, (u64, u8)>>,
@@ -4372,7 +4379,9 @@ impl MomentumContext {
         // FIX-35: Check if this mint was orphaned during bootstrap
         let orphan_data = self.orphaned_mints.write().remove(mint);
         if let Some((balance_raw, decimals)) = orphan_data {
-            if let Some(reconciled) = self.build_reconciled_position(mint, balance_raw, decimals) {
+            if let Some(reconciled) =
+                self.try_reconcile_wallet_position(mint, balance_raw, decimals)
+            {
                 let hold_secs = reconciled.entry_time.elapsed().as_secs();
                 self.positions
                     .write()
@@ -4449,7 +4458,7 @@ impl MomentumContext {
             let orphan_data = self.orphaned_mints.write().remove(mint);
             if let Some((balance_raw, decimals)) = orphan_data {
                 if let Some(reconciled) =
-                    self.build_reconciled_position(mint, balance_raw, decimals)
+                    self.try_reconcile_wallet_position(mint, balance_raw, decimals)
                 {
                     self.positions
                         .write()
@@ -5936,6 +5945,7 @@ impl MomentumContext {
                     new_tracker.bonding_curve_progress_bps = Some(snap.progress_bps);
                 }
                 positions.insert(p.mint.to_string(), new_tracker);
+                self.confirmed_full_sell_at.write().remove(p.mint);
                 if p.entry_confirmed_slot == 0 {
                     warn!(
                         mint = %p.mint,
@@ -6098,24 +6108,90 @@ impl MomentumContext {
     fn authority_signals_closed(snap: Option<&PositionAuthoritySnapshot>) -> bool {
         match snap {
             None => true,
-            Some(s) => s.balance_raw == 0 || s.status == PositionAuthorityStatus::Closed,
+            Some(s) => {
+                // ReconcileNeeded + balance_raw==0 is covered by balance_raw==0 (PA-5.2).
+                s.balance_raw == 0 || s.status == PositionAuthorityStatus::Closed
+            }
         }
     }
 
-    /// Overlay token amount when authority close is deferred by the 90s grace period.
-    fn overlay_exit_amount_during_authority_grace(&self, mint: &str) -> Option<u64> {
-        const GHOST_CLEANUP_GRACE_SECS: u64 = 90;
-        let positions = self.positions.read();
-        let pos = positions.get(mint)?;
-        if pos.entry_time.elapsed().as_secs() >= GHOST_CLEANUP_GRACE_SECS {
+    fn has_recent_confirmed_full_sell(&self, mint: &str) -> bool {
+        self.confirmed_full_sell_at
+            .read()
+            .get(mint)
+            .map(|t| t.elapsed().as_secs() < CONFIRMED_FULL_SELL_REOPEN_GUARD_SECS)
+            .unwrap_or(false)
+    }
+
+    /// PA-5.2: optimistic authority tombstone after confirmed full SELL (before KV catches up).
+    fn mark_confirmed_full_sell(&self, mint: &str) {
+        self.confirmed_full_sell_at
+            .write()
+            .insert(mint.to_string(), Instant::now());
+        let decimals = self
+            .positions
+            .read()
+            .get(mint)
+            .map(|p| p.token_decimals)
+            .unwrap_or(0);
+        self.authority_by_mint.write().insert(
+            mint.to_string(),
+            PositionAuthoritySnapshot {
+                mint: mint.to_string(),
+                balance_raw: 0,
+                decimals,
+                status: PositionAuthorityStatus::Closed,
+                last_update_source: PositionAuthorityUpdateSource::Execution,
+                sold_raw_total: None,
+            },
+        );
+    }
+
+    /// PA-5.2: hard close evidence bypasses the 90s BUY-race grace on authority KV updates.
+    fn authority_close_bypasses_grace(
+        &self,
+        mint: &str,
+        snap: Option<&PositionAuthoritySnapshot>,
+    ) -> bool {
+        if self.has_recent_confirmed_full_sell(mint) {
+            return true;
+        }
+        match snap {
+            Some(s) if Self::authority_signals_closed(Some(s)) => {
+                s.last_update_source == PositionAuthorityUpdateSource::Execution
+            }
+            None => false,
+            _ => false,
+        }
+    }
+
+    /// PA-5.2: wallet/orphan reconcile must not reopen overlay against flat authority.
+    fn authority_blocks_overlay_reopen(&self, mint: &str) -> bool {
+        if self.has_recent_confirmed_full_sell(mint) {
+            return true;
+        }
+        self.authority_by_mint
+            .read()
+            .get(mint)
+            .map(|s| Self::authority_signals_closed(Some(s)))
+            .unwrap_or(false)
+    }
+
+    fn try_reconcile_wallet_position(
+        &self,
+        mint: &str,
+        balance_raw: u64,
+        decimals: u8,
+    ) -> Option<PositionTracker> {
+        if self.authority_blocks_overlay_reopen(mint) {
+            debug!(
+                mint = %mint,
+                balance_raw,
+                "Wallet/orphan reconcile suppressed: PositionAuthority closed or recent confirmed full SELL"
+            );
             return None;
         }
-        let amount = pos.token_amount;
-        if amount > 0 {
-            Some(amount)
-        } else {
-            None
-        }
+        self.build_reconciled_position(mint, balance_raw, decimals)
     }
 
     /// Apply a PositionAuthority KV update and enforce overlay-close rule.
@@ -6124,9 +6200,8 @@ impl MomentumContext {
         mint: &str,
         snap: Option<PositionAuthoritySnapshot>,
     ) {
-        const GHOST_CLEANUP_GRACE_SECS: u64 = 90;
-
         let closed = Self::authority_signals_closed(snap.as_ref());
+        let bypass_grace = self.authority_close_bypasses_grace(mint, snap.as_ref());
 
         {
             let mut cache = self.authority_by_mint.write();
@@ -6148,12 +6223,12 @@ impl MomentumContext {
                 .get(mint)
                 .map(|p| p.entry_time.elapsed().as_secs())
                 .unwrap_or(u64::MAX);
-            if hold_secs < GHOST_CLEANUP_GRACE_SECS {
+            if hold_secs < GHOST_CLEANUP_GRACE_SECS && !bypass_grace {
                 warn!(
                     mint = %mint,
                     hold_secs,
                     grace_secs = GHOST_CLEANUP_GRACE_SECS,
-                    "Authority close skipped: overlay too fresh (grace period)"
+                    "Authority close skipped: overlay too fresh (grace period, no hard close evidence)"
                 );
                 return;
             }
@@ -6691,6 +6766,21 @@ impl MomentumContext {
             }
 
             if self.sell_fail_cooldown_blocks_soft_exit(mint, pos) {
+                continue;
+            }
+
+            // PA-5.2: suppress soft exits when PositionAuthority signals flat/closed.
+            if self
+                .authority_by_mint
+                .read()
+                .get(mint)
+                .map(|s| Self::authority_signals_closed(Some(s)))
+                .unwrap_or(false)
+            {
+                debug!(
+                    mint = %mint,
+                    "Soft exit suppressed: PositionAuthority closed or zero balance"
+                );
                 continue;
             }
 
@@ -7599,10 +7689,6 @@ impl MomentumContext {
         let authority_snap = self.authority_by_mint.read().get(mint).cloned();
         if let Some(ref auth) = authority_snap {
             if Self::authority_signals_closed(Some(auth)) {
-                // Grace: defer overlay close but do not block exits on a fresh position.
-                if let Some(overlay_grace) = self.overlay_exit_amount_during_authority_grace(mint) {
-                    return overlay_grace;
-                }
                 return 0;
             }
             let overlay = self
@@ -7720,6 +7806,7 @@ impl MomentumContext {
                             signature = ?result.signature,
                             "LIQUIDATION SELL CONFIRMED (external) - Closing position"
                         );
+                        self.mark_confirmed_full_sell(mint);
                         self.close_position(mint);
                     } else {
                         debug!(
@@ -8420,6 +8507,7 @@ impl MomentumContext {
                             self.latest_wallet_balance_raw_by_mint
                                 .write()
                                 .remove(&pending.mint);
+                            self.mark_confirmed_full_sell(&pending.mint);
                             self.close_position(&pending.mint);
                         }
                     }
@@ -10417,6 +10505,7 @@ async fn main() -> Result<()> {
         position_kv: tokio::sync::OnceCell::new(),
         position_authority_kv: tokio::sync::OnceCell::new(),
         authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
+        confirmed_full_sell_at: parking_lot::RwLock::new(HashMap::new()),
         orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
         orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
             ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -12648,6 +12737,7 @@ mod tests {
             position_kv: tokio::sync::OnceCell::new(),
             position_authority_kv: tokio::sync::OnceCell::new(),
             authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            confirmed_full_sell_at: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -14649,6 +14739,7 @@ mod tests {
             position_kv: tokio::sync::OnceCell::new(),
             position_authority_kv: tokio::sync::OnceCell::new(),
             authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            confirmed_full_sell_at: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -14720,6 +14811,7 @@ mod tests {
             position_kv: tokio::sync::OnceCell::new(),
             position_authority_kv: tokio::sync::OnceCell::new(),
             authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            confirmed_full_sell_at: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -17120,6 +17212,7 @@ mod tests {
             position_kv: tokio::sync::OnceCell::new(),
             position_authority_kv: tokio::sync::OnceCell::new(),
             authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            confirmed_full_sell_at: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -17213,6 +17306,7 @@ mod tests {
             position_kv: tokio::sync::OnceCell::new(),
             position_authority_kv: tokio::sync::OnceCell::new(),
             authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            confirmed_full_sell_at: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -17300,6 +17394,7 @@ mod tests {
             position_kv: tokio::sync::OnceCell::new(),
             position_authority_kv: tokio::sync::OnceCell::new(),
             authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            confirmed_full_sell_at: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -17472,6 +17567,7 @@ mod tests {
             position_kv: tokio::sync::OnceCell::new(),
             position_authority_kv: tokio::sync::OnceCell::new(),
             authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            confirmed_full_sell_at: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -17589,6 +17685,7 @@ mod tests {
             position_kv: tokio::sync::OnceCell::new(),
             position_authority_kv: tokio::sync::OnceCell::new(),
             authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            confirmed_full_sell_at: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -17880,6 +17977,7 @@ mod tests {
             position_kv: tokio::sync::OnceCell::new(),
             position_authority_kv: tokio::sync::OnceCell::new(),
             authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            confirmed_full_sell_at: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -17959,6 +18057,7 @@ mod tests {
             position_kv: tokio::sync::OnceCell::new(),
             position_authority_kv: tokio::sync::OnceCell::new(),
             authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            confirmed_full_sell_at: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -18030,6 +18129,7 @@ mod tests {
             position_kv: tokio::sync::OnceCell::new(),
             position_authority_kv: tokio::sync::OnceCell::new(),
             authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            confirmed_full_sell_at: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -19039,6 +19139,7 @@ mod tests {
             position_kv: tokio::sync::OnceCell::new(),
             position_authority_kv: tokio::sync::OnceCell::new(),
             authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            confirmed_full_sell_at: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -19191,6 +19292,7 @@ mod tests {
             position_kv: tokio::sync::OnceCell::new(),
             position_authority_kv: tokio::sync::OnceCell::new(),
             authority_by_mint: parking_lot::RwLock::new(HashMap::new()),
+            confirmed_full_sell_at: parking_lot::RwLock::new(HashMap::new()),
             orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             orphaned_recovered_intent_ids: parking_lot::RwLock::new(BoundedIntentIdCache::new(
                 ORPHANED_RECOVERED_INTENT_IDS_CAP,
@@ -20995,7 +21097,7 @@ mod tests {
         assert_eq!(ctx.resolve_exit_token_amount_raw(mint, 1_000), 400);
     }
 
-    /// PA-5.1 bugfix: authority closed during 90s grace must not suppress exits.
+    /// PA-5.1 bugfix / PA-5.2: authority closed during 90s grace without hard evidence keeps overlay but suppresses exits.
     #[tokio::test]
     async fn pa51_authority_closed_grace_allows_exit_amount() {
         let tmp = TempDir::new().expect("tempdir");
@@ -21023,19 +21125,192 @@ mod tests {
                 balance_raw: 0,
                 decimals: 6,
                 status: PositionAuthorityStatus::Closed,
-                last_update_source: ironcrab::ipc::PositionAuthorityUpdateSource::Execution,
+                last_update_source: PositionAuthorityUpdateSource::WalletSnapshot,
                 sold_raw_total: None,
             },
         );
 
         assert_eq!(
             ctx.resolve_exit_token_amount_raw(mint, 800),
-            800,
-            "fresh overlay must still exit during authority-close grace"
+            0,
+            "PA-5.2: soft exits suppressed when authority closed during BUY-race grace"
         );
         assert!(
             ctx.positions.read().contains_key(mint),
-            "overlay must remain open during grace"
+            "overlay must remain open during grace without hard close evidence"
+        );
+    }
+
+    /// PA-5.2: authority closed from execution with hold < 90s closes overlay immediately (grace bypass).
+    #[tokio::test]
+    async fn pa52_authority_execution_closed_bypasses_grace() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "Pa52GraceBypassMintttttttttttttttttttttttttt";
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "pool",
+            dex: "raydium",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 500,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 1,
+            initial_bonding: None,
+        });
+        // hold_secs < 90 — default entry_time is now
+
+        Arc::clone(&ctx).apply_authority_snapshot_update(
+            mint,
+            Some(PositionAuthoritySnapshot {
+                mint: mint.to_string(),
+                balance_raw: 0,
+                decimals: 6,
+                status: PositionAuthorityStatus::Closed,
+                last_update_source: PositionAuthorityUpdateSource::Execution,
+                sold_raw_total: None,
+            }),
+        );
+        assert!(
+            !ctx.positions.read().contains_key(mint),
+            "execution-sourced authority close must bypass 90s grace"
+        );
+    }
+
+    /// PA-5.2: confirmed full SELL closes overlay even without KV update.
+    #[tokio::test]
+    async fn pa52_confirmed_full_sell_closes_overlay_without_kv() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "Pa52FullSellMintttttttttttttttttttttttttttttt";
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "pool",
+            dex: "raydium",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 1_000,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 1,
+            initial_bonding: None,
+        });
+        ctx.register_sell_intent("sell-pa52", mint, "pool", "raydium", 1_000);
+
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("side".to_string(), "SELL".to_string());
+        let result = ExecutionResult {
+            header: RecordHeader::new("test", BUILD_VERSION, "run-test"),
+            execution_id: "ex-pa52".to_string(),
+            decision_id: "dec-pa52".to_string(),
+            intent_id: "sell-pa52".to_string(),
+            source: "momentum-bot".to_string(),
+            token_mint: Some(mint.to_string()),
+            signature: Some("sig-pa52".to_string()),
+            bundle_id: None,
+            status: ExecutionStatus::Confirmed,
+            fill_in: Some(ExplicitAmount::new(1_000, 6)),
+            fill_out: Some(ExplicitAmount::new(50_000_000, 9)),
+            fill_status: Some(FillStatus::Complete),
+            fill_unavailable_reason: None,
+            confirmed_slot: Some(2),
+            block_time_unix_ms: None,
+            fees: None,
+            pnl: None,
+            wallet_sol_delta_lamports: Some(50_000_000),
+            error_message: None,
+            error_code: None,
+            latency_ms: None,
+            metadata: meta,
+        };
+        Arc::clone(&ctx).handle_execution_result(&result);
+
+        assert!(
+            !ctx.positions.read().contains_key(mint),
+            "confirmed full SELL must close overlay without waiting for authority KV"
+        );
+        assert!(
+            ctx.has_recent_confirmed_full_sell(mint),
+            "full sell marker must be set for reopen guard"
+        );
+    }
+
+    /// PA-5.2: wallet snapshot must not reopen overlay after authority tombstone / full sell.
+    #[tokio::test]
+    async fn pa52_wallet_snapshot_does_not_reopen_after_authority_closed() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "Pa52NoReopenMintttttttttttttttttttttttttttttt";
+        ctx.register_pool(mint, "pool", "raydium", 1);
+        ctx.update_pool_accounts(mint, "pool", vec!["a0".to_string()]);
+        ctx.mark_confirmed_full_sell(mint);
+        ctx.cache_wallet_balance_snapshot_raw(mint, 1_000_000);
+
+        let event = wallet_balance_snapshot_event(mint, 1_000_000, 6);
+        process_market_event(&ctx, &event, false)
+            .await
+            .expect("wallet snapshot");
+
+        assert!(
+            !ctx.positions.read().contains_key(mint),
+            "wallet snapshot reconcile must not reopen against flat authority"
+        );
+    }
+
+    /// PA-5.2: soft exits suppressed when PositionAuthority signals closed.
+    #[tokio::test]
+    async fn pa52_soft_exit_suppressed_when_authority_closed() {
+        let mut cfg = MomentumConfig::default();
+        cfg.max_hold_time_secs = 1;
+        cfg.take_profit_pct = 1.0;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context_with_config(jsonl_writer, cfg);
+
+        let mint = "Pa52SoftExitMintttttttttttttttttttttttttttttt";
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool: "pool",
+            dex: "raydium",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: 1_000,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 1,
+            initial_bonding: None,
+        });
+        ctx.positions
+            .write()
+            .get_mut(mint)
+            .expect("position")
+            .set_entry_time_ago(std::time::Duration::from_secs(120));
+        ctx.authority_by_mint.write().insert(
+            mint.to_string(),
+            PositionAuthoritySnapshot {
+                mint: mint.to_string(),
+                balance_raw: 0,
+                decimals: 6,
+                status: PositionAuthorityStatus::Closed,
+                last_update_source: PositionAuthorityUpdateSource::Execution,
+                sold_raw_total: None,
+            },
+        );
+
+        assert!(
+            ctx.check_for_exits().is_empty(),
+            "TIME_EXIT and other soft exits must be suppressed when authority is closed"
         );
     }
 
@@ -22277,7 +22552,7 @@ async fn process_market_event(
                         "WalletBalanceSnapshot: pending BUY — skip reconcile (await ExecutionResult)"
                     );
                 } else if let Some(reconciled) =
-                    ctx.build_reconciled_position(mint, *balance_raw, *decimals)
+                    ctx.try_reconcile_wallet_position(mint, *balance_raw, *decimals)
                 {
                     let hold_secs = reconciled.entry_time.elapsed().as_secs();
                     {
@@ -22303,12 +22578,22 @@ async fn process_market_event(
                 } else {
                     // Wallet has tokens but no pool known yet. Store as orphaned so
                     // we can reconcile later when PoolCreated/DexPoolAccounts arrives.
-                    ctx.orphaned_mints.write().insert(mint.to_string(), (*balance_raw, *decimals));
-                    warn!(
-                        mint = %mint,
-                        balance_raw = *balance_raw,
-                        "WalletBalanceSnapshot: tokens present but no known pool — added to orphaned_mints for lazy reconciliation"
-                    );
+                    if !ctx.authority_blocks_overlay_reopen(mint) {
+                        ctx.orphaned_mints
+                            .write()
+                            .insert(mint.to_string(), (*balance_raw, *decimals));
+                        warn!(
+                            mint = %mint,
+                            balance_raw = *balance_raw,
+                            "WalletBalanceSnapshot: tokens present but no known pool — added to orphaned_mints for lazy reconciliation"
+                        );
+                    } else {
+                        debug!(
+                            mint = %mint,
+                            balance_raw = *balance_raw,
+                            "WalletBalanceSnapshot: orphan reconcile suppressed — PositionAuthority closed"
+                        );
+                    }
                 }
             }
         }
