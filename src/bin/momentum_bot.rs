@@ -3789,24 +3789,38 @@ impl MomentumContext {
     }
 
     /// I-MD-9: Geyser hot-set readiness for imminent entry — fresh `LivePoolCache` reserves, no RPC.
-    fn entry_hot_set_fresh(&self, mint: &str, pool: &str) -> bool {
+    fn entry_hot_set_fresh(&self, mint: &str, pool: &str, dex: &str) -> bool {
+        match self.entry_hot_set_fresh_reason(mint, pool) {
+            Ok(()) => true,
+            Err(reason) => {
+                ironcrab::metrics::record_momentum_entry_hot_fresh_fail(reason, dex);
+                false
+            }
+        }
+    }
+
+    fn entry_hot_set_fresh_reason(
+        &self,
+        mint: &str,
+        pool: &str,
+    ) -> Result<(), ironcrab::metrics::MomentumEntryHotFreshFailReason> {
         let Ok(pool_pk) = solana_sdk::pubkey::Pubkey::from_str(pool) else {
-            return false;
+            return Err(ironcrab::metrics::MomentumEntryHotFreshFailReason::Missing);
         };
         let Ok(token_mint) = solana_sdk::pubkey::Pubkey::from_str(mint) else {
-            return false;
+            return Err(ironcrab::metrics::MomentumEntryHotFreshFailReason::Missing);
         };
         let Some((state, _slot, age_ms)) = self.live_pool_cache.get_with_metadata(&pool_pk) else {
-            return false;
+            return Err(ironcrab::metrics::MomentumEntryHotFreshFailReason::Missing);
         };
         if age_ms > ENTRY_HOT_SET_MAX_CACHE_AGE_MS {
-            return false;
+            return Err(ironcrab::metrics::MomentumEntryHotFreshFailReason::Age);
         }
         const PROBE_TOKENS: u64 = 1_000;
-        matches!(
-            quote_calculator::quote_output_amount(&state, PROBE_TOKENS, &token_mint),
-            Ok(sol_out) if sol_out > 0
-        )
+        match quote_calculator::quote_output_amount(&state, PROBE_TOKENS, &token_mint) {
+            Ok(sol_out) if sol_out > 0 => Ok(()),
+            _ => Err(ironcrab::metrics::MomentumEntryHotFreshFailReason::Quote),
+        }
     }
 
     /// A.2: Normalize DEX names for execution-engine compatibility (pumpswap/PumpFunAmm → pump_amm)
@@ -5528,8 +5542,11 @@ impl MomentumContext {
                             self.mark_entry_eval_dirty_key(key);
                             continue 'tracker_keys;
                         }
-                        let entry_hot_fresh =
-                            self.entry_hot_set_fresh(&mint, tracker.pool.as_str());
+                        let entry_hot_fresh = self.entry_hot_set_fresh(
+                            &mint,
+                            tracker.pool.as_str(),
+                            tracker.dex.as_str(),
+                        );
                         ironcrab::metrics::record_momentum_filter_pass_hot_fresh(entry_hot_fresh);
                         if probe_sol == 0 {
                             warn!(
@@ -5596,6 +5613,9 @@ impl MomentumContext {
                                 MomentumActivePinReason::Tracker,
                             );
                         }
+                    } else if matches!(tracker.state, TrackerState::WaitHotSet { .. }) {
+                        // I-MD-9: stay dirty through transient filter rot until timeout/intent/exit.
+                        self.mark_entry_eval_dirty_key(key);
                     } else if matches!(tracker.state, TrackerState::Discovery) {
                         // Move to validation state if not yet there
                         tracker.state = TrackerState::Validation;
@@ -5689,7 +5709,11 @@ impl MomentumContext {
                             self.mark_entry_eval_dirty_key(key);
                             continue 'tracker_keys;
                         }
-                        if !self.entry_hot_set_fresh(&mint, tracker.pool.as_str()) {
+                        if !self.entry_hot_set_fresh(
+                            &mint,
+                            tracker.pool.as_str(),
+                            tracker.dex.as_str(),
+                        ) {
                             self.mark_entry_eval_dirty_key(key);
                             continue 'tracker_keys;
                         }
@@ -12119,6 +12143,7 @@ async fn momentum_apply_pool_cache_jetstream_batch_items(
             update.header.ts_unix_ms,
         );
         pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, update);
+        ctx.mark_entry_eval_dirty_for_mint(&update.base_mint);
     }
     pool_cache_process_accounted = pool_cache_process_accounted.saturating_add(phase1_t0.elapsed());
 
@@ -19805,6 +19830,171 @@ mod tests {
             1
         );
         assert_eq!(wait_hot_set_test_counters::filter_pass_hot_fresh_true(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn entry_hot_fresh_fail_reasons_record_distinct_metrics() {
+        use ironcrab::metrics::{wait_hot_set_test_counters, MomentumEntryHotFreshFailReason};
+        wait_hot_set_test_counters::reset();
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = Pubkey::new_from_array([0x68u8; 32]).to_string();
+        let pool = Pubkey::new_from_array([0x69u8; 32]).to_string();
+
+        assert!(
+            !ctx.entry_hot_set_fresh(mint.as_str(), pool.as_str(), "raydium"),
+            "missing cache row"
+        );
+        assert_eq!(
+            wait_hot_set_test_counters::entry_hot_fresh_fail_total(
+                MomentumEntryHotFreshFailReason::Missing,
+                "raydium"
+            ),
+            1
+        );
+
+        let zero_quote = pool_cache_update_stub(
+            mint.as_str(),
+            pool.as_str(),
+            0,
+            0,
+            1,
+            wall_clock_unix_ms_now(),
+        );
+        pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, &zero_quote);
+        assert!(
+            !ctx.entry_hot_set_fresh(mint.as_str(), pool.as_str(), "raydium"),
+            "zero reserves must fail quote gate"
+        );
+        assert_eq!(
+            wait_hot_set_test_counters::entry_hot_fresh_fail_total(
+                MomentumEntryHotFreshFailReason::Quote,
+                "raydium"
+            ),
+            1
+        );
+
+        assert!(seed_test_entry_hot_set(&ctx, mint.as_str(), pool.as_str()));
+        std::thread::sleep(Duration::from_millis(ENTRY_HOT_SET_MAX_CACHE_AGE_MS + 200));
+        assert!(
+            !ctx.entry_hot_set_fresh(mint.as_str(), pool.as_str(), "raydium"),
+            "stale cache must fail age gate"
+        );
+        assert_eq!(
+            wait_hot_set_test_counters::entry_hot_fresh_fail_total(
+                MomentumEntryHotFreshFailReason::Age,
+                "raydium"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn jetstream_pool_cache_apply_marks_entry_eval_dirty() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = Pubkey::new_from_array([0x6au8; 32]).to_string();
+        let pool = Pubkey::new_from_array([0x6bu8; 32]).to_string();
+        let sk = MomentumContext::tracker_storage_key(mint.as_str(), pool.as_str());
+        assert!(ctx.get_or_create_tracker(
+            mint.as_str(),
+            pool.as_str(),
+            "raydium",
+            1,
+            10_000_000_000
+        ));
+        ctx.dirty_entry_tracker_keys.write().clear();
+
+        let update = pool_cache_update_stub(
+            mint.as_str(),
+            pool.as_str(),
+            10_000_000_000_000,
+            1_000_000_000_000,
+            10,
+            wall_clock_unix_ms_now(),
+        );
+        pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, &update);
+        ctx.mark_entry_eval_dirty_for_mint(&update.base_mint);
+
+        assert!(
+            ctx.dirty_entry_tracker_keys.read().contains(&sk),
+            "JetStream apply path must mark tracker dirty for re-eval"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn wait_hot_set_stays_dirty_when_filter_rotates() {
+        let cfg = probe_entry_filter_pass_config();
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "MintWaitHotDirty88888888888888888888888888888";
+        let pool = "poolWaitHotDirty8888888888888888888888888888";
+        let sk = seed_probe_ready_tracker(&ctx, &cfg, mint, pool);
+
+        let _ = ctx.check_for_signals();
+        assert!(ctx
+            .token_trackers
+            .read()
+            .get(&sk)
+            .is_some_and(|t| matches!(t.state, TrackerState::WaitHotSet { .. })));
+
+        ctx.config.write().min_unique_buyers = 100;
+        ctx.mark_entry_eval_dirty_key(&sk);
+        let _ = ctx.check_for_signals_dirty_priority_tick();
+        assert!(
+            ctx.dirty_entry_tracker_keys.read().contains(&sk),
+            "WaitHotSet must stay dirty through transient !should_trade"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn zero_reserve_discover_then_quotable_balance_allows_hot_fresh() {
+        use ironcrab::ipc::PoolCacheUpdateType;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = Pubkey::new_from_array([0x6cu8; 32]).to_string();
+        let pool = Pubkey::new_from_array([0x6du8; 32]).to_string();
+
+        let mut discover = pool_cache_update_stub(
+            mint.as_str(),
+            pool.as_str(),
+            0,
+            0,
+            1,
+            wall_clock_unix_ms_now(),
+        );
+        discover.update_type = PoolCacheUpdateType::PoolDiscovered;
+        pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, &discover);
+        std::thread::sleep(Duration::from_millis(30));
+        pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, &discover);
+        let (_, _, age_after_repeat) = ctx
+            .live_pool_cache
+            .get_with_metadata(&Pubkey::from_str(pool.as_str()).unwrap())
+            .expect("pool cached");
+        assert!(
+            age_after_repeat >= 25,
+            "repeated 0/0 discover must not spoof fresh age"
+        );
+
+        assert!(seed_test_entry_hot_set(&ctx, mint.as_str(), pool.as_str()));
+        assert!(
+            ctx.entry_hot_set_fresh(mint.as_str(), pool.as_str(), "raydium"),
+            "quotable balance update must allow fresh=true"
+        );
     }
 
     #[test]
