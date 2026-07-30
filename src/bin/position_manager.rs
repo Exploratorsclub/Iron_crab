@@ -1,8 +1,8 @@
-//! position-manager binary — PA-6a shadow PositionAuthority reducer.
+//! position-manager binary — PA-6b PositionAuthority reducer + sole KV writer.
 //!
-//! Keyless process that mirrors execution-engine PositionAuthority updates from JetStream
-//! (ExecutionResult + WalletBalanceSnapshot) without writing to the productive
-//! `POSITION_AUTHORITY` KV bucket. EE remains the sole KV writer until PA-6b cutover.
+//! Keyless process that maintains PositionAuthority from JetStream
+//! (ExecutionResult + WalletBalanceSnapshot) and publishes to the productive
+//! `POSITION_AUTHORITY` KV bucket. EE keeps an in-process reducer for PA-3/4 gates only.
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -30,7 +30,10 @@ use ironcrab::nats::jetstream::{
     EXECUTION_RESULTS_STREAM_NAME, WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS};
-use ironcrab::position_authority::PositionAuthority;
+use ironcrab::position_authority::{
+    reconcile_position_authority_kv_after_restart, PositionAuthority,
+    PositionAuthorityKvMetricsSink, PositionAuthorityKvPublisher,
+};
 
 type JetStreamPullConsumer =
     async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>;
@@ -41,7 +44,7 @@ const PM_EXECUTION_RESULT_FETCH_EXPIRES: Duration = Duration::from_millis(250);
 
 #[derive(Parser, Debug)]
 #[command(name = "position-manager")]
-#[command(about = "IronCrab PA-6a shadow PositionAuthority reducer (keyless, no KV writes)")]
+#[command(about = "IronCrab PositionAuthority reducer + POSITION_AUTHORITY KV writer (keyless)")]
 struct Args {
     /// Path to configuration file (optional; reads [position_manager] when present).
     #[arg(short, long, default_value = "config.toml")]
@@ -62,12 +65,14 @@ struct Args {
 
 struct PositionManagerContext {
     position_authority: Mutex<PositionAuthority>,
+    kv_publisher: PositionAuthorityKvPublisher,
 }
 
 impl PositionManagerContext {
-    fn new() -> Self {
+    fn new(kv_publisher: PositionAuthorityKvPublisher) -> Self {
         Self {
             position_authority: Mutex::new(PositionAuthority::new()),
+            kv_publisher,
         }
     }
 
@@ -75,19 +80,21 @@ impl PositionManagerContext {
         if exec.status != ExecutionStatus::Confirmed {
             return;
         }
-        {
+        let changes = {
             let mut pa = self.position_authority.lock();
-            let _changes = pa.apply_from_confirmed_execution_result(exec);
-        }
+            pa.apply_from_confirmed_execution_result(exec)
+        };
+        self.kv_publisher.enqueue(&changes);
         record_position_manager_event_applied();
         self.refresh_metrics();
     }
 
     fn apply_wallet_event_kind(&self, kind: &MarketEventKind) {
-        {
+        let changes = {
             let mut pa = self.position_authority.lock();
-            let _changes = pa.apply_from_wallet_market_event_kind(kind);
-        }
+            pa.apply_from_wallet_market_event_kind(kind)
+        };
+        self.kv_publisher.enqueue(&changes);
         record_position_manager_event_applied();
         self.refresh_metrics();
     }
@@ -164,12 +171,12 @@ fn is_enabled(args: &Args) -> bool {
     true
 }
 
-/// Bootstrap wallet snapshots from JetStream (LastPerSubject per mint) into PositionAuthority.
-async fn bootstrap_position_authority_from_wallet_snapshot(
+/// Bootstrap wallet snapshots from JetStream (LastPerSubject per mint).
+/// Returns observed count and event kinds for KV reconcile (apply deferred to reconcile).
+async fn bootstrap_wallet_snapshot_kinds(
     nats: &NatsClient,
     wallet: &str,
-    ctx: &Arc<PositionManagerContext>,
-) -> usize {
+) -> (usize, Vec<MarketEventKind>) {
     use async_nats::jetstream;
 
     let jetstream = jetstream::new(nats.client().clone());
@@ -181,7 +188,7 @@ async fn bootstrap_position_authority_from_wallet_snapshot(
                 stream = WALLET_SNAPSHOT_STREAM_NAME,
                 "Wallet snapshot stream not found during bootstrap (market-data may not be running)"
             );
-            return 0;
+            return (0, Vec::new());
         }
     };
 
@@ -192,12 +199,13 @@ async fn bootstrap_position_authority_from_wallet_snapshot(
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "Failed to create wallet snapshot bootstrap consumer");
-            return 0;
+            return (0, Vec::new());
         }
     };
 
     let batch_size = 1000;
     let mut observed = 0usize;
+    let mut wallet_snapshot_kinds = Vec::new();
 
     loop {
         let mut messages = match consumer.fetch().max_messages(batch_size).messages().await {
@@ -222,7 +230,13 @@ async fn bootstrap_position_authority_from_wallet_snapshot(
             match serde_json::from_slice::<MarketEvent>(&msg.payload) {
                 Ok(event) => {
                     observed += 1;
-                    ctx.apply_wallet_event_kind(&event.kind);
+                    if matches!(
+                        event.kind,
+                        MarketEventKind::WalletBalanceSnapshot { .. }
+                            | MarketEventKind::WalletSnapshotComplete { .. }
+                    ) {
+                        wallet_snapshot_kinds.push(event.kind);
+                    }
                 }
                 Err(e) => {
                     debug!(error = %e, "Failed to deserialize wallet snapshot MarketEvent");
@@ -242,11 +256,11 @@ async fn bootstrap_position_authority_from_wallet_snapshot(
     info!(
         wallet = %wallet,
         snapshots = observed,
-        open_positions = ctx.position_authority.lock().open_positions_count(),
-        "Wallet snapshot bootstrap applied to shadow PositionAuthority"
+        kinds = wallet_snapshot_kinds.len(),
+        "Wallet snapshot bootstrap kinds collected for PositionAuthority KV reconcile"
     );
 
-    observed
+    (observed, wallet_snapshot_kinds)
 }
 
 async fn create_wallet_snapshot_live_consumer(
@@ -284,7 +298,7 @@ async fn create_wallet_snapshot_live_consumer(
                 } else {
                     "New"
                 },
-                "Subscribed to JetStream WalletBalanceSnapshot (shadow live)"
+                "Subscribed to JetStream WalletBalanceSnapshot (live)"
             );
             Some(consumer)
         }
@@ -439,7 +453,7 @@ async fn main() -> Result<()> {
         wallet = %wallet,
         metrics_port,
         nats_url = %args.nats_url,
-        "Starting position-manager (PA-6a shadow — not prod KV writer)"
+        "Starting position-manager (PA-6b — sole POSITION_AUTHORITY KV writer)"
     );
 
     let metrics_addr = SocketAddr::from(([0, 0, 0, 0], metrics_port));
@@ -462,10 +476,31 @@ async fn main() -> Result<()> {
         warn!(error = %e, "Failed to ensure EXECUTION_RESULTS stream (may already exist)");
     }
 
-    let ctx = Arc::new(PositionManagerContext::new());
+    let kv_publisher = PositionAuthorityKvPublisher::spawn(
+        nats.clone_for_spawned_publish(),
+        PositionAuthorityKvMetricsSink::PositionManager,
+    );
+    let ctx = Arc::new(PositionManagerContext::new(kv_publisher));
 
-    let bootstrap_observed =
-        bootstrap_position_authority_from_wallet_snapshot(&nats, &wallet, &ctx).await;
+    let (bootstrap_observed, wallet_snapshot_kinds) =
+        bootstrap_wallet_snapshot_kinds(&nats, &wallet).await;
+
+    let position_authority_kv = tokio::sync::OnceCell::new();
+    if let Err(e) = reconcile_position_authority_kv_after_restart(
+        &nats,
+        &ctx.position_authority,
+        &position_authority_kv,
+        &wallet_snapshot_kinds,
+        PositionAuthorityKvMetricsSink::PositionManager,
+    )
+    .await
+    {
+        warn!(
+            error = %e,
+            "PositionAuthority KV startup reconcile failed (Momentum may see stale KV until next update)"
+        );
+    }
+    ctx.refresh_metrics();
 
     let wallet_snapshot_consumer =
         create_wallet_snapshot_live_consumer(&nats, &wallet, bootstrap_observed).await;
@@ -493,7 +528,7 @@ async fn main() -> Result<()> {
                     info!(
                         stream = EXECUTION_RESULTS_STREAM_NAME,
                         topic = TOPIC_EXECUTION_RESULTS,
-                        "Subscribed to ExecutionResults via JetStream (shadow reducer)"
+                        "Subscribed to ExecutionResults via JetStream"
                     );
                     Some(consumer)
                 }
@@ -526,8 +561,6 @@ async fn main() -> Result<()> {
             None
         }
     };
-
-    ctx.refresh_metrics();
 
     loop {
         tokio::select! {

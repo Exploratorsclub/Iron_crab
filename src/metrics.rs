@@ -3332,6 +3332,21 @@ pub fn record_position_manager_event_applied() {
     POSITION_MANAGER_EVENTS_APPLIED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+#[inline]
+pub fn record_position_manager_kv_put() {
+    POSITION_MANAGER_KV_PUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_position_manager_kv_tombstone() {
+    POSITION_MANAGER_KV_TOMBSTONE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_position_manager_kv_publish_error() {
+    POSITION_MANAGER_KV_PUBLISH_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn set_position_authority_drift_momentum(drift: i64) {
     POSITION_AUTHORITY_DRIFT_MOMENTUM.store(drift, Ordering::Relaxed);
 }
@@ -6446,6 +6461,13 @@ pub static POSITION_MANAGER_RECONCILE_NEEDED_GAUGE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// PA-6a shadow: total events applied to local PositionAuthority reducer.
 pub static POSITION_MANAGER_EVENTS_APPLIED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub static POSITION_MANAGER_KV_PUT_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub static POSITION_MANAGER_KV_TOMBSTONE_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub static POSITION_MANAGER_KV_PUBLISH_ERRORS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// PA-4: liquidation skipped LockManager seed because PositionAuthority reports closed/zero.
 pub static LIQUIDATION_SEED_SKIPPED_AUTHORITY_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -10258,6 +10280,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "position_manager_events_applied_total",
         POSITION_MANAGER_EVENTS_APPLIED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "position_manager_kv_put_total",
+        POSITION_MANAGER_KV_PUT_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "position_manager_kv_tombstone_total",
+        POSITION_MANAGER_KV_TOMBSTONE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "position_manager_kv_publish_errors_total",
+        POSITION_MANAGER_KV_PUBLISH_ERRORS_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "concurrent_intents",

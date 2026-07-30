@@ -70,10 +70,9 @@ use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
     DecisionRecord, DexPoolReadiness, ExecutionResult, ExecutionStatus, ExplicitAmount,
     FairnessPolicy, FeePolicy, FillStatus, FillUnavailableReason, IntentOrigin, IntentTier,
-    KillSwitchContext, MarketEvent, MarketEventKind, PoolCacheUpdate, PositionAuthoritySnapshot,
-    PriorityFeePercentiles, RecordHeader, RejectReason, SimulationResult,
-    TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide, TradingRegime,
-    POSITION_AUTHORITY_KV_BUCKET,
+    KillSwitchContext, MarketEvent, MarketEventKind, PoolCacheUpdate, PriorityFeePercentiles,
+    RecordHeader, RejectReason, SimulationResult, TradeExecutionConstraints, TradeIntent,
+    TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
@@ -122,7 +121,9 @@ use ironcrab::nats::{
     TRADE_INTENTS_STREAM_NAME, WALLET_SNAPSHOT_STREAM_NAME, WALLET_TX_CONFIRM_STREAM_NAME,
 };
 use ironcrab::position_authority::{
-    position_authority_drift_lockmanager, PositionAuthority, PositionAuthorityChange,
+    position_authority_drift_lockmanager, reconcile_position_authority_kv_after_restart,
+    PositionAuthority, PositionAuthorityChange, PositionAuthorityKvMetricsSink,
+    PositionAuthorityKvPublisher,
 };
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::dex::meteora_dlmm::MeteoraDlmm;
@@ -1571,6 +1572,9 @@ struct ExecutionConfig {
     janitor_swap_dust_max_slippage_bps: u32,
     janitor_swap_dust_max_per_run: usize,
     janitor_dry_run: bool,
+
+    /// PA-6b: EE publishes PositionAuthority KV when true (rollback only; default false).
+    publish_position_authority_kv: bool,
 }
 
 impl Default for ExecutionConfig {
@@ -1631,6 +1635,7 @@ impl Default for ExecutionConfig {
             janitor_swap_dust_max_slippage_bps: 500,
             janitor_swap_dust_max_per_run: 5,
             janitor_dry_run: false,
+            publish_position_authority_kv: false,
         }
     }
 }
@@ -2453,9 +2458,8 @@ struct ExecutionContext {
     lock_manager: LockManager,
     /// PA-2: passive PositionAuthority (metrics only; not used for gating or reservations).
     position_authority: Arc<ParkingMutex<PositionAuthority>>,
-    /// PA-5.1: FIFO queue for ordered PositionAuthority KV publishes (per reducer apply order).
-    position_authority_kv_tx:
-        Option<tokio::sync::mpsc::UnboundedSender<Vec<PositionAuthorityChange>>>,
+    /// PA-5.1 / PA-6b: FIFO queue for ordered PositionAuthority KV publishes (disabled when PM is writer).
+    position_authority_kv_publisher: PositionAuthorityKvPublisher,
     log_base: PathBuf, // P1: For state persistence
     decision_counter: std::sync::atomic::AtomicU64,
     execution_counter: std::sync::atomic::AtomicU64,
@@ -2599,7 +2603,7 @@ impl ExecutionContext {
             burn_writer,
             lock_manager,
             position_authority: Arc::new(ParkingMutex::new(position_authority)),
-            position_authority_kv_tx: None,
+            position_authority_kv_publisher: PositionAuthorityKvPublisher::disabled(),
             log_base: log_dir,
             decision_counter: std::sync::atomic::AtomicU64::new(0),
             execution_counter: std::sync::atomic::AtomicU64::new(0),
@@ -6596,14 +6600,9 @@ impl ExecutionContext {
         self.refresh_position_authority_metrics();
     }
 
-    /// PA-5.1: enqueue KV publish while holding reducer lock (preserves apply order).
+    /// PA-5.1 / PA-6b: enqueue KV publish while holding reducer lock (preserves apply order).
     fn enqueue_position_authority_kv_publish(&self, changes: &[PositionAuthorityChange]) {
-        if changes.is_empty() {
-            return;
-        }
-        if let Some(tx) = &self.position_authority_kv_tx {
-            let _ = tx.send(changes.to_vec());
-        }
+        self.position_authority_kv_publisher.enqueue(changes);
     }
 
     /// Apply a WalletBalanceSnapshot MarketEvent to LockManager + decimals cache.
@@ -6688,134 +6687,6 @@ impl ExecutionContext {
         POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE.store(lock_open as u64, Ordering::Relaxed);
         POSITION_AUTHORITY_DRIFT_LOCKMANAGER.store(drift, Ordering::Relaxed);
     }
-}
-
-/// PA-5.1: single worker preserves reducer apply order for PositionAuthority KV writes.
-fn spawn_position_authority_kv_publish_worker(
-    nats: NatsClient,
-    kv_cell: tokio::sync::OnceCell<async_nats::jetstream::kv::Store>,
-) -> tokio::sync::mpsc::UnboundedSender<Vec<PositionAuthorityChange>> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        while let Some(changes) = rx.recv().await {
-            if let Err(e) = publish_position_authority_changes_to_kv(&nats, &kv_cell, changes).await
-            {
-                warn!(error = %e, "PositionAuthority KV publish failed");
-            }
-        }
-    });
-    tx
-}
-
-/// PA-5.1: write PositionAuthority deltas to JetStream KV (`POSITION_AUTHORITY` bucket).
-async fn publish_position_authority_changes_to_kv(
-    nats: &NatsClient,
-    kv_cell: &tokio::sync::OnceCell<async_nats::jetstream::kv::Store>,
-    changes: Vec<PositionAuthorityChange>,
-) -> anyhow::Result<()> {
-    if changes.is_empty() {
-        return Ok(());
-    }
-    let store = if let Some(store) = kv_cell.get() {
-        store.clone()
-    } else {
-        let store = nats
-            .get_or_create_kv_bucket(POSITION_AUTHORITY_KV_BUCKET)
-            .await?;
-        let _ = kv_cell.set(store.clone());
-        store
-    };
-    for change in changes {
-        match change {
-            PositionAuthorityChange::Put(snapshot) => {
-                let mint = snapshot.mint.clone();
-                nats.kv_put(&store, &mint, &snapshot).await?;
-            }
-            PositionAuthorityChange::Tombstone { mint } => {
-                if let Err(e) = nats.kv_delete(&store, &mint).await {
-                    debug!(mint = %mint, error = %e, "PositionAuthority KV tombstone delete (may not exist)");
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// PA-5.1: tombstone sweep only when bootstrap included `WalletSnapshotComplete`
-/// (partial balance snapshots alone are not a complete wallet picture).
-fn wallet_bootstrap_allows_pa_kv_tombstone_sweep(
-    wallet_snapshot_kinds: &[MarketEventKind],
-) -> bool {
-    wallet_snapshot_kinds
-        .iter()
-        .any(|k| matches!(k, MarketEventKind::WalletSnapshotComplete { .. }))
-}
-
-/// PA-5.1: after EE restart, seed in-process PositionAuthority from wallet bootstrap and
-/// tombstone JetStream KV keys that no longer exist in the authority model.
-async fn reconcile_position_authority_kv_after_restart(
-    nats: &NatsClient,
-    position_authority: &ParkingMutex<PositionAuthority>,
-    kv_cell: &tokio::sync::OnceCell<async_nats::jetstream::kv::Store>,
-    wallet_snapshot_kinds: &[MarketEventKind],
-) -> anyhow::Result<()> {
-    let (changes, tracked) = {
-        let mut pa = position_authority.lock();
-        let mut changes = Vec::new();
-        for kind in wallet_snapshot_kinds {
-            changes.extend(pa.apply_from_wallet_market_event_kind(kind));
-        }
-        let tracked: std::collections::HashSet<String> = pa.tracked_mints().into_iter().collect();
-        (changes, tracked)
-    };
-
-    let mut changes = changes;
-
-    let store = if let Some(store) = kv_cell.get() {
-        store.clone()
-    } else {
-        let store = nats
-            .get_or_create_kv_bucket(POSITION_AUTHORITY_KV_BUCKET)
-            .await?;
-        let _ = kv_cell.set(store.clone());
-        store
-    };
-
-    let allow_tombstone_sweep =
-        wallet_bootstrap_allows_pa_kv_tombstone_sweep(wallet_snapshot_kinds);
-
-    if allow_tombstone_sweep {
-        let kv_entries = nats
-            .kv_get_all::<PositionAuthoritySnapshot>(&store)
-            .await
-            .unwrap_or_default();
-        for mint in kv_entries.keys() {
-            if !tracked.contains(mint) {
-                changes.push(PositionAuthorityChange::Tombstone { mint: mint.clone() });
-            }
-        }
-        if !changes.is_empty() {
-            publish_position_authority_changes_to_kv(nats, kv_cell, changes).await?;
-            info!(
-                wallet_snapshots = wallet_snapshot_kinds.len(),
-                kv_keys = kv_entries.len(),
-                tracked_mints = tracked.len(),
-                "PositionAuthority KV reconciled after execution-engine restart (tombstone sweep)"
-            );
-        }
-    } else {
-        if !changes.is_empty() {
-            publish_position_authority_changes_to_kv(nats, kv_cell, changes).await?;
-        }
-        warn!(
-            wallet_snapshots = wallet_snapshot_kinds.len(),
-            has_snapshot_complete = false,
-            tracked_mints = tracked.len(),
-            "PositionAuthority KV reconcile: tombstone sweep skipped (wallet bootstrap missing WalletSnapshotComplete or empty)"
-        );
-    }
-
-    Ok(())
 }
 
 #[allow(dead_code)]
@@ -7927,8 +7798,20 @@ async fn main() -> Result<()> {
         capital_lock_ttl_buffer_ms: exec_eng_cfg
             .and_then(|e| e.capital_lock_ttl_buffer_ms)
             .unwrap_or(10_000),
+        publish_position_authority_kv: exec_eng_cfg
+            .and_then(|e| e.publish_position_authority_kv)
+            .unwrap_or(false),
         ..Default::default()
     };
+
+    if exec_config.publish_position_authority_kv {
+        warn!(
+            "execution-engine publish_position_authority_kv=true: EE will write POSITION_AUTHORITY KV. \
+             Stop position-manager to avoid split-brain (PA-6b rollback mode only)."
+        );
+    } else {
+        info!("PositionAuthority JetStream KV writes disabled in execution-engine (position-manager is sole writer)");
+    }
 
     info!(
         jito_enabled = exec_config.jito_enabled,
@@ -8258,13 +8141,19 @@ async fn main() -> Result<()> {
         parking_lot::RwLock<std::collections::HashMap<String, OrphanTxConfirmEntry>>,
     > = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
 
+    let publish_position_authority_kv = exec_config.publish_position_authority_kv;
     let position_authority_kv = tokio::sync::OnceCell::new();
-    let position_authority_kv_tx = nats.as_ref().map(|n| {
-        spawn_position_authority_kv_publish_worker(
-            n.clone_for_spawned_publish(),
-            position_authority_kv.clone(),
-        )
-    });
+    let position_authority_kv_publisher = if publish_position_authority_kv {
+        nats.as_ref()
+            .map_or(PositionAuthorityKvPublisher::disabled(), |n| {
+                PositionAuthorityKvPublisher::spawn(
+                    n.clone_for_spawned_publish(),
+                    PositionAuthorityKvMetricsSink::None,
+                )
+            })
+    } else {
+        PositionAuthorityKvPublisher::disabled()
+    };
 
     let mut ctx = ExecutionContext {
         run_id: run_id.clone(),
@@ -8286,7 +8175,7 @@ async fn main() -> Result<()> {
         burn_writer,
         lock_manager,
         position_authority: Arc::new(ParkingMutex::new(PositionAuthority::new())),
-        position_authority_kv_tx,
+        position_authority_kv_publisher,
         log_base: log_base.clone(),
         decision_counter: std::sync::atomic::AtomicU64::new(initial_decision_counter),
         execution_counter: std::sync::atomic::AtomicU64::new(initial_execution_counter),
@@ -8331,20 +8220,25 @@ async fn main() -> Result<()> {
         pump_amm_hot_path_refresh_last: Arc::new(ParkingMutex::new(HashMap::new())),
     };
 
-    if let Some(ref nats_client) = ctx.nats {
-        if let Err(e) = reconcile_position_authority_kv_after_restart(
-            nats_client,
-            &ctx.position_authority,
-            &position_authority_kv,
-            &wallet_snapshot_kinds,
-        )
-        .await
-        {
-            warn!(
-                error = %e,
-                "PositionAuthority KV startup reconcile failed (Momentum may see stale KV until next update)"
-            );
+    if publish_position_authority_kv {
+        if let Some(ref nats_client) = ctx.nats {
+            if let Err(e) = reconcile_position_authority_kv_after_restart(
+                nats_client,
+                &ctx.position_authority,
+                &position_authority_kv,
+                &wallet_snapshot_kinds,
+                PositionAuthorityKvMetricsSink::None,
+            )
+            .await
+            {
+                warn!(
+                    error = %e,
+                    "PositionAuthority KV startup reconcile failed (Momentum may see stale KV until next update)"
+                );
+            }
         }
+    }
+    if ctx.nats.is_some() {
         ctx.refresh_position_authority_metrics();
     }
 
@@ -9659,7 +9553,7 @@ async fn build_replay_context(
         burn_writer,
         lock_manager,
         position_authority: Arc::new(ParkingMutex::new(PositionAuthority::new())),
-        position_authority_kv_tx: None,
+        position_authority_kv_publisher: PositionAuthorityKvPublisher::disabled(),
         log_base: log_dir,
         decision_counter: std::sync::atomic::AtomicU64::new(0),
         execution_counter: std::sync::atomic::AtomicU64::new(0),
@@ -14095,8 +13989,7 @@ mod execution_engine_tests {
         try_pump_amm_hot_path_refresh_publish, wait_for_meteora_dlmm_slave_after_recovery,
         wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder,
         wait_for_pump_amm_slave_after_recovery, wait_for_pumpfun_bonding_cache_refresh,
-        wallet_bootstrap_allows_pa_kv_tombstone_sweep, ComputedIntentFills,
-        DiscoveryRequestOutcome, ExecutionConfig, LiquidationSeedDecision,
+        ComputedIntentFills, DiscoveryRequestOutcome, ExecutionConfig, LiquidationSeedDecision,
         PumpAmmHotPathRefreshDecision, RouteCandidate, PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN,
         WSOL_MINT,
     };
@@ -14114,7 +14007,9 @@ mod execution_engine_tests {
         IntentOrigin, IntentTier, MarketEventKind, PoolCacheUpdate, TradeIntent, TradeResources,
         TradeSide, TradingRegime,
     };
-    use ironcrab::position_authority::{PositionAuthority, PositionEvent};
+    use ironcrab::position_authority::{
+        wallet_bootstrap_allows_pa_kv_tombstone_sweep, PositionAuthority, PositionEvent,
+    };
     use ironcrab::solana::address_lookup_table::LoadedAlt;
     use ironcrab::solana::dex::pumpfun::PumpFunDex;
     use ironcrab::storage::locks::{LockHolder, LockManager, LockResult};
@@ -14222,6 +14117,15 @@ mod execution_engine_tests {
         ctx.apply_wallet_balance_snapshot_event(&wsol_wallet_snapshot_event(0));
 
         assert_eq!(ctx.lock_manager.available_wsol(), 0);
+    }
+
+    #[test]
+    fn execution_config_default_disables_position_authority_kv_publish() {
+        let cfg = ExecutionConfig::default();
+        assert!(
+            !cfg.publish_position_authority_kv,
+            "PA-6b: EE must not publish PositionAuthority KV by default"
+        );
     }
 
     #[test]
