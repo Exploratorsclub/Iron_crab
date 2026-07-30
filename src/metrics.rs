@@ -3320,6 +3320,18 @@ pub fn record_momentum_soft_exit_suppressed_authority_total(
 }
 
 #[inline]
+/// PA-6a shadow: refresh position-manager authority gauges from local reducer state.
+pub fn refresh_position_manager_authority_gauges(open: u64, reconcile_needed: u64) {
+    POSITION_MANAGER_OPEN_POSITIONS_GAUGE.store(open, Ordering::Relaxed);
+    POSITION_MANAGER_RECONCILE_NEEDED_GAUGE.store(reconcile_needed, Ordering::Relaxed);
+    POSITION_MANAGER_UP_GAUGE.store(1, Ordering::Relaxed);
+}
+
+/// PA-6a shadow: increment events-applied counter after a reducer apply.
+pub fn record_position_manager_event_applied() {
+    POSITION_MANAGER_EVENTS_APPLIED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn set_position_authority_drift_momentum(drift: i64) {
     POSITION_AUTHORITY_DRIFT_MOMENTUM.store(drift, Ordering::Relaxed);
 }
@@ -4296,6 +4308,8 @@ pub enum MetricsComponent {
     ExecutionEngine,
     MomentumBot,
     ArbStrategy,
+    /// PA-6a shadow: position-manager reduces PositionAuthority locally (not prod KV writer).
+    PositionManager,
 }
 
 /// Set readiness: NATS connected
@@ -6423,6 +6437,15 @@ pub static POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE: Lazy<AtomicU64> =
 pub static POSITION_AUTHORITY_DRIFT_LOCKMANAGER: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
 /// PA-5.1: `authority_open - momentum_overlay_count` (signed; Prometheus scalar).
 pub static POSITION_AUTHORITY_DRIFT_MOMENTUM: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
+/// PA-6a shadow: position-manager process heartbeat (1 = up).
+pub static POSITION_MANAGER_UP_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// PA-6a shadow: open positions from local PositionAuthority reducer.
+pub static POSITION_MANAGER_OPEN_POSITIONS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// PA-6a shadow: reconcile-needed positions from local PositionAuthority reducer.
+pub static POSITION_MANAGER_RECONCILE_NEEDED_GAUGE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PA-6a shadow: total events applied to local PositionAuthority reducer.
+pub static POSITION_MANAGER_EVENTS_APPLIED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// PA-4: liquidation skipped LockManager seed because PositionAuthority reports closed/zero.
 pub static LIQUIDATION_SEED_SKIPPED_AUTHORITY_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -10221,6 +10244,22 @@ async fn metrics_response() -> Response<Body> {
         LIQUIDATION_SEED_SKIPPED_AUTHORITY_TOTAL.load(Ordering::Relaxed)
     );
     line!(
+        "position_manager_up",
+        POSITION_MANAGER_UP_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "position_manager_open_positions",
+        POSITION_MANAGER_OPEN_POSITIONS_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "position_manager_reconcile_needed_positions",
+        POSITION_MANAGER_RECONCILE_NEEDED_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "position_manager_events_applied_total",
+        POSITION_MANAGER_EVENTS_APPLIED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
         "concurrent_intents",
         CONCURRENT_INTENTS_GAUGE.load(Ordering::Relaxed)
     );
@@ -10654,6 +10693,15 @@ fn status_response(component: MetricsComponent) -> String {
                 },
             )
         }
+        MetricsComponent::PositionManager => (
+            "position-manager",
+            nats,
+            if nats {
+                vec![]
+            } else {
+                vec!["nats_connected".to_string()]
+            },
+        ),
     };
 
     let reason_not_ready = if !ready && !missing_checks.is_empty() {

@@ -267,6 +267,28 @@ pub struct Config {
     pub execution_engine: Option<ExecutionEngineCfg>,
     #[serde(default)]
     pub market_data_geyser: MarketDataGeyserCfg,
+    /// PA-6a shadow position-manager (keyless; not prod KV writer until PA-6b).
+    #[serde(default)]
+    pub position_manager: Option<PositionManagerCfg>,
+}
+
+/// Position Manager Configuration (PA-6a shadow binary)
+/// TOML section: [position_manager]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionManagerCfg {
+    /// When false, binary exits early (deploy keeps service disabled by default).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Prometheus metrics HTTP port. Default: 9805
+    #[serde(default = "default_position_manager_metrics_port")]
+    pub metrics_port: u16,
+    /// Trading wallet pubkey for wallet-snapshot JetStream filter.
+    #[serde(default)]
+    pub wallet_pubkey: Option<String>,
+}
+
+fn default_position_manager_metrics_port() -> u16 {
+    9805
 }
 
 /// Execution Engine Configuration (for execution-engine binary)
