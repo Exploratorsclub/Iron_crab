@@ -63,7 +63,9 @@ use ironcrab::execution::live_pool_cache::{
 };
 use ironcrab::execution::quote_calculator;
 use ironcrab::execution::tx_builder;
-use ironcrab::execution::wsol_manager::{WsolManager, WsolManagerConfig, WSOL_MINT};
+use ironcrab::execution::wsol_manager::{
+    PendingWrapState, WsolManager, WsolManagerConfig, WSOL_MINT,
+};
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
     DecisionRecord, DexPoolReadiness, ExecutionResult, ExecutionStatus, ExplicitAmount,
@@ -2527,6 +2529,9 @@ struct ExecutionContext {
     /// When Some, WalletBalanceSnapshot for NATIVE_SOL/WSOL are forwarded here.
     wsol_balance_tx: Option<tokio::sync::mpsc::Sender<(u64, Option<u64>)>>,
 
+    /// Shared with WsolManager: pending-wrap floor for LockManager capital sync.
+    wsol_pending_wrap: Option<Arc<PendingWrapState>>,
+
     // === PR3: JetStream TX Confirmation ===
     /// Pending signature → oneshot notify (filled by main-loop JetStream WalletTxConfirmed consumer).
     pending_tx_confirms: Arc<
@@ -2617,6 +2622,7 @@ impl ExecutionContext {
             intent_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             pending_discovery_responses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             wsol_balance_tx: None,
+            wsol_pending_wrap: None,
             pending_tx_confirms: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             recent_orphan_tx_confirms: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             intents_received: std::sync::atomic::AtomicU64::new(0),
@@ -6617,10 +6623,32 @@ impl ExecutionContext {
                     let _ = tx.try_send((*balance_raw, Some(wsol)));
                 }
             } else if mint == WSOL_MINT || mint == SOL_MINT {
-                self.lock_manager.update_wsol_only(*balance_raw);
+                let incoming = *balance_raw;
+                let effective_wsol = if let Some(ref pending) = self.wsol_pending_wrap {
+                    let (effective, confirms, was_floored) =
+                        pending.effective_wsol_for_snapshot(incoming);
+                    if was_floored {
+                        ironcrab::metrics::WSOL_LOCK_MANAGER_SNAPSHOT_FLOORED_TOTAL
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            event = "lock_manager_stale_wsol_snapshot_floored_due_to_pending_wrap",
+                            incoming_wsol_lamports = incoming,
+                            pending_expected_wsol_lamports = pending.pending_expected(),
+                            effective_wsol_lamports = effective,
+                            "Floored LockManager WSOL snapshot while pending post-wrap confirmation"
+                        );
+                    }
+                    if confirms {
+                        pending.clear();
+                    }
+                    effective
+                } else {
+                    incoming
+                };
+                self.lock_manager.update_wsol_only(effective_wsol);
                 if let Some(ref tx) = self.wsol_balance_tx {
                     let sol = self.lock_manager.total_native_sol();
-                    let _ = tx.try_send((sol, Some(*balance_raw)));
+                    let _ = tx.try_send((sol, Some(incoming)));
                 }
             } else {
                 let old = self.lock_manager.available_token_balance(mint);
@@ -8291,6 +8319,7 @@ async fn main() -> Result<()> {
         recent_orphan_tx_confirms,
         // WsolManager balance updates (from JetStream); set when WsolManager enabled
         wsol_balance_tx: None,
+        wsol_pending_wrap: None,
         // Metrics
         intents_received: std::sync::atomic::AtomicU64::new(0),
         intents_rejected: std::sync::atomic::AtomicU64::new(0),
@@ -8389,9 +8418,14 @@ async fn main() -> Result<()> {
     }
 
     // Create WsolManager balance channel when treasury exists (JetStream → WsolManager)
+    let wsol_pending_wrap_state = ctx
+        .treasury
+        .as_ref()
+        .map(|_| Arc::new(PendingWrapState::new()));
     let wsol_balance_rx = if ctx.treasury.is_some() {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         ctx.wsol_balance_tx = Some(tx);
+        ctx.wsol_pending_wrap = wsol_pending_wrap_state.clone();
         Some(rx)
     } else {
         None
@@ -8429,6 +8463,16 @@ async fn main() -> Result<()> {
 
         if wsol_config.enabled {
             let ctx_for_kill_switch = Arc::clone(&ctx);
+            let ctx_for_lock_sync = Arc::clone(&ctx);
+            let lock_sync: ironcrab::execution::wsol_manager::WsolLockSyncCallback =
+                Arc::new(move |wsol_lamports| {
+                    ctx_for_lock_sync
+                        .lock_manager
+                        .update_wsol_only(wsol_lamports);
+                });
+            let pending_wrap = wsol_pending_wrap_state
+                .clone()
+                .expect("pending wrap state set when treasury exists");
             let wsol_manager = WsolManager::with_jsonl_writer(
                 wsol_config.clone(),
                 Arc::new(treasury.clone()),
@@ -8437,7 +8481,9 @@ async fn main() -> Result<()> {
                 &run_id,
                 Arc::clone(&wsol_writer),
             )
-            .with_kill_switch(move || ctx_for_kill_switch.is_kill_switch_active());
+            .with_kill_switch(move || ctx_for_kill_switch.is_kill_switch_active())
+            .with_pending_wrap_state(pending_wrap)
+            .with_lock_manager_sync(lock_sync);
             let shutdown_rx_wsol = shutdown_rx.clone();
 
             let balance_rx = wsol_balance_rx.expect("wsol_balance_rx set when treasury exists");
@@ -9638,6 +9684,7 @@ async fn build_replay_context(
             std::collections::HashMap::new(),
         )),
         wsol_balance_tx: None,
+        wsol_pending_wrap: None,
         pending_tx_confirms: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
         recent_orphan_tx_confirms: Arc::new(parking_lot::RwLock::new(
             std::collections::HashMap::new(),
@@ -14058,6 +14105,8 @@ mod execution_engine_tests {
     };
     use ironcrab::execution::pool_cache_sync::apply_pool_cache_update;
     use ironcrab::execution::tx_builder::TxPlan;
+    use ironcrab::execution::wsol_manager::PendingWrapState;
+    use ironcrab::ipc::MarketEvent;
     use ironcrab::ipc::RejectReason;
     use ironcrab::ipc::{
         CheckResult, ControlResponse, ControlResponseStatus, DecisionOutcome, DecisionRecord,
@@ -14079,6 +14128,7 @@ mod execution_engine_tests {
     };
     use std::collections::HashMap;
     use std::str::FromStr;
+    use std::sync::Arc;
     use std::time::Instant;
 
     fn test_system_transfer(from: &Pubkey, to: &Pubkey, lamports: u64) -> Instruction {
@@ -14108,6 +14158,70 @@ mod execution_engine_tests {
 
         assert_eq!(unsigned.message, signed.message);
         assert!(matches!(unsigned.message, VersionedMessage::Legacy(_)));
+    }
+
+    fn wsol_wallet_snapshot_event(balance_raw: u64) -> MarketEvent {
+        MarketEvent::new(
+            "test",
+            "test",
+            "run",
+            "evt-wsol-snapshot".to_string(),
+            "geyser",
+            None,
+            MarketEventKind::WalletBalanceSnapshot {
+                mint: WSOL_MINT.to_string(),
+                balance_raw,
+                decimals: 9,
+                token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            },
+        )
+    }
+
+    fn test_ctx_with_pending_wrap(
+        lock_manager: LockManager,
+    ) -> (super::ExecutionContext, Arc<PendingWrapState>) {
+        let pending = Arc::new(PendingWrapState::new());
+        let mut ctx =
+            super::ExecutionContext::test_for_pa2_metrics(lock_manager, PositionAuthority::new());
+        ctx.wsol_pending_wrap = Some(Arc::clone(&pending));
+        (ctx, pending)
+    }
+
+    #[test]
+    fn lock_manager_pending_wrap_floors_stale_zero_snapshot() {
+        let (ctx, pending) = test_ctx_with_pending_wrap(LockManager::new(3_000_000_000));
+        pending.arm(1_000_000_000);
+        ctx.lock_manager.update_wsol_only(1_000_000_000);
+
+        ctx.apply_wallet_balance_snapshot_event(&wsol_wallet_snapshot_event(0));
+
+        assert_eq!(ctx.lock_manager.available_wsol(), 1_000_000_000);
+        assert_eq!(pending.pending_expected(), 1_000_000_000);
+    }
+
+    #[test]
+    fn lock_manager_pending_wrap_confirms_on_matching_snapshot() {
+        let (ctx, pending) = test_ctx_with_pending_wrap(LockManager::new(3_000_000_000));
+        pending.arm(1_000_000_000);
+        ctx.lock_manager.update_wsol_only(0);
+
+        ctx.apply_wallet_balance_snapshot_event(&wsol_wallet_snapshot_event(1_000_000_000));
+
+        assert_eq!(ctx.lock_manager.available_wsol(), 1_000_000_000);
+        assert_eq!(pending.pending_expected(), 0);
+    }
+
+    #[test]
+    fn lock_manager_without_pending_accepts_zero_unwrap_snapshot() {
+        let ctx = super::ExecutionContext::test_for_pa2_metrics(
+            LockManager::new(3_000_000_000),
+            PositionAuthority::new(),
+        );
+        ctx.lock_manager.update_wsol_only(1_000_000_000);
+
+        ctx.apply_wallet_balance_snapshot_event(&wsol_wallet_snapshot_event(0));
+
+        assert_eq!(ctx.lock_manager.available_wsol(), 0);
     }
 
     #[test]
