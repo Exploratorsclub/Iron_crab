@@ -48,7 +48,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Components
-COMPONENTS=("market-data" "momentum-bot" "arb-strategy" "execution-engine")
+COMPONENTS=("market-data" "position-manager" "momentum-bot" "arb-strategy" "execution-engine")
 SYSTEMD_DIR="/etc/systemd/system"
 SYSTEMD_SRC_DIR="$SCRIPT_DIR/docs/systemd"
 
@@ -80,7 +80,7 @@ if [ "$SKIP_BUILD" = false ]; then
     log_info "Building execution-engine..."
     cargo build --release --bin execution-engine
 
-    log_info "Building position-manager (PA-6a shadow, optional service)..."
+    log_info "Building position-manager (PA-6b POSITION_AUTHORITY KV writer)..."
     cargo build --release --bin position-manager
     
     log_info "All binaries built successfully."
@@ -131,7 +131,13 @@ EOF
 [Service]
 Environment="IRONCRAB_WALLET_PUBKEY=$WALLET_PUBKEY"
 EOF
+        sudo mkdir -p /etc/systemd/system/position-manager.service.d/
+        sudo tee /etc/systemd/system/position-manager.service.d/wallet.conf > /dev/null <<EOF
+[Service]
+Environment="IRONCRAB_WALLET_PUBKEY=$WALLET_PUBKEY"
+EOF
         log_info "market-data will publish wallet balance snapshot at startup"
+        log_info "position-manager will filter wallet snapshots for $WALLET_PUBKEY"
     else
         log_warn "Could not extract wallet pubkey (position reconciliation disabled)"
     fi
@@ -150,6 +156,7 @@ install_service() {
 
 log_info "Installing systemd services..."
 install_service "market-data"
+install_service "position-manager"
 install_service "momentum-bot"
 install_service "arb-strategy"
 install_service "execution-engine"
@@ -184,7 +191,7 @@ else
     # systemctl start ironcrab.target does NOT restart already-running Wants= units;
     # after cargo build replaces binaries, stale processes keep the old inode until restarted.
     log_info "Restarting all IronCrab services..."
-    SERVICES=(market-data momentum-bot arb-strategy execution-engine control-plane trades-server)
+    SERVICES=(market-data position-manager momentum-bot arb-strategy execution-engine control-plane trades-server)
     for svc in "${SERVICES[@]}"; do
         log_info "Restarting $svc..."
         sudo systemctl restart "$svc"
@@ -203,7 +210,7 @@ sudo systemctl enable ironcrab.target
 sleep 2
 log_info "Service status:"
 echo ""
-for svc in market-data momentum-bot execution-engine control-plane trades-server; do
+for svc in market-data position-manager momentum-bot execution-engine control-plane trades-server; do
     status=$(systemctl is-active "$svc" 2>/dev/null || echo "inactive")
     if [ "$status" = "active" ]; then
         echo -e "  ${GREEN}●${NC} $svc: $status"
@@ -227,6 +234,7 @@ echo "   - market-data:      http://localhost:9801/metrics"
 echo "   - momentum-bot:     http://localhost:9802/metrics"
 echo "   - arb-strategy:     http://localhost:9803/metrics"
 echo "   - execution-engine: http://localhost:9804/metrics"
+echo "   - position-manager: http://localhost:9805/metrics"
 echo ""
 echo "🔧 Control Plane:      http://localhost:8080"
 echo "📈 Trades API:         http://localhost:9899/trades (Grafana Infinity)"
@@ -236,6 +244,7 @@ echo "   journalctl -u market-data -f"
 echo "   journalctl -u momentum-bot -f"
 echo "   journalctl -u arb-strategy -f"
 echo "   journalctl -u execution-engine -f"
+echo "   journalctl -u position-manager -f"
 echo "   journalctl -u control-plane -f"
 echo "   journalctl -u trades-server -f"
 echo ""

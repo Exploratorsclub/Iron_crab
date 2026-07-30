@@ -331,6 +331,10 @@ pub struct ExecutionEngineCfg {
     /// Buffer (ms) added to discovery + simulation when computing pre-send capital-lock TTL. Default: 10000.
     #[serde(default)]
     pub capital_lock_ttl_buffer_ms: Option<u64>,
+    /// PA-6b: when true, EE publishes PositionAuthority to JetStream KV (rollback / emergency).
+    /// Default false — `position-manager` is the sole writer. Enabling while PM runs causes split-brain.
+    #[serde(default)]
+    pub publish_position_authority_kv: Option<bool>,
 }
 
 /// Fee Policy Configuration

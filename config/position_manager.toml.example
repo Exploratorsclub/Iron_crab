@@ -1,9 +1,7 @@
-# PA-6a shadow position-manager — NOT the productive PositionAuthority KV writer.
-# EE remains writer on POSITION_AUTHORITY until PA-6b cutover.
+# PA-6b position-manager — sole productive PositionAuthority KV writer.
 
 [position_manager]
-# Default false in production deploy; set true to run shadow reducer.
-enabled = false
+enabled = true
 metrics_port = 9805
 # Trading wallet pubkey (or use IRONCRAB_WALLET_PUBKEY env / --wallet-pubkey CLI).
 # wallet_pubkey = "YourWalletPubkeyHere"

@@ -1,8 +1,8 @@
 [Unit]
-Description=IronCrab Position Manager (PA-6a Shadow, Keyless)
-After=network-online.target nats.service market-data.service execution-engine.service
+Description=IronCrab Position Manager (PA-6b KV Writer, Keyless)
+After=network-online.target nats.service market-data.service
 Wants=network-online.target
-# PA-6a: deliberately NOT PartOf=ironcrab.target until PA-6b cutover approval.
+Before=execution-engine.service momentum-bot.service
 
 StartLimitBurst=10
 StartLimitIntervalSec=300
@@ -22,7 +22,7 @@ Environment=RUST_LOG=info,position_manager=info
 # Wallet pubkey for JetStream wallet-snapshot filter (set by deploy or override):
 # Environment=IRONCRAB_WALLET_PUBKEY=
 
-# IMPORTANT: No wallet keys (keyless shadow reducer)
+# IMPORTANT: No wallet keys (keyless PositionAuthority reducer + KV writer)
 # Do NOT set IRONCRAB_KEYPAIR_PATH/KEYPAIR_PATH in this service.
 
 Restart=on-failure
@@ -39,5 +39,4 @@ ProtectSystem=strict
 ProtectHome=read-only
 
 [Install]
-# PA-6a shadow: enable manually after validation — not auto-started with ironcrab.target.
-# WantedBy=ironcrab.target
+WantedBy=ironcrab.target
