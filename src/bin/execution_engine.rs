@@ -70,9 +70,9 @@ use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
     DecisionRecord, DexPoolReadiness, ExecutionResult, ExecutionStatus, ExplicitAmount,
     FairnessPolicy, FeePolicy, FillStatus, FillUnavailableReason, IntentOrigin, IntentTier,
-    KillSwitchContext, MarketEvent, MarketEventKind, PoolCacheUpdate,
-    PriorityFeePercentiles, RecordHeader, RejectReason, SimulationResult,
-    TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide, TradingRegime,
+    KillSwitchContext, MarketEvent, MarketEventKind, PoolCacheUpdate, PriorityFeePercentiles,
+    RecordHeader, RejectReason, SimulationResult, TradeExecutionConstraints, TradeIntent,
+    TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
