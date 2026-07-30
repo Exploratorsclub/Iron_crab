@@ -502,6 +502,21 @@ pub fn wallet_snapshot_live_consumer_config_execution_engine(
     }
 }
 
+/// Consumer config for live WalletBalanceSnapshot updates in position-manager (PA-6a shadow).
+/// Durable consumer scoped per wallet; DeliverPolicy may be overridden at create time.
+pub fn wallet_snapshot_live_consumer_config_position_manager(
+    wallet: &str,
+) -> jetstream::consumer::pull::Config {
+    jetstream::consumer::pull::Config {
+        deliver_policy: jetstream::consumer::DeliverPolicy::New,
+        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+        durable_name: Some(format!("position-manager-wallet-snapshot-{}", wallet)),
+        max_ack_pending: 1000,
+        filter_subject: format!("ironcrab.wallet_snapshot.{}.*", wallet),
+        ..Default::default()
+    }
+}
+
 /// Consumer config for live WalletTxConfirmed updates in execution-engine.
 /// Durable consumer scoped per wallet; `DeliverPolicy::All` includes confirms published
 /// before the consumer exists (e.g. stream/EE startup ordering gap).

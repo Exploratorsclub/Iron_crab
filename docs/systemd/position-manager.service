@@ -1,0 +1,43 @@
+[Unit]
+Description=IronCrab Position Manager (PA-6a Shadow, Keyless)
+After=network-online.target nats.service market-data.service execution-engine.service
+Wants=network-online.target
+# PA-6a: deliberately NOT PartOf=ironcrab.target until PA-6b cutover approval.
+
+StartLimitBurst=10
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User=ironcrab
+Group=ironcrab
+WorkingDirectory=/home/ironcrab/Iron_crab
+
+ExecStart=/home/ironcrab/Iron_crab/target/release/position-manager \
+    --config /home/ironcrab/Iron_crab/my_config.server.toml \
+    --nats-url nats://localhost:4222 \
+    --metrics-port 9805
+
+Environment=RUST_LOG=info,position_manager=info
+# Wallet pubkey for JetStream wallet-snapshot filter (set by deploy or override):
+# Environment=IRONCRAB_WALLET_PUBKEY=
+
+# IMPORTANT: No wallet keys (keyless shadow reducer)
+# Do NOT set IRONCRAB_KEYPAIR_PATH/KEYPAIR_PATH in this service.
+
+Restart=on-failure
+RestartSec=3
+
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUWeight=50
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+# PA-6a shadow: enable manually after validation — not auto-started with ironcrab.target.
+# WantedBy=ironcrab.target

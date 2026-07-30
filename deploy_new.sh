@@ -79,6 +79,9 @@ if [ "$SKIP_BUILD" = false ]; then
     
     log_info "Building execution-engine..."
     cargo build --release --bin execution-engine
+
+    log_info "Building position-manager (PA-6a shadow, optional service)..."
+    cargo build --release --bin position-manager
     
     log_info "All binaries built successfully."
 else
