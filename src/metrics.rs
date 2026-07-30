@@ -4375,6 +4375,8 @@ pub static WSOL_WRAP_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static WSOL_UNWRAP_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static WSOL_WRAP_LAMPORTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static WSOL_UNWRAP_LAMPORTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static WSOL_LOCK_MANAGER_SNAPSHOT_FLOORED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 // --- AccountJanitor metrics ---
 pub static JANITOR_CLOSE_ATA_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -9190,6 +9192,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "wsol_unwrap_lamports_total",
         WSOL_UNWRAP_LAMPORTS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "wsol_lock_manager_snapshot_floored_total",
+        WSOL_LOCK_MANAGER_SNAPSHOT_FLOORED_TOTAL.load(Ordering::Relaxed)
     );
 
     // --- AccountJanitor ---

@@ -55,7 +55,10 @@ const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
 /// After a successful on-chain wrap, hold this effective WSOL floor until a snapshot confirms
 /// `wsol >= pending_expected` or we hit the confirmation timeout (then one RPC resync, cold path).
-fn compute_effective_wsol_on_snapshot(pending_expected: u64, incoming_wsol: u64) -> (u64, bool) {
+pub fn compute_effective_wsol_on_snapshot(
+    pending_expected: u64,
+    incoming_wsol: u64,
+) -> (u64, bool) {
     if pending_expected == 0 {
         return (incoming_wsol, false);
     }
@@ -65,6 +68,70 @@ fn compute_effective_wsol_on_snapshot(pending_expected: u64, incoming_wsol: u64)
         (pending_expected, false)
     }
 }
+
+/// Shared pending-wrap confirmation state between WsolManager and execution-engine LockManager.
+pub struct PendingWrapState {
+    pending_wrap_expected_wsol: AtomicU64,
+    pending_wrap_started_ts: AtomicU64,
+    pending_wrap_rpc_resync_done: AtomicBool,
+}
+
+impl PendingWrapState {
+    pub fn new() -> Self {
+        Self {
+            pending_wrap_expected_wsol: AtomicU64::new(0),
+            pending_wrap_started_ts: AtomicU64::new(0),
+            pending_wrap_rpc_resync_done: AtomicBool::new(false),
+        }
+    }
+
+    pub fn pending_expected(&self) -> u64 {
+        self.pending_wrap_expected_wsol.load(Ordering::Relaxed)
+    }
+
+    pub fn pending_started_ts(&self) -> u64 {
+        self.pending_wrap_started_ts.load(Ordering::Relaxed)
+    }
+
+    pub fn arm(&self, expected_wsol_lamports: u64) {
+        let now = unix_secs();
+        self.pending_wrap_expected_wsol
+            .store(expected_wsol_lamports, Ordering::SeqCst);
+        self.pending_wrap_started_ts.store(now, Ordering::SeqCst);
+        self.pending_wrap_rpc_resync_done
+            .store(false, Ordering::SeqCst);
+    }
+
+    pub fn clear(&self) {
+        self.pending_wrap_expected_wsol.store(0, Ordering::SeqCst);
+        self.pending_wrap_started_ts.store(0, Ordering::SeqCst);
+        self.pending_wrap_rpc_resync_done
+            .store(false, Ordering::SeqCst);
+    }
+
+    /// Returns `(effective_wsol, confirms_pending, was_floored)`.
+    pub fn effective_wsol_for_snapshot(&self, incoming_wsol: u64) -> (u64, bool, bool) {
+        let pending = self.pending_wrap_expected_wsol.load(Ordering::Relaxed);
+        let (effective, confirms) = compute_effective_wsol_on_snapshot(pending, incoming_wsol);
+        let was_floored = pending > 0 && incoming_wsol < pending;
+        (effective, confirms, was_floored)
+    }
+
+    pub fn try_mark_rpc_resync_done(&self) -> bool {
+        self.pending_wrap_rpc_resync_done
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+}
+
+impl Default for PendingWrapState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Sync authoritative WSOL lamports into LockManager (execution-engine callback).
+pub type WsolLockSyncCallback = Arc<dyn Fn(u64) + Send + Sync>;
 
 #[inline]
 fn unix_secs() -> u64 {
@@ -228,13 +295,11 @@ pub struct WsolManager {
     /// Wrap in progress flag (prevents double-wrap race condition)
     wrap_in_progress: AtomicBool,
 
-    /// After successful wrap: minimum WSOL (lamports) we treat as authoritative until snapshot
-    /// confirms at least this level, or timeout + optional RPC resync clears the pending state.
-    pending_wrap_expected_wsol: AtomicU64,
-    /// UNIX seconds when `pending_wrap_expected_wsol` was armed (`0` = no pending confirmation).
-    pending_wrap_started_ts: AtomicU64,
-    /// At most one RPC resync per pending-wrap episode (after confirmation timeout).
-    pending_wrap_rpc_resync_done: AtomicBool,
+    /// Shared with execution-engine for LockManager capital sync during pending wrap.
+    pending_wrap: Arc<PendingWrapState>,
+
+    /// Optional hook to seed LockManager after wrap success / cold-path RPC resync.
+    lock_manager_sync: Option<WsolLockSyncCallback>,
 
     /// Build version for records
     build_version: String,
@@ -269,9 +334,8 @@ impl WsolManager {
             last_action_ts: AtomicU64::new(0),
             running: AtomicBool::new(true),
             wrap_in_progress: AtomicBool::new(false),
-            pending_wrap_expected_wsol: AtomicU64::new(0),
-            pending_wrap_started_ts: AtomicU64::new(0),
-            pending_wrap_rpc_resync_done: AtomicBool::new(false),
+            pending_wrap: Arc::new(PendingWrapState::new()),
+            lock_manager_sync: None,
             build_version: build_version.to_string(),
             run_id: run_id.to_string(),
             jsonl_writer: None,
@@ -300,14 +364,25 @@ impl WsolManager {
             last_action_ts: AtomicU64::new(0),
             running: AtomicBool::new(true),
             wrap_in_progress: AtomicBool::new(false),
-            pending_wrap_expected_wsol: AtomicU64::new(0),
-            pending_wrap_started_ts: AtomicU64::new(0),
-            pending_wrap_rpc_resync_done: AtomicBool::new(false),
+            pending_wrap: Arc::new(PendingWrapState::new()),
+            lock_manager_sync: None,
             build_version: build_version.to_string(),
             run_id: run_id.to_string(),
             jsonl_writer: Some(jsonl_writer),
             kill_switch_checker: None,
         }
+    }
+
+    /// Share pending-wrap atomics with execution-engine (LockManager snapshot floor).
+    pub fn with_pending_wrap_state(mut self, state: Arc<PendingWrapState>) -> Self {
+        self.pending_wrap = state;
+        self
+    }
+
+    /// Seed LockManager after successful wrap or cold-path RPC resync.
+    pub fn with_lock_manager_sync(mut self, sync: WsolLockSyncCallback) -> Self {
+        self.lock_manager_sync = Some(sync);
+        self
     }
 
     /// Set kill switch checker function
@@ -392,23 +467,26 @@ impl WsolManager {
         Ok(())
     }
 
+    fn notify_lock_manager_wsol(&self, wsol_lamports: u64) {
+        if let Some(ref sync) = self.lock_manager_sync {
+            sync(wsol_lamports);
+        }
+    }
+
     /// Apply SOL/WSOL balance update (from JetStream WalletBalanceSnapshot)
     async fn apply_balance_update(&self, sol: u64, wsol_opt: Option<u64>) -> Result<()> {
         self.sol_balance.store(sol, Ordering::Relaxed);
 
         if let Some(incoming_wsol) = wsol_opt {
-            let pending_expected = self.pending_wrap_expected_wsol.load(Ordering::Relaxed);
-            let pending_started = self.pending_wrap_started_ts.load(Ordering::Relaxed);
+            let pending_expected = self.pending_wrap.pending_expected();
+            let pending_started = self.pending_wrap.pending_started_ts();
             let now = unix_secs();
 
             if pending_expected > 0 && pending_started > 0 {
                 let age = now.saturating_sub(pending_started);
                 if age > self.config.cooldown_secs.saturating_mul(4)
                     && incoming_wsol < pending_expected
-                    && self
-                        .pending_wrap_rpc_resync_done
-                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_ok()
+                    && self.pending_wrap.try_mark_rpc_resync_done()
                 {
                     match self
                         .treasury
@@ -424,10 +502,7 @@ impl WsolManager {
                                 rpc_wsol_lamports = b,
                                 "Pending wrap confirmation timed out; applied one bounded WSOL ATA RPC resync (cold path)"
                             );
-                            self.clear_pending_wrap_state();
-                            self.wsol_balance.store(b, Ordering::Relaxed);
-                            self.wsol_initialized.store(true, Ordering::Relaxed);
-                            WSOL_BALANCE_LAMPORTS.store(b, Ordering::Relaxed);
+                            self.apply_authoritative_wsol_resync(b);
                             debug!(
                                 sol = sol as f64 / LAMPORTS_PER_SOL as f64,
                                 wsol = Some(b as f64 / LAMPORTS_PER_SOL as f64),
@@ -449,7 +524,7 @@ impl WsolManager {
                 }
             }
 
-            let pending_expected = self.pending_wrap_expected_wsol.load(Ordering::Relaxed);
+            let pending_expected = self.pending_wrap.pending_expected();
             let (effective_wsol, snapshot_confirms_pending) =
                 compute_effective_wsol_on_snapshot(pending_expected, incoming_wsol);
 
@@ -481,20 +556,20 @@ impl WsolManager {
         self.check_and_act().await
     }
 
+    fn apply_authoritative_wsol_resync(&self, wsol_lamports: u64) {
+        self.clear_pending_wrap_state();
+        self.wsol_balance.store(wsol_lamports, Ordering::Relaxed);
+        self.wsol_initialized.store(true, Ordering::Relaxed);
+        WSOL_BALANCE_LAMPORTS.store(wsol_lamports, Ordering::Relaxed);
+        self.notify_lock_manager_wsol(wsol_lamports);
+    }
+
     fn clear_pending_wrap_state(&self) {
-        self.pending_wrap_expected_wsol.store(0, Ordering::SeqCst);
-        self.pending_wrap_started_ts.store(0, Ordering::SeqCst);
-        self.pending_wrap_rpc_resync_done
-            .store(false, Ordering::SeqCst);
+        self.pending_wrap.clear();
     }
 
     fn arm_pending_wrap_confirmation(&self, expected_wsol_lamports: u64) {
-        let now = unix_secs();
-        self.pending_wrap_expected_wsol
-            .store(expected_wsol_lamports, Ordering::SeqCst);
-        self.pending_wrap_started_ts.store(now, Ordering::SeqCst);
-        self.pending_wrap_rpc_resync_done
-            .store(false, Ordering::SeqCst);
+        self.pending_wrap.arm(expected_wsol_lamports);
     }
 
     #[cfg(test)]
@@ -511,8 +586,14 @@ impl WsolManager {
         let new_wsol = wsol_before.saturating_add(amount_lamports);
         self.wsol_balance.store(new_wsol, Ordering::Relaxed);
         self.arm_pending_wrap_confirmation(new_wsol);
+        self.notify_lock_manager_wsol(new_wsol);
         WSOL_BALANCE_LAMPORTS.store(new_wsol, Ordering::Relaxed);
         self.wsol_initialized.store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn test_apply_authoritative_wsol_resync(&self, wsol_lamports: u64) {
+        self.apply_authoritative_wsol_resync(wsol_lamports);
     }
 
     #[cfg(test)]
@@ -525,7 +606,7 @@ impl WsolManager {
 
     #[cfg(test)]
     pub(crate) fn test_pending_expected_wsol(&self) -> u64 {
-        self.pending_wrap_expected_wsol.load(Ordering::Relaxed)
+        self.pending_wrap.pending_expected()
     }
 
     /// Check current balances and wrap/unwrap if needed
@@ -552,7 +633,7 @@ impl WsolManager {
         // Do not start another wrap while a successful wrap is not yet confirmed by snapshot
         // (or timeout + bounded RPC resync). Cooldown alone is insufficient when stale snapshots
         // carry wsol=0 across the cooldown window.
-        if self.pending_wrap_expected_wsol.load(Ordering::Relaxed) > 0 {
+        if self.pending_wrap.pending_expected() > 0 {
             debug!("Pending post-wrap snapshot confirmation; skipping new wrap attempts");
             return Ok(());
         }
@@ -708,6 +789,7 @@ impl WsolManager {
                     .fetch_add(amount_lamports, Ordering::Relaxed)
                     + amount_lamports;
                 self.arm_pending_wrap_confirmation(new_wsol);
+                self.notify_lock_manager_wsol(new_wsol);
                 // Update Prometheus metrics
                 WSOL_WRAP_TOTAL.fetch_add(1, Ordering::Relaxed);
                 WSOL_WRAP_LAMPORTS_TOTAL.fetch_add(amount_lamports, Ordering::Relaxed);
@@ -1113,6 +1195,38 @@ mod tests {
 
         // Should NOT unwrap (below max)
         assert!(current_wsol <= max_wsol);
+    }
+
+    #[test]
+    fn successful_wrap_syncs_lock_manager_callback() {
+        let treasury = Arc::new(Treasury::from_signer(Arc::new(Keypair::new())));
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let synced = Arc::new(AtomicU64::new(0));
+        let synced_cb = Arc::clone(&synced);
+        let mgr = WsolManager::new(WsolManagerConfig::default(), treasury, rpc, "test", "run")
+            .with_lock_manager_sync(Arc::new(move |wsol| {
+                synced_cb.store(wsol, Ordering::SeqCst);
+            }));
+
+        mgr.test_simulate_successful_wrap_optimistic(1_000_000_000, 3_000_000_000, 0);
+        assert_eq!(synced.load(Ordering::SeqCst), 1_000_000_000);
+        assert_eq!(mgr.wsol_balance(), 1_000_000_000);
+    }
+
+    #[test]
+    fn rpc_resync_success_syncs_lock_manager_callback() {
+        let treasury = Arc::new(Treasury::from_signer(Arc::new(Keypair::new())));
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let synced = Arc::new(AtomicU64::new(0));
+        let synced_cb = Arc::clone(&synced);
+        let mgr = WsolManager::new(WsolManagerConfig::default(), treasury, rpc, "test", "run")
+            .with_lock_manager_sync(Arc::new(move |wsol| {
+                synced_cb.store(wsol, Ordering::SeqCst);
+            }));
+
+        mgr.test_apply_authoritative_wsol_resync(1_000_000_000);
+        assert_eq!(synced.load(Ordering::SeqCst), 1_000_000_000);
+        assert_eq!(mgr.test_pending_expected_wsol(), 0);
     }
 
     #[tokio::test]
