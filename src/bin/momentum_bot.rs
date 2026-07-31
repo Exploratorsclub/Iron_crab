@@ -1144,11 +1144,15 @@ fn exit_quote_price_exit_guard_violation(
         }
     }
     if let Some(slot) = q.source_slot {
-        if pos.entry_confirmed_slot > 0 && slot <= pos.entry_confirmed_slot {
-            return Some("QUOTE_SLOT_NOT_AFTER_ENTRY_CONFIRM");
-        }
-        if pos.last_price_slot > 0 && slot < pos.last_price_slot {
-            return Some("QUOTE_SLOT_BEFORE_LAST_POSITION_MARK_SLOT");
+        // Unknown watermark (`None` handled above; `Some(0)` = cold-path / missing Geyser slot):
+        // do not apply slot ordering guards — other freshness guards still apply.
+        if slot > 0 {
+            if pos.entry_confirmed_slot > 0 && slot <= pos.entry_confirmed_slot {
+                return Some("QUOTE_SLOT_NOT_AFTER_ENTRY_CONFIRM");
+            }
+            if pos.last_price_slot > 0 && slot < pos.last_price_slot {
+                return Some("QUOTE_SLOT_BEFORE_LAST_POSITION_MARK_SLOT");
+            }
         }
     }
     if let Some(accs) = dex_pool_accounts {
@@ -3808,6 +3812,7 @@ impl MomentumContext {
         try_rows.retain(|p| seen.insert(p.pool_address.clone()));
 
         let mut best: Option<(ExitExecutableQuote, u64)> = None;
+        let mut guard_reject_sample: Option<(&'static str, String)> = None;
 
         for pool_row in try_rows {
             let pool_addr = pool_row.pool_address.clone();
@@ -3849,6 +3854,9 @@ impl MomentumContext {
             if let Some(reason) =
                 exit_quote_price_exit_guard_violation(pos, &candidate, merged_accounts.as_deref())
             {
+                if guard_reject_sample.is_none() {
+                    guard_reject_sample = Some((reason, pool_addr.clone()));
+                }
                 trace!(
                     mint = %pos.mint,
                     quote_pool = %candidate.quote_pool,
@@ -3871,6 +3879,18 @@ impl MomentumContext {
                 None => best = Some((candidate, sol_out)),
                 Some((_, best_sol)) if sol_out > best_sol => best = Some((candidate, sol_out)),
                 _ => {}
+            }
+        }
+
+        if best.is_none() {
+            if let Some((reason, quote_pool)) = guard_reject_sample {
+                warn!(
+                    mint = %pos.mint,
+                    position_pool = %pos.pool,
+                    quote_pool = %quote_pool,
+                    reason = %reason,
+                    "executable_exit_quote: all reserve quote candidates rejected by exit guards"
+                );
             }
         }
 
@@ -19092,6 +19112,61 @@ mod tests {
             pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
                 .is_none(),
             "older on-chain slot than BUY confirm must not authorize price exit"
+        );
+    }
+
+    #[test]
+    fn exit_guard_ignores_slot_zero_watermark_for_entry_confirm_check() {
+        let mut pos = PositionTracker::new("m", "p", "dex", 100.0, 6, 1_000_000, 0);
+        pos.entry_confirmed_slot = 436_375_627;
+        let mut ex = sample_exit_quote(50.0);
+        ex.source_slot = Some(0);
+        ex.cache_age_ms = Some(0);
+        assert_ne!(
+            exit_quote_price_exit_guard_violation(&pos, &ex, None),
+            Some("QUOTE_SLOT_NOT_AFTER_ENTRY_CONFIRM"),
+            "slot=0 is unknown watermark and must not trip entry-confirm slot guard"
+        );
+    }
+
+    #[test]
+    fn exit_guard_rejects_positive_slot_at_or_before_entry_confirm() {
+        let mut pos = PositionTracker::new("m", "p", "dex", 100.0, 6, 1_000_000, 0);
+        pos.entry_confirmed_slot = 500;
+        let mut ex = sample_exit_quote(50.0);
+        ex.cache_age_ms = Some(0);
+        ex.source_slot = Some(500);
+        assert_eq!(
+            exit_quote_price_exit_guard_violation(&pos, &ex, None),
+            Some("QUOTE_SLOT_NOT_AFTER_ENTRY_CONFIRM")
+        );
+        ex.source_slot = Some(499);
+        assert_eq!(
+            exit_quote_price_exit_guard_violation(&pos, &ex, None),
+            Some("QUOTE_SLOT_NOT_AFTER_ENTRY_CONFIRM")
+        );
+    }
+
+    #[test]
+    fn exit_guard_allows_positive_slot_after_entry_confirm() {
+        let mut pos = PositionTracker::new("m", "p", "dex", 100.0, 6, 1_000_000, 0);
+        pos.entry_confirmed_slot = 500;
+        let mut ex = sample_exit_quote(100.0);
+        ex.source_slot = Some(501);
+        ex.cache_age_ms = Some(0);
+        assert!(exit_quote_price_exit_guard_violation(&pos, &ex, None).is_none());
+    }
+
+    #[test]
+    fn exit_guard_stale_cache_age_still_rejects_when_slot_unknown() {
+        let mut pos = PositionTracker::new("m", "p", "dex", 100.0, 6, 1_000_000, 0);
+        pos.entry_confirmed_slot = 500;
+        let mut ex = sample_exit_quote(50.0);
+        ex.source_slot = Some(0);
+        ex.cache_age_ms = Some(EXIT_QUOTE_MAX_CACHE_AGE_MS + 1);
+        assert_eq!(
+            exit_quote_price_exit_guard_violation(&pos, &ex, None),
+            Some("STALE_CACHE_AGE_MS")
         );
     }
 

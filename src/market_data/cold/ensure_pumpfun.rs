@@ -1,6 +1,7 @@
 //! I-24d EnsurePumpfunBondingCurve cold-path handler.
 
 use super::host::{publish_control_response, ColdHost};
+use super::publish_slot::resolve_cold_path_publish_slot;
 use crate::execution::live_pool_cache::{CachedPoolState, PumpFunState};
 use crate::ipc::{ControlResponseStatus, DexPoolReadiness, PoolCacheUpdate, NATIVE_SOL_MINT};
 use crate::nats::jetstream::pool_subject;
@@ -101,30 +102,8 @@ pub async fn handle_ensure_pumpfun_bonding_curve(
         );
     }
 
-    let state = match rpc.get_account_retry(&bonding_curve).await {
-        Ok(acct) => match BondingCurveState::parse(&acct.data) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(
-                    request_id = %request_id,
-                    pool = %bonding_curve_str,
-                    error = %e,
-                    "EnsurePumpfunBondingCurve: parse bonding curve failed"
-                );
-                if let Some(nats) = host.nats() {
-                    publish_control_response(
-                        nats,
-                        host.run_id(),
-                        request_id,
-                        ControlResponseStatus::Error,
-                        Some(bonding_curve_str),
-                        Some(format!("parse error: {e}")),
-                    )
-                    .await;
-                }
-                return;
-            }
-        },
+    let (acct, rpc_context_slot) = match rpc.get_account_with_slot_retry(&bonding_curve).await {
+        Ok(pair) => pair,
         Err(e) => {
             warn!(
                 request_id = %request_id,
@@ -146,6 +125,44 @@ pub async fn handle_ensure_pumpfun_bonding_curve(
             return;
         }
     };
+    let state = match BondingCurveState::parse(&acct.data) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                request_id = %request_id,
+                pool = %bonding_curve_str,
+                error = %e,
+                "EnsurePumpfunBondingCurve: parse bonding curve failed"
+            );
+            if let Some(nats) = host.nats() {
+                publish_control_response(
+                    nats,
+                    host.run_id(),
+                    request_id,
+                    ControlResponseStatus::Error,
+                    Some(bonding_curve_str),
+                    Some(format!("parse error: {e}")),
+                )
+                .await;
+            }
+            return;
+        }
+    };
+
+    let mut publish_slot = resolve_cold_path_publish_slot(rpc_context_slot);
+    if publish_slot == 0 {
+        if let Ok(slot) = rpc.get_slot_retry().await {
+            publish_slot = slot;
+        }
+    }
+    if publish_slot == 0 {
+        warn!(
+            request_id = %request_id,
+            pool = %bonding_curve_str,
+            rpc_context_slot,
+            "EnsurePumpfunBondingCurve: no publish slot watermark (RPC context, Geyser head, getSlot all zero)"
+        );
+    }
 
     let token_program = host
         .live_pool_cache()
@@ -166,7 +183,8 @@ pub async fn handle_ensure_pumpfun_bonding_curve(
         creator: state.creator,
         cashback_enabled: state.cashback_enabled,
     });
-    host.live_pool_cache().upsert(bonding_curve, cached, 0);
+    host.live_pool_cache()
+        .upsert(bonding_curve, cached, publish_slot);
 
     let jetstream_ok = if let Some(nats) = host.nats() {
         let mut pool_update = PoolCacheUpdate::new_pool_discovered(
@@ -179,8 +197,8 @@ pub async fn handle_ensure_pumpfun_bonding_curve(
             NATIVE_SOL_MINT.to_string(),
             state.virtual_token_reserves,
             state.virtual_sol_reserves,
-            Some(0),
-            0,
+            Some(publish_slot),
+            publish_slot,
         );
         let mut meta = std::collections::HashMap::new();
         meta.insert("creator".to_string(), state.creator.to_string());

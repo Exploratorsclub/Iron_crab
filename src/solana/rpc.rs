@@ -2,6 +2,7 @@ use solana_client::client_error::ClientError;
 use solana_client::rpc_config::RpcProgramAccountsConfig;
 use solana_client::rpc_config::RpcTransactionConfig;
 use solana_client::rpc_response::Response;
+use solana_commitment_config::CommitmentConfig;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{hash::Hash, message::Message, pubkey::Pubkey, signature::Signature};
 // no UiTransactionEncoding needed here
@@ -413,13 +414,79 @@ impl SolanaRpc {
         &self,
         key: &Pubkey,
     ) -> Result<solana_sdk::account::Account, ClientError> {
+        Ok(self.get_account_with_slot_retry(key).await?.0)
+    }
+
+    /// Like [`get_account_retry`] but also returns the RPC response `context.slot` (Cold Path).
+    pub async fn get_account_with_slot_retry(
+        &self,
+        key: &Pubkey,
+    ) -> Result<(solana_sdk::account::Account, u64), ClientError> {
+        let commitment = CommitmentConfig::confirmed();
         let _permit = self.limiter.acquire().await;
         let mut attempt = 0u32;
         loop {
-            match self.with_timeout(self.rpc.get_account(key)).await {
-                Some(Ok(acc)) => {
+            match self
+                .with_timeout(self.rpc.get_account_with_commitment(key, commitment))
+                .await
+            {
+                Some(Ok(response)) => {
                     self.limiter.on_success();
-                    return Ok(acc);
+                    let slot = response.context.slot;
+                    let acc = response.value.ok_or_else(|| {
+                        ClientError::from(solana_client::client_error::ClientErrorKind::Custom(
+                            "account not found".into(),
+                        ))
+                    })?;
+                    return Ok((acc, slot));
+                }
+                Some(Err(e)) => {
+                    let class = Self::classify_client_error(&e);
+                    match class {
+                        ErrorClass::RateLimited
+                        | ErrorClass::Http(429)
+                        | ErrorClass::Http(503)
+                        | ErrorClass::Http(504) => {
+                            self.limiter.on_rate_limit();
+                            crate::metrics::RPC_RATE_LIMIT_HITS_TOTAL
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        ErrorClass::Timeout => {
+                            self.limiter.on_timeout();
+                        }
+                        ErrorClass::Other => {}
+                        ErrorClass::Http(_) => {}
+                    }
+                    if !Self::is_transient_error(&e) || attempt >= 2 {
+                        return Err(e);
+                    }
+                    attempt += 1;
+                    crate::metrics::RPC_RETRY_ATTEMPTS_TOTAL
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Self::sleep_with_backoff(attempt, class).await;
+                }
+                None => {
+                    if attempt >= 2 {
+                        return Err(e_against_timeout());
+                    }
+                    attempt += 1;
+                    crate::metrics::RPC_RETRY_ATTEMPTS_TOTAL
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Self::sleep_with_backoff(attempt, ErrorClass::Timeout).await;
+                }
+            }
+        }
+    }
+
+    /// Chain head slot via RPC (Cold Path fallback when account context and Geyser head are zero).
+    pub async fn get_slot_retry(&self) -> Result<u64, ClientError> {
+        let _permit = self.limiter.acquire().await;
+        let mut attempt = 0u32;
+        loop {
+            match self.with_timeout(self.rpc.get_slot()).await {
+                Some(Ok(slot)) => {
+                    self.limiter.on_success();
+                    return Ok(slot);
                 }
                 Some(Err(e)) => {
                     let class = Self::classify_client_error(&e);

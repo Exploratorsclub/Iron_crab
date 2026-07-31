@@ -1653,3 +1653,15 @@ BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap 
 | **Betroffene Module** | `src/market_data/ingest/`, `src/bin/market_data.rs` |
 | **Regression-Prüfung** | `cargo fmt`, `cargo clippy -D warnings`, `cargo test`, `cargo test phase4_`; Eval Level 5. |
 | **Tags** | [market-data, hybrid-rollback, phase4b, account-ingest, monolith-slice, i-md-2, i-md-4, pr-phase4b] |
+
+---
+
+## FIX-51: P0 — EnsurePumpfun `geyser_slot=0` bricht STOP_LOSS (CIRCUS 2026-07-31)
+
+| Symptom | Offene PumpFun-Position: wiederholte `quote_missing_retry` → `MOMENTUM_EXIT` statt `STOP_LOSS`, obwohl Hard-Stop per Chart/PnL erreicht. MD `EnsurePumpfunBondingCurve` publizierte erfolgreich, Momentum verwarf Quote dauerhaft (`executable_exit_quote == None`). Mint `5kvbzaiVLHZw7jHynCocxvPnyf14J8HtcCoSLQ8Xpump`. |
+|---------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | Cold-Path Ensure schrieb `geyser_slot=0` in JetStream + `LivePoolCache::upsert`. Exit-Guard `QUOTE_SLOT_NOT_AFTER_ENTRY_CONFIRM` wertete `source_slot=Some(0)` als `0 <= entry_confirmed_slot` → permanenter Reject; quote-first STOP_LOSS blind. |
+| **Fix** | (A) `ensure_pumpfun.rs` / `ensure_pump.rs`: RPC `context.slot` (bzw. Geyser-Head/`getSlot`-Fallback) in `upsert` + `PoolCacheUpdate::geyser_slot`. (B) `exit_quote_price_exit_guard_violation`: Slot-Guards nur bei `source_slot > 0`. (C) WARN wenn alle `executable_exit_quote`-Kandidaten an Guards scheitern. |
+| **Betroffene Module** | `src/market_data/cold/ensure_pumpfun.rs`, `ensure_pump.rs`, `publish_slot.rs`, `src/solana/rpc.rs`, `src/bin/momentum_bot.rs` |
+| **Regression-Prüfung** | Unit-Tests Slot-0/positiv/stale; `cargo fmt`, `cargo clippy -D warnings`, `cargo test`. |
+| **Tags** | [momentum, pumpfun, stop-loss, cold-path, jetstream, i-16, i-7, quote-first] |
