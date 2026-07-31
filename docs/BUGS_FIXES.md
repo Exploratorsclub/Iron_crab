@@ -1665,3 +1665,15 @@ BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap 
 | **Betroffene Module** | `src/market_data/cold/ensure_pumpfun.rs`, `ensure_pump.rs`, `publish_slot.rs`, `src/solana/rpc.rs`, `src/bin/momentum_bot.rs` |
 | **Regression-Prüfung** | Unit-Tests Slot-0/positiv/stale; `cargo fmt`, `cargo clippy -D warnings`, `cargo test`. |
 | **Tags** | [momentum, pumpfun, stop-loss, cold-path, jetstream, i-16, i-7, quote-first] |
+
+---
+
+## FIX-52: P0 — CI `cargo audit` RUSTSEC-2026-0221 `event-listener` (2026-07-31)
+
+| Symptom | CI Job `Security audit (cargo-audit)` failt mit `RUSTSEC-2026-0221` (unsound `event-listener` 5.4.1 via `async-lock` → `solana-quic-client`). |
+|---------|--------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | Lockfile pinnte `event-listener` 5.4.1; Advisory verlangt `>= 5.4.2`. |
+| **Fix** | `cargo update -p event-listener@5.4.1 --precise 5.4.2` (nur `Cargo.lock`; kein Solana-Bump, kein `audit.toml`-Ignore). |
+| **Betroffene Module** | `Cargo.lock` |
+| **Regression-Prüfung** | `cargo audit --deny warnings`, `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`. |
+| **Tags** | [ci, security, rustsec, supply-chain, event-listener] |
