@@ -10,7 +10,8 @@ pub use kv_publish::{
     PositionAuthorityKvPublisher,
 };
 pub use state::{
-    is_sol_or_wsol_mint, position_authority_drift_lockmanager, position_authority_drift_momentum,
-    PositionAuthority, PositionAuthorityChange, PositionEvent, PositionState, PositionStatus,
-    UpdateSource,
+    is_sol_or_wsol_mint, open_positions_count_from_kv_snapshots, position_authority_drift_ee_vs_kv,
+    position_authority_drift_lockmanager, position_authority_drift_momentum,
+    snapshot_counts_as_open_position, PositionAuthority, PositionAuthorityChange, PositionEvent,
+    PositionState, PositionStatus, UpdateSource,
 };

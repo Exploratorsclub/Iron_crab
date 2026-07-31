@@ -70,9 +70,10 @@ use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
     DecisionRecord, DexPoolReadiness, ExecutionResult, ExecutionStatus, ExplicitAmount,
     FairnessPolicy, FeePolicy, FillStatus, FillUnavailableReason, IntentOrigin, IntentTier,
-    KillSwitchContext, MarketEvent, MarketEventKind, PoolCacheUpdate, PriorityFeePercentiles,
-    RecordHeader, RejectReason, SimulationResult, TradeExecutionConstraints, TradeIntent,
-    TradeResources, TradeSide, TradingRegime,
+    KillSwitchContext, MarketEvent, MarketEventKind, PoolCacheUpdate, PositionAuthoritySnapshot,
+    PriorityFeePercentiles, RecordHeader, RejectReason, SimulationResult,
+    TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide, TradingRegime,
+    POSITION_AUTHORITY_KV_BUCKET,
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
@@ -95,7 +96,8 @@ use ironcrab::metrics::{
     IN_FLIGHT_CAPITAL_RESERVATIONS, JITO_BUNDLES_LANDED_TOTAL, JITO_BUNDLES_REJECTED_TOTAL,
     JITO_BUNDLES_SUBMITTED_TOTAL, JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL,
     KILL_SWITCH_ACTIVE, NATS_MESSAGES_RECEIVED_TOTAL, OPEN_POSITIONS_GAUGE,
-    POSITION_AUTHORITY_DRIFT_LOCKMANAGER, POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE,
+    POSITION_AUTHORITY_DRIFT_EE_VS_KV, POSITION_AUTHORITY_DRIFT_LOCKMANAGER,
+    POSITION_AUTHORITY_KV_OPEN_POSITIONS, POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE,
     POSITION_AUTHORITY_OPEN_GAUGE, POSITION_AUTHORITY_RECONCILE_NEEDED_GAUGE,
     PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_FAIL_TOTAL,
     PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_SUCCESS_TOTAL,
@@ -121,6 +123,7 @@ use ironcrab::nats::{
     TRADE_INTENTS_STREAM_NAME, WALLET_SNAPSHOT_STREAM_NAME, WALLET_TX_CONFIRM_STREAM_NAME,
 };
 use ironcrab::position_authority::{
+    open_positions_count_from_kv_snapshots, position_authority_drift_ee_vs_kv,
     position_authority_drift_lockmanager, reconcile_position_authority_kv_after_restart,
     PositionAuthority, PositionAuthorityChange, PositionAuthorityKvMetricsSink,
     PositionAuthorityKvPublisher,
@@ -2460,6 +2463,10 @@ struct ExecutionContext {
     position_authority: Arc<ParkingMutex<PositionAuthority>>,
     /// PA-5.1 / PA-6b: FIFO queue for ordered PositionAuthority KV publishes (disabled when PM is writer).
     position_authority_kv_publisher: PositionAuthorityKvPublisher,
+    /// PA-6c1: readonly JetStream KV bucket handle (no EE writes; observability + PA-6c2 prep).
+    position_authority_kv: tokio::sync::OnceCell<async_nats::jetstream::kv::Store>,
+    /// PA-6c1: latest KV snapshots from readonly watch (cross-check vs in-process authority).
+    authority_kv_by_mint: parking_lot::RwLock<HashMap<String, PositionAuthoritySnapshot>>,
     log_base: PathBuf, // P1: For state persistence
     decision_counter: std::sync::atomic::AtomicU64,
     execution_counter: std::sync::atomic::AtomicU64,
@@ -2604,6 +2611,8 @@ impl ExecutionContext {
             lock_manager,
             position_authority: Arc::new(ParkingMutex::new(position_authority)),
             position_authority_kv_publisher: PositionAuthorityKvPublisher::disabled(),
+            position_authority_kv: tokio::sync::OnceCell::new(),
+            authority_kv_by_mint: parking_lot::RwLock::new(HashMap::new()),
             log_base: log_dir,
             decision_counter: std::sync::atomic::AtomicU64::new(0),
             execution_counter: std::sync::atomic::AtomicU64::new(0),
@@ -6680,12 +6689,146 @@ impl ExecutionContext {
         let lock_open = self.lock_manager.count_non_zero_token_balances();
         let drift = position_authority_drift_lockmanager(auth_open, lock_open);
         drop(a);
+        let kv_open = self.position_authority_kv_open_count();
+        let drift_ee_kv = position_authority_drift_ee_vs_kv(auth_open, kv_open);
         // PA-2 Rest: primary `open_positions` gauge follows PositionAuthority (I-24a).
         OPEN_POSITIONS_GAUGE.store(auth_open as u64, Ordering::Relaxed);
         POSITION_AUTHORITY_OPEN_GAUGE.store(auth_open as u64, Ordering::Relaxed);
         POSITION_AUTHORITY_RECONCILE_NEEDED_GAUGE.store(reconcile as u64, Ordering::Relaxed);
         POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE.store(lock_open as u64, Ordering::Relaxed);
         POSITION_AUTHORITY_DRIFT_LOCKMANAGER.store(drift, Ordering::Relaxed);
+        POSITION_AUTHORITY_KV_OPEN_POSITIONS.store(kv_open as u64, Ordering::Relaxed);
+        POSITION_AUTHORITY_DRIFT_EE_VS_KV.store(drift_ee_kv, Ordering::Relaxed);
+    }
+
+    fn apply_authority_kv_snapshot_update(
+        &self,
+        mint: &str,
+        snap: Option<PositionAuthoritySnapshot>,
+    ) {
+        let mut map = self.authority_kv_by_mint.write();
+        match snap {
+            Some(s) => {
+                map.insert(mint.to_string(), s);
+            }
+            None => {
+                map.remove(mint);
+            }
+        }
+        drop(map);
+        self.refresh_position_authority_metrics();
+    }
+
+    fn position_authority_kv_open_count(&self) -> usize {
+        open_positions_count_from_kv_snapshots(self.authority_kv_by_mint.read().values())
+    }
+
+    async fn get_position_authority_kv(&self) -> Option<&async_nats::jetstream::kv::Store> {
+        let nats = self.nats.as_ref()?;
+        if let Some(store) = self.position_authority_kv.get() {
+            return Some(store);
+        }
+        match nats
+            .get_or_create_kv_bucket(POSITION_AUTHORITY_KV_BUCKET)
+            .await
+        {
+            Ok(store) => {
+                let _ = self.position_authority_kv.set(store);
+                self.position_authority_kv.get()
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to create PositionAuthority KV bucket");
+                None
+            }
+        }
+    }
+
+    /// Bootstrap + live watch on `POSITION_AUTHORITY` KV (readonly, no RPC; PA-6c1).
+    async fn bootstrap_and_watch_position_authority_kv(self: Arc<Self>) {
+        let Some(nats) = self.nats.as_ref() else {
+            return;
+        };
+        let Some(store) = self.get_position_authority_kv().await else {
+            return;
+        };
+
+        match nats.kv_get_all::<PositionAuthoritySnapshot>(store).await {
+            Ok(entries) => {
+                info!(
+                    count = entries.len(),
+                    "Bootstrapped PositionAuthority snapshots from JetStream KV (readonly)"
+                );
+                for (mint, snap) in entries {
+                    self.apply_authority_kv_snapshot_update(&mint, Some(snap));
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to bootstrap PositionAuthority KV");
+            }
+        }
+
+        let ctx = Arc::clone(&self);
+        let store = store.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            use std::time::Duration;
+
+            const WATCH_BACKOFF_INITIAL_MS: u64 = 500;
+            const WATCH_BACKOFF_MAX_MS: u64 = 30_000;
+            let mut backoff_ms = WATCH_BACKOFF_INITIAL_MS;
+
+            loop {
+                let mut watch = match store.watch_all().await {
+                    Ok(w) => w,
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            backoff_ms,
+                            "PositionAuthority KV watch failed to start"
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(WATCH_BACKOFF_MAX_MS);
+                        continue;
+                    }
+                };
+                info!("PositionAuthority KV watch started (execution-engine readonly)");
+                backoff_ms = WATCH_BACKOFF_INITIAL_MS;
+
+                while let Some(entry_res) = watch.next().await {
+                    match entry_res {
+                        Ok(entry) => {
+                            let mint = entry.key;
+                            if entry.operation == async_nats::jetstream::kv::Operation::Delete
+                                || entry.value.is_empty()
+                            {
+                                ctx.apply_authority_kv_snapshot_update(&mint, None);
+                                continue;
+                            }
+                            match serde_json::from_slice::<PositionAuthoritySnapshot>(&entry.value)
+                            {
+                                Ok(snap) => {
+                                    ctx.apply_authority_kv_snapshot_update(&mint, Some(snap));
+                                }
+                                Err(e) => {
+                                    warn!(mint = %mint, error = %e, "Invalid PositionAuthority KV payload");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                backoff_ms,
+                                "PositionAuthority KV watch error"
+                            );
+                            break;
+                        }
+                    }
+                }
+                warn!(backoff_ms, "PositionAuthority KV watch ended, reconnecting");
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(WATCH_BACKOFF_MAX_MS);
+            }
+        });
     }
 }
 
@@ -8176,6 +8319,8 @@ async fn main() -> Result<()> {
         lock_manager,
         position_authority: Arc::new(ParkingMutex::new(PositionAuthority::new())),
         position_authority_kv_publisher,
+        position_authority_kv: tokio::sync::OnceCell::new(),
+        authority_kv_by_mint: parking_lot::RwLock::new(HashMap::new()),
         log_base: log_base.clone(),
         decision_counter: std::sync::atomic::AtomicU64::new(initial_decision_counter),
         execution_counter: std::sync::atomic::AtomicU64::new(initial_execution_counter),
@@ -8332,6 +8477,14 @@ async fn main() -> Result<()> {
 
     // Publish initial gauge values immediately (before the first 30s heartbeat).
     ctx.refresh_position_authority_metrics();
+
+    // PA-6c1: readonly POSITION_AUTHORITY KV watch for drift observability (no EE writes).
+    {
+        let ctx_kv = Arc::clone(&ctx);
+        tokio::spawn(async move {
+            ctx_kv.bootstrap_and_watch_position_authority_kv().await;
+        });
+    }
 
     // === WsolManager: Background WSOL balance maintenance ===
     // Professional arb bots don't wrap/unwrap in the arb TX itself
@@ -9554,6 +9707,8 @@ async fn build_replay_context(
         lock_manager,
         position_authority: Arc::new(ParkingMutex::new(PositionAuthority::new())),
         position_authority_kv_publisher: PositionAuthorityKvPublisher::disabled(),
+        position_authority_kv: tokio::sync::OnceCell::new(),
+        authority_kv_by_mint: parking_lot::RwLock::new(HashMap::new()),
         log_base: log_dir,
         decision_counter: std::sync::atomic::AtomicU64::new(0),
         execution_counter: std::sync::atomic::AtomicU64::new(0),
@@ -9723,35 +9878,38 @@ fn create_test_intent(run_id: &str) -> TradeIntent {
     .with_ttl_ms(5000)
 }
 
-/// BUY max-open-positions gate: conservative count vs config limit (A.28 / Scope 49 / PA-3).
+/// BUY max-open-positions gate: conservative count vs config limit (A.28 / Scope 49 / PA-3 / PA-6c1).
 ///
 /// In-process only — no wallet scan / RPC.
 /// `authority_current` is [`PositionAuthority::open_positions_count`] when available.
-/// `lockmanager_current` is [`LockManager::count_non_zero_token_balances`].
+/// `lockmanager_current` is [`LockManager::count_non_zero_token_balances`] (observability only after PA-6c1).
 /// `metadata_current` is strategy-reported (`current_open_positions`).
-/// Effective count is the max of all available sources so neither ghost locks nor stale metadata
-/// alone can bypass the limit.
+/// When authority is available, effective count is `max(metadata, authority)` — LockManager ghosts
+/// must not inflate the limit. Fallback when authority unavailable: `max(metadata, lockmanager)`.
 fn max_open_positions_buy_gate(
     metadata_current: usize,
     authority_current: Option<usize>,
     lockmanager_current: usize,
     max_open: usize,
 ) -> (bool, String) {
-    let (effective_current, source, authority_suffix) = match authority_current {
-        Some(authority) => (
-            metadata_current.max(authority).max(lockmanager_current),
-            "position_authority(+lockmanager)",
-            format!("authority_current={authority} "),
-        ),
-        None => (
-            metadata_current.max(lockmanager_current),
-            "lockmanager",
-            "authority_unavailable=true ".to_string(),
-        ),
-    };
+    let (effective_current, source, authority_suffix, lockmanager_in_effective) =
+        match authority_current {
+            Some(authority) => (
+                metadata_current.max(authority),
+                "position_authority",
+                format!("authority_current={authority} "),
+                false,
+            ),
+            None => (
+                metadata_current.max(lockmanager_current),
+                "lockmanager",
+                "authority_unavailable=true ".to_string(),
+                true,
+            ),
+        };
     let passed = effective_current < max_open;
     let details = format!(
-        "{authority_suffix}lockmanager_current={lockmanager_current} metadata_current={metadata_current} effective_current={effective_current} {} max={max_open} source={source}",
+        "{authority_suffix}lockmanager_current={lockmanager_current} metadata_current={metadata_current} effective_current={effective_current} {} max={max_open} source={source} lockmanager_in_effective={lockmanager_in_effective}",
         if passed { "<" } else { ">=" },
     );
     (passed, details)
@@ -14370,20 +14528,26 @@ mod execution_engine_tests {
         assert!(details.contains("lockmanager_current=1"));
         assert!(details.contains("metadata_current=1"));
         assert!(details.contains("effective_current=5"));
-        assert!(details.contains("source=position_authority(+lockmanager)"));
+        assert!(details.contains("source=position_authority"));
+        assert!(details.contains("lockmanager_in_effective=false"));
         assert!(details.contains("max=5"));
     }
 
     #[test]
-    fn max_open_positions_gate_rejects_when_lock_manager_exceeds_metadata() {
+    fn max_open_positions_gate_passes_when_lockmanager_exceeds_authority_but_authority_below_max() {
         let max_open = 5usize;
         let (passed, details) = max_open_positions_buy_gate(1, Some(1), 5, max_open);
-        assert!(!passed);
+        assert!(
+            passed,
+            "PA-6c1: lockmanager ghosts must not inflate effective count"
+        );
         assert!(details.contains("authority_current=1"));
         assert!(details.contains("lockmanager_current=5"));
         assert!(details.contains("metadata_current=1"));
-        assert!(details.contains("effective_current=5"));
-        assert!(details.contains("max=5"));
+        assert!(details.contains("effective_current=1"));
+        assert!(details.contains("source=position_authority"));
+        assert!(details.contains("lockmanager_in_effective=false"));
+        assert!(details.contains("< max=5"));
     }
 
     #[test]
@@ -14395,6 +14559,7 @@ mod execution_engine_tests {
         assert!(details.contains("authority_current=1"));
         assert!(details.contains("lockmanager_current=1"));
         assert!(details.contains("effective_current=5"));
+        assert!(details.contains("lockmanager_in_effective=false"));
     }
 
     #[test]
@@ -14407,7 +14572,8 @@ mod execution_engine_tests {
         assert!(details.contains("metadata_current=2"));
         assert!(details.contains("effective_current=3"));
         assert!(details.contains("< max=5"));
-        assert!(details.contains("source=position_authority(+lockmanager)"));
+        assert!(details.contains("source=position_authority"));
+        assert!(details.contains("lockmanager_in_effective=false"));
     }
 
     #[test]
@@ -14420,6 +14586,7 @@ mod execution_engine_tests {
         assert!(details.contains("metadata_current=1"));
         assert!(details.contains("effective_current=5"));
         assert!(details.contains("source=lockmanager"));
+        assert!(details.contains("lockmanager_in_effective=true"));
     }
 
     #[test]

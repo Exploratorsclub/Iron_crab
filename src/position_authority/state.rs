@@ -201,6 +201,28 @@ pub fn position_authority_drift_lockmanager(authority_open: usize, lockmanager_o
     authority_open as i64 - lockmanager_open as i64
 }
 
+/// `ee in-process open count` minus `JetStream KV open count` (PA-6c1 drift metric).
+#[inline]
+pub fn position_authority_drift_ee_vs_kv(ee_open: usize, kv_open: usize) -> i64 {
+    ee_open as i64 - kv_open as i64
+}
+
+/// Whether a KV snapshot counts as an open trade position (PA-5.1 / PA-6c1).
+#[inline]
+pub fn snapshot_counts_as_open_position(snap: &PositionAuthoritySnapshot) -> bool {
+    snap.balance_raw > 0 && snap.status != PositionAuthorityStatus::Closed
+}
+
+/// Open-position count from readonly JetStream KV snapshots (same semantics as momentum overlay).
+pub fn open_positions_count_from_kv_snapshots<'a>(
+    snapshots: impl IntoIterator<Item = &'a PositionAuthoritySnapshot>,
+) -> usize {
+    snapshots
+        .into_iter()
+        .filter(|s| snapshot_counts_as_open_position(s))
+        .count()
+}
+
 /// KV publish delta after a reducer apply (PA-5.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PositionAuthorityChange {
@@ -857,6 +879,85 @@ mod tests {
         a.apply_from_confirmed_execution_result(&r);
         assert_eq!(a.open_positions_count(), 1);
         assert_eq!(a.get(&m).unwrap().balance_raw, 10);
+    }
+
+    #[test]
+    fn apply_from_confirmed_exec_buy_returns_kv_put_change() {
+        use std::collections::HashMap;
+
+        let m = mint();
+        let mut meta = HashMap::new();
+        meta.insert("side".to_string(), "BUY".to_string());
+        meta.insert("token_program".to_string(), default_spl_token_program());
+        let r = ExecutionResult {
+            header: RecordHeader::new("test", "0", "run"),
+            execution_id: "e1".to_string(),
+            decision_id: "d1".to_string(),
+            intent_id: "i1".to_string(),
+            source: "test".to_string(),
+            token_mint: Some(m.clone()),
+            signature: None,
+            bundle_id: None,
+            status: ExecutionStatus::Confirmed,
+            fill_in: None,
+            fill_out: Some(ExplicitAmount::new(10, 6)),
+            fill_status: None,
+            fill_unavailable_reason: None,
+            confirmed_slot: None,
+            block_time_unix_ms: None,
+            fees: None,
+            pnl: None,
+            wallet_sol_delta_lamports: None,
+            error_message: None,
+            error_code: None,
+            latency_ms: None,
+            metadata: meta,
+        };
+        let mut a = PositionAuthority::new();
+        let changes = a.apply_from_confirmed_execution_result(&r);
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            PositionAuthorityChange::Put(snap) => {
+                assert_eq!(snap.mint, m);
+                assert_eq!(snap.balance_raw, 10);
+                assert_eq!(snap.status, PositionAuthorityStatus::Open);
+            }
+            other => panic!("expected Put change, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_positions_count_from_kv_snapshots_ignores_closed_and_zero_balance() {
+        use crate::ipc::schema::PositionAuthorityUpdateSource;
+
+        let open = PositionAuthoritySnapshot {
+            mint: mint(),
+            balance_raw: 100,
+            decimals: 6,
+            status: PositionAuthorityStatus::Open,
+            last_update_source: PositionAuthorityUpdateSource::Execution,
+            sold_raw_total: None,
+        };
+        let closed = PositionAuthoritySnapshot {
+            mint: "closed".to_string(),
+            balance_raw: 0,
+            decimals: 6,
+            status: PositionAuthorityStatus::Closed,
+            last_update_source: PositionAuthorityUpdateSource::Execution,
+            sold_raw_total: None,
+        };
+        let zero_open_status = PositionAuthoritySnapshot {
+            mint: "zero".to_string(),
+            balance_raw: 0,
+            decimals: 6,
+            status: PositionAuthorityStatus::Open,
+            last_update_source: PositionAuthorityUpdateSource::Execution,
+            sold_raw_total: None,
+        };
+        assert_eq!(
+            open_positions_count_from_kv_snapshots([&open, &closed, &zero_open_status]),
+            1
+        );
     }
 
     #[test]

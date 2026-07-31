@@ -3352,6 +3352,16 @@ pub fn set_position_authority_drift_momentum(drift: i64) {
 }
 
 #[inline]
+pub fn set_position_authority_kv_open_positions(count: u64) {
+    POSITION_AUTHORITY_KV_OPEN_POSITIONS.store(count, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_position_authority_drift_ee_vs_kv(drift: i64) {
+    POSITION_AUTHORITY_DRIFT_EE_VS_KV.store(drift, Ordering::Relaxed);
+}
+
+#[inline]
 pub fn record_liquidation_seed_skipped_authority_total() {
     LIQUIDATION_SEED_SKIPPED_AUTHORITY_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
@@ -6452,6 +6462,10 @@ pub static POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE: Lazy<AtomicU64> =
 pub static POSITION_AUTHORITY_DRIFT_LOCKMANAGER: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
 /// PA-5.1: `authority_open - momentum_overlay_count` (signed; Prometheus scalar).
 pub static POSITION_AUTHORITY_DRIFT_MOMENTUM: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
+/// PA-6c1: open positions from readonly `POSITION_AUTHORITY` KV snapshots (EE cross-check).
+pub static POSITION_AUTHORITY_KV_OPEN_POSITIONS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// PA-6c1: `ee_in_process_open - kv_open` (signed; Prometheus scalar).
+pub static POSITION_AUTHORITY_DRIFT_EE_VS_KV: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
 /// PA-6a shadow: position-manager process heartbeat (1 = up).
 pub static POSITION_MANAGER_UP_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// PA-6a shadow: open positions from local PositionAuthority reducer.
@@ -10260,6 +10274,14 @@ async fn metrics_response() -> Response<Body> {
     out.push_str(&format!(
         "position_authority_drift_momentum {}\n",
         POSITION_AUTHORITY_DRIFT_MOMENTUM.load(Ordering::Relaxed)
+    ));
+    line!(
+        "position_authority_kv_open_positions",
+        POSITION_AUTHORITY_KV_OPEN_POSITIONS.load(Ordering::Relaxed)
+    );
+    out.push_str(&format!(
+        "position_authority_drift_ee_vs_kv {}\n",
+        POSITION_AUTHORITY_DRIFT_EE_VS_KV.load(Ordering::Relaxed)
     ));
     line!(
         "liquidation_seed_skipped_authority_total",
