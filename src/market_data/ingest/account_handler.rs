@@ -112,20 +112,21 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
             }
         } else if is_wsol_ata {
             // WSOL ATA — parse token account balance. Publish WSOL only.
-            // When the ATA is closed (unwrap), Geyser often delivers an update with
-            // `data` empty (account gone) — not parseable as SPL token state.
-            // That means WSOL=0. Previously we `continue`d and kept a stale balance
-            // with no zero WalletBalanceSnapshot to JetStream.
-            let Some(balance) = wsol_ata_balance_lamports_from_geyser_data(&account_update.data)
-            else {
-                return;
-            };
+            // When the ATA is closed (unwrap / external Phantom close), Geyser often delivers
+            // an update with `data` empty (account gone) or non-empty but unparseable.
+            // Both mean WSOL=0. Must always publish WalletBalanceSnapshot so EE LockManager
+            // and WsolManager heal (including MD prev=0 drift after EE wrap callback).
+            let parsed = wsol_ata_balance_lamports_from_geyser_data(&account_update.data);
+            let closed_or_unparseable = account_update.data.is_empty() || parsed.is_none();
+            let balance = parsed.unwrap_or(0);
             let prev = host.account_wallet_wsol_swap(balance);
             host.account_wallet_wsol_seen_set();
+            let force_zero_publish = closed_or_unparseable && balance == 0;
             if let Some(snapshot) =
                 wallet_geyser_snapshots_to_publish(WalletGeyserUpdateSource::WsolAta {
                     balance,
                     prev_balance: prev,
+                    force_zero_publish,
                 })
             {
                 if host.account_nats().is_some() {
@@ -156,12 +157,23 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
                     )
                     .await;
 
-                    info!(
-                        wallet = %wallet_str,
-                        wsol_lamports = snapshot.balance_raw,
-                        slot = account_update.slot,
-                        "WalletBalanceSnapshot (WSOL) enqueued for JetStream"
-                    );
+                    if closed_or_unparseable {
+                        info!(
+                            wallet = %wallet_str,
+                            wsol_lamports = snapshot.balance_raw,
+                            slot = account_update.slot,
+                            reason = "wsol_ata_closed_or_unparseable",
+                            prev_wsol_lamports = prev,
+                            "WalletBalanceSnapshot (WSOL=0) enqueued after ATA close or unparseable data"
+                        );
+                    } else {
+                        info!(
+                            wallet = %wallet_str,
+                            wsol_lamports = snapshot.balance_raw,
+                            slot = account_update.slot,
+                            "WalletBalanceSnapshot (WSOL) enqueued for JetStream"
+                        );
+                    }
                 }
             }
         } else if is_token_ata

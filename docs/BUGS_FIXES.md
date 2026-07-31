@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-WSOL-ATA-CLOSE-ZERO: Phantom WSOL-ATA-Close → JetStream WSOL=0 + EE-Heal
+**Datum**: 2026-07-31  
+**Problem**: Externes Schliessen der WSOL-ATA (z.B. Phantom „Close Account“ nach Dust-Sell) liess EE Heartbeat/Metrics bei `available_wsol=1e9` haengen. MD publizierte kein `WalletBalanceSnapshot` WSOL=0 wenn (a) Geyser-Daten unparsebar waren (`return` ohne Publish), oder (b) MD `last_wsol_balance` bei 0 blieb waehrend EE den Wrap-Callback schon auf 1e9 gesetzt hatte (`prev==balance` → kein JetStream-Zero).  
+**Fix**: (1) `account_handler`: leere/unparseable WSOL-ATA-Daten → autoritatives `balance=0`, `force_zero_publish` auch bei `prev=0`, INFO `reason=wsol_ata_closed_or_unparseable`. (2) `wallet_geyser_snapshots_to_publish`: `force_zero_publish` fuer ATA-Close-Heal. (3) EE/WsolManager: `wsol_external_zero` WARN bei Snapshot 0 nach vorher >0 ohne aktives pending-wrap. Pending-wrap-Floor unveraendert waehrend Confirmation.  
+**Evidence**: Prod 2026-07-31 — Phantom Close, native SOL Snapshots ok, WSOL Heartbeat stale 1e9.  
+**Dateien**: `src/market_data/ingest/{account_handler,account_parse}.rs`, `src/bin/market_data.rs`, `src/bin/execution_engine.rs`, `src/execution/wsol_manager.rs`, `docs/BUGS_FIXES.md`
+
 ### HYBRID-PHASE5e: ingest/jsonl/md-state Modul-Extraktion + Legacy-Cleanup (Monolith-Slice)
 **Datum**: 2026-06-26  
 **Problem**: `market_data.rs` (~14.4k LOC nach 5d) — JSONL-Filter/Enqueue, Geyser-Account-Ingest-Filter und md-state Worker/Command-Enum lagen inline im Bin; verbotene `RegisterReservesAfterTrade` / `RegisterPoolVaultsFromAccount` md-state Commands noch im Enum.  

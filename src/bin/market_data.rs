@@ -12132,9 +12132,8 @@ mod wsol_ata_update_tests {
     }
 
     #[test]
-    fn short_corrupt_wsol_ata_data_skips_update() {
-        // Not enough bytes for a standard token account; must not be treated as 0
-        // (avoids clobbering state on transient garbage).
+    fn short_corrupt_wsol_ata_data_is_unparseable_not_zero() {
+        // Parser alone returns None; account_handler treats WSOL ATA unparseable as authoritative 0.
         assert_eq!(wsol_ata_balance_lamports_from_geyser_data(&[1, 2, 3]), None);
     }
 
@@ -12186,6 +12185,7 @@ mod wallet_geyser_snapshot_decouple_tests {
         let snapshot = wallet_geyser_snapshots_to_publish(WalletGeyserUpdateSource::WsolAta {
             balance: 1_000_000_000,
             prev_balance: 0,
+            force_zero_publish: false,
         })
         .expect("wsol balance changed");
         assert_eq!(snapshot.mint, WalletGeyserSnapshotMint::Wsol);
@@ -12197,6 +12197,7 @@ mod wallet_geyser_snapshot_decouple_tests {
         let snapshot = wallet_geyser_snapshots_to_publish(WalletGeyserUpdateSource::WsolAta {
             balance: 0,
             prev_balance: 1_000_000_000,
+            force_zero_publish: false,
         })
         .expect("unwrap must publish WSOL=0");
         assert_eq!(snapshot.mint, WalletGeyserSnapshotMint::Wsol);
@@ -12209,6 +12210,32 @@ mod wallet_geyser_snapshot_decouple_tests {
             wallet_geyser_snapshots_to_publish(WalletGeyserUpdateSource::WsolAta {
                 balance: 1_000_000_000,
                 prev_balance: 1_000_000_000,
+                force_zero_publish: false,
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn wsol_ata_closed_force_zero_publishes_even_when_prev_already_zero() {
+        // MD cache drift: EE saw wrap via callback but MD last_wsol_balance stayed 0.
+        let snapshot = wallet_geyser_snapshots_to_publish(WalletGeyserUpdateSource::WsolAta {
+            balance: 0,
+            prev_balance: 0,
+            force_zero_publish: true,
+        })
+        .expect("ATA close must force-publish WSOL=0 to heal EE drift");
+        assert_eq!(snapshot.mint, WalletGeyserSnapshotMint::Wsol);
+        assert_eq!(snapshot.balance_raw, 0);
+    }
+
+    #[test]
+    fn wsol_ata_zero_without_force_skips_when_prev_already_zero() {
+        assert!(
+            wallet_geyser_snapshots_to_publish(WalletGeyserUpdateSource::WsolAta {
+                balance: 0,
+                prev_balance: 0,
+                force_zero_publish: false,
             })
             .is_none()
         );

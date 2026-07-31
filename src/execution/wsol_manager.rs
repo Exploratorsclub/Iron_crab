@@ -528,6 +528,17 @@ impl WsolManager {
             let (effective_wsol, snapshot_confirms_pending) =
                 compute_effective_wsol_on_snapshot(pending_expected, incoming_wsol);
 
+            if pending_expected == 0 && incoming_wsol == 0 {
+                let current = self.wsol_balance.load(Ordering::Relaxed);
+                if current > 0 {
+                    warn!(
+                        event = "wsol_external_zero",
+                        previous_wsol_lamports = current,
+                        "WSOL balance snapshot dropped to zero (external unwrap/ATA close)"
+                    );
+                }
+            }
+
             if pending_expected > 0 && incoming_wsol < pending_expected {
                 warn!(
                     event = "stale_wsol_snapshot_ignored_due_to_pending_wrap",
@@ -1278,6 +1289,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mgr.wsol_balance(), 1_000_000_000);
+        assert_eq!(mgr.test_pending_expected_wsol(), 0);
+    }
+
+    #[tokio::test]
+    async fn external_zero_snapshot_applies_when_no_pending_wrap() {
+        let treasury = Arc::new(Treasury::from_signer(Arc::new(Keypair::new())));
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let mgr = WsolManager::new(
+            WsolManagerConfig {
+                enabled: true,
+                dry_run: true,
+                ..WsolManagerConfig::default()
+            },
+            treasury,
+            rpc,
+            "test",
+            "run",
+        );
+
+        mgr.test_seed_balances(3_000_000_000, 1_000_000_000);
+        assert_eq!(mgr.test_pending_expected_wsol(), 0);
+
+        mgr.apply_balance_update(4_000_000_000, Some(0))
+            .await
+            .unwrap();
+
+        assert_eq!(mgr.wsol_balance(), 0);
         assert_eq!(mgr.test_pending_expected_wsol(), 0);
     }
 
