@@ -5,6 +5,7 @@ pub mod ensure_pump;
 pub mod ensure_pumpfun;
 pub mod ensure_raydium;
 pub mod host;
+pub mod publish_slot;
 pub mod pump_layout;
 pub mod rpc_refresh;
 

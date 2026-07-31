@@ -1,6 +1,7 @@
 //! I-24d EnsurePumpAmmPoolAccounts cold-path handler.
 
 use super::host::{publish_control_response, ColdHost};
+use super::publish_slot::resolve_cold_path_publish_slot;
 use crate::execution::live_pool_cache::{CachedPoolState, PumpAmmState};
 use crate::ipc::{ControlResponseStatus, PoolCacheUpdate};
 use crate::nats::jetstream::pool_subject;
@@ -351,7 +352,16 @@ pub async fn handle_ensure_pump_amm_pool_accounts(
                 pool_accounts: accounts.clone(),
                 creator: creator_opt,
             });
-            host.live_pool_cache().upsert(pool_address, state, 0);
+            let publish_slot = resolve_cold_path_publish_slot(0);
+            if publish_slot == 0 {
+                warn!(
+                    request_id = %request_id,
+                    pool = %pool_address_str,
+                    "EnsurePumpAmmPoolAccounts: no publish slot watermark (Geyser head zero)"
+                );
+            }
+            host.live_pool_cache()
+                .upsert(pool_address, state, publish_slot);
             if force_refresh {
                 host.live_pool_cache()
                     .set_pump_amm_sell_layout_authoritative(
@@ -407,7 +417,7 @@ pub async fn handle_ensure_pump_amm_pool_accounts(
                     base_reserve,
                     quote_reserve,
                     None,
-                    0,
+                    publish_slot,
                 );
                 let mut meta = std::collections::HashMap::new();
                 let accounts_str: Vec<String> = accounts.iter().map(|p| p.to_string()).collect();
