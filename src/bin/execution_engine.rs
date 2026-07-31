@@ -6632,6 +6632,7 @@ impl ExecutionContext {
                 }
             } else if mint == WSOL_MINT || mint == SOL_MINT {
                 let incoming = *balance_raw;
+                let prev_wsol_on_chain = self.lock_manager.wsol_balance();
                 let effective_wsol = if let Some(ref pending) = self.wsol_pending_wrap {
                     let (effective, confirms, was_floored) =
                         pending.effective_wsol_for_snapshot(incoming);
@@ -6653,6 +6654,22 @@ impl ExecutionContext {
                 } else {
                     incoming
                 };
+                if incoming == 0
+                    && effective_wsol == 0
+                    && prev_wsol_on_chain > 0
+                    && self
+                        .wsol_pending_wrap
+                        .as_ref()
+                        .map(|p| p.pending_expected() == 0)
+                        .unwrap_or(true)
+                {
+                    warn!(
+                        event = "wsol_external_zero",
+                        previous_wsol_lamports = prev_wsol_on_chain,
+                        slot = ?event.slot,
+                        "WSOL WalletBalanceSnapshot dropped to zero (external unwrap/ATA close)"
+                    );
+                }
                 self.lock_manager.update_wsol_only(effective_wsol);
                 if let Some(ref tx) = self.wsol_balance_tx {
                     let sol = self.lock_manager.total_native_sol();

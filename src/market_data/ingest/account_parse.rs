@@ -65,8 +65,17 @@ pub fn wsol_ata_balance_lamports_from_geyser_data(data: &[u8]) -> Option<u64> {
 /// Which tracked-wallet Geyser account produced a balance update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalletGeyserUpdateSource {
-    NativeSol { lamports: u64, prev_lamports: u64 },
-    WsolAta { balance: u64, prev_balance: u64 },
+    NativeSol {
+        lamports: u64,
+        prev_lamports: u64,
+    },
+    WsolAta {
+        balance: u64,
+        prev_balance: u64,
+        /// When true, publish WSOL=0 even if `prev_balance` already equals 0 (ATA closed /
+        /// unparseable while MD cache drifted vs EE wrap callback).
+        force_zero_publish: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,10 +105,20 @@ pub fn wallet_geyser_snapshots_to_publish(
         WalletGeyserUpdateSource::WsolAta {
             balance,
             prev_balance,
-        } => (balance != prev_balance).then_some(WalletGeyserSnapshotToPublish {
-            mint: WalletGeyserSnapshotMint::Wsol,
-            balance_raw: balance,
-        }),
+            force_zero_publish,
+        } => {
+            if force_zero_publish && balance == 0 {
+                Some(WalletGeyserSnapshotToPublish {
+                    mint: WalletGeyserSnapshotMint::Wsol,
+                    balance_raw: 0,
+                })
+            } else {
+                (balance != prev_balance).then_some(WalletGeyserSnapshotToPublish {
+                    mint: WalletGeyserSnapshotMint::Wsol,
+                    balance_raw: balance,
+                })
+            }
+        }
     }
 }
 
