@@ -23,9 +23,10 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// Native SOL mint address
 pub const NATIVE_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
-/// JetStream KV bucket for PositionAuthority snapshots (PA-5.1 / PA-6b, I-24a).
+/// JetStream KV bucket for PositionAuthority snapshots (PA-5.1 / PA-6b / PA-6c1, I-24a).
 /// Key = mint (base58), value = [`PositionAuthoritySnapshot`] JSON.
 /// Writer after PA-6b: `position-manager` only (EE rollback via `publish_position_authority_kv`).
+/// EE and momentum-bot subscribe readonly for drift observability (PA-6c1); gates stay in-process until PA-6c2.
 pub const POSITION_AUTHORITY_KV_BUCKET: &str = "POSITION_AUTHORITY";
 
 /// Default quote mint for backward compatibility (SOL)
