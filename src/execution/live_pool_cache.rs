@@ -871,6 +871,8 @@ impl LivePoolCache {
     }
 
     /// Cold-path: seed creator on an existing PumpFun bonding-curve row (e.g. after liquidation RPC).
+    /// Does not touch `updated_at` — EE/Momentum share this SLAVE cache; creator-only RPC must not
+    /// refresh cache age or STALE/executable_exit_quote guards may treat stale reserves as fresh.
     pub fn seed_pumpfun_creator_if_missing(&self, bonding_curve: &Pubkey, creator: Pubkey) {
         if creator == Pubkey::default() {
             return;
@@ -879,7 +881,6 @@ impl LivePoolCache {
             if let CachedPoolState::PumpFun(ref mut s) = entry.state {
                 if s.creator == Pubkey::default() {
                     s.creator = creator;
-                    entry.updated_at = Instant::now();
                 }
             }
         }
