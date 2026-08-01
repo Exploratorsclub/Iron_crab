@@ -25,6 +25,7 @@ use crate::metrics::{
     inc_market_data_enrichment_balance_updated_total,
     inc_market_data_enrichment_pool_state_publish_total,
     inc_market_data_md_sidefx_enrich_publish_skipped_total,
+    inc_market_data_open_position_pumpfun_jetstream_publish_total,
     inc_market_data_pool_state_publish_skipped_balance_unchanged_total,
     record_market_data_bonding_curve_grpc_to_devwallet_ms,
     record_market_data_pool_mint_map_to_devwallet_ms, MarketDataLatencySegment,
@@ -167,6 +168,43 @@ fn md_sidefx_build_balance_updated_from_cache(
     Some(balance_update)
 }
 
+#[inline]
+fn md_sidefx_is_open_position_pumpfun_pin(
+    host: &dyn SidefxWorkerHost,
+    pool_pubkey: &Pubkey,
+    cached_state: &CachedPoolState,
+) -> bool {
+    matches!(cached_state, CachedPoolState::PumpFun(_))
+        && host.is_open_position_pumpfun_pin(pool_pubkey)
+}
+
+/// P0: force JetStream BalanceUpdated for open-position PumpFun pins (no vault Geyser feed).
+fn md_sidefx_publish_open_position_pumpfun_balance_refresh(
+    host: &dyn SidefxWorkerHost,
+    run_id: &str,
+    pool_pubkey: &Pubkey,
+    slot: u64,
+) {
+    if !host.nats_enabled() {
+        return;
+    }
+    let Some(balance_update) =
+        md_sidefx_build_balance_updated_from_cache(host, run_id, pool_pubkey, slot)
+    else {
+        return;
+    };
+    let subject = pool_subject(&pool_pubkey.to_string());
+    sidefx_host_enqueue_jetstream(
+        host,
+        subject,
+        &balance_update,
+        "PoolCacheUpdate::BalanceUpdated (open-position PumpFun pin)",
+        false,
+    );
+    inc_market_data_open_position_pumpfun_jetstream_publish_total();
+    inc_market_data_enrichment_balance_updated_total();
+}
+
 /// P2: JetStream BalanceUpdated + Core PoolStateUpdate after MASTER cache upsert (I-MD-4).
 fn md_sidefx_publish_enrichment_from_cache_upsert(
     host: &dyn SidefxWorkerHost,
@@ -186,16 +224,25 @@ fn md_sidefx_publish_enrichment_from_cache_upsert(
     if !cached_pool_has_fresh_reserve_basis(cached_state) {
         return;
     }
+    let open_position_pumpfun_pin =
+        md_sidefx_is_open_position_pumpfun_pin(host, pool_pubkey, cached_state);
     let balance_unchanged = prev_state
         .as_ref()
         .is_some_and(|prev| cache_balance_fields_unchanged(prev, cached_state));
-    if balance_unchanged {
+    if balance_unchanged && !open_position_pumpfun_pin {
         inc_market_data_pool_state_publish_skipped_balance_unchanged_total();
         return;
     }
 
     if host.nats_enabled() {
-        if let Some(balance_update) =
+        if open_position_pumpfun_pin {
+            md_sidefx_publish_open_position_pumpfun_balance_refresh(
+                host,
+                run_id,
+                pool_pubkey,
+                slot,
+            );
+        } else if let Some(balance_update) =
             md_sidefx_build_balance_updated_from_cache(host, run_id, pool_pubkey, slot)
         {
             let subject = pool_subject(&pool_pubkey.to_string());
@@ -1446,7 +1493,10 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
         };
 
         // Publish PoolCacheUpdate to JetStream (Single Source of Truth for pool state)
+        let open_position_pumpfun_pin =
+            md_sidefx_is_open_position_pumpfun_pin(host, pool_pubkey, &cached_state);
         let should_publish_pool_cache = update_class.is_exec_hot()
+            || open_position_pumpfun_pin
             || md_sidefx_should_publish_enrich_pool_cache_update(
                 host,
                 pool_pubkey,

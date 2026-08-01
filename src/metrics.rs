@@ -3305,6 +3305,24 @@ pub fn inc_market_data_open_position_pumpfun_registration_remediate_total() {
     MARKET_DATA_OPEN_POSITION_PUMPFUN_REGISTRATION_REMEDIATE_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+static MARKET_DATA_OPEN_POSITION_PUMPFUN_JETSTREAM_PUBLISH_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn inc_market_data_open_position_pumpfun_jetstream_publish_total() {
+    MARKET_DATA_OPEN_POSITION_PUMPFUN_JETSTREAM_PUBLISH_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+static MOMENTUM_OPEN_POSITION_EXIT_BLIND_ENSURE_TOTAL: Lazy<RwLock<HashMap<&'static str, u64>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Labeled: `momentum_open_position_exit_blind_ensure_total{reason=...}`.
+#[inline]
+pub fn inc_momentum_open_position_exit_blind_ensure_total(reason: &'static str) {
+    let mut map = MOMENTUM_OPEN_POSITION_EXIT_BLIND_ENSURE_TOTAL.write();
+    *map.entry(reason).or_insert(0) += 1;
+}
+
 #[inline]
 pub fn record_momentum_overlay_closed_by_authority_total() {
     MOMENTUM_OVERLAY_CLOSED_BY_AUTHORITY_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -8582,6 +8600,17 @@ async fn metrics_response() -> Response<Body> {
         "market_data_open_position_pumpfun_registration_remediate_total",
         MARKET_DATA_OPEN_POSITION_PUMPFUN_REGISTRATION_REMEDIATE_TOTAL.load(Ordering::Relaxed)
     );
+    line!(
+        "market_data_open_position_pumpfun_jetstream_publish_total",
+        MARKET_DATA_OPEN_POSITION_PUMPFUN_JETSTREAM_PUBLISH_TOTAL.load(Ordering::Relaxed)
+    );
+    for (reason, count) in MOMENTUM_OPEN_POSITION_EXIT_BLIND_ENSURE_TOTAL.read().iter() {
+        out.push_str("momentum_open_position_exit_blind_ensure_total{reason=\"");
+        out.push_str(reason);
+        out.push_str("\"} ");
+        out.push_str(&count.to_string());
+        out.push('\n');
+    }
     line!(
         "momentum_overlay_closed_by_authority_total",
         MOMENTUM_OVERLAY_CLOSED_BY_AUTHORITY_TOTAL.load(Ordering::Relaxed)

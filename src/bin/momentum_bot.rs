@@ -226,8 +226,11 @@ fn open_position_pool_recovery_cooldown(
     recovery_kind: OpenPositionPoolRecoveryKind,
     reason_tag: &'static str,
 ) -> Duration {
-    if reason_tag == "quote_missing_retry"
-        && recovery_kind == OpenPositionPoolRecoveryKind::PumpfunBonding
+    if recovery_kind == OpenPositionPoolRecoveryKind::PumpfunBonding
+        && matches!(
+            reason_tag,
+            "quote_missing_retry" | "stale_cache_age_retry" | "exit_blind_retry"
+        )
     {
         OPEN_POSITION_EXIT_BLIND_PUMPFUN_RECOVERY_COOLDOWN
     } else {
@@ -1213,6 +1216,53 @@ fn exit_quote_price_exit_guard_violation(
         return Some("QUOTE_TPS_SCALE_MISMATCH");
     }
     None
+}
+
+/// True when the **position pool** specifically lacks a usable exit quote (stale SLAVE age or cache miss).
+/// Unlike [`MomentumContext::executable_exit_quote`], does not accept a fresher alternate pool row.
+fn position_pool_exit_blind(pos: &PositionTracker, live_pool_cache: &LivePoolCache) -> bool {
+    if pos.pool.is_empty() || pos.token_amount == 0 {
+        return false;
+    }
+    let Ok(pool_pk) = solana_sdk::pubkey::Pubkey::from_str(&pos.pool) else {
+        return true;
+    };
+    let Some((state, _slot, age_ms)) = live_pool_cache.get_with_metadata(&pool_pk) else {
+        return true;
+    };
+    if age_ms > EXIT_QUOTE_MAX_CACHE_AGE_MS {
+        return true;
+    }
+    let Ok(token_mint) = solana_sdk::pubkey::Pubkey::from_str(&pos.mint) else {
+        return true;
+    };
+    let Ok(sol_out) = quote_calculator::quote_output_amount(&state, pos.token_amount, &token_mint)
+    else {
+        return true;
+    };
+    if sol_out == 0 {
+        return true;
+    }
+    let tps = tokens_per_sol::ui_tokens_per_sol(pos.token_amount, pos.token_decimals, sol_out);
+    if !tps.is_finite() || tps <= 0.0 {
+        return true;
+    }
+    let candidate = ExitExecutableQuote {
+        tokens_per_sol: tps,
+        pool_sourced: true,
+        quote_pool: pos.pool.clone(),
+        quote_dex: pos.dex.clone(),
+        marks_position_pool: true,
+        source_slot: Some(_slot),
+        cache_age_ms: Some(age_ms),
+    };
+    exit_quote_price_exit_guard_violation(
+        pos,
+        &candidate,
+        None,
+        ExitQuoteGuardOpts::RelaxPositionMarkSlotForHardPriceExit,
+    )
+    .is_some()
 }
 
 /// `exit_quote` = optional reserve quote; `price_exit_quote` = same row after freshness / SOL-leg
@@ -4163,6 +4213,9 @@ impl MomentumContext {
             }
             match nats.publish(TOPIC_CONTROL_REQUESTS, &req).await {
                 Ok(true) => {
+                    ironcrab::metrics::inc_momentum_open_position_exit_blind_ensure_total(
+                        reason_tag,
+                    );
                     info!(
                         mint = %mint,
                         pool = %pool,
@@ -4209,37 +4262,42 @@ impl MomentumContext {
     }
 
     async fn tick_open_position_pool_recovery_retries(self: &Arc<Self>) {
-        let mut rows: Vec<(String, String, String)> = Vec::new();
+        let mut rows: Vec<(String, String, String, &'static str)> = Vec::new();
         {
             let positions = self.positions.read();
             for (mint, pos) in positions.iter() {
                 if pos.pool.is_empty() || pos.token_amount == 0 {
                     continue;
                 }
-                if self
+                let pool_blind = position_pool_exit_blind(pos, &self.live_pool_cache);
+                let no_usable_exit_quote = self
                     .executable_exit_quote(
                         pos,
                         None,
                         ExitQuoteGuardOpts::RelaxPositionMarkSlotForHardPriceExit,
                     )
-                    .is_some()
-                {
+                    .is_none();
+                if !pool_blind && !no_usable_exit_quote {
                     continue;
                 }
-                rows.push((mint.clone(), pos.pool.clone(), pos.dex.clone()));
+                let reason_tag = if pool_blind {
+                    if Self::normalize_dex_for_execution_engine(&pos.dex) == "pumpfun" {
+                        "stale_cache_age_retry"
+                    } else {
+                        "exit_blind_retry"
+                    }
+                } else {
+                    "quote_missing_retry"
+                };
+                rows.push((mint.clone(), pos.pool.clone(), pos.dex.clone(), reason_tag));
             }
         }
-        for (mint, pool, dex) in rows
+        for (mint, pool, dex, reason_tag) in rows
             .into_iter()
             .take(OPEN_POSITION_POOL_RECOVERY_RETRY_MAX_PER_TICK)
         {
-            self.publish_open_position_pool_recovery_if_allowed(
-                &mint,
-                &pool,
-                &dex,
-                "quote_missing_retry",
-            )
-            .await;
+            self.publish_open_position_pool_recovery_if_allowed(&mint, &pool, &dex, reason_tag)
+                .await;
         }
     }
 
@@ -13151,6 +13209,49 @@ mod tests {
     }
 
     #[test]
+    fn position_pool_exit_blind_detects_stale_position_pool_cache() {
+        use ironcrab::execution::live_pool_cache::{CachedPoolState, PumpFunState};
+
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let mint_pk = Pubkey::new_unique();
+        cache.upsert(
+            pool,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: mint_pk,
+                bonding_curve: pool,
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: 30_000_000_000,
+                virtual_token_reserves: 1_073_000_000_000_000,
+                real_sol_reserves: 10_000_000_000,
+                real_token_reserves: 500_000_000_000_000,
+                complete: false,
+                creator: Pubkey::new_unique(),
+                cashback_enabled: false,
+            }),
+            1,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(
+            (EXIT_QUOTE_MAX_CACHE_AGE_MS + 50) as u64,
+        ));
+        let mut pos = PositionTracker::new(
+            &mint_pk.to_string(),
+            &pool.to_string(),
+            "pumpfun",
+            1.0,
+            6,
+            1_000_000,
+            0,
+        );
+        pos.entry_confirmed_slot = 0;
+        pos.last_price_slot = 0;
+        assert!(
+            position_pool_exit_blind(&pos, &cache),
+            "stale position-pool SLAVE age must count as exit blind"
+        );
+    }
+
+    #[test]
     fn open_position_pool_recovery_kinds_mapping() {
         assert_eq!(
             open_position_pool_recovery_kinds_for_normalized_dex("pumpfun"),
@@ -13168,13 +13269,20 @@ mod tests {
 
     #[test]
     fn open_position_exit_blind_pumpfun_recovery_uses_short_cooldown() {
-        assert_eq!(
-            open_position_pool_recovery_cooldown(
-                OpenPositionPoolRecoveryKind::PumpfunBonding,
-                "quote_missing_retry"
-            ),
-            OPEN_POSITION_EXIT_BLIND_PUMPFUN_RECOVERY_COOLDOWN
-        );
+        for reason in [
+            "quote_missing_retry",
+            "stale_cache_age_retry",
+            "exit_blind_retry",
+        ] {
+            assert_eq!(
+                open_position_pool_recovery_cooldown(
+                    OpenPositionPoolRecoveryKind::PumpfunBonding,
+                    reason
+                ),
+                OPEN_POSITION_EXIT_BLIND_PUMPFUN_RECOVERY_COOLDOWN,
+                "reason={reason}"
+            );
+        }
         assert_eq!(
             open_position_pool_recovery_cooldown(
                 OpenPositionPoolRecoveryKind::PumpfunBonding,
