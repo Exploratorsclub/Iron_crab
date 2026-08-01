@@ -13232,7 +13232,7 @@ mod tests {
             1,
         );
         std::thread::sleep(std::time::Duration::from_millis(
-            (EXIT_QUOTE_MAX_CACHE_AGE_MS + 50) as u64,
+            EXIT_QUOTE_MAX_CACHE_AGE_MS + 50,
         ));
         let mut pos = PositionTracker::new(
             &mint_pk.to_string(),
