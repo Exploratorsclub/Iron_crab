@@ -870,6 +870,21 @@ impl LivePoolCache {
         None
     }
 
+    /// Cold-path: seed creator on an existing PumpFun bonding-curve row (e.g. after liquidation RPC).
+    pub fn seed_pumpfun_creator_if_missing(&self, bonding_curve: &Pubkey, creator: Pubkey) {
+        if creator == Pubkey::default() {
+            return;
+        }
+        if let Some(mut entry) = self.pools.get_mut(bonding_curve) {
+            if let CachedPoolState::PumpFun(ref mut s) = entry.state {
+                if s.creator == Pubkey::default() {
+                    s.creator = creator;
+                    entry.updated_at = Instant::now();
+                }
+            }
+        }
+    }
+
     /// Check if a PumpFun bonding curve for a given mint is marked as `complete`.
     /// Returns Some(true) if complete, Some(false) if not, None if not found.
     pub fn is_pumpfun_complete_for_mint(&self, mint: &Pubkey) -> Option<bool> {

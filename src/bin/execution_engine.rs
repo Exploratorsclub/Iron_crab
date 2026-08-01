@@ -2573,6 +2573,11 @@ struct ExecutionContext {
     pump_amm_hot_path_refresh_last: Arc<ParkingMutex<HashMap<Pubkey, Instant>>>,
 }
 
+struct PumpfunLiquidationSellOutcome {
+    min_out: Option<u64>,
+    missing_creator: bool,
+}
+
 #[cfg(test)]
 impl ExecutionContext {
     fn test_for_pa2_metrics(
@@ -2839,8 +2844,52 @@ impl ExecutionContext {
         ((quoted_out as u128) * (keep_bps as u128) / 10_000u128) as u64
     }
 
+    /// Cold-path: resolve PumpFun bonding-curve creator (cache first, then RPC).
+    async fn liquidation_fetch_pumpfun_creator(
+        &self,
+        bonding_curve: &Pubkey,
+        mint: &Pubkey,
+    ) -> Result<Pubkey, String> {
+        if let Some(cache) = self.live_pool_cache.as_ref() {
+            if let Some(creator) = cache.get_pumpfun_creator(bonding_curve) {
+                return Ok(creator);
+            }
+        }
+
+        warn!(
+            mint = %mint,
+            bonding_curve = %bonding_curve,
+            "LIQUIDATION: Creator not in cache, falling back to RPC"
+        );
+
+        let account = self
+            .rpc
+            .get_account(bonding_curve)
+            .await
+            .map_err(|e| format!("rpc_fetch_failed: {e:#}"))?;
+
+        let state = BondingCurveState::parse(&account.data)
+            .map_err(|e| format!("rpc_parse_failed: {e:#}"))?;
+
+        if state.creator == Pubkey::default() {
+            return Err("rpc_parse_default_creator".to_string());
+        }
+
+        if let Some(cache) = self.live_pool_cache.as_ref() {
+            cache.seed_pumpfun_creator_if_missing(bonding_curve, state.creator);
+        }
+
+        info!(
+            mint = %mint,
+            bonding_curve = %bonding_curve,
+            creator = %state.creator,
+            "LIQUIDATION: Creator fetched via RPC fallback"
+        );
+        Ok(state.creator)
+    }
+
     /// Cold-path: build a PumpFun bonding-curve SELL quote. `route_label` is `pumpfun_preferred`
-    /// (Scope 51: try before multi-pool) or `pumpfun_fallback` (legacy: last resort after multi-pool).
+    /// (Scope 51: try before multi-pool), `pumpfun_creator_retry`, or `pumpfun_fallback`.
     #[allow(clippy::too_many_arguments)] // Consolidates duplicated liquidation pumpfun SELL build path
     async fn liquidation_build_pumpfun_sell(
         &self,
@@ -2853,8 +2902,9 @@ impl ExecutionContext {
         metadata: &mut HashMap<String, String>,
         resources: &mut TradeResources,
         quote_attempts: &mut Vec<String>,
-    ) -> Option<u64> {
+    ) -> PumpfunLiquidationSellOutcome {
         let mut min_out: Option<u64> = None;
+        let mut missing_creator = false;
         match pumpfun
             .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
             .await
@@ -2863,50 +2913,30 @@ impl ExecutionContext {
                 if let Some(bc_str) = q.route.first() {
                     resources.pools = vec![bc_str.clone()];
 
-                    let mut _creator_found = false;
                     if let Ok(bc) = Pubkey::from_str(bc_str) {
-                        if let Some(cache) = self.live_pool_cache.as_ref() {
-                            if let Some(creator) = cache.get_pumpfun_creator(&bc) {
+                        match self.liquidation_fetch_pumpfun_creator(&bc, mint).await {
+                            Ok(creator) => {
                                 metadata.insert("creator".to_string(), creator.to_string());
-                                _creator_found = true;
+                            }
+                            Err(reason) => {
+                                missing_creator = true;
+                                warn!(
+                                    mint = %mint,
+                                    bonding_curve = %bc,
+                                    reason = %reason,
+                                    "LIQUIDATION: Creator resolution failed"
+                                );
+                                quote_attempts.push(format!(
+                                    "{route_label}=skip missing_creator reason={reason}"
+                                ));
                             }
                         }
-
-                        if !_creator_found {
-                            warn!(
-                                mint = %mint,
-                                bonding_curve = %bc,
-                                "LIQUIDATION: Creator not in cache, falling back to RPC"
-                            );
-                            match self.rpc.get_account(&bc).await {
-                                Ok(account) => {
-                                    if account.data.len() >= 81 {
-                                        let creator_bytes: [u8; 32] = account.data[49..81]
-                                            .try_into()
-                                            .expect("slice is exactly 32 bytes");
-                                        let creator = Pubkey::new_from_array(creator_bytes);
-                                        if creator != Pubkey::default() {
-                                            metadata
-                                                .insert("creator".to_string(), creator.to_string());
-                                            _creator_found = true;
-                                            info!(
-                                                mint = %mint,
-                                                creator = %creator,
-                                                "LIQUIDATION: Creator fetched via RPC fallback"
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        error = %e,
-                                        mint = %mint,
-                                        "LIQUIDATION: RPC fallback for creator failed"
-                                    );
-                                }
-                            }
-                        }
+                    } else {
+                        quote_attempts.push(format!(
+                            "{route_label}=skip invalid_bonding_curve_pubkey pool={bc_str}"
+                        ));
                     }
+
                     if metadata.contains_key("creator") && resources.pools.len() == 1 {
                         metadata.insert("sell_routing".to_string(), route_label.to_string());
                         metadata.insert("dex".to_string(), "pumpfun".to_string());
@@ -2922,7 +2952,7 @@ impl ExecutionContext {
                                 .map(|s| s.as_str())
                                 .unwrap_or("<none>")
                         ));
-                    } else {
+                    } else if !missing_creator {
                         quote_attempts.push(format!(
                             "{}=skip missing_creator_or_pool creator_present={} pools_len={}",
                             route_label,
@@ -2941,7 +2971,10 @@ impl ExecutionContext {
                 quote_attempts.push(format!("{route_label}=err {e:#}"));
             }
         }
-        min_out
+        PumpfunLiquidationSellOutcome {
+            min_out,
+            missing_creator,
+        }
     }
 
     /// 6005-Retry: Bei BondingCurveComplete (PumpFun) Retry mit PumpSwap AMM.
@@ -4154,9 +4187,11 @@ impl ExecutionContext {
             let try_pumpfun_first =
                 liquidation_pumpfun_sell_preference(ctx.live_pool_cache.as_deref(), &mint);
 
+            let mut pumpfun_preferred_missing_creator = false;
+
             if try_pumpfun_first {
                 if let Some(ref pfun) = pumpfun {
-                    min_out_sol = ctx
+                    let outcome = ctx
                         .liquidation_build_pumpfun_sell(
                             pfun,
                             &mint,
@@ -4169,6 +4204,8 @@ impl ExecutionContext {
                             &mut quote_attempts,
                         )
                         .await;
+                    min_out_sol = outcome.min_out;
+                    pumpfun_preferred_missing_creator = outcome.missing_creator;
                     #[cfg(unix)]
                     maybe_ping_watchdog();
                 }
@@ -4347,21 +4384,51 @@ impl ExecutionContext {
                             });
                         };
 
+                    // Bonding curve was quotable but creator missed on preferred pass — retry PumpFun
+                    // before blocking on the 45s PumpSwap quote/discovery timeout.
+                    if pumpfun_preferred_missing_creator {
+                        if let Some(ref pfun) = pumpfun {
+                            let outcome = ctx
+                                .liquidation_build_pumpfun_sell(
+                                    pfun,
+                                    &mint,
+                                    &sol_mint,
+                                    amount_in,
+                                    max_slippage_bps,
+                                    "pumpfun_creator_retry",
+                                    &mut metadata,
+                                    &mut resources,
+                                    &mut quote_attempts,
+                                )
+                                .await;
+                            min_out_sol = outcome.min_out;
+                            if outcome.min_out.is_some() {
+                                pumpfun_preferred_missing_creator = false;
+                            }
+                            #[cfg(unix)]
+                            maybe_ping_watchdog();
+                        }
+                    }
+
                     // PumpSwap (Pump.fun AMM) with timeout guard.
                     // For LIQUIDATION: always try PumpSwap AMM regardless of bonding_curve_known_complete.
                     // The LivePoolCache may not know the curve is complete, but PumpSwap AMM
                     // might still have a pool. The RPC-based discovery in quote_exact_in handles this.
-                    let pump_amm_quote = Some(
-                        tokio::time::timeout(
-                            Duration::from_secs(PUMPSWAP_LIQUIDATION_QUOTE_TIMEOUT_SECS),
-                            pump_amm.quote_exact_in(
-                                &mint.to_string(),
-                                &sol_mint.to_string(),
-                                amount_in,
-                            ),
+                    let pump_amm_quote = if min_out_sol.is_none() {
+                        Some(
+                            tokio::time::timeout(
+                                Duration::from_secs(PUMPSWAP_LIQUIDATION_QUOTE_TIMEOUT_SECS),
+                                pump_amm.quote_exact_in(
+                                    &mint.to_string(),
+                                    &sol_mint.to_string(),
+                                    amount_in,
+                                ),
+                            )
+                            .await,
                         )
-                        .await,
-                    );
+                    } else {
+                        None
+                    };
                     match pump_amm_quote {
                         None => {} // Already logged above
                         Some(Err(_timeout)) => {
@@ -5003,22 +5070,30 @@ impl ExecutionContext {
                 }
 
                 // Last resort: PumpFun bonding-curve SELL when multi-pool + cache had no route.
-                // (Skip if we already tried pumpfun_preferred at the start — no duplicate work.)
-                if min_out_sol.is_none() && !try_pumpfun_first {
+                // Retry when preferred skipped only due to missing_creator (not a duplicate ok-quote).
+                let allow_pumpfun_fallback =
+                    !try_pumpfun_first || pumpfun_preferred_missing_creator;
+                if min_out_sol.is_none() && allow_pumpfun_fallback {
                     if let Some(ref pfun) = pumpfun {
-                        min_out_sol = ctx
+                        let route_label = if pumpfun_preferred_missing_creator {
+                            "pumpfun_creator_retry"
+                        } else {
+                            "pumpfun_fallback"
+                        };
+                        let outcome = ctx
                             .liquidation_build_pumpfun_sell(
                                 pfun,
                                 &mint,
                                 &sol_mint,
                                 amount_in,
                                 max_slippage_bps,
-                                "pumpfun_fallback",
+                                route_label,
                                 &mut metadata,
                                 &mut resources,
                                 &mut quote_attempts,
                             )
                             .await;
+                        min_out_sol = outcome.min_out;
                     }
                 }
             } // end if min_out_sol.is_none() (Meteora/Raydium recovery + multi-pool + cache; last-resort pumpfun_fallback inside)
@@ -6656,16 +6731,21 @@ impl ExecutionContext {
                 };
                 if incoming == 0
                     && effective_wsol == 0
-                    && prev_wsol_on_chain > 0
-                    && self
-                        .wsol_pending_wrap
-                        .as_ref()
-                        .map(|p| p.pending_expected() == 0)
-                        .unwrap_or(true)
+                    && (prev_wsol_on_chain > 0
+                        || self
+                            .wsol_pending_wrap
+                            .as_ref()
+                            .map(|p| p.pending_expected() > 0)
+                            .unwrap_or(false))
                 {
                     warn!(
                         event = "wsol_external_zero",
                         previous_wsol_lamports = prev_wsol_on_chain,
+                        pending_expected_wsol_lamports = self
+                            .wsol_pending_wrap
+                            .as_ref()
+                            .map(|p| p.pending_expected())
+                            .unwrap_or(0),
                         slot = ?event.slot,
                         "WSOL WalletBalanceSnapshot dropped to zero (external unwrap/ATA close)"
                     );
@@ -14258,15 +14338,27 @@ mod execution_engine_tests {
     }
 
     #[test]
-    fn lock_manager_pending_wrap_floors_stale_zero_snapshot() {
+    fn lock_manager_pending_wrap_floors_stale_partial_snapshot() {
+        let (ctx, pending) = test_ctx_with_pending_wrap(LockManager::new(3_000_000_000));
+        pending.arm(1_000_000_000);
+        ctx.lock_manager.update_wsol_only(1_000_000_000);
+
+        ctx.apply_wallet_balance_snapshot_event(&wsol_wallet_snapshot_event(500_000_000));
+
+        assert_eq!(ctx.lock_manager.available_wsol(), 1_000_000_000);
+        assert_eq!(pending.pending_expected(), 1_000_000_000);
+    }
+
+    #[test]
+    fn lock_manager_pending_wrap_clears_on_authoritative_zero_snapshot() {
         let (ctx, pending) = test_ctx_with_pending_wrap(LockManager::new(3_000_000_000));
         pending.arm(1_000_000_000);
         ctx.lock_manager.update_wsol_only(1_000_000_000);
 
         ctx.apply_wallet_balance_snapshot_event(&wsol_wallet_snapshot_event(0));
 
-        assert_eq!(ctx.lock_manager.available_wsol(), 1_000_000_000);
-        assert_eq!(pending.pending_expected(), 1_000_000_000);
+        assert_eq!(ctx.lock_manager.available_wsol(), 0);
+        assert_eq!(pending.pending_expected(), 0);
     }
 
     #[test]

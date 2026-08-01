@@ -55,12 +55,18 @@ const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
 /// After a successful on-chain wrap, hold this effective WSOL floor until a snapshot confirms
 /// `wsol >= pending_expected` or we hit the confirmation timeout (then one RPC resync, cold path).
+///
+/// `incoming_wsol == 0` is authoritative (external unwrap / ATA close): effective is 0 and pending
+/// clears. The post-wrap floor applies only when `incoming_wsol > 0` but has not yet caught up.
 pub fn compute_effective_wsol_on_snapshot(
     pending_expected: u64,
     incoming_wsol: u64,
 ) -> (u64, bool) {
     if pending_expected == 0 {
         return (incoming_wsol, false);
+    }
+    if incoming_wsol == 0 {
+        return (0, true);
     }
     if incoming_wsol >= pending_expected {
         (incoming_wsol, true)
@@ -113,7 +119,7 @@ impl PendingWrapState {
     pub fn effective_wsol_for_snapshot(&self, incoming_wsol: u64) -> (u64, bool, bool) {
         let pending = self.pending_wrap_expected_wsol.load(Ordering::Relaxed);
         let (effective, confirms) = compute_effective_wsol_on_snapshot(pending, incoming_wsol);
-        let was_floored = pending > 0 && incoming_wsol < pending;
+        let was_floored = pending > 0 && incoming_wsol > 0 && incoming_wsol < pending;
         (effective, confirms, was_floored)
     }
 
@@ -528,18 +534,17 @@ impl WsolManager {
             let (effective_wsol, snapshot_confirms_pending) =
                 compute_effective_wsol_on_snapshot(pending_expected, incoming_wsol);
 
-            if pending_expected == 0 && incoming_wsol == 0 {
+            if incoming_wsol == 0 {
                 let current = self.wsol_balance.load(Ordering::Relaxed);
-                if current > 0 {
+                if current > 0 || pending_expected > 0 {
                     warn!(
                         event = "wsol_external_zero",
                         previous_wsol_lamports = current,
+                        pending_expected_wsol_lamports = pending_expected,
                         "WSOL balance snapshot dropped to zero (external unwrap/ATA close)"
                     );
                 }
-            }
-
-            if pending_expected > 0 && incoming_wsol < pending_expected {
+            } else if pending_expected > 0 && incoming_wsol < pending_expected {
                 warn!(
                     event = "stale_wsol_snapshot_ignored_due_to_pending_wrap",
                     incoming_wsol_lamports = incoming_wsol,
@@ -1241,7 +1246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_wrap_blocks_second_wrap_on_stale_zero_snapshot() {
+    async fn pending_wrap_floors_stale_partial_snapshot_not_zero() {
         let treasury = Arc::new(Treasury::from_signer(Arc::new(Keypair::new())));
         let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
         let mgr = WsolManager::new(
@@ -1267,14 +1272,15 @@ mod tests {
         assert_eq!(mgr.wsol_balance(), 1_000_000_000);
         assert_eq!(mgr.test_pending_expected_wsol(), 1_000_000_000);
 
-        mgr.apply_balance_update(2_247_213_376, Some(0))
+        // Partial snapshot (non-zero but below pending) must not clobber optimistic WSOL.
+        mgr.apply_balance_update(2_247_213_376, Some(500_000_000))
             .await
             .unwrap();
 
         assert_eq!(
             mgr.wsol_balance(),
             1_000_000_000,
-            "stale wsol=0 must not clobber optimistic WSOL"
+            "stale partial wsol must not clobber optimistic WSOL"
         );
         assert_eq!(
             mgr.test_pending_expected_wsol(),
@@ -1289,6 +1295,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mgr.wsol_balance(), 1_000_000_000);
+        assert_eq!(mgr.test_pending_expected_wsol(), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_wrap_clears_on_authoritative_external_zero_snapshot() {
+        let treasury = Arc::new(Treasury::from_signer(Arc::new(Keypair::new())));
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let mgr = WsolManager::new(
+            WsolManagerConfig {
+                enabled: true,
+                dry_run: true,
+                ..WsolManagerConfig::default()
+            },
+            treasury,
+            rpc,
+            "test",
+            "run",
+        );
+
+        mgr.test_seed_balances(3_000_000_000, 0);
+        mgr.test_simulate_successful_wrap_optimistic(1_000_000_000, 3_000_000_000, 0);
+        assert_eq!(mgr.wsol_balance(), 1_000_000_000);
+        assert_eq!(mgr.test_pending_expected_wsol(), 1_000_000_000);
+
+        mgr.apply_balance_update(2_000_000_000, Some(0))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mgr.wsol_balance(),
+            0,
+            "external wsol=0 must clear pending floor"
+        );
         assert_eq!(mgr.test_pending_expected_wsol(), 0);
     }
 
@@ -1323,7 +1362,13 @@ mod tests {
     fn compute_effective_wsol_unit() {
         assert_eq!(
             compute_effective_wsol_on_snapshot(1_000_000_000, 0),
-            (1_000_000_000, false)
+            (0, true),
+            "external zero clears pending floor"
+        );
+        assert_eq!(
+            compute_effective_wsol_on_snapshot(1_000_000_000, 500_000_000),
+            (1_000_000_000, false),
+            "partial snapshot below pending keeps floor"
         );
         assert_eq!(
             compute_effective_wsol_on_snapshot(1_000_000_000, 1_000_000_000),
