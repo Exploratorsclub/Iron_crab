@@ -459,7 +459,7 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
     }
 
     fn nats_enabled(&self) -> bool {
-        self.ctx.nats.is_some()
+        self.ctx.nats.is_some() || self.publish_tx.is_some()
     }
 
     fn enqueue_core_market_event(
@@ -634,6 +634,16 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
 
     fn is_hot_pool(&self, pool: &Pubkey) -> bool {
         self.ctx.hot_pool_registry.is_hot_pool(*pool)
+    }
+
+    fn is_open_position_pumpfun_pin(&self, pool: &Pubkey) -> bool {
+        if !self.ctx.hot_pool_registry.is_position_pin_for_pool(*pool) {
+            return false;
+        }
+        matches!(
+            self.ctx.live_pool_cache.get(pool),
+            Some(CachedPoolState::PumpFun(_))
+        )
     }
 
     fn is_enrichment_member(&self, pool: &Pubkey) -> bool {
@@ -2390,6 +2400,16 @@ impl IngestHost for MarketDataContext {
 
     fn ingest_is_hot_pool(&self, pool: &Pubkey) -> bool {
         self.hot_pool_registry.ingest_is_hot_pool(pool)
+    }
+
+    fn ingest_is_open_position_pumpfun_pin(&self, pool: &Pubkey) -> bool {
+        if !self.hot_pool_registry.is_position_pin_for_pool(*pool) {
+            return false;
+        }
+        matches!(
+            self.live_pool_cache.get(pool),
+            Some(CachedPoolState::PumpFun(_))
+        )
     }
 
     fn ingest_is_enrichment_member(&self, pool: &Pubkey) -> bool {
@@ -4635,6 +4655,11 @@ impl MarketDataContext {
         else {
             return;
         };
+        let publish_slot = self
+            .live_pool_cache
+            .get_with_metadata(&pool)
+            .map(|(_, slot, _)| slot)
+            .unwrap_or(0);
         let Some(nats) = self
             .nats
             .as_ref()
@@ -4655,7 +4680,7 @@ impl MarketDataContext {
                 quote_mint.to_string(),
                 base_reserve,
                 quote_reserve,
-                0,
+                publish_slot,
             );
             if dex == "raydium_cpmm" {
                 if let CachedPoolState::RaydiumCpmm(ref s) = state {
@@ -5382,6 +5407,7 @@ impl MarketDataContext {
         active: &[MomentumActivePoolEntry],
     ) -> bool {
         let mut batch_dirty = false;
+        let mut had_position_pin = false;
         for a in active {
             let Ok(mint_pk) = Pubkey::from_str(a.mint.trim()) else {
                 warn!(mint = %a.mint, "MomentumActivePoolsUpdate.active: invalid mint");
@@ -5392,6 +5418,9 @@ impl MarketDataContext {
                 continue;
             };
             let is_position = a.pin_reason == MomentumActivePinReason::Position;
+            if is_position {
+                had_position_pin = true;
+            }
             let explicit_entry = ExplicitEntry {
                 consumers: HashSet::from([if is_position {
                     ConsumerId::MomentumPosition
@@ -5478,6 +5507,9 @@ impl MarketDataContext {
                 let _ =
                     admission.touch_group(Self::pool_consumer_owner(pool_pk, momentum_consumer));
             }
+        }
+        if had_position_pin {
+            batch_dirty |= self.remediate_open_position_pumpfun_registration(admission);
         }
         batch_dirty
     }
@@ -13403,6 +13435,79 @@ mod pr_b_geyser_tracking_tests {
                 .get_with_metadata(&pool)
                 .map(|(_, slot, _)| slot),
             Some(42)
+        );
+    }
+
+    /// P0: open-position PumpFun pin must publish JetStream on ENRICH + unchanged reserves.
+    #[test]
+    fn open_position_pumpfun_pin_enrich_publishes_on_balance_unchanged() {
+        use ironcrab::market_data::sidefx::handlers::md_sidefx_process_live_pool_cache_account_update;
+        use ironcrab::market_data::sidefx::MdSidefxCommand;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, _depth, _md_state_rx) = test_md_state_sender_no_worker();
+        let (publish_tx, mut publish_rx) = tokio::sync::mpsc::channel(8);
+        let worker = MarketDataSidefxHost {
+            ctx: ctx.clone(),
+            publish_tx: Some(publish_tx),
+            md_state: md_state.clone(),
+            track_worker: test_noop_track_worker_sender(),
+        };
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let account_data = test_pumpfun_bonding_curve_account_data(
+            1_073_000_000_000_000,
+            30_000_000_000,
+            500_000_000_000_000,
+            10_000_000_000,
+            creator,
+        );
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: mint,
+                bonding_curve: pool,
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: 30_000_000_000,
+                virtual_token_reserves: 1_073_000_000_000_000,
+                real_sol_reserves: 10_000_000_000,
+                real_token_reserves: 500_000_000_000_000,
+                complete: false,
+                creator,
+                cashback_enabled: false,
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool_with_reason(mint, pool, true);
+
+        let mk_job = |slot: u64| MdSidefxCommand::LivePoolCacheAccountUpdate {
+            run_id: "open-pos-pumpfun".into(),
+            pool_pubkey: pool,
+            owner: PUMPFUN_PROGRAM_OWNER,
+            account_data: account_data.clone(),
+            slot,
+            grpc_recv_at: Instant::now(),
+            update_class: SidefxUpdateClass::Enrich,
+        };
+
+        let mut scratch = MdSidefxBurstScratch::new();
+        md_sidefx_process_live_pool_cache_account_update(&worker, &mk_job(20), &mut scratch);
+        assert!(
+            publish_rx.try_recv().is_ok(),
+            "first ENRICH upsert must publish for open-position PumpFun pin"
+        );
+        while publish_rx.try_recv().is_ok() {}
+
+        let mut scratch2 = MdSidefxBurstScratch::new();
+        md_sidefx_process_live_pool_cache_account_update(&worker, &mk_job(21), &mut scratch2);
+        assert!(
+            publish_rx.try_recv().is_ok(),
+            "unchanged reserves on ENRICH must still publish for open-position PumpFun pin"
         );
     }
 

@@ -27,6 +27,9 @@ pub trait IngestHost: Send + Sync {
 
     fn ingest_is_hot_pool(&self, pool: &Pubkey) -> bool;
 
+    /// Scope C: open-position pin on a PumpFun bonding-curve pool (never drop Geyser updates).
+    fn ingest_is_open_position_pumpfun_pin(&self, pool: &Pubkey) -> bool;
+
     /// P2 EnrichmentRegistry: pool_mint_map ∪ bonding-curve priority ∪ hot-pool pins.
     fn ingest_is_enrichment_member(&self, pool: &Pubkey) -> bool;
 

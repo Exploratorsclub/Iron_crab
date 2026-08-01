@@ -75,6 +75,10 @@ impl<T: IngestHost + ?Sized> IngestHost for Arc<T> {
         (**self).ingest_is_hot_pool(pool)
     }
 
+    fn ingest_is_open_position_pumpfun_pin(&self, pool: &solana_sdk::pubkey::Pubkey) -> bool {
+        (**self).ingest_is_open_position_pumpfun_pin(pool)
+    }
+
     fn ingest_is_enrichment_member(&self, pool: &solana_sdk::pubkey::Pubkey) -> bool {
         (**self).ingest_is_enrichment_member(pool)
     }

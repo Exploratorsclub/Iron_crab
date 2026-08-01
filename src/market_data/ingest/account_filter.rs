@@ -102,6 +102,9 @@ pub fn account_geyser_update_relevance<H: IngestHost>(
     }
 
     let pool_pk = u.pubkey;
+    if u.owner == PUMPFUN_PROGRAM_OWNER && host.ingest_is_open_position_pumpfun_pin(&pool_pk) {
+        return AccountGeyserRelevance::Relevant;
+    }
     if host.ingest_is_enrichment_member(&pool_pk) {
         inc_market_data_account_relevance_enrichment_hit_total();
         return AccountGeyserRelevance::Relevant;
@@ -203,6 +206,9 @@ pub fn account_geyser_dispatch_priority_high<H: IngestHost>(
     u: &GeyserAccountUpdate,
 ) -> bool {
     let pool_pk = u.pubkey;
+    if host.ingest_is_open_position_pumpfun_pin(&pool_pk) {
+        return true;
+    }
     if account_geyser_update_is_dex_pool_owner(&u.owner) && host.ingest_is_hot_pool(&pool_pk) {
         return true;
     }
@@ -292,6 +298,10 @@ mod tests {
 
         fn ingest_is_hot_pool(&self, pool: &Pubkey) -> bool {
             self.hot_pools.contains(pool)
+        }
+
+        fn ingest_is_open_position_pumpfun_pin(&self, _pool: &Pubkey) -> bool {
+            false
         }
 
         fn ingest_is_enrichment_member(&self, pool: &Pubkey) -> bool {
