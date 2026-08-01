@@ -619,6 +619,16 @@ impl LockManager {
             .count()
     }
 
+    /// Snapshot of mints with non-zero available balance (for liquidation retry merge).
+    pub fn non_zero_available_token_balances(&self) -> Vec<(String, u64)> {
+        self.available_tokens
+            .read()
+            .iter()
+            .filter(|(_, balance)| **balance > 0)
+            .map(|(mint, balance)| (mint.clone(), *balance))
+            .collect()
+    }
+
     /// Get free-to-spend capital for the next BUY (same rule as [`Self::try_lock_capital`]
     /// for empty `tokens`): [`Self::available_wsol`] after the first WSOL update, else
     /// [`Self::available_sol`].
@@ -1489,6 +1499,23 @@ mod tests {
         m.release_locks("sell-in-flight");
         m.set_available_token_balance(M.to_string(), 1_000_000);
         assert_eq!(m.available_token_balance(M), 1_000_000u64);
+    }
+
+    #[test]
+    fn test_non_zero_available_token_balances_snapshot() {
+        let m = LockManager::new(1_000_000_000);
+        assert!(m.non_zero_available_token_balances().is_empty());
+
+        m.set_available_token_balance("MintA".to_string(), 100);
+        m.set_available_token_balance("MintB".to_string(), 0);
+        m.set_available_token_balance("MintC".to_string(), 200);
+
+        let mut snap = m.non_zero_available_token_balances();
+        snap.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            snap,
+            vec![("MintA".to_string(), 100), ("MintC".to_string(), 200),]
+        );
     }
 
     #[test]

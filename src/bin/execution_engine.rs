@@ -2578,6 +2578,178 @@ struct PumpfunLiquidationSellOutcome {
     missing_creator: bool,
 }
 
+/// Liquidation inventory row: (mint, balance_raw, decimals, token_program, token_account_pubkey).
+type LiquidationInventoryRow = (String, u64, u8, String, String);
+
+const MAX_LIQUIDATION_RETRY_ROUNDS: u32 = 2;
+const LIQUIDATION_RETRY_INTER_PASS_SLEEP_SECS: u64 = 10;
+const LIQUIDATION_RETRY_SET_MISMATCH_REFETCH_MS: u64 = 1500;
+
+async fn liquidation_fetch_rpc_inventory(
+    ctx: &ExecutionContext,
+    owner: Pubkey,
+) -> Vec<LiquidationInventoryRow> {
+    let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        .expect("valid token program");
+    let token_2022_program_id = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+        .expect("valid token-2022 program");
+
+    let mut rpc_token_accounts = ctx
+        .rpc
+        .rpc
+        .get_token_accounts_by_owner(&owner, TokenAccountsFilter::ProgramId(token_program_id))
+        .await
+        .unwrap_or_default();
+
+    if let Ok(mut accounts_2022) = ctx
+        .rpc
+        .rpc
+        .get_token_accounts_by_owner(
+            &owner,
+            TokenAccountsFilter::ProgramId(token_2022_program_id),
+        )
+        .await
+    {
+        rpc_token_accounts.append(&mut accounts_2022);
+    }
+
+    let mut inventory = Vec::new();
+    for ta in &rpc_token_accounts {
+        let parsed = match &ta.account.data {
+            UiAccountData::Json(parsed) => parsed,
+            _ => continue,
+        };
+        let info = match parsed.parsed.get("info") {
+            Some(v) => v,
+            None => continue,
+        };
+        let mint_str = info
+            .get("mint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let balance_str = info
+            .get("tokenAmount")
+            .and_then(|v| v.get("amount"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("0");
+        let balance_raw: u64 = balance_str.parse().unwrap_or(0);
+        let decimals = info
+            .get("tokenAmount")
+            .and_then(|v| v.get("decimals"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(6) as u8;
+        let token_prog_str = ta.account.owner.clone();
+        let ta_pubkey_str = ta.pubkey.clone();
+
+        if balance_raw > 0 && mint_str != SOL_MINT && mint_str != WSOL_MINT {
+            inventory.push((
+                mint_str,
+                balance_raw,
+                decimals,
+                token_prog_str,
+                ta_pubkey_str,
+            ));
+        }
+    }
+    inventory
+}
+
+async fn liquidation_count_rpc_nonzero_tokens(ctx: &ExecutionContext, owner: Pubkey) -> u32 {
+    liquidation_fetch_rpc_inventory(ctx, owner)
+        .await
+        .len()
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
+fn liquidation_merge_lockmanager_nonzero_tokens(
+    ctx: &ExecutionContext,
+    owner: &Pubkey,
+    inventory: &mut Vec<LiquidationInventoryRow>,
+) -> usize {
+    let mut merged = 0usize;
+    for (mint, lm_balance) in ctx.lock_manager.non_zero_available_token_balances() {
+        if mint == SOL_MINT || mint == WSOL_MINT || lm_balance == 0 {
+            continue;
+        }
+        if let Some(row) = inventory.iter_mut().find(|(m, ..)| m == &mint) {
+            if row.1 < lm_balance {
+                info!(
+                    mint = %mint,
+                    rpc_balance_raw = row.1,
+                    lockmanager_balance_raw = lm_balance,
+                    "Liquidation retry: bumped inventory balance from LockManager"
+                );
+                row.1 = lm_balance;
+            }
+            continue;
+        }
+        let Ok(mint_pk) = Pubkey::from_str(&mint) else {
+            continue;
+        };
+        let token_program = ExecutionContext::token_program_for_mint_cached(
+            ctx.live_pool_cache.as_deref(),
+            &mint_pk,
+            None,
+        );
+        let decimals = ctx
+            .live_pool_cache
+            .as_ref()
+            .and_then(|c| c.get_mint_decimals(&mint_pk))
+            .unwrap_or(6);
+        let ata = ExecutionContext::ata_for_owner_mint(owner, &mint_pk, &token_program);
+        inventory.push((
+            mint.clone(),
+            lm_balance,
+            decimals,
+            token_program.to_string(),
+            ata.to_string(),
+        ));
+        merged += 1;
+        info!(
+            mint = %mint,
+            balance_raw = lm_balance,
+            "Liquidation retry: merged LockManager-only token into inventory"
+        );
+    }
+    merged
+}
+
+async fn liquidation_build_retry_inventory(
+    ctx: &ExecutionContext,
+    owner: Pubkey,
+) -> Vec<LiquidationInventoryRow> {
+    let mut inventory = liquidation_fetch_rpc_inventory(ctx, owner).await;
+    let lm_mints: HashSet<String> = ctx
+        .lock_manager
+        .non_zero_available_token_balances()
+        .into_iter()
+        .map(|(m, _)| m)
+        .filter(|m| m != SOL_MINT && m != WSOL_MINT)
+        .collect();
+    let rpc_mints: HashSet<String> = inventory.iter().map(|(m, ..)| m.clone()).collect();
+    let lm_only: Vec<&String> = lm_mints.difference(&rpc_mints).collect();
+    if !lm_only.is_empty() {
+        info!(
+            lockmanager_only_mints = ?lm_only,
+            "Liquidation retry: LockManager/RPC mint set mismatch; brief RPC re-fetch"
+        );
+        tokio::time::sleep(Duration::from_millis(
+            LIQUIDATION_RETRY_SET_MISMATCH_REFETCH_MS,
+        ))
+        .await;
+        inventory = liquidation_fetch_rpc_inventory(ctx, owner).await;
+    }
+    let merged = liquidation_merge_lockmanager_nonzero_tokens(ctx, &owner, &mut inventory);
+    info!(
+        retry_positions = inventory.len(),
+        lockmanager_merged = merged,
+        "Liquidation retry: inventory built"
+    );
+    inventory
+}
+
 #[cfg(test)]
 impl ExecutionContext {
     fn test_for_pa2_metrics(
@@ -3832,6 +4004,33 @@ impl ExecutionContext {
         });
     }
 
+    /// Apply authoritative WSOL=0 locally after a confirmed unwrap / ATA close (cold path).
+    /// Complements JetStream snapshots when Geyser/MD propagation lags (#348 / Scope 55).
+    /// State-only: does not touch native SOL or `AVAILABLE_SOL_LAMPORTS` (KNOWN_BUG #23).
+    /// Unwrap TX counters (`WSOL_UNWRAP_*`) stay on the send path (WsolManager / future
+    /// liquidation send site) — not here, to avoid double-counting.
+    fn apply_confirmed_local_wsol_zero(&self, reason: &str, signature: Option<&str>) {
+        let prev = self.lock_manager.wsol_balance();
+        if let Some(ref pending) = self.wsol_pending_wrap {
+            pending.clear();
+        }
+        self.lock_manager.update_wsol_only(0);
+        ironcrab::metrics::WSOL_BALANCE_LAMPORTS.store(0, Ordering::Relaxed);
+        if prev > 0 || signature.is_some() {
+            info!(
+                event = "wsol_local_zero_after_unwrap",
+                previous_wsol_lamports = prev,
+                reason = reason,
+                signature = signature,
+                "Applied local WSOL=0 after confirmed unwrap/ATA close"
+            );
+        }
+        if let Some(ref tx) = self.wsol_balance_tx {
+            let sol = self.lock_manager.total_native_sol();
+            let _ = tx.try_send((sol, Some(0)));
+        }
+    }
+
     async fn run_liquidation_job(
         ctx: Arc<ExecutionContext>,
         max_slippage_bps: u32,
@@ -3974,499 +4173,467 @@ impl ExecutionContext {
 
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
 
-        // Liquidation inventory: RPC-based (getTokenAccountsByOwner).
-        // Liquidation is a manual safety action — RPC calls are acceptable here.
-        // This bypasses JetStream snapshot staleness and ATA derivation issues.
-        let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-            .expect("valid token program");
-        let token_2022_program_id = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
-            .expect("valid token-2022 program");
-
-        info!(wallet = %owner, "Liquidation: fetching wallet inventory via RPC (getTokenAccountsByOwner)");
-
-        let mut rpc_token_accounts = ctx
-            .rpc
-            .rpc
-            .get_token_accounts_by_owner(&owner, TokenAccountsFilter::ProgramId(token_program_id))
-            .await
-            .unwrap_or_default();
-
-        if let Ok(mut accounts_2022) = ctx
-            .rpc
-            .rpc
-            .get_token_accounts_by_owner(
-                &owner,
-                TokenAccountsFilter::ProgramId(token_2022_program_id),
-            )
-            .await
-        {
-            rpc_token_accounts.append(&mut accounts_2022);
-        }
-
-        info!(
-            wallet = %owner,
-            spl_plus_t22_accounts = rpc_token_accounts.len(),
-            "Liquidation: RPC owner-scan complete"
-        );
-
-        // Parse RPC results into (mint, balance, decimals, token_program, token_account_pubkey)
-        let mut inventory: Vec<(String, u64, u8, String, String)> = Vec::new();
-        for ta in &rpc_token_accounts {
-            let parsed = match &ta.account.data {
-                UiAccountData::Json(parsed) => parsed,
-                _ => continue,
-            };
-            let info = match parsed.parsed.get("info") {
-                Some(v) => v,
-                None => continue,
-            };
-            let mint_str = info
-                .get("mint")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let balance_str = info
-                .get("tokenAmount")
-                .and_then(|v| v.get("amount"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("0");
-            let balance_raw: u64 = balance_str.parse().unwrap_or(0);
-            let decimals = info
-                .get("tokenAmount")
-                .and_then(|v| v.get("decimals"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(6) as u8;
-            let token_prog_str = ta.account.owner.clone();
-            let ta_pubkey_str = ta.pubkey.clone();
-
-            if balance_raw > 0 && mint_str != SOL_MINT && mint_str != WSOL_MINT {
-                inventory.push((
-                    mint_str,
-                    balance_raw,
-                    decimals,
-                    token_prog_str,
-                    ta_pubkey_str,
-                ));
-            }
-        }
-
-        info!(
-            non_zero_positions = inventory.len(),
-            "Liquidation: inventory filtered (non-zero, non-SOL/WSOL)"
-        );
-
-        // PA-4: filter inventory and cap seed amounts via PositionAuthority (no ghost LockManager seeds).
-        let inventory = {
-            let pa = ctx.position_authority.lock();
-            let mut authority_filtered_inventory = Vec::with_capacity(inventory.len());
-            for (mint_str, balance_raw, decimals, token_prog, ta_pubkey) in inventory {
-                match liquidation_lockmanager_seed_decision(&pa, &mint_str, balance_raw) {
-                    LiquidationSeedDecision::Skip => {
-                        info!(
-                            mint = %mint_str,
-                            rpc_balance_raw = balance_raw,
-                            "Liquidation: skipped LockManager seed (authority_closed_or_zero)"
-                        );
-                        record_liquidation_seed_skipped_authority_total();
-                    }
-                    LiquidationSeedDecision::Seed(seed_amount) if seed_amount > 0 => {
-                        if seed_amount < balance_raw {
-                            info!(
-                                mint = %mint_str,
-                                rpc_balance_raw = balance_raw,
-                                authority_capped_seed = seed_amount,
-                                "Liquidation: capped LockManager seed to PositionAuthority tradable"
-                            );
-                        }
-                        authority_filtered_inventory.push((
-                            mint_str,
-                            seed_amount,
-                            decimals,
-                            token_prog,
-                            ta_pubkey,
-                        ));
-                    }
-                    LiquidationSeedDecision::Seed(_) => {}
-                }
-            }
-            authority_filtered_inventory
-        };
-
-        info!(
-            positions_after_authority_guard = inventory.len(),
-            "Liquidation: inventory after PositionAuthority seed guard"
-        );
-
-        // Seed LockManager with RPC-discovered balances so that the
-        // SIM_INSUFFICIENT_BALANCE preflight check passes for SELL intents.
-        for (mint_str, balance_raw, _decimals, _token_prog, _ta_pubkey) in &inventory {
-            ctx.lock_manager
-                .set_available_token_balance(mint_str.clone(), *balance_raw);
-            info!(
-                mint = %mint_str,
-                balance_raw = balance_raw,
-                "Liquidation: seeded LockManager with RPC balance"
-            );
-        }
-
-        for (mint_str, balance_raw, decimals, token_program_str, ta_pubkey_str) in &inventory {
-            let balance_raw = *balance_raw;
-            let decimals = *decimals;
-            #[cfg(unix)]
-            maybe_ping_watchdog();
-
-            let mint = match Pubkey::from_str(mint_str) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(
-                        mint = %mint_str,
-                        error = %e,
-                        balance_raw,
-                        "LIQUIDATION SKIP: invalid mint pubkey, cannot parse"
-                    );
-                    continue;
-                }
-            };
-            if mint == sol_mint {
-                continue;
-            }
-            let token_program = match Pubkey::from_str(token_program_str) {
-                Ok(p) => p,
-                Err(_) => {
-                    Self::token_program_for_mint_cached(ctx.live_pool_cache.as_deref(), &mint, None)
-                }
-            };
-            #[cfg(unix)]
-            maybe_ping_watchdog();
-            // Use the actual token account pubkey from RPC (not derived ATA)
-            let ta_pubkey = match Pubkey::from_str(ta_pubkey_str) {
-                Ok(p) => p,
-                Err(_) => Self::ata_for_owner_mint(&owner, &mint, &token_program),
-            };
-            let amount_in: u64 = balance_raw;
-            #[cfg(unix)]
-            maybe_ping_watchdog();
-
-            // Build metadata/resources similar to sell-all.
-            let mut metadata: HashMap<String, String> = HashMap::new();
-            metadata.insert("purpose".to_string(), "liquidation".to_string());
-            metadata.insert("kill_switch".to_string(), "true".to_string());
-            metadata.insert("mint_decimals".to_string(), decimals.to_string());
-            metadata.insert("token_account".to_string(), ta_pubkey.to_string());
-            metadata.insert("token_program".to_string(), token_program.to_string());
-            // Exit type/reason for Grafana dashboard display
-            metadata.insert("exit_type".to_string(), "LIQUIDATION".to_string());
-            if let Some(r) = &reason {
-                metadata.insert("kill_reason".to_string(), r.clone());
-                metadata.insert("exit_reason".to_string(), format!("Kill switch: {}", r));
+        let mut liquidation_round = 0u32;
+        loop {
+            if liquidation_round > 0 {
+                info!(
+                    round = liquidation_round,
+                    max_rounds = MAX_LIQUIDATION_RETRY_ROUNDS,
+                    "Liquidation retry pass: waiting before re-inventory"
+                );
+                tokio::time::sleep(Duration::from_secs(LIQUIDATION_RETRY_INTER_PASS_SLEEP_SECS))
+                    .await;
+                #[cfg(unix)]
+                maybe_ping_watchdog();
             } else {
-                metadata.insert(
-                    "exit_reason".to_string(),
-                    "Kill switch liquidation".to_string(),
+                info!(
+                    wallet = %owner,
+                    "Liquidation: fetching wallet inventory via RPC (getTokenAccountsByOwner)"
                 );
             }
 
-            let mut resources = TradeResources {
-                input_mint: mint.to_string(),
-                output_mint: sol_mint.to_string(),
-                pools: vec![],
-                accounts: vec![ta_pubkey.to_string()],
-                token_program: Some(token_program.to_string()),
+            let inventory_rows = if liquidation_round == 0 {
+                let rows = liquidation_fetch_rpc_inventory(&ctx, owner).await;
+                info!(
+                    wallet = %owner,
+                    non_zero_positions = rows.len(),
+                    "Liquidation: RPC owner-scan complete / inventory filtered (non-zero, non-SOL/WSOL)"
+                );
+                rows
+            } else {
+                liquidation_build_retry_inventory(&ctx, owner).await
             };
 
-            let mut min_out_sol: Option<u64> = None;
-            let mut quote_attempts: Vec<String> = Vec::new();
+            // PA-4: filter inventory and cap seed amounts via PositionAuthority (no ghost LockManager seeds).
+            let inventory = {
+                let pa = ctx.position_authority.lock();
+                let mut authority_filtered_inventory = Vec::with_capacity(inventory_rows.len());
+                for (mint_str, balance_raw, decimals, token_prog, ta_pubkey) in inventory_rows {
+                    match liquidation_lockmanager_seed_decision(&pa, &mint_str, balance_raw) {
+                        LiquidationSeedDecision::Skip => {
+                            info!(
+                                mint = %mint_str,
+                                rpc_balance_raw = balance_raw,
+                                "Liquidation: skipped LockManager seed (authority_closed_or_zero)"
+                            );
+                            record_liquidation_seed_skipped_authority_total();
+                        }
+                        LiquidationSeedDecision::Seed(seed_amount) if seed_amount > 0 => {
+                            if seed_amount < balance_raw {
+                                info!(
+                                    mint = %mint_str,
+                                    rpc_balance_raw = balance_raw,
+                                    authority_capped_seed = seed_amount,
+                                    "Liquidation: capped LockManager seed to PositionAuthority tradable"
+                                );
+                            }
+                            authority_filtered_inventory.push((
+                                mint_str,
+                                seed_amount,
+                                decimals,
+                                token_prog,
+                                ta_pubkey,
+                            ));
+                        }
+                        LiquidationSeedDecision::Seed(_) => {}
+                    }
+                }
+                authority_filtered_inventory
+            };
 
-            // LIQUIDATION ROUTING (Cold Path, Scope 51):
-            // - Known **active** PumpFun bonding curve (`LivePoolCache` complete=false): try direct
-            //   PumpFun SELL first to avoid 45s PumpSwap quote/discovery before first SELL.
-            // - Known **migrated** (complete) or Geyser-unknown: multi-pool + cache first; PumpFun
-            //   only as last resort (stale quotes can 6005 on completed curves).
-            // - 6005 at send time still triggers `try_6005_pumpfun_retry` (PumpSwap).
+            info!(
+                positions_after_authority_guard = inventory.len(),
+                "Liquidation: inventory after PositionAuthority seed guard"
+            );
 
-            let try_pumpfun_first =
-                liquidation_pumpfun_sell_preference(ctx.live_pool_cache.as_deref(), &mint);
+            // Seed LockManager with RPC-discovered balances so that the
+            // SIM_INSUFFICIENT_BALANCE preflight check passes for SELL intents.
+            for (mint_str, balance_raw, _decimals, _token_prog, _ta_pubkey) in &inventory {
+                ctx.lock_manager
+                    .set_available_token_balance(mint_str.clone(), *balance_raw);
+                info!(
+                    mint = %mint_str,
+                    balance_raw = balance_raw,
+                    "Liquidation: seeded LockManager with RPC balance"
+                );
+            }
 
-            let mut pumpfun_preferred_missing_creator = false;
-
-            if try_pumpfun_first {
-                if let Some(ref pfun) = pumpfun {
-                    let outcome = ctx
-                        .liquidation_build_pumpfun_sell(
-                            pfun,
-                            &mint,
-                            &sol_mint,
-                            amount_in,
-                            max_slippage_bps,
-                            "pumpfun_preferred",
-                            &mut metadata,
-                            &mut resources,
-                            &mut quote_attempts,
-                        )
-                        .await;
-                    min_out_sol = outcome.min_out;
-                    pumpfun_preferred_missing_creator = outcome.missing_creator;
-                    #[cfg(unix)]
-                    maybe_ping_watchdog();
+            if inventory.is_empty() {
+                if liquidation_round == 0 {
+                    info!("Liquidation: no non-zero token positions to liquidate");
+                } else {
+                    info!(
+                        round = liquidation_round,
+                        "Liquidation retry pass: empty inventory"
+                    );
                 }
             }
 
-            if min_out_sol.is_none() {
-                // I-24d Scope 21: one EnsureMeteoraDlmmPoolState + bounded JetStream wait per liquidation mint
-                // when SLAVE has DLMM rows for this mint but none are explicitly Ready (no connector RPC).
-                if let Some(ref cache) = ctx.live_pool_cache {
-                    let rows = cache.meteora_dlmm_pools_for_mint(&mint);
-                    if !rows.is_empty()
-                        && !cache.base_mint_has_explicit_meteora_dlmm_ready_pool(&mint)
-                    {
-                        let pool_hint = rows
-                            .iter()
-                            .find(|(_, s)| s.token_x_mint == mint || s.token_y_mint == mint)
-                            .map(|(pk, _)| pk.to_string());
+            for (mint_str, balance_raw, decimals, token_program_str, ta_pubkey_str) in &inventory {
+                let balance_raw = *balance_raw;
+                let decimals = *decimals;
+                #[cfg(unix)]
+                maybe_ping_watchdog();
+
+                let mint = match Pubkey::from_str(mint_str) {
+                    Ok(m) => m,
+                    Err(e) => {
                         warn!(
-                            mint = %mint,
-                            dlmm_rows = rows.len(),
-                            pool_address_hint = ?pool_hint,
-                            reason = "liquidation: Meteora DLMM pools in SLAVE but no explicit Ready — requesting EnsureMeteoraDlmmPoolState from market-data (bounded wait, one attempt per mint)",
-                            "Meteora DLMM cold-path: pre-quote recovery request"
+                            mint = %mint_str,
+                            error = %e,
+                            balance_raw,
+                            "LIQUIDATION SKIP: invalid mint pubkey, cannot parse"
                         );
-                        // Bug #34: capture evidence **before** the request (same as Orca cold-path). If we
-                        // snapshot after `ControlResponse::Ok`, a fast JetStream merge can make `before`
-                        // equal the post-recovery tuple and the wait never observes a change.
-                        let hint_pk = pool_hint.as_deref().and_then(|s| Pubkey::from_str(s).ok());
-                        let before_evidence = hint_pk.and_then(|pk| {
-                            cache.get(&pk).and_then(|st| match st {
-                                CachedPoolState::Meteora(s) => Some((
-                                    s.active_id,
-                                    s.bin_step,
-                                    s.reserve_x_balance,
-                                    s.reserve_y_balance,
-                                )),
-                                _ => None,
-                            })
-                        });
-                        if let DiscoveryRequestOutcome::Ok = ctx
-                            .request_meteora_dlmm_recovery_and_wait(
-                                mint_str.as_str(),
-                                pool_hint.as_deref(),
+                        continue;
+                    }
+                };
+                if mint == sol_mint {
+                    continue;
+                }
+                let token_program = match Pubkey::from_str(token_program_str) {
+                    Ok(p) => p,
+                    Err(_) => Self::token_program_for_mint_cached(
+                        ctx.live_pool_cache.as_deref(),
+                        &mint,
+                        None,
+                    ),
+                };
+                #[cfg(unix)]
+                maybe_ping_watchdog();
+                // Use the actual token account pubkey from RPC (not derived ATA)
+                let ta_pubkey = match Pubkey::from_str(ta_pubkey_str) {
+                    Ok(p) => p,
+                    Err(_) => Self::ata_for_owner_mint(&owner, &mint, &token_program),
+                };
+                let amount_in: u64 = balance_raw;
+                #[cfg(unix)]
+                maybe_ping_watchdog();
+
+                // Build metadata/resources similar to sell-all.
+                let mut metadata: HashMap<String, String> = HashMap::new();
+                metadata.insert("purpose".to_string(), "liquidation".to_string());
+                metadata.insert("kill_switch".to_string(), "true".to_string());
+                metadata.insert("mint_decimals".to_string(), decimals.to_string());
+                metadata.insert("token_account".to_string(), ta_pubkey.to_string());
+                metadata.insert("token_program".to_string(), token_program.to_string());
+                // Exit type/reason for Grafana dashboard display
+                metadata.insert("exit_type".to_string(), "LIQUIDATION".to_string());
+                if let Some(r) = &reason {
+                    metadata.insert("kill_reason".to_string(), r.clone());
+                    metadata.insert("exit_reason".to_string(), format!("Kill switch: {}", r));
+                } else {
+                    metadata.insert(
+                        "exit_reason".to_string(),
+                        "Kill switch liquidation".to_string(),
+                    );
+                }
+
+                let mut resources = TradeResources {
+                    input_mint: mint.to_string(),
+                    output_mint: sol_mint.to_string(),
+                    pools: vec![],
+                    accounts: vec![ta_pubkey.to_string()],
+                    token_program: Some(token_program.to_string()),
+                };
+
+                let mut min_out_sol: Option<u64> = None;
+                let mut quote_attempts: Vec<String> = Vec::new();
+
+                // LIQUIDATION ROUTING (Cold Path, Scope 51):
+                // - Known **active** PumpFun bonding curve (`LivePoolCache` complete=false): try direct
+                //   PumpFun SELL first to avoid 45s PumpSwap quote/discovery before first SELL.
+                // - Known **migrated** (complete) or Geyser-unknown: multi-pool + cache first; PumpFun
+                //   only as last resort (stale quotes can 6005 on completed curves).
+                // - 6005 at send time still triggers `try_6005_pumpfun_retry` (PumpSwap).
+
+                let try_pumpfun_first =
+                    liquidation_pumpfun_sell_preference(ctx.live_pool_cache.as_deref(), &mint);
+
+                let mut pumpfun_preferred_missing_creator = false;
+
+                if try_pumpfun_first {
+                    if let Some(ref pfun) = pumpfun {
+                        let outcome = ctx
+                            .liquidation_build_pumpfun_sell(
+                                pfun,
+                                &mint,
+                                &sol_mint,
+                                amount_in,
+                                max_slippage_bps,
+                                "pumpfun_preferred",
+                                &mut metadata,
+                                &mut resources,
+                                &mut quote_attempts,
                             )
-                            .await
-                        {
-                            if let Some(pk) = hint_pk {
-                                if wait_for_meteora_dlmm_slave_after_recovery(
-                                    cache,
-                                    &pk,
-                                    before_evidence,
-                                    DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
-                                    DISCOVERY_CACHE_POLL_INTERVAL_MS,
-                                )
-                                .await
-                                {
-                                    for (pool_addr, ms) in cache.meteora_dlmm_pools_for_mint(&mint)
-                                    {
-                                        let _ =
-                                            meteora.inject_cached_meteora_state(&pool_addr, &ms);
-                                    }
-                                    info!(
-                                        mint = %mint,
-                                        pool = %pk,
-                                        "Meteora DLMM cold-path: SLAVE shows fresh explicit Ready after recovery — continuing liquidation quotes"
-                                    );
-                                } else {
-                                    warn!(
-                                        mint = %mint,
-                                        pool = %pk,
-                                        timeout_ms = DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
-                                        "Meteora DLMM cold-path: ControlResponse ok but bounded wait for SLAVE explicit Ready + fresh evidence timed out"
-                                    );
-                                }
-                            }
-                        }
+                            .await;
+                        min_out_sol = outcome.min_out;
+                        pumpfun_preferred_missing_creator = outcome.missing_creator;
+                        #[cfg(unix)]
+                        maybe_ping_watchdog();
                     }
                 }
 
-                // I-24d Scope 22: one EnsureRaydiumAmmPoolState + bounded JetStream wait per liquidation mint
-                // when SLAVE has Raydium AMM rows for this mint but none are explicitly Ready (no connector RPC).
-                if let Some(ref cache) = ctx.live_pool_cache {
-                    let rows = cache.raydium_amm_pools_for_mint(&mint);
-                    if !rows.is_empty()
-                        && !cache.base_mint_has_explicit_raydium_amm_ready_pool(&mint)
-                    {
-                        let pool_hint = rows
-                            .iter()
-                            .find(|(_, s)| s.base_mint == mint || s.quote_mint == mint)
-                            .map(|(pk, _)| pk.to_string());
-                        warn!(
-                            mint = %mint,
-                            raydium_amm_rows = rows.len(),
-                            pool_address_hint = ?pool_hint,
-                            reason = "liquidation: Raydium AMM pools in SLAVE but no explicit Ready — requesting EnsureRaydiumAmmPoolState from market-data (bounded wait, one attempt per mint)",
-                            "Raydium AMM cold-path: pre-quote recovery request"
-                        );
-                        let hint_pk = pool_hint.as_deref().and_then(|s| Pubkey::from_str(s).ok());
-                        let before_evidence = hint_pk.and_then(|pk| {
-                            cache
-                                .raydium_amm_slave_readiness_snapshot(&pk)
-                                .map(|(s, _)| {
-                                    (
-                                        s.coin_reserve.unwrap_or(0),
-                                        s.pc_reserve.unwrap_or(0),
-                                        s.serum_bids,
-                                        s.serum_asks,
-                                        s.serum_event_queue,
-                                    )
-                                })
-                        });
-                        if let DiscoveryRequestOutcome::Ok = ctx
-                            .request_raydium_amm_recovery_and_wait(
-                                mint_str.as_str(),
-                                pool_hint.as_deref(),
-                            )
-                            .await
+                if min_out_sol.is_none() {
+                    // I-24d Scope 21: one EnsureMeteoraDlmmPoolState + bounded JetStream wait per liquidation mint
+                    // when SLAVE has DLMM rows for this mint but none are explicitly Ready (no connector RPC).
+                    if let Some(ref cache) = ctx.live_pool_cache {
+                        let rows = cache.meteora_dlmm_pools_for_mint(&mint);
+                        if !rows.is_empty()
+                            && !cache.base_mint_has_explicit_meteora_dlmm_ready_pool(&mint)
                         {
-                            if let Some(pk) = hint_pk {
-                                if wait_for_raydium_amm_slave_after_recovery(
-                                    cache,
-                                    &pk,
-                                    before_evidence,
-                                    DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
-                                    DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                            let pool_hint = rows
+                                .iter()
+                                .find(|(_, s)| s.token_x_mint == mint || s.token_y_mint == mint)
+                                .map(|(pk, _)| pk.to_string());
+                            warn!(
+                                mint = %mint,
+                                dlmm_rows = rows.len(),
+                                pool_address_hint = ?pool_hint,
+                                reason = "liquidation: Meteora DLMM pools in SLAVE but no explicit Ready — requesting EnsureMeteoraDlmmPoolState from market-data (bounded wait, one attempt per mint)",
+                                "Meteora DLMM cold-path: pre-quote recovery request"
+                            );
+                            // Bug #34: capture evidence **before** the request (same as Orca cold-path). If we
+                            // snapshot after `ControlResponse::Ok`, a fast JetStream merge can make `before`
+                            // equal the post-recovery tuple and the wait never observes a change.
+                            let hint_pk =
+                                pool_hint.as_deref().and_then(|s| Pubkey::from_str(s).ok());
+                            let before_evidence = hint_pk.and_then(|pk| {
+                                cache.get(&pk).and_then(|st| match st {
+                                    CachedPoolState::Meteora(s) => Some((
+                                        s.active_id,
+                                        s.bin_step,
+                                        s.reserve_x_balance,
+                                        s.reserve_y_balance,
+                                    )),
+                                    _ => None,
+                                })
+                            });
+                            if let DiscoveryRequestOutcome::Ok = ctx
+                                .request_meteora_dlmm_recovery_and_wait(
+                                    mint_str.as_str(),
+                                    pool_hint.as_deref(),
                                 )
                                 .await
-                                {
-                                    for (pool_addr, st) in cache.raydium_amm_pools_for_mint(&mint) {
-                                        raydium.inject_cached_amm_state(
-                                            pool_addr,
-                                            st.base_mint,
-                                            st.quote_mint,
-                                            st.coin_vault,
-                                            st.pc_vault,
-                                            st.base_decimals,
-                                            st.quote_decimals,
-                                            st.coin_reserve,
-                                            st.pc_reserve,
-                                            st.market_id,
-                                            st.serum_bids,
-                                            st.serum_asks,
-                                            st.serum_event_queue,
+                            {
+                                if let Some(pk) = hint_pk {
+                                    if wait_for_meteora_dlmm_slave_after_recovery(
+                                        cache,
+                                        &pk,
+                                        before_evidence,
+                                        DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                        DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                                    )
+                                    .await
+                                    {
+                                        for (pool_addr, ms) in
+                                            cache.meteora_dlmm_pools_for_mint(&mint)
+                                        {
+                                            let _ = meteora
+                                                .inject_cached_meteora_state(&pool_addr, &ms);
+                                        }
+                                        info!(
+                                            mint = %mint,
+                                            pool = %pk,
+                                            "Meteora DLMM cold-path: SLAVE shows fresh explicit Ready after recovery — continuing liquidation quotes"
+                                        );
+                                    } else {
+                                        warn!(
+                                            mint = %mint,
+                                            pool = %pk,
+                                            timeout_ms = DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                            "Meteora DLMM cold-path: ControlResponse ok but bounded wait for SLAVE explicit Ready + fresh evidence timed out"
                                         );
                                     }
-                                    info!(
-                                        mint = %mint,
-                                        pool = %pk,
-                                        "Raydium AMM cold-path: SLAVE shows fresh explicit Ready after recovery — continuing liquidation quotes"
-                                    );
-                                } else {
-                                    warn!(
-                                        mint = %mint,
-                                        pool = %pk,
-                                        timeout_ms = DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
-                                        "Raydium AMM cold-path: ControlResponse ok but bounded wait for SLAVE explicit Ready + fresh evidence timed out"
-                                    );
                                 }
                             }
                         }
                     }
-                }
 
-                // --- Phase 1: Multi-pool routing (preferred for liquidation) ---
-                {
-                    let mut candidates: Vec<RouteCandidate> = Vec::new();
-                    let mut record_candidate =
-                        |dex: &str, amount_out: u64, pool_id: String, accounts: Vec<String>| {
-                            candidates.push(RouteCandidate {
-                                dex: dex.to_string(),
-                                amount_out,
-                                pool_id,
-                                accounts,
-                                creator: None,
-                                execution_min_out_lamports: None,
+                    // I-24d Scope 22: one EnsureRaydiumAmmPoolState + bounded JetStream wait per liquidation mint
+                    // when SLAVE has Raydium AMM rows for this mint but none are explicitly Ready (no connector RPC).
+                    if let Some(ref cache) = ctx.live_pool_cache {
+                        let rows = cache.raydium_amm_pools_for_mint(&mint);
+                        if !rows.is_empty()
+                            && !cache.base_mint_has_explicit_raydium_amm_ready_pool(&mint)
+                        {
+                            let pool_hint = rows
+                                .iter()
+                                .find(|(_, s)| s.base_mint == mint || s.quote_mint == mint)
+                                .map(|(pk, _)| pk.to_string());
+                            warn!(
+                                mint = %mint,
+                                raydium_amm_rows = rows.len(),
+                                pool_address_hint = ?pool_hint,
+                                reason = "liquidation: Raydium AMM pools in SLAVE but no explicit Ready — requesting EnsureRaydiumAmmPoolState from market-data (bounded wait, one attempt per mint)",
+                                "Raydium AMM cold-path: pre-quote recovery request"
+                            );
+                            let hint_pk =
+                                pool_hint.as_deref().and_then(|s| Pubkey::from_str(s).ok());
+                            let before_evidence = hint_pk.and_then(|pk| {
+                                cache
+                                    .raydium_amm_slave_readiness_snapshot(&pk)
+                                    .map(|(s, _)| {
+                                        (
+                                            s.coin_reserve.unwrap_or(0),
+                                            s.pc_reserve.unwrap_or(0),
+                                            s.serum_bids,
+                                            s.serum_asks,
+                                            s.serum_event_queue,
+                                        )
+                                    })
                             });
-                        };
-
-                    // Bonding curve was quotable but creator missed on preferred pass — retry PumpFun
-                    // before blocking on the 45s PumpSwap quote/discovery timeout.
-                    if pumpfun_preferred_missing_creator {
-                        if let Some(ref pfun) = pumpfun {
-                            let outcome = ctx
-                                .liquidation_build_pumpfun_sell(
-                                    pfun,
-                                    &mint,
-                                    &sol_mint,
-                                    amount_in,
-                                    max_slippage_bps,
-                                    "pumpfun_creator_retry",
-                                    &mut metadata,
-                                    &mut resources,
-                                    &mut quote_attempts,
+                            if let DiscoveryRequestOutcome::Ok = ctx
+                                .request_raydium_amm_recovery_and_wait(
+                                    mint_str.as_str(),
+                                    pool_hint.as_deref(),
                                 )
-                                .await;
-                            min_out_sol = outcome.min_out;
-                            if outcome.min_out.is_some() {
-                                pumpfun_preferred_missing_creator = false;
+                                .await
+                            {
+                                if let Some(pk) = hint_pk {
+                                    if wait_for_raydium_amm_slave_after_recovery(
+                                        cache,
+                                        &pk,
+                                        before_evidence,
+                                        DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                        DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                                    )
+                                    .await
+                                    {
+                                        for (pool_addr, st) in
+                                            cache.raydium_amm_pools_for_mint(&mint)
+                                        {
+                                            raydium.inject_cached_amm_state(
+                                                pool_addr,
+                                                st.base_mint,
+                                                st.quote_mint,
+                                                st.coin_vault,
+                                                st.pc_vault,
+                                                st.base_decimals,
+                                                st.quote_decimals,
+                                                st.coin_reserve,
+                                                st.pc_reserve,
+                                                st.market_id,
+                                                st.serum_bids,
+                                                st.serum_asks,
+                                                st.serum_event_queue,
+                                            );
+                                        }
+                                        info!(
+                                            mint = %mint,
+                                            pool = %pk,
+                                            "Raydium AMM cold-path: SLAVE shows fresh explicit Ready after recovery — continuing liquidation quotes"
+                                        );
+                                    } else {
+                                        warn!(
+                                            mint = %mint,
+                                            pool = %pk,
+                                            timeout_ms = DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                            "Raydium AMM cold-path: ControlResponse ok but bounded wait for SLAVE explicit Ready + fresh evidence timed out"
+                                        );
+                                    }
+                                }
                             }
-                            #[cfg(unix)]
-                            maybe_ping_watchdog();
                         }
                     }
 
-                    // PumpSwap (Pump.fun AMM) with timeout guard.
-                    // For LIQUIDATION: always try PumpSwap AMM regardless of bonding_curve_known_complete.
-                    // The LivePoolCache may not know the curve is complete, but PumpSwap AMM
-                    // might still have a pool. The RPC-based discovery in quote_exact_in handles this.
-                    let pump_amm_quote = if min_out_sol.is_none() {
-                        Some(
-                            tokio::time::timeout(
-                                Duration::from_secs(PUMPSWAP_LIQUIDATION_QUOTE_TIMEOUT_SECS),
-                                pump_amm.quote_exact_in(
-                                    &mint.to_string(),
-                                    &sol_mint.to_string(),
-                                    amount_in,
-                                ),
-                            )
-                            .await,
-                        )
-                    } else {
-                        None
-                    };
-                    match pump_amm_quote {
-                        None => {} // Already logged above
-                        Some(Err(_timeout)) => {
-                            quote_attempts.push(pump_amm_liquidation_quote_timeout_str());
-                        }
-                        Some(Ok(inner)) => match inner {
-                            Ok(Some(q)) => {
+                    // --- Phase 1: Multi-pool routing (preferred for liquidation) ---
+                    {
+                        let mut candidates: Vec<RouteCandidate> = Vec::new();
+                        let mut record_candidate =
+                            |dex: &str, amount_out: u64, pool_id: String, accounts: Vec<String>| {
+                                candidates.push(RouteCandidate {
+                                    dex: dex.to_string(),
+                                    amount_out,
+                                    pool_id,
+                                    accounts,
+                                    creator: None,
+                                    execution_min_out_lamports: None,
+                                });
+                            };
+
+                        // Bonding curve was quotable but creator missed on preferred pass — retry PumpFun
+                        // before blocking on the 45s PumpSwap quote/discovery timeout.
+                        if pumpfun_preferred_missing_creator {
+                            if let Some(ref pfun) = pumpfun {
+                                let outcome = ctx
+                                    .liquidation_build_pumpfun_sell(
+                                        pfun,
+                                        &mint,
+                                        &sol_mint,
+                                        amount_in,
+                                        max_slippage_bps,
+                                        "pumpfun_creator_retry",
+                                        &mut metadata,
+                                        &mut resources,
+                                        &mut quote_attempts,
+                                    )
+                                    .await;
+                                min_out_sol = outcome.min_out;
+                                if outcome.min_out.is_some() {
+                                    pumpfun_preferred_missing_creator = false;
+                                }
                                 #[cfg(unix)]
                                 maybe_ping_watchdog();
-                                if let Some(pool_id) = q.route.first().cloned() {
-                                    // I-24d: Cache-only — no pump_amm.pool_accounts_v1_for_base_mint.
-                                    let accounts = ctx.live_pool_cache.as_ref().and_then(|c| {
-                                        c.get_ready_pump_amm_pool_accounts_by_base_mint(&mint)
-                                    });
-                                    match accounts {
-                                        Some(accounts) if accounts.len() >= 14 => {
-                                            let acct_strings: Vec<String> = accounts
-                                                .into_iter()
-                                                .map(|p| p.to_string())
-                                                .collect();
-                                            quote_attempts.push(format!(
+                            }
+                        }
+
+                        // PumpSwap (Pump.fun AMM) with timeout guard.
+                        // For LIQUIDATION: always try PumpSwap AMM regardless of bonding_curve_known_complete.
+                        // The LivePoolCache may not know the curve is complete, but PumpSwap AMM
+                        // might still have a pool. The RPC-based discovery in quote_exact_in handles this.
+                        let pump_amm_quote = if min_out_sol.is_none() {
+                            Some(
+                                tokio::time::timeout(
+                                    Duration::from_secs(PUMPSWAP_LIQUIDATION_QUOTE_TIMEOUT_SECS),
+                                    pump_amm.quote_exact_in(
+                                        &mint.to_string(),
+                                        &sol_mint.to_string(),
+                                        amount_in,
+                                    ),
+                                )
+                                .await,
+                            )
+                        } else {
+                            None
+                        };
+                        match pump_amm_quote {
+                            None => {} // Already logged above
+                            Some(Err(_timeout)) => {
+                                quote_attempts.push(pump_amm_liquidation_quote_timeout_str());
+                            }
+                            Some(Ok(inner)) => match inner {
+                                Ok(Some(q)) => {
+                                    #[cfg(unix)]
+                                    maybe_ping_watchdog();
+                                    if let Some(pool_id) = q.route.first().cloned() {
+                                        // I-24d: Cache-only — no pump_amm.pool_accounts_v1_for_base_mint.
+                                        let accounts = ctx.live_pool_cache.as_ref().and_then(|c| {
+                                            c.get_ready_pump_amm_pool_accounts_by_base_mint(&mint)
+                                        });
+                                        match accounts {
+                                            Some(accounts) if accounts.len() >= 14 => {
+                                                let acct_strings: Vec<String> = accounts
+                                                    .into_iter()
+                                                    .map(|p| p.to_string())
+                                                    .collect();
+                                                quote_attempts.push(format!(
                                                 "pump_amm=ok amount_out={} pool={} accounts_len={}",
                                                 q.amount_out,
                                                 pool_id,
                                                 acct_strings.len()
                                             ));
-                                            record_candidate(
-                                                "pump_amm",
-                                                q.amount_out,
-                                                pool_id,
-                                                acct_strings,
-                                            );
-                                        }
-                                        _ => {
-                                            // I-24d: Request discovery, wait bounded on authoritative cache state.
-                                            // pool_id from quote enables fast getAccount path in market-data.
-                                            info!(mint = %mint, pool = %pool_id, "pump_amm quote ok but ready pool_accounts missing; requesting discovery (force_refresh)");
-                                            match ctx
+                                                record_candidate(
+                                                    "pump_amm",
+                                                    q.amount_out,
+                                                    pool_id,
+                                                    acct_strings,
+                                                );
+                                            }
+                                            _ => {
+                                                // I-24d: Request discovery, wait bounded on authoritative cache state.
+                                                // pool_id from quote enables fast getAccount path in market-data.
+                                                info!(mint = %mint, pool = %pool_id, "pump_amm quote ok but ready pool_accounts missing; requesting discovery (force_refresh)");
+                                                match ctx
                                                 .request_discovery_and_wait(
                                                     &mint.to_string(),
                                                     Some(pool_id.as_str()),
@@ -4588,455 +4755,282 @@ impl ExecutionContext {
                                                 ));
                                                 }
                                             }
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            Ok(None) => {
-                                // I-24d: Cold-Path Recovery — quote cache miss/degenerate, trigger Discovery-Request.
-                                info!(
-                                    mint = %mint,
-                                    "pump_amm quote cache miss; requesting discovery from market-data"
-                                );
-                                let pool_hint = ctx
-                                    .live_pool_cache
-                                    .as_ref()
-                                    .and_then(|c| c.get_pump_amm_pool_address_by_base_mint(&mint))
-                                    .map(|p| p.to_string());
-                                match ctx
-                                    .request_discovery_and_wait(
-                                        &mint.to_string(),
-                                        pool_hint.as_deref(),
-                                        pump_amm_liquidation_discovery_force_refresh(),
-                                    )
-                                    .await
-                                {
-                                    DiscoveryRequestOutcome::Ok => {
-                                        if let Some(cache) = ctx.live_pool_cache.as_ref() {
-                                            if wait_for_usable_pump_amm_cache_state(
-                                                cache,
-                                                &mint,
-                                                PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS,
-                                                DISCOVERY_CACHE_POLL_INTERVAL_MS,
-                                            )
-                                            .await
-                                            {
-                                                // Retry quote_exact_in (cache may now have reserves + pool_accounts).
-                                                let retry_quote = pump_amm
-                                                    .quote_exact_in(
-                                                        &mint.to_string(),
-                                                        &sol_mint.to_string(),
-                                                        amount_in,
-                                                    )
-                                                    .await;
-                                                match retry_quote {
-                                                    Ok(Some(q)) if q.amount_out > 0 => {
-                                                        if let Some(pool_id) =
-                                                            q.route.first().cloned()
-                                                        {
-                                                            let accounts = cache
+                                Ok(None) => {
+                                    // I-24d: Cold-Path Recovery — quote cache miss/degenerate, trigger Discovery-Request.
+                                    info!(
+                                        mint = %mint,
+                                        "pump_amm quote cache miss; requesting discovery from market-data"
+                                    );
+                                    let pool_hint = ctx
+                                        .live_pool_cache
+                                        .as_ref()
+                                        .and_then(|c| {
+                                            c.get_pump_amm_pool_address_by_base_mint(&mint)
+                                        })
+                                        .map(|p| p.to_string());
+                                    match ctx
+                                        .request_discovery_and_wait(
+                                            &mint.to_string(),
+                                            pool_hint.as_deref(),
+                                            pump_amm_liquidation_discovery_force_refresh(),
+                                        )
+                                        .await
+                                    {
+                                        DiscoveryRequestOutcome::Ok => {
+                                            if let Some(cache) = ctx.live_pool_cache.as_ref() {
+                                                if wait_for_usable_pump_amm_cache_state(
+                                                    cache,
+                                                    &mint,
+                                                    PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS,
+                                                    DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                                                )
+                                                .await
+                                                {
+                                                    // Retry quote_exact_in (cache may now have reserves + pool_accounts).
+                                                    let retry_quote = pump_amm
+                                                        .quote_exact_in(
+                                                            &mint.to_string(),
+                                                            &sol_mint.to_string(),
+                                                            amount_in,
+                                                        )
+                                                        .await;
+                                                    match retry_quote {
+                                                        Ok(Some(q)) if q.amount_out > 0 => {
+                                                            if let Some(pool_id) =
+                                                                q.route.first().cloned()
+                                                            {
+                                                                let accounts = cache
                                                             .get_ready_pump_amm_pool_accounts_by_base_mint(&mint);
-                                                            if let Some(accounts) = accounts {
-                                                                if accounts.len() >= 14 {
-                                                                    let acct_strings: Vec<String> =
-                                                                        accounts
+                                                                if let Some(accounts) = accounts {
+                                                                    if accounts.len() >= 14 {
+                                                                        let acct_strings: Vec<
+                                                                            String,
+                                                                        > = accounts
                                                                             .into_iter()
                                                                             .map(|p| p.to_string())
                                                                             .collect();
-                                                                    quote_attempts.push(format!(
+                                                                        quote_attempts.push(format!(
                                                                     "pump_amm=ok amount_out={} pool={} accounts_len={} (after discovery)",
                                                                     q.amount_out,
                                                                     pool_id,
                                                                     acct_strings.len()
                                                                 ));
-                                                                    record_candidate(
-                                                                        "pump_amm",
-                                                                        q.amount_out,
-                                                                        pool_id,
-                                                                        acct_strings,
-                                                                    );
-                                                                } else {
-                                                                    quote_attempts.push(format!(
+                                                                        record_candidate(
+                                                                            "pump_amm",
+                                                                            q.amount_out,
+                                                                            pool_id,
+                                                                            acct_strings,
+                                                                        );
+                                                                    } else {
+                                                                        quote_attempts.push(format!(
                                                                     "pump_amm=skip no_pool_accounts amount_out={} pool={}",
                                                                     q.amount_out, pool_id
                                                                 ));
-                                                                }
-                                                            } else {
-                                                                quote_attempts.push(format!(
+                                                                    }
+                                                                } else {
+                                                                    quote_attempts.push(format!(
                                                                 "pump_amm=skip no_pool_accounts amount_out={} pool={}",
                                                                 q.amount_out, pool_id
                                                             ));
-                                                            }
-                                                        } else {
-                                                            quote_attempts.push(
+                                                                }
+                                                            } else {
+                                                                quote_attempts.push(
                                                                 "pump_amm=none (after discovery)"
                                                                     .to_string(),
                                                             );
+                                                            }
                                                         }
-                                                    }
-                                                    _ => {
-                                                        quote_attempts.push(
+                                                        _ => {
+                                                            quote_attempts.push(
                                                         "pump_amm=none (after discovery, zero amount_out or degenerate reserves)"
                                                             .to_string(),
                                                     );
+                                                        }
                                                     }
-                                                }
-                                            } else {
-                                                if let Some(pool_id) = pool_hint.as_deref() {
-                                                    log_pump_amm_slave_wait_timeout_evidence(
+                                                } else {
+                                                    if let Some(pool_id) = pool_hint.as_deref() {
+                                                        log_pump_amm_slave_wait_timeout_evidence(
                                                         &mint,
                                                         pool_id,
                                                         cache,
                                                         PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS,
                                                     );
-                                                } else {
-                                                    warn!(
-                                                        mint = %mint,
-                                                        timeout_ms = PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS,
-                                                        "pump_amm: usable cache state not visible after discovery timeout (no pool hint)"
-                                                    );
-                                                }
-                                                quote_attempts.push(
+                                                    } else {
+                                                        warn!(
+                                                            mint = %mint,
+                                                            timeout_ms = PUMP_AMM_FORCE_REFRESH_SLAVE_WAIT_TIMEOUT_MS,
+                                                            "pump_amm: usable cache state not visible after discovery timeout (no pool hint)"
+                                                        );
+                                                    }
+                                                    quote_attempts.push(
                                                 "pump_amm=skip timeout (cache wait after discovery)"
                                                     .to_string(),
                                             );
+                                                }
+                                            } else {
+                                                quote_attempts
+                                                    .push("pump_amm=skip no_cache".to_string());
                                             }
-                                        } else {
+                                        }
+                                        DiscoveryRequestOutcome::NotFound => {
+                                            quote_attempts.push(
+                                                "pump_amm=none (discovery not_found)".to_string(),
+                                            );
+                                        }
+                                        DiscoveryRequestOutcome::Error(e) => {
                                             quote_attempts
-                                                .push("pump_amm=skip no_cache".to_string());
+                                                .push(format!("pump_amm=err_discovery {e}"));
+                                        }
+                                        DiscoveryRequestOutcome::Timeout => {
+                                            quote_attempts.push(
+                                                "pump_amm=none (discovery timeout)".to_string(),
+                                            );
                                         }
                                     }
-                                    DiscoveryRequestOutcome::NotFound => {
-                                        quote_attempts.push(
-                                            "pump_amm=none (discovery not_found)".to_string(),
-                                        );
-                                    }
-                                    DiscoveryRequestOutcome::Error(e) => {
-                                        quote_attempts.push(format!("pump_amm=err_discovery {e}"));
-                                    }
-                                    DiscoveryRequestOutcome::Timeout => {
-                                        quote_attempts
-                                            .push("pump_amm=none (discovery timeout)".to_string());
-                                    }
                                 }
-                            }
-                            Err(e) => {
-                                quote_attempts.push(format!("pump_amm=err {e:#}"));
-                            }
-                        },
-                    }
+                                Err(e) => {
+                                    quote_attempts.push(format!("pump_amm=err {e:#}"));
+                                }
+                            },
+                        }
 
-                    // Meteora DLMM (requires valid Geyser active_id and pool accounts).
-                    match meteora
-                        .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
-                        .await
-                    {
-                        Ok(Some(q)) => {
-                            #[cfg(unix)]
-                            maybe_ping_watchdog();
+                        // Meteora DLMM (requires valid Geyser active_id and pool accounts).
+                        match meteora
+                            .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
+                            .await
+                        {
+                            Ok(Some(q)) => {
+                                #[cfg(unix)]
+                                maybe_ping_watchdog();
 
-                            if let Some(pool_id) = q.route.first().cloned() {
-                                if let Ok(pool_pk) = Pubkey::from_str(&pool_id) {
-                                    let explicit_ready = ctx
-                                        .live_pool_cache
-                                        .as_ref()
-                                        .map(|c| c.meteora_dlmm_pool_explicitly_ready(&pool_pk))
-                                        .unwrap_or(false);
-                                    if let Some(pool_accounts) = meteora.get_pool_accounts(&pool_pk)
-                                    {
-                                        let active_id = pool_accounts
-                                            .get(5)
-                                            .and_then(|s| s.strip_prefix("active_id:"))
-                                            .and_then(|v| v.parse::<i32>().ok())
-                                            .unwrap_or(0);
+                                if let Some(pool_id) = q.route.first().cloned() {
+                                    if let Ok(pool_pk) = Pubkey::from_str(&pool_id) {
+                                        let explicit_ready = ctx
+                                            .live_pool_cache
+                                            .as_ref()
+                                            .map(|c| c.meteora_dlmm_pool_explicitly_ready(&pool_pk))
+                                            .unwrap_or(false);
+                                        if let Some(pool_accounts) =
+                                            meteora.get_pool_accounts(&pool_pk)
+                                        {
+                                            let active_id = pool_accounts
+                                                .get(5)
+                                                .and_then(|s| s.strip_prefix("active_id:"))
+                                                .and_then(|v| v.parse::<i32>().ok())
+                                                .unwrap_or(0);
 
-                                        if explicit_ready {
-                                            quote_attempts.push(format!(
+                                            if explicit_ready {
+                                                quote_attempts.push(format!(
                                             "meteora=ok amount_out={} pool={} active_id={} accounts_len={}",
                                             q.amount_out,
                                             pool_id,
                                             active_id,
                                             pool_accounts.len()
                                         ));
+                                                record_candidate(
+                                                    "meteora_dlmm",
+                                                    q.amount_out,
+                                                    pool_id,
+                                                    pool_accounts,
+                                                );
+                                            } else {
+                                                quote_attempts.push(format!(
+                                            "meteora=skip no_explicit_ready pool={} active_id={}",
+                                            pool_id, active_id
+                                        ));
+                                            }
+                                        } else {
+                                            quote_attempts.push(format!(
+                                            "meteora=skip no_pool_accounts amount_out={} pool={}",
+                                            q.amount_out, pool_id
+                                        ));
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                quote_attempts.push("meteora=none".to_string());
+                            }
+                            Err(e) => {
+                                quote_attempts.push(format!("meteora=err {e:#}"));
+                            }
+                        }
+
+                        // Raydium (no additional pool accounts needed here).
+                        match raydium
+                            .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
+                            .await
+                        {
+                            Ok(Some(q)) => {
+                                #[cfg(unix)]
+                                maybe_ping_watchdog();
+
+                                if let Some(pool_id) = q.route.first().cloned() {
+                                    quote_attempts.push(format!(
+                                        "raydium=ok amount_out={} pool={}",
+                                        q.amount_out, pool_id
+                                    ));
+                                    record_candidate(
+                                        "raydium",
+                                        q.amount_out,
+                                        pool_id,
+                                        resources.accounts.clone(),
+                                    );
+                                }
+                            }
+                            Ok(None) => {
+                                quote_attempts.push("raydium=none".to_string());
+                            }
+                            Err(e) => {
+                                quote_attempts.push(format!("raydium=err {e:#}"));
+                            }
+                        }
+
+                        // Orca Whirlpool (requires pool accounts).
+                        match orca
+                            .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
+                            .await
+                        {
+                            Ok(Some(q)) => {
+                                #[cfg(unix)]
+                                maybe_ping_watchdog();
+
+                                if let Some(pool_id) = q.route.first().cloned() {
+                                    if let Ok(pool_pk) = Pubkey::from_str(&pool_id) {
+                                        if let Some(pool_accounts) =
+                                            orca.get_pool_accounts(&pool_pk)
+                                        {
+                                            quote_attempts.push(format!(
+                                                "orca=ok amount_out={} pool={} accounts_len={}",
+                                                q.amount_out,
+                                                pool_id,
+                                                pool_accounts.len()
+                                            ));
                                             record_candidate(
-                                                "meteora_dlmm",
+                                                "orca",
                                                 q.amount_out,
                                                 pool_id,
                                                 pool_accounts,
                                             );
                                         } else {
                                             quote_attempts.push(format!(
-                                            "meteora=skip no_explicit_ready pool={} active_id={}",
-                                            pool_id, active_id
-                                        ));
+                                                "orca=skip no_pool_accounts amount_out={} pool={}",
+                                                q.amount_out, pool_id
+                                            ));
                                         }
-                                    } else {
-                                        quote_attempts.push(format!(
-                                            "meteora=skip no_pool_accounts amount_out={} pool={}",
-                                            q.amount_out, pool_id
-                                        ));
                                     }
                                 }
                             }
-                        }
-                        Ok(None) => {
-                            quote_attempts.push("meteora=none".to_string());
-                        }
-                        Err(e) => {
-                            quote_attempts.push(format!("meteora=err {e:#}"));
-                        }
-                    }
-
-                    // Raydium (no additional pool accounts needed here).
-                    match raydium
-                        .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
-                        .await
-                    {
-                        Ok(Some(q)) => {
-                            #[cfg(unix)]
-                            maybe_ping_watchdog();
-
-                            if let Some(pool_id) = q.route.first().cloned() {
-                                quote_attempts.push(format!(
-                                    "raydium=ok amount_out={} pool={}",
-                                    q.amount_out, pool_id
-                                ));
-                                record_candidate(
-                                    "raydium",
-                                    q.amount_out,
-                                    pool_id,
-                                    resources.accounts.clone(),
-                                );
+                            Ok(None) => {
+                                quote_attempts.push("orca=none".to_string());
                             }
-                        }
-                        Ok(None) => {
-                            quote_attempts.push("raydium=none".to_string());
-                        }
-                        Err(e) => {
-                            quote_attempts.push(format!("raydium=err {e:#}"));
-                        }
-                    }
-
-                    // Orca Whirlpool (requires pool accounts).
-                    match orca
-                        .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
-                        .await
-                    {
-                        Ok(Some(q)) => {
-                            #[cfg(unix)]
-                            maybe_ping_watchdog();
-
-                            if let Some(pool_id) = q.route.first().cloned() {
-                                if let Ok(pool_pk) = Pubkey::from_str(&pool_id) {
-                                    if let Some(pool_accounts) = orca.get_pool_accounts(&pool_pk) {
-                                        quote_attempts.push(format!(
-                                            "orca=ok amount_out={} pool={} accounts_len={}",
-                                            q.amount_out,
-                                            pool_id,
-                                            pool_accounts.len()
-                                        ));
-                                        record_candidate(
-                                            "orca",
-                                            q.amount_out,
-                                            pool_id,
-                                            pool_accounts,
-                                        );
-                                    } else {
-                                        quote_attempts.push(format!(
-                                            "orca=skip no_pool_accounts amount_out={} pool={}",
-                                            q.amount_out, pool_id
-                                        ));
-                                    }
-                                }
+                            Err(e) => {
+                                quote_attempts.push(format!("orca=err {e:#}"));
                             }
-                        }
-                        Ok(None) => {
-                            quote_attempts.push("orca=none".to_string());
-                        }
-                        Err(e) => {
-                            quote_attempts.push(format!("orca=err {e:#}"));
-                        }
-                    }
-
-                    let buildable = liquidation_filter_multi_pool_buildable_candidates(
-                        ctx.live_pool_cache.as_deref(),
-                        &orca,
-                        &mint,
-                        &sol_mint,
-                        candidates,
-                        &mut quote_attempts,
-                    )
-                    .await;
-                    if let Some(best_route) = buildable.first().cloned() {
-                        liquidation_store_multi_pool_fallback_metadata(&mut metadata, &buildable);
-                        metadata.insert("sell_routing".to_string(), "multi_pool".to_string());
-                        metadata.insert("dex".to_string(), best_route.dex.clone());
-                        if let Some(creator) = best_route.creator.clone() {
-                            metadata.insert("creator".to_string(), creator);
-                        }
-                        resources.pools = vec![best_route.pool_id.clone()];
-                        resources.accounts = best_route.accounts;
-                        min_out_sol = Some(Self::apply_slippage_min_out(
-                            best_route.amount_out,
-                            max_slippage_bps,
-                        ));
-                        quote_attempts.push(format!(
-                            "multi_pool=best dex={} amount_out={} pool={}",
-                            best_route.dex, best_route.amount_out, best_route.pool_id
-                        ));
-                    }
-                }
-
-                // Final fallback: LivePoolCache-derived quote + accounts (GEYSER-first).
-                if min_out_sol.is_none() {
-                    if let Some(ref cache) = ctx.live_pool_cache {
-                        let sol_mint_pk = sol_mint;
-                        let mut candidates: Vec<RouteCandidate> = Vec::new();
-
-                        for (pool_addr, state) in cache.iter() {
-                            let has_pair = match &state {
-                                CachedPoolState::PumpFun(s) => {
-                                    s.token_mint == mint
-                                        && s.creator != Pubkey::default()
-                                        && !s.complete // Skip completed bonding curves (migrated to PumpSwap AMM)
-                                }
-                                CachedPoolState::PumpAmm(s) => {
-                                    (s.base_mint == mint && s.quote_mint == sol_mint_pk)
-                                        || (s.quote_mint == mint && s.base_mint == sol_mint_pk)
-                                }
-                                CachedPoolState::RaydiumAmm(s) => {
-                                    (s.base_mint == mint && s.quote_mint == sol_mint_pk)
-                                        || (s.quote_mint == mint && s.base_mint == sol_mint_pk)
-                                }
-                                CachedPoolState::RaydiumCpmm(s) => {
-                                    (s.token_0_mint == mint && s.token_1_mint == sol_mint_pk)
-                                        || (s.token_1_mint == mint && s.token_0_mint == sol_mint_pk)
-                                }
-                                CachedPoolState::Meteora(s) => {
-                                    (s.token_x_mint == mint && s.token_y_mint == sol_mint_pk)
-                                        || (s.token_y_mint == mint && s.token_x_mint == sol_mint_pk)
-                                }
-                                CachedPoolState::MeteoraCpmm(s) => {
-                                    (s.token_0_mint == mint && s.token_1_mint == sol_mint_pk)
-                                        || (s.token_1_mint == mint && s.token_0_mint == sol_mint_pk)
-                                }
-                                CachedPoolState::Orca(s) => {
-                                    (s.token_mint_a == mint && s.token_mint_b == sol_mint_pk)
-                                        || (s.token_mint_b == mint && s.token_mint_a == sol_mint_pk)
-                                }
-                            };
-
-                            if !has_pair {
-                                continue;
-                            }
-
-                            let mut intent_for_quote = TradeIntent::new_sell(
-                                "execution-engine",
-                                BUILD_VERSION,
-                                &ctx.run_id,
-                                format!("liquidation-cache-{}", Uuid::new_v4()),
-                                "execution-engine",
-                                IntentTier::Tier0,
-                                IntentOrigin::ExecutionMevB,
-                                mint.to_string(),
-                                decimals,
-                                sol_mint.to_string(),
-                                amount_in,
-                                0,
-                                max_slippage_bps,
-                                TradingRegime::NotApplicable,
-                            );
-                            intent_for_quote.resources.pools = vec![pool_addr.to_string()];
-
-                            let min_out = match quote_calculator::calculate_fresh_min_out(
-                                cache,
-                                &intent_for_quote,
-                            ) {
-                                Ok(Some(v)) => v,
-                                Ok(None) => {
-                                    quote_attempts
-                                        .push(format!("cache=skip no_quote pool={}", pool_addr));
-                                    continue;
-                                }
-                                Err(e) => {
-                                    quote_attempts
-                                        .push(format!("cache=err pool={} err={}", pool_addr, e));
-                                    continue;
-                                }
-                            };
-
-                            let dex = state.dex_name().to_string();
-                            let pool_id = pool_addr.to_string();
-
-                            let accounts = match &state {
-                                CachedPoolState::PumpAmm(s) => {
-                                    if s.pool_accounts.is_empty() {
-                                        quote_attempts.push(format!(
-                                            "cache=skip pump_amm no_pool_accounts pool={}",
-                                            pool_id
-                                        ));
-                                        continue;
-                                    }
-                                    if s.pool_accounts[0].to_string() != pool_id {
-                                        quote_attempts.push(format!(
-                                            "cache=skip pump_amm pool_mismatch pool={}",
-                                            pool_id
-                                        ));
-                                        continue;
-                                    }
-                                    s.pool_accounts.iter().map(|p| p.to_string()).collect()
-                                }
-                                CachedPoolState::Meteora(_) => {
-                                    let pool_pk = match Pubkey::from_str(&pool_id) {
-                                        Ok(pk) => pk,
-                                        Err(_) => continue,
-                                    };
-                                    if !cache.meteora_dlmm_pool_explicitly_ready(&pool_pk) {
-                                        quote_attempts.push(format!(
-                                            "cache=skip meteora no_explicit_ready pool={}",
-                                            pool_id
-                                        ));
-                                        continue;
-                                    }
-                                    let Some(pool_accounts) = meteora.get_pool_accounts(&pool_pk)
-                                    else {
-                                        quote_attempts.push(format!(
-                                            "cache=skip meteora no_pool_accounts pool={}",
-                                            pool_id
-                                        ));
-                                        continue;
-                                    };
-                                    pool_accounts
-                                }
-                                CachedPoolState::Orca(_) => {
-                                    let pool_pk = match Pubkey::from_str(&pool_id) {
-                                        Ok(pk) => pk,
-                                        Err(_) => continue,
-                                    };
-                                    let Some(pool_accounts) = orca.get_pool_accounts(&pool_pk)
-                                    else {
-                                        quote_attempts.push(format!(
-                                            "cache=skip orca no_pool_accounts pool={}",
-                                            pool_id
-                                        ));
-                                        continue;
-                                    };
-                                    pool_accounts
-                                }
-                                _ => resources.accounts.clone(),
-                            };
-
-                            candidates.push(RouteCandidate {
-                                dex,
-                                amount_out: min_out,
-                                pool_id,
-                                accounts,
-                                creator: match &state {
-                                    CachedPoolState::PumpFun(s) => Some(s.creator.to_string()),
-                                    _ => None,
-                                },
-                                execution_min_out_lamports: Some(min_out),
-                            });
                         }
 
                         let buildable = liquidation_filter_multi_pool_buildable_candidates(
@@ -5060,79 +5054,273 @@ impl ExecutionContext {
                             }
                             resources.pools = vec![best_route.pool_id.clone()];
                             resources.accounts = best_route.accounts;
-                            min_out_sol = Some(best_route.amount_out);
+                            min_out_sol = Some(Self::apply_slippage_min_out(
+                                best_route.amount_out,
+                                max_slippage_bps,
+                            ));
                             quote_attempts.push(format!(
-                                "cache=best dex={} min_out={} pool={}",
+                                "multi_pool=best dex={} amount_out={} pool={}",
                                 best_route.dex, best_route.amount_out, best_route.pool_id
                             ));
                         }
                     }
-                }
 
-                // Last resort: PumpFun bonding-curve SELL when multi-pool + cache had no route.
-                // Retry when preferred skipped only due to missing_creator (not a duplicate ok-quote).
-                let allow_pumpfun_fallback =
-                    !try_pumpfun_first || pumpfun_preferred_missing_creator;
-                if min_out_sol.is_none() && allow_pumpfun_fallback {
-                    if let Some(ref pfun) = pumpfun {
-                        let route_label = if pumpfun_preferred_missing_creator {
-                            "pumpfun_creator_retry"
-                        } else {
-                            "pumpfun_fallback"
-                        };
-                        let outcome = ctx
-                            .liquidation_build_pumpfun_sell(
-                                pfun,
+                    // Final fallback: LivePoolCache-derived quote + accounts (GEYSER-first).
+                    if min_out_sol.is_none() {
+                        if let Some(ref cache) = ctx.live_pool_cache {
+                            let sol_mint_pk = sol_mint;
+                            let mut candidates: Vec<RouteCandidate> = Vec::new();
+
+                            for (pool_addr, state) in cache.iter() {
+                                let has_pair = match &state {
+                                    CachedPoolState::PumpFun(s) => {
+                                        s.token_mint == mint
+                                            && s.creator != Pubkey::default()
+                                            && !s.complete // Skip completed bonding curves (migrated to PumpSwap AMM)
+                                    }
+                                    CachedPoolState::PumpAmm(s) => {
+                                        (s.base_mint == mint && s.quote_mint == sol_mint_pk)
+                                            || (s.quote_mint == mint && s.base_mint == sol_mint_pk)
+                                    }
+                                    CachedPoolState::RaydiumAmm(s) => {
+                                        (s.base_mint == mint && s.quote_mint == sol_mint_pk)
+                                            || (s.quote_mint == mint && s.base_mint == sol_mint_pk)
+                                    }
+                                    CachedPoolState::RaydiumCpmm(s) => {
+                                        (s.token_0_mint == mint && s.token_1_mint == sol_mint_pk)
+                                            || (s.token_1_mint == mint
+                                                && s.token_0_mint == sol_mint_pk)
+                                    }
+                                    CachedPoolState::Meteora(s) => {
+                                        (s.token_x_mint == mint && s.token_y_mint == sol_mint_pk)
+                                            || (s.token_y_mint == mint
+                                                && s.token_x_mint == sol_mint_pk)
+                                    }
+                                    CachedPoolState::MeteoraCpmm(s) => {
+                                        (s.token_0_mint == mint && s.token_1_mint == sol_mint_pk)
+                                            || (s.token_1_mint == mint
+                                                && s.token_0_mint == sol_mint_pk)
+                                    }
+                                    CachedPoolState::Orca(s) => {
+                                        (s.token_mint_a == mint && s.token_mint_b == sol_mint_pk)
+                                            || (s.token_mint_b == mint
+                                                && s.token_mint_a == sol_mint_pk)
+                                    }
+                                };
+
+                                if !has_pair {
+                                    continue;
+                                }
+
+                                let mut intent_for_quote = TradeIntent::new_sell(
+                                    "execution-engine",
+                                    BUILD_VERSION,
+                                    &ctx.run_id,
+                                    format!("liquidation-cache-{}", Uuid::new_v4()),
+                                    "execution-engine",
+                                    IntentTier::Tier0,
+                                    IntentOrigin::ExecutionMevB,
+                                    mint.to_string(),
+                                    decimals,
+                                    sol_mint.to_string(),
+                                    amount_in,
+                                    0,
+                                    max_slippage_bps,
+                                    TradingRegime::NotApplicable,
+                                );
+                                intent_for_quote.resources.pools = vec![pool_addr.to_string()];
+
+                                let min_out = match quote_calculator::calculate_fresh_min_out(
+                                    cache,
+                                    &intent_for_quote,
+                                ) {
+                                    Ok(Some(v)) => v,
+                                    Ok(None) => {
+                                        quote_attempts.push(format!(
+                                            "cache=skip no_quote pool={}",
+                                            pool_addr
+                                        ));
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        quote_attempts.push(format!(
+                                            "cache=err pool={} err={}",
+                                            pool_addr, e
+                                        ));
+                                        continue;
+                                    }
+                                };
+
+                                let dex = state.dex_name().to_string();
+                                let pool_id = pool_addr.to_string();
+
+                                let accounts = match &state {
+                                    CachedPoolState::PumpAmm(s) => {
+                                        if s.pool_accounts.is_empty() {
+                                            quote_attempts.push(format!(
+                                                "cache=skip pump_amm no_pool_accounts pool={}",
+                                                pool_id
+                                            ));
+                                            continue;
+                                        }
+                                        if s.pool_accounts[0].to_string() != pool_id {
+                                            quote_attempts.push(format!(
+                                                "cache=skip pump_amm pool_mismatch pool={}",
+                                                pool_id
+                                            ));
+                                            continue;
+                                        }
+                                        s.pool_accounts.iter().map(|p| p.to_string()).collect()
+                                    }
+                                    CachedPoolState::Meteora(_) => {
+                                        let pool_pk = match Pubkey::from_str(&pool_id) {
+                                            Ok(pk) => pk,
+                                            Err(_) => continue,
+                                        };
+                                        if !cache.meteora_dlmm_pool_explicitly_ready(&pool_pk) {
+                                            quote_attempts.push(format!(
+                                                "cache=skip meteora no_explicit_ready pool={}",
+                                                pool_id
+                                            ));
+                                            continue;
+                                        }
+                                        let Some(pool_accounts) =
+                                            meteora.get_pool_accounts(&pool_pk)
+                                        else {
+                                            quote_attempts.push(format!(
+                                                "cache=skip meteora no_pool_accounts pool={}",
+                                                pool_id
+                                            ));
+                                            continue;
+                                        };
+                                        pool_accounts
+                                    }
+                                    CachedPoolState::Orca(_) => {
+                                        let pool_pk = match Pubkey::from_str(&pool_id) {
+                                            Ok(pk) => pk,
+                                            Err(_) => continue,
+                                        };
+                                        let Some(pool_accounts) = orca.get_pool_accounts(&pool_pk)
+                                        else {
+                                            quote_attempts.push(format!(
+                                                "cache=skip orca no_pool_accounts pool={}",
+                                                pool_id
+                                            ));
+                                            continue;
+                                        };
+                                        pool_accounts
+                                    }
+                                    _ => resources.accounts.clone(),
+                                };
+
+                                candidates.push(RouteCandidate {
+                                    dex,
+                                    amount_out: min_out,
+                                    pool_id,
+                                    accounts,
+                                    creator: match &state {
+                                        CachedPoolState::PumpFun(s) => Some(s.creator.to_string()),
+                                        _ => None,
+                                    },
+                                    execution_min_out_lamports: Some(min_out),
+                                });
+                            }
+
+                            let buildable = liquidation_filter_multi_pool_buildable_candidates(
+                                ctx.live_pool_cache.as_deref(),
+                                &orca,
                                 &mint,
                                 &sol_mint,
-                                amount_in,
-                                max_slippage_bps,
-                                route_label,
-                                &mut metadata,
-                                &mut resources,
+                                candidates,
                                 &mut quote_attempts,
                             )
                             .await;
-                        min_out_sol = outcome.min_out;
+                            if let Some(best_route) = buildable.first().cloned() {
+                                liquidation_store_multi_pool_fallback_metadata(
+                                    &mut metadata,
+                                    &buildable,
+                                );
+                                metadata
+                                    .insert("sell_routing".to_string(), "multi_pool".to_string());
+                                metadata.insert("dex".to_string(), best_route.dex.clone());
+                                if let Some(creator) = best_route.creator.clone() {
+                                    metadata.insert("creator".to_string(), creator);
+                                }
+                                resources.pools = vec![best_route.pool_id.clone()];
+                                resources.accounts = best_route.accounts;
+                                min_out_sol = Some(best_route.amount_out);
+                                quote_attempts.push(format!(
+                                    "cache=best dex={} min_out={} pool={}",
+                                    best_route.dex, best_route.amount_out, best_route.pool_id
+                                ));
+                            }
+                        }
                     }
-                }
-            } // end if min_out_sol.is_none() (Meteora/Raydium recovery + multi-pool + cache; last-resort pumpfun_fallback inside)
 
-            let Some(min_out) = min_out_sol else {
-                warn!(
-                    mint = %mint,
-                    amount_in,
-                    token_account = %ta_pubkey,
-                    quote_attempts = %quote_attempts.join(" | "),
-                    "LIQUIDATION SKIP: No supported route found for token"
-                );
+                    // Last resort: PumpFun bonding-curve SELL when multi-pool + cache had no route.
+                    // Retry when preferred skipped only due to missing_creator (not a duplicate ok-quote).
+                    let allow_pumpfun_fallback =
+                        !try_pumpfun_first || pumpfun_preferred_missing_creator;
+                    if min_out_sol.is_none() && allow_pumpfun_fallback {
+                        if let Some(ref pfun) = pumpfun {
+                            let route_label = if pumpfun_preferred_missing_creator {
+                                "pumpfun_creator_retry"
+                            } else {
+                                "pumpfun_fallback"
+                            };
+                            let outcome = ctx
+                                .liquidation_build_pumpfun_sell(
+                                    pfun,
+                                    &mint,
+                                    &sol_mint,
+                                    amount_in,
+                                    max_slippage_bps,
+                                    route_label,
+                                    &mut metadata,
+                                    &mut resources,
+                                    &mut quote_attempts,
+                                )
+                                .await;
+                            min_out_sol = outcome.min_out;
+                        }
+                    }
+                } // end if min_out_sol.is_none() (Meteora/Raydium recovery + multi-pool + cache; last-resort pumpfun_fallback inside)
 
-                // Emit a rejected DecisionRecord so the reason is forensically visible even
-                // when we cannot generate a sell intent (no quote / no supported route).
-                // This is especially important for “why was token X not liquidated?” cases.
-                let skip_intent_id = format!("liquidation-skip-{}", Uuid::new_v4());
-                let mut skip_intent = TradeIntent::new_sell(
-                    "execution-engine",
-                    BUILD_VERSION,
-                    &ctx.run_id,
-                    skip_intent_id,
-                    "execution-engine",
-                    IntentTier::Tier0,
-                    IntentOrigin::ExecutionMevB,
-                    mint.to_string(),
-                    decimals,
-                    sol_mint.to_string(),
-                    amount_in,
-                    0,
-                    max_slippage_bps,
-                    TradingRegime::NotApplicable,
-                );
-                skip_intent.ttl_ms = Some(ttl_ms);
-                skip_intent.resources = resources;
-                skip_intent.metadata.extend(metadata);
+                let Some(min_out) = min_out_sol else {
+                    warn!(
+                        mint = %mint,
+                        amount_in,
+                        token_account = %ta_pubkey,
+                        quote_attempts = %quote_attempts.join(" | "),
+                        "LIQUIDATION SKIP: No supported route found for token"
+                    );
 
-                let decision_id = ctx.next_decision_id();
-                let checks = vec![CheckResult {
+                    // Emit a rejected DecisionRecord so the reason is forensically visible even
+                    // when we cannot generate a sell intent (no quote / no supported route).
+                    // This is especially important for “why was token X not liquidated?” cases.
+                    let skip_intent_id = format!("liquidation-skip-{}", Uuid::new_v4());
+                    let mut skip_intent = TradeIntent::new_sell(
+                        "execution-engine",
+                        BUILD_VERSION,
+                        &ctx.run_id,
+                        skip_intent_id,
+                        "execution-engine",
+                        IntentTier::Tier0,
+                        IntentOrigin::ExecutionMevB,
+                        mint.to_string(),
+                        decimals,
+                        sol_mint.to_string(),
+                        amount_in,
+                        0,
+                        max_slippage_bps,
+                        TradingRegime::NotApplicable,
+                    );
+                    skip_intent.ttl_ms = Some(ttl_ms);
+                    skip_intent.resources = resources;
+                    skip_intent.metadata.extend(metadata);
+
+                    let decision_id = ctx.next_decision_id();
+                    let checks = vec![CheckResult {
                     check_name: "liquidation_quote".to_string(),
                     passed: false,
                     reason_code: Some(RejectReason::QuoteUnavailable.to_string()),
@@ -5145,161 +5333,115 @@ impl ExecutionContext {
                     )),
                 }];
 
-                let _ = emit_rejected_decision(
-                    ctx.as_ref(),
-                    decision_id,
-                    &skip_intent,
-                    checks,
-                    RejectReason::QuoteUnavailable,
-                )
-                .await;
-                continue;
-            };
+                    let _ = emit_rejected_decision(
+                        ctx.as_ref(),
+                        decision_id,
+                        &skip_intent,
+                        checks,
+                        RejectReason::QuoteUnavailable,
+                    )
+                    .await;
+                    continue;
+                };
 
-            let intent_id = format!("liquidation-{}", Uuid::new_v4());
-            let mut intent = TradeIntent::new_sell(
-                "execution-engine",
-                BUILD_VERSION,
-                &ctx.run_id,
-                intent_id,
-                "execution-engine",
-                IntentTier::Tier0,
-                IntentOrigin::ExecutionMevB,
-                mint.to_string(),
-                decimals,
-                sol_mint.to_string(),
-                amount_in,
-                0,
-                max_slippage_bps,
-                TradingRegime::NotApplicable,
-            );
-            // Log BEFORE move so we can reference metadata/resources
-            info!(
-                mint = %mint,
-                dex = metadata.get("dex").map(|s| s.as_str()).unwrap_or("?"),
-                routing = metadata.get("sell_routing").map(|s| s.as_str()).unwrap_or("?"),
-                creator_present = metadata.contains_key("creator"),
-                amount_in,
-                min_out,
-                pools = ?resources.pools,
-                quote_attempts = %quote_attempts.join(" | "),
-                "LIQUIDATION: Intent prepared for token"
-            );
+                let intent_id = format!("liquidation-{}", Uuid::new_v4());
+                let mut intent = TradeIntent::new_sell(
+                    "execution-engine",
+                    BUILD_VERSION,
+                    &ctx.run_id,
+                    intent_id,
+                    "execution-engine",
+                    IntentTier::Tier0,
+                    IntentOrigin::ExecutionMevB,
+                    mint.to_string(),
+                    decimals,
+                    sol_mint.to_string(),
+                    amount_in,
+                    0,
+                    max_slippage_bps,
+                    TradingRegime::NotApplicable,
+                );
+                // Log BEFORE move so we can reference metadata/resources
+                info!(
+                    mint = %mint,
+                    dex = metadata.get("dex").map(|s| s.as_str()).unwrap_or("?"),
+                    routing = metadata.get("sell_routing").map(|s| s.as_str()).unwrap_or("?"),
+                    creator_present = metadata.contains_key("creator"),
+                    amount_in,
+                    min_out,
+                    pools = ?resources.pools,
+                    quote_attempts = %quote_attempts.join(" | "),
+                    "LIQUIDATION: Intent prepared for token"
+                );
 
-            intent.ttl_ms = Some(ttl_ms);
-            intent.resources = resources;
-            intent.execution = Some(TradeExecutionConstraints {
-                min_out: Some(ExplicitAmount::new(min_out, 9)),
-            });
-            intent.metadata.extend(metadata);
+                intent.ttl_ms = Some(ttl_ms);
+                intent.resources = resources;
+                intent.execution = Some(TradeExecutionConstraints {
+                    min_out: Some(ExplicitAmount::new(min_out, 9)),
+                });
+                intent.metadata.extend(metadata);
 
-            // Stream: process each fully-prepared SELL as soon as it is ready (Scope 51). Discovery
-            // for later inventory rows does not block earlier sends; still one sequential loop (no
-            // parallel getProgramAccounts storms).
-            #[cfg(unix)]
-            maybe_ping_watchdog();
+                // Stream: process each fully-prepared SELL as soon as it is ready (Scope 51). Discovery
+                // for later inventory rows does not block earlier sends; still one sequential loop (no
+                // parallel getProgramAccounts storms).
+                #[cfg(unix)]
+                maybe_ping_watchdog();
 
-            match process_intent(&ctx, intent.clone()).await {
-                Ok(()) => {}
-                Err(e) => {
-                    let mint_str = intent.resources.input_mint.clone();
-                    let is_6005 = is_6005_bonding_curve_complete(&e);
-                    let dex_pumpfun =
-                        intent.metadata.get("dex").map(|s| s.as_str()) == Some("pumpfun");
+                match process_intent(&ctx, intent.clone()).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let mint_str = intent.resources.input_mint.clone();
+                        let is_6005 = is_6005_bonding_curve_complete(&e);
+                        let dex_pumpfun =
+                            intent.metadata.get("dex").map(|s| s.as_str()) == Some("pumpfun");
 
-                    if is_6005 && dex_pumpfun {
-                        info!(
-                            mint = %mint_str,
-                            "6005-retry: BondingCurveComplete detected; retrying with PumpSwap AMM"
-                        );
-                        if let Some(retry) = ctx
-                            .try_6005_pumpfun_retry(&intent, &pump_amm, max_slippage_bps)
-                            .await
-                        {
-                            if let Err(retry_e) = process_intent(&ctx, retry).await {
-                                warn!(
-                                    mint = %mint_str,
-                                    error = %retry_e,
-                                    "6005-retry: PumpSwap AMM attempt also failed"
-                                );
+                        if is_6005 && dex_pumpfun {
+                            info!(
+                                mint = %mint_str,
+                                "6005-retry: BondingCurveComplete detected; retrying with PumpSwap AMM"
+                            );
+                            if let Some(retry) = ctx
+                                .try_6005_pumpfun_retry(&intent, &pump_amm, max_slippage_bps)
+                                .await
+                            {
+                                if let Err(retry_e) = process_intent(&ctx, retry).await {
+                                    warn!(
+                                        mint = %mint_str,
+                                        error = %retry_e,
+                                        "6005-retry: PumpSwap AMM attempt also failed"
+                                    );
+                                }
                             }
+                        } else {
+                            warn!(error = %e, "Liquidation intent processing failed");
                         }
-                    } else {
-                        warn!(error = %e, "Liquidation intent processing failed");
                     }
                 }
             }
-        }
 
-        // === Retry Phase: Re-scan wallet for tokens still present ===
-        // First pass may have failed for some tokens (stale quotes, RPC issues, sim failures).
-        // Wait for first-pass TXs to confirm, then re-scan and retry failed tokens.
-        info!("Liquidation first pass complete. Waiting before retry scan...");
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        #[cfg(unix)]
-        maybe_ping_watchdog();
-
-        let token_program_id = Pubkey::new_from_array(spl_token::id().to_bytes());
-        let token_2022_program_id = Pubkey::new_from_array(spl_token_2022::id().to_bytes());
-        let mut retry_rpc_accounts = ctx
-            .rpc
-            .rpc
-            .get_token_accounts_by_owner(&owner, TokenAccountsFilter::ProgramId(token_program_id))
-            .await
-            .unwrap_or_default();
-
-        if let Ok(mut accounts_2022) = ctx
-            .rpc
-            .rpc
-            .get_token_accounts_by_owner(
-                &owner,
-                TokenAccountsFilter::ProgramId(token_2022_program_id),
-            )
-            .await
-        {
-            retry_rpc_accounts.append(&mut accounts_2022);
-        }
-
-        let mut retry_count = 0u32;
-        for ta in &retry_rpc_accounts {
-            let parsed = match &ta.account.data {
-                UiAccountData::Json(parsed) => parsed,
-                _ => continue,
-            };
-            let info = match parsed.parsed.get("info") {
-                Some(v) => v,
-                None => continue,
-            };
-            let mint_str = info
-                .get("mint")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let balance_str = info
-                .get("tokenAmount")
-                .and_then(|v| v.get("amount"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("0");
-            let balance_raw: u64 = balance_str.parse().unwrap_or(0);
-
-            if balance_raw == 0 || mint_str == SOL_MINT || mint_str == WSOL_MINT {
-                continue;
+            if liquidation_round >= MAX_LIQUIDATION_RETRY_ROUNDS {
+                break;
             }
 
-            retry_count += 1;
-            warn!(
-                mint = %mint_str,
-                balance_raw,
-                "LIQUIDATION RETRY: Token still in wallet after first pass"
-            );
-        }
+            let lm_remaining = ctx.lock_manager.count_non_zero_token_balances();
+            let rpc_remaining = liquidation_count_rpc_nonzero_tokens(&ctx, owner).await;
+            if lm_remaining == 0 && rpc_remaining == 0 {
+                info!(
+                    round = liquidation_round,
+                    lockmanager_non_zero = lm_remaining,
+                    rpc_non_zero = rpc_remaining,
+                    "Liquidation pass complete with no remaining tokens; skipping further retries"
+                );
+                break;
+            }
 
-        if retry_count > 0 {
             warn!(
-                remaining_tokens = retry_count,
-                "Liquidation: {} tokens still in wallet — full retry would require re-routing (logged for diagnostics)",
-                retry_count
+                round = liquidation_round,
+                lockmanager_non_zero = lm_remaining,
+                rpc_non_zero = rpc_remaining,
+                "Liquidation pass complete with remaining tokens; scheduling full retry pass"
             );
+            liquidation_round += 1;
         }
 
         // Post-liquidation cleanup:
@@ -5382,6 +5524,10 @@ impl ExecutionContext {
                         {
                             Ok(sig) => {
                                 info!(wallet = %wallet, wsol_ata = %wsol_ata, signature = %sig, "Unwrapped WSOL (closed ATA)");
+                                ctx.apply_confirmed_local_wsol_zero(
+                                    "liquidation_cleanup_close_ata",
+                                    Some(&sig.to_string()),
+                                );
                             }
                             Err(e) => {
                                 warn!(wallet = %wallet, wsol_ata = %wsol_ata, error = %e, "Failed to unwrap WSOL (close ATA send failed)")
@@ -5394,6 +5540,20 @@ impl ExecutionContext {
                     warn!(wallet = %wallet, wsol_ata = %wsol_ata, error = ?sim.error_code, "WSOL unwrap simulation failed; not sending");
                 }
             }
+        } else if ctx.lock_manager.wsol_balance() > 0
+            || ctx
+                .wsol_pending_wrap
+                .as_ref()
+                .map(|p| p.pending_expected() > 0)
+                .unwrap_or(false)
+        {
+            info!(
+                wallet = %wallet,
+                wsol_ata = %wsol_ata,
+                lockmanager_wsol_lamports = ctx.lock_manager.wsol_balance(),
+                "WSOL ATA absent during liquidation cleanup; applying local WSOL=0"
+            );
+            ctx.apply_confirmed_local_wsol_zero("liquidation_cleanup_ata_absent", None);
         }
 
         // 2) Close empty token accounts (best-effort)
@@ -14335,6 +14495,20 @@ mod execution_engine_tests {
             super::ExecutionContext::test_for_pa2_metrics(lock_manager, PositionAuthority::new());
         ctx.wsol_pending_wrap = Some(Arc::clone(&pending));
         (ctx, pending)
+    }
+
+    #[test]
+    fn apply_confirmed_local_wsol_zero_clears_lockmanager_and_pending() {
+        let (ctx, pending) = test_ctx_with_pending_wrap(LockManager::new(3_000_000_000));
+        pending.arm(1_000_000_000);
+        ctx.lock_manager.update_wsol_only(1_000_000_000);
+        ctx.lock_manager.update_native_sol_only(2_500_000_000);
+
+        ctx.apply_confirmed_local_wsol_zero("test_unwrap", Some("sig-test"));
+
+        assert_eq!(ctx.lock_manager.available_wsol(), 0);
+        assert_eq!(ctx.lock_manager.total_native_sol(), 2_500_000_000);
+        assert_eq!(pending.pending_expected(), 0);
     }
 
     #[test]
