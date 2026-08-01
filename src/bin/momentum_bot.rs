@@ -1086,13 +1086,12 @@ fn sell_fail_cooldown_secs(error_code: Option<&str>, sell_fail_count: u32) -> u6
     10
 }
 
-/// Conservative max `LivePoolCache` age for **price-based** exits (STOP / TP).
-/// Below `quote_calculator`'s 5s warning so we do not SELL-trigger on long-stale reserve snapshots
-/// when the chain may have moved (I-16).
+/// Legacy wall-clock threshold (diagnostic / entry-hot-set only).
+/// Exit price guards do **not** reject on cache age — event-driven freshness is slot/reserve-based (I-16).
 const EXIT_QUOTE_MAX_CACHE_AGE_MS: u64 = 4_000;
 /// Max ratio between executable quote TPS and entry/mark TPS before rejecting price exits.
 const EXIT_QUOTE_TPS_MAX_SCALE_RATIO: f64 = 100.0;
-/// Max `LivePoolCache` age for imminent-entry hot-set readiness (I-MD-9; same conservatism as exits).
+/// Max `LivePoolCache` age for imminent-entry hot-set readiness (I-MD-9).
 const ENTRY_HOT_SET_MAX_CACHE_AGE_MS: u64 = EXIT_QUOTE_MAX_CACHE_AGE_MS;
 
 const SPL_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -1113,12 +1112,6 @@ fn exit_quote_hard_price_exit_may_relax_mark_slot_guard(
     pos: &PositionTracker,
     q: &ExitExecutableQuote,
 ) -> bool {
-    let fresh = q
-        .cache_age_ms
-        .is_some_and(|age| age <= EXIT_QUOTE_MAX_CACHE_AGE_MS);
-    if !fresh {
-        return false;
-    }
     match q.source_slot {
         Some(slot) if slot > 0 => pos.entry_confirmed_slot == 0 || slot > pos.entry_confirmed_slot,
         _ => false,
@@ -1185,7 +1178,7 @@ fn exit_quote_price_exit_guard_violation(
     }
     if let Some(age) = q.cache_age_ms {
         if age > EXIT_QUOTE_MAX_CACHE_AGE_MS {
-            return Some("STALE_CACHE_AGE_MS");
+            ironcrab::metrics::record_momentum_exit_quote_legacy_stale_age_diag_total();
         }
     }
     if let Some(slot) = q.source_slot {
@@ -1218,8 +1211,9 @@ fn exit_quote_price_exit_guard_violation(
     None
 }
 
-/// True when the **position pool** specifically lacks a usable exit quote (stale SLAVE age or cache miss).
+/// True when the **position pool** specifically lacks a usable exit quote (cache miss or structural guard).
 /// Unlike [`MomentumContext::executable_exit_quote`], does not accept a fresher alternate pool row.
+/// Wall-clock cache age is **not** a blindness criterion (I-16 quiet-market event-driven freshness).
 fn position_pool_exit_blind(pos: &PositionTracker, live_pool_cache: &LivePoolCache) -> bool {
     if pos.pool.is_empty() || pos.token_amount == 0 {
         return false;
@@ -1230,9 +1224,6 @@ fn position_pool_exit_blind(pos: &PositionTracker, live_pool_cache: &LivePoolCac
     let Some((state, _slot, age_ms)) = live_pool_cache.get_with_metadata(&pool_pk) else {
         return true;
     };
-    if age_ms > EXIT_QUOTE_MAX_CACHE_AGE_MS {
-        return true;
-    }
     let Ok(token_mint) = solana_sdk::pubkey::Pubkey::from_str(&pos.mint) else {
         return true;
     };
@@ -13216,7 +13207,7 @@ mod tests {
     }
 
     #[test]
-    fn position_pool_exit_blind_detects_stale_position_pool_cache() {
+    fn position_pool_exit_blind_ignores_wall_clock_cache_age() {
         use ironcrab::execution::live_pool_cache::{CachedPoolState, PumpFunState};
 
         let cache = LivePoolCache::new();
@@ -13241,20 +13232,25 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(
             EXIT_QUOTE_MAX_CACHE_AGE_MS + 50,
         ));
+        let (state, _slot, _age_ms) = cache.get_with_metadata(&pool).expect("pool in cache");
+        let sol_out = quote_calculator::quote_output_amount(&state, 1_000_000, &mint_pk)
+            .expect("pumpfun sell quote");
+        let tps = tokens_per_sol::ui_tokens_per_sol(1_000_000, 6, sol_out);
         let mut pos = PositionTracker::new(
             &mint_pk.to_string(),
             &pool.to_string(),
             "pumpfun",
-            1.0,
+            tps,
             6,
             1_000_000,
             0,
         );
+        pos.current_price = tps;
         pos.entry_confirmed_slot = 0;
         pos.last_price_slot = 0;
         assert!(
-            position_pool_exit_blind(&pos, &cache),
-            "stale position-pool SLAVE age must count as exit blind"
+            !position_pool_exit_blind(&pos, &cache),
+            "quiet-market wall-clock age must not count as exit blind when reserves are quotable"
         );
     }
 
@@ -19424,21 +19420,22 @@ mod tests {
     }
 
     #[test]
-    fn exit_guard_hard_price_exit_keeps_mark_slot_veto_when_cache_stale() {
+    fn exit_guard_hard_price_exit_relaxes_mark_slot_when_post_entry_despite_old_cache_age() {
         let mut pos = PositionTracker::new("m", "p", "dex", 100.0, 6, 1_000_000, 0);
         pos.entry_confirmed_slot = 500;
         pos.last_price_slot = 900;
         let mut ex = sample_exit_quote(50.0);
         ex.source_slot = Some(850);
         ex.cache_age_ms = Some(EXIT_QUOTE_MAX_CACHE_AGE_MS + 1);
-        assert_eq!(
+        assert!(
             exit_quote_price_exit_guard_violation(
                 &pos,
                 &ex,
                 None,
                 ExitQuoteGuardOpts::RelaxPositionMarkSlotForHardPriceExit,
-            ),
-            Some("STALE_CACHE_AGE_MS")
+            )
+            .is_none(),
+            "post-entry slot must relax mark-slot guard even when wall-clock age exceeds legacy threshold"
         );
     }
 
@@ -19464,20 +19461,21 @@ mod tests {
     }
 
     #[test]
-    fn exit_guard_stale_cache_age_still_rejects_when_slot_unknown() {
+    fn exit_guard_does_not_reject_on_cache_age_when_slot_unknown() {
         let mut pos = PositionTracker::new("m", "p", "dex", 100.0, 6, 1_000_000, 0);
         pos.entry_confirmed_slot = 500;
         let mut ex = sample_exit_quote(50.0);
         ex.source_slot = Some(0);
         ex.cache_age_ms = Some(EXIT_QUOTE_MAX_CACHE_AGE_MS + 1);
-        assert_eq!(
-            exit_quote_price_exit_guard_violation(&pos, &ex, None, ExitQuoteGuardOpts::Strict),
-            Some("STALE_CACHE_AGE_MS")
+        assert!(
+            exit_quote_price_exit_guard_violation(&pos, &ex, None, ExitQuoteGuardOpts::Strict)
+                .is_none(),
+            "wall-clock cache age must not hard-reject exits when slot watermark is unknown"
         );
     }
 
     #[test]
-    fn price_exit_suppressed_when_executable_cache_age_stale() {
+    fn price_exit_allowed_when_cache_age_stale_but_slot_valid() {
         let mut c = make_exit_config();
         c.hard_stop_loss_pct = 20.0;
         c.take_profit_pct = 1_000.0;
@@ -19487,10 +19485,11 @@ mod tests {
         pos.highest_price = entry;
         let mut ex = sample_exit_quote(250.0);
         ex.cache_age_ms = Some(EXIT_QUOTE_MAX_CACHE_AGE_MS + 1);
-        assert!(
+        assert_eq!(
             pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
-                .is_none(),
-            "stale reserve snapshot must not drive STOP_LOSS"
+                .map(|(t, _)| t),
+            Some("STOP_LOSS".to_string()),
+            "quiet-market reserve snapshot must still drive STOP_LOSS when slot guards pass"
         );
     }
 
