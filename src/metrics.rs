@@ -3297,6 +3297,14 @@ pub fn inc_market_data_open_position_pumpfun_registration_unsatisfied_warn_total
         .fetch_add(1, Ordering::Relaxed);
 }
 
+static MARKET_DATA_OPEN_POSITION_PUMPFUN_REGISTRATION_REMEDIATE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn inc_market_data_open_position_pumpfun_registration_remediate_total() {
+    MARKET_DATA_OPEN_POSITION_PUMPFUN_REGISTRATION_REMEDIATE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 #[inline]
 pub fn record_momentum_overlay_closed_by_authority_total() {
     MOMENTUM_OVERLAY_CLOSED_BY_AUTHORITY_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -8569,6 +8577,10 @@ async fn metrics_response() -> Response<Body> {
         "market_data_open_position_pumpfun_registration_unsatisfied_warn_total",
         MARKET_DATA_OPEN_POSITION_PUMPFUN_REGISTRATION_UNSATISFIED_WARN_TOTAL
             .load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_open_position_pumpfun_registration_remediate_total",
+        MARKET_DATA_OPEN_POSITION_PUMPFUN_REGISTRATION_REMEDIATE_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "momentum_overlay_closed_by_authority_total",

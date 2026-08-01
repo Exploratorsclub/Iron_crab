@@ -110,7 +110,11 @@ pub trait TrackWorkerContext: Send + Sync {
     fn arb_pool_is_must_hot(&self, pool: Pubkey) -> bool;
     fn refresh_hot_pool_registry_gauges(&self);
     /// Periodic JetStream refresh for momentum-hot pins (WaitHotSet sustained freshness).
-    fn tick_momentum_hot_balance_refresh_heartbeat(&self);
+    /// Returns `true` when explicit Geyser sync should be coalesced (registration remediation).
+    fn tick_momentum_hot_balance_refresh_heartbeat(
+        &self,
+        admission: &mut FixedCapAdmission,
+    ) -> bool;
     fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey>;
     fn sync_geyser_tracked_accounts_batched_flush_with_deadline(
         &self,
@@ -667,7 +671,16 @@ fn track_worker_loop<C: TrackWorkerContext + 'static>(
             >= Duration::from_millis(MARKET_DATA_MOMENTUM_HOT_BALANCE_REFRESH_HEARTBEAT_MS)
         {
             last_momentum_hot_balance_heartbeat = Instant::now();
-            ctx.tick_momentum_hot_balance_refresh_heartbeat();
+            if ctx.tick_momentum_hot_balance_refresh_heartbeat(&mut admission) {
+                track_worker_prepare_command_delivery(
+                    &ctx,
+                    &TrackWorkerCommand::ScheduleGeyserPush,
+                    &mut coalesce_deadline,
+                    &mut push_before_keys,
+                    &mut pending_continue_evict,
+                    &mut pending_release_flush_slot,
+                );
+            }
         }
     }
 }
@@ -1013,7 +1026,12 @@ mod tests {
 
         fn refresh_hot_pool_registry_gauges(&self) {}
 
-        fn tick_momentum_hot_balance_refresh_heartbeat(&self) {}
+        fn tick_momentum_hot_balance_refresh_heartbeat(
+            &self,
+            _admission: &mut FixedCapAdmission,
+        ) -> bool {
+            false
+        }
 
         fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
             HashSet::new()
@@ -1327,7 +1345,12 @@ mod tests {
 
             fn refresh_hot_pool_registry_gauges(&self) {}
 
-            fn tick_momentum_hot_balance_refresh_heartbeat(&self) {}
+            fn tick_momentum_hot_balance_refresh_heartbeat(
+                &self,
+                _admission: &mut FixedCapAdmission,
+            ) -> bool {
+                false
+            }
 
             fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
                 HashSet::new()
@@ -1586,7 +1609,12 @@ mod tests {
 
         fn refresh_hot_pool_registry_gauges(&self) {}
 
-        fn tick_momentum_hot_balance_refresh_heartbeat(&self) {}
+        fn tick_momentum_hot_balance_refresh_heartbeat(
+            &self,
+            _admission: &mut FixedCapAdmission,
+        ) -> bool {
+            false
+        }
 
         fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
             HashSet::new()
@@ -1841,7 +1869,12 @@ mod tests {
                 false
             }
             fn refresh_hot_pool_registry_gauges(&self) {}
-            fn tick_momentum_hot_balance_refresh_heartbeat(&self) {}
+            fn tick_momentum_hot_balance_refresh_heartbeat(
+                &self,
+                _admission: &mut FixedCapAdmission,
+            ) -> bool {
+                false
+            }
             fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
                 HashSet::new()
             }

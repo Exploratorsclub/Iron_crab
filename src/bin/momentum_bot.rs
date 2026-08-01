@@ -157,6 +157,8 @@ struct MomentumActivePoolPublishQueue {
 
 /// Cooldown between repeated `Ensure*` ControlRequests for the same open-position pool recovery key.
 const OPEN_POSITION_POOL_RECOVERY_COOLDOWN: Duration = Duration::from_secs(60);
+/// Aggressive cooldown when an open PumpFun position lacks a usable exit quote (exit blindness).
+const OPEN_POSITION_EXIT_BLIND_PUMPFUN_RECOVERY_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// Max recovery publishes per timed reconcile tick when executable quotes are still missing.
 const OPEN_POSITION_POOL_RECOVERY_RETRY_MAX_PER_TICK: usize = 8;
@@ -218,6 +220,19 @@ fn open_position_pool_recovery_dedupe_key(
     kind: OpenPositionPoolRecoveryKind,
 ) -> String {
     format!("{mint}\x1f{pool}\x1f{kind:?}")
+}
+
+fn open_position_pool_recovery_cooldown(
+    recovery_kind: OpenPositionPoolRecoveryKind,
+    reason_tag: &'static str,
+) -> Duration {
+    if reason_tag == "quote_missing_retry"
+        && recovery_kind == OpenPositionPoolRecoveryKind::PumpfunBonding
+    {
+        OPEN_POSITION_EXIT_BLIND_PUMPFUN_RECOVERY_COOLDOWN
+    } else {
+        OPEN_POSITION_POOL_RECOVERY_COOLDOWN
+    }
 }
 
 /// Core NATS delivers no publisher discovery: subscribing to [`TOPIC_MOMENTUM_MARKET_EVENTS`]
@@ -4123,11 +4138,12 @@ impl MomentumContext {
                 recovery_kind,
             );
             let key = open_position_pool_recovery_dedupe_key(mint, pool, kind);
+            let cooldown = open_position_pool_recovery_cooldown(kind, reason_tag);
             let now = Instant::now();
             {
                 let map = self.open_position_pool_recovery_last_sent.read();
                 if let Some(prev) = map.get(&key) {
-                    if now.duration_since(*prev) < OPEN_POSITION_POOL_RECOVERY_COOLDOWN {
+                    if now.duration_since(*prev) < cooldown {
                         debug!(
                             mint = %mint,
                             pool = %pool,
@@ -13148,6 +13164,31 @@ mod tests {
             &[OpenPositionPoolRecoveryKind::PumpAmmAccounts]
         );
         assert!(open_position_pool_recovery_kinds_for_normalized_dex("unknown_dex").is_empty());
+    }
+
+    #[test]
+    fn open_position_exit_blind_pumpfun_recovery_uses_short_cooldown() {
+        assert_eq!(
+            open_position_pool_recovery_cooldown(
+                OpenPositionPoolRecoveryKind::PumpfunBonding,
+                "quote_missing_retry"
+            ),
+            OPEN_POSITION_EXIT_BLIND_PUMPFUN_RECOVERY_COOLDOWN
+        );
+        assert_eq!(
+            open_position_pool_recovery_cooldown(
+                OpenPositionPoolRecoveryKind::PumpfunBonding,
+                "startup"
+            ),
+            OPEN_POSITION_POOL_RECOVERY_COOLDOWN
+        );
+        assert_eq!(
+            open_position_pool_recovery_cooldown(
+                OpenPositionPoolRecoveryKind::PumpAmmAccounts,
+                "quote_missing_retry"
+            ),
+            OPEN_POSITION_POOL_RECOVERY_COOLDOWN
+        );
     }
 
     #[test]
