@@ -3278,6 +3278,25 @@ pub fn record_momentum_exit_quote_scale_mismatch_total() {
     MOMENTUM_EXIT_QUOTE_SCALE_MISMATCH_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+static MOMENTUM_EXIT_QUOTE_GUARD_REJECT_TOTAL: Lazy<RwLock<HashMap<&'static str, u64>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Labeled: `momentum_exit_quote_guard_reject_total{reason=...}`.
+#[inline]
+pub fn record_momentum_exit_quote_guard_reject_total(reason: &'static str) {
+    let mut map = MOMENTUM_EXIT_QUOTE_GUARD_REJECT_TOTAL.write();
+    *map.entry(reason).or_insert(0) += 1;
+}
+
+static MARKET_DATA_OPEN_POSITION_PUMPFUN_REGISTRATION_UNSATISFIED_WARN_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn inc_market_data_open_position_pumpfun_registration_unsatisfied_warn_total() {
+    MARKET_DATA_OPEN_POSITION_PUMPFUN_REGISTRATION_UNSATISFIED_WARN_TOTAL
+        .fetch_add(1, Ordering::Relaxed);
+}
+
 #[inline]
 pub fn record_momentum_overlay_closed_by_authority_total() {
     MOMENTUM_OVERLAY_CLOSED_BY_AUTHORITY_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -8538,6 +8557,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "momentum_exit_quote_scale_mismatch_total",
         MOMENTUM_EXIT_QUOTE_SCALE_MISMATCH_TOTAL.load(Ordering::Relaxed)
+    );
+    for (reason, count) in MOMENTUM_EXIT_QUOTE_GUARD_REJECT_TOTAL.read().iter() {
+        out.push_str("momentum_exit_quote_guard_reject_total{reason=\"");
+        out.push_str(reason);
+        out.push_str("\"} ");
+        out.push_str(&count.to_string());
+        out.push('\n');
+    }
+    line!(
+        "market_data_open_position_pumpfun_registration_unsatisfied_warn_total",
+        MARKET_DATA_OPEN_POSITION_PUMPFUN_REGISTRATION_UNSATISFIED_WARN_TOTAL
+            .load(Ordering::Relaxed)
     );
     line!(
         "momentum_overlay_closed_by_authority_total",
