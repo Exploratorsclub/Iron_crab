@@ -896,6 +896,7 @@ impl WsolManager {
                 self.sol_balance.fetch_add(wsol_before, Ordering::Relaxed);
                 self.wsol_balance.store(0, Ordering::Relaxed);
                 self.clear_pending_wrap_state();
+                self.notify_lock_manager_wsol(0);
                 // Update Prometheus metrics
                 WSOL_UNWRAP_TOTAL.fetch_add(1, Ordering::Relaxed);
                 WSOL_UNWRAP_LAMPORTS_TOTAL.fetch_add(wsol_before, Ordering::Relaxed);
