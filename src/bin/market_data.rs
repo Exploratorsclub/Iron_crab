@@ -118,6 +118,7 @@ use ironcrab::metrics::{
     inc_market_data_momentum_admission_rejected_total,
     inc_market_data_open_position_pin_applied_total,
     inc_market_data_open_position_pin_deferred_cache_miss_total,
+    inc_market_data_open_position_pumpfun_registration_remediate_total,
     inc_market_data_open_position_pumpfun_registration_unsatisfied_warn_total,
     inc_market_data_tracker_admission_admitted_total,
     inc_market_data_tracker_admission_rejected_total,
@@ -2195,8 +2196,11 @@ impl TrackWorkerContext for MarketDataContext {
         self.refresh_hot_pool_registry_gauges();
     }
 
-    fn tick_momentum_hot_balance_refresh_heartbeat(&self) {
-        self.tick_momentum_hot_balance_refresh_heartbeat();
+    fn tick_momentum_hot_balance_refresh_heartbeat(
+        &self,
+        admission: &mut FixedCapAdmission,
+    ) -> bool {
+        self.tick_momentum_hot_balance_refresh_heartbeat(admission)
     }
 
     fn snapshot_explicit_subscription_pubkeys(&self) -> HashSet<Pubkey> {
@@ -4469,16 +4473,82 @@ impl MarketDataContext {
     }
 
     /// Periodic heartbeat for momentum-hot pins: sustain SLAVE `LivePoolCache` age during WaitHotSet.
-    fn tick_momentum_hot_balance_refresh_heartbeat(&self) {
+    /// Returns `true` when explicit Geyser sync should be coalesced (registration remediation).
+    fn tick_momentum_hot_balance_refresh_heartbeat(
+        &self,
+        admission: &mut FixedCapAdmission,
+    ) -> bool {
         if self.hot_pool_registry.hot_pool_count_momentum() == 0 {
-            return;
+            return false;
         }
         for pool in self.hot_pool_registry.snapshot_hot_pool_pubkeys() {
             if self.hot_pool_registry.pool_has_momentum(pool) {
                 self.try_publish_balance_updated_from_cache(pool);
             }
         }
+        let batch_dirty = self.remediate_open_position_pumpfun_registration(admission);
         self.tick_open_position_pumpfun_registration_observability();
+        batch_dirty
+    }
+
+    /// Admit/register/resync bonding-curve explicit for position-pinned PumpFun when unsatisfied.
+    fn remediate_open_position_pumpfun_registration(
+        &self,
+        admission: &mut FixedCapAdmission,
+    ) -> bool {
+        let mut batch_dirty = false;
+        for (mint, pool) in self.hot_pool_registry.snapshot_pairs() {
+            if !self.hot_pool_registry.is_position_pin(mint, pool) {
+                continue;
+            }
+            let Some(state) = self.live_pool_cache.get(&pool) else {
+                self.note_deferred_hot_pool_reserve_registration(
+                    pool,
+                    GeyserPinReason::MomentumActive,
+                );
+                continue;
+            };
+            if !matches!(state, CachedPoolState::PumpFun(_)) {
+                continue;
+            }
+            if self.hot_pool_reserve_registration_satisfied(pool) {
+                continue;
+            }
+
+            inc_market_data_open_position_pumpfun_registration_remediate_total();
+            let consumer = ExplicitConsumer::MomentumPosition;
+            let admitted_before: HashSet<Pubkey> =
+                admission.snapshot_pubkeys().into_iter().collect();
+            if !self.try_admit_pool_consumer_group(admission, pool, consumer) {
+                self.note_deferred_hot_pool_reserve_registration(
+                    pool,
+                    GeyserPinReason::MomentumActive,
+                );
+                continue;
+            }
+            let registered = self
+                .register_geyser_reserves_for_active_pool(pool, GeyserPinReason::MomentumActive);
+            let admitted_after: HashSet<Pubkey> =
+                admission.snapshot_pubkeys().into_iter().collect();
+            self.sync_explicit_pool_admitted_from_admission(admission, pool, consumer);
+            if self.hot_pool_reserve_registration_satisfied(pool) {
+                self.clear_deferred_hot_pool_reserve_registration(pool);
+                inc_market_data_open_position_pin_applied_total();
+                self.publish_momentum_hot_balance_refresh_from_cache(pool);
+            } else {
+                self.note_deferred_hot_pool_reserve_registration(
+                    pool,
+                    GeyserPinReason::MomentumActive,
+                );
+            }
+            if admitted_before != admitted_after || registered {
+                batch_dirty = true;
+            }
+            if self.explicit_physical_publish_needed(admission) {
+                batch_dirty = true;
+            }
+        }
+        batch_dirty
     }
 
     /// WARN once per episode when position-pinned PumpFun lacks bonding-curve Geyser registration.
@@ -16855,7 +16925,8 @@ mod pr_b_geyser_tracking_tests {
 
         assert!(ctx.hot_pool_registry.pool_has_momentum(pool));
         assert!(!ctx.balance_updated_from_cache_skipped_for_live_feed(pool));
-        ctx.tick_momentum_hot_balance_refresh_heartbeat();
+        let mut admission = test_admission_for(&ctx);
+        ctx.tick_momentum_hot_balance_refresh_heartbeat(&mut admission);
         assert!(
             cached_pool_has_fresh_reserve_basis(&ctx.live_pool_cache.get(&pool).unwrap()),
             "heartbeat must target momentum-hot pool with publishable reserve basis"
@@ -16887,7 +16958,55 @@ mod pr_b_geyser_tracking_tests {
         ctx.hot_pool_registry.pin_arb_pool(pool);
 
         assert!(!ctx.hot_pool_registry.pool_has_momentum(pool));
-        ctx.tick_momentum_hot_balance_refresh_heartbeat();
+        let mut admission = test_admission_for(&ctx);
+        ctx.tick_momentum_hot_balance_refresh_heartbeat(&mut admission);
+    }
+
+    #[test]
+    fn open_position_pumpfun_unsatisfied_registration_remediates_admission() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: mint,
+                bonding_curve: pool,
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: 30_000_000_000,
+                virtual_token_reserves: 1_073_000_000_000_000,
+                real_sol_reserves: 10_000_000_000,
+                real_token_reserves: 500_000_000_000_000,
+                complete: false,
+                creator: Pubkey::new_unique(),
+                cashback_enabled: false,
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool_with_reason(mint, pool, true);
+
+        assert!(
+            !ctx.hot_pool_reserve_registration_satisfied(pool),
+            "position pin must require bonding curve explicit sync"
+        );
+
+        let mut admission = test_admission_for(&ctx);
+        assert!(
+            ctx.remediate_open_position_pumpfun_registration(&mut admission),
+            "remediation must admit bonding curve and request Geyser sync"
+        );
+        assert!(
+            admission.snapshot_pubkeys().contains(&pool),
+            "bonding curve must be in admitted explicit set"
+        );
+        assert!(
+            ctx.explicit_physical_publish_needed(&admission),
+            "physical Geyser publish must be scheduled after admission delta"
+        );
     }
 
     #[test]
@@ -16925,7 +17044,11 @@ mod pr_b_geyser_tracking_tests {
                 .contains(&pool),
             "unpinned pool must leave hot registry before heartbeat tick"
         );
-        ctx.tick_momentum_hot_balance_refresh_heartbeat();
+        let mut admission = test_admission_for(&ctx);
+        assert!(
+            !ctx.tick_momentum_hot_balance_refresh_heartbeat(&mut admission),
+            "heartbeat must no-op when no momentum-hot pools remain"
+        );
     }
 
     #[test]

@@ -1776,6 +1776,59 @@ mod tests {
     }
 
     #[test]
+    fn test_pumpfun_balance_updated_refreshes_existing_cache_age() {
+        use std::time::Duration;
+
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+
+        let mut discovered = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "pumpfun".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1_073_000_000_000_000,
+            30_000_000_000,
+            Some(0),
+            1,
+        );
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("complete".to_string(), "false".to_string());
+        discovered.metadata = Some(meta);
+        assert!(apply_pool_cache_update(&cache, &discovered));
+
+        std::thread::sleep(Duration::from_millis(40));
+        let (_, _, age_before) = cache.get_with_metadata(&pool).expect("cached");
+        assert!(age_before >= 30, "seed row must age before refresh");
+
+        let mut bal = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "pumpfun".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1_050_000_000_000_000,
+            32_000_000_000,
+            2,
+        );
+        bal.set_dex_readiness_in_metadata(DexPoolReadiness::Observed);
+        assert!(apply_pool_cache_update(&cache, &bal));
+
+        let (_, _, age_after) = cache.get_with_metadata(&pool).expect("cached");
+        assert!(
+            age_after < 20,
+            "PumpFun BalanceUpdated with reserve basis must refresh SLAVE cache age"
+        );
+    }
+
+    #[test]
     fn test_raydium_cpmm_balance_updated_preserves_vaults_and_merges_readiness() {
         let cache = LivePoolCache::new();
         let pool = Pubkey::new_unique();
