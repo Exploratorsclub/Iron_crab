@@ -13511,6 +13511,83 @@ mod pr_b_geyser_tracking_tests {
         );
     }
 
+    /// P0: open-position PumpFun pin must publish JetStream even when not EnrichmentRegistry member
+    /// (e.g. hot_pool_pubkeys_snapshot lag while position pin is already active).
+    #[test]
+    fn open_position_pumpfun_pin_publishes_without_enrichment_membership() {
+        use ironcrab::market_data::sidefx::handlers::md_sidefx_process_live_pool_cache_account_update;
+        use ironcrab::market_data::sidefx::MdSidefxCommand;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, _depth, _md_state_rx) = test_md_state_sender_no_worker();
+        let (publish_tx, mut publish_rx) = tokio::sync::mpsc::channel(8);
+        let worker = MarketDataSidefxHost {
+            ctx: ctx.clone(),
+            publish_tx: Some(publish_tx),
+            md_state: md_state.clone(),
+            track_worker: test_noop_track_worker_sender(),
+        };
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let account_data = test_pumpfun_bonding_curve_account_data(
+            1_073_000_000_000_000,
+            30_000_000_000,
+            500_000_000_000_000,
+            10_000_000_000,
+            creator,
+        );
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: mint,
+                bonding_curve: pool,
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: 30_000_000_000,
+                virtual_token_reserves: 1_073_000_000_000_000,
+                real_sol_reserves: 10_000_000_000,
+                real_token_reserves: 500_000_000_000_000,
+                complete: false,
+                creator,
+                cashback_enabled: false,
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool_with_reason(mint, pool, true);
+        // Simulate ingest snapshot lag: position pin active but pool not in enrichment hot set.
+        ctx.hot_pool_registry
+            .hot_pool_pubkeys_snapshot
+            .store(std::sync::Arc::new(std::collections::HashSet::new()));
+        assert!(
+            !ctx.ingest_is_enrichment_member(&pool),
+            "test setup: pool must not be enrichment member"
+        );
+        assert!(
+            ctx.hot_pool_registry.is_position_pin_for_pool(pool),
+            "test setup: position pin must remain active"
+        );
+
+        let job = MdSidefxCommand::LivePoolCacheAccountUpdate {
+            run_id: "open-pos-no-enrich".into(),
+            pool_pubkey: pool,
+            owner: PUMPFUN_PROGRAM_OWNER,
+            account_data,
+            slot: 30,
+            grpc_recv_at: Instant::now(),
+            update_class: SidefxUpdateClass::Enrich,
+        };
+        let mut scratch = MdSidefxBurstScratch::new();
+        md_sidefx_process_live_pool_cache_account_update(&worker, &job, &mut scratch);
+        assert!(
+            publish_rx.try_recv().is_ok(),
+            "open-position PumpFun pin must publish JetStream without enrichment membership"
+        );
+    }
+
     #[test]
     fn md_sidefx_live_pool_cache_update_skips_md_state_for_non_hot_pool() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
