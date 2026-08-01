@@ -3929,7 +3929,7 @@ impl MomentumContext {
         try_rows.retain(|p| seen.insert(p.pool_address.clone()));
 
         let mut best: Option<(ExitExecutableQuote, u64)> = None;
-        let mut guard_reject_sample: Option<(&'static str, String)> = None;
+        let mut guard_reject_sample: Option<(&'static str, String, u64, u64)> = None;
 
         for pool_row in try_rows {
             let pool_addr = pool_row.pool_address.clone();
@@ -3976,7 +3976,7 @@ impl MomentumContext {
             ) {
                 ironcrab::metrics::record_momentum_exit_quote_guard_reject_total(reason);
                 if guard_reject_sample.is_none() {
-                    guard_reject_sample = Some((reason, pool_addr.clone()));
+                    guard_reject_sample = Some((reason, pool_addr.clone(), age_ms, slot));
                 }
                 trace!(
                     mint = %pos.mint,
@@ -4004,12 +4004,16 @@ impl MomentumContext {
         }
 
         if best.is_none() {
-            if let Some((reason, quote_pool)) = guard_reject_sample {
+            if let Some((reason, quote_pool, cache_age_ms, quote_slot)) = guard_reject_sample {
                 warn!(
                     mint = %pos.mint,
                     position_pool = %pos.pool,
                     quote_pool = %quote_pool,
                     reason = %reason,
+                    cache_age_ms = cache_age_ms,
+                    quote_slot = quote_slot,
+                    entry_confirmed_slot = pos.entry_confirmed_slot,
+                    last_price_slot = pos.last_price_slot,
                     "executable_exit_quote: all reserve quote candidates rejected by exit guards"
                 );
             }
@@ -4262,6 +4266,7 @@ impl MomentumContext {
     }
 
     async fn tick_open_position_pool_recovery_retries(self: &Arc<Self>) {
+        // Cold-path Ensure* fallback when SLAVE cache is blind/stale — not a Hot Path freshness ticker.
         let mut rows: Vec<(String, String, String, &'static str)> = Vec::new();
         {
             let positions = self.positions.read();
@@ -11762,7 +11767,9 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Timed-exit reconciliation (retry exits that were generated but never confirmed)
+            // Timed-exit reconciliation (retry exits that were generated but never confirmed).
+            // Cold-path recovery only: `tick_open_position_pool_recovery_retries` issues Ensure*
+            // via NATS — not the event-driven Hot Path for exit-quote freshness (I-16).
             _ = reconcile_interval.tick() => {
                 ironcrab::metrics::record_activity();
                 ctx.reconcile_timed_exits().await;

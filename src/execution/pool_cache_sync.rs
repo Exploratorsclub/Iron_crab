@@ -1829,6 +1829,65 @@ mod tests {
     }
 
     #[test]
+    fn pumpfun_balance_updated_same_reserves_new_slot_refreshes_slave_age() {
+        use std::time::Duration;
+
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let token_reserves = 1_073_000_000_000_000u64;
+        let sol_reserves = 30_000_000_000u64;
+
+        let mut discovered = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "pumpfun".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            token_reserves,
+            sol_reserves,
+            Some(0),
+            10,
+        );
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("complete".to_string(), "false".to_string());
+        discovered.metadata = Some(meta);
+        assert!(apply_pool_cache_update(&cache, &discovered));
+
+        std::thread::sleep(Duration::from_millis(40));
+        let (_, slot_before, age_before) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(slot_before, 10);
+        assert!(
+            age_before >= 30,
+            "seed row must age before slot-only refresh"
+        );
+
+        let bal = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "pumpfun".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            token_reserves,
+            sol_reserves,
+            11,
+        );
+        assert!(apply_pool_cache_update(&cache, &bal));
+
+        let (_, slot_after, age_after) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(slot_after, 11, "slot must advance from Geyser event");
+        assert!(
+            age_after < 20,
+            "unchanged reserves with newer slot must refresh SLAVE cache age (event-driven pin path)"
+        );
+    }
+
+    #[test]
     fn test_raydium_cpmm_balance_updated_preserves_vaults_and_merges_readiness() {
         let cache = LivePoolCache::new();
         let pool = Pubkey::new_unique();

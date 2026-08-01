@@ -215,6 +215,35 @@ fn md_sidefx_publish_enrichment_from_cache_upsert(
     slot: u64,
     grpc_recv_at: Instant,
 ) {
+    let open_position_pumpfun_pin =
+        md_sidefx_is_open_position_pumpfun_pin(host, pool_pubkey, cached_state);
+
+    // P0: open-position PumpFun pins must refresh JetStream even without EnrichmentRegistry
+    // membership (account path already guarantees PoolDiscovered; this path is BalanceUpdated).
+    if open_position_pumpfun_pin {
+        if !cached_pool_has_fresh_reserve_basis(cached_state) {
+            return;
+        }
+        if host.nats_enabled() {
+            md_sidefx_publish_open_position_pumpfun_balance_refresh(
+                host,
+                run_id,
+                pool_pubkey,
+                slot,
+            );
+        }
+        if md_sidefx_publish_pool_state_update_from_cache(
+            host,
+            run_id,
+            pool_pubkey,
+            slot,
+            grpc_recv_at,
+        ) {
+            inc_market_data_enrichment_pool_state_publish_total();
+        }
+        return;
+    }
+
     if !host.is_enrichment_member(pool_pubkey) {
         return;
     }
@@ -224,25 +253,16 @@ fn md_sidefx_publish_enrichment_from_cache_upsert(
     if !cached_pool_has_fresh_reserve_basis(cached_state) {
         return;
     }
-    let open_position_pumpfun_pin =
-        md_sidefx_is_open_position_pumpfun_pin(host, pool_pubkey, cached_state);
     let balance_unchanged = prev_state
         .as_ref()
         .is_some_and(|prev| cache_balance_fields_unchanged(prev, cached_state));
-    if balance_unchanged && !open_position_pumpfun_pin {
+    if balance_unchanged {
         inc_market_data_pool_state_publish_skipped_balance_unchanged_total();
         return;
     }
 
     if host.nats_enabled() {
-        if open_position_pumpfun_pin {
-            md_sidefx_publish_open_position_pumpfun_balance_refresh(
-                host,
-                run_id,
-                pool_pubkey,
-                slot,
-            );
-        } else if let Some(balance_update) =
+        if let Some(balance_update) =
             md_sidefx_build_balance_updated_from_cache(host, run_id, pool_pubkey, slot)
         {
             let subject = pool_subject(&pool_pubkey.to_string());
