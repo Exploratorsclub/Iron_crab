@@ -1228,6 +1228,41 @@ pub fn md_sidefx_process_bonding_curve(host: &dyn SidefxWorkerHost, job: &MdSide
                 "P2#7: BondingCurveUpdate fallback PoolCacheUpdate enqueued for JetStream"
             );
         }
+    } else if host.is_hot_pool(pool_address) {
+        if let Some(CachedPoolState::PumpFun(mut s)) = host.live_pool_cache().get(pool_address) {
+            s.virtual_token_reserves = *virtual_token_reserves;
+            s.virtual_sol_reserves = *virtual_sol_reserves;
+            s.real_token_reserves = *real_token_reserves;
+            s.real_sol_reserves = *real_sol_reserves;
+            s.complete = *complete;
+            s.cashback_enabled = *cashback_enabled;
+            if s.creator == Pubkey::default() {
+                s.creator = *creator;
+            }
+            if host
+                .live_pool_cache()
+                .upsert(*pool_address, CachedPoolState::PumpFun(s), *slot)
+                && host.nats_enabled()
+            {
+                if let Some(balance_update) =
+                    md_sidefx_build_balance_updated_from_cache(host, run_id, pool_address, *slot)
+                {
+                    let subject = pool_subject(&pool_str);
+                    sidefx_host_enqueue_jetstream(
+                        host,
+                        subject,
+                        &balance_update,
+                        "hot PumpFun BondingCurve reserve refresh PoolCacheUpdate",
+                        false,
+                    );
+                    debug!(
+                        pool = %pool_str,
+                        slot = *slot,
+                        "hot PumpFun BondingCurve reserve refresh enqueued for JetStream"
+                    );
+                }
+            }
+        }
     }
 }
 

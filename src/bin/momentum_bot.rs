@@ -1081,6 +1081,32 @@ const SPL_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const SPL_TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
+/// Controls slot-ordering relaxations in [`exit_quote_price_exit_guard_violation`].
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum ExitQuoteGuardOpts {
+    #[default]
+    Strict,
+    /// STOP_LOSS / TAKE_PROFIT: fresh post-entry bonding-curve quotes may trail trade-mark slots.
+    RelaxPositionMarkSlotForHardPriceExit,
+}
+
+#[inline]
+fn exit_quote_hard_price_exit_may_relax_mark_slot_guard(
+    pos: &PositionTracker,
+    q: &ExitExecutableQuote,
+) -> bool {
+    let fresh = q
+        .cache_age_ms
+        .is_some_and(|age| age <= EXIT_QUOTE_MAX_CACHE_AGE_MS);
+    if !fresh {
+        return false;
+    }
+    match q.source_slot {
+        Some(slot) if slot > 0 => pos.entry_confirmed_slot == 0 || slot > pos.entry_confirmed_slot,
+        _ => false,
+    }
+}
+
 #[inline]
 fn exit_quote_address_is_token_program_pseudopool(addr: &str) -> bool {
     addr == SPL_TOKEN_PROGRAM || addr == SPL_TOKEN_2022_PROGRAM
@@ -1131,6 +1157,7 @@ fn exit_quote_price_exit_guard_violation(
     pos: &PositionTracker,
     q: &ExitExecutableQuote,
     dex_pool_accounts: Option<&[String]>,
+    opts: ExitQuoteGuardOpts,
 ) -> Option<&'static str> {
     if !exit_executable_quote_is_usable(q) {
         return Some("NOT_POOL_SOURCED_OR_INVALID_TPS");
@@ -1151,7 +1178,11 @@ fn exit_quote_price_exit_guard_violation(
                 return Some("QUOTE_SLOT_NOT_AFTER_ENTRY_CONFIRM");
             }
             if pos.last_price_slot > 0 && slot < pos.last_price_slot {
-                return Some("QUOTE_SLOT_BEFORE_LAST_POSITION_MARK_SLOT");
+                let relax = opts == ExitQuoteGuardOpts::RelaxPositionMarkSlotForHardPriceExit
+                    && exit_quote_hard_price_exit_may_relax_mark_slot_guard(pos, q);
+                if !relax {
+                    return Some("QUOTE_SLOT_BEFORE_LAST_POSITION_MARK_SLOT");
+                }
             }
         }
     }
@@ -1643,8 +1674,15 @@ impl PositionTracker {
         live_trades_per_min: Option<f64>,
     ) -> Option<(String, String)> {
         let structural_q = exit_quote.filter(|q| exit_executable_quote_is_usable(q));
-        let price_exit_q =
-            exit_quote.filter(|q| exit_quote_price_exit_guard_violation(self, q, None).is_none());
+        let price_exit_q = exit_quote.filter(|q| {
+            exit_quote_price_exit_guard_violation(
+                self,
+                q,
+                None,
+                ExitQuoteGuardOpts::RelaxPositionMarkSlotForHardPriceExit,
+            )
+            .is_none()
+        });
         let pnl = self.pnl_pct();
         let hold_secs = self.entry_time.elapsed().as_secs();
 
@@ -1687,9 +1725,16 @@ impl PositionTracker {
                 ));
             }
         } else if pnl <= -effective_hard_stop {
-            let suppressed =
-                exit_quote.and_then(|q| exit_quote_price_exit_guard_violation(self, q, None));
+            let suppressed = exit_quote.and_then(|q| {
+                exit_quote_price_exit_guard_violation(
+                    self,
+                    q,
+                    None,
+                    ExitQuoteGuardOpts::RelaxPositionMarkSlotForHardPriceExit,
+                )
+            });
             if let Some(code) = suppressed {
+                ironcrab::metrics::record_momentum_exit_quote_guard_reject_total(code);
                 log_momentum_exit_price_decision(
                     self,
                     exit_quote,
@@ -1749,7 +1794,13 @@ impl PositionTracker {
                 }
             } else if pnl >= config.take_profit_pct {
                 if let Some(q) = exit_quote {
-                    if let Some(code) = exit_quote_price_exit_guard_violation(self, q, None) {
+                    if let Some(code) = exit_quote_price_exit_guard_violation(
+                        self,
+                        q,
+                        None,
+                        ExitQuoteGuardOpts::RelaxPositionMarkSlotForHardPriceExit,
+                    ) {
+                        ironcrab::metrics::record_momentum_exit_quote_guard_reject_total(code);
                         log_momentum_exit_price_decision(
                             self,
                             exit_quote,
@@ -3779,6 +3830,7 @@ impl MomentumContext {
         &self,
         pos: &PositionTracker,
         token_trackers: Option<&HashMap<String, TokenTracker>>,
+        guard_opts: ExitQuoteGuardOpts,
     ) -> Option<ExitExecutableQuote> {
         let token_mint = solana_sdk::pubkey::Pubkey::from_str(&pos.mint).ok()?;
         if pos.pool.is_empty() || pos.token_amount == 0 {
@@ -3851,9 +3903,13 @@ impl MomentumContext {
                 pool_row.dex_pool_accounts.clone().or_else(|| {
                     self.dex_pool_accounts_for_mint_pool(&pos.mint, &pool_addr, token_trackers)
                 });
-            if let Some(reason) =
-                exit_quote_price_exit_guard_violation(pos, &candidate, merged_accounts.as_deref())
-            {
+            if let Some(reason) = exit_quote_price_exit_guard_violation(
+                pos,
+                &candidate,
+                merged_accounts.as_deref(),
+                guard_opts,
+            ) {
+                ironcrab::metrics::record_momentum_exit_quote_guard_reject_total(reason);
                 if guard_reject_sample.is_none() {
                     guard_reject_sample = Some((reason, pool_addr.clone()));
                 }
@@ -4144,7 +4200,14 @@ impl MomentumContext {
                 if pos.pool.is_empty() || pos.token_amount == 0 {
                     continue;
                 }
-                if self.executable_exit_quote(pos, None).is_some() {
+                if self
+                    .executable_exit_quote(
+                        pos,
+                        None,
+                        ExitQuoteGuardOpts::RelaxPositionMarkSlotForHardPriceExit,
+                    )
+                    .is_some()
+                {
                     continue;
                 }
                 rows.push((mint.clone(), pos.pool.clone(), pos.dex.clone()));
@@ -5771,7 +5834,9 @@ impl MomentumContext {
                     self.mark_entry_eval_dirty_key(key);
                     continue;
                 };
-                let Some(ex_q) = self.executable_exit_quote(pos, Some(trackers)) else {
+                let Some(ex_q) =
+                    self.executable_exit_quote(pos, Some(trackers), ExitQuoteGuardOpts::Strict)
+                else {
                     ironcrab::metrics::record_momentum_scale_in_gate_blocked_total(
                         ironcrab::metrics::MomentumScaleInGateBlockedReason::NoQuote,
                     );
@@ -6867,7 +6932,11 @@ impl MomentumContext {
                 continue;
             }
 
-            let exit_q = self.executable_exit_quote(pos, None);
+            let exit_q = self.executable_exit_quote(
+                pos,
+                None,
+                ExitQuoteGuardOpts::RelaxPositionMarkSlotForHardPriceExit,
+            );
             let live_trades_per_min = trades_per_min_by_tracker_key
                 .get(&Self::tracker_storage_key(mint, &pos.pool))
                 .copied();
@@ -7035,9 +7104,13 @@ impl MomentumContext {
             let config = self.config.read().clone();
             let exit_q = {
                 let positions = self.positions.read();
-                positions
-                    .get(&candidate.mint)
-                    .and_then(|p| self.executable_exit_quote(p, None))
+                positions.get(&candidate.mint).and_then(|p| {
+                    self.executable_exit_quote(
+                        p,
+                        None,
+                        ExitQuoteGuardOpts::RelaxPositionMarkSlotForHardPriceExit,
+                    )
+                })
             };
             let chain_head_slot = self
                 .last_event_slot
@@ -19123,7 +19196,7 @@ mod tests {
         ex.source_slot = Some(0);
         ex.cache_age_ms = Some(0);
         assert_ne!(
-            exit_quote_price_exit_guard_violation(&pos, &ex, None),
+            exit_quote_price_exit_guard_violation(&pos, &ex, None, ExitQuoteGuardOpts::Strict),
             Some("QUOTE_SLOT_NOT_AFTER_ENTRY_CONFIRM"),
             "slot=0 is unknown watermark and must not trip entry-confirm slot guard"
         );
@@ -19137,12 +19210,12 @@ mod tests {
         ex.cache_age_ms = Some(0);
         ex.source_slot = Some(500);
         assert_eq!(
-            exit_quote_price_exit_guard_violation(&pos, &ex, None),
+            exit_quote_price_exit_guard_violation(&pos, &ex, None, ExitQuoteGuardOpts::Strict),
             Some("QUOTE_SLOT_NOT_AFTER_ENTRY_CONFIRM")
         );
         ex.source_slot = Some(499);
         assert_eq!(
-            exit_quote_price_exit_guard_violation(&pos, &ex, None),
+            exit_quote_price_exit_guard_violation(&pos, &ex, None, ExitQuoteGuardOpts::Strict),
             Some("QUOTE_SLOT_NOT_AFTER_ENTRY_CONFIRM")
         );
     }
@@ -19154,7 +19227,84 @@ mod tests {
         let mut ex = sample_exit_quote(100.0);
         ex.source_slot = Some(501);
         ex.cache_age_ms = Some(0);
-        assert!(exit_quote_price_exit_guard_violation(&pos, &ex, None).is_none());
+        assert!(
+            exit_quote_price_exit_guard_violation(&pos, &ex, None, ExitQuoteGuardOpts::Strict)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn exit_guard_strict_rejects_fresh_quote_before_last_position_mark_slot() {
+        let mut pos = PositionTracker::new("m", "p", "dex", 100.0, 6, 1_000_000, 0);
+        pos.entry_confirmed_slot = 500;
+        pos.last_price_slot = 900;
+        let mut ex = sample_exit_quote(50.0);
+        ex.source_slot = Some(850);
+        ex.cache_age_ms = Some(500);
+        assert_eq!(
+            exit_quote_price_exit_guard_violation(&pos, &ex, None, ExitQuoteGuardOpts::Strict),
+            Some("QUOTE_SLOT_BEFORE_LAST_POSITION_MARK_SLOT")
+        );
+    }
+
+    #[test]
+    fn exit_guard_hard_price_exit_relaxes_mark_slot_when_fresh_and_after_entry() {
+        let mut pos = PositionTracker::new("m", "p", "dex", 100.0, 6, 1_000_000, 0);
+        pos.entry_confirmed_slot = 500;
+        pos.last_price_slot = 900;
+        let mut ex = sample_exit_quote(50.0);
+        ex.source_slot = Some(850);
+        ex.cache_age_ms = Some(500);
+        assert!(
+            exit_quote_price_exit_guard_violation(
+                &pos,
+                &ex,
+                None,
+                ExitQuoteGuardOpts::RelaxPositionMarkSlotForHardPriceExit,
+            )
+            .is_none(),
+            "fresh post-entry bonding-curve quote must not be vetoed by trade-mark slot"
+        );
+    }
+
+    #[test]
+    fn exit_guard_hard_price_exit_keeps_mark_slot_veto_when_cache_stale() {
+        let mut pos = PositionTracker::new("m", "p", "dex", 100.0, 6, 1_000_000, 0);
+        pos.entry_confirmed_slot = 500;
+        pos.last_price_slot = 900;
+        let mut ex = sample_exit_quote(50.0);
+        ex.source_slot = Some(850);
+        ex.cache_age_ms = Some(EXIT_QUOTE_MAX_CACHE_AGE_MS + 1);
+        assert_eq!(
+            exit_quote_price_exit_guard_violation(
+                &pos,
+                &ex,
+                None,
+                ExitQuoteGuardOpts::RelaxPositionMarkSlotForHardPriceExit,
+            ),
+            Some("STALE_CACHE_AGE_MS")
+        );
+    }
+
+    #[test]
+    fn stop_loss_allows_fresh_quote_when_bonding_curve_slot_trails_trade_mark() {
+        let mut c = make_exit_config();
+        c.hard_stop_loss_pct = 20.0;
+        c.take_profit_pct = 1_000.0;
+        let entry = 100.0;
+        let mut pos = PositionTracker::new("m", "p", "dex", entry, 6, 1_000_000, 0);
+        pos.entry_confirmed_slot = 500;
+        pos.last_price_slot = 900;
+        pos.current_price = 110.0;
+        pos.highest_price = entry;
+        let mut ex = sample_exit_quote(250.0);
+        ex.source_slot = Some(850);
+        ex.cache_age_ms = Some(500);
+        assert_eq!(
+            pos.should_exit(&c, Some(&ex), "test", 9_000_000_000u64, None)
+                .map(|(t, _)| t),
+            Some("STOP_LOSS".to_string())
+        );
     }
 
     #[test]
@@ -19165,7 +19315,7 @@ mod tests {
         ex.source_slot = Some(0);
         ex.cache_age_ms = Some(EXIT_QUOTE_MAX_CACHE_AGE_MS + 1);
         assert_eq!(
-            exit_quote_price_exit_guard_violation(&pos, &ex, None),
+            exit_quote_price_exit_guard_violation(&pos, &ex, None, ExitQuoteGuardOpts::Strict),
             Some("STALE_CACHE_AGE_MS")
         );
     }
@@ -19220,11 +19370,22 @@ mod tests {
         };
         let bad = vec!["a".to_string(), "b".to_string()];
         assert_eq!(
-            exit_quote_price_exit_guard_violation(&pos, &ex, Some(&bad)),
+            exit_quote_price_exit_guard_violation(
+                &pos,
+                &ex,
+                Some(&bad),
+                ExitQuoteGuardOpts::Strict
+            ),
             Some("QUOTE_POOL_ACCOUNTS_NOT_VERIFIED_SOL_PAIR")
         );
         let ok = vec!["x".to_string(), WSOL_MINT.to_string(), "mint9".to_string()];
-        assert!(exit_quote_price_exit_guard_violation(&pos, &ex, Some(&ok)).is_none());
+        assert!(exit_quote_price_exit_guard_violation(
+            &pos,
+            &ex,
+            Some(&ok),
+            ExitQuoteGuardOpts::Strict
+        )
+        .is_none());
     }
 
     #[test]
@@ -19232,7 +19393,7 @@ mod tests {
         let pos = PositionTracker::new("m", "p", "dex", 1.0e7, 6, 69_000_000_000, 0);
         let ex = sample_exit_quote(0.17);
         assert_eq!(
-            exit_quote_price_exit_guard_violation(&pos, &ex, None),
+            exit_quote_price_exit_guard_violation(&pos, &ex, None, ExitQuoteGuardOpts::Strict),
             Some("QUOTE_TPS_SCALE_MISMATCH")
         );
     }
@@ -19241,7 +19402,10 @@ mod tests {
     fn scale_mismatch_guard_allows_quote_within_100x_of_entry() {
         let pos = PositionTracker::new("m", "p", "dex", 1.0e7, 6, 1_000_000, 0);
         let ex = sample_exit_quote(9.0e6);
-        assert!(exit_quote_price_exit_guard_violation(&pos, &ex, None).is_none());
+        assert!(
+            exit_quote_price_exit_guard_violation(&pos, &ex, None, ExitQuoteGuardOpts::Strict)
+                .is_none()
+        );
     }
 
     #[test]

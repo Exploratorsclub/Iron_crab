@@ -118,6 +118,7 @@ use ironcrab::metrics::{
     inc_market_data_momentum_admission_rejected_total,
     inc_market_data_open_position_pin_applied_total,
     inc_market_data_open_position_pin_deferred_cache_miss_total,
+    inc_market_data_open_position_pumpfun_registration_unsatisfied_warn_total,
     inc_market_data_tracker_admission_admitted_total,
     inc_market_data_tracker_admission_rejected_total,
     inc_market_data_vault_high_priority_dispatch_total,
@@ -1288,6 +1289,10 @@ struct MarketDataContext {
     dlmm_registered_active_id: parking_lot::RwLock<HashMap<Pubkey, i32>>,
     /// Scope C: hot pools awaiting LivePoolCache layout for vault/bin Geyser registration.
     deferred_hot_pool_reserve_pins: parking_lot::RwLock<HashMap<Pubkey, GeyserPinReason>>,
+    /// Open-position PumpFun pools with unsatisfied bonding-curve Geyser registration (observability).
+    open_position_pumpfun_registration_unsatisfied_since:
+        parking_lot::RwLock<HashMap<Pubkey, Instant>>,
+    open_position_pumpfun_registration_warned: parking_lot::RwLock<HashSet<Pubkey>>,
     /// PR3: startup restore / first physical publish barrier before Geyser connect.
     geyser_connect_barrier: Arc<GeyserConnectBarrier>,
     /// PR3: explicit admission readiness (wallet-over-cap fail-closed).
@@ -4471,6 +4476,49 @@ impl MarketDataContext {
         for pool in self.hot_pool_registry.snapshot_hot_pool_pubkeys() {
             if self.hot_pool_registry.pool_has_momentum(pool) {
                 self.try_publish_balance_updated_from_cache(pool);
+            }
+        }
+        self.tick_open_position_pumpfun_registration_observability();
+    }
+
+    /// WARN once per episode when position-pinned PumpFun lacks bonding-curve Geyser registration.
+    fn tick_open_position_pumpfun_registration_observability(&self) {
+        const WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+        for (mint, pool) in self.hot_pool_registry.snapshot_pairs() {
+            if !self.hot_pool_registry.is_position_pin(mint, pool) {
+                continue;
+            }
+            let Some(state) = self.live_pool_cache.get(&pool) else {
+                continue;
+            };
+            if !matches!(state, CachedPoolState::PumpFun(_)) {
+                continue;
+            }
+            if self.hot_pool_reserve_registration_satisfied(pool) {
+                self.open_position_pumpfun_registration_unsatisfied_since
+                    .write()
+                    .remove(&pool);
+                self.open_position_pumpfun_registration_warned
+                    .write()
+                    .remove(&pool);
+                continue;
+            }
+            let mut since_map = self
+                .open_position_pumpfun_registration_unsatisfied_since
+                .write();
+            let since = since_map.entry(pool).or_insert_with(Instant::now);
+            if since.elapsed() < WARN_AFTER {
+                continue;
+            }
+            drop(since_map);
+            let mut warned = self.open_position_pumpfun_registration_warned.write();
+            if warned.insert(pool) {
+                inc_market_data_open_position_pumpfun_registration_unsatisfied_warn_total();
+                warn!(
+                    pool = %pool,
+                    mint = %mint,
+                    "open-position PumpFun hot_pool_reserve_registration_satisfied=false for >10s — bonding curve Geyser explicit may be missing"
+                );
             }
         }
     }
@@ -7814,6 +7862,10 @@ async fn main() -> Result<()> {
         last_arb_snapshot_target: parking_lot::RwLock::new(None),
         dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
         deferred_hot_pool_reserve_pins: parking_lot::RwLock::new(HashMap::new()),
+        open_position_pumpfun_registration_unsatisfied_since: parking_lot::RwLock::new(
+            HashMap::new(),
+        ),
+        open_position_pumpfun_registration_warned: parking_lot::RwLock::new(HashSet::new()),
         geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
         geyser_explicit_ready: AtomicBool::new(true),
         geyser_explicit_config_error: parking_lot::RwLock::new(None),
@@ -12360,6 +12412,10 @@ mod wallet_snapshot_stale_cleanup_tests {
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
             deferred_hot_pool_reserve_pins: parking_lot::RwLock::new(HashMap::new()),
+            open_position_pumpfun_registration_unsatisfied_since: parking_lot::RwLock::new(
+                HashMap::new(),
+            ),
+            open_position_pumpfun_registration_warned: parking_lot::RwLock::new(HashSet::new()),
             geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
             geyser_explicit_ready: AtomicBool::new(true),
             geyser_explicit_config_error: parking_lot::RwLock::new(None),
@@ -12589,6 +12645,10 @@ mod wallet_tx_meta_balance_tests {
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
             deferred_hot_pool_reserve_pins: parking_lot::RwLock::new(HashMap::new()),
+            open_position_pumpfun_registration_unsatisfied_since: parking_lot::RwLock::new(
+                HashMap::new(),
+            ),
+            open_position_pumpfun_registration_warned: parking_lot::RwLock::new(HashSet::new()),
             geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
             geyser_explicit_ready: AtomicBool::new(true),
             geyser_explicit_config_error: parking_lot::RwLock::new(None),
@@ -13206,6 +13266,73 @@ mod pr_b_geyser_tracking_tests {
         assert!(
             pool_cache_balance_fields_from_state(&state).is_some(),
             "PumpFun must expose balance fields for JetStream publish path"
+        );
+    }
+
+    #[test]
+    fn pumpfun_hot_bonding_curve_sidefx_refreshes_existing_cache_reserves() {
+        use ironcrab::market_data::sidefx::handlers::md_sidefx_process_bonding_curve;
+        use ironcrab::market_data::sidefx::MdSidefxCommand;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, _depth, _md_state_rx) = test_md_state_sender_no_worker();
+        let worker = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        ctx.pool_mint_map
+            .write()
+            .insert(pool.to_string(), mint.to_string());
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: mint,
+                bonding_curve: pool,
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: 30_000_000_000,
+                virtual_token_reserves: 1_073_000_000_000_000,
+                real_sol_reserves: 10_000_000_000,
+                real_token_reserves: 500_000_000_000_000,
+                complete: false,
+                creator,
+                cashback_enabled: false,
+            }),
+            10,
+        );
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+
+        md_sidefx_process_bonding_curve(
+            &worker,
+            &MdSidefxCommand::BondingCurveDevWallet {
+                run_id: "hot-bonding-refresh".into(),
+                pool_address: pool,
+                creator,
+                slot: 42,
+                grpc_recv_at: Instant::now(),
+                virtual_token_reserves: 900_000_000_000_000,
+                virtual_sol_reserves: 35_000_000_000,
+                real_token_reserves: 400_000_000_000_000,
+                real_sol_reserves: 12_000_000_000,
+                complete: false,
+                cashback_enabled: false,
+            },
+        );
+
+        let state = ctx.live_pool_cache.get(&pool).expect("cache row");
+        let CachedPoolState::PumpFun(s) = state else {
+            panic!("expected PumpFun cache row");
+        };
+        assert_eq!(s.virtual_token_reserves, 900_000_000_000_000);
+        assert_eq!(s.virtual_sol_reserves, 35_000_000_000);
+        assert_eq!(
+            ctx.live_pool_cache
+                .get_with_metadata(&pool)
+                .map(|(_, slot, _)| slot),
+            Some(42)
         );
     }
 
@@ -13965,6 +14092,10 @@ mod pr_b_geyser_tracking_tests {
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
             deferred_hot_pool_reserve_pins: parking_lot::RwLock::new(HashMap::new()),
+            open_position_pumpfun_registration_unsatisfied_since: parking_lot::RwLock::new(
+                HashMap::new(),
+            ),
+            open_position_pumpfun_registration_warned: parking_lot::RwLock::new(HashSet::new()),
             geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
             geyser_explicit_ready: AtomicBool::new(true),
             geyser_explicit_config_error: parking_lot::RwLock::new(None),
@@ -14046,6 +14177,10 @@ mod pr_b_geyser_tracking_tests {
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
             deferred_hot_pool_reserve_pins: parking_lot::RwLock::new(HashMap::new()),
+            open_position_pumpfun_registration_unsatisfied_since: parking_lot::RwLock::new(
+                HashMap::new(),
+            ),
+            open_position_pumpfun_registration_warned: parking_lot::RwLock::new(HashSet::new()),
             geyser_connect_barrier: Arc::new(GeyserConnectBarrier::new()),
             geyser_explicit_ready: AtomicBool::new(true),
             geyser_explicit_config_error: parking_lot::RwLock::new(None),
