@@ -1518,6 +1518,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn test_concurrent_set_available_token_balance_and_sell_lock_try() {
         const M: &str = "BaseMintZ";
         let m = Arc::new(LockManager::new(0));

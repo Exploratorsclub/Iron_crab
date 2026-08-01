@@ -4006,6 +4006,9 @@ impl ExecutionContext {
 
     /// Apply authoritative WSOL=0 locally after a confirmed unwrap / ATA close (cold path).
     /// Complements JetStream snapshots when Geyser/MD propagation lags (#348 / Scope 55).
+    /// State-only: does not touch native SOL or `AVAILABLE_SOL_LAMPORTS` (KNOWN_BUG #23).
+    /// Unwrap TX counters (`WSOL_UNWRAP_*`) stay on the send path (WsolManager / future
+    /// liquidation send site) — not here, to avoid double-counting.
     fn apply_confirmed_local_wsol_zero(&self, reason: &str, signature: Option<&str>) {
         let prev = self.lock_manager.wsol_balance();
         if let Some(ref pending) = self.wsol_pending_wrap {
@@ -4013,11 +4016,6 @@ impl ExecutionContext {
         }
         self.lock_manager.update_wsol_only(0);
         ironcrab::metrics::WSOL_BALANCE_LAMPORTS.store(0, Ordering::Relaxed);
-        AVAILABLE_SOL_LAMPORTS.store(0, Ordering::Relaxed);
-        ironcrab::metrics::WSOL_UNWRAP_TOTAL.fetch_add(1, Ordering::Relaxed);
-        if prev > 0 {
-            ironcrab::metrics::WSOL_UNWRAP_LAMPORTS_TOTAL.fetch_add(prev, Ordering::Relaxed);
-        }
         if prev > 0 || signature.is_some() {
             info!(
                 event = "wsol_local_zero_after_unwrap",
@@ -14504,10 +14502,12 @@ mod execution_engine_tests {
         let (ctx, pending) = test_ctx_with_pending_wrap(LockManager::new(3_000_000_000));
         pending.arm(1_000_000_000);
         ctx.lock_manager.update_wsol_only(1_000_000_000);
+        ctx.lock_manager.update_native_sol_only(2_500_000_000);
 
         ctx.apply_confirmed_local_wsol_zero("test_unwrap", Some("sig-test"));
 
         assert_eq!(ctx.lock_manager.available_wsol(), 0);
+        assert_eq!(ctx.lock_manager.total_native_sol(), 2_500_000_000);
         assert_eq!(pending.pending_expected(), 0);
     }
 
