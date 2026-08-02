@@ -3331,6 +3331,18 @@ pub fn inc_pool_cache_apply_rejected_stale_slot_total() {
 
 static MOMENTUM_POOL_CACHE_APPLY_REJECTED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+static MOMENTUM_POOL_CACHE_APPLY_OUTCOME_TOTAL: Lazy<RwLock<HashMap<(String, String), u64>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Record Mom pool-cache apply outcome with `reason` + `dex` labels.
+/// `reason`: `applied` | `stale_slot` | `build_none` | `unsupported_dex` | `invalid_pool_address` | `skipped_noop` | `skipped_restored_dex`
+#[inline]
+pub fn record_momentum_pool_cache_apply_outcome(dex: &str, reason: &'static str) {
+    let mut map = MOMENTUM_POOL_CACHE_APPLY_OUTCOME_TOTAL.write();
+    *map.entry((reason.to_string(), dex.to_string()))
+        .or_insert(0) += 1;
+}
+
 /// Increment Mom apply-reject counter; returns true when a rate-limited WARN should be emitted.
 #[inline]
 pub fn record_momentum_pool_cache_apply_rejected() -> bool {
@@ -8690,6 +8702,15 @@ async fn metrics_response() -> Response<Body> {
         "momentum_pool_cache_apply_rejected_total",
         MOMENTUM_POOL_CACHE_APPLY_REJECTED_TOTAL.load(Ordering::Relaxed)
     );
+    for ((reason, dex), count) in MOMENTUM_POOL_CACHE_APPLY_OUTCOME_TOTAL.read().iter() {
+        out.push_str("momentum_pool_cache_apply_outcome_total{reason=\"");
+        out.push_str(reason);
+        out.push_str("\",dex=\"");
+        out.push_str(dex);
+        out.push_str("\"} ");
+        out.push_str(&count.to_string());
+        out.push('\n');
+    }
     line!(
         "market_data_open_position_pumpfun_remediate_admit_fail_total",
         MARKET_DATA_OPEN_POSITION_PUMPFUN_REMEDIATE_ADMIT_FAIL_TOTAL.load(Ordering::Relaxed)
