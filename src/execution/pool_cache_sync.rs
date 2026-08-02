@@ -506,6 +506,48 @@ fn apply_decimals_from_metadata(cache: &LivePoolCache, update: &PoolCacheUpdate)
     }
 }
 
+/// Outcome of applying a `PoolCacheUpdate` or Core `PoolStateUpdate` bridge to SLAVE cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolCacheApplyOutcome {
+    Applied,
+    /// `dex == "restored"` vault snapshot rows — not a quotable pool cache update.
+    SkippedRestoredDex,
+    /// No-op paths (`PoolRemoved`, etc.) — not a reject.
+    SkippedNoOp,
+    RejectedStaleSlot,
+    RejectedBuildNone,
+    RejectedUnsupportedDex,
+    RejectedInvalidPoolAddress,
+}
+
+impl PoolCacheApplyOutcome {
+    pub fn reject_reason_label(self) -> Option<&'static str> {
+        match self {
+            Self::Applied | Self::SkippedRestoredDex | Self::SkippedNoOp => None,
+            Self::RejectedStaleSlot => Some("stale_slot"),
+            Self::RejectedBuildNone => Some("build_none"),
+            Self::RejectedUnsupportedDex => Some("unsupported_dex"),
+            Self::RejectedInvalidPoolAddress => Some("invalid_pool_address"),
+        }
+    }
+
+    pub fn is_applied(self) -> bool {
+        matches!(self, Self::Applied)
+    }
+
+    pub fn metrics_reason_label(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::SkippedRestoredDex => "skipped_restored_dex",
+            Self::SkippedNoOp => "skipped_noop",
+            Self::RejectedStaleSlot => "stale_slot",
+            Self::RejectedBuildNone => "build_none",
+            Self::RejectedUnsupportedDex => "unsupported_dex",
+            Self::RejectedInvalidPoolAddress => "invalid_pool_address",
+        }
+    }
+}
+
 /// Apply a single PoolCacheUpdate to a LivePoolCache.
 ///
 /// For BalanceUpdated: merges partial updates (one vault at a time) with existing cache state.
@@ -514,6 +556,24 @@ fn apply_decimals_from_metadata(cache: &LivePoolCache, update: &PoolCacheUpdate)
 ///
 /// Returns true if the cache was modified.
 pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) -> bool {
+    apply_pool_cache_update_outcome(cache, update).is_applied()
+}
+
+/// Detailed apply outcome for observability (reason + dex metrics).
+pub fn apply_pool_cache_update_outcome(
+    cache: &LivePoolCache,
+    update: &PoolCacheUpdate,
+) -> PoolCacheApplyOutcome {
+    if update.dex == "restored" {
+        return PoolCacheApplyOutcome::SkippedRestoredDex;
+    }
+    apply_pool_cache_update_outcome_inner(cache, update)
+}
+
+fn apply_pool_cache_update_outcome_inner(
+    cache: &LivePoolCache,
+    update: &PoolCacheUpdate,
+) -> PoolCacheApplyOutcome {
     match update.update_type {
         PoolCacheUpdateType::PoolDiscovered => {
             if let Some((pool_addr, mut minimal_state)) = build_minimal_pool_state(update) {
@@ -597,7 +657,7 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                     if update.geyser_slot > 0 {
                         crate::metrics::inc_pool_cache_apply_rejected_stale_slot_total();
                     }
-                    return false;
+                    return PoolCacheApplyOutcome::RejectedStaleSlot;
                 }
                 if update.dex == "pump_amm" {
                     cache.merge_pump_amm_sell_layout_from_metadata(
@@ -655,13 +715,14 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 }
                 // P3 #13: Propagate base_decimals and quote_decimals to SLAVE cache
                 apply_decimals_from_metadata(cache, update);
-                return true;
+                return PoolCacheApplyOutcome::Applied;
             }
+            return PoolCacheApplyOutcome::RejectedBuildNone;
         }
         PoolCacheUpdateType::BalanceUpdated => {
             let pool_addr = match Pubkey::from_str(&update.pool_address) {
                 Ok(p) => p,
-                Err(_) => return false,
+                Err(_) => return PoolCacheApplyOutcome::RejectedInvalidPoolAddress,
             };
             let existing = cache.get(&pool_addr);
             let (base_reserve, quote_reserve) = if let Some(ref ex) = existing {
@@ -1083,7 +1144,7 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                     if update.geyser_slot > 0 {
                         crate::metrics::inc_pool_cache_apply_rejected_stale_slot_total();
                     }
-                    return false;
+                    return PoolCacheApplyOutcome::RejectedStaleSlot;
                 }
                 if update.dex == "pump_amm" {
                     cache.merge_pump_amm_sell_layout_from_metadata(&addr, update.metadata.as_ref());
@@ -1123,14 +1184,56 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 }
                 // P3 #13: Apply decimals from metadata when present (e.g. BalanceUpdated with metadata)
                 apply_decimals_from_metadata(cache, update);
-                return true;
+                return PoolCacheApplyOutcome::Applied;
             }
+            return PoolCacheApplyOutcome::RejectedBuildNone;
         }
         PoolCacheUpdateType::PoolRemoved => {
             // Skip removed pools
         }
     }
-    false
+    PoolCacheApplyOutcome::SkippedNoOp
+}
+
+/// Fields from Core NATS `MarketEventKind::PoolStateUpdate` for SLAVE cache bridge.
+#[derive(Debug, Clone)]
+pub struct PoolStateUpdateBridge<'a> {
+    pub pool_address: &'a str,
+    pub dex: &'a str,
+    pub reserve_base: u64,
+    pub reserve_quote: u64,
+    pub base_mint: &'a str,
+    pub quote_mint: &'a str,
+    pub update_slot: u64,
+}
+
+/// Bridge Core NATS `PoolStateUpdate` (reserves + `update_slot`) into SLAVE `LivePoolCache`.
+///
+/// JetStream `PoolCacheUpdate` remains SSOT; this path is a low-latency supplement when MD
+/// already published reserves on Core (e.g. open-position PumpFun pin after BondingCurve upsert).
+pub fn apply_pool_state_update_to_cache(
+    cache: &LivePoolCache,
+    bridge: &PoolStateUpdateBridge<'_>,
+) -> PoolCacheApplyOutcome {
+    if bridge.dex == "restored" {
+        return PoolCacheApplyOutcome::SkippedRestoredDex;
+    }
+    if bridge.reserve_base == 0 && bridge.reserve_quote == 0 {
+        return PoolCacheApplyOutcome::SkippedNoOp;
+    }
+    let update = PoolCacheUpdate::new_balance_updated(
+        "market-data",
+        "",
+        "",
+        bridge.pool_address.to_string(),
+        bridge.dex.to_string(),
+        bridge.base_mint.to_string(),
+        bridge.quote_mint.to_string(),
+        bridge.reserve_base,
+        bridge.reserve_quote,
+        bridge.update_slot,
+    );
+    apply_pool_cache_update_outcome(cache, &update)
 }
 
 /// Bootstrap LivePoolCache from JetStream (state recovery after restart)
@@ -3244,5 +3347,77 @@ mod tests {
         );
         let (_, slot, _) = cache.get_with_metadata(&pool).expect("cached");
         assert_eq!(slot, 500);
+    }
+
+    #[test]
+    fn apply_pool_state_update_bridge_advances_pumpfun_slave_slot() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let token_reserves = 1_073_000_000_000_000u64;
+        let sol_reserves = 30_000_000_000u64;
+
+        let mut seed = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "pumpfun".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            token_reserves,
+            sol_reserves,
+            Some(0),
+            436_803_351,
+        );
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("complete".to_string(), "false".to_string());
+        seed.metadata = Some(meta);
+        assert!(apply_pool_cache_update(&cache, &seed));
+
+        let outcome = apply_pool_state_update_to_cache(
+            &cache,
+            &PoolStateUpdateBridge {
+                pool_address: &pool.to_string(),
+                dex: "pumpfun",
+                reserve_base: token_reserves.saturating_sub(1_000_000),
+                reserve_quote: sol_reserves.saturating_add(1_000_000),
+                base_mint: &base_mint.to_string(),
+                quote_mint: &quote_mint.to_string(),
+                update_slot: 436_803_366,
+            },
+        );
+        assert_eq!(outcome, PoolCacheApplyOutcome::Applied);
+        let (_, slot_after, _) = cache.get_with_metadata(&pool).expect("cached");
+        assert!(
+            slot_after >= 436_803_366,
+            "Core PoolStateUpdate bridge must raise SLAVE slot to >= publish_slot S"
+        );
+    }
+
+    #[test]
+    fn apply_skips_restored_dex_without_reject() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let update = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "restored".to_string(),
+            Pubkey::new_unique().to_string(),
+            Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT)
+                .unwrap()
+                .to_string(),
+            1_000,
+            2_000,
+            100,
+        );
+        assert_eq!(
+            apply_pool_cache_update_outcome(&cache, &update),
+            PoolCacheApplyOutcome::SkippedRestoredDex
+        );
+        assert!(cache.get(&pool).is_none());
     }
 }

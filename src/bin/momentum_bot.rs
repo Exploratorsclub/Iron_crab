@@ -7295,6 +7295,23 @@ impl MomentumContext {
         self.positions.read().len()
     }
 
+    /// Pool addresses with an open momentum position (for PoolCache apply prioritization / bridge).
+    fn open_position_pool_addresses(&self) -> std::collections::HashSet<String> {
+        self.positions
+            .read()
+            .values()
+            .map(|p| p.pool.clone())
+            .collect()
+    }
+
+    /// True when `pool_address` is the sell pool for an open PumpFun position.
+    fn has_open_pumpfun_position_for_pool(&self, pool_address: &str) -> bool {
+        self.positions
+            .read()
+            .values()
+            .any(|p| p.pool == pool_address && p.dex == "pumpfun")
+    }
+
     /// Get pending intent count for heartbeat
     fn pending_count(&self) -> usize {
         self.pending_intents.read().len()
@@ -12585,7 +12602,7 @@ struct PoolCacheJetstreamBatchOutcome {
 /// optional exit scan + bounded `ExecutionResult` drain).
 async fn momentum_apply_pool_cache_jetstream_batch_items(
     ctx: &Arc<MomentumContext>,
-    batch_items: Vec<(
+    mut batch_items: Vec<(
         async_nats::jetstream::message::Message,
         ironcrab::ipc::PoolCacheUpdate,
     )>,
@@ -12599,6 +12616,17 @@ async fn momentum_apply_pool_cache_jetstream_batch_items(
     let mut pool_cache_process_accounted = Duration::ZERO;
     let mut position_price_updates_applied: u32 = 0;
 
+    let open_pools = ctx.open_position_pool_addresses();
+    if !open_pools.is_empty() {
+        batch_items.sort_by_key(|(_, u)| {
+            if open_pools.contains(u.pool_address.as_str()) {
+                0u8
+            } else {
+                1u8
+            }
+        });
+    }
+
     let phase1_t0 = Instant::now();
     let now_ms_js = wall_clock_unix_ms_now();
     for (_, update) in &batch_items {
@@ -12606,15 +12634,23 @@ async fn momentum_apply_pool_cache_jetstream_batch_items(
             now_ms_js,
             update.header.ts_unix_ms,
         );
-        if !pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, update)
+        let outcome =
+            pool_cache_sync::apply_pool_cache_update_outcome(&ctx.live_pool_cache, update);
+        ironcrab::metrics::record_momentum_pool_cache_apply_outcome(
+            update.dex.as_str(),
+            outcome.metrics_reason_label(),
+        );
+        if outcome.reject_reason_label().is_some()
             && ironcrab::metrics::record_momentum_pool_cache_apply_rejected()
         {
+            let reason = outcome.reject_reason_label().unwrap_or("unknown");
             warn!(
                 pool = %update.pool_address,
                 dex = %update.dex,
                 geyser_slot = update.geyser_slot,
                 update_type = ?update.update_type,
-                "Mom apply_pool_cache_update rejected (stale slot or no-op)"
+                reject_reason = reason,
+                "Mom apply_pool_cache_update rejected"
             );
         }
         ctx.mark_entry_eval_dirty_for_mint(&update.base_mint);
@@ -20920,6 +20956,92 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn pool_state_update_bridge_raises_slave_slot_past_entry_confirm() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = Pubkey::new_unique().to_string();
+        let pool = Pubkey::new_unique().to_string();
+        let quote_mint = ironcrab::ipc::NATIVE_SOL_MINT.to_string();
+        let entry_slot = 436_803_351u64;
+        let publish_slot = 436_803_366u64;
+        let token_reserves = 1_073_000_000_000_000u64;
+        let sol_reserves = 30_000_000_000u64;
+
+        let mut seed = ironcrab::ipc::PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.clone(),
+            "pumpfun".to_string(),
+            mint.clone(),
+            quote_mint.clone(),
+            token_reserves,
+            sol_reserves,
+            Some(0),
+            entry_slot,
+        );
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("complete".to_string(), "false".to_string());
+        seed.metadata = Some(meta);
+        pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, &seed);
+
+        let mut pos = PositionTracker::new(
+            mint.as_str(),
+            pool.as_str(),
+            "pumpfun",
+            100.0,
+            6,
+            1_000_000,
+            1_000_000_000,
+        );
+        pos.entry_confirmed_slot = entry_slot;
+        ctx.positions.write().insert(mint.clone(), pos);
+
+        let evt = MarketEvent::new(
+            "market-data",
+            "0.1.0",
+            "run",
+            "evt-psu-bridge".to_string(),
+            "geyser_dlmm_cache",
+            Some(publish_slot),
+            MarketEventKind::PoolStateUpdate {
+                pool_address: pool.clone(),
+                dex: "pumpfun".to_string(),
+                reserve_base: token_reserves.saturating_sub(5_000_000),
+                reserve_quote: sol_reserves.saturating_add(1_000_000),
+                base_mint: mint.clone(),
+                quote_mint,
+                update_slot: publish_slot,
+                active_id: None,
+                bin_step: None,
+            },
+        );
+        let need_exit = process_market_event(&ctx, &evt, false)
+            .await
+            .expect("process");
+        assert!(
+            need_exit,
+            "applied PoolStateUpdate bridge must return Ok(true) so caller runs process_exit_signals immediately"
+        );
+
+        let pool_pk = Pubkey::from_str(pool.as_str()).unwrap();
+        let (_, cache_slot, _) = ctx
+            .live_pool_cache
+            .get_with_metadata(&pool_pk)
+            .expect("slave cache");
+        assert!(
+            cache_slot >= publish_slot,
+            "PoolStateUpdate bridge must advance SLAVE slot to MD publish_slot S"
+        );
+        assert!(
+            cache_slot > entry_slot,
+            "after bridge, exit guard must not stay on QUOTE_SLOT_NOT_AFTER_ENTRY_CONFIRM solely due to stale slave slot"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn wait_hot_set_stays_dirty_when_filter_rotates() {
@@ -23373,6 +23495,58 @@ async fn process_market_event(
                     is_periodic = is_periodic,
                     "WalletSnapshotComplete: no ghost positions found"
                 );
+            }
+        }
+
+        MarketEventKind::PoolStateUpdate {
+            pool_address,
+            dex,
+            reserve_base,
+            reserve_quote,
+            base_mint,
+            quote_mint,
+            update_slot,
+            ..
+        } => {
+            // B2: Core bridge — MD publishes reserves+slot on Core for open-position PumpFun pins;
+            // BondingCurveProgress alone has no reserves and does not touch LivePoolCache.
+            if ctx.has_open_pumpfun_position_for_pool(pool_address.as_str()) {
+                let outcome = pool_cache_sync::apply_pool_state_update_to_cache(
+                    &ctx.live_pool_cache,
+                    &pool_cache_sync::PoolStateUpdateBridge {
+                        pool_address: pool_address.as_str(),
+                        dex: dex.as_str(),
+                        reserve_base: *reserve_base,
+                        reserve_quote: *reserve_quote,
+                        base_mint: base_mint.as_str(),
+                        quote_mint: quote_mint.as_str(),
+                        update_slot: *update_slot,
+                    },
+                );
+                ironcrab::metrics::record_momentum_pool_cache_apply_outcome(
+                    dex.as_str(),
+                    outcome.metrics_reason_label(),
+                );
+                if outcome.is_applied() {
+                    trace!(
+                        pool = %pool_address,
+                        dex = %dex,
+                        update_slot = update_slot,
+                        "PoolStateUpdate bridge applied to SLAVE LivePoolCache (open PumpFun position)"
+                    );
+                    ctx.mark_entry_eval_dirty_for_mint(base_mint.as_str());
+                    return Ok(true);
+                } else if let Some(reason) = outcome.reject_reason_label() {
+                    if ironcrab::metrics::record_momentum_pool_cache_apply_rejected() {
+                        warn!(
+                            pool = %pool_address,
+                            dex = %dex,
+                            update_slot = update_slot,
+                            reject_reason = reason,
+                            "PoolStateUpdate bridge rejected for open PumpFun position"
+                        );
+                    }
+                }
             }
         }
 

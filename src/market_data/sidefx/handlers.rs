@@ -1782,6 +1782,9 @@ pub fn md_sidefx_process_vault_balance_tick(
     let Some(vault_view) = host.vault_membership_view(vault_pubkey) else {
         return;
     };
+    if vault_view.dex == "restored" {
+        return;
+    }
     let prev_balance = vault_view
         .last_balance
         .swap(*balance, std::sync::atomic::Ordering::Relaxed);
