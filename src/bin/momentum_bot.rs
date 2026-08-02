@@ -21019,9 +21019,13 @@ mod tests {
                 bin_step: None,
             },
         );
-        process_market_event(&ctx, &evt, false)
+        let need_exit = process_market_event(&ctx, &evt, false)
             .await
             .expect("process");
+        assert!(
+            need_exit,
+            "applied PoolStateUpdate bridge must return Ok(true) so caller runs process_exit_signals immediately"
+        );
 
         let pool_pk = Pubkey::from_str(pool.as_str()).unwrap();
         let (_, cache_slot, _) = ctx
@@ -23531,6 +23535,7 @@ async fn process_market_event(
                         "PoolStateUpdate bridge applied to SLAVE LivePoolCache (open PumpFun position)"
                     );
                     ctx.mark_entry_eval_dirty_for_mint(base_mint.as_str());
+                    return Ok(true);
                 } else if let Some(reason) = outcome.reject_reason_label() {
                     if ironcrab::metrics::record_momentum_pool_cache_apply_rejected() {
                         warn!(
