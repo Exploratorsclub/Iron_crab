@@ -1098,6 +1098,31 @@ const SPL_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const SPL_TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
+/// SELL proceeds SSOT (Pattern #11 / FIX-39): prefer SOL/WSOL `fill_out` over native wallet delta.
+fn sell_proceeds_lamports_from_execution(result: &ExecutionResult) -> i128 {
+    if let Some(ref fo) = result.fill_out {
+        if fo.decimals == 9 && fo.raw > 0 {
+            return fo.raw as i128;
+        }
+    }
+    if let Some(delta) = result.wallet_sol_delta_lamports {
+        if delta > 0 {
+            return delta;
+        }
+    }
+    if result.wallet_sol_delta_lamports.is_some()
+        || result.fill_out.as_ref().is_some_and(|fo| fo.raw > 0)
+    {
+        warn!(
+            intent_id = %result.intent_id,
+            wallet_sol_delta_lamports = ?result.wallet_sol_delta_lamports,
+            fill_out_raw = result.fill_out.as_ref().map(|fo| fo.raw),
+            "SELL proceeds unavailable from fill_out or positive wallet_sol_delta; using 0"
+        );
+    }
+    0
+}
+
 /// Controls slot-ordering relaxations in [`exit_quote_price_exit_guard_violation`].
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum ExitQuoteGuardOpts {
@@ -8725,9 +8750,9 @@ impl MomentumContext {
                             }
                         } else {
                             // Full sell — close position entirely.
-                            // Calculate realized PnL from wallet SOL delta.
+                            // Calculate realized PnL from SELL proceeds (fill_out preferred over wallet delta).
                             let sell_proceeds_lamports =
-                                result.wallet_sol_delta_lamports.unwrap_or(0);
+                                sell_proceeds_lamports_from_execution(result);
                             let cost_basis_lamports = {
                                 self.positions
                                     .read()
@@ -13401,6 +13426,55 @@ mod tests {
             req.kind,
             ControlRequestKind::EnsurePumpAmmPoolAccounts { .. }
         ));
+    }
+
+    #[test]
+    fn sell_proceeds_lamports_prefers_wsol_fill_out_over_negative_wallet_delta() {
+        use ironcrab::ipc::{ExecutionResult, ExecutionStatus, ExplicitAmount};
+
+        let result = ExecutionResult::new_sent(
+            "test",
+            "0",
+            "run",
+            "exec-1".to_string(),
+            "dec-1".to_string(),
+            "int-1".to_string(),
+            "momentum-bot".to_string(),
+            Some("mint".to_string()),
+            Some("sig".to_string()),
+            None,
+        )
+        .with_fills(
+            Some(ExplicitAmount::new(1_000_000, 6)),
+            Some(ExplicitAmount::new(50_000_000, 9)),
+        )
+        .with_sol_delta(-5_000);
+        let mut result = result;
+        result.status = ExecutionStatus::Confirmed;
+        assert_eq!(sell_proceeds_lamports_from_execution(&result), 50_000_000);
+    }
+
+    #[test]
+    fn sell_proceeds_lamports_zero_when_only_negative_wallet_delta() {
+        use ironcrab::ipc::{ExecutionResult, ExecutionStatus};
+
+        let result = ExecutionResult::new_sent(
+            "test",
+            "0",
+            "run",
+            "exec-2".to_string(),
+            "dec-2".to_string(),
+            "int-2".to_string(),
+            "momentum-bot".to_string(),
+            Some("mint".to_string()),
+            Some("sig".to_string()),
+            None,
+        )
+        .with_sol_delta(-5_000);
+        let mut result = result;
+        result.status = ExecutionStatus::Failed;
+        result.error_message = Some("execution_failed".to_string());
+        assert_eq!(sell_proceeds_lamports_from_execution(&result), 0);
     }
 
     const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";

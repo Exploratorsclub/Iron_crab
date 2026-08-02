@@ -950,6 +950,11 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
     def parse_execution_result(self, record: dict) -> dict:
         """Parse execution_results JSONL record into Grafana-compatible trade format"""
         try:
+            # Defense-in-depth: terminal failures are not successful fills for the trades UI.
+            status = str(record.get("status") or "").lower()
+            if status in ("failed", "timeout", "sent"):
+                return None
+
             # Extract data from execution result
             ts_ms = _effective_timestamp_ms_from_record(record)
             run_id = record.get('run_id', '')
@@ -1282,6 +1287,36 @@ def _self_check():
         }
     )
     assert parsed_legacy and parsed_legacy["timestamp_ms"] == 888
+
+    failed_confirmed = h.parse_execution_result(
+        {
+            "status": "failed",
+            "ts_unix_ms": 1_700_000_000_000,
+            "signature": "failed_sig",
+            "metadata": {"side": "SELL"},
+            "fill_in": {"raw": 16455755302, "decimals": 6},
+            "fill_out": {"raw": 0, "decimals": 9},
+            "wallet_sol_delta_lamports": -5000,
+            "token_mint": "2q76mnMQAT5qbqapPx2R3f1dHvzCYUiUo8oGhfB6pump",
+            "intent_id": "int-failed-confirmed",
+        }
+    )
+    assert failed_confirmed is None, "FailedConfirmed-equivalent status must not produce a trade row"
+
+    wsol_proceeds = h.parse_execution_result(
+        {
+            "status": "confirmed",
+            "ts_unix_ms": 1_700_000_000_000,
+            "signature": "wsol_sig",
+            "metadata": {"side": "SELL"},
+            "fill_in": {"raw": 16455755302, "decimals": 6},
+            "fill_out": {"raw": 50_000_000, "decimals": 9},
+            "wallet_sol_delta_lamports": -5000,
+            "token_mint": "2q76mnMQAT5qbqapPx2R3f1dHvzCYUiUo8oGhfB6pump",
+            "intent_id": "int-wsol-sell",
+        }
+    )
+    assert wsol_proceeds and wsol_proceeds.get("value_sol") == 0.05
 
     ts_ms = 1_700_000_000_000
     expected_utc = (

@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-FAILEDCONFIRMED-PHANTOM-SELL: FailedConfirmed ≠ Success-Accounting + WSOL Proceeds
+**Datum**: 2026-08-02  
+**Problem**: `FailedConfirmed` SELL (on-chain fail, z.B. Slippage/Curve complete) lief durch denselben Post-Confirm-Block wie `Confirmed`: LockManager `set_available(0)` („confirmed full SELL“), `record_recent_trade` → Phantom −100% SELL in Trades-UI. Separat: Mom Full-SELL Close nutzte `wallet_sol_delta_lamports` statt WSOL `fill_out` → `sell_proceeds=-5000` bei PumpSwap-SELL.  
+**Fix**: (1) EE: LockManager seed/clear + `recent_trade` nur bei `DecisionOutcome::Confirmed`; `FailedConfirmed` → `release_locks` (restore) + Metric `failed_confirmed_no_fill_accounting_total`. (2) Mom: `sell_proceeds_lamports_from_execution` — prefer SOL/WSOL `fill_out`, dann positives wallet_delta, sonst 0+WARN. (3) `trades_server.parse_execution_result`: `status=failed|timeout|sent` → skip.  
+**Evidence**: Prod 2026-08-02 Mint `2q76mnMQ…` — BC-Exit FailedConfirmed + spaeterer PumpSwap-Close mit falscher Realized-PnL.  
+**Dateien**: `src/bin/execution_engine.rs`, `src/bin/momentum_bot.rs`, `scripts/trades_server.py`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-WSOL-ATA-CLOSE-ZERO: Phantom WSOL-ATA-Close → JetStream WSOL=0 + EE-Heal
 **Datum**: 2026-07-31  
 **Problem**: Externes Schliessen der WSOL-ATA (z.B. Phantom „Close Account“ nach Dust-Sell) liess EE Heartbeat/Metrics bei `available_wsol=1e9` haengen. MD publizierte kein `WalletBalanceSnapshot` WSOL=0 wenn (a) Geyser-Daten unparsebar waren (`return` ohne Publish), oder (b) MD `last_wsol_balance` bei 0 blieb waehrend EE den Wrap-Callback schon auf 1e9 gesetzt hatte (`prev==balance` → kein JetStream-Zero).  
