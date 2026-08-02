@@ -3497,6 +3497,11 @@ pub fn record_liquidation_seed_skipped_authority_total() {
     LIQUIDATION_SEED_SKIPPED_AUTHORITY_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+#[inline]
+pub fn record_failed_confirmed_no_fill_accounting_total() {
+    FAILED_CONFIRMED_NO_FILL_ACCOUNTING_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Per-mint signed divergence: `position.token_amount_raw - wallet_snapshot.balance_raw`.
 /// Cardinality bounded to open positions with non-zero drift (pruned on close / align).
 pub static MOMENTUM_WALLET_BALANCE_DIVERGENCE_BY_MINT: Lazy<RwLock<HashMap<String, i64>>> =
@@ -6615,6 +6620,9 @@ pub static POSITION_MANAGER_KV_PUBLISH_ERRORS_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// PA-4: liquidation skipped LockManager seed because PositionAuthority reports closed/zero.
 pub static LIQUIDATION_SEED_SKIPPED_AUTHORITY_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// FailedConfirmed on-chain outcome: skipped LockManager success accounting + recent_trade fill row.
+pub static FAILED_CONFIRMED_NO_FILL_ACCOUNTING_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static CONCURRENT_INTENTS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// Pending TradeIntents in `intent_rx` between JetStream enqueue and dispatcher recv.
@@ -10489,6 +10497,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "liquidation_seed_skipped_authority_total",
         LIQUIDATION_SEED_SKIPPED_AUTHORITY_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "failed_confirmed_no_fill_accounting_total",
+        FAILED_CONFIRMED_NO_FILL_ACCOUNTING_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "position_manager_up",

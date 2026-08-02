@@ -81,6 +81,7 @@ use ironcrab::metrics::{
     inc_execution_pool_cache_messages_processed, record_execution_engine_interval_tick_duration_ms,
     record_execution_intent_channel_wait_ms, record_execution_intent_jetstream_to_channel_ms,
     record_execution_process_intent_us, record_execution_slot_lag_at_send_slots,
+    record_failed_confirmed_no_fill_accounting_total,
     record_liquidation_seed_skipped_authority_total, record_recent_trade,
     record_tx_confirmed_slot_delta_slots, record_tx_priority_fee_source, record_tx_rebroadcast,
     record_tx_rebroadcast_during_confirm_ms, record_tx_rebroadcast_method,
@@ -586,6 +587,12 @@ struct Scope48ConfirmedSellCloseDecision {
     full_close: bool,
     sell_token_account_closed: bool,
     sell_untracked_ata: bool,
+}
+
+/// Success fill accounting (LockManager seed/clear, recent_trades) applies only to Confirmed outcomes.
+#[inline]
+fn should_apply_success_fill_accounting(outcome: DecisionOutcome) -> bool {
+    outcome == DecisionOutcome::Confirmed
 }
 
 fn scope48_confirmed_sell_close_decision(
@@ -12922,7 +12929,9 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         DecisionOutcome::Confirmed | DecisionOutcome::FailedConfirmed
     ) {
         INTENTS_EXECUTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
 
+    if should_apply_success_fill_accounting(decision.outcome) {
         // Primary `open_positions` gauge is refreshed from PositionAuthority (PA-2 Rest).
         // LockManager balance updates below affect lockmanager overlay gauge only.
         match intent.side {
@@ -13103,6 +13112,14 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
             pnl_pct: None,
             latency_ms: None,
         });
+    } else if decision.outcome == DecisionOutcome::FailedConfirmed {
+        record_failed_confirmed_no_fill_accounting_total();
+        info!(
+            intent_id = %intent.intent_id,
+            side = ?intent.side,
+            outcome = ?decision.outcome,
+            "FailedConfirmed: skipping success fill accounting (LockManager seed/clear + recent_trade)"
+        );
     }
 
     IN_FLIGHT_CAPITAL_RESERVATIONS.store(
@@ -14398,10 +14415,11 @@ mod execution_engine_tests {
         pump_amm_liquidation_quote_timeout_str, pump_amm_pool_market_hint_merge,
         pump_amm_slave_recovery_snapshot, record_pump_amm_hot_path_refresh_after_success,
         scale_in_max_open_positions_skip_details, scope48_confirmed_sell_close_decision,
-        sell_token_balance_gate, should_publish_open_position_pool_pin_after_confirmed_buy,
-        sim_failure_reject_reason, simulation_result_on_rpc_timeout,
-        sort_route_candidates_by_amount_out, take_next_multi_pool_buildable_fallback_route,
-        try_pump_amm_hot_path_refresh_publish, wait_for_meteora_dlmm_slave_after_recovery,
+        sell_token_balance_gate, should_apply_success_fill_accounting,
+        should_publish_open_position_pool_pin_after_confirmed_buy, sim_failure_reject_reason,
+        simulation_result_on_rpc_timeout, sort_route_candidates_by_amount_out,
+        take_next_multi_pool_buildable_fallback_route, try_pump_amm_hot_path_refresh_publish,
+        wait_for_meteora_dlmm_slave_after_recovery,
         wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder,
         wait_for_pump_amm_slave_after_recovery, wait_for_pumpfun_bonding_cache_refresh,
         ComputedIntentFills, DiscoveryRequestOutcome, ExecutionConfig, LiquidationSeedDecision,
@@ -16348,6 +16366,23 @@ mod execution_engine_tests {
             !stuck,
             "with before == post-recovery evidence, wait must not succeed (guards Bug #34 ordering)"
         );
+    }
+
+    /// FailedConfirmed must not run success fill accounting (LockManager clear / recent_trade).
+    #[test]
+    fn should_apply_success_fill_accounting_only_for_confirmed() {
+        assert!(should_apply_success_fill_accounting(
+            DecisionOutcome::Confirmed
+        ));
+        assert!(!should_apply_success_fill_accounting(
+            DecisionOutcome::FailedConfirmed
+        ));
+        assert!(!should_apply_success_fill_accounting(
+            DecisionOutcome::Rejected
+        ));
+        assert!(!should_apply_success_fill_accounting(
+            DecisionOutcome::SimFailed
+        ));
     }
 
     /// Production Scope 48 failure: `close_token_ata=true` + complete fills + probe-only sold amount
