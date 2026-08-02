@@ -3371,6 +3371,14 @@ pub fn inc_market_data_open_position_pumpfun_remediate_ok_total() {
     MARKET_DATA_OPEN_POSITION_PUMPFUN_REMEDIATE_OK_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+static MARKET_DATA_COLD_PATH_RPC_CONTEXT_LAGS_GEYSER_HEAD_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn inc_market_data_cold_path_rpc_context_lags_geyser_head_total() {
+    MARKET_DATA_COLD_PATH_RPC_CONTEXT_LAGS_GEYSER_HEAD_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 static MOMENTUM_OPEN_POSITION_EXIT_BLIND_ENSURE_TOTAL: Lazy<RwLock<HashMap<&'static str, u64>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
@@ -8689,6 +8697,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_open_position_pumpfun_remediate_ok_total",
         MARKET_DATA_OPEN_POSITION_PUMPFUN_REMEDIATE_OK_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_cold_path_rpc_context_lags_geyser_head_total",
+        MARKET_DATA_COLD_PATH_RPC_CONTEXT_LAGS_GEYSER_HEAD_TOTAL.load(Ordering::Relaxed)
     );
     for (reason, count) in MOMENTUM_OPEN_POSITION_EXIT_BLIND_ENSURE_TOTAL.read().iter() {
         out.push_str("momentum_open_position_exit_blind_ensure_total{reason=\"");

@@ -1,7 +1,7 @@
 //! I-24d EnsurePumpfunBondingCurve cold-path handler.
 
 use super::host::{publish_control_response, ColdHost};
-use super::publish_slot::resolve_cold_path_publish_slot;
+use super::publish_slot::{observe_cold_path_rpc_context_slot_lag, resolve_cold_path_publish_slot};
 use crate::execution::live_pool_cache::{CachedPoolState, PumpFunState};
 use crate::ipc::{ControlResponseStatus, DexPoolReadiness, PoolCacheUpdate, NATIVE_SOL_MINT};
 use crate::nats::jetstream::pool_subject;
@@ -151,6 +151,7 @@ pub async fn handle_ensure_pumpfun_bonding_curve(
     };
 
     let mut publish_slot = resolve_cold_path_publish_slot(rpc_context_slot);
+    observe_cold_path_rpc_context_slot_lag(rpc_context_slot);
     if publish_slot == 0 {
         if let Ok(slot) = rpc.get_slot_retry().await {
             publish_slot = slot;
