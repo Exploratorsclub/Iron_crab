@@ -12606,7 +12606,17 @@ async fn momentum_apply_pool_cache_jetstream_batch_items(
             now_ms_js,
             update.header.ts_unix_ms,
         );
-        pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, update);
+        if !pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, update)
+            && ironcrab::metrics::record_momentum_pool_cache_apply_rejected()
+        {
+            warn!(
+                pool = %update.pool_address,
+                dex = %update.dex,
+                geyser_slot = update.geyser_slot,
+                update_type = ?update.update_type,
+                "Mom apply_pool_cache_update rejected (stale slot or no-op)"
+            );
+        }
         ctx.mark_entry_eval_dirty_for_mint(&update.base_mint);
     }
     pool_cache_process_accounted = pool_cache_process_accounted.saturating_add(phase1_t0.elapsed());

@@ -2,14 +2,12 @@
 
 /// Watermark for cold-path `LivePoolCache::upsert` and `PoolCacheUpdate::geyser_slot`.
 ///
-/// Prefers the RPC account response `context.slot`. When that is zero (unknown), falls back to
-/// the monotonic Geyser head tracked by market-data ingest — never silently treats `0` as a
-/// valid exit-quote watermark when a head is available.
+/// Uses `max(rpc_context_slot, geyser_head)` so a stale RPC `context.slot` cannot publish a slot
+/// below the live Geyser head (Mom SLAVE monotonic reject would drop the JetStream update).
+/// When both are zero, returns `0` (callers may fall back to `getSlot`).
 pub fn resolve_cold_path_publish_slot(rpc_context_slot: u64) -> u64 {
-    if rpc_context_slot > 0 {
-        return rpc_context_slot;
-    }
-    crate::metrics::market_data_geyser_head_slot_value()
+    let head = crate::metrics::market_data_geyser_head_slot_value();
+    rpc_context_slot.max(head)
 }
 
 #[cfg(test)]
@@ -19,6 +17,7 @@ mod tests {
 
     #[test]
     fn resolve_prefers_rpc_context_slot_when_positive() {
+        crate::metrics::MARKET_DATA_GEYSER_HEAD_SLOT.store(0, Ordering::Relaxed);
         assert_eq!(resolve_cold_path_publish_slot(436_375_700), 436_375_700);
     }
 
@@ -27,5 +26,20 @@ mod tests {
         let head = 99_001_234u64;
         crate::metrics::MARKET_DATA_GEYSER_HEAD_SLOT.store(head, Ordering::Relaxed);
         assert_eq!(resolve_cold_path_publish_slot(0), head);
+    }
+
+    #[test]
+    fn resolve_merges_rpc_context_with_geyser_head_monotonic() {
+        crate::metrics::MARKET_DATA_GEYSER_HEAD_SLOT.store(436_771_131, Ordering::Relaxed);
+        assert_eq!(
+            resolve_cold_path_publish_slot(436_771_116),
+            436_771_131,
+            "stale RPC context must not publish below Geyser head"
+        );
+        assert_eq!(
+            resolve_cold_path_publish_slot(436_771_200),
+            436_771_200,
+            "fresh RPC context above head must win"
+        );
     }
 }

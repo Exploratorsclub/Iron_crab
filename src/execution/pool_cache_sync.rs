@@ -593,7 +593,12 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                         }
                     }
                 }
-                cache.upsert(pool_addr, minimal_state, update.geyser_slot);
+                if !cache.upsert(pool_addr, minimal_state, update.geyser_slot) {
+                    if update.geyser_slot > 0 {
+                        crate::metrics::inc_pool_cache_apply_rejected_stale_slot_total();
+                    }
+                    return false;
+                }
                 if update.dex == "pump_amm" {
                     cache.merge_pump_amm_sell_layout_from_metadata(
                         &pool_addr,
@@ -1074,7 +1079,12 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                         }
                     }
                 }
-                cache.upsert(addr, minimal_state, update.geyser_slot);
+                if !cache.upsert(addr, minimal_state, update.geyser_slot) {
+                    if update.geyser_slot > 0 {
+                        crate::metrics::inc_pool_cache_apply_rejected_stale_slot_total();
+                    }
+                    return false;
+                }
                 if update.dex == "pump_amm" {
                     cache.merge_pump_amm_sell_layout_from_metadata(&addr, update.metadata.as_ref());
                     if update
@@ -3142,5 +3152,97 @@ mod tests {
         } else {
             panic!("expected Orca state");
         }
+    }
+
+    /// P0-B: Ensure-equivalent JetStream publish must advance SLAVE slot when S ≫ prior cache.
+    #[test]
+    fn ensure_equivalent_pool_cache_update_advances_slave_slot() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let token_reserves = 1_073_000_000_000_000u64;
+        let sol_reserves = 30_000_000_000u64;
+
+        let mut seed = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "pumpfun".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            token_reserves,
+            sol_reserves,
+            Some(0),
+            436_771_116,
+        );
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("complete".to_string(), "false".to_string());
+        seed.metadata = Some(meta);
+        assert!(apply_pool_cache_update(&cache, &seed));
+
+        let ensure_refresh = PoolCacheUpdate::new_balance_updated(
+            "market-data",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "pumpfun".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            token_reserves,
+            sol_reserves,
+            436_771_200,
+        );
+        assert!(
+            apply_pool_cache_update(&cache, &ensure_refresh),
+            "Ensure-equivalent BalanceUpdated must apply when slot advances"
+        );
+        let (_, slot_after, _) = cache.get_with_metadata(&pool).expect("cached");
+        assert!(
+            slot_after >= 436_771_200,
+            "SLAVE slot must be >= publish_slot S after apply"
+        );
+    }
+
+    #[test]
+    fn apply_rejects_stale_lower_slot_monotonic() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+
+        let fresh = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "pumpfun".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1_000,
+            2_000,
+            500,
+        );
+        assert!(apply_pool_cache_update(&cache, &fresh));
+
+        let stale = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "pumpfun".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1_000,
+            2_000,
+            400,
+        );
+        assert!(
+            !apply_pool_cache_update(&cache, &stale),
+            "stale slot must be rejected"
+        );
+        let (_, slot, _) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(slot, 500);
     }
 }

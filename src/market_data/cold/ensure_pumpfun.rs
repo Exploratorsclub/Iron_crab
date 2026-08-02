@@ -71,6 +71,7 @@ pub async fn handle_ensure_pumpfun_bonding_curve(
         .and_then(|s| Pubkey::from_str(s).ok())
         .unwrap_or(bonding_curve);
     let bonding_curve_str = bonding_curve.to_string();
+    let had_master_pool = host.live_pool_cache().get(&bonding_curve).is_some();
 
     if !force_refresh {
         if let Some(CachedPoolState::PumpFun(_)) = host.live_pool_cache().get(&bonding_curve) {
@@ -186,8 +187,44 @@ pub async fn handle_ensure_pumpfun_bonding_curve(
     host.live_pool_cache()
         .upsert(bonding_curve, cached, publish_slot);
 
-    let jetstream_ok = if let Some(nats) = host.nats() {
-        let mut pool_update = PoolCacheUpdate::new_pool_discovered(
+    let mut meta = std::collections::HashMap::new();
+    meta.insert("creator".to_string(), state.creator.to_string());
+    meta.insert(
+        "associated_bonding_curve".to_string(),
+        associated_bonding_curve.to_string(),
+    );
+    meta.insert("complete".to_string(), state.complete.to_string());
+    meta.insert(
+        "real_token_reserves".to_string(),
+        state.real_token_reserves.to_string(),
+    );
+    meta.insert(
+        "real_sol_reserves".to_string(),
+        state.real_sol_reserves.to_string(),
+    );
+    meta.insert(
+        "cashback_enabled".to_string(),
+        state.cashback_enabled.to_string(),
+    );
+
+    let use_balance_updated = had_master_pool || force_refresh;
+    let mut pool_update = if use_balance_updated {
+        let mut bal = PoolCacheUpdate::new_balance_updated(
+            "market-data",
+            BUILD_VERSION,
+            run_id,
+            bonding_curve_str.clone(),
+            "pumpfun".to_string(),
+            base_mint.to_string(),
+            NATIVE_SOL_MINT.to_string(),
+            state.virtual_token_reserves,
+            state.virtual_sol_reserves,
+            publish_slot,
+        );
+        bal.metadata = Some(meta.clone());
+        bal
+    } else {
+        let mut disc = PoolCacheUpdate::new_pool_discovered(
             "market-data",
             BUILD_VERSION,
             run_id,
@@ -200,36 +237,24 @@ pub async fn handle_ensure_pumpfun_bonding_curve(
             Some(publish_slot),
             publish_slot,
         );
-        let mut meta = std::collections::HashMap::new();
-        meta.insert("creator".to_string(), state.creator.to_string());
-        meta.insert(
-            "associated_bonding_curve".to_string(),
-            associated_bonding_curve.to_string(),
-        );
-        meta.insert("complete".to_string(), state.complete.to_string());
-        meta.insert(
-            "real_token_reserves".to_string(),
-            state.real_token_reserves.to_string(),
-        );
-        meta.insert(
-            "real_sol_reserves".to_string(),
-            state.real_sol_reserves.to_string(),
-        );
-        meta.insert(
-            "cashback_enabled".to_string(),
-            state.cashback_enabled.to_string(),
-        );
-        pool_update.metadata = Some(meta);
-        // Cold-path RPC refresh: explicit Ready for JetStream / SLAVE (Bug #36).
-        pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
-        host.live_pool_cache()
-            .merge_pumpfun_bonding_readiness(bonding_curve, DexPoolReadiness::Ready);
+        disc.metadata = Some(meta);
+        disc
+    };
+    // Cold-path RPC refresh: explicit Ready for JetStream / SLAVE (Bug #36).
+    pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+    host.live_pool_cache()
+        .merge_pumpfun_bonding_readiness(bonding_curve, DexPoolReadiness::Ready);
+
+    let jetstream_ok = if let Some(nats) = host.nats() {
         let subject = pool_subject(&bonding_curve_str);
         match nats.jetstream_publish(&subject, &pool_update).await {
             Ok(true) => {
                 info!(
                     pool = %bonding_curve_str,
                     base_mint = %base_mint_str,
+                    publish_slot,
+                    rpc_context_slot,
+                    update_type = if use_balance_updated { "BalanceUpdated" } else { "PoolDiscovered" },
                     "EnsurePumpfunBondingCurve: Published PoolCacheUpdate to JetStream"
                 );
                 true
