@@ -120,6 +120,10 @@ use ironcrab::metrics::{
     inc_market_data_open_position_pin_deferred_cache_miss_total,
     inc_market_data_open_position_pumpfun_registration_remediate_total,
     inc_market_data_open_position_pumpfun_registration_unsatisfied_warn_total,
+    inc_market_data_open_position_pumpfun_remediate_admit_fail_total,
+    inc_market_data_open_position_pumpfun_remediate_flush_pending_total,
+    inc_market_data_open_position_pumpfun_remediate_ok_total,
+    inc_market_data_open_position_pumpfun_remediate_still_unsatisfied_total,
     inc_market_data_tracker_admission_admitted_total,
     inc_market_data_tracker_admission_rejected_total,
     inc_market_data_vault_high_priority_dispatch_total,
@@ -3899,18 +3903,22 @@ impl MarketDataContext {
         out
     }
 
-    /// PumpFun bonding curve must be in the last Geyser explicit flush (not vacuous vault satisfied).
+    /// PumpFun bonding curve must be in the last Geyser explicit flush **or** admitted pending flush.
     fn pool_pumpfun_bonding_curve_registration_satisfied(
         &self,
         pool: Pubkey,
         state: &CachedPoolState,
+        admission: Option<&FixedCapAdmission>,
     ) -> bool {
         match state {
             CachedPoolState::PumpFun(_) => {
                 if !self.hot_pool_registry.is_hot_pool(pool) {
                     return true;
                 }
-                self.last_synced_explicit_pubkeys.read().contains(&pool)
+                if self.last_synced_explicit_pubkeys.read().contains(&pool) {
+                    return true;
+                }
+                admission.is_some_and(|a| a.snapshot_pubkeys().contains(&pool))
             }
             _ => true,
         }
@@ -4526,6 +4534,7 @@ impl MarketDataContext {
                     pool,
                     GeyserPinReason::MomentumActive,
                 );
+                inc_market_data_open_position_pumpfun_remediate_still_unsatisfied_total();
                 continue;
             };
             if !matches!(state, CachedPoolState::PumpFun(_)) {
@@ -4544,6 +4553,7 @@ impl MarketDataContext {
                     pool,
                     GeyserPinReason::MomentumActive,
                 );
+                inc_market_data_open_position_pumpfun_remediate_admit_fail_total();
                 continue;
             }
             let registered = self
@@ -4551,15 +4561,23 @@ impl MarketDataContext {
             let admitted_after: HashSet<Pubkey> =
                 admission.snapshot_pubkeys().into_iter().collect();
             self.sync_explicit_pool_admitted_from_admission(admission, pool, consumer);
-            if self.hot_pool_reserve_registration_satisfied(pool) {
+            if admitted_before != admitted_after
+                && admitted_after.contains(&pool)
+                && self.explicit_physical_publish_needed(admission)
+            {
+                inc_market_data_open_position_pumpfun_remediate_flush_pending_total();
+            }
+            if self.hot_pool_reserve_registration_satisfied_with_admission(pool, Some(admission)) {
                 self.clear_deferred_hot_pool_reserve_registration(pool);
                 inc_market_data_open_position_pin_applied_total();
+                inc_market_data_open_position_pumpfun_remediate_ok_total();
                 self.publish_momentum_hot_balance_refresh_from_cache(pool);
             } else {
                 self.note_deferred_hot_pool_reserve_registration(
                     pool,
                     GeyserPinReason::MomentumActive,
                 );
+                inc_market_data_open_position_pumpfun_remediate_still_unsatisfied_total();
             }
             if admitted_before != admitted_after || registered {
                 batch_dirty = true;
@@ -5011,6 +5029,14 @@ impl MarketDataContext {
 
     /// True when cache has layout and expected vault/bin rows are already tracked (registration no-op).
     fn hot_pool_reserve_registration_satisfied(&self, pool: Pubkey) -> bool {
+        self.hot_pool_reserve_registration_satisfied_with_admission(pool, None)
+    }
+
+    fn hot_pool_reserve_registration_satisfied_with_admission(
+        &self,
+        pool: Pubkey,
+        admission: Option<&FixedCapAdmission>,
+    ) -> bool {
         if !self.hot_pool_registry.is_hot_pool(pool) {
             return true;
         }
@@ -5019,7 +5045,7 @@ impl MarketDataContext {
         };
         self.pool_vaults_fully_tracked_for_cache(pool, &state)
             && self.pool_geyser_bins_fully_tracked_for_cache(pool, &state)
-            && self.pool_pumpfun_bonding_curve_registration_satisfied(pool, &state)
+            && self.pool_pumpfun_bonding_curve_registration_satisfied(pool, &state, admission)
     }
 
     /// C1b: gauge arb pins with incomplete vault/bin Geyser registration (no RPC).
@@ -17188,6 +17214,25 @@ mod pr_b_geyser_tracking_tests {
         assert!(
             ctx.explicit_physical_publish_needed(&admission),
             "physical Geyser publish must be scheduled after admission delta"
+        );
+        assert!(
+            !ctx.last_synced_explicit_pubkeys.read().contains(&pool),
+            "last_synced must not be faked before physical flush"
+        );
+        assert!(
+            ctx.hot_pool_reserve_registration_satisfied_with_admission(pool, Some(&admission)),
+            "remediation must satisfy registration via admission pending flush"
+        );
+
+        *ctx.last_synced_explicit_pubkeys.write() =
+            admission.snapshot_pubkeys().into_iter().collect();
+        assert!(
+            ctx.last_synced_explicit_pubkeys.read().contains(&pool),
+            "bonding curve must be in last_synced only after explicit flush simulation"
+        );
+        assert!(
+            ctx.hot_pool_reserve_registration_satisfied(pool),
+            "after flush simulation, satisfied without admission context"
         );
     }
 

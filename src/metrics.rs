@@ -3321,6 +3321,72 @@ pub fn inc_market_data_open_position_pumpfun_jetstream_publish_total() {
     MARKET_DATA_OPEN_POSITION_PUMPFUN_JETSTREAM_PUBLISH_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+static POOL_CACHE_APPLY_REJECTED_STALE_SLOT_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn inc_pool_cache_apply_rejected_stale_slot_total() {
+    POOL_CACHE_APPLY_REJECTED_STALE_SLOT_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+static MOMENTUM_POOL_CACHE_APPLY_REJECTED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// Increment Mom apply-reject counter; returns true when a rate-limited WARN should be emitted.
+#[inline]
+pub fn record_momentum_pool_cache_apply_rejected() -> bool {
+    let n = MOMENTUM_POOL_CACHE_APPLY_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    n == 1 || n.is_multiple_of(64)
+}
+
+static MARKET_DATA_OPEN_POSITION_PUMPFUN_REMEDIATE_ADMIT_FAIL_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn inc_market_data_open_position_pumpfun_remediate_admit_fail_total() {
+    MARKET_DATA_OPEN_POSITION_PUMPFUN_REMEDIATE_ADMIT_FAIL_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+static MARKET_DATA_OPEN_POSITION_PUMPFUN_REMEDIATE_FLUSH_PENDING_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn inc_market_data_open_position_pumpfun_remediate_flush_pending_total() {
+    MARKET_DATA_OPEN_POSITION_PUMPFUN_REMEDIATE_FLUSH_PENDING_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+static MARKET_DATA_OPEN_POSITION_PUMPFUN_REMEDIATE_STILL_UNSATISFIED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn inc_market_data_open_position_pumpfun_remediate_still_unsatisfied_total() {
+    MARKET_DATA_OPEN_POSITION_PUMPFUN_REMEDIATE_STILL_UNSATISFIED_TOTAL
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+static MARKET_DATA_OPEN_POSITION_PUMPFUN_REMEDIATE_OK_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn inc_market_data_open_position_pumpfun_remediate_ok_total() {
+    MARKET_DATA_OPEN_POSITION_PUMPFUN_REMEDIATE_OK_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+static MARKET_DATA_COLD_PATH_RPC_CONTEXT_LAGS_GEYSER_HEAD_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn inc_market_data_cold_path_rpc_context_lags_geyser_head_total() {
+    MARKET_DATA_COLD_PATH_RPC_CONTEXT_LAGS_GEYSER_HEAD_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+static MARKET_DATA_ENSURE_PUMPFUN_MASTER_UPSERT_STALE_REJECT_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn inc_market_data_ensure_pumpfun_master_upsert_stale_reject_total() {
+    MARKET_DATA_ENSURE_PUMPFUN_MASTER_UPSERT_STALE_REJECT_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 static MOMENTUM_OPEN_POSITION_EXIT_BLIND_ENSURE_TOTAL: Lazy<RwLock<HashMap<&'static str, u64>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
@@ -8615,6 +8681,38 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_open_position_pumpfun_jetstream_publish_total",
         MARKET_DATA_OPEN_POSITION_PUMPFUN_JETSTREAM_PUBLISH_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "pool_cache_apply_rejected_stale_slot_total",
+        POOL_CACHE_APPLY_REJECTED_STALE_SLOT_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_pool_cache_apply_rejected_total",
+        MOMENTUM_POOL_CACHE_APPLY_REJECTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_open_position_pumpfun_remediate_admit_fail_total",
+        MARKET_DATA_OPEN_POSITION_PUMPFUN_REMEDIATE_ADMIT_FAIL_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_open_position_pumpfun_remediate_flush_pending_total",
+        MARKET_DATA_OPEN_POSITION_PUMPFUN_REMEDIATE_FLUSH_PENDING_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_open_position_pumpfun_remediate_still_unsatisfied_total",
+        MARKET_DATA_OPEN_POSITION_PUMPFUN_REMEDIATE_STILL_UNSATISFIED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_open_position_pumpfun_remediate_ok_total",
+        MARKET_DATA_OPEN_POSITION_PUMPFUN_REMEDIATE_OK_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_cold_path_rpc_context_lags_geyser_head_total",
+        MARKET_DATA_COLD_PATH_RPC_CONTEXT_LAGS_GEYSER_HEAD_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_ensure_pumpfun_master_upsert_stale_reject_total",
+        MARKET_DATA_ENSURE_PUMPFUN_MASTER_UPSERT_STALE_REJECT_TOTAL.load(Ordering::Relaxed)
     );
     for (reason, count) in MOMENTUM_OPEN_POSITION_EXIT_BLIND_ENSURE_TOTAL.read().iter() {
         out.push_str("momentum_open_position_exit_blind_ensure_total{reason=\"");

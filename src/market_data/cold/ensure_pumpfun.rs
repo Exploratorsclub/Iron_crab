@@ -1,8 +1,8 @@
 //! I-24d EnsurePumpfunBondingCurve cold-path handler.
 
 use super::host::{publish_control_response, ColdHost};
-use super::publish_slot::resolve_cold_path_publish_slot;
-use crate::execution::live_pool_cache::{CachedPoolState, PumpFunState};
+use super::publish_slot::{observe_cold_path_rpc_context_slot_lag, resolve_cold_path_publish_slot};
+use crate::execution::live_pool_cache::{CachedPoolState, LivePoolCache, PumpFunState};
 use crate::ipc::{ControlResponseStatus, DexPoolReadiness, PoolCacheUpdate, NATIVE_SOL_MINT};
 use crate::nats::jetstream::pool_subject;
 use crate::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
@@ -13,6 +13,24 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// True when Ensure must **not** publish JetStream: MASTER monotonic slot rejected the upsert.
+pub(crate) fn ensure_pumpfun_should_skip_jetstream_publish(
+    master_upsert_applied: bool,
+    publish_slot: u64,
+) -> bool {
+    !master_upsert_applied && publish_slot > 0
+}
+
+/// Apply RPC-fetched PumpFun row to MASTER cache (monotonic slot).
+pub(crate) fn apply_ensure_pumpfun_master_cache_upsert(
+    cache: &LivePoolCache,
+    pool: Pubkey,
+    state: CachedPoolState,
+    publish_slot: u64,
+) -> bool {
+    cache.upsert(pool, state, publish_slot)
+}
 
 /// Cold-path recovery: fetch PumpFun bonding curve account via RPC (force_refresh), update MASTER
 /// cache, publish JetStream PoolCacheUpdate. Does not short-circuit on cache when `force_refresh`.
@@ -71,6 +89,7 @@ pub async fn handle_ensure_pumpfun_bonding_curve(
         .and_then(|s| Pubkey::from_str(s).ok())
         .unwrap_or(bonding_curve);
     let bonding_curve_str = bonding_curve.to_string();
+    let had_master_pool = host.live_pool_cache().get(&bonding_curve).is_some();
 
     if !force_refresh {
         if let Some(CachedPoolState::PumpFun(_)) = host.live_pool_cache().get(&bonding_curve) {
@@ -150,6 +169,7 @@ pub async fn handle_ensure_pumpfun_bonding_curve(
     };
 
     let mut publish_slot = resolve_cold_path_publish_slot(rpc_context_slot);
+    observe_cold_path_rpc_context_slot_lag(rpc_context_slot);
     if publish_slot == 0 {
         if let Ok(slot) = rpc.get_slot_retry().await {
             publish_slot = slot;
@@ -183,11 +203,81 @@ pub async fn handle_ensure_pumpfun_bonding_curve(
         creator: state.creator,
         cashback_enabled: state.cashback_enabled,
     });
-    host.live_pool_cache()
-        .upsert(bonding_curve, cached, publish_slot);
+    let master_upsert_applied = apply_ensure_pumpfun_master_cache_upsert(
+        host.live_pool_cache(),
+        bonding_curve,
+        cached,
+        publish_slot,
+    );
+    if ensure_pumpfun_should_skip_jetstream_publish(master_upsert_applied, publish_slot) {
+        let master_slot = host
+            .live_pool_cache()
+            .get_with_metadata(&bonding_curve)
+            .map(|(_, slot, _)| slot)
+            .unwrap_or(0);
+        crate::metrics::inc_market_data_ensure_pumpfun_master_upsert_stale_reject_total();
+        warn!(
+            request_id = %request_id,
+            pool = %bonding_curve_str,
+            publish_slot,
+            master_slot,
+            rpc_context_slot,
+            "EnsurePumpfunBondingCurve: MASTER upsert rejected stale RPC slot — skipping JetStream publish"
+        );
+        if let Some(nats) = host.nats() {
+            publish_control_response(
+                nats,
+                host.run_id(),
+                request_id,
+                ControlResponseStatus::Error,
+                Some(bonding_curve_str),
+                Some(format!(
+                    "MASTER cache slot {master_slot} newer than publish_slot {publish_slot}; JetStream publish skipped"
+                )),
+            )
+            .await;
+        }
+        return;
+    }
 
-    let jetstream_ok = if let Some(nats) = host.nats() {
-        let mut pool_update = PoolCacheUpdate::new_pool_discovered(
+    let mut meta = std::collections::HashMap::new();
+    meta.insert("creator".to_string(), state.creator.to_string());
+    meta.insert(
+        "associated_bonding_curve".to_string(),
+        associated_bonding_curve.to_string(),
+    );
+    meta.insert("complete".to_string(), state.complete.to_string());
+    meta.insert(
+        "real_token_reserves".to_string(),
+        state.real_token_reserves.to_string(),
+    );
+    meta.insert(
+        "real_sol_reserves".to_string(),
+        state.real_sol_reserves.to_string(),
+    );
+    meta.insert(
+        "cashback_enabled".to_string(),
+        state.cashback_enabled.to_string(),
+    );
+
+    let use_balance_updated = had_master_pool || force_refresh;
+    let mut pool_update = if use_balance_updated {
+        let mut bal = PoolCacheUpdate::new_balance_updated(
+            "market-data",
+            BUILD_VERSION,
+            run_id,
+            bonding_curve_str.clone(),
+            "pumpfun".to_string(),
+            base_mint.to_string(),
+            NATIVE_SOL_MINT.to_string(),
+            state.virtual_token_reserves,
+            state.virtual_sol_reserves,
+            publish_slot,
+        );
+        bal.metadata = Some(meta.clone());
+        bal
+    } else {
+        let mut disc = PoolCacheUpdate::new_pool_discovered(
             "market-data",
             BUILD_VERSION,
             run_id,
@@ -200,36 +290,24 @@ pub async fn handle_ensure_pumpfun_bonding_curve(
             Some(publish_slot),
             publish_slot,
         );
-        let mut meta = std::collections::HashMap::new();
-        meta.insert("creator".to_string(), state.creator.to_string());
-        meta.insert(
-            "associated_bonding_curve".to_string(),
-            associated_bonding_curve.to_string(),
-        );
-        meta.insert("complete".to_string(), state.complete.to_string());
-        meta.insert(
-            "real_token_reserves".to_string(),
-            state.real_token_reserves.to_string(),
-        );
-        meta.insert(
-            "real_sol_reserves".to_string(),
-            state.real_sol_reserves.to_string(),
-        );
-        meta.insert(
-            "cashback_enabled".to_string(),
-            state.cashback_enabled.to_string(),
-        );
-        pool_update.metadata = Some(meta);
-        // Cold-path RPC refresh: explicit Ready for JetStream / SLAVE (Bug #36).
-        pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
-        host.live_pool_cache()
-            .merge_pumpfun_bonding_readiness(bonding_curve, DexPoolReadiness::Ready);
+        disc.metadata = Some(meta);
+        disc
+    };
+    // Cold-path RPC refresh: explicit Ready for JetStream / SLAVE (Bug #36).
+    pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+    host.live_pool_cache()
+        .merge_pumpfun_bonding_readiness(bonding_curve, DexPoolReadiness::Ready);
+
+    let jetstream_ok = if let Some(nats) = host.nats() {
         let subject = pool_subject(&bonding_curve_str);
         match nats.jetstream_publish(&subject, &pool_update).await {
             Ok(true) => {
                 info!(
                     pool = %bonding_curve_str,
                     base_mint = %base_mint_str,
+                    publish_slot,
+                    rpc_context_slot,
+                    update_type = if use_balance_updated { "BalanceUpdated" } else { "PoolDiscovered" },
                     "EnsurePumpfunBondingCurve: Published PoolCacheUpdate to JetStream"
                 );
                 true
@@ -268,5 +346,70 @@ pub async fn handle_ensure_pumpfun_bonding_curve(
             message,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::live_pool_cache::{LivePoolCache, PumpFunState};
+
+    fn sample_pumpfun_state(pool: Pubkey, mint: Pubkey) -> CachedPoolState {
+        CachedPoolState::PumpFun(PumpFunState {
+            token_mint: mint,
+            bonding_curve: pool,
+            associated_bonding_curve: Pubkey::new_unique(),
+            virtual_sol_reserves: 30_000_000_000,
+            virtual_token_reserves: 1_073_000_000_000_000,
+            real_sol_reserves: 10_000_000_000,
+            real_token_reserves: 500_000_000_000_000,
+            complete: false,
+            creator: Pubkey::new_unique(),
+            cashback_enabled: false,
+        })
+    }
+
+    #[test]
+    fn ensure_skips_jetstream_when_master_upsert_rejects_stale_slot() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let state = sample_pumpfun_state(pool, mint);
+
+        assert!(apply_ensure_pumpfun_master_cache_upsert(
+            &cache,
+            pool,
+            state.clone(),
+            436_771_131
+        ));
+        let rejected = apply_ensure_pumpfun_master_cache_upsert(&cache, pool, state, 436_771_116);
+        assert!(!rejected, "MASTER must reject lower RPC slot");
+        assert!(
+            ensure_pumpfun_should_skip_jetstream_publish(rejected, 436_771_116),
+            "JetStream publish must be skipped when MASTER upsert rejects"
+        );
+        let (_, master_slot, _) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(master_slot, 436_771_131);
+    }
+
+    #[test]
+    fn ensure_allows_jetstream_when_master_upsert_advances_slot() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let state = sample_pumpfun_state(pool, mint);
+
+        assert!(apply_ensure_pumpfun_master_cache_upsert(
+            &cache,
+            pool,
+            state.clone(),
+            436_771_116
+        ));
+        let applied = apply_ensure_pumpfun_master_cache_upsert(&cache, pool, state, 436_771_200);
+        assert!(applied);
+        assert!(!ensure_pumpfun_should_skip_jetstream_publish(
+            applied,
+            436_771_200
+        ));
     }
 }
