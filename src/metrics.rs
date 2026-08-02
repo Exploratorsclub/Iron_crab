@@ -3240,6 +3240,9 @@ pub static MOMENTUM_EXIT_AMOUNT_OVERLAY_ONLY_TOTAL: Lazy<AtomicU64> =
 /// Exit quote rejected: `tokens_per_sol` scale incompatible with entry/mark (false TAKE_PROFIT guard).
 pub static MOMENTUM_EXIT_QUOTE_SCALE_MISMATCH_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Exit quote with cache age above legacy 4s threshold (diagnostic only; no guard reject).
+pub static MOMENTUM_EXIT_QUOTE_LEGACY_STALE_AGE_DIAG_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// PA-5.1: overlay closed because PositionAuthority signaled closed/absent/zero.
 pub static MOMENTUM_OVERLAY_CLOSED_BY_AUTHORITY_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -3276,6 +3279,11 @@ pub fn record_momentum_exit_amount_overlay_only_total() {
 #[inline]
 pub fn record_momentum_exit_quote_scale_mismatch_total() {
     MOMENTUM_EXIT_QUOTE_SCALE_MISMATCH_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_momentum_exit_quote_legacy_stale_age_diag_total() {
+    MOMENTUM_EXIT_QUOTE_LEGACY_STALE_AGE_DIAG_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 static MOMENTUM_EXIT_QUOTE_GUARD_REJECT_TOTAL: Lazy<RwLock<HashMap<&'static str, u64>>> =
@@ -8583,6 +8591,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "momentum_exit_quote_scale_mismatch_total",
         MOMENTUM_EXIT_QUOTE_SCALE_MISMATCH_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_exit_quote_legacy_stale_age_diag_total",
+        MOMENTUM_EXIT_QUOTE_LEGACY_STALE_AGE_DIAG_TOTAL.load(Ordering::Relaxed)
     );
     for (reason, count) in MOMENTUM_EXIT_QUOTE_GUARD_REJECT_TOTAL.read().iter() {
         out.push_str("momentum_exit_quote_guard_reject_total{reason=\"");
