@@ -303,8 +303,10 @@ pub static MARKET_DATA_ARB_TRACK_COALESCED_MESSAGES_TOTAL: Lazy<AtomicU64> =
 /// Merged `ApplyArbTrackRequests` batches enqueued to md-track-worker (Phase 3).
 pub static MARKET_DATA_ARB_TRACK_COALESCED_BATCHES_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
-/// Vaults registered via arb multi-dex admission (no momentum pin).
-pub static MARKET_DATA_ARB_REGISTERED_VAULTS_TOTAL: Lazy<AtomicU64> =
+/// Vault rows currently tracked with `GeyserPinReason::ArbMultiDex` (gauge, not cumulative).
+pub static MARKET_DATA_ARB_TRACKED_VAULTS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Successful arb pin vault/bin Geyser registrations (one increment per register call that changed tracking).
+pub static MARKET_DATA_ARB_PIN_VAULT_REGISTER_OK_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// Account worker dispatch: tracked vault pubkey classified HIGH.
 pub static MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL: Lazy<AtomicU64> =
@@ -365,6 +367,21 @@ pub static MARKET_DATA_ARB_PIN_GEYSER_REGISTER_DEFERRED_LIVE_POOL_CACHE_MISS: La
     Lazy::new(|| AtomicU64::new(0));
 /// Arb pin: Geyser reserve registration deferred because vault/bin register was a no-op.
 pub static MARKET_DATA_ARB_PIN_GEYSER_REGISTER_DEFERRED_VAULT_NO_CHANGE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Arb pin: deferred because EXEC_HOT arb admit suppress rejected warmable pin.
+pub static MARKET_DATA_ARB_PIN_GEYSER_REGISTER_DEFERRED_ADMIT_SUPPRESS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Arb pin: deferred queue entry cleared after successful reserve registration.
+pub static MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Arb pin: retry tick still unsatisfied — LivePoolCache miss persists.
+pub static MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_LIVE_POOL_CACHE_MISS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Arb pin: retry tick still unsatisfied — explicit admit rejected.
+pub static MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_ADMIT_FAIL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Arb pin: retry tick still unsatisfied — vault/bin register no-op.
+pub static MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_VAULT_NO_CHANGE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
 /// Geyser explicit-tracked subscription list syncs coalesced from the TX trade path (debounced flush).
@@ -595,8 +612,37 @@ pub fn inc_market_data_arb_track_worker_enqueue_dropped_total() {
 }
 
 #[inline]
-pub fn inc_market_data_arb_registered_vaults_total() {
-    MARKET_DATA_ARB_REGISTERED_VAULTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+pub fn set_market_data_arb_tracked_vaults_gauge(n: usize) {
+    MARKET_DATA_ARB_TRACKED_VAULTS_GAUGE.store(n as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_pin_vault_register_ok_total() {
+    MARKET_DATA_ARB_PIN_VAULT_REGISTER_OK_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_pin_deferred_cleared_total() {
+    MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_arb_pin_deferred_still_unsatisfied_total(reason: &str) {
+    match reason {
+        "live_pool_cache_miss" => {
+            MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_LIVE_POOL_CACHE_MISS
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        "admit_fail" => {
+            MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_ADMIT_FAIL
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        "vault_register_no_change" => {
+            MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_VAULT_NO_CHANGE
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
 }
 
 #[inline]
@@ -720,6 +766,10 @@ pub fn inc_market_data_arb_pin_geyser_register_deferred_total(reason: &str) {
         }
         "vault_register_no_change" => {
             MARKET_DATA_ARB_PIN_GEYSER_REGISTER_DEFERRED_VAULT_NO_CHANGE
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        "admit_suppress" => {
+            MARKET_DATA_ARB_PIN_GEYSER_REGISTER_DEFERRED_ADMIT_SUPPRESS
                 .fetch_add(1, Ordering::Relaxed);
         }
         _ => {}
@@ -7800,8 +7850,16 @@ async fn metrics_response() -> Response<Body> {
         MARKET_DATA_ARB_TRACK_COALESCED_BATCHES_TOTAL.load(Ordering::Relaxed)
     );
     line!(
-        "market_data_arb_registered_vaults_total",
-        MARKET_DATA_ARB_REGISTERED_VAULTS_TOTAL.load(Ordering::Relaxed)
+        "market_data_arb_tracked_vaults",
+        MARKET_DATA_ARB_TRACKED_VAULTS_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_arb_pin_vault_register_ok_total",
+        MARKET_DATA_ARB_PIN_VAULT_REGISTER_OK_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_arb_pin_deferred_cleared_total",
+        MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_vault_high_priority_dispatch_total",
@@ -7858,6 +7916,38 @@ async fn metrics_response() -> Response<Body> {
     );
     out.push_str(
         &MARKET_DATA_ARB_PIN_GEYSER_REGISTER_DEFERRED_VAULT_NO_CHANGE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_arb_pin_geyser_register_deferred_total{reason=\"admit_suppress\"} ");
+    out.push_str(
+        &MARKET_DATA_ARB_PIN_GEYSER_REGISTER_DEFERRED_ADMIT_SUPPRESS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        "market_data_arb_pin_deferred_still_unsatisfied_total{reason=\"live_pool_cache_miss\"} ",
+    );
+    out.push_str(
+        &MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_LIVE_POOL_CACHE_MISS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_arb_pin_deferred_still_unsatisfied_total{reason=\"admit_fail\"} ");
+    out.push_str(
+        &MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_ADMIT_FAIL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        "market_data_arb_pin_deferred_still_unsatisfied_total{reason=\"vault_register_no_change\"} ",
+    );
+    out.push_str(
+        &MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_VAULT_NO_CHANGE
             .load(Ordering::Relaxed)
             .to_string(),
     );

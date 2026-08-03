@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ARB-C1c: Arb Pin Vault Completeness — Deferred Retry Queue
+**Datum**: 2026-08-03  
+**Problem**: Arb screent aktiv, aber `sell_missing_vault` ~15k Rejects und `arb_registered_vaults_total=0`. `apply_arb_active_entries` inkrementierte nur deferred-Metriken/WARN bei Register-Miss, ohne `note_deferred_hot_pool_reserve_registration` — Retry-Queue blieb leer. Admit-Suppress (`market_data_exec_hot_arb_admit_suppress`) skippte warmable und must-hot still ohne Completeness-Pfad.  
+**Fix**: (1) Arb apply notiert deferred bei Cache-Miss, Register-No-Op, Admit-Reject und Admit-Suppress (warmable); must-hot bypassed Suppress und versucht Register. (2) `retry_deferred_hot_pool_reserve_registrations` metrisiert Arb still-unsatisfied/cleared. (3) Unpin cleart deferred. (4) Metriken: `market_data_arb_tracked_vaults` Gauge, `arb_pin_deferred_cleared_total`, deferred still-unsatisfied by reason, `admit_suppress` deferred counter. **Invarianten**: I-4/I-7 — kein RPC im Apply/Retry.  
+**Evidence**: `findings_arb_zero_opp_20260803.md`, Prod Tip `30978a0`.  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-FAILEDCONFIRMED-PHANTOM-SELL: FailedConfirmed ≠ Success-Accounting + WSOL Proceeds
 **Datum**: 2026-08-02  
 **Problem**: `FailedConfirmed` SELL (on-chain fail, z.B. Slippage/Curve complete) lief durch denselben Post-Confirm-Block wie `Confirmed`: LockManager `set_available(0)` („confirmed full SELL“), `record_recent_trade` → Phantom −100% SELL in Trades-UI. Separat: Mom Full-SELL Close nutzte `wallet_sol_delta_lamports` statt WSOL `fill_out` → `sell_proceeds=-5000` bei PumpSwap-SELL.  
