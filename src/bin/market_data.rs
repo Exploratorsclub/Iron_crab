@@ -5098,15 +5098,10 @@ impl MarketDataContext {
     }
 
     fn clear_arb_pin_deferred_with_metric(&self, pool: Pubkey) {
-        if self
-            .deferred_hot_pool_reserve_pins
-            .read()
-            .contains_key(&pool)
-        {
-            self.clear_deferred_hot_pool_reserve_registration(pool);
-            inc_market_data_arb_pin_deferred_cleared_total();
-        } else {
-            self.clear_deferred_hot_pool_reserve_registration(pool);
+        if let Some(pin) = self.deferred_hot_pool_reserve_pins.write().remove(&pool) {
+            if pin == GeyserPinReason::ArbMultiDex {
+                inc_market_data_arb_pin_deferred_cleared_total();
+            }
         }
     }
 
