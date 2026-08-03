@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ARB-C1f: Arb DLMM Bin Consume — Live Snapshot + Bin-Update Rescreen
+**Datum**: 2026-08-03  
+**Problem**: Post-C1e: MD `dlmm_bin_publish_exec_hot` ~7k+, aber Arb `sell_missing_dlmm_bins` dominant (~876/3.3k screens). `check_arbitrage_v2` nutzte `ApplyTrade`-Snapshot (`bin_arrays`) aus dem Writer-Thread; BinArrayUpdate landete oft erst danach im globalen Cache → `dlmm_bins.is_none()` trotz publizierter Bins. Zusätzlich: pinned DLMM-BinArrayUpdates ohne `known_pools`-Eintrag → LOW-Priority-Coalescer.  
+**Fix**: (1) Forensik: `arb_dlmm_bin_array_update_{received,applied}`, `arb_dlmm_bin_rescreen_scheduled`, `arb_v2_screen_meteora_sell_bin_{hit,miss}`, `arb_pinned_meteora_pool_bin_cache_miss`. (2) `check_arbitrage_for_tracker` liest live scoped `snapshot_vault_bins_for_tracker` zum Screen-Zeitpunkt. (3) `BinArrayUpdate` für selected/pinned Mint → `ArbTwoHopWorkerJob::Rescreen`. (4) Ingress: pinned Pools → HIGH priority für BinArrayUpdate. **Invarianten**: I-4/I-7 kein RPC; Dual-Consumer/C1e unverändert.  
+**Evidence**: `findings_arb_zero_opp_post361_20260803.md`, Prod Tip `9fbbce5`.  
+**Dateien**: `src/bin/arb_strategy.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-ARB-C1e: DLMM BinArray Publish Path — Stash + Replay nach Membership
 **Datum**: 2026-08-03  
 **Problem**: Post-C1d: `tracked_bin_arrays` und `dlmm_bin_register_ok_total` OK, aber `market_data_bin_array_publish_total=0`. METEORA-DLMM-Bin-PDAs liefen bereits über Program-Owner-Filter; vor Membership-Registrierung `EarlyDrop DexPoolNotEnrichment`. Nach Register keine erneute Geyser-Zustellung bei unveränderten Accounts → Handler/Publish nie.  

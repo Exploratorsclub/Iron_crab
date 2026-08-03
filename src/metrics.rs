@@ -4795,6 +4795,19 @@ pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_RESERVES_IMPLAUSIBLE: Lazy<Atom
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_DLMM_ACTIVE_BIN_MISSING: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+
+// --- C1f: Arb DLMM bin consume / pin-coverage forensics ---
+pub static ARB_DLMM_BIN_ARRAY_UPDATE_RECEIVED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_DLMM_BIN_ARRAY_UPDATE_APPLIED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_DLMM_BIN_RESCREEN_SCHEDULED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_V2_SCREEN_METEORA_SELL_BIN_HIT_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_V2_SCREEN_METEORA_SELL_BIN_MISS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_PINNED_METEORA_POOL_BIN_CACHE_MISS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_DLMM_WALKER_ZERO: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_DLMM_MARGINAL_REJECT: Lazy<AtomicU64> =
@@ -5306,6 +5319,36 @@ pub fn arb_two_hop_v2_screen_inc() {
 /// Increment `arb_two_hop_v2_screen_multi_dex_total`.
 pub fn arb_two_hop_v2_screen_multi_dex_inc() {
     ARB_TWO_HOP_V2_SCREEN_MULTI_DEX_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_dlmm_bin_array_update_received_total`.
+pub fn inc_arb_dlmm_bin_array_update_received_total() {
+    ARB_DLMM_BIN_ARRAY_UPDATE_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_dlmm_bin_array_update_applied_total`.
+pub fn inc_arb_dlmm_bin_array_update_applied_total() {
+    ARB_DLMM_BIN_ARRAY_UPDATE_APPLIED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_dlmm_bin_rescreen_scheduled_total`.
+pub fn inc_arb_dlmm_bin_rescreen_scheduled_total() {
+    ARB_DLMM_BIN_RESCREEN_SCHEDULED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_v2_screen_meteora_sell_bin_hit_total`.
+pub fn inc_arb_v2_screen_meteora_sell_bin_hit_total() {
+    ARB_V2_SCREEN_METEORA_SELL_BIN_HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_v2_screen_meteora_sell_bin_miss_total`.
+pub fn inc_arb_v2_screen_meteora_sell_bin_miss_total() {
+    ARB_V2_SCREEN_METEORA_SELL_BIN_MISS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_pinned_meteora_pool_bin_cache_miss_total`.
+pub fn inc_arb_pinned_meteora_pool_bin_cache_miss_total() {
+    ARB_PINNED_METEORA_POOL_BIN_CACHE_MISS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Subreason for `arb_two_hop_v2_insufficient_subreason_total{reason=...}`.
@@ -9848,6 +9891,30 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_two_hop_v2_screen_total",
         ARB_TWO_HOP_V2_SCREEN_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_dlmm_bin_array_update_received_total",
+        ARB_DLMM_BIN_ARRAY_UPDATE_RECEIVED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_dlmm_bin_array_update_applied_total",
+        ARB_DLMM_BIN_ARRAY_UPDATE_APPLIED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_dlmm_bin_rescreen_scheduled_total",
+        ARB_DLMM_BIN_RESCREEN_SCHEDULED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_v2_screen_meteora_sell_bin_hit_total",
+        ARB_V2_SCREEN_METEORA_SELL_BIN_HIT_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_v2_screen_meteora_sell_bin_miss_total",
+        ARB_V2_SCREEN_METEORA_SELL_BIN_MISS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_pinned_meteora_pool_bin_cache_miss_total",
+        ARB_PINNED_METEORA_POOL_BIN_CACHE_MISS_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "arb_two_hop_v2_incompatible_kind_total",

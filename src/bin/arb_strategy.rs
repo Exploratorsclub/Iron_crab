@@ -74,7 +74,10 @@ use ironcrab::metrics::{
     arb_two_hop_v2_no_cross_dex_sell_detail_inc, arb_two_hop_v2_rejected_inc,
     arb_two_hop_v2_round_trip_formable_inc, arb_two_hop_v2_screen_inc,
     arb_two_hop_v2_screen_multi_dex_inc, arb_two_hop_v2_screen_skipped_inc,
-    arb_two_hop_v2_sell_quote_none_detail_inc, record_arb_heartbeat_phase,
+    arb_two_hop_v2_sell_quote_none_detail_inc, inc_arb_dlmm_bin_array_update_applied_total,
+    inc_arb_dlmm_bin_array_update_received_total, inc_arb_dlmm_bin_rescreen_scheduled_total,
+    inc_arb_pinned_meteora_pool_bin_cache_miss_total, inc_arb_v2_screen_meteora_sell_bin_hit_total,
+    inc_arb_v2_screen_meteora_sell_bin_miss_total, record_arb_heartbeat_phase,
     record_arb_price_freshness_stale_age_ms, record_arb_proactive_pin_first_publish,
     record_arb_proactive_track_publish_total, record_arb_quote_pair_slot_delta,
     record_arb_quote_shadow_round_trip, record_arb_track_publish_skipped_unchanged_total,
@@ -3770,12 +3773,13 @@ fn market_event_pool_key(event: &MarketEvent) -> Option<String> {
 fn classify_market_event_priority(
     event: &MarketEvent,
     known_pools: &HashSet<String>,
+    pinned_pools: &HashSet<String>,
 ) -> ArbEventPriority {
     match &event.kind {
         MarketEventKind::Trade { .. } => ArbEventPriority::High,
         MarketEventKind::PoolStateUpdate { pool_address, .. }
         | MarketEventKind::BinArrayUpdate { pool_address, .. } => {
-            if known_pools.contains(pool_address) {
+            if known_pools.contains(pool_address) || pinned_pools.contains(pool_address) {
                 ArbEventPriority::High
             } else {
                 ArbEventPriority::Low
@@ -3797,6 +3801,7 @@ fn should_enqueue_pool_created(base_mint: &str, quote_mint: &str) -> bool {
 fn arb_market_event_ingress_priority(
     event: &MarketEvent,
     known_pools: &HashSet<String>,
+    pinned_pools: &HashSet<String>,
 ) -> Option<ArbEventPriority> {
     if let MarketEventKind::PoolCreated {
         base_mint,
@@ -3812,7 +3817,11 @@ fn arb_market_event_ingress_priority(
     if !is_arb_handled_market_event(&event.kind) {
         return None;
     }
-    Some(classify_market_event_priority(event, known_pools))
+    Some(classify_market_event_priority(
+        event,
+        known_pools,
+        pinned_pools,
+    ))
 }
 
 /// Kinds that `handle_market_event` processes; all others are no-ops for arb-strategy.
@@ -4086,6 +4095,13 @@ struct ArbTwoHopTradeJob {
     ts_unix_ms: u64,
 }
 
+/// Jobs for the off-hot-loop 2-hop worker (trade-driven screen + bin-update rescreen).
+#[derive(Debug, Clone)]
+enum ArbTwoHopWorkerJob {
+    Trade(ArbTwoHopTradeJob),
+    Rescreen { mint: String },
+}
+
 /// Result of fast `apply_trade_to_tracker` in the single writer (check_arbitrage runs outside).
 /// `vault_balances` and `bin_arrays` are snapshotted in the writer immediately after apply
 /// so `check_arbitrage` sees a consistent view with `tracker_snapshot`.
@@ -4094,7 +4110,11 @@ struct ApplyTradeResult {
     tracker_snapshot: TokenArbTracker,
     config: ArbConfig,
     mint: String,
+    /// Writer-side scoped vault snapshot (asserted in tests; v2 screen uses live snapshot).
+    #[allow(dead_code)]
     vault_balances: HashMap<String, VaultBalanceCache>,
+    /// Retained for writer-side snapshot consistency; v2 screen reads live cache (C1f).
+    #[allow(dead_code)]
     bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>>,
 }
 
@@ -4192,104 +4212,167 @@ impl ArbTrackerWriteHandle {
     }
 }
 
-fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoHopTradeJob>) {
+fn record_v2_meteora_pinned_sell_bin_coverage(
+    tracker: &TokenArbTracker,
+    bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
+    pinned: &HashSet<String>,
+) {
+    for (pool_addr, pool) in &tracker.pools {
+        if pool.dex != "meteora_dlmm" || !pinned.contains(pool_addr) {
+            continue;
+        }
+        if bin_arrays.contains_key(pool_addr) {
+            inc_arb_v2_screen_meteora_sell_bin_hit_total();
+        } else {
+            inc_arb_v2_screen_meteora_sell_bin_miss_total();
+            inc_arb_pinned_meteora_pool_bin_cache_miss_total();
+        }
+    }
+}
+
+async fn finalize_arb_opportunity_from_check(
+    ctx: &Arc<ArbContext>,
+    mint: String,
+    intent_cooldown_ms: u64,
+    opp: ArbOpportunity,
+    slot: Option<u64>,
+    ts_unix_ms: Option<u64>,
+) {
+    let (finalize_tx, finalize_rx) = oneshot::channel();
+    if !ctx.tracker_write.try_enqueue(
+        ArbTrackerWriteJob::FinalizeOpportunity {
+            mint: mint.clone(),
+            intent_cooldown_ms,
+            opp,
+            reply: finalize_tx,
+        },
+        ArbTrackerWriteJobType::FinalizeOpportunity,
+    ) {
+        debug!("Dropped FinalizeOpportunity (tracker-write queue full)");
+        return;
+    }
+    let finalized = match finalize_rx.await {
+        Ok(opp) => opp,
+        Err(_) => return,
+    };
+    if let Some(opp) = finalized {
+        ARB_TRIANGLE_OPPORTUNITIES.fetch_add(1, Ordering::Relaxed);
+        info!(
+            mint = %opp.base_mint,
+            buy_dex = %opp.buy_dex,
+            sell_dex = %opp.sell_dex,
+            spread_bps = opp.spread_bps,
+            profit_lamports = opp.estimated_profit_lamports,
+            "🔥 Arbitrage opportunity detected (two-hop worker)"
+        );
+        ctx.publish_arb_trade_signal_track_pins(&opp.base_mint, &opp.buy_pool, &opp.sell_pool);
+        if let Some(mut intent) = create_arb_intent(ctx, &opp) {
+            if let Some(slot) = slot {
+                intent.metadata.insert("slot".to_string(), slot.to_string());
+            }
+            if let Some(ts_unix_ms) = ts_unix_ms {
+                intent
+                    .metadata
+                    .insert("slot_seen_at_ms".to_string(), ts_unix_ms.to_string());
+            }
+            publish_arb_intent(ctx, &intent).await;
+        }
+    }
+}
+
+fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoHopWorkerJob>) {
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             let two_hop_enabled = ctx.config.read().two_hop_enabled;
             if !two_hop_enabled {
                 continue;
             }
-            let (reply_tx, reply_rx) = oneshot::channel();
-            // Flush coalesced PoolStateUpdates before ApplyTrade so writer applies fresh
-            // reserves (FIFO) before apply_trade_to_tracker / check_arbitrage snapshot.
-            ctx.flush_tracker_write_coalescer();
-            if !ctx.tracker_write.try_enqueue(
-                ArbTrackerWriteJob::ApplyTrade {
-                    job: job.clone(),
-                    reply: reply_tx,
-                },
-                ArbTrackerWriteJobType::ApplyTrade,
-            ) {
-                debug!("Dropped ApplyTrade (tracker-write queue full)");
-                continue;
-            }
-            set_arb_two_hop_blocked_on_apply_trade(true);
-            let apply_result = match reply_rx.await {
-                Ok(Some(result)) => result,
-                _ => {
-                    set_arb_two_hop_blocked_on_apply_trade(false);
-                    continue;
-                }
-            };
-            set_arb_two_hop_blocked_on_apply_trade(false);
-            let intent_cooldown_ms = apply_result.config.intent_cooldown_ms;
-            let mint = apply_result.mint.clone();
-            let ctx_for_check = Arc::clone(&ctx);
-            let known_pools = ctx.known_pools.read().clone();
-            let selected_mints = ctx.arb_selected_mints.read().clone();
-            let pinned_pools = ctx.arb_pinned_pools.read().clone();
-            let opp = tokio::task::spawn_blocking(move || {
-                apply_result.tracker_snapshot.check_arbitrage(
-                    &apply_result.config,
-                    &known_pools,
-                    &apply_result.vault_balances,
-                    &apply_result.bin_arrays,
-                    &ArbCheckContext {
-                        spread_warn_last: &ctx_for_check.spread_too_large_warn_last,
-                        data_quality_rejects: &ctx_for_check.data_quality_rejects,
-                        forensics: Some(&ctx_for_check.eligibility_forensics),
-                        v2_forensics: Some(&ctx_for_check.v2_eligibility_forensics),
-                        selected_mints: Some(&selected_mints),
-                        pinned_pools: Some(&pinned_pools),
-                    },
-                )
-            })
-            .await
-            .ok()
-            .flatten();
-            let Some(opp) = opp else {
-                continue;
-            };
-            let (finalize_tx, finalize_rx) = oneshot::channel();
-            if !ctx.tracker_write.try_enqueue(
-                ArbTrackerWriteJob::FinalizeOpportunity {
-                    mint: mint.clone(),
-                    intent_cooldown_ms,
-                    opp,
-                    reply: finalize_tx,
-                },
-                ArbTrackerWriteJobType::FinalizeOpportunity,
-            ) {
-                debug!("Dropped FinalizeOpportunity (tracker-write queue full)");
-                continue;
-            }
-            let finalized = match finalize_rx.await {
-                Ok(opp) => opp,
-                Err(_) => continue,
-            };
-            if let Some(opp) = finalized {
-                ARB_TRIANGLE_OPPORTUNITIES.fetch_add(1, Ordering::Relaxed);
-                info!(
-                    mint = %opp.base_mint,
-                    buy_dex = %opp.buy_dex,
-                    sell_dex = %opp.sell_dex,
-                    spread_bps = opp.spread_bps,
-                    profit_lamports = opp.estimated_profit_lamports,
-                    "🔥 Arbitrage opportunity detected (two-hop worker)"
-                );
-                ctx.publish_arb_trade_signal_track_pins(
-                    &opp.base_mint,
-                    &opp.buy_pool,
-                    &opp.sell_pool,
-                );
-                if let Some(mut intent) = create_arb_intent(&ctx, &opp) {
-                    if let Some(slot) = job.slot {
-                        intent.metadata.insert("slot".to_string(), slot.to_string());
+
+            match job {
+                ArbTwoHopWorkerJob::Rescreen { mint } => {
+                    let config = ctx.config.read().clone();
+                    let intent_cooldown_ms = config.intent_cooldown_ms;
+                    let tracker_snapshot = {
+                        let trackers = ctx.trackers.read();
+                        trackers.get(&mint).cloned()
+                    };
+                    let Some(tracker_snapshot) = tracker_snapshot else {
+                        continue;
+                    };
+                    if tracker_snapshot.pool_count_on_distinct_dexes() < 2 {
+                        continue;
                     }
-                    intent
-                        .metadata
-                        .insert("slot_seen_at_ms".to_string(), job.ts_unix_ms.to_string());
-                    publish_arb_intent(&ctx, &intent).await;
+                    let ctx_for_check = Arc::clone(&ctx);
+                    let opp = tokio::task::spawn_blocking(move || {
+                        ctx_for_check.check_arbitrage_for_tracker(&tracker_snapshot, &config)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    let Some(opp) = opp else {
+                        continue;
+                    };
+                    finalize_arb_opportunity_from_check(
+                        &ctx,
+                        mint,
+                        intent_cooldown_ms,
+                        opp,
+                        None,
+                        None,
+                    )
+                    .await;
+                }
+                ArbTwoHopWorkerJob::Trade(job) => {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    // Flush coalesced PoolStateUpdates before ApplyTrade so writer applies fresh
+                    // reserves (FIFO) before apply_trade_to_tracker.
+                    ctx.flush_tracker_write_coalescer();
+                    if !ctx.tracker_write.try_enqueue(
+                        ArbTrackerWriteJob::ApplyTrade {
+                            job: job.clone(),
+                            reply: reply_tx,
+                        },
+                        ArbTrackerWriteJobType::ApplyTrade,
+                    ) {
+                        debug!("Dropped ApplyTrade (tracker-write queue full)");
+                        continue;
+                    }
+                    set_arb_two_hop_blocked_on_apply_trade(true);
+                    let apply_result = match reply_rx.await {
+                        Ok(Some(result)) => result,
+                        _ => {
+                            set_arb_two_hop_blocked_on_apply_trade(false);
+                            continue;
+                        }
+                    };
+                    set_arb_two_hop_blocked_on_apply_trade(false);
+                    let intent_cooldown_ms = apply_result.config.intent_cooldown_ms;
+                    let mint = apply_result.mint.clone();
+                    let config = apply_result.config.clone();
+                    let tracker_snapshot = apply_result.tracker_snapshot.clone();
+                    let slot = job.slot;
+                    let ts_unix_ms = job.ts_unix_ms;
+                    let ctx_for_check = Arc::clone(&ctx);
+                    // C1f: live scoped vault/bin snapshot at screen time — ApplyTrade captures
+                    // bins in the writer thread and can be stale vs the global cache.
+                    let opp = tokio::task::spawn_blocking(move || {
+                        ctx_for_check.check_arbitrage_for_tracker(&tracker_snapshot, &config)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    let Some(opp) = opp else {
+                        continue;
+                    };
+                    finalize_arb_opportunity_from_check(
+                        &ctx,
+                        mint,
+                        intent_cooldown_ms,
+                        opp,
+                        slot,
+                        Some(ts_unix_ms),
+                    )
+                    .await;
                 }
             }
         }
@@ -4363,7 +4446,10 @@ fn spawn_arb_market_event_pipeline(
             reader_ctx.mark_market_event_seen();
 
             let known_pools = reader_ctx.known_pools.read().clone();
-            let Some(priority) = arb_market_event_ingress_priority(&event, &known_pools) else {
+            let pinned_pools = reader_ctx.arb_pinned_pools.read().clone();
+            let Some(priority) =
+                arb_market_event_ingress_priority(&event, &known_pools, &pinned_pools)
+            else {
                 continue;
             };
 
@@ -4534,7 +4620,7 @@ struct ArbContext {
     /// Phase 3: count of track_requests publishes (heartbeat).
     arb_track_published: AtomicU64,
     /// Scope D: enqueue-only sender for off-hot-loop 2-hop detection.
-    two_hop_tx: mpsc::Sender<ArbTwoHopTradeJob>,
+    two_hop_tx: mpsc::Sender<ArbTwoHopWorkerJob>,
     /// Single-writer channel for `trackers` / `vault_balances` mutations.
     tracker_write: ArbTrackerWriteHandle,
     /// Latest-wins coalescer for PoolStateUpdate / DexPoolAccounts before tracker-write queue.
@@ -5367,6 +5453,7 @@ impl ArbContext {
         bins: Vec<BinData>,
         update_slot: u64,
     ) {
+        inc_arb_dlmm_bin_array_update_received_total();
         let mut cache = self.bin_arrays.write();
         let pool_cache = cache.entry(pool_address.to_string()).or_default();
         let bins_count = bins.len();
@@ -5378,6 +5465,7 @@ impl ArbContext {
             return;
         }
         pool_cache.insert(bin_array_index, BinArrayCache { bins, update_slot });
+        inc_arb_dlmm_bin_array_update_applied_total();
         drop(cache);
 
         // Bin liquidity updates are a valid DLMM price signal (H3): refresh vault + pool timestamps.
@@ -5423,6 +5511,7 @@ impl ArbContext {
             for mint in &mints_with_pool {
                 self.arb_track_selection.mark_dirty(mint);
             }
+            self.schedule_arb_rescreen_for_mints(pool_address, &mints_with_pool);
         }
 
         debug!(
@@ -5793,6 +5882,73 @@ impl ArbContext {
         }
 
         (vault_balances, bin_arrays)
+    }
+
+    /// Run v2 check with a live scoped vault/bin snapshot (C1f pin-coverage).
+    fn check_arbitrage_for_tracker(
+        &self,
+        tracker_snapshot: &TokenArbTracker,
+        config: &ArbConfig,
+    ) -> Option<ArbOpportunity> {
+        let (vault_balances, bin_arrays) = self.snapshot_vault_bins_for_tracker(tracker_snapshot);
+        let pinned_pools = self.arb_pinned_pools.read();
+        record_v2_meteora_pinned_sell_bin_coverage(tracker_snapshot, &bin_arrays, &pinned_pools);
+        let known_pools = self.known_pools.read();
+        let selected_mints = self.arb_selected_mints.read();
+        tracker_snapshot.check_arbitrage(
+            config,
+            &known_pools,
+            &vault_balances,
+            &bin_arrays,
+            &ArbCheckContext {
+                spread_warn_last: &self.spread_too_large_warn_last,
+                data_quality_rejects: &self.data_quality_rejects,
+                forensics: Some(&self.eligibility_forensics),
+                v2_forensics: Some(&self.v2_eligibility_forensics),
+                selected_mints: Some(&selected_mints),
+                pinned_pools: Some(&pinned_pools),
+            },
+        )
+    }
+
+    /// Re-screen selected mints when DLMM bins arrive after the last trade-driven screen (H4).
+    fn schedule_arb_rescreen_for_mints(&self, pool_address: &str, mints: &[String]) {
+        if mints.is_empty() || !self.config.read().two_hop_enabled {
+            return;
+        }
+        let pinned = self.arb_pinned_pools.read();
+        let selected = self.arb_selected_mints.read();
+        let pool_is_pinned = pinned.contains(pool_address);
+        let trackers = self.trackers.read();
+        for mint in mints {
+            if !selected.contains(mint) {
+                continue;
+            }
+            let Some(tracker) = trackers.get(mint) else {
+                continue;
+            };
+            if !pool_is_pinned {
+                let Some(pool) = tracker.pools.get(pool_address) else {
+                    continue;
+                };
+                if pool.dex != "meteora_dlmm" {
+                    continue;
+                }
+            }
+            if self
+                .two_hop_tx
+                .try_send(ArbTwoHopWorkerJob::Rescreen { mint: mint.clone() })
+                .is_ok()
+            {
+                inc_arb_dlmm_bin_rescreen_scheduled_total();
+            } else {
+                debug!(
+                    mint = %mint,
+                    pool = %pool_address,
+                    "arb two-hop rescreen queue full; dropping bin-update rescreen"
+                );
+            }
+        }
     }
 
     fn finalize_trade_opportunity(
@@ -7169,7 +7325,8 @@ async fn main() -> Result<()> {
         run_id.clone(),
     );
 
-    let (two_hop_tx, two_hop_rx) = mpsc::channel::<ArbTwoHopTradeJob>(ARB_TWO_HOP_WORKER_QUEUE_CAP);
+    let (two_hop_tx, two_hop_rx) =
+        mpsc::channel::<ArbTwoHopWorkerJob>(ARB_TWO_HOP_WORKER_QUEUE_CAP);
     let (tracker_write_tx, tracker_write_rx) =
         mpsc::channel::<ArbTrackerWriteJob>(ARB_TRACKER_WRITE_QUEUE_CAP);
     let tracker_write = ArbTrackerWriteHandle {
@@ -7719,7 +7876,11 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
                     slot: event.slot,
                     ts_unix_ms: event.header.ts_unix_ms,
                 };
-                if ctx.two_hop_tx.try_send(job).is_err() {
+                if ctx
+                    .two_hop_tx
+                    .try_send(ArbTwoHopWorkerJob::Trade(job))
+                    .is_err()
+                {
                     debug!("arb two-hop worker queue full; dropping trade detection job");
                 }
             }
@@ -7910,7 +8071,8 @@ mod event_pipeline_tests {
         );
 
         let known = HashSet::new();
-        let decision = arb_market_event_ingress_priority(&event, &known);
+        let pinned = HashSet::new();
+        let decision = arb_market_event_ingress_priority(&event, &known, &pinned);
         assert_eq!(decision, None);
 
         let mut coalescer = ArbLowEventCoalescer::new();
@@ -7923,9 +8085,10 @@ mod event_pipeline_tests {
     #[test]
     fn trade_events_classify_as_high_priority() {
         let known = HashSet::new();
+        let pinned = HashSet::new();
         let event = sample_trade_event("pool-trade");
         assert_eq!(
-            classify_market_event_priority(&event, &known),
+            classify_market_event_priority(&event, &known, &pinned),
             ArbEventPriority::High
         );
     }
@@ -7972,13 +8135,26 @@ mod event_pipeline_tests {
                 quote_mint: "TokenMint11111111111111111111111111111111".to_string(),
             },
         );
+        let pinned = HashSet::new();
         assert_eq!(
-            classify_market_event_priority(&high_event, &known),
+            classify_market_event_priority(&high_event, &known, &pinned),
             ArbEventPriority::High
         );
         assert_eq!(
-            classify_market_event_priority(&low_event, &known),
+            classify_market_event_priority(&low_event, &known, &pinned),
             ArbEventPriority::Low
+        );
+    }
+
+    #[test]
+    fn pinned_bin_array_update_is_high_even_when_pool_unknown() {
+        let known = HashSet::new();
+        let mut pinned = HashSet::new();
+        pinned.insert("pool-pinned-dlmm".to_string());
+        let event = sample_bin_array_update("pool-pinned-dlmm", 0, 100);
+        assert_eq!(
+            classify_market_event_priority(&event, &known, &pinned),
+            ArbEventPriority::High
         );
     }
 
@@ -8246,7 +8422,7 @@ mod event_pipeline_tests {
             tx: tracker_write_tx,
             capacity: ARB_TRACKER_WRITE_QUEUE_CAP,
         };
-        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopTradeJob>(1);
+        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopWorkerJob>(1);
 
         let ctx = Arc::new(ArbContext {
             run_id: TEST_RUN.to_string(),
@@ -8358,7 +8534,7 @@ mod event_pipeline_tests {
             tx: tracker_write_tx,
             capacity: ARB_TRACKER_WRITE_QUEUE_CAP,
         };
-        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopTradeJob>(1);
+        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopWorkerJob>(1);
 
         let ctx = Arc::new(ArbContext {
             run_id: TEST_RUN.to_string(),
@@ -8468,7 +8644,7 @@ mod event_pipeline_tests {
             tx: tracker_write_tx,
             capacity: ARB_TRACKER_WRITE_QUEUE_CAP,
         };
-        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopTradeJob>(1);
+        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopWorkerJob>(1);
 
         let ctx = Arc::new(ArbContext {
             run_id: TEST_RUN.to_string(),
@@ -8655,7 +8831,7 @@ mod event_pipeline_tests {
             tx: tracker_write_tx,
             capacity: ARB_TRACKER_WRITE_QUEUE_CAP,
         };
-        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopTradeJob>(1);
+        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopWorkerJob>(1);
 
         let mut vault_balances = HashMap::new();
         for i in 0..12_000usize {
@@ -8796,7 +8972,7 @@ mod event_pipeline_tests {
             tx: tracker_write_tx,
             capacity: 8,
         };
-        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopTradeJob>(1);
+        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopWorkerJob>(1);
 
         let ctx = Arc::new(ArbContext {
             run_id: TEST_RUN.to_string(),
@@ -8908,7 +9084,7 @@ mod event_pipeline_tests {
             tx: tracker_write_tx,
             capacity: 8,
         };
-        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopTradeJob>(1);
+        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopWorkerJob>(1);
 
         let ctx = Arc::new(ArbContext {
             run_id: TEST_RUN.to_string(),
@@ -8991,7 +9167,7 @@ mod event_pipeline_tests {
             tx: tracker_write_tx,
             capacity: 8,
         };
-        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopTradeJob>(1);
+        let (two_hop_tx, _two_hop_rx) = mpsc::channel::<ArbTwoHopWorkerJob>(1);
 
         let ctx = Arc::new(ArbContext {
             run_id: TEST_RUN.to_string(),
@@ -9554,6 +9730,148 @@ mod two_hop_price_tests {
             Some(&vault_after),
             max_age
         ));
+    }
+
+    #[test]
+    fn scoped_snapshot_includes_bins_cached_after_bin_array_update() {
+        let ctx = test_arb_context(create_shared_cache());
+        let mint = "TokenMintScopedBinSnap1111111111111111111";
+        let dlmm_pool = "dlmmScopedSnap";
+        {
+            let mut trackers = ctx.trackers.write();
+            let mut tracker = TokenArbTracker::new(mint);
+            tracker.upsert_pool(sample_pool("meteora_dlmm", dlmm_pool, None, None));
+            trackers.insert(mint.to_string(), tracker);
+        }
+        let tracker = ctx.trackers.read().get(mint).unwrap().clone();
+        let (_, bins_before) = ctx.snapshot_vault_bins_for_tracker(&tracker);
+        assert!(!bins_before.contains_key(dlmm_pool));
+
+        ctx.handle_bin_array_update(
+            dlmm_pool,
+            0,
+            vec![BinData {
+                offset: 0,
+                amount_x: 1_000_000,
+                amount_y: 1_000_000_000,
+            }],
+            42,
+        );
+
+        let (_, bins_after) = ctx.snapshot_vault_bins_for_tracker(&tracker);
+        assert!(
+            bins_after.contains_key(dlmm_pool),
+            "live scoped snapshot must include bins written by BinArrayUpdate"
+        );
+    }
+
+    #[test]
+    fn check_arbitrage_for_tracker_records_meteora_sell_bin_hit_when_cached() {
+        let ctx = test_arb_context(create_shared_cache());
+        let mint = "TokenMintDlmmHit1111111111111111111111111";
+        let orca_pool = "orca_hit_pool";
+        let dlmm_pool = "dlmm_hit_pool";
+        let reserves = (1_000_000_000_000u64, 1_000_000_000u64);
+
+        {
+            let mut trackers = ctx.trackers.write();
+            let mut tracker = TokenArbTracker::new(mint);
+            tracker.token_decimals = Some(6);
+            tracker.upsert_pool(sample_pool("orca", orca_pool, None, None));
+            tracker.upsert_pool(sample_pool("meteora_dlmm", dlmm_pool, None, None));
+            trackers.insert(mint.to_string(), tracker);
+        }
+        ctx.known_pools.write().insert(orca_pool.to_string());
+        ctx.known_pools.write().insert(dlmm_pool.to_string());
+        ctx.arb_pinned_pools
+            .write()
+            .extend([orca_pool.to_string(), dlmm_pool.to_string()]);
+        ctx.arb_selected_mints.write().insert(mint.to_string());
+        ctx.vault_balances.write().extend([
+            (orca_pool.to_string(), vault(reserves.0, reserves.1)),
+            (
+                dlmm_pool.to_string(),
+                VaultBalanceCache {
+                    reserve_base: reserves.0,
+                    reserve_quote: reserves.1,
+                    update_slot: 1,
+                    active_id: Some(0),
+                    bin_step: Some(10),
+                    updated_at: Instant::now(),
+                    dlmm_sol_is_x: true,
+                    dlmm_token_x_mint: Some(NATIVE_SOL_MINT.to_string()),
+                },
+            ),
+        ]);
+        ctx.handle_bin_array_update(
+            dlmm_pool,
+            0,
+            vec![BinData {
+                offset: 0,
+                amount_x: reserves.0,
+                amount_y: reserves.1,
+            }],
+            5,
+        );
+
+        let before_hit =
+            ironcrab::metrics::ARB_V2_SCREEN_METEORA_SELL_BIN_HIT_TOTAL.load(Ordering::Relaxed);
+        let tracker = ctx.trackers.read().get(mint).unwrap().clone();
+        let config = ArbConfig {
+            arb_two_hop_v2_enabled: true,
+            two_hop_enabled: true,
+            min_spread_bps: 1,
+            min_profit_lamports: 1,
+            est_tx_cost_lamports: 1,
+            ..Default::default()
+        };
+        let _ = ctx.check_arbitrage_for_tracker(&tracker, &config);
+        assert!(
+            ironcrab::metrics::ARB_V2_SCREEN_METEORA_SELL_BIN_HIT_TOTAL.load(Ordering::Relaxed)
+                > before_hit,
+            "pinned Meteora sell must see dlmm_bins from live cache at screen time"
+        );
+    }
+
+    #[test]
+    fn bin_array_update_schedules_rescreen_for_selected_pinned_mint() {
+        let cache = create_shared_cache();
+        let (two_hop_tx, mut two_hop_rx) = mpsc::channel::<ArbTwoHopWorkerJob>(4);
+        let mut ctx = test_arb_context(cache);
+        ctx.two_hop_tx = two_hop_tx;
+        ctx.config.write().two_hop_enabled = true;
+
+        let mint = "TokenMintRescreen111111111111111111111111";
+        let dlmm_pool = "dlmm_rescreen_pool";
+        {
+            let mut trackers = ctx.trackers.write();
+            let mut tracker = TokenArbTracker::new(mint);
+            tracker.upsert_pool(sample_pool("meteora_dlmm", dlmm_pool, None, None));
+            trackers.insert(mint.to_string(), tracker);
+        }
+        ctx.arb_pinned_pools.write().insert(dlmm_pool.to_string());
+        ctx.arb_selected_mints.write().insert(mint.to_string());
+
+        let before =
+            ironcrab::metrics::ARB_DLMM_BIN_RESCREEN_SCHEDULED_TOTAL.load(Ordering::Relaxed);
+        ctx.handle_bin_array_update(
+            dlmm_pool,
+            0,
+            vec![BinData {
+                offset: 0,
+                amount_x: 1,
+                amount_y: 1,
+            }],
+            7,
+        );
+        assert!(
+            ironcrab::metrics::ARB_DLMM_BIN_RESCREEN_SCHEDULED_TOTAL.load(Ordering::Relaxed)
+                > before
+        );
+        match two_hop_rx.try_recv().expect("rescreen must be queued") {
+            ArbTwoHopWorkerJob::Rescreen { mint: queued } => assert_eq!(queued, mint),
+            other => panic!("expected rescreen job, got {other:?}"),
+        }
     }
 
     #[test]
