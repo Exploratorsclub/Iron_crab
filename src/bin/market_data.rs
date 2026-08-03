@@ -36,9 +36,10 @@ use uuid::Uuid;
 
 use ironcrab::config::{Config, MarketDataGeyserCfg, WalletTrackerCfg};
 use ironcrab::ipc::{
-    ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ControlRequest, ControlRequestKind,
-    DexPoolReadiness, ExecutionResult, ExecutionStatus, IntentTier, MarketEvent, MarketEventKind,
-    PoolCacheUpdate, NATIVE_SOL_MINT, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
+    BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ControlRequest,
+    ControlRequestKind, DexPoolReadiness, ExecutionResult, ExecutionStatus, IntentTier,
+    MarketEvent, MarketEventKind, PoolCacheUpdate, NATIVE_SOL_MINT,
+    POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use ironcrab::market_data::cold::{
     cold_path_rpc_refresh_meteora_cpmm_pool_row, cold_path_rpc_refresh_meteora_dlmm_pool_row,
@@ -111,7 +112,8 @@ use ironcrab::metrics::{
     inc_market_data_arb_pin_deferred_still_unsatisfied_total,
     inc_market_data_arb_pin_geyser_register_deferred_total,
     inc_market_data_arb_pin_vault_register_ok_total,
-    inc_market_data_balance_updated_from_cache_total, inc_market_data_dlmm_bin_register_ok_total,
+    inc_market_data_balance_updated_from_cache_total,
+    inc_market_data_dlmm_bin_early_drop_stashed_total, inc_market_data_dlmm_bin_register_ok_total,
     inc_market_data_exec_hot_hard_shed_steps_for_tier_reason,
     inc_market_data_exec_hot_pressure_admit_rejected_total,
     inc_market_data_geyser_sync_skipped_rate_limit_total,
@@ -170,7 +172,7 @@ use ironcrab::metrics::{
     set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
     touch_market_data_global_ingest_progress,
     touch_market_data_tracked_membership_snapshot_refresh, update_readiness_market_data_current,
-    ExecHotShedTier, MarketDataLatencySegment, MetricsComponent,
+    ExecHotShedTier, MarketDataAccountEarlyDropReason, MarketDataLatencySegment, MetricsComponent,
     MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH_EXEC_HOT,
     MARKET_DATA_LAST_BONDING_CURVE_PUBLISH_TS_UNIX_MS, MARKET_EVENTS_RECEIVED_TOTAL,
     POOLS_TRACKED_GAUGE,
@@ -1307,6 +1309,8 @@ struct MarketDataContext {
     last_arb_snapshot_target: parking_lot::RwLock<Option<HashSet<Pubkey>>>,
     /// Last `active_id` used when registering DLMM bin-array window per pool (Fix B).
     dlmm_registered_active_id: parking_lot::RwLock<HashMap<Pubkey, i32>>,
+    /// C1e: bin-array Geyser payloads stashed on early-drop before membership registration.
+    dlmm_bin_geyser_stash: parking_lot::RwLock<HashMap<Pubkey, StashedDlmmBinGeyserUpdate>>,
     /// Scope C: hot pools awaiting LivePoolCache layout for vault/bin Geyser registration.
     deferred_hot_pool_reserve_pins: parking_lot::RwLock<HashMap<Pubkey, GeyserPinReason>>,
     /// Open-position PumpFun pools with unsatisfied bonding-curve Geyser registration (observability).
@@ -1570,6 +1574,15 @@ struct BinArrayInfo {
     pinned: bool,
     pin: Option<GeyserPinReason>,
 }
+
+/// Stashed DLMM bin-array Geyser payload for replay after membership registration.
+#[derive(Clone)]
+struct StashedDlmmBinGeyserUpdate {
+    data: Vec<u8>,
+    slot: u64,
+}
+
+const DLMM_BIN_GEYSER_STASH_MAX: usize = 4096;
 
 /// Phase1: lock-free vault metadata for ingest/sidefx (refreshed by md-state only).
 #[derive(Clone)]
@@ -3821,6 +3834,7 @@ impl MarketDataContext {
         *self.last_synced_explicit_pubkeys.write() =
             admission.snapshot_pubkeys().into_iter().collect();
         self.publish_momentum_hot_balance_refresh_after_explicit_sync(&prev_synced);
+        self.publish_hot_bin_array_replay_after_explicit_sync(&prev_synced);
         self.clear_geyser_prune_resume();
         true
     }
@@ -4712,6 +4726,139 @@ impl MarketDataContext {
         }
     }
 
+    /// C1e: stash bin-array Geyser payload dropped before membership registration (METEORA owner stream).
+    fn maybe_stash_dlmm_bin_array_before_early_drop(&self, update: &GeyserAccountUpdate) {
+        if !ironcrab::market_data::ingest::geyser_update_looks_like_meteora_bin_array(update) {
+            return;
+        }
+        let mut stash = self.dlmm_bin_geyser_stash.write();
+        while stash.len() >= DLMM_BIN_GEYSER_STASH_MAX {
+            if let Some(key) = stash.keys().next().copied() {
+                stash.remove(&key);
+            } else {
+                break;
+            }
+        }
+        stash.insert(
+            update.pubkey,
+            StashedDlmmBinGeyserUpdate {
+                data: update.data.clone(),
+                slot: update.slot,
+            },
+        );
+        inc_market_data_dlmm_bin_early_drop_stashed_total();
+    }
+
+    /// C1e: replay stashed bin-array updates after membership registration or explicit sync.
+    fn try_replay_stashed_dlmm_bin_updates(&self, pdas: &[Pubkey]) {
+        if pdas.is_empty() {
+            return;
+        }
+        let Some(nats) = self
+            .nats
+            .as_ref()
+            .map(NatsClient::clone_for_spawned_publish)
+        else {
+            return;
+        };
+        let membership = self.tracked_membership.load();
+        let mut replay_rows: Vec<(Pubkey, StashedDlmmBinGeyserUpdate, SnapshotBinArrayView)> =
+            Vec::new();
+        let mut replayed_keys = Vec::new();
+        {
+            let stash = self.dlmm_bin_geyser_stash.read();
+            for pda in pdas {
+                if let Some(s) = stash.get(pda) {
+                    if let Some(view) = membership.bin_array_by_pubkey.get(pda) {
+                        replay_rows.push((*pda, s.clone(), view.clone()));
+                        replayed_keys.push(*pda);
+                    }
+                }
+            }
+        }
+        if replay_rows.is_empty() {
+            return;
+        }
+        let run_id = self.run_id.clone();
+        let publish = async move {
+            use ironcrab::market_data::publish::publish_market_event_core_and_momentum_ex;
+            use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
+            let mut replay_seq = 0u64;
+            for (_pda, stashed, view) in replay_rows {
+                replay_seq += 1;
+                match BinArray::parse(&stashed.data, view.bin_step) {
+                    Ok(parsed_array) => {
+                        let bins: Vec<BinData> = parsed_array
+                            .bins
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, bin)| bin.amount_x > 0 || bin.amount_y > 0)
+                            .map(|(offset, bin)| BinData {
+                                offset: offset as u8,
+                                amount_x: bin.amount_x,
+                                amount_y: bin.amount_y,
+                            })
+                            .collect();
+                        if bins.is_empty() {
+                            ironcrab::metrics::inc_market_data_dlmm_bin_emit_skipped_empty_total();
+                            continue;
+                        }
+                        let event_id = format!("bin-replay-{}-{:06}", &run_id[..8], replay_seq);
+                        let bin_event = MarketEvent::new(
+                            "market-data",
+                            BUILD_VERSION,
+                            &run_id,
+                            event_id,
+                            "geyser_bin_array_replay",
+                            Some(stashed.slot),
+                            MarketEventKind::BinArrayUpdate {
+                                pool_address: view.pool_address.to_string(),
+                                bin_array_index: view.bin_array_index,
+                                bins,
+                                update_slot: stashed.slot,
+                            },
+                        );
+                        ironcrab::metrics::market_data_bin_array_publish_inc();
+                        ironcrab::metrics::inc_market_data_dlmm_bin_replay_publish_total();
+                        ironcrab::metrics::inc_market_data_dlmm_bin_publish_exec_hot_total();
+                        let _ = publish_market_event_core_and_momentum_ex(
+                            &nats, &bin_event, None, None,
+                        )
+                        .await;
+                    }
+                    Err(_) => {
+                        ironcrab::metrics::inc_market_data_dlmm_bin_parse_fail_total();
+                    }
+                }
+            }
+        };
+        if let Some(handle) = self.ingest_tokio_handle.read().clone() {
+            handle.spawn(publish);
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(publish);
+        }
+        self.dlmm_bin_geyser_stash
+            .write()
+            .retain(|pk, _| !replayed_keys.contains(pk));
+    }
+
+    /// C1e: after explicit sync, replay stashed bin arrays for newly live hot-pool PDAs (Mom + Arb).
+    fn publish_hot_bin_array_replay_after_explicit_sync(&self, prev_synced: &HashSet<Pubkey>) {
+        let synced = self.last_synced_explicit_pubkeys.read();
+        let mut replay_pdas = Vec::new();
+        for pool in self.hot_pool_registry.snapshot_hot_pool_pubkeys() {
+            if !self.hot_pool_reserve_registration_satisfied(pool) {
+                continue;
+            }
+            for pk in self.pool_explicit_vault_bin_pubkeys(pool) {
+                if !prev_synced.contains(&pk) && synced.contains(&pk) {
+                    replay_pdas.push(pk);
+                }
+            }
+        }
+        self.try_replay_stashed_dlmm_bin_updates(&replay_pdas);
+    }
+
     /// Cache-first JetStream BalanceUpdated for pools with fresh reserve basis (no vault Geyser sub required).
     fn try_publish_balance_updated_from_cache(&self, pool: Pubkey) {
         if self.balance_updated_from_cache_skipped_for_live_feed(pool) {
@@ -5424,6 +5571,14 @@ impl MarketDataContext {
             inc_market_data_dlmm_bin_register_ok_total();
             self.refresh_tracked_membership_snapshot();
             self.refresh_tracked_bin_arrays_gauges();
+            let pool_bins: Vec<Pubkey> = self
+                .tracked_bin_arrays
+                .read()
+                .iter()
+                .filter(|(_, b)| b.pool_address == pool)
+                .map(|(pk, _)| *pk)
+                .collect();
+            self.try_replay_stashed_dlmm_bin_updates(&pool_bins);
         }
         bins_changed
     }
@@ -8152,6 +8307,7 @@ async fn main() -> Result<()> {
         last_momentum_snapshot_target: parking_lot::RwLock::new(None),
         last_arb_snapshot_target: parking_lot::RwLock::new(None),
         dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+        dlmm_bin_geyser_stash: parking_lot::RwLock::new(HashMap::new()),
         deferred_hot_pool_reserve_pins: parking_lot::RwLock::new(HashMap::new()),
         open_position_pumpfun_registration_unsatisfied_since: parking_lot::RwLock::new(
             HashMap::new(),
@@ -9063,6 +9219,9 @@ fn handle_account_broadcast_recv_ok(
 
     if let Some(reason) = early_drop_reason {
         if matches!(path, AccountBroadcastRecvPath::ExecHot) {
+            if reason == MarketDataAccountEarlyDropReason::DexPoolNotEnrichment {
+                ctx.maybe_stash_dlmm_bin_array_before_early_drop(&account_update);
+            }
             record_market_data_account_early_drop(reason);
             inc_market_data_account_updates_total(class.as_prometheus_label());
             record_market_data_account_recv_iteration_duration_us(
@@ -12702,6 +12861,7 @@ mod wallet_snapshot_stale_cleanup_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+            dlmm_bin_geyser_stash: parking_lot::RwLock::new(HashMap::new()),
             deferred_hot_pool_reserve_pins: parking_lot::RwLock::new(HashMap::new()),
             open_position_pumpfun_registration_unsatisfied_since: parking_lot::RwLock::new(
                 HashMap::new(),
@@ -12935,6 +13095,7 @@ mod wallet_tx_meta_balance_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+            dlmm_bin_geyser_stash: parking_lot::RwLock::new(HashMap::new()),
             deferred_hot_pool_reserve_pins: parking_lot::RwLock::new(HashMap::new()),
             open_position_pumpfun_registration_unsatisfied_since: parking_lot::RwLock::new(
                 HashMap::new(),
@@ -13851,8 +14012,16 @@ mod pr_b_geyser_tracking_tests {
 
     /// Scope D: ENRICH account-parse sidefx skips redundant JetStream when vault feed is live.
     #[test]
+    #[serial_test::serial]
     fn scope_d_enrich_sidefx_skips_redundant_pool_discovered_under_vault_feed() {
         use ironcrab::metrics::MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL;
+
+        fn enrich_publish_skipped_delta<F: FnOnce()>(f: F) -> u64 {
+            let before = MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed);
+            f();
+            let after = MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed);
+            after.saturating_sub(before)
+        }
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
@@ -13893,7 +14062,6 @@ mod pr_b_geyser_tracking_tests {
             admission.snapshot_pubkeys().into_iter().collect();
         assert!(worker.pool_has_live_vault_geyser_feed(pool));
 
-        MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.store(0, Ordering::Relaxed);
         let mk_job =
             |slot: u64, class: SidefxUpdateClass| MdSidefxCommand::LivePoolCacheAccountUpdate {
                 run_id: "scope-d".into(),
@@ -13905,44 +14073,45 @@ mod pr_b_geyser_tracking_tests {
                 update_class: class,
             };
 
-        let mut scratch = MdSidefxBurstScratch::new();
-        md_sidefx_process_live_pool_cache_account_update(
-            &worker,
-            &mk_job(10, SidefxUpdateClass::Enrich),
-            &mut scratch,
-        );
-        let skipped_after_first =
-            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed);
+        enrich_publish_skipped_delta(|| {
+            let mut scratch = MdSidefxBurstScratch::new();
+            md_sidefx_process_live_pool_cache_account_update(
+                &worker,
+                &mk_job(10, SidefxUpdateClass::Enrich),
+                &mut scratch,
+            );
+        });
 
-        let mut scratch2 = MdSidefxBurstScratch::new();
-        md_sidefx_process_live_pool_cache_account_update(
-            &worker,
-            &mk_job(11, SidefxUpdateClass::Enrich),
-            &mut scratch2,
-        );
+        let delta_second_enrich = enrich_publish_skipped_delta(|| {
+            let mut scratch = MdSidefxBurstScratch::new();
+            md_sidefx_process_live_pool_cache_account_update(
+                &worker,
+                &mk_job(11, SidefxUpdateClass::Enrich),
+                &mut scratch,
+            );
+        });
         assert!(
-            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed)
-                > skipped_after_first,
+            delta_second_enrich > 0,
             "second ENRICH upsert with unchanged reserves under vault feed must skip JetStream"
         );
 
-        let skipped_before_exec_hot =
-            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed);
-        let mut scratch3 = MdSidefxBurstScratch::new();
-        md_sidefx_process_live_pool_cache_account_update(
-            &worker,
-            &mk_job(12, SidefxUpdateClass::ExecHot),
-            &mut scratch3,
-        );
+        let delta_exec_hot = enrich_publish_skipped_delta(|| {
+            let mut scratch = MdSidefxBurstScratch::new();
+            md_sidefx_process_live_pool_cache_account_update(
+                &worker,
+                &mk_job(12, SidefxUpdateClass::ExecHot),
+                &mut scratch,
+            );
+        });
         assert_eq!(
-            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed),
-            skipped_before_exec_hot,
+            delta_exec_hot, 0,
             "EXEC_HOT must not increment ENRICH skip counter (I-MD-4)"
         );
     }
 
     /// Bugbot: ENRICH JetStream skip must not skip MASTER readiness merge.
     #[test]
+    #[serial_test::serial]
     fn scope_d_enrich_skips_publish_but_merges_readiness() {
         use ironcrab::ipc::DexPoolReadiness;
         use ironcrab::metrics::MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL;
@@ -13989,7 +14158,7 @@ mod pr_b_geyser_tracking_tests {
             admission.snapshot_pubkeys().into_iter().collect();
         assert!(worker.pool_has_live_vault_geyser_feed(pool));
 
-        MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.store(0, Ordering::Relaxed);
+        let before = MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed);
         let mut scratch = MdSidefxBurstScratch::new();
         md_sidefx_process_live_pool_cache_account_update(
             &worker,
@@ -14006,7 +14175,7 @@ mod pr_b_geyser_tracking_tests {
         );
 
         assert!(
-            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed) > 0,
+            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed) > before,
             "ENRICH must skip redundant JetStream under vault feed + unchanged layout/reserves"
         );
         assert_eq!(
@@ -14532,6 +14701,7 @@ mod pr_b_geyser_tracking_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+            dlmm_bin_geyser_stash: parking_lot::RwLock::new(HashMap::new()),
             deferred_hot_pool_reserve_pins: parking_lot::RwLock::new(HashMap::new()),
             open_position_pumpfun_registration_unsatisfied_since: parking_lot::RwLock::new(
                 HashMap::new(),
@@ -14617,6 +14787,7 @@ mod pr_b_geyser_tracking_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+            dlmm_bin_geyser_stash: parking_lot::RwLock::new(HashMap::new()),
             deferred_hot_pool_reserve_pins: parking_lot::RwLock::new(HashMap::new()),
             open_position_pumpfun_registration_unsatisfied_since: parking_lot::RwLock::new(
                 HashMap::new(),
@@ -16480,6 +16651,7 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn account_enrich_dispatch_upsert_and_flush_preserves_latest_wins() {
         use ironcrab::metrics::MARKET_DATA_ACCOUNT_ENRICH_COALESCE_TOTAL;
         let coalesce_before = MARKET_DATA_ACCOUNT_ENRICH_COALESCE_TOTAL.load(Ordering::Relaxed);
@@ -21310,5 +21482,53 @@ mod pr_b_geyser_tracking_tests {
         for (_pda, info) in bins.iter().filter(|(_, b)| b.pool_address == pool) {
             assert_eq!(info.pin, Some(GeyserPinReason::MomentumActive));
         }
+    }
+
+    /// C1e: bin-array Geyser payloads stashed on early-drop replay after membership registration.
+    #[test]
+    #[serial_test::serial]
+    fn scope_c1e_dlmm_bin_stash_replay_after_register() {
+        use ironcrab::metrics::MARKET_DATA_DLMM_BIN_EARLY_DROP_STASHED_TOTAL;
+        use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        ctx.live_pool_cache
+            .upsert(pool, test_meteora_dlmm_cached_state(42), 1);
+        let state = ctx.live_pool_cache.get(&pool).unwrap();
+        let bin_pdas = planned_meteora_dlmm_bin_pubkeys_for_cache(pool, &state);
+        let bin_pda = bin_pdas[0];
+
+        let mut data = vec![0u8; BinArray::ACCOUNT_SIZE];
+        data[56..64].copy_from_slice(&100u64.to_le_bytes());
+
+        let update = GeyserAccountUpdate {
+            pubkey: bin_pda,
+            slot: 42,
+            owner: Pubkey::from_str(METEORA_DLMM).unwrap(),
+            data,
+            lamports: 0,
+            grpc_recv_at: Instant::now(),
+        };
+        let before_stash = MARKET_DATA_DLMM_BIN_EARLY_DROP_STASHED_TOTAL.load(Ordering::Relaxed);
+        ctx.maybe_stash_dlmm_bin_array_before_early_drop(&update);
+        assert!(
+            MARKET_DATA_DLMM_BIN_EARLY_DROP_STASHED_TOTAL.load(Ordering::Relaxed) > before_stash
+        );
+        assert!(ctx.dlmm_bin_geyser_stash.read().contains_key(&bin_pda));
+
+        assert!(ctx.register_meteora_dlmm_bin_arrays(
+            pool,
+            42,
+            15,
+            GeyserPinReason::ArbMultiDex,
+            Instant::now()
+        ));
+        assert!(ctx.tracked_membership.load().bin_arrays.contains(&bin_pda));
     }
 }

@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ARB-C1e: DLMM BinArray Publish Path — Stash + Replay nach Membership
+**Datum**: 2026-08-03  
+**Problem**: Post-C1d: `tracked_bin_arrays` und `dlmm_bin_register_ok_total` OK, aber `market_data_bin_array_publish_total=0`. METEORA-DLMM-Bin-PDAs liefen bereits über Program-Owner-Filter; vor Membership-Registrierung `EarlyDrop DexPoolNotEnrichment`. Nach Register keine erneute Geyser-Zustellung bei unveränderten Accounts → Handler/Publish nie.  
+**Fix**: (1) Forensik-Counter: owner/membership hit/miss, parse fail, empty skip, stash, replay, exec_hot/enrich publish. (2) Stash bin-array-förmiger Early-Drops (`maybe_stash_dlmm_bin_array_before_early_drop`). (3) Replay nach `register_meteora_dlmm_bin_arrays` und nach explicit sync (`publish_hot_bin_array_replay_after_explicit_sync`, Mom+Arb). (4) `publish_meteora_dlmm_bin_array_from_geyser` konsolidiert Handler-Gate. **Invarianten**: I-4/I-7 kein RPC; Dual-Consumer unverändert.  
+**Evidence**: `findings_arb_zero_opp_post360_20260803.md`, Prod Tip `4a9e133`.  
+**Dateien**: `src/market_data/ingest/{account_handler,account_filter}.rs`, `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-ARB-C1d: DLMM Bin-Array Completeness — Geyser-Flush Gate (Dual-Consumer)
 **Datum**: 2026-08-03  
 **Problem**: Post-C1c Soak: `market_data_bin_array_publish_total=0`, Arb `sell_missing_dlmm_bins` ~65–73% der Sell-Fails. `tracked_bin_arrays` hatte PDAs lokal, aber `hot_pool_reserve_registration_satisfied` prüfte nur Map-Präsenz — Deferred/Retry clearten bei Vault-OK, Geyser-Explicit-Flush für Bins blieb aus; Membership-Snapshot nach Bin-Register fehlte. `maybe_refresh_arb_dlmm_bin_window` nur Arb.  
