@@ -1515,14 +1515,17 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
         // Publish PoolCacheUpdate to JetStream (Single Source of Truth for pool state)
         let open_position_pumpfun_pin =
             md_sidefx_is_open_position_pumpfun_pin(host, pool_pubkey, &cached_state);
-        let should_publish_pool_cache = update_class.is_exec_hot()
-            || open_position_pumpfun_pin
-            || md_sidefx_should_publish_enrich_pool_cache_update(
+        // I-MD-4: EXEC_HOT must never evaluate ENRICH-only skip gate (no enrich skip counter bump).
+        let should_publish_pool_cache = if update_class.is_exec_hot() || open_position_pumpfun_pin {
+            true
+        } else {
+            md_sidefx_should_publish_enrich_pool_cache_update(
                 host,
                 pool_pubkey,
                 prev_state.as_ref(),
                 &cached_state,
-            );
+            )
+        };
         if should_publish_pool_cache && host.nats_enabled() {
             let mut pool_update = PoolCacheUpdate::new_pool_discovered(
                 "market-data",

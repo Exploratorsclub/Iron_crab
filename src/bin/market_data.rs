@@ -14012,8 +14012,16 @@ mod pr_b_geyser_tracking_tests {
 
     /// Scope D: ENRICH account-parse sidefx skips redundant JetStream when vault feed is live.
     #[test]
+    #[serial_test::serial]
     fn scope_d_enrich_sidefx_skips_redundant_pool_discovered_under_vault_feed() {
         use ironcrab::metrics::MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL;
+
+        fn enrich_publish_skipped_delta<F: FnOnce()>(f: F) -> u64 {
+            let before = MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed);
+            f();
+            let after = MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed);
+            after.saturating_sub(before)
+        }
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
@@ -14054,7 +14062,6 @@ mod pr_b_geyser_tracking_tests {
             admission.snapshot_pubkeys().into_iter().collect();
         assert!(worker.pool_has_live_vault_geyser_feed(pool));
 
-        MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.store(0, Ordering::Relaxed);
         let mk_job =
             |slot: u64, class: SidefxUpdateClass| MdSidefxCommand::LivePoolCacheAccountUpdate {
                 run_id: "scope-d".into(),
@@ -14066,44 +14073,45 @@ mod pr_b_geyser_tracking_tests {
                 update_class: class,
             };
 
-        let mut scratch = MdSidefxBurstScratch::new();
-        md_sidefx_process_live_pool_cache_account_update(
-            &worker,
-            &mk_job(10, SidefxUpdateClass::Enrich),
-            &mut scratch,
-        );
-        let skipped_after_first =
-            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed);
+        enrich_publish_skipped_delta(|| {
+            let mut scratch = MdSidefxBurstScratch::new();
+            md_sidefx_process_live_pool_cache_account_update(
+                &worker,
+                &mk_job(10, SidefxUpdateClass::Enrich),
+                &mut scratch,
+            );
+        });
 
-        let mut scratch2 = MdSidefxBurstScratch::new();
-        md_sidefx_process_live_pool_cache_account_update(
-            &worker,
-            &mk_job(11, SidefxUpdateClass::Enrich),
-            &mut scratch2,
-        );
+        let delta_second_enrich = enrich_publish_skipped_delta(|| {
+            let mut scratch = MdSidefxBurstScratch::new();
+            md_sidefx_process_live_pool_cache_account_update(
+                &worker,
+                &mk_job(11, SidefxUpdateClass::Enrich),
+                &mut scratch,
+            );
+        });
         assert!(
-            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed)
-                > skipped_after_first,
+            delta_second_enrich > 0,
             "second ENRICH upsert with unchanged reserves under vault feed must skip JetStream"
         );
 
-        let skipped_before_exec_hot =
-            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed);
-        let mut scratch3 = MdSidefxBurstScratch::new();
-        md_sidefx_process_live_pool_cache_account_update(
-            &worker,
-            &mk_job(12, SidefxUpdateClass::ExecHot),
-            &mut scratch3,
-        );
+        let delta_exec_hot = enrich_publish_skipped_delta(|| {
+            let mut scratch = MdSidefxBurstScratch::new();
+            md_sidefx_process_live_pool_cache_account_update(
+                &worker,
+                &mk_job(12, SidefxUpdateClass::ExecHot),
+                &mut scratch,
+            );
+        });
         assert_eq!(
-            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed),
-            skipped_before_exec_hot,
+            delta_exec_hot, 0,
             "EXEC_HOT must not increment ENRICH skip counter (I-MD-4)"
         );
     }
 
     /// Bugbot: ENRICH JetStream skip must not skip MASTER readiness merge.
     #[test]
+    #[serial_test::serial]
     fn scope_d_enrich_skips_publish_but_merges_readiness() {
         use ironcrab::ipc::DexPoolReadiness;
         use ironcrab::metrics::MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL;
@@ -14150,7 +14158,7 @@ mod pr_b_geyser_tracking_tests {
             admission.snapshot_pubkeys().into_iter().collect();
         assert!(worker.pool_has_live_vault_geyser_feed(pool));
 
-        MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.store(0, Ordering::Relaxed);
+        let before = MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed);
         let mut scratch = MdSidefxBurstScratch::new();
         md_sidefx_process_live_pool_cache_account_update(
             &worker,
@@ -14167,7 +14175,7 @@ mod pr_b_geyser_tracking_tests {
         );
 
         assert!(
-            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed) > 0,
+            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed) > before,
             "ENRICH must skip redundant JetStream under vault feed + unchanged layout/reserves"
         );
         assert_eq!(
@@ -16643,6 +16651,7 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn account_enrich_dispatch_upsert_and_flush_preserves_latest_wins() {
         use ironcrab::metrics::MARKET_DATA_ACCOUNT_ENRICH_COALESCE_TOTAL;
         let coalesce_before = MARKET_DATA_ACCOUNT_ENRICH_COALESCE_TOTAL.load(Ordering::Relaxed);
@@ -21477,6 +21486,7 @@ mod pr_b_geyser_tracking_tests {
 
     /// C1e: bin-array Geyser payloads stashed on early-drop replay after membership registration.
     #[test]
+    #[serial_test::serial]
     fn scope_c1e_dlmm_bin_stash_replay_after_register() {
         use ironcrab::metrics::MARKET_DATA_DLMM_BIN_EARLY_DROP_STASHED_TOTAL;
         use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
