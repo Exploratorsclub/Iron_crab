@@ -111,7 +111,7 @@ use ironcrab::metrics::{
     inc_market_data_arb_pin_deferred_still_unsatisfied_total,
     inc_market_data_arb_pin_geyser_register_deferred_total,
     inc_market_data_arb_pin_vault_register_ok_total,
-    inc_market_data_balance_updated_from_cache_total,
+    inc_market_data_balance_updated_from_cache_total, inc_market_data_dlmm_bin_register_ok_total,
     inc_market_data_exec_hot_hard_shed_steps_for_tier_reason,
     inc_market_data_exec_hot_pressure_admit_rejected_total,
     inc_market_data_geyser_sync_skipped_rate_limit_total,
@@ -165,8 +165,10 @@ use ironcrab::metrics::{
     set_market_data_geyser_explicit_cap_overflow, set_market_data_geyser_explicit_set_size,
     set_market_data_geyser_merge_pending, set_market_data_geyser_sync_pending,
     set_market_data_hot_pool_registry_pools_gauge, set_market_data_momentum_active_pool_pins_gauge,
-    set_market_data_tx_broadcast_queue_depth, set_readiness_control_sub_active, set_readiness_mode,
-    set_readiness_nats_connected, touch_market_data_global_ingest_progress,
+    set_market_data_tracked_bin_arrays_arb_gauge, set_market_data_tracked_bin_arrays_gauge,
+    set_market_data_tracked_bin_arrays_momentum_gauge, set_market_data_tx_broadcast_queue_depth,
+    set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
+    touch_market_data_global_ingest_progress,
     touch_market_data_tracked_membership_snapshot_refresh, update_readiness_market_data_current,
     ExecHotShedTier, MarketDataLatencySegment, MetricsComponent,
     MARKET_DATA_ACCOUNT_BROADCAST_QUEUE_DEPTH_EXEC_HOT,
@@ -1972,6 +1974,25 @@ fn planned_explicit_pubkeys_for_pool_from_cache(
         set.insert(b);
     }
     set.into_iter().collect()
+}
+
+/// Planned Meteora DLMM bin-array PDAs for one pool (`active_id` ±3 windows).
+fn planned_meteora_dlmm_bin_pubkeys_for_cache(
+    pool: Pubkey,
+    state: &CachedPoolState,
+) -> Vec<Pubkey> {
+    let CachedPoolState::Meteora(s) = state else {
+        return Vec::new();
+    };
+    let active_array_index = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(s.active_id);
+    let mut out = Vec::new();
+    for offset in -3i64..=3i64 {
+        let index = active_array_index + offset;
+        if let Ok(pda) = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&pool, index) {
+            out.push(pda);
+        }
+    }
+    out
 }
 
 /// CPMM pool cache rows: normalize base/quote mints and vault ATAs (SOL as quote when present).
@@ -3928,6 +3949,36 @@ impl MarketDataContext {
         }
     }
 
+    /// DLMM bin-array PDAs must be in the last Geyser explicit flush **or** admitted pending flush.
+    fn pool_meteora_dlmm_bins_geyser_registration_satisfied(
+        &self,
+        pool: Pubkey,
+        state: &CachedPoolState,
+        admission: Option<&FixedCapAdmission>,
+    ) -> bool {
+        if !self.config.read().enable_meteora_dlmm {
+            return true;
+        }
+        if !self.hot_pool_registry.is_hot_pool(pool) {
+            return true;
+        }
+        let bin_pdas = planned_meteora_dlmm_bin_pubkeys_for_cache(pool, state);
+        if bin_pdas.is_empty() {
+            return true;
+        }
+        let synced = self.last_synced_explicit_pubkeys.read();
+        for pda in bin_pdas {
+            if synced.contains(&pda) {
+                continue;
+            }
+            if admission.is_some_and(|a| a.snapshot_pubkeys().contains(&pda)) {
+                continue;
+            }
+            return false;
+        }
+        true
+    }
+
     /// True when all vault/bin pubkeys for this pool were included in the last Geyser sync flush.
     #[cfg_attr(not(test), allow(dead_code))]
     fn pool_has_live_vault_geyser_feed(&self, pool: Pubkey) -> bool {
@@ -5049,6 +5100,7 @@ impl MarketDataContext {
         };
         self.pool_vaults_fully_tracked_for_cache(pool, &state)
             && self.pool_geyser_bins_fully_tracked_for_cache(pool, &state)
+            && self.pool_meteora_dlmm_bins_geyser_registration_satisfied(pool, &state, admission)
             && self.pool_pumpfun_bonding_curve_registration_satisfied(pool, &state, admission)
     }
 
@@ -5072,6 +5124,55 @@ impl MarketDataContext {
             .filter(|v| v.pin == Some(GeyserPinReason::ArbMultiDex))
             .count();
         set_market_data_arb_tracked_vaults_gauge(count);
+    }
+
+    /// C1d: gauge tracked DLMM bin-array rows by pin tier.
+    fn refresh_tracked_bin_arrays_gauges(&self) {
+        let bins = self.tracked_bin_arrays.read();
+        set_market_data_tracked_bin_arrays_gauge(bins.len());
+        let arb = bins
+            .values()
+            .filter(|b| b.pin == Some(GeyserPinReason::ArbMultiDex))
+            .count();
+        let momentum = bins
+            .values()
+            .filter(|b| b.pin == Some(GeyserPinReason::MomentumActive))
+            .count();
+        set_market_data_tracked_bin_arrays_arb_gauge(arb);
+        set_market_data_tracked_bin_arrays_momentum_gauge(momentum);
+    }
+
+    /// Pin priority for hot DLMM bin-window refresh: Wallet > Momentum > Arb (via caller pin).
+    fn geyser_pin_for_hot_dlmm_pool(&self, pool: Pubkey) -> Option<GeyserPinReason> {
+        if self.hot_pool_registry.pool_has_momentum(pool) {
+            Some(GeyserPinReason::MomentumActive)
+        } else if self.hot_pool_registry.pool_has_arb(pool) {
+            Some(GeyserPinReason::ArbMultiDex)
+        } else {
+            None
+        }
+    }
+
+    fn arb_pin_deferred_still_unsatisfied_reason(
+        &self,
+        pool: Pubkey,
+        admission: &FixedCapAdmission,
+    ) -> &'static str {
+        if self.live_pool_cache.get(&pool).is_none() {
+            return "live_pool_cache_miss";
+        }
+        if let Some(state) = self.live_pool_cache.get(&pool) {
+            if self.pool_geyser_bins_fully_tracked_for_cache(pool, &state)
+                && !self.pool_meteora_dlmm_bins_geyser_registration_satisfied(
+                    pool,
+                    &state,
+                    Some(admission),
+                )
+            {
+                return "bins_not_synced";
+            }
+        }
+        "vault_register_no_change"
     }
 
     fn log_arb_pin_deferred_throttled(&self, pool: Pubkey, reason: &'static str) {
@@ -5217,7 +5318,7 @@ impl MarketDataContext {
                 }
             } else if pin == GeyserPinReason::ArbMultiDex {
                 inc_market_data_arb_pin_deferred_still_unsatisfied_total(
-                    "vault_register_no_change",
+                    self.arb_pin_deferred_still_unsatisfied_reason(pool, admission),
                 );
             }
             self.sync_explicit_pool_admitted_from_admission(admission, pool, consumer);
@@ -5294,8 +5395,8 @@ impl MarketDataContext {
                                 bin_array_index: index,
                                 bin_step,
                                 last_used_at: now,
-                                pinned: false,
-                                pin: None,
+                                pinned: true,
+                                pin: Some(pin),
                             });
                             bins_changed = true;
                             new_bins.push(pda);
@@ -5320,15 +5421,18 @@ impl MarketDataContext {
             self.dlmm_registered_active_id
                 .write()
                 .insert(pool, active_id);
+            inc_market_data_dlmm_bin_register_ok_total();
+            self.refresh_tracked_membership_snapshot();
+            self.refresh_tracked_bin_arrays_gauges();
         }
         bins_changed
     }
 
-    /// Fix B: when arb-pinned DLMM `active_id` drifts, register new bin-array PDAs + Geyser push.
-    fn maybe_refresh_arb_dlmm_bin_window(&self, pool: Pubkey, new_active_id: i32) -> bool {
-        if !self.hot_pool_registry.pool_has_arb(pool) {
+    /// C1d: when hot-pool DLMM `active_id` drifts, register new bin-array PDAs (Mom + Arb shared).
+    fn maybe_refresh_hot_dlmm_bin_window(&self, pool: Pubkey, new_active_id: i32) -> bool {
+        let Some(pin) = self.geyser_pin_for_hot_dlmm_pool(pool) else {
             return false;
-        }
+        };
         let prev = self.dlmm_registered_active_id.read().get(&pool).copied();
         if prev == Some(new_active_id) {
             return false;
@@ -5336,13 +5440,12 @@ impl MarketDataContext {
         let Some(CachedPoolState::Meteora(s)) = self.live_pool_cache.get(&pool) else {
             return false;
         };
-        self.register_meteora_dlmm_bin_arrays(
-            pool,
-            new_active_id,
-            s.bin_step,
-            GeyserPinReason::ArbMultiDex,
-            Instant::now(),
-        )
+        self.register_meteora_dlmm_bin_arrays(pool, new_active_id, s.bin_step, pin, Instant::now())
+    }
+
+    /// Fix B / C1d: arb-pinned DLMM `active_id` drift — delegates to shared hot-pool refresh.
+    fn maybe_refresh_arb_dlmm_bin_window(&self, pool: Pubkey, new_active_id: i32) -> bool {
+        self.maybe_refresh_hot_dlmm_bin_window(pool, new_active_id)
     }
 
     fn register_geyser_reserves_impl(&self, pool: Pubkey, pin: GeyserPinReason) -> bool {
@@ -5419,7 +5522,11 @@ impl MarketDataContext {
             }
         }
 
-        vaults_changed || bins_changed || mints_changed
+        let needs_geyser_flush = matches!(&state, CachedPoolState::Meteora(_))
+            && self.hot_pool_registry.is_hot_pool(pool)
+            && !self.pool_meteora_dlmm_bins_geyser_registration_satisfied(pool, &state, None);
+
+        vaults_changed || bins_changed || mints_changed || needs_geyser_flush
     }
 
     fn geyser_pin_may_promote(current: Option<GeyserPinReason>, target: GeyserPinReason) -> bool {
@@ -5589,7 +5696,7 @@ impl MarketDataContext {
                     is_position,
                     registered,
                 );
-                if registered {
+                if registered || self.explicit_physical_publish_needed(admission) {
                     batch_dirty = true;
                 } else if self.live_pool_cache.get(&pool_pk).is_none() {
                     debug!(
@@ -5820,7 +5927,7 @@ impl MarketDataContext {
                 inc_market_data_arb_admission_admitted_total();
                 let registered = self.register_geyser_reserves_for_arb_active_pool(pool_pk);
                 self.record_arb_active_pool_reserve_registration_outcome(pool_pk, registered);
-                if registered {
+                if registered || self.explicit_physical_publish_needed(admission) {
                     batch_dirty = true;
                 }
             } else {
@@ -21039,5 +21146,169 @@ mod pr_b_geyser_tracking_tests {
                 > cache_miss_before,
             "must-hot must attempt register and defer on cache miss, not admit_suppress skip"
         );
+    }
+
+    fn test_meteora_dlmm_cached_state(active_id: i32) -> CachedPoolState {
+        use ironcrab::execution::live_pool_cache::MeteoraState;
+        CachedPoolState::Meteora(MeteoraState {
+            token_x_mint: Pubkey::new_unique(),
+            token_y_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+            reserve_x: Pubkey::new_unique(),
+            reserve_y: Pubkey::new_unique(),
+            active_id,
+            bin_step: 15,
+            reserve_x_balance: Some(1),
+            reserve_y_balance: Some(1),
+        })
+    }
+
+    /// C1d: momentum-only DLMM hot pin tracks full bin window locally.
+    #[test]
+    fn scope_c1d_mom_only_dlmm_bins_fully_tracked_after_register() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        ctx.live_pool_cache
+            .upsert(pool, test_meteora_dlmm_cached_state(42), 1);
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+
+        let mut admission = test_admission_for(&ctx);
+        assert!(ctx.try_admit_pool_consumer_group(
+            &mut admission,
+            pool,
+            ExplicitConsumer::Momentum
+        ));
+        assert!(ctx.register_geyser_reserves_for_momentum_active_pool(pool));
+        let state = ctx.live_pool_cache.get(&pool).unwrap();
+        assert!(ctx.pool_geyser_bins_fully_tracked_for_cache(pool, &state));
+        assert!(
+            !ctx.hot_pool_reserve_registration_satisfied(pool),
+            "bins must not clear until Geyser explicit flush"
+        );
+        let bin_pdas = planned_meteora_dlmm_bin_pubkeys_for_cache(pool, &state);
+        assert!(!bin_pdas.is_empty());
+        let mut synced = ctx.last_synced_explicit_pubkeys.write();
+        synced.extend(bin_pdas);
+        drop(synced);
+        assert!(ctx.hot_pool_reserve_registration_satisfied(pool));
+    }
+
+    /// C1d: arb-only DLMM hot pin tracks full bin window locally.
+    #[test]
+    fn scope_c1d_arb_only_dlmm_bins_fully_tracked_after_register() {
+        use ironcrab::nats::{
+            ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackReadiness, ArbTrackRequestsUpdate,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        ctx.live_pool_cache
+            .upsert(pool, test_meteora_dlmm_cached_state(100), 1);
+
+        let mut admission = test_admission_for(&ctx);
+        ctx.apply_arb_track_requests_update(
+            &mut admission,
+            &ArbTrackRequestsUpdate {
+                version: 1,
+                ts_unix_ms: 1,
+                active: vec![ArbTrackActiveEntry {
+                    pool: pool.to_string(),
+                    reason: ArbTrackActiveReason::MultiDex,
+                    readiness: ArbTrackReadiness::QuoteReady,
+                }],
+                removed: vec![],
+                reconcile: false,
+            },
+        );
+
+        let state = ctx.live_pool_cache.get(&pool).unwrap();
+        assert!(ctx.pool_geyser_bins_fully_tracked_for_cache(pool, &state));
+        assert!(!ctx.hot_pool_reserve_registration_satisfied(pool));
+        assert!(ctx.explicit_physical_publish_needed(&admission));
+    }
+
+    /// C1d: Mom+Arb same DLMM pool — bins tracked; pin stays Momentum when Mom pinned first.
+    #[test]
+    fn scope_c1d_mom_arb_same_pool_bins_momentum_pin_priority() {
+        use ironcrab::nats::{
+            ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackReadiness, ArbTrackRequestsUpdate,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        ctx.live_pool_cache
+            .upsert(pool, test_meteora_dlmm_cached_state(7), 1);
+
+        let mut admission = test_admission_for(&ctx);
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+        assert!(ctx.try_admit_pool_consumer_group(
+            &mut admission,
+            pool,
+            ExplicitConsumer::Momentum
+        ));
+        assert!(ctx.register_geyser_reserves_for_momentum_active_pool(pool));
+
+        ctx.apply_arb_track_requests_update(
+            &mut admission,
+            &ArbTrackRequestsUpdate {
+                version: 1,
+                ts_unix_ms: 2,
+                active: vec![ArbTrackActiveEntry {
+                    pool: pool.to_string(),
+                    reason: ArbTrackActiveReason::MultiDex,
+                    readiness: ArbTrackReadiness::QuoteReady,
+                }],
+                removed: vec![],
+                reconcile: false,
+            },
+        );
+
+        let state = ctx.live_pool_cache.get(&pool).unwrap();
+        assert!(ctx.pool_geyser_bins_fully_tracked_for_cache(pool, &state));
+        let bins = ctx.tracked_bin_arrays.read();
+        for (_pda, info) in bins.iter().filter(|(_, b)| b.pool_address == pool) {
+            assert_eq!(
+                info.pin,
+                Some(GeyserPinReason::MomentumActive),
+                "Arb promote must not demote Momentum bin pin"
+            );
+        }
+    }
+
+    /// C1d: momentum-hot DLMM `active_id` drift refreshes bin window (not arb-only).
+    #[test]
+    fn scope_c1d_momentum_dlmm_bin_window_refreshes_on_active_id_drift() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+        ctx.live_pool_cache
+            .upsert(pool, test_meteora_dlmm_cached_state(10), 1);
+        assert!(ctx.register_geyser_reserves_for_momentum_active_pool(pool));
+        let before = ctx.tracked_bin_arrays.read().len();
+
+        assert!(ctx.maybe_refresh_hot_dlmm_bin_window(pool, 800));
+        assert!(ctx.tracked_bin_arrays.read().len() >= before);
+        let bins = ctx.tracked_bin_arrays.read();
+        for (_pda, info) in bins.iter().filter(|(_, b)| b.pool_address == pool) {
+            assert_eq!(info.pin, Some(GeyserPinReason::MomentumActive));
+        }
     }
 }

@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ARB-C1d: DLMM Bin-Array Completeness — Geyser-Flush Gate (Dual-Consumer)
+**Datum**: 2026-08-03  
+**Problem**: Post-C1c Soak: `market_data_bin_array_publish_total=0`, Arb `sell_missing_dlmm_bins` ~65–73% der Sell-Fails. `tracked_bin_arrays` hatte PDAs lokal, aber `hot_pool_reserve_registration_satisfied` prüfte nur Map-Präsenz — Deferred/Retry clearten bei Vault-OK, Geyser-Explicit-Flush für Bins blieb aus; Membership-Snapshot nach Bin-Register fehlte. `maybe_refresh_arb_dlmm_bin_window` nur Arb.  
+**Fix**: (1) `pool_meteora_dlmm_bins_geyser_registration_satisfied` analog PumpFun bonding-curve (last_synced ∨ admission). (2) `register_meteora_dlmm_bin_arrays` → sofort `refresh_tracked_membership_snapshot` + Bin-Gauges. (3) `register_geyser_reserves_impl` triggert Geyser-Push wenn Bins lokal aber nicht geflusht. (4) Shared `maybe_refresh_hot_dlmm_bin_window` für Mom+Arb mit Pin-Priorität. (5) Deferred still-unsatisfied `bins_not_synced`. Metriken: `tracked_bin_arrays` (+ arb/momentum), `dlmm_bin_register_ok_total`. **Invarianten**: I-4/I-7 — kein RPC; Dual-Consumer Pin-Priorität unverändert.  
+**Evidence**: `findings_arb_zero_opp_post359_20260803.md`, Prod Tip `24f1eaf`.  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `src/market_data/sidefx/host.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-ARB-C1c: Arb Pin Vault Completeness — Deferred Retry Queue
 **Datum**: 2026-08-03  
 **Problem**: Arb screent aktiv, aber `sell_missing_vault` ~15k Rejects und `arb_registered_vaults_total=0`. `apply_arb_active_entries` inkrementierte nur deferred-Metriken/WARN bei Register-Miss, ohne `note_deferred_hot_pool_reserve_registration` — Retry-Queue blieb leer. Admit-Suppress (`market_data_exec_hot_arb_admit_suppress`) skippte warmable und must-hot still ohne Completeness-Pfad.  

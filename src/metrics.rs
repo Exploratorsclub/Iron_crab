@@ -383,6 +383,20 @@ pub static MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_ADMIT_FAIL: Lazy<Atomi
 /// Arb pin: retry tick still unsatisfied — vault/bin register no-op.
 pub static MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_VAULT_NO_CHANGE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Arb pin: retry tick still unsatisfied — DLMM bin PDAs tracked locally but not Geyser-flushed.
+pub static MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_BINS_NOT_SYNCED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Rows in `tracked_bin_arrays` (all pins).
+pub static MARKET_DATA_TRACKED_BIN_ARRAYS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Rows in `tracked_bin_arrays` pinned `ArbMultiDex`.
+pub static MARKET_DATA_TRACKED_BIN_ARRAYS_ARB_GAUGE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Rows in `tracked_bin_arrays` pinned `MomentumActive`.
+pub static MARKET_DATA_TRACKED_BIN_ARRAYS_MOMENTUM_GAUGE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Successful DLMM bin-array window registrations (`register_meteora_dlmm_bin_arrays` changed tracking).
+pub static MARKET_DATA_DLMM_BIN_REGISTER_OK_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 /// Geyser explicit-tracked subscription list syncs coalesced from the TX trade path (debounced flush).
 pub static MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -641,8 +655,32 @@ pub fn inc_market_data_arb_pin_deferred_still_unsatisfied_total(reason: &str) {
             MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_VAULT_NO_CHANGE
                 .fetch_add(1, Ordering::Relaxed);
         }
+        "bins_not_synced" => {
+            MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_BINS_NOT_SYNCED
+                .fetch_add(1, Ordering::Relaxed);
+        }
         _ => {}
     }
+}
+
+#[inline]
+pub fn set_market_data_tracked_bin_arrays_gauge(n: usize) {
+    MARKET_DATA_TRACKED_BIN_ARRAYS_GAUGE.store(n as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_tracked_bin_arrays_arb_gauge(n: usize) {
+    MARKET_DATA_TRACKED_BIN_ARRAYS_ARB_GAUGE.store(n as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_tracked_bin_arrays_momentum_gauge(n: usize) {
+    MARKET_DATA_TRACKED_BIN_ARRAYS_MOMENTUM_GAUGE.store(n as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_dlmm_bin_register_ok_total() {
+    MARKET_DATA_DLMM_BIN_REGISTER_OK_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -7854,6 +7892,22 @@ async fn metrics_response() -> Response<Body> {
         MARKET_DATA_ARB_TRACKED_VAULTS_GAUGE.load(Ordering::Relaxed)
     );
     line!(
+        "market_data_tracked_bin_arrays",
+        MARKET_DATA_TRACKED_BIN_ARRAYS_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tracked_bin_arrays_arb",
+        MARKET_DATA_TRACKED_BIN_ARRAYS_ARB_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tracked_bin_arrays_momentum",
+        MARKET_DATA_TRACKED_BIN_ARRAYS_MOMENTUM_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_dlmm_bin_register_ok_total",
+        MARKET_DATA_DLMM_BIN_REGISTER_OK_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
         "market_data_arb_pin_vault_register_ok_total",
         MARKET_DATA_ARB_PIN_VAULT_REGISTER_OK_TOTAL.load(Ordering::Relaxed)
     );
@@ -7948,6 +8002,15 @@ async fn metrics_response() -> Response<Body> {
     );
     out.push_str(
         &MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_VAULT_NO_CHANGE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        "market_data_arb_pin_deferred_still_unsatisfied_total{reason=\"bins_not_synced\"} ",
+    );
+    out.push_str(
+        &MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_BINS_NOT_SYNCED
             .load(Ordering::Relaxed)
             .to_string(),
     );
