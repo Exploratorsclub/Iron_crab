@@ -1406,11 +1406,19 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
             if meta_changed && host.is_hot_pool(pool_pubkey) {
                 scratch.note_dlmm_pool_state_signal(*pool_pubkey, run_id, *slot, *grpc_recv_at);
             }
-            if let Some((prev_id, _)) = prev_meteora_meta {
-                if prev_id != s.active_id {
+            if host.is_hot_pool(pool_pubkey) {
+                let should_refresh = match prev_meteora_meta {
+                    None => true,
+                    Some((prev_id, _)) => prev_id != s.active_id,
+                };
+                if should_refresh {
                     let _ = host.maybe_refresh_arb_dlmm_bin_window(*pool_pubkey, s.active_id);
                 }
             }
+        }
+
+        if host.is_hot_pool(pool_pubkey) {
+            host.maybe_retry_deferred_hot_pool_reserves_on_cache_fill(pool_pubkey);
         }
 
         // Phase1: sidefx only updates MASTER cache + JetStream; vault registration stays in md-state.

@@ -84,8 +84,11 @@ pub trait SidefxWorkerHost: Send + Sync {
     /// True when vault/bin pubkeys for this pool were included in the last Geyser sync flush.
     fn pool_has_live_vault_geyser_feed(&self, pool: Pubkey) -> bool;
 
-    /// Re-register DLMM bin-array window when hot-pool `active_id` drifts (Mom + Arb, C1d).
+    /// Re-register DLMM bin-array window when hot-pool `active_id` drifts (Mom + Arb, C1d/C1g).
     fn maybe_refresh_arb_dlmm_bin_window(&self, pool: Pubkey, new_active_id: i32) -> bool;
+
+    /// C1g: enqueue deferred vault/bin registration retry after LivePoolCache gains layout.
+    fn maybe_retry_deferred_hot_pool_reserves_on_cache_fill(&self, pool: &Pubkey);
 }
 
 #[inline]

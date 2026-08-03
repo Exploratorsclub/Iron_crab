@@ -414,6 +414,15 @@ pub static MARKET_DATA_DLMM_BIN_PARSE_FAIL_TOTAL: Lazy<AtomicU64> = Lazy::new(||
 /// DLMM bin-array emit skipped: parsed but no non-zero liquidity bins.
 pub static MARKET_DATA_DLMM_BIN_EMIT_SKIPPED_EMPTY_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// DLMM bin-array publish: zero-liquidity active bin retained for quote walker (C1g).
+pub static MARKET_DATA_DLMM_BIN_EMIT_ACTIVE_ZERO_TOUCH_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// DLMM hot-pool bin window re-registered because expected arrays were untracked (C1g).
+pub static MARKET_DATA_DLMM_BIN_WINDOW_REFRESH_UNTRACKED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Deferred hot-pool reserve retry enqueued after LivePoolCache fill (C1g).
+pub static MARKET_DATA_DEFERRED_RETRY_POOL_STATE_FILL_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// DLMM bin-array publishes from stashed Geyser replay (post-register / post-sync).
 pub static MARKET_DATA_DLMM_BIN_REPLAY_PUBLISH_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -737,6 +746,21 @@ pub fn inc_market_data_dlmm_bin_parse_fail_total() {
 #[inline]
 pub fn inc_market_data_dlmm_bin_emit_skipped_empty_total() {
     MARKET_DATA_DLMM_BIN_EMIT_SKIPPED_EMPTY_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_dlmm_bin_emit_active_zero_touch_total() {
+    MARKET_DATA_DLMM_BIN_EMIT_ACTIVE_ZERO_TOUCH_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_dlmm_bin_window_refresh_untracked_total() {
+    MARKET_DATA_DLMM_BIN_WINDOW_REFRESH_UNTRACKED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_deferred_retry_pool_state_fill_total() {
+    MARKET_DATA_DEFERRED_RETRY_POOL_STATE_FILL_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -8044,6 +8068,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_dlmm_bin_emit_skipped_empty_total",
         MARKET_DATA_DLMM_BIN_EMIT_SKIPPED_EMPTY_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_dlmm_bin_emit_active_zero_touch_total",
+        MARKET_DATA_DLMM_BIN_EMIT_ACTIVE_ZERO_TOUCH_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_dlmm_bin_window_refresh_untracked_total",
+        MARKET_DATA_DLMM_BIN_WINDOW_REFRESH_UNTRACKED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_deferred_retry_pool_state_fill_total",
+        MARKET_DATA_DEFERRED_RETRY_POOL_STATE_FILL_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_dlmm_bin_replay_publish_total",

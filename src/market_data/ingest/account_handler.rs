@@ -11,7 +11,8 @@ use super::account_parse::{
     wallet_geyser_snapshots_to_publish, wsol_ata_balance_lamports_from_geyser_data,
     WalletGeyserUpdateSource,
 };
-use crate::ipc::{BinData, MarketEvent, MarketEventKind, NATIVE_SOL_MINT};
+use super::dlmm_bin_publish::filter_dlmm_bins_for_publish;
+use crate::ipc::{MarketEvent, MarketEventKind, NATIVE_SOL_MINT};
 use crate::market_data::ingest::AccountUpdateClass;
 use crate::market_data::md_state::MdStateSender;
 use crate::market_data::publish::{
@@ -77,17 +78,12 @@ pub async fn publish_meteora_dlmm_bin_array_from_geyser<H: AccountIngestHost>(
     }
     match BinArray::parse(&account_update.data, bin_array_info.bin_step) {
         Ok(parsed_array) => {
-            let bins: Vec<BinData> = parsed_array
-                .bins
-                .iter()
-                .enumerate()
-                .filter(|(_, bin)| bin.amount_x > 0 || bin.amount_y > 0)
-                .map(|(offset, bin)| BinData {
-                    offset: offset as u8,
-                    amount_x: bin.amount_x,
-                    amount_y: bin.amount_y,
-                })
-                .collect();
+            let active_id = host.ingest_pool_dlmm_active_id(&bin_array_info.pool_address);
+            let bins = filter_dlmm_bins_for_publish(
+                &parsed_array.bins,
+                bin_array_info.bin_array_index,
+                active_id,
+            );
 
             if bins.is_empty() {
                 inc_market_data_dlmm_bin_emit_skipped_empty_total();

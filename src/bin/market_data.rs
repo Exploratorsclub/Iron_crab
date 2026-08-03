@@ -36,10 +36,9 @@ use uuid::Uuid;
 
 use ironcrab::config::{Config, MarketDataGeyserCfg, WalletTrackerCfg};
 use ironcrab::ipc::{
-    BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ControlRequest,
-    ControlRequestKind, DexPoolReadiness, ExecutionResult, ExecutionStatus, IntentTier,
-    MarketEvent, MarketEventKind, PoolCacheUpdate, NATIVE_SOL_MINT,
-    POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
+    ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ControlRequest, ControlRequestKind,
+    DexPoolReadiness, ExecutionResult, ExecutionStatus, IntentTier, MarketEvent, MarketEventKind,
+    PoolCacheUpdate, NATIVE_SOL_MINT, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use ironcrab::market_data::cold::{
     cold_path_rpc_refresh_meteora_cpmm_pool_row, cold_path_rpc_refresh_meteora_dlmm_pool_row,
@@ -676,6 +675,21 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
             );
         }
         changed
+    }
+
+    fn maybe_retry_deferred_hot_pool_reserves_on_cache_fill(&self, pool: &Pubkey) {
+        if self
+            .ctx
+            .deferred_hot_pool_reserve_pins
+            .read()
+            .contains_key(pool)
+        {
+            ironcrab::metrics::inc_market_data_deferred_retry_pool_state_fill_total();
+            let _ = track_worker_try_enqueue(
+                &self.track_worker,
+                TrackWorkerCommand::RetryDeferredHotPoolReserves,
+            );
+        }
     }
 }
 
@@ -2500,6 +2514,13 @@ impl IngestHost for MarketDataContext {
 
     fn ingest_record_enrichment_relevance_hit(&self) {
         ironcrab::metrics::inc_market_data_account_relevance_enrichment_hit_total();
+    }
+
+    fn ingest_pool_dlmm_active_id(&self, pool: &Pubkey) -> Option<i32> {
+        match self.live_pool_cache.get(pool)? {
+            CachedPoolState::Meteora(s) => Some(s.active_id),
+            _ => None,
+        }
     }
 }
 
@@ -4780,25 +4801,32 @@ impl MarketDataContext {
             return;
         }
         let run_id = self.run_id.clone();
+        let replay_active_ids: Vec<Option<i32>> = replay_rows
+            .iter()
+            .map(
+                |(_, _, view)| match self.live_pool_cache.get(&view.pool_address) {
+                    Some(CachedPoolState::Meteora(s)) => Some(s.active_id),
+                    _ => None,
+                },
+            )
+            .collect();
         let publish = async move {
+            use ironcrab::market_data::ingest::filter_dlmm_bins_for_publish;
             use ironcrab::market_data::publish::publish_market_event_core_and_momentum_ex;
             use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
             let mut replay_seq = 0u64;
-            for (_pda, stashed, view) in replay_rows {
+            for ((idx, (_pda, stashed, view)), active_id) in
+                replay_rows.into_iter().enumerate().zip(replay_active_ids)
+            {
+                let _ = idx;
                 replay_seq += 1;
                 match BinArray::parse(&stashed.data, view.bin_step) {
                     Ok(parsed_array) => {
-                        let bins: Vec<BinData> = parsed_array
-                            .bins
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, bin)| bin.amount_x > 0 || bin.amount_y > 0)
-                            .map(|(offset, bin)| BinData {
-                                offset: offset as u8,
-                                amount_x: bin.amount_x,
-                                amount_y: bin.amount_y,
-                            })
-                            .collect();
+                        let bins = filter_dlmm_bins_for_publish(
+                            &parsed_array.bins,
+                            view.bin_array_index,
+                            active_id,
+                        );
                         if bins.is_empty() {
                             ironcrab::metrics::inc_market_data_dlmm_bin_emit_skipped_empty_total();
                             continue;
@@ -5583,18 +5611,25 @@ impl MarketDataContext {
         bins_changed
     }
 
-    /// C1d: when hot-pool DLMM `active_id` drifts, register new bin-array PDAs (Mom + Arb shared).
+    /// C1d/C1g: when hot-pool DLMM `active_id` drifts or bin window is untracked, register PDAs (Mom + Arb shared).
     fn maybe_refresh_hot_dlmm_bin_window(&self, pool: Pubkey, new_active_id: i32) -> bool {
         let Some(pin) = self.geyser_pin_for_hot_dlmm_pool(pool) else {
             return false;
         };
-        let prev = self.dlmm_registered_active_id.read().get(&pool).copied();
-        if prev == Some(new_active_id) {
-            return false;
-        }
-        let Some(CachedPoolState::Meteora(s)) = self.live_pool_cache.get(&pool) else {
+        let Some(state) = self.live_pool_cache.get(&pool) else {
             return false;
         };
+        let CachedPoolState::Meteora(s) = &state else {
+            return false;
+        };
+        let prev = self.dlmm_registered_active_id.read().get(&pool).copied();
+        let bins_untracked = !self.pool_geyser_bins_fully_tracked_for_cache(pool, &state);
+        if prev == Some(new_active_id) && !bins_untracked {
+            return false;
+        }
+        if bins_untracked && prev == Some(new_active_id) {
+            ironcrab::metrics::inc_market_data_dlmm_bin_window_refresh_untracked_total();
+        }
         self.register_meteora_dlmm_bin_arrays(pool, new_active_id, s.bin_step, pin, Instant::now())
     }
 
@@ -21482,6 +21517,26 @@ mod pr_b_geyser_tracking_tests {
         for (_pda, info) in bins.iter().filter(|(_, b)| b.pool_address == pool) {
             assert_eq!(info.pin, Some(GeyserPinReason::MomentumActive));
         }
+    }
+
+    /// C1g: hot DLMM bin window re-registers when tracked arrays miss current active window.
+    #[test]
+    fn scope_c1g_dlmm_bin_window_refreshes_when_untracked() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+        ctx.live_pool_cache
+            .upsert(pool, test_meteora_dlmm_cached_state(800), 1);
+        ctx.dlmm_registered_active_id.write().insert(pool, 800);
+        let before = ctx.tracked_bin_arrays.read().len();
+
+        assert!(ctx.maybe_refresh_hot_dlmm_bin_window(pool, 800));
+        assert!(ctx.tracked_bin_arrays.read().len() >= before);
     }
 
     /// C1e: bin-array Geyser payloads stashed on early-drop replay after membership registration.

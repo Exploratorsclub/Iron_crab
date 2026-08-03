@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ARB-C1g: DLMM Quote Completeness — Active Bin Touch + Window Refresh
+**Datum**: 2026-08-04  
+**Problem**: Post-C1f: `sell_quote_none` / `dlmm_active_bin_missing` dominant (~3k+); `sell_missing_vault` ~1.6–2k. MD publish filtert Bins mit `amount_x/y == 0` — Zero-Liquidity Active-Bin erscheint nie im `BinArrayUpdate` → `active_bin_present` false trotz bin cache hit. Bin-Fenster-Drift: Refresh nur bei `prev_id != active_id`, nicht bei untracked arrays; Deferred-Retry erst auf activity tick nach LivePoolCache-Fill.  
+**Fix**: (1) `filter_dlmm_bins_for_publish`: Active-Bin immer emittieren (zero-liquidity touch), Replay-Pfad analog. (2) `maybe_refresh_hot_dlmm_bin_window`: auch bei untracked bin window re-register (H1). (3) Sidefx: erster Hot-Pool-State + Deferred-Retry auf PoolState-Fill. (4) Forensik: `dlmm_bin_emit_active_zero_touch`, `dlmm_bin_window_refresh_untracked`, `deferred_retry_pool_state_fill`. (5) Quote-Test: zero-liquidity active bin → kein `DlmmActiveBinMissing`. **Invarianten**: I-4/I-7 kein RPC; Dual-Consumer/C1e/C1f unverändert.  
+**Evidence**: `findings_arb_zero_opp_post362_20260804.md`, Prod Tip `886dd4f`.  
+**Dateien**: `src/market_data/ingest/dlmm_bin_publish.rs`, `account_handler.rs`, `src/bin/market_data.rs`, `src/market_data/sidefx/{host,handlers}.rs`, `src/arbitrage/pool_quote.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-ARB-C1f: Arb DLMM Bin Consume — Live Snapshot + Bin-Update Rescreen
 **Datum**: 2026-08-03  
 **Problem**: Post-C1e: MD `dlmm_bin_publish_exec_hot` ~7k+, aber Arb `sell_missing_dlmm_bins` dominant (~876/3.3k screens). `check_arbitrage_v2` nutzte `ApplyTrade`-Snapshot (`bin_arrays`) aus dem Writer-Thread; BinArrayUpdate landete oft erst danach im globalen Cache → `dlmm_bins.is_none()` trotz publizierter Bins. Zusätzlich: pinned DLMM-BinArrayUpdates ohne `known_pools`-Eintrag → LOW-Priority-Coalescer.  

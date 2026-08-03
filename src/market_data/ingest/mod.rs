@@ -2,6 +2,7 @@ pub mod account_filter;
 pub mod account_handler;
 pub mod account_host;
 pub mod account_parse;
+pub mod dlmm_bin_publish;
 pub mod host;
 pub mod tx_filter;
 pub mod tx_handler;
@@ -25,6 +26,7 @@ pub use account_parse::{
     wsol_ata_balance_lamports_from_geyser_data, WalletGeyserSnapshotMint,
     WalletGeyserSnapshotToPublish, WalletGeyserUpdateSource,
 };
+pub use dlmm_bin_publish::{active_bin_offset_in_array, filter_dlmm_bins_for_publish};
 pub use host::IngestHost;
 pub use tx_filter::geyser_tx_involves_wallet;
 pub use tx_handler::handle_geyser_transaction_update;
