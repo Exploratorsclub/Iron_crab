@@ -397,6 +397,32 @@ pub static MARKET_DATA_TRACKED_BIN_ARRAYS_MOMENTUM_GAUGE: Lazy<AtomicU64> =
 /// Successful DLMM bin-array window registrations (`register_meteora_dlmm_bin_arrays` changed tracking).
 pub static MARKET_DATA_DLMM_BIN_REGISTER_OK_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// DLMM bin-array account updates observed at ingest handler (bin-shaped METEORA owner).
+pub static MARKET_DATA_DLMM_BIN_OWNER_UPDATE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// DLMM bin-array updates stashed on early-drop before membership registration.
+pub static MARKET_DATA_DLMM_BIN_EARLY_DROP_STASHED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// DLMM bin-array handler: membership snapshot hit.
+pub static MARKET_DATA_DLMM_BIN_MEMBERSHIP_HIT_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// DLMM bin-array handler: membership snapshot miss (update fell through).
+pub static MARKET_DATA_DLMM_BIN_MEMBERSHIP_MISS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// DLMM bin-array parse failures at publish gate.
+pub static MARKET_DATA_DLMM_BIN_PARSE_FAIL_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// DLMM bin-array emit skipped: parsed but no non-zero liquidity bins.
+pub static MARKET_DATA_DLMM_BIN_EMIT_SKIPPED_EMPTY_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// DLMM bin-array publishes from stashed Geyser replay (post-register / post-sync).
+pub static MARKET_DATA_DLMM_BIN_REPLAY_PUBLISH_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// DLMM bin-array handler publishes on ExecHot lane.
+pub static MARKET_DATA_DLMM_BIN_PUBLISH_EXEC_HOT_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// DLMM bin-array handler publishes on Enrich lane.
+pub static MARKET_DATA_DLMM_BIN_PUBLISH_ENRICH_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 
 /// Geyser explicit-tracked subscription list syncs coalesced from the TX trade path (debounced flush).
 pub static MARKET_DATA_GEYSER_SYNC_BATCH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -681,6 +707,51 @@ pub fn set_market_data_tracked_bin_arrays_momentum_gauge(n: usize) {
 #[inline]
 pub fn inc_market_data_dlmm_bin_register_ok_total() {
     MARKET_DATA_DLMM_BIN_REGISTER_OK_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_dlmm_bin_owner_update_total() {
+    MARKET_DATA_DLMM_BIN_OWNER_UPDATE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_dlmm_bin_early_drop_stashed_total() {
+    MARKET_DATA_DLMM_BIN_EARLY_DROP_STASHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_dlmm_bin_membership_hit_total() {
+    MARKET_DATA_DLMM_BIN_MEMBERSHIP_HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_dlmm_bin_membership_miss_total() {
+    MARKET_DATA_DLMM_BIN_MEMBERSHIP_MISS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_dlmm_bin_parse_fail_total() {
+    MARKET_DATA_DLMM_BIN_PARSE_FAIL_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_dlmm_bin_emit_skipped_empty_total() {
+    MARKET_DATA_DLMM_BIN_EMIT_SKIPPED_EMPTY_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_dlmm_bin_replay_publish_total() {
+    MARKET_DATA_DLMM_BIN_REPLAY_PUBLISH_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_dlmm_bin_publish_exec_hot_total() {
+    MARKET_DATA_DLMM_BIN_PUBLISH_EXEC_HOT_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_dlmm_bin_publish_enrich_total() {
+    MARKET_DATA_DLMM_BIN_PUBLISH_ENRICH_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -7906,6 +7977,42 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_dlmm_bin_register_ok_total",
         MARKET_DATA_DLMM_BIN_REGISTER_OK_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_dlmm_bin_owner_update_total",
+        MARKET_DATA_DLMM_BIN_OWNER_UPDATE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_dlmm_bin_early_drop_stashed_total",
+        MARKET_DATA_DLMM_BIN_EARLY_DROP_STASHED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_dlmm_bin_membership_hit_total",
+        MARKET_DATA_DLMM_BIN_MEMBERSHIP_HIT_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_dlmm_bin_membership_miss_total",
+        MARKET_DATA_DLMM_BIN_MEMBERSHIP_MISS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_dlmm_bin_parse_fail_total",
+        MARKET_DATA_DLMM_BIN_PARSE_FAIL_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_dlmm_bin_emit_skipped_empty_total",
+        MARKET_DATA_DLMM_BIN_EMIT_SKIPPED_EMPTY_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_dlmm_bin_replay_publish_total",
+        MARKET_DATA_DLMM_BIN_REPLAY_PUBLISH_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_dlmm_bin_publish_exec_hot_total",
+        MARKET_DATA_DLMM_BIN_PUBLISH_EXEC_HOT_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_dlmm_bin_publish_enrich_total",
+        MARKET_DATA_DLMM_BIN_PUBLISH_ENRICH_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_arb_pin_vault_register_ok_total",

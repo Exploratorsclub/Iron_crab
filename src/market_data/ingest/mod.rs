@@ -11,10 +11,14 @@ pub mod tx_parse;
 pub use account_filter::{
     account_geyser_dispatch_priority_high, account_geyser_enrich_path_needs_classify,
     account_geyser_update_is_dex_pool_owner, account_geyser_update_might_be_relevant,
-    account_geyser_update_relevance, classify_account_geyser_update, AccountGeyserRelevance,
-    AccountUpdateClass,
+    account_geyser_update_relevance, classify_account_geyser_update,
+    geyser_account_data_looks_like_meteora_bin_array, geyser_update_looks_like_meteora_bin_array,
+    AccountGeyserRelevance, AccountUpdateClass,
 };
-pub use account_handler::handle_geyser_account_update;
+pub use account_handler::{
+    handle_geyser_account_update, publish_meteora_dlmm_bin_array_from_geyser,
+    DlmmBinArrayPublishOutcome,
+};
 pub use account_host::{AccountBinArrayView, AccountIngestHost, AccountTrackedWalletView};
 pub use account_parse::{
     try_parse_mint_account, try_parse_token_account_balance, wallet_geyser_snapshots_to_publish,

@@ -4,6 +4,8 @@ use super::host::IngestHost;
 use crate::metrics::{
     inc_market_data_account_relevance_enrichment_hit_total, MarketDataAccountEarlyDropReason,
 };
+use crate::solana::dex::meteora_bin_array_layout::BinArray;
+use crate::solana::dex::meteora_dlmm_layout::DlmmPool;
 use crate::solana::geyser_listener::GeyserAccountUpdate;
 use solana_sdk::pubkey::Pubkey;
 
@@ -22,6 +24,20 @@ const METEORA_DLMM_OWNER: Pubkey =
     solana_sdk::pubkey!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
 const METEORA_CPMM_OWNER: Pubkey =
     solana_sdk::pubkey!("cpmmpPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D");
+
+/// Heuristic: METEORA DLMM owner + bin-array account size (not LB Pair pool state).
+#[inline]
+pub fn geyser_account_data_looks_like_meteora_bin_array(owner: &Pubkey, data: &[u8]) -> bool {
+    *owner == METEORA_DLMM_OWNER
+        && data.len() >= BinArray::ACCOUNT_SIZE
+        && data.len() != DlmmPool::ACCOUNT_SIZE
+}
+
+/// Heuristic for recv early-drop stash: bin-array-shaped METEORA account update.
+#[inline]
+pub fn geyser_update_looks_like_meteora_bin_array(u: &GeyserAccountUpdate) -> bool {
+    geyser_account_data_looks_like_meteora_bin_array(&u.owner, &u.data)
+}
 
 #[inline]
 pub fn account_geyser_update_is_dex_pool_owner(owner: &Pubkey) -> bool {
@@ -464,6 +480,24 @@ mod tests {
         let (class, early_drop_reason) = classify_account_geyser_update(&host, &u);
         assert_eq!(class, AccountUpdateClass::Enrich);
         assert_eq!(early_drop_reason, None);
+    }
+
+    #[test]
+    fn geyser_account_data_looks_like_meteora_bin_array_vs_lb_pair() {
+        let bin_data = vec![0u8; BinArray::ACCOUNT_SIZE];
+        assert!(geyser_account_data_looks_like_meteora_bin_array(
+            &METEORA_DLMM_OWNER,
+            &bin_data
+        ));
+        let pool_data = vec![0u8; DlmmPool::ACCOUNT_SIZE];
+        assert!(!geyser_account_data_looks_like_meteora_bin_array(
+            &METEORA_DLMM_OWNER,
+            &pool_data
+        ));
+        assert!(!geyser_account_data_looks_like_meteora_bin_array(
+            &RAYDIUM_CPMM_OWNER,
+            &bin_data
+        ));
     }
 
     #[test]

@@ -3,8 +3,9 @@
 
 use super::account_filter::{
     account_geyser_update_is_dex_pool_owner, account_geyser_update_is_sidefx_only_pool_owner,
+    geyser_account_data_looks_like_meteora_bin_array,
 };
-use super::account_host::AccountIngestHost;
+use super::account_host::{AccountBinArrayView, AccountIngestHost};
 use super::account_parse::{
     account_publish_segment, try_parse_mint_account, try_parse_token_account_balance,
     wallet_geyser_snapshots_to_publish, wsol_ata_balance_lamports_from_geyser_data,
@@ -21,8 +22,12 @@ use crate::market_data::sidefx::{
     SidefxUpdateClass,
 };
 use crate::metrics::{
-    record_market_data_tokio_progress, record_market_data_unparsed_account_dropped,
-    MarketDataUnparsedAccountDropReason,
+    inc_market_data_dlmm_bin_emit_skipped_empty_total,
+    inc_market_data_dlmm_bin_membership_hit_total, inc_market_data_dlmm_bin_membership_miss_total,
+    inc_market_data_dlmm_bin_owner_update_total, inc_market_data_dlmm_bin_parse_fail_total,
+    inc_market_data_dlmm_bin_publish_enrich_total, inc_market_data_dlmm_bin_publish_exec_hot_total,
+    inc_market_data_dlmm_bin_replay_publish_total, record_market_data_tokio_progress,
+    record_market_data_unparsed_account_dropped, MarketDataUnparsedAccountDropReason,
 };
 use crate::nats::wallet_snapshot_subject;
 use crate::solana::dex::meteora_bin_array_layout::BinArray;
@@ -36,6 +41,132 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::{debug, info, warn};
+
+/// Outcome of the DLMM bin-array publish gate (forensics + replay).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DlmmBinArrayPublishOutcome {
+    Published,
+    ParseFailed,
+    SkippedEmptyLiquidity,
+    SkippedNoNats,
+}
+
+/// Parse + publish one Meteora DLMM bin-array Geyser update for a tracked membership row.
+#[allow(clippy::too_many_arguments)]
+pub async fn publish_meteora_dlmm_bin_array_from_geyser<H: AccountIngestHost>(
+    host: &H,
+    run_id: &str,
+    account_geyser_recv_at: Instant,
+    account_update: &GeyserAccountUpdate,
+    bin_array_info: AccountBinArrayView,
+    publish_tx: Option<&AccountPublishSender>,
+    md_sidefx: Option<&MdSidefxSender>,
+    sidefx_class: SidefxUpdateClass,
+    update_class: AccountUpdateClass,
+    replay_from_stash: bool,
+) -> DlmmBinArrayPublishOutcome {
+    if let Some(md_sidefx) = md_sidefx {
+        md_sidefx_try_enqueue_classed(
+            md_sidefx,
+            sidefx_class,
+            MdSidefxCommand::TouchBinArrayTick {
+                pda: account_update.pubkey,
+                update_class: sidefx_class,
+            },
+        );
+    }
+    match BinArray::parse(&account_update.data, bin_array_info.bin_step) {
+        Ok(parsed_array) => {
+            let bins: Vec<BinData> = parsed_array
+                .bins
+                .iter()
+                .enumerate()
+                .filter(|(_, bin)| bin.amount_x > 0 || bin.amount_y > 0)
+                .map(|(offset, bin)| BinData {
+                    offset: offset as u8,
+                    amount_x: bin.amount_x,
+                    amount_y: bin.amount_y,
+                })
+                .collect();
+
+            if bins.is_empty() {
+                inc_market_data_dlmm_bin_emit_skipped_empty_total();
+                return DlmmBinArrayPublishOutcome::SkippedEmptyLiquidity;
+            }
+
+            let bin_event = MarketEvent::new(
+                "market-data",
+                host.account_build_version(),
+                run_id,
+                host.account_next_event_id(),
+                "geyser_bin_array",
+                Some(account_update.slot),
+                MarketEventKind::BinArrayUpdate {
+                    pool_address: bin_array_info.pool_address.to_string(),
+                    bin_array_index: bin_array_info.bin_array_index,
+                    bins,
+                    update_slot: account_update.slot,
+                },
+            );
+
+            host.account_write_market_event_jsonl(&bin_event);
+
+            if host.account_nats().is_some() {
+                match update_class {
+                    AccountUpdateClass::ExecHot => {
+                        inc_market_data_dlmm_bin_publish_exec_hot_total()
+                    }
+                    AccountUpdateClass::Enrich => inc_market_data_dlmm_bin_publish_enrich_total(),
+                    AccountUpdateClass::Drop => {}
+                }
+                if replay_from_stash {
+                    inc_market_data_dlmm_bin_replay_publish_total();
+                }
+                let seg = account_publish_segment(&bin_event.kind);
+                account_path_enqueue_core_market_event(
+                    publish_tx,
+                    host.account_nats(),
+                    host.account_publish_host(),
+                    bin_event,
+                    Some(MarketEventCorePublishTrace {
+                        recv_at: account_geyser_recv_at,
+                        cold_path: false,
+                        segment: seg,
+                    }),
+                )
+                .await;
+            } else {
+                return DlmmBinArrayPublishOutcome::SkippedNoNats;
+            }
+
+            if host.ingest_is_hot_pool(&bin_array_info.pool_address) {
+                if let Some(md_sidefx) = md_sidefx {
+                    md_sidefx_try_enqueue_classed(
+                        md_sidefx,
+                        SidefxUpdateClass::ExecHot,
+                        MdSidefxCommand::DlmmPoolStatePublishSignal {
+                            run_id: run_id.to_string(),
+                            pool_address: bin_array_info.pool_address,
+                            slot: account_update.slot,
+                            grpc_recv_at: account_geyser_recv_at,
+                            update_class: SidefxUpdateClass::ExecHot,
+                        },
+                    );
+                }
+            }
+            DlmmBinArrayPublishOutcome::Published
+        }
+        Err(e) => {
+            inc_market_data_dlmm_bin_parse_fail_total();
+            debug!(
+                error = %e,
+                pubkey = %account_update.pubkey,
+                "Failed to parse bin array account"
+            );
+            DlmmBinArrayPublishOutcome::ParseFailed
+        }
+    }
+}
 
 /// Geyser account ingest (dedizierte worker pool, siehe MARKET-DATA-ACCOUNT-THROUGHPUT-P0).
 /// STOP-CHECK: keine neuen RPC-Calls; gleiche Logik wie zuvor im Bin.
@@ -355,90 +486,35 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
     let dlmm_program =
         Pubkey::from_str(METEORA_DLMM_PROGRAM).expect("Invalid METEORA_DLMM_PROGRAM constant");
     if account_update.owner == dlmm_program {
+        if geyser_account_data_looks_like_meteora_bin_array(
+            &account_update.owner,
+            &account_update.data,
+        ) {
+            inc_market_data_dlmm_bin_owner_update_total();
+        }
         if let Some(bin_array_info) = host.account_membership_bin_array_info(&account_update.pubkey)
         {
-            md_sidefx_try_enqueue_classed(
-                md_sidefx,
+            inc_market_data_dlmm_bin_membership_hit_total();
+            publish_meteora_dlmm_bin_array_from_geyser(
+                host,
+                run_id,
+                account_geyser_recv_at,
+                &account_update,
+                bin_array_info,
+                publish_tx,
+                Some(md_sidefx),
                 sidefx_class,
-                MdSidefxCommand::TouchBinArrayTick {
-                    pda: account_update.pubkey,
-                    update_class: sidefx_class,
-                },
-            );
-            // Parse bin array to extract liquidity distribution
-            match BinArray::parse(&account_update.data, bin_array_info.bin_step) {
-                Ok(parsed_array) => {
-                    // Convert to compact BinData (only bins with liquidity)
-                    let bins: Vec<BinData> = parsed_array
-                        .bins
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, bin)| bin.amount_x > 0 || bin.amount_y > 0)
-                        .map(|(offset, bin)| BinData {
-                            offset: offset as u8,
-                            amount_x: bin.amount_x,
-                            amount_y: bin.amount_y,
-                        })
-                        .collect();
-
-                    // Only emit if there's any liquidity
-                    if !bins.is_empty() {
-                        let bin_event = MarketEvent::new(
-                            "market-data",
-                            host.account_build_version(),
-                            run_id,
-                            host.account_next_event_id(),
-                            "geyser_bin_array",
-                            Some(account_update.slot),
-                            MarketEventKind::BinArrayUpdate {
-                                pool_address: bin_array_info.pool_address.to_string(),
-                                bin_array_index: bin_array_info.bin_array_index,
-                                bins,
-                                update_slot: account_update.slot,
-                            },
-                        );
-
-                        host.account_write_market_event_jsonl(&bin_event);
-
-                        if host.account_nats().is_some() {
-                            let seg = account_publish_segment(&bin_event.kind);
-                            account_path_enqueue_core_market_event(
-                                publish_tx,
-                                host.account_nats(),
-                                host.account_publish_host(),
-                                bin_event,
-                                Some(MarketEventCorePublishTrace {
-                                    recv_at: account_geyser_recv_at,
-                                    cold_path: false,
-                                    segment: seg,
-                                }),
-                            )
-                            .await;
-                        }
-                        if host.ingest_is_hot_pool(&bin_array_info.pool_address) {
-                            md_sidefx_try_enqueue_classed(
-                                md_sidefx,
-                                SidefxUpdateClass::ExecHot,
-                                MdSidefxCommand::DlmmPoolStatePublishSignal {
-                                    run_id: run_id.to_string(),
-                                    pool_address: bin_array_info.pool_address,
-                                    slot: account_update.slot,
-                                    grpc_recv_at: account_geyser_recv_at,
-                                    update_class: SidefxUpdateClass::ExecHot,
-                                },
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        error = %e,
-                        pubkey = %account_update.pubkey,
-                        "Failed to parse bin array account"
-                    );
-                }
-            }
+                update_class,
+                false,
+            )
+            .await;
             return;
+        }
+        if geyser_account_data_looks_like_meteora_bin_array(
+            &account_update.owner,
+            &account_update.data,
+        ) {
+            inc_market_data_dlmm_bin_membership_miss_total();
         }
     }
 
