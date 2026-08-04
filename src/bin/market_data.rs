@@ -107,10 +107,12 @@ use ironcrab::metrics::{
     inc_market_data_account_low_priority_queue_depth,
     inc_market_data_account_recv_iterations_total, inc_market_data_account_updates_total,
     inc_market_data_account_worker_queue_depth, inc_market_data_arb_admission_admitted_total,
-    inc_market_data_arb_admission_rejected_total, inc_market_data_arb_pin_deferred_cleared_total,
+    inc_market_data_arb_admission_rejected_total,
+    inc_market_data_arb_pin_deferred_cleared_by_reason_total,
+    inc_market_data_arb_pin_deferred_cleared_total,
     inc_market_data_arb_pin_deferred_still_unsatisfied_total,
     inc_market_data_arb_pin_geyser_register_deferred_total,
-    inc_market_data_arb_pin_vault_register_ok_total,
+    inc_market_data_arb_pin_vault_published_total, inc_market_data_arb_pin_vault_register_ok_total,
     inc_market_data_balance_updated_from_cache_total,
     inc_market_data_dlmm_bin_early_drop_stashed_total, inc_market_data_dlmm_bin_register_ok_total,
     inc_market_data_exec_hot_hard_shed_steps_for_tier_reason,
@@ -1325,8 +1327,8 @@ struct MarketDataContext {
     dlmm_registered_active_id: parking_lot::RwLock<HashMap<Pubkey, i32>>,
     /// C1e: bin-array Geyser payloads stashed on early-drop before membership registration.
     dlmm_bin_geyser_stash: parking_lot::RwLock<HashMap<Pubkey, StashedDlmmBinGeyserUpdate>>,
-    /// Scope C: hot pools awaiting LivePoolCache layout for vault/bin Geyser registration.
-    deferred_hot_pool_reserve_pins: parking_lot::RwLock<HashMap<Pubkey, GeyserPinReason>>,
+    /// Scope C / C1vault: hot pools awaiting LivePoolCache layout or admit for vault/bin Geyser registration.
+    deferred_hot_pool_reserve_pins: parking_lot::RwLock<HashMap<Pubkey, DeferredHotPoolReserve>>,
     /// Open-position PumpFun pools with unsatisfied bonding-curve Geyser registration (observability).
     open_position_pumpfun_registration_unsatisfied_since:
         parking_lot::RwLock<HashMap<Pubkey, Instant>>,
@@ -1338,6 +1340,13 @@ struct MarketDataContext {
     geyser_explicit_config_error: parking_lot::RwLock<Option<String>>,
     /// Resume cursor for budgeted prune across `ContinueGeyserEvict` slices.
     geyser_prune_resume: parking_lot::Mutex<GeyserPruneResume>,
+}
+
+/// Deferred Geyser reserve registration for a hot pool (pin tier + original defer reason).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeferredHotPoolReserve {
+    pin: GeyserPinReason,
+    reason: &'static str,
 }
 
 /// Max removals per budget slice when pruning tracked maps to admitted set.
@@ -4583,11 +4592,21 @@ impl MarketDataContext {
             && !self.hot_pool_registry.pool_has_momentum(pool)
     }
 
-    /// JetStream refresh from MASTER cache for momentum-hot pools (cache-first, no RPC).
-    fn publish_momentum_hot_balance_refresh_from_cache(&self, pool: Pubkey) {
-        if self.hot_pool_registry.pool_has_momentum(pool) {
-            self.try_publish_balance_updated_from_cache(pool);
+    /// JetStream refresh from MASTER cache for momentum-hot / arb-pinned pools (cache-first, no RPC).
+    fn publish_hot_pool_balance_refresh_from_cache(&self, pool: Pubkey) {
+        let is_momentum = self.hot_pool_registry.pool_has_momentum(pool);
+        let is_arb = self.hot_pool_registry.pool_has_arb(pool);
+        if !is_momentum && !is_arb {
+            return;
         }
+        // Arb-only: force cache seed so SLAVE vault_balances populate before first Geyser vault tick.
+        let force_arb_seed = is_arb && !is_momentum;
+        self.try_publish_balance_updated_from_cache(pool, force_arb_seed);
+    }
+
+    /// Back-compat alias for momentum-only call sites.
+    fn publish_momentum_hot_balance_refresh_from_cache(&self, pool: Pubkey) {
+        self.publish_hot_pool_balance_refresh_from_cache(pool);
     }
 
     /// Periodic heartbeat for momentum-hot pins: sustain SLAVE `LivePoolCache` age during WaitHotSet.
@@ -4601,7 +4620,7 @@ impl MarketDataContext {
         }
         for pool in self.hot_pool_registry.snapshot_hot_pool_pubkeys() {
             if self.hot_pool_registry.pool_has_momentum(pool) {
-                self.try_publish_balance_updated_from_cache(pool);
+                self.try_publish_balance_updated_from_cache(pool, false);
             }
         }
         let batch_dirty = self.remediate_open_position_pumpfun_registration(admission);
@@ -4623,6 +4642,7 @@ impl MarketDataContext {
                 self.note_deferred_hot_pool_reserve_registration(
                     pool,
                     GeyserPinReason::MomentumActive,
+                    "live_pool_cache_miss",
                 );
                 inc_market_data_open_position_pumpfun_remediate_still_unsatisfied_total();
                 continue;
@@ -4642,6 +4662,7 @@ impl MarketDataContext {
                 self.note_deferred_hot_pool_reserve_registration(
                     pool,
                     GeyserPinReason::MomentumActive,
+                    "live_pool_cache_miss",
                 );
                 inc_market_data_open_position_pumpfun_remediate_admit_fail_total();
                 continue;
@@ -4666,6 +4687,7 @@ impl MarketDataContext {
                 self.note_deferred_hot_pool_reserve_registration(
                     pool,
                     GeyserPinReason::MomentumActive,
+                    "live_pool_cache_miss",
                 );
                 inc_market_data_open_position_pumpfun_remediate_still_unsatisfied_total();
             }
@@ -4742,7 +4764,7 @@ impl MarketDataContext {
                 .iter()
                 .any(|pk| !prev_synced.contains(pk) && synced.contains(pk));
             if newly_live {
-                self.try_publish_balance_updated_from_cache(pool);
+                self.try_publish_balance_updated_from_cache(pool, false);
             }
         }
     }
@@ -4888,8 +4910,8 @@ impl MarketDataContext {
     }
 
     /// Cache-first JetStream BalanceUpdated for pools with fresh reserve basis (no vault Geyser sub required).
-    fn try_publish_balance_updated_from_cache(&self, pool: Pubkey) {
-        if self.balance_updated_from_cache_skipped_for_live_feed(pool) {
+    fn try_publish_balance_updated_from_cache(&self, pool: Pubkey, force_arb_seed: bool) {
+        if !force_arb_seed && self.balance_updated_from_cache_skipped_for_live_feed(pool) {
             return;
         }
         let Some(state) = self.live_pool_cache.get(&pool) else {
@@ -4973,16 +4995,22 @@ impl MarketDataContext {
         };
         if let Some(handle) = self.ingest_tokio_handle.read().clone() {
             inc_market_data_balance_updated_from_cache_total();
+            if force_arb_seed && self.hot_pool_registry.pool_has_arb(pool) {
+                inc_market_data_arb_pin_vault_published_total();
+            }
             handle.spawn(publish);
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             inc_market_data_balance_updated_from_cache_total();
+            if force_arb_seed && self.hot_pool_registry.pool_has_arb(pool) {
+                inc_market_data_arb_pin_vault_published_total();
+            }
             handle.spawn(publish);
         }
     }
 
     /// PR-B: after a parsed swap trade — cache-first BalanceUpdated; vault/bin registration only for hot pools.
     fn register_geyser_reserves_after_trade(&self, pool: Pubkey) -> bool {
-        self.try_publish_balance_updated_from_cache(pool);
+        self.try_publish_balance_updated_from_cache(pool, false);
         if !self.hot_pool_registry.pool_has_momentum(pool) {
             return false;
         }
@@ -5160,7 +5188,7 @@ impl MarketDataContext {
     /// PR169a: register vault ATAs from MASTER cache after account-path pool upsert (hot pools only).
     #[cfg_attr(not(test), allow(dead_code))]
     fn register_pool_vaults_from_account(&self, pool: Pubkey) -> bool {
-        self.try_publish_balance_updated_from_cache(pool);
+        self.try_publish_balance_updated_from_cache(pool, false);
         if !self.hot_pool_registry.is_hot_pool(pool) {
             return false;
         }
@@ -5374,20 +5402,26 @@ impl MarketDataContext {
     }
 
     fn clear_arb_pin_deferred_with_metric(&self, pool: Pubkey) {
-        if let Some(pin) = self.deferred_hot_pool_reserve_pins.write().remove(&pool) {
-            if pin == GeyserPinReason::ArbMultiDex {
+        if let Some(entry) = self.deferred_hot_pool_reserve_pins.write().remove(&pool) {
+            if entry.pin == GeyserPinReason::ArbMultiDex {
                 inc_market_data_arb_pin_deferred_cleared_total();
+                inc_market_data_arb_pin_deferred_cleared_by_reason_total(entry.reason);
             }
         }
     }
 
-    fn note_deferred_hot_pool_reserve_registration(&self, pool: Pubkey, pin: GeyserPinReason) {
+    fn note_deferred_hot_pool_reserve_registration(
+        &self,
+        pool: Pubkey,
+        pin: GeyserPinReason,
+        reason: &'static str,
+    ) {
         if !self.hot_pool_registry.is_hot_pool(pool) {
             return;
         }
         self.deferred_hot_pool_reserve_pins
             .write()
-            .insert(pool, pin);
+            .insert(pool, DeferredHotPoolReserve { pin, reason });
     }
 
     fn clear_deferred_hot_pool_reserve_registration(&self, pool: Pubkey) {
@@ -5419,19 +5453,29 @@ impl MarketDataContext {
             inc_market_data_arb_pin_vault_register_ok_total();
             self.clear_arb_pin_deferred_with_metric(pool);
             self.refresh_arb_tracked_vaults_gauge();
+            self.publish_hot_pool_balance_refresh_from_cache(pool);
             return;
         }
         if self.live_pool_cache.get(&pool).is_none() {
-            self.note_deferred_hot_pool_reserve_registration(pool, GeyserPinReason::ArbMultiDex);
+            self.note_deferred_hot_pool_reserve_registration(
+                pool,
+                GeyserPinReason::ArbMultiDex,
+                "live_pool_cache_miss",
+            );
             self.log_arb_pin_deferred_throttled(pool, "live_pool_cache_miss");
             return;
         }
         if self.hot_pool_reserve_registration_satisfied(pool) {
             self.clear_arb_pin_deferred_with_metric(pool);
             self.refresh_arb_tracked_vaults_gauge();
+            self.publish_hot_pool_balance_refresh_from_cache(pool);
             return;
         }
-        self.note_deferred_hot_pool_reserve_registration(pool, GeyserPinReason::ArbMultiDex);
+        self.note_deferred_hot_pool_reserve_registration(
+            pool,
+            GeyserPinReason::ArbMultiDex,
+            "vault_register_no_change",
+        );
         self.log_arb_pin_deferred_throttled(pool, "vault_register_no_change");
     }
 
@@ -5440,19 +5484,27 @@ impl MarketDataContext {
         &self,
         admission: &mut FixedCapAdmission,
     ) -> bool {
-        let pending: Vec<(Pubkey, GeyserPinReason)> = self
+        let pending: Vec<(Pubkey, DeferredHotPoolReserve)> = self
             .deferred_hot_pool_reserve_pins
             .read()
             .iter()
-            .map(|(pool, pin)| (*pool, *pin))
+            .map(|(pool, entry)| (*pool, *entry))
             .collect();
         if pending.is_empty() {
             return false;
         }
         let mut batch_dirty = false;
-        for (pool, pin) in pending {
+        for (pool, entry) in pending {
+            let pin = entry.pin;
             if !self.hot_pool_registry.is_hot_pool(pool) {
                 self.clear_deferred_hot_pool_reserve_registration(pool);
+                continue;
+            }
+            if pin == GeyserPinReason::ArbMultiDex
+                && market_data_exec_hot_arb_admit_suppress()
+                && !self.arb_pool_is_must_hot(pool)
+            {
+                inc_market_data_arb_pin_deferred_still_unsatisfied_total("admit_suppress");
                 continue;
             }
             if self.live_pool_cache.get(&pool).is_none() {
@@ -5487,7 +5539,7 @@ impl MarketDataContext {
                 if self.hot_pool_registry.is_position_pin_for_pool(pool) {
                     inc_market_data_open_position_pin_applied_total();
                 }
-                self.publish_momentum_hot_balance_refresh_from_cache(pool);
+                self.publish_hot_pool_balance_refresh_from_cache(pool);
                 if changed {
                     batch_dirty = true;
                 }
@@ -5523,7 +5575,7 @@ impl MarketDataContext {
             ironcrab::metrics::inc_market_data_momentum_pin_vault_register_total(
                 ironcrab::metrics::MomentumPinVaultRegisterResult::CacheMiss,
             );
-            self.note_deferred_hot_pool_reserve_registration(pool, pin);
+            self.note_deferred_hot_pool_reserve_registration(pool, pin, "live_pool_cache_miss");
             if is_position {
                 inc_market_data_open_position_pin_deferred_cache_miss_total();
             }
@@ -5540,7 +5592,7 @@ impl MarketDataContext {
         ironcrab::metrics::inc_market_data_momentum_pin_vault_register_total(
             ironcrab::metrics::MomentumPinVaultRegisterResult::Deferred,
         );
-        self.note_deferred_hot_pool_reserve_registration(pool, pin);
+        self.note_deferred_hot_pool_reserve_registration(pool, pin, "vault_register_no_change");
     }
 
     fn register_meteora_dlmm_bin_arrays(
@@ -6025,6 +6077,7 @@ impl MarketDataContext {
         }
         batch_dirty |= self.apply_arb_removed_entries(admission, &update.removed);
         batch_dirty |= self.apply_arb_active_entries(admission, &update.active);
+        batch_dirty |= self.retry_deferred_hot_pool_reserve_registrations(admission);
         if !batch_dirty {
             self.refresh_geyser_pins_gauge();
         }
@@ -6103,6 +6156,7 @@ impl MarketDataContext {
                 self.note_deferred_hot_pool_reserve_registration(
                     pool_pk,
                     GeyserPinReason::ArbMultiDex,
+                    "admit_suppress",
                 );
                 self.log_arb_pin_deferred_throttled(pool_pk, "admit_suppress");
                 self.sync_explicit_pool_admitted_from_admission(
@@ -9035,6 +9089,7 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
         let mut lag_alarm = false;
         let mut lag_clear_ticks = 0u32;
         let mut last_enqueued_tier: Option<ExecHotShedTier> = None;
+        let mut prev_arb_admit_suppress = market_data_exec_hot_arb_admit_suppress();
         let mut interval = tokio::time::interval(EXEC_HOT_SHED_CONTROLLER_INTERVAL);
         loop {
             interval.tick().await;
@@ -9139,6 +9194,13 @@ fn spawn_exec_hot_pressure_shed_controller(track_worker: TrackWorkerSender) {
                 momentum_admit_suppress,
                 arb_admit_suppress,
             );
+            if prev_arb_admit_suppress && !arb_admit_suppress {
+                let _ = track_worker_try_enqueue(
+                    &track_worker,
+                    TrackWorkerCommand::RetryDeferredHotPoolReserves,
+                );
+            }
+            prev_arb_admit_suppress = arb_admit_suppress;
 
             if soft_shed {
                 soft_shed_samples = soft_shed_samples.saturating_add(1);
@@ -13691,7 +13753,7 @@ mod pr_b_geyser_tracking_tests {
         ctx.hot_pool_registry.pin_pool(mint, pool);
 
         let counter_before = MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed);
-        ctx.try_publish_balance_updated_from_cache(pool);
+        ctx.try_publish_balance_updated_from_cache(pool, false);
         assert_eq!(
             MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed),
             counter_before,
@@ -15064,9 +15126,13 @@ mod pr_b_geyser_tracking_tests {
         }
         assert!(ctx.pool_vaults_fully_tracked_for_cache(pool, &state));
 
-        ctx.deferred_hot_pool_reserve_pins
-            .write()
-            .insert(pool, GeyserPinReason::MomentumActive);
+        ctx.deferred_hot_pool_reserve_pins.write().insert(
+            pool,
+            DeferredHotPoolReserve {
+                pin: GeyserPinReason::MomentumActive,
+                reason: "vault_register_no_change",
+            },
+        );
 
         let mut admission = test_admission_for(&ctx);
         ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission);
@@ -15397,9 +15463,13 @@ mod pr_b_geyser_tracking_tests {
             );
         }
         assert!(ctx.pool_vaults_fully_tracked_for_cache(pool, &state));
-        ctx.deferred_hot_pool_reserve_pins
-            .write()
-            .insert(pool, GeyserPinReason::MomentumActive);
+        ctx.deferred_hot_pool_reserve_pins.write().insert(
+            pool,
+            DeferredHotPoolReserve {
+                pin: GeyserPinReason::MomentumActive,
+                reason: "vault_register_no_change",
+            },
+        );
 
         let mut admission = FixedCapAdmission::new(0);
         ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission);
@@ -17158,7 +17228,7 @@ mod pr_b_geyser_tracking_tests {
         );
 
         let counter_before = MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed);
-        ctx.try_publish_balance_updated_from_cache(pool);
+        ctx.try_publish_balance_updated_from_cache(pool, false);
         assert_eq!(
             MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed),
             counter_before,
@@ -17336,7 +17406,7 @@ mod pr_b_geyser_tracking_tests {
             !ctx.balance_updated_from_cache_skipped_for_live_feed(pool),
             "register success must not be blocked by live curve feed"
         );
-        ctx.try_publish_balance_updated_from_cache(pool);
+        ctx.try_publish_balance_updated_from_cache(pool, false);
         assert_eq!(
             MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed),
             counter_before,
@@ -17385,7 +17455,7 @@ mod pr_b_geyser_tracking_tests {
             !ctx.balance_updated_from_cache_skipped_for_live_feed(pool),
             "already-satisfied pin must still allow JetStream refresh"
         );
-        ctx.try_publish_balance_updated_from_cache(pool);
+        ctx.try_publish_balance_updated_from_cache(pool, false);
         assert_eq!(
             MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed),
             counter_before,
@@ -21585,5 +21655,154 @@ mod pr_b_geyser_tracking_tests {
             Instant::now()
         ));
         assert!(ctx.tracked_membership.load().bin_arrays.contains(&bin_pda));
+    }
+
+    /// C1vault: arb apply must retry deferred pins (parity with momentum apply).
+    #[test]
+    fn scope_c1vault_arb_apply_retries_deferred_on_cache_fill() {
+        use ironcrab::metrics::{
+            set_market_data_exec_hot_admit_suppress, MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_TOTAL,
+            MARKET_DATA_ARB_TRACKED_VAULTS_GAUGE,
+        };
+        use ironcrab::nats::{
+            ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackReadiness, ArbTrackRequestsUpdate,
+        };
+        use std::sync::atomic::Ordering;
+
+        set_market_data_exec_hot_admit_suppress(false, false, true);
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+
+        let mut admission = test_admission_for(&ctx);
+        ctx.apply_arb_track_requests_update(
+            &mut admission,
+            &ArbTrackRequestsUpdate {
+                version: 1,
+                ts_unix_ms: 1,
+                active: vec![ArbTrackActiveEntry {
+                    pool: pool.to_string(),
+                    reason: ArbTrackActiveReason::TradeSignal,
+                    readiness: ArbTrackReadiness::Warmable,
+                }],
+                removed: vec![],
+                reconcile: false,
+            },
+        );
+        set_market_data_exec_hot_admit_suppress(false, false, false);
+        assert!(ctx
+            .deferred_hot_pool_reserve_pins
+            .read()
+            .contains_key(&pool));
+
+        let cleared_before = MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_TOTAL.load(Ordering::Relaxed);
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_mint,
+                token_1_mint: quote,
+                token_0_vault: coin_vault,
+                token_1_vault: pc_vault,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            2,
+        );
+        ctx.apply_arb_track_requests_update(
+            &mut admission,
+            &ArbTrackRequestsUpdate {
+                version: 2,
+                ts_unix_ms: 2,
+                active: vec![ArbTrackActiveEntry {
+                    pool: pool.to_string(),
+                    reason: ArbTrackActiveReason::TradeSignal,
+                    readiness: ArbTrackReadiness::Warmable,
+                }],
+                removed: vec![],
+                reconcile: false,
+            },
+        );
+
+        assert!(!ctx
+            .deferred_hot_pool_reserve_pins
+            .read()
+            .contains_key(&pool));
+        assert!(
+            MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_TOTAL.load(Ordering::Relaxed) > cleared_before
+        );
+        assert!(
+            MARKET_DATA_ARB_TRACKED_VAULTS_GAUGE.load(Ordering::Relaxed) >= 2,
+            "arb vault rows must be tracked after retry"
+        );
+    }
+
+    /// C1vault: retry while admit suppress active must not try admit for warmable (still_unsatisfied).
+    #[test]
+    fn scope_c1vault_admit_suppress_retry_counts_still_unsatisfied() {
+        use ironcrab::metrics::{
+            set_market_data_exec_hot_admit_suppress,
+            MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_ADMIT_SUPPRESS,
+        };
+        use ironcrab::nats::{
+            ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackReadiness, ArbTrackRequestsUpdate,
+        };
+        use std::sync::atomic::Ordering;
+
+        set_market_data_exec_hot_admit_suppress(false, false, true);
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let mut admission = test_admission_for(&ctx);
+        ctx.apply_arb_track_requests_update(
+            &mut admission,
+            &ArbTrackRequestsUpdate {
+                version: 1,
+                ts_unix_ms: 1,
+                active: vec![ArbTrackActiveEntry {
+                    pool: pool.to_string(),
+                    reason: ArbTrackActiveReason::TradeSignal,
+                    readiness: ArbTrackReadiness::Warmable,
+                }],
+                removed: vec![],
+                reconcile: false,
+            },
+        );
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_mint,
+                token_1_mint: quote,
+                token_0_vault: Pubkey::new_unique(),
+                token_1_vault: Pubkey::new_unique(),
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        assert!(ctx
+            .deferred_hot_pool_reserve_pins
+            .read()
+            .contains_key(&pool));
+        set_market_data_exec_hot_admit_suppress(false, false, true);
+        let before =
+            MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_ADMIT_SUPPRESS.load(Ordering::Relaxed);
+        ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission);
+        assert!(
+            MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_ADMIT_SUPPRESS.load(Ordering::Relaxed)
+                > before
+        );
+        set_market_data_exec_hot_admit_suppress(false, false, false);
     }
 }

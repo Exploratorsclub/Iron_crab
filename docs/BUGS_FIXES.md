@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ARB-C1vault: Arb Pin Vault Completeness — Publish + Retry + Consume (post-C1g)
+**Datum**: 2026-08-04  
+**Problem**: Post-#363/C1g: `sell_missing_vault` ~67% sell-fails trotz `arb_tracked_vaults`~310. Root causes: (1) Arb apply ohne `retry_deferred` (Momentum hatte es). (2) Kein cache-first JetStream-Seed für arb-only nach Register (`publish_momentum_*` Mom-only). (3) Arb Consume-Gap: kein LivePoolCache-Vault-Seed beim v2-Screen und kein Rescreen auf `PoolStateUpdate`.  
+**Fix**: (1) Arb apply + track-worker retry deferred; admit_suppress retry gate + suppress-lift trigger. (2) `publish_hot_pool_balance_refresh_from_cache` Mom+Arb mit force-seed. (3) `try_seed_vault_from_live_cache` + vault rescreen. Forensik: deferred cleared by reason, `arb_pin_vault_published_total`, `arb_vault_*`. **Invarianten**: I-4/I-7 kein RPC.  
+**Evidence**: `findings_arb_zero_opp_post363_20260804.md`, Prod Tip `586a683`.  
+**Dateien**: `src/bin/market_data.rs`, `src/market_data/track/worker.rs`, `src/bin/arb_strategy.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-ARB-C1g: DLMM Quote Completeness — Active Bin Touch + Window Refresh
 **Datum**: 2026-08-04  
 **Problem**: Post-C1f: `sell_quote_none` / `dlmm_active_bin_missing` dominant (~3k+); `sell_missing_vault` ~1.6–2k. MD publish filtert Bins mit `amount_x/y == 0` — Zero-Liquidity Active-Bin erscheint nie im `BinArrayUpdate` → `active_bin_present` false trotz bin cache hit. Bin-Fenster-Drift: Refresh nur bei `prev_id != active_id`, nicht bei untracked arrays; Deferred-Retry erst auf activity tick nach LivePoolCache-Fill.  
