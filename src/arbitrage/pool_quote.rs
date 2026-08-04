@@ -2415,6 +2415,63 @@ mod tests {
     }
 
     #[test]
+    fn dlmm_sell_quote_with_zero_liquidity_active_bin_uses_adjacent_bins() {
+        let active_id = 5i32;
+        let bin_step = 100u16;
+        let token_amount = 1_000_000_000u64;
+        let sol_amount = 500_000_000u64;
+        let array_index = 0i64;
+        let mut bins: DlmmBinArrays = HashMap::new();
+        bins.insert(
+            array_index,
+            vec![
+                BinData {
+                    offset: active_id as u8,
+                    amount_x: 0,
+                    amount_y: 0,
+                },
+                BinData {
+                    offset: 4,
+                    amount_x: token_amount,
+                    amount_y: sol_amount,
+                },
+            ],
+        );
+        let pool = sample_pool("meteora_dlmm", "dlmm");
+        let vault = QuoteVaultInput {
+            reserve_base: token_amount,
+            reserve_quote: sol_amount,
+            update_slot: 1,
+            updated_at: Instant::now(),
+            active_id: Some(active_id),
+            bin_step: Some(bin_step),
+            dlmm_sol_is_x: false,
+            dlmm_token_x_mint: Some(pool.token_mint.clone()),
+        };
+        let failure = classify_cross_dex_sell_failure(
+            &RoundTripPoolCandidate {
+                pool: &pool,
+                vault: Some(&vault),
+                dlmm_bins: Some(&bins),
+                dex: "meteora_dlmm",
+            },
+            1_000_000,
+            &QuoteFreshnessConfig::default(),
+            Instant::now(),
+            6,
+        );
+        assert!(
+            failure.is_none()
+                || failure
+                    != Some(CrossDexSellFailure::QuoteNone(
+                        SellQuoteNoneDetailReason::DlmmActiveBinMissing
+                    )),
+            "zero-liquidity active bin present must not yield DlmmActiveBinMissing: {:?}",
+            failure
+        );
+    }
+
+    #[test]
     fn dlmm_sell_large_token_amount_succeeds_without_marginal_probe_gate() {
         let active_id = 0i32;
         let bin_step = 100u16;

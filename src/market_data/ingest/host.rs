@@ -50,4 +50,10 @@ pub trait IngestHost: Send + Sync {
     fn ingest_record_vault_high_priority_dispatch(&self);
 
     fn ingest_record_enrichment_relevance_hit(&self);
+
+    /// Cached Meteora DLMM `active_id` for publish shaping (Geyser-only; no RPC).
+    fn ingest_pool_dlmm_active_id(&self, pool: &Pubkey) -> Option<i32> {
+        let _ = pool;
+        None
+    }
 }
