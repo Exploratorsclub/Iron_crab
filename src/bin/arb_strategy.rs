@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use ironcrab::arbitrage::{
     arb_track_removal_reason, classify_cross_dex_sell_failure, dlmm_marginal_price_plausible,
-    dlmm_sol_output_from_bins, dlmm_token_output_from_bins, is_quote_fresh,
+    dlmm_sol_output_from_bins, dlmm_token_output_from_bins, freshness_age_bucket, is_quote_fresh,
     populate_arb_slave_from_live_pool_cache, quote_exact_in, quote_exact_in_with_freshness,
     quote_sell_round_trip, quotes_pairable, round_trip_profit_lamports, select_arb_track_pools,
     select_round_trip_pools, sync_arb_slave_from_pool_cache_update, MultiHopArbitrage,
@@ -71,20 +71,22 @@ use ironcrab::metrics::{
     arb_two_hop_opportunity_inc, arb_two_hop_pool_gate_add, arb_two_hop_reject_subreason_inc,
     arb_two_hop_rejected_inc, arb_two_hop_tracker_seeded_pools_add,
     arb_two_hop_v2_incompatible_kind_inc, arb_two_hop_v2_insufficient_subreason_inc,
-    arb_two_hop_v2_no_cross_dex_sell_detail_inc, arb_two_hop_v2_rejected_inc,
-    arb_two_hop_v2_round_trip_formable_inc, arb_two_hop_v2_screen_inc,
+    arb_two_hop_v2_no_cross_dex_sell_detail_inc, arb_two_hop_v2_no_fresh_buy_quote_detail_inc,
+    arb_two_hop_v2_rejected_inc, arb_two_hop_v2_round_trip_formable_inc, arb_two_hop_v2_screen_inc,
     arb_two_hop_v2_screen_multi_dex_inc, arb_two_hop_v2_screen_skipped_inc,
-    arb_two_hop_v2_sell_quote_none_detail_inc, inc_arb_dlmm_bin_array_update_applied_total,
-    inc_arb_dlmm_bin_array_update_received_total, inc_arb_dlmm_bin_rescreen_scheduled_total,
-    inc_arb_pinned_meteora_pool_bin_cache_miss_total, inc_arb_v2_screen_meteora_sell_bin_hit_total,
-    inc_arb_v2_screen_meteora_sell_bin_miss_total, inc_arb_vault_balance_applied_total,
-    inc_arb_vault_live_snapshot_refreshed_total, inc_arb_vault_live_snapshot_seeded_total,
-    inc_arb_vault_rescreen_scheduled_total, record_arb_heartbeat_phase,
-    record_arb_price_freshness_stale_age_ms, record_arb_proactive_pin_first_publish,
-    record_arb_proactive_track_publish_total, record_arb_quote_pair_slot_delta,
-    record_arb_quote_shadow_round_trip, record_arb_track_publish_skipped_unchanged_total,
-    record_arb_track_removed_total, record_arb_track_requests_messages_total,
-    record_arb_track_requests_publish_chunks_total, record_arb_track_requests_publish_failed_total,
+    arb_two_hop_v2_sell_not_fresh_detail_inc, arb_two_hop_v2_sell_quote_none_detail_inc,
+    arb_two_hop_v2_state_stale_age_bucket_inc, arb_vault_live_snapshot_cache_age_bucket_inc,
+    inc_arb_dlmm_bin_array_update_applied_total, inc_arb_dlmm_bin_array_update_received_total,
+    inc_arb_dlmm_bin_rescreen_scheduled_total, inc_arb_pinned_meteora_pool_bin_cache_miss_total,
+    inc_arb_v2_screen_meteora_sell_bin_hit_total, inc_arb_v2_screen_meteora_sell_bin_miss_total,
+    inc_arb_vault_balance_applied_total, inc_arb_vault_live_snapshot_refreshed_total,
+    inc_arb_vault_live_snapshot_seeded_total, inc_arb_vault_rescreen_scheduled_total,
+    record_arb_heartbeat_phase, record_arb_price_freshness_stale_age_ms,
+    record_arb_proactive_pin_first_publish, record_arb_proactive_track_publish_total,
+    record_arb_quote_pair_slot_delta, record_arb_quote_shadow_round_trip,
+    record_arb_track_publish_skipped_unchanged_total, record_arb_track_removed_total,
+    record_arb_track_requests_messages_total, record_arb_track_requests_publish_chunks_total,
+    record_arb_track_requests_publish_failed_total,
     record_arb_track_selection_blocking_join_failed_total,
     record_arb_track_selection_queue_overflow_total, record_arb_track_selection_recompute_total,
     record_arb_writer_lock_wait, serve_metrics, set_arb_pool_cache_apply_batch_size_gauge,
@@ -455,6 +457,7 @@ fn try_seed_vault_from_live_cache(
     let Some(vault) = vault_balance_from_live_cache_state(&state, slot, age_ms) else {
         return false;
     };
+    record_live_cache_age_at_snapshot("seed", age_ms);
     vault_cache.insert(pool_address.to_string(), vault);
     true
 }
@@ -481,6 +484,7 @@ fn try_refresh_vault_from_live_cache(
     if !live_pool_cache_fresher_than_vault(slot, new_vault.updated_at, existing) {
         return false;
     }
+    record_live_cache_age_at_snapshot("refresh", age_ms);
     vault_cache.insert(pool_address.to_string(), new_vault);
     true
 }
@@ -2382,10 +2386,18 @@ fn v2_sell_quote_none_detail_to_metric(
     }
 }
 
+fn record_live_cache_age_at_snapshot(op: &str, age_ms: u64) {
+    let bucket = freshness_age_bucket(age_ms).as_metric_label();
+    arb_vault_live_snapshot_cache_age_bucket_inc(op, bucket);
+}
+
 fn record_v2_insufficient_subreason(insufficient: &RoundTripInsufficient) {
     arb_two_hop_v2_insufficient_subreason_inc(v2_insufficient_subreason_to_metric(
         insufficient.subreason,
     ));
+    if let Some(detail) = insufficient.no_fresh_buy_quote_detail {
+        arb_two_hop_v2_no_fresh_buy_quote_detail_inc(detail.as_metric_label());
+    }
     if let Some(detail) = insufficient.no_cross_dex_sell_detail {
         arb_two_hop_v2_no_cross_dex_sell_detail_inc(v2_no_cross_dex_sell_detail_to_metric(detail));
     }
@@ -2394,6 +2406,23 @@ fn record_v2_insufficient_subreason(insufficient: &RoundTripInsufficient) {
             let metric = v2_sell_quote_none_detail_to_metric(*reason);
             for _ in 0..*count {
                 arb_two_hop_v2_sell_quote_none_detail_inc(metric);
+            }
+        }
+    }
+    if let Some(counts) = &insufficient.sell_not_fresh_detail_counts {
+        for (diagnosis, count) in counts {
+            for _ in 0..*count {
+                arb_two_hop_v2_sell_not_fresh_detail_inc(
+                    diagnosis.kind.as_metric_label(),
+                    diagnosis.cause.as_metric_label(),
+                );
+            }
+        }
+    }
+    if let Some(counts) = &insufficient.state_stale_age_bucket_counts {
+        for (bucket, count) in counts {
+            for _ in 0..*count {
+                arb_two_hop_v2_state_stale_age_bucket_inc(bucket.as_metric_label());
             }
         }
     }
@@ -12598,6 +12627,9 @@ mod two_hop_price_tests {
             subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
             no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellMissingVault),
             sell_quote_none_detail_counts: None,
+            sell_not_fresh_detail_counts: None,
+            no_fresh_buy_quote_detail: None,
+            state_stale_age_bucket_counts: None,
         };
         assert_eq!(
             v2_insufficient_log_category(&cross_dex),

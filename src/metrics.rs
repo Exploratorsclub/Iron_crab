@@ -4873,6 +4873,45 @@ pub static ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| 
 /// v2 screen refreshed stale vault_balances from fresher SLAVE LivePoolCache (C1h).
 pub static ARB_VAULT_LIVE_SNAPSHOT_REFRESHED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+
+// --- C1h2: Freshness root-cause forensics ---
+pub static ARB_TWO_HOP_V2_SELL_NOT_FRESH_DETAIL_EM_AGE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_SELL_NOT_FRESH_DETAIL_EM_FP: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_SELL_NOT_FRESH_DETAIL_LTM_AGE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_STATE_STALE_AGE_LE_30S: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_STATE_STALE_AGE_LE_120S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_STATE_STALE_AGE_LE_300S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_STATE_STALE_AGE_GT_300S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_SEED_LE_30S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_SEED_LE_120S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_SEED_LE_300S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_SEED_GT_300S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_REFRESH_LE_30S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_REFRESH_LE_120S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_REFRESH_LE_300S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_REFRESH_GT_300S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_QUOTE_NONE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_STATE_STALE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_TRADE_STALE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_NOT_FRESH_AFTER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// PoolStateUpdate scheduled off-hot-loop rescreen for selected mints (C1vault).
 pub static ARB_VAULT_RESCREEN_SCHEDULED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_V2_SCREEN_METEORA_SELL_BIN_HIT_TOTAL: Lazy<AtomicU64> =
@@ -5422,6 +5461,59 @@ pub fn inc_arb_vault_live_snapshot_seeded_total() {
 /// Increment `arb_vault_live_snapshot_refreshed_total`.
 pub fn inc_arb_vault_live_snapshot_refreshed_total() {
     ARB_VAULT_LIVE_SNAPSHOT_REFRESHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// C1h2: `arb_two_hop_v2_sell_not_fresh_detail_total{kind,cause}`.
+pub fn arb_two_hop_v2_sell_not_fresh_detail_inc(kind: &str, cause: &str) {
+    let counter = match (kind, cause) {
+        ("executable_marginal", "age_exceeded") => &*ARB_TWO_HOP_V2_SELL_NOT_FRESH_DETAIL_EM_AGE,
+        ("executable_marginal", "fingerprint_mismatch") => {
+            &*ARB_TWO_HOP_V2_SELL_NOT_FRESH_DETAIL_EM_FP
+        }
+        ("last_trade_mid", "age_exceeded") => &*ARB_TWO_HOP_V2_SELL_NOT_FRESH_DETAIL_LTM_AGE,
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// C1h2: `arb_two_hop_v2_state_stale_age_bucket_total{bucket}`.
+pub fn arb_two_hop_v2_state_stale_age_bucket_inc(bucket: &str) {
+    let counter = match bucket {
+        "le_30s" => &*ARB_TWO_HOP_V2_STATE_STALE_AGE_LE_30S,
+        "le_120s" => &*ARB_TWO_HOP_V2_STATE_STALE_AGE_LE_120S,
+        "le_300s" => &*ARB_TWO_HOP_V2_STATE_STALE_AGE_LE_300S,
+        "gt_300s" => &*ARB_TWO_HOP_V2_STATE_STALE_AGE_GT_300S,
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// C1h2: `arb_vault_live_snapshot_cache_age_bucket_total{op,bucket}`.
+pub fn arb_vault_live_snapshot_cache_age_bucket_inc(op: &str, bucket: &str) {
+    let counter = match (op, bucket) {
+        ("seed", "le_30s") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_SEED_LE_30S,
+        ("seed", "le_120s") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_SEED_LE_120S,
+        ("seed", "le_300s") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_SEED_LE_300S,
+        ("seed", "gt_300s") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_SEED_GT_300S,
+        ("refresh", "le_30s") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_REFRESH_LE_30S,
+        ("refresh", "le_120s") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_REFRESH_LE_120S,
+        ("refresh", "le_300s") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_REFRESH_LE_300S,
+        ("refresh", "gt_300s") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_REFRESH_GT_300S,
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// C1h2: `arb_two_hop_v2_no_fresh_buy_quote_detail_total{reason}`.
+pub fn arb_two_hop_v2_no_fresh_buy_quote_detail_inc(reason: &str) {
+    let counter = match reason {
+        "quote_none" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_QUOTE_NONE,
+        "state_stale" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_STATE_STALE,
+        "trade_stale" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_TRADE_STALE,
+        "not_fresh_after_quote" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_NOT_FRESH_AFTER,
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Increment `arb_vault_rescreen_scheduled_total`.
@@ -6471,6 +6563,120 @@ fn append_arb_two_hop_v2_no_cross_dex_sell_detail_total(out: &mut String) {
             .to_string(),
     );
     out.push('\n');
+}
+
+fn append_arb_c1h2_freshness_forensics_total(out: &mut String) {
+    out.push_str(
+        "arb_two_hop_v2_sell_not_fresh_detail_total{kind=\"executable_marginal\",cause=\"age_exceeded\"} ",
+    );
+    out.push_str(
+        &ARB_TWO_HOP_V2_SELL_NOT_FRESH_DETAIL_EM_AGE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        "arb_two_hop_v2_sell_not_fresh_detail_total{kind=\"executable_marginal\",cause=\"fingerprint_mismatch\"} ",
+    );
+    out.push_str(
+        &ARB_TWO_HOP_V2_SELL_NOT_FRESH_DETAIL_EM_FP
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        "arb_two_hop_v2_sell_not_fresh_detail_total{kind=\"last_trade_mid\",cause=\"age_exceeded\"} ",
+    );
+    out.push_str(
+        &ARB_TWO_HOP_V2_SELL_NOT_FRESH_DETAIL_LTM_AGE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    for (bucket, counter) in [
+        ("le_30s", &*ARB_TWO_HOP_V2_STATE_STALE_AGE_LE_30S),
+        ("le_120s", &*ARB_TWO_HOP_V2_STATE_STALE_AGE_LE_120S),
+        ("le_300s", &*ARB_TWO_HOP_V2_STATE_STALE_AGE_LE_300S),
+        ("gt_300s", &*ARB_TWO_HOP_V2_STATE_STALE_AGE_GT_300S),
+    ] {
+        out.push_str(&format!(
+            "arb_two_hop_v2_state_stale_age_bucket_total{{bucket=\"{bucket}\"}} "
+        ));
+        out.push_str(&counter.load(Ordering::Relaxed).to_string());
+        out.push('\n');
+    }
+    for (op, bucket, counter) in [
+        (
+            "seed",
+            "le_30s",
+            &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_SEED_LE_30S,
+        ),
+        (
+            "seed",
+            "le_120s",
+            &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_SEED_LE_120S,
+        ),
+        (
+            "seed",
+            "le_300s",
+            &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_SEED_LE_300S,
+        ),
+        (
+            "seed",
+            "gt_300s",
+            &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_SEED_GT_300S,
+        ),
+        (
+            "refresh",
+            "le_30s",
+            &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_REFRESH_LE_30S,
+        ),
+        (
+            "refresh",
+            "le_120s",
+            &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_REFRESH_LE_120S,
+        ),
+        (
+            "refresh",
+            "le_300s",
+            &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_REFRESH_LE_300S,
+        ),
+        (
+            "refresh",
+            "gt_300s",
+            &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_REFRESH_GT_300S,
+        ),
+    ] {
+        out.push_str(&format!(
+            "arb_vault_live_snapshot_cache_age_bucket_total{{op=\"{op}\",bucket=\"{bucket}\"}} "
+        ));
+        out.push_str(&counter.load(Ordering::Relaxed).to_string());
+        out.push('\n');
+    }
+    for (reason, counter) in [
+        (
+            "quote_none",
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_QUOTE_NONE,
+        ),
+        (
+            "state_stale",
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_STATE_STALE,
+        ),
+        (
+            "trade_stale",
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_TRADE_STALE,
+        ),
+        (
+            "not_fresh_after_quote",
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_NOT_FRESH_AFTER,
+        ),
+    ] {
+        out.push_str(&format!(
+            "arb_two_hop_v2_no_fresh_buy_quote_detail_total{{reason=\"{reason}\"}} "
+        ));
+        out.push_str(&counter.load(Ordering::Relaxed).to_string());
+        out.push('\n');
+    }
 }
 
 fn append_arb_two_hop_v2_sell_quote_none_detail_total(out: &mut String) {
@@ -10119,6 +10325,7 @@ async fn metrics_response() -> Response<Body> {
     append_arb_two_hop_v2_insufficient_subreason_total(&mut out);
     append_arb_two_hop_v2_no_cross_dex_sell_detail_total(&mut out);
     append_arb_two_hop_v2_sell_quote_none_detail_total(&mut out);
+    append_arb_c1h2_freshness_forensics_total(&mut out);
     append_momentum_latency_histogram_prometheus(
         &mut out,
         "arb_quote_pair_slot_delta_slots",
@@ -11851,6 +12058,38 @@ mod arb_two_hop_v2_sell_quote_none_detail_metrics_tests {
                 out.contains(&format!("reason=\"{label}\"")),
                 "missing sell_quote_none detail label {label}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod arb_c1h2_freshness_forensics_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn c1h2_forensics_inc_and_prometheus_labels() {
+        let before = ARB_TWO_HOP_V2_SELL_NOT_FRESH_DETAIL_EM_AGE.load(Ordering::Relaxed);
+        arb_two_hop_v2_sell_not_fresh_detail_inc("executable_marginal", "age_exceeded");
+        assert_eq!(
+            ARB_TWO_HOP_V2_SELL_NOT_FRESH_DETAIL_EM_AGE.load(Ordering::Relaxed),
+            before + 1
+        );
+
+        arb_two_hop_v2_state_stale_age_bucket_inc("gt_300s");
+        arb_vault_live_snapshot_cache_age_bucket_inc("refresh", "le_120s");
+        arb_two_hop_v2_no_fresh_buy_quote_detail_inc("state_stale");
+
+        let mut out = String::new();
+        append_arb_c1h2_freshness_forensics_total(&mut out);
+        for needle in [
+            "kind=\"executable_marginal\",cause=\"age_exceeded\"",
+            "kind=\"executable_marginal\",cause=\"fingerprint_mismatch\"",
+            "kind=\"last_trade_mid\",cause=\"age_exceeded\"",
+            "state_stale_age_bucket_total{bucket=\"gt_300s\"}",
+            "cache_age_bucket_total{op=\"refresh\",bucket=\"le_120s\"}",
+            "no_fresh_buy_quote_detail_total{reason=\"state_stale\"}",
+        ] {
+            assert!(out.contains(needle), "missing c1h2 metric {needle}");
         }
     }
 }

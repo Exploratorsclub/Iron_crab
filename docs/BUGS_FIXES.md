@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ARB-C1h2: Freshness Forensics + Arb-Pin SLAVE Age Sustain (post-C1h)
+**Datum**: 2026-08-04  
+**Problem**: Post-#365/C1h: `sell_not_fresh` weiter ~74%; `state_stale` dominant. C1h refresh kopiert `LivePoolCache.age_ms` in `vault.updated_at` — wenn Cache-Eintrag > `STATE_TTL_MS` (120s), hilft Refresh nicht. Arb-only Pins hatten keinen Momentum-äquivalenten Balance-Heartbeat; `balance_updated_from_cache_skipped_for_live_feed` blockierte JetStream-Touch für Arb trotz Live-Vault-Feed.  
+**Fix**: (1) C1h2 Forensik: `sell_not_fresh` Split `{kind,cause}`, `state_stale` age buckets, `live_cache_age` bei seed/refresh, `no_fresh_buy_quote` Subreason. (2) H5 eng: Arb-Pins in MD Balance-Heartbeat + Live-Feed-Skip-Bypass (wie Momentum). **Invarianten**: I-4/I-7 kein RPC; TTL nicht erhöht.  
+**Evidence**: `findings_arb_zero_opp_post365_20260804.md`, Prod Tip `04e2dd8`.  
+**Dateien**: `src/arbitrage/pool_quote.rs`, `src/bin/arb_strategy.rs`, `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-ARB-C1h: Arb Quote Freshness — Live Vault Refresh at Screen (post-C1vault)
 **Datum**: 2026-08-04  
 **Problem**: Post-#364/C1vault: `sell_not_fresh` ~67% sell-fails; `state_stale` dominant in `sell_quote_none`. C1vault seed-if-missing filled vault rows but `snapshot_vault_bins_for_tracker` cloned stale `vault_balances` without refreshing when SLAVE LivePoolCache was newer. `arb_vault_balance_applied_total` ~14 (counter only on `is_new`).  
