@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ARB-C1h3: SLAVE Cache Age Sustain on Stale-Slot Heartbeat + NotFresh Detail Wiring (post-C1h2)
+**Datum**: 2026-08-04  
+**Problem**: Post-#366/C1h2: Seed/refresh `live_cache_age` ~95% `gt_300s`; `sell_not_fresh` ~72% bei `sell_not_fresh_detail_*` = 0. MD Heartbeat publisht BalanceUpdated mit MASTER-Slot; Arb-SLAVE kann durch lokalen Geyser voraus sein → `upsert` lehnt Slot-Regress ab und refresht `updated_at` nicht. `StateStale` → `sell_not_fresh` zählt ohne `sell_not_fresh_detail`. Vault-Seed ignorierte frischere Cache-`updated_at` wenn JetStream-Slot ≤ Geyser-Slot.  
+**Fix**: (1) `touch_freshness_on_existing_reserve_basis` bei BalanceUpdated mit Slot-Regress (SLAVE ahead of MASTER); MASTER `upsert` reject bleibt. (2) Vault-Seed: `updated_at` aus Cache wenn frischer als Vault-Slot. (3) H5: `StateStale` Sell-Pfad inkrementiert `sell_not_fresh_detail{executable_marginal,age_exceeded}`. **Invarianten**: I-4/I-7 kein RPC; I-ARB-4 Spoof-Guard bleibt; TTL nicht erhöht.  
+**Evidence**: `findings_arb_zero_opp_post366_20260804.md`, Prod Tip `aa78449`.  
+**Dateien**: `src/execution/live_pool_cache.rs`, `src/execution/pool_cache_sync.rs`, `src/bin/arb_strategy.rs`, `src/arbitrage/pool_quote.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-ARB-C1h2: Freshness Forensics + Arb-Pin SLAVE Age Sustain (post-C1h)
 **Datum**: 2026-08-04  
 **Problem**: Post-#365/C1h: `sell_not_fresh` weiter ~74%; `state_stale` dominant. C1h refresh kopiert `LivePoolCache.age_ms` in `vault.updated_at` — wenn Cache-Eintrag > `STATE_TTL_MS` (120s), hilft Refresh nicht. Arb-only Pins hatten keinen Momentum-äquivalenten Balance-Heartbeat; `balance_updated_from_cache_skipped_for_live_feed` blockierte JetStream-Touch für Arb trotz Live-Vault-Feed.  

@@ -1708,9 +1708,13 @@ fn seed_one_pool_from_live_cache(
     };
     let dlmm_sol_is_x = dlmm_token_x_mint.as_deref() == Some(NATIVE_SOL_MINT);
 
-    let should_update_vault = match vault_balances.get(&pool_addr) {
-        Some(existing) => slot >= existing.update_slot,
-        None => true,
+    let (should_replace_vault, should_touch_vault_updated_at) = match vault_balances.get(&pool_addr)
+    {
+        Some(existing) => (
+            slot >= existing.update_slot,
+            cache_updated_at > existing.updated_at,
+        ),
+        None => (true, false),
     };
 
     let tracker = trackers
@@ -1742,7 +1746,7 @@ fn seed_one_pool_from_live_cache(
         vault_reserves_for_comparable,
     ) = match warmup.quote_kind {
         ArbWarmupQuoteKind::Sol => {
-            if should_update_vault {
+            if should_replace_vault {
                 vault_balances.insert(
                     pool_addr.clone(),
                     VaultBalanceCache {
@@ -1756,6 +1760,10 @@ fn seed_one_pool_from_live_cache(
                         dlmm_token_x_mint,
                     },
                 );
+            } else if should_touch_vault_updated_at {
+                if let Some(vault) = vault_balances.get_mut(&pool_addr) {
+                    vault.updated_at = cache_updated_at;
+                }
             }
             let vault_ref = vault_balances
                 .get(&pool_addr)
@@ -1803,9 +1811,6 @@ fn seed_one_pool_from_live_cache(
     };
 
     let pool_last_update = match tracker.pools.get(&pool_addr) {
-        Some(p) if warmup.quote_kind == ArbWarmupQuoteKind::Sol && !should_update_vault => {
-            p.last_update.max(eff_updated_at)
-        }
         Some(p) => p.last_update.max(eff_updated_at),
         None => eff_updated_at,
     };
@@ -9429,7 +9434,7 @@ mod event_pipeline_tests {
 mod two_hop_price_tests {
     use super::*;
     use ironcrab::execution::live_pool_cache::{
-        create_shared_cache, CachedPoolState, MeteoraState, SharedLivePoolCache,
+        create_shared_cache, CachedPoolState, MeteoraState, OrcaWhirlpoolState, SharedLivePoolCache,
     };
     use ironcrab::ipc::PoolCacheUpdate;
     use rust_decimal::Decimal;
@@ -10950,7 +10955,9 @@ mod two_hop_price_tests {
     }
 
     #[test]
-    fn seed_skips_stale_jetstream_vault_when_geyser_slot_is_newer() {
+    fn seed_preserves_geyser_vault_when_jetstream_slot_is_stale() {
+        use std::time::Duration;
+
         let cache = create_shared_cache();
         let token_mint = Pubkey::new_unique();
         let pool = Pubkey::new_unique();
@@ -10971,7 +10978,7 @@ mod two_hop_price_tests {
         );
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &stale_cache_update);
 
-        let fresher_updated_at = Instant::now();
+        let stale_vault_updated_at = Instant::now() - Duration::from_secs(400);
         let mut vault_balances = HashMap::from([(
             pool_str.clone(),
             VaultBalanceCache {
@@ -10980,7 +10987,7 @@ mod two_hop_price_tests {
                 update_slot: 100,
                 active_id: None,
                 bin_step: None,
-                updated_at: fresher_updated_at,
+                updated_at: stale_vault_updated_at,
                 dlmm_sol_is_x: false,
                 dlmm_token_x_mint: None,
             },
@@ -10999,7 +11006,121 @@ mod two_hop_price_tests {
         assert_eq!(vault.update_slot, 100);
         assert_eq!(vault.reserve_base, 9_999);
         assert_eq!(vault.reserve_quote, 8_888);
-        assert_eq!(vault.updated_at, fresher_updated_at);
+        assert!(
+            vault.updated_at > stale_vault_updated_at,
+            "stale vault.updated_at must follow fresher SLAVE cache age without slot regress"
+        );
+    }
+
+    #[test]
+    fn balance_updated_stale_slot_sustains_slave_age_and_refreshes_vault() {
+        use std::time::Duration;
+
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+        let pool_str = pool.to_string();
+
+        let seed_update = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            2_000_000_000,
+            100,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &seed_update);
+
+        let ahead_state = cache.get(&pool).expect("seeded");
+        let CachedPoolState::Orca(ref orca) = ahead_state else {
+            panic!("expected orca");
+        };
+        let bumped = CachedPoolState::Orca(OrcaWhirlpoolState {
+            token_mint_a: orca.token_mint_a,
+            token_mint_b: orca.token_mint_b,
+            token_vault_a: orca.token_vault_a,
+            token_vault_b: orca.token_vault_b,
+            tick_current_index: orca.tick_current_index,
+            sqrt_price: orca.sqrt_price,
+            liquidity: orca.liquidity,
+            fee_rate: orca.fee_rate,
+            protocol_fee_rate: orca.protocol_fee_rate,
+            tick_spacing: orca.tick_spacing,
+            vault_a_balance: orca.vault_a_balance,
+            vault_b_balance: orca.vault_b_balance,
+            token_a_program: orca.token_a_program,
+            token_b_program: orca.token_b_program,
+        });
+        cache.upsert(pool, bumped, 200);
+
+        std::thread::sleep(Duration::from_millis(40));
+        let (_, _, age_before) = cache.get_with_metadata(&pool).expect("cached");
+        assert!(age_before >= 30, "cache must age before heartbeat sustain");
+
+        let stale_heartbeat = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            2_000_000_000,
+            100,
+        );
+        assert!(
+            ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &stale_heartbeat),
+            "stale-slot heartbeat must apply age sustain"
+        );
+
+        let (_, slot_after, age_after) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(slot_after, 200, "local Geyser slot must not regress");
+        assert!(
+            age_after < 20,
+            "heartbeat BalanceUpdated must refresh SLAVE cache age"
+        );
+
+        let stale_vault_updated_at = Instant::now() - Duration::from_secs(400);
+        let mut vault_balances = HashMap::from([(
+            pool_str.clone(),
+            VaultBalanceCache {
+                reserve_base: 1_000_000_000_000,
+                reserve_quote: 2_000_000_000,
+                update_slot: 200,
+                active_id: None,
+                bin_step: None,
+                updated_at: stale_vault_updated_at,
+                dlmm_sol_is_x: false,
+                dlmm_token_x_mint: None,
+            },
+        )]);
+        let mut trackers = HashMap::new();
+
+        seed_token_tracker_from_live_pool_cache(
+            &mint_str,
+            &cache,
+            &mut trackers,
+            &mut vault_balances,
+            Some(&pool_str),
+        );
+
+        let vault = vault_balances.get(&pool_str).expect("vault");
+        assert_eq!(vault.update_slot, 200);
+        assert!(
+            vault.updated_at > stale_vault_updated_at,
+            "vault.updated_at must follow fresher cache age at seed"
+        );
+        let (_, _, age_ms) = cache.get_with_metadata(&pool).expect("cached");
+        assert!(
+            age_ms <= 120_000,
+            "screen seed should land in le_120s freshness bucket, got age_ms={age_ms}"
+        );
     }
 
     #[test]

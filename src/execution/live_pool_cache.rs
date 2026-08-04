@@ -630,6 +630,21 @@ impl LivePoolCache {
         }
     }
 
+    /// Refresh `updated_at` on an existing row with quotable reserve basis without changing slot/state.
+    ///
+    /// Used when a JetStream `BalanceUpdated` heartbeat arrives with a regressed slot (SLAVE ahead of
+    /// MASTER from local Geyser) — sustains age without spoofing 0/0 discovery rows.
+    pub fn touch_freshness_on_existing_reserve_basis(&self, pool: &Pubkey) -> bool {
+        if let Some(mut entry) = self.pools.get_mut(pool) {
+            if pool_state_has_reserve_basis(&entry.state) {
+                entry.updated_at = Instant::now();
+                self.updates_total.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Update vault balance for a pool
     pub fn update_vault_balance(&self, vault: &Pubkey, balance: u64, slot: u64) {
         if let Some(mapping) = self.vault_to_pool.get(vault) {
@@ -2564,6 +2579,78 @@ mod tests {
         assert!(
             age_after_quotable < 20,
             "quotable upsert must refresh cache age"
+        );
+    }
+
+    #[test]
+    fn touch_freshness_on_stale_slot_heartbeat_sustains_age_without_slot_regress() {
+        use std::time::Duration;
+
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let state = CachedPoolState::PumpAmm(PumpAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            pool_base_token_account: Pubkey::new_unique(),
+            pool_quote_token_account: Pubkey::new_unique(),
+            base_reserve: Some(1_000_000),
+            quote_reserve: Some(50_000_000_000),
+            pool_accounts: Vec::new(),
+            creator: None,
+        });
+
+        cache.upsert(pool, state.clone(), 100);
+        std::thread::sleep(Duration::from_millis(40));
+        let (_, slot_before, age_before) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(slot_before, 100);
+        assert!(age_before >= 30, "row must age before heartbeat sustain");
+
+        assert!(
+            !cache.upsert(pool, state, 50),
+            "stale slot upsert must still reject slot regress"
+        );
+        assert!(
+            cache.touch_freshness_on_existing_reserve_basis(&pool),
+            "heartbeat age sustain must touch existing quotable row"
+        );
+        let (_, slot_after, age_after) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(slot_after, 100, "slot must not regress on age-only sustain");
+        assert!(
+            age_after < 20,
+            "stale-slot heartbeat must refresh cache age when reserves are quotable"
+        );
+    }
+
+    #[test]
+    fn touch_freshness_skipped_for_zero_reserve_rows() {
+        use std::time::Duration;
+
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let zero_state = CachedPoolState::PumpAmm(PumpAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            pool_base_token_account: Pubkey::new_unique(),
+            pool_quote_token_account: Pubkey::new_unique(),
+            base_reserve: Some(0),
+            quote_reserve: Some(0),
+            pool_accounts: Vec::new(),
+            creator: None,
+        });
+
+        cache.upsert(pool, zero_state, 100);
+        std::thread::sleep(Duration::from_millis(40));
+        let (_, _, age_before) = cache.get_with_metadata(&pool).expect("cached");
+
+        assert!(
+            !cache.touch_freshness_on_existing_reserve_basis(&pool),
+            "0/0 row must not spoof age refresh"
+        );
+        let (_, slot_after, age_after) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(slot_after, 100);
+        assert!(
+            age_after >= age_before,
+            "spoof guard must keep stale age on 0/0 row"
         );
     }
 

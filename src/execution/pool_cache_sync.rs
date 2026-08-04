@@ -21,8 +21,8 @@ use std::str::FromStr;
 use tracing::{debug, info, warn};
 
 use crate::execution::live_pool_cache::{
-    CachedPoolState, LivePoolCache, MeteoraCpmmState, MeteoraState, OrcaWhirlpoolState,
-    PumpAmmState, PumpFunState, RaydiumAmmState, RaydiumCpmmState,
+    pool_state_has_reserve_basis, CachedPoolState, LivePoolCache, MeteoraCpmmState, MeteoraState,
+    OrcaWhirlpoolState, PumpAmmState, PumpFunState, RaydiumAmmState, RaydiumCpmmState,
 };
 use crate::ipc::{
     PoolCacheUpdate, PoolCacheUpdateType, NATIVE_SOL_MINT,
@@ -1140,11 +1140,19 @@ fn apply_pool_cache_update_outcome_inner(
                         }
                     }
                 }
-                if !cache.upsert(addr, minimal_state, update.geyser_slot) {
+                let incoming_has_reserve_basis = pool_state_has_reserve_basis(&minimal_state);
+                let upserted = cache.upsert(addr, minimal_state, update.geyser_slot);
+                if !upserted {
                     if update.geyser_slot > 0 {
                         crate::metrics::inc_pool_cache_apply_rejected_stale_slot_total();
+                        let age_sustained = incoming_has_reserve_basis
+                            && cache.touch_freshness_on_existing_reserve_basis(&addr);
+                        if !age_sustained {
+                            return PoolCacheApplyOutcome::RejectedStaleSlot;
+                        }
+                    } else {
+                        return PoolCacheApplyOutcome::RejectedStaleSlot;
                     }
-                    return PoolCacheApplyOutcome::RejectedStaleSlot;
                 }
                 if update.dex == "pump_amm" {
                     cache.merge_pump_amm_sell_layout_from_metadata(&addr, update.metadata.as_ref());
@@ -3309,7 +3317,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_rejects_stale_lower_slot_monotonic() {
+    fn apply_stale_lower_slot_sustains_age_when_reserve_basis() {
+        use std::time::Duration;
+
         let cache = LivePoolCache::new();
         let pool = Pubkey::new_unique();
         let base_mint = Pubkey::new_unique();
@@ -3329,6 +3339,8 @@ mod tests {
         );
         assert!(apply_pool_cache_update(&cache, &fresh));
 
+        std::thread::sleep(Duration::from_millis(40));
+
         let stale = PoolCacheUpdate::new_balance_updated(
             "test",
             "0.1.0",
@@ -3342,8 +3354,51 @@ mod tests {
             400,
         );
         assert!(
+            apply_pool_cache_update(&cache, &stale),
+            "stale-slot heartbeat with reserve basis must sustain age (C1h3)"
+        );
+        let (_, slot, age_ms) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(slot, 500, "slot must not regress");
+        assert!(age_ms < 20, "age must refresh on stale-slot sustain");
+    }
+
+    #[test]
+    fn apply_rejects_stale_lower_slot_without_reserve_basis() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+
+        let discovered = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            0,
+            0,
+            None,
+            500,
+        );
+        assert!(apply_pool_cache_update(&cache, &discovered));
+
+        let stale = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            0,
+            0,
+            400,
+        );
+        assert!(
             !apply_pool_cache_update(&cache, &stale),
-            "stale slot must be rejected"
+            "0/0 stale slot must not spoof age refresh"
         );
         let (_, slot, _) = cache.get_with_metadata(&pool).expect("cached");
         assert_eq!(slot, 500);
