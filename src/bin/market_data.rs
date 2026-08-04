@@ -118,6 +118,8 @@ use ironcrab::metrics::{
     inc_market_data_exec_hot_hard_shed_steps_for_tier_reason,
     inc_market_data_exec_hot_pressure_admit_rejected_total,
     inc_market_data_geyser_sync_skipped_rate_limit_total,
+    inc_market_data_heartbeat_balance_refresh_published_total,
+    inc_market_data_heartbeat_balance_refresh_skipped_total,
     inc_market_data_ingest_membership_snapshot_hits_total,
     inc_market_data_jsonl_enqueue_dropped_total, inc_market_data_momentum_admission_admitted_total,
     inc_market_data_momentum_admission_rejected_total,
@@ -1788,6 +1790,19 @@ fn cached_pool_has_fresh_reserve_basis(state: &CachedPoolState) -> bool {
         CachedPoolState::PumpFun(s) => {
             !s.complete && s.virtual_sol_reserves > 0 && s.virtual_token_reserves > 0
         }
+    }
+}
+
+fn heartbeat_balance_refresh_coverage_label(
+    is_momentum: bool,
+    force_arb_seed: bool,
+) -> &'static str {
+    if force_arb_seed {
+        "arb_pin"
+    } else if is_momentum {
+        "momentum"
+    } else {
+        "other"
     }
 }
 
@@ -3863,7 +3878,7 @@ impl MarketDataContext {
         let prev_synced = self.last_synced_explicit_pubkeys.read().clone();
         *self.last_synced_explicit_pubkeys.write() =
             admission.snapshot_pubkeys().into_iter().collect();
-        self.publish_momentum_hot_balance_refresh_after_explicit_sync(&prev_synced);
+        self.publish_hot_pool_balance_refresh_after_explicit_sync(&prev_synced);
         self.publish_hot_bin_array_replay_after_explicit_sync(&prev_synced);
         self.clear_geyser_prune_resume();
         true
@@ -4628,7 +4643,12 @@ impl MarketDataContext {
                 continue;
             }
             let force_arb_seed = is_arb && !is_momentum;
-            self.try_publish_balance_updated_from_cache(pool, force_arb_seed);
+            let coverage = heartbeat_balance_refresh_coverage_label(is_momentum, force_arb_seed);
+            self.try_publish_balance_updated_from_cache_with_heartbeat_observability(
+                pool,
+                force_arb_seed,
+                Some(coverage),
+            );
         }
         let batch_dirty = self.remediate_open_position_pumpfun_registration(admission);
         self.tick_open_position_pumpfun_registration_observability();
@@ -4750,14 +4770,13 @@ impl MarketDataContext {
         }
     }
 
-    /// After explicit Geyser sync, refresh SLAVE age once when a momentum-hot pool's feed becomes live.
-    fn publish_momentum_hot_balance_refresh_after_explicit_sync(
-        &self,
-        prev_synced: &HashSet<Pubkey>,
-    ) {
+    /// After explicit Geyser sync, refresh SLAVE age once when a hot pool's vault/bin feed becomes live.
+    fn publish_hot_pool_balance_refresh_after_explicit_sync(&self, prev_synced: &HashSet<Pubkey>) {
         let synced = self.last_synced_explicit_pubkeys.read();
         for pool in self.hot_pool_registry.snapshot_hot_pool_pubkeys() {
-            if !self.hot_pool_registry.pool_has_momentum(pool) {
+            let is_momentum = self.hot_pool_registry.pool_has_momentum(pool);
+            let is_arb = self.hot_pool_registry.pool_has_arb(pool);
+            if !is_momentum && !is_arb {
                 continue;
             }
             if !self.hot_pool_reserve_registration_satisfied(pool) {
@@ -4771,7 +4790,8 @@ impl MarketDataContext {
                 .iter()
                 .any(|pk| !prev_synced.contains(pk) && synced.contains(pk));
             if newly_live {
-                self.try_publish_balance_updated_from_cache(pool, false);
+                let force_arb_seed = is_arb && !is_momentum;
+                self.try_publish_balance_updated_from_cache(pool, force_arb_seed);
             }
         }
     }
@@ -4918,18 +4938,49 @@ impl MarketDataContext {
 
     /// Cache-first JetStream BalanceUpdated for pools with fresh reserve basis (no vault Geyser sub required).
     fn try_publish_balance_updated_from_cache(&self, pool: Pubkey, force_arb_seed: bool) {
+        self.try_publish_balance_updated_from_cache_with_heartbeat_observability(
+            pool,
+            force_arb_seed,
+            None,
+        );
+    }
+
+    fn try_publish_balance_updated_from_cache_with_heartbeat_observability(
+        &self,
+        pool: Pubkey,
+        force_arb_seed: bool,
+        heartbeat_coverage: Option<&'static str>,
+    ) {
         if !force_arb_seed && self.balance_updated_from_cache_skipped_for_live_feed(pool) {
+            if let Some(coverage) = heartbeat_coverage {
+                inc_market_data_heartbeat_balance_refresh_skipped_total(coverage, "live_feed");
+            }
             return;
         }
         let Some(state) = self.live_pool_cache.get(&pool) else {
+            if let Some(coverage) = heartbeat_coverage {
+                inc_market_data_heartbeat_balance_refresh_skipped_total(coverage, "cache_miss");
+            }
             return;
         };
         if !cached_pool_has_fresh_reserve_basis(&state) {
+            if let Some(coverage) = heartbeat_coverage {
+                inc_market_data_heartbeat_balance_refresh_skipped_total(
+                    coverage,
+                    "no_reserve_basis",
+                );
+            }
             return;
         }
         let Some((base_mint, quote_mint, base_reserve, quote_reserve, dex)) =
             pool_cache_balance_fields_from_state(&state)
         else {
+            if let Some(coverage) = heartbeat_coverage {
+                inc_market_data_heartbeat_balance_refresh_skipped_total(
+                    coverage,
+                    "balance_fields_none",
+                );
+            }
             return;
         };
         let publish_slot = self
@@ -4942,6 +4993,9 @@ impl MarketDataContext {
             .as_ref()
             .map(NatsClient::clone_for_spawned_publish)
         else {
+            if let Some(coverage) = heartbeat_coverage {
+                inc_market_data_heartbeat_balance_refresh_skipped_total(coverage, "no_nats");
+            }
             return;
         };
         let run_id = self.run_id.clone();
@@ -5005,13 +5059,21 @@ impl MarketDataContext {
             if force_arb_seed && self.hot_pool_registry.pool_has_arb(pool) {
                 inc_market_data_arb_pin_vault_published_total();
             }
+            if let Some(coverage) = heartbeat_coverage {
+                inc_market_data_heartbeat_balance_refresh_published_total(coverage);
+            }
             handle.spawn(publish);
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             inc_market_data_balance_updated_from_cache_total();
             if force_arb_seed && self.hot_pool_registry.pool_has_arb(pool) {
                 inc_market_data_arb_pin_vault_published_total();
             }
+            if let Some(coverage) = heartbeat_coverage {
+                inc_market_data_heartbeat_balance_refresh_published_total(coverage);
+            }
             handle.spawn(publish);
+        } else if let Some(coverage) = heartbeat_coverage {
+            inc_market_data_heartbeat_balance_refresh_skipped_total(coverage, "no_runtime");
         }
     }
 
@@ -17285,6 +17347,109 @@ mod pr_b_geyser_tracking_tests {
         assert!(
             !ctx.balance_updated_from_cache_skipped_for_live_feed(pool),
             "arb-pinned pool with live vault feed must sustain SLAVE cache age (C1h2)"
+        );
+    }
+
+    #[test]
+    fn arb_pin_balance_refresh_after_explicit_sync_when_vault_becomes_live() {
+        use ironcrab::metrics::MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        assert!(ctx.register_geyser_reserves_for_arb_active_pool(pool));
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        ironcrab::market_data::track::converge_admission_from_ctx(ctx.as_ref(), &mut admission);
+        ctx.prune_tracked_maps_to_admitted(&admission);
+        ctx.publish_admitted_explicit_physical(&admission);
+        let prev_synced: HashSet<Pubkey> = HashSet::new();
+        *ctx.last_synced_explicit_pubkeys.write() =
+            admission.snapshot_pubkeys().into_iter().collect();
+
+        assert!(
+            ctx.hot_pool_reserve_registration_satisfied(pool),
+            "arb pin must have vault rows registered"
+        );
+        assert!(
+            ctx.pool_has_live_vault_geyser_feed(pool),
+            "vault pubkeys must be in synced explicit set"
+        );
+
+        let counter_before = MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed);
+        ctx.publish_hot_pool_balance_refresh_after_explicit_sync(&prev_synced);
+        // Without NATS/runtime the spawn path is a no-op, but arb pin must not be filtered out
+        // by the old momentum-only explicit-sync gate (C1h4 coverage).
+        assert!(
+            !ctx.balance_updated_from_cache_skipped_for_live_feed(pool),
+            "arb pin with live vault feed must remain eligible for explicit-sync refresh"
+        );
+        assert_eq!(
+            MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed),
+            counter_before,
+            "no NATS in test harness — publish is expected no-op after eligibility checks"
+        );
+    }
+
+    #[test]
+    fn arb_only_heartbeat_targets_arb_pin_with_force_seed() {
+        use ironcrab::metrics::MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_ARB_PIN_NO_NATS;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        assert!(!ctx.hot_pool_registry.pool_has_momentum(pool));
+        assert!(!ctx.balance_updated_from_cache_skipped_for_live_feed(pool));
+
+        let skipped_before =
+            MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_ARB_PIN_NO_NATS.load(Ordering::Relaxed);
+        let mut admission = test_admission_for(&ctx);
+        ctx.tick_momentum_hot_balance_refresh_heartbeat(&mut admission);
+        assert!(
+            MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_ARB_PIN_NO_NATS.load(Ordering::Relaxed)
+                > skipped_before,
+            "arb-only heartbeat must traverse publish path for arb_pin coverage"
         );
     }
 

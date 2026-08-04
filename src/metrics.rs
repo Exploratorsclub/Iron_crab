@@ -497,6 +497,41 @@ pub static MARKET_DATA_HOT_POOL_REGISTRY_POOLS_BOTH: Lazy<AtomicU64> =
 /// BalanceUpdated published from MASTER cache without vault Geyser subscription.
 pub static MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// C1h4: heartbeat BalanceUpdated publish attempts that spawned JetStream work.
+pub static MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_PUBLISHED_ARB_PIN: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_PUBLISHED_MOMENTUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_PUBLISHED_OTHER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// C1h4: heartbeat publish skipped before JetStream spawn.
+pub static MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_ARB_PIN_LIVE_FEED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_ARB_PIN_CACHE_MISS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_ARB_PIN_NO_RESERVE_BASIS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_ARB_PIN_BALANCE_FIELDS_NONE: Lazy<
+    AtomicU64,
+> = Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_ARB_PIN_NO_NATS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_ARB_PIN_NO_RUNTIME: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_MOMENTUM_LIVE_FEED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_MOMENTUM_CACHE_MISS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_MOMENTUM_NO_RESERVE_BASIS: Lazy<
+    AtomicU64,
+> = Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_MOMENTUM_BALANCE_FIELDS_NONE: Lazy<
+    AtomicU64,
+> = Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_MOMENTUM_NO_NATS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_MOMENTUM_NO_RUNTIME: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// P2: JetStream BalanceUpdated from enrichment cache upsert path.
 pub static MARKET_DATA_ENRICHMENT_BALANCE_UPDATED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -1038,6 +1073,59 @@ pub fn set_market_data_hot_pool_registry_pools_gauge(reason: &str, n: usize) {
 #[inline]
 pub fn inc_market_data_balance_updated_from_cache_total() {
     MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// C1h4: `market_data_heartbeat_balance_refresh_published_total{coverage}`.
+#[inline]
+pub fn inc_market_data_heartbeat_balance_refresh_published_total(coverage: &str) {
+    let counter = match coverage {
+        "arb_pin" => &*MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_PUBLISHED_ARB_PIN,
+        "momentum" => &*MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_PUBLISHED_MOMENTUM,
+        "other" => &*MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_PUBLISHED_OTHER,
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// C1h4: `market_data_heartbeat_balance_refresh_skipped_total{coverage,reason}`.
+#[inline]
+pub fn inc_market_data_heartbeat_balance_refresh_skipped_total(coverage: &str, reason: &str) {
+    let counter = match (coverage, reason) {
+        ("arb_pin", "live_feed") => {
+            &*MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_ARB_PIN_LIVE_FEED
+        }
+        ("arb_pin", "cache_miss") => {
+            &*MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_ARB_PIN_CACHE_MISS
+        }
+        ("arb_pin", "no_reserve_basis") => {
+            &*MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_ARB_PIN_NO_RESERVE_BASIS
+        }
+        ("arb_pin", "balance_fields_none") => {
+            &*MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_ARB_PIN_BALANCE_FIELDS_NONE
+        }
+        ("arb_pin", "no_nats") => &*MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_ARB_PIN_NO_NATS,
+        ("arb_pin", "no_runtime") => {
+            &*MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_ARB_PIN_NO_RUNTIME
+        }
+        ("momentum", "live_feed") => {
+            &*MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_MOMENTUM_LIVE_FEED
+        }
+        ("momentum", "cache_miss") => {
+            &*MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_MOMENTUM_CACHE_MISS
+        }
+        ("momentum", "no_reserve_basis") => {
+            &*MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_MOMENTUM_NO_RESERVE_BASIS
+        }
+        ("momentum", "balance_fields_none") => {
+            &*MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_MOMENTUM_BALANCE_FIELDS_NONE
+        }
+        ("momentum", "no_nats") => &*MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_MOMENTUM_NO_NATS,
+        ("momentum", "no_runtime") => {
+            &*MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_MOMENTUM_NO_RUNTIME
+        }
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn inc_market_data_enrichment_balance_updated_total() {
@@ -3552,6 +3640,15 @@ pub fn inc_pool_cache_apply_rejected_stale_slot_total() {
     POOL_CACHE_APPLY_REJECTED_STALE_SLOT_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+static POOL_CACHE_TOUCH_FRESHNESS_ON_STALE_SLOT_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// C1h4: stale-slot JetStream heartbeat sustained SLAVE cache age via reserve-basis touch.
+#[inline]
+pub fn inc_pool_cache_touch_freshness_on_stale_slot_total() {
+    POOL_CACHE_TOUCH_FRESHNESS_ON_STALE_SLOT_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 static MOMENTUM_POOL_CACHE_APPLY_REJECTED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 static MOMENTUM_POOL_CACHE_APPLY_OUTCOME_TOTAL: Lazy<RwLock<HashMap<(String, String), u64>>> =
@@ -4904,6 +5001,40 @@ pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_REFRESH_LE_300S: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_REFRESH_GT_300S: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// C1h4: pin-labeled cache age at screen snapshot (arb-pinned pools).
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_LE_30S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_LE_120S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_LE_300S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_GT_300S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_REFRESH_LE_30S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_REFRESH_LE_120S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_REFRESH_LE_300S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_REFRESH_GT_300S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// C1h4: non-pin tracker pools at screen snapshot (documented out-of-scope for heartbeat).
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_SEED_LE_30S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_SEED_LE_120S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_SEED_LE_300S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_SEED_GT_300S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_REFRESH_LE_30S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_REFRESH_LE_120S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_REFRESH_LE_300S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_REFRESH_GT_300S: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_QUOTE_NONE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_STATE_STALE: Lazy<AtomicU64> =
@@ -5499,6 +5630,30 @@ pub fn arb_vault_live_snapshot_cache_age_bucket_inc(op: &str, bucket: &str) {
         ("refresh", "le_120s") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_REFRESH_LE_120S,
         ("refresh", "le_300s") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_REFRESH_LE_300S,
         ("refresh", "gt_300s") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_REFRESH_GT_300S,
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// C1h4: `arb_vault_live_snapshot_cache_age_bucket_total{op,bucket,pin}`.
+pub fn arb_vault_live_snapshot_cache_age_pin_bucket_inc(op: &str, bucket: &str, pin: &str) {
+    let counter = match (op, bucket, pin) {
+        ("seed", "le_30s", "pin") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_LE_30S,
+        ("seed", "le_120s", "pin") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_LE_120S,
+        ("seed", "le_300s", "pin") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_LE_300S,
+        ("seed", "gt_300s", "pin") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_GT_300S,
+        ("refresh", "le_30s", "pin") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_REFRESH_LE_30S,
+        ("refresh", "le_120s", "pin") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_REFRESH_LE_120S,
+        ("refresh", "le_300s", "pin") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_REFRESH_LE_300S,
+        ("refresh", "gt_300s", "pin") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_REFRESH_GT_300S,
+        ("seed", "le_30s", "cold") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_SEED_LE_30S,
+        ("seed", "le_120s", "cold") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_SEED_LE_120S,
+        ("seed", "le_300s", "cold") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_SEED_LE_300S,
+        ("seed", "gt_300s", "cold") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_SEED_GT_300S,
+        ("refresh", "le_30s", "cold") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_REFRESH_LE_30S,
+        ("refresh", "le_120s", "cold") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_REFRESH_LE_120S,
+        ("refresh", "le_300s", "cold") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_REFRESH_LE_300S,
+        ("refresh", "gt_300s", "cold") => &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_REFRESH_GT_300S,
         _ => return,
     };
     counter.fetch_add(1, Ordering::Relaxed);
@@ -6649,6 +6804,50 @@ fn append_arb_c1h2_freshness_forensics_total(out: &mut String) {
     ] {
         out.push_str(&format!(
             "arb_vault_live_snapshot_cache_age_bucket_total{{op=\"{op}\",bucket=\"{bucket}\"}} "
+        ));
+        out.push_str(&counter.load(Ordering::Relaxed).to_string());
+        out.push('\n');
+    }
+    for (op, bucket, pin, counter) in [
+        (
+            "seed",
+            "le_120s",
+            "pin",
+            &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_LE_120S,
+        ),
+        (
+            "seed",
+            "gt_300s",
+            "pin",
+            &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_GT_300S,
+        ),
+        (
+            "refresh",
+            "le_120s",
+            "pin",
+            &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_REFRESH_LE_120S,
+        ),
+        (
+            "refresh",
+            "gt_300s",
+            "pin",
+            &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_REFRESH_GT_300S,
+        ),
+        (
+            "seed",
+            "gt_300s",
+            "cold",
+            &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_SEED_GT_300S,
+        ),
+        (
+            "refresh",
+            "gt_300s",
+            "cold",
+            &*ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_REFRESH_GT_300S,
+        ),
+    ] {
+        out.push_str(&format!(
+            "arb_vault_live_snapshot_cache_age_bucket_total{{op=\"{op}\",bucket=\"{bucket}\",pin=\"{pin}\"}} "
         ));
         out.push_str(&counter.load(Ordering::Relaxed).to_string());
         out.push('\n');
@@ -8661,6 +8860,22 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_balance_updated_from_cache_total",
         MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_heartbeat_balance_refresh_published_total{coverage=\"arb_pin\"}",
+        MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_PUBLISHED_ARB_PIN.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_heartbeat_balance_refresh_published_total{coverage=\"momentum\"}",
+        MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_PUBLISHED_MOMENTUM.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_heartbeat_balance_refresh_skipped_total{coverage=\"arb_pin\",reason=\"cache_miss\"}",
+        MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_ARB_PIN_CACHE_MISS.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_heartbeat_balance_refresh_skipped_total{coverage=\"arb_pin\",reason=\"no_reserve_basis\"}",
+        MARKET_DATA_HEARTBEAT_BALANCE_REFRESH_SKIPPED_ARB_PIN_NO_RESERVE_BASIS.load(Ordering::Relaxed)
     );
     line!(
         "market_data_enrichment_balance_updated_total",

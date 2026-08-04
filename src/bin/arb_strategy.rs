@@ -76,17 +76,17 @@ use ironcrab::metrics::{
     arb_two_hop_v2_screen_multi_dex_inc, arb_two_hop_v2_screen_skipped_inc,
     arb_two_hop_v2_sell_not_fresh_detail_inc, arb_two_hop_v2_sell_quote_none_detail_inc,
     arb_two_hop_v2_state_stale_age_bucket_inc, arb_vault_live_snapshot_cache_age_bucket_inc,
-    inc_arb_dlmm_bin_array_update_applied_total, inc_arb_dlmm_bin_array_update_received_total,
-    inc_arb_dlmm_bin_rescreen_scheduled_total, inc_arb_pinned_meteora_pool_bin_cache_miss_total,
-    inc_arb_v2_screen_meteora_sell_bin_hit_total, inc_arb_v2_screen_meteora_sell_bin_miss_total,
-    inc_arb_vault_balance_applied_total, inc_arb_vault_live_snapshot_refreshed_total,
-    inc_arb_vault_live_snapshot_seeded_total, inc_arb_vault_rescreen_scheduled_total,
-    record_arb_heartbeat_phase, record_arb_price_freshness_stale_age_ms,
-    record_arb_proactive_pin_first_publish, record_arb_proactive_track_publish_total,
-    record_arb_quote_pair_slot_delta, record_arb_quote_shadow_round_trip,
-    record_arb_track_publish_skipped_unchanged_total, record_arb_track_removed_total,
-    record_arb_track_requests_messages_total, record_arb_track_requests_publish_chunks_total,
-    record_arb_track_requests_publish_failed_total,
+    arb_vault_live_snapshot_cache_age_pin_bucket_inc, inc_arb_dlmm_bin_array_update_applied_total,
+    inc_arb_dlmm_bin_array_update_received_total, inc_arb_dlmm_bin_rescreen_scheduled_total,
+    inc_arb_pinned_meteora_pool_bin_cache_miss_total, inc_arb_v2_screen_meteora_sell_bin_hit_total,
+    inc_arb_v2_screen_meteora_sell_bin_miss_total, inc_arb_vault_balance_applied_total,
+    inc_arb_vault_live_snapshot_refreshed_total, inc_arb_vault_live_snapshot_seeded_total,
+    inc_arb_vault_rescreen_scheduled_total, record_arb_heartbeat_phase,
+    record_arb_price_freshness_stale_age_ms, record_arb_proactive_pin_first_publish,
+    record_arb_proactive_track_publish_total, record_arb_quote_pair_slot_delta,
+    record_arb_quote_shadow_round_trip, record_arb_track_publish_skipped_unchanged_total,
+    record_arb_track_removed_total, record_arb_track_requests_messages_total,
+    record_arb_track_requests_publish_chunks_total, record_arb_track_requests_publish_failed_total,
     record_arb_track_selection_blocking_join_failed_total,
     record_arb_track_selection_queue_overflow_total, record_arb_track_selection_recompute_total,
     record_arb_writer_lock_wait, serve_metrics, set_arb_pool_cache_apply_batch_size_gauge,
@@ -444,6 +444,7 @@ fn try_seed_vault_from_live_cache(
     pool_address: &str,
     live_pool_cache: &SharedLivePoolCache,
     vault_cache: &mut HashMap<String, VaultBalanceCache>,
+    pin_class: &str,
 ) -> bool {
     if vault_cache.contains_key(pool_address) {
         return false;
@@ -457,7 +458,7 @@ fn try_seed_vault_from_live_cache(
     let Some(vault) = vault_balance_from_live_cache_state(&state, slot, age_ms) else {
         return false;
     };
-    record_live_cache_age_at_snapshot("seed", age_ms);
+    record_live_cache_age_at_snapshot("seed", age_ms, pin_class);
     vault_cache.insert(pool_address.to_string(), vault);
     true
 }
@@ -467,6 +468,7 @@ fn try_refresh_vault_from_live_cache(
     pool_address: &str,
     live_pool_cache: &SharedLivePoolCache,
     vault_cache: &mut HashMap<String, VaultBalanceCache>,
+    pin_class: &str,
 ) -> bool {
     let Ok(pool_pk) = Pubkey::from_str(pool_address) else {
         return false;
@@ -484,7 +486,7 @@ fn try_refresh_vault_from_live_cache(
     if !live_pool_cache_fresher_than_vault(slot, new_vault.updated_at, existing) {
         return false;
     }
-    record_live_cache_age_at_snapshot("refresh", age_ms);
+    record_live_cache_age_at_snapshot("refresh", age_ms, pin_class);
     vault_cache.insert(pool_address.to_string(), new_vault);
     true
 }
@@ -2391,9 +2393,10 @@ fn v2_sell_quote_none_detail_to_metric(
     }
 }
 
-fn record_live_cache_age_at_snapshot(op: &str, age_ms: u64) {
+fn record_live_cache_age_at_snapshot(op: &str, age_ms: u64, pin_class: &str) {
     let bucket = freshness_age_bucket(age_ms).as_metric_label();
     arb_vault_live_snapshot_cache_age_bucket_inc(op, bucket);
+    arb_vault_live_snapshot_cache_age_pin_bucket_inc(op, bucket, pin_class);
 }
 
 fn record_v2_insufficient_subreason(insufficient: &RoundTripInsufficient) {
@@ -5595,6 +5598,12 @@ impl ArbContext {
         // Bin liquidity updates are a valid DLMM price signal (H3): refresh vault + pool timestamps.
         let now = Instant::now();
         {
+            let pinned = self.arb_pinned_pools.read();
+            let pin_class = if pinned.contains(pool_address) {
+                "pin"
+            } else {
+                "cold"
+            };
             let mut vault_cache = self.vault_balances.write();
             try_seed_dlmm_vault_on_bin_update(
                 pool_address,
@@ -5607,6 +5616,7 @@ impl ArbContext {
                     pool_address,
                     &self.live_pool_cache,
                     &mut vault_cache,
+                    pin_class,
                 )
             {
                 if let Some(v) = vault_cache.get_mut(pool_address) {
@@ -5996,15 +6006,22 @@ impl ArbContext {
         HashMap<String, HashMap<i64, BinArrayCache>>,
     ) {
         let pool_keys: Vec<String> = tracker_snapshot.pools.keys().cloned().collect();
+        let pinned_pools = self.arb_pinned_pools.read();
         let vaults = self.vault_balances.read();
         let mut vault_balances = HashMap::with_capacity(pool_keys.len());
         for pool_key in &pool_keys {
+            let pin_class = if pinned_pools.contains(pool_key) {
+                "pin"
+            } else {
+                "cold"
+            };
             if let Some(entry) = vaults.get(pool_key) {
                 vault_balances.insert(pool_key.clone(), entry.clone());
                 if try_refresh_vault_from_live_cache(
                     pool_key,
                     &self.live_pool_cache,
                     &mut vault_balances,
+                    pin_class,
                 ) {
                     inc_arb_vault_live_snapshot_refreshed_total();
                 }
@@ -6012,11 +6029,13 @@ impl ArbContext {
                 pool_key,
                 &self.live_pool_cache,
                 &mut vault_balances,
+                pin_class,
             ) {
                 inc_arb_vault_live_snapshot_seeded_total();
             }
         }
         drop(vaults);
+        drop(pinned_pools);
 
         let bins = self.bin_arrays.read();
         let mut bin_arrays = HashMap::with_capacity(pool_keys.len());
@@ -11120,6 +11139,49 @@ mod two_hop_price_tests {
         assert!(
             age_ms <= 120_000,
             "screen seed should land in le_120s freshness bucket, got age_ms={age_ms}"
+        );
+    }
+
+    #[test]
+    fn live_snapshot_cache_age_records_pin_label() {
+        use ironcrab::metrics::{
+            ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_LE_120S,
+            ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_LE_30S,
+        };
+        use std::sync::atomic::Ordering;
+
+        let cache = create_shared_cache();
+        let pool = Pubkey::new_unique();
+        let pool_str = pool.to_string();
+        let seed_update = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            Pubkey::new_unique().to_string(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            2_000_000_000,
+            100,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &seed_update);
+
+        let before_30s = ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_LE_30S.load(Ordering::Relaxed);
+        let before_120s =
+            ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_LE_120S.load(Ordering::Relaxed);
+        let mut vault_balances = HashMap::new();
+        assert!(try_seed_vault_from_live_cache(
+            &pool_str,
+            &cache,
+            &mut vault_balances,
+            "pin"
+        ));
+        let after_30s = ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_LE_30S.load(Ordering::Relaxed);
+        let after_120s = ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_LE_120S.load(Ordering::Relaxed);
+        assert!(
+            after_30s > before_30s || after_120s > before_120s,
+            "pin-labeled cache age bucket must increment for arb-pinned seed path"
         );
     }
 

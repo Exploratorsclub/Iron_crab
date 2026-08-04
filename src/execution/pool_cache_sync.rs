@@ -1147,6 +1147,9 @@ fn apply_pool_cache_update_outcome_inner(
                         crate::metrics::inc_pool_cache_apply_rejected_stale_slot_total();
                         let age_sustained = incoming_has_reserve_basis
                             && cache.touch_freshness_on_existing_reserve_basis(&addr);
+                        if age_sustained {
+                            crate::metrics::inc_pool_cache_touch_freshness_on_stale_slot_total();
+                        }
                         if !age_sustained {
                             return PoolCacheApplyOutcome::RejectedStaleSlot;
                         }
