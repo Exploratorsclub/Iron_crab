@@ -1892,6 +1892,12 @@ pub fn select_round_trip_pools(
                     if let Some(vault) = sell_candidate.vault {
                         let bucket = freshness_age_bucket(vault_state_age_ms(vault, now));
                         *state_stale_age_bucket_counts.entry(bucket).or_default() += 1;
+                        // C1h3 H5: same classify path as `sell_not_fresh` top-level counter.
+                        let diagnosis = QuoteNotFreshDiagnosis {
+                            kind: QuoteNotFreshKind::ExecutableMarginal,
+                            cause: QuoteNotFreshCause::AgeExceeded,
+                        };
+                        *sell_not_fresh_detail_counts.entry(diagnosis).or_default() += 1;
                     }
                 }
                 let top = if sub == SellQuoteNoneDetailReason::StateStale {
@@ -2894,5 +2900,61 @@ mod tests {
         assert_eq!(selection.buy_pool_address, "poolA");
         assert_eq!(selection.sell_pool_address, "poolB");
         assert!(selection.sell_quote.amount_out > 0);
+    }
+
+    #[test]
+    fn select_round_trip_pools_state_stale_sell_records_not_fresh_detail() {
+        let pool_a = sample_pool("orca", "poolA");
+        let pool_b = sample_pool("pump_amm", "poolB");
+        let vault_a = sample_vault(1_000_000_000_000, 900_000_000);
+        let mut vault_b = sample_vault(1_000_000_000_000, 1_100_000_000);
+        vault_b.updated_at = Instant::now() - Duration::from_secs(300);
+        let candidates = [
+            RoundTripPoolCandidate {
+                pool: &pool_a,
+                vault: Some(&vault_a),
+                dlmm_bins: None,
+                dex: "orca",
+            },
+            RoundTripPoolCandidate {
+                pool: &pool_b,
+                vault: Some(&vault_b),
+                dlmm_bins: None,
+                dex: "pump_amm",
+            },
+        ];
+        let err = select_round_trip_pools(
+            &candidates,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+        )
+        .unwrap_err();
+        if let RoundTripSelectFailure::InsufficientPools(insufficient) = err {
+            assert_eq!(
+                insufficient.subreason,
+                RoundTripInsufficientSubreason::NoCrossDexSell
+            );
+            assert_eq!(
+                insufficient.no_cross_dex_sell_detail,
+                Some(NoCrossDexSellDetailReason::SellNotFresh)
+            );
+            let detail = insufficient
+                .sell_not_fresh_detail_counts
+                .as_ref()
+                .and_then(|m| {
+                    m.get(&QuoteNotFreshDiagnosis {
+                        kind: QuoteNotFreshKind::ExecutableMarginal,
+                        cause: QuoteNotFreshCause::AgeExceeded,
+                    })
+                })
+                .copied()
+                .unwrap_or(0);
+            assert!(
+                detail > 0,
+                "StateStale sell path must increment sell_not_fresh_detail"
+            );
+        } else {
+            panic!("expected NoCrossDexSell");
+        }
     }
 }
