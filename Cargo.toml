@@ -36,7 +36,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 
 # Math & time
-rust_decimal = { version = "1", features = ["serde"] }
+rust_decimal = { version = "1", default-features = false, features = ["serde", "std"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.21"
 bs58 = "0.5"
