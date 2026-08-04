@@ -4585,11 +4585,12 @@ impl MarketDataContext {
     }
 
     /// True when a live Geyser vault/bin feed makes cache-first JetStream publish redundant.
-    /// Momentum-hot / imminent pins bypass this guard so SLAVE `LivePoolCache` age keeps refreshing.
+    /// Momentum-hot / arb-pinned pins bypass this guard so SLAVE `LivePoolCache` age keeps refreshing.
     #[cfg_attr(not(test), allow(dead_code))]
     fn balance_updated_from_cache_skipped_for_live_feed(&self, pool: Pubkey) -> bool {
         self.pool_has_live_vault_geyser_feed(pool)
             && !self.hot_pool_registry.pool_has_momentum(pool)
+            && !self.hot_pool_registry.pool_has_arb(pool)
     }
 
     /// JetStream refresh from MASTER cache for momentum-hot / arb-pinned pools (cache-first, no RPC).
@@ -4609,19 +4610,25 @@ impl MarketDataContext {
         self.publish_hot_pool_balance_refresh_from_cache(pool);
     }
 
-    /// Periodic heartbeat for momentum-hot pins: sustain SLAVE `LivePoolCache` age during WaitHotSet.
+    /// Periodic heartbeat for momentum-hot / arb-pinned pools: sustain SLAVE `LivePoolCache` age.
     /// Returns `true` when explicit Geyser sync should be coalesced (registration remediation).
     fn tick_momentum_hot_balance_refresh_heartbeat(
         &self,
         admission: &mut FixedCapAdmission,
     ) -> bool {
-        if self.hot_pool_registry.hot_pool_count_momentum() == 0 {
+        if self.hot_pool_registry.hot_pool_count_momentum() == 0
+            && self.hot_pool_registry.arb_pool_count() == 0
+        {
             return false;
         }
         for pool in self.hot_pool_registry.snapshot_hot_pool_pubkeys() {
-            if self.hot_pool_registry.pool_has_momentum(pool) {
-                self.try_publish_balance_updated_from_cache(pool, false);
+            let is_momentum = self.hot_pool_registry.pool_has_momentum(pool);
+            let is_arb = self.hot_pool_registry.pool_has_arb(pool);
+            if !is_momentum && !is_arb {
+                continue;
             }
+            let force_arb_seed = is_arb && !is_momentum;
+            self.try_publish_balance_updated_from_cache(pool, force_arb_seed);
         }
         let batch_dirty = self.remediate_open_position_pumpfun_registration(admission);
         self.tick_open_position_pumpfun_registration_observability();
@@ -17237,7 +17244,7 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
-    fn cache_publish_skipped_after_vault_pubkeys_in_last_synced_snapshot_non_momentum() {
+    fn cache_publish_not_skipped_for_arb_pin_with_live_vault_feed() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
@@ -17276,8 +17283,8 @@ mod pr_b_geyser_tracking_tests {
         );
         assert!(!ctx.hot_pool_registry.pool_has_momentum(pool));
         assert!(
-            ctx.balance_updated_from_cache_skipped_for_live_feed(pool),
-            "arb-only pool with live vault feed must skip cache-first publish"
+            !ctx.balance_updated_from_cache_skipped_for_live_feed(pool),
+            "arb-pinned pool with live vault feed must sustain SLAVE cache age (C1h2)"
         );
     }
 

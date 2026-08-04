@@ -57,19 +57,197 @@ pub fn is_quote_fresh(
     current_vault: Option<&QuoteVaultInput>,
     now: Instant,
 ) -> bool {
+    diagnose_quote_not_fresh(quote, config, current_vault, now).is_none()
+}
+
+/// Age bucket for vault/state-stale forensics (C1h2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FreshnessAgeBucket {
+    Le30s,
+    Le120s,
+    Le300s,
+    Gt300s,
+}
+
+impl FreshnessAgeBucket {
+    pub fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::Le30s => "le_30s",
+            Self::Le120s => "le_120s",
+            Self::Le300s => "le_300s",
+            Self::Gt300s => "gt_300s",
+        }
+    }
+}
+
+/// Map elapsed milliseconds to freshness forensics buckets.
+pub fn freshness_age_bucket(age_ms: u64) -> FreshnessAgeBucket {
+    if age_ms <= 30_000 {
+        FreshnessAgeBucket::Le30s
+    } else if age_ms <= 120_000 {
+        FreshnessAgeBucket::Le120s
+    } else if age_ms <= 300_000 {
+        FreshnessAgeBucket::Le300s
+    } else {
+        FreshnessAgeBucket::Gt300s
+    }
+}
+
+/// Vault reserve snapshot age in milliseconds (for StateStale drill-down).
+pub fn vault_state_age_ms(vault: &QuoteVaultInput, now: Instant) -> u64 {
+    now.duration_since(vault.updated_at).as_millis() as u64
+}
+
+/// Quote kind label for NotFresh forensics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuoteNotFreshKind {
+    ExecutableMarginal,
+    LastTradeMid,
+}
+
+impl QuoteNotFreshKind {
+    pub fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::ExecutableMarginal => "executable_marginal",
+            Self::LastTradeMid => "last_trade_mid",
+        }
+    }
+
+    fn from_quote_kind(kind: QuoteKind) -> Self {
+        match kind {
+            QuoteKind::ExecutableMarginal => Self::ExecutableMarginal,
+            QuoteKind::LastTradeMid => Self::LastTradeMid,
+        }
+    }
+}
+
+/// Root cause when `is_quote_fresh` returns false.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuoteNotFreshCause {
+    AgeExceeded,
+    FingerprintMismatch,
+}
+
+impl QuoteNotFreshCause {
+    pub fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::AgeExceeded => "age_exceeded",
+            Self::FingerprintMismatch => "fingerprint_mismatch",
+        }
+    }
+}
+
+/// Drill-down for cross-DEX sell `NotFresh` (C1h2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QuoteNotFreshDiagnosis {
+    pub kind: QuoteNotFreshKind,
+    pub cause: QuoteNotFreshCause,
+}
+
+/// Returns `Some(diagnosis)` when quote fails freshness re-check.
+pub fn diagnose_quote_not_fresh(
+    quote: &PoolQuote,
+    config: &QuoteFreshnessConfig,
+    current_vault: Option<&QuoteVaultInput>,
+    now: Instant,
+) -> Option<QuoteNotFreshDiagnosis> {
+    let kind = QuoteNotFreshKind::from_quote_kind(quote.kind);
     match quote.kind {
         QuoteKind::LastTradeMid => {
-            now.duration_since(quote.as_of_ts) <= Duration::from_millis(config.trade_ttl_ms)
+            if now.duration_since(quote.as_of_ts) <= Duration::from_millis(config.trade_ttl_ms) {
+                return None;
+            }
+            Some(QuoteNotFreshDiagnosis {
+                kind,
+                cause: QuoteNotFreshCause::AgeExceeded,
+            })
         }
         QuoteKind::ExecutableMarginal => {
             if now.duration_since(quote.as_of_ts) > Duration::from_millis(config.state_ttl_ms) {
-                return false;
+                return Some(QuoteNotFreshDiagnosis {
+                    kind,
+                    cause: QuoteNotFreshCause::AgeExceeded,
+                });
             }
             match current_vault {
-                Some(vault) => state_fingerprint(vault) == quote.state_fingerprint,
-                None => true,
+                Some(vault) if state_fingerprint(vault) != quote.state_fingerprint => {
+                    Some(QuoteNotFreshDiagnosis {
+                        kind,
+                        cause: QuoteNotFreshCause::FingerprintMismatch,
+                    })
+                }
+                _ => None,
             }
         }
+    }
+}
+
+/// Subreason when no candidate produces a fresh buy quote (C1h2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NoFreshBuyQuoteSubreason {
+    QuoteNone,
+    StateStale,
+    TradeStale,
+    NotFreshAfterQuote,
+}
+
+impl NoFreshBuyQuoteSubreason {
+    pub fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::QuoteNone => "quote_none",
+            Self::StateStale => "state_stale",
+            Self::TradeStale => "trade_stale",
+            Self::NotFreshAfterQuote => "not_fresh_after_quote",
+        }
+    }
+}
+
+/// Diagnose why a buy leg failed freshness for round-trip selection.
+pub fn diagnose_no_fresh_buy_quote(
+    pool: &QuotePoolInput,
+    vault: Option<&QuoteVaultInput>,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    probe_lamports: u64,
+    freshness: &QuoteFreshnessConfig,
+    now: Instant,
+) -> NoFreshBuyQuoteSubreason {
+    let buy_quote = quote_exact_in_with_freshness(
+        pool,
+        vault,
+        dlmm_bins,
+        NATIVE_SOL_MINT,
+        &pool.token_mint,
+        probe_lamports,
+        freshness,
+    );
+    let Some(buy_quote) = buy_quote else {
+        if let Some(v) = vault {
+            if !state_fresh(v, now, freshness.state_ttl_ms) {
+                return NoFreshBuyQuoteSubreason::StateStale;
+            }
+        }
+        if trade_fresh(pool, now, freshness.trade_ttl_ms) {
+            return NoFreshBuyQuoteSubreason::QuoteNone;
+        }
+        return NoFreshBuyQuoteSubreason::TradeStale;
+    };
+    if is_quote_fresh(&buy_quote, freshness, vault, now) {
+        return NoFreshBuyQuoteSubreason::NotFreshAfterQuote;
+    }
+    match diagnose_quote_not_fresh(&buy_quote, freshness, vault, now) {
+        Some(QuoteNotFreshDiagnosis {
+            kind: QuoteNotFreshKind::LastTradeMid,
+            ..
+        }) => NoFreshBuyQuoteSubreason::TradeStale,
+        Some(QuoteNotFreshDiagnosis {
+            kind: QuoteNotFreshKind::ExecutableMarginal,
+            cause: QuoteNotFreshCause::AgeExceeded,
+        }) => NoFreshBuyQuoteSubreason::StateStale,
+        Some(QuoteNotFreshDiagnosis {
+            kind: QuoteNotFreshKind::ExecutableMarginal,
+            cause: QuoteNotFreshCause::FingerprintMismatch,
+        }) => NoFreshBuyQuoteSubreason::StateStale,
+        None => NoFreshBuyQuoteSubreason::NotFreshAfterQuote,
     }
 }
 
@@ -1198,7 +1376,7 @@ pub enum CrossDexSellFailure {
     MissingDlmmBins,
     MissingVault,
     QuoteNone(SellQuoteNoneDetailReason),
-    NotFresh,
+    NotFresh(QuoteNotFreshDiagnosis),
     ZeroOut,
 }
 
@@ -1211,7 +1389,7 @@ impl CrossDexSellFailure {
                 NoCrossDexSellDetailReason::SellNotFresh
             }
             Self::QuoteNone(_) => NoCrossDexSellDetailReason::SellQuoteNone,
-            Self::NotFresh => NoCrossDexSellDetailReason::SellNotFresh,
+            Self::NotFresh(_) => NoCrossDexSellDetailReason::SellNotFresh,
             Self::ZeroOut => NoCrossDexSellDetailReason::SellZeroOut,
         }
     }
@@ -1479,6 +1657,9 @@ pub struct RoundTripInsufficient {
     pub subreason: RoundTripInsufficientSubreason,
     pub no_cross_dex_sell_detail: Option<NoCrossDexSellDetailReason>,
     pub sell_quote_none_detail_counts: Option<HashMap<SellQuoteNoneDetailReason, usize>>,
+    pub sell_not_fresh_detail_counts: Option<HashMap<QuoteNotFreshDiagnosis, usize>>,
+    pub no_fresh_buy_quote_detail: Option<NoFreshBuyQuoteSubreason>,
+    pub state_stale_age_bucket_counts: Option<HashMap<FreshnessAgeBucket, usize>>,
 }
 
 impl RoundTripInsufficient {
@@ -1487,6 +1668,9 @@ impl RoundTripInsufficient {
             subreason,
             no_cross_dex_sell_detail: None,
             sell_quote_none_detail_counts: None,
+            sell_not_fresh_detail_counts: None,
+            no_fresh_buy_quote_detail: None,
+            state_stale_age_bucket_counts: None,
         }
     }
 }
@@ -1543,8 +1727,9 @@ pub fn classify_cross_dex_sell_failure(
         );
         return Some(CrossDexSellFailure::QuoteNone(sub));
     };
-    if !is_quote_fresh(&sell_quote, freshness, candidate.vault, now) {
-        return Some(CrossDexSellFailure::NotFresh);
+    if let Some(diagnosis) = diagnose_quote_not_fresh(&sell_quote, freshness, candidate.vault, now)
+    {
+        return Some(CrossDexSellFailure::NotFresh(diagnosis));
     }
     let sol_per_token = sol_per_token_from_sell_quote(&sell_quote, token_decimals);
     if sol_per_token <= Decimal::ZERO {
@@ -1563,6 +1748,7 @@ fn dominant_no_cross_dex_sell_detail(
 }
 
 /// I-ARB-5 evolution: enumerate valid cross-DEX (buy, sell) pairs and pick best round-trip.
+#[allow(clippy::result_large_err)]
 pub fn select_round_trip_pools(
     candidates: &[RoundTripPoolCandidate<'_>],
     probe_lamports: u64,
@@ -1620,8 +1806,31 @@ pub fn select_round_trip_pools(
     }
 
     if valid_buys.is_empty() {
+        let mut buy_fail_counts: HashMap<NoFreshBuyQuoteSubreason, usize> = HashMap::new();
+        for candidate in candidates {
+            let sub = diagnose_no_fresh_buy_quote(
+                candidate.pool,
+                candidate.vault,
+                candidate.dlmm_bins,
+                probe_lamports,
+                freshness,
+                now,
+            );
+            *buy_fail_counts.entry(sub).or_default() += 1;
+        }
+        let dominant_buy_detail = buy_fail_counts
+            .iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(reason, _)| *reason);
         return Err(RoundTripSelectFailure::InsufficientPools(
-            RoundTripInsufficient::new(RoundTripInsufficientSubreason::NoFreshBuyQuote),
+            RoundTripInsufficient {
+                subreason: RoundTripInsufficientSubreason::NoFreshBuyQuote,
+                no_cross_dex_sell_detail: None,
+                sell_quote_none_detail_counts: None,
+                sell_not_fresh_detail_counts: None,
+                no_fresh_buy_quote_detail: dominant_buy_detail,
+                state_stale_age_bucket_counts: None,
+            },
         ));
     }
 
@@ -1640,6 +1849,8 @@ pub fn select_round_trip_pools(
         std::collections::HashMap::new();
     let mut sell_quote_none_detail_counts: HashMap<SellQuoteNoneDetailReason, usize> =
         HashMap::new();
+    let mut sell_not_fresh_detail_counts: HashMap<QuoteNotFreshDiagnosis, usize> = HashMap::new();
+    let mut state_stale_age_bucket_counts: HashMap<FreshnessAgeBucket, usize> = HashMap::new();
 
     for buy in &valid_buys {
         for sell_candidate in candidates {
@@ -1677,6 +1888,12 @@ pub fn select_round_trip_pools(
                     now,
                 );
                 *sell_quote_none_detail_counts.entry(sub).or_default() += 1;
+                if sub == SellQuoteNoneDetailReason::StateStale {
+                    if let Some(vault) = sell_candidate.vault {
+                        let bucket = freshness_age_bucket(vault_state_age_ms(vault, now));
+                        *state_stale_age_bucket_counts.entry(bucket).or_default() += 1;
+                    }
+                }
                 let top = if sub == SellQuoteNoneDetailReason::StateStale {
                     NoCrossDexSellDetailReason::SellNotFresh
                 } else {
@@ -1685,7 +1902,10 @@ pub fn select_round_trip_pools(
                 *sell_fail_counts.entry(top).or_default() += 1;
                 continue;
             };
-            if !is_quote_fresh(&sell_quote, freshness, sell_candidate.vault, now) {
+            if let Some(diagnosis) =
+                diagnose_quote_not_fresh(&sell_quote, freshness, sell_candidate.vault, now)
+            {
+                *sell_not_fresh_detail_counts.entry(diagnosis).or_default() += 1;
                 *sell_fail_counts
                     .entry(NoCrossDexSellDetailReason::SellNotFresh)
                     .or_default() += 1;
@@ -1731,6 +1951,11 @@ pub fn select_round_trip_pools(
                 no_cross_dex_sell_detail: dominant_no_cross_dex_sell_detail(&sell_fail_counts),
                 sell_quote_none_detail_counts: (!sell_quote_none_detail_counts.is_empty())
                     .then_some(sell_quote_none_detail_counts),
+                sell_not_fresh_detail_counts: (!sell_not_fresh_detail_counts.is_empty())
+                    .then_some(sell_not_fresh_detail_counts),
+                no_fresh_buy_quote_detail: None,
+                state_stale_age_bucket_counts: (!state_stale_age_bucket_counts.is_empty())
+                    .then_some(state_stale_age_bucket_counts),
             },
         ));
     };
@@ -2230,6 +2455,9 @@ mod tests {
                 subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
                 no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellMissingVault),
                 sell_quote_none_detail_counts: None,
+                sell_not_fresh_detail_counts: None,
+                no_fresh_buy_quote_detail: None,
+                state_stale_age_bucket_counts: None,
             })
         );
     }
@@ -2266,6 +2494,9 @@ mod tests {
                 subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
                 no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellMissingDlmmBins),
                 sell_quote_none_detail_counts: None,
+                sell_not_fresh_detail_counts: None,
+                no_fresh_buy_quote_detail: None,
+                state_stale_age_bucket_counts: None,
             })
         );
     }
@@ -2519,6 +2750,119 @@ mod tests {
             sell_quote.is_some(),
             "large DLMM sell must not fail marginal probe gate"
         );
+    }
+
+    #[test]
+    fn diagnose_quote_not_fresh_trade_age_exceeded() {
+        let config = QuoteFreshnessConfig::default();
+        let quote = PoolQuote {
+            pool_address: "p".into(),
+            dex: "orca".into(),
+            kind: QuoteKind::LastTradeMid,
+            side: QuoteSide::Sell,
+            as_of_slot: 0,
+            as_of_ts: Instant::now() - Duration::from_secs(60),
+            fresh: false,
+            state_fingerprint: 0,
+            amount_in: 1,
+            amount_out: 2,
+        };
+        let diagnosis = diagnose_quote_not_fresh(&quote, &config, None, Instant::now())
+            .expect("stale trade quote");
+        assert_eq!(diagnosis.kind, QuoteNotFreshKind::LastTradeMid);
+        assert_eq!(diagnosis.cause, QuoteNotFreshCause::AgeExceeded);
+    }
+
+    #[test]
+    fn diagnose_quote_not_fresh_executable_fingerprint_mismatch() {
+        let config = QuoteFreshnessConfig::default();
+        let vault = sample_vault(1_000_000_000_000, 1_000_000_000);
+        let fingerprint = state_fingerprint(&vault);
+        let quote = PoolQuote {
+            pool_address: "p".into(),
+            dex: "orca".into(),
+            kind: QuoteKind::ExecutableMarginal,
+            side: QuoteSide::Sell,
+            as_of_slot: 1,
+            as_of_ts: Instant::now(),
+            fresh: true,
+            state_fingerprint: fingerprint,
+            amount_in: 1,
+            amount_out: 2,
+        };
+        let mut changed_vault = vault.clone();
+        changed_vault.reserve_base += 1;
+        let diagnosis =
+            diagnose_quote_not_fresh(&quote, &config, Some(&changed_vault), Instant::now())
+                .expect("fingerprint mismatch");
+        assert_eq!(diagnosis.kind, QuoteNotFreshKind::ExecutableMarginal);
+        assert_eq!(diagnosis.cause, QuoteNotFreshCause::FingerprintMismatch);
+    }
+
+    #[test]
+    fn freshness_age_bucket_boundaries() {
+        assert_eq!(freshness_age_bucket(15_000), FreshnessAgeBucket::Le30s);
+        assert_eq!(freshness_age_bucket(60_000), FreshnessAgeBucket::Le120s);
+        assert_eq!(freshness_age_bucket(200_000), FreshnessAgeBucket::Le300s);
+        assert_eq!(freshness_age_bucket(400_000), FreshnessAgeBucket::Gt300s);
+    }
+
+    #[test]
+    fn diagnose_no_fresh_buy_quote_state_stale_vault() {
+        let pool = sample_pool("orca", "staleBuy");
+        let mut vault = sample_vault(1_000_000_000_000, 1_000_000_000);
+        vault.updated_at = Instant::now() - Duration::from_secs(300);
+        let sub = diagnose_no_fresh_buy_quote(
+            &pool,
+            Some(&vault),
+            None,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+            Instant::now(),
+        );
+        assert_eq!(sub, NoFreshBuyQuoteSubreason::StateStale);
+    }
+
+    #[test]
+    fn select_round_trip_pools_no_fresh_buy_records_subreason() {
+        let pool_a = sample_pool("orca", "poolA");
+        let pool_b = sample_pool("pump_amm", "poolB");
+        let mut vault_a = sample_vault(1_000_000_000_000, 900_000_000);
+        vault_a.updated_at = Instant::now() - Duration::from_secs(300);
+        let mut vault_b = sample_vault(1_000_000_000_000, 1_100_000_000);
+        vault_b.updated_at = Instant::now() - Duration::from_secs(300);
+        let candidates = [
+            RoundTripPoolCandidate {
+                pool: &pool_a,
+                vault: Some(&vault_a),
+                dlmm_bins: None,
+                dex: "orca",
+            },
+            RoundTripPoolCandidate {
+                pool: &pool_b,
+                vault: Some(&vault_b),
+                dlmm_bins: None,
+                dex: "pump_amm",
+            },
+        ];
+        let err = select_round_trip_pools(
+            &candidates,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+        )
+        .unwrap_err();
+        if let RoundTripSelectFailure::InsufficientPools(insufficient) = err {
+            assert_eq!(
+                insufficient.subreason,
+                RoundTripInsufficientSubreason::NoFreshBuyQuote
+            );
+            assert_eq!(
+                insufficient.no_fresh_buy_quote_detail,
+                Some(NoFreshBuyQuoteSubreason::StateStale)
+            );
+        } else {
+            panic!("expected NoFreshBuyQuote");
+        }
     }
 
     #[test]
