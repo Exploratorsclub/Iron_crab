@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ARB-C1h: Arb Quote Freshness — Live Vault Refresh at Screen (post-C1vault)
+**Datum**: 2026-08-04  
+**Problem**: Post-#364/C1vault: `sell_not_fresh` ~67% sell-fails; `state_stale` dominant in `sell_quote_none`. C1vault seed-if-missing filled vault rows but `snapshot_vault_bins_for_tracker` cloned stale `vault_balances` without refreshing when SLAVE LivePoolCache was newer. `arb_vault_balance_applied_total` ~14 (counter only on `is_new`).  
+**Fix**: (1) C1h H1: `try_refresh_vault_from_live_cache` at scoped screen snapshot when cache slot/age fresher than `vault_balances`. (2) H2: `arb_vault_balance_applied_total` on every PoolStateUpdate apply; bin-update path tries live refresh before timestamp touch. (3) Forensik: `arb_vault_live_snapshot_refreshed_total`. **Invarianten**: I-4/I-7 kein RPC; TTL nicht erhöht.  
+**Evidence**: `findings_arb_zero_opp_post364_20260804.md`, Prod Tip `8494f10`.  
+**Dateien**: `src/bin/arb_strategy.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-ARB-C1vault: Arb Pin Vault Completeness — Publish + Retry + Consume (post-C1g)
 **Datum**: 2026-08-04  
 **Problem**: Post-#363/C1g: `sell_missing_vault` ~67% sell-fails trotz `arb_tracked_vaults`~310. Root causes: (1) Arb apply ohne `retry_deferred` (Momentum hatte es). (2) Kein cache-first JetStream-Seed für arb-only nach Register (`publish_momentum_*` Mom-only). (3) Arb Consume-Gap: kein LivePoolCache-Vault-Seed beim v2-Screen und kein Rescreen auf `PoolStateUpdate`.  

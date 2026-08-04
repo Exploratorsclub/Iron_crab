@@ -78,13 +78,13 @@ use ironcrab::metrics::{
     inc_arb_dlmm_bin_array_update_received_total, inc_arb_dlmm_bin_rescreen_scheduled_total,
     inc_arb_pinned_meteora_pool_bin_cache_miss_total, inc_arb_v2_screen_meteora_sell_bin_hit_total,
     inc_arb_v2_screen_meteora_sell_bin_miss_total, inc_arb_vault_balance_applied_total,
-    inc_arb_vault_live_snapshot_seeded_total, inc_arb_vault_rescreen_scheduled_total,
-    record_arb_heartbeat_phase, record_arb_price_freshness_stale_age_ms,
-    record_arb_proactive_pin_first_publish, record_arb_proactive_track_publish_total,
-    record_arb_quote_pair_slot_delta, record_arb_quote_shadow_round_trip,
-    record_arb_track_publish_skipped_unchanged_total, record_arb_track_removed_total,
-    record_arb_track_requests_messages_total, record_arb_track_requests_publish_chunks_total,
-    record_arb_track_requests_publish_failed_total,
+    inc_arb_vault_live_snapshot_refreshed_total, inc_arb_vault_live_snapshot_seeded_total,
+    inc_arb_vault_rescreen_scheduled_total, record_arb_heartbeat_phase,
+    record_arb_price_freshness_stale_age_ms, record_arb_proactive_pin_first_publish,
+    record_arb_proactive_track_publish_total, record_arb_quote_pair_slot_delta,
+    record_arb_quote_shadow_round_trip, record_arb_track_publish_skipped_unchanged_total,
+    record_arb_track_removed_total, record_arb_track_requests_messages_total,
+    record_arb_track_requests_publish_chunks_total, record_arb_track_requests_publish_failed_total,
     record_arb_track_selection_blocking_join_failed_total,
     record_arb_track_selection_queue_overflow_total, record_arb_track_selection_recompute_total,
     record_arb_writer_lock_wait, serve_metrics, set_arb_pool_cache_apply_batch_size_gauge,
@@ -399,6 +399,44 @@ fn vault_dlmm_sol_is_x(vault: &VaultBalanceCache) -> bool {
         .unwrap_or(vault.dlmm_sol_is_x)
 }
 
+/// Build vault row from SLAVE LivePoolCache entry (Geyser-only, SOL-quoted pools only).
+fn vault_balance_from_live_cache_state(
+    state: &CachedPoolState,
+    slot: u64,
+    age_ms: u64,
+) -> Option<VaultBalanceCache> {
+    let warmup = arb_warmup_pool_seed(state)?;
+    if warmup.quote_kind != ArbWarmupQuoteKind::Sol {
+        return None;
+    }
+    let cache_updated_at = Instant::now()
+        .checked_sub(Duration::from_millis(age_ms))
+        .unwrap_or_else(Instant::now);
+    let dlmm_token_x_mint = match state {
+        CachedPoolState::Meteora(s) => Some(s.token_x_mint.to_string()),
+        _ => None,
+    };
+    let dlmm_sol_is_x = dlmm_token_x_mint.as_deref() == Some(NATIVE_SOL_MINT);
+    Some(VaultBalanceCache {
+        reserve_base: warmup.reserve_base,
+        reserve_quote: warmup.reserve_quote,
+        update_slot: slot,
+        active_id: warmup.active_id,
+        bin_step: warmup.bin_step,
+        updated_at: cache_updated_at,
+        dlmm_sol_is_x,
+        dlmm_token_x_mint,
+    })
+}
+
+fn live_pool_cache_fresher_than_vault(
+    cache_slot: u64,
+    cache_updated_at: Instant,
+    existing: &VaultBalanceCache,
+) -> bool {
+    cache_slot > existing.update_slot || cache_updated_at > existing.updated_at
+}
+
 /// H3 / C1vault: seed missing vault row from SLAVE LivePoolCache (Geyser-only, all SOL-quoted DEXes).
 fn try_seed_vault_from_live_cache(
     pool_address: &str,
@@ -414,33 +452,36 @@ fn try_seed_vault_from_live_cache(
     let Some((state, slot, age_ms)) = live_pool_cache.get_with_metadata(&pool_pk) else {
         return false;
     };
-    let Some(warmup) = arb_warmup_pool_seed(&state) else {
+    let Some(vault) = vault_balance_from_live_cache_state(&state, slot, age_ms) else {
         return false;
     };
-    if warmup.quote_kind != ArbWarmupQuoteKind::Sol {
+    vault_cache.insert(pool_address.to_string(), vault);
+    true
+}
+
+/// C1h H1: refresh stale vault_balances row from fresher SLAVE LivePoolCache at screen snapshot.
+fn try_refresh_vault_from_live_cache(
+    pool_address: &str,
+    live_pool_cache: &SharedLivePoolCache,
+    vault_cache: &mut HashMap<String, VaultBalanceCache>,
+) -> bool {
+    let Ok(pool_pk) = Pubkey::from_str(pool_address) else {
+        return false;
+    };
+    let existing = match vault_cache.get(pool_address) {
+        Some(v) => v,
+        None => return false,
+    };
+    let Some((state, slot, age_ms)) = live_pool_cache.get_with_metadata(&pool_pk) else {
+        return false;
+    };
+    let Some(new_vault) = vault_balance_from_live_cache_state(&state, slot, age_ms) else {
+        return false;
+    };
+    if !live_pool_cache_fresher_than_vault(slot, new_vault.updated_at, existing) {
         return false;
     }
-    let cache_updated_at = Instant::now()
-        .checked_sub(Duration::from_millis(age_ms))
-        .unwrap_or_else(Instant::now);
-    let dlmm_token_x_mint = match &state {
-        CachedPoolState::Meteora(s) => Some(s.token_x_mint.to_string()),
-        _ => None,
-    };
-    let dlmm_sol_is_x = dlmm_token_x_mint.as_deref() == Some(NATIVE_SOL_MINT);
-    vault_cache.insert(
-        pool_address.to_string(),
-        VaultBalanceCache {
-            reserve_base: warmup.reserve_base,
-            reserve_quote: warmup.reserve_quote,
-            update_slot: slot,
-            active_id: warmup.active_id,
-            bin_step: warmup.bin_step,
-            updated_at: cache_updated_at,
-            dlmm_sol_is_x,
-            dlmm_token_x_mint,
-        },
-    );
+    vault_cache.insert(pool_address.to_string(), new_vault);
     true
 }
 
@@ -5440,6 +5481,7 @@ impl ArbContext {
                 "Vault balances updated"
             );
         }
+        inc_arb_vault_balance_applied_total();
         drop(cache);
 
         // Mirror SOL liquidity + reserve flag into per-mint pool trackers (Geyser-only, no RPC)
@@ -5489,12 +5531,7 @@ impl ArbContext {
         for mint in &mints_with_pool {
             self.arb_track_selection.mark_dirty(mint);
         }
-        if is_new {
-            inc_arb_vault_balance_applied_total();
-        }
-        if !mints_with_pool.is_empty() {
-            self.schedule_arb_vault_rescreen_for_mints(pool_address, &mints_with_pool);
-        }
+        self.schedule_arb_vault_rescreen_for_mints(pool_address, &mints_with_pool);
     }
 
     /// Handle BinArrayUpdate event - cache Meteora DLMM bin arrays from Geyser
@@ -5531,8 +5568,16 @@ impl ArbContext {
                 &self.live_pool_cache,
                 &mut vault_cache,
             );
-            if let Some(v) = vault_cache.get_mut(pool_address) {
-                v.updated_at = now;
+            if vault_cache.contains_key(pool_address)
+                && !try_refresh_vault_from_live_cache(
+                    pool_address,
+                    &self.live_pool_cache,
+                    &mut vault_cache,
+                )
+            {
+                if let Some(v) = vault_cache.get_mut(pool_address) {
+                    v.updated_at = now;
+                }
             }
         }
         let read_wait = Instant::now();
@@ -5922,6 +5967,13 @@ impl ArbContext {
         for pool_key in &pool_keys {
             if let Some(entry) = vaults.get(pool_key) {
                 vault_balances.insert(pool_key.clone(), entry.clone());
+                if try_refresh_vault_from_live_cache(
+                    pool_key,
+                    &self.live_pool_cache,
+                    &mut vault_balances,
+                ) {
+                    inc_arb_vault_live_snapshot_refreshed_total();
+                }
             } else if try_seed_vault_from_live_cache(
                 pool_key,
                 &self.live_pool_cache,
@@ -9897,6 +9949,122 @@ mod two_hop_price_tests {
             "snapshot must seed vault from SLAVE cache when vault_balances empty"
         );
         assert!(ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL.load(Ordering::Relaxed) > seeded_before);
+    }
+
+    #[test]
+    fn scoped_snapshot_refreshes_stale_vault_from_fresher_live_cache() {
+        use ironcrab::arbitrage::pool_quote::STATE_TTL_MS;
+        use ironcrab::metrics::{
+            ARB_VAULT_LIVE_SNAPSHOT_REFRESHED_TOTAL, ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL,
+        };
+        use std::sync::atomic::Ordering;
+
+        let cache = create_shared_cache();
+        let pool_pk = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        cache.upsert(
+            pool_pk,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: token_mint,
+                token_y_mint: sol,
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id: 10,
+                bin_step: 20,
+                reserve_x_balance: Some(800_000),
+                reserve_y_balance: Some(2_000_000_000),
+            }),
+            50,
+        );
+        let ctx = test_arb_context(cache);
+        let mint = "TokenMintScopedVaultRefresh111111111111111";
+        let pool_addr = pool_pk.to_string();
+        {
+            let mut trackers = ctx.trackers.write();
+            let mut tracker = TokenArbTracker::new(mint);
+            tracker.upsert_pool(sample_pool("meteora_dlmm", &pool_addr, None, None));
+            trackers.insert(mint.to_string(), tracker);
+        }
+        ctx.vault_balances.write().insert(
+            pool_addr.clone(),
+            VaultBalanceCache {
+                reserve_base: 100_000,
+                reserve_quote: 500_000_000,
+                update_slot: 1,
+                active_id: Some(0),
+                bin_step: Some(10),
+                updated_at: Instant::now() - Duration::from_millis(STATE_TTL_MS + 60_000),
+                dlmm_sol_is_x: true,
+                dlmm_token_x_mint: Some(NATIVE_SOL_MINT.to_string()),
+            },
+        );
+
+        let tracker = ctx.trackers.read().get(mint).unwrap().clone();
+        let seeded_before = ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL.load(Ordering::Relaxed);
+        let refreshed_before = ARB_VAULT_LIVE_SNAPSHOT_REFRESHED_TOTAL.load(Ordering::Relaxed);
+        let (vaults, _) = ctx.snapshot_vault_bins_for_tracker(&tracker);
+        let vault = vaults
+            .get(&pool_addr)
+            .expect("snapshot must include vault row");
+        assert!(
+            vault.updated_at.elapsed() <= Duration::from_millis(STATE_TTL_MS),
+            "live refresh must replace stale vault_balances.updated_at"
+        );
+        assert_eq!(vault.update_slot, 50);
+        assert_eq!(vault.reserve_base, 800_000);
+        assert_eq!(vault.reserve_quote, 2_000_000_000);
+        assert_eq!(
+            ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL.load(Ordering::Relaxed),
+            seeded_before,
+            "refresh path must not count as seed"
+        );
+        assert!(ARB_VAULT_LIVE_SNAPSHOT_REFRESHED_TOTAL.load(Ordering::Relaxed) > refreshed_before);
+    }
+
+    #[test]
+    fn pool_state_update_increments_vault_balance_applied_on_update() {
+        use ironcrab::metrics::ARB_VAULT_BALANCE_APPLIED_TOTAL;
+        use std::sync::atomic::Ordering;
+
+        let ctx = test_arb_context(create_shared_cache());
+        let pool_addr = "orcaPoolStateUpdateApplied";
+        let mint = "TokenMintVaultApplied111111111111111111111";
+        {
+            let mut trackers = ctx.trackers.write();
+            let mut tracker = TokenArbTracker::new(mint);
+            tracker.upsert_pool(sample_pool("orca", pool_addr, None, None));
+            trackers.insert(mint.to_string(), tracker);
+        }
+        ctx.vault_balances.write().insert(
+            pool_addr.to_string(),
+            VaultBalanceCache {
+                reserve_base: 1_000_000_000,
+                reserve_quote: 1_000_000,
+                update_slot: 10,
+                active_id: None,
+                bin_step: None,
+                updated_at: Instant::now(),
+                dlmm_sol_is_x: false,
+                dlmm_token_x_mint: None,
+            },
+        );
+        let before = ARB_VAULT_BALANCE_APPLIED_TOTAL.load(Ordering::Relaxed);
+        ctx.handle_pool_state_update(
+            pool_addr,
+            "orca",
+            1_000_000_000,
+            1_100_000,
+            20,
+            None,
+            None,
+            mint,
+            NATIVE_SOL_MINT,
+        );
+        assert!(
+            ARB_VAULT_BALANCE_APPLIED_TOTAL.load(Ordering::Relaxed) > before,
+            "PoolStateUpdate must increment applied counter on slot-advancing update"
+        );
     }
 
     #[test]
