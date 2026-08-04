@@ -7,6 +7,8 @@
 # (spl-associated-token-account) — no patch without Solana/SPL major alignment.
 # RUSTSEC-2026-0098 / RUSTSEC-2026-0099: rustls-webpki — fixing via direct dep pin breaks ironcrab-eval
 # (path/git patch) resolver; ignore until transitive rustls pulls a patched webpki without a root pin.
+# RUSTSEC-2026-0235: rkyv 0.7.46 optional dep of rust_decimal (lockfile only; rkyv feature not
+# enabled — ironcrab uses serde/std). rust_decimal locks rkyv 0.7; patch requires >=0.8.17 (breaking).
 ignore = [
     "RUSTSEC-2025-0141",
     "RUSTSEC-2025-0134",
@@ -14,6 +16,7 @@ ignore = [
     "RUSTSEC-2026-0097",
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0235",
 ]
 
 # Disable yanked warnings - js-sys, wasm-bindgen come from web-time/rustls-pki-types via async-nats

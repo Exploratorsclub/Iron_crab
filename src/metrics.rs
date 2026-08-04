@@ -4866,10 +4866,13 @@ pub static ARB_DLMM_BIN_ARRAY_UPDATE_RECEIVED_TOTAL: Lazy<AtomicU64> =
 pub static ARB_DLMM_BIN_ARRAY_UPDATE_APPLIED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_DLMM_BIN_RESCREEN_SCHEDULED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
-/// PoolStateUpdate applied a new vault_balances row for arb screening.
+/// PoolStateUpdate applied vault_balances for arb screening (new or updated row).
 pub static ARB_VAULT_BALANCE_APPLIED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// v2 screen seeded missing vault from SLAVE LivePoolCache at snapshot time (C1vault).
 pub static ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// v2 screen refreshed stale vault_balances from fresher SLAVE LivePoolCache (C1h).
+pub static ARB_VAULT_LIVE_SNAPSHOT_REFRESHED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// PoolStateUpdate scheduled off-hot-loop rescreen for selected mints (C1vault).
 pub static ARB_VAULT_RESCREEN_SCHEDULED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_V2_SCREEN_METEORA_SELL_BIN_HIT_TOTAL: Lazy<AtomicU64> =
@@ -5414,6 +5417,11 @@ pub fn inc_arb_vault_balance_applied_total() {
 /// Increment `arb_vault_live_snapshot_seeded_total`.
 pub fn inc_arb_vault_live_snapshot_seeded_total() {
     ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_vault_live_snapshot_refreshed_total`.
+pub fn inc_arb_vault_live_snapshot_refreshed_total() {
+    ARB_VAULT_LIVE_SNAPSHOT_REFRESHED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Increment `arb_vault_rescreen_scheduled_total`.
@@ -10033,6 +10041,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_vault_live_snapshot_seeded_total",
         ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_vault_live_snapshot_refreshed_total",
+        ARB_VAULT_LIVE_SNAPSHOT_REFRESHED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "arb_vault_rescreen_scheduled_total",
