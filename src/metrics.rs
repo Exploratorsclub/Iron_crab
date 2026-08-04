@@ -386,6 +386,19 @@ pub static MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_VAULT_NO_CHANGE: Lazy<
 /// Arb pin: retry tick still unsatisfied — DLMM bin PDAs tracked locally but not Geyser-flushed.
 pub static MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_BINS_NOT_SYNCED: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Arb pin: retry tick still unsatisfied — EXEC_HOT arb admit suppress still active for warmable.
+pub static MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_ADMIT_SUPPRESS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Arb pin: deferred cleared after successful registration (by original defer reason).
+pub static MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_ADMIT_SUPPRESS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_LIVE_POOL_CACHE_MISS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_VAULT_REGISTER_NO_CHANGE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Arb pin: cache-first JetStream vault seed published after arb register/retry success.
+pub static MARKET_DATA_ARB_PIN_VAULT_PUBLISHED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// Rows in `tracked_bin_arrays` (all pins).
 pub static MARKET_DATA_TRACKED_BIN_ARRAYS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// Rows in `tracked_bin_arrays` pinned `ArbMultiDex`.
@@ -694,8 +707,35 @@ pub fn inc_market_data_arb_pin_deferred_still_unsatisfied_total(reason: &str) {
             MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_BINS_NOT_SYNCED
                 .fetch_add(1, Ordering::Relaxed);
         }
+        "admit_suppress" => {
+            MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_ADMIT_SUPPRESS
+                .fetch_add(1, Ordering::Relaxed);
+        }
         _ => {}
     }
+}
+
+#[inline]
+pub fn inc_market_data_arb_pin_deferred_cleared_by_reason_total(reason: &str) {
+    match reason {
+        "admit_suppress" => {
+            MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_ADMIT_SUPPRESS.fetch_add(1, Ordering::Relaxed);
+        }
+        "live_pool_cache_miss" => {
+            MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_LIVE_POOL_CACHE_MISS
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        "vault_register_no_change" => {
+            MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_VAULT_REGISTER_NO_CHANGE
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+#[inline]
+pub fn inc_market_data_arb_pin_vault_published_total() {
+    MARKET_DATA_ARB_PIN_VAULT_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -4826,6 +4866,12 @@ pub static ARB_DLMM_BIN_ARRAY_UPDATE_RECEIVED_TOTAL: Lazy<AtomicU64> =
 pub static ARB_DLMM_BIN_ARRAY_UPDATE_APPLIED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_DLMM_BIN_RESCREEN_SCHEDULED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// PoolStateUpdate applied a new vault_balances row for arb screening.
+pub static ARB_VAULT_BALANCE_APPLIED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// v2 screen seeded missing vault from SLAVE LivePoolCache at snapshot time (C1vault).
+pub static ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// PoolStateUpdate scheduled off-hot-loop rescreen for selected mints (C1vault).
+pub static ARB_VAULT_RESCREEN_SCHEDULED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_V2_SCREEN_METEORA_SELL_BIN_HIT_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_V2_SCREEN_METEORA_SELL_BIN_MISS_TOTAL: Lazy<AtomicU64> =
@@ -5358,6 +5404,21 @@ pub fn inc_arb_dlmm_bin_array_update_applied_total() {
 /// Increment `arb_dlmm_bin_rescreen_scheduled_total`.
 pub fn inc_arb_dlmm_bin_rescreen_scheduled_total() {
     ARB_DLMM_BIN_RESCREEN_SCHEDULED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_vault_balance_applied_total`.
+pub fn inc_arb_vault_balance_applied_total() {
+    ARB_VAULT_BALANCE_APPLIED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_vault_live_snapshot_seeded_total`.
+pub fn inc_arb_vault_live_snapshot_seeded_total() {
+    ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_vault_rescreen_scheduled_total`.
+pub fn inc_arb_vault_rescreen_scheduled_total() {
+    ARB_VAULT_RESCREEN_SCHEDULED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Increment `arb_v2_screen_meteora_sell_bin_hit_total`.
@@ -8201,6 +8262,31 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
+    out.push_str(
+        "market_data_arb_pin_deferred_still_unsatisfied_total{reason=\"admit_suppress\"} ",
+    );
+    out.push_str(
+        &MARKET_DATA_ARB_PIN_DEFERRED_STILL_UNSATISFIED_ADMIT_SUPPRESS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "market_data_arb_pin_deferred_cleared_admit_suppress_total",
+        MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_ADMIT_SUPPRESS.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_arb_pin_deferred_cleared_live_pool_cache_miss_total",
+        MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_LIVE_POOL_CACHE_MISS.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_arb_pin_deferred_cleared_vault_register_no_change_total",
+        MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_VAULT_REGISTER_NO_CHANGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_arb_pin_vault_published_total",
+        MARKET_DATA_ARB_PIN_VAULT_PUBLISHED_TOTAL.load(Ordering::Relaxed)
+    );
     line!(
         "market_data_arb_pin_budget_used",
         MARKET_DATA_ARB_PIN_BUDGET_USED_GAUGE.load(Ordering::Relaxed)
@@ -9939,6 +10025,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_dlmm_bin_rescreen_scheduled_total",
         ARB_DLMM_BIN_RESCREEN_SCHEDULED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_vault_balance_applied_total",
+        ARB_VAULT_BALANCE_APPLIED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_vault_live_snapshot_seeded_total",
+        ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_vault_rescreen_scheduled_total",
+        ARB_VAULT_RESCREEN_SCHEDULED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "arb_v2_screen_meteora_sell_bin_hit_total",

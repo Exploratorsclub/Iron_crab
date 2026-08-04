@@ -77,12 +77,14 @@ use ironcrab::metrics::{
     arb_two_hop_v2_sell_quote_none_detail_inc, inc_arb_dlmm_bin_array_update_applied_total,
     inc_arb_dlmm_bin_array_update_received_total, inc_arb_dlmm_bin_rescreen_scheduled_total,
     inc_arb_pinned_meteora_pool_bin_cache_miss_total, inc_arb_v2_screen_meteora_sell_bin_hit_total,
-    inc_arb_v2_screen_meteora_sell_bin_miss_total, record_arb_heartbeat_phase,
-    record_arb_price_freshness_stale_age_ms, record_arb_proactive_pin_first_publish,
-    record_arb_proactive_track_publish_total, record_arb_quote_pair_slot_delta,
-    record_arb_quote_shadow_round_trip, record_arb_track_publish_skipped_unchanged_total,
-    record_arb_track_removed_total, record_arb_track_requests_messages_total,
-    record_arb_track_requests_publish_chunks_total, record_arb_track_requests_publish_failed_total,
+    inc_arb_v2_screen_meteora_sell_bin_miss_total, inc_arb_vault_balance_applied_total,
+    inc_arb_vault_live_snapshot_seeded_total, inc_arb_vault_rescreen_scheduled_total,
+    record_arb_heartbeat_phase, record_arb_price_freshness_stale_age_ms,
+    record_arb_proactive_pin_first_publish, record_arb_proactive_track_publish_total,
+    record_arb_quote_pair_slot_delta, record_arb_quote_shadow_round_trip,
+    record_arb_track_publish_skipped_unchanged_total, record_arb_track_removed_total,
+    record_arb_track_requests_messages_total, record_arb_track_requests_publish_chunks_total,
+    record_arb_track_requests_publish_failed_total,
     record_arb_track_selection_blocking_join_failed_total,
     record_arb_track_selection_queue_overflow_total, record_arb_track_selection_recompute_total,
     record_arb_writer_lock_wait, serve_metrics, set_arb_pool_cache_apply_batch_size_gauge,
@@ -395,6 +397,51 @@ fn vault_dlmm_sol_is_x(vault: &VaultBalanceCache) -> bool {
         .as_deref()
         .map(|m| m == NATIVE_SOL_MINT)
         .unwrap_or(vault.dlmm_sol_is_x)
+}
+
+/// H3 / C1vault: seed missing vault row from SLAVE LivePoolCache (Geyser-only, all SOL-quoted DEXes).
+fn try_seed_vault_from_live_cache(
+    pool_address: &str,
+    live_pool_cache: &SharedLivePoolCache,
+    vault_cache: &mut HashMap<String, VaultBalanceCache>,
+) -> bool {
+    if vault_cache.contains_key(pool_address) {
+        return false;
+    }
+    let Ok(pool_pk) = Pubkey::from_str(pool_address) else {
+        return false;
+    };
+    let Some((state, slot, age_ms)) = live_pool_cache.get_with_metadata(&pool_pk) else {
+        return false;
+    };
+    let Some(warmup) = arb_warmup_pool_seed(&state) else {
+        return false;
+    };
+    if warmup.quote_kind != ArbWarmupQuoteKind::Sol {
+        return false;
+    }
+    let cache_updated_at = Instant::now()
+        .checked_sub(Duration::from_millis(age_ms))
+        .unwrap_or_else(Instant::now);
+    let dlmm_token_x_mint = match &state {
+        CachedPoolState::Meteora(s) => Some(s.token_x_mint.to_string()),
+        _ => None,
+    };
+    let dlmm_sol_is_x = dlmm_token_x_mint.as_deref() == Some(NATIVE_SOL_MINT);
+    vault_cache.insert(
+        pool_address.to_string(),
+        VaultBalanceCache {
+            reserve_base: warmup.reserve_base,
+            reserve_quote: warmup.reserve_quote,
+            update_slot: slot,
+            active_id: warmup.active_id,
+            bin_step: warmup.bin_step,
+            updated_at: cache_updated_at,
+            dlmm_sol_is_x,
+            dlmm_token_x_mint,
+        },
+    );
+    true
 }
 
 /// H3: seed missing DLMM vault row from SLAVE cache on BinArrayUpdate (Geyser-only).
@@ -5442,6 +5489,12 @@ impl ArbContext {
         for mint in &mints_with_pool {
             self.arb_track_selection.mark_dirty(mint);
         }
+        if is_new {
+            inc_arb_vault_balance_applied_total();
+        }
+        if !mints_with_pool.is_empty() {
+            self.schedule_arb_vault_rescreen_for_mints(pool_address, &mints_with_pool);
+        }
     }
 
     /// Handle BinArrayUpdate event - cache Meteora DLMM bin arrays from Geyser
@@ -5869,6 +5922,12 @@ impl ArbContext {
         for pool_key in &pool_keys {
             if let Some(entry) = vaults.get(pool_key) {
                 vault_balances.insert(pool_key.clone(), entry.clone());
+            } else if try_seed_vault_from_live_cache(
+                pool_key,
+                &self.live_pool_cache,
+                &mut vault_balances,
+            ) {
+                inc_arb_vault_live_snapshot_seeded_total();
             }
         }
         drop(vaults);
@@ -5946,6 +6005,39 @@ impl ArbContext {
                     mint = %mint,
                     pool = %pool_address,
                     "arb two-hop rescreen queue full; dropping bin-update rescreen"
+                );
+            }
+        }
+    }
+
+    /// Re-screen selected mints when vault balances arrive after the last trade-driven screen (C1vault).
+    fn schedule_arb_vault_rescreen_for_mints(&self, pool_address: &str, mints: &[String]) {
+        if mints.is_empty() || !self.config.read().two_hop_enabled {
+            return;
+        }
+        let selected = self.arb_selected_mints.read();
+        let trackers = self.trackers.read();
+        for mint in mints {
+            if !selected.contains(mint) {
+                continue;
+            }
+            let Some(tracker) = trackers.get(mint) else {
+                continue;
+            };
+            if !tracker.pools.contains_key(pool_address) {
+                continue;
+            }
+            if self
+                .two_hop_tx
+                .try_send(ArbTwoHopWorkerJob::Rescreen { mint: mint.clone() })
+                .is_ok()
+            {
+                inc_arb_vault_rescreen_scheduled_total();
+            } else {
+                debug!(
+                    mint = %mint,
+                    pool = %pool_address,
+                    "arb two-hop rescreen queue full; dropping vault-update rescreen"
                 );
             }
         }
@@ -9763,6 +9855,48 @@ mod two_hop_price_tests {
             bins_after.contains_key(dlmm_pool),
             "live scoped snapshot must include bins written by BinArrayUpdate"
         );
+    }
+
+    #[test]
+    fn scoped_snapshot_seeds_missing_vault_from_live_cache() {
+        use ironcrab::metrics::ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL;
+        use std::sync::atomic::Ordering;
+
+        let cache = create_shared_cache();
+        let pool_pk = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        cache.upsert(
+            pool_pk,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: token_mint,
+                token_y_mint: sol,
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id: 10,
+                bin_step: 20,
+                reserve_x_balance: Some(500_000),
+                reserve_y_balance: Some(1_500_000_000),
+            }),
+            5,
+        );
+        let ctx = test_arb_context(cache);
+        let mint = "TokenMintScopedVaultSnap111111111111111111";
+        let pool_addr = pool_pk.to_string();
+        {
+            let mut trackers = ctx.trackers.write();
+            let mut tracker = TokenArbTracker::new(mint);
+            tracker.upsert_pool(sample_pool("meteora_dlmm", &pool_addr, None, None));
+            trackers.insert(mint.to_string(), tracker);
+        }
+        let tracker = ctx.trackers.read().get(mint).unwrap().clone();
+        let seeded_before = ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL.load(Ordering::Relaxed);
+        let (vaults, _) = ctx.snapshot_vault_bins_for_tracker(&tracker);
+        assert!(
+            vaults.contains_key(&pool_addr),
+            "snapshot must seed vault from SLAVE cache when vault_balances empty"
+        );
+        assert!(ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL.load(Ordering::Relaxed) > seeded_before);
     }
 
     #[test]
