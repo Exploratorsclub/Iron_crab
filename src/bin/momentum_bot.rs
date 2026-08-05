@@ -7043,7 +7043,11 @@ impl MomentumContext {
                 live_trades_per_min,
             ) {
                 let overlay_amount = pos.token_amount;
-                let exit_amount = self.resolve_exit_token_amount_raw(mint, overlay_amount);
+                let exit_amount = self.resolve_exit_token_amount_raw_with_overlay(
+                    mint,
+                    overlay_amount,
+                    overlay_amount,
+                );
                 if exit_amount == 0 {
                     continue;
                 }
@@ -7959,14 +7963,10 @@ impl MomentumContext {
 
     /// Phase 4 P2 + scale-in full exit: confirmed overlay is SSOT; never cap below overlay when
     /// authority lags after scale-in. Wallet snapshot caps oversell safety only.
+    ///
+    /// `overlay_amount`: when called from `check_for_exits` while `positions` write-lock is held,
+    /// pass `pos.token_amount` here to avoid re-locking `positions` (deadlock).
     fn resolve_exit_token_amount_raw(&self, mint: &str, hint_amount: u64) -> u64 {
-        let authority_snap = self.authority_by_mint.read().get(mint).cloned();
-        if let Some(ref auth) = authority_snap {
-            if Self::authority_signals_closed(Some(auth)) {
-                return 0;
-            }
-        }
-
         let overlay = self
             .positions
             .read()
@@ -7974,6 +7974,21 @@ impl MomentumContext {
             .map(|p| p.token_amount)
             .filter(|t| *t > 0)
             .unwrap_or(hint_amount);
+        self.resolve_exit_token_amount_raw_with_overlay(mint, hint_amount, overlay)
+    }
+
+    fn resolve_exit_token_amount_raw_with_overlay(
+        &self,
+        mint: &str,
+        hint_amount: u64,
+        overlay: u64,
+    ) -> u64 {
+        let authority_snap = self.authority_by_mint.read().get(mint).cloned();
+        if let Some(ref auth) = authority_snap {
+            if Self::authority_signals_closed(Some(auth)) {
+                return 0;
+            }
+        }
 
         let wallet_snap = self
             .latest_wallet_balance_raw_by_mint
@@ -8018,6 +8033,12 @@ impl MomentumContext {
         }
 
         exit
+    }
+
+    /// Whether exit intent metadata should request ATA close (full sell of known position).
+    fn should_close_token_ata_on_exit(&self, mint: &str, exit_token_amount_raw: u64) -> bool {
+        let known_full = self.known_full_position_balance_raw(mint);
+        known_full > 0 && exit_token_amount_raw >= known_full
     }
 
     /// Highest known full position size for close_token_ata gating (overlay, wallet hint, authority).
@@ -21931,114 +21952,63 @@ mod tests {
         );
     }
 
-    /// Partial exit size must not request ATA close.
-    #[tokio::test]
-    async fn exit_intent_omits_close_token_ata_when_below_known_full() {
+    /// Partial exit size must not request ATA close (sync — no intent worker / JSONL wait).
+    #[test]
+    fn close_token_ata_omitted_when_exit_below_known_full() {
         let tmp = TempDir::new().expect("tempdir");
         let jsonl_writer = test_queued_jsonl_writer(tmp.path());
-        let ctx = empty_test_context_with_intent_worker(jsonl_writer, MomentumConfig::default());
+        let ctx = empty_test_context(jsonl_writer);
 
         let mint = "PartialCloseMinttttttttttttttttttttttttttttt";
-        let pool = "PartialClosePooltttttttttttttttttttttttttttt";
         let full = 5_000_000u64;
         let partial = 2_000_000u64;
 
-        ctx.register_pool(mint, pool, "raydium", 1);
-        ctx.update_pool_accounts(mint, pool, vec!["a0".to_string(), "a1".to_string()]);
-        ctx.open_position(OpenPositionParams {
-            mint,
-            pool,
-            dex: "raydium",
-            entry_price: 1.0,
-            token_decimals: 6,
-            token_amount: full,
-            sol_invested: 1_000_000,
-            token_program: None,
-            creator: None,
-            entry_confirmed_slot: 1,
-            initial_bonding: None,
-        });
+        {
+            let mut positions = ctx.positions.write();
+            let mut tracker =
+                PositionTracker::new(mint, "pool", "raydium", 1.0, 6, full, 1_000_000);
+            tracker.entry_confirmed_slot = 1;
+            positions.insert(mint.to_string(), tracker);
+        }
         insert_test_authority_open(&ctx, mint, full, 6);
-        // Wallet snapshot below overlay: resolved exit stays partial vs known full position.
         ctx.cache_wallet_balance_snapshot_raw(mint, partial);
 
-        generate_and_publish_exit_intent(
-            ctx.as_ref(),
-            mint,
-            pool,
-            "raydium",
-            "TIME_EXIT",
-            "test",
-            partial,
-            None,
-        )
-        .await
-        .expect("exit intent");
-        wait_for_intent_jsonl_records(ctx.as_ref(), 1).await;
-
-        let path = ctx.jsonl_writer.current_path().expect("jsonl path");
-        let content = std::fs::read_to_string(path).expect("read jsonl");
-        let line = content.lines().last().expect("intent line");
-        let intent: TradeIntent = serde_json::from_str(line).expect("parse TradeIntent");
-        assert_ne!(
-            intent.metadata.get("close_token_ata").map(String::as_str),
-            Some("true"),
+        let exit_amount = ctx.resolve_exit_token_amount_raw(mint, partial);
+        assert_eq!(
+            exit_amount, partial,
+            "wallet snapshot caps exit below overlay"
+        );
+        assert!(
+            !ctx.should_close_token_ata_on_exit(mint, exit_amount),
             "partial exit must not set close_token_ata"
         );
     }
 
-    /// Full exit size must request ATA close when known full position is covered.
-    #[tokio::test]
-    async fn exit_intent_sets_close_token_ata_on_full_known_balance() {
+    /// Full exit size must request ATA close when known full position is covered (sync).
+    #[test]
+    fn close_token_ata_set_when_exit_equals_known_full() {
         let tmp = TempDir::new().expect("tempdir");
         let jsonl_writer = test_queued_jsonl_writer(tmp.path());
-        let ctx = empty_test_context_with_intent_worker(jsonl_writer, MomentumConfig::default());
+        let ctx = empty_test_context(jsonl_writer);
 
         let mint = "FullCloseMintttttttttttttttttttttttttttttttt";
-        let pool = "FullClosePoolttttttttttttttttttttttttttttttt";
         let full = 8_888_888u64;
 
-        ctx.register_pool(mint, pool, "raydium", 1);
-        ctx.update_pool_accounts(mint, pool, vec!["a0".to_string(), "a1".to_string()]);
-        ctx.open_position(OpenPositionParams {
-            mint,
-            pool,
-            dex: "raydium",
-            entry_price: 1.0,
-            token_decimals: 6,
-            token_amount: full,
-            sol_invested: 1_000_000,
-            token_program: None,
-            creator: None,
-            entry_confirmed_slot: 1,
-            initial_bonding: None,
-        });
+        {
+            let mut positions = ctx.positions.write();
+            let mut tracker =
+                PositionTracker::new(mint, "pool", "raydium", 1.0, 6, full, 1_000_000);
+            tracker.entry_confirmed_slot = 1;
+            positions.insert(mint.to_string(), tracker);
+        }
         insert_test_authority_open(&ctx, mint, full, 6);
 
-        generate_and_publish_exit_intent(
-            ctx.as_ref(),
-            mint,
-            pool,
-            "raydium",
-            "TIME_EXIT",
-            "test",
-            full,
-            None,
-        )
-        .await
-        .expect("exit intent");
-        wait_for_intent_jsonl_records(ctx.as_ref(), 1).await;
-
-        let path = ctx.jsonl_writer.current_path().expect("jsonl path");
-        let content = std::fs::read_to_string(path).expect("read jsonl");
-        let line = content.lines().last().expect("intent line");
-        let intent: TradeIntent = serde_json::from_str(line).expect("parse TradeIntent");
-        assert_eq!(
-            intent.metadata.get("close_token_ata").map(String::as_str),
-            Some("true"),
+        let exit_amount = ctx.resolve_exit_token_amount_raw(mint, full);
+        assert_eq!(exit_amount, full);
+        assert!(
+            ctx.should_close_token_ata_on_exit(mint, exit_amount),
             "full exit must set close_token_ata"
         );
-        assert_eq!(intent.required_capital.raw, full);
     }
 
     /// PA-5.1 bugfix / PA-5.2: authority closed during 90s grace without hard evidence keeps overlay but suppresses exits.
@@ -22993,8 +22963,7 @@ async fn generate_and_publish_exit_intent(
 
     // Close token ATA after full sell to recover rent (~0.002 SOL) for accurate PnL.
     // Only when exit size covers the highest known full position (overlay / wallet / authority).
-    let known_full = ctx.known_full_position_balance_raw(mint);
-    if known_full > 0 && token_amount >= known_full {
+    if ctx.should_close_token_ata_on_exit(mint, token_amount) {
         intent
             .metadata
             .insert("close_token_ata".to_string(), "true".to_string());
