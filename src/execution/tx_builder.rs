@@ -257,6 +257,15 @@ async fn fetch_orca_from_rpc(
 /// Optional hint for SELL: (available_balance_raw, required_amount_raw).
 /// When provided and available != required, CloseAccount is NOT added (partial sell safety).
 ///
+/// Returns true when `sell_balance_hint` confirms a full sell of the highest known balance.
+///
+/// Hint tuple is `(known_balance_raw, required_raw)` from execution-engine preflight.
+pub fn sell_close_account_verified(sell_balance_hint: Option<(u64, u64)>) -> bool {
+    sell_balance_hint
+        .map(|(known_balance, required)| known_balance > 0 && required == known_balance)
+        .unwrap_or(false)
+}
+
 /// `allow_rpc_fallback`: When true (Cold Path, e.g. Liquidation ExecutionMevB), Raydium may use
 /// RPC on cache miss. When false (Hot Path), reject on cache miss (GEYSER-ONLY).
 pub async fn build_tx_plan(
@@ -1486,16 +1495,14 @@ pub async fn build_tx_plan(
             all_ixs.extend(ixs);
 
             // Close token ATA after full sell to recover rent (~0.002 SOL).
-            // Only when sell_balance_hint confirms full sell (available == required).
+            // Only when sell_balance_hint confirms full sell of highest known balance.
             // Otherwise Custom(11) "Non-native account can only be closed if its balance is zero".
             let close_ata = intent
                 .metadata
                 .get("close_token_ata")
                 .map(|v| v == "true")
                 .unwrap_or(false);
-            let full_sell_verified = sell_balance_hint
-                .map(|(available, required)| available == required)
-                .unwrap_or(false);
+            let full_sell_verified = sell_close_account_verified(sell_balance_hint);
 
             if close_ata && full_sell_verified {
                 let token_mint = Pubkey::from_str(&intent.resources.input_mint).unwrap_or_default();
@@ -1652,16 +1659,14 @@ pub async fn build_tx_plan(
         all_ixs.extend(ixs);
 
         // Close token ATA after full sell to recover rent (~0.002 SOL).
-        // Only when sell_balance_hint confirms full sell (available == required).
+        // Only when sell_balance_hint confirms full sell of highest known balance.
         // Otherwise Token-2022 Custom(11): "Non-native account can only be closed if its balance is zero".
         let close_ata = intent
             .metadata
             .get("close_token_ata")
             .map(|v| v == "true")
             .unwrap_or(false);
-        let full_sell_verified = sell_balance_hint
-            .map(|(available, required)| available == required)
-            .unwrap_or(false);
+        let full_sell_verified = sell_close_account_verified(sell_balance_hint);
 
         if close_ata && full_sell_verified {
             let token_ata_spl =
@@ -2668,5 +2673,29 @@ mod tests {
         let sell_ix = &plan.instructions[plan.instructions.len() - 1];
         assert_eq!(sell_ix.accounts.last().unwrap().pubkey, third_target);
         assert_ne!(sell_ix.accounts.last().unwrap().pubkey, third_other);
+    }
+
+    #[test]
+    fn sell_close_account_verified_rejects_when_required_below_known_balance() {
+        assert!(!sell_close_account_verified(Some((
+            41_491_153_724,
+            10_490_465_194
+        ))));
+    }
+
+    #[test]
+    fn sell_close_account_verified_allows_when_required_equals_known_balance() {
+        assert!(sell_close_account_verified(Some((
+            41_491_153_724,
+            41_491_153_724
+        ))));
+    }
+
+    #[test]
+    fn sell_close_account_verified_rejects_when_required_above_known_balance() {
+        assert!(!sell_close_account_verified(Some((
+            10_490_465_194,
+            41_491_153_724
+        ))));
     }
 }

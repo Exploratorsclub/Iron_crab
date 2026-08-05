@@ -7043,12 +7043,14 @@ impl MomentumContext {
                 live_trades_per_min,
             ) {
                 let overlay_amount = pos.token_amount;
-                let exit_amount = self
-                    .authority_by_mint
-                    .read()
-                    .get(mint)
-                    .map(|auth| overlay_amount.min(auth.balance_raw))
-                    .unwrap_or(overlay_amount);
+                let exit_amount = self.resolve_exit_token_amount_raw_with_overlay(
+                    mint,
+                    overlay_amount,
+                    overlay_amount,
+                );
+                if exit_amount == 0 {
+                    continue;
+                }
                 // Note: exit_generated is set by caller after successful publish
                 exits.push((
                     mint.clone(),
@@ -7959,26 +7961,12 @@ impl MomentumContext {
         );
     }
 
-    /// Phase 4 P2 + PA-5.1: confirmed overlay SSOT; Authority caps exit when published.
+    /// Phase 4 P2 + scale-in full exit: confirmed overlay is SSOT; never cap below overlay when
+    /// authority lags after scale-in. Wallet snapshot caps oversell safety only.
+    ///
+    /// `overlay_amount`: when called from `check_for_exits` while `positions` write-lock is held,
+    /// pass `pos.token_amount` here to avoid re-locking `positions` (deadlock).
     fn resolve_exit_token_amount_raw(&self, mint: &str, hint_amount: u64) -> u64 {
-        let authority_snap = self.authority_by_mint.read().get(mint).cloned();
-        if let Some(ref auth) = authority_snap {
-            if Self::authority_signals_closed(Some(auth)) {
-                return 0;
-            }
-            let overlay = self
-                .positions
-                .read()
-                .get(mint)
-                .map(|p| p.token_amount)
-                .filter(|t| *t > 0)
-                .unwrap_or(hint_amount);
-            if overlay > 0 {
-                return overlay.min(auth.balance_raw);
-            }
-            return auth.balance_raw.min(hint_amount);
-        }
-
         let overlay = self
             .positions
             .read()
@@ -7986,32 +7974,95 @@ impl MomentumContext {
             .map(|p| p.token_amount)
             .filter(|t| *t > 0)
             .unwrap_or(hint_amount);
+        self.resolve_exit_token_amount_raw_with_overlay(mint, hint_amount, overlay)
+    }
 
-        let snapshot = self
+    fn resolve_exit_token_amount_raw_with_overlay(
+        &self,
+        mint: &str,
+        hint_amount: u64,
+        overlay: u64,
+    ) -> u64 {
+        let authority_snap = self.authority_by_mint.read().get(mint).cloned();
+        if let Some(ref auth) = authority_snap {
+            if Self::authority_signals_closed(Some(auth)) {
+                return 0;
+            }
+        }
+
+        let wallet_snap = self
             .latest_wallet_balance_raw_by_mint
             .read()
             .get(mint)
             .copied()
             .filter(|a| *a > 0);
 
+        let authority_raw = authority_snap.as_ref().map(|a| a.balance_raw);
+
         if overlay > 0 {
-            if let Some(snap) = snapshot {
-                self.record_wallet_balance_divergence_if_any(mint, overlay, snap);
-                // Safety: when position overstates wallet (double-count race), cap SELL to snapshot.
-                if overlay > snap {
-                    return snap;
+            if let Some(auth_bal) = authority_raw {
+                if auth_bal < overlay {
+                    ironcrab::metrics::record_momentum_exit_amount_authority_below_overlay_total();
                 }
-            } else {
-                ironcrab::metrics::clear_momentum_wallet_balance_divergence_for_mint(mint);
             }
-            overlay
-        } else if let Some(snap) = snapshot {
-            ironcrab::metrics::record_momentum_exit_amount_overlay_only_total();
-            snap
+        }
+
+        let mut exit = if overlay > 0 { overlay } else { hint_amount };
+        exit = exit.max(hint_amount);
+
+        if let Some(auth_bal) = authority_raw.filter(|b| *b > 0) {
+            if auth_bal > exit {
+                exit = auth_bal;
+            }
+        }
+
+        if let Some(wallet) = wallet_snap {
+            if overlay > 0 {
+                self.record_wallet_balance_divergence_if_any(mint, overlay, wallet);
+            } else {
+                ironcrab::metrics::record_momentum_exit_amount_overlay_only_total();
+                exit = exit.max(wallet);
+            }
+            if wallet < exit {
+                return wallet;
+            }
+        } else if overlay > 0 {
+            ironcrab::metrics::clear_momentum_wallet_balance_divergence_for_mint(mint);
         } else {
             ironcrab::metrics::record_momentum_exit_amount_overlay_only_total();
-            overlay
         }
+
+        exit
+    }
+
+    /// Whether exit intent metadata should request ATA close (full sell of known position).
+    fn should_close_token_ata_on_exit(&self, mint: &str, exit_token_amount_raw: u64) -> bool {
+        let known_full = self.known_full_position_balance_raw(mint);
+        known_full > 0 && exit_token_amount_raw >= known_full
+    }
+
+    /// Highest known full position size for close_token_ata gating (overlay, wallet hint, authority).
+    fn known_full_position_balance_raw(&self, mint: &str) -> u64 {
+        let overlay = self
+            .positions
+            .read()
+            .get(mint)
+            .map(|p| p.token_amount)
+            .unwrap_or(0);
+        let wallet = self
+            .latest_wallet_balance_raw_by_mint
+            .read()
+            .get(mint)
+            .copied()
+            .unwrap_or(0);
+        let authority = self
+            .authority_by_mint
+            .read()
+            .get(mint)
+            .filter(|a| !Self::authority_signals_closed(Some(a)))
+            .map(|a| a.balance_raw)
+            .unwrap_or(0);
+        [overlay, wallet, authority].into_iter().max().unwrap_or(0)
     }
 
     fn execution_result_removes_pending(status: ExecutionStatus) -> bool {
@@ -21811,9 +21862,9 @@ mod tests {
         );
     }
 
-    /// PA-5.1: exit sizing uses min(overlay, authority.balance_raw).
+    /// Exit sizing uses confirmed overlay, not stale probe-only PositionAuthority.
     #[tokio::test]
-    async fn pa51_exit_amount_min_authority_balance() {
+    async fn pa51_exit_amount_uses_overlay_not_stale_authority() {
         let tmp = TempDir::new().expect("tempdir");
         let jsonl_writer = test_queued_jsonl_writer(tmp.path());
         let ctx = empty_test_context(jsonl_writer);
@@ -21844,7 +21895,120 @@ mod tests {
             },
         );
 
-        assert_eq!(ctx.resolve_exit_token_amount_raw(mint, 1_000), 400);
+        assert_eq!(ctx.resolve_exit_token_amount_raw(mint, 1_000), 1_000);
+    }
+
+    /// Prod CNT7 class: overlay probe+scale-in, stale authority probe-only → full overlay exit.
+    #[tokio::test]
+    async fn scale_in_overlay_authority_probe_only_exit_full_size() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "Cnt7ClassMintttttttttttttttttttttttttttttttt";
+        let pool = "Cnt7ClassPooltttttttttttttttttttttttttttttt";
+        let probe = 10_490_465_194u64;
+        let scale_in = 31_000_688_530u64;
+        let total = probe.saturating_add(scale_in);
+
+        ctx.register_pool(mint, pool, "pump_amm", 1);
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool,
+            dex: "pump_amm",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: probe,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 1,
+            initial_bonding: None,
+        });
+        ctx.open_position(OpenPositionParams {
+            mint,
+            pool,
+            dex: "pump_amm",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount: scale_in,
+            sol_invested: 2_000_000,
+            token_program: None,
+            creator: None,
+            entry_confirmed_slot: 2,
+            initial_bonding: None,
+        });
+        insert_test_authority_open(&ctx, mint, probe, 6);
+
+        assert_eq!(
+            ctx.resolve_exit_token_amount_raw(mint, probe),
+            total,
+            "exit must use full overlay, not probe authority"
+        );
+        assert_eq!(
+            ctx.known_full_position_balance_raw(mint),
+            total,
+            "known full position uses overlay max"
+        );
+    }
+
+    /// Partial exit size must not request ATA close (sync — no intent worker / JSONL wait).
+    #[test]
+    fn close_token_ata_omitted_when_exit_below_known_full() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "PartialCloseMinttttttttttttttttttttttttttttt";
+        let full = 5_000_000u64;
+        let partial = 2_000_000u64;
+
+        {
+            let mut positions = ctx.positions.write();
+            let mut tracker =
+                PositionTracker::new(mint, "pool", "raydium", 1.0, 6, full, 1_000_000);
+            tracker.entry_confirmed_slot = 1;
+            positions.insert(mint.to_string(), tracker);
+        }
+        insert_test_authority_open(&ctx, mint, full, 6);
+        ctx.cache_wallet_balance_snapshot_raw(mint, partial);
+
+        let exit_amount = ctx.resolve_exit_token_amount_raw(mint, partial);
+        assert_eq!(
+            exit_amount, partial,
+            "wallet snapshot caps exit below overlay"
+        );
+        assert!(
+            !ctx.should_close_token_ata_on_exit(mint, exit_amount),
+            "partial exit must not set close_token_ata"
+        );
+    }
+
+    /// Full exit size must request ATA close when known full position is covered (sync).
+    #[test]
+    fn close_token_ata_set_when_exit_equals_known_full() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+
+        let mint = "FullCloseMintttttttttttttttttttttttttttttttt";
+        let full = 8_888_888u64;
+
+        {
+            let mut positions = ctx.positions.write();
+            let mut tracker =
+                PositionTracker::new(mint, "pool", "raydium", 1.0, 6, full, 1_000_000);
+            tracker.entry_confirmed_slot = 1;
+            positions.insert(mint.to_string(), tracker);
+        }
+        insert_test_authority_open(&ctx, mint, full, 6);
+
+        let exit_amount = ctx.resolve_exit_token_amount_raw(mint, full);
+        assert_eq!(exit_amount, full);
+        assert!(
+            ctx.should_close_token_ata_on_exit(mint, exit_amount),
+            "full exit must set close_token_ata"
+        );
     }
 
     /// PA-5.1 bugfix / PA-5.2: authority closed during 90s grace without hard evidence keeps overlay but suppresses exits.
@@ -22101,16 +22265,12 @@ mod tests {
         );
     }
 
-    /// PA-5: soft exit sizing follows PositionAuthority balance when overlay is larger.
+    /// Soft exit uses confirmed overlay size even when authority balance is stale-low.
     #[tokio::test]
-    async fn pa5_soft_exit_sized_to_authority_balance() {
-        let mut cfg = MomentumConfig::default();
-        cfg.max_hold_time_secs = 1;
-        cfg.take_profit_pct = 1.0;
-
+    async fn pa5_soft_exit_uses_overlay_not_stale_authority_balance() {
         let tmp = TempDir::new().expect("tempdir");
         let jsonl_writer = test_queued_jsonl_writer(tmp.path());
-        let ctx = empty_test_context_with_config(jsonl_writer, cfg);
+        let ctx = empty_test_context(jsonl_writer);
 
         let mint = "Pa5SoftSizeMinttttttttttttttttttttttttttttttt";
         let authority_balance = 400u64;
@@ -22127,19 +22287,12 @@ mod tests {
             entry_confirmed_slot: 1,
             initial_bonding: None,
         });
-        ctx.positions
-            .write()
-            .get_mut(mint)
-            .expect("position")
-            .set_entry_time_ago(std::time::Duration::from_secs(120));
         insert_test_authority_open(&ctx, mint, authority_balance, 6);
 
-        let exits = ctx.check_for_exits();
-        assert_eq!(exits.len(), 1, "TIME_EXIT expected with open authority");
-        assert_eq!(exits[0].3, "TIME_EXIT");
         assert_eq!(
-            exits[0].5, authority_balance,
-            "soft exit hint must cap to authority balance"
+            ctx.resolve_exit_token_amount_raw(mint, 1_000),
+            1_000,
+            "soft exit must use overlay size, not stale authority balance"
         );
     }
 
@@ -22809,10 +22962,12 @@ async fn generate_and_publish_exit_intent(
     }
 
     // Close token ATA after full sell to recover rent (~0.002 SOL) for accurate PnL.
-    // All momentum exits are full sells, so this is safe.
-    intent
-        .metadata
-        .insert("close_token_ata".to_string(), "true".to_string());
+    // Only when exit size covers the highest known full position (overlay / wallet / authority).
+    if ctx.should_close_token_ata_on_exit(mint, token_amount) {
+        intent
+            .metadata
+            .insert("close_token_ata".to_string(), "true".to_string());
+    }
 
     // Include current open positions count for execution-engine risk check.
     // execution-engine uses this instead of tracking positions itself (Single Source of Truth).
