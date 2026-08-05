@@ -3548,6 +3548,9 @@ pub static MOMENTUM_ORPHAN_SCALE_IN_RECOVERY_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static MOMENTUM_EXIT_AMOUNT_OVERLAY_ONLY_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Exit sizing: PositionAuthority balance_raw trailed confirmed overlay (e.g. stale probe after scale-in).
+pub static MOMENTUM_EXIT_AMOUNT_AUTHORITY_BELOW_OVERLAY_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// Exit quote rejected: `tokens_per_sol` scale incompatible with entry/mark (false TAKE_PROFIT guard).
 pub static MOMENTUM_EXIT_QUOTE_SCALE_MISMATCH_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -3585,6 +3588,11 @@ pub fn record_momentum_orphan_scale_in_recovery_total() {
 #[inline]
 pub fn record_momentum_exit_amount_overlay_only_total() {
     MOMENTUM_EXIT_AMOUNT_OVERLAY_ONLY_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_momentum_exit_amount_authority_below_overlay_total() {
+    MOMENTUM_EXIT_AMOUNT_AUTHORITY_BELOW_OVERLAY_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -9775,6 +9783,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "momentum_exit_amount_overlay_only_total",
         MOMENTUM_EXIT_AMOUNT_OVERLAY_ONLY_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "momentum_exit_amount_authority_below_overlay_total",
+        MOMENTUM_EXIT_AMOUNT_AUTHORITY_BELOW_OVERLAY_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "momentum_exit_quote_scale_mismatch_total",

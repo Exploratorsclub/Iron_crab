@@ -10205,6 +10205,17 @@ fn sell_token_balance_gate(
     (passed, details, effective)
 }
 
+/// Highest known on-chain token balance for CloseAccount gating (defense-in-depth vs stale min).
+fn known_sell_token_balance_raw(
+    lockmanager_available: u64,
+    authority_tradable: Option<u64>,
+) -> u64 {
+    match authority_tradable {
+        Some(auth) => lockmanager_available.max(auth),
+        None => lockmanager_available,
+    }
+}
+
 /// Liquidation LockManager seed decision (PA-4): skip ghost seeds when authority is closed/zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiquidationSeedDecision {
@@ -10722,6 +10733,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
 
     // Check 3e: SELL token balance preflight (avoid emitting SELL intents we cannot fulfill)
     // sell_balance_hint: passed to tx_builder so CloseAccount is only added for full sells.
+    // Tuple is (known_balance_raw, required_raw) where known = max(LockManager, Authority).
     let sell_balance_hint: Option<(u64, u64)> = if intent.side == TradeSide::Sell {
         let mint_str = intent.resources.input_mint.clone();
         let required_raw = intent.required_capital.raw;
@@ -10743,7 +10755,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
             let pa = ctx.position_authority.lock();
             pa.tradable_balance_raw(&mint_str)
         };
-        let (passed, details, effective_raw) = sell_token_balance_gate(
+        let (passed, details, _effective_raw) = sell_token_balance_gate(
             lockmanager_available,
             authority_tradable,
             required_raw,
@@ -10766,7 +10778,9 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
             reason_code: None,
             details: Some(details),
         });
-        Some((effective_raw, required_raw))
+        let known_balance_raw =
+            known_sell_token_balance_raw(lockmanager_available, authority_tradable);
+        Some((known_balance_raw, required_raw))
     } else {
         None
     };
@@ -14407,9 +14421,9 @@ mod execution_engine_tests {
         compute_pre_send_capital_lock_ttl, effective_intent_ttl_ms, intent_is_expired,
         is_cold_path_recovery_sell, is_pump_amm_structural_sim_error,
         is_pumpfun_bonding_curve_structural_sim_error, is_regular_momentum_hot_path_sell,
-        liquidation_lockmanager_seed_decision, liquidation_pumpfun_sell_preference,
-        liquidation_store_multi_pool_fallback_metadata, max_open_positions_buy_gate,
-        prepare_unsigned_versioned_tx_for_simulation,
+        known_sell_token_balance_raw, liquidation_lockmanager_seed_decision,
+        liquidation_pumpfun_sell_preference, liquidation_store_multi_pool_fallback_metadata,
+        max_open_positions_buy_gate, prepare_unsigned_versioned_tx_for_simulation,
         pump_amm_hint_pool_cache_usable_for_tx_plan_builder,
         pump_amm_hot_path_quote_not_ready_detail, pump_amm_liquidation_discovery_force_refresh,
         pump_amm_liquidation_quote_timeout_str, pump_amm_pool_market_hint_merge,
@@ -15038,6 +15052,19 @@ mod execution_engine_tests {
         assert_eq!(effective, 1_000_000);
         assert!(details.contains("effective=1000000"));
         assert!(details.contains("required=1000000"));
+    }
+
+    #[test]
+    fn known_sell_token_balance_raw_uses_max_of_sources() {
+        assert_eq!(
+            known_sell_token_balance_raw(41_491_153_724, Some(10_490_465_194)),
+            41_491_153_724
+        );
+        assert_eq!(
+            known_sell_token_balance_raw(10_490_465_194, Some(41_491_153_724)),
+            41_491_153_724
+        );
+        assert_eq!(known_sell_token_balance_raw(1_000_000, None), 1_000_000);
     }
 
     #[test]
