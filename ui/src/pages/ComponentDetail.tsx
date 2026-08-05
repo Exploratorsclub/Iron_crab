@@ -230,6 +230,10 @@ const CONFIG_DESCRIPTIONS: Record<string, Record<string, string>> = {
     min_spread_bps: '2-HOP: Min spread between DEX prices (bps, 100=1%)',
     min_profit_lamports: '2-HOP: Min net profit after tx cost (lamports)',
     max_position_lamports: '2-HOP: Max notional per intent (lamports)',
+    arb_probe_lamports:
+      '2-HOP V2: Round-trip screening probe size (lamports); default follows max_position_lamports',
+    arb_probe_follows_max_position:
+      '2-HOP V2: When true, arb_probe_lamports tracks max_position_lamports',
     est_tx_cost_lamports: '2-HOP: Estimated tx cost for profit calc (lamports)',
     max_slippage_bps: '2-HOP: Max slippage included in intent (bps)',
     intent_cooldown_ms: '2-HOP: Cooldown per pair before next intent (ms)',
@@ -390,6 +394,8 @@ const CONFIG_GROUPS: Record<string, Record<string, string[]>> = {
       'min_profit_lamports',
       'est_tx_cost_lamports',
       'max_position_lamports',
+      'arb_probe_lamports',
+      'arb_probe_follows_max_position',
       'max_slippage_bps',
       'intent_cooldown_ms',
       'intent_ttl_ms',
@@ -542,6 +548,8 @@ const DEFAULT_CONFIGS: Record<string, ComponentConfig> = {
     min_spread_bps: 50,
     min_profit_lamports: 10_000_000,
     max_position_lamports: 1_000_000_000,
+    arb_probe_lamports: 1_000_000_000,
+    arb_probe_follows_max_position: true,
     est_tx_cost_lamports: 50_000,
     max_slippage_bps: 100,
     intent_cooldown_ms: 5_000,
