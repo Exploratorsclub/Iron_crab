@@ -31,8 +31,9 @@ use uuid::Uuid;
 
 use ironcrab::arbitrage::{
     arb_track_removal_reason, classify_cross_dex_sell_failure, dlmm_marginal_price_plausible,
-    dlmm_sol_output_from_bins, dlmm_token_output_from_bins, freshness_age_bucket, is_quote_fresh,
-    populate_arb_slave_from_live_pool_cache, quote_exact_in, quote_exact_in_with_freshness,
+    dlmm_sol_output_from_bins, dlmm_token_output_from_bins, freshness_age_bucket,
+    is_expected_token_output_plausible, is_quote_fresh, populate_arb_slave_from_live_pool_cache,
+    price_based_token_output_raw, quote_exact_in, quote_exact_in_with_freshness,
     quote_sell_round_trip, quotes_pairable, round_trip_profit_lamports, select_arb_track_pools,
     select_round_trip_pools, sync_arb_slave_from_pool_cache_update, MultiHopArbitrage,
     MultiHopConfig, MultiHopIntentBatch, NoCrossDexSellDetailReason, PoolQuote,
@@ -82,11 +83,12 @@ use ironcrab::metrics::{
     inc_arb_v2_screen_meteora_sell_bin_miss_total, inc_arb_vault_balance_applied_total,
     inc_arb_vault_live_snapshot_refreshed_total, inc_arb_vault_live_snapshot_seeded_total,
     inc_arb_vault_rescreen_scheduled_total, record_arb_heartbeat_phase,
-    record_arb_price_freshness_stale_age_ms, record_arb_proactive_pin_first_publish,
-    record_arb_proactive_track_publish_total, record_arb_quote_pair_slot_delta,
-    record_arb_quote_shadow_round_trip, record_arb_track_publish_skipped_unchanged_total,
-    record_arb_track_removed_total, record_arb_track_requests_messages_total,
-    record_arb_track_requests_publish_chunks_total, record_arb_track_requests_publish_failed_total,
+    record_arb_intent_suppressed_implausible_token_out, record_arb_price_freshness_stale_age_ms,
+    record_arb_proactive_pin_first_publish, record_arb_proactive_track_publish_total,
+    record_arb_quote_pair_slot_delta, record_arb_quote_shadow_round_trip,
+    record_arb_track_publish_skipped_unchanged_total, record_arb_track_removed_total,
+    record_arb_track_requests_messages_total, record_arb_track_requests_publish_chunks_total,
+    record_arb_track_requests_publish_failed_total,
     record_arb_track_selection_blocking_join_failed_total,
     record_arb_track_selection_queue_overflow_total, record_arb_track_selection_recompute_total,
     record_arb_two_hop_v2_formable_gates, record_arb_writer_lock_wait, serve_metrics,
@@ -5855,7 +5857,7 @@ impl ArbContext {
         if bin_arrays.is_empty() {
             debug!(
                 pool = %pool_address,
-                "DLMM: no bin arrays cached, falling back to price-based"
+                "DLMM: no bin arrays cached — omit expected_token_output (EE price-based fallback)"
             );
             return None;
         }
@@ -5867,6 +5869,15 @@ impl ArbContext {
             &bin_arrays,
             vault_dlmm_sol_is_x(pool_state),
         )?;
+
+        if result == 0 {
+            debug!(
+                pool = %pool_address,
+                sol_in_lamports,
+                "DLMM bin walker returned zero output — omit expected_token_output"
+            );
+            return None;
+        }
 
         info!(
             pool = %pool_address,
@@ -6287,6 +6298,15 @@ impl ArbContext {
     fn get_token_program_for_mint(&self, mint: &str) -> Option<String> {
         let trackers = self.trackers.read();
         trackers.get(mint).and_then(|t| t.token_program.clone())
+    }
+
+    /// Token decimals for mint from tracker / LivePoolCache (I-15). Fallback 6 when unknown.
+    fn get_token_decimals_for_mint(&self, mint: &str) -> u8 {
+        self.trackers
+            .read()
+            .get(mint)
+            .and_then(|t| t.token_decimals)
+            .unwrap_or(6)
     }
 
     fn spawn_publish_arb_track_requests(
@@ -6807,35 +6827,59 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
     let token_program = ctx.get_token_program_for_mint(&opp.base_mint);
 
     // =========================================================================
-    // OPTION D: Calculate expected_token_output from pool reserves (Geyser)
+    // OPTION D: Calculate expected_token_output from pool reserves / bin walker
     // =========================================================================
-    // This eliminates the need for safety margins in execution-engine.
-    // The sell leg uses this as amount_in - exact value from reserves, not estimated.
-    //
-    // For AMMs (Raydium, CPMM): constant product formula with fee deduction
-    // For DLMM: falls back to price-based (concentrated liquidity is complex)
-    //
-    // Token decimals: pump.fun tokens are always 6 decimals
-    let expected_token_output = ctx.calculate_expected_token_output(
+    // EE uses this as buy amount_out and sell amount_in. Must match the canonical
+    // `dlmm_token_output_from_bins` path in pool_quote (same orientation + bins).
+    // When bins are incomplete or the walker yields a degenerate quote, omit metadata
+    // so EE falls back to price-based sizing (15% safety margin).
+    let token_decimals = ctx.get_token_decimals_for_mint(&opp.base_mint);
+    let mut expected_token_output = ctx.calculate_expected_token_output(
         &opp.buy_pool,
         &opp.buy_dex,
         opp.trade_amount_lamports,
-        6, // pump.fun tokens
+        token_decimals,
     );
 
+    let price_based_estimate =
+        price_based_token_output_raw(opp.trade_amount_lamports, opp.buy_price, token_decimals);
+
     if let Some(token_out) = expected_token_output {
-        debug!(
-            buy_pool = %opp.buy_pool,
-            buy_dex = %opp.buy_dex,
-            sol_in = opp.trade_amount_lamports,
+        if !is_expected_token_output_plausible(
             token_out,
-            "Option D: calculated expected_token_output from reserves"
-        );
+            price_based_estimate,
+            opp.trade_amount_lamports,
+        ) {
+            warn!(
+                mint = %opp.base_mint,
+                buy_pool = %opp.buy_pool,
+                buy_dex = %opp.buy_dex,
+                trade_amount_lamports = opp.trade_amount_lamports,
+                token_out,
+                price_based_estimate = ?price_based_estimate,
+                buy_price = %opp.buy_price,
+                token_decimals,
+                "Suppressing implausible expected_token_output — EE will use price-based fallback"
+            );
+            record_arb_intent_suppressed_implausible_token_out();
+            expected_token_output = None;
+        } else {
+            debug!(
+                buy_pool = %opp.buy_pool,
+                buy_dex = %opp.buy_dex,
+                sol_in = opp.trade_amount_lamports,
+                token_out,
+                price_based_estimate = ?price_based_estimate,
+                token_decimals,
+                "Option D: calculated expected_token_output from reserves/bin walker"
+            );
+        }
     } else {
         debug!(
             buy_pool = %opp.buy_pool,
             buy_dex = %opp.buy_dex,
-            "Option D: falling back to price-based estimation (no reserves or DLMM)"
+            price_based_estimate = ?price_based_estimate,
+            "Option D: no reserve/bin quote — EE price-based fallback"
         );
     }
 
@@ -6919,10 +6963,9 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
     );
 
     // =========================================================================
-    // OPTION D: Pass expected_token_output to execution-engine
+    // OPTION D: Pass expected_token_output to execution-engine (plausibility-gated)
     // =========================================================================
-    // If calculated from reserves, this is the exact value the sell leg should use.
-    // If None (DLMM or missing reserves), execution-engine falls back to price-based.
+    // Omitted when reserve/bin quote is missing or failed the price-based plausibility gate.
     if let Some(token_out) = expected_token_output {
         intent
             .metadata
@@ -13099,6 +13142,25 @@ mod two_hop_price_tests {
         assert!(
             !fn_body.contains("format!("),
             "throttle decision must not allocate dynamic string keys"
+        );
+    }
+}
+
+#[cfg(test)]
+mod expected_token_output_gate_tests {
+    use ironcrab::arbitrage::{is_expected_token_output_plausible, price_based_token_output_raw};
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    /// Prod 2026-08-05: meteora_dlmm buy published `expected_token_output=11` for 0.1 SOL.
+    #[test]
+    fn degenerate_dlmm_token_out_not_plausible_for_publish_metadata() {
+        let buy_price = Decimal::from_str("0.00006069").unwrap();
+        let trade_amount = 100_000_000u64;
+        let estimate = price_based_token_output_raw(trade_amount, buy_price, 6).expect("estimate");
+        assert!(
+            !is_expected_token_output_plausible(11, Some(estimate), trade_amount),
+            "token_out=11 must be suppressed so EE uses price-based fallback"
         );
     }
 }

@@ -550,7 +550,12 @@ fn trade_implied_sol_per_token(sol_amount: u64, token_amount: u64, token_decimal
     sol_dec / token_dec
 }
 
-fn tokens_from_trade_price(sol_lamports: u64, price: Decimal, token_decimals: u8) -> Option<u64> {
+/// Raw token amount (smallest units) from SOL input and SOL-per-token price (I-15).
+pub fn price_based_token_output_raw(
+    sol_lamports: u64,
+    price: Decimal,
+    token_decimals: u8,
+) -> Option<u64> {
     if price <= Decimal::ZERO || sol_lamports == 0 {
         return None;
     }
@@ -558,7 +563,47 @@ fn tokens_from_trade_price(sol_lamports: u64, price: Decimal, token_decimals: u8
     let tokens_whole = sol / price;
     let token_divisor = Decimal::from(10u64.pow(token_decimals as u32));
     let raw = (tokens_whole * token_divisor).floor();
-    raw.to_u64()
+    raw.to_u64().filter(|v| *v > 0)
+}
+
+fn tokens_from_trade_price(sol_lamports: u64, price: Decimal, token_decimals: u8) -> Option<u64> {
+    price_based_token_output_raw(sol_lamports, price, token_decimals)
+}
+
+/// Minimum fraction of price-based raw estimate that `token_out` must reach (10%).
+pub const ARB_TOKEN_OUT_MIN_PRICE_FRACTION_BPS: u64 = 1_000;
+
+/// Absolute floor for `token_out` on trades ≥ [`ARB_TOKEN_OUT_FLOOR_TRADE_AMOUNT_LAMPORTS`].
+pub const ARB_TOKEN_OUT_MIN_RAW_FLOOR: u64 = 1_000;
+
+/// Trade size (lamports) at which the absolute raw floor applies.
+pub const ARB_TOKEN_OUT_FLOOR_TRADE_AMOUNT_LAMPORTS: u64 = 10_000_000;
+
+/// Returns true when reserve/bin-walker `token_out` is plausible vs a price-based estimate.
+pub fn is_expected_token_output_plausible(
+    token_out: u64,
+    price_based_estimate: Option<u64>,
+    trade_amount_lamports: u64,
+) -> bool {
+    if token_out == 0 {
+        return false;
+    }
+    if let Some(estimate) = price_based_estimate {
+        if estimate > 0 {
+            let min_from_price = estimate
+                .saturating_mul(ARB_TOKEN_OUT_MIN_PRICE_FRACTION_BPS)
+                .saturating_div(10_000);
+            if token_out < min_from_price {
+                return false;
+            }
+        }
+    }
+    if trade_amount_lamports >= ARB_TOKEN_OUT_FLOOR_TRADE_AMOUNT_LAMPORTS
+        && token_out < ARB_TOKEN_OUT_MIN_RAW_FLOOR
+    {
+        return false;
+    }
+    true
 }
 
 fn sol_from_trade_price(token_raw: u64, price: Decimal, token_decimals: u8) -> Option<u64> {
@@ -2956,5 +3001,38 @@ mod tests {
         } else {
             panic!("expected NoCrossDexSell");
         }
+    }
+
+    #[test]
+    fn price_based_token_output_raw_matches_prod_memecoin_fixture() {
+        let buy_price = Decimal::from_str("0.00006069").unwrap();
+        let trade_amount = 100_000_000u64;
+        let estimate = price_based_token_output_raw(trade_amount, buy_price, 6).expect("estimate");
+        // 0.1 SOL / 6.07e-5 ≈ 1.65e9 raw (6 decimals)
+        assert!(
+            estimate > 1_000_000_000,
+            "estimate should be ~1.65e9, got {estimate}"
+        );
+        assert!(!is_expected_token_output_plausible(
+            11,
+            Some(estimate),
+            trade_amount
+        ));
+        assert!(is_expected_token_output_plausible(
+            estimate / 2,
+            Some(estimate),
+            trade_amount
+        ));
+    }
+
+    #[test]
+    fn implausible_token_out_floor_for_large_trades() {
+        let estimate = Some(2_000_000u64);
+        assert!(!is_expected_token_output_plausible(
+            999, estimate, 10_000_000
+        ));
+        assert!(is_expected_token_output_plausible(
+            1_500_000, estimate, 10_000_000
+        ));
     }
 }

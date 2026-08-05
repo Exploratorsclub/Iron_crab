@@ -19,6 +19,7 @@
 //! - RPC getProgramAccounts calls
 
 use anyhow::{anyhow, Result};
+use rust_decimal::Decimal;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
@@ -28,6 +29,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+use crate::arbitrage::pool_quote::{
+    is_expected_token_output_plausible, price_based_token_output_raw,
+};
 use crate::execution::live_pool_cache::{CachedPoolState, LivePoolCache};
 use crate::ipc::TradeIntent;
 use crate::solana::dex::meteora_dlmm::MeteoraDlmm;
@@ -601,20 +605,42 @@ impl CrossDexHandler {
         // - The value is computed from the same Geyser data the simulation uses
         // - No stale price estimation, no guessing
         //
-        // Fallback (if arb-strategy didn't provide it):
-        // - Price-based estimation with 3% safety margin (for DLMM or missing reserves)
+        // Fallback (if arb-strategy didn't provide it or value is implausible vs buy_price):
+        // - Price-based estimation with 15% safety margin (for DLMM or missing reserves)
+        let token_decimals = 6u8;
+        let price_based_estimate = buy_price_str
+            .parse::<Decimal>()
+            .ok()
+            .and_then(|p| price_based_token_output_raw(trade_amount, p, token_decimals));
         let expected_tokens_out: u64 = intent
             .metadata
             .get("expected_token_output")
             .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&token_out| {
+                is_expected_token_output_plausible(token_out, price_based_estimate, trade_amount)
+            })
             .inspect(|&token_out| {
                 info!(
                     token_out,
+                    price_based_estimate = ?price_based_estimate,
                     source = "arb-strategy (Option D)",
                     "Using expected_token_output from intent metadata (reserve-based)"
                 );
             })
             .unwrap_or_else(|| {
+                if let Some(ignored) = intent
+                    .metadata
+                    .get("expected_token_output")
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    warn!(
+                        token_out = ignored,
+                        price_based_estimate = ?price_based_estimate,
+                        trade_amount,
+                        buy_price,
+                        "Ignoring implausible expected_token_output in intent metadata"
+                    );
+                }
                 // Fallback: price-based estimation for DLMM or when reserves unavailable
                 if buy_price > 0.0 {
                     let sol_amount = trade_amount as f64 / 1_000_000_000.0;
