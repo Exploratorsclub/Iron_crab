@@ -89,18 +89,19 @@ use ironcrab::metrics::{
     record_arb_track_requests_publish_chunks_total, record_arb_track_requests_publish_failed_total,
     record_arb_track_selection_blocking_join_failed_total,
     record_arb_track_selection_queue_overflow_total, record_arb_track_selection_recompute_total,
-    record_arb_writer_lock_wait, serve_metrics, set_arb_pool_cache_apply_batch_size_gauge,
-    set_arb_quote_shadow_legacy_spread_bps, set_arb_track_selected_pool_readiness_metrics,
-    set_arb_track_selection_metrics, set_arb_tracker_write_coalescer_pending,
-    set_arb_tracker_write_queue_depth, set_arb_two_hop_blocked_on_apply_trade,
-    set_readiness_nats_connected, tick_arb_heartbeat_seconds_since_last_finish,
-    tick_arb_tracker_write_seconds_since_last_finish,
+    record_arb_two_hop_v2_formable_gates, record_arb_writer_lock_wait, serve_metrics,
+    set_arb_pool_cache_apply_batch_size_gauge, set_arb_quote_shadow_legacy_spread_bps,
+    set_arb_track_selected_pool_readiness_metrics, set_arb_track_selection_metrics,
+    set_arb_tracker_write_coalescer_pending, set_arb_tracker_write_queue_depth,
+    set_arb_two_hop_blocked_on_apply_trade, set_readiness_nats_connected,
+    tick_arb_heartbeat_seconds_since_last_finish, tick_arb_tracker_write_seconds_since_last_finish,
     try_record_arb_track_pin_before_first_screen_ms, wall_clock_unix_ms_now, ArbHeartbeatPhase,
     ArbStrategyWarmupSkipReason, ArbTrackerWriteJobType, ArbTwoHopInsufficientSubreason,
     ArbTwoHopPoolGate, ArbTwoHopRejectReason, ArbTwoHopRejectSubreason,
-    ArbTwoHopV2InsufficientSubreason, ArbTwoHopV2NoCrossDexSellDetail, ArbTwoHopV2RejectReason,
-    ArbTwoHopV2ScreenSkipReason, ArbTwoHopV2SellQuoteNoneDetail, ArbWriterLockKind,
-    MetricsComponent, ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH, ARB_REJECTED_MISSING_ACCOUNTS,
+    ArbTwoHopV2FormableGateOutcome, ArbTwoHopV2InsufficientSubreason,
+    ArbTwoHopV2NoCrossDexSellDetail, ArbTwoHopV2RejectReason, ArbTwoHopV2ScreenSkipReason,
+    ArbTwoHopV2SellQuoteNoneDetail, ArbWriterLockKind, MetricsComponent,
+    ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH, ARB_REJECTED_MISSING_ACCOUNTS,
     ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL, ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH,
     ARB_TRACKER_WRITE_COALESCER_PENDING, ARB_TRACKER_WRITE_CURRENT_JOB_STARTED_UNIX_MS,
     ARB_TRACKER_WRITE_CURRENT_JOB_TYPE, ARB_TRACKER_WRITE_QUEUE_DEPTH,
@@ -205,8 +206,10 @@ struct ArbConfig {
     arb_quote_shadow_mode: bool,
     /// Profit-first 2-hop v2 (round-trip quotes). Default: false.
     arb_two_hop_v2_enabled: bool,
-    /// SOL probe for v2 round-trip screening. Default: 10_000_000 (0.01 SOL).
+    /// SOL probe for v2 round-trip screening. Default: follows max_position_lamports.
     arb_probe_lamports: u64,
+    /// When true, arb_probe_lamports tracks max_position_lamports on load/update.
+    arb_probe_follows_max_position: bool,
     /// LastTradeMid quote TTL for v2 freshness. Default: 30_000 ms.
     arb_quote_trade_ttl_ms: u64,
     /// ExecutableMarginal state TTL for v2 freshness. Default: 120_000 ms.
@@ -217,7 +220,7 @@ struct ArbConfig {
 
 impl Default for ArbConfig {
     fn default() -> Self {
-        Self {
+        let mut cfg = Self {
             min_spread_bps: 50,                   // 0.5% minimum spread
             min_profit_lamports: 10_000_000,      // 0.01 SOL min profit
             max_position_lamports: 1_000_000_000, // 1 SOL max position
@@ -231,10 +234,20 @@ impl Default for ArbConfig {
             arb_quote_shadow_mode: false,
             arb_two_hop_v2_enabled: false,
             arb_probe_lamports: DLMM_PROBE_SOL_LAMPORTS,
+            arb_probe_follows_max_position: true,
             arb_quote_trade_ttl_ms: 30_000,
             arb_quote_state_ttl_ms: 120_000,
             arb_max_leg_slot_delta: 2,
-        }
+        };
+        sync_arb_probe_to_max_position(&mut cfg);
+        cfg
+    }
+}
+
+/// Keep v2 screening probe aligned with max position unless explicitly overridden.
+fn sync_arb_probe_to_max_position(config: &mut ArbConfig) {
+    if config.arb_probe_follows_max_position && config.max_position_lamports > 0 {
+        config.arb_probe_lamports = config.max_position_lamports;
     }
 }
 
@@ -281,6 +294,7 @@ fn load_initial_arb_config(config_path: &Path) -> ArbConfig {
         }
     }
 
+    sync_arb_probe_to_max_position(&mut cfg);
     cfg
 }
 
@@ -3464,15 +3478,41 @@ impl TokenArbTracker {
             MAX_REASONABLE_SPREAD_BPS
         };
 
-        if spread_bps as i64 > max_spread || spread_bps < config.min_spread_bps as i32 {
-            arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::RoundTripUnprofitable);
+        if spread_bps < config.min_spread_bps as i32 {
+            record_arb_two_hop_v2_formable_gates(
+                spread_bps,
+                profit_lamports,
+                ArbTwoHopV2FormableGateOutcome::RejectedSpreadBelow,
+            );
+            arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::RoundTripSpreadBelowMin);
+            return None;
+        }
+
+        if spread_bps as i64 > max_spread {
+            record_arb_two_hop_v2_formable_gates(
+                spread_bps,
+                profit_lamports,
+                ArbTwoHopV2FormableGateOutcome::RejectedSpreadAbove,
+            );
+            arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::RoundTripSpreadAboveMax);
             return None;
         }
 
         if profit_lamports < effective_min_profit as i64 {
-            arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::RoundTripUnprofitable);
+            record_arb_two_hop_v2_formable_gates(
+                spread_bps,
+                profit_lamports,
+                ArbTwoHopV2FormableGateOutcome::RejectedProfitBelow,
+            );
+            arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::RoundTripProfitBelowMin);
             return None;
         }
+
+        record_arb_two_hop_v2_formable_gates(
+            spread_bps,
+            profit_lamports,
+            ArbTwoHopV2FormableGateOutcome::PassedGates,
+        );
 
         let buy_price = Decimal::from(selection.buy_quote.amount_in)
             / Decimal::from(1_000_000_000u64)
@@ -4891,6 +4931,7 @@ impl ArbContext {
                     if let Some(v) = value.as_u64() {
                         if v > 0 {
                             config.max_position_lamports = v;
+                            sync_arb_probe_to_max_position(&mut config);
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
                         } else {
@@ -5012,6 +5053,7 @@ impl ArbContext {
                     if let Some(v) = value.as_u64() {
                         if v > 0 {
                             config.arb_probe_lamports = v;
+                            config.arb_probe_follows_max_position = false;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
                         } else {
@@ -5019,6 +5061,18 @@ impl ArbContext {
                         }
                     } else {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "arb_probe_follows_max_position" => {
+                    if let Some(v) = value.as_bool() {
+                        config.arb_probe_follows_max_position = v;
+                        if v {
+                            sync_arb_probe_to_max_position(&mut config);
+                        }
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
                     }
                 }
                 "arb_quote_trade_ttl_ms" => {
@@ -9464,6 +9518,13 @@ mod two_hop_price_tests {
     const TEST_BUILD: &str = "0.0.0";
     const TEST_RUN: &str = "run-test";
 
+    /// Fixture pools are calibrated for the legacy 0.01 SOL screening probe.
+    fn with_small_v2_probe(mut config: ArbConfig) -> ArbConfig {
+        config.arb_probe_lamports = DLMM_PROBE_SOL_LAMPORTS;
+        config.arb_probe_follows_max_position = false;
+        config
+    }
+
     fn sample_pool(
         dex: &str,
         addr: &str,
@@ -10172,14 +10233,14 @@ mod two_hop_price_tests {
         let before_hit =
             ironcrab::metrics::ARB_V2_SCREEN_METEORA_SELL_BIN_HIT_TOTAL.load(Ordering::Relaxed);
         let tracker = ctx.trackers.read().get(mint).unwrap().clone();
-        let config = ArbConfig {
+        let config = with_small_v2_probe(ArbConfig {
             arb_two_hop_v2_enabled: true,
             two_hop_enabled: true,
             min_spread_bps: 1,
             min_profit_lamports: 1,
             est_tx_cost_lamports: 1,
             ..Default::default()
-        };
+        });
         let _ = ctx.check_arbitrage_for_tracker(&tracker, &config);
         assert!(
             ironcrab::metrics::ARB_V2_SCREEN_METEORA_SELL_BIN_HIT_TOTAL.load(Ordering::Relaxed)
@@ -10364,13 +10425,13 @@ mod two_hop_price_tests {
         assert_eq!(tracker.pools.len(), 2, "expected two seeded pools");
         assert_eq!(vault_balances.len(), 2, "expected two vault entries");
 
-        let config = ArbConfig {
+        let config = with_small_v2_probe(ArbConfig {
             arb_two_hop_v2_enabled: true,
             min_spread_bps: 1,
             min_profit_lamports: 1,
             est_tx_cost_lamports: 1,
             ..Default::default()
-        };
+        });
 
         let bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
         let spread_warn_last = RwLock::new(HashMap::new());
@@ -10448,14 +10509,14 @@ mod two_hop_price_tests {
         let tracker = trackers.get_mut(&mint_str).unwrap();
         tracker.token_decimals = Some(6);
 
-        let config = ArbConfig {
+        let config = with_small_v2_probe(ArbConfig {
             arb_two_hop_v2_enabled: true,
             arb_max_leg_slot_delta: 2,
             min_spread_bps: 1,
             min_profit_lamports: 1,
             est_tx_cost_lamports: 1,
             ..Default::default()
-        };
+        });
 
         let bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
         let spread_warn_last = RwLock::new(HashMap::new());
@@ -10480,6 +10541,207 @@ mod two_hop_price_tests {
         assert!(
             ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED.load(Ordering::Relaxed)
                 > before
+        );
+    }
+
+    #[test]
+    fn sync_arb_probe_follows_max_position_by_default() {
+        let config = ArbConfig::default();
+        assert!(config.arb_probe_follows_max_position);
+        assert_eq!(config.arb_probe_lamports, config.max_position_lamports);
+    }
+
+    #[test]
+    fn max_position_update_syncs_probe_when_follows_enabled() {
+        let mut config = ArbConfig::default();
+        config.max_position_lamports = 250_000_000;
+        sync_arb_probe_to_max_position(&mut config);
+        assert_eq!(config.arb_probe_lamports, 250_000_000);
+    }
+
+    #[test]
+    fn explicit_arb_probe_override_preserves_custom_probe_on_max_position_update() {
+        let mut config = ArbConfig::default();
+        config.arb_probe_lamports = 42_000_000;
+        config.arb_probe_follows_max_position = false;
+        config.max_position_lamports = 500_000_000;
+        sync_arb_probe_to_max_position(&mut config);
+        assert_eq!(config.arb_probe_lamports, 42_000_000);
+    }
+
+    #[test]
+    fn check_arbitrage_v2_rejects_spread_below_min_with_split_reason() {
+        use ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_SPREAD_BELOW_MIN;
+
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+
+        let update_orca = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_a.to_string(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            1_000_000_000,
+            1,
+        );
+        let update_pump = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_b.to_string(),
+            "pump_amm".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            1_000_000_000,
+            2,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        seed_token_tracker_from_live_pool_cache(
+            &mint_str,
+            &cache,
+            &mut trackers,
+            &mut vault_balances,
+            None,
+        );
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert(pool_a.to_string());
+        known_pools.insert(pool_b.to_string());
+
+        let tracker = trackers.get_mut(&mint_str).unwrap();
+        tracker.token_decimals = Some(6);
+
+        let config = with_small_v2_probe(ArbConfig {
+            arb_two_hop_v2_enabled: true,
+            min_spread_bps: 10_000,
+            min_profit_lamports: 1,
+            est_tx_cost_lamports: 1,
+            ..Default::default()
+        });
+
+        let bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
+        let spread_warn_last = RwLock::new(HashMap::new());
+        let data_quality_rejects = AtomicU64::new(0);
+        let reject_before =
+            ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_SPREAD_BELOW_MIN.load(Ordering::Relaxed);
+        let opp = tracker.check_arbitrage(
+            &config,
+            &known_pools,
+            &vault_balances,
+            &bin_arrays,
+            &ArbCheckContext {
+                spread_warn_last: &spread_warn_last,
+                data_quality_rejects: &data_quality_rejects,
+                forensics: None,
+                v2_forensics: None,
+                selected_mints: None,
+                pinned_pools: None,
+            },
+        );
+        assert!(opp.is_none(), "equal reserves should fail spread gate");
+        assert!(
+            ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_SPREAD_BELOW_MIN.load(Ordering::Relaxed)
+                > reject_before
+        );
+    }
+
+    #[test]
+    fn check_arbitrage_v2_rejects_profit_below_min_with_split_reason() {
+        use ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_PROFIT_BELOW_MIN;
+
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+
+        let update_orca = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_a.to_string(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            980_000_000,
+            1,
+        );
+        let update_pump = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_b.to_string(),
+            "pump_amm".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            1_020_000_000,
+            2,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        seed_token_tracker_from_live_pool_cache(
+            &mint_str,
+            &cache,
+            &mut trackers,
+            &mut vault_balances,
+            None,
+        );
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert(pool_a.to_string());
+        known_pools.insert(pool_b.to_string());
+
+        let tracker = trackers.get_mut(&mint_str).unwrap();
+        tracker.token_decimals = Some(6);
+
+        let config = with_small_v2_probe(ArbConfig {
+            arb_two_hop_v2_enabled: true,
+            min_spread_bps: 1,
+            min_profit_lamports: 1_000_000_000_000,
+            est_tx_cost_lamports: 1,
+            ..Default::default()
+        });
+
+        let bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
+        let spread_warn_last = RwLock::new(HashMap::new());
+        let data_quality_rejects = AtomicU64::new(0);
+        let reject_before =
+            ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_PROFIT_BELOW_MIN.load(Ordering::Relaxed);
+        let opp = tracker.check_arbitrage(
+            &config,
+            &known_pools,
+            &vault_balances,
+            &bin_arrays,
+            &ArbCheckContext {
+                spread_warn_last: &spread_warn_last,
+                data_quality_rejects: &data_quality_rejects,
+                forensics: None,
+                v2_forensics: None,
+                selected_mints: None,
+                pinned_pools: None,
+            },
+        );
+        assert!(opp.is_none(), "tiny edge should fail profit gate");
+        assert!(
+            ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_PROFIT_BELOW_MIN.load(Ordering::Relaxed)
+                > reject_before
         );
     }
 
@@ -10534,14 +10796,14 @@ mod two_hop_price_tests {
         let tracker = trackers.get_mut(&mint_str).unwrap();
         tracker.token_decimals = Some(6);
 
-        let config = ArbConfig {
+        let config = with_small_v2_probe(ArbConfig {
             arb_two_hop_v2_enabled: true,
             arb_max_leg_slot_delta: 0,
             min_spread_bps: 1,
             min_profit_lamports: 1,
             est_tx_cost_lamports: 1,
             ..Default::default()
-        };
+        });
 
         let bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
         let spread_warn_last = RwLock::new(HashMap::new());
@@ -11505,10 +11767,10 @@ mod two_hop_price_tests {
     ) -> Option<ArbOpportunity> {
         let spread_warn_last = RwLock::new(HashMap::new());
         let data_quality_rejects = AtomicU64::new(0);
-        let config = ArbConfig {
+        let config = with_small_v2_probe(ArbConfig {
             arb_two_hop_v2_enabled: true,
             ..Default::default()
-        };
+        });
         tracker.check_arbitrage(
             &config,
             known_pools,
@@ -11955,13 +12217,13 @@ mod two_hop_price_tests {
         tracker.token_decimals = Some(6);
         assert_eq!(tracker.pool_count_on_distinct_dexes(), 2);
 
-        let config = ArbConfig {
+        let config = with_small_v2_probe(ArbConfig {
             arb_two_hop_v2_enabled: true,
             min_spread_bps: 1,
             min_profit_lamports: 1,
             est_tx_cost_lamports: 1,
             ..Default::default()
-        };
+        });
         let spread_warn_last = RwLock::new(HashMap::new());
         let data_quality_rejects = AtomicU64::new(0);
         let _ = tracker.check_arbitrage(
@@ -12001,10 +12263,10 @@ mod two_hop_price_tests {
         let data_quality_rejects = AtomicU64::new(0);
         let selected_mints = HashSet::new();
         let pinned_pools = HashSet::new();
-        let config = ArbConfig {
+        let config = with_small_v2_probe(ArbConfig {
             arb_two_hop_v2_enabled: true,
             ..Default::default()
-        };
+        });
 
         let _ = tracker.check_arbitrage(
             &config,
@@ -12063,13 +12325,13 @@ mod two_hop_price_tests {
 
         let spread_warn_last = RwLock::new(HashMap::new());
         let data_quality_rejects = AtomicU64::new(0);
-        let config = ArbConfig {
+        let config = with_small_v2_probe(ArbConfig {
             arb_two_hop_v2_enabled: true,
             min_spread_bps: 1,
             min_profit_lamports: 1,
             est_tx_cost_lamports: 1,
             ..Default::default()
-        };
+        });
 
         let _ = tracker.check_arbitrage(
             &config,

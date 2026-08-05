@@ -4932,6 +4932,69 @@ pub static ARB_TWO_HOP_V2_REJECTED_INSUFFICIENT_POOLS: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_SPREAD_BELOW_MIN: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_SPREAD_ABOVE_MAX: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_PROFIT_BELOW_MIN: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+const ARB_TWO_HOP_V2_FORMABLE_SPREAD_BPS_BUCKETS: &[i64] =
+    &[-100, -50, -10, 0, 10, 50, 100, 200, 500, 1000, 10000];
+const ARB_TWO_HOP_V2_FORMABLE_PROBE_PROFIT_BUCKETS: &[i64] = &[
+    -100_000_000,
+    -10_000_000,
+    -1_000_000,
+    0,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
+];
+const ARB_TWO_HOP_V2_GATE_OUTCOME_COUNT: usize = 4;
+
+static ARB_TWO_HOP_V2_FORMABLE_SPREAD_BPS_BUCKET_COUNTS: Lazy<Vec<Vec<AtomicU64>>> =
+    Lazy::new(|| {
+        (0..ARB_TWO_HOP_V2_GATE_OUTCOME_COUNT)
+            .map(|_| {
+                ARB_TWO_HOP_V2_FORMABLE_SPREAD_BPS_BUCKETS
+                    .iter()
+                    .map(|_| AtomicU64::new(0))
+                    .collect()
+            })
+            .collect()
+    });
+static ARB_TWO_HOP_V2_FORMABLE_SPREAD_BPS_SUM: Lazy<Vec<AtomicI64>> = Lazy::new(|| {
+    (0..ARB_TWO_HOP_V2_GATE_OUTCOME_COUNT)
+        .map(|_| AtomicI64::new(0))
+        .collect()
+});
+static ARB_TWO_HOP_V2_FORMABLE_SPREAD_BPS_COUNT: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    (0..ARB_TWO_HOP_V2_GATE_OUTCOME_COUNT)
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+static ARB_TWO_HOP_V2_FORMABLE_PROBE_PROFIT_BUCKET_COUNTS: Lazy<Vec<Vec<AtomicU64>>> =
+    Lazy::new(|| {
+        (0..ARB_TWO_HOP_V2_GATE_OUTCOME_COUNT)
+            .map(|_| {
+                ARB_TWO_HOP_V2_FORMABLE_PROBE_PROFIT_BUCKETS
+                    .iter()
+                    .map(|_| AtomicU64::new(0))
+                    .collect()
+            })
+            .collect()
+    });
+static ARB_TWO_HOP_V2_FORMABLE_PROBE_PROFIT_SUM: Lazy<Vec<AtomicI64>> = Lazy::new(|| {
+    (0..ARB_TWO_HOP_V2_GATE_OUTCOME_COUNT)
+        .map(|_| AtomicI64::new(0))
+        .collect()
+});
+static ARB_TWO_HOP_V2_FORMABLE_PROBE_PROFIT_COUNT: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    (0..ARB_TWO_HOP_V2_GATE_OUTCOME_COUNT)
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
 pub static ARB_TWO_HOP_V2_INSUFFICIENT_CANDIDATES_LT2: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_INSUFFICIENT_NO_FRESH_BUY_QUOTE: Lazy<AtomicU64> =
@@ -5548,10 +5611,42 @@ pub fn set_arb_quote_shadow_legacy_spread_bps(spread_bps: i64) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArbTwoHopV2RejectReason {
     RoundTripUnprofitable,
+    RoundTripSpreadBelowMin,
+    RoundTripSpreadAboveMax,
+    RoundTripProfitBelowMin,
     QuoteStale,
     IncompatibleQuoteKind,
     InsufficientPools,
     SlotDeltaExceeded,
+}
+
+/// Outcome label for `arb_two_hop_v2_formable_spread_bps` / `arb_two_hop_v2_formable_probe_profit_lamports`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbTwoHopV2FormableGateOutcome {
+    RejectedSpreadBelow,
+    RejectedSpreadAbove,
+    RejectedProfitBelow,
+    PassedGates,
+}
+
+impl ArbTwoHopV2FormableGateOutcome {
+    fn index(self) -> usize {
+        match self {
+            Self::RejectedSpreadBelow => 0,
+            Self::RejectedSpreadAbove => 1,
+            Self::RejectedProfitBelow => 2,
+            Self::PassedGates => 3,
+        }
+    }
+
+    fn prometheus_label(self) -> &'static str {
+        match self {
+            Self::RejectedSpreadBelow => "rejected_spread_below",
+            Self::RejectedSpreadAbove => "rejected_spread_above",
+            Self::RejectedProfitBelow => "rejected_profit_below",
+            Self::PassedGates => "passed_gates",
+        }
+    }
 }
 
 /// Increment `arb_two_hop_v2_screen_total`.
@@ -5804,11 +5899,60 @@ pub fn arb_two_hop_v2_incompatible_kind_inc() {
     ARB_TWO_HOP_V2_INCOMPATIBLE_KIND_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+#[inline]
+fn record_histogram_i64_into(
+    buckets: &[i64],
+    bucket_counts: &[AtomicU64],
+    sum: &AtomicI64,
+    count: &AtomicU64,
+    value: i64,
+) {
+    sum.fetch_add(value, Ordering::Relaxed);
+    count.fetch_add(1, Ordering::Relaxed);
+    for (i, b) in buckets.iter().enumerate() {
+        if value <= *b {
+            bucket_counts[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Record spread/profit histograms for a formable v2 round-trip after the slot gate.
+pub fn record_arb_two_hop_v2_formable_gates(
+    spread_bps: i32,
+    probe_profit_lamports: i64,
+    outcome: ArbTwoHopV2FormableGateOutcome,
+) {
+    let idx = outcome.index();
+    record_histogram_i64_into(
+        ARB_TWO_HOP_V2_FORMABLE_SPREAD_BPS_BUCKETS,
+        &ARB_TWO_HOP_V2_FORMABLE_SPREAD_BPS_BUCKET_COUNTS[idx],
+        &ARB_TWO_HOP_V2_FORMABLE_SPREAD_BPS_SUM[idx],
+        &ARB_TWO_HOP_V2_FORMABLE_SPREAD_BPS_COUNT[idx],
+        i64::from(spread_bps),
+    );
+    record_histogram_i64_into(
+        ARB_TWO_HOP_V2_FORMABLE_PROBE_PROFIT_BUCKETS,
+        &ARB_TWO_HOP_V2_FORMABLE_PROBE_PROFIT_BUCKET_COUNTS[idx],
+        &ARB_TWO_HOP_V2_FORMABLE_PROBE_PROFIT_SUM[idx],
+        &ARB_TWO_HOP_V2_FORMABLE_PROBE_PROFIT_COUNT[idx],
+        probe_profit_lamports,
+    );
+}
+
 /// Increment `arb_two_hop_v2_rejected_total{reason=...}`.
 pub fn arb_two_hop_v2_rejected_inc(reason: ArbTwoHopV2RejectReason) {
     let counter = match reason {
         ArbTwoHopV2RejectReason::RoundTripUnprofitable => {
             &*ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_UNPROFITABLE
+        }
+        ArbTwoHopV2RejectReason::RoundTripSpreadBelowMin => {
+            &*ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_SPREAD_BELOW_MIN
+        }
+        ArbTwoHopV2RejectReason::RoundTripSpreadAboveMax => {
+            &*ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_SPREAD_ABOVE_MAX
+        }
+        ArbTwoHopV2RejectReason::RoundTripProfitBelowMin => {
+            &*ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_PROFIT_BELOW_MIN
         }
         ArbTwoHopV2RejectReason::QuoteStale => &*ARB_TWO_HOP_V2_REJECTED_QUOTE_STALE,
         ArbTwoHopV2RejectReason::IncompatibleQuoteKind => {
@@ -5867,6 +6011,46 @@ pub fn record_arb_quote_pair_slot_delta(buy_as_of_slot: u64, sell_as_of_slot: u6
         buy_as_of_slot,
         sell_as_of_slot,
     ));
+}
+
+#[cfg(any(test, feature = "test_helpers"))]
+pub fn arb_two_hop_v2_formable_spread_bps_count_for_test(
+    outcome: ArbTwoHopV2FormableGateOutcome,
+) -> u64 {
+    ARB_TWO_HOP_V2_FORMABLE_SPREAD_BPS_COUNT[outcome.index()].load(Ordering::Relaxed)
+}
+
+#[cfg(any(test, feature = "test_helpers"))]
+pub fn arb_two_hop_v2_formable_probe_profit_count_for_test(
+    outcome: ArbTwoHopV2FormableGateOutcome,
+) -> u64 {
+    ARB_TWO_HOP_V2_FORMABLE_PROBE_PROFIT_COUNT[outcome.index()].load(Ordering::Relaxed)
+}
+
+#[cfg(any(test, feature = "test_helpers"))]
+pub fn reset_arb_two_hop_v2_formable_gate_metrics_for_test() {
+    for buckets in ARB_TWO_HOP_V2_FORMABLE_SPREAD_BPS_BUCKET_COUNTS.iter() {
+        for bucket in buckets {
+            bucket.store(0, Ordering::Relaxed);
+        }
+    }
+    for sum in ARB_TWO_HOP_V2_FORMABLE_SPREAD_BPS_SUM.iter() {
+        sum.store(0, Ordering::Relaxed);
+    }
+    for count in ARB_TWO_HOP_V2_FORMABLE_SPREAD_BPS_COUNT.iter() {
+        count.store(0, Ordering::Relaxed);
+    }
+    for buckets in ARB_TWO_HOP_V2_FORMABLE_PROBE_PROFIT_BUCKET_COUNTS.iter() {
+        for bucket in buckets {
+            bucket.store(0, Ordering::Relaxed);
+        }
+    }
+    for sum in ARB_TWO_HOP_V2_FORMABLE_PROBE_PROFIT_SUM.iter() {
+        sum.store(0, Ordering::Relaxed);
+    }
+    for count in ARB_TWO_HOP_V2_FORMABLE_PROBE_PROFIT_COUNT.iter() {
+        count.store(0, Ordering::Relaxed);
+    }
 }
 
 #[cfg(any(test, feature = "test_helpers"))]
@@ -7957,6 +8141,70 @@ pub fn record_price_impact(_price_impact_bps: f64) {
 pub fn record_slippage(_slippage_bps: f64) {
     // For now, we'll just track in the trade success metrics
     // Could add a separate histogram for slippage if needed
+}
+
+/// Append `_bucket{le=...}`, `_sum`, `_count` lines with a single label dimension.
+#[allow(clippy::too_many_arguments)]
+fn append_labeled_i64_histogram_prometheus(
+    out: &mut String,
+    metric: &str,
+    label_key: &str,
+    label_value: &str,
+    buckets: &[i64],
+    bucket_counts: &[AtomicU64],
+    sum: &AtomicI64,
+    count: &AtomicU64,
+) {
+    let c = count.load(Ordering::Relaxed);
+    let s = sum.load(Ordering::Relaxed);
+    for (i, b) in buckets.iter().enumerate() {
+        let v = bucket_counts[i].load(Ordering::Relaxed);
+        out.push_str(&format!(
+            "{metric}_bucket{{{label_key}=\"{label_value}\",le=\"{b}\"}} {v}\n"
+        ));
+    }
+    out.push_str(&format!(
+        "{metric}_bucket{{{label_key}=\"{label_value}\",le=\"+Inf\"}} {c}\n"
+    ));
+    out.push_str(&format!(
+        "{metric}_sum{{{label_key}=\"{label_value}\"}} {s}\n"
+    ));
+    out.push_str(&format!(
+        "{metric}_count{{{label_key}=\"{label_value}\"}} {c}\n"
+    ));
+}
+
+fn append_arb_two_hop_v2_formable_gate_histograms(out: &mut String) {
+    let outcomes = [
+        ArbTwoHopV2FormableGateOutcome::RejectedSpreadBelow,
+        ArbTwoHopV2FormableGateOutcome::RejectedSpreadAbove,
+        ArbTwoHopV2FormableGateOutcome::RejectedProfitBelow,
+        ArbTwoHopV2FormableGateOutcome::PassedGates,
+    ];
+    for outcome in outcomes {
+        let idx = outcome.index();
+        let label = outcome.prometheus_label();
+        append_labeled_i64_histogram_prometheus(
+            out,
+            "arb_two_hop_v2_formable_spread_bps",
+            "outcome",
+            label,
+            ARB_TWO_HOP_V2_FORMABLE_SPREAD_BPS_BUCKETS,
+            &ARB_TWO_HOP_V2_FORMABLE_SPREAD_BPS_BUCKET_COUNTS[idx],
+            &ARB_TWO_HOP_V2_FORMABLE_SPREAD_BPS_SUM[idx],
+            &ARB_TWO_HOP_V2_FORMABLE_SPREAD_BPS_COUNT[idx],
+        );
+        append_labeled_i64_histogram_prometheus(
+            out,
+            "arb_two_hop_v2_formable_probe_profit_lamports",
+            "outcome",
+            label,
+            ARB_TWO_HOP_V2_FORMABLE_PROBE_PROFIT_BUCKETS,
+            &ARB_TWO_HOP_V2_FORMABLE_PROBE_PROFIT_BUCKET_COUNTS[idx],
+            &ARB_TWO_HOP_V2_FORMABLE_PROBE_PROFIT_SUM[idx],
+            &ARB_TWO_HOP_V2_FORMABLE_PROBE_PROFIT_COUNT[idx],
+        );
+    }
 }
 
 /// Append `_bucket{le=...}`, `_sum`, `_count` lines (same layout as `tx_slot_to_send_ms`).
@@ -10522,6 +10770,27 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
+    out.push_str("arb_two_hop_v2_rejected_total{reason=\"round_trip_spread_below_min\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_SPREAD_BELOW_MIN
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_rejected_total{reason=\"round_trip_spread_above_max\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_SPREAD_ABOVE_MAX
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_rejected_total{reason=\"round_trip_profit_below_min\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_PROFIT_BELOW_MIN
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     line!(
         "arb_two_hop_v2_screen_multi_dex_total",
         ARB_TWO_HOP_V2_SCREEN_MULTI_DEX_TOTAL.load(Ordering::Relaxed)
@@ -10570,6 +10839,7 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
+    append_arb_two_hop_v2_formable_gate_histograms(&mut out);
     append_momentum_latency_histogram_prometheus(
         &mut out,
         "arb_track_pin_before_first_screen_ms",
@@ -12440,5 +12710,46 @@ mod arb_quote_pair_slot_skew_metrics_tests {
             ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL.load(Ordering::Relaxed),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod arb_two_hop_v2_formable_gate_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn formable_gate_histogram_records_spread_and_profit_per_outcome() {
+        reset_arb_two_hop_v2_formable_gate_metrics_for_test();
+        let spread_before = arb_two_hop_v2_formable_spread_bps_count_for_test(
+            ArbTwoHopV2FormableGateOutcome::RejectedSpreadBelow,
+        );
+        let profit_before = arb_two_hop_v2_formable_probe_profit_count_for_test(
+            ArbTwoHopV2FormableGateOutcome::RejectedSpreadBelow,
+        );
+
+        record_arb_two_hop_v2_formable_gates(
+            -5,
+            -25_000,
+            ArbTwoHopV2FormableGateOutcome::RejectedSpreadBelow,
+        );
+
+        assert_eq!(
+            arb_two_hop_v2_formable_spread_bps_count_for_test(
+                ArbTwoHopV2FormableGateOutcome::RejectedSpreadBelow
+            ),
+            spread_before + 1
+        );
+        assert_eq!(
+            arb_two_hop_v2_formable_probe_profit_count_for_test(
+                ArbTwoHopV2FormableGateOutcome::RejectedSpreadBelow
+            ),
+            profit_before + 1
+        );
+
+        let mut out = String::new();
+        append_arb_two_hop_v2_formable_gate_histograms(&mut out);
+        assert!(out.contains("arb_two_hop_v2_formable_spread_bps_bucket{outcome=\"rejected_spread_below\""));
+        assert!(out.contains("arb_two_hop_v2_formable_probe_profit_lamports_bucket{outcome=\"rejected_spread_below\""));
+        assert!(out.contains("outcome=\"passed_gates\""));
     }
 }
