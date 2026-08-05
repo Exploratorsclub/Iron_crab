@@ -10553,18 +10553,22 @@ mod two_hop_price_tests {
 
     #[test]
     fn max_position_update_syncs_probe_when_follows_enabled() {
-        let mut config = ArbConfig::default();
-        config.max_position_lamports = 250_000_000;
+        let mut config = ArbConfig {
+            max_position_lamports: 250_000_000,
+            ..Default::default()
+        };
         sync_arb_probe_to_max_position(&mut config);
         assert_eq!(config.arb_probe_lamports, 250_000_000);
     }
 
     #[test]
     fn explicit_arb_probe_override_preserves_custom_probe_on_max_position_update() {
-        let mut config = ArbConfig::default();
-        config.arb_probe_lamports = 42_000_000;
-        config.arb_probe_follows_max_position = false;
-        config.max_position_lamports = 500_000_000;
+        let mut config = ArbConfig {
+            arb_probe_lamports: 42_000_000,
+            arb_probe_follows_max_position: false,
+            max_position_lamports: 500_000_000,
+            ..Default::default()
+        };
         sync_arb_probe_to_max_position(&mut config);
         assert_eq!(config.arb_probe_lamports, 42_000_000);
     }

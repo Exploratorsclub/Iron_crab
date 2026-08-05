@@ -12748,7 +12748,9 @@ mod arb_two_hop_v2_formable_gate_metrics_tests {
 
         let mut out = String::new();
         append_arb_two_hop_v2_formable_gate_histograms(&mut out);
-        assert!(out.contains("arb_two_hop_v2_formable_spread_bps_bucket{outcome=\"rejected_spread_below\""));
+        assert!(out.contains(
+            "arb_two_hop_v2_formable_spread_bps_bucket{outcome=\"rejected_spread_below\""
+        ));
         assert!(out.contains("arb_two_hop_v2_formable_probe_profit_lamports_bucket{outcome=\"rejected_spread_below\""));
         assert!(out.contains("outcome=\"passed_gates\""));
     }
