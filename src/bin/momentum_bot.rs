@@ -4038,6 +4038,69 @@ impl MomentumContext {
         best.map(|(q, _)| q)
     }
 
+    /// Post-migration exit may route to PumpAmm (SCOPE57 / FIX-20) after bonding-curve evidence.
+    fn is_post_migration_pump_amm_exit_route(
+        &self,
+        mint: &str,
+        original_dex: &str,
+        selected_dex: &str,
+    ) -> bool {
+        if Self::normalize_dex_for_execution_engine(selected_dex) != "pump_amm" {
+            return false;
+        }
+        if Self::normalize_dex_for_execution_engine(original_dex) == "pumpfun" {
+            return true;
+        }
+        self.live_cache_pumpfun_complete_evidence(mint)
+    }
+
+    /// Reserve-based executable quote for one selected pool (I-7: LivePoolCache only).
+    fn warm_executable_exit_quote_for_pool(
+        &self,
+        pos: &PositionTracker,
+        pool: &str,
+        dex: &str,
+        token_amount: u64,
+        guard_opts: ExitQuoteGuardOpts,
+    ) -> Option<ExitExecutableQuote> {
+        if token_amount == 0 || pool.is_empty() {
+            return None;
+        }
+        let token_mint = solana_sdk::pubkey::Pubkey::from_str(&pos.mint).ok()?;
+        let pool_pk = solana_sdk::pubkey::Pubkey::from_str(pool).ok()?;
+        let (state, slot, age_ms) = self.live_pool_cache.get_with_metadata(&pool_pk)?;
+        let sol_out =
+            quote_calculator::quote_output_amount(&state, token_amount, &token_mint).ok()?;
+        if sol_out == 0 {
+            return None;
+        }
+        let tps = tokens_per_sol::ui_tokens_per_sol(token_amount, pos.token_decimals, sol_out);
+        if !tps.is_finite() || tps <= 0.0 {
+            return None;
+        }
+        let candidate = ExitExecutableQuote {
+            tokens_per_sol: tps,
+            pool_sourced: true,
+            quote_pool: pool.to_string(),
+            quote_dex: dex.to_string(),
+            marks_position_pool: pool == pos.pool,
+            source_slot: Some(slot),
+            cache_age_ms: Some(age_ms),
+        };
+        let dex_accounts = self.dex_pool_accounts_for_mint_pool(&pos.mint, pool, None);
+        if exit_quote_price_exit_guard_violation(
+            pos,
+            &candidate,
+            dex_accounts.as_deref(),
+            guard_opts,
+        )
+        .is_some()
+        {
+            return None;
+        }
+        Some(candidate)
+    }
+
     /// I-MD-9: Geyser hot-set readiness for imminent entry — fresh `LivePoolCache` reserves, no RPC.
     ///
     /// `probe_lamports` must match the planned entry BUY size (probe or scale-in SOL in), EE-aligned.
@@ -15506,6 +15569,202 @@ mod tests {
         assert_eq!(pool, "PF_BC_Y7");
     }
 
+    fn seed_post_migration_exit_test_pools(
+        ctx: &MomentumContext,
+        mint: &str,
+        pf_pool: &str,
+        amm_pool: &str,
+        migration_evidence: bool,
+    ) {
+        let mut pf = PoolInfo::new(pf_pool.to_string(), "pumpfun".to_string(), 50);
+        pf.bonding_curve_complete = Some(migration_evidence);
+        pf.last_trade_ratio = Some(1e-9);
+        pf.dex_pool_accounts = Some(vec!["pf_acc".to_string()]);
+
+        let mut amm = PoolInfo::new(amm_pool.to_string(), "pump_amm".to_string(), 500);
+        amm.last_trade_ratio = Some(3e-9);
+        amm.dex_pool_accounts = Some(vec![
+            WSOL_MINT.to_string(),
+            mint.to_string(),
+            "c".to_string(),
+        ]);
+
+        ctx.mint_pools
+            .write()
+            .insert(mint.to_string(), vec![pf, amm]);
+        if migration_evidence {
+            ctx.merge_pumpfun_migration_complete_evidence(mint, 500, 10);
+        }
+    }
+
+    /// Post-migration PumpAmm exit without warm cache reserves must not publish SELL intent.
+    #[tokio::test]
+    async fn post_migration_exit_suppressed_without_warm_pump_amm_quote() {
+        use solana_sdk::pubkey::Pubkey;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context_with_intent_worker(jsonl_writer, MomentumConfig::default());
+
+        let mint = Pubkey::new_from_array([0xA1u8; 32]).to_string();
+        let pf_pool = Pubkey::new_from_array([0xB1u8; 32]).to_string();
+        let amm_pool = Pubkey::new_from_array([0xC1u8; 32]).to_string();
+        let token_amount = 1_000_000u64;
+
+        seed_post_migration_exit_test_pools(&ctx, &mint, &pf_pool, &amm_pool, true);
+        ctx.open_position(OpenPositionParams {
+            mint: &mint,
+            pool: &pf_pool,
+            dex: "pumpfun",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: Some("creatorPostMigr111111111111111111111111".to_string()),
+            entry_confirmed_slot: 100,
+            initial_bonding: None,
+        });
+
+        let metric_before = ironcrab::metrics::MOMENTUM_POST_MIGRATION_EXIT_WAIT_WARM_QUOTE_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        generate_and_publish_exit_intent(
+            ctx.as_ref(),
+            &mint,
+            &pf_pool,
+            "pumpfun",
+            "STOP_LOSS",
+            "post-migration test",
+            token_amount,
+            None,
+        )
+        .await
+        .expect("gate returns Ok without publish");
+
+        assert_eq!(
+            ctx.jsonl_writer.stats().0,
+            0,
+            "must not publish SELL without warm PumpAmm reserves"
+        );
+        assert!(
+            !ctx.positions.read().get(&mint).unwrap().exit_generated,
+            "exit latch must stay clear for retry"
+        );
+        let metric_after = ironcrab::metrics::MOMENTUM_POST_MIGRATION_EXIT_WAIT_WARM_QUOTE_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(metric_after, metric_before + 1);
+    }
+
+    /// Post-migration PumpAmm exit with warm cache reserves may publish SELL intent.
+    #[tokio::test]
+    async fn post_migration_exit_allowed_with_warm_pump_amm_quote() {
+        use solana_sdk::pubkey::Pubkey;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context_with_intent_worker(jsonl_writer, MomentumConfig::default());
+
+        let mint = Pubkey::new_from_array([0xA2u8; 32]).to_string();
+        let pf_pool = Pubkey::new_from_array([0xB2u8; 32]).to_string();
+        let amm_pool = Pubkey::new_from_array([0xC2u8; 32]).to_string();
+        let token_amount = 1_000_000u64;
+
+        seed_post_migration_exit_test_pools(&ctx, &mint, &pf_pool, &amm_pool, true);
+        let upd = pool_cache_update_stub(
+            &mint,
+            &amm_pool,
+            10_000_000_000_000,
+            10_000_000_000_000_000,
+            900,
+            1,
+        );
+        assert!(pool_cache_sync::apply_pool_cache_update(
+            &ctx.live_pool_cache,
+            &upd
+        ));
+
+        ctx.open_position(OpenPositionParams {
+            mint: &mint,
+            pool: &pf_pool,
+            dex: "pumpfun",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: Some("creatorPostMigrWarm1111111111111111111111".to_string()),
+            entry_confirmed_slot: 100,
+            initial_bonding: None,
+        });
+
+        generate_and_publish_exit_intent(
+            ctx.as_ref(),
+            &mint,
+            &pf_pool,
+            "pumpfun",
+            "STOP_LOSS",
+            "post-migration warm quote test",
+            token_amount,
+            None,
+        )
+        .await
+        .expect("exit intent");
+        wait_for_intent_jsonl_records(ctx.as_ref(), 1).await;
+        assert!(ctx.positions.read().get(&mint).unwrap().exit_generated);
+    }
+
+    /// Active PumpFun without migration evidence: gate must not block PumpFun exit routing.
+    #[tokio::test]
+    async fn post_migration_exit_gate_does_not_apply_without_migration_evidence() {
+        use solana_sdk::pubkey::Pubkey;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context_with_intent_worker(jsonl_writer, MomentumConfig::default());
+
+        let mint = Pubkey::new_from_array([0xA3u8; 32]).to_string();
+        let pf_pool = Pubkey::new_from_array([0xB3u8; 32]).to_string();
+        let amm_pool = Pubkey::new_from_array([0xC3u8; 32]).to_string();
+        let token_amount = 1_000_000u64;
+
+        seed_post_migration_exit_test_pools(&ctx, &mint, &pf_pool, &amm_pool, false);
+        ctx.open_position(OpenPositionParams {
+            mint: &mint,
+            pool: &pf_pool,
+            dex: "pumpfun",
+            entry_price: 1.0,
+            token_decimals: 6,
+            token_amount,
+            sol_invested: 1_000_000,
+            token_program: None,
+            creator: Some("creatorPostMigrNoEv111111111111111111111".to_string()),
+            entry_confirmed_slot: 100,
+            initial_bonding: None,
+        });
+
+        let (pool, dex, _, _, _) = ctx
+            .find_best_sell_pool(&mint, token_amount, &pf_pool, "pumpfun")
+            .expect("sell pool");
+        assert_eq!(dex, "pumpfun");
+        assert_eq!(pool, pf_pool);
+
+        generate_and_publish_exit_intent(
+            ctx.as_ref(),
+            &mint,
+            &pf_pool,
+            "pumpfun",
+            "STOP_LOSS",
+            "active pumpfun exit",
+            token_amount,
+            None,
+        )
+        .await
+        .expect("exit intent");
+        wait_for_intent_jsonl_records(ctx.as_ref(), 1).await;
+        assert!(ctx.positions.read().get(&mint).unwrap().exit_generated);
+    }
+
     #[test]
     fn probe_then_scale_signal_flow() {
         use solana_sdk::pubkey::Pubkey;
@@ -22726,6 +22985,40 @@ async fn generate_and_publish_exit_intent(
                 )
             }
         };
+
+    // Post-migration PumpAmm routing: do not publish until SLAVE LivePoolCache has a warm,
+    // non-degenerate reserve quote for the selected pool (I-7 / I-16 / KNOWN_BUG_PATTERNS #27).
+    if ctx.is_post_migration_pump_amm_exit_route(mint, original_dex, &dex) {
+        let gate_blocked = {
+            let positions = ctx.positions.read();
+            let Some(pos) = positions.get(mint) else {
+                return Ok(());
+            };
+            ctx.warm_executable_exit_quote_for_pool(
+                pos,
+                &pool,
+                &dex,
+                token_amount,
+                ExitQuoteGuardOpts::RelaxPositionMarkSlotForHardPriceExit,
+            )
+            .is_none()
+        };
+        if gate_blocked {
+            ironcrab::metrics::record_momentum_post_migration_exit_wait_warm_quote_total();
+            warn!(
+                mint = %mint,
+                selected_pool = %pool,
+                selected_dex = %dex,
+                original_pool = %original_pool,
+                original_dex = %original_dex,
+                exit_type = %exit_type,
+                token_amount = token_amount,
+                reason = "no_warm_pump_amm_reserve_quote",
+                "POST_MIGRATION_EXIT_WAIT_WARM_QUOTE"
+            );
+            return Ok(());
+        }
+    }
 
     // Decimals depend on the token. Prefer decimals from the open position (which was seeded
     // from MarketEventKind::TokenMintInfo), fall back to mint_infos cache, then fallback to 6.

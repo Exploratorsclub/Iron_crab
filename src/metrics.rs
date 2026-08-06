@@ -3574,6 +3574,13 @@ pub static MOMENTUM_SCALE_IN_GATE_BLOCKED_WINDOW_EXPIRED: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static MOMENTUM_SCALE_IN_GATE_BLOCKED_NO_QUOTE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_POST_MIGRATION_EXIT_WAIT_WARM_QUOTE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+#[inline]
+pub fn record_momentum_post_migration_exit_wait_warm_quote_total() {
+    MOMENTUM_POST_MIGRATION_EXIT_WAIT_WARM_QUOTE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
 
 #[inline]
 pub fn record_momentum_orphan_probe_recovery_total() {
@@ -9924,6 +9931,13 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("momentum_scale_in_gate_blocked_total{reason=\"no_quote\"} ");
     out.push_str(
         &MOMENTUM_SCALE_IN_GATE_BLOCKED_NO_QUOTE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("momentum_post_migration_exit_wait_warm_quote_total ");
+    out.push_str(
+        &MOMENTUM_POST_MIGRATION_EXIT_WAIT_WARM_QUOTE_TOTAL
             .load(Ordering::Relaxed)
             .to_string(),
     );
