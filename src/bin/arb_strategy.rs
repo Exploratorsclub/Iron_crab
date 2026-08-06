@@ -32,15 +32,16 @@ use uuid::Uuid;
 use ironcrab::arbitrage::{
     arb_track_removal_reason, classify_cross_dex_sell_failure, dlmm_marginal_price_plausible,
     dlmm_sol_output_from_bins, dlmm_token_output_from_bins, freshness_age_bucket,
-    is_expected_token_output_plausible, is_quote_fresh, populate_arb_slave_from_live_pool_cache,
-    price_based_token_output_raw, quote_exact_in, quote_exact_in_with_freshness,
-    quote_sell_round_trip, quotes_pairable, round_trip_profit_lamports, select_arb_track_pools,
-    select_round_trip_pools, sync_arb_slave_from_pool_cache_update, MultiHopArbitrage,
-    MultiHopConfig, MultiHopIntentBatch, NoCrossDexSellDetailReason, PoolQuote,
-    QuoteFreshnessConfig, QuoteKind, QuotePoolInput, QuoteVaultInput, RoundTripInsufficient,
-    RoundTripInsufficientSubreason, RoundTripLeg, RoundTripPoolCandidate, RoundTripSelectFailure,
-    SellQuoteNoneDetailReason, TrackCandidateCounts, TrackMintInput, TrackPoolInput,
-    TrackPoolReadiness, TrackSelectionConfig, DLMM_PROBE_SOL_LAMPORTS,
+    is_arb_route_executable, is_expected_token_output_plausible, is_quote_fresh,
+    populate_arb_slave_from_live_pool_cache, price_based_token_output_raw, quote_exact_in,
+    quote_exact_in_with_freshness, quote_sell_round_trip, quotes_pairable,
+    round_trip_profit_lamports, select_arb_track_pools, select_round_trip_pools,
+    sync_arb_slave_from_pool_cache_update, MultiHopArbitrage, MultiHopConfig, MultiHopIntentBatch,
+    NoCrossDexSellDetailReason, PoolQuote, QuoteFreshnessConfig, QuoteKind, QuotePoolInput,
+    QuoteVaultInput, RoundTripInsufficient, RoundTripInsufficientSubreason, RoundTripLeg,
+    RoundTripPoolCandidate, RoundTripSelectFailure, SellQuoteNoneDetailReason,
+    TrackCandidateCounts, TrackMintInput, TrackPoolInput, TrackPoolReadiness, TrackSelectionConfig,
+    DLMM_PROBE_SOL_LAMPORTS,
 };
 use ironcrab::config::Config as AppConfig;
 use ironcrab::execution::live_pool_cache::{
@@ -83,7 +84,8 @@ use ironcrab::metrics::{
     inc_arb_v2_screen_meteora_sell_bin_miss_total, inc_arb_vault_balance_applied_total,
     inc_arb_vault_live_snapshot_refreshed_total, inc_arb_vault_live_snapshot_seeded_total,
     inc_arb_vault_rescreen_scheduled_total, record_arb_heartbeat_phase,
-    record_arb_intent_suppressed_implausible_token_out, record_arb_price_freshness_stale_age_ms,
+    record_arb_intent_suppressed_implausible_token_out,
+    record_arb_intent_suppressed_unsupported_route, record_arb_price_freshness_stale_age_ms,
     record_arb_proactive_pin_first_publish, record_arb_proactive_track_publish_total,
     record_arb_quote_pair_slot_delta, record_arb_quote_shadow_round_trip,
     record_arb_track_publish_skipped_unchanged_total, record_arb_track_removed_total,
@@ -6777,6 +6779,21 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
             "Rejecting arb: sell pool missing DexPoolAccounts (GEYSER-FIRST)"
         );
         ARB_REJECTED_MISSING_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+
+    if !is_arb_route_executable(&opp.buy_dex, &opp.sell_dex) {
+        warn!(
+            buy_dex = %opp.buy_dex,
+            sell_dex = %opp.sell_dex,
+            buy_pool = %opp.buy_pool,
+            sell_pool = %opp.sell_pool,
+            mint = %opp.base_mint,
+            spread_bps = opp.spread_bps,
+            reason = "unsupported_cross_dex_route",
+            "Suppressing arb intent: EE cannot build cross-DEX plan for this route"
+        );
+        record_arb_intent_suppressed_unsupported_route();
         return None;
     }
 

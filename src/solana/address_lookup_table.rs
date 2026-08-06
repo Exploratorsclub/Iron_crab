@@ -85,6 +85,49 @@ impl LoadedAlt {
     }
 }
 
+/// Build an `AddressLookupTableAccount`, optionally excluding `tip_account`.
+///
+/// Jito bundle tips must be static writable keys in v0 messages. If the tip account
+/// is referenced via ALT lookup, the writable flag cannot be set and Jito rejects the
+/// bundle. Simulation and send must both use the same filtered ALT.
+pub fn address_lookup_table_account(
+    alt: &LoadedAlt,
+    exclude_tip: Option<&Pubkey>,
+) -> AddressLookupTableAccount {
+    let addresses = match exclude_tip {
+        Some(tip) => alt
+            .accounts
+            .iter()
+            .filter(|addr| *addr != tip)
+            .copied()
+            .collect(),
+        None => alt.accounts.clone(),
+    };
+    AddressLookupTableAccount {
+        key: alt.address,
+        addresses,
+    }
+}
+
+/// Compile a v0 `VersionedMessage` with optional ALT and tip filtering.
+pub fn compile_v0_versioned_message(
+    payer: &Pubkey,
+    instructions: &[Instruction],
+    alt: Option<&LoadedAlt>,
+    exclude_tip_from_alt: Option<&Pubkey>,
+    recent_blockhash: solana_sdk::hash::Hash,
+) -> Result<VersionedMessage, String> {
+    let message = if let Some(alt) = alt {
+        let alt_account = address_lookup_table_account(alt, exclude_tip_from_alt);
+        v0::Message::try_compile(payer, instructions, &[alt_account], recent_blockhash)
+            .map_err(|e| format!("v0_compile_error:{e}"))?
+    } else {
+        v0::Message::try_compile(payer, instructions, &[], recent_blockhash)
+            .map_err(|e| format!("v0_compile_error:{e}"))?
+    };
+    Ok(VersionedMessage::V0(message))
+}
+
 /// Load an existing ALT from chain.
 pub async fn load_alt(rpc: &RpcClient, alt_address: &Pubkey) -> Result<LoadedAlt> {
     let account = rpc
@@ -221,5 +264,63 @@ mod tests {
 
         // Random pubkey should not be in ALT
         assert!(!alt.contains(&Pubkey::new_unique()));
+    }
+
+    #[test]
+    fn address_lookup_table_account_filters_tip_from_alt() {
+        let tip = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let alt = LoadedAlt {
+            address: Pubkey::new_unique(),
+            accounts: vec![tip, other],
+        };
+
+        let filtered = address_lookup_table_account(&alt, Some(&tip));
+        assert_eq!(filtered.addresses.len(), 1);
+        assert_eq!(filtered.addresses[0], other);
+
+        let unfiltered = address_lookup_table_account(&alt, None);
+        assert_eq!(unfiltered.addresses.len(), 2);
+    }
+
+    #[test]
+    fn compile_v0_versioned_message_tip_filter_matches_send_form() {
+        use solana_sdk::instruction::{AccountMeta, Instruction};
+        use solana_system_program;
+
+        let payer = Pubkey::new_unique();
+        let tip = Pubkey::from_str("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5").unwrap();
+        let recipient = Pubkey::new_unique();
+        let blockhash = solana_sdk::hash::Hash::new_unique();
+        let alt = LoadedAlt {
+            address: Pubkey::new_unique(),
+            accounts: vec![tip, recipient],
+        };
+        let mut data = vec![2, 0, 0, 0];
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let ix = Instruction {
+            program_id: solana_system_program::id(),
+            accounts: vec![AccountMeta::new(payer, true), AccountMeta::new(tip, false)],
+            data,
+        };
+
+        let with_tip_in_alt = compile_v0_versioned_message(
+            &payer,
+            std::slice::from_ref(&ix),
+            Some(&alt),
+            None,
+            blockhash,
+        )
+        .expect("compile with tip in ALT");
+        let tip_filtered = compile_v0_versioned_message(
+            &payer,
+            std::slice::from_ref(&ix),
+            Some(&alt),
+            Some(&tip),
+            blockhash,
+        )
+        .expect("compile with tip filtered from ALT");
+
+        assert_ne!(with_tip_in_alt, tip_filtered);
     }
 }

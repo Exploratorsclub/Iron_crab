@@ -579,6 +579,17 @@ pub const ARB_TOKEN_OUT_MIN_RAW_FLOOR: u64 = 1_000;
 /// Trade size (lamports) at which the absolute raw floor applies.
 pub const ARB_TOKEN_OUT_FLOOR_TRADE_AMOUNT_LAMPORTS: u64 = 10_000_000;
 
+/// Returns true when execution-engine can reliably build a cross-DEX swap plan for this pair.
+///
+/// Strategy must not publish intents for unsupported pairs (I-12: log + metric, no silent drop).
+pub fn is_arb_route_executable(buy_dex: &str, sell_dex: &str) -> bool {
+    // Prod 2026-08-06: orca ↔ meteora_dlmm fails in EE `build_swap_plan` (Intent 000004).
+    !matches!(
+        (buy_dex, sell_dex),
+        ("orca", "meteora_dlmm") | ("meteora_dlmm", "orca")
+    )
+}
+
 /// Returns true when reserve/bin-walker `token_out` is plausible vs a price-based estimate.
 pub fn is_expected_token_output_plausible(
     token_out: u64,
@@ -3034,5 +3045,13 @@ mod tests {
         assert!(is_expected_token_output_plausible(
             1_500_000, estimate, 10_000_000
         ));
+    }
+
+    #[test]
+    fn arb_route_gate_blocks_orca_meteora_dlmm_pairs() {
+        assert!(!is_arb_route_executable("orca", "meteora_dlmm"));
+        assert!(!is_arb_route_executable("meteora_dlmm", "orca"));
+        assert!(is_arb_route_executable("meteora_dlmm", "pump_amm"));
+        assert!(is_arb_route_executable("pump_amm", "meteora_dlmm"));
     }
 }
