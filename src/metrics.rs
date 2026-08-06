@@ -4911,6 +4911,14 @@ pub static ARB_TRIANGLE_OPPORTUNITIES: Lazy<AtomicU64> = Lazy::new(|| AtomicU64:
 /// Count of arb opportunities rejected due to missing DexPoolAccounts for pump_amm
 pub static ARB_REJECTED_MISSING_ACCOUNTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+/// Arb intents published without `expected_token_output` because the reserve/bin quote was implausible.
+pub static ARB_INTENT_SUPPRESSED_IMPLAUSIBLE_TOKEN_OUT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub fn record_arb_intent_suppressed_implausible_token_out() {
+    ARB_INTENT_SUPPRESSED_IMPLAUSIBLE_TOKEN_OUT.fetch_add(1, Ordering::Relaxed);
+}
+
 /// 2-hop cross-DEX opportunities that passed all filters in arb-strategy
 pub static ARB_TWO_HOP_OPPORTUNITIES: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
@@ -10667,6 +10675,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_rejected_missing_accounts_total",
         ARB_REJECTED_MISSING_ACCOUNTS.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_intent_suppressed_implausible_token_out_total",
+        ARB_INTENT_SUPPRESSED_IMPLAUSIBLE_TOKEN_OUT.load(Ordering::Relaxed)
     );
     line!(
         "arb_two_hop_opportunities_total",
