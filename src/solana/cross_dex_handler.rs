@@ -36,13 +36,21 @@ use crate::execution::live_pool_cache::{CachedPoolState, LivePoolCache};
 use crate::ipc::TradeIntent;
 use crate::solana::dex::meteora_dlmm::MeteoraDlmm;
 use crate::solana::dex::orca::Orca;
-use crate::solana::dex::pumpfun_amm::PumpFunAmmDex;
+use crate::solana::dex::pumpfun_amm::{
+    pump_amm_buy_program_ix_index, pump_amm_resolve_sell_pre_fee_meta_1_for_build,
+    pump_amm_sell_ix_uses_global_fee_at, pump_amm_singleton_global_volume_accumulator_pub,
+    PumpFunAmmDex, PUMPFUN_AMM_BUY_TOTAL_ACCOUNTS, PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS,
+    PUMPFUN_AMM_SELL_FEE_CONFIG_IX_V2, PUMPFUN_AMM_SELL_FEE_PROGRAM_IX_V2,
+};
 use crate::solana::dex::raydium::Raydium;
 use crate::solana::dex::{Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
 
 /// Token-2022 Program ID
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+/// PumpSwap AMM program id (for layout slot guards).
+const PUMPFUN_AMM_PROGRAM_ID_STR: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
 /// Helper to convert spl_token instruction to solana_sdk instruction
 fn prog_ix_to_sdk(ix: spl_token::solana_program::instruction::Instruction) -> Instruction {
@@ -300,6 +308,241 @@ impl CrossDexHandler {
         }
 
         (buy_accounts, sell_accounts)
+    }
+
+    /// Resolve pump_amm v14 `pool_accounts` from intent strings or LivePoolCache (GEYSER-FIRST, no RPC).
+    fn resolve_pump_amm_pool_accounts_v14(
+        &self,
+        pool_str: &str,
+        account_strings: Option<&[String]>,
+    ) -> Result<Vec<Pubkey>> {
+        let pool_pk = Pubkey::from_str(pool_str)
+            .map_err(|_| anyhow!("Invalid pump_amm pool address: {}", pool_str))?;
+
+        if let Some(accts) = account_strings {
+            if accts.len() >= 14 {
+                let mut parsed = Vec::with_capacity(14);
+                for (idx, a) in accts.iter().take(14).enumerate() {
+                    parsed.push(Pubkey::from_str(a).map_err(|e| {
+                        anyhow!("invalid pump_amm pool account[{idx}] '{}': {e}", a)
+                    })?);
+                }
+                if parsed[0] != pool_pk {
+                    return Err(anyhow!(
+                        "pump_amm pool mismatch: expected {pool_pk}, accounts[0]={}",
+                        parsed[0]
+                    ));
+                }
+                return Ok(parsed);
+            }
+        }
+
+        if let Some(ref cache) = self.pool_cache {
+            if let Some(CachedPoolState::PumpAmm(amm_state)) = cache.get(&pool_pk) {
+                if amm_state.pool_accounts.len() >= 14 {
+                    return Ok(amm_state.pool_accounts[..14].to_vec());
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "pump_amm: pool {} requires 14 v14 accounts in intent or LivePoolCache",
+            pool_str
+        ))
+    }
+
+    /// Build pump_amm swap instructions via `build_swap_ix_from_pool_accounts_with_extended_tail`
+    /// (same SSOT path as `tx_builder`, not deprecated `Dex::build_swap_ix`).
+    #[allow(clippy::too_many_arguments)]
+    fn build_pump_amm_arb_swap_ixs(
+        &self,
+        input_mint: &str,
+        output_mint: &str,
+        amount_in: u64,
+        min_out: u64,
+        pool_str: &str,
+        account_strings: Option<&[String]>,
+        token_program_override: Option<Pubkey>,
+        is_buy_leg: bool,
+    ) -> Result<Vec<Instruction>> {
+        let wallet = self
+            .wallet_pubkey
+            .ok_or_else(|| anyhow!("wallet_pubkey not set for pump_amm arb build"))?;
+
+        let pool_pk = Pubkey::from_str(pool_str)?;
+        let pool_accounts = self.resolve_pump_amm_pool_accounts_v14(pool_str, account_strings)?;
+
+        let (
+            sell_requires_cashback_remaining,
+            sell_cashback_third_meta,
+            sell_extended_tail_0,
+            sell_extended_tail_1,
+            sell_extended_fee_tail_0,
+            sell_extended_fee_tail_1,
+            sell_requires_pre_fee_metas,
+            cached_sell_pre_fee_meta_1,
+            sell_requires_fee_tail,
+            sell_layout_ready,
+        ) = if let Some(ref cache) = self.pool_cache {
+            let (sell_ext, third, t0, t1) = cache.pump_amm_sell_extended_layout(&pool_pk);
+            let (fee_t0, fee_t1) = cache.pump_amm_sell_fee_tail_layout(&pool_pk);
+            (
+                sell_ext,
+                third,
+                t0,
+                t1,
+                fee_t0,
+                fee_t1,
+                cache.pump_amm_sell_requires_pre_fee_metas(&pool_pk),
+                cache.pump_amm_sell_pre_fee_meta_1(&pool_pk),
+                cache.pump_amm_sell_requires_fee_tail(&pool_pk),
+                cache.pump_amm_sell_layout_ready(&pool_pk),
+            )
+        } else {
+            (
+                false, None, None, None, None, None, false, None, false, false,
+            )
+        };
+
+        let is_sell_leg = !is_buy_leg;
+        if is_sell_leg
+            && sell_requires_cashback_remaining
+            && !sell_layout_ready
+            && sell_cashback_third_meta.is_none()
+        {
+            return Err(anyhow!(
+                "pump_amm SELL: extended layout required for pool {} but LivePoolCache layout not ready (missing third_meta/tails)",
+                pool_str
+            ));
+        }
+        if is_buy_leg
+            && sell_requires_pre_fee_metas
+            && sell_requires_cashback_remaining
+            && !sell_layout_ready
+        {
+            return Err(anyhow!(
+                "pump_amm BUY: extended v2 layout required for pool {} but LivePoolCache layout not ready",
+                pool_str
+            ));
+        }
+
+        let global_volume_accumulator = pool_accounts
+            .get(11)
+            .copied()
+            .filter(|p| *p != Pubkey::default());
+        let (sell_pre_fee_meta_1, _pre_fee_source) = if is_sell_leg && sell_requires_pre_fee_metas {
+            if let Some(gva) = global_volume_accumulator {
+                pump_amm_resolve_sell_pre_fee_meta_1_for_build(
+                    &pool_pk,
+                    gva,
+                    cached_sell_pre_fee_meta_1,
+                )
+            } else {
+                (cached_sell_pre_fee_meta_1, "cache_unvalidated")
+            }
+        } else if is_buy_leg && sell_requires_pre_fee_metas {
+            pump_amm_resolve_sell_pre_fee_meta_1_for_build(
+                &pool_pk,
+                pump_amm_singleton_global_volume_accumulator_pub(),
+                cached_sell_pre_fee_meta_1,
+            )
+        } else {
+            (cached_sell_pre_fee_meta_1, "cache")
+        };
+
+        let use_extended_layout = sell_requires_cashback_remaining && (is_sell_leg || is_buy_leg);
+
+        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
+            input_mint,
+            output_mint,
+            amount_in,
+            min_out,
+            wallet,
+            &pool_accounts,
+            token_program_override,
+            use_extended_layout,
+            if use_extended_layout {
+                sell_cashback_third_meta
+            } else {
+                None
+            },
+            sell_requires_pre_fee_metas && (is_sell_leg || is_buy_leg),
+            sell_pre_fee_meta_1,
+            sell_extended_tail_0,
+            sell_extended_tail_1,
+            sell_extended_fee_tail_0,
+            sell_extended_fee_tail_1,
+            sell_requires_fee_tail && is_sell_leg,
+            false,
+        )
+        .map_err(|e| {
+            anyhow!(
+                "pump_amm {} leg build_swap_ix_from_pool_accounts failed for pool {}: {e}",
+                if is_buy_leg { "BUY" } else { "SELL" },
+                pool_str
+            )
+        })?;
+
+        if let Some(ix) = ixs.first() {
+            let account_count = ix.accounts.len();
+            let program_slot = if is_buy_leg {
+                pump_amm_buy_program_ix_index(account_count)
+            } else {
+                Some(16)
+            };
+            let (fee_cfg_ix, fee_prog_ix) = if is_sell_leg {
+                pump_amm_sell_ix_uses_global_fee_at(account_count).unwrap_or((0, 0))
+            } else if account_count == PUMPFUN_AMM_BUY_TOTAL_ACCOUNTS {
+                (20, 21)
+            } else if account_count == PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS {
+                (
+                    PUMPFUN_AMM_SELL_FEE_CONFIG_IX_V2,
+                    PUMPFUN_AMM_SELL_FEE_PROGRAM_IX_V2,
+                )
+            } else {
+                (0, 0)
+            };
+            let fee_cfg_pk = ix
+                .accounts
+                .get(fee_cfg_ix)
+                .map(|m| m.pubkey.to_string())
+                .unwrap_or_default();
+            let fee_prog_pk = ix
+                .accounts
+                .get(fee_prog_ix)
+                .map(|m| m.pubkey.to_string())
+                .unwrap_or_default();
+            let program_pk = program_slot
+                .and_then(|idx| ix.accounts.get(idx))
+                .map(|m| m.pubkey.to_string())
+                .unwrap_or_default();
+            info!(
+                pool = %pool_str,
+                leg = if is_buy_leg { "buy" } else { "sell" },
+                ix_account_count = account_count,
+                program_slot_pubkey = %program_pk,
+                fee_config_slot_pubkey = %fee_cfg_pk,
+                fee_program_slot_pubkey = %fee_prog_pk,
+                sell_requires_pre_fee_metas,
+                sell_requires_cashback_remaining,
+                "pump_amm cross-dex swap ix built (tx_builder SSOT path)"
+            );
+            let expected_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID_STR).unwrap_or_default();
+            if let Some(idx) = program_slot {
+                if ix.accounts[idx].pubkey != expected_program {
+                    warn!(
+                        pool = %pool_str,
+                        leg = if is_buy_leg { "buy" } else { "sell" },
+                        program_slot = idx,
+                        got = %ix.accounts[idx].pubkey,
+                        expected = %expected_program,
+                        "pump_amm cross-dex: program meta slot mismatch before simulation"
+                    );
+                }
+            }
+        }
+
+        Ok(ixs)
     }
 
     /// Check if this intent is a cross-DEX arbitrage intent (old 2-hop style)
@@ -1040,95 +1283,39 @@ impl CrossDexHandler {
             "Parsed pool accounts from intent"
         );
 
-        // Build buy instructions
-        let buy_connector = self
-            .dexes
-            .get(&buy_dex)
-            .ok_or_else(|| anyhow!("Unknown buy DEX: {}", buy_dex))?;
-
-        // Set pool from intent accounts (NO RPC!) - arb-strategy provides these from DexPoolAccounts events
-        if let Some(ref accts) = buy_accounts {
-            if let Err(e) = buy_connector.set_pool_from_accounts(&buy_pool, accts) {
-                warn!(
-                    pool = %buy_pool,
-                    dex = %buy_dex,
-                    error = %e,
-                    "Failed to set buy pool from intent accounts"
-                );
-            }
-        } else if !buy_pool.is_empty() {
-            // No accounts in intent - check LivePoolCache
-            // GEYSER-FIRST (TARGET_ARCHITECTURE.md §4.5): NO RPC in hot path!
-            // If Geyser hasn't delivered the data, RPC won't have it either (same validator).
-            let pool_pk = Pubkey::from_str(&buy_pool)
-                .map_err(|_| anyhow!("Invalid buy pool address: {}", buy_pool))?;
-
-            if !self.try_inject_from_cache(&buy_dex, &pool_pk, buy_connector) {
-                // Cache miss = REJECT. No RPC fallback.
-                // The arb-strategy should not have generated this intent without DexPoolAccounts.
-                return Err(anyhow!(
-                    "GEYSER_CACHE_MISS: buy pool {} ({}) not in cache and no accounts in intent. \
-                     arb-strategy should require DexPoolAccounts before generating intents.",
-                    buy_pool,
-                    buy_dex
-                ));
-            }
-        }
-
         // Use trade_amount (from intent) as buy_amount_in
-        // arb-strategy already computed the optimal amounts
         let buy_amount_in = trade_amount;
 
         // ====================================================================
         // Determine token program BEFORE ATA creation and DEX injection
-        // This is used for:
-        // 1. ATA creation (must use correct program for Token-2022)
-        // 2. DEX connectors (Meteora DLMM needs this for swap IX building)
         // ====================================================================
         let token_mint_pk = Pubkey::from_str(token_mint)
             .map_err(|_| anyhow!("Invalid token mint: {}", token_mint))?;
 
-        // Determine the token program:
-        // 1. From Intent (arb-strategy sends this via TokenMintInfo)
-        // 2. From cache (Geyser-populated)
-        // 3. From DEX hint
-        // 4. Default to SPL Token
         let token_program = get_token_program_for_mint_cached(
             self.pool_cache.as_deref(),
             &token_mint_pk,
-            Some(&buy_dex), // Use buy_dex as hint for pump.fun detection
-            intent.resources.token_program.as_deref(), // From Intent (GEYSER-FIRST)
+            Some(&buy_dex),
+            intent.resources.token_program.as_deref(),
         );
         let token_program_sdk = Pubkey::new_from_array(token_program.to_bytes());
 
         // ====================================================================
         // Create Token ATA (idempotent) - only for the token being traded
-        //
-        // NOTE: WSOL ATA creation REMOVED - WsolManager guarantees WSOL ATA exists
-        // and has sufficient balance. This saves ~20k CU per arb TX.
-        //
-        // Token ATA is still needed because:
-        // - First arb of a new token needs the ATA
-        // - Idempotent = no-op if exists (~2k CU), only costs when creating (~20k CU)
-        //
-        // IMPORTANT: For Token-2022 mints, we MUST use the Token-2022 program ID,
-        // otherwise ATA creation fails with IncorrectProgramId.
         // ====================================================================
         let mut ata_creation_instructions = Vec::new();
         if let Some(wallet) = self.wallet_pubkey {
             let wallet_spl =
                 spl_token::solana_program::pubkey::Pubkey::new_from_array(wallet.to_bytes());
 
-            // Create Token ATA (for the token being bought/sold)
-            // MUST use the correct token program (SPL Token OR Token-2022)
             let token_mint_spl =
                 spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint_pk.to_bytes());
 
             let create_token_ata_ix_prog = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-                &wallet_spl,        // payer
-                &wallet_spl,        // owner  
-                &token_mint_spl,    // token mint
-                &token_program,     // token program (dynamically determined above!)
+                &wallet_spl,
+                &wallet_spl,
+                &token_mint_spl,
+                &token_program,
             );
             let token_ata_ix = prog_ix_to_sdk(create_token_ata_ix_prog);
 
@@ -1142,78 +1329,58 @@ impl CrossDexHandler {
             ata_creation_instructions.push(token_ata_ix);
         }
 
-        // ====================================================================
-        // GEYSER-FIRST: Inject cached data for IX building
-        // This eliminates RPC calls in build_swap_ix_async
-        // ====================================================================
+        // Build buy instructions
+        let buy_swap_instructions = if buy_dex == "pump_amm" {
+            self.build_pump_amm_arb_swap_ixs(
+                SOL_MINT,
+                token_mint,
+                buy_amount_in,
+                buy_min_out,
+                &buy_pool,
+                buy_accounts.as_deref(),
+                Some(token_program_sdk),
+                true,
+            )?
+        } else {
+            let buy_connector = self
+                .dexes
+                .get(&buy_dex)
+                .ok_or_else(|| anyhow!("Unknown buy DEX: {}", buy_dex))?;
 
-        // Inject Token-2022 program info for all DEXes that need it (Meteora DLMM, Orca, etc.)
-        // The token_program was already determined above for ATA creation.
-        // We cache it with key "token_program:<mint>" so DEX connectors can use it.
-        buy_connector.cache_extra_data(
-            &format!("token_program:{}", token_mint),
-            &token_program_sdk.to_string(),
-        );
+            if let Some(ref accts) = buy_accounts {
+                if let Err(e) = buy_connector.set_pool_from_accounts(&buy_pool, accts) {
+                    warn!(
+                        pool = %buy_pool,
+                        dex = %buy_dex,
+                        error = %e,
+                        "Failed to set buy pool from intent accounts"
+                    );
+                }
+            } else if !buy_pool.is_empty() {
+                let pool_pk = Pubkey::from_str(&buy_pool)
+                    .map_err(|_| anyhow!("Invalid buy pool address: {}", buy_pool))?;
 
-        // Use async build to support DEXes that need it
-        let buy_instructions = buy_connector
-            .build_swap_ix_async(SOL_MINT, token_mint, buy_amount_in, buy_min_out)
-            .await?;
+                if !self.try_inject_from_cache(&buy_dex, &pool_pk, buy_connector) {
+                    return Err(anyhow!(
+                        "GEYSER_CACHE_MISS: buy pool {} ({}) not in cache and no accounts in intent. \
+                         arb-strategy should require DexPoolAccounts before generating intents.",
+                        buy_pool,
+                        buy_dex
+                    ));
+                }
+            }
+
+            buy_connector.cache_extra_data(
+                &format!("token_program:{}", token_mint),
+                &token_program_sdk.to_string(),
+            );
+
+            buy_connector
+                .build_swap_ix_async(SOL_MINT, token_mint, buy_amount_in, buy_min_out)
+                .await?
+        };
 
         // Build sell instructions
-        let sell_connector = self
-            .dexes
-            .get(&sell_dex)
-            .ok_or_else(|| anyhow!("Unknown sell DEX: {}", sell_dex))?;
-
-        // Inject Token-2022 program info for sell DEX as well
-        sell_connector.cache_extra_data(
-            &format!("token_program:{}", token_mint),
-            &token_program_sdk.to_string(),
-        );
-
-        // Set sell pool from intent accounts (NO RPC!)
-        if let Some(ref accts) = sell_accounts {
-            if let Err(e) = sell_connector.set_pool_from_accounts(&sell_pool, accts) {
-                warn!(
-                    pool = %sell_pool,
-                    dex = %sell_dex,
-                    error = %e,
-                    "Failed to set sell pool from intent accounts"
-                );
-            }
-        } else if !sell_pool.is_empty() {
-            // No accounts in intent - check LivePoolCache
-            // GEYSER-FIRST (TARGET_ARCHITECTURE.md §4.5): NO RPC in hot path!
-            // If Geyser hasn't delivered the data, RPC won't have it either (same validator).
-            let pool_pk = Pubkey::from_str(&sell_pool)
-                .map_err(|_| anyhow!("Invalid sell pool address: {}", sell_pool))?;
-
-            if !self.try_inject_from_cache(&sell_dex, &pool_pk, sell_connector) {
-                // Cache miss = REJECT. No RPC fallback.
-                // The arb-strategy should not have generated this intent without DexPoolAccounts.
-                return Err(anyhow!(
-                    "GEYSER_CACHE_MISS: sell pool {} ({}) not in cache and no accounts in intent. \
-                     arb-strategy should require DexPoolAccounts before generating intents.",
-                    sell_pool,
-                    sell_dex
-                ));
-            }
-        }
-
-        // ====================================================================
-        // SELL AMOUNT: Use expected token output from buy leg (Option D)
-        // ====================================================================
-        // For atomic arb bundles:
-        // - Buy leg: SOL → Token (receives tokens)
-        // - Sell leg: Token → SOL (sells those tokens)
-        //
-        // OPTION D: buy_quote.amount_out comes from arb-strategy's reserve-based calculation
-        // - For AMMs (Raydium, CPMM): exact value from constant product formula
-        // - For DLMM: price-based estimation with 3% safety margin (fallback)
-        //
-        // This eliminates the previous 20% safety margin problem that made trades unprofitable.
-        // The simulation validates the actual output - if there's a mismatch, it fails early.
         let sell_amount_in = buy_quote.amount_out;
 
         info!(
@@ -1223,17 +1390,58 @@ impl CrossDexHandler {
             "Building sell instruction with expected buy output as amount_in (Option D)"
         );
 
-        let sell_instructions = sell_connector
-            .build_swap_ix_async(token_mint, SOL_MINT, sell_amount_in, sell_min_out)
-            .await?;
+        let sell_instructions = if sell_dex == "pump_amm" {
+            self.build_pump_amm_arb_swap_ixs(
+                token_mint,
+                SOL_MINT,
+                sell_amount_in,
+                sell_min_out,
+                &sell_pool,
+                sell_accounts.as_deref(),
+                Some(token_program_sdk),
+                false,
+            )?
+        } else {
+            let sell_connector = self
+                .dexes
+                .get(&sell_dex)
+                .ok_or_else(|| anyhow!("Unknown sell DEX: {}", sell_dex))?;
 
-        // Combine: Token ATA creation (optional) + buy swap + sell swap
-        // Instructions in ata_creation_instructions:
-        // - 1x CreateIdempotent Token ATA (~2k CU if exists, ~20k CU if new)
-        // NOTE: WSOL ATA creation REMOVED - WsolManager guarantees it exists.
-        // NOTE: wrap SOL (Transfer + SyncNative) REMOVED - WsolManager handles this.
+            sell_connector.cache_extra_data(
+                &format!("token_program:{}", token_mint),
+                &token_program_sdk.to_string(),
+            );
+
+            if let Some(ref accts) = sell_accounts {
+                if let Err(e) = sell_connector.set_pool_from_accounts(&sell_pool, accts) {
+                    warn!(
+                        pool = %sell_pool,
+                        dex = %sell_dex,
+                        error = %e,
+                        "Failed to set sell pool from intent accounts"
+                    );
+                }
+            } else if !sell_pool.is_empty() {
+                let pool_pk = Pubkey::from_str(&sell_pool)
+                    .map_err(|_| anyhow!("Invalid sell pool address: {}", sell_pool))?;
+
+                if !self.try_inject_from_cache(&sell_dex, &pool_pk, sell_connector) {
+                    return Err(anyhow!(
+                        "GEYSER_CACHE_MISS: sell pool {} ({}) not in cache and no accounts in intent. \
+                         arb-strategy should require DexPoolAccounts before generating intents.",
+                        sell_pool,
+                        sell_dex
+                    ));
+                }
+            }
+
+            sell_connector
+                .build_swap_ix_async(token_mint, SOL_MINT, sell_amount_in, sell_min_out)
+                .await?
+        };
+
         let mut combined_buy_instructions = ata_creation_instructions;
-        combined_buy_instructions.extend(buy_instructions);
+        combined_buy_instructions.extend(buy_swap_instructions);
 
         // Estimate compute units:
         // - 1x Token ATA create ~20k (often no-op ~2k)
