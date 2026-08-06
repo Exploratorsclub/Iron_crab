@@ -4919,6 +4919,21 @@ pub fn record_arb_intent_suppressed_implausible_token_out() {
     ARB_INTENT_SUPPRESSED_IMPLAUSIBLE_TOKEN_OUT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Arb intents suppressed because EE cannot build the buy_dex/sell_dex cross-DEX plan.
+pub static ARB_INTENT_SUPPRESSED_UNSUPPORTED_ROUTE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub fn record_arb_intent_suppressed_unsupported_route() {
+    ARB_INTENT_SUPPRESSED_UNSUPPORTED_ROUTE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Bundle transactions rejected locally because serialized size exceeds 1232 bytes.
+pub static ARB_BUNDLE_TX_TOO_LARGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub fn record_arb_bundle_tx_too_large() {
+    ARB_BUNDLE_TX_TOO_LARGE.fetch_add(1, Ordering::Relaxed);
+}
+
 /// 2-hop cross-DEX opportunities that passed all filters in arb-strategy
 pub static ARB_TWO_HOP_OPPORTUNITIES: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
@@ -10679,6 +10694,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_intent_suppressed_implausible_token_out_total",
         ARB_INTENT_SUPPRESSED_IMPLAUSIBLE_TOKEN_OUT.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_intent_suppressed_unsupported_route_total",
+        ARB_INTENT_SUPPRESSED_UNSUPPORTED_ROUTE.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_bundle_tx_too_large_total",
+        ARB_BUNDLE_TX_TOO_LARGE.load(Ordering::Relaxed)
     );
     line!(
         "arb_two_hop_opportunities_total",

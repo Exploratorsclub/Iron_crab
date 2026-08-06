@@ -33,14 +33,14 @@ use solana_client::rpc_config::{
 };
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
-use solana_message::{v0, AddressLookupTableAccount, VersionedMessage};
+use solana_message::VersionedMessage;
 use solana_sdk::bs58;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::{
     hash::Hash,
     signature::Signer,
-    transaction::{Transaction, VersionedTransaction},
+    transaction::VersionedTransaction,
 };
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding, UiTransactionTokenBalance,
@@ -78,10 +78,10 @@ use ironcrab::ipc::{
 use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
     dec_execution_intent_rx_queue_depth, inc_execution_intent_rx_queue_depth,
-    inc_execution_pool_cache_messages_processed, record_execution_engine_interval_tick_duration_ms,
-    record_execution_intent_channel_wait_ms, record_execution_intent_jetstream_to_channel_ms,
-    record_execution_process_intent_us, record_execution_slot_lag_at_send_slots,
-    record_failed_confirmed_no_fill_accounting_total,
+    inc_execution_pool_cache_messages_processed, record_arb_bundle_tx_too_large,
+    record_execution_engine_interval_tick_duration_ms, record_execution_intent_channel_wait_ms,
+    record_execution_intent_jetstream_to_channel_ms, record_execution_process_intent_us,
+    record_execution_slot_lag_at_send_slots, record_failed_confirmed_no_fill_accounting_total,
     record_liquidation_seed_skipped_authority_total, record_recent_trade,
     record_tx_confirmed_slot_delta_slots, record_tx_priority_fee_source, record_tx_rebroadcast,
     record_tx_rebroadcast_during_confirm_ms, record_tx_rebroadcast_method,
@@ -5516,7 +5516,7 @@ impl ExecutionContext {
                 let plan = tx_builder::TxPlan {
                     instructions: vec![close_ix],
                 };
-                let sim = simulate_transaction(ctx, wallet, &plan).await;
+                let sim = simulate_transaction(ctx, wallet, &plan, None).await;
                 if sim.success {
                     let config = ctx.get_config();
                     if config.send_enabled {
@@ -5654,7 +5654,7 @@ impl ExecutionContext {
                 instructions: vec![close_ix],
             };
 
-            let sim = simulate_transaction(ctx, wallet, &plan).await;
+            let sim = simulate_transaction(ctx, wallet, &plan, None).await;
             if !sim.success {
                 warn!(token_account = %token_account, mint = %mint, token_program = %token_program, error = ?sim.error_code, "Close empty token account simulation failed; not sending");
                 continue;
@@ -6098,7 +6098,7 @@ impl ExecutionContext {
             }
 
             let plan = tx_builder::TxPlan { instructions: ixs };
-            let sim = simulate_transaction(&ctx, wallet, &plan).await;
+            let sim = simulate_transaction(&ctx, wallet, &plan, None).await;
             if !sim.success {
                 warn!(request_id = %request_id, token_account = %token_account_pk, mint = %mint, error = ?sim.error_code, "Burn simulation failed; not sending");
                 let rec = BurnOpRecord {
@@ -11617,7 +11617,9 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         // === Simulate (P0: simulate-gated) ===
         info!(intent_id = %intent.intent_id, "Running simulation");
 
-        let sim_result = simulate_transaction(ctx, wallet_pubkey, &tx_plan_for_sim).await;
+        let bundle_tip_exclude = bundle_tip_ix.as_ref().map(|ix| ix.accounts[1].pubkey);
+        let sim_result =
+            simulate_transaction(ctx, wallet_pubkey, &tx_plan_for_sim, bundle_tip_exclude).await;
 
         if sim_result.success {
             break (
@@ -12105,7 +12107,6 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                 .as_ref()
                 .expect("bundle_config gate ensures jito_client is present");
 
-            let signer = treasury.signer_ref();
             let blockhash_for_send = match ctx.get_latest_blockhash_for_send().await {
                 Ok(bh) => bh,
                 Err(e) => {
@@ -12163,105 +12164,87 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                 "✅ Tip instruction added to Jito bundle transaction"
             );
 
-            // Use ALT if available to reduce transaction size (Jito bundles can exceed 1232 byte limit without ALT)
-            // CRITICAL: Jito tip account MUST be writable in the final transaction.
-            // If the tip account is in the ALT, v0::Message::try_compile will reference it via lookup,
-            // but the v0 Message format cannot specify writable flags for lookup accounts.
-            // This causes Jito rejection: "Bundles must write lock at least one tip account".
-            // Solution: Filter tip account out of ALT before compiling v0 Message.
-            let send_result = if let Some(ref alt) = ctx.address_lookup_table {
-                // ALT path enabled for bundles to reduce TX size
-                // Build versioned transaction with ALT
-                // AddressLookupTableAccount, v0, VersionedMessage already imported at top
-                use solana_sdk::transaction::VersionedTransaction;
+            let tip_account = tip_ix.accounts[1].pubkey;
+            let bundle_plan = tx_builder::TxPlan { instructions: ixs };
 
-                // Get the tip account from the tip instruction (accounts[1] is the recipient, accounts[0] is payer)
-                let tip_account = tip_ix.accounts[1].pubkey;
-
-                // Filter out Jito tip account from ALT to preserve its writable flag
-                let original_count = alt.accounts.len();
-                let filtered_accounts: Vec<Pubkey> = alt
-                    .accounts
-                    .iter()
-                    .filter(|&addr| *addr != tip_account)
-                    .copied()
-                    .collect();
-
-                if filtered_accounts.len() < original_count {
-                    info!(
-                        intent_id = %intent.intent_id,
-                        tip_account = %tip_account,
-                        removed_count = %(original_count - filtered_accounts.len()),
-                        "Removed Jito tip account from ALT to preserve writable flag"
-                    );
-                }
-
-                // Convert LoadedAlt to AddressLookupTableAccount for v0::Message::try_compile
-                let alt_account = AddressLookupTableAccount {
-                    key: alt.address,
-                    addresses: filtered_accounts,
-                };
-
-                match v0::Message::try_compile(&wallet_pubkey, &ixs, &[alt_account], blockhash) {
-                    Ok(v0_message) => {
-                        let versioned_msg = VersionedMessage::V0(v0_message);
-                        match VersionedTransaction::try_new(versioned_msg, &[signer]) {
-                            Ok(versioned_tx) => {
-                                info!(
-                                    intent_id = %intent.intent_id,
-                                    alt_address = %alt.address,
-                                    alt_accounts = alt.accounts.len(),
-                                    "Submitting versioned transaction with ALT to Jito"
-                                );
-                                jito_client.send_versioned_bundle(&[versioned_tx]).await
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "VersionedTransaction signing failed, using legacy");
-                                let tx = Transaction::new_signed_with_payer(
-                                    &ixs,
-                                    Some(&wallet_pubkey),
-                                    &[signer],
-                                    blockhash,
-                                );
-                                jito_client.send_bundle(&[tx]).await
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Fallback to legacy if ALT compile fails
-                        warn!(error = %e, "ALT message compile failed, using legacy transaction");
-                        let tx = Transaction::new_signed_with_payer(
-                            &ixs,
-                            Some(&wallet_pubkey),
-                            &[signer],
-                            blockhash,
-                        );
-                        jito_client.send_bundle(&[tx]).await
-                    }
-                }
-            } else {
-                // Legacy transaction (fallback when no ALT available)
+            if ctx
+                .address_lookup_table
+                .as_ref()
+                .is_some_and(|alt| alt.contains(&tip_account))
+            {
                 info!(
                     intent_id = %intent.intent_id,
-                    "Using legacy transaction for Jito bundle (no ALT available)"
+                    tip_account = %tip_account,
+                    "Removed Jito tip account from ALT to preserve writable flag"
                 );
+            }
 
-                // Build transaction manually to ensure proper serialization for Jito
-                use solana_sdk::message::Message;
-                let message = Message::new(&ixs, Some(&wallet_pubkey));
-                let mut tx = Transaction::new_unsigned(message);
-                tx.sign(&[signer], blockhash);
-
-                info!(
-                    intent_id = %intent.intent_id,
-                    is_signed = tx.is_signed(),
-                    signature_count = tx.signatures.len(),
-                    message_size = bincode::serialize(&tx).map(|b| b.len()).unwrap_or(0),
-                    "Legacy transaction signed for Jito bundle"
-                );
-
-                jito_client.send_bundle(&[tx]).await
+            let build_result = {
+                let signer = treasury.signer_ref();
+                build_signed_versioned_tx(
+                    &wallet_pubkey,
+                    &bundle_plan,
+                    blockhash,
+                    ctx.address_lookup_table.as_ref(),
+                    Some(&tip_account),
+                    &[signer],
+                )
             };
+
+            let versioned_tx = match build_result {
+                Ok(tx) => tx,
+                Err(e) => {
+                    let reason = RejectReason::InternalError;
+                    checks.push(CheckResult {
+                        check_name: "bundle_tx_compile".to_string(),
+                        passed: false,
+                        reason_code: Some(reason.to_string()),
+                        details: Some(format!("bundle_tx_compile_error:{e}")),
+                    });
+                    ctx.record_intent_rejected();
+                    INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    ctx.lock_manager.release_locks(&intent.intent_id);
+                    warn!(
+                        intent_id = %intent.intent_id,
+                        error = %e,
+                        "Failed to compile bundle transaction for Jito send"
+                    );
+                    return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+                }
+            };
+
+            if let Err(size_err) = check_versioned_tx_size(&versioned_tx) {
+                let serialized_len = versioned_tx_serialized_len(&versioned_tx).unwrap_or(0);
+                log_bundle_tx_size_rejection(
+                    &intent,
+                    serialized_len,
+                    &size_err,
+                    ctx.address_lookup_table
+                        .as_ref()
+                        .is_some_and(|alt| alt.contains(&tip_account)),
+                );
+                let reason = sim_failure_reject_reason(Some(&size_err));
+                checks.push(CheckResult {
+                    check_name: "bundle_tx_size".to_string(),
+                    passed: false,
+                    reason_code: Some(reason.to_string()),
+                    details: Some(size_err),
+                });
+                ctx.record_intent_rejected();
+                INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                ctx.lock_manager.release_locks(&intent.intent_id);
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+            }
+
+            let serialized_len = versioned_tx_serialized_len(&versioned_tx).unwrap_or(0);
+            info!(
+                intent_id = %intent.intent_id,
+                serialized_len,
+                alt_configured = ctx.address_lookup_table.is_some(),
+                "Submitting size-checked bundle transaction to Jito"
+            );
+
+            let send_result = jito_client.send_versioned_bundle(&[versioned_tx]).await;
 
             if let Some(tip_lamports) = bundle_tip_lamports {
                 JITO_TIP_LAMPORTS_TOTAL.fetch_add(tip_lamports, Ordering::Relaxed);
@@ -13428,20 +13411,23 @@ const MAX_SERIALIZED_TX_BYTES: usize = 1232;
 /// Build the versioned message shared by simulation and send.
 ///
 /// v0+ALT when an ALT is configured, otherwise legacy.
+/// When `exclude_tip_from_alt` is set, the tip account is removed from the ALT so it
+/// remains a static writable key (required for Jito bundles; sim must match send).
 fn build_versioned_message(
     wallet_pubkey: &Pubkey,
     plan: &tx_builder::TxPlan,
     blockhash: Hash,
     alt: Option<&ironcrab::solana::address_lookup_table::LoadedAlt>,
+    exclude_tip_from_alt: Option<&Pubkey>,
 ) -> Result<VersionedMessage, String> {
     if let Some(alt) = alt {
-        let alt_account = AddressLookupTableAccount {
-            key: alt.address,
-            addresses: alt.accounts.clone(),
-        };
-        v0::Message::try_compile(wallet_pubkey, &plan.instructions, &[alt_account], blockhash)
-            .map(VersionedMessage::V0)
-            .map_err(|e| format!("v0_compile_error:{e}"))
+        ironcrab::solana::address_lookup_table::compile_v0_versioned_message(
+            wallet_pubkey,
+            &plan.instructions,
+            Some(alt),
+            exclude_tip_from_alt,
+            blockhash,
+        )
     } else {
         let message = solana_sdk::message::Message::new_with_blockhash(
             &plan.instructions,
@@ -13458,8 +13444,10 @@ fn build_unsigned_versioned_tx(
     plan: &tx_builder::TxPlan,
     blockhash: Hash,
     alt: Option<&ironcrab::solana::address_lookup_table::LoadedAlt>,
+    exclude_tip_from_alt: Option<&Pubkey>,
 ) -> Result<VersionedTransaction, String> {
-    let message = build_versioned_message(wallet_pubkey, plan, blockhash, alt)?;
+    let message =
+        build_versioned_message(wallet_pubkey, plan, blockhash, alt, exclude_tip_from_alt)?;
     Ok(VersionedTransaction {
         signatures: vec![Signature::default()],
         message,
@@ -13472,9 +13460,11 @@ fn build_signed_versioned_tx(
     plan: &tx_builder::TxPlan,
     blockhash: Hash,
     alt: Option<&ironcrab::solana::address_lookup_table::LoadedAlt>,
+    exclude_tip_from_alt: Option<&Pubkey>,
     signers: &[&dyn Signer],
 ) -> Result<VersionedTransaction, String> {
-    let message = build_versioned_message(wallet_pubkey, plan, blockhash, alt)?;
+    let message =
+        build_versioned_message(wallet_pubkey, plan, blockhash, alt, exclude_tip_from_alt)?;
     VersionedTransaction::try_new(message, signers).map_err(|e| format!("sign_error:{e}"))
 }
 
@@ -13494,14 +13484,44 @@ fn check_versioned_tx_size(tx: &VersionedTransaction) -> Result<(), String> {
     Ok(())
 }
 
+fn log_bundle_tx_size_rejection(
+    intent: &TradeIntent,
+    serialized_len: usize,
+    size_err: &str,
+    tip_filtered_from_alt: bool,
+) {
+    let buy_dex = intent
+        .metadata
+        .get("buy_dex")
+        .map(|s| s.as_str())
+        .unwrap_or("?");
+    let sell_dex = intent
+        .metadata
+        .get("sell_dex")
+        .map(|s| s.as_str())
+        .unwrap_or("?");
+    warn!(
+        intent_id = %intent.intent_id,
+        serialized_len,
+        buy_dex,
+        sell_dex,
+        tip_filtered_from_alt,
+        error = %size_err,
+        "Bundle transaction exceeds Solana serialized size limit; rejecting before Jito submit"
+    );
+    record_arb_bundle_tx_too_large();
+}
+
 /// Build + size-gate the unsigned TX used for simulation (same form as send, no RPC yet).
 fn prepare_unsigned_versioned_tx_for_simulation(
     wallet_pubkey: &Pubkey,
     plan: &tx_builder::TxPlan,
     blockhash: Hash,
     alt: Option<&ironcrab::solana::address_lookup_table::LoadedAlt>,
+    exclude_tip_from_alt: Option<&Pubkey>,
 ) -> Result<VersionedTransaction, String> {
-    let tx = build_unsigned_versioned_tx(wallet_pubkey, plan, blockhash, alt)?;
+    let tx =
+        build_unsigned_versioned_tx(wallet_pubkey, plan, blockhash, alt, exclude_tip_from_alt)?;
     check_versioned_tx_size(&tx)?;
     Ok(tx)
 }
@@ -13511,11 +13531,12 @@ fn prepare_unsigned_versioned_tx_for_simulation(
 /// Notes:
 /// - Uses `sig_verify=false` (unsigned tx is fine for simulation).
 /// - Uses `replace_recent_blockhash=true` so simulation does not depend on blockhash freshness.
-/// - Uses the same message form as send (v0+ALT or legacy).
+/// - Uses the same message form as send (v0+ALT or legacy), including tip ALT filtering for bundles.
 async fn simulate_transaction(
     ctx: &ExecutionContext,
     wallet_pubkey: Pubkey,
     plan: &tx_builder::TxPlan,
+    exclude_tip_from_alt: Option<Pubkey>,
 ) -> SimulationResult {
     let blockhash = match ctx.get_latest_blockhash().await {
         Ok(hash) => hash,
@@ -13529,11 +13550,13 @@ async fn simulate_transaction(
         }
     };
 
+    let tip_ref = exclude_tip_from_alt.as_ref();
     let tx_result = prepare_unsigned_versioned_tx_for_simulation(
         &wallet_pubkey,
         plan,
         blockhash,
         ctx.address_lookup_table.as_ref(),
+        tip_ref,
     );
 
     let tx = match tx_result {
@@ -13636,6 +13659,7 @@ async fn send_transaction_rpc(
         plan,
         blockhash,
         ctx.address_lookup_table.as_ref(),
+        None,
         &[signer],
     )?;
     check_versioned_tx_size(&tx)?;
@@ -13693,6 +13717,7 @@ async fn send_transaction_with_fallback(
         plan,
         blockhash_for_send.hash,
         ctx.address_lookup_table.as_ref(),
+        None,
         &[signer],
     )?;
     check_versioned_tx_size(&vtx)?;
@@ -14492,10 +14517,10 @@ mod execution_engine_tests {
             instructions: vec![test_system_transfer(&wallet.pubkey(), &recipient, 1)],
         };
 
-        let unsigned = build_unsigned_versioned_tx(&wallet.pubkey(), &plan, blockhash, None)
+        let unsigned = build_unsigned_versioned_tx(&wallet.pubkey(), &plan, blockhash, None, None)
             .expect("unsigned legacy tx");
         let signed =
-            build_signed_versioned_tx(&wallet.pubkey(), &plan, blockhash, None, &[&wallet])
+            build_signed_versioned_tx(&wallet.pubkey(), &plan, blockhash, None, None, &[&wallet])
                 .expect("signed legacy tx");
 
         assert_eq!(unsigned.message, signed.message);
@@ -14641,14 +14666,55 @@ mod execution_engine_tests {
             instructions: vec![test_system_transfer(&wallet.pubkey(), &recipient, 1)],
         };
 
-        let unsigned = build_unsigned_versioned_tx(&wallet.pubkey(), &plan, blockhash, Some(&alt))
-            .expect("unsigned v0 tx");
-        let signed =
-            build_signed_versioned_tx(&wallet.pubkey(), &plan, blockhash, Some(&alt), &[&wallet])
-                .expect("signed v0 tx");
+        let unsigned =
+            build_unsigned_versioned_tx(&wallet.pubkey(), &plan, blockhash, Some(&alt), None)
+                .expect("unsigned v0 tx");
+        let signed = build_signed_versioned_tx(
+            &wallet.pubkey(),
+            &plan,
+            blockhash,
+            Some(&alt),
+            None,
+            &[&wallet],
+        )
+        .expect("signed v0 tx");
 
         assert_eq!(unsigned.message, signed.message);
         assert!(matches!(unsigned.message, VersionedMessage::V0(_)));
+    }
+
+    #[test]
+    fn bundle_sim_and_send_share_identical_message_with_tip_filtered_alt() {
+        let wallet = Keypair::new();
+        let tip = Pubkey::from_str("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5").unwrap();
+        let recipient = Pubkey::new_unique();
+        let blockhash = Hash::new_unique();
+        let alt = LoadedAlt {
+            address: Pubkey::new_unique(),
+            accounts: vec![tip, recipient],
+        };
+        let plan = TxPlan {
+            instructions: vec![test_system_transfer(&wallet.pubkey(), &tip, 1)],
+        };
+
+        let unsigned =
+            build_unsigned_versioned_tx(&wallet.pubkey(), &plan, blockhash, Some(&alt), Some(&tip))
+                .expect("unsigned bundle sim tx");
+        let signed = build_signed_versioned_tx(
+            &wallet.pubkey(),
+            &plan,
+            blockhash,
+            Some(&alt),
+            Some(&tip),
+            &[&wallet],
+        )
+        .expect("signed bundle send tx");
+
+        assert_eq!(unsigned.message, signed.message);
+        let unfiltered =
+            build_unsigned_versioned_tx(&wallet.pubkey(), &plan, blockhash, Some(&alt), None)
+                .expect("unfiltered compile");
+        assert_ne!(unsigned.message, unfiltered.message);
     }
 
     fn oversized_legacy_tx_plan(wallet: &Keypair) -> (TxPlan, Hash) {
@@ -14668,8 +14734,9 @@ mod execution_engine_tests {
     fn tx_size_check_rejects_oversized_serialized_transaction_on_send_path() {
         let wallet = Keypair::new();
         let (plan, blockhash) = oversized_legacy_tx_plan(&wallet);
-        let tx = build_signed_versioned_tx(&wallet.pubkey(), &plan, blockhash, None, &[&wallet])
-            .unwrap();
+        let tx =
+            build_signed_versioned_tx(&wallet.pubkey(), &plan, blockhash, None, None, &[&wallet])
+                .unwrap();
         let err = super::check_versioned_tx_size(&tx)
             .expect_err("oversized legacy tx should be rejected on send");
         assert!(err.starts_with("tx_too_large:"));
@@ -14679,9 +14746,14 @@ mod execution_engine_tests {
     fn oversized_tx_rejected_before_simulation() {
         let wallet = Keypair::new();
         let (plan, blockhash) = oversized_legacy_tx_plan(&wallet);
-        let err =
-            prepare_unsigned_versioned_tx_for_simulation(&wallet.pubkey(), &plan, blockhash, None)
-                .expect_err("oversized legacy tx should be rejected before simulation RPC");
+        let err = prepare_unsigned_versioned_tx_for_simulation(
+            &wallet.pubkey(),
+            &plan,
+            blockhash,
+            None,
+            None,
+        )
+        .expect_err("oversized legacy tx should be rejected before simulation RPC");
         assert!(err.starts_with("tx_too_large:"));
     }
 
